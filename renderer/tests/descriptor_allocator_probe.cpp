@@ -4,9 +4,36 @@
 
 #include <cstdlib>
 #include <iostream>
+#include <optional>
 #include <stdexcept>
 
 namespace {
+
+// "heap" is not a recognized WALLPAPERX_FORCE_TIER value (only "buffer"/"classic"
+// are -- see tier_selection.cpp's parseTierOverride), so it has no real override
+// effect; Heap tier is already top priority and gets selected automatically
+// whenever the hardware/driver supports it. Given that, a non-Heap result here
+// always means genuine lack of hardware support, never a forced override falling
+// back -- so this must fail loudly everywhere except the one place that's
+// actually expected to lack it: the Lavapipe ctest pass, which sets
+// WALLPAPERX_ALLOW_NO_HEAP_TIER (see renderer/CMakeLists.txt). Returns nullopt to
+// mean "proceed with the real test body"; a concrete bool means "return this
+// immediately without running the body".
+std::optional<bool> heapTierGuard(wallpaperx::Device& device, const char* label) {
+    if (device.descriptorAllocator().tier() == wallpaperx::DescriptorTier::Heap) {
+        return std::nullopt;
+    }
+    if (std::getenv("WALLPAPERX_ALLOW_NO_HEAP_TIER")) {
+        std::cout << "descriptor_allocator_probe (" << label << "): skipped, hardware/driver has no Heap tier support"
+                  << std::endl;
+        return true;
+    }
+    std::cerr << "descriptor_allocator_probe (" << label << "): expected Heap tier but resolved to "
+              << wallpaperx::toString(device.descriptorAllocator().tier())
+              << " -- set WALLPAPERX_ALLOW_NO_HEAP_TIER=1 only when this is expected (e.g. running under Lavapipe)"
+              << std::endl;
+    return false;
+}
 
 struct TestResource {
     wallpaperx::AllocatedImage image;
@@ -127,12 +154,17 @@ bool testTierRejectsDoubleAllocate(const char* forceTier) {
 }
 
 bool testHeapTierUniformSlotsDoNotCollideWithImageSlots() {
-    setenv("WALLPAPERX_FORCE_TIER", "heap", 1);
+    // No override needed -- Heap is already top priority and auto-selected
+    // whenever supported (see heapTierGuard's comment above).
+    unsetenv("WALLPAPERX_FORCE_TIER");
     wallpaperx::resetValidationWarningCount();
 
     bool ok = true;
     try {
         wallpaperx::Device device(/*enableValidation=*/true);
+        if (auto result = heapTierGuard(device, "heap uniform")) {
+            return *result;
+        }
         TestResource image1 = createTestResource(device);
         TestResource image2 = createTestResource(device);
 
@@ -199,11 +231,14 @@ bool testHeapTierUniformSlotsDoNotCollideWithImageSlots() {
 }
 
 bool testHeapTierAllowsMultipleAllocate() {
-    setenv("WALLPAPERX_FORCE_TIER", "heap", 1);
+    unsetenv("WALLPAPERX_FORCE_TIER");
     wallpaperx::resetValidationWarningCount();
 
     try {
         wallpaperx::Device device(/*enableValidation=*/true);
+        if (auto result = heapTierGuard(device, "heap multi-slot")) {
+            return *result;
+        }
         TestResource a = createTestResource(device);
         TestResource b = createTestResource(device);
 

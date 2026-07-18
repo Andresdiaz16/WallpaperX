@@ -55,6 +55,15 @@ endif()
 
 find_program(GLSLC_EXECUTABLE glslc REQUIRED)
 
+# Lavapipe (Mesa's software Vulkan implementation) — optional. When present,
+# GPU-backed tests also get registered against it (separately from the real
+# GPU), giving hardware-independent coverage and forcing the Classic/Buffer
+# descriptor tiers to run every time instead of only when manually forced.
+find_file(WALLPAPERX_LAVAPIPE_ICD
+    NAMES lvp_icd.json lvp_icd.x86_64.json
+    PATHS /usr/share/vulkan/icd.d
+)
+
 # --------------------------------------------------------------------------- #
 # Static library target
 # --------------------------------------------------------------------------- #
@@ -109,6 +118,11 @@ message(STATUS "  PipeWire: ${PIPEWIRE_VERSION}")
 message(STATUS "  FFTW3:    ${FFTW3_VERSION}")
 message(STATUS "  shaderc:  ${SHADERC_VERSION}")
 message(STATUS "  VMA:      vendored (third_party/vk_mem_alloc.h)")
+if(WALLPAPERX_LAVAPIPE_ICD)
+    message(STATUS "  Lavapipe: found (${WALLPAPERX_LAVAPIPE_ICD}) -- lavapipe ctest pass enabled")
+else()
+    message(STATUS "  Lavapipe: not found -- lavapipe ctest pass skipped (optional; pacman -S vulkan-swrast to enable)")
+endif()
 
 set(SHADER_OUTPUT_DIR ${CMAKE_CURRENT_BINARY_DIR}/shaders)
 file(MAKE_DIRECTORY ${SHADER_OUTPUT_DIR})
@@ -157,3 +171,31 @@ add_test(NAME device_probe COMMAND wallpaperx-device-probe)
 add_test(NAME offscreen_probe COMMAND wallpaperx-offscreen-probe)
 add_test(NAME static_renderer_probe COMMAND wallpaperx-static-renderer-probe)
 add_test(NAME descriptor_allocator_probe COMMAND wallpaperx-descriptor-allocator-probe)
+
+# static_renderer_probe and its _lavapipe twin run the same binary and both
+# read/write the same WALLPAPERX_TEST_IMAGE_DIR path -- lock them to the same
+# resource so ctest never runs them concurrently (e.g. under `ctest -jN`),
+# which would otherwise risk one process reading a half-written PNG from
+# the other.
+set_tests_properties(static_renderer_probe PROPERTIES RESOURCE_LOCK static_renderer_probe_test_image)
+
+if(WALLPAPERX_LAVAPIPE_ICD)
+    add_test(NAME device_probe_lavapipe COMMAND wallpaperx-device-probe)
+    add_test(NAME offscreen_probe_lavapipe COMMAND wallpaperx-offscreen-probe)
+    add_test(NAME static_renderer_probe_lavapipe COMMAND wallpaperx-static-renderer-probe)
+    add_test(NAME descriptor_allocator_probe_lavapipe COMMAND wallpaperx-descriptor-allocator-probe)
+    set_tests_properties(
+        device_probe_lavapipe
+        offscreen_probe_lavapipe
+        static_renderer_probe_lavapipe
+        descriptor_allocator_probe_lavapipe
+        PROPERTIES
+            # WALLPAPERX_ALLOW_NO_HEAP_TIER tells descriptor_allocator_probe's
+            # Heap-tier tests that resolving to a non-Heap tier here is expected
+            # (Lavapipe doesn't implement VK_EXT_descriptor_heap) rather than a
+            # regression -- see heapTierGuard() in descriptor_allocator_probe.cpp.
+            ENVIRONMENT "VK_ICD_FILENAMES=${WALLPAPERX_LAVAPIPE_ICD};WALLPAPERX_ALLOW_NO_HEAP_TIER=1"
+            LABELS "lavapipe"
+    )
+    set_tests_properties(static_renderer_probe_lavapipe PROPERTIES RESOURCE_LOCK static_renderer_probe_test_image)
+endif()
