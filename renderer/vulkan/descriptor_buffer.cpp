@@ -86,6 +86,12 @@ void DescriptorBufferAllocator::loadFunctions() {
 }
 
 DescriptorHandle DescriptorBufferAllocator::allocate(VkImageView view, VkSampler sampler) {
+    if (m_imageOccupied) {
+        throw std::runtime_error(
+            "DescriptorBufferAllocator::allocate: image slot already in use — this tier supports only "
+            "one live image at a time; call free() on the previous handle first");
+    }
+
     VkDescriptorImageInfo imageInfo{};
     imageInfo.sampler = sampler;
     imageInfo.imageView = view;
@@ -97,10 +103,17 @@ DescriptorHandle DescriptorBufferAllocator::allocate(VkImageView view, VkSampler
 
     m_pfnGetDescriptor(m_device, &getInfo, m_properties.combinedImageSamplerDescriptorSize,
                         static_cast<uint8_t*>(m_buffer.mapped) + m_imageOffset);
+    m_imageOccupied = true;
     return DescriptorHandle{kImageBinding};
 }
 
 DescriptorHandle DescriptorBufferAllocator::allocateUniform(VkBuffer buffer, VkDeviceSize size) {
+    if (m_uniformOccupied) {
+        throw std::runtime_error(
+            "DescriptorBufferAllocator::allocateUniform: uniform slot already in use — this tier supports "
+            "only one live uniform buffer at a time; call free() on the previous handle first");
+    }
+
     VkBufferDeviceAddressInfo addrInfo{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
     addrInfo.buffer = buffer;
 
@@ -115,6 +128,7 @@ DescriptorHandle DescriptorBufferAllocator::allocateUniform(VkBuffer buffer, VkD
 
     m_pfnGetDescriptor(m_device, &getInfo, m_properties.uniformBufferDescriptorSize,
                         static_cast<uint8_t*>(m_buffer.mapped) + m_uniformOffset);
+    m_uniformOccupied = true;
     return DescriptorHandle{kUniformBinding};
 }
 
@@ -131,7 +145,12 @@ void DescriptorBufferAllocator::bind(VkCommandBuffer cmd, VkPipelineBindPoint bi
     m_pfnCmdSetOffsets(cmd, bindPoint, m_pipelineLayout, 0, 1, &bufferIndex, &offset);
 }
 
-void DescriptorBufferAllocator::free(DescriptorHandle) {
+void DescriptorBufferAllocator::free(DescriptorHandle handle) {
+    if (handle.index == kImageBinding) {
+        m_imageOccupied = false;
+    } else if (handle.index == kUniformBinding) {
+        m_uniformOccupied = false;
+    }
 }
 
 }

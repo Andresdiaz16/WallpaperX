@@ -4,6 +4,7 @@
 #include "memory.h"
 #include "tier_selection.h"
 
+#include <functional>
 #include <memory>
 #include <string>
 
@@ -38,12 +39,17 @@ public:
     Memory& memory() { return m_memory; }
     IDescriptorAllocator& descriptorAllocator() { return *m_descriptorAllocator; }
 
+    VkCommandPool commandPool() const { return m_commandPool; }
+
+    void immediateSubmit(const std::function<void(VkCommandBuffer)>& record);
+
 private:
     void createInstance(bool enableValidation);
     void selectPhysicalDevice();
     void determineTier();
     void createLogicalDevice();
     void createDescriptorAllocator();
+    void createCommandPool();
 
     VkInstance m_instance = VK_NULL_HANDLE;
     VkDebugUtilsMessengerEXT m_debugMessenger = VK_NULL_HANDLE;
@@ -56,6 +62,7 @@ private:
     DescriptorTier m_selectedTier = DescriptorTier::Classic;
     Memory m_memory;
     std::unique_ptr<IDescriptorAllocator> m_descriptorAllocator;
+    VkCommandPool m_commandPool = VK_NULL_HANDLE;
 };
 
 }

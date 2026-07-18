@@ -29,6 +29,8 @@ private:
     VkDescriptorPool m_pool = VK_NULL_HANDLE;
     VkDescriptorSet m_set = VK_NULL_HANDLE;
     VkPipelineLayout m_pipelineLayout = VK_NULL_HANDLE;
+    bool m_imageOccupied = false;
+    bool m_uniformOccupied = false;
 };
 
 }

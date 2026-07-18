@@ -29,16 +29,25 @@ public:
     void free(DescriptorHandle handle) override;
     DescriptorTier tier() const override { return DescriptorTier::Heap; }
 
+    void pushData(VkCommandBuffer cmd, uint32_t offset, const void* data, size_t size);
+
 private:
     void loadFunctions();
-    uint32_t acquireSlot();
+    uint32_t acquireImageSlot();
+    uint32_t acquireUniformSlot();
 
     VkPhysicalDevice m_physicalDevice = VK_NULL_HANDLE;
     VkDevice m_device = VK_NULL_HANDLE;
     Memory& m_memory;
 
     VkPhysicalDeviceDescriptorHeapPropertiesEXT m_properties{};
-    VkDeviceSize m_resourceStride = 0;
+
+    // Images and uniform buffers have different native descriptor sizes, so each
+    // gets its own byte region of m_resourceHeap (addressed at its own stride) and
+    // its own slot free-list. m_uniformIndexBase is chosen so uniform handle
+    // indices never numerically collide with image handle indices (see free()).
+    VkDeviceSize m_uniformRegionOffset = 0;
+    uint32_t m_uniformIndexBase = 0;
 
     AllocatedBuffer m_resourceHeap;
     AllocatedBuffer m_samplerHeap;
@@ -47,16 +56,22 @@ private:
     VkDeviceSize m_resourceHeapSize = 0;
     VkDeviceSize m_samplerHeapSize = 0;
 
-    std::vector<uint32_t> m_freeSlots;
-    uint32_t m_nextSlot = 0;
+    std::vector<uint32_t> m_freeImageSlots;
+    uint32_t m_nextImageSlot = 0;
+    std::vector<uint32_t> m_freeUniformSlots;
+    uint32_t m_nextUniformSlot = 0;
 
     std::unordered_map<VkImageView, VkImageViewCreateInfo> m_registeredViews;
     std::unordered_map<VkSampler, VkSamplerCreateInfo> m_registeredSamplers;
+
+    std::unordered_map<uint32_t, VkImageView> m_slotView;
+    std::unordered_map<uint32_t, VkSampler> m_slotSampler;
 
     PFN_vkWriteResourceDescriptorsEXT m_pfnWriteResource = nullptr;
     PFN_vkWriteSamplerDescriptorsEXT m_pfnWriteSampler = nullptr;
     PFN_vkCmdBindResourceHeapEXT m_pfnCmdBindResourceHeap = nullptr;
     PFN_vkCmdBindSamplerHeapEXT m_pfnCmdBindSamplerHeap = nullptr;
+    PFN_vkCmdPushDataEXT m_pfnCmdPushData = nullptr;
 };
 
 }

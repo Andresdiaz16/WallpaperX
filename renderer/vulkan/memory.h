@@ -20,13 +20,14 @@ struct AllocatedImage {
 
 class Memory {
 public:
-    void init(VkInstance instance, VkPhysicalDevice physicalDevice, VkDevice device, uint32_t apiVersion);
+    void init(VkInstance instance, VkPhysicalDevice physicalDevice, VkDevice device, uint32_t apiVersion, bool bufferDeviceAddressEnabled);
     void shutdown();
 
     AllocatedBuffer createBuffer(VkDeviceSize size, VkBufferUsageFlags usage, bool hostVisible, const char* debugName = nullptr);
     void destroyBuffer(AllocatedBuffer& buffer);
 
     AllocatedImage createExportableImage(const VkImageCreateInfo& imageInfo, VkExternalMemoryHandleTypeFlagBits exportHandleType, const char* debugName = nullptr);
+    AllocatedImage createImage(const VkImageCreateInfo& imageInfo, const char* debugName = nullptr);
     void destroyImage(AllocatedImage& image);
     VkDeviceMemory imageDeviceMemory(const AllocatedImage& image) const;
 

@@ -53,6 +53,8 @@ if(NOT STB_INCLUDE_DIR)
     )
 endif()
 
+find_program(GLSLC_EXECUTABLE glslc REQUIRED)
+
 # --------------------------------------------------------------------------- #
 # Static library target
 # --------------------------------------------------------------------------- #
@@ -67,6 +69,7 @@ add_library(wallpaperx-renderer STATIC
     vulkan/descriptor_buffer.cpp
     vulkan/descriptor_heap.cpp
     vulkan/offscreen.cpp
+    renderers/static_renderer.cpp
 )
 
 target_include_directories(wallpaperx-renderer
@@ -107,6 +110,23 @@ message(STATUS "  FFTW3:    ${FFTW3_VERSION}")
 message(STATUS "  shaderc:  ${SHADERC_VERSION}")
 message(STATUS "  VMA:      vendored (third_party/vk_mem_alloc.h)")
 
+set(SHADER_OUTPUT_DIR ${CMAKE_CURRENT_BINARY_DIR}/shaders)
+file(MAKE_DIRECTORY ${SHADER_OUTPUT_DIR})
+
+set(SHADER_SPV_FILES "")
+foreach(SHADER_SRC fullscreen.vert fullscreen_set.frag fullscreen_heap.frag)
+    set(SHADER_SPV ${SHADER_OUTPUT_DIR}/${SHADER_SRC}.spv)
+    add_custom_command(
+        OUTPUT ${SHADER_SPV}
+        COMMAND ${GLSLC_EXECUTABLE} --target-env=vulkan1.3 -o ${SHADER_SPV} ${CMAKE_CURRENT_SOURCE_DIR}/shaders/${SHADER_SRC}
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/shaders/${SHADER_SRC}
+        COMMENT "Compiling shader ${SHADER_SRC}"
+    )
+    list(APPEND SHADER_SPV_FILES ${SHADER_SPV})
+endforeach()
+
+add_custom_target(wallpaperx-shaders DEPENDS ${SHADER_SPV_FILES})
+
 add_executable(wallpaperx-device-probe tests/device_probe.cpp)
 target_link_libraries(wallpaperx-device-probe PRIVATE wallpaperx-renderer)
 
@@ -119,8 +139,21 @@ target_link_libraries(wallpaperx-memory-export-test PRIVATE wallpaperx-renderer)
 add_executable(wallpaperx-offscreen-probe tests/offscreen_probe.cpp)
 target_link_libraries(wallpaperx-offscreen-probe PRIVATE wallpaperx-renderer)
 
+add_executable(wallpaperx-static-renderer-probe tests/static_renderer_probe.cpp)
+target_link_libraries(wallpaperx-static-renderer-probe PRIVATE wallpaperx-renderer)
+add_dependencies(wallpaperx-static-renderer-probe wallpaperx-shaders)
+target_compile_definitions(wallpaperx-static-renderer-probe PRIVATE
+    WALLPAPERX_SHADER_DIR="${SHADER_OUTPUT_DIR}"
+    WALLPAPERX_TEST_IMAGE_DIR="${CMAKE_CURRENT_BINARY_DIR}/test_assets"
+)
+
+add_executable(wallpaperx-descriptor-allocator-probe tests/descriptor_allocator_probe.cpp)
+target_link_libraries(wallpaperx-descriptor-allocator-probe PRIVATE wallpaperx-renderer)
+
 enable_testing()
 add_test(NAME tier_selection COMMAND wallpaperx-tier-selection-test)
 add_test(NAME memory_export COMMAND wallpaperx-memory-export-test)
 add_test(NAME device_probe COMMAND wallpaperx-device-probe)
 add_test(NAME offscreen_probe COMMAND wallpaperx-offscreen-probe)
+add_test(NAME static_renderer_probe COMMAND wallpaperx-static-renderer-probe)
+add_test(NAME descriptor_allocator_probe COMMAND wallpaperx-descriptor-allocator-probe)

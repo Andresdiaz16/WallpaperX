@@ -60,6 +60,12 @@ ClassicDescriptorAllocator::~ClassicDescriptorAllocator() {
 }
 
 DescriptorHandle ClassicDescriptorAllocator::allocate(VkImageView view, VkSampler sampler) {
+    if (m_imageOccupied) {
+        throw std::runtime_error(
+            "ClassicDescriptorAllocator::allocate: image slot already in use — this tier supports only "
+            "one live image at a time; call free() on the previous handle first");
+    }
+
     VkDescriptorImageInfo imageInfo{};
     imageInfo.sampler = sampler;
     imageInfo.imageView = view;
@@ -73,10 +79,17 @@ DescriptorHandle ClassicDescriptorAllocator::allocate(VkImageView view, VkSample
     write.pImageInfo = &imageInfo;
 
     vkUpdateDescriptorSets(m_device, 1, &write, 0, nullptr);
+    m_imageOccupied = true;
     return DescriptorHandle{kImageBinding};
 }
 
 DescriptorHandle ClassicDescriptorAllocator::allocateUniform(VkBuffer buffer, VkDeviceSize size) {
+    if (m_uniformOccupied) {
+        throw std::runtime_error(
+            "ClassicDescriptorAllocator::allocateUniform: uniform slot already in use — this tier supports "
+            "only one live uniform buffer at a time; call free() on the previous handle first");
+    }
+
     VkDescriptorBufferInfo bufferInfo{};
     bufferInfo.buffer = buffer;
     bufferInfo.offset = 0;
@@ -90,6 +103,7 @@ DescriptorHandle ClassicDescriptorAllocator::allocateUniform(VkBuffer buffer, Vk
     write.pBufferInfo = &bufferInfo;
 
     vkUpdateDescriptorSets(m_device, 1, &write, 0, nullptr);
+    m_uniformOccupied = true;
     return DescriptorHandle{kUniformBinding};
 }
 
@@ -97,7 +111,12 @@ void ClassicDescriptorAllocator::bind(VkCommandBuffer cmd, VkPipelineBindPoint b
     vkCmdBindDescriptorSets(cmd, bindPoint, m_pipelineLayout, 0, 1, &m_set, 0, nullptr);
 }
 
-void ClassicDescriptorAllocator::free(DescriptorHandle) {
+void ClassicDescriptorAllocator::free(DescriptorHandle handle) {
+    if (handle.index == kImageBinding) {
+        m_imageOccupied = false;
+    } else if (handle.index == kUniformBinding) {
+        m_uniformOccupied = false;
+    }
 }
 
 }

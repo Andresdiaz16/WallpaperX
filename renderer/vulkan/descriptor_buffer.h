@@ -45,6 +45,8 @@ private:
     PFN_vkCmdSetDescriptorBufferOffsetsEXT m_pfnCmdSetOffsets = nullptr;
 
     VkPhysicalDeviceDescriptorBufferPropertiesEXT m_properties{};
+    bool m_imageOccupied = false;
+    bool m_uniformOccupied = false;
 };
 
 }

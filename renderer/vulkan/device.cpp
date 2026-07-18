@@ -57,11 +57,14 @@ Device::Device(bool enableValidation) {
     selectPhysicalDevice();
     determineTier();
     createLogicalDevice();
-    m_memory.init(m_instance, m_physicalDevice, m_device, VK_API_VERSION_1_3);
+    const bool bufferDeviceAddressEnabled = m_selectedTier == DescriptorTier::Heap || m_selectedTier == DescriptorTier::Buffer;
+    m_memory.init(m_instance, m_physicalDevice, m_device, VK_API_VERSION_1_3, bufferDeviceAddressEnabled);
     createDescriptorAllocator();
+    createCommandPool();
 }
 
 Device::~Device() {
+    if (m_commandPool) vkDestroyCommandPool(m_device, m_commandPool, nullptr);
     m_descriptorAllocator.reset();
     m_memory.shutdown();
 
@@ -143,6 +146,7 @@ void Device::selectPhysicalDevice() {
 
     VkPhysicalDevice best = VK_NULL_HANDLE;
     VkPhysicalDeviceProperties bestProps{};
+    uint32_t bestGraphicsQueueFamily = UINT32_MAX;
 
     for (VkPhysicalDevice candidate : devices) {
         uint32_t extCount = 0;
@@ -151,6 +155,22 @@ void Device::selectPhysicalDevice() {
         vkEnumerateDeviceExtensionProperties(candidate, nullptr, &extCount, extensions.data());
 
         if (!hasExtension(extensions, VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME)) {
+            continue;
+        }
+
+        uint32_t queueFamilyCount = 0;
+        vkGetPhysicalDeviceQueueFamilyProperties(candidate, &queueFamilyCount, nullptr);
+        std::vector<VkQueueFamilyProperties> queueFamilies(queueFamilyCount);
+        vkGetPhysicalDeviceQueueFamilyProperties(candidate, &queueFamilyCount, queueFamilies.data());
+
+        uint32_t graphicsQueueFamily = UINT32_MAX;
+        for (uint32_t i = 0; i < queueFamilyCount; ++i) {
+            if (queueFamilies[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) {
+                graphicsQueueFamily = i;
+                break;
+            }
+        }
+        if (graphicsQueueFamily == UINT32_MAX) {
             continue;
         }
 
@@ -164,14 +184,16 @@ void Device::selectPhysicalDevice() {
         if (isBetter) {
             best = candidate;
             bestProps = props;
+            bestGraphicsQueueFamily = graphicsQueueFamily;
         }
     }
 
     if (best == VK_NULL_HANDLE) {
-        throw std::runtime_error("Device: no GPU with VK_KHR_external_memory_fd found");
+        throw std::runtime_error("Device: no GPU with VK_KHR_external_memory_fd and a graphics queue found");
     }
 
     m_physicalDevice = best;
+    m_graphicsQueueFamily = bestGraphicsQueueFamily;
     m_info.gpuName = bestProps.deviceName;
     m_info.vendor = vendorFromId(bestProps.vendorID);
 
@@ -184,19 +206,19 @@ void Device::selectPhysicalDevice() {
     m_info.hasDescriptorBuffer = hasExtension(extensions, VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME);
     m_info.hasExternalMemoryDmaBuf = hasExtension(extensions, VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);
 
-    uint32_t queueFamilyCount = 0;
-    vkGetPhysicalDeviceQueueFamilyProperties(m_physicalDevice, &queueFamilyCount, nullptr);
-    std::vector<VkQueueFamilyProperties> queueFamilies(queueFamilyCount);
-    vkGetPhysicalDeviceQueueFamilyProperties(m_physicalDevice, &queueFamilyCount, queueFamilies.data());
-
-    for (uint32_t i = 0; i < queueFamilyCount; ++i) {
-        if (queueFamilies[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) {
-            m_graphicsQueueFamily = i;
-            break;
-        }
+    if (m_info.hasDescriptorHeap) {
+        VkPhysicalDeviceDescriptorHeapFeaturesEXT heapFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_HEAP_FEATURES_EXT};
+        VkPhysicalDeviceFeatures2 features2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+        features2.pNext = &heapFeatures;
+        vkGetPhysicalDeviceFeatures2(m_physicalDevice, &features2);
+        m_info.hasDescriptorHeap = heapFeatures.descriptorHeap == VK_TRUE;
     }
-    if (m_graphicsQueueFamily == UINT32_MAX) {
-        throw std::runtime_error("Device: no graphics-capable queue family found");
+    if (m_info.hasDescriptorBuffer) {
+        VkPhysicalDeviceDescriptorBufferFeaturesEXT bufferFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_FEATURES_EXT};
+        VkPhysicalDeviceFeatures2 features2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+        features2.pNext = &bufferFeatures;
+        vkGetPhysicalDeviceFeatures2(m_physicalDevice, &features2);
+        m_info.hasDescriptorBuffer = bufferFeatures.descriptorBuffer == VK_TRUE;
     }
 }
 
@@ -216,12 +238,18 @@ void Device::createLogicalDevice() {
     }
     if (useHeap) {
         deviceExtensions.push_back(VK_EXT_DESCRIPTOR_HEAP_EXTENSION_NAME);
+        deviceExtensions.push_back(VK_KHR_SHADER_UNTYPED_POINTERS_EXTENSION_NAME);
     } else if (useBuffer) {
         deviceExtensions.push_back(VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME);
     }
 
     VkPhysicalDeviceVulkan12Features vulkan12Features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     vulkan12Features.bufferDeviceAddress = (useHeap || useBuffer) ? VK_TRUE : VK_FALSE;
+
+    VkPhysicalDeviceShaderUntypedPointersFeaturesKHR untypedPointersFeatures{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_UNTYPED_POINTERS_FEATURES_KHR};
+    untypedPointersFeatures.shaderUntypedPointers = VK_TRUE;
+    untypedPointersFeatures.pNext = &vulkan12Features;
 
     VkPhysicalDeviceDescriptorBufferFeaturesEXT descriptorBufferFeatures{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_FEATURES_EXT};
@@ -231,7 +259,7 @@ void Device::createLogicalDevice() {
     VkPhysicalDeviceDescriptorHeapFeaturesEXT descriptorHeapFeatures{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_HEAP_FEATURES_EXT};
     descriptorHeapFeatures.descriptorHeap = VK_TRUE;
-    descriptorHeapFeatures.pNext = &vulkan12Features;
+    descriptorHeapFeatures.pNext = &untypedPointersFeatures;
 
     void* featureChain = &vulkan12Features;
     if (useHeap) {
@@ -272,6 +300,58 @@ void Device::createDescriptorAllocator() {
             m_descriptorAllocator = std::make_unique<ClassicDescriptorAllocator>(m_device);
             break;
     }
+}
+
+void Device::createCommandPool() {
+    VkCommandPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+    poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    poolInfo.queueFamilyIndex = m_graphicsQueueFamily;
+
+    if (vkCreateCommandPool(m_device, &poolInfo, nullptr, &m_commandPool) != VK_SUCCESS) {
+        throw std::runtime_error("Device: failed to create command pool");
+    }
+}
+
+void Device::immediateSubmit(const std::function<void(VkCommandBuffer)>& record) {
+    VkCommandBufferAllocateInfo allocInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    allocInfo.commandPool = m_commandPool;
+    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocInfo.commandBufferCount = 1;
+
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    if (vkAllocateCommandBuffers(m_device, &allocInfo, &cmd) != VK_SUCCESS) {
+        throw std::runtime_error("Device::immediateSubmit: failed to allocate command buffer");
+    }
+
+    VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd, &beginInfo);
+
+    record(cmd);
+
+    vkEndCommandBuffer(cmd);
+
+    VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    VkFence fence = VK_NULL_HANDLE;
+    if (vkCreateFence(m_device, &fenceInfo, nullptr, &fence) != VK_SUCCESS) {
+        vkFreeCommandBuffers(m_device, m_commandPool, 1, &cmd);
+        throw std::runtime_error("Device::immediateSubmit: failed to create fence");
+    }
+
+    VkSubmitInfo submitInfo{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &cmd;
+
+    if (vkQueueSubmit(m_graphicsQueue, 1, &submitInfo, fence) != VK_SUCCESS) {
+        vkDestroyFence(m_device, fence, nullptr);
+        vkFreeCommandBuffers(m_device, m_commandPool, 1, &cmd);
+        throw std::runtime_error("Device::immediateSubmit: vkQueueSubmit failed");
+    }
+
+    vkWaitForFences(m_device, 1, &fence, VK_TRUE, UINT64_MAX);
+
+    vkDestroyFence(m_device, fence, nullptr);
+    vkFreeCommandBuffers(m_device, m_commandPool, 1, &cmd);
 }
 
 }

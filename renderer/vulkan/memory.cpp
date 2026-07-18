@@ -7,13 +7,15 @@
 
 namespace wallpaperx {
 
-void Memory::init(VkInstance instance, VkPhysicalDevice physicalDevice, VkDevice device, uint32_t apiVersion) {
+void Memory::init(VkInstance instance, VkPhysicalDevice physicalDevice, VkDevice device, uint32_t apiVersion, bool bufferDeviceAddressEnabled) {
     VmaAllocatorCreateInfo info{};
     info.instance = instance;
     info.physicalDevice = physicalDevice;
     info.device = device;
     info.vulkanApiVersion = apiVersion;
-    info.flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
+    if (bufferDeviceAddressEnabled) {
+        info.flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
+    }
 
     if (vmaCreateAllocator(&info, &m_allocator) != VK_SUCCESS) {
         throw std::runtime_error("Memory: vmaCreateAllocator failed");
@@ -74,6 +76,17 @@ AllocatedImage Memory::createExportableImage(const VkImageCreateInfo& imageInfoI
     AllocatedImage result;
     if (vmaCreateDedicatedImage(m_allocator, &imageInfo, &allocInfo, &exportInfo, &result.image, &result.allocation, nullptr) != VK_SUCCESS) {
         throw std::runtime_error(std::string("Memory: failed to create exportable image ") + (debugName ? debugName : ""));
+    }
+    return result;
+}
+
+AllocatedImage Memory::createImage(const VkImageCreateInfo& imageInfo, const char* debugName) {
+    VmaAllocationCreateInfo allocInfo{};
+    allocInfo.usage = VMA_MEMORY_USAGE_AUTO;
+
+    AllocatedImage result;
+    if (vmaCreateImage(m_allocator, &imageInfo, &allocInfo, &result.image, &result.allocation, nullptr) != VK_SUCCESS) {
+        throw std::runtime_error(std::string("Memory: failed to create image ") + (debugName ? debugName : ""));
     }
     return result;
 }
