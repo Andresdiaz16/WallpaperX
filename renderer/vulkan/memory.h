@@ -13,6 +13,11 @@ struct AllocatedBuffer {
     void* mapped = nullptr;
 };
 
+struct AllocatedImage {
+    VkImage image = VK_NULL_HANDLE;
+    VmaAllocation allocation = nullptr;
+};
+
 class Memory {
 public:
     void init(VkInstance instance, VkPhysicalDevice physicalDevice, VkDevice device, uint32_t apiVersion);
@@ -20,6 +25,10 @@ public:
 
     AllocatedBuffer createBuffer(VkDeviceSize size, VkBufferUsageFlags usage, bool hostVisible, const char* debugName = nullptr);
     void destroyBuffer(AllocatedBuffer& buffer);
+
+    AllocatedImage createExportableImage(const VkImageCreateInfo& imageInfo, VkExternalMemoryHandleTypeFlagBits exportHandleType, const char* debugName = nullptr);
+    void destroyImage(AllocatedImage& image);
+    VkDeviceMemory imageDeviceMemory(const AllocatedImage& image) const;
 
     VmaAllocator handle() const { return m_allocator; }
 

@@ -20,6 +20,8 @@ public:
 
     void registerImageView(VkImageView view, const VkImageViewCreateInfo& createInfo);
     void registerSampler(VkSampler sampler, const VkSamplerCreateInfo& createInfo);
+    void unregisterImageView(VkImageView view);
+    void unregisterSampler(VkSampler sampler);
 
     DescriptorHandle allocate(VkImageView view, VkSampler sampler) override;
     DescriptorHandle allocateUniform(VkBuffer buffer, VkDeviceSize size) override;

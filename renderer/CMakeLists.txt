@@ -61,10 +61,12 @@ add_library(wallpaperx-renderer STATIC
     renderer.cpp
     vulkan/device.cpp
     vulkan/memory.cpp
+    vulkan/memory_export.cpp
     vulkan/tier_selection.cpp
     vulkan/descriptor_classic.cpp
     vulkan/descriptor_buffer.cpp
     vulkan/descriptor_heap.cpp
+    vulkan/offscreen.cpp
 )
 
 target_include_directories(wallpaperx-renderer
@@ -111,6 +113,14 @@ target_link_libraries(wallpaperx-device-probe PRIVATE wallpaperx-renderer)
 add_executable(wallpaperx-tier-selection-test tests/tier_selection_test.cpp)
 target_link_libraries(wallpaperx-tier-selection-test PRIVATE wallpaperx-renderer)
 
+add_executable(wallpaperx-memory-export-test tests/memory_export_test.cpp)
+target_link_libraries(wallpaperx-memory-export-test PRIVATE wallpaperx-renderer)
+
+add_executable(wallpaperx-offscreen-probe tests/offscreen_probe.cpp)
+target_link_libraries(wallpaperx-offscreen-probe PRIVATE wallpaperx-renderer)
+
 enable_testing()
 add_test(NAME tier_selection COMMAND wallpaperx-tier-selection-test)
+add_test(NAME memory_export COMMAND wallpaperx-memory-export-test)
 add_test(NAME device_probe COMMAND wallpaperx-device-probe)
+add_test(NAME offscreen_probe COMMAND wallpaperx-offscreen-probe)

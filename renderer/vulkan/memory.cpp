@@ -57,4 +57,39 @@ void Memory::destroyBuffer(AllocatedBuffer& buffer) {
     }
 }
 
+AllocatedImage Memory::createExportableImage(const VkImageCreateInfo& imageInfoIn, VkExternalMemoryHandleTypeFlagBits exportHandleType, const char* debugName) {
+    VkExternalMemoryImageCreateInfo externalImageInfo{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO};
+    externalImageInfo.handleTypes = exportHandleType;
+
+    VkImageCreateInfo imageInfo = imageInfoIn;
+    imageInfo.pNext = &externalImageInfo;
+
+    VkExportMemoryAllocateInfo exportInfo{VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO};
+    exportInfo.handleTypes = exportHandleType;
+
+    VmaAllocationCreateInfo allocInfo{};
+    allocInfo.usage = VMA_MEMORY_USAGE_AUTO;
+    allocInfo.flags = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
+
+    AllocatedImage result;
+    if (vmaCreateDedicatedImage(m_allocator, &imageInfo, &allocInfo, &exportInfo, &result.image, &result.allocation, nullptr) != VK_SUCCESS) {
+        throw std::runtime_error(std::string("Memory: failed to create exportable image ") + (debugName ? debugName : ""));
+    }
+    return result;
+}
+
+void Memory::destroyImage(AllocatedImage& image) {
+    if (image.image != VK_NULL_HANDLE) {
+        vmaDestroyImage(m_allocator, image.image, image.allocation);
+        image.image = VK_NULL_HANDLE;
+        image.allocation = nullptr;
+    }
+}
+
+VkDeviceMemory Memory::imageDeviceMemory(const AllocatedImage& image) const {
+    VmaAllocationInfo info{};
+    vmaGetAllocationInfo(m_allocator, image.allocation, &info);
+    return info.deviceMemory;
+}
+
 }

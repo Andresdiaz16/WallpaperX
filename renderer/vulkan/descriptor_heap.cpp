@@ -73,6 +73,14 @@ void DescriptorHeapAllocator::registerSampler(VkSampler sampler, const VkSampler
     m_registeredSamplers[sampler] = createInfo;
 }
 
+void DescriptorHeapAllocator::unregisterImageView(VkImageView view) {
+    m_registeredViews.erase(view);
+}
+
+void DescriptorHeapAllocator::unregisterSampler(VkSampler sampler) {
+    m_registeredSamplers.erase(sampler);
+}
+
 uint32_t DescriptorHeapAllocator::acquireSlot() {
     if (!m_freeSlots.empty()) {
         uint32_t slot = m_freeSlots.back();
