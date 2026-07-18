@@ -1,0 +1,13 @@
+{
+    "KPackageStructure": "Plasma/Wallpaper",
+    "KPlugin": {
+        "Id":          "com.wallpaperx.wallpaper",
+        "Name":        "WallpaperX",
+        "Description": "Interactive wallpapers for Linux",
+        "Icon":        "preferences-desktop-wallpaper",
+        "License":     "GPLv2+",
+        "Version":     "0.1.0"
+    },
+    "X-KDE-ParentApp":              "org.kde.plasmashell",
+    "X-Plasma-API-Minimum-Version": "6.0"
+}
