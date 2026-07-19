@@ -38,71 +38,104 @@ std::optional<bool> heapTierGuard(wallpaperx::Device& device, const char* label)
     return false;
 }
 
-struct TestResource {
-    wallpaperx::AllocatedImage image;
-    VkImageView view = VK_NULL_HANDLE;
-    VkSampler sampler = VK_NULL_HANDLE;
+// RAII test resource: creates an image + view + sampler (registered with the heap
+// allocator when that tier is active) and cleans them all up on destruction, so no
+// test exit path -- including the exception/catch path, which the old manual
+// destroyTestResource() calls did NOT cover -- can leak a GPU allocation (a leak
+// would trip VMA's fatal teardown assert). Move-only: it owns raw Vulkan handles.
+class TestResource {
+public:
+    explicit TestResource(wallpaperx::Device& device) : m_device(&device) {
+        VkImageCreateInfo imageInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        imageInfo.imageType = VK_IMAGE_TYPE_2D;
+        imageInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+        imageInfo.extent = {4, 4, 1};
+        imageInfo.mipLevels = 1;
+        imageInfo.arrayLayers = 1;
+        imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+        imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+        imageInfo.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
+        imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+        m_image = device.memory().createImage(imageInfo, "descriptor-allocator-probe-image");
+
+        VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        viewInfo.image = m_image.image;
+        viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        viewInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+        viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        if (vkCreateImageView(device.device(), &viewInfo, nullptr, &m_view) != VK_SUCCESS) {
+            device.memory().destroyImage(m_image);
+            throw std::runtime_error("descriptor_allocator_probe: failed to create image view");
+        }
+        if (auto* heap = dynamic_cast<wallpaperx::DescriptorHeapAllocator*>(&device.descriptorAllocator())) {
+            heap->registerImageView(m_view, viewInfo);
+        }
+
+        VkSamplerCreateInfo samplerInfo{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+        samplerInfo.magFilter = VK_FILTER_LINEAR;
+        samplerInfo.minFilter = VK_FILTER_LINEAR;
+        samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+        if (vkCreateSampler(device.device(), &samplerInfo, nullptr, &m_sampler) != VK_SUCCESS) {
+            cleanup();  // m_view is already created/registered -- release it before throwing
+            throw std::runtime_error("descriptor_allocator_probe: failed to create sampler");
+        }
+        if (auto* heap = dynamic_cast<wallpaperx::DescriptorHeapAllocator*>(&device.descriptorAllocator())) {
+            heap->registerSampler(m_sampler, samplerInfo);
+        }
+    }
+
+    ~TestResource() { cleanup(); }
+
+    TestResource(TestResource&& other) noexcept
+        : m_device(other.m_device), m_image(other.m_image), m_view(other.m_view), m_sampler(other.m_sampler) {
+        other.m_device = nullptr;
+        other.m_image = {};
+        other.m_view = VK_NULL_HANDLE;
+        other.m_sampler = VK_NULL_HANDLE;
+    }
+    TestResource& operator=(TestResource&& other) noexcept {
+        if (this != &other) {
+            cleanup();
+            m_device = other.m_device;
+            m_image = other.m_image;
+            m_view = other.m_view;
+            m_sampler = other.m_sampler;
+            other.m_device = nullptr;
+            other.m_image = {};
+            other.m_view = VK_NULL_HANDLE;
+            other.m_sampler = VK_NULL_HANDLE;
+        }
+        return *this;
+    }
+    TestResource(const TestResource&) = delete;
+    TestResource& operator=(const TestResource&) = delete;
+
+    VkImageView view() const { return m_view; }
+    VkSampler sampler() const { return m_sampler; }
+
+private:
+    void cleanup() {
+        if (!m_device) return;  // moved-from -- owns nothing
+        if (auto* heap = dynamic_cast<wallpaperx::DescriptorHeapAllocator*>(&m_device->descriptorAllocator())) {
+            heap->unregisterImageView(m_view);
+            heap->unregisterSampler(m_sampler);
+        }
+        if (m_sampler) vkDestroySampler(m_device->device(), m_sampler, nullptr);
+        if (m_view) vkDestroyImageView(m_device->device(), m_view, nullptr);
+        m_device->memory().destroyImage(m_image);
+        m_device = nullptr;
+    }
+
+    wallpaperx::Device* m_device = nullptr;
+    wallpaperx::AllocatedImage m_image;
+    VkImageView m_view = VK_NULL_HANDLE;
+    VkSampler m_sampler = VK_NULL_HANDLE;
 };
-
-TestResource createTestResource(wallpaperx::Device& device) {
-    TestResource resource;
-
-    VkImageCreateInfo imageInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-    imageInfo.imageType = VK_IMAGE_TYPE_2D;
-    imageInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
-    imageInfo.extent = {4, 4, 1};
-    imageInfo.mipLevels = 1;
-    imageInfo.arrayLayers = 1;
-    imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
-    imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
-    imageInfo.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
-    imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-
-    resource.image = device.memory().createImage(imageInfo, "descriptor-allocator-probe-image");
-
-    VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-    viewInfo.image = resource.image.image;
-    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-    viewInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
-    viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-
-    if (vkCreateImageView(device.device(), &viewInfo, nullptr, &resource.view) != VK_SUCCESS) {
-        throw std::runtime_error("descriptor_allocator_probe: failed to create image view");
-    }
-
-    if (auto* heap = dynamic_cast<wallpaperx::DescriptorHeapAllocator*>(&device.descriptorAllocator())) {
-        heap->registerImageView(resource.view, viewInfo);
-    }
-
-    VkSamplerCreateInfo samplerInfo{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
-    samplerInfo.magFilter = VK_FILTER_LINEAR;
-    samplerInfo.minFilter = VK_FILTER_LINEAR;
-    samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
-
-    if (vkCreateSampler(device.device(), &samplerInfo, nullptr, &resource.sampler) != VK_SUCCESS) {
-        throw std::runtime_error("descriptor_allocator_probe: failed to create sampler");
-    }
-
-    if (auto* heap = dynamic_cast<wallpaperx::DescriptorHeapAllocator*>(&device.descriptorAllocator())) {
-        heap->registerSampler(resource.sampler, samplerInfo);
-    }
-
-    return resource;
-}
-
-void destroyTestResource(wallpaperx::Device& device, TestResource& resource) {
-    if (auto* heap = dynamic_cast<wallpaperx::DescriptorHeapAllocator*>(&device.descriptorAllocator())) {
-        heap->unregisterImageView(resource.view);
-        heap->unregisterSampler(resource.sampler);
-    }
-    vkDestroySampler(device.device(), resource.sampler, nullptr);
-    vkDestroyImageView(device.device(), resource.view, nullptr);
-    device.memory().destroyImage(resource.image);
-}
 
 bool testTierRejectsDoubleAllocate(const char* forceTier) {
     setenv("WALLPAPERX_FORCE_TIER", forceTier, 1);
@@ -110,32 +143,28 @@ bool testTierRejectsDoubleAllocate(const char* forceTier) {
 
     try {
         wallpaperx::Device device(/*enableValidation=*/true);
-        TestResource a = createTestResource(device);
-        TestResource b = createTestResource(device);
+        TestResource a(device);
+        TestResource b(device);
 
-        wallpaperx::DescriptorHandle handleA = device.descriptorAllocator().allocate(a.view, a.sampler);
+        wallpaperx::DescriptorHandle handleA = device.descriptorAllocator().allocate(a.view(), a.sampler());
 
         bool threw = false;
         try {
-            device.descriptorAllocator().allocate(b.view, b.sampler);
+            device.descriptorAllocator().allocate(b.view(), b.sampler());
         } catch (const std::runtime_error&) {
             threw = true;
         }
         if (!threw) {
             std::cerr << "descriptor_allocator_probe (" << forceTier
                       << "): second allocate() should have thrown but silently succeeded" << std::endl;
-            destroyTestResource(device, a);
-            destroyTestResource(device, b);
             return false;
         }
 
         device.descriptorAllocator().free(handleA);
-        wallpaperx::DescriptorHandle handleB = device.descriptorAllocator().allocate(b.view, b.sampler);
+        wallpaperx::DescriptorHandle handleB = device.descriptorAllocator().allocate(b.view(), b.sampler());
         if (!handleB.valid()) {
             std::cerr << "descriptor_allocator_probe (" << forceTier
                       << "): allocate() after free() should succeed" << std::endl;
-            destroyTestResource(device, a);
-            destroyTestResource(device, b);
             return false;
         }
 
@@ -150,13 +179,9 @@ bool testTierRejectsDoubleAllocate(const char* forceTier) {
         if (!doubleFreeThrew) {
             std::cerr << "descriptor_allocator_probe (" << forceTier << "): second free() should have thrown"
                       << std::endl;
-            destroyTestResource(device, a);
-            destroyTestResource(device, b);
             return false;
         }
 
-        destroyTestResource(device, a);
-        destroyTestResource(device, b);
     } catch (const std::exception& e) {
         std::cerr << "descriptor_allocator_probe (" << forceTier << ") failed: " << e.what() << std::endl;
         return false;
@@ -183,13 +208,13 @@ bool testHeapTierUniformSlotsDoNotCollideWithImageSlots() {
         if (auto result = heapTierGuard(device, "heap uniform")) {
             return *result;
         }
-        TestResource image1 = createTestResource(device);
+        TestResource image1(device);
 
         wallpaperx::AllocatedBuffer uniformBuffer = device.memory().createBuffer(
             256, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
             wallpaperx::HostAccess::Write, "descriptor-allocator-probe-uniform");
 
-        wallpaperx::DescriptorHandle imageHandle = device.descriptorAllocator().allocate(image1.view, image1.sampler);
+        wallpaperx::DescriptorHandle imageHandle = device.descriptorAllocator().allocate(image1.view(), image1.sampler());
         wallpaperx::DescriptorHandle uniformHandle =
             device.descriptorAllocator().allocateUniform(uniformBuffer.buffer, 256);
 
@@ -219,7 +244,7 @@ bool testHeapTierUniformSlotsDoNotCollideWithImageSlots() {
         // This is the regression guard for the old bug where free() dropped the
         // registration and this allocate() would have thrown "never registered".
         // allocateUniform() has no registration step, so reusing uniformBuffer is fine.
-        wallpaperx::DescriptorHandle imageHandle2 = device.descriptorAllocator().allocate(image1.view, image1.sampler);
+        wallpaperx::DescriptorHandle imageHandle2 = device.descriptorAllocator().allocate(image1.view(), image1.sampler());
         wallpaperx::DescriptorHandle uniformHandle2 =
             device.descriptorAllocator().allocateUniform(uniformBuffer.buffer, 256);
         if (imageHandle2.index != imageHandle.index || uniformHandle2.index != uniformHandle.index) {
@@ -231,7 +256,6 @@ bool testHeapTierUniformSlotsDoNotCollideWithImageSlots() {
         device.descriptorAllocator().free(imageHandle2);
         device.descriptorAllocator().free(uniformHandle2);
         device.memory().destroyBuffer(uniformBuffer);
-        destroyTestResource(device, image1);
     } catch (const std::exception& e) {
         std::cerr << "descriptor_allocator_probe (heap uniform) failed: " << e.what() << std::endl;
         return false;
@@ -258,11 +282,11 @@ bool testHeapTierRejectsDoubleFree() {
             return *result;
         }
 
-        TestResource a = createTestResource(device);
-        TestResource b = createTestResource(device);
-        TestResource c = createTestResource(device);
+        TestResource a(device);
+        TestResource b(device);
+        TestResource c(device);
 
-        wallpaperx::DescriptorHandle handleA = device.descriptorAllocator().allocate(a.view, a.sampler);
+        wallpaperx::DescriptorHandle handleA = device.descriptorAllocator().allocate(a.view(), a.sampler());
         device.descriptorAllocator().free(handleA);
 
         bool threw = false;
@@ -274,23 +298,17 @@ bool testHeapTierRejectsDoubleFree() {
         if (!threw) {
             std::cerr << "descriptor_allocator_probe (heap double-free): second free() should have thrown"
                       << std::endl;
-            destroyTestResource(device, a);
-            destroyTestResource(device, b);
-            destroyTestResource(device, c);
             return false;
         }
 
         // The double-free must not have corrupted the free-list into handing the
         // same slot to two independent, simultaneously-live allocations.
-        wallpaperx::DescriptorHandle handleB = device.descriptorAllocator().allocate(b.view, b.sampler);
-        wallpaperx::DescriptorHandle handleC = device.descriptorAllocator().allocate(c.view, c.sampler);
+        wallpaperx::DescriptorHandle handleB = device.descriptorAllocator().allocate(b.view(), b.sampler());
+        wallpaperx::DescriptorHandle handleC = device.descriptorAllocator().allocate(c.view(), c.sampler());
         const bool aliased = handleB.index == handleC.index;
 
         device.descriptorAllocator().free(handleB);
         device.descriptorAllocator().free(handleC);
-        destroyTestResource(device, a);
-        destroyTestResource(device, b);
-        destroyTestResource(device, c);
 
         if (aliased) {
             std::cerr << "descriptor_allocator_probe (heap double-free): two live resources got the same slot"
@@ -332,16 +350,16 @@ bool testHeapTierExhaustion() {
         handles.reserve(wallpaperx::kMaxDescriptorSlots);
 
         for (uint32_t i = 0; i < wallpaperx::kMaxDescriptorSlots; ++i) {
-            resources.push_back(createTestResource(device));
-            handles.push_back(device.descriptorAllocator().allocate(resources.back().view, resources.back().sampler));
+            resources.push_back(TestResource(device));
+            handles.push_back(device.descriptorAllocator().allocate(resources.back().view(), resources.back().sampler()));
         }
 
         // The (kMaxDescriptorSlots + 1)th allocation must fail cleanly, not
         // corrupt state or succeed silently past the documented capacity.
-        resources.push_back(createTestResource(device));
+        resources.push_back(TestResource(device));
         bool threw = false;
         try {
-            device.descriptorAllocator().allocate(resources.back().view, resources.back().sampler);
+            device.descriptorAllocator().allocate(resources.back().view(), resources.back().sampler());
         } catch (const std::runtime_error&) {
             threw = true;
         }
@@ -349,9 +367,7 @@ bool testHeapTierExhaustion() {
         for (size_t i = 0; i < handles.size(); ++i) {
             device.descriptorAllocator().free(handles[i]);
         }
-        for (auto& resource : resources) {
-            destroyTestResource(device, resource);
-        }
+        // resources clean themselves up (RAII) when the vector goes out of scope.
 
         if (!threw) {
             std::cerr << "descriptor_allocator_probe (heap exhaustion): allocate() past kMaxDescriptorSlots "
@@ -382,23 +398,19 @@ bool testHeapTierAllowsMultipleAllocate() {
         if (auto result = heapTierGuard(device, "heap multi-slot")) {
             return *result;
         }
-        TestResource a = createTestResource(device);
-        TestResource b = createTestResource(device);
+        TestResource a(device);
+        TestResource b(device);
 
-        wallpaperx::DescriptorHandle handleA = device.descriptorAllocator().allocate(a.view, a.sampler);
-        wallpaperx::DescriptorHandle handleB = device.descriptorAllocator().allocate(b.view, b.sampler);
+        wallpaperx::DescriptorHandle handleA = device.descriptorAllocator().allocate(a.view(), a.sampler());
+        wallpaperx::DescriptorHandle handleB = device.descriptorAllocator().allocate(b.view(), b.sampler());
 
         if (!handleA.valid() || !handleB.valid() || handleA.index == handleB.index) {
             std::cerr << "descriptor_allocator_probe (heap): expected two distinct valid slots" << std::endl;
-            destroyTestResource(device, a);
-            destroyTestResource(device, b);
             return false;
         }
 
         device.descriptorAllocator().free(handleA);
         device.descriptorAllocator().free(handleB);
-        destroyTestResource(device, a);
-        destroyTestResource(device, b);
     } catch (const std::exception& e) {
         std::cerr << "descriptor_allocator_probe (heap multi-slot) failed: " << e.what() << std::endl;
         return false;
