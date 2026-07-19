@@ -25,40 +25,51 @@ DescriptorBufferAllocator::DescriptorBufferAllocator(VkPhysicalDevice physicalDe
     bindings[1].descriptorCount = 1;
     bindings[1].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
 
-    VkDescriptorSetLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    layoutInfo.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
-    layoutInfo.bindingCount = static_cast<uint32_t>(bindings.size());
-    layoutInfo.pBindings = bindings.data();
-    if (vkCreateDescriptorSetLayout(m_device, &layoutInfo, nullptr, &m_setLayout) != VK_SUCCESS) {
-        throw std::runtime_error("DescriptorBufferAllocator: failed to create descriptor set layout");
+    // Everything acquired below is released only by ~DescriptorBufferAllocator,
+    // which never runs if the constructor throws -- so clean up on throw to avoid
+    // leaking the set layout / pipeline layout / descriptor buffer (the latter
+    // would also trip Memory's teardown leak abort).
+    try {
+        VkDescriptorSetLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        layoutInfo.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
+        layoutInfo.bindingCount = static_cast<uint32_t>(bindings.size());
+        layoutInfo.pBindings = bindings.data();
+        if (vkCreateDescriptorSetLayout(m_device, &layoutInfo, nullptr, &m_setLayout) != VK_SUCCESS) {
+            throw std::runtime_error("DescriptorBufferAllocator: failed to create descriptor set layout");
+        }
+
+        VkPipelineLayoutCreateInfo pipelineLayoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        pipelineLayoutInfo.setLayoutCount = 1;
+        pipelineLayoutInfo.pSetLayouts = &m_setLayout;
+        if (vkCreatePipelineLayout(m_device, &pipelineLayoutInfo, nullptr, &m_pipelineLayout) != VK_SUCCESS) {
+            throw std::runtime_error("DescriptorBufferAllocator: failed to create pipeline layout");
+        }
+
+        VkDeviceSize layoutSize = 0;
+        m_pfnGetLayoutSize(m_device, m_setLayout, &layoutSize);
+        m_pfnGetBindingOffset(m_device, m_setLayout, kImageBinding, &m_imageOffset);
+        m_pfnGetBindingOffset(m_device, m_setLayout, kUniformBinding, &m_uniformOffset);
+
+        const VkDeviceSize alignment = m_properties.descriptorBufferOffsetAlignment;
+        const VkDeviceSize alignedSize = (layoutSize + alignment - 1) & ~(alignment - 1);
+
+        m_buffer = m_memory.createBuffer(
+            alignedSize,
+            VK_BUFFER_USAGE_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT |
+                VK_BUFFER_USAGE_SAMPLER_DESCRIPTOR_BUFFER_BIT_EXT |
+                VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+            HostAccess::Write,
+            "descriptor-buffer-tier-set");
+
+        VkBufferDeviceAddressInfo addrInfo{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+        addrInfo.buffer = m_buffer.buffer;
+        m_bufferAddress = vkGetBufferDeviceAddress(m_device, &addrInfo);
+    } catch (...) {
+        m_memory.destroyBuffer(m_buffer);
+        if (m_pipelineLayout) vkDestroyPipelineLayout(m_device, m_pipelineLayout, nullptr);
+        if (m_setLayout) vkDestroyDescriptorSetLayout(m_device, m_setLayout, nullptr);
+        throw;
     }
-
-    VkPipelineLayoutCreateInfo pipelineLayoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-    pipelineLayoutInfo.setLayoutCount = 1;
-    pipelineLayoutInfo.pSetLayouts = &m_setLayout;
-    if (vkCreatePipelineLayout(m_device, &pipelineLayoutInfo, nullptr, &m_pipelineLayout) != VK_SUCCESS) {
-        throw std::runtime_error("DescriptorBufferAllocator: failed to create pipeline layout");
-    }
-
-    VkDeviceSize layoutSize = 0;
-    m_pfnGetLayoutSize(m_device, m_setLayout, &layoutSize);
-    m_pfnGetBindingOffset(m_device, m_setLayout, kImageBinding, &m_imageOffset);
-    m_pfnGetBindingOffset(m_device, m_setLayout, kUniformBinding, &m_uniformOffset);
-
-    const VkDeviceSize alignment = m_properties.descriptorBufferOffsetAlignment;
-    const VkDeviceSize alignedSize = (layoutSize + alignment - 1) & ~(alignment - 1);
-
-    m_buffer = m_memory.createBuffer(
-        alignedSize,
-        VK_BUFFER_USAGE_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT |
-            VK_BUFFER_USAGE_SAMPLER_DESCRIPTOR_BUFFER_BIT_EXT |
-            VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-        /*hostVisible=*/true,
-        "descriptor-buffer-tier-set");
-
-    VkBufferDeviceAddressInfo addrInfo{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
-    addrInfo.buffer = m_buffer.buffer;
-    m_bufferAddress = vkGetBufferDeviceAddress(m_device, &addrInfo);
 }
 
 DescriptorBufferAllocator::~DescriptorBufferAllocator() {
@@ -103,6 +114,7 @@ DescriptorHandle DescriptorBufferAllocator::allocate(VkImageView view, VkSampler
 
     m_pfnGetDescriptor(m_device, &getInfo, m_properties.combinedImageSamplerDescriptorSize,
                         static_cast<uint8_t*>(m_buffer.mapped) + m_imageOffset);
+    m_memory.flushForHostWrite(m_buffer);
     m_imageOccupied = true;
     return DescriptorHandle{kImageBinding};
 }
@@ -128,6 +140,7 @@ DescriptorHandle DescriptorBufferAllocator::allocateUniform(VkBuffer buffer, VkD
 
     m_pfnGetDescriptor(m_device, &getInfo, m_properties.uniformBufferDescriptorSize,
                         static_cast<uint8_t*>(m_buffer.mapped) + m_uniformOffset);
+    m_memory.flushForHostWrite(m_buffer);
     m_uniformOccupied = true;
     return DescriptorHandle{kUniformBinding};
 }

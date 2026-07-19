@@ -17,39 +17,48 @@ ClassicDescriptorAllocator::ClassicDescriptorAllocator(VkDevice device) : m_devi
     bindings[1].descriptorCount = 1;
     bindings[1].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
 
-    VkDescriptorSetLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    layoutInfo.bindingCount = static_cast<uint32_t>(bindings.size());
-    layoutInfo.pBindings = bindings.data();
-    if (vkCreateDescriptorSetLayout(m_device, &layoutInfo, nullptr, &m_setLayout) != VK_SUCCESS) {
-        throw std::runtime_error("ClassicDescriptorAllocator: failed to create descriptor set layout");
-    }
+    // Cleanup on throw: ~ClassicDescriptorAllocator won't run if the constructor
+    // throws partway, so the layout/pool created before the throw point would leak.
+    try {
+        VkDescriptorSetLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        layoutInfo.bindingCount = static_cast<uint32_t>(bindings.size());
+        layoutInfo.pBindings = bindings.data();
+        if (vkCreateDescriptorSetLayout(m_device, &layoutInfo, nullptr, &m_setLayout) != VK_SUCCESS) {
+            throw std::runtime_error("ClassicDescriptorAllocator: failed to create descriptor set layout");
+        }
 
-    std::array<VkDescriptorPoolSize, 2> poolSizes{
-        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1},
-        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1},
-    };
+        std::array<VkDescriptorPoolSize, 2> poolSizes{
+            VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1},
+            VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1},
+        };
 
-    VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    poolInfo.maxSets = 1;
-    poolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
-    poolInfo.pPoolSizes = poolSizes.data();
-    if (vkCreateDescriptorPool(m_device, &poolInfo, nullptr, &m_pool) != VK_SUCCESS) {
-        throw std::runtime_error("ClassicDescriptorAllocator: failed to create descriptor pool");
-    }
+        VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        poolInfo.maxSets = 1;
+        poolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
+        poolInfo.pPoolSizes = poolSizes.data();
+        if (vkCreateDescriptorPool(m_device, &poolInfo, nullptr, &m_pool) != VK_SUCCESS) {
+            throw std::runtime_error("ClassicDescriptorAllocator: failed to create descriptor pool");
+        }
 
-    VkDescriptorSetAllocateInfo allocInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-    allocInfo.descriptorPool = m_pool;
-    allocInfo.descriptorSetCount = 1;
-    allocInfo.pSetLayouts = &m_setLayout;
-    if (vkAllocateDescriptorSets(m_device, &allocInfo, &m_set) != VK_SUCCESS) {
-        throw std::runtime_error("ClassicDescriptorAllocator: failed to allocate descriptor set");
-    }
+        VkDescriptorSetAllocateInfo allocInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        allocInfo.descriptorPool = m_pool;
+        allocInfo.descriptorSetCount = 1;
+        allocInfo.pSetLayouts = &m_setLayout;
+        if (vkAllocateDescriptorSets(m_device, &allocInfo, &m_set) != VK_SUCCESS) {
+            throw std::runtime_error("ClassicDescriptorAllocator: failed to allocate descriptor set");
+        }
 
-    VkPipelineLayoutCreateInfo pipelineLayoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-    pipelineLayoutInfo.setLayoutCount = 1;
-    pipelineLayoutInfo.pSetLayouts = &m_setLayout;
-    if (vkCreatePipelineLayout(m_device, &pipelineLayoutInfo, nullptr, &m_pipelineLayout) != VK_SUCCESS) {
-        throw std::runtime_error("ClassicDescriptorAllocator: failed to create pipeline layout");
+        VkPipelineLayoutCreateInfo pipelineLayoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        pipelineLayoutInfo.setLayoutCount = 1;
+        pipelineLayoutInfo.pSetLayouts = &m_setLayout;
+        if (vkCreatePipelineLayout(m_device, &pipelineLayoutInfo, nullptr, &m_pipelineLayout) != VK_SUCCESS) {
+            throw std::runtime_error("ClassicDescriptorAllocator: failed to create pipeline layout");
+        }
+    } catch (...) {
+        if (m_pipelineLayout) vkDestroyPipelineLayout(m_device, m_pipelineLayout, nullptr);
+        if (m_pool) vkDestroyDescriptorPool(m_device, m_pool, nullptr);
+        if (m_setLayout) vkDestroyDescriptorSetLayout(m_device, m_setLayout, nullptr);
+        throw;
     }
 }
 

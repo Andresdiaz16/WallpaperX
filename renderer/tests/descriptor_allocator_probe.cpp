@@ -184,11 +184,10 @@ bool testHeapTierUniformSlotsDoNotCollideWithImageSlots() {
             return *result;
         }
         TestResource image1 = createTestResource(device);
-        TestResource image2 = createTestResource(device);
 
         wallpaperx::AllocatedBuffer uniformBuffer = device.memory().createBuffer(
             256, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-            /*hostVisible=*/true, "descriptor-allocator-probe-uniform");
+            wallpaperx::HostAccess::Write, "descriptor-allocator-probe-uniform");
 
         wallpaperx::DescriptorHandle imageHandle = device.descriptorAllocator().allocate(image1.view, image1.sampler);
         wallpaperx::DescriptorHandle uniformHandle =
@@ -215,10 +214,12 @@ bool testHeapTierUniformSlotsDoNotCollideWithImageSlots() {
         device.descriptorAllocator().free(uniformHandle);
 
         // Re-allocating each type should reuse its own free-list, not the other's.
-        // image1's registration was dropped by free(), so the second image
-        // allocation uses image2 (mirrors testTierRejectsDoubleAllocate's pattern);
+        // Reusing image1's SAME view+sampler here is deliberate: free() no longer
+        // unregisters them, so a register-once / reuse-across-cycles caller works.
+        // This is the regression guard for the old bug where free() dropped the
+        // registration and this allocate() would have thrown "never registered".
         // allocateUniform() has no registration step, so reusing uniformBuffer is fine.
-        wallpaperx::DescriptorHandle imageHandle2 = device.descriptorAllocator().allocate(image2.view, image2.sampler);
+        wallpaperx::DescriptorHandle imageHandle2 = device.descriptorAllocator().allocate(image1.view, image1.sampler);
         wallpaperx::DescriptorHandle uniformHandle2 =
             device.descriptorAllocator().allocateUniform(uniformBuffer.buffer, 256);
         if (imageHandle2.index != imageHandle.index || uniformHandle2.index != uniformHandle.index) {
@@ -231,7 +232,6 @@ bool testHeapTierUniformSlotsDoNotCollideWithImageSlots() {
         device.descriptorAllocator().free(uniformHandle2);
         device.memory().destroyBuffer(uniformBuffer);
         destroyTestResource(device, image1);
-        destroyTestResource(device, image2);
     } catch (const std::exception& e) {
         std::cerr << "descriptor_allocator_probe (heap uniform) failed: " << e.what() << std::endl;
         return false;

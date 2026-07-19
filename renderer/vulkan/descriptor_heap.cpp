@@ -6,8 +6,18 @@
 namespace wallpaperx {
 
 namespace {
+// Rounds up to a multiple of a true power-of-two alignment (Vulkan alignments
+// are always powers of two). Do NOT use this for arbitrary sizes -- the bitmask
+// is only correct when `alignment` is a power of two.
 VkDeviceSize alignUp(VkDeviceSize value, VkDeviceSize alignment) {
     return alignment == 0 ? value : (value + alignment - 1) & ~(alignment - 1);
+}
+
+// Rounds up to a multiple of an arbitrary (not necessarily power-of-two) size,
+// e.g. a descriptor size in bytes, which the spec does not guarantee is a power
+// of two.
+VkDeviceSize roundUpToMultiple(VkDeviceSize value, VkDeviceSize multiple) {
+    return multiple == 0 ? value : ((value + multiple - 1) / multiple) * multiple;
 }
 }
 
@@ -34,33 +44,53 @@ DescriptorHeapAllocator::DescriptorHeapAllocator(VkPhysicalDevice physicalDevice
     // multiple of bufferDescriptorAlignment, which holds for descriptor-heap-style
     // extensions where "size" already accounts for placement padding.
     m_uniformRegionOffset = std::max(
-        alignUp(alignUp(imageRegionSize, m_properties.bufferDescriptorAlignment), m_properties.bufferDescriptorSize),
+        roundUpToMultiple(alignUp(imageRegionSize, m_properties.bufferDescriptorAlignment),
+                          m_properties.bufferDescriptorSize),
         static_cast<VkDeviceSize>(m_properties.bufferDescriptorSize) * kMaxDescriptorSlots);
     m_uniformIndexBase = static_cast<uint32_t>(m_uniformRegionOffset / m_properties.bufferDescriptorSize);
     const VkDeviceSize uniformRegionSize = static_cast<VkDeviceSize>(m_properties.bufferDescriptorSize) * kMaxDescriptorSlots;
 
-    m_resourceHeapSize =
+    // Descriptor storage occupies [0, descriptorRegion); the driver-required
+    // reserved range is appended after it so the two never overlap. heapRange in
+    // bind() spans the whole grown buffer.
+    const VkDeviceSize resourceDescriptorRegion =
         alignUp(m_uniformRegionOffset + uniformRegionSize, m_properties.resourceHeapAlignment);
-    m_samplerHeapSize = alignUp(
+    m_resourceReservedOffset = resourceDescriptorRegion;
+    m_resourceReservedSize = alignUp(m_properties.minResourceHeapReservedRange, m_properties.resourceHeapAlignment);
+    m_resourceHeapSize = m_resourceReservedOffset + m_resourceReservedSize;
+
+    const VkDeviceSize samplerDescriptorRegion = alignUp(
         static_cast<VkDeviceSize>(m_properties.samplerDescriptorSize) * kMaxDescriptorSlots,
         m_properties.samplerHeapAlignment);
+    m_samplerReservedOffset = samplerDescriptorRegion;
+    m_samplerReservedSize = alignUp(m_properties.minSamplerHeapReservedRange, m_properties.samplerHeapAlignment);
+    m_samplerHeapSize = m_samplerReservedOffset + m_samplerReservedSize;
 
-    m_resourceHeap = m_memory.createBuffer(
-        m_resourceHeapSize,
-        VK_BUFFER_USAGE_DESCRIPTOR_HEAP_BIT_EXT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-        /*hostVisible=*/true, "descriptor-heap-resource");
-    m_samplerHeap = m_memory.createBuffer(
-        m_samplerHeapSize,
-        VK_BUFFER_USAGE_DESCRIPTOR_HEAP_BIT_EXT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-        /*hostVisible=*/true, "descriptor-heap-sampler");
+    // If the second createBuffer (or anything after) throws, ~DescriptorHeapAllocator
+    // never runs, so the first heap would leak -- and, being registered in Memory's
+    // live-allocation set, would later trip its teardown abort. Clean up on throw.
+    try {
+        m_resourceHeap = m_memory.createBuffer(
+            m_resourceHeapSize,
+            VK_BUFFER_USAGE_DESCRIPTOR_HEAP_BIT_EXT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+            HostAccess::Write, "descriptor-heap-resource");
+        m_samplerHeap = m_memory.createBuffer(
+            m_samplerHeapSize,
+            VK_BUFFER_USAGE_DESCRIPTOR_HEAP_BIT_EXT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+            HostAccess::Write, "descriptor-heap-sampler");
 
-    VkBufferDeviceAddressInfo resourceAddrInfo{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
-    resourceAddrInfo.buffer = m_resourceHeap.buffer;
-    m_resourceHeapAddress = vkGetBufferDeviceAddress(m_device, &resourceAddrInfo);
+        VkBufferDeviceAddressInfo resourceAddrInfo{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+        resourceAddrInfo.buffer = m_resourceHeap.buffer;
+        m_resourceHeapAddress = vkGetBufferDeviceAddress(m_device, &resourceAddrInfo);
 
-    VkBufferDeviceAddressInfo samplerAddrInfo{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
-    samplerAddrInfo.buffer = m_samplerHeap.buffer;
-    m_samplerHeapAddress = vkGetBufferDeviceAddress(m_device, &samplerAddrInfo);
+        VkBufferDeviceAddressInfo samplerAddrInfo{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+        samplerAddrInfo.buffer = m_samplerHeap.buffer;
+        m_samplerHeapAddress = vkGetBufferDeviceAddress(m_device, &samplerAddrInfo);
+    } catch (...) {
+        m_memory.destroyBuffer(m_resourceHeap);
+        m_memory.destroyBuffer(m_samplerHeap);
+        throw;
+    }
 }
 
 DescriptorHeapAllocator::~DescriptorHeapAllocator() {
@@ -164,6 +194,9 @@ DescriptorHandle DescriptorHeapAllocator::allocate(VkImageView view, VkSampler s
         throw std::runtime_error("DescriptorHeapAllocator: vkWriteSamplerDescriptorsEXT failed");
     }
 
+    m_memory.flushForHostWrite(m_resourceHeap);
+    m_memory.flushForHostWrite(m_samplerHeap);
+
     m_slotView[slot] = view;
     m_slotSampler[slot] = sampler;
 
@@ -193,6 +226,8 @@ DescriptorHandle DescriptorHeapAllocator::allocateUniform(VkBuffer buffer, VkDev
         throw std::runtime_error("DescriptorHeapAllocator: vkWriteResourceDescriptorsEXT (uniform) failed");
     }
 
+    m_memory.flushForHostWrite(m_resourceHeap);
+
     m_activeUniformSlots.insert(slot);
     return DescriptorHandle{m_uniformIndexBase + slot};
 }
@@ -201,11 +236,15 @@ void DescriptorHeapAllocator::bind(VkCommandBuffer cmd, VkPipelineBindPoint) {
     VkBindHeapInfoEXT resourceBind{VK_STRUCTURE_TYPE_BIND_HEAP_INFO_EXT};
     resourceBind.heapRange.address = m_resourceHeapAddress;
     resourceBind.heapRange.size = m_resourceHeapSize;
+    resourceBind.reservedRangeOffset = m_resourceReservedOffset;
+    resourceBind.reservedRangeSize = m_resourceReservedSize;
     m_pfnCmdBindResourceHeap(cmd, &resourceBind);
 
     VkBindHeapInfoEXT samplerBind{VK_STRUCTURE_TYPE_BIND_HEAP_INFO_EXT};
     samplerBind.heapRange.address = m_samplerHeapAddress;
     samplerBind.heapRange.size = m_samplerHeapSize;
+    samplerBind.reservedRangeOffset = m_samplerReservedOffset;
+    samplerBind.reservedRangeSize = m_samplerReservedSize;
     m_pfnCmdBindSamplerHeap(cmd, &samplerBind);
 }
 
@@ -234,17 +273,13 @@ void DescriptorHeapAllocator::free(DescriptorHandle handle) {
         throw std::runtime_error("DescriptorHeapAllocator::free: image handle already freed or never allocated");
     }
 
-    // A registered view/sampler may back more than one live slot (the same
-    // texture allocated into two heap indices), so only drop its registration
-    // once no other slot still references it — otherwise freeing one slot would
-    // unregister a view/sampler a different, still-live slot depends on.
-    const VkImageView view = viewIt->second;
+    // Drop the slot's tracking, but NOT the view/sampler registration. Registration
+    // lifetime is owned solely by register/unregisterImageView/Sampler, independent
+    // of descriptor-slot lifetime: a caller may register a view or sampler once and
+    // reuse it across many allocate()/free() cycles. Unregistering here would break
+    // that -- a later allocate() with the same still-live sampler would wrongly fail
+    // as "never registered".
     m_slotView.erase(viewIt);
-    const bool viewStillReferenced = std::any_of(
-        m_slotView.begin(), m_slotView.end(), [view](const auto& entry) { return entry.second == view; });
-    if (!viewStillReferenced) {
-        m_registeredViews.erase(view);
-    }
 
     // allocate() always populates m_slotView and m_slotSampler together, so a
     // slot found in one but missing from the other means that invariant broke
@@ -254,13 +289,7 @@ void DescriptorHeapAllocator::free(DescriptorHandle handle) {
     if (samplerIt == m_slotSampler.end()) {
         throw std::runtime_error("DescriptorHeapAllocator::free: internal inconsistency -- slot had a view but no sampler");
     }
-    const VkSampler sampler = samplerIt->second;
     m_slotSampler.erase(samplerIt);
-    const bool samplerStillReferenced = std::any_of(
-        m_slotSampler.begin(), m_slotSampler.end(), [sampler](const auto& entry) { return entry.second == sampler; });
-    if (!samplerStillReferenced) {
-        m_registeredSamplers.erase(sampler);
-    }
 
     m_freeImageSlots.push_back(handle.index);
 }

@@ -57,6 +57,15 @@ private:
     VkDeviceSize m_resourceHeapSize = 0;
     VkDeviceSize m_samplerHeapSize = 0;
 
+    // The driver requires each bound heap to carry a reserved range of at least
+    // min*HeapReservedRange bytes (VkBindHeapInfoEXT). We carve it out of dedicated
+    // space at the end of each heap, past all descriptor storage, so descriptor
+    // offsets are unaffected.
+    VkDeviceSize m_resourceReservedOffset = 0;
+    VkDeviceSize m_resourceReservedSize = 0;
+    VkDeviceSize m_samplerReservedOffset = 0;
+    VkDeviceSize m_samplerReservedSize = 0;
+
     std::vector<uint32_t> m_freeImageSlots;
     uint32_t m_nextImageSlot = 0;
     std::vector<uint32_t> m_freeUniformSlots;

@@ -90,8 +90,9 @@ void StaticRenderer::loadAndUploadTexture(const std::string& imagePath) {
     const VkDeviceSize imageSize = static_cast<VkDeviceSize>(imageWidth) * imageHeight * 4;
 
     AllocatedBuffer staging = m_device.memory().createBuffer(
-        imageSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, /*hostVisible=*/true, "static-renderer-staging");
+        imageSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, HostAccess::Write, "static-renderer-staging");
     std::memcpy(staging.mapped, pixels, static_cast<size_t>(imageSize));
+    m_device.memory().flushForHostWrite(staging);
     stbi_image_free(pixels);
 
     VkImageCreateInfo imageInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
@@ -190,8 +191,9 @@ void StaticRenderer::createQuad() {
     const VkDeviceSize size = sizeof(vertices);
 
     m_vertexBuffer = m_device.memory().createBuffer(
-        size, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, /*hostVisible=*/true, "quad-vertex-buffer");
+        size, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, HostAccess::Write, "quad-vertex-buffer");
     std::memcpy(m_vertexBuffer.mapped, vertices, size);
+    m_device.memory().flushForHostWrite(m_vertexBuffer);
 }
 
 std::vector<uint32_t> StaticRenderer::readSpirv(const std::string& path) {
@@ -199,10 +201,15 @@ std::vector<uint32_t> StaticRenderer::readSpirv(const std::string& path) {
     if (!file.is_open()) {
         throw std::runtime_error("StaticRenderer: failed to open shader file " + path);
     }
-    const size_t size = static_cast<size_t>(file.tellg());
-    if (size % sizeof(uint32_t) != 0) {
+    const std::streamoff rawSize = file.tellg();
+    // tellg() returns -1 on a stat failure even for an open stream; casting that
+    // to size_t would request a ~16 EB allocation. A zero-byte file would build a
+    // 0-word module (codeSize == 0), which is invalid. Reject both, plus non-word
+    // sizes, before allocating.
+    if (rawSize <= 0 || static_cast<size_t>(rawSize) % sizeof(uint32_t) != 0) {
         throw std::runtime_error("StaticRenderer: shader file is not a valid SPIR-V module: " + path);
     }
+    const size_t size = static_cast<size_t>(rawSize);
     std::vector<uint32_t> buffer(size / sizeof(uint32_t));
     file.seekg(0);
     file.read(reinterpret_cast<char*>(buffer.data()), static_cast<std::streamsize>(size));
@@ -228,7 +235,15 @@ void StaticRenderer::createPipeline(VkRenderPass renderPass, const std::string& 
     auto fragSpirv = readSpirv(shaderDir + (isHeapTier ? "/fullscreen_heap.frag.spv" : "/fullscreen_set.frag.spv"));
 
     VkShaderModule vertModule = createShaderModule(m_device.device(), vertSpirv);
-    VkShaderModule fragModule = createShaderModule(m_device.device(), fragSpirv);
+    VkShaderModule fragModule = VK_NULL_HANDLE;
+    try {
+        fragModule = createShaderModule(m_device.device(), fragSpirv);
+    } catch (...) {
+        // vertModule already succeeded; without this it leaks when the fragment
+        // module fails (bad SPIR-V, OOM).
+        vkDestroyShaderModule(m_device.device(), vertModule, nullptr);
+        throw;
+    }
 
     VkPipelineShaderStageCreateInfo vertStage{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
     vertStage.stage = VK_SHADER_STAGE_VERTEX_BIT;

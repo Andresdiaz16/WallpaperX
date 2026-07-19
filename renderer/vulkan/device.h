@@ -50,6 +50,7 @@ private:
     void createLogicalDevice();
     void createDescriptorAllocator();
     void createCommandPool();
+    void destroyResources();
 
     VkInstance m_instance = VK_NULL_HANDLE;
     VkDebugUtilsMessengerEXT m_debugMessenger = VK_NULL_HANDLE;

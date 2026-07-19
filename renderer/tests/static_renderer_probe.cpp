@@ -63,7 +63,7 @@ bool testRenderValidImage() {
 
         wallpaperx::AllocatedBuffer readback = device.memory().createBuffer(
             static_cast<VkDeviceSize>(target.width) * target.height * 4,
-            VK_BUFFER_USAGE_TRANSFER_DST_BIT, /*hostVisible=*/true, "readback");
+            VK_BUFFER_USAGE_TRANSFER_DST_BIT, wallpaperx::HostAccess::Read, "readback");
 
         device.immediateSubmit([&](VkCommandBuffer copyCmd) {
             VkBufferImageCopy region{};
@@ -72,6 +72,10 @@ bool testRenderValidImage() {
             vkCmdCopyImageToBuffer(copyCmd, target.image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                     readback.buffer, 1, &region);
         });
+
+        // immediateSubmit has waited on the copy's fence; make the device writes
+        // visible to the host (no-op on coherent memory) before reading them.
+        device.memory().invalidateForHostRead(readback);
 
         const unsigned char* pixels = static_cast<const unsigned char*>(readback.mapped);
         const unsigned char b = pixels[0];

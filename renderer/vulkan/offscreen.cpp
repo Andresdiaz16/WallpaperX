@@ -78,7 +78,10 @@ const OffscreenTarget& OffscreenTargetManager::create(int monitorId, uint32_t wi
     imageInfo.arrayLayers = 1;
     imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
     imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
-    imageInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    // TRANSFER_SRC so the rendered frame can be copied out (readback for tests,
+    // and the natural expectation for a frame we intend to export/hand off).
+    imageInfo.usage =
+        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
     imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
@@ -134,6 +137,15 @@ void OffscreenTargetManager::destroy(int monitorId) {
 }
 
 void OffscreenTargetManager::destroyTarget(OffscreenTarget& target) {
+    // The image/view/framebuffer may still be referenced by in-flight GPU work
+    // (e.g. a monitor resized while its previous frame is still executing). Destroying
+    // them under the GPU is a use-after-free, so wait for the device to go idle first.
+    // All destruction paths (destroy(), the create() replace path, the destructor, and
+    // create()'s own error cleanup) funnel through here, so this is the one guard point.
+    // Ignore the result: this runs in teardown paths (including a destructor) where
+    // throwing is not an option, and a lost device is being torn down anyway.
+    vkDeviceWaitIdle(m_device.device());
+
     if (auto* heap = dynamic_cast<DescriptorHeapAllocator*>(&m_device.descriptorAllocator())) {
         heap->unregisterImageView(target.view);
     }

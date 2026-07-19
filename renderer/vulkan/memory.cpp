@@ -43,7 +43,7 @@ void Memory::shutdown() {
     }
 }
 
-AllocatedBuffer Memory::createBuffer(VkDeviceSize size, VkBufferUsageFlags usage, bool hostVisible, const char* debugName) {
+AllocatedBuffer Memory::createBuffer(VkDeviceSize size, VkBufferUsageFlags usage, HostAccess hostAccess, const char* debugName) {
     VkBufferCreateInfo bufferInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bufferInfo.size = size;
     bufferInfo.usage = usage;
@@ -51,8 +51,12 @@ AllocatedBuffer Memory::createBuffer(VkDeviceSize size, VkBufferUsageFlags usage
 
     VmaAllocationCreateInfo allocInfo{};
     allocInfo.usage = VMA_MEMORY_USAGE_AUTO;
-    if (hostVisible) {
+    if (hostAccess == HostAccess::Write) {
+        // Upload-only: SEQUENTIAL_WRITE lets VMA pick fast write-combined memory.
         allocInfo.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+    } else if (hostAccess == HostAccess::Read) {
+        // Readback: RANDOM forces host-cached memory so CPU reads are coherent.
+        allocInfo.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
     }
 
     AllocatedBuffer result;
@@ -73,6 +77,20 @@ void Memory::destroyBuffer(AllocatedBuffer& buffer) {
         buffer.allocation = nullptr;
         buffer.mapped = nullptr;
     }
+}
+
+void Memory::invalidateForHostRead(const AllocatedBuffer& buffer) const {
+    // vmaInvalidateAllocation checks the memory's coherence flags internally: it
+    // issues vkInvalidateMappedMemoryRanges only for non-coherent memory and is a
+    // no-op otherwise, so this is always safe to call before a host read.
+    vmaInvalidateAllocation(m_allocator, buffer.allocation, 0, VK_WHOLE_SIZE);
+}
+
+void Memory::flushForHostWrite(const AllocatedBuffer& buffer) const {
+    // Symmetric with invalidateForHostRead: vmaFlushAllocation issues
+    // vkFlushMappedMemoryRanges only for non-coherent memory and no-ops otherwise,
+    // so this is always safe to call after a host write and before GPU submission.
+    vmaFlushAllocation(m_allocator, buffer.allocation, 0, VK_WHOLE_SIZE);
 }
 
 AllocatedImage Memory::createExportableImage(const VkImageCreateInfo& imageInfoIn, VkExternalMemoryHandleTypeFlagBits exportHandleType, const char* debugName) {
@@ -118,10 +136,30 @@ void Memory::destroyImage(AllocatedImage& image) {
     }
 }
 
+void Memory::requireLiveAllocation(VmaAllocation allocation, const char* context) const {
+    // Best-effort: VMA may recycle a freed VmaAllocation handle value, so a
+    // reused handle can read as "live". This reliably catches the common
+    // use-after-free (freed and not yet reused) and turns it into a clean,
+    // catchable error instead of a driver-side crash -- it is not a proof of
+    // validity.
+    if (m_liveAllocations.find(allocation) == m_liveAllocations.end()) {
+        throw std::runtime_error(std::string(context) +
+                                 ": allocation is not live (already destroyed or never allocated)");
+    }
+}
+
 VkDeviceMemory Memory::imageDeviceMemory(const AllocatedImage& image) const {
+    requireLiveAllocation(image.allocation, "Memory::imageDeviceMemory");
     VmaAllocationInfo info{};
     vmaGetAllocationInfo(m_allocator, image.allocation, &info);
     return info.deviceMemory;
+}
+
+VkDeviceSize Memory::imageAllocationSize(const AllocatedImage& image) const {
+    requireLiveAllocation(image.allocation, "Memory::imageAllocationSize");
+    VmaAllocationInfo info{};
+    vmaGetAllocationInfo(m_allocator, image.allocation, &info);
+    return info.size;
 }
 
 }

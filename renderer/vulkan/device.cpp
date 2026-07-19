@@ -53,30 +53,54 @@ VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(
 }
 
 Device::Device(bool enableValidation) {
-    createInstance(enableValidation);
-    selectPhysicalDevice();
-    determineTier();
-    createLogicalDevice();
-    const bool bufferDeviceAddressEnabled = m_selectedTier == DescriptorTier::Heap || m_selectedTier == DescriptorTier::Buffer;
-    m_memory.init(m_instance, m_physicalDevice, m_device, VK_API_VERSION_1_3, bufferDeviceAddressEnabled);
-    createDescriptorAllocator();
-    createCommandPool();
+    try {
+        createInstance(enableValidation);
+        selectPhysicalDevice();
+        determineTier();
+        createLogicalDevice();
+        const bool bufferDeviceAddressEnabled = m_selectedTier == DescriptorTier::Heap || m_selectedTier == DescriptorTier::Buffer;
+        m_memory.init(m_instance, m_physicalDevice, m_device, VK_API_VERSION_1_3, bufferDeviceAddressEnabled);
+        createDescriptorAllocator();
+        createCommandPool();
+    } catch (...) {
+        // A C++ destructor does not run for an object whose constructor throws,
+        // so without this the instance/device/allocator created before the throw
+        // point would leak (and Memory's leaked-allocation check would never even
+        // run). destroyResources() is null-guarded, so it is safe on a partially
+        // constructed Device.
+        destroyResources();
+        throw;
+    }
 }
 
 Device::~Device() {
-    if (m_commandPool) vkDestroyCommandPool(m_device, m_commandPool, nullptr);
+    destroyResources();
+}
+
+void Device::destroyResources() {
+    if (m_commandPool) {
+        vkDestroyCommandPool(m_device, m_commandPool, nullptr);
+        m_commandPool = VK_NULL_HANDLE;
+    }
     m_descriptorAllocator.reset();
     m_memory.shutdown();
 
-    if (m_device) vkDestroyDevice(m_device, nullptr);
+    if (m_device) {
+        vkDestroyDevice(m_device, nullptr);
+        m_device = VK_NULL_HANDLE;
+    }
 
     if (m_debugMessenger) {
         auto destroyFn = reinterpret_cast<PFN_vkDestroyDebugUtilsMessengerEXT>(
             vkGetInstanceProcAddr(m_instance, "vkDestroyDebugUtilsMessengerEXT"));
         if (destroyFn) destroyFn(m_instance, m_debugMessenger, nullptr);
+        m_debugMessenger = VK_NULL_HANDLE;
     }
 
-    if (m_instance) vkDestroyInstance(m_instance, nullptr);
+    if (m_instance) {
+        vkDestroyInstance(m_instance, nullptr);
+        m_instance = VK_NULL_HANDLE;
+    }
 }
 
 void Device::createInstance(bool enableValidation) {
@@ -207,11 +231,31 @@ void Device::selectPhysicalDevice() {
     m_info.hasExternalMemoryDmaBuf = hasExtension(extensions, VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);
 
     if (m_info.hasDescriptorHeap) {
+        // The heap tier doesn't just need VK_EXT_descriptor_heap: createLogicalDevice()
+        // also enables VK_KHR_maintenance5 + VK_KHR_shader_untyped_pointers and the
+        // maintenance5 / shaderUntypedPointers / shaderSampledImageArrayNonUniformIndexing
+        // features. If any of those is missing, enabling them at vkCreateDevice would
+        // fail the whole device instead of falling back, so gate heap availability on
+        // all of them here (mirrors how descriptorBuffer is gated below).
+        const bool hasHeapDeps =
+            hasExtension(extensions, VK_KHR_MAINTENANCE_5_EXTENSION_NAME) &&
+            hasExtension(extensions, VK_KHR_SHADER_UNTYPED_POINTERS_EXTENSION_NAME);
+
         VkPhysicalDeviceDescriptorHeapFeaturesEXT heapFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_HEAP_FEATURES_EXT};
+        VkPhysicalDeviceMaintenance5FeaturesKHR maintenance5Features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR};
+        VkPhysicalDeviceShaderUntypedPointersFeaturesKHR untypedPointersFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_UNTYPED_POINTERS_FEATURES_KHR};
+        VkPhysicalDeviceVulkan12Features vulkan12Features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+        heapFeatures.pNext = &maintenance5Features;
+        maintenance5Features.pNext = &untypedPointersFeatures;
+        untypedPointersFeatures.pNext = &vulkan12Features;
         VkPhysicalDeviceFeatures2 features2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
         features2.pNext = &heapFeatures;
         vkGetPhysicalDeviceFeatures2(m_physicalDevice, &features2);
-        m_info.hasDescriptorHeap = heapFeatures.descriptorHeap == VK_TRUE;
+
+        m_info.hasDescriptorHeap = hasHeapDeps && heapFeatures.descriptorHeap == VK_TRUE &&
+                                   maintenance5Features.maintenance5 == VK_TRUE &&
+                                   untypedPointersFeatures.shaderUntypedPointers == VK_TRUE &&
+                                   vulkan12Features.shaderSampledImageArrayNonUniformIndexing == VK_TRUE;
     }
     if (m_info.hasDescriptorBuffer) {
         VkPhysicalDeviceDescriptorBufferFeaturesEXT bufferFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_FEATURES_EXT};
@@ -239,12 +283,18 @@ void Device::createLogicalDevice() {
     if (useHeap) {
         deviceExtensions.push_back(VK_EXT_DESCRIPTOR_HEAP_EXTENSION_NAME);
         deviceExtensions.push_back(VK_KHR_SHADER_UNTYPED_POINTERS_EXTENSION_NAME);
+        // VK_EXT_descriptor_heap requires VK_KHR_maintenance5, which is also what
+        // the heap-tier graphics pipeline's VkPipelineCreateFlags2CreateInfo needs.
+        deviceExtensions.push_back(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
     } else if (useBuffer) {
         deviceExtensions.push_back(VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME);
     }
 
     VkPhysicalDeviceVulkan12Features vulkan12Features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     vulkan12Features.bufferDeviceAddress = (useHeap || useBuffer) ? VK_TRUE : VK_FALSE;
+    // The heap-tier fragment shader (fullscreen_heap.frag) indexes the descriptor
+    // heap arrays with nonuniformEXT, which requires this feature to be enabled.
+    vulkan12Features.shaderSampledImageArrayNonUniformIndexing = useHeap ? VK_TRUE : VK_FALSE;
 
     VkPhysicalDeviceShaderUntypedPointersFeaturesKHR untypedPointersFeatures{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_UNTYPED_POINTERS_FEATURES_KHR};
@@ -256,10 +306,15 @@ void Device::createLogicalDevice() {
     descriptorBufferFeatures.descriptorBuffer = VK_TRUE;
     descriptorBufferFeatures.pNext = &vulkan12Features;
 
+    VkPhysicalDeviceMaintenance5FeaturesKHR maintenance5Features{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR};
+    maintenance5Features.maintenance5 = VK_TRUE;
+    maintenance5Features.pNext = &untypedPointersFeatures;
+
     VkPhysicalDeviceDescriptorHeapFeaturesEXT descriptorHeapFeatures{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_HEAP_FEATURES_EXT};
     descriptorHeapFeatures.descriptorHeap = VK_TRUE;
-    descriptorHeapFeatures.pNext = &untypedPointersFeatures;
+    descriptorHeapFeatures.pNext = &maintenance5Features;
 
     void* featureChain = &vulkan12Features;
     if (useHeap) {
@@ -323,18 +378,38 @@ void Device::immediateSubmit(const std::function<void(VkCommandBuffer)>& record)
         throw std::runtime_error("Device::immediateSubmit: failed to allocate command buffer");
     }
 
+    VkFence fence = VK_NULL_HANDLE;
+
+    // Free the command buffer and fence on every exit path -- including the
+    // caller's record() lambda throwing, or any of the checks below. Captures the
+    // handles by value and cmd/fence by reference so it cleans up whatever exists
+    // at scope exit. (A local class can't touch Device's private members, so it
+    // takes the device/pool handles by value.)
+    struct Cleanup {
+        VkDevice device;
+        VkCommandPool pool;
+        VkCommandBuffer& cmd;
+        VkFence& fence;
+        ~Cleanup() {
+            if (fence) vkDestroyFence(device, fence, nullptr);
+            if (cmd) vkFreeCommandBuffers(device, pool, 1, &cmd);
+        }
+    } cleanup{m_device, m_commandPool, cmd, fence};
+
     VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(cmd, &beginInfo);
+    if (vkBeginCommandBuffer(cmd, &beginInfo) != VK_SUCCESS) {
+        throw std::runtime_error("Device::immediateSubmit: vkBeginCommandBuffer failed");
+    }
 
     record(cmd);
 
-    vkEndCommandBuffer(cmd);
+    if (vkEndCommandBuffer(cmd) != VK_SUCCESS) {
+        throw std::runtime_error("Device::immediateSubmit: vkEndCommandBuffer failed");
+    }
 
     VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-    VkFence fence = VK_NULL_HANDLE;
     if (vkCreateFence(m_device, &fenceInfo, nullptr, &fence) != VK_SUCCESS) {
-        vkFreeCommandBuffers(m_device, m_commandPool, 1, &cmd);
         throw std::runtime_error("Device::immediateSubmit: failed to create fence");
     }
 
@@ -343,15 +418,12 @@ void Device::immediateSubmit(const std::function<void(VkCommandBuffer)>& record)
     submitInfo.pCommandBuffers = &cmd;
 
     if (vkQueueSubmit(m_graphicsQueue, 1, &submitInfo, fence) != VK_SUCCESS) {
-        vkDestroyFence(m_device, fence, nullptr);
-        vkFreeCommandBuffers(m_device, m_commandPool, 1, &cmd);
         throw std::runtime_error("Device::immediateSubmit: vkQueueSubmit failed");
     }
 
-    vkWaitForFences(m_device, 1, &fence, VK_TRUE, UINT64_MAX);
-
-    vkDestroyFence(m_device, fence, nullptr);
-    vkFreeCommandBuffers(m_device, m_commandPool, 1, &cmd);
+    if (vkWaitForFences(m_device, 1, &fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) {
+        throw std::runtime_error("Device::immediateSubmit: vkWaitForFences failed");
+    }
 }
 
 }

@@ -78,6 +78,7 @@ add_library(wallpaperx-renderer STATIC
     vulkan/descriptor_buffer.cpp
     vulkan/descriptor_heap.cpp
     vulkan/offscreen.cpp
+    vulkan/frame_export.cpp
     renderers/static_renderer.cpp
 )
 
@@ -164,6 +165,14 @@ target_compile_definitions(wallpaperx-static-renderer-probe PRIVATE
 add_executable(wallpaperx-descriptor-allocator-probe tests/descriptor_allocator_probe.cpp)
 target_link_libraries(wallpaperx-descriptor-allocator-probe PRIVATE wallpaperx-renderer)
 
+add_executable(wallpaperx-frame-export-probe tests/frame_export_probe.cpp)
+target_link_libraries(wallpaperx-frame-export-probe PRIVATE wallpaperx-renderer)
+add_dependencies(wallpaperx-frame-export-probe wallpaperx-shaders)
+target_compile_definitions(wallpaperx-frame-export-probe PRIVATE
+    WALLPAPERX_SHADER_DIR="${SHADER_OUTPUT_DIR}"
+    WALLPAPERX_TEST_IMAGE_DIR="${CMAKE_CURRENT_BINARY_DIR}/test_assets"
+)
+
 enable_testing()
 add_test(NAME tier_selection COMMAND wallpaperx-tier-selection-test)
 add_test(NAME memory_export COMMAND wallpaperx-memory-export-test)
@@ -171,6 +180,7 @@ add_test(NAME device_probe COMMAND wallpaperx-device-probe)
 add_test(NAME offscreen_probe COMMAND wallpaperx-offscreen-probe)
 add_test(NAME static_renderer_probe COMMAND wallpaperx-static-renderer-probe)
 add_test(NAME descriptor_allocator_probe COMMAND wallpaperx-descriptor-allocator-probe)
+add_test(NAME frame_export_probe COMMAND wallpaperx-frame-export-probe)
 
 # static_renderer_probe and its _lavapipe twin run the same binary and both
 # read/write the same WALLPAPERX_TEST_IMAGE_DIR path -- lock them to the same
@@ -184,11 +194,19 @@ if(WALLPAPERX_LAVAPIPE_ICD)
     add_test(NAME offscreen_probe_lavapipe COMMAND wallpaperx-offscreen-probe)
     add_test(NAME static_renderer_probe_lavapipe COMMAND wallpaperx-static-renderer-probe)
     add_test(NAME descriptor_allocator_probe_lavapipe COMMAND wallpaperx-descriptor-allocator-probe)
+    # Unlike the Heap tier, frame export needs no capability-skip under Lavapipe:
+    # Lavapipe advertises both VK_KHR_external_memory_fd and
+    # VK_EXT_external_memory_dma_buf, so exportFrame() takes the DMA_BUF path and
+    # succeeds here (verified: distinct fds, correct size, zero validation
+    # warnings). This is the only place the DMA_BUF branch runs in CI, since the
+    # owner's real GPU is NVIDIA (OPAQUE_FD).
+    add_test(NAME frame_export_probe_lavapipe COMMAND wallpaperx-frame-export-probe)
     set_tests_properties(
         device_probe_lavapipe
         offscreen_probe_lavapipe
         static_renderer_probe_lavapipe
         descriptor_allocator_probe_lavapipe
+        frame_export_probe_lavapipe
         PROPERTIES
             # WALLPAPERX_ALLOW_NO_HEAP_TIER tells descriptor_allocator_probe's
             # Heap-tier tests that resolving to a non-Heap tier here is expected
