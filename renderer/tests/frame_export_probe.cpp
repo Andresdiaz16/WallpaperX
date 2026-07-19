@@ -7,6 +7,7 @@
 #include <stb_image_write.h>
 
 #include <fcntl.h>
+#include <sys/resource.h>
 #include <unistd.h>
 
 #include <filesystem>
@@ -101,6 +102,19 @@ bool testHappyPathExport() {
             ok = false;
         }
 
+        // DMA-BUF stub contract (exercised under Lavapipe, which takes this path):
+        // the layout metadata is deliberately not populated yet, and must report
+        // the unset sentinels -- modifier INVALID (not 0 = LINEAR) -- so a consumer
+        // can tell it apart from a real, importable layout.
+        if (frame1.type == wallpaperx::ExportedFrame::HandleType::DmaBuf) {
+            if (frame1.modifier != wallpaperx::kDrmModifierInvalid || frame1.drmFormat != 0 || frame1.stride != 0) {
+                std::cerr << "frame_export_probe: DmaBuf frame should report unset layout metadata "
+                             "(modifier=INVALID, drmFormat=0, stride=0) until DRM-modifier export is implemented"
+                          << std::endl;
+                ok = false;
+            }
+        }
+
         std::cout << "frame_export_probe: fd1=" << frame1.fd << " fd2=" << frame2.fd << " " << frame1.width << "x"
                   << frame1.height << " memorySize=" << frame1.memorySize << " type="
                   << (frame1.type == wallpaperx::ExportedFrame::HandleType::OpaqueFd ? "OpaqueFd" : "DmaBuf")
@@ -164,11 +178,66 @@ bool testExportFromDestroyedTargetThrows() {
     return true;
 }
 
+// Regression test (QA pass 2026-07-18): under fd exhaustion, Lavapipe's DMA_BUF
+// vkGetMemoryFdKHR returns VK_SUCCESS while writing fd = -1, and exportFrame() used
+// to hand that back as a valid-looking frame with a dead fd. The contract is "a
+// fresh valid fd, or throw" -- exportFrame() must NEVER return an fd < 0. Runs on
+// both backends (the OpaqueFd path fails via the return code, the DmaBuf path via
+// the fd check). RLIMIT_NOFILE is lowered for this process only.
+bool testNeverReturnsInvalidFdUnderExhaustion() {
+    try {
+        wallpaperx::Device device(/*enableValidation=*/true);
+        wallpaperx::OffscreenTargetManager targets(device);
+        const auto& target = targets.create(0, 64, 64);
+
+        rlimit original{};
+        getrlimit(RLIMIT_NOFILE, &original);
+        rlimit lowered = original;
+        lowered.rlim_cur = 40;  // this process only; system untouched
+        if (setrlimit(RLIMIT_NOFILE, &lowered) != 0) {
+            std::cout << "frame_export_probe (exhaustion): skipped, could not lower RLIMIT_NOFILE" << std::endl;
+            return true;
+        }
+
+        std::vector<int> held;
+        bool sawInvalidFd = false;
+        for (int i = 0; i < 200; ++i) {  // deliberately never close -- force exhaustion
+            try {
+                wallpaperx::ExportedFrame frame = wallpaperx::exportFrame(device, target);
+                if (frame.fd < 0) {
+                    sawInvalidFd = true;  // the bug: returned without throwing but fd is dead
+                    break;
+                }
+                held.push_back(frame.fd);
+            } catch (const std::runtime_error&) {
+                break;  // clean failure once the OS runs out of fds -- expected
+            }
+        }
+
+        for (int fd : held) close(fd);
+        setrlimit(RLIMIT_NOFILE, &original);
+
+        if (sawInvalidFd) {
+            std::cerr << "frame_export_probe (exhaustion): exportFrame() returned an ExportedFrame with fd < 0 "
+                         "instead of throwing"
+                      << std::endl;
+            return false;
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "frame_export_probe (exhaustion) failed: " << e.what() << std::endl;
+        return false;
+    }
+
+    std::cout << "frame_export_probe (exhaustion): passed" << std::endl;
+    return true;
+}
+
 }
 
 int main() {
     bool ok = true;
     ok &= testHappyPathExport();
     ok &= testExportFromDestroyedTargetThrows();
+    ok &= testNeverReturnsInvalidFdUnderExhaustion();
     return ok ? 0 : 1;
 }

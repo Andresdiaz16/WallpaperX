@@ -26,8 +26,12 @@ ExportedFrame exportFrame(Device& device, const OffscreenTarget& target) {
     const VkDeviceSize memorySize = device.memory().imageAllocationSize(target.image);
 
     ExportedFrame frame;
-    if (pfnGetMemoryFd(device.device(), &getFdInfo, &frame.fd) != VK_SUCCESS) {
-        throw std::runtime_error("exportFrame: vkGetMemoryFdKHR failed");
+    // Validate the fd itself, not just the return code: some drivers (observed on
+    // Lavapipe's DMA_BUF path under fd exhaustion) return VK_SUCCESS while writing
+    // fd = -1, which would otherwise be handed back as a valid-looking frame with a
+    // dead fd. exportFrame's contract is "a fresh valid fd, or throw".
+    if (pfnGetMemoryFd(device.device(), &getFdInfo, &frame.fd) != VK_SUCCESS || frame.fd < 0) {
+        throw std::runtime_error("exportFrame: vkGetMemoryFdKHR failed to produce a valid fd");
     }
 
     frame.width = target.width;
@@ -36,11 +40,12 @@ ExportedFrame exportFrame(Device& device, const OffscreenTarget& target) {
     frame.type = (handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT) ? ExportedFrame::HandleType::OpaqueFd
                                                                                : ExportedFrame::HandleType::DmaBuf;
 
-    // drmFormat/stride/modifier intentionally left zeroed -- see PLAN.md Step 5's
-    // scope decision. The DMA-BUF (AMD/Intel) path is structurally present but
-    // not verified on real hardware; correct compositor import additionally
-    // needs the offscreen image created with an explicit DRM format modifier,
-    // which is deferred to a follow-up step.
+    // drmFormat/stride/modifier are deliberately left at their unset sentinels
+    // (see ExportedFrame's field docs and PLAN.md Step 5's scope decision). The
+    // DMA-BUF (AMD/Intel) branch is structurally present and produces a valid fd,
+    // but the layout metadata a compositor needs to import it requires the image
+    // to be created with an explicit DRM format modifier -- deferred. Leaving
+    // modifier as kDrmModifierInvalid (not 0 = LINEAR) keeps that unambiguous.
 
     return frame;
 }
