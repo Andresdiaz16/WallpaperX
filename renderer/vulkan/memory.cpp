@@ -2,6 +2,7 @@
 #include "memory.h"
 #include "../third_party/vk_mem_alloc.h"
 
+#include <cstdio>
 #include <stdexcept>
 #include <string>
 
@@ -24,6 +25,19 @@ void Memory::init(VkInstance instance, VkPhysicalDevice physicalDevice, VkDevice
 
 void Memory::shutdown() {
     if (m_allocator) {
+        // vmaDestroyAllocator() hard-asserts (SIGABRT, uncatchable) if any
+        // allocation is still outstanding -- that assert gives no indication of
+        // which allocation leaked or from where. Naming it here first, before
+        // that assert inevitably fires, turns an opaque crash into an
+        // attributable one.
+        if (!m_liveAllocations.empty()) {
+            std::fprintf(stderr, "Memory::shutdown: %zu GPU allocation(s) were never freed before teardown:\n",
+                         m_liveAllocations.size());
+            for (const auto& [allocation, name] : m_liveAllocations) {
+                std::fprintf(stderr, "  - %s\n", name.c_str());
+            }
+            std::fflush(stderr);
+        }
         vmaDestroyAllocator(m_allocator);
         m_allocator = nullptr;
     }
@@ -47,11 +61,13 @@ AllocatedBuffer Memory::createBuffer(VkDeviceSize size, VkBufferUsageFlags usage
         throw std::runtime_error(std::string("Memory: failed to create buffer ") + (debugName ? debugName : ""));
     }
     result.mapped = outInfo.pMappedData;
+    m_liveAllocations[result.allocation] = debugName ? debugName : "(unnamed buffer)";
     return result;
 }
 
 void Memory::destroyBuffer(AllocatedBuffer& buffer) {
     if (buffer.buffer != VK_NULL_HANDLE) {
+        m_liveAllocations.erase(buffer.allocation);
         vmaDestroyBuffer(m_allocator, buffer.buffer, buffer.allocation);
         buffer.buffer = VK_NULL_HANDLE;
         buffer.allocation = nullptr;
@@ -77,6 +93,7 @@ AllocatedImage Memory::createExportableImage(const VkImageCreateInfo& imageInfoI
     if (vmaCreateDedicatedImage(m_allocator, &imageInfo, &allocInfo, &exportInfo, &result.image, &result.allocation, nullptr) != VK_SUCCESS) {
         throw std::runtime_error(std::string("Memory: failed to create exportable image ") + (debugName ? debugName : ""));
     }
+    m_liveAllocations[result.allocation] = debugName ? debugName : "(unnamed exportable image)";
     return result;
 }
 
@@ -88,11 +105,13 @@ AllocatedImage Memory::createImage(const VkImageCreateInfo& imageInfo, const cha
     if (vmaCreateImage(m_allocator, &imageInfo, &allocInfo, &result.image, &result.allocation, nullptr) != VK_SUCCESS) {
         throw std::runtime_error(std::string("Memory: failed to create image ") + (debugName ? debugName : ""));
     }
+    m_liveAllocations[result.allocation] = debugName ? debugName : "(unnamed image)";
     return result;
 }
 
 void Memory::destroyImage(AllocatedImage& image) {
     if (image.image != VK_NULL_HANDLE) {
+        m_liveAllocations.erase(image.allocation);
         vmaDestroyImage(m_allocator, image.image, image.allocation);
         image.image = VK_NULL_HANDLE;
         image.allocation = nullptr;

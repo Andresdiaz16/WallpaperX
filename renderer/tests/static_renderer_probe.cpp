@@ -32,9 +32,7 @@ std::string writeTestImage() {
     return path;
 }
 
-}
-
-int main() {
+bool testRenderValidImage() {
     wallpaperx::resetValidationWarningCount();
 
     try {
@@ -88,19 +86,69 @@ int main() {
 
         if (r < 250 || g > 5 || b > 5 || a < 250) {
             std::cerr << "static_renderer_probe: rendered pixel does not match expected solid red" << std::endl;
-            return 1;
+            return false;
         }
     } catch (const std::exception& e) {
         std::cerr << "static_renderer_probe failed: " << e.what() << std::endl;
-        return 1;
+        return false;
     }
 
     const int warnings = wallpaperx::validationWarningCount();
     if (warnings > 0) {
         std::cerr << "static_renderer_probe: " << warnings << " Vulkan validation warning(s)" << std::endl;
-        return 1;
+        return false;
     }
 
     std::cout << "static_renderer_probe: passed, zero validation warnings" << std::endl;
-    return 0;
+    return true;
+}
+
+// From TEST.md's QA pass (2026-07-18): confirms StaticRenderer's own error path
+// (as opposed to stb_image's) throws a catchable, clear exception for a missing
+// file, rather than crashing or leaving partially-constructed state.
+bool testMissingImageThrows() {
+    wallpaperx::resetValidationWarningCount();
+
+    try {
+        wallpaperx::Device device(/*enableValidation=*/true);
+        // renderPass() is valid immediately after construction (built in the
+        // constructor, independent of create()) -- StaticRenderer fails at
+        // stbi_load before it ever consumes the render pass, so no actual
+        // offscreen target needs to exist for this test.
+        wallpaperx::OffscreenTargetManager targets(device);
+
+        bool threw = false;
+        try {
+            wallpaperx::StaticRenderer renderer(device, targets.renderPass(),
+                                                 "/nonexistent/path/does-not-exist.png", WALLPAPERX_SHADER_DIR);
+        } catch (const std::runtime_error&) {
+            threw = true;
+        }
+        if (!threw) {
+            std::cerr << "static_renderer_probe (missing image): constructing with a nonexistent path "
+                         "should have thrown"
+                      << std::endl;
+            return false;
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "static_renderer_probe (missing image) failed: " << e.what() << std::endl;
+        return false;
+    }
+
+    if (wallpaperx::validationWarningCount() > 0) {
+        std::cerr << "static_renderer_probe (missing image): validation warnings" << std::endl;
+        return false;
+    }
+
+    std::cout << "static_renderer_probe (missing image): passed" << std::endl;
+    return true;
+}
+
+}
+
+int main() {
+    bool ok = true;
+    ok &= testRenderValidImage();
+    ok &= testMissingImageThrows();
+    return ok ? 0 : 1;
 }

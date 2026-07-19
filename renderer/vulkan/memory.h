@@ -2,6 +2,9 @@
 
 #include <vulkan/vulkan.h>
 
+#include <string>
+#include <unordered_map>
+
 typedef struct VmaAllocator_T* VmaAllocator;
 typedef struct VmaAllocation_T* VmaAllocation;
 
@@ -35,6 +38,10 @@ public:
 
 private:
     VmaAllocator m_allocator = nullptr;
+
+    // Debug-name tracking only, for a clear diagnostic if shutdown() finds
+    // outstanding allocations -- not consulted anywhere else.
+    std::unordered_map<VmaAllocation, std::string> m_liveAllocations;
 };
 
 }

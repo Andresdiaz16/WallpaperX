@@ -193,6 +193,7 @@ DescriptorHandle DescriptorHeapAllocator::allocateUniform(VkBuffer buffer, VkDev
         throw std::runtime_error("DescriptorHeapAllocator: vkWriteResourceDescriptorsEXT (uniform) failed");
     }
 
+    m_activeUniformSlots.insert(slot);
     return DescriptorHandle{m_uniformIndexBase + slot};
 }
 
@@ -214,36 +215,51 @@ void DescriptorHeapAllocator::free(DescriptorHandle handle) {
     // Image indices occupy [0, kMaxDescriptorSlots); uniform indices occupy
     // [m_uniformIndexBase, m_uniformIndexBase + kMaxDescriptorSlots), and the
     // constructor guarantees m_uniformIndexBase >= kMaxDescriptorSlots, so these
-    // ranges never overlap.
+    // ranges never overlap. Both branches reject a handle that isn't currently
+    // active (already freed, or never allocated) rather than pushing it onto the
+    // free-list anyway -- doing that silently would hand the same slot out to two
+    // independent, simultaneously-live allocations.
     if (handle.index >= m_uniformIndexBase) {
         const uint32_t local = handle.index - m_uniformIndexBase;
-        if (local < kMaxDescriptorSlots) {
-            m_freeUniformSlots.push_back(local);
+        if (m_activeUniformSlots.erase(local) == 0) {
+            throw std::runtime_error(
+                "DescriptorHeapAllocator::free: uniform handle already freed or never allocated");
         }
+        m_freeUniformSlots.push_back(local);
         return;
+    }
+
+    auto viewIt = m_slotView.find(handle.index);
+    if (viewIt == m_slotView.end()) {
+        throw std::runtime_error("DescriptorHeapAllocator::free: image handle already freed or never allocated");
     }
 
     // A registered view/sampler may back more than one live slot (the same
     // texture allocated into two heap indices), so only drop its registration
     // once no other slot still references it — otherwise freeing one slot would
     // unregister a view/sampler a different, still-live slot depends on.
-    if (auto viewIt = m_slotView.find(handle.index); viewIt != m_slotView.end()) {
-        const VkImageView view = viewIt->second;
-        m_slotView.erase(viewIt);
-        const bool stillReferenced = std::any_of(
-            m_slotView.begin(), m_slotView.end(), [view](const auto& entry) { return entry.second == view; });
-        if (!stillReferenced) {
-            m_registeredViews.erase(view);
-        }
+    const VkImageView view = viewIt->second;
+    m_slotView.erase(viewIt);
+    const bool viewStillReferenced = std::any_of(
+        m_slotView.begin(), m_slotView.end(), [view](const auto& entry) { return entry.second == view; });
+    if (!viewStillReferenced) {
+        m_registeredViews.erase(view);
     }
-    if (auto samplerIt = m_slotSampler.find(handle.index); samplerIt != m_slotSampler.end()) {
-        const VkSampler sampler = samplerIt->second;
-        m_slotSampler.erase(samplerIt);
-        const bool stillReferenced = std::any_of(
-            m_slotSampler.begin(), m_slotSampler.end(), [sampler](const auto& entry) { return entry.second == sampler; });
-        if (!stillReferenced) {
-            m_registeredSamplers.erase(sampler);
-        }
+
+    // allocate() always populates m_slotView and m_slotSampler together, so a
+    // slot found in one but missing from the other means that invariant broke
+    // somewhere -- fail loud rather than silently proceeding on inconsistent
+    // internal state.
+    auto samplerIt = m_slotSampler.find(handle.index);
+    if (samplerIt == m_slotSampler.end()) {
+        throw std::runtime_error("DescriptorHeapAllocator::free: internal inconsistency -- slot had a view but no sampler");
+    }
+    const VkSampler sampler = samplerIt->second;
+    m_slotSampler.erase(samplerIt);
+    const bool samplerStillReferenced = std::any_of(
+        m_slotSampler.begin(), m_slotSampler.end(), [sampler](const auto& entry) { return entry.second == sampler; });
+    if (!samplerStillReferenced) {
+        m_registeredSamplers.erase(sampler);
     }
 
     m_freeImageSlots.push_back(handle.index);

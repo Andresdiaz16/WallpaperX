@@ -9,6 +9,7 @@
 #include <stb_image.h>
 
 #include <array>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <stdexcept>
@@ -51,7 +52,17 @@ void StaticRenderer::cleanup() {
     m_pipeline = VK_NULL_HANDLE;
     m_pipelineLayout = VK_NULL_HANDLE;
 
-    m_device.descriptorAllocator().free(m_descriptorHandle);
+    // cleanup() runs from both ~StaticRenderer() (implicitly noexcept -- an
+    // escaping exception here would call std::terminate(), an uncontrolled
+    // process abort) and the constructor's catch block (where a new exception
+    // from cleanup() would replace, and hide, the real construction failure).
+    // free() can throw (e.g. on a double-free bug), so it must never be allowed
+    // to escape this function.
+    try {
+        m_device.descriptorAllocator().free(m_descriptorHandle);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "StaticRenderer::cleanup: descriptorAllocator().free() failed: %s\n", e.what());
+    }
     m_device.memory().destroyBuffer(m_vertexBuffer);
 
     if (m_heapAllocator) {

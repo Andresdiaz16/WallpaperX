@@ -3,9 +3,11 @@
 #include "vulkan/memory.h"
 
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <optional>
 #include <stdexcept>
+#include <vector>
 
 namespace {
 
@@ -23,7 +25,8 @@ std::optional<bool> heapTierGuard(wallpaperx::Device& device, const char* label)
     if (device.descriptorAllocator().tier() == wallpaperx::DescriptorTier::Heap) {
         return std::nullopt;
     }
-    if (std::getenv("WALLPAPERX_ALLOW_NO_HEAP_TIER")) {
+    const char* allowNoHeapTier = std::getenv("WALLPAPERX_ALLOW_NO_HEAP_TIER");
+    if (allowNoHeapTier && std::strcmp(allowNoHeapTier, "1") == 0) {
         std::cout << "descriptor_allocator_probe (" << label << "): skipped, hardware/driver has no Heap tier support"
                   << std::endl;
         return true;
@@ -137,6 +140,21 @@ bool testTierRejectsDoubleAllocate(const char* forceTier) {
         }
 
         device.descriptorAllocator().free(handleB);
+
+        bool doubleFreeThrew = false;
+        try {
+            device.descriptorAllocator().free(handleB);  // double-free the same handle
+        } catch (const std::runtime_error&) {
+            doubleFreeThrew = true;
+        }
+        if (!doubleFreeThrew) {
+            std::cerr << "descriptor_allocator_probe (" << forceTier << "): second free() should have thrown"
+                      << std::endl;
+            destroyTestResource(device, a);
+            destroyTestResource(device, b);
+            return false;
+        }
+
         destroyTestResource(device, a);
         destroyTestResource(device, b);
     } catch (const std::exception& e) {
@@ -230,6 +248,131 @@ bool testHeapTierUniformSlotsDoNotCollideWithImageSlots() {
     return true;
 }
 
+bool testHeapTierRejectsDoubleFree() {
+    unsetenv("WALLPAPERX_FORCE_TIER");
+    wallpaperx::resetValidationWarningCount();
+
+    try {
+        wallpaperx::Device device(/*enableValidation=*/true);
+        if (auto result = heapTierGuard(device, "heap double-free")) {
+            return *result;
+        }
+
+        TestResource a = createTestResource(device);
+        TestResource b = createTestResource(device);
+        TestResource c = createTestResource(device);
+
+        wallpaperx::DescriptorHandle handleA = device.descriptorAllocator().allocate(a.view, a.sampler);
+        device.descriptorAllocator().free(handleA);
+
+        bool threw = false;
+        try {
+            device.descriptorAllocator().free(handleA);  // double-free the same handle
+        } catch (const std::runtime_error&) {
+            threw = true;
+        }
+        if (!threw) {
+            std::cerr << "descriptor_allocator_probe (heap double-free): second free() should have thrown"
+                      << std::endl;
+            destroyTestResource(device, a);
+            destroyTestResource(device, b);
+            destroyTestResource(device, c);
+            return false;
+        }
+
+        // The double-free must not have corrupted the free-list into handing the
+        // same slot to two independent, simultaneously-live allocations.
+        wallpaperx::DescriptorHandle handleB = device.descriptorAllocator().allocate(b.view, b.sampler);
+        wallpaperx::DescriptorHandle handleC = device.descriptorAllocator().allocate(c.view, c.sampler);
+        const bool aliased = handleB.index == handleC.index;
+
+        device.descriptorAllocator().free(handleB);
+        device.descriptorAllocator().free(handleC);
+        destroyTestResource(device, a);
+        destroyTestResource(device, b);
+        destroyTestResource(device, c);
+
+        if (aliased) {
+            std::cerr << "descriptor_allocator_probe (heap double-free): two live resources got the same slot"
+                      << std::endl;
+            return false;
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "descriptor_allocator_probe (heap double-free) failed: " << e.what() << std::endl;
+        return false;
+    }
+
+    if (wallpaperx::validationWarningCount() > 0) {
+        std::cerr << "descriptor_allocator_probe (heap double-free): validation warnings" << std::endl;
+        return false;
+    }
+
+    std::cout << "descriptor_allocator_probe (heap double-free): passed" << std::endl;
+    return true;
+}
+
+bool testHeapTierExhaustion() {
+    unsetenv("WALLPAPERX_FORCE_TIER");
+    wallpaperx::resetValidationWarningCount();
+
+    try {
+        wallpaperx::Device device(/*enableValidation=*/true);
+        if (auto result = heapTierGuard(device, "heap exhaustion")) {
+            return *result;
+        }
+
+        // resources ends up with one MORE entry than handles: the
+        // (kMaxDescriptorSlots + 1)th resource is created to attempt (and fail)
+        // one allocation past capacity, so it never gets a handle. Both vectors
+        // are driven off their own .size() below -- never zip them together by
+        // index.
+        std::vector<TestResource> resources;
+        std::vector<wallpaperx::DescriptorHandle> handles;
+        resources.reserve(wallpaperx::kMaxDescriptorSlots + 1);
+        handles.reserve(wallpaperx::kMaxDescriptorSlots);
+
+        for (uint32_t i = 0; i < wallpaperx::kMaxDescriptorSlots; ++i) {
+            resources.push_back(createTestResource(device));
+            handles.push_back(device.descriptorAllocator().allocate(resources.back().view, resources.back().sampler));
+        }
+
+        // The (kMaxDescriptorSlots + 1)th allocation must fail cleanly, not
+        // corrupt state or succeed silently past the documented capacity.
+        resources.push_back(createTestResource(device));
+        bool threw = false;
+        try {
+            device.descriptorAllocator().allocate(resources.back().view, resources.back().sampler);
+        } catch (const std::runtime_error&) {
+            threw = true;
+        }
+
+        for (size_t i = 0; i < handles.size(); ++i) {
+            device.descriptorAllocator().free(handles[i]);
+        }
+        for (auto& resource : resources) {
+            destroyTestResource(device, resource);
+        }
+
+        if (!threw) {
+            std::cerr << "descriptor_allocator_probe (heap exhaustion): allocate() past kMaxDescriptorSlots "
+                         "should have thrown"
+                      << std::endl;
+            return false;
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "descriptor_allocator_probe (heap exhaustion) failed: " << e.what() << std::endl;
+        return false;
+    }
+
+    if (wallpaperx::validationWarningCount() > 0) {
+        std::cerr << "descriptor_allocator_probe (heap exhaustion): validation warnings" << std::endl;
+        return false;
+    }
+
+    std::cout << "descriptor_allocator_probe (heap exhaustion): passed" << std::endl;
+    return true;
+}
+
 bool testHeapTierAllowsMultipleAllocate() {
     unsetenv("WALLPAPERX_FORCE_TIER");
     wallpaperx::resetValidationWarningCount();
@@ -278,5 +421,7 @@ int main() {
     ok &= testTierRejectsDoubleAllocate("buffer");
     ok &= testHeapTierAllowsMultipleAllocate();
     ok &= testHeapTierUniformSlotsDoNotCollideWithImageSlots();
+    ok &= testHeapTierRejectsDoubleFree();
+    ok &= testHeapTierExhaustion();
     return ok ? 0 : 1;
 }

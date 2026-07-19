@@ -4,6 +4,7 @@
 #include "memory.h"
 
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace wallpaperx {
@@ -66,6 +67,7 @@ private:
 
     std::unordered_map<uint32_t, VkImageView> m_slotView;
     std::unordered_map<uint32_t, VkSampler> m_slotSampler;
+    std::unordered_set<uint32_t> m_activeUniformSlots;
 
     PFN_vkWriteResourceDescriptorsEXT m_pfnWriteResource = nullptr;
     PFN_vkWriteSamplerDescriptorsEXT m_pfnWriteSampler = nullptr;

@@ -147,8 +147,15 @@ void DescriptorBufferAllocator::bind(VkCommandBuffer cmd, VkPipelineBindPoint bi
 
 void DescriptorBufferAllocator::free(DescriptorHandle handle) {
     if (handle.index == kImageBinding) {
+        if (!m_imageOccupied) {
+            throw std::runtime_error("DescriptorBufferAllocator::free: image handle already freed or never allocated");
+        }
         m_imageOccupied = false;
     } else if (handle.index == kUniformBinding) {
+        if (!m_uniformOccupied) {
+            throw std::runtime_error(
+                "DescriptorBufferAllocator::free: uniform handle already freed or never allocated");
+        }
         m_uniformOccupied = false;
     }
 }
