@@ -54,23 +54,53 @@ endif()
 # wallpaperx-daemon (placeholder — sources added in later steps)
 # --------------------------------------------------------------------------- #
 
-add_executable(wallpaperx-daemon
-    daemon/main.cpp
+# Daemon logic lives in a static lib so both the executable and the tests link it
+# (mirrors the renderer lib + probes layout).
+add_library(wallpaperx-daemon-lib STATIC
+    daemon/dbus_service.cpp
 )
 
-target_include_directories(wallpaperx-daemon PRIVATE
+target_include_directories(wallpaperx-daemon-lib PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${HTTPLIB_INCLUDE_DIR}
 )
 
-target_link_libraries(wallpaperx-daemon PRIVATE
+target_link_libraries(wallpaperx-daemon-lib PUBLIC
     wallpaperx-renderer
-    Qt6::Core
-    Qt6::DBus
     SDBusCpp::sdbus-c++
     nlohmann_json::nlohmann_json
     ${LIBZIP_LIBRARIES}
 )
+
+# The daemon talks DBus through sdbus-c++ (via wallpaperx-daemon-lib), not Qt --
+# Qt is reserved for the separate WallpaperX KDE plugin .so below.
+add_executable(wallpaperx-daemon daemon/main.cpp)
+target_link_libraries(wallpaperx-daemon PRIVATE wallpaperx-daemon-lib)
+
+# --------------------------------------------------------------------------- #
+# Tests
+# --------------------------------------------------------------------------- #
+
+enable_testing()
+
+add_executable(wallpaperx-dbus-service-test tests/dbus_service_test.cpp)
+target_link_libraries(wallpaperx-dbus-service-test PRIVATE wallpaperx-daemon-lib)
+
+# These targets have no Q_OBJECT / Qt usage; AUTOMOC is on globally via
+# qt_standard_project_setup(), so turn it off here to skip a pointless moc step.
+set_target_properties(wallpaperx-daemon-lib wallpaperx-daemon wallpaperx-dbus-service-test
+    PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+
+# The DBus service test needs a session bus. dbus-run-session gives each run a
+# private one (isolated from the developer's real session, and works headless in
+# CI). If it isn't installed, skip registering the test rather than fail the build.
+find_program(DBUS_RUN_SESSION dbus-run-session)
+if(DBUS_RUN_SESSION)
+    add_test(NAME dbus_service
+             COMMAND ${DBUS_RUN_SESSION} -- $<TARGET_FILE:wallpaperx-dbus-service-test>)
+else()
+    message(STATUS "  dbus-run-session not found -- dbus_service test skipped (install dbus)")
+endif()
 
 # --------------------------------------------------------------------------- #
 # KDE plugin — libWallpaperX.so (placeholder — sources added in later steps)
