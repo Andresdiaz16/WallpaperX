@@ -1,5 +1,7 @@
 #include "static_renderer.h"
 
+#include "../vulkan/offscreen.h"
+
 #include "../vulkan/descriptor_buffer.h"
 #include "../vulkan/descriptor_classic.h"
 #include "../vulkan/descriptor_heap.h"
@@ -353,7 +355,11 @@ void StaticRenderer::createPipeline(VkRenderPass renderPass, const std::string& 
     }
 }
 
-void StaticRenderer::render(VkCommandBuffer cmd, VkFramebuffer framebuffer, uint32_t width, uint32_t height) {
+VkImageLayout StaticRenderer::record(VkCommandBuffer cmd, const OffscreenTarget& target) {
+    const VkFramebuffer framebuffer = target.framebuffer;
+    const uint32_t width = target.width;
+    const uint32_t height = target.height;
+
     VkClearValue clearColor{};
     clearColor.color = {{0.0f, 0.0f, 0.0f, 1.0f}};
 
@@ -384,6 +390,9 @@ void StaticRenderer::render(VkCommandBuffer cmd, VkFramebuffer framebuffer, uint
     vkCmdDraw(cmd, 6, 1, 0, 0);
 
     vkCmdEndRenderPass(cmd);
+
+    // The shared offscreen render pass declares this as its finalLayout.
+    return kRenderedLayout;
 }
 
 }

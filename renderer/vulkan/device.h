@@ -19,6 +19,18 @@ struct DeviceInfo {
     bool hasDescriptorHeap = false;
     bool hasDescriptorBuffer = false;
     bool hasExternalMemoryDmaBuf = false;
+
+    // Whether a dma_buf frame can be described to an importer. Tracked separately
+    // from hasExternalMemoryDmaBuf because the two degrade differently: without the
+    // dma_buf extension a non-NVIDIA GPU cannot export at all, but without the
+    // modifier extension it can still export and render -- the frame just carries no
+    // layout metadata. Conflating them turns the second case into a hard failure.
+    bool hasImageDrmFormatModifier = false;
+
+    // VK_EXT_queue_family_foreign: lets the exported image's queue-family ownership
+    // be released to a non-Vulkan consumer (a compositor). Without it the release
+    // falls back to VK_QUEUE_FAMILY_EXTERNAL, which is core since 1.1.
+    bool hasQueueFamilyForeign = false;
 };
 
 class Device {

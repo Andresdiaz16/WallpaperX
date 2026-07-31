@@ -3,6 +3,7 @@
 #include "memory.h"
 
 #include <cstdint>
+#include <vector>
 
 namespace wallpaperx {
 
@@ -15,6 +16,31 @@ struct OffscreenTarget;
 // valid DRM_FORMAT_MOD_LINEAR and would otherwise be mistaken for a real layout.
 inline constexpr uint64_t kDrmModifierInvalid = (1ULL << 56) - 1;
 
+// DRM fourcc codes (from drm_fourcc.h, redefined to avoid a libdrm dependency). The
+// DRM naming is little-endian channel order, so DRM's "ARGB8888" is the same byte
+// layout as Vulkan's VK_FORMAT_B8G8R8A8_UNORM -- they are not a typo for each other.
+inline constexpr uint32_t kDrmFormatArgb8888 = 'A' | ('R' << 8) | ('2' << 16) | ('4' << 24);
+inline constexpr uint32_t kDrmFormatXrgb8888 = 'X' | ('R' << 8) | ('2' << 16) | ('4' << 24);
+inline constexpr uint32_t kDrmFormatAbgr8888 = 'A' | ('B' << 8) | ('2' << 16) | ('4' << 24);
+inline constexpr uint32_t kDrmFormatXbgr8888 = 'X' | ('B' << 8) | ('2' << 16) | ('4' << 24);
+inline constexpr uint32_t kDrmFormatAbgr2101010 = 'A' | ('B' << 8) | ('3' << 16) | ('0' << 24);
+inline constexpr uint32_t kDrmFormatXbgr2101010 = 'X' | ('B' << 8) | ('3' << 16) | ('0' << 24);
+
+// The DRM fourcc naming a compositor needs for `format`, or 0 if this format has no
+// mapping here. Returning 0 rather than guessing is deliberate: an importer told the
+// wrong fourcc renders swapped channels or garbage, whereas 0 means "unknown" and
+// makes the export fail loudly. Callers must treat 0 as an error, not a default.
+uint32_t drmFourccForVkFormat(VkFormat format);
+
+// Where one plane of a DMA-BUF frame lives within the exported memory. Multi-planar
+// modifiers (common on Intel, e.g. compressed layouts with a separate metadata plane)
+// need one of these per plane, which is why this is a list rather than a single
+// stride -- a scalar stride silently describes only single-plane layouts.
+struct ExportedFramePlane {
+    uint64_t offset = 0;
+    uint64_t rowPitch = 0;
+};
+
 struct ExportedFrame {
     enum class HandleType { OpaqueFd, DmaBuf };
 
@@ -24,17 +50,16 @@ struct ExportedFrame {
     uint64_t memorySize = 0;
     HandleType type = HandleType::OpaqueFd;
 
-    // DMA-BUF layout metadata (AMD/Intel). Currently NOT populated on either
-    // path: the OpaqueFd (NVIDIA) path doesn't need it, and the DmaBuf path is a
-    // structural stub -- the offscreen image is VK_IMAGE_TILING_OPTIMAL with no
-    // explicit DRM format modifier, so stride/modifier are driver-private and
-    // unknowable here. These sentinels (drmFormat 0, stride 0, modifier INVALID)
-    // mean "unset": a DmaBuf frame is not yet importable by a compositor. Filling
-    // these in requires creating the image with VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT
-    // (deferred -- see PLAN.md Step 5 scope decision).
+    // DMA-BUF layout metadata (AMD/Intel), describing how to interpret the bytes
+    // behind `fd`. Populated on the DmaBuf path only; the OpaqueFd (NVIDIA) path
+    // leaves them at their unset sentinels because an opaque fd is importable only
+    // by another Vulkan/GL context on the same device, which already knows the
+    // layout. Note that modifier's sentinel is kDrmModifierInvalid rather than 0 --
+    // 0 is the valid DRM_FORMAT_MOD_LINEAR, so a zero default would be
+    // indistinguishable from a genuine linear layout.
     uint32_t drmFormat = 0;
-    uint32_t stride = 0;
     uint64_t modifier = kDrmModifierInvalid;
+    std::vector<ExportedFramePlane> planes;
 };
 
 // Exports target.image's backing memory as a new file descriptor. Every call

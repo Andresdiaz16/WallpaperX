@@ -1,5 +1,7 @@
 #include "offscreen.h"
 
+#include "../renderers/renderer_base.h"
+
 #include "descriptor_heap.h"
 #include "device.h"
 #include "memory_export.h"
@@ -30,7 +32,7 @@ void OffscreenTargetManager::createRenderPass() {
     colorAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
     colorAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
     colorAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    colorAttachment.finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    colorAttachment.finalLayout = kRenderedLayout;
 
     VkAttachmentReference colorRef{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
 
@@ -67,6 +69,49 @@ void OffscreenTargetManager::createRenderPass() {
     if (vkCreateRenderPass(m_device.device(), &renderPassInfo, nullptr, &m_renderPass) != VK_SUCCESS) {
         throw std::runtime_error("OffscreenTargetManager: failed to create render pass");
     }
+}
+
+void OffscreenTargetManager::render(IRenderer& renderer, const OffscreenTarget& target) {
+    VkImageLayout resultingLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    bool recorded = false;
+    try {
+        m_device.immediateSubmit([&](VkCommandBuffer cmd) {
+            recorded = true;
+
+            // Take ownership back before writing. exportFrame() released it to an
+            // external consumer, and a release with no matching acquire is where a
+            // driver's compressed-modifier metadata resolve is undefined -- so the
+            // second and later renders of a target must re-acquire, not just overwrite.
+            if (target.externalOwner != VK_QUEUE_FAMILY_IGNORED) {
+                VkImageMemoryBarrier acquire{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+                acquire.srcAccessMask = 0;  // the release side made the writes available
+                acquire.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+                acquire.oldLayout = target.exportLayout;
+                acquire.newLayout = target.exportLayout;  // ownership only; the render pass re-transitions
+                acquire.srcQueueFamilyIndex = target.externalOwner;
+                acquire.dstQueueFamilyIndex = m_device.graphicsQueueFamily();
+                acquire.image = target.image.image;
+                acquire.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                     VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                                     &acquire);
+                target.externalOwner = VK_QUEUE_FAMILY_IGNORED;
+            }
+
+            resultingLayout = renderer.record(cmd, target);
+        });
+    } catch (...) {
+        // Only invalidate if commands were actually recorded. immediateSubmit can also
+        // throw from vkAllocateCommandBuffers/vkBeginCommandBuffer before reaching the
+        // lambda, in which case nothing touched the image -- stamping UNDEFINED there
+        // would discard a still-valid layout and let the next export's barrier license
+        // the driver to throw away a frame the compositor is currently displaying.
+        if (recorded) {
+            target.notifyLayout(VK_IMAGE_LAYOUT_UNDEFINED);
+        }
+        throw;
+    }
+    target.notifyLayout(resultingLayout);
 }
 
 const OffscreenTarget& OffscreenTargetManager::create(int monitorId, uint32_t width, uint32_t height) {

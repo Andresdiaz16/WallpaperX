@@ -8,7 +8,7 @@
 
 namespace wallpaperx {
 
-void Memory::init(VkInstance instance, VkPhysicalDevice physicalDevice, VkDevice device, uint32_t apiVersion, bool bufferDeviceAddressEnabled) {
+void Memory::init(VkInstance instance, VkPhysicalDevice physicalDevice, VkDevice device, uint32_t apiVersion, bool bufferDeviceAddressEnabled, bool drmFormatModifierSupported) {
     VmaAllocatorCreateInfo info{};
     info.instance = instance;
     info.physicalDevice = physicalDevice;
@@ -21,6 +21,8 @@ void Memory::init(VkInstance instance, VkPhysicalDevice physicalDevice, VkDevice
     if (vmaCreateAllocator(&info, &m_allocator) != VK_SUCCESS) {
         throw std::runtime_error("Memory: vmaCreateAllocator failed");
     }
+    m_physicalDevice = physicalDevice;
+    m_drmFormatModifierSupported = drmFormatModifierSupported;
 }
 
 void Memory::shutdown() {
@@ -93,12 +95,116 @@ void Memory::flushForHostWrite(const AllocatedBuffer& buffer) const {
     vmaFlushAllocation(m_allocator, buffer.allocation, 0, VK_WHOLE_SIZE);
 }
 
+std::vector<VkDrmFormatModifierPropertiesEXT> queryDrmModifierList(VkPhysicalDevice physicalDevice, VkFormat format) {
+    VkDrmFormatModifierPropertiesListEXT modifierList{VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT};
+    VkFormatProperties2 formatProps{VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2};
+    formatProps.pNext = &modifierList;
+    vkGetPhysicalDeviceFormatProperties2(physicalDevice, format, &formatProps);
+
+    std::vector<VkDrmFormatModifierPropertiesEXT> all(modifierList.drmFormatModifierCount);
+    if (all.empty()) {
+        return {};
+    }
+    modifierList.pDrmFormatModifierProperties = all.data();
+    vkGetPhysicalDeviceFormatProperties2(physicalDevice, format, &formatProps);
+
+    // drmFormatModifierCount is in/out: the second call overwrites it with how many
+    // entries were actually written, which may be fewer than the first call reported.
+    // Without this resize the tail stays value-initialised and reads as modifier 0 --
+    // a *valid* DRM_FORMAT_MOD_LINEAR with planeCount 0, not an obvious empty slot.
+    all.resize(modifierList.drmFormatModifierCount);
+    return all;
+}
+
+std::vector<uint64_t> Memory::supportedDrmModifiers(VkFormat format, VkImageType imageType, VkImageUsageFlags usage,
+                                                    VkExtent3D extent) const {
+    const std::vector<VkDrmFormatModifierPropertiesEXT> all = queryDrmModifierList(m_physicalDevice, format);
+
+    // A modifier appearing in the format's list only means the driver understands the
+    // layout -- not that it can render to it, sample it, or export it as a dma_buf.
+    // Each has to be re-checked against the actual usage, or vkCreateImage fails later
+    // with no indication of which requirement was the problem.
+    std::vector<uint64_t> usable;
+    for (const auto& candidate : all) {
+        VkPhysicalDeviceImageDrmFormatModifierInfoEXT modifierInfo{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT};
+        modifierInfo.drmFormatModifier = candidate.drmFormatModifier;
+        modifierInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+        VkPhysicalDeviceExternalImageFormatInfo externalInfo{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO};
+        externalInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+        externalInfo.pNext = &modifierInfo;
+
+        VkPhysicalDeviceImageFormatInfo2 imageFormatInfo{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2};
+        imageFormatInfo.format = format;
+        imageFormatInfo.type = imageType;
+        imageFormatInfo.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
+        imageFormatInfo.usage = usage;
+        imageFormatInfo.pNext = &externalInfo;
+
+        VkExternalImageFormatProperties externalProps{VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES};
+        VkImageFormatProperties2 imageFormatProps{VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2};
+        imageFormatProps.pNext = &externalProps;
+
+        if (vkGetPhysicalDeviceImageFormatProperties2(m_physicalDevice, &imageFormatInfo, &imageFormatProps) !=
+                VK_SUCCESS ||
+            !(externalProps.externalMemoryProperties.externalMemoryFeatures &
+              VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT)) {
+            continue;
+        }
+        // The extent is not part of the query, so the returned maxExtent has to be
+        // checked by hand. A tiled or compressed modifier can cap out below a large
+        // display's resolution; offering it anyway just moves the failure to
+        // vkCreateImage, where the error says nothing about which modifier was at
+        // fault and the whole list fails with it.
+        const VkExtent3D& maxExtent = imageFormatProps.imageFormatProperties.maxExtent;
+        if (extent.width > maxExtent.width || extent.height > maxExtent.height ||
+            extent.depth > maxExtent.depth) {
+            continue;
+        }
+        usable.push_back(candidate.drmFormatModifier);
+    }
+    return usable;
+}
+
 AllocatedImage Memory::createExportableImage(const VkImageCreateInfo& imageInfoIn, VkExternalMemoryHandleTypeFlagBits exportHandleType, const char* debugName) {
     VkExternalMemoryImageCreateInfo externalImageInfo{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO};
     externalImageInfo.handleTypes = exportHandleType;
 
     VkImageCreateInfo imageInfo = imageInfoIn;
     imageInfo.pNext = &externalImageInfo;
+
+    // Kept alive until vmaCreateDedicatedImage() consumes the pNext chain below.
+    std::vector<uint64_t> modifiers;
+    VkImageDrmFormatModifierListCreateInfoEXT modifierListInfo{
+        VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT};
+
+    bool drmModifierTiled = false;
+    if (exportHandleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT && m_drmFormatModifierSupported) {
+        modifiers = supportedDrmModifiers(imageInfo.format, imageInfo.imageType, imageInfo.usage, imageInfo.extent);
+        if (modifiers.empty()) {
+            // Same degrade-don't-fail policy as a driver missing the extension outright
+            // (see device.cpp's gating): a frame no compositor can import still beats no
+            // frame at all. Loud, because it means AMD/Intel import will not work here.
+            std::fprintf(stderr,
+                         "Memory: no exportable DRM format modifier supports %ux%u with the requested usage for %s "
+                         "-- falling back to the caller's tiling; the frame will carry no layout metadata\n",
+                         imageInfo.extent.width, imageInfo.extent.height,
+                         debugName ? debugName : "(unnamed exportable image)");
+        } else {
+            // Offering the driver every usable modifier lets it pick its most efficient
+            // layout; the one it actually chose is read back after creation via
+            // vkGetImageDrmFormatModifierPropertiesEXT (see exportFrame).
+            modifierListInfo.drmFormatModifierCount = static_cast<uint32_t>(modifiers.size());
+            modifierListInfo.pDrmFormatModifiers = modifiers.data();
+            modifierListInfo.pNext = &externalImageInfo;
+
+            imageInfo.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
+            imageInfo.pNext = &modifierListInfo;
+            drmModifierTiled = true;
+        }
+    }
 
     VkExportMemoryAllocateInfo exportInfo{VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO};
     exportInfo.handleTypes = exportHandleType;
@@ -111,6 +217,7 @@ AllocatedImage Memory::createExportableImage(const VkImageCreateInfo& imageInfoI
     if (vmaCreateDedicatedImage(m_allocator, &imageInfo, &allocInfo, &exportInfo, &result.image, &result.allocation, nullptr) != VK_SUCCESS) {
         throw std::runtime_error(std::string("Memory: failed to create exportable image ") + (debugName ? debugName : ""));
     }
+    result.drmModifierTiled = drmModifierTiled;
     m_liveAllocations[result.allocation] = debugName ? debugName : "(unnamed exportable image)";
     return result;
 }

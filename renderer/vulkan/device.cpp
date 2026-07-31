@@ -59,7 +59,8 @@ Device::Device(bool enableValidation) {
         determineTier();
         createLogicalDevice();
         const bool bufferDeviceAddressEnabled = m_selectedTier == DescriptorTier::Heap || m_selectedTier == DescriptorTier::Buffer;
-        m_memory.init(m_instance, m_physicalDevice, m_device, VK_API_VERSION_1_3, bufferDeviceAddressEnabled);
+        m_memory.init(m_instance, m_physicalDevice, m_device, VK_API_VERSION_1_3, bufferDeviceAddressEnabled,
+                      m_info.hasImageDrmFormatModifier);
         createDescriptorAllocator();
         createCommandPool();
     } catch (...) {
@@ -115,6 +116,7 @@ void Device::createInstance(bool enableValidation) {
     std::vector<const char*> instanceLayers;
 
     bool validationAvailable = false;
+    bool syncValidationAvailable = false;
     if (enableValidation) {
         uint32_t layerCount = 0;
         vkEnumerateInstanceLayerProperties(&layerCount, nullptr);
@@ -129,11 +131,44 @@ void Device::createInstance(bool enableValidation) {
         if (validationAvailable) {
             instanceLayers.push_back("VK_LAYER_KHRONOS_validation");
             instanceExtensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+
+            // VK_EXT_validation_features is provided by the layer, not the loader, and
+            // it is deprecated in favour of VK_EXT_layer_settings -- so a stripped or
+            // newer layer build may not expose it. Enabling it blind would fail
+            // vkCreateInstance outright and take the whole renderer down; the correct
+            // degradation is to run without synchronization validation.
+            uint32_t layerExtCount = 0;
+            vkEnumerateInstanceExtensionProperties("VK_LAYER_KHRONOS_validation", &layerExtCount, nullptr);
+            std::vector<VkExtensionProperties> layerExts(layerExtCount);
+            vkEnumerateInstanceExtensionProperties("VK_LAYER_KHRONOS_validation", &layerExtCount, layerExts.data());
+            syncValidationAvailable = hasExtension(layerExts, VK_EXT_VALIDATION_FEATURES_EXTENSION_NAME);
+            if (syncValidationAvailable) {
+                instanceExtensions.push_back(VK_EXT_VALIDATION_FEATURES_EXTENSION_NAME);
+            } else {
+                std::cerr << "[vulkan] validation layer present but VK_EXT_validation_features is not -- "
+                             "running without synchronization validation"
+                          << std::endl;
+            }
         }
     }
 
+    // The layer's default checks cover API usage, not GPU hazards: missing barriers,
+    // layout hazards and destroy-while-in-flight are all silent unless synchronization
+    // validation is opted into explicitly. Both ICDs we test on are poor witnesses for
+    // sync bugs (Lavapipe largely serializes; NVIDIA is forgiving about layouts) while
+    // RADV is not, so without this the first AMD user is the sync validator.
+    // Thread-safety checks are on by default and need no opt-in here.
+    constexpr VkValidationFeatureEnableEXT kSyncValidation =
+        VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT;
+    VkValidationFeaturesEXT validationFeatures{VK_STRUCTURE_TYPE_VALIDATION_FEATURES_EXT};
+    validationFeatures.enabledValidationFeatureCount = 1;
+    validationFeatures.pEnabledValidationFeatures = &kSyncValidation;
+
     VkInstanceCreateInfo createInfo{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     createInfo.pApplicationInfo = &appInfo;
+    if (syncValidationAvailable) {
+        createInfo.pNext = &validationFeatures;
+    }
     createInfo.enabledLayerCount = static_cast<uint32_t>(instanceLayers.size());
     createInfo.ppEnabledLayerNames = instanceLayers.data();
     createInfo.enabledExtensionCount = static_cast<uint32_t>(instanceExtensions.size());
@@ -229,6 +264,13 @@ void Device::selectPhysicalDevice() {
     m_info.hasDescriptorHeap = hasExtension(extensions, VK_EXT_DESCRIPTOR_HEAP_EXTENSION_NAME);
     m_info.hasDescriptorBuffer = hasExtension(extensions, VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME);
     m_info.hasExternalMemoryDmaBuf = hasExtension(extensions, VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);
+    // Deliberately NOT folded into hasExternalMemoryDmaBuf: a driver with dma_buf but
+    // no modifier support can still render and export, it just cannot describe the
+    // layout. Requiring both would make externalMemoryHandleType() throw on such a
+    // driver and take the wallpaper down entirely, trading a frame no compositor can
+    // import for no frame at all.
+    m_info.hasImageDrmFormatModifier = hasExtension(extensions, VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME);
+    m_info.hasQueueFamilyForeign = hasExtension(extensions, VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME);
 
     if (m_info.hasDescriptorHeap) {
         // The heap tier doesn't just need VK_EXT_descriptor_heap: createLogicalDevice()
@@ -279,6 +321,12 @@ void Device::createLogicalDevice() {
     std::vector<const char*> deviceExtensions{VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME};
     if (m_info.hasExternalMemoryDmaBuf) {
         deviceExtensions.push_back(VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);
+    }
+    if (m_info.hasImageDrmFormatModifier) {
+        deviceExtensions.push_back(VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME);
+    }
+    if (m_info.hasQueueFamilyForeign) {
+        deviceExtensions.push_back(VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME);
     }
     if (useHeap) {
         deviceExtensions.push_back(VK_EXT_DESCRIPTOR_HEAP_EXTENSION_NAME);

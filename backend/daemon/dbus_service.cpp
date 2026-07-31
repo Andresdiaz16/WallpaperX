@@ -22,7 +22,8 @@ void DbusService::registerVTable() {
             sdbus::registerMethod("GetFrameFd")
                 .implementedAs([this](int32_t monitorId) { return getFrameFd(monitorId); })
                 .withInputParamNames("monitor_id")
-                .withOutputParamNames("fd", "width", "height", "memory_size", "handle_type"),
+                .withOutputParamNames("fd", "width", "height", "memory_size", "handle_type", "sync_fds",
+                                      "frame_generation", "drm_format", "drm_modifier", "planes"),
             sdbus::registerMethod("GetStatus").implementedAs([this]() { return getStatus(); }).withOutputParamNames("status"),
             sdbus::registerSignal("FrameReady").withParameters<int32_t>("monitor_id"))
         .forInterface(std::string(kInterface));
@@ -40,7 +41,7 @@ void DbusService::setWallpaper(const std::string& type, const std::string& path,
     std::fflush(stdout);
 }
 
-std::tuple<sdbus::UnixFd, uint32_t, uint32_t, uint64_t, int32_t> DbusService::getFrameFd(int32_t monitorId) {
+DbusService::FrameFdResult DbusService::getFrameFd(int32_t monitorId) {
     // Task 1 stub: there is no renderer yet, so no frame to export. Task 2 wires this
     // to the renderer's exportFrame(). Throw a DBus error rather than return a bogus
     // fd, so callers get a clean, named failure.

@@ -44,11 +44,16 @@ bool testRenderValidImage() {
 
         wallpaperx::StaticRenderer renderer(device, targets.renderPass(), imagePath, WALLPAPERX_SHADER_DIR);
 
-        device.immediateSubmit([&](VkCommandBuffer cmd) {
-            renderer.render(cmd, target.framebuffer, target.width, target.height);
+        targets.render(renderer, target);
 
+        // Readback transition, issued outside OffscreenTargetManager::render(). Any
+        // such out-of-band transition has to be reported back to the target, or its
+        // tracked layout goes stale and a later export declares a layout the image has
+        // since left -- silently, because validation skips the layout check on an
+        // ownership release.
+        device.immediateSubmit([&](VkCommandBuffer cmd) {
             VkImageMemoryBarrier toTransferSrc{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-            toTransferSrc.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            toTransferSrc.oldLayout = wallpaperx::kRenderedLayout;
             toTransferSrc.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
             toTransferSrc.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
             toTransferSrc.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -60,6 +65,7 @@ bool testRenderValidImage() {
             vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                                   0, 0, nullptr, 0, nullptr, 1, &toTransferSrc);
         });
+        target.notifyLayout(VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
 
         wallpaperx::AllocatedBuffer readback = device.memory().createBuffer(
             static_cast<VkDeviceSize>(target.width) * target.height * 4,
