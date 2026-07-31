@@ -6,6 +6,32 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 # --------------------------------------------------------------------------- #
+# Sanitizers (opt-in, separate build tree)
+# --------------------------------------------------------------------------- #
+
+# Set before add_subdirectory so the renderer is instrumented too -- a ThreadSanitizer
+# build that misses the renderer would see the daemon's locks but none of the GPU-side
+# state they protect, which is the half worth checking.
+#
+# TSan is the reason this exists. The daemon has two threads and a documented lock
+# order, and TSan tests that order better than any hand-written test could: it flags an
+# inversion the first time the two paths interleave, rather than on the run where the
+# timing happens to be bad. Use a separate build tree:
+#
+#   cmake -S backend -B backend/build-tsan -DWALLPAPERX_SANITIZE=thread \
+#         -DWALLPAPERX_BUILD_KDE_PLUGIN=OFF
+#   TSAN_OPTIONS="suppressions=$PWD/backend/tsan.supp" ctest --test-dir backend/build-tsan -L lavapipe
+#
+# Lavapipe only: the uninstrumented NVIDIA driver reports races TSan cannot see into,
+# and the noise buries anything real.
+set(WALLPAPERX_SANITIZE "" CACHE STRING "Build with a sanitizer: thread, address, undefined, or empty")
+if(WALLPAPERX_SANITIZE)
+    add_compile_options(-fsanitize=${WALLPAPERX_SANITIZE} -g -fno-omit-frame-pointer)
+    add_link_options(-fsanitize=${WALLPAPERX_SANITIZE})
+    message(STATUS "  Sanitizer: ${WALLPAPERX_SANITIZE}")
+endif()
+
+# --------------------------------------------------------------------------- #
 # wallpaperx-renderer (subproject)
 # --------------------------------------------------------------------------- #
 

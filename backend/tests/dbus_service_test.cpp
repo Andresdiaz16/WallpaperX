@@ -34,6 +34,8 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -70,6 +72,21 @@ constexpr int32_t kMonitorNeverSet = 9;
 constexpr auto kSignalTimeout = std::chrono::seconds(30);
 
 std::string testAssetDir() { return std::string(WALLPAPERX_TEST_IMAGE_DIR); }
+
+// Whether to run without the validation layer. Exists for one caller: a ThreadSanitizer
+// build, where the layer is uninstrumented, keeps its own lock-heavy state maps, and
+// drowns the report in races inside code we do not ship -- while suppressing it produces
+// its own artifacts, since TSan then sees the layer's unlocks without their locks.
+//
+// Compared against "1" exactly, matching WALLPAPERX_ALLOW_NO_HEAP_TIER: a plain getenv()
+// truthiness check would make "=0" mean "waived", which is the opposite of what anyone
+// typing it intends. Waiving is announced loudly below, because this deliberately
+// disables the suite's only GPU-side oracle and a silent version of this switch is
+// exactly the vacuous-green trap the validation check was added to close.
+bool validationWaived() {
+    const char* env = std::getenv("WALLPAPERX_ALLOW_NO_VALIDATION");
+    return env != nullptr && std::strcmp(env, "1") == 0;
+}
 
 std::string writeTestImage() {
     std::filesystem::create_directories(testAssetDir());
@@ -555,7 +572,7 @@ int main() {
         config.height = kTargetHeight;
         // Validation on: it is the correctness oracle for the export path's barriers and
         // queue-family transfers, none of which this test can observe directly.
-        config.enableValidation = true;
+        config.enableValidation = !validationWaived();
         wallpaperx::WallpaperManager manager(config);
 
         // Service side: requests the name and serves on a background event loop.
@@ -587,7 +604,12 @@ int main() {
     // the layer package is absent, and the warning count then stays 0 no matter what the
     // GPU actually did. Without this check the suite's only GPU-side oracle reports green
     // on any machine without vulkan-validation-layers installed.
-    if (!wallpaperx::validationLayerActive()) {
+    if (validationWaived()) {
+        std::printf(
+            "dbus_service_test: WARNING -- running with WALLPAPERX_ALLOW_NO_VALIDATION=1. The GPU-side "
+            "correctness oracle is DISABLED; this run proves only that the DBus and threading behaviour "
+            "holds. Do not read a pass here as the suite being green.\n");
+    } else if (!wallpaperx::validationLayerActive()) {
         std::fprintf(stderr,
                      "FAIL: VK_LAYER_KHRONOS_validation was requested but is not loaded -- the "
                      "zero-warning check below would pass without validating anything. "

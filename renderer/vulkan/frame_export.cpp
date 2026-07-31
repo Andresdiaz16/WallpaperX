@@ -179,6 +179,12 @@ void releaseToExternalConsumer(Device& device, const OffscreenTarget& target, Ex
 }  // namespace
 
 ExportedFrame exportFrame(Device& device, const OffscreenTarget& target) {
+    // The export submits an ownership-release barrier, so it is GPU work like any other
+    // and belongs on the same thread as the renders it interleaves with. In the daemon
+    // this is what makes GetFrameFd's asynchronous handling load-bearing rather than
+    // stylistic: answering it inline on the DBus thread would trip this.
+    device.assertGpuThread("exportFrame");
+
     auto pfnGetMemoryFd = reinterpret_cast<PFN_vkGetMemoryFdKHR>(
         vkGetDeviceProcAddr(device.device(), "vkGetMemoryFdKHR"));
     if (!pfnGetMemoryFd) {
@@ -212,10 +218,16 @@ ExportedFrame exportFrame(Device& device, const OffscreenTarget& target) {
 
     try {
         // Gated on how the image was actually created, not on device capability:
-        // creation falls back to the caller's tiling when no modifier qualifies, and
-        // querying a modifier from a non-modifier image is a spec violation. A frame
-        // that took the fallback goes out carrying the unset "layout unknown" sentinels.
-        if (frame.type == ExportedFrame::HandleType::DmaBuf && target.image.drmModifierTiled) {
+        // querying a modifier from a non-modifier image is a spec violation. The two
+        // must agree -- createExportableImage now refuses to produce a DMA_BUF image
+        // without an explicit modifier, so a dma_buf frame always carries real layout
+        // metadata and never the "layout unknown" sentinels.
+        if (frame.type == ExportedFrame::HandleType::DmaBuf) {
+            if (!target.image.drmModifierTiled) {
+                throw std::runtime_error(
+                    "exportFrame: dma_buf export of an image created without an explicit DRM format modifier -- "
+                    "no importer can interpret it");
+            }
             populateDmaBufLayout(device, target, frame);
         }
         releaseToExternalConsumer(device, target, frame.type);

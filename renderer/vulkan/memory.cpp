@@ -181,29 +181,41 @@ AllocatedImage Memory::createExportableImage(const VkImageCreateInfo& imageInfoI
         VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT};
 
     bool drmModifierTiled = false;
-    if (exportHandleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT && m_drmFormatModifierSupported) {
+    if (exportHandleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT) {
+        // A dma_buf with no explicit modifier is refused rather than degraded. There is
+        // no legal consumer for one: an importer handed a dma_buf and no modifier cannot
+        // interpret the bytes at all -- that is the entire reason
+        // VK_EXT_image_drm_format_modifier exists -- so a frame exported this way is not
+        // "worse", it is unusable, and the sentinels it would carry invite the plugin to
+        // guess. The earlier degrade-don't-fail policy also produced a branch that no
+        // machine here can reach: every ICD available to this project (NVIDIA 3080 Ti and
+        // Mesa Lavapipe) supports the extension, so that code would first have executed
+        // on a stranger's GPU, having never been run by anyone.
+        if (!m_drmFormatModifierSupported) {
+            throw std::runtime_error(
+                std::string("Memory: cannot export ") + (debugName ? debugName : "(unnamed exportable image)") +
+                " as a dma_buf -- VK_EXT_image_drm_format_modifier is unavailable, and a dma_buf without a "
+                "DRM format modifier cannot be interpreted by any importer");
+        }
+
         modifiers = supportedDrmModifiers(imageInfo.format, imageInfo.imageType, imageInfo.usage, imageInfo.extent);
         if (modifiers.empty()) {
-            // Same degrade-don't-fail policy as a driver missing the extension outright
-            // (see device.cpp's gating): a frame no compositor can import still beats no
-            // frame at all. Loud, because it means AMD/Intel import will not work here.
-            std::fprintf(stderr,
-                         "Memory: no exportable DRM format modifier supports %ux%u with the requested usage for %s "
-                         "-- falling back to the caller's tiling; the frame will carry no layout metadata\n",
-                         imageInfo.extent.width, imageInfo.extent.height,
-                         debugName ? debugName : "(unnamed exportable image)");
-        } else {
-            // Offering the driver every usable modifier lets it pick its most efficient
-            // layout; the one it actually chose is read back after creation via
-            // vkGetImageDrmFormatModifierPropertiesEXT (see exportFrame).
-            modifierListInfo.drmFormatModifierCount = static_cast<uint32_t>(modifiers.size());
-            modifierListInfo.pDrmFormatModifiers = modifiers.data();
-            modifierListInfo.pNext = &externalImageInfo;
-
-            imageInfo.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
-            imageInfo.pNext = &modifierListInfo;
-            drmModifierTiled = true;
+            throw std::runtime_error(
+                std::string("Memory: no exportable DRM format modifier supports ") +
+                std::to_string(imageInfo.extent.width) + "x" + std::to_string(imageInfo.extent.height) +
+                " with the requested usage for " + (debugName ? debugName : "(unnamed exportable image)"));
         }
+
+        // Offering the driver every usable modifier lets it pick its most efficient
+        // layout; the one it actually chose is read back after creation via
+        // vkGetImageDrmFormatModifierPropertiesEXT (see exportFrame).
+        modifierListInfo.drmFormatModifierCount = static_cast<uint32_t>(modifiers.size());
+        modifierListInfo.pDrmFormatModifiers = modifiers.data();
+        modifierListInfo.pNext = &externalImageInfo;
+
+        imageInfo.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
+        imageInfo.pNext = &modifierListInfo;
+        drmModifierTiled = true;
     }
 
     VkExportMemoryAllocateInfo exportInfo{VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO};

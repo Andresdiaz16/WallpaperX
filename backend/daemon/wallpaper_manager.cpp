@@ -68,7 +68,19 @@ WallpaperManager::WallpaperManager(Config config) : m_config(std::move(config)) 
 // Out of line, and non-trivial for a reason: Device and OffscreenTargetManager are
 // only forward-declared in the header, so the unique_ptr deleters need their
 // definitions, which are visible here.
-WallpaperManager::~WallpaperManager() = default;
+WallpaperManager::~WallpaperManager() {
+    // The Device was created on the render thread, but this destructor runs on whichever
+    // thread owns the manager -- the daemon's main thread -- and destroying the targets
+    // and the device is GPU work. That handoff is legitimate only because the owner joins
+    // the render worker before destroying the manager (DbusService::~DbusService stops it
+    // first, and main.cpp declares the service after the manager so it dies first).
+    // Saying so explicitly is the point: without this the affinity check fires on every
+    // shutdown, and silencing it by not checking teardown at all would have given up the
+    // check exactly where use-after-free lives.
+    if (m_device) {
+        m_device->adoptGpuThread();
+    }
+}
 
 void WallpaperManager::ensureGpu() {
     if (m_device) return;
@@ -98,9 +110,7 @@ void WallpaperManager::ensureGpu() {
     m_gpuStatus.descriptorTier = toString(m_device->descriptorTier());
 }
 
-void WallpaperManager::renderStatic(int monitorId, const std::string& path) {
-    ensureGpu();
-
+const OffscreenTarget& WallpaperManager::acquireTarget(int monitorId) {
     // Reuse the existing target unless its geometry no longer matches -- create()
     // replaces (and waits for idle), which is wasted work when nothing changed. The
     // size can only differ once real monitor geometry arrives in Step 15, but keying
@@ -108,16 +118,7 @@ void WallpaperManager::renderStatic(int monitorId, const std::string& path) {
     // not silently keep rendering at the old resolution.
     const bool reusable = m_targets->has(monitorId) && m_targets->get(monitorId).width == m_config.width &&
                           m_targets->get(monitorId).height == m_config.height;
-    const OffscreenTarget& target =
-        reusable ? m_targets->get(monitorId) : m_targets->create(monitorId, m_config.width, m_config.height);
-
-    // Not retained past this call. A static wallpaper renders once, so keeping the
-    // texture, pipeline and descriptor alive per monitor would hold VRAM for something
-    // nothing re-renders; immediateSubmit has already waited on its fence by the time
-    // render() returns, so nothing is destroyed out from under the GPU. Step 13's video
-    // renderer does need to persist and will live in MonitorState.
-    StaticRenderer renderer(*m_device, m_targets->renderPass(), path, m_resolvedShaderDir);
-    m_targets->render(renderer, target);
+    return reusable ? m_targets->get(monitorId) : m_targets->create(monitorId, m_config.width, m_config.height);
 }
 
 void WallpaperManager::releaseTarget(int monitorId) {
@@ -190,59 +191,106 @@ RenderOutcome WallpaperManager::renderPending(int monitorId) {
         seq = it->second.requestSeq;
     }
 
-    std::string error;
     if (type != "static") {
         // Recorded only; video/shader render in Step 13 / Phase 3. Release the target --
         // nothing will read it again, and holding a full-size image per monitor for a
         // wallpaper type this build cannot draw is memory kept for no one.
         releaseTarget(monitorId);
-    } else {
-        try {
-            renderStatic(monitorId, path);
-        } catch (const std::exception& e) {
-            error = e.what();
-            // A monitor whose render failed keeps no frame, so its target has no reader.
-            // Freeing it also means a retry starts from a clean target rather than
-            // reusing one left in whatever state the failure produced.
-            releaseTarget(monitorId);
+
+        std::lock_guard<std::mutex> stateLock(m_stateMutex);
+        auto it = m_monitors.find(monitorId);
+        if (it != m_monitors.end() && it->second.requestSeq == seq) {
+            it->second.servicedSeq = seq;
+        }
+        return {};
+    }
+
+    // Everything expensive happens here, outside m_stateMutex: decoding the image,
+    // uploading the texture, building the pipeline, creating the target. None of it
+    // touches the offscreen image's contents.
+    std::string error;
+    std::optional<StaticRenderer> renderer;
+    const OffscreenTarget* target = nullptr;
+    try {
+        ensureGpu();
+        target = &acquireTarget(monitorId);
+        // Not retained past this call. A static wallpaper renders once, so keeping the
+        // texture, pipeline and descriptor alive per monitor would hold VRAM for
+        // something nothing re-renders; immediateSubmit has already waited on its fence
+        // by the time render() returns, so nothing is destroyed out from under the GPU.
+        // Step 13's video renderer does need to persist and will live in MonitorState.
+        renderer.emplace(*m_device, m_targets->renderPass(), path, m_resolvedShaderDir);
+    } catch (const std::exception& e) {
+        error = e.what();
+    }
+
+    bool committed = false;
+    uint64_t generation = 0;
+    {
+        // m_stateMutex is held across the submit, and that is the whole point rather
+        // than an oversight. The target is single-buffered: the submit writes into the
+        // very memory an already-imported consumer is displaying. If a newer request
+        // could land between the check and the submit, this render would repaint the
+        // published frame with a wallpaper the user has just replaced -- and, because a
+        // superseded render deliberately does not bump the generation or emit
+        // FrameReady, it would do so with nothing on the wire to say it happened. The
+        // consumer would go on believing it holds generation N. Making the check and the
+        // submit atomic is what reduces that to "either the render is published or the
+        // image is never touched".
+        //
+        // The cost is bounded by one fullscreen-quad submit, not by the render as a
+        // whole -- decode, upload and pipeline creation are all above, unlocked -- so
+        // GetStatus can wait on a draw, never on an image load or device creation.
+        std::lock_guard<std::mutex> stateLock(m_stateMutex);
+        auto it = m_monitors.find(monitorId);
+        if (it == m_monitors.end() || it->second.requestSeq != seq) {
+            // Superseded. Nothing has been submitted, so the image still holds exactly
+            // what the consumer was last told about. Leave servicedSeq alone so the
+            // newer request's own pass is not mistaken for one already done.
+            return {};
+        }
+
+        if (error.empty()) {
+            try {
+                m_targets->render(*renderer, *target);
+            } catch (const std::exception& e) {
+                error = e.what();
+            }
+        }
+
+        // Marked for every outcome, not just success: a failed render must not be
+        // retried by a duplicate queue entry either, or a broken image file would be
+        // decoded again for every spurious post.
+        it->second.servicedSeq = seq;
+
+        if (!error.empty()) {
+            it->second.lastError = error;
+        } else {
+            ++it->second.generation;
+            it->second.hasFrame = true;
+            it->second.width = m_config.width;
+            it->second.height = m_config.height;
+            // Cleared here rather than relying on requestWallpaper having cleared it. A
+            // successful commit is what makes "this monitor has a frame" true, and the
+            // two facts have to be set together -- otherwise a monitor can report
+            // has_frame alongside a stale last_error, and a client branching on
+            // last_error calls a working wallpaper broken.
+            it->second.lastError.clear();
+            committed = true;
+            generation = it->second.generation;
         }
     }
 
-    std::lock_guard<std::mutex> stateLock(m_stateMutex);
-    auto it = m_monitors.find(monitorId);
-    if (it == m_monitors.end() || it->second.requestSeq != seq) {
-        // A newer request landed while this one was rendering. Committing now would flag
-        // the monitor as holding a frame whose pixels belong to the wallpaper the user
-        // just replaced, and would burn a generation number on it. The newer request has
-        // its own pass queued; let that one be the truth -- and leave servicedSeq alone,
-        // so that pass is not mistaken for one already done.
-        return {};
-    }
-
-    // Marked for every outcome, not just success: a failed render must not be retried
-    // by a duplicate queue entry either, or a broken image file would be decoded again
-    // for every spurious post.
-    it->second.servicedSeq = seq;
-
-    if (type != "static") {
-        return {};
-    }
     if (!error.empty()) {
-        it->second.lastError = error;
+        // Outside the state lock: destroying a target waits for device idle, which has
+        // no business blocking GetStatus. A monitor whose render failed keeps no frame,
+        // so its target has no reader, and freeing it means a retry starts clean.
+        renderer.reset();
+        releaseTarget(monitorId);
         return {};
     }
 
-    ++it->second.generation;
-    it->second.hasFrame = true;
-    it->second.width = m_config.width;
-    it->second.height = m_config.height;
-    // Cleared here rather than relying on requestWallpaper having cleared it. A
-    // successful commit is what makes "this monitor has a frame" true, and the two facts
-    // have to be set together -- otherwise a monitor can report has_frame alongside a
-    // stale last_error, and a client branching on last_error calls a working wallpaper
-    // broken.
-    it->second.lastError.clear();
-    return RenderOutcome{true, it->second.generation};
+    return RenderOutcome{committed, generation};
 }
 
 std::optional<FrameHandle> WallpaperManager::exportCurrentFrame(int monitorId) {

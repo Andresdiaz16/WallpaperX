@@ -7,6 +7,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <thread>
 
 namespace wallpaperx {
 
@@ -62,6 +63,31 @@ public:
 
     void immediateSubmit(const std::function<void(VkCommandBuffer)>& record);
 
+    // Aborts unless called from the thread that created this Device.
+    //
+    // Vulkan queue submission is not free-threaded and this Device shares one command
+    // pool, so every caller into the GPU has to be on the same thread. In the daemon
+    // that is the render worker, and the rule it enforces -- no DBus handler touches
+    // the GPU -- is what keeps the single event loop responsive. A rule that lives only
+    // in comments is one refactor from being broken silently, and the symptom would be
+    // a data race: intermittent, unreproducible, and invisible to every existing test.
+    // This turns it into an immediate, located failure under any test that trips it.
+    //
+    // Aborts rather than throws on purpose. A wrong-thread call is a programming error,
+    // not a runtime condition; throwing would let a caller's catch turn it into a
+    // routine "render failed" and hide exactly what needs to be loud.
+    void assertGpuThread(const char* what) const;
+
+    // Re-binds the above to the calling thread. Vulkan permits use from any thread as
+    // long as access is externally synchronised, so the affinity check is stricter than
+    // the spec -- deliberately, because "one designated thread" is a rule a reviewer can
+    // check and "externally synchronised" is not. This is the escape hatch for the one
+    // legitimate handoff: an owner that has *joined* the render thread and is now tearing
+    // the device down from its own. The caller must guarantee no other thread can touch
+    // the Device; calling it while the worker still runs re-points the check at the wrong
+    // thread and disables the very protection it exists for.
+    void adoptGpuThread() { m_gpuThread = std::this_thread::get_id(); }
+
 private:
     void createInstance(bool enableValidation);
     void selectPhysicalDevice();
@@ -77,6 +103,11 @@ private:
     VkDevice m_device = VK_NULL_HANDLE;
     VkQueue m_graphicsQueue = VK_NULL_HANDLE;
     uint32_t m_graphicsQueueFamily = UINT32_MAX;
+
+    // The thread that constructed this Device, and therefore the only one allowed to
+    // touch it. Captured rather than configured: whoever created the device is by
+    // definition the GPU thread.
+    std::thread::id m_gpuThread = std::this_thread::get_id();
 
     DeviceInfo m_info;
     DescriptorTier m_selectedTier = DescriptorTier::Classic;

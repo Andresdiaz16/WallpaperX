@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <thread>
 #include <stdexcept>
 #include <vector>
 
@@ -422,7 +423,21 @@ void Device::createCommandPool() {
     }
 }
 
+void Device::assertGpuThread(const char* what) const {
+    if (std::this_thread::get_id() == m_gpuThread) return;
+
+    std::cerr << "[vulkan] FATAL: " << (what ? what : "GPU call")
+              << " was made from a thread other than the one that created the Device. Vulkan submission is "
+                 "not free-threaded and this Device shares one command pool, so this is a data race. In the "
+                 "daemon this means a DBus handler reached the GPU directly instead of going through the "
+                 "render worker."
+              << std::endl;
+    std::abort();
+}
+
 void Device::immediateSubmit(const std::function<void(VkCommandBuffer)>& record) {
+    assertGpuThread("Device::immediateSubmit");
+
     VkCommandBufferAllocateInfo allocInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
     allocInfo.commandPool = m_commandPool;
     allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;

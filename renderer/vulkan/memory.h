@@ -27,10 +27,10 @@ struct AllocatedImage {
     VmaAllocation allocation = nullptr;
 
     // True when the image was created with VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT and
-    // therefore has a queryable DRM modifier and plane layout. The export path must
-    // consult this rather than the device's extension support: creation falls back to
-    // the caller's tiling when no modifier qualifies, and querying a modifier from a
-    // non-modifier image is a spec violation.
+    // therefore has a queryable DRM modifier and plane layout. Always true for a
+    // DMA_BUF export (creation now throws rather than producing an image without one)
+    // and always false for OPAQUE_FD; querying a modifier from a non-modifier image is
+    // a spec violation, so the export path still checks it rather than inferring.
     bool drmModifierTiled = false;
 };
 
@@ -68,14 +68,14 @@ public:
     // its fd cannot be described to an importer, and querying one is a spec violation
     // (VUID-vkGetImageDrmFormatModifierPropertiesEXT-image-02272).
     //
-    // NEVER throws for want of a usable modifier. Both degraded cases -- the extension
-    // absent, and the extension present but no modifier satisfying the format, usage
-    // and extent -- keep the caller's tiling, warn to stderr, and leave
-    // AllocatedImage::drmModifierTiled false; the frame is still rendered and still
-    // exportable to a same-device consumer, it just carries no layout metadata. That
-    // beats refusing to draw anything at all, but it is silent to callers by design:
-    // check drmModifierTiled (or the exported frame's modifier) rather than relying on
-    // an exception to detect that a compositor will not be able to import the result.
+    // THROWS if a DMA_BUF image cannot be given an explicit DRM format modifier --
+    // either because VK_EXT_image_drm_format_modifier is unavailable or because no
+    // modifier satisfies the format, usage and extent. This used to degrade to the
+    // caller's tiling with a warning, which was wrong twice over: a dma_buf with no
+    // modifier cannot be interpreted by any importer, so the "degraded" frame is not
+    // worse but unusable; and the branch was unreachable on every ICD available to this
+    // project, so it would have first executed on a user's machine having never run
+    // once here.
     //
     // OPAQUE_FD always keeps the caller's tiling: that handle type is only importable
     // by another Vulkan/GL context on the same device, which needs no layout metadata.

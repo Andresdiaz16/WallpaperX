@@ -1,0 +1,26 @@
+# ThreadSanitizer suppressions for the WallpaperX daemon.
+#
+# Everything here is a *third-party* library TSan cannot see into, not a WallpaperX
+# race. Nothing in backend/ or renderer/ belongs in this file -- if a report names our
+# own code, it is a finding, not noise.
+
+# The Khronos validation layer. Uninstrumented, and it keeps its own concurrent state
+# maps behind rwlocks TSan cannot pair up. This is the loudest source by far, and it is
+# present only because the tests ask for validation -- the shipped daemon does not load
+# it at all.
+called_from_lib:libVkLayer_khronos_validation.so
+
+# Mesa / Lavapipe. Uninstrumented, and llvmpipe's rasteriser uses its own worker pool
+# with atomics and futexes TSan reads as unsynchronised.
+called_from_lib:libvulkan_lvp.so
+called_from_lib:libvulkan.so
+called_from_lib:libLLVM
+
+# The Vulkan loader spawns nothing itself but dlopen's ICDs whose init TSan attributes
+# to whichever thread got there first.
+called_from_lib:libvulkan_radeon.so
+called_from_lib:libvulkan_intel.so
+
+# sd-bus runs the connection's event loop; its internal reference counting is
+# uninstrumented and shows up on every signal emission from the render thread.
+called_from_lib:libsystemd.so

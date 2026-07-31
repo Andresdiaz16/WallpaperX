@@ -14,6 +14,7 @@ namespace wallpaperx {
 
 class Device;
 class OffscreenTargetManager;
+struct OffscreenTarget;
 
 // A request that was malformed rather than one that failed to render. Its own type
 // so the DBus layer can answer with InvalidArgs instead of a generic failure --
@@ -183,7 +184,7 @@ private:
     void ensureGpu();
 
     // Both called with m_gpuMutex held.
-    void renderStatic(int monitorId, const std::string& path);
+    const OffscreenTarget& acquireTarget(int monitorId);
     void releaseTarget(int monitorId);
 
     const Config m_config;

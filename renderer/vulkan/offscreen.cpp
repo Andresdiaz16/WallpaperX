@@ -126,6 +126,8 @@ void OffscreenTargetManager::render(IRenderer& renderer, const OffscreenTarget& 
 }
 
 const OffscreenTarget& OffscreenTargetManager::create(int monitorId, uint32_t width, uint32_t height) {
+    m_device.assertGpuThread("OffscreenTargetManager::create");
+
     VkImageCreateInfo imageInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     imageInfo.imageType = VK_IMAGE_TYPE_2D;
     imageInfo.format = kFormat;
@@ -193,6 +195,8 @@ void OffscreenTargetManager::destroy(int monitorId) {
 }
 
 void OffscreenTargetManager::destroyTarget(OffscreenTarget& target) {
+    m_device.assertGpuThread("OffscreenTargetManager::destroyTarget");
+
     // The image/view/framebuffer may still be referenced by in-flight GPU work
     // (e.g. a monitor resized while its previous frame is still executing). Destroying
     // them under the GPU is a use-after-free, so wait for the device to go idle first.
