@@ -1,9 +1,12 @@
 #pragma once
 
+#include "render_worker.h"
+
 #include <sdbus-c++/sdbus-c++.h>
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <tuple>
 #include <vector>
@@ -30,12 +33,21 @@ public:
 
     // `manager` must outlive this object.
     DbusService(sdbus::IConnection& connection, WallpaperManager& manager);
+    ~DbusService();
 
 private:
     void registerVTable();
 
     // DBus method handlers (see the DBus Interface section in PLAN.md).
+    //
+    // Returns as soon as the request is recorded and queued; the render happens on the
+    // worker thread. A successful reply therefore means "accepted", not "the frame is
+    // ready" -- FrameReady announces that. Only client-side mistakes (unknown type,
+    // out-of-range monitor, a path that is not a file) still fail synchronously, since
+    // those cost nothing to detect and are the ones worth failing fast.
     void setWallpaper(const std::string& type, const std::string& path, int32_t monitorId);
+
+    void emitFrameReady(int monitorId, uint64_t generation);
 
     // Returns (fd, width, height, memory_size, handle_type, sync_fds, frame_generation,
     //          drm_format, drm_modifier, planes).
@@ -57,15 +69,27 @@ private:
     //
     // frameGeneration is a monotonic per-monitor render counter, letting a consumer tell
     // a fresh frame from a stale or repeated one.
-    using FrameFdResult =
-        std::tuple<sdbus::UnixFd, uint32_t, uint32_t, uint64_t, int32_t, std::vector<sdbus::UnixFd>, uint64_t,
-                   uint32_t, uint64_t, std::vector<sdbus::Struct<uint64_t, uint64_t>>>;
-    FrameFdResult getFrameFd(int32_t monitorId);
+    //
+    // Answered asynchronously, from the render worker's thread. Exporting a frame needs
+    // the GPU, and the GPU lock is held for a whole render -- so doing it in the handler
+    // would park the daemon's single event-loop thread behind whatever is rendering and
+    // stall GetStatus and SetWallpaper with it. That is the same stall this design moved
+    // SetWallpaper off; the rule that keeps it fixed is that no DBus handler touches the
+    // GPU. The caller still waits for its frame, which is unavoidable, but nothing else
+    // does.
+    using FrameFdCall =
+        sdbus::Result<sdbus::UnixFd, uint32_t, uint32_t, uint64_t, int32_t, std::vector<sdbus::UnixFd>, uint64_t,
+                      uint32_t, uint64_t, std::vector<sdbus::Struct<uint64_t, uint64_t>>>;
+    void completeGetFrameFd(FrameFdCall call, int32_t monitorId);
 
     std::string getStatus();
 
+    // Destroyed first among the members, but the destructor stops the worker before any
+    // of that runs -- see ~DbusService for why the ordering cannot be left to
+    // declaration order alone.
     WallpaperManager& m_manager;
     std::unique_ptr<sdbus::IObject> m_object;
+    RenderWorker m_worker;
 };
 
 }

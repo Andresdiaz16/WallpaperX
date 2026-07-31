@@ -24,8 +24,24 @@ constexpr const char* kErrorInvalidArgs = "org.freedesktop.DBus.Error.InvalidArg
 }  // namespace
 
 DbusService::DbusService(sdbus::IConnection& connection, WallpaperManager& manager)
-    : m_manager(manager), m_object(sdbus::createObject(connection, sdbus::ObjectPath{kObjectPath})) {
+    : m_manager(manager),
+      m_object(sdbus::createObject(connection, sdbus::ObjectPath{kObjectPath})),
+      m_worker(manager, [this](int monitorId, uint64_t generation) { emitFrameReady(monitorId, generation); }) {
+    // The worker starts idle -- it can only do anything once a handler posts to it, and
+    // no handler can be dispatched until the vtable below is registered.
     registerVTable();
+}
+
+DbusService::~DbusService() {
+    // Explicit, because neither destruction order alone can be correct. Handlers run on
+    // the event-loop thread, which may still be dispatching while this destructor runs
+    // (any daemon shut down from a signal handler, and the tests' enterEventLoopAsync):
+    // setWallpaper() posts to m_worker, and getFrameFd's task touches m_object, so
+    // destroying either one first leaves the other reachable through a dangling
+    // reference. stop() breaks the cycle: it joins the render thread, after which
+    // nothing can reach m_object, and it leaves the worker object alive and its post()
+    // methods harmless no-ops for any handler still in flight.
+    m_worker.stop();
 }
 
 void DbusService::registerVTable() {
@@ -37,31 +53,44 @@ void DbusService::registerVTable() {
                 })
                 .withInputParamNames("type", "path", "monitor_id"),
             sdbus::registerMethod("GetFrameFd")
-                .implementedAs([this](int32_t monitorId) { return getFrameFd(monitorId); })
+                // Async: the handler hands the export to the GPU thread and returns, so
+                // the event loop keeps serving while the frame is produced.
+                .implementedAs([this](FrameFdCall&& call, int32_t monitorId) {
+                    m_worker.postTask(
+                        [this, call = std::move(call), monitorId]() mutable {
+                            completeGetFrameFd(std::move(call), monitorId);
+                        });
+                })
                 .withInputParamNames("monitor_id")
                 .withOutputParamNames("fd", "width", "height", "memory_size", "handle_type", "sync_fds",
                                       "frame_generation", "drm_format", "drm_modifier", "planes"),
             sdbus::registerMethod("GetStatus").implementedAs([this]() { return getStatus(); }).withOutputParamNames("status"),
-            sdbus::registerSignal("FrameReady").withParameters<int32_t>("monitor_id"))
+            // frame_generation rides along with the monitor id. A bare FrameReady(monitor)
+            // was unambiguous only while rendering was synchronous; now that several
+            // requests for one monitor can be in flight, a consumer receiving the signal
+            // otherwise cannot tell which frame it is being told about, nor whether the
+            // one it already holds is the one being announced.
+            sdbus::registerSignal("FrameReady").withParameters<int32_t, uint64_t>("monitor_id", "frame_generation"))
         .forInterface(std::string(kInterface));
 }
 
+void DbusService::emitFrameReady(int monitorId, uint64_t generation) {
+    // Called on the render worker's thread. sdbus-c++ documents signal emission on
+    // IObject as thread-safe by design, so this needs no hop back to the event loop.
+    try {
+        m_object->emitSignal("FrameReady")
+            .onInterface(kInterface)
+            .withArguments(static_cast<int32_t>(monitorId), generation);
+    } catch (const std::exception& e) {
+        // A failed emit must not escape into the worker thread, where it would be
+        // std::terminate. The frame itself is fine and GetFrameFd will still serve it;
+        // only the notification was lost, which a polling consumer recovers from.
+        std::fprintf(stderr, "wallpaperx-daemon: failed to emit FrameReady(monitor=%d, generation=%llu): %s\n",
+                     monitorId, static_cast<unsigned long long>(generation), e.what());
+    }
+}
+
 void DbusService::setWallpaper(const std::string& type, const std::string& path, int32_t monitorId) {
-    // A "static" request renders synchronously inside this call, so the reply is the
-    // client's confirmation that the frame exists and GetFrameFd will succeed. That is
-    // affordable because rendering is triggered by a user action, not per frame; Step
-    // 13's video renderer is what will need a render thread.
-    //
-    // The cost is real and known: main.cpp runs one blocking event loop, so a slow
-    // render delays every other method, and a render slower than sd-bus's 25 s default
-    // would fail the caller with NoReply. Handing the render to a worker thread does not
-    // fix that on its own -- the reply still cannot be sent until the frame exists, so
-    // the caller's timeout is unchanged -- and it would cost the ordering guarantee
-    // clients have today, that a returned SetWallpaper means the next GetFrameFd
-    // succeeds. The fix is a SetWallpaper that acknowledges immediately plus a
-    // FrameReady signal to announce completion, which is Step 6 task 3. Deferred there
-    // deliberately rather than half-done here.
-    //
     // Logged on entry, not on success. Most DBus clients drop an error reply on the
     // floor, so the daemon's log is the only place a failed request is visible -- and
     // logging after the call meant the requests that failed were exactly the ones that
@@ -71,7 +100,7 @@ void DbusService::setWallpaper(const std::string& type, const std::string& path,
     std::fflush(stdout);
 
     try {
-        m_manager.setWallpaper(type, path, monitorId);
+        m_manager.requestWallpaper(type, path, monitorId);
     } catch (const InvalidRequest& e) {
         std::fprintf(stderr, "wallpaperx-daemon: SetWallpaper rejected (monitor=%d): %s\n", monitorId, e.what());
         throw sdbus::Error(sdbus::Error::Name{kErrorInvalidArgs}, e.what());
@@ -79,22 +108,33 @@ void DbusService::setWallpaper(const std::string& type, const std::string& path,
         std::fprintf(stderr, "wallpaperx-daemon: SetWallpaper failed (monitor=%d): %s\n", monitorId, e.what());
         throw sdbus::Error(sdbus::Error::Name{kErrorRenderFailed}, e.what());
     }
+
+    // Posted for every accepted type, not just "static": video and shader requests still
+    // need their monitor's target released, and that is GPU work, so it belongs on the
+    // worker rather than in this handler.
+    m_worker.post(monitorId);
 }
 
-DbusService::FrameFdResult DbusService::getFrameFd(int32_t monitorId) {
+void DbusService::completeGetFrameFd(FrameFdCall call, int32_t monitorId) {
+    // Runs on the render worker's thread, so nothing here may throw past this frame --
+    // an escaping exception would be std::terminate on a bare thread. Every path below
+    // either returns results or returns an error on `call`.
     std::optional<FrameHandle> handle;
     try {
         handle = m_manager.exportCurrentFrame(monitorId);
     } catch (const InvalidRequest& e) {
-        throw sdbus::Error(sdbus::Error::Name{kErrorInvalidArgs}, e.what());
+        call.returnError(sdbus::Error(sdbus::Error::Name{kErrorInvalidArgs}, e.what()));
+        return;
     } catch (const std::exception& e) {
-        throw sdbus::Error(sdbus::Error::Name{kErrorExportFailed}, e.what());
+        call.returnError(sdbus::Error(sdbus::Error::Name{kErrorExportFailed}, e.what()));
+        return;
     }
 
     if (!handle) {
-        throw sdbus::Error(sdbus::Error::Name{kErrorNoFrame},
-                           "no frame available for monitor " + std::to_string(monitorId) +
-                               " (call SetWallpaper first)");
+        call.returnError(sdbus::Error(sdbus::Error::Name{kErrorNoFrame},
+                                      "no frame available for monitor " + std::to_string(monitorId) +
+                                          " (call SetWallpaper first)"));
+        return;
     }
 
     const ExportedFrame& frame = handle->frame;
@@ -112,24 +152,37 @@ DbusService::FrameFdResult DbusService::getFrameFd(int32_t monitorId) {
         planes.emplace_back(plane.offset, plane.rowPitch);
     }
 
-    return FrameFdResult{std::move(fd),
-                         frame.width,
-                         frame.height,
-                         frame.memorySize,
-                         frame.type == ExportedFrame::HandleType::DmaBuf ? 1 : 0,
-                         {},  // sync_fds: reserved, always empty today
-                         handle->generation,
-                         frame.drmFormat,
-                         frame.modifier,
-                         std::move(planes)};
+    call.returnResults(fd, frame.width, frame.height, frame.memorySize,
+                       frame.type == ExportedFrame::HandleType::DmaBuf ? 1 : 0,
+                       std::vector<sdbus::UnixFd>{},  // sync_fds: reserved, always empty today
+                       handle->generation, frame.drmFormat, frame.modifier, planes);
 }
 
 std::string DbusService::getStatus() {
     nlohmann::json status;
     status["running"] = true;
 
+    // The GPU block is absent until something has actually needed the GPU -- the Device
+    // is created on the first render, so reporting a tier before then would be a guess.
+    // "initialized" says which of those two states this is; a client that finds it false
+    // has not hit a problem, it has just caught the daemon before its first wallpaper.
+    //
+    // One snapshot for both halves: reading the GPU block and the monitor map under
+    // separate locks would let a render commit in between and produce a reply claiming
+    // no GPU beside a monitor that already has a frame.
+    const WallpaperManager::Snapshot snap = m_manager.snapshot();
+    const GpuStatus& gpu = snap.gpu;
+    nlohmann::json gpuJson{{"initialized", gpu.initialized}};
+    if (gpu.initialized) {
+        gpuJson["name"] = gpu.name;
+        // Which descriptor tier a machine resolved to is the first thing worth knowing
+        // when a bug reproduces on one GPU and not another.
+        gpuJson["descriptor_tier"] = gpu.descriptorTier;
+    }
+    status["gpu"] = std::move(gpuJson);
+
     nlohmann::json wallpapers = nlohmann::json::object();
-    for (const auto& [monitorId, monitor] : m_manager.status()) {
+    for (const auto& [monitorId, monitor] : snap.monitors) {
         nlohmann::json entry{{"type", monitor.type},
                              {"path", monitor.path},
                              {"generation", monitor.generation},
@@ -137,6 +190,13 @@ std::string DbusService::getStatus() {
         if (monitor.hasFrame) {
             entry["width"] = monitor.width;
             entry["height"] = monitor.height;
+        }
+        // Present only when the last request failed. Since SetWallpaper now replies
+        // before the render is attempted, this is the only place a render failure is
+        // reported at all -- a client that gets a successful reply and then no
+        // FrameReady looks here to find out why.
+        if (!monitor.lastError.empty()) {
+            entry["last_error"] = monitor.lastError;
         }
         wallpapers[std::to_string(monitorId)] = std::move(entry);
     }

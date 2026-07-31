@@ -54,6 +54,7 @@ public:
     uint32_t graphicsQueueFamily() const { return m_graphicsQueueFamily; }
 
     const DeviceInfo& info() const { return m_info; }
+    DescriptorTier descriptorTier() const { return m_selectedTier; }
     Memory& memory() { return m_memory; }
     IDescriptorAllocator& descriptorAllocator() { return *m_descriptorAllocator; }
 

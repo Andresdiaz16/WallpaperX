@@ -3,11 +3,14 @@
 #include "renderers/static_renderer.h"
 #include "vulkan/device.h"
 #include "vulkan/offscreen.h"
+#include "vulkan/tier_selection.h"
 
 #include <cstdlib>
 #include <filesystem>
 #include <stdexcept>
 #include <utility>
+
+#include <unistd.h>
 
 #ifndef WALLPAPERX_DEFAULT_SHADER_DIR
 #error "WALLPAPERX_DEFAULT_SHADER_DIR must be defined by the build -- see backend/CMakeLists.txt"
@@ -86,9 +89,16 @@ void WallpaperManager::ensureGpu() {
     // pointer does not move the object, so that reference stays valid.
     m_device = std::move(device);
     m_targets = std::move(targets);
+
+    // Published as a plain copy so status() can report the GPU without taking m_gpuMutex
+    // -- which a render holds for its whole duration, and GetStatus must not wait on.
+    std::lock_guard<std::mutex> stateLock(m_stateMutex);
+    m_gpuStatus.initialized = true;
+    m_gpuStatus.name = m_device->info().gpuName;
+    m_gpuStatus.descriptorTier = toString(m_device->descriptorTier());
 }
 
-void WallpaperManager::renderStatic(int monitorId, const std::string& path, MonitorState& state) {
+void WallpaperManager::renderStatic(int monitorId, const std::string& path) {
     ensureGpu();
 
     // Reuse the existing target unless its geometry no longer matches -- create()
@@ -108,47 +118,6 @@ void WallpaperManager::renderStatic(int monitorId, const std::string& path, Moni
     // renderer does need to persist and will live in MonitorState.
     StaticRenderer renderer(*m_device, m_targets->renderPass(), path, m_resolvedShaderDir);
     m_targets->render(renderer, target);
-
-    ++state.generation;
-    state.hasFrame = true;
-}
-
-void WallpaperManager::setWallpaper(const std::string& type, const std::string& path, int monitorId) {
-    if (!isKnownType(type)) {
-        throw InvalidRequest("unknown wallpaper type '" + type + "' (expected static, video or shader)");
-    }
-    requireValidMonitorId(monitorId);
-
-    std::lock_guard<std::mutex> lock(m_mutex);
-
-    MonitorState& state = m_monitors[monitorId];
-    state.type = type;
-    state.path = path;
-
-    // Cleared before the attempt, not after a failure. Whatever happens next, the frame
-    // this monitor currently holds no longer matches the request just recorded, and
-    // handing out a frame of the previous wallpaper under the new path is a worse
-    // failure than reporting no frame at all. The generation counter is left alone --
-    // it counts renders, and no render has happened yet.
-    state.hasFrame = false;
-
-    if (type != "static") {
-        // Recorded only; video/shader render in Step 13 / Phase 3. Release the target
-        // first -- nothing will read it again, and holding a full-size image per monitor
-        // for a wallpaper type this build cannot draw is memory kept for no one.
-        releaseTarget(monitorId);
-        return;
-    }
-
-    try {
-        renderStatic(monitorId, path, state);
-    } catch (...) {
-        // A monitor whose render failed keeps no frame (hasFrame is already false), so
-        // its target has no reader. Freeing it also means a retry starts from a clean
-        // target rather than reusing one left in whatever state the failure produced.
-        releaseTarget(monitorId);
-        throw;
-    }
 }
 
 void WallpaperManager::releaseTarget(int monitorId) {
@@ -157,15 +126,146 @@ void WallpaperManager::releaseTarget(int monitorId) {
     }
 }
 
+void WallpaperManager::requestWallpaper(const std::string& type, const std::string& path, int monitorId) {
+    if (!isKnownType(type)) {
+        throw InvalidRequest("unknown wallpaper type '" + type + "' (expected static, video or shader)");
+    }
+    requireValidMonitorId(monitorId);
+
+    // A path that is not a file at all is a client mistake, and rendering is
+    // asynchronous now -- so without this check the single most common user error would
+    // come back as a successful reply followed by silence, discoverable only by polling
+    // GetStatus. It is an early-out, not a guarantee: a file that exists but is not a
+    // decodable image still fails later, on the render thread.
+    if (type == "static") {
+        // Both halves matter, and the message has to match what is actually tested.
+        // Checking only the file type would accept a mode-000 file with a success reply
+        // and then fail it on the render thread, so the same user mistake -- "I gave it
+        // a path it cannot open" -- would surface through two different channels
+        // depending on why it could not be opened.
+        std::error_code ec;
+        if (!std::filesystem::is_regular_file(path, ec) || ::access(path.c_str(), R_OK) != 0) {
+            throw InvalidRequest("'" + path + "' is not a readable file");
+        }
+    }
+
+    std::lock_guard<std::mutex> stateLock(m_stateMutex);
+
+    MonitorState& state = m_monitors[monitorId];
+    state.type = type;
+    state.path = path;
+    ++state.requestSeq;
+    state.lastError.clear();
+
+    // Cleared before the render, not after a failure. Whatever happens next, the frame
+    // this monitor currently holds no longer matches the request just recorded, and
+    // handing out a frame of the previous wallpaper under the new path is a worse
+    // failure than reporting no frame at all. The generation counter is left alone --
+    // it counts renders, and no render has happened yet.
+    state.hasFrame = false;
+}
+
+RenderOutcome WallpaperManager::renderPending(int monitorId) {
+    std::lock_guard<std::mutex> gpuLock(m_gpuMutex);
+
+    std::string type;
+    std::string path;
+    uint64_t seq = 0;
+    {
+        std::lock_guard<std::mutex> stateLock(m_stateMutex);
+        auto it = m_monitors.find(monitorId);
+        if (it == m_monitors.end()) {
+            return {};  // the request was never recorded; nothing to do
+        }
+        // Already been through a pass for this exact request. The worker's queue can
+        // legitimately name a monitor twice -- a request landing after the monitor was
+        // dequeued but before this snapshot re-queues it, since the coalescing set no
+        // longer holds it -- and rendering the same request again would duplicate the
+        // frame, the generation number and the FrameReady.
+        if (it->second.servicedSeq == it->second.requestSeq) {
+            return {};
+        }
+        type = it->second.type;
+        path = it->second.path;
+        seq = it->second.requestSeq;
+    }
+
+    std::string error;
+    if (type != "static") {
+        // Recorded only; video/shader render in Step 13 / Phase 3. Release the target --
+        // nothing will read it again, and holding a full-size image per monitor for a
+        // wallpaper type this build cannot draw is memory kept for no one.
+        releaseTarget(monitorId);
+    } else {
+        try {
+            renderStatic(monitorId, path);
+        } catch (const std::exception& e) {
+            error = e.what();
+            // A monitor whose render failed keeps no frame, so its target has no reader.
+            // Freeing it also means a retry starts from a clean target rather than
+            // reusing one left in whatever state the failure produced.
+            releaseTarget(monitorId);
+        }
+    }
+
+    std::lock_guard<std::mutex> stateLock(m_stateMutex);
+    auto it = m_monitors.find(monitorId);
+    if (it == m_monitors.end() || it->second.requestSeq != seq) {
+        // A newer request landed while this one was rendering. Committing now would flag
+        // the monitor as holding a frame whose pixels belong to the wallpaper the user
+        // just replaced, and would burn a generation number on it. The newer request has
+        // its own pass queued; let that one be the truth -- and leave servicedSeq alone,
+        // so that pass is not mistaken for one already done.
+        return {};
+    }
+
+    // Marked for every outcome, not just success: a failed render must not be retried
+    // by a duplicate queue entry either, or a broken image file would be decoded again
+    // for every spurious post.
+    it->second.servicedSeq = seq;
+
+    if (type != "static") {
+        return {};
+    }
+    if (!error.empty()) {
+        it->second.lastError = error;
+        return {};
+    }
+
+    ++it->second.generation;
+    it->second.hasFrame = true;
+    it->second.width = m_config.width;
+    it->second.height = m_config.height;
+    // Cleared here rather than relying on requestWallpaper having cleared it. A
+    // successful commit is what makes "this monitor has a frame" true, and the two facts
+    // have to be set together -- otherwise a monitor can report has_frame alongside a
+    // stale last_error, and a client branching on last_error calls a working wallpaper
+    // broken.
+    it->second.lastError.clear();
+    return RenderOutcome{true, it->second.generation};
+}
+
 std::optional<FrameHandle> WallpaperManager::exportCurrentFrame(int monitorId) {
     requireValidMonitorId(monitorId);
 
-    std::lock_guard<std::mutex> lock(m_mutex);
+    std::lock_guard<std::mutex> gpuLock(m_gpuMutex);
 
-    auto it = m_monitors.find(monitorId);
-    if (it == m_monitors.end() || !it->second.hasFrame) {
-        return std::nullopt;
+    uint64_t generation = 0;
+    {
+        std::lock_guard<std::mutex> stateLock(m_stateMutex);
+        auto it = m_monitors.find(monitorId);
+        if (it == m_monitors.end() || !it->second.hasFrame) {
+            return std::nullopt;
+        }
+        generation = it->second.generation;
     }
+
+    // A request can land between releasing m_stateMutex and exporting, which clears
+    // hasFrame. That is deliberately not re-checked: what goes out is the last frame
+    // actually rendered, labelled with its true generation. The consumer learns about
+    // the newer one from FrameReady and re-fetches -- which is what the generation
+    // counter exists for.
+
     // hasFrame is only ever set by a completed render, which creates the target first,
     // so the two cannot disagree -- but the export path is the one place a stale flag
     // would turn into a std::out_of_range from get() rather than a clean DBus error.
@@ -176,25 +276,29 @@ std::optional<FrameHandle> WallpaperManager::exportCurrentFrame(int monitorId) {
 
     FrameHandle handle;
     handle.frame = wallpaperx::exportFrame(*m_device, m_targets->get(monitorId));
-    handle.generation = it->second.generation;
+    handle.generation = generation;
     return handle;
 }
 
-std::map<int, MonitorStatus> WallpaperManager::status() const {
-    std::lock_guard<std::mutex> lock(m_mutex);
+WallpaperManager::Snapshot WallpaperManager::snapshot() const {
+    // One acquisition for both halves. Two would let a render commit between them and
+    // produce a reply that reports no GPU beside a monitor that already has a frame.
+    std::lock_guard<std::mutex> stateLock(m_stateMutex);
 
-    std::map<int, MonitorStatus> out;
+    Snapshot out;
+    out.gpu = m_gpuStatus;
     for (const auto& [monitorId, state] : m_monitors) {
         MonitorStatus entry;
         entry.type = state.type;
         entry.path = state.path;
         entry.generation = state.generation;
         entry.hasFrame = state.hasFrame;
-        if (state.hasFrame && m_targets && m_targets->has(monitorId)) {
-            entry.width = m_targets->get(monitorId).width;
-            entry.height = m_targets->get(monitorId).height;
+        entry.lastError = state.lastError;
+        if (state.hasFrame) {
+            entry.width = state.width;
+            entry.height = state.height;
         }
-        out.emplace(monitorId, std::move(entry));
+        out.monitors.emplace(monitorId, std::move(entry));
     }
     return out;
 }

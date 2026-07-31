@@ -1,15 +1,22 @@
 // System-level test for Step 6: stands up the real DbusService on the session bus
 // and drives it through a real sdbus-c++ proxy client (same process, separate
-// connections -- messages still round-trip through the bus). Task 2 made this an
-// end-to-end test: a static wallpaper is rendered on the GPU and its frame comes
-// back over DBus as a real Unix fd plus the metadata an importer needs.
+// connections -- messages still round-trip through the bus). A static wallpaper is
+// rendered on the GPU and its frame comes back over DBus as a real Unix fd plus the
+// metadata an importer needs.
 //
 // Run under a private bus, e.g. `dbus-run-session -- ./wallpaperx-dbus-service-test`.
 //
-// The checks are ordered so everything that needs no GPU runs first. This entry used
-// to be hardware-independent and no longer is, and the parts that still are -- the
-// wire-signature lock above all -- are too valuable to lose on a host whose Vulkan
-// stack cannot come up.
+// Two structural rules this file follows, both learned the hard way:
+//
+//  - Everything that needs no GPU runs first. This entry used to be
+//    hardware-independent and no longer is, and the parts that still are -- the
+//    wire-signature lock above all -- are too valuable to lose on a host whose Vulkan
+//    stack cannot come up.
+//  - Nothing waits on a sleep. Since task 3, SetWallpaper returns before the render
+//    happens, so "the frame is ready" is knowable only from the FrameReady signal.
+//    Negative cases ("no signal for this one") are settled by posting a later request
+//    that *does* signal: the daemon has a single FIFO render thread, so that later
+//    signal proves the earlier request was already processed.
 #include "daemon/dbus_service.h"
 #include "daemon/wallpaper_manager.h"
 
@@ -23,11 +30,15 @@
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include <stb_image_write.h>
 
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <exception>
 #include <filesystem>
+#include <fstream>
 #include <functional>
+#include <mutex>
 #include <regex>
 #include <stdexcept>
 #include <string>
@@ -50,12 +61,19 @@ constexpr uint32_t kTargetHeight = 48;
 // silently start passing/failing for the wrong reason as the test grows.
 constexpr int32_t kMonitorStatic = 0;
 constexpr int32_t kMonitorVideo = 1;
-constexpr int32_t kMonitorBadPath = 2;
+constexpr int32_t kMonitorCorrupt = 2;
+constexpr int32_t kMonitorBarrier = 3;
 constexpr int32_t kMonitorNeverSet = 9;
 
+// Generous: it bounds a GPU render on a software rasteriser under load, and is only
+// ever reached when something is actually broken.
+constexpr auto kSignalTimeout = std::chrono::seconds(30);
+
+std::string testAssetDir() { return std::string(WALLPAPERX_TEST_IMAGE_DIR); }
+
 std::string writeTestImage() {
-    std::filesystem::create_directories(WALLPAPERX_TEST_IMAGE_DIR);
-    const std::string path = std::string(WALLPAPERX_TEST_IMAGE_DIR) + "/dbus_test_blue.png";
+    std::filesystem::create_directories(testAssetDir());
+    const std::string path = testAssetDir() + "/dbus_test_blue.png";
 
     const int w = 8;
     const int h = 8;
@@ -69,6 +87,20 @@ std::string writeTestImage() {
 
     if (!stbi_write_png(path.c_str(), w, h, 4, pixels.data(), w * 4)) {
         throw std::runtime_error("dbus_service_test: failed to write test image");
+    }
+    return path;
+}
+
+// A file that exists but is not an image. SetWallpaper's synchronous check only proves
+// the path is a regular file, so this is what reaches the render thread and fails
+// there -- the only way to exercise the asynchronous failure path.
+std::string writeCorruptImage() {
+    std::filesystem::create_directories(testAssetDir());
+    const std::string path = testAssetDir() + "/dbus_test_corrupt.png";
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    out << "this is not a PNG";
+    if (!out) {
+        throw std::runtime_error("dbus_service_test: failed to write corrupt test image");
     }
     return path;
 }
@@ -87,34 +119,76 @@ size_t openFdCount() {
     return count;
 }
 
-// Every <arg> of `method` in introspection XML, in document order, as
+// Records every FrameReady the daemon emits, and lets a test block until a specific
+// (monitor, generation) arrives.
+class FrameReadyLog {
+public:
+    void record(int32_t monitorId, uint64_t generation) {
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_events.emplace_back(monitorId, generation);
+        }
+        m_arrived.notify_all();
+    }
+
+    // Waits for FrameReady(monitorId, generation). Returns false on timeout.
+    bool wait(int32_t monitorId, uint64_t generation) {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        return m_arrived.wait_for(lock, kSignalTimeout, [&] {
+            for (const auto& [id, gen] : m_events) {
+                if (id == monitorId && gen == generation) return true;
+            }
+            return false;
+        });
+    }
+
+    size_t countFor(int32_t monitorId) const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        size_t n = 0;
+        for (const auto& [id, gen] : m_events) {
+            if (id == monitorId) ++n;
+        }
+        return n;
+    }
+
+private:
+    mutable std::mutex m_mutex;
+    std::condition_variable m_arrived;
+    std::vector<std::pair<int32_t, uint64_t>> m_events;
+};
+
+// Every <arg> of an introspection element, in document order, as
 // (direction, "type:name"). Attribute order and whitespace inside the tag don't
-// matter -- only the values, which are the wire contract.
-std::vector<std::pair<std::string, std::string>> parseMethodArgs(const std::string& xml, const std::string& method) {
+// matter -- only the values, which are the wire contract. `element` is "method" or
+// "signal"; a signal's args carry no direction, which shows up as an empty string.
+std::vector<std::pair<std::string, std::string>> parseArgs(const std::string& xml, const std::string& element,
+                                                           const std::string& name) {
     std::vector<std::pair<std::string, std::string>> args;
     // [\s\S] rather than . -- the XML is multi-line and . does not match newline.
-    const std::regex methodRe("<method name=\"" + method + "\">([\\s\\S]*?)</method>");
-    std::smatch methodMatch;
-    if (!std::regex_search(xml, methodMatch, methodRe)) {
+    const std::regex elementRe("<" + element + " name=\"" + name + "\">([\\s\\S]*?)</" + element + ">");
+    std::smatch elementMatch;
+    if (!std::regex_search(xml, elementMatch, elementRe)) {
         return args;
     }
-    const std::string body = methodMatch[1].str();
+    const std::string body = elementMatch[1].str();
 
     const std::regex argRe("<arg\\b[^>]*/>");
     const std::regex attrRe("(\\w+)=\"([^\"]*)\"");
     for (auto it = std::sregex_iterator(body.begin(), body.end(), argRe); it != std::sregex_iterator(); ++it) {
         const std::string tag = it->str();
-        std::string type, name, direction;
+        std::string type, argName, direction;
         for (auto a = std::sregex_iterator(tag.begin(), tag.end(), attrRe); a != std::sregex_iterator(); ++a) {
             const std::string key = (*a)[1].str(), value = (*a)[2].str();
             if (key == "type") type = value;
-            else if (key == "name") name = value;
+            else if (key == "name") argName = value;
             else if (key == "direction") direction = value;
         }
-        args.emplace_back(direction, type + ":" + name);
+        args.emplace_back(direction, type + ":" + argName);
     }
     return args;
 }
+
+using ArgList = std::vector<std::pair<std::string, std::string>>;
 
 // Everything GetFrameFd hands back, in one place, so the assertions below read as
 // claims about the frame rather than as tuple indices.
@@ -141,6 +215,16 @@ Frame getFrameFd(sdbus::IProxy& proxy, int32_t monitorId) {
     return frame;
 }
 
+void setWallpaper(sdbus::IProxy& proxy, const std::string& type, const std::string& path, int32_t monitorId) {
+    proxy.callMethod("SetWallpaper").onInterface(DbusService::kInterface).withArguments(type, path, monitorId);
+}
+
+nlohmann::json getStatus(sdbus::IProxy& proxy) {
+    std::string status;
+    proxy.callMethod("GetStatus").onInterface(DbusService::kInterface).storeResultsTo(status);
+    return nlohmann::json::parse(status, nullptr, /*allow_exceptions=*/false);
+}
+
 // Returns the DBus error name a call failed with, or "" if it unexpectedly succeeded.
 std::string errorNameFrom(const std::function<void()>& call) {
     try {
@@ -158,51 +242,54 @@ using Check = std::function<void(bool, const char*)>;
 // create a Vulkan device still verifies the wire contract.
 // --------------------------------------------------------------------------- //
 void runHostChecks(sdbus::IProxy& proxy, const std::string& imagePath, const Check& check) {
-    std::string status;
-    proxy.callMethod("GetStatus").onInterface(DbusService::kInterface).storeResultsTo(status);
-    nlohmann::json json = nlohmann::json::parse(status, nullptr, /*allow_exceptions=*/false);
+    nlohmann::json json = getStatus(proxy);
     check(!json.is_discarded(), "GetStatus returns parseable JSON");
     check(!json.is_discarded() && json.value("running", false), "GetStatus reports running=true");
+
+    // Nothing has needed the GPU yet, so there is no tier to report. Reporting one here
+    // would mean the daemon had guessed.
+    check(!json.is_discarded() && json.contains("gpu") && json["gpu"]["initialized"] == false,
+          "GetStatus reports the GPU as uninitialised before the first render");
 
     // A monitor nothing was ever set on has no frame -- a named, distinguishable error
     // rather than a bogus fd.
     check(errorNameFrom([&] { getFrameFd(proxy, kMonitorNeverSet); }) == "io.wallpaperx.Daemon.Error.NoFrame",
           "GetFrameFd reports NoFrame for a monitor that was never set");
 
-    check(errorNameFrom([&] {
-              proxy.callMethod("SetWallpaper")
-                  .onInterface(DbusService::kInterface)
-                  .withArguments(std::string("banana"), imagePath, kMonitorVideo);
-          }) == "org.freedesktop.DBus.Error.InvalidArgs",
+    check(errorNameFrom([&] { setWallpaper(proxy, "banana", imagePath, kMonitorVideo); }) ==
+              "org.freedesktop.DBus.Error.InvalidArgs",
           "an unknown wallpaper type is rejected as InvalidArgs");
 
-    check(errorNameFrom([&] {
-              proxy.callMethod("SetWallpaper")
-                  .onInterface(DbusService::kInterface)
-                  .withArguments(std::string("static"), imagePath, int32_t{-1});
-          }) == "org.freedesktop.DBus.Error.InvalidArgs",
+    check(errorNameFrom([&] { setWallpaper(proxy, "static", imagePath, -1); }) ==
+              "org.freedesktop.DBus.Error.InvalidArgs",
           "a negative monitor id is rejected as InvalidArgs");
 
     const int32_t tooLarge = wallpaperx::WallpaperManager::kMaxMonitors;
-    check(errorNameFrom([&] {
-              proxy.callMethod("SetWallpaper")
-                  .onInterface(DbusService::kInterface)
-                  .withArguments(std::string("static"), imagePath, tooLarge);
-          }) == "org.freedesktop.DBus.Error.InvalidArgs",
+    check(errorNameFrom([&] { setWallpaper(proxy, "static", imagePath, tooLarge); }) ==
+              "org.freedesktop.DBus.Error.InvalidArgs",
           "a monitor id at or above the cap is rejected as InvalidArgs");
 
     // Both entry points must reject an id the same way. GetFrameFd answering NoFrame
     // for an out-of-range id would tell a polling consumer to retry forever on what is
     // actually a permanent client-side mistake.
-    check(errorNameFrom([&] { getFrameFd(proxy, int32_t{-1}); }) == "org.freedesktop.DBus.Error.InvalidArgs",
+    check(errorNameFrom([&] { getFrameFd(proxy, -1); }) == "org.freedesktop.DBus.Error.InvalidArgs",
           "GetFrameFd rejects a negative monitor id as InvalidArgs, not NoFrame");
     check(errorNameFrom([&] { getFrameFd(proxy, tooLarge); }) == "org.freedesktop.DBus.Error.InvalidArgs",
           "GetFrameFd rejects an out-of-range monitor id as InvalidArgs, not NoFrame");
 
-    // Lock the whole wire signature, every arg, in order. The KDE plugin (Step 12) is
-    // generated against it, so a reordering, a type change or a dropped slot must fail
-    // here rather than at plugin-import time -- a partial check would let width/height
-    // be swapped and still report green.
+    // A path that is not a file is the commonest user error, and rendering is
+    // asynchronous -- so it must fail on the reply rather than becoming silence the
+    // client can only discover by polling.
+    check(errorNameFrom([&] { setWallpaper(proxy, "static", "/nonexistent/wallpaperx.png", kMonitorNeverSet); }) ==
+              "org.freedesktop.DBus.Error.InvalidArgs",
+          "a static path that is not a file is rejected synchronously as InvalidArgs");
+    check(errorNameFrom([&] { getFrameFd(proxy, kMonitorNeverSet); }) == "io.wallpaperx.Daemon.Error.NoFrame",
+          "a rejected request leaves the monitor with no frame");
+
+    // Lock the whole wire contract: every argument of every method and signal, in
+    // order. The KDE plugin (Step 12) is generated against it, so a reordering, a type
+    // change or a dropped slot must fail here rather than at plugin-import time -- a
+    // partial check would let width/height be swapped and still report green.
     //
     // Parsed rather than substring-matched: matching sd-bus's emitted XML verbatim
     // would couple this test to libsystemd's attribute order and spacing, so a
@@ -210,32 +297,70 @@ void runHostChecks(sdbus::IProxy& proxy, const std::string& imagePath, const Che
     std::string introspection;
     proxy.callMethod("Introspect").onInterface("org.freedesktop.DBus.Introspectable").storeResultsTo(introspection);
 
-    const std::vector<std::pair<std::string, std::string>> expectedArgs = {
-        {"in", "i:monitor_id"},   {"out", "h:fd"},
-        {"out", "u:width"},       {"out", "u:height"},
-        {"out", "t:memory_size"}, {"out", "i:handle_type"},
-        {"out", "ah:sync_fds"},   {"out", "t:frame_generation"},
-        {"out", "u:drm_format"},  {"out", "t:drm_modifier"},
-        {"out", "a(tt):planes"},
+    const std::vector<std::tuple<std::string, std::string, ArgList>> expected = {
+        {"method", "SetWallpaper",
+         ArgList{{"in", "s:type"}, {"in", "s:path"}, {"in", "i:monitor_id"}}},
+        {"method", "GetFrameFd",
+         ArgList{{"in", "i:monitor_id"},
+                 {"out", "h:fd"},
+                 {"out", "u:width"},
+                 {"out", "u:height"},
+                 {"out", "t:memory_size"},
+                 {"out", "i:handle_type"},
+                 {"out", "ah:sync_fds"},
+                 {"out", "t:frame_generation"},
+                 {"out", "u:drm_format"},
+                 {"out", "t:drm_modifier"},
+                 {"out", "a(tt):planes"}}},
+        {"method", "GetStatus", ArgList{{"out", "s:status"}}},
+        // A signal's args carry no direction attribute, hence the empty first field.
+        {"signal", "FrameReady", ArgList{{"", "i:monitor_id"}, {"", "t:frame_generation"}}},
     };
-    const std::vector<std::pair<std::string, std::string>> actualArgs = parseMethodArgs(introspection, "GetFrameFd");
-    check(actualArgs == expectedArgs, "GetFrameFd's full wire signature and arg order are unchanged");
-    if (actualArgs != expectedArgs) {
-        std::fprintf(stderr, "  expected:");
-        for (const auto& [dir, arg] : expectedArgs) std::fprintf(stderr, " %s(%s)", arg.c_str(), dir.c_str());
-        std::fprintf(stderr, "\n  actual:  ");
-        for (const auto& [dir, arg] : actualArgs) std::fprintf(stderr, " %s(%s)", arg.c_str(), dir.c_str());
-        std::fprintf(stderr, "\n");
+
+    for (const auto& [element, name, expectedArgs] : expected) {
+        const ArgList actualArgs = parseArgs(introspection, element, name);
+        const std::string label = element + " " + name;
+        check(actualArgs == expectedArgs, ("wire signature of " + label + " is unchanged").c_str());
+        if (actualArgs != expectedArgs) {
+            std::fprintf(stderr, "  %s expected:", label.c_str());
+            for (const auto& [dir, arg] : expectedArgs) std::fprintf(stderr, " %s(%s)", arg.c_str(), dir.c_str());
+            std::fprintf(stderr, "\n  %s actual:  ", label.c_str());
+            for (const auto& [dir, arg] : actualArgs) std::fprintf(stderr, " %s(%s)", arg.c_str(), dir.c_str());
+            std::fprintf(stderr, "\n");
+        }
     }
 }
 
 // --------------------------------------------------------------------------- //
 // Checks that render on the GPU and export a real frame.
 // --------------------------------------------------------------------------- //
-void runRenderChecks(sdbus::IProxy& proxy, const std::string& imagePath, const Check& check) {
-    proxy.callMethod("SetWallpaper")
-        .onInterface(DbusService::kInterface)
-        .withArguments(std::string("static"), imagePath, kMonitorStatic);
+void runRenderChecks(sdbus::IProxy& proxy, FrameReadyLog& signals, const std::string& imagePath,
+                     const std::string& corruptPath, const Check& check) {
+    // Timed, because this is the one behaviour nothing else here can distinguish: every
+    // other assertion in this function is satisfied just as well by rendering inside the
+    // handler. This is also the most expensive request the daemon ever serves -- the
+    // first one creates the Vulkan instance, loads the validation layers, builds the
+    // device and the descriptor allocator, compiles the pipeline and only then renders.
+    //
+    // The assertion compares the reply against *this run's own* render duration rather
+    // than against a fixed bound. A fixed bound was tried first and was useless: with
+    // the render inside the handler the reply took 186 ms on NVIDIA and 29 ms on
+    // Lavapipe, so any threshold loose enough to be safe on the slower machine also
+    // passed the regression on the faster one. The two clauses cover each other -- a
+    // reply that is essentially instant is proof on its own, and the ratio catches a
+    // slow bus round trip on a loaded machine, where an absolute bound would flake.
+    const auto requestedAt = std::chrono::steady_clock::now();
+    setWallpaper(proxy, "static", imagePath, kMonitorStatic);
+    const auto replyMs =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - requestedAt).count();
+
+    check(signals.wait(kMonitorStatic, 1), "FrameReady(monitor=0, generation=1) arrives after the first render");
+    const auto frameMs =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - requestedAt).count();
+
+    std::printf("dbus_service_test: SetWallpaper replied in %lld ms, FrameReady at %lld ms\n",
+                static_cast<long long>(replyMs), static_cast<long long>(frameMs));
+    check(replyMs <= 2 || replyMs * 4 < frameMs, "SetWallpaper replies without waiting for the render to finish");
 
     {
         const Frame frame = getFrameFd(proxy, kMonitorStatic);
@@ -243,7 +368,9 @@ void runRenderChecks(sdbus::IProxy& proxy, const std::string& imagePath, const C
         check(frame.fd.isValid(), "GetFrameFd returns a valid Unix fd after a static render");
         check(frame.width == kTargetWidth && frame.height == kTargetHeight,
               "GetFrameFd reports the target's dimensions");
-        check(frame.generation == 1, "frame_generation is 1 after the first render");
+        // The signal's generation must name the frame the export hands back, or a
+        // consumer cannot tell whether the frame it holds is the announced one.
+        check(frame.generation == 1, "the exported frame carries the generation FrameReady announced");
         check(frame.syncFds.empty(), "sync_fds is empty (reserved slot)");
         check(frame.handleType == 0 || frame.handleType == 1, "handle_type is OPAQUE_FD (0) or DMA_BUF (1)");
 
@@ -286,6 +413,22 @@ void runRenderChecks(sdbus::IProxy& proxy, const std::string& imagePath, const C
                     frame.planes.size());
     }
 
+    // The GPU is up now, so GetStatus must say which one and which descriptor tier it
+    // resolved to -- the first thing worth knowing when a bug reproduces on one GPU and
+    // not another.
+    {
+        const nlohmann::json json = getStatus(proxy);
+        const bool reported = !json.is_discarded() && json["gpu"]["initialized"] == true &&
+                              json["gpu"].contains("name") && !json["gpu"]["name"].get<std::string>().empty() &&
+                              json["gpu"].contains("descriptor_tier") &&
+                              !json["gpu"]["descriptor_tier"].get<std::string>().empty();
+        check(reported, "GetStatus reports the GPU name and resolved descriptor tier once initialised");
+        if (!json.is_discarded() && json["gpu"]["initialized"] == true) {
+            std::printf("dbus_service_test: gpu=%s tier=%s\n", json["gpu"].value("name", "?").c_str(),
+                        json["gpu"].value("descriptor_tier", "?").c_str());
+        }
+    }
+
     // Every GetFrameFd produces a fresh descriptor that the daemon must hand over
     // exactly once. Asserting the returned fd is open proves nothing -- sdbus-c++ dups
     // out of the received message, so the client's copy is always open and is not the
@@ -311,55 +454,70 @@ void runRenderChecks(sdbus::IProxy& proxy, const std::string& imagePath, const C
     // Re-rendering the same monitor exercises the queue-family acquire that pairs with
     // the release the exports above performed -- the path that only runs from the second
     // frame onward, and the one validation is silent about.
-    proxy.callMethod("SetWallpaper")
-        .onInterface(DbusService::kInterface)
-        .withArguments(std::string("static"), imagePath, kMonitorStatic);
+    setWallpaper(proxy, "static", imagePath, kMonitorStatic);
+    check(signals.wait(kMonitorStatic, 2), "FrameReady(generation=2) arrives after a re-render");
     {
         const Frame frame = getFrameFd(proxy, kMonitorStatic);
         check(frame.generation == 2, "frame_generation increments on re-render");
         check(frame.fd.isValid(), "a re-rendered frame still exports a valid fd");
     }
 
-    // video is a recognised type but Step 13 renders it; it is recorded, not rendered.
-    proxy.callMethod("SetWallpaper")
-        .onInterface(DbusService::kInterface)
-        .withArguments(std::string("video"), std::string("/tmp/wallpaperx-test.mp4"), kMonitorVideo);
+    // --- Requests that must produce no frame and no signal. ---
+
+    // The failure case gets a working wallpaper first, so there is a frame to go stale.
+    // Asserting "no frame after a failed render" on a monitor that never had one passes
+    // no matter what the daemon does on failure -- which is exactly how a regression
+    // that served the previous wallpaper's pixels under the new path would slip through.
+    setWallpaper(proxy, "static", imagePath, kMonitorCorrupt);
+    check(signals.wait(kMonitorCorrupt, 1), "the monitor used for the failure case renders a frame first");
+    check(errorNameFrom([&] { getFrameFd(proxy, kMonitorCorrupt); }).empty(),
+          "the monitor used for the failure case starts with a valid frame");
+
+    // These three are posted before a request that does signal. The daemon does all GPU
+    // work on one FIFO thread, so once the barrier's FrameReady arrives, they have
+    // provably been processed -- no sleep, no flake.
+    setWallpaper(proxy, "video", "/tmp/wallpaperx-test.mp4", kMonitorVideo);
+    setWallpaper(proxy, "static", corruptPath, kMonitorCorrupt);
+    setWallpaper(proxy, "static", imagePath, kMonitorBarrier);
+    check(signals.wait(kMonitorBarrier, 1), "FrameReady arrives for the barrier request");
+
+    check(signals.countFor(kMonitorVideo) == 0, "a video request emits no FrameReady");
     check(errorNameFrom([&] { getFrameFd(proxy, kMonitorVideo); }) == "io.wallpaperx.Daemon.Error.NoFrame",
           "a video wallpaper is recorded but yields no frame");
 
-    // A failed render must leave the monitor with no frame, not with a stale one. The
-    // monitor is given a working wallpaper first, so there is a frame to go stale --
-    // asserting this on a monitor that never had one would pass no matter what
-    // SetWallpaper does on failure.
-    proxy.callMethod("SetWallpaper")
-        .onInterface(DbusService::kInterface)
-        .withArguments(std::string("static"), imagePath, kMonitorBadPath);
-    check(errorNameFrom([&] { getFrameFd(proxy, kMonitorBadPath); }).empty(),
-          "the monitor used for the failure case starts with a valid frame");
+    // Still 1: the good render above, and nothing for the corrupt one that followed.
+    check(signals.countFor(kMonitorCorrupt) == 1, "a render that fails emits no FrameReady");
+    check(errorNameFrom([&] { getFrameFd(proxy, kMonitorCorrupt); }) == "io.wallpaperx.Daemon.Error.NoFrame",
+          "a failed render leaves no frame, not the previous wallpaper's");
 
-    check(errorNameFrom([&] {
-              proxy.callMethod("SetWallpaper")
-                  .onInterface(DbusService::kInterface)
-                  .withArguments(std::string("static"), std::string("/nonexistent/wallpaperx.png"), kMonitorBadPath);
-          }) == "io.wallpaperx.Daemon.Error.RenderFailed",
-          "an unreadable image fails with RenderFailed");
-    check(errorNameFrom([&] { getFrameFd(proxy, kMonitorBadPath); }) == "io.wallpaperx.Daemon.Error.NoFrame",
-          "a monitor whose render failed has no frame");
+    // The reply to SetWallpaper was already sent by the time the render failed, so
+    // GetStatus is the only place that failure is reported.
+    {
+        const nlohmann::json json = getStatus(proxy);
+        const std::string corruptId = std::to_string(kMonitorCorrupt);
+        const bool reported = !json.is_discarded() && json["wallpapers"].contains(corruptId) &&
+                              json["wallpapers"][corruptId].contains("last_error") &&
+                              !json["wallpapers"][corruptId]["last_error"].get<std::string>().empty();
+        check(reported, "GetStatus reports last_error for an asynchronous render failure");
+    }
 
-    // GetStatus reflects the recorded requests, rendered or not.
-    std::string status;
-    proxy.callMethod("GetStatus").onInterface(DbusService::kInterface).storeResultsTo(status);
-    nlohmann::json json = nlohmann::json::parse(status, nullptr, false);
-    const std::string staticId = std::to_string(kMonitorStatic);
-    const std::string videoId = std::to_string(kMonitorVideo);
-    const bool reflected = !json.is_discarded() && json["wallpapers"].contains(staticId) &&
-                           json["wallpapers"][staticId]["type"] == "static" &&
-                           json["wallpapers"][staticId]["path"] == imagePath &&
-                           json["wallpapers"][staticId]["has_frame"] == true &&
-                           json["wallpapers"][staticId]["generation"] == 2 &&
-                           json["wallpapers"][videoId]["type"] == "video" &&
-                           json["wallpapers"][videoId]["has_frame"] == false;
-    check(reflected, "GetStatus reflects per-monitor type, path, generation and frame availability");
+    // A monitor that rendered successfully must not carry a stale error.
+    {
+        const nlohmann::json json = getStatus(proxy);
+        const std::string staticId = std::to_string(kMonitorStatic);
+        const std::string videoId = std::to_string(kMonitorVideo);
+        const bool reflected = !json.is_discarded() && json["wallpapers"].contains(staticId) &&
+                               json["wallpapers"][staticId]["type"] == "static" &&
+                               json["wallpapers"][staticId]["path"] == imagePath &&
+                               json["wallpapers"][staticId]["has_frame"] == true &&
+                               json["wallpapers"][staticId]["generation"] == 2 &&
+                               json["wallpapers"][staticId]["width"] == kTargetWidth &&
+                               json["wallpapers"][staticId]["height"] == kTargetHeight &&
+                               !json["wallpapers"][staticId].contains("last_error") &&
+                               json["wallpapers"][videoId]["type"] == "video" &&
+                               json["wallpapers"][videoId]["has_frame"] == false;
+        check(reflected, "GetStatus reflects per-monitor type, path, size, generation and frame availability");
+    }
 }
 
 }  // namespace
@@ -375,14 +533,22 @@ int main() {
 
     wallpaperx::resetValidationWarningCount();
 
-    // Scoped so the manager, and with it the Vulkan Device, the offscreen targets and
-    // Memory's leaked-allocation check, are all destroyed before the validation counter
-    // is read below. Destroying an image still owned by an external queue family, or
-    // leaking device memory, only raises validation errors during teardown -- sampling
-    // the counter while the manager is still alive silently exempts the whole
-    // destruction half of the code under test.
+    // Scoped so the manager, and with it the render thread, the Vulkan Device, the
+    // offscreen targets and Memory's leaked-allocation check, are all destroyed before
+    // the validation counter is read below. Destroying an image still owned by an
+    // external queue family, or leaking device memory, only raises validation errors
+    // during teardown -- sampling the counter while the manager is still alive silently
+    // exempts the whole destruction half of the code under test.
     try {
         const std::string imagePath = writeTestImage();
+        const std::string corruptPath = writeCorruptImage();
+
+        // Declared before everything it outlives. The signal callback below captures it,
+        // and that callback runs on the proxy's dispatch thread -- so if the log were
+        // declared after the proxy it would be destroyed first, and any FrameReady still
+        // in flight during an unwinding stack would lock a destroyed mutex. Reverse
+        // declaration order is what guarantees proxy-then-service-then-log teardown.
+        FrameReadyLog signals;
 
         wallpaperx::WallpaperManager::Config config;
         config.width = kTargetWidth;
@@ -401,13 +567,18 @@ int main() {
         auto proxy =
             sdbus::createProxy(sdbus::ServiceName{DbusService::kBusName}, sdbus::ObjectPath{DbusService::kObjectPath});
 
+        // Subscribed before the first request, so no signal can be missed.
+        proxy->uponSignal("FrameReady")
+            .onInterface(DbusService::kInterface)
+            .call([&signals](int32_t monitorId, uint64_t generation) { signals.record(monitorId, generation); });
+
         runHostChecks(*proxy, imagePath, check);
-        runRenderChecks(*proxy, imagePath, check);
+        runRenderChecks(*proxy, signals, imagePath, corruptPath, check);
     } catch (const std::exception& e) {
         // Without this the first unhandled sdbus::Error -- which is what a host with no
-        // usable Vulkan ICD produces on the very first SetWallpaper -- would escape main
-        // and abort the process, so ctest would report an opaque SIGABRT instead of a
-        // named failure, and none of the FAIL lines above would ever be printed.
+        // usable Vulkan ICD produces -- would escape main and abort the process, so
+        // ctest would report an opaque SIGABRT instead of a named failure, and none of
+        // the FAIL lines above would ever be printed.
         std::fprintf(stderr, "FAIL: unexpected exception: %s\n", e.what());
         ++failures;
     }

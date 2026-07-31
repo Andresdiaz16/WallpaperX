@@ -67,6 +67,7 @@ endif()
 # (mirrors the renderer lib + probes layout).
 add_library(wallpaperx-daemon-lib STATIC
     daemon/dbus_service.cpp
+    daemon/render_worker.cpp
     daemon/wallpaper_manager.cpp
 )
 
@@ -75,10 +76,15 @@ target_include_directories(wallpaperx-daemon-lib PUBLIC
     ${HTTPLIB_INCLUDE_DIR}
 )
 
+# Threads::Threads for the render worker. Current glibc folds pthread into libc so this
+# links either way here, but relying on that makes the build silently platform-specific.
+find_package(Threads REQUIRED)
+
 target_link_libraries(wallpaperx-daemon-lib PUBLIC
     wallpaperx-renderer
     SDBusCpp::sdbus-c++
     nlohmann_json::nlohmann_json
+    Threads::Threads
     ${LIBZIP_LIBRARIES}
 )
 
