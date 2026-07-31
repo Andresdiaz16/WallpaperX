@@ -74,6 +74,7 @@ void OffscreenTargetManager::createRenderPass() {
 void OffscreenTargetManager::render(IRenderer& renderer, const OffscreenTarget& target) {
     VkImageLayout resultingLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     bool recorded = false;
+    bool acquired = false;
     try {
         m_device.immediateSubmit([&](VkCommandBuffer cmd) {
             recorded = true;
@@ -95,7 +96,7 @@ void OffscreenTargetManager::render(IRenderer& renderer, const OffscreenTarget& 
                 vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                                      VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1,
                                      &acquire);
-                target.externalOwner = VK_QUEUE_FAMILY_IGNORED;
+                acquired = true;
             }
 
             resultingLayout = renderer.record(cmd, target);
@@ -106,10 +107,20 @@ void OffscreenTargetManager::render(IRenderer& renderer, const OffscreenTarget& 
         // lambda, in which case nothing touched the image -- stamping UNDEFINED there
         // would discard a still-valid layout and let the next export's barrier license
         // the driver to throw away a frame the compositor is currently displaying.
+        //
+        // externalOwner is deliberately NOT touched here. The acquire barrier only takes
+        // effect if the submit succeeds, so on failure the external consumer still owns
+        // the image and the next render must issue the acquire again. Clearing it at
+        // record time (as this did originally) desynchronised ownership permanently for
+        // any caller that survives a failed submit -- harmless for a probe that exits on
+        // throw, silent corruption for a long-lived daemon.
         if (recorded) {
             target.notifyLayout(VK_IMAGE_LAYOUT_UNDEFINED);
         }
         throw;
+    }
+    if (acquired) {
+        target.externalOwner = VK_QUEUE_FAMILY_IGNORED;
     }
     target.notifyLayout(resultingLayout);
 }

@@ -46,3 +46,56 @@ jobs:
       # GPU with the Heap tier.
       - name: Test (Lavapipe)
         run: ctest --test-dir renderer/build-ci -L lavapipe --output-on-failure
+
+  # The daemon's DBus tests are the only place the DMA_BUF wire fields
+  # (drm_format / drm_modifier / planes) are exercised end to end: the developer's
+  # GPU is NVIDIA, which takes the OPAQUE_FD path and leaves all three at sentinels,
+  # so Lavapipe is the sole witness. Leaving this out of CI meant a change that
+  # dropped or reordered those out-args could merge green and first surface as a
+  # garbage image on an AMD/Intel user's desktop.
+  #
+  # WALLPAPERX_BUILD_KDE_PLUGIN=OFF keeps Qt6 + ECM + Plasma + KF6 out of the job --
+  # the daemon uses none of them, and installing the whole Plasma stack here would
+  # cost far more than the coverage is worth.
+  backend-dbus-lavapipe:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build pkg-config git \
+            libvulkan-dev vulkan-validation-layers mesa-vulkan-drivers \
+            glslc libshaderc-dev \
+            libmpv-dev libpipewire-0.3-dev libfftw3-dev \
+            libstb-dev nlohmann-json3-dev \
+            libzip-dev libsystemd-dev dbus
+
+      # Built from source deliberately: the daemon uses the sdbus-c++ v2 API
+      # (registerMethod().implementedAs(), sdbus::ServiceName, ...), and Ubuntu 24.04
+      # ships 1.x, whose API is different enough that the daemon does not compile
+      # against it. Pinned to the same version the developer builds against, so CI
+      # cannot pass or fail for reasons that do not reproduce locally.
+      - name: Build sdbus-c++ v2
+        run: |
+          git clone --depth 1 --branch v2.3.1 https://github.com/Kistler-Group/sdbus-cpp.git /tmp/sdbus-cpp
+          cmake -S /tmp/sdbus-cpp -B /tmp/sdbus-cpp/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local \
+            -DSDBUSCPP_BUILD_CODEGEN=OFF -DSDBUSCPP_BUILD_TESTS=OFF
+          cmake --build /tmp/sdbus-cpp/build
+          sudo cmake --install /tmp/sdbus-cpp/build
+          sudo ldconfig
+
+      - name: Configure
+        run: cmake -S backend -B backend/build-ci -G Ninja -DWALLPAPERX_BUILD_KDE_PLUGIN=OFF
+
+      - name: Build
+        run: cmake --build backend/build-ci
+
+      # The dbus_service_lavapipe entry carries the lavapipe label and sets
+      # VK_ICD_FILENAMES itself; the renderer's lavapipe entries come along because
+      # the backend adds the renderer as a subproject.
+      - name: Test (Lavapipe)
+        run: ctest --test-dir backend/build-ci -L lavapipe --output-on-failure

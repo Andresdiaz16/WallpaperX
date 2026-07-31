@@ -128,6 +128,14 @@ endif()
 set(SHADER_OUTPUT_DIR ${CMAKE_CURRENT_BINARY_DIR}/shaders)
 file(MAKE_DIRECTORY ${SHADER_OUTPUT_DIR})
 
+# Consumers built via add_subdirectory (the backend daemon) need this path at runtime
+# to hand StaticRenderer a shader directory. A plain set() would not escape this
+# scope, and hardcoding "<backend build>/renderer/shaders" on the other side would
+# duplicate a layout only this file decides. INTERNAL rather than PARENT_SCOPE so it
+# also works when the renderer is configured standalone (no parent to set).
+set(WALLPAPERX_SHADER_OUTPUT_DIR ${SHADER_OUTPUT_DIR} CACHE INTERNAL
+    "Directory holding the renderer's compiled SPIR-V")
+
 set(SHADER_SPV_FILES "")
 foreach(SHADER_SRC fullscreen.vert fullscreen_set.frag fullscreen_heap.frag)
     set(SHADER_SPV ${SHADER_OUTPUT_DIR}/${SHADER_SRC}.spv)

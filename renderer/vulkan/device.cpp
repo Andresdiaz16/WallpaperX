@@ -15,10 +15,12 @@ namespace wallpaperx {
 
 namespace {
 std::atomic<int> g_validationWarningCount{0};
+std::atomic<bool> g_validationLayerActive{false};
 }
 
 void resetValidationWarningCount() { g_validationWarningCount = 0; }
 int validationWarningCount() { return g_validationWarningCount; }
+bool validationLayerActive() { return g_validationLayerActive; }
 
 const char* toString(DescriptorTier tier) {
     switch (tier) {
@@ -129,6 +131,11 @@ void Device::createInstance(bool enableValidation) {
             }
         }
         if (validationAvailable) {
+            // Published so a test can tell "zero validation warnings" from "no validator
+            // was listening". Requesting validation is not the same as getting it: the
+            // layer is a separate package, and without this a suite whose only GPU-side
+            // oracle is the warning count reports green on a machine that checked nothing.
+            g_validationLayerActive = true;
             instanceLayers.push_back("VK_LAYER_KHRONOS_validation");
             instanceExtensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
 

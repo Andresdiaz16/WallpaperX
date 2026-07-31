@@ -3,27 +3,33 @@
 #include <sdbus-c++/sdbus-c++.h>
 
 #include <cstdint>
-#include <map>
 #include <memory>
-#include <mutex>
 #include <string>
 #include <tuple>
 #include <vector>
 
 namespace wallpaperx {
 
+class WallpaperManager;
+
 // Serves the io.wallpaperx.Daemon DBus interface on a caller-provided connection.
 // The connection owns the bus-name request and the event loop (blocking in the
 // daemon's main(), async in tests) -- this class only registers and implements the
-// methods and signals. All shared state is guarded by m_mutex, since the sdbus-c++
-// event loop can invoke handlers from its own thread.
+// methods and signals.
+//
+// Stateless by design: every handler forwards to the WallpaperManager, which owns
+// both the wallpaper state and the lock guarding it. An earlier version kept its own
+// mutex and request map here; that made the recorded requests and the rendered frames
+// two separate truths under two separate locks, which is exactly the split that lets
+// GetStatus and GetFrameFd disagree.
 class DbusService {
 public:
     static constexpr const char* kBusName = "io.wallpaperx.Daemon";
     static constexpr const char* kObjectPath = "/io/wallpaperx/Daemon";
     static constexpr const char* kInterface = "io.wallpaperx.Daemon";
 
-    explicit DbusService(sdbus::IConnection& connection);
+    // `manager` must outlive this object.
+    DbusService(sdbus::IConnection& connection, WallpaperManager& manager);
 
 private:
     void registerVTable();
@@ -58,14 +64,8 @@ private:
 
     std::string getStatus();
 
+    WallpaperManager& m_manager;
     std::unique_ptr<sdbus::IObject> m_object;
-
-    struct WallpaperRequest {
-        std::string type;
-        std::string path;
-    };
-    std::mutex m_mutex;
-    std::map<int32_t, WallpaperRequest> m_wallpapers;  // monitor_id -> most recent SetWallpaper
 };
 
 }

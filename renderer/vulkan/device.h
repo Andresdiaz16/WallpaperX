@@ -13,6 +13,12 @@ namespace wallpaperx {
 void resetValidationWarningCount();
 int validationWarningCount();
 
+// Whether a Device actually loaded VK_LAYER_KHRONOS_validation. Distinct from having
+// asked for it: Device degrades silently when the layer package is not installed, so a
+// test that treats validationWarningCount() == 0 as proof of GPU-side correctness must
+// check this too, or it passes vacuously on any machine without the layers.
+bool validationLayerActive();
+
 struct DeviceInfo {
     std::string gpuName;
     GpuVendor vendor = GpuVendor::Other;

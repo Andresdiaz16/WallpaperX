@@ -18,18 +18,27 @@ add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../renderer
 
 find_package(PkgConfig REQUIRED)
 
-# Qt6 — required for KDE plugin
-find_package(Qt6 REQUIRED COMPONENTS Core DBus Quick Qml)
-qt_standard_project_setup()
+# The daemon and its tests use no Qt and no KDE Frameworks -- they talk DBus through
+# sdbus-c++. Only the Plasma wallpaper plugin and wpxctl do. Making that split explicit
+# lets a headless machine (CI above all) configure and test the daemon without pulling
+# in Qt6 + ECM + Plasma + KF6, which is what kept the DBus tests -- including the only
+# coverage of the DMA_BUF wire fields -- out of CI entirely.
+option(WALLPAPERX_BUILD_KDE_PLUGIN "Build the Plasma wallpaper plugin and wpxctl (needs Qt6/ECM/Plasma/KF6)" ON)
 
-# ECM + KDE — required for KDE plugin
-find_package(ECM REQUIRED NO_MODULE)
-set(CMAKE_MODULE_PATH ${ECM_MODULE_PATH} ${CMAKE_MODULE_PATH})
-include(KDEInstallDirs6)
-include(KDECMakeSettings)
+if(WALLPAPERX_BUILD_KDE_PLUGIN)
+    # Qt6 — required for KDE plugin
+    find_package(Qt6 REQUIRED COMPONENTS Core DBus Quick Qml)
+    qt_standard_project_setup()
 
-find_package(Plasma REQUIRED)
-find_package(KF6 REQUIRED COMPONENTS Package)
+    # ECM + KDE — required for KDE plugin
+    find_package(ECM REQUIRED NO_MODULE)
+    set(CMAKE_MODULE_PATH ${ECM_MODULE_PATH} ${CMAKE_MODULE_PATH})
+    include(KDEInstallDirs6)
+    include(KDECMakeSettings)
+
+    find_package(Plasma REQUIRED)
+    find_package(KF6 REQUIRED COMPONENTS Package)
+endif()
 
 # sdbus-c++
 find_package(sdbus-c++ REQUIRED CONFIG)
@@ -58,6 +67,7 @@ endif()
 # (mirrors the renderer lib + probes layout).
 add_library(wallpaperx-daemon-lib STATIC
     daemon/dbus_service.cpp
+    daemon/wallpaper_manager.cpp
 )
 
 target_include_directories(wallpaperx-daemon-lib PUBLIC
@@ -72,6 +82,18 @@ target_link_libraries(wallpaperx-daemon-lib PUBLIC
     ${LIBZIP_LIBRARIES}
 )
 
+# Where StaticRenderer looks for compiled SPIR-V when nothing overrides it. Points
+# into the build tree, which is right for running from a build and wrong for an
+# install -- $WALLPAPERX_SHADER_DIR covers the gap until packaging (Step 14) gives
+# the shaders a real installed location.
+target_compile_definitions(wallpaperx-daemon-lib PRIVATE
+    WALLPAPERX_DEFAULT_SHADER_DIR="${WALLPAPERX_SHADER_OUTPUT_DIR}"
+)
+
+# The .spv files are produced by a custom target, so nothing links them in -- without
+# this the daemon builds fine and then fails at the first SetWallpaper.
+add_dependencies(wallpaperx-daemon-lib wallpaperx-shaders)
+
 # The daemon talks DBus through sdbus-c++ (via wallpaperx-daemon-lib), not Qt --
 # Qt is reserved for the separate WallpaperX KDE plugin .so below.
 add_executable(wallpaperx-daemon daemon/main.cpp)
@@ -85,11 +107,16 @@ enable_testing()
 
 add_executable(wallpaperx-dbus-service-test tests/dbus_service_test.cpp)
 target_link_libraries(wallpaperx-dbus-service-test PRIVATE wallpaperx-daemon-lib)
+target_compile_definitions(wallpaperx-dbus-service-test PRIVATE
+    WALLPAPERX_TEST_IMAGE_DIR="${CMAKE_CURRENT_BINARY_DIR}/test_assets"
+)
 
 # These targets have no Q_OBJECT / Qt usage; AUTOMOC is on globally via
 # qt_standard_project_setup(), so turn it off here to skip a pointless moc step.
-set_target_properties(wallpaperx-daemon-lib wallpaperx-daemon wallpaperx-dbus-service-test
-    PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+if(WALLPAPERX_BUILD_KDE_PLUGIN)
+    set_target_properties(wallpaperx-daemon-lib wallpaperx-daemon wallpaperx-dbus-service-test
+        PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+endif()
 
 # The DBus service test needs a session bus. dbus-run-session gives each run a
 # private one (isolated from the developer's real session, and works headless in
@@ -98,54 +125,73 @@ find_program(DBUS_RUN_SESSION dbus-run-session)
 if(DBUS_RUN_SESSION)
     add_test(NAME dbus_service
              COMMAND ${DBUS_RUN_SESSION} -- $<TARGET_FILE:wallpaperx-dbus-service-test>)
+
+    # The test now renders and exports a real frame, so it exercises the export path
+    # end to end -- and on the owner's NVIDIA GPU that path is OPAQUE_FD only. The
+    # Lavapipe twin is the only place the DMA_BUF branch (and its DRM modifier
+    # metadata) crosses the DBus wire, which is the half a KDE plugin on AMD/Intel
+    # will actually consume.
+    if(WALLPAPERX_LAVAPIPE_ICD)
+        add_test(NAME dbus_service_lavapipe
+                 COMMAND ${DBUS_RUN_SESSION} -- $<TARGET_FILE:wallpaperx-dbus-service-test>)
+        set_tests_properties(dbus_service_lavapipe PROPERTIES
+            ENVIRONMENT "VK_ICD_FILENAMES=${WALLPAPERX_LAVAPIPE_ICD}"
+            LABELS "lavapipe")
+    endif()
+
+    # Both variants render from the same generated PNG under WALLPAPERX_TEST_IMAGE_DIR,
+    # so keep ctest -jN from running one while the other is mid-write.
+    set_tests_properties(dbus_service PROPERTIES RESOURCE_LOCK dbus_service_test_image)
+    if(WALLPAPERX_LAVAPIPE_ICD)
+        set_tests_properties(dbus_service_lavapipe PROPERTIES RESOURCE_LOCK dbus_service_test_image)
+    endif()
 else()
     message(STATUS "  dbus-run-session not found -- dbus_service test skipped (install dbus)")
 endif()
 
 # --------------------------------------------------------------------------- #
-# KDE plugin — libWallpaperX.so (placeholder — sources added in later steps)
+# KDE plugin — libWallpaperX.so, wpxctl, KDE package install
+# (placeholders — sources added in later steps)
 # --------------------------------------------------------------------------- #
 
-add_library(WallpaperX SHARED
-    kde/plugin.cpp
-)
+if(WALLPAPERX_BUILD_KDE_PLUGIN)
+    add_library(WallpaperX SHARED
+        kde/plugin.cpp
+    )
 
-target_include_directories(WallpaperX PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}
-)
+    target_include_directories(WallpaperX PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
 
-target_link_libraries(WallpaperX PRIVATE
-    Qt6::Core
-    Qt6::Quick
-    Qt6::Qml
-    Qt6::DBus
-)
+    target_link_libraries(WallpaperX PRIVATE
+        Qt6::Core
+        Qt6::Quick
+        Qt6::Qml
+        Qt6::DBus
+    )
 
-set_target_properties(WallpaperX PROPERTIES
-    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/kde
-)
+    set_target_properties(WallpaperX PROPERTIES
+        LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/kde
+    )
 
-# --------------------------------------------------------------------------- #
-# wpxctl CLI (placeholder — sources added in later steps)
-# --------------------------------------------------------------------------- #
+    add_executable(wpxctl
+        wpxctl/main.cpp
+    )
 
-add_executable(wpxctl
-    wpxctl/main.cpp
-)
+    target_link_libraries(wpxctl PRIVATE
+        Qt6::Core
+        Qt6::DBus
+        SDBusCpp::sdbus-c++
+    )
 
-target_link_libraries(wpxctl PRIVATE
-    Qt6::Core
-    Qt6::DBus
-    SDBusCpp::sdbus-c++
-)
-
-# --------------------------------------------------------------------------- #
-# KDE package install
-# --------------------------------------------------------------------------- #
-
-plasma_install_package(kde/kpackage com.wallpaperx.wallpaper wallpapers wallpaper)
+    plasma_install_package(kde/kpackage com.wallpaperx.wallpaper wallpapers wallpaper)
+endif()
 
 message(STATUS "wallpaperx-backend configured")
-message(STATUS "  Qt6:     ${Qt6_VERSION}")
-message(STATUS "  ECM:     ${ECM_VERSION}")
+if(WALLPAPERX_BUILD_KDE_PLUGIN)
+    message(STATUS "  Qt6:     ${Qt6_VERSION}")
+    message(STATUS "  ECM:     ${ECM_VERSION}")
+else()
+    message(STATUS "  KDE plugin: disabled (WALLPAPERX_BUILD_KDE_PLUGIN=OFF) -- daemon + tests only")
+endif()
 message(STATUS "  sdbus:   ${SDBusCpp_VERSION}")
