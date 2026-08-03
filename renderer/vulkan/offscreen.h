@@ -60,6 +60,17 @@ class OffscreenTargetManager {
 public:
     static constexpr VkFormat kFormat = VK_FORMAT_B8G8R8A8_UNORM;
 
+    // The usage every offscreen target is created with. Public because a DRM format
+    // modifier is only valid for a specific usage: anything querying which modifiers
+    // could describe one of these images has to ask about exactly this set, and a
+    // second copy of the mask in another file silently stops matching the first the
+    // moment a renderer needs a new bit.
+    //
+    // TRANSFER_SRC so the rendered frame can be copied out (readback for tests, and the
+    // natural expectation for a frame we intend to export/hand off).
+    static constexpr VkImageUsageFlags kUsage =
+        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+
     explicit OffscreenTargetManager(Device& device);
     ~OffscreenTargetManager();
 

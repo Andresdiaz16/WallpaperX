@@ -18,10 +18,13 @@
 //    that *does* signal: the daemon has a single FIFO render thread, so that later
 //    signal proves the earlier request was already processed.
 #include "daemon/dbus_service.h"
+#include "daemon/render_worker.h"
 #include "daemon/wallpaper_manager.h"
 
 #include "vulkan/device.h"
 #include "vulkan/frame_export.h"
+
+#include "support/exported_frame_map.h"
 
 #include <sdbus-c++/sdbus-c++.h>
 
@@ -30,9 +33,12 @@
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include <stb_image_write.h>
 
+#include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <future>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -65,7 +71,17 @@ constexpr int32_t kMonitorStatic = 0;
 constexpr int32_t kMonitorVideo = 1;
 constexpr int32_t kMonitorCorrupt = 2;
 constexpr int32_t kMonitorBarrier = 3;
+constexpr int32_t kMonitorBurstFailLast = 4;
+constexpr int32_t kMonitorBurstRenderLast = 5;
+constexpr int32_t kMonitorBurstContent = 6;
+constexpr int32_t kMonitorCoalesceBarrier = 7;
+constexpr int32_t kMonitorErrorRecovery = 8;
 constexpr int32_t kMonitorNeverSet = 9;
+constexpr int32_t kMonitorWorkerCoalesce = 10;
+
+// How many requests each coalescing burst fires at one monitor. Five is enough that a
+// worker draining one per render still leaves several to collapse.
+constexpr int kBurstSize = 5;
 
 // Generous: it bounds a GPU render on a software rasteriser under load, and is only
 // ever reached when something is actually broken.
@@ -106,6 +122,54 @@ std::string writeTestImage() {
         throw std::runtime_error("dbus_service_test: failed to write test image");
     }
     return path;
+}
+
+// The colours the coalescing burst cycles through, as RGB. Solid fills, so the rendered
+// frame is one colour end to end and identifying which request produced it needs no
+// knowledge of how StaticRenderer scales its input.
+//
+// Chosen so the first and last differ in every channel: a daemon that served the first
+// request of a burst instead of the last must be wrong about red, green *and* blue, not
+// merely dim.
+constexpr int kBurstColorCount = kBurstSize;
+constexpr unsigned char kBurstColors[kBurstColorCount][3] = {
+    {255, 0, 0}, {0, 255, 0}, {0, 0, 255}, {255, 255, 0}, {32, 160, 224},
+};
+
+// Asserted here, at build time, rather than as a runtime check() inside the burst.
+// Every operand is constexpr, so the compiler folds the whole expression -- checking it
+// at run time meant an edit that made the palette non-discriminating was caught only
+// after building, launching a daemon and running a burst, on whichever machine happened
+// to run the suite, and was then reported as a test failure rather than as what it is:
+// a bad edit to a constant.
+static_assert(kBurstColors[0][0] != kBurstColors[kBurstColorCount - 1][0] &&
+                  kBurstColors[0][1] != kBurstColors[kBurstColorCount - 1][1] &&
+                  kBurstColors[0][2] != kBurstColors[kBurstColorCount - 1][2],
+              "the burst palette's first and last colours must differ in every channel, or the pixel comparison in "
+              "runCoalescingChecks cannot tell first-wins from last-wins");
+
+// Writes one solid-colour PNG per burst step and returns their paths, in order.
+std::vector<std::string> writeBurstImages() {
+    std::filesystem::create_directories(testAssetDir());
+    std::vector<std::string> paths;
+    for (int i = 0; i < kBurstColorCount; ++i) {
+        const std::string path = testAssetDir() + "/dbus_burst_" + std::to_string(i) + ".png";
+
+        const int w = 8;
+        const int h = 8;
+        std::vector<unsigned char> pixels(static_cast<size_t>(w) * h * 4);
+        for (int p = 0; p < w * h; ++p) {
+            pixels[p * 4 + 0] = kBurstColors[i][0];
+            pixels[p * 4 + 1] = kBurstColors[i][1];
+            pixels[p * 4 + 2] = kBurstColors[i][2];
+            pixels[p * 4 + 3] = 255;
+        }
+        if (!stbi_write_png(path.c_str(), w, h, 4, pixels.data(), w * 4)) {
+            throw std::runtime_error("dbus_service_test: failed to write burst test image");
+        }
+        paths.push_back(path);
+    }
+    return paths;
 }
 
 // A file that exists but is not an image. SetWallpaper's synchronous check only proves
@@ -240,6 +304,26 @@ nlohmann::json getStatus(sdbus::IProxy& proxy) {
     std::string status;
     proxy.callMethod("GetStatus").onInterface(DbusService::kInterface).storeResultsTo(status);
     return nlohmann::json::parse(status, nullptr, /*allow_exceptions=*/false);
+}
+
+// GetStatus's entry for one monitor, or nullptr when the reply does not contain one.
+//
+// Every caller goes through this rather than writing json["wallpapers"][id] itself. The
+// parsed reply is const, so operator[] on it is nlohmann's const overload -- JSON_ASSERT
+// followed by a dereference. Under NDEBUG the assert compiles away and a missing key
+// dereferences end(), so a daemon regression that dropped "wallpapers" or a monitor from
+// the reply would crash this test instead of printing the FAIL line the check exists to
+// produce. One accessor is what stops the next site from forgetting the guard; of the
+// five sites that existed, four had.
+//
+// Callers read individual fields with value(), for the same reason: a missing "type" or
+// "has_frame" must make the comparison false, not abort.
+const nlohmann::json* wallpaperStatus(const nlohmann::json& json, const std::string& monitorId) {
+    if (json.is_discarded() || !json.is_object() || !json.contains("wallpapers")) return nullptr;
+    const nlohmann::json& wallpapers = json["wallpapers"];
+    if (!wallpapers.is_object() || !wallpapers.contains(monitorId)) return nullptr;
+    const nlohmann::json& entry = wallpapers[monitorId];
+    return entry.is_object() ? &entry : nullptr;
 }
 
 // Returns the DBus error name a call failed with, or "" if it unexpectedly succeeded.
@@ -511,29 +595,342 @@ void runRenderChecks(sdbus::IProxy& proxy, FrameReadyLog& signals, const std::st
     // GetStatus is the only place that failure is reported.
     {
         const nlohmann::json json = getStatus(proxy);
-        const std::string corruptId = std::to_string(kMonitorCorrupt);
-        const bool reported = !json.is_discarded() && json["wallpapers"].contains(corruptId) &&
-                              json["wallpapers"][corruptId].contains("last_error") &&
-                              !json["wallpapers"][corruptId]["last_error"].get<std::string>().empty();
+        const nlohmann::json* corrupt = wallpaperStatus(json, std::to_string(kMonitorCorrupt));
+        const bool reported = corrupt != nullptr && !corrupt->value("last_error", std::string()).empty();
         check(reported, "GetStatus reports last_error for an asynchronous render failure");
     }
 
     // A monitor that rendered successfully must not carry a stale error.
     {
         const nlohmann::json json = getStatus(proxy);
-        const std::string staticId = std::to_string(kMonitorStatic);
-        const std::string videoId = std::to_string(kMonitorVideo);
-        const bool reflected = !json.is_discarded() && json["wallpapers"].contains(staticId) &&
-                               json["wallpapers"][staticId]["type"] == "static" &&
-                               json["wallpapers"][staticId]["path"] == imagePath &&
-                               json["wallpapers"][staticId]["has_frame"] == true &&
-                               json["wallpapers"][staticId]["generation"] == 2 &&
-                               json["wallpapers"][staticId]["width"] == kTargetWidth &&
-                               json["wallpapers"][staticId]["height"] == kTargetHeight &&
-                               !json["wallpapers"][staticId].contains("last_error") &&
-                               json["wallpapers"][videoId]["type"] == "video" &&
-                               json["wallpapers"][videoId]["has_frame"] == false;
+        const nlohmann::json* still = wallpaperStatus(json, std::to_string(kMonitorStatic));
+        const nlohmann::json* video = wallpaperStatus(json, std::to_string(kMonitorVideo));
+        const bool reflected =
+            still != nullptr && video != nullptr && still->value("type", std::string()) == "static" &&
+            still->value("path", std::string()) == imagePath && still->value("has_frame", false) &&
+            still->value("generation", uint64_t{0}) == 2 && still->value("width", uint32_t{0}) == kTargetWidth &&
+            still->value("height", uint32_t{0}) == kTargetHeight && !still->contains("last_error") &&
+            video->value("type", std::string()) == "video" && !video->value("has_frame", true);
         check(reflected, "GetStatus reflects per-monitor type, path, size, generation and frame availability");
+    }
+}
+
+// --------------------------------------------------------------------------- //
+// Coalescing, driven at the level the mechanisms actually live at.
+//
+// Two independent mechanisms collapse a burst, and both sit below DBus:
+//
+//   RenderWorker::m_queuedRenders  drops a monitor already sitting in the queue.
+//   WallpaperManager::servicedSeq  makes renderPending a no-op for a request that has
+//                                  already been serviced.
+//
+// So this drives the worker and the manager directly rather than through the bus. The
+// point is not to avoid DBus for its own sake -- it is that over the bus the claim
+// cannot be stated exactly. Counting the renders a burst produces measures how many
+// completed inside a window whose length the OS scheduler sets, not the daemon: the
+// worker erases a monitor from m_queuedRenders before rendering it, so every render that
+// finishes mid-burst admits one more queue entry, and under `ctest -jN` the client's own
+// calls are descheduled too. Any fixed bound is therefore either flaky or too loose to
+// catch the thing it is bounding -- `<= 2` was reachable at 3.
+//
+// Holding the worker on a task that blocks removes the race instead of tolerating it:
+// the worker runs one job at a time, so nothing can render until this thread releases
+// the gate, and all five requests are provably recorded before the first render starts.
+// The assertion becomes exact. Measured against the alternatives: with the gate held,
+// either mechanism alone still yields 1, and both disabled yields 5.
+//
+// Uses its own WallpaperManager rather than the daemon's, and not for isolation's sake:
+// Device pins itself to the thread that created it and aborts on a GPU call from any
+// other, because Vulkan submission is not free-threaded and it shares one command pool.
+// The daemon's Device belongs to the daemon's worker thread, so a second worker driving
+// the same manager trips that guard by design. A second manager brings its own Device,
+// created on and confined to the worker started below.
+void runWorkerCoalescingChecks(const wallpaperx::WallpaperManager::Config& config,
+                               const std::vector<std::string>& burstPaths, const Check& check) {
+    wallpaperx::WallpaperManager manager(config);
+    std::atomic<int> frameReadySignals{0};
+
+    // Released on every path, including an exception between here and the release below.
+    // A worker left blocked on this gate would never observe stop(), so ~RenderWorker
+    // would join a thread that never returns and the test would hang instead of failing.
+    struct Gate {
+        std::promise<void> promise;
+        bool open = false;
+        void release() {
+            if (!open) {
+                open = true;
+                promise.set_value();
+            }
+        }
+        ~Gate() { release(); }
+    } gate;
+    const std::shared_future<void> gateOpen = gate.promise.get_future().share();
+
+    wallpaperx::RenderWorker worker(manager, [&](int, uint64_t) { ++frameReadySignals; });
+    worker.postTask([gateOpen] { gateOpen.wait(); });
+
+    for (const std::string& path : burstPaths) {
+        manager.requestWallpaper("static", path, kMonitorWorkerCoalesce);
+        worker.post(kMonitorWorkerCoalesce);
+    }
+
+    // Queued behind the burst on the same FIFO, so once it runs every render the burst
+    // produced has completed. stop() deliberately does not drain the queue, so it cannot
+    // be used as the barrier here.
+    std::promise<void> drained;
+    const std::future<void> drainedFuture = drained.get_future();
+    worker.postTask([&drained] { drained.set_value(); });
+
+    gate.release();
+    drainedFuture.wait();
+
+    const wallpaperx::WallpaperManager::Snapshot snapshot = manager.snapshot();
+    const auto entry = snapshot.monitors.find(kMonitorWorkerCoalesce);
+    const bool present = entry != snapshot.monitors.end();
+    check(present, "the monitor the coalescing burst targeted appears in the manager's snapshot");
+    if (!present) return;
+
+    check(entry->second.generation == 1,
+          "five requests posted while the render thread is held collapse into exactly one render");
+    check(frameReadySignals.load() == 1, "exactly one FrameReady callback fires for the collapsed burst");
+    check(entry->second.path == burstPaths.back(), "the one render that happens serves the LAST request of the burst");
+
+    if (entry->second.generation != 1) {
+        std::fprintf(stderr, "  generation is %llu after a burst of %d, expected 1\n",
+                     static_cast<unsigned long long>(entry->second.generation), kBurstSize);
+    }
+}
+
+// --------------------------------------------------------------------------- //
+// Coalescing over the bus: when requests for one monitor arrive faster than the GPU can
+// serve them, the daemon must render the LAST one.
+//
+// This exists because the claim was previously asserted on evidence that could not
+// carry it. Five requests were fired at one monitor, the generation counter read 1, and
+// that was taken as proof. All five named the *same image* -- so a daemon that served
+// the first request and discarded the rest produces an identical observation, as does
+// one that served the last. The counter distinguishes "how many renders committed",
+// which was never the question; the question is "which request's pixels won".
+//
+// Two independent answers below. The outcome checks decide it from whether a frame
+// exists at all, which needs no access to the frame's contents and therefore runs on
+// every ICD. The content check decides it from the pixels, which needs a CPU-mappable
+// export and therefore runs only on the DMA_BUF + LINEAR path.
+// --------------------------------------------------------------------------- //
+void runCoalescingChecks(sdbus::IProxy& proxy, FrameReadyLog& signals, const std::string& imagePath,
+                         const std::string& corruptPath, const std::vector<std::string>& burstPaths,
+                         const Check& check) {
+    // The burst monitors are drained by the time the barrier monitor's frame lands: the
+    // daemon does all GPU work on one FIFO thread, and every burst request has already
+    // been recorded and posted by the time SetWallpaper returns to this thread, so the
+    // barrier request is unconditionally behind them in the queue. No sleep, no flake.
+    int barrierGeneration = 0;
+    const auto barrier = [&](const char* what) {
+        ++barrierGeneration;
+        setWallpaper(proxy, "static", imagePath, kMonitorCoalesceBarrier);
+        check(signals.wait(kMonitorCoalesceBarrier, static_cast<uint64_t>(barrierGeneration)), what);
+    };
+
+    // --- Outcome, on every ICD: a burst ending in a request that cannot render. ---
+    //
+    // If the last request wins, the monitor ends with no frame and a recorded error. If
+    // the first request won instead, it ends holding a perfectly good frame. Nothing
+    // about the *number* of renders is asserted -- an intermediate valid request may or
+    // may not commit and emit its own FrameReady depending on how fast the worker
+    // drains, and asserting on that would be asserting on the scheduler.
+    for (int i = 0; i < kBurstSize - 1; ++i) {
+        setWallpaper(proxy, "static", imagePath, kMonitorBurstFailLast);
+    }
+    setWallpaper(proxy, "static", corruptPath, kMonitorBurstFailLast);
+    barrier("the barrier frame arrives after a burst ending in an unrenderable request");
+
+    check(errorNameFrom([&] { getFrameFd(proxy, kMonitorBurstFailLast); }) == "io.wallpaperx.Daemon.Error.NoFrame",
+          "a burst ending in an unrenderable request leaves no frame -- the last request is served, not the first");
+    {
+        const nlohmann::json json = getStatus(proxy);
+        const nlohmann::json* monitor = wallpaperStatus(json, std::to_string(kMonitorBurstFailLast));
+        const bool reported = monitor != nullptr && monitor->value("path", std::string()) == corruptPath &&
+                              !monitor->value("has_frame", true) && monitor->contains("last_error");
+        check(reported, "GetStatus attributes the burst's outcome to the last request in it");
+    }
+
+    // --- Outcome, the mirror image: a burst ending in a request that *can* render. ---
+    //
+    // Runs the same shape in reverse so neither direction can pass for the wrong reason.
+    // Without it, a daemon that simply dropped every request after the first would fail
+    // the check above and pass nothing else -- but so would one that dropped every
+    // request, full stop, which is a different bug with a different fix.
+    for (int i = 0; i < kBurstSize - 1; ++i) {
+        setWallpaper(proxy, "static", corruptPath, kMonitorBurstRenderLast);
+    }
+    setWallpaper(proxy, "static", imagePath, kMonitorBurstRenderLast);
+    barrier("the barrier frame arrives after a burst ending in a renderable request");
+
+    check(errorNameFrom([&] { getFrameFd(proxy, kMonitorBurstRenderLast); }).empty(),
+          "a burst ending in a renderable request leaves a frame, even after four failures");
+    {
+        const nlohmann::json json = getStatus(proxy);
+        const nlohmann::json* monitor = wallpaperStatus(json, std::to_string(kMonitorBurstRenderLast));
+        const bool served = monitor != nullptr && monitor->value("path", std::string()) == imagePath &&
+                            monitor->value("has_frame", false);
+        check(served, "the burst's last request is the one reflected in GetStatus");
+    }
+
+    // --- Error recovery, deliberately NOT a burst. ---
+    //
+    // Whether a successful render clears a previous failure's last_error cannot be asked
+    // of a burst at all. Coalescing means the four corrupt requests above are never
+    // rendered -- the worker reads the latest request when the monitor is dequeued, so
+    // exactly one render runs and it is the valid one. last_error is therefore never set
+    // for that monitor, and asserting its absence afterwards holds no matter what the
+    // clearing code does. The check used to live there, passing for a monitor that had
+    // never failed.
+    //
+    // Sequencing the two requests, each behind its own barrier, is what makes the
+    // corrupt render actually execute and record an error for the next one to clear.
+    setWallpaper(proxy, "static", corruptPath, kMonitorErrorRecovery);
+    barrier("the barrier frame arrives after a standalone failing request");
+    {
+        const nlohmann::json json = getStatus(proxy);
+        const nlohmann::json* monitor = wallpaperStatus(json, std::to_string(kMonitorErrorRecovery));
+        const bool failed = monitor != nullptr && !monitor->value("has_frame", true) &&
+                            !monitor->value("last_error", std::string()).empty();
+        // Without this the clearing check below is unfalsifiable again, one step further
+        // out: nothing else here proves the error was ever recorded in the first place.
+        check(failed, "a standalone failing render records last_error, so there is an error to clear");
+    }
+
+    setWallpaper(proxy, "static", imagePath, kMonitorErrorRecovery);
+    check(signals.wait(kMonitorErrorRecovery, 1), "the recovering render emits FrameReady");
+    {
+        const nlohmann::json json = getStatus(proxy);
+        const nlohmann::json* monitor = wallpaperStatus(json, std::to_string(kMonitorErrorRecovery));
+        const bool cleared = monitor != nullptr && monitor->value("path", std::string()) == imagePath &&
+                             monitor->value("has_frame", false) && !monitor->contains("last_error");
+        // Pins the outcome, not one particular line. WallpaperManager clears lastError
+        // twice -- once in requestWallpaper() when the request is recorded, once in
+        // renderPending() when a render commits -- and either alone is sufficient here,
+        // so removing just one does not make this fail. Removing both does (verified).
+        // That redundancy is worth knowing about: a future edit that deletes one of them
+        // will not be caught by this check, and should not be assumed safe because it is.
+        check(cleared, "a successful render leaves no last_error behind from an earlier failed one");
+    }
+
+    // --- Content: which request's pixels actually reached the exported frame. ---
+    for (const std::string& path : burstPaths) {
+        setWallpaper(proxy, "static", path, kMonitorBurstContent);
+    }
+    barrier("the barrier frame arrives after a burst of five different images");
+
+    const Frame frame = getFrameFd(proxy, kMonitorBurstContent);
+    {
+        const nlohmann::json json = getStatus(proxy);
+        const nlohmann::json* monitor = wallpaperStatus(json, std::to_string(kMonitorBurstContent));
+        check(monitor != nullptr && monitor->value("path", std::string()) == burstPaths.back(),
+              "GetStatus reports the last image of the burst as the monitor's wallpaper");
+    }
+    // Reported, not asserted. How many renders a burst produces over the bus depends on
+    // how many complete before the next request lands, which is the scheduler's decision
+    // and not the daemon's -- runWorkerCoalescingChecks asserts the collapse exactly, by
+    // holding the render thread so there is no window to race with. Printed as both
+    // numbers rather than their difference: generation is uint64_t and kBurstSize is int,
+    // so subtracting produced 18446744073709551615 in precisely the broken case the line
+    // was there to explain.
+    std::printf("dbus_service_test: %d rapid requests over the bus produced generation %llu\n", kBurstSize,
+                static_cast<unsigned long long>(frame.generation));
+
+    if (frame.handleType != 1) {
+        std::printf(
+            "dbus_service_test: content check skipped -- this device exports OPAQUE_FD, whose bytes are "
+            "importable only by another Vulkan/GL context on the same device. The outcome checks above still "
+            "ran, and they decide first-wins vs last-wins on their own.\n");
+        return;
+    }
+    if (frame.drmModifier != wallpaperx::testing::kDrmModifierLinear) {
+        std::printf(
+            "dbus_service_test: content check skipped -- modifier 0x%llx is tiled, so its rows are not "
+            "CPU-addressable and a byte comparison would fail a correct export.\n",
+            static_cast<unsigned long long>(frame.drmModifier));
+        return;
+    }
+    if (frame.planes.empty()) {
+        check(false, "a LINEAR DMA_BUF frame carries a plane layout");
+        return;
+    }
+
+    // The fd must really be at least memorySize bytes before it is mapped. MappedFrame
+    // bounds-checks rows against memorySize -- the value the daemon *claims* -- not
+    // against the object's real size, so a daemon publishing a too-large memorySize
+    // yields a mapping whose tail has no backing pages and the pixel loop below takes a
+    // SIGBUS. frame_export_probe gained exactly this gate; the equivalent check here did
+    // not. The nearest existing assertion is a non-fatal check() on a different monitor,
+    // which records a FAIL and then falls straight through into this mmap.
+    const off_t fdSize = lseek(frame.fd.get(), 0, SEEK_END);
+    if (fdSize < 0) {
+        // "Could not determine the size" is not "the size is fine". Falling through here
+        // is what the gate exists to prevent: mmap does not validate length against the
+        // object, so a shorter object maps cleanly and the pixel loop below dies of
+        // SIGBUS with no FAIL line at all. Losing the content check on a non-seekable
+        // exporter is a stated gap; a crash is not.
+        std::printf(
+            "dbus_service_test: content check skipped -- lseek on the exported fd failed (%s), so its real size "
+            "cannot be confirmed against the published memory_size of %llu before mapping it.\n",
+            std::strerror(errno), static_cast<unsigned long long>(frame.memorySize));
+        return;
+    }
+    if (static_cast<uint64_t>(fdSize) < frame.memorySize) {
+        check(false, "the exported fd is at least as large as the memory_size the daemon published");
+        std::fprintf(stderr, "  fd is %lld bytes but memory_size is %llu -- not mapping it\n",
+                     static_cast<long long>(fdSize), static_cast<unsigned long long>(frame.memorySize));
+        return;
+    }
+
+    const wallpaperx::testing::MappedFrame mapping(frame.fd.get(), frame.memorySize);
+    if (!mapping.valid()) {
+        std::printf("dbus_service_test: content check skipped -- mmap of the exported fd failed (%s).\n",
+                    mapping.error().c_str());
+        return;
+    }
+
+    // The target is a solid fill of the last burst colour, in B8G8R8A8 order.
+    const unsigned char* rgb = kBurstColors[kBurstColorCount - 1];
+    const unsigned char expectedB = rgb[2];
+    const unsigned char expectedG = rgb[1];
+    const unsigned char expectedR = rgb[0];
+    constexpr int kTolerance = 6;
+
+    const uint64_t offset = frame.planes[0].get<0>();
+    const uint64_t pitch = frame.planes[0].get<1>();
+    size_t badPixels = 0;
+    unsigned char firstBad[4] = {0, 0, 0, 0};
+    for (uint32_t y = 0; y < kTargetHeight; ++y) {
+        const unsigned char* row = mapping.row(offset, pitch, y, static_cast<size_t>(kTargetWidth) * 4);
+        if (row == nullptr) {
+            badPixels += kTargetWidth;
+            continue;
+        }
+        for (uint32_t x = 0; x < kTargetWidth; ++x) {
+            const unsigned char* px = row + static_cast<size_t>(x) * 4;
+            if (std::abs(int(px[0]) - int(expectedB)) > kTolerance ||
+                std::abs(int(px[1]) - int(expectedG)) > kTolerance ||
+                std::abs(int(px[2]) - int(expectedR)) > kTolerance) {
+                if (badPixels == 0) std::memcpy(firstBad, px, 4);
+                ++badPixels;
+            }
+        }
+    }
+
+    check(badPixels == 0,
+          "the exported frame's pixels are the LAST image of the burst, read back through its own fd");
+    if (badPixels != 0) {
+        std::fprintf(stderr,
+                     "  %zu of %u pixels differ; expected B,G,R = %d,%d,%d, first mismatch was %d,%d,%d "
+                     "(the burst's first colour is B,G,R = %d,%d,%d)\n",
+                     badPixels, kTargetWidth * kTargetHeight, expectedB, expectedG, expectedR, firstBad[0],
+                     firstBad[1], firstBad[2], kBurstColors[0][2], kBurstColors[0][1], kBurstColors[0][0]);
+    } else {
+        std::printf("dbus_service_test: exported frame is solid B,G,R = %d,%d,%d -- the burst's last image\n",
+                    expectedB, expectedG, expectedR);
     }
 }
 
@@ -559,6 +956,7 @@ int main() {
     try {
         const std::string imagePath = writeTestImage();
         const std::string corruptPath = writeCorruptImage();
+        const std::vector<std::string> burstPaths = writeBurstImages();
 
         // Declared before everything it outlives. The signal callback below captures it,
         // and that callback runs on the proxy's dispatch thread -- so if the log were
@@ -591,6 +989,11 @@ int main() {
 
         runHostChecks(*proxy, imagePath, check);
         runRenderChecks(*proxy, signals, imagePath, corruptPath, check);
+        runCoalescingChecks(*proxy, signals, imagePath, corruptPath, burstPaths, check);
+
+        // Its own manager and Device, scoped inside the call so both are torn down
+        // before the validation warning count is read below.
+        runWorkerCoalescingChecks(config, burstPaths, check);
     } catch (const std::exception& e) {
         // Without this the first unhandled sdbus::Error -- which is what a host with no
         // usable Vulkan ICD produces -- would escape main and abort the process, so

@@ -139,6 +139,11 @@ enable_testing()
 
 add_executable(wallpaperx-dbus-service-test tests/dbus_service_test.cpp)
 target_link_libraries(wallpaperx-dbus-service-test PRIVATE wallpaperx-daemon-lib)
+# Header-only test scaffolding shared with the renderer's probes (support/), for
+# reading an exported frame's bytes back through its fd. Not part of the renderer
+# library: nothing WallpaperX ships CPU-maps an exported frame, only a test does.
+target_include_directories(wallpaperx-dbus-service-test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../renderer/tests)
 target_compile_definitions(wallpaperx-dbus-service-test PRIVATE
     WALLPAPERX_TEST_IMAGE_DIR="${CMAKE_CURRENT_BINARY_DIR}/test_assets"
 )

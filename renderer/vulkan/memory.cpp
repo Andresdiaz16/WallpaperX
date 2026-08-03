@@ -116,9 +116,10 @@ std::vector<VkDrmFormatModifierPropertiesEXT> queryDrmModifierList(VkPhysicalDev
     return all;
 }
 
-std::vector<uint64_t> Memory::supportedDrmModifiers(VkFormat format, VkImageType imageType, VkImageUsageFlags usage,
-                                                    VkExtent3D extent) const {
-    const std::vector<VkDrmFormatModifierPropertiesEXT> all = queryDrmModifierList(m_physicalDevice, format);
+std::vector<uint64_t> usableDrmModifiers(VkPhysicalDevice physicalDevice, VkFormat format, VkImageType imageType,
+                                         VkImageUsageFlags usage, VkExtent3D extent,
+                                         VkExternalMemoryFeatureFlags requiredFeatures) {
+    const std::vector<VkDrmFormatModifierPropertiesEXT> all = queryDrmModifierList(physicalDevice, format);
 
     // A modifier appearing in the format's list only means the driver understands the
     // layout -- not that it can render to it, sample it, or export it as a dma_buf.
@@ -147,10 +148,10 @@ std::vector<uint64_t> Memory::supportedDrmModifiers(VkFormat format, VkImageType
         VkImageFormatProperties2 imageFormatProps{VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2};
         imageFormatProps.pNext = &externalProps;
 
-        if (vkGetPhysicalDeviceImageFormatProperties2(m_physicalDevice, &imageFormatInfo, &imageFormatProps) !=
+        if (vkGetPhysicalDeviceImageFormatProperties2(physicalDevice, &imageFormatInfo, &imageFormatProps) !=
                 VK_SUCCESS ||
-            !(externalProps.externalMemoryProperties.externalMemoryFeatures &
-              VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT)) {
+            (externalProps.externalMemoryProperties.externalMemoryFeatures & requiredFeatures) !=
+                requiredFeatures) {
             continue;
         }
         // The extent is not part of the query, so the returned maxExtent has to be
@@ -198,10 +199,20 @@ AllocatedImage Memory::createExportableImage(const VkImageCreateInfo& imageInfoI
                 "DRM format modifier cannot be interpreted by any importer");
         }
 
-        modifiers = supportedDrmModifiers(imageInfo.format, imageInfo.imageType, imageInfo.usage, imageInfo.extent);
+        // EXPORTABLE *and* IMPORTABLE. Exportability alone is the wrong question: the
+        // artifact this produces is defined by whether a consumer can interpret it, and a
+        // driver may advertise a modifier it can hand out but not take back. Offering
+        // such a modifier lets the driver pick it, after which exportFrame() publishes it
+        // over DBus, the compositor's vkCreateImage/EGL_LINUX_DMA_BUF rejects it, and the
+        // wallpaper never appears while GetStatus still reports has_frame=true with no
+        // last_error. Narrowing the set trades that for a failure here, where it is
+        // attributable and local.
+        modifiers = usableDrmModifiers(
+            m_physicalDevice, imageInfo.format, imageInfo.imageType, imageInfo.usage, imageInfo.extent,
+            VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT | VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT);
         if (modifiers.empty()) {
             throw std::runtime_error(
-                std::string("Memory: no exportable DRM format modifier supports ") +
+                std::string("Memory: no DRM format modifier is both exportable and importable for ") +
                 std::to_string(imageInfo.extent.width) + "x" + std::to_string(imageInfo.extent.height) +
                 " with the requested usage for " + (debugName ? debugName : "(unnamed exportable image)"));
         }

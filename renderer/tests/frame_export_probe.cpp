@@ -3,6 +3,9 @@
 #include "vulkan/frame_export.h"
 #include "renderers/static_renderer.h"
 
+#include "support/exported_frame_map.h"
+#include "support/gpu_readback.h"
+
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include <stb_image_write.h>
 
@@ -10,34 +13,282 @@
 #include <sys/resource.h>
 #include <unistd.h>
 
+#include <cstring>
 #include <filesystem>
 #include <iostream>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace {
 
-// A distinct filename from static_renderer_probe's test_red.png so the two
-// probes never touch the same file, even under `ctest -jN` -- no RESOURCE_LOCK
-// needed here.
+using wallpaperx::testing::kBytesPerPixel;
+using wallpaperx::testing::kDrmModifierLinear;
+using wallpaperx::testing::renderReference;
+using wallpaperx::testing::variesInBothAxes;
+
+// Deliberately not square, and deliberately not a round number of pixels wide.
+//
+// A square target passes just as happily with width and height transposed, and a
+// power-of-two width makes a rowPitch that ignores padding indistinguishable from one
+// that accounts for it -- the two mistakes this probe most needs to catch. 68x36 is
+// large enough for a driver to pad the stride and small enough to stay fast under
+// software rasterisation.
+constexpr uint32_t kTargetWidth = 68;
+constexpr uint32_t kTargetHeight = 36;
+
+// A distinct filename from static_renderer_probe's test_red.png so the two probes
+// never touch the same file. That is not sufficient on its own: this probe and its
+// _lavapipe twin are the same binary and write this same path, so they are locked to
+// a shared ctest RESOURCE_LOCK -- without it `ctest -jN` can have one process reading
+// a half-written PNG the other is still emitting.
+//
+// The pattern is a per-pixel gradient, not the flat red the other probes use. Flat
+// colour is worthless to this probe specifically: the content check below compares a
+// CPU mapping of the exported memory against a Vulkan readback of the same image, and
+// against a uniform frame that comparison succeeds for *any* rowPitch, any plane
+// offset, and either orientation. Only content that varies in both axes can fail it.
 std::string writeTestImage() {
     std::filesystem::create_directories(WALLPAPERX_TEST_IMAGE_DIR);
-    const std::string path = std::string(WALLPAPERX_TEST_IMAGE_DIR) + "/frame_export_red.png";
+    const std::string path = std::string(WALLPAPERX_TEST_IMAGE_DIR) + "/frame_export_gradient.png";
 
-    const int w = 8;
-    const int h = 8;
+    const int w = 16;
+    const int h = 16;
     std::vector<unsigned char> pixels(static_cast<size_t>(w) * h * 4);
-    for (int i = 0; i < w * h; ++i) {
-        pixels[i * 4 + 0] = 255;
-        pixels[i * 4 + 1] = 0;
-        pixels[i * 4 + 2] = 0;
-        pixels[i * 4 + 3] = 255;
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            unsigned char* px = &pixels[(static_cast<size_t>(y) * w + x) * 4];
+            px[0] = static_cast<unsigned char>(16 + x * 15);  // R varies along x only
+            px[1] = static_cast<unsigned char>(16 + y * 15);  // G varies along y only
+            px[2] = static_cast<unsigned char>((x * 16 + y * 3) & 0xff);
+            px[3] = 255;
+        }
     }
 
     if (!stbi_write_png(path.c_str(), w, h, 4, pixels.data(), w * 4)) {
         throw std::runtime_error("frame_export_probe: failed to write test image");
     }
     return path;
+}
+
+// The layout assertions that hold for any DmaBuf frame carrying a real modifier.
+// Split out of testHappyPathExport so the content test can apply them too without
+// duplicating the reasoning about which of them are modifier-dependent.
+bool checkDmaBufLayout(const wallpaperx::ExportedFrame& frame, uint32_t width, uint32_t height) {
+    bool ok = true;
+
+    if (frame.modifier == wallpaperx::kDrmModifierInvalid) {
+        std::cerr << "frame_export_probe: DmaBuf frame reports DRM_FORMAT_MOD_INVALID -- "
+                     "the image was not created with an explicit DRM format modifier"
+                  << std::endl;
+        ok = false;
+    }
+    // Derived from kFormat through the same mapping the exporter uses, so this
+    // tracks a format change instead of pinning a literal. The real guard
+    // against an unmapped format is drmFourccForVkFormat returning 0, which
+    // makes exportFrame throw -- asserted separately here.
+    const uint32_t expectedFourcc = wallpaperx::drmFourccForVkFormat(wallpaperx::OffscreenTargetManager::kFormat);
+    if (expectedFourcc == 0) {
+        std::cerr << "frame_export_probe: no DRM fourcc mapping for the offscreen target's format -- "
+                     "drmFourccForVkFormat needs a case for it"
+                  << std::endl;
+        ok = false;
+    }
+    if (frame.drmFormat != expectedFourcc) {
+        std::cerr << "frame_export_probe: DmaBuf frame reports drmFormat 0x" << std::hex << frame.drmFormat
+                  << ", expected 0x" << expectedFourcc << std::dec << " for the target's Vulkan format" << std::endl;
+        ok = false;
+    }
+    if (frame.planes.empty()) {
+        std::cerr << "frame_export_probe: DmaBuf frame carries no plane layout" << std::endl;
+        ok = false;
+    }
+    // Every plane must sit inside the memory actually exported -- catches a
+    // layout that was defaulted rather than queried, and holds for any modifier.
+    for (size_t i = 0; i < frame.planes.size(); ++i) {
+        if (frame.planes[i].offset >= frame.memorySize) {
+            std::cerr << "frame_export_probe: plane " << i << " offset " << frame.planes[i].offset
+                      << " lies outside the exported allocation (" << frame.memorySize << " bytes)" << std::endl;
+            ok = false;
+        }
+    }
+    // rowPitch is a real byte stride only under LINEAR. For tiled/compressed
+    // modifiers (AMD DCC, Intel Y-tiled+CCS) vkGetImageSubresourceLayout may
+    // report a pitch that is not the linear width of a row, and 0 is legal for
+    // planes whose contents are not row-addressable -- so bounding it there
+    // would fail a correct export on exactly the hardware this code is for.
+    // Lavapipe only offers LINEAR, so CI still exercises this branch.
+    if (frame.modifier == kDrmModifierLinear && !frame.planes.empty()) {
+        const uint64_t rowBytes = uint64_t{width} * kBytesPerPixel;
+        if (frame.planes[0].rowPitch < rowBytes) {
+            std::cerr << "frame_export_probe: LINEAR plane 0 rowPitch " << frame.planes[0].rowPitch << " is below the "
+                      << rowBytes << " bytes a " << width << "px BGRA row needs" << std::endl;
+            ok = false;
+        }
+        // Under LINEAR the whole image is addressable, so the *extent* is checkable
+        // and not just the starting offset. An allocation that stops short of the
+        // last row is one an importer walks off the end of -- and the offset-only
+        // check above passes for it, because the offset is still in range.
+        const uint64_t lastRowEnd =
+            frame.planes[0].offset + uint64_t{height - 1} * frame.planes[0].rowPitch + rowBytes;
+        if (lastRowEnd > frame.memorySize) {
+            std::cerr << "frame_export_probe: LINEAR plane 0 needs " << lastRowEnd << " bytes for " << width << "x"
+                      << height << " at pitch " << frame.planes[0].rowPitch << ", but only " << frame.memorySize
+                      << " were exported" << std::endl;
+            ok = false;
+        }
+    }
+    return ok;
+}
+
+// The check this probe exists for, and the only one here that does not take the
+// exporter's word for anything: map the exported memory through nothing but the fd,
+// walk it using nothing but the offset/rowPitch/dimensions the frame published, and
+// compare the result against a Vulkan readback of the same image.
+//
+// Every previous assertion in this file is the export path describing itself --
+// internally consistent whether or not the numbers mean anything to a consumer. This
+// one fails if plane[0].offset points at the wrong place, if rowPitch is off by a
+// padding row, if width and height are transposed, or if memorySize describes a
+// different allocation than the fd does.
+//
+// Only runs where the bytes are CPU-addressable: a DmaBuf frame with the LINEAR
+// modifier. That is Lavapipe, which runs as a ctest twin on every build, so this is
+// not a branch that first executes on a stranger's machine. A tiled modifier
+// (NVIDIA's block-linear, AMD DCC) has no CPU-walkable row layout and is skipped
+// loudly -- verifying those needs a real importer, which is a separate piece of work.
+bool testExportedBytesMatchReadback() {
+    wallpaperx::resetValidationWarningCount();
+
+    // Set by the paths that cannot run the comparison on this device. They are not
+    // failures, but they must not re-encode the pass criterion either: each used to
+    // `return validationWarningCount() == 0` inline, which silently dropped the
+    // "N Vulkan validation warning(s)" diagnostic the tail prints. On the OPAQUE_FD
+    // path -- the default on this project's own hardware, so the one that runs most
+    // often -- that meant a validation warning failed the probe with no stated reason.
+    bool skipped = false;
+
+    try {
+        const std::string imagePath = writeTestImage();
+
+        wallpaperx::Device device(/*enableValidation=*/true);
+        wallpaperx::OffscreenTargetManager targets(device);
+        wallpaperx::StaticRenderer renderer(device, targets.renderPass(), imagePath, WALLPAPERX_SHADER_DIR);
+
+        // The reference comes from its own target, which is never exported. See
+        // renderReference() for why reading back the exported target first would move
+        // exportFrame() onto a release scope the daemon never uses.
+        const std::vector<unsigned char> expected =
+            renderReference(device, targets, renderer, /*monitorId=*/1, kTargetWidth, kTargetHeight);
+        if (!variesInBothAxes(expected, kTargetWidth, kTargetHeight)) {
+            std::cerr << "frame_export_probe (contents): the rendered frame is constant along an axis, so comparing "
+                         "it against the exported memory cannot detect a wrong stride or a transposed read -- the "
+                         "test image or the renderer changed and this check has lost its power"
+                      << std::endl;
+            return false;
+        }
+
+        // Exported straight from the layout the render left behind, exactly as
+        // GetFrameFd does.
+        const auto& target = targets.create(0, kTargetWidth, kTargetHeight);
+        targets.render(renderer, target);
+
+        wallpaperx::ExportedFrame frame = wallpaperx::exportFrame(device, target);
+        struct FdGuard {
+            int fd;
+            ~FdGuard() {
+                if (fd >= 0) close(fd);
+            }
+        } fdGuard{frame.fd};
+
+        std::cout << "frame_export_probe (contents): fd " << frame.fd << " -> "
+                  << wallpaperx::testing::fdDescription(frame.fd) << std::endl;
+
+        if (frame.type != wallpaperx::ExportedFrame::HandleType::DmaBuf) {
+            std::cout << "frame_export_probe (contents): skipped, this device exports OPAQUE_FD -- its bytes are "
+                         "importable only by another Vulkan/GL context on the same device, not by the CPU"
+                      << std::endl;
+            skipped = true;
+        } else if (!checkDmaBufLayout(frame, kTargetWidth, kTargetHeight)) {
+            return false;
+        } else if (frame.modifier != kDrmModifierLinear) {
+            std::cout << "frame_export_probe (contents): skipped, modifier 0x" << std::hex << frame.modifier << std::dec
+                      << " is tiled -- its rows are not CPU-addressable, so a byte-for-byte comparison would fail a "
+                         "correct export"
+                      << std::endl;
+            skipped = true;
+        }
+
+        if (!skipped) {
+            // An independent statement of the buffer's size: for a real dma_buf the
+            // kernel answers this from the object itself, with no involvement from
+            // Vulkan. Not every fd supports it (a memfd does, a pipe does not), so a
+            // failure is a skip rather than a verdict -- but when it answers, it must
+            // not contradict the memorySize the frame carries.
+            const off_t seekSize = lseek(frame.fd, 0, SEEK_END);
+            if (seekSize >= 0 && static_cast<uint64_t>(seekSize) < frame.memorySize) {
+                std::cerr << "frame_export_probe (contents): the fd is " << seekSize
+                          << " bytes but the frame claims memorySize " << frame.memorySize
+                          << " -- the exported handle is smaller than the allocation it describes" << std::endl;
+                return false;
+            }
+
+            const wallpaperx::testing::MappedFrame mapping(frame.fd, frame.memorySize);
+            if (!mapping.valid()) {
+                // A LINEAR dma_buf that cannot be mapped is not a configuration this
+                // project can verify, but it is also not one it can call broken:
+                // whether an exporter permits CPU mapping is driver policy, and a GPU
+                // importer never needs it. Skip loudly rather than fail, and rather
+                // than pass in silence.
+                std::cout << "frame_export_probe (contents): skipped, mmap of the exported fd failed ("
+                          << mapping.error() << ") -- this driver does not permit CPU mapping of its dma_buf"
+                          << std::endl;
+                skipped = true;
+            } else {
+                const uint64_t offset = frame.planes[0].offset;
+                const uint64_t pitch = frame.planes[0].rowPitch;
+                const size_t rowBytes = static_cast<size_t>(kTargetWidth) * kBytesPerPixel;
+
+                size_t mismatchedRows = 0;
+                uint32_t firstBadRow = 0;
+                for (uint32_t y = 0; y < kTargetHeight; ++y) {
+                    const unsigned char* exportedRow = mapping.row(offset, pitch, y, rowBytes);
+                    const unsigned char* expectedRow = expected.data() + static_cast<size_t>(y) * rowBytes;
+                    if (exportedRow == nullptr || std::memcmp(exportedRow, expectedRow, rowBytes) != 0) {
+                        if (mismatchedRows == 0) firstBadRow = y;
+                        ++mismatchedRows;
+                    }
+                }
+
+                if (mismatchedRows != 0) {
+                    std::cerr << "frame_export_probe (contents): " << mismatchedRows << " of " << kTargetHeight
+                              << " rows read back through the exported fd differ from the Vulkan readback (first at "
+                                 "row "
+                              << firstBadRow << ", plane offset " << offset << ", rowPitch " << pitch
+                              << ") -- the published layout does not describe the exported bytes" << std::endl;
+                    return false;
+                }
+
+                std::cout << "frame_export_probe (contents): all " << kTargetHeight << " rows of the " << kTargetWidth
+                          << "x" << kTargetHeight << " frame read correctly through the exported fd (offset " << offset
+                          << ", rowPitch " << pitch << ")" << std::endl;
+            }
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "frame_export_probe (contents) failed: " << e.what() << std::endl;
+        return false;
+    }
+
+    // One tail for every exit, skipped or not.
+    const int warnings = wallpaperx::validationWarningCount();
+    if (warnings > 0) {
+        std::cerr << "frame_export_probe (contents): " << warnings << " Vulkan validation warning(s)" << std::endl;
+        return false;
+    }
+
+    std::cout << "frame_export_probe (contents): " << (skipped ? "skipped" : "passed")
+              << ", zero validation warnings" << std::endl;
+    return true;
 }
 
 bool testHappyPathExport() {
@@ -49,9 +300,7 @@ bool testHappyPathExport() {
         wallpaperx::Device device(/*enableValidation=*/true);
         wallpaperx::OffscreenTargetManager targets(device);
 
-        const uint32_t width = 64;
-        const uint32_t height = 64;
-        const auto& target = targets.create(0, width, height);
+        const auto& target = targets.create(0, kTargetWidth, kTargetHeight);
 
         // Render a real frame into the target first -- exercises the realistic
         // "export something that has actually been drawn into" flow, not just an
@@ -75,6 +324,18 @@ bool testHappyPathExport() {
             std::cerr << "frame_export_probe: re-rendered export did not produce a valid fd" << std::endl;
             ok = false;
         }
+        // Re-exporting the same target must describe the same buffer. The image was not
+        // reallocated between the two exports, so a differing modifier, fourcc, plane
+        // count or size means the metadata is being derived from transient state rather
+        // than queried from the image -- which an importer caching the first frame's
+        // layout (as a compositor does) would then misread on every later frame.
+        if (frame3.type != frame1.type || frame3.modifier != frame1.modifier ||
+            frame3.drmFormat != frame1.drmFormat || frame3.planes.size() != frame1.planes.size() ||
+            frame3.memorySize != frame1.memorySize) {
+            std::cerr << "frame_export_probe: re-exporting an unchanged target produced different layout metadata"
+                      << std::endl;
+            ok = false;
+        }
         close(frame3.fd);
 
         // The fd must be a real, currently-open OS file descriptor.
@@ -88,20 +349,20 @@ bool testHappyPathExport() {
         }
 
         // width/height are copied straight from the target and must match exactly.
-        if (frame1.width != width || frame1.height != height) {
+        if (frame1.width != kTargetWidth || frame1.height != kTargetHeight) {
             std::cerr << "frame_export_probe: exported dimensions " << frame1.width << "x" << frame1.height
-                      << " do not match target " << width << "x" << height << std::endl;
+                      << " do not match target " << kTargetWidth << "x" << kTargetHeight << std::endl;
             ok = false;
         }
 
         // The backing allocation must be large enough to hold the image. It can
         // legitimately be larger than width*height*bpp due to alignment/padding
         // (dedicated allocation), so assert a lower bound, not equality.
-        const VkDeviceSize minBytes = static_cast<VkDeviceSize>(width) * height * 4;  // B8G8R8A8_UNORM
+        const VkDeviceSize minBytes = static_cast<VkDeviceSize>(kTargetWidth) * kTargetHeight * kBytesPerPixel;
         if (frame1.memorySize < minBytes) {
             std::cerr << "frame_export_probe: exported memorySize " << frame1.memorySize
-                      << " is smaller than the minimum " << minBytes << " for a " << width << "x" << height
-                      << " BGRA image" << std::endl;
+                      << " is smaller than the minimum " << minBytes << " for a " << kTargetWidth << "x"
+                      << kTargetHeight << " BGRA image" << std::endl;
             ok = false;
         }
 
@@ -118,10 +379,14 @@ bool testHappyPathExport() {
         // rather than assert the absence of it: a frame carrying MOD_INVALID or a zero
         // pitch is one no compositor can interpret.
         //
-        // Gated on the image actually being modifier-tiled, not just on the frame being
-        // DmaBuf: a driver with dma_buf but no usable DRM modifier is a configuration
-        // the renderer deliberately supports in degraded form, and it correctly reports
-        // the unset sentinels. Asserting unconditionally would fail that config.
+        // Applied to every DmaBuf frame, with no extra gate on the image being
+        // modifier-tiled. That gate dated from when a dma_buf export without
+        // VK_EXT_image_drm_format_modifier was degraded rather than refused;
+        // createExportableImage() now throws for it, so drmModifierTiled is necessarily
+        // true for any frame that reaches here as DmaBuf and the condition was
+        // unreachable-false. Worse, the two call sites of checkDmaBufLayout() disagreed
+        // about it, so the same frame was held to different standards depending on which
+        // test looked at it.
         // An opaque fd is imported by another context on the same device, which needs
         // no layout metadata -- publishing a real-looking modifier here would send the
         // KDE plugin down its dmabuf-import branch for a handle that cannot support it.
@@ -133,66 +398,8 @@ bool testHappyPathExport() {
                 ok = false;
             }
         }
-        if (frame1.type == wallpaperx::ExportedFrame::HandleType::DmaBuf && !target.image.drmModifierTiled) {
-            if (frame1.modifier != wallpaperx::kDrmModifierInvalid || frame1.drmFormat != 0 ||
-                !frame1.planes.empty()) {
-                std::cerr << "frame_export_probe: a DmaBuf frame without modifier tiling must report unset layout "
-                             "metadata, not a partially-filled one"
-                          << std::endl;
-                ok = false;
-            }
-        }
-        if (frame1.type == wallpaperx::ExportedFrame::HandleType::DmaBuf && target.image.drmModifierTiled) {
-            if (frame1.modifier == wallpaperx::kDrmModifierInvalid) {
-                std::cerr << "frame_export_probe: DmaBuf frame reports DRM_FORMAT_MOD_INVALID -- "
-                             "the image was not created with an explicit DRM format modifier"
-                          << std::endl;
-                ok = false;
-            }
-            // Derived from kFormat through the same mapping the exporter uses, so this
-            // tracks a format change instead of pinning a literal. The real guard
-            // against an unmapped format is drmFourccForVkFormat returning 0, which
-            // makes exportFrame throw -- asserted separately below.
-            const uint32_t expectedFourcc =
-                wallpaperx::drmFourccForVkFormat(wallpaperx::OffscreenTargetManager::kFormat);
-            if (expectedFourcc == 0) {
-                std::cerr << "frame_export_probe: no DRM fourcc mapping for the offscreen target's format -- "
-                             "drmFourccForVkFormat needs a case for it"
-                          << std::endl;
-                ok = false;
-            }
-            if (frame1.drmFormat != expectedFourcc) {
-                std::cerr << "frame_export_probe: DmaBuf frame reports drmFormat 0x" << std::hex << frame1.drmFormat
-                          << ", expected 0x" << expectedFourcc << std::dec << " for the target's Vulkan format"
-                          << std::endl;
-                ok = false;
-            }
-            if (frame1.planes.empty()) {
-                std::cerr << "frame_export_probe: DmaBuf frame carries no plane layout" << std::endl;
-                ok = false;
-            }
-            // Every plane must sit inside the memory actually exported -- catches a
-            // layout that was defaulted rather than queried, and holds for any modifier.
-            for (size_t i = 0; i < frame1.planes.size(); ++i) {
-                if (frame1.planes[i].offset >= frame1.memorySize) {
-                    std::cerr << "frame_export_probe: plane " << i << " offset " << frame1.planes[i].offset
-                              << " lies outside the exported allocation (" << frame1.memorySize << " bytes)"
-                              << std::endl;
-                    ok = false;
-                }
-            }
-            // rowPitch is a real byte stride only under LINEAR. For tiled/compressed
-            // modifiers (AMD DCC, Intel Y-tiled+CCS) vkGetImageSubresourceLayout may
-            // report a pitch that is not the linear width of a row, and 0 is legal for
-            // planes whose contents are not row-addressable -- so bounding it there
-            // would fail a correct export on exactly the hardware this code is for.
-            // Lavapipe only offers LINEAR, so CI still exercises this branch.
-            constexpr uint64_t kDrmModifierLinear = 0;
-            if (frame1.modifier == kDrmModifierLinear && !frame1.planes.empty() &&
-                frame1.planes[0].rowPitch < uint64_t{width} * 4) {
-                std::cerr << "frame_export_probe: LINEAR plane 0 rowPitch " << frame1.planes[0].rowPitch
-                          << " is below the " << (width * 4) << " bytes a " << width << "px BGRA row needs"
-                          << std::endl;
+        if (frame1.type == wallpaperx::ExportedFrame::HandleType::DmaBuf) {
+            if (!checkDmaBufLayout(frame1, kTargetWidth, kTargetHeight)) {
                 ok = false;
             }
         }
@@ -247,7 +454,7 @@ bool testExportFromDestroyedTargetThrows() {
         wallpaperx::Device device(/*enableValidation=*/true);
         wallpaperx::OffscreenTargetManager targets(device);
 
-        const wallpaperx::OffscreenTarget stale = targets.create(0, 64, 64);
+        const wallpaperx::OffscreenTarget stale = targets.create(0, kTargetWidth, kTargetHeight);
         targets.destroy(0);
 
         bool threw = false;
@@ -294,7 +501,7 @@ bool testNeverReturnsInvalidFdUnderExhaustion() {
     try {
         wallpaperx::Device device(/*enableValidation=*/true);
         wallpaperx::OffscreenTargetManager targets(device);
-        const auto& target = targets.create(0, 64, 64);
+        const auto& target = targets.create(0, kTargetWidth, kTargetHeight);
 
         rlimit original{};
         getrlimit(RLIMIT_NOFILE, &original);
@@ -355,6 +562,7 @@ bool testNeverReturnsInvalidFdUnderExhaustion() {
 int main() {
     bool ok = true;
     ok &= testHappyPathExport();
+    ok &= testExportedBytesMatchReadback();
     ok &= testExportFromDestroyedTargetThrows();
     ok &= testNeverReturnsInvalidFdUnderExhaustion();
     return ok ? 0 : 1;

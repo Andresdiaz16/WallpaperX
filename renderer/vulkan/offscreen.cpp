@@ -136,10 +136,7 @@ const OffscreenTarget& OffscreenTargetManager::create(int monitorId, uint32_t wi
     imageInfo.arrayLayers = 1;
     imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
     imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
-    // TRANSFER_SRC so the rendered frame can be copied out (readback for tests,
-    // and the natural expectation for a frame we intend to export/hand off).
-    imageInfo.usage =
-        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    imageInfo.usage = kUsage;
     imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 

@@ -175,20 +175,57 @@ target_link_libraries(wallpaperx-descriptor-allocator-probe PRIVATE wallpaperx-r
 
 add_executable(wallpaperx-frame-export-probe tests/frame_export_probe.cpp)
 target_link_libraries(wallpaperx-frame-export-probe PRIVATE wallpaperx-renderer)
+# tests/support/ holds header-only test scaffolding shared with backend/tests -- kept
+# out of the renderer library because nothing WallpaperX ships CPU-maps an exported
+# frame; only a test needs to.
+target_include_directories(wallpaperx-frame-export-probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 add_dependencies(wallpaperx-frame-export-probe wallpaperx-shaders)
 target_compile_definitions(wallpaperx-frame-export-probe PRIVATE
     WALLPAPERX_SHADER_DIR="${SHADER_OUTPUT_DIR}"
     WALLPAPERX_TEST_IMAGE_DIR="${CMAKE_CURRENT_BINARY_DIR}/test_assets"
 )
 
+add_executable(wallpaperx-modifier-roundtrip-probe tests/modifier_roundtrip_probe.cpp)
+target_link_libraries(wallpaperx-modifier-roundtrip-probe PRIVATE wallpaperx-renderer)
+add_dependencies(wallpaperx-modifier-roundtrip-probe wallpaperx-shaders)
+target_compile_definitions(wallpaperx-modifier-roundtrip-probe PRIVATE
+    WALLPAPERX_SHADER_DIR="${SHADER_OUTPUT_DIR}"
+    WALLPAPERX_TEST_IMAGE_DIR="${CMAKE_CURRENT_BINARY_DIR}/test_assets"
+)
+
+add_executable(wallpaperx-handle-type-env-test tests/handle_type_env_test.cpp)
+target_link_libraries(wallpaperx-handle-type-env-test PRIVATE wallpaperx-renderer)
+
 enable_testing()
 add_test(NAME tier_selection COMMAND wallpaperx-tier-selection-test)
 add_test(NAME memory_export COMMAND wallpaperx-memory-export-test)
+
+# The two-argument externalMemoryHandleType() caches WALLPAPERX_FORCE_HANDLE_TYPE in a
+# function-local static, so one process can only ever observe one value of it. Three
+# processes, three environments -- a single binary looping over setenv would test the
+# first value three times and report the other two as passing.
+add_test(NAME handle_type_env_default COMMAND wallpaperx-handle-type-env-test "")
+add_test(NAME handle_type_env_opaque COMMAND wallpaperx-handle-type-env-test opaque)
+add_test(NAME handle_type_env_dmabuf COMMAND wallpaperx-handle-type-env-test dmabuf)
+set_tests_properties(handle_type_env_opaque PROPERTIES ENVIRONMENT "WALLPAPERX_FORCE_HANDLE_TYPE=opaque")
+set_tests_properties(handle_type_env_dmabuf PROPERTIES ENVIRONMENT "WALLPAPERX_FORCE_HANDLE_TYPE=dmabuf")
+# Explicitly unset for the default case: ctest inherits the caller's environment, so a
+# developer who exported the variable would otherwise silently turn this into a fourth
+# copy of whichever case they happened to have set.
+set_tests_properties(handle_type_env_default PROPERTIES ENVIRONMENT "WALLPAPERX_FORCE_HANDLE_TYPE=")
 add_test(NAME device_probe COMMAND wallpaperx-device-probe)
 add_test(NAME offscreen_probe COMMAND wallpaperx-offscreen-probe)
 add_test(NAME static_renderer_probe COMMAND wallpaperx-static-renderer-probe)
 add_test(NAME descriptor_allocator_probe COMMAND wallpaperx-descriptor-allocator-probe)
 add_test(NAME frame_export_probe COMMAND wallpaperx-frame-export-probe)
+# Two entries, one binary. The probe makes two claims that are verifiable on different
+# hardware: the round trip needs one usable DRM modifier, while modifier *sensitivity*
+# needs two, so a wrong one can be substituted. Lavapipe offers exactly one (LINEAR), so
+# it verifies the first and cannot verify the second. Reporting both as a single verdict
+# means either claiming the control ran when it did not, or marking the whole probe
+# unverified when the round trip demonstrably passed.
+add_test(NAME modifier_roundtrip_probe COMMAND wallpaperx-modifier-roundtrip-probe roundtrip)
+add_test(NAME modifier_sensitivity_probe COMMAND wallpaperx-modifier-roundtrip-probe sensitivity)
 
 # static_renderer_probe and its _lavapipe twin run the same binary and both
 # read/write the same WALLPAPERX_TEST_IMAGE_DIR path -- lock them to the same
@@ -196,6 +233,22 @@ add_test(NAME frame_export_probe COMMAND wallpaperx-frame-export-probe)
 # which would otherwise risk one process reading a half-written PNG from
 # the other.
 set_tests_properties(static_renderer_probe PROPERTIES RESOURCE_LOCK static_renderer_probe_test_image)
+
+# Same hazard for frame_export_probe, which writes its own gradient PNG: the probe and
+# its _lavapipe twin are one binary run twice, so they share the file regardless of it
+# being named differently from static_renderer_probe's.
+set_tests_properties(frame_export_probe PROPERTIES RESOURCE_LOCK frame_export_probe_test_image)
+
+# 77 means "this driver could not answer the question": no dma_buf/modifier support at
+# all for either entry, or -- for the sensitivity entry only -- no second modifier to
+# substitute. Without SKIP_RETURN_CODE such a run exits 0 and is indistinguishable from
+# one that actually verified something, so a regression making the importer
+# modifier-blind would ship under a green tick.
+#
+# All four entries share the lock: they are one binary writing one PNG path, so `ctest
+# -jN` would otherwise have one process reading a file another is still emitting.
+set_tests_properties(modifier_roundtrip_probe modifier_sensitivity_probe
+                     PROPERTIES RESOURCE_LOCK modifier_roundtrip_probe_test_image SKIP_RETURN_CODE 77)
 
 if(WALLPAPERX_LAVAPIPE_ICD)
     add_test(NAME device_probe_lavapipe COMMAND wallpaperx-device-probe)
@@ -209,12 +262,16 @@ if(WALLPAPERX_LAVAPIPE_ICD)
     # warnings). This is the only place the DMA_BUF branch runs in CI, since the
     # owner's real GPU is NVIDIA (OPAQUE_FD).
     add_test(NAME frame_export_probe_lavapipe COMMAND wallpaperx-frame-export-probe)
+    add_test(NAME modifier_roundtrip_probe_lavapipe COMMAND wallpaperx-modifier-roundtrip-probe roundtrip)
+    add_test(NAME modifier_sensitivity_probe_lavapipe COMMAND wallpaperx-modifier-roundtrip-probe sensitivity)
     set_tests_properties(
         device_probe_lavapipe
         offscreen_probe_lavapipe
         static_renderer_probe_lavapipe
         descriptor_allocator_probe_lavapipe
         frame_export_probe_lavapipe
+        modifier_roundtrip_probe_lavapipe
+        modifier_sensitivity_probe_lavapipe
         PROPERTIES
             # WALLPAPERX_ALLOW_NO_HEAP_TIER tells descriptor_allocator_probe's
             # Heap-tier tests that resolving to a non-Heap tier here is expected
@@ -224,4 +281,7 @@ if(WALLPAPERX_LAVAPIPE_ICD)
             LABELS "lavapipe"
     )
     set_tests_properties(static_renderer_probe_lavapipe PROPERTIES RESOURCE_LOCK static_renderer_probe_test_image)
+    set_tests_properties(frame_export_probe_lavapipe PROPERTIES RESOURCE_LOCK frame_export_probe_test_image)
+    set_tests_properties(modifier_roundtrip_probe_lavapipe modifier_sensitivity_probe_lavapipe
+                         PROPERTIES RESOURCE_LOCK modifier_roundtrip_probe_test_image SKIP_RETURN_CODE 77)
 endif()

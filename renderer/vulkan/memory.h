@@ -40,6 +40,25 @@ struct AllocatedImage {
 // is in/out and shrinks on the second call) that duplicating it invites drift.
 std::vector<VkDrmFormatModifierPropertiesEXT> queryDrmModifierList(VkPhysicalDevice physicalDevice, VkFormat format);
 
+// Every DRM format modifier this driver can use for a dma_buf image with
+// `format`/`imageType`/`usage` at `extent`, restricted to those advertising every bit
+// in `requiredFeatures`. Empty if none qualify.
+//
+// Strictly narrower than queryDrmModifierList: appearing in the format's list only
+// means the driver understands the layout, not that it can render to it, sample it, or
+// hand it across a process boundary at this size.
+//
+// `requiredFeatures` is explicit, with no default, because export and import are
+// different questions with different answers. VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT
+// is what the export path needs; a caller that intends to *import* a modifier must ask
+// for IMPORTABLE_BIT as well, and a driver may advertise one without the other. This
+// parameter used to be hardcoded to EXPORTABLE while a test used the result to pick a
+// modifier it then imported -- so a modifier that was exportable-only got rejected at
+// vkCreateImage, and the test blamed the round trip for a capability mismatch.
+std::vector<uint64_t> usableDrmModifiers(VkPhysicalDevice physicalDevice, VkFormat format, VkImageType imageType,
+                                         VkImageUsageFlags usage, VkExtent3D extent,
+                                         VkExternalMemoryFeatureFlags requiredFeatures);
+
 class Memory {
 public:
     void init(VkInstance instance, VkPhysicalDevice physicalDevice, VkDevice device, uint32_t apiVersion, bool bufferDeviceAddressEnabled, bool drmFormatModifierSupported);
@@ -93,11 +112,6 @@ private:
     // freed allocation to VMA/the driver otherwise get undefined behaviour -- e.g.
     // exporting a frame from a destroyed OffscreenTarget crashes inside the driver.
     void requireLiveAllocation(VmaAllocation allocation, const char* context) const;
-
-    // Every DRM format modifier this driver can use for `format` with `usage`, as an
-    // exportable dma_buf image. Empty if the combination is unsupported.
-    std::vector<uint64_t> supportedDrmModifiers(VkFormat format, VkImageType imageType,
-                                                VkImageUsageFlags usage, VkExtent3D extent) const;
 
     VmaAllocator m_allocator = nullptr;
     VkPhysicalDevice m_physicalDevice = VK_NULL_HANDLE;  // for the modifier queries above
