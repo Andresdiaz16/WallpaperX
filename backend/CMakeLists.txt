@@ -148,10 +148,28 @@ target_compile_definitions(wallpaperx-dbus-service-test PRIVATE
     WALLPAPERX_TEST_IMAGE_DIR="${CMAKE_CURRENT_BINARY_DIR}/test_assets"
 )
 
+# The system-level tier: spawns the real wallpaperx-daemon executable and drives it over
+# the bus. It links the daemon library only for the DBus name/interface constants and
+# the client-side test scaffolding -- deliberately not to call into the daemon's code,
+# since the point of this tier is that the daemon under test is a separate program.
+add_executable(wallpaperx-daemon-system-test tests/daemon_system_test.cpp)
+target_link_libraries(wallpaperx-daemon-system-test PRIVATE wallpaperx-daemon-lib)
+target_include_directories(wallpaperx-daemon-system-test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../renderer/tests)
+target_compile_definitions(wallpaperx-daemon-system-test PRIVATE
+    WALLPAPERX_TEST_IMAGE_DIR="${CMAKE_CURRENT_BINARY_DIR}/test_assets"
+    WALLPAPERX_DAEMON_BINARY="$<TARGET_FILE:wallpaperx-daemon>"
+)
+# Baking the path in is not enough -- without this the test can be built and run against
+# a stale or missing daemon binary, and would report the daemon's absence as a bus
+# timeout thirty seconds later.
+add_dependencies(wallpaperx-daemon-system-test wallpaperx-daemon)
+
 # These targets have no Q_OBJECT / Qt usage; AUTOMOC is on globally via
 # qt_standard_project_setup(), so turn it off here to skip a pointless moc step.
 if(WALLPAPERX_BUILD_KDE_PLUGIN)
     set_target_properties(wallpaperx-daemon-lib wallpaperx-daemon wallpaperx-dbus-service-test
+                          wallpaperx-daemon-system-test
         PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
 endif()
 
@@ -181,6 +199,27 @@ if(DBUS_RUN_SESSION)
     set_tests_properties(dbus_service PROPERTIES RESOURCE_LOCK dbus_service_test_image)
     if(WALLPAPERX_LAVAPIPE_ICD)
         set_tests_properties(dbus_service_lavapipe PROPERTIES RESOURCE_LOCK dbus_service_test_image)
+    endif()
+
+    # Same private-bus wrapper, one tier up: this one spawns the real daemon binary.
+    # Its own dbus-run-session, so the daemon it starts cannot collide with the
+    # in-process service above under ctest -jN -- each gets a bus of its own, and both
+    # request the same well-known name.
+    add_test(NAME daemon_system
+             COMMAND ${DBUS_RUN_SESSION} -- $<TARGET_FILE:wallpaperx-daemon-system-test>)
+    set_tests_properties(daemon_system PROPERTIES RESOURCE_LOCK daemon_system_test_image)
+
+    # The cross-process content check only runs where the export is a LINEAR dma_buf,
+    # which on the machines this is developed on means Lavapipe. On NVIDIA (OPAQUE_FD)
+    # the twin still covers the process, wire and concurrency halves and says out loud
+    # that it skipped the pixels.
+    if(WALLPAPERX_LAVAPIPE_ICD)
+        add_test(NAME daemon_system_lavapipe
+                 COMMAND ${DBUS_RUN_SESSION} -- $<TARGET_FILE:wallpaperx-daemon-system-test>)
+        set_tests_properties(daemon_system_lavapipe PROPERTIES
+            ENVIRONMENT "VK_ICD_FILENAMES=${WALLPAPERX_LAVAPIPE_ICD}"
+            LABELS "lavapipe"
+            RESOURCE_LOCK daemon_system_test_image)
     endif()
 else()
     message(STATUS "  dbus-run-session not found -- dbus_service test skipped (install dbus)")

@@ -24,7 +24,11 @@
 #include "vulkan/device.h"
 #include "vulkan/frame_export.h"
 
+// Two support directories, spelled differently on purpose: the renderer's is on the
+// include path as `support/...`, the backend's is reached through the backend source
+// root, so the two never resolve to each other by accident.
 #include "support/exported_frame_map.h"
+#include "tests/support/daemon_client.h"
 
 #include <sdbus-c++/sdbus-c++.h>
 
@@ -59,6 +63,21 @@ using wallpaperx::DbusService;
 
 namespace {
 
+// The client-side wire helpers now live in tests/support/daemon_client.h, shared with
+// daemon_system_test so both tiers read the same reply layout. Pulled in one name at a
+// time rather than with a blanket using-directive, so it stays visible which of them
+// this file depends on.
+using wallpaperx::testing::Check;
+using wallpaperx::testing::errorNameFrom;
+using wallpaperx::testing::Frame;
+using wallpaperx::testing::FrameReadyLog;
+using wallpaperx::testing::getFrameFd;
+using wallpaperx::testing::getStatus;
+using wallpaperx::testing::kSignalTimeout;
+using wallpaperx::testing::openFdCount;
+using wallpaperx::testing::setWallpaper;
+using wallpaperx::testing::wallpaperStatus;
+
 // Deliberately not square. With equal dimensions a width/height swap anywhere between
 // the target and the wire would satisfy every assertion below.
 constexpr uint32_t kTargetWidth = 64;
@@ -82,10 +101,6 @@ constexpr int32_t kMonitorWorkerCoalesce = 10;
 // How many requests each coalescing burst fires at one monitor. Five is enough that a
 // worker draining one per render still leaves several to collapse.
 constexpr int kBurstSize = 5;
-
-// Generous: it bounds a GPU render on a software rasteriser under load, and is only
-// ever reached when something is actually broken.
-constexpr auto kSignalTimeout = std::chrono::seconds(30);
 
 std::string testAssetDir() { return std::string(WALLPAPERX_TEST_IMAGE_DIR); }
 
@@ -186,58 +201,6 @@ std::string writeCorruptImage() {
     return path;
 }
 
-// Descriptors currently open in this process. The service and the client share the
-// process here, so a descriptor the daemon forgets to close is visible from the test
-// -- which is the only vantage point from which GetFrameFd's fd ownership can actually
-// be observed (see the leak check below).
-size_t openFdCount() {
-    size_t count = 0;
-    std::error_code ec;
-    for (auto it = std::filesystem::directory_iterator("/proc/self/fd", ec);
-         !ec && it != std::filesystem::directory_iterator(); it.increment(ec)) {
-        ++count;
-    }
-    return count;
-}
-
-// Records every FrameReady the daemon emits, and lets a test block until a specific
-// (monitor, generation) arrives.
-class FrameReadyLog {
-public:
-    void record(int32_t monitorId, uint64_t generation) {
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            m_events.emplace_back(monitorId, generation);
-        }
-        m_arrived.notify_all();
-    }
-
-    // Waits for FrameReady(monitorId, generation). Returns false on timeout.
-    bool wait(int32_t monitorId, uint64_t generation) {
-        std::unique_lock<std::mutex> lock(m_mutex);
-        return m_arrived.wait_for(lock, kSignalTimeout, [&] {
-            for (const auto& [id, gen] : m_events) {
-                if (id == monitorId && gen == generation) return true;
-            }
-            return false;
-        });
-    }
-
-    size_t countFor(int32_t monitorId) const {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        size_t n = 0;
-        for (const auto& [id, gen] : m_events) {
-            if (id == monitorId) ++n;
-        }
-        return n;
-    }
-
-private:
-    mutable std::mutex m_mutex;
-    std::condition_variable m_arrived;
-    std::vector<std::pair<int32_t, uint64_t>> m_events;
-};
-
 // Every <arg> of an introspection element, in document order, as
 // (direction, "type:name"). Attribute order and whitespace inside the tag don't
 // matter -- only the values, which are the wire contract. `element` is "method" or
@@ -270,73 +233,6 @@ std::vector<std::pair<std::string, std::string>> parseArgs(const std::string& xm
 }
 
 using ArgList = std::vector<std::pair<std::string, std::string>>;
-
-// Everything GetFrameFd hands back, in one place, so the assertions below read as
-// claims about the frame rather than as tuple indices.
-struct Frame {
-    sdbus::UnixFd fd;
-    uint32_t width = 0;
-    uint32_t height = 0;
-    uint64_t memorySize = 0;
-    int32_t handleType = 0;
-    std::vector<sdbus::UnixFd> syncFds;
-    uint64_t generation = 0;
-    uint32_t drmFormat = 0;
-    uint64_t drmModifier = 0;
-    std::vector<sdbus::Struct<uint64_t, uint64_t>> planes;
-};
-
-Frame getFrameFd(sdbus::IProxy& proxy, int32_t monitorId) {
-    Frame frame;
-    proxy.callMethod("GetFrameFd")
-        .onInterface(DbusService::kInterface)
-        .withArguments(monitorId)
-        .storeResultsTo(frame.fd, frame.width, frame.height, frame.memorySize, frame.handleType, frame.syncFds,
-                        frame.generation, frame.drmFormat, frame.drmModifier, frame.planes);
-    return frame;
-}
-
-void setWallpaper(sdbus::IProxy& proxy, const std::string& type, const std::string& path, int32_t monitorId) {
-    proxy.callMethod("SetWallpaper").onInterface(DbusService::kInterface).withArguments(type, path, monitorId);
-}
-
-nlohmann::json getStatus(sdbus::IProxy& proxy) {
-    std::string status;
-    proxy.callMethod("GetStatus").onInterface(DbusService::kInterface).storeResultsTo(status);
-    return nlohmann::json::parse(status, nullptr, /*allow_exceptions=*/false);
-}
-
-// GetStatus's entry for one monitor, or nullptr when the reply does not contain one.
-//
-// Every caller goes through this rather than writing json["wallpapers"][id] itself. The
-// parsed reply is const, so operator[] on it is nlohmann's const overload -- JSON_ASSERT
-// followed by a dereference. Under NDEBUG the assert compiles away and a missing key
-// dereferences end(), so a daemon regression that dropped "wallpapers" or a monitor from
-// the reply would crash this test instead of printing the FAIL line the check exists to
-// produce. One accessor is what stops the next site from forgetting the guard; of the
-// five sites that existed, four had.
-//
-// Callers read individual fields with value(), for the same reason: a missing "type" or
-// "has_frame" must make the comparison false, not abort.
-const nlohmann::json* wallpaperStatus(const nlohmann::json& json, const std::string& monitorId) {
-    if (json.is_discarded() || !json.is_object() || !json.contains("wallpapers")) return nullptr;
-    const nlohmann::json& wallpapers = json["wallpapers"];
-    if (!wallpapers.is_object() || !wallpapers.contains(monitorId)) return nullptr;
-    const nlohmann::json& entry = wallpapers[monitorId];
-    return entry.is_object() ? &entry : nullptr;
-}
-
-// Returns the DBus error name a call failed with, or "" if it unexpectedly succeeded.
-std::string errorNameFrom(const std::function<void()>& call) {
-    try {
-        call();
-    } catch (const sdbus::Error& e) {
-        return e.getName();
-    }
-    return "";
-}
-
-using Check = std::function<void(bool, const char*)>;
 
 // --------------------------------------------------------------------------- //
 // Checks that need no working GPU. Kept first and separate so a host that cannot
