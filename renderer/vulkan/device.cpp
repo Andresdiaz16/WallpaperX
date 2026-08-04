@@ -1,5 +1,9 @@
 #include "device.h"
 
+// Defines the three read accessors declared there; the counter they read lives below,
+// next to the debug callback that increments it.
+#include "validation_probe.h"
+
 #include "descriptor_buffer.h"
 #include "descriptor_classic.h"
 #include "descriptor_heap.h"

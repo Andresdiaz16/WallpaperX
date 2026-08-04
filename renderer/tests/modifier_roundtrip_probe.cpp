@@ -48,6 +48,7 @@
 //                 nobody here has. Treat the transfer as unverified.
 
 #include "vulkan/device.h"
+#include "vulkan/validation_probe.h"
 #include "vulkan/frame_export.h"
 #include "vulkan/memory.h"
 #include "vulkan/memory_export.h"

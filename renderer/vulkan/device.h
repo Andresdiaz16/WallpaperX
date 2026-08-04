@@ -11,14 +11,10 @@
 
 namespace wallpaperx {
 
-void resetValidationWarningCount();
-int validationWarningCount();
-
-// Whether a Device actually loaded VK_LAYER_KHRONOS_validation. Distinct from having
-// asked for it: Device degrades silently when the layer package is not installed, so a
-// test that treats validationWarningCount() == 0 as proof of GPU-side correctness must
-// check this too, or it passes vacuously on any machine without the layers.
-bool validationLayerActive();
+// The validation-warning counter's read accessors used to be declared here. They have
+// no production caller -- every one is a test -- so they moved to
+// vulkan/validation_probe.h rather than sit in a header the whole renderer includes.
+// The counter and its debug callback remain in device.cpp, where they belong.
 
 struct DeviceInfo {
     std::string gpuName;

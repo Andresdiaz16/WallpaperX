@@ -194,6 +194,17 @@ if(DBUS_RUN_SESSION)
             LABELS "lavapipe")
     endif()
 
+    # DoD 12 wants the Classic descriptor tier verified end to end *through the
+    # daemon*, and no machine here resolves to it on its own: NVIDIA gives Heap and
+    # Lavapipe gives Buffer, so without forcing it the whole daemon-side Classic path
+    # is only ever exercised by a renderer probe. Same binary, same private bus, one
+    # environment variable -- and dbus_service_test asserts the reported tier really is
+    # Classic, so this cannot silently degrade into a second run of the default tier.
+    add_test(NAME dbus_service_classic
+             COMMAND ${DBUS_RUN_SESSION} -- $<TARGET_FILE:wallpaperx-dbus-service-test>)
+    set_tests_properties(dbus_service_classic PROPERTIES
+        ENVIRONMENT "WALLPAPERX_FORCE_TIER=classic")
+
     # One lock across every bus-driven test, not one per tier. Two reasons, and the
     # second is the reason it is shared rather than merely present: they render from
     # generated PNGs under the same WALLPAPERX_TEST_IMAGE_DIR, so ctest -jN must not run
@@ -203,6 +214,7 @@ if(DBUS_RUN_SESSION)
     # first without inflating the second, which fails the check by accusing SetWallpaper
     # of rendering inline. Serialising them costs well under a second in total.
     set_tests_properties(dbus_service PROPERTIES RESOURCE_LOCK wallpaperx_bus_tests)
+    set_tests_properties(dbus_service_classic PROPERTIES RESOURCE_LOCK wallpaperx_bus_tests)
     if(WALLPAPERX_LAVAPIPE_ICD)
         set_tests_properties(dbus_service_lavapipe PROPERTIES RESOURCE_LOCK wallpaperx_bus_tests)
     endif()
@@ -230,8 +242,9 @@ if(DBUS_RUN_SESSION)
 else()
     message(WARNING
         "dbus-run-session not found -- ALL bus-driven tests are unregistered: dbus_service, "
-        "dbus_service_lavapipe, daemon_system, daemon_system_lavapipe. That removes the only "
-        "coverage of the DBus wire contract, the DMA_BUF metadata, and the daemon's "
+        "dbus_service_classic, dbus_service_lavapipe, daemon_system, daemon_system_lavapipe. That "
+        "removes the only coverage of the DBus wire contract, the DMA_BUF metadata, the Classic "
+        "descriptor tier through the daemon, and the daemon's "
         "process-level behaviour (name acquisition, second-instance refusal, SIGTERM/SIGINT "
         "shutdown, cross-process frame import). A green ctest run without them means much less "
         "than it looks like. Install dbus.")

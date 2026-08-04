@@ -435,10 +435,26 @@ public:
     }
 
 private:
-    std::unique_ptr<sdbus::IProxy> m_proxy;
+    // GOAL: X.4 -- no test aborts or corrupts memory instead of reporting.
+    // WHY-THIS-SHAPE: m_proxy is declared *last*, which reads backwards next to the
+    //       constructor that initialises it first, and it has to be. Members are
+    //       destroyed in reverse declaration order, and the signal callback registered
+    //       on the proxy touches m_mutex, m_events and m_changed. With the proxy
+    //       declared first it was destroyed last, so a NameOwnerChanged arriving during
+    //       teardown ran notify_all() on an already-destroyed condition_variable.
+    //       ThreadSanitizer caught it on a real run: "data race ...
+    //       std::condition_variable::~condition_variable()" with the previous access
+    //       inside NameWatcher's own lambda. Declaring the proxy last makes it the
+    //       first thing destroyed, and sdbus unregisters the handler there.
+    // CONTROL: with the declaration back above m_mutex, six consecutive TSan runs
+    //       (`WALLPAPERX_ALLOW_NO_VALIDATION=1 TSAN_OPTIONS=suppressions=backend/tsan.supp
+    //       dbus-run-session -- ./wallpaperx-daemon-system-test` in build-tsan) each
+    //       reported the race twice; with the order below, six runs reported it zero
+    //       times. Reverted to the order below.
     std::mutex m_mutex;
     std::condition_variable m_changed;
     uint64_t m_events = 0;
+    std::unique_ptr<sdbus::IProxy> m_proxy;
 };
 
 // Whether VK_LAYER_KHRONOS_validation can be loaded on this host. Asked through the
@@ -793,6 +809,8 @@ struct StormResult {
     std::atomic<int> unexpectedErrors{0};
     std::atomic<int> generationRegressions{0};
     std::atomic<int> generationComparisons{0};
+    std::atomic<int> inconsistentSnapshots{0};
+    std::atomic<int> statusReplies{0};
     std::atomic<int> calls{0};
     std::mutex mutex;
     std::string firstUnexpected;
@@ -860,6 +878,14 @@ void stormThread(int index, const std::string& bluePath, const std::string& redP
                     break;
                 case 1: {
                     const nlohmann::json status = getStatus(*proxy);
+                    // See the annotation on statusSelfConsistent in
+                    // tests/client/daemon_client.h. Sampled here above all: a two-lock
+                    // GetStatus opens its window only when a render commits between the
+                    // two acquisitions, so a run with four clients hammering the daemon
+                    // while renders are in flight is the only place in the suite where
+                    // that window is being aimed at rather than hoped for.
+                    ++result.statusReplies;
+                    if (!wallpaperx::testing::statusSelfConsistent(status)) ++result.inconsistentSnapshots;
                     const nlohmann::json* entry = wallpaperStatus(status, std::to_string(monitorId));
                     if (entry != nullptr) {
                         observeGeneration(result, marks, monitorId, entry->value("generation", uint64_t{0}));
@@ -915,13 +941,39 @@ void checkConcurrentClients(sdbus::IProxy& proxy, FrameReadyLog& signals, const 
                      result.firstUnexpected.c_str());
     }
     check(result.generationRegressions == 0, "a monitor's generation never goes backwards under concurrent clients");
-    // The check above is worth exactly as much as this number: a first look establishes a
-    // client's mark and proves nothing, so a run with near-zero repeat observations has
-    // asserted near-nothing. Made an assertion rather than a print so it cannot decay.
-    check(result.generationComparisons >= kStormThreads,
+    // GOAL: X.5 -- the monotonicity check asserts how much comparing it actually did.
+    // WHY-THIS-SHAPE: a first look establishes a client's mark and compares against
+    //       nothing, so a run with near-zero repeat observations has asserted
+    //       near-nothing. The bound was kStormThreads (4), and the count turns out to
+    //       be steeply non-linear in kStormIterations -- measured on this host, 8
+    //       iterations yields 1 comparison, 14 yields 6, 16 yields 11 and the shipped
+    //       24 yields 24-27 over eight runs across both ICDs. So the old bound left a
+    //       wide band (5 through 23) in which the check was two-thirds hollow and
+    //       still green. Three per client (12) is half the measured minimum: enough
+    //       margin that a slow host cannot flake it, and enough bite that any
+    //       meaningful reduction fails. Deliberately not tightened to the ~16 the
+    //       GetStatus branch alone should produce -- how many GetFrameFd calls land
+    //       on a monitor with no frame yet is a scheduling outcome, and a bound set at
+    //       the margin would be asserting on the scheduler.
+    // CONTROL: kStormIterations reduced from 24 to 14 -- chosen because the *old*
+    //       bound of 4 still passes there, so the control separates the new check from
+    //       the one it replaces. 6 comparisons, "FAIL: the monotonicity check made
+    //       enough repeat observations to be worth asserting". Reverted.
+    check(result.generationComparisons >= kStormThreads * 3,
           "the monotonicity check made enough repeat observations to be worth asserting");
-    std::printf("daemon_system_test: %d concurrent calls across %d clients completed, %d generation comparisons\n",
-                result.calls.load(), kStormThreads, result.generationComparisons.load());
+
+    // See the annotation on statusSelfConsistent in tests/client/daemon_client.h.
+    check(result.inconsistentSnapshots == 0,
+          "no GetStatus reply during the storm reported an uninitialised GPU beside a monitor with a frame");
+    // Same reasoning as the comparison count above: the invariant is worth what the
+    // number of replies it was applied to is worth, and that number is runtime state.
+    // Which iterations take the GetStatus branch is fixed by the per-thread PRNG, so
+    // this count is deterministic at 29 here; 12 is the same three-per-client floor.
+    check(result.statusReplies >= kStormThreads * 3,
+          "enough GetStatus replies were sampled for the snapshot-consistency check to mean something");
+    std::printf("daemon_system_test: %d concurrent calls across %d clients completed, %d generation comparisons, "
+                "%d GetStatus replies checked for snapshot consistency\n",
+                result.calls.load(), kStormThreads, result.generationComparisons.load(), result.statusReplies.load());
 
     // The daemon is still there and still correct afterwards. Quiescing each stormed
     // monitor to a known request and checking where it lands is what makes the storm an
@@ -1087,6 +1139,25 @@ int main() {
             const std::string secondOutput = second.output();
             check(secondOutput.find("fatal:") != std::string::npos,
                   "the second instance says why it exited rather than dying silently");
+
+            // GOAL: S6.28 -- the second instance is refused with
+            //       org.freedesktop.DBus.Error.FileExists, i.e. it loses the name
+            //       request, rather than failing for some unrelated reason that
+            //       happens to be fatal.
+            // WHY-THIS-SHAPE: "the output contains fatal:" is satisfied by any startup
+            //       failure at all -- a missing shader directory, a broken ICD, an
+            //       unwritable path. Each of those would make this phase pass while
+            //       proving nothing about name ownership, and one of them is a
+            //       plausible future regression. The error name is what pins the
+            //       reason, and it is the name a caller of
+            //       createSessionBusConnection() would branch on.
+            // CONTROL: main.cpp patched to throw before requesting the name
+            //       (`throw std::runtime_error("no")` above createSessionBusConnection)
+            //       -> "FAIL: the second instance is refused with
+            //       org.freedesktop.DBus.Error.FileExists", while the pre-existing
+            //       "says why it exited" check stayed green. Reverted.
+            check(secondOutput.find("org.freedesktop.DBus.Error.FileExists") != std::string::npos,
+                  "the second instance is refused with org.freedesktop.DBus.Error.FileExists");
 
             auto proxy = sdbus::createProxy(sdbus::ServiceName{DbusService::kBusName},
                                             sdbus::ObjectPath{DbusService::kObjectPath});

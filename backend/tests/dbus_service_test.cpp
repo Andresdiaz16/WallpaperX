@@ -22,6 +22,7 @@
 #include "daemon/wallpaper_manager.h"
 
 #include "vulkan/device.h"
+#include "vulkan/validation_probe.h"
 #include "vulkan/frame_export.h"
 
 // The renderer's shared test scaffolding, on the include path as `support/...`. The
@@ -98,12 +99,30 @@ constexpr int32_t kMonitorCoalesceBarrier = 7;
 constexpr int32_t kMonitorErrorRecovery = 8;
 constexpr int32_t kMonitorNeverSet = 9;
 constexpr int32_t kMonitorWorkerCoalesce = 10;
+// Its own id, kept off kMonitorNeverSet: the rejected-path checks below assert that the
+// *reply* refuses them, and if one ever stopped refusing, the request would be recorded
+// -- turning the separate "never set" assertions into a second failure for the same
+// fault, pointing at the wrong property.
+constexpr int32_t kMonitorRejectedPaths = 11;
 
 // How many requests each coalescing burst fires at one monitor. Five is enough that a
 // worker draining one per render still leaves several to collapse.
 constexpr int kBurstSize = 5;
 
 std::string testAssetDir() { return std::string(WALLPAPERX_TEST_IMAGE_DIR); }
+
+// The *message* a call failed with, as opposed to errorNameFrom's name. Kept local
+// rather than pushed into daemon_client.h: only this tier asserts on message text, and
+// a shared helper would invite the system tier to do the same, where the text is not
+// the thing under test.
+std::string errorMessageFrom(const std::function<void()>& call) {
+    try {
+        call();
+    } catch (const sdbus::Error& e) {
+        return e.getMessage();
+    }
+    return "";
+}
 
 std::string writeTestImage() {
     std::filesystem::create_directories(testAssetDir());
@@ -207,11 +226,42 @@ std::vector<std::pair<std::string, std::string>> parseArgs(const std::string& xm
 
 using ArgList = std::vector<std::pair<std::string, std::string>>;
 
+// The body of one <interface name="..."> element, or "" when the object does not
+// export it. Everything the wire-signature lock below inspects is looked up inside
+// this, never in the whole document -- see the annotation at its call site.
+std::string interfaceBody(const std::string& xml, const std::string& name) {
+    const std::regex interfaceRe("<interface name=\"" + name + "\">([\\s\\S]*?)</interface>");
+    std::smatch match;
+    if (!std::regex_search(xml, match, interfaceRe)) return {};
+    return match[1].str();
+}
+
 // --------------------------------------------------------------------------- //
 // Checks that need no working GPU. Kept first and separate so a host that cannot
 // create a Vulkan device still verifies the wire contract.
 // --------------------------------------------------------------------------- //
 void runHostChecks(sdbus::IProxy& proxy, const std::string& imagePath, const Check& check) {
+    // GOAL: S6.1 -- the bus name, object path and interface are exactly the three
+    //       strings PLAN.md documents; a typo in any of them fails a test.
+    // WHY-THIS-SHAPE: every other check in both tiers reaches the daemon through
+    //       DbusService::kBusName / kObjectPath / kInterface, so a typo is applied to
+    //       the client and the service *together* and the whole suite stays green.
+    //       Comparing the constants against literals written out here is the only
+    //       shape that can fail, because it is the only place the documented string
+    //       appears independently of the code under test. Deliberately literals, not
+    //       a shared constant -- a constant would be the same coupling one level up.
+    // CONTROL: all three constants in dbus_service.h changed to "...Deamon". Before
+    //       this check the whole in-process tier still passed and the system tier
+    //       produced one FAIL, whose message was about validation capture. With it:
+    //       "FAIL: the bus name is exactly io.wallpaperx.Daemon" plus the object-path
+    //       and interface lines. Reverted.
+    check(std::string(DbusService::kBusName) == "io.wallpaperx.Daemon",
+          "the bus name is exactly io.wallpaperx.Daemon");
+    check(std::string(DbusService::kObjectPath) == "/io/wallpaperx/Daemon",
+          "the object path is exactly /io/wallpaperx/Daemon");
+    check(std::string(DbusService::kInterface) == "io.wallpaperx.Daemon",
+          "the interface is exactly io.wallpaperx.Daemon");
+
     nlohmann::json json = getStatus(proxy);
     check(!json.is_discarded(), "GetStatus returns parseable JSON");
     check(!json.is_discarded() && json.value("running", false), "GetStatus reports running=true");
@@ -220,6 +270,20 @@ void runHostChecks(sdbus::IProxy& proxy, const std::string& imagePath, const Che
     // would mean the daemon had guessed.
     check(!json.is_discarded() && json.contains("gpu") && json["gpu"]["initialized"] == false,
           "GetStatus reports the GPU as uninitialised before the first render");
+
+    // GOAL: S6.16 -- gpu.name and gpu.descriptor_tier are *absent* before the first
+    //       render, not merely wrong. The device is created lazily, so any value here
+    //       would be a guess, and a client cannot tell a guess from a fact.
+    // WHY-THIS-SHAPE: checking initialized==false above is not the same claim. A
+    //       daemon that reported initialized=false alongside a hopeful
+    //       "descriptor_tier": "Heap" would satisfy it and still hand a client a
+    //       number it must not trust. contains() is the only form that fails for that.
+    // CONTROL: dbus_service.cpp patched to write gpuJson["descriptor_tier"] before
+    //       the `if (gpu.initialized)` block -> "FAIL: no GPU name or descriptor tier
+    //       is reported before the device exists". Reverted.
+    check(!json.is_discarded() && json.contains("gpu") && !json["gpu"].contains("name") &&
+              !json["gpu"].contains("descriptor_tier"),
+          "no GPU name or descriptor tier is reported before the device exists");
 
     // A monitor nothing was ever set on has no frame -- a named, distinguishable error
     // rather than a bogus fd.
@@ -256,6 +320,53 @@ void runHostChecks(sdbus::IProxy& proxy, const std::string& imagePath, const Che
     check(errorNameFrom([&] { getFrameFd(proxy, kMonitorNeverSet); }) == "io.wallpaperx.Daemon.Error.NoFrame",
           "a rejected request leaves the monitor with no frame");
 
+    // GOAL: S6.12 -- a `static` path that is not a *regular file*, and one that exists
+    //       but cannot be *read*, are both rejected on the reply as InvalidArgs.
+    //       Existence alone is not the check.
+    // WHY-THIS-SHAPE: the nonexistent-path case above is the only one that was
+    //       tested, and it is satisfied by a bare exists() test -- so the two halves
+    //       the daemon actually implements (is_regular_file, access(R_OK)) had no
+    //       coverage at all. A directory and a mode-000 file are the minimal pair that
+    //       separates them: both exist, neither is openable, and each fails a
+    //       different clause. Rejecting them on the *reply* is the property: rendering
+    //       is asynchronous, so anything not caught here becomes silence the client
+    //       can only discover by polling GetStatus.
+    // CONTROL: the condition in WallpaperManager::requestWallpaper replaced with
+    //       `!std::filesystem::exists(path, ec)`. Before these two lines the whole
+    //       suite stayed green on both tiers and both ICDs; with them, "FAIL: a
+    //       directory is rejected synchronously as InvalidArgs" and "FAIL: an
+    //       unreadable file is rejected synchronously as InvalidArgs". Reverted.
+    check(errorNameFrom([&] { setWallpaper(proxy, "static", testAssetDir(), kMonitorRejectedPaths); }) ==
+              "org.freedesktop.DBus.Error.InvalidArgs",
+          "a directory is rejected synchronously as InvalidArgs");
+
+    // Skipped rather than asserted when the test runs as root, where mode 000 is still
+    // readable: a root run would otherwise report a daemon defect for a property of the
+    // caller's uid. Announced, because an unnoticed skip here is a silent loss of the
+    // access(R_OK) half.
+    const std::string unreadablePath = testAssetDir() + "/dbus_test_unreadable.png";
+    {
+        std::ofstream out(unreadablePath, std::ios::binary);
+        out << "not readable";
+    }
+    std::error_code permEc;
+    std::filesystem::permissions(unreadablePath, std::filesystem::perms::none,
+                                 std::filesystem::perm_options::replace, permEc);
+    if (permEc || ::access(unreadablePath.c_str(), R_OK) == 0) {
+        std::printf(
+            "dbus_service_test: unreadable-file check skipped -- this process can still read a mode-000 file "
+            "(running as root?), so its acceptance would say nothing about the daemon.\n");
+    } else {
+        check(errorNameFrom([&] { setWallpaper(proxy, "static", unreadablePath, kMonitorRejectedPaths); }) ==
+                  "org.freedesktop.DBus.Error.InvalidArgs",
+              "an unreadable file is rejected synchronously as InvalidArgs");
+    }
+    // Restored so a later `rm -rf` of the asset dir, and a rebuild that rewrites it,
+    // are not blocked by a file nothing can open.
+    std::filesystem::permissions(unreadablePath, std::filesystem::perms::owner_read |
+                                                     std::filesystem::perms::owner_write,
+                                 std::filesystem::perm_options::replace, permEc);
+
     // Lock the whole wire contract: every argument of every method and signal, in
     // order. The KDE plugin (Step 12) is generated against it, so a reordering, a type
     // change or a dropped slot must fail here rather than at plugin-import time -- a
@@ -266,6 +377,20 @@ void runHostChecks(sdbus::IProxy& proxy, const std::string& imagePath, const Che
     // formatting change there would look like a wire-format regression.
     std::string introspection;
     proxy.callMethod("Introspect").onInterface("org.freedesktop.DBus.Introspectable").storeResultsTo(introspection);
+
+    // GOAL: S6.1/S6.2 -- the methods and signal belong to io.wallpaperx.Daemon, not
+    //       merely to some interface this object happens to export.
+    // WHY-THIS-SHAPE: the simpler version searched the whole introspection document
+    //       for <method name="SetWallpaper">. That passes for a vtable registered
+    //       under any interface name at all -- including a misspelled one -- because
+    //       the element it matches is the same either way. Extracting the interface
+    //       body first makes the interface name part of what the signature lock
+    //       actually locks.
+    // CONTROL: kInterface changed to "io.wallpaperx.Deamon" -> "FAIL: the object
+    //       exports the io.wallpaperx.Daemon interface" followed by all four
+    //       signature lines, since none of the elements are reachable. Reverted.
+    const std::string ifaceXml = interfaceBody(introspection, "io.wallpaperx.Daemon");
+    check(!ifaceXml.empty(), "the object exports the io.wallpaperx.Daemon interface");
 
     const std::vector<std::tuple<std::string, std::string, ArgList>> expected = {
         {"method", "SetWallpaper",
@@ -288,7 +413,7 @@ void runHostChecks(sdbus::IProxy& proxy, const std::string& imagePath, const Che
     };
 
     for (const auto& [element, name, expectedArgs] : expected) {
-        const ArgList actualArgs = parseArgs(introspection, element, name);
+        const ArgList actualArgs = parseArgs(ifaceXml, element, name);
         const std::string label = element + " " + name;
         check(actualArgs == expectedArgs, ("wire signature of " + label + " is unchanged").c_str());
         if (actualArgs != expectedArgs) {
@@ -397,6 +522,36 @@ void runRenderChecks(sdbus::IProxy& proxy, FrameReadyLog& signals, const std::st
             std::printf("dbus_service_test: gpu=%s tier=%s\n", json["gpu"].value("name", "?").c_str(),
                         json["gpu"].value("descriptor_tier", "?").c_str());
         }
+
+        // See the annotation on statusSelfConsistent in tests/client/daemon_client.h.
+        // Asserted here because this is the first reply in the run where the forbidden
+        // conjunction is even expressible: monitor 0 holds a frame from the render above.
+        check(wallpaperx::testing::statusSelfConsistent(json),
+              "GetStatus never reports an uninitialised GPU beside a monitor that already has a frame");
+
+        // GOAL: S6.34 -- the Classic descriptor-tier path works end to end *through
+        //       the daemon*, not only in a renderer probe. [DoD 12]
+        // WHY-THIS-SHAPE: the tier a machine resolves to is a property of the GPU, so
+        //       there is nothing to assert unconditionally -- NVIDIA gives Heap and
+        //       Lavapipe gives Buffer here, and neither will ever exercise Classic on
+        //       its own. The ctest entry dbus_service_classic sets
+        //       WALLPAPERX_FORCE_TIER=classic; this reads the same variable and turns
+        //       the whole render-and-export run that follows into a Classic-tier run
+        //       with a verified tier. Without the assertion the entry would be a
+        //       second identical run of the default tier and nobody would know.
+        // CONTROL: the entry run with WALLPAPERX_FORCE_TIER=buffer instead ->
+        //       "FAIL: WALLPAPERX_FORCE_TIER is honoured through the daemon (tier is
+        //       Classic)". Reverted.
+        if (const char* forced = std::getenv("WALLPAPERX_FORCE_TIER");
+            forced != nullptr && std::strcmp(forced, "classic") == 0) {
+            const std::string tier =
+                json.is_discarded() ? std::string() : json["gpu"].value("descriptor_tier", std::string());
+            check(tier == "Classic", "WALLPAPERX_FORCE_TIER is honoured through the daemon (tier is Classic)");
+            if (tier != "Classic") {
+                std::fprintf(stderr, "  WALLPAPERX_FORCE_TIER=classic but the daemon reports tier '%s'\n",
+                             tier.c_str());
+            }
+        }
     }
 
     // Every GetFrameFd produces a fresh descriptor that the daemon must hand over
@@ -455,6 +610,29 @@ void runRenderChecks(sdbus::IProxy& proxy, FrameReadyLog& signals, const std::st
     check(errorNameFrom([&] { getFrameFd(proxy, kMonitorVideo); }) == "io.wallpaperx.Daemon.Error.NoFrame",
           "a video wallpaper is recorded but yields no frame");
 
+    // GOAL: S6.7 -- NoFrame for a monitor whose request is recorded but has produced
+    //       nothing yet is ordinary protocol state, and is reported *distinctly* from
+    //       a monitor nothing was ever set on. The two need different client
+    //       responses: one says "your request is in flight", the other "you never made
+    //       one".
+    // WHY-THIS-SHAPE: asserting only the error name cannot separate them -- both are
+    //       NoFrame by design, which is the whole reason the reason lives in the
+    //       message. So the message is what is compared, and both directions are
+    //       asserted together so a daemon that collapsed NoFrameReason back to one
+    //       branch fails whichever way it collapsed. The video monitor is used because
+    //       it is the one state reachable from outside that stays NotRendered: a
+    //       static request is serviced by the same FIFO thread that answers
+    //       GetFrameFd, so its export task can never overtake its own render.
+    // CONTROL: NoFrameReason::NotRendered folded into NeverRequested in
+    //       wallpaper_manager.cpp -> "FAIL: a recorded-but-unrendered monitor is not
+    //       told to call SetWallpaper first". Reverted.
+    const std::string videoReason = errorMessageFrom([&] { getFrameFd(proxy, kMonitorVideo); });
+    check(videoReason.find("call SetWallpaper first") == std::string::npos,
+          "a recorded-but-unrendered monitor is not told to call SetWallpaper first");
+    check(errorMessageFrom([&] { getFrameFd(proxy, kMonitorNeverSet); }).find("call SetWallpaper first") !=
+              std::string::npos,
+          "a monitor that was never set is told to call SetWallpaper first");
+
     // Still 1: the good render above, and nothing for the corrupt one that followed.
     check(signals.countFor(kMonitorCorrupt) == 1, "a render that fails emits no FrameReady");
     // RenderFailed, not NoFrame, and this is the whole point of the distinction: this
@@ -466,6 +644,32 @@ void runRenderChecks(sdbus::IProxy& proxy, FrameReadyLog& signals, const std::st
     check(errorNameFrom([&] { getFrameFd(proxy, kMonitorCorrupt); }) ==
               "io.wallpaperx.Daemon.Error.RenderFailed",
           "a failed render is reported as RenderFailed, distinctly from a monitor with nothing rendered yet");
+
+    // GOAL: S6.14 -- the RenderFailed reply carries the render's *own* error text, so
+    //       a client that never sees GetStatus can still say why the wallpaper is
+    //       missing.
+    // WHY-THIS-SHAPE: the name check above passes for a reply whose message is a
+    //       fixed string, which is what the error used to be, and that is the half
+    //       that made a polling client useless. Compared against the same text
+    //       GetStatus publishes for that monitor rather than against a literal:
+    //       matching a literal would pin the test to StaticRenderer's wording and
+    //       break on any message edit, while agreement between the two channels is
+    //       the actual contract and cannot be satisfied by a canned string.
+    // CONTROL: the `+ exported.lastError` dropped from the RenderFailed reply in
+    //       dbus_service.cpp -> "FAIL: the RenderFailed reply carries the same error
+    //       text GetStatus reports". Reverted.
+    {
+        const std::string replyText = errorMessageFrom([&] { getFrameFd(proxy, kMonitorCorrupt); });
+        const nlohmann::json json = getStatus(proxy);
+        const nlohmann::json* corrupt = wallpaperStatus(json, std::to_string(kMonitorCorrupt));
+        const std::string statusText = corrupt == nullptr ? std::string() : corrupt->value("last_error", std::string());
+        check(!statusText.empty() && replyText.find(statusText) != std::string::npos,
+              "the RenderFailed reply carries the same error text GetStatus reports");
+        if (statusText.empty() || replyText.find(statusText) == std::string::npos) {
+            std::fprintf(stderr, "  reply said '%s' but GetStatus reports last_error '%s'\n", replyText.c_str(),
+                         statusText.c_str());
+        }
+    }
 
     // The reply to SetWallpaper was already sent by the time the render failed, so
     // GetStatus is the only place that failure is reported.
@@ -553,12 +757,35 @@ void runWorkerCoalescingChecks(const wallpaperx::WallpaperManager::Config& confi
     // Queued behind the burst on the same FIFO, so once it runs every render the burst
     // produced has completed. stop() deliberately does not drain the queue, so it cannot
     // be used as the barrier here.
-    std::promise<void> drained;
-    const std::future<void> drainedFuture = drained.get_future();
-    worker.postTask([&drained] { drained.set_value(); });
+    //
+    // GOAL: X.1 -- a wedged worker must fail this phase, not stall it.
+    // WHY-THIS-SHAPE: the plain future::wait() this replaces had no deadline at all. A
+    //       worker that never dequeued would hang here until ctest's own timeout fired,
+    //       which reports the binary as a timeout and prints none of the FAIL lines the
+    //       run had already accumulated -- destroying exactly the diagnostics the phase
+    //       exists to produce. wait_for plus an explicit false branch turns the same
+    //       fault into a named failure. The phase is abandoned rather than continued:
+    //       every assertion below reads a snapshot that is only meaningful once the
+    //       queue is empty.
+    // CONTROL: the barrier task changed to leak its promise instead of satisfying it
+    //       (`new std::promise<void>(std::move(done))`, so the shared state is neither
+    //       set nor broken -- simply dropping it would make the future ready with a
+    //       broken_promise and not model a wedged worker at all) -> "FAIL: the render
+    //       worker drains the coalescing burst" after 30.4 s, and the run went on to
+    //       the validation checks and exited 1 instead of hanging. Reverted.
+    const auto drain = [&worker](const char* what, const Check& c) {
+        std::promise<void> done;
+        std::future<void> future = done.get_future();
+        // Moved into the task: a promise left on this stack would be destroyed while
+        // the worker still held a reference to it if the wait below timed out.
+        worker.postTask([done = std::move(done)]() mutable { done.set_value(); });
+        if (future.wait_for(wallpaperx::testing::kSignalTimeout) == std::future_status::ready) return true;
+        c(false, what);
+        return false;
+    };
 
     gate.release();
-    drainedFuture.wait();
+    if (!drain("the render worker drains the coalescing burst", check)) return;
 
     const wallpaperx::WallpaperManager::Snapshot snapshot = manager.snapshot();
     const auto entry = snapshot.monitors.find(kMonitorWorkerCoalesce);
@@ -574,6 +801,42 @@ void runWorkerCoalescingChecks(const wallpaperx::WallpaperManager::Config& confi
     if (entry->second.generation != 1) {
         std::fprintf(stderr, "  generation is %llu after a burst of %d, expected 1\n",
                      static_cast<unsigned long long>(entry->second.generation), kBurstSize);
+    }
+
+    // GOAL: S6.25 -- a render pass is idempotent per *request*: one SetWallpaper never
+    //       produces two renders, two generations or two FrameReady signals, however
+    //       many times the monitor is queued.
+    // WHY-THIS-SHAPE: the burst above does not test this and cannot. Two mechanisms
+    //       collapse a burst, and with the gate held only one of them is in play:
+    //       RenderWorker::post() refuses to queue a monitor already in m_queuedRenders,
+    //       so five posts become one queue entry and WallpaperManager::servicedSeq is
+    //       never consulted. What servicedSeq guards is the *other* shape -- a monitor
+    //       posted again after it was already dequeued and serviced -- which only
+    //       happens with no new request behind it. Posting without a preceding
+    //       requestWallpaper is the only way to produce that state deliberately, and it
+    //       is reachable from here because this phase drives the worker directly; over
+    //       the bus every post has a request in front of it.
+    // CONTROL: the `servicedSeq == requestSeq` early return in
+    //       WallpaperManager::renderPending() disabled. Before this block the entire
+    //       suite stayed green with it disabled -- both tiers, both ICDs -- which is
+    //       what made the mechanism untested. With it: "FAIL: re-posting a monitor
+    //       whose request was already serviced renders nothing again" and "FAIL:
+    //       a re-post emits no second FrameReady", generation 2 against 1. Reverted.
+    worker.post(kMonitorWorkerCoalesce);
+    if (!drain("the render worker drains the idempotence re-post", check)) return;
+
+    const wallpaperx::WallpaperManager::Snapshot after = manager.snapshot();
+    const auto repeated = after.monitors.find(kMonitorWorkerCoalesce);
+    const bool stillPresent = repeated != after.monitors.end();
+    check(stillPresent, "the re-posted monitor is still in the manager's snapshot");
+    if (!stillPresent) return;
+
+    check(repeated->second.generation == 1,
+          "re-posting a monitor whose request was already serviced renders nothing again");
+    check(frameReadySignals.load() == 1, "a re-post emits no second FrameReady");
+    if (repeated->second.generation != 1) {
+        std::fprintf(stderr, "  generation went from 1 to %llu on a re-post with no new request\n",
+                     static_cast<unsigned long long>(repeated->second.generation));
     }
 }
 

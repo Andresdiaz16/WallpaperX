@@ -1,4 +1,5 @@
 #include "vulkan/device.h"
+#include "vulkan/validation_probe.h"
 
 #include <cstdlib>
 #include <cstring>

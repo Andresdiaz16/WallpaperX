@@ -217,6 +217,34 @@ inline const nlohmann::json* wallpaperStatus(const nlohmann::json& json, const s
     return entry.is_object() ? &entry : nullptr;
 }
 
+// GOAL: S6.18 -- GetStatus is one consistent snapshot: it can never report
+//       gpu.initialized=false beside a monitor with has_frame=true, because a frame
+//       only exists once the Device does.
+// WHY-THIS-SHAPE: the obvious alternative is to test the *timing* -- race a
+//       SetWallpaper against a GetStatus and hope to catch the window. That cannot be
+//       made to fail reliably: the window a two-lock implementation opens is a few
+//       microseconds wide, so a test built on it passes on a correct daemon and on a
+//       broken one alike. Asserting the forbidden *conjunction* on every reply the
+//       suite already collects is falsifiable the moment the state is ever reachable,
+//       and costs nothing. Returns true for an unparseable reply -- that is a
+//       different defect, reported by its own check, and failing here too would give
+//       one fault two names.
+// CONTROL: WallpaperManager::snapshot() patched to clear out.gpu.initialized after
+//       copying the monitor map (which is what a second lock acquisition makes
+//       reachable): "FAIL: GetStatus never reports an uninitialised GPU beside a
+//       monitor that already has a frame" in both tiers. Reverted.
+inline bool statusSelfConsistent(const nlohmann::json& json) {
+    if (json.is_discarded() || !json.is_object()) return true;
+    if (!json.contains("gpu") || !json["gpu"].is_object()) return true;
+    if (json["gpu"].value("initialized", true)) return true;
+    if (!json.contains("wallpapers") || !json["wallpapers"].is_object()) return true;
+    for (const auto& [id, entry] : json["wallpapers"].items()) {
+        (void)id;
+        if (entry.is_object() && entry.value("has_frame", false)) return false;
+    }
+    return true;
+}
+
 // Returns the DBus error name a call failed with, or "" if it unexpectedly succeeded.
 inline std::string errorNameFrom(const std::function<void()>& call) {
     try {
