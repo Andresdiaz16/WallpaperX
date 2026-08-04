@@ -1253,6 +1253,33 @@ int main() {
         ++failures;
     }
 
+    // GOAL: S6.31 -- the daemon reports its GPU name and descriptor tier once the device
+    //       exists (Definition of Done #1). The startup line alone does not satisfy it:
+    //       an operator needs to know which device and which tier the daemon resolved,
+    //       and the tier is the whole point of the three-tier descriptor system.
+    // WHY-THIS-SHAPE: asserted against the daemon's captured stdout rather than read back
+    //       through GetStatus, because DoD #1 is a claim about what the daemon *prints*.
+    //       GetStatus carries the same two fields and is already checked (S6.15, S6.16),
+    //       so going over the wire here would restate that check and leave the printed
+    //       output -- the thing this goal is about -- unverified. Matched on the two
+    //       labels rather than the whole line, so the GPU name, which differs per host
+    //       and per ICD, is not baked into the assertion.
+    // CONTROL: with the printf deleted from WallpaperManager::ensureGpu, this reports
+    //       "FAIL: the daemon reports its GPU and descriptor tier once the device exists"
+    //       while every other check stays green. Reverted.
+    if (!daemonOutputRead || !daemonCameUp) {
+        std::printf("daemon_system_test: GPU/tier report check skipped -- %s, and the failure that caused "
+                    "that is reported above.\n",
+                    daemonCameUp ? "the daemon's output was never collected" : "the daemon never started");
+    } else {
+        const bool reported = daemonOutput.find("GPU: ") != std::string::npos &&
+                              daemonOutput.find("Descriptor tier: ") != std::string::npos;
+        check(reported, "the daemon reports its GPU and descriptor tier once the device exists");
+        if (!reported) {
+            std::fprintf(stderr, "  no 'GPU: ... | Descriptor tier: ...' line in the daemon's output\n");
+        }
+    }
+
     // The daemon's own Vulkan usage, judged from its output. Only meaningful when the
     // layer is installed; the warning at the top of main says so when it is not.
     if (wantValidation && (!daemonOutputRead || !daemonCameUp)) {

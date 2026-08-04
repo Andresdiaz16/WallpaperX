@@ -5,6 +5,7 @@
 #include "vulkan/offscreen.h"
 #include "vulkan/tier_selection.h"
 
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <stdexcept>
@@ -104,10 +105,22 @@ void WallpaperManager::ensureGpu() {
 
     // Published as a plain copy so status() can report the GPU without taking m_gpuMutex
     // -- which a render holds for its whole duration, and GetStatus must not wait on.
-    std::lock_guard<std::mutex> stateLock(m_stateMutex);
-    m_gpuStatus.initialized = true;
-    m_gpuStatus.name = m_device->info().gpuName;
-    m_gpuStatus.descriptorTier = toString(m_device->descriptorTier());
+    {
+        std::lock_guard<std::mutex> stateLock(m_stateMutex);
+        m_gpuStatus.initialized = true;
+        m_gpuStatus.name = m_device->info().gpuName;
+        m_gpuStatus.descriptorTier = toString(m_device->descriptorTier());
+    }
+
+    // Definition of Done #1 wants the daemon to report its GPU and descriptor tier. Here
+    // rather than at startup, because the device is created lazily and printing a tier
+    // before one exists would be a guess -- the same reason GetStatus omits the fields
+    // until now. Deliberately the identical format wallpaperx-device-probe prints, so an
+    // operator can compare the daemon's answer against the probe's line for line.
+    std::printf("wallpaperx-daemon: GPU: %s | Vendor: %s | Descriptor tier: %s\n",
+                m_device->info().gpuName.c_str(), toString(m_device->info().vendor),
+                toString(m_device->descriptorTier()));
+    std::fflush(stdout);
 }
 
 const OffscreenTarget& WallpaperManager::acquireTarget(int monitorId) {
