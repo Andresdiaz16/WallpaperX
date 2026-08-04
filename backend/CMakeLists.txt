@@ -251,6 +251,81 @@ else()
 endif()
 
 # --------------------------------------------------------------------------- #
+# ThreadSanitizer tier
+# --------------------------------------------------------------------------- #
+#
+# Without this block a bare `ctest --test-dir backend/build-tsan` is worse than useless.
+# It needs two environment variables that nothing set, so every run drowned in validation
+# -layer noise and reported the loader artifact as a failure -- meaning a *correct* run
+# was red. A gate that is red when correct is not a gate: a real race arrives as one more
+# FAIL among expected FAILs and nobody looks twice. That is very nearly what happened with
+# the NameWatcher use-after-destroy, which TSan had been reporting all along.
+#
+# So: when this tree is built with -DWALLPAPERX_SANITIZE=thread, the suppressions file and
+# the validation waiver are attached to the tests themselves, and a clean run is GREEN.
+#
+# The waiver is not optional here. The Khronos validation layer is uninstrumented and
+# keeps concurrent state behind rwlocks TSan cannot pair, so it is by far the loudest
+# source of noise -- and the shipped daemon never loads it. Waiving it costs the GPU-side
+# oracle for sanitizer runs only; the non-sanitized tiers still assert it, and the tests
+# announce the waiver loudly rather than degrading in silence.
+if(WALLPAPERX_SANITIZE STREQUAL "thread" AND CMAKE_VERSION VERSION_LESS 3.28)
+    # DIRECTORY-scoped TEST properties landed in 3.28, and this project's floor is 3.25.
+    # Refusing to configure would punish everyone for an opt-in developer tier, so say
+    # plainly what is missing instead of half-applying it -- a partially-wired TSan tier
+    # is the red-when-correct state this block exists to remove.
+    message(WARNING
+        "CMake ${CMAKE_VERSION} is too old to auto-wire the TSan tier (needs 3.28 for "
+        "DIRECTORY-scoped TEST properties). The tests are registered but carry neither the "
+        "suppressions file nor the validation waiver, so a bare ctest here will be red for "
+        "reasons unrelated to your code. Run them by hand instead:\n"
+        "  VK_ICD_FILENAMES=<lavapipe icd> WALLPAPERX_ALLOW_NO_VALIDATION=1 \\\n"
+        "  TSAN_OPTIONS=suppressions=${CMAKE_CURRENT_SOURCE_DIR}/tsan.supp \\\n"
+        "  ctest --test-dir <build> -L lavapipe")
+elseif(WALLPAPERX_SANITIZE STREQUAL "thread")
+    set(_tsan_env
+        "TSAN_OPTIONS=suppressions=${CMAKE_CURRENT_SOURCE_DIR}/tsan.supp:report_mutex_bugs=0"
+        "WALLPAPERX_ALLOW_NO_VALIDATION=1")
+
+    # Lavapipe only, and the NVIDIA entries are disabled rather than left to fail. Under
+    # TSan the proprietary driver takes a SEGV inside its own uninstrumented code on the
+    # first SetWallpaper ("nested bug in the same thread, aborting"), so the daemon dies
+    # before the storm phase runs. Left enabled, those entries would be permanently red
+    # for a reason that has nothing to do with this project's code -- exactly the
+    # red-when-correct trap this block exists to remove.
+    # Both directories, and the second one is the whole point: the renderer probes are
+    # registered by renderer/CMakeLists.txt via add_subdirectory, and DIRECTORY PROPERTY
+    # TESTS only ever lists the tests of the directory asked. Querying just this one left
+    # every renderer probe without the suppressions file -- so the validation layer's own
+    # uninstrumented races were reported as failures, which is the noise this block exists
+    # to remove, and it looked like the block was working because the backend tests went
+    # green.
+    set(_tsan_dirs "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/../renderer")
+    foreach(_dir IN LISTS _tsan_dirs)
+        get_property(_dir_tests DIRECTORY "${_dir}" PROPERTY TESTS)
+        foreach(_t IN LISTS _dir_tests)
+            # DIRECTORY-scoped, because a TEST property is only reachable from the
+            # directory that registered the test (CMake >= 3.28 for this form).
+            get_property(_labels TEST "${_t}" DIRECTORY "${_dir}" PROPERTY LABELS)
+            get_property(_existing TEST "${_t}" DIRECTORY "${_dir}" PROPERTY ENVIRONMENT)
+            if("lavapipe" IN_LIST _labels)
+                if(_existing)
+                    set_property(TEST "${_t}" DIRECTORY "${_dir}"
+                                 PROPERTY ENVIRONMENT "${_existing};${_tsan_env}")
+                else()
+                    set_property(TEST "${_t}" DIRECTORY "${_dir}" PROPERTY ENVIRONMENT "${_tsan_env}")
+                endif()
+            else()
+                set_property(TEST "${_t}" DIRECTORY "${_dir}" PROPERTY DISABLED TRUE)
+            endif()
+        endforeach()
+    endforeach()
+
+    message(STATUS "  TSan tier: lavapipe tests carry suppressions + validation waiver; "
+                   "non-lavapipe tests disabled (NVIDIA driver SEGVs under TSan)")
+endif()
+
+# --------------------------------------------------------------------------- #
 # KDE plugin — libWallpaperX.so, wpxctl, KDE package install
 # (placeholders — sources added in later steps)
 # --------------------------------------------------------------------------- #

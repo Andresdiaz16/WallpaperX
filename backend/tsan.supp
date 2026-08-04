@@ -2,7 +2,33 @@
 #
 # Everything here is a *third-party* library TSan cannot see into, not a WallpaperX
 # race. Nothing in backend/ or renderer/ belongs in this file -- if a report names our
-# own code, it is a finding, not noise.
+# own code, it is a finding, not noise. That rule survives intact; read on before adding
+# an exception to it.
+#
+# THE LOADER ARTIFACT IS HANDLED BY A FLAG, NOT BY AN ENTRY HERE. `vkDestroyDevice` and
+# `vkDestroyInstance` unlock a loader-internal mutex TSan never saw locked, and because
+# the loader is uninstrumented TSan attributes the unlock to the nearest instrumented
+# frame -- `Device::destroyResources()`, ours. `called_from_lib:` cannot catch it for
+# exactly that reason. llvmpipe's LLVM thread pool produces the same shape through
+# `std::condition_variable::wait`, attributed to libstdc++. Both are mutex-*misuse*
+# reports, not races, so `report_mutex_bugs=0` (set on the TSan tests by
+# backend/CMakeLists.txt) removes the whole class without naming a single one of our
+# functions. Measured 2026-08-04: with it, data races between instrumented threads, the
+# condition_variable use-after-destroy, and a race placed inside `destroyResources`
+# itself are all still reported.
+#
+# What that costs, stated plainly: TSan no longer reports double-lock, unlock-of-unlocked
+# or destroy-while-locked anywhere. Data race detection -- the reason this suite runs TSan
+# at all -- is untouched.
+#
+# WHAT NOT TO REACH FOR: `ignore_noninstrumented_modules=1` looks like the purpose-built
+# answer here, and it does silence the loader artifact. Do not use it. Measured
+# 2026-08-04: it also silences a use-after-destroy on a `std::condition_variable`
+# notified by a live thread -- 2 reports without it, 0 with -- because the notify path
+# runs through libstdc++/libc. That is precisely the shape of the `NameWatcher` bug this
+# suite found, so the flag blinds the gate to the bug class it exists to catch. It leaves
+# plain races between instrumented threads visible, which is what makes it so convincing
+# and so dangerous.
 
 # The Khronos validation layer. Uninstrumented, and it keeps its own concurrent state
 # maps behind rwlocks TSan cannot pair up. This is the loudest source by far, and it is
