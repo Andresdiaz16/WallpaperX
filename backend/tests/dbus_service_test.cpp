@@ -22,7 +22,7 @@
 #include "daemon/wallpaper_manager.h"
 
 #include "vulkan/device.h"
-#include "vulkan/validation_probe.h"
+#include "support/validation_probe.h"
 #include "vulkan/frame_export.h"
 
 // The renderer's shared test scaffolding, on the include path as `support/...`. The
@@ -763,29 +763,45 @@ void runWorkerCoalescingChecks(const wallpaperx::WallpaperManager::Config& confi
     //       worker that never dequeued would hang here until ctest's own timeout fired,
     //       which reports the binary as a timeout and prints none of the FAIL lines the
     //       run had already accumulated -- destroying exactly the diagnostics the phase
-    //       exists to produce. wait_for plus an explicit false branch turns the same
-    //       fault into a named failure. The phase is abandoned rather than continued:
-    //       every assertion below reads a snapshot that is only meaningful once the
-    //       queue is empty.
-    // CONTROL: the barrier task changed to leak its promise instead of satisfying it
-    //       (`new std::promise<void>(std::move(done))`, so the shared state is neither
-    //       set nor broken -- simply dropping it would make the future ready with a
-    //       broken_promise and not model a wedged worker at all) -> "FAIL: the render
-    //       worker drains the coalescing burst" after 30.4 s, and the run went on to
-    //       the validation checks and exited 1 instead of hanging. Reverted.
+    //       exists to produce. The bounded wait is only half the fix, and the half that
+    //       does not work on its own: returning from here unwinds into ~RenderWorker,
+    //       whose stop() calls m_thread.join() unconditionally -- on the very thread the
+    //       timeout just proved is not progressing. A bounded wait followed by an
+    //       unbounded join is still unbounded, so the timeout would hand the hang
+    //       straight back one scope exit later. _Exit runs no destructors, so no join is
+    //       attempted and ctest sees a failed process rather than a timeout. It also
+    //       abandons the phase, which is wanted independently: every assertion below
+    //       reads a snapshot that is only meaningful once the queue is empty.
+    // CONTROL: the barrier task replaced by one that never returns
+    //       (`worker.postTask([]{ for (;;) std::this_thread::sleep_for(std::chrono::hours(1)); })`
+    //       posted ahead of it, wedging the FIFO the way a real dequeue regression
+    //       would) -> "FAIL: the render worker drains the coalescing burst" followed by
+    //       the "ending the run here" line, process gone at 30.5 s. The _Exit is load
+    //       bearing and was measured to be: with `return` in its place, the same
+    //       mutation was still running when a 75 s hard kill fired (SIGKILL, 137) --
+    //       which is the state this shape exists to rule out. An earlier CONTROL here
+    //       leaked the promise instead; that never reached the join, so it could not
+    //       have observed either behaviour and its no-hang claim was unfounded. Both
+    //       mutations reverted.
     const auto drain = [&worker](const char* what, const Check& c) {
         std::promise<void> done;
         std::future<void> future = done.get_future();
         // Moved into the task: a promise left on this stack would be destroyed while
         // the worker still held a reference to it if the wait below timed out.
         worker.postTask([done = std::move(done)]() mutable { done.set_value(); });
-        if (future.wait_for(wallpaperx::testing::kSignalTimeout) == std::future_status::ready) return true;
+        if (future.wait_for(wallpaperx::testing::kSignalTimeout) == std::future_status::ready) return;
         c(false, what);
-        return false;
+        std::fprintf(stderr,
+                     "dbus_service_test: the render worker did not progress within the signal "
+                     "timeout; ending the run here rather than joining a wedged thread\n");
+        // Mandatory before _Exit: stdout is fully buffered under ctest, so every progress
+        // and WARNING line written so far is still in the buffer that _Exit discards.
+        std::fflush(nullptr);
+        std::_Exit(1);
     };
 
     gate.release();
-    if (!drain("the render worker drains the coalescing burst", check)) return;
+    drain("the render worker drains the coalescing burst", check);
 
     const wallpaperx::WallpaperManager::Snapshot snapshot = manager.snapshot();
     const auto entry = snapshot.monitors.find(kMonitorWorkerCoalesce);
@@ -823,7 +839,7 @@ void runWorkerCoalescingChecks(const wallpaperx::WallpaperManager::Config& confi
     //       whose request was already serviced renders nothing again" and "FAIL:
     //       a re-post emits no second FrameReady", generation 2 against 1. Reverted.
     worker.post(kMonitorWorkerCoalesce);
-    if (!drain("the render worker drains the idempotence re-post", check)) return;
+    drain("the render worker drains the idempotence re-post", check);
 
     const wallpaperx::WallpaperManager::Snapshot after = manager.snapshot();
     const auto repeated = after.monitors.find(kMonitorWorkerCoalesce);

@@ -11,10 +11,13 @@
 
 namespace wallpaperx {
 
-// The validation-warning counter's read accessors used to be declared here. They have
-// no production caller -- every one is a test -- so they moved to
-// vulkan/validation_probe.h rather than sit in a header the whole renderer includes.
-// The counter and its debug callback remain in device.cpp, where they belong.
+// A validation-warning counter and its three read accessors used to live here and in
+// device.cpp. Every caller was a test, so both the state and the accessors were test-only
+// code compiled into the shipped renderer; moving just the declarations to a test-facing
+// header did not change that. They are gone. Tests now count warnings by reading the
+// "[vulkan] " lines Device's debug callback already writes to stderr -- see
+// renderer/tests/support/validation_probe.h, which no production translation unit is on
+// the include path for. Nothing here needs to be added back to serve a test.
 
 struct DeviceInfo {
     std::string gpuName;

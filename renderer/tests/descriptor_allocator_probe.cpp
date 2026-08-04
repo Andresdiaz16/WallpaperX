@@ -1,6 +1,6 @@
 #include "vulkan/descriptor_heap.h"
 #include "vulkan/device.h"
-#include "vulkan/validation_probe.h"
+#include "support/validation_probe.h"
 #include "vulkan/memory.h"
 
 #include <cstdlib>

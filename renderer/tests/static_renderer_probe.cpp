@@ -1,5 +1,5 @@
 #include "vulkan/device.h"
-#include "vulkan/validation_probe.h"
+#include "support/validation_probe.h"
 #include "vulkan/offscreen.h"
 #include "renderers/static_renderer.h"
 

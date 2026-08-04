@@ -20,10 +20,16 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 #
 #   cmake -S backend -B backend/build-tsan -DWALLPAPERX_SANITIZE=thread \
 #         -DWALLPAPERX_BUILD_KDE_PLUGIN=OFF
-#   TSAN_OPTIONS="suppressions=$PWD/backend/tsan.supp" ctest --test-dir backend/build-tsan -L lavapipe
+#   ctest --test-dir backend/build-tsan
 #
-# Lavapipe only: the uninstrumented NVIDIA driver reports races TSan cannot see into,
-# and the noise buries anything real.
+# No TSAN_OPTIONS on that command line, deliberately. The suppressions file and the
+# validation waiver are attached to each test as an ENVIRONMENT property further down,
+# and a per-test ENVIRONMENT overrides the same variable exported by the caller -- so a
+# hand-set TSAN_OPTIONS here would be silently discarded while appearing to take effect.
+# Tests that would load the proprietary ICD are disabled rather than left to fail: under
+# TSan that driver SEGVs inside its own uninstrumented code, which is red for a reason
+# unrelated to this project. Watch the configure output for the "TSan tier:" line -- if
+# it warns that every test was disabled, a green ctest run here means nothing.
 set(WALLPAPERX_SANITIZE "" CACHE STRING "Build with a sanitizer: thread, address, undefined, or empty")
 if(WALLPAPERX_SANITIZE)
     add_compile_options(-fsanitize=${WALLPAPERX_SANITIZE} -g -fno-omit-frame-pointer)
@@ -138,7 +144,8 @@ target_link_libraries(wallpaperx-daemon PRIVATE wallpaperx-daemon-lib)
 enable_testing()
 
 add_executable(wallpaperx-dbus-service-test tests/dbus_service_test.cpp)
-target_link_libraries(wallpaperx-dbus-service-test PRIVATE wallpaperx-daemon-lib)
+target_link_libraries(wallpaperx-dbus-service-test PRIVATE wallpaperx-daemon-lib
+                                                          wallpaperx-test-support)
 # Header-only test scaffolding shared with the renderer's probes (support/), for
 # reading an exported frame's bytes back through its fd. Not part of the renderer
 # library: nothing WallpaperX ships CPU-maps an exported frame, only a test does.
@@ -180,6 +187,13 @@ find_program(DBUS_RUN_SESSION dbus-run-session)
 if(DBUS_RUN_SESSION)
     add_test(NAME dbus_service
              COMMAND ${DBUS_RUN_SESSION} -- $<TARGET_FILE:wallpaperx-dbus-service-test>)
+    # Explicitly cleared, for the same reason handle_type_env_default clears its own
+    # override: ctest merges each test's ENVIRONMENT into the caller's, so a developer
+    # who exported WALLPAPERX_FORCE_TIER while debugging the Classic path would
+    # otherwise turn this entry -- and the lavapipe twin below -- into further copies of
+    # dbus_service_classic. All three would pass, the tier assertion included, while
+    # Heap and Buffer went entirely unexercised through the daemon.
+    set_tests_properties(dbus_service PROPERTIES ENVIRONMENT "WALLPAPERX_FORCE_TIER=")
 
     # The test now renders and exports a real frame, so it exercises the export path
     # end to end -- and on the owner's NVIDIA GPU that path is OPAQUE_FD only. The
@@ -190,7 +204,7 @@ if(DBUS_RUN_SESSION)
         add_test(NAME dbus_service_lavapipe
                  COMMAND ${DBUS_RUN_SESSION} -- $<TARGET_FILE:wallpaperx-dbus-service-test>)
         set_tests_properties(dbus_service_lavapipe PROPERTIES
-            ENVIRONMENT "VK_ICD_FILENAMES=${WALLPAPERX_LAVAPIPE_ICD}"
+            ENVIRONMENT "VK_ICD_FILENAMES=${WALLPAPERX_LAVAPIPE_ICD};WALLPAPERX_FORCE_TIER="
             LABELS "lavapipe")
     endif()
 
@@ -204,6 +218,21 @@ if(DBUS_RUN_SESSION)
              COMMAND ${DBUS_RUN_SESSION} -- $<TARGET_FILE:wallpaperx-dbus-service-test>)
     set_tests_properties(dbus_service_classic PROPERTIES
         ENVIRONMENT "WALLPAPERX_FORCE_TIER=classic")
+
+    # The Classic tier needs a lavapipe twin of its own, and not for coverage symmetry.
+    # The TSan tier can only run lavapipe entries (the proprietary driver SEGVs under
+    # instrumentation), so without this the daemon-side Classic path -- the one DoD 12
+    # exists to cover -- is the single descriptor tier the sanitizer never sees. A race
+    # in the Classic descriptor update path would be invisible to the gate built to
+    # find exactly that.
+    if(WALLPAPERX_LAVAPIPE_ICD)
+        add_test(NAME dbus_service_classic_lavapipe
+                 COMMAND ${DBUS_RUN_SESSION} -- $<TARGET_FILE:wallpaperx-dbus-service-test>)
+        set_tests_properties(dbus_service_classic_lavapipe PROPERTIES
+            ENVIRONMENT "VK_ICD_FILENAMES=${WALLPAPERX_LAVAPIPE_ICD};WALLPAPERX_FORCE_TIER=classic"
+            LABELS "lavapipe"
+            RESOURCE_LOCK wallpaperx_bus_tests)
+    endif()
 
     # One lock across every bus-driven test, not one per tier. Two reasons, and the
     # second is the reason it is shared rather than merely present: they render from
@@ -279,13 +308,25 @@ if(WALLPAPERX_SANITIZE STREQUAL "thread" AND CMAKE_VERSION VERSION_LESS 3.28)
         "DIRECTORY-scoped TEST properties). The tests are registered but carry neither the "
         "suppressions file nor the validation waiver, so a bare ctest here will be red for "
         "reasons unrelated to your code. Run them by hand instead:\n"
-        "  VK_ICD_FILENAMES=<lavapipe icd> WALLPAPERX_ALLOW_NO_VALIDATION=1 \\\n"
-        "  TSAN_OPTIONS=suppressions=${CMAKE_CURRENT_SOURCE_DIR}/tsan.supp \\\n"
-        "  ctest --test-dir <build> -L lavapipe")
+        "  WALLPAPERX_ALLOW_NO_VALIDATION=1 \\\n"
+        "  TSAN_OPTIONS=suppressions=${CMAKE_CURRENT_SOURCE_DIR}/tsan.supp:report_mutex_bugs=0 \\\n"
+        "  ctest --test-dir <build> -L 'lavapipe|novulkan'\n"
+        "report_mutex_bugs=0 is not optional: without it every run reports the Vulkan "
+        "loader's and llvmpipe's mutex misuse as failures. The lavapipe entries set "
+        "VK_ICD_FILENAMES themselves, so it does not belong on this command line.")
 elseif(WALLPAPERX_SANITIZE STREQUAL "thread")
     set(_tsan_env
-        "TSAN_OPTIONS=suppressions=${CMAKE_CURRENT_SOURCE_DIR}/tsan.supp:report_mutex_bugs=0"
-        "WALLPAPERX_ALLOW_NO_VALIDATION=1")
+        "TSAN_OPTIONS=suppressions=${CMAKE_CURRENT_SOURCE_DIR}/tsan.supp:report_mutex_bugs=0")
+
+    # The waiver goes only where something reads it. backend/tests/client/daemon_client.h
+    # is the sole reader, so it is meaningful for the two bus-driven tests and inert
+    # everywhere else: the renderer probes hard-code enableValidation=true and assert
+    # validationWarningCount() == 0, which is a claim about warnings and not about the
+    # layer being present, so no value of this variable changes what they do. Attaching
+    # it to all sixteen implied the probes were running without the layer under TSan,
+    # which was never true -- they load it and lean on the called_from_lib entry in
+    # tsan.supp instead.
+    set(_tsan_waiver "WALLPAPERX_ALLOW_NO_VALIDATION=1")
 
     # Lavapipe only, and the NVIDIA entries are disabled rather than left to fail. Under
     # TSan the proprietary driver takes a SEGV inside its own uninstrumented code on the
@@ -301,19 +342,30 @@ elseif(WALLPAPERX_SANITIZE STREQUAL "thread")
     # to remove, and it looked like the block was working because the backend tests went
     # green.
     set(_tsan_dirs "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/../renderer")
+    set(_tsan_enabled 0)
+    set(_tsan_lavapipe 0)
     foreach(_dir IN LISTS _tsan_dirs)
         get_property(_dir_tests DIRECTORY "${_dir}" PROPERTY TESTS)
         foreach(_t IN LISTS _dir_tests)
             # DIRECTORY-scoped, because a TEST property is only reachable from the
             # directory that registered the test (CMake >= 3.28 for this form).
             get_property(_labels TEST "${_t}" DIRECTORY "${_dir}" PROPERTY LABELS)
-            get_property(_existing TEST "${_t}" DIRECTORY "${_dir}" PROPERTY ENVIRONMENT)
-            if("lavapipe" IN_LIST _labels)
-                if(_existing)
+            # Two labels, not one, and the second is the correction: what disqualifies a
+            # test here is *loading the proprietary ICD*, which the absence of a lavapipe
+            # label is a bad proxy for. Keyed on that absence, this branch also disabled
+            # the five CPU-only tests, which never open a driver and cannot SEGV in one.
+            if("lavapipe" IN_LIST _labels OR "novulkan" IN_LIST _labels)
+                # APPEND rather than read-modify-write: CMake already handles the
+                # empty-property case and the list quoting.
+                set_property(TEST "${_t}" DIRECTORY "${_dir}"
+                             APPEND PROPERTY ENVIRONMENT ${_tsan_env})
+                if(_dir STREQUAL "${CMAKE_CURRENT_SOURCE_DIR}")
                     set_property(TEST "${_t}" DIRECTORY "${_dir}"
-                                 PROPERTY ENVIRONMENT "${_existing};${_tsan_env}")
-                else()
-                    set_property(TEST "${_t}" DIRECTORY "${_dir}" PROPERTY ENVIRONMENT "${_tsan_env}")
+                                 APPEND PROPERTY ENVIRONMENT ${_tsan_waiver})
+                endif()
+                math(EXPR _tsan_enabled "${_tsan_enabled} + 1")
+                if("lavapipe" IN_LIST _labels)
+                    math(EXPR _tsan_lavapipe "${_tsan_lavapipe} + 1")
                 endif()
             else()
                 set_property(TEST "${_t}" DIRECTORY "${_dir}" PROPERTY DISABLED TRUE)
@@ -321,8 +373,28 @@ elseif(WALLPAPERX_SANITIZE STREQUAL "thread")
         endforeach()
     endforeach()
 
-    message(STATUS "  TSan tier: lavapipe tests carry suppressions + validation waiver; "
-                   "non-lavapipe tests disabled (NVIDIA driver SEGVs under TSan)")
+    # A tier that disabled everything is the failure this block is most likely to have,
+    # and the one least likely to be noticed: ctest prints "0 tests failed out of 0" and
+    # exits 0, which reads exactly like a clean gate. It happens whenever the lavapipe
+    # ICD is missing, since every lavapipe entry is registered under find_file. Say so at
+    # configure time -- by the time ctest is green it is too late to notice.
+    # Counted on the lavapipe entries specifically, not on the total. The novulkan five
+    # are single-threaded and always survive, so a total of 5 would satisfy an
+    # "anything left?" check while detecting no race whatever -- every threaded path in
+    # this project reaches TSan through a lavapipe entry. Without the ICD that is what
+    # the tier degrades to, and it still exits 0.
+    if(_tsan_lavapipe EQUAL 0)
+        message(WARNING
+            "TSan tier: no lavapipe test survived, so this tree detects no races at all "
+            "-- only the ${_tsan_enabled} single-threaded CPU-only test(s) will run, and "
+            "ctest will still exit 0. Almost certainly the Lavapipe ICD was not found "
+            "(install vulkan-swrast / mesa-lavapipe and re-configure). Do not read a "
+            "green run from this tree as a passing sanitizer gate.")
+    else()
+        message(STATUS "  TSan tier: ${_tsan_enabled} test(s) carry suppressions "
+                       "(${_tsan_lavapipe} lavapipe; bus tests also carry the validation "
+                       "waiver); default-ICD tests disabled (SEGVs under TSan)")
+    endif()
 endif()
 
 # --------------------------------------------------------------------------- #

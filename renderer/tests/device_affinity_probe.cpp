@@ -20,26 +20,47 @@
 // Vulkan state is ever inherited across a fork. The parent holds no device at all while
 // the negative cases run -- the in-process positive case is deliberately last.
 //
-// NO CONTROL PATCH IS NEEDED, AND THAT IS THE POINT. The usual way to show a check can
-// fail is to break the thing it guards and watch it go red, which means editing
-// production code. Here the negative case *is* that mutation, expressed as a permanent
-// test: the guard either fires or the child exits 0 and the check fails. Stubbing
-// `assertGpuThread` to return early turns every negative case below red, which is the
-// regression nothing previously caught -- but it is a property of the test, not a step
-// anyone has to remember to run.
+// NO CONTROL PATCH IS NEEDED FOR THE GUARD CASES, AND THAT IS THE POINT. The usual way
+// to show a check can fail is to break the thing it guards and watch it go red, which
+// means editing production code. Here the negative case *is* that mutation, expressed as
+// a permanent test: the guard either fires or the child exits 0 and the check fails.
+// Stubbing `assertGpuThread` to return early turns every negative case below red, which
+// is the regression nothing previously caught -- but it is a property of the test, not a
+// step anyone has to remember to run.
+//
+// GOAL: X.4 -- a fault in this harness, or a host that cannot run these cases at all, is
+//       never reported as a failure of the code under test.
+// WHY-THIS-SHAPE: three outcomes that all used to collapse into "the guard is broken"
+//       are now distinct, because each has a different reader and a different fix. A
+//       child that cannot build a Device is a host problem (skip, exit 77); a pipe, fork
+//       or waitpid that fails is a problem with this file or the machine (HARN, exit 1,
+//       but never a claim about the guard); only a child that ran and did not abort is a
+//       renderer regression (FAIL). The simpler alternative -- letting the Device
+//       exception escape and reading the resulting SIGABRT -- is what produced the bug:
+//       std::terminate aborts, so a machine with no ICD looked exactly like the guard
+//       firing with the wrong message, five times over.
+// CONTROL: (a) `VK_ICD_FILENAMES=/nonexistent/icd.json ./wallpaperx-device-affinity-probe`
+//       -> 7 "skip:" lines and exit 77; before this change the same command produced
+//       five FAILs reading "child aborted, but not from the affinity guard". (b) the pid
+//       argument of waitpid replaced by -999999, which fails ECHILD -- a non-EINTR error
+//       -> 6 "HARN:" lines and exit 1; before, `status` stayed 0, WIFEXITED(0) was true
+//       with WEXITSTATUS(0) == 0, and every case reported "the call returned instead of
+//       aborting (child exited 0) -- the guard did not fire". Both reverted.
 
 #include "vulkan/device.h"
 #include "vulkan/frame_export.h"
 #include "vulkan/offscreen.h"
-#include "vulkan/validation_probe.h"
+#include "support/validation_probe.h"
 
 #include <atomic>
+#include <cerrno>
+#include <csignal>
 #include <cstdio>
 #include <cstring>
 #include <functional>
+#include <optional>
 #include <string>
 #include <thread>
-#include <vector>
 
 #include <sys/wait.h>
 #include <unistd.h>
@@ -60,11 +81,39 @@ constexpr uint32_t kWidth = 64;
 constexpr uint32_t kHeight = 64;
 constexpr int kMonitor = 0;
 
+// The child could not build a Device at all, so the case proved nothing about the guard.
+// Distinct from every other exit code a child here can produce: 0 means the guarded call
+// returned (a real miss) and 126 means dup2 failed.
+constexpr int kDeviceUnavailableExit = 77;
+
 int failures = 0;
+int harnessFaults = 0;
+int skipped = 0;
 
 void check(bool ok, const char* what) {
     std::printf("%s: %s\n", ok ? "ok  " : "FAIL", what);
     if (!ok) ++failures;
+}
+
+// Reported separately from check() on purpose. A pipe that could not be opened is not
+// evidence about Device::assertGpuThread, and counting it as a failed check would put a
+// renderer bug on the screen when the actual fault is in this file or in the machine.
+void harnessFault(const char* what, const char* detail) {
+    std::printf("HARN: %s\n", what);
+    // Flushed before writing to stderr: under ctest stdout is a pipe and therefore fully
+    // buffered while stderr is not, so without this the detail line overtakes the HARN
+    // line it belongs to and attaches itself to the previous case in the log.
+    std::fflush(stdout);
+    std::fprintf(stderr, "  harness could not run this case: %s -- this says nothing about the guard\n", detail);
+    ++harnessFaults;
+}
+
+void skip(const char* what, const std::string& detail) {
+    // Trimmed because `detail` is usually the child's captured stderr, which ends in the
+    // newline the child wrote; printed raw it puts a blank line between every skip.
+    const size_t end = detail.find_last_not_of(" \t\r\n");
+    std::printf("skip: %s -- %s\n", what, end == std::string::npos ? detail.c_str() : detail.substr(0, end + 1).c_str());
+    ++skipped;
 }
 
 struct ChildResult {
@@ -72,6 +121,8 @@ struct ChildResult {
     int signal = 0;            // which one
     bool exited = false;       // returned normally
     int exitCode = -1;
+    bool harnessFailed = false;  // fork/pipe/waitpid failed -- the case never ran
+    std::string harnessError;
     std::string stderrText;
 };
 
@@ -86,7 +137,8 @@ ChildResult runInChild(const std::function<void()>& body) {
 
     int fds[2];
     if (pipe(fds) != 0) {
-        result.stderrText = "pipe() failed";
+        result.harnessFailed = true;
+        result.harnessError = std::string("pipe() failed: ") + strerror(errno);
         return result;
     }
 
@@ -102,7 +154,8 @@ ChildResult runInChild(const std::function<void()>& body) {
     if (pid < 0) {
         close(fds[0]);
         close(fds[1]);
-        result.stderrText = "fork() failed";
+        result.harnessFailed = true;
+        result.harnessError = std::string("fork() failed: ") + strerror(errno);
         return result;
     }
 
@@ -131,10 +184,19 @@ ChildResult runInChild(const std::function<void()>& body) {
     close(fds[0]);
 
     int status = 0;
-    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+    pid_t waited = 0;
+    while ((waited = waitpid(pid, &status, 0)) < 0 && errno == EINTR) {
     }
-
     result.stderrText = std::move(captured);
+    if (waited < 0) {
+        // Left as a harness fault rather than falling through, because `status` is still
+        // 0 here and WIFEXITED(0) is true with WEXITSTATUS(0) == 0 -- indistinguishable
+        // from a child that returned cleanly, which is precisely the "the guard did not
+        // fire" verdict. A waitpid failure would have been reported as a renderer bug.
+        result.harnessFailed = true;
+        result.harnessError = std::string("waitpid() failed: ") + strerror(errno);
+        return result;
+    }
     if (WIFSIGNALED(status)) {
         result.crashed = true;
         result.signal = WTERMSIG(status);
@@ -145,11 +207,47 @@ ChildResult runInChild(const std::function<void()>& body) {
     return result;
 }
 
+// Builds the Device inside the child and hands it to `body`, or exits with a code the
+// parent can tell apart from every real outcome.
+//
+// Constructing a Device is the one step in these children that fails for reasons having
+// nothing to do with thread affinity: no ICD installed, no queue family with the needed
+// bits, a driver that will not initialise. Uncaught, that exception escapes the child's
+// body, std::terminate calls abort(), and the child dies by SIGABRT with no guard
+// sentence on its stderr -- which expectGuardAbort reports as "child aborted, but not
+// from the affinity guard", once per case. Five failures blaming assertGpuThread for the
+// absence of a GPU. std::optional::emplace constructs in place, so this does not need
+// Device to be movable.
+void withDevice(const std::function<void(Device&)>& body) {
+    std::optional<Device> device;
+    try {
+        device.emplace(/*enableValidation=*/true);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "device unavailable: %s\n", e.what());
+        std::fflush(stderr);
+        _exit(kDeviceUnavailableExit);
+    }
+    body(*device);
+}
+
 // Asserts that a child died the way the guard makes things die, and names every other
 // outcome distinguishably. A child that exits 0 means the guard did not fire; a child
 // that dies by some other signal, or by SIGABRT without the guard's message, means
 // something else killed it and this case proved nothing either way.
 void expectGuardAbort(const ChildResult& result, const char* label, const char* what) {
+    if (result.harnessFailed) {
+        harnessFault(what, result.harnessError.c_str());
+        return;
+    }
+    if (result.exited && result.exitCode == kDeviceUnavailableExit) {
+        skip(what, result.stderrText.empty() ? std::string("no usable Vulkan device in the child")
+                                             : result.stderrText);
+        return;
+    }
+    if (result.exited && result.exitCode == 126) {
+        harnessFault(what, "dup2() of the capture pipe failed in the child");
+        return;
+    }
     if (result.exited) {
         check(false, what);
         std::fprintf(stderr, "  the call returned instead of aborting (child exited %d) -- the guard did not fire\n",
@@ -201,34 +299,38 @@ int main() {
     // ---- Negative cases. Each is its own process, and each must die by the guard. ----
 
     expectGuardAbort(runInChild([] {
-                         Device device(/*enableValidation=*/true);
-                         OffscreenTargetManager targets(device);
-                         onAnotherThread([&] { targets.create(kMonitor, kWidth, kHeight); });
+                         withDevice([](Device& device) {
+                             OffscreenTargetManager targets(device);
+                             onAnotherThread([&] { targets.create(kMonitor, kWidth, kHeight); });
+                         });
                      }),
                      "OffscreenTargetManager::create",
                      "creating an offscreen target from a non-GPU thread aborts");
 
     expectGuardAbort(runInChild([] {
-                         Device device(/*enableValidation=*/true);
-                         OffscreenTargetManager targets(device);
-                         targets.create(kMonitor, kWidth, kHeight);  // correct thread
-                         onAnotherThread([&] { targets.destroy(kMonitor); });
+                         withDevice([](Device& device) {
+                             OffscreenTargetManager targets(device);
+                             targets.create(kMonitor, kWidth, kHeight);  // correct thread
+                             onAnotherThread([&] { targets.destroy(kMonitor); });
+                         });
                      }),
                      "OffscreenTargetManager::destroyTarget",
                      "destroying an offscreen target from a non-GPU thread aborts");
 
     expectGuardAbort(runInChild([] {
-                         Device device(/*enableValidation=*/true);
-                         onAnotherThread([&] { device.immediateSubmit([](VkCommandBuffer) {}); });
+                         withDevice([](Device& device) {
+                             onAnotherThread([&] { device.immediateSubmit([](VkCommandBuffer) {}); });
+                         });
                      }),
                      "Device::immediateSubmit",
                      "submitting GPU work from a non-GPU thread aborts");
 
     expectGuardAbort(runInChild([] {
-                         Device device(/*enableValidation=*/true);
-                         OffscreenTargetManager targets(device);
-                         const auto& target = targets.create(kMonitor, kWidth, kHeight);
-                         onAnotherThread([&] { (void)wallpaperx::exportFrame(device, target); });
+                         withDevice([](Device& device) {
+                             OffscreenTargetManager targets(device);
+                             const auto& target = targets.create(kMonitor, kWidth, kHeight);
+                             onAnotherThread([&] { (void)wallpaperx::exportFrame(device, target); });
+                         });
                      }),
                      "exportFrame", "exporting a frame from a non-GPU thread aborts");
 
@@ -240,13 +342,14 @@ int main() {
     // must be allowed through, and -- the half that would otherwise go untested -- the
     // old one must not.
     expectGuardAbort(runInChild([] {
-                         Device device(/*enableValidation=*/true);
-                         OffscreenTargetManager targets(device);
-                         targets.create(kMonitor, kWidth, kHeight);
-                         std::thread adopter([&] { device.adoptGpuThread(); });
-                         adopter.join();
-                         // The creating thread is now the *wrong* one.
-                         targets.destroy(kMonitor);
+                         withDevice([](Device& device) {
+                             OffscreenTargetManager targets(device);
+                             targets.create(kMonitor, kWidth, kHeight);
+                             std::thread adopter([&] { device.adoptGpuThread(); });
+                             adopter.join();
+                             // The creating thread is now the *wrong* one.
+                             targets.destroy(kMonitor);
+                         });
                      }),
                      "OffscreenTargetManager::destroyTarget",
                      "after adoptGpuThread the original creating thread is refused");
@@ -255,22 +358,30 @@ int main() {
         // The positive half of the handoff, in a child because a pass here leaves a
         // Device owned by a thread that is about to end.
         const ChildResult adopted = runInChild([] {
-            Device device(/*enableValidation=*/true);
-            OffscreenTargetManager targets(device);
-            targets.create(kMonitor, kWidth, kHeight);
-            std::atomic<bool> ok{false};
-            std::thread worker([&] {
-                device.adoptGpuThread();
-                targets.destroy(kMonitor);  // must be allowed now
-                ok = true;
+            withDevice([](Device& device) {
+                OffscreenTargetManager targets(device);
+                targets.create(kMonitor, kWidth, kHeight);
+                std::atomic<bool> ok{false};
+                std::thread worker([&] {
+                    device.adoptGpuThread();
+                    targets.destroy(kMonitor);  // must be allowed now
+                    ok = true;
+                });
+                worker.join();
+                _exit(ok ? 0 : 1);
             });
-            worker.join();
-            _exit(ok ? 0 : 1);
         });
-        check(adopted.exited && adopted.exitCode == 0, "after adoptGpuThread the adopting thread is allowed through");
-        if (!(adopted.exited && adopted.exitCode == 0)) {
-            std::fprintf(stderr, "  child %s%d; stderr: %s\n", adopted.crashed ? "died by signal " : "exited ",
-                         adopted.crashed ? adopted.signal : adopted.exitCode, adopted.stderrText.c_str());
+        const char* const what = "after adoptGpuThread the adopting thread is allowed through";
+        if (adopted.harnessFailed) {
+            harnessFault(what, adopted.harnessError.c_str());
+        } else if (adopted.exited && adopted.exitCode == kDeviceUnavailableExit) {
+            skip(what, adopted.stderrText);
+        } else {
+            check(adopted.exited && adopted.exitCode == 0, what);
+            if (!(adopted.exited && adopted.exitCode == 0)) {
+                std::fprintf(stderr, "  child %s%d; stderr: %s\n", adopted.crashed ? "died by signal " : "exited ",
+                             adopted.crashed ? adopted.signal : adopted.exitCode, adopted.stderrText.c_str());
+            }
         }
     }
 
@@ -279,30 +390,53 @@ int main() {
     // Without this the whole file is satisfied by a Device that aborts on *every* call,
     // which is not a guard, it is a brick.
     wallpaperx::resetValidationWarningCount();
+    // Construction is separated from the four calls so the two failure meanings stay
+    // apart: a Device that cannot be built here means the same "could not run" the
+    // children report, while a throw from any call *after* it is a real failure of the
+    // positive path. Folding both into one try/catch reported a machine with no ICD as a
+    // broken guard.
+    std::optional<Device> device;
     try {
-        Device device(/*enableValidation=*/true);
-        OffscreenTargetManager targets(device);
-        const auto& target = targets.create(kMonitor, kWidth, kHeight);
-        device.immediateSubmit([](VkCommandBuffer) {});
-        const wallpaperx::ExportedFrame frame = wallpaperx::exportFrame(device, target);
-        if (frame.fd >= 0) close(frame.fd);
-        targets.destroy(kMonitor);
-        check(true, "the creating thread performs the same four calls without aborting");
-
-        if (!wallpaperx::validationLayerActive()) {
-            std::printf("skip: validation-warning check -- VK_LAYER_KHRONOS_validation is not loadable here\n");
-        } else {
-            check(wallpaperx::validationWarningCount() == 0, "the positive path produces no validation warnings");
-        }
+        device.emplace(/*enableValidation=*/true);
     } catch (const std::exception& e) {
-        check(false, "the creating thread performs the same four calls without aborting");
-        std::fprintf(stderr, "  threw instead: %s\n", e.what());
+        skip("the creating thread performs the same four calls without aborting", e.what());
+    }
+    if (device) {
+        try {
+            OffscreenTargetManager targets(*device);
+            const auto& target = targets.create(kMonitor, kWidth, kHeight);
+            device->immediateSubmit([](VkCommandBuffer) {});
+            const wallpaperx::ExportedFrame frame = wallpaperx::exportFrame(*device, target);
+            if (frame.fd >= 0) close(frame.fd);
+            targets.destroy(kMonitor);
+            check(true, "the creating thread performs the same four calls without aborting");
+
+            if (!wallpaperx::validationLayerActive()) {
+                std::printf("skip: validation-warning check -- VK_LAYER_KHRONOS_validation is not loadable here\n");
+            } else {
+                check(wallpaperx::validationWarningCount() == 0, "the positive path produces no validation warnings");
+            }
+        } catch (const std::exception& e) {
+            check(false, "the creating thread performs the same four calls without aborting");
+            std::fprintf(stderr, "  threw instead: %s\n", e.what());
+        }
     }
 
-    if (failures == 0) {
-        std::printf("device_affinity_probe: all checks passed\n");
-        return 0;
+    if (failures > 0) {
+        std::fprintf(stderr, "device_affinity_probe: %d check(s) failed\n", failures);
+        return 1;
     }
-    std::fprintf(stderr, "device_affinity_probe: %d check(s) failed\n", failures);
-    return 1;
+    // Harness faults outrank the skip: they mean this file could not do its job, which is
+    // not the same as a host that cannot run it, and must not be reported as a pass.
+    if (harnessFaults > 0) {
+        std::fprintf(stderr, "device_affinity_probe: %d case(s) could not be run by the harness -- "
+                             "no conclusion about the affinity guard either way\n", harnessFaults);
+        return 1;
+    }
+    if (skipped > 0) {
+        std::printf("device_affinity_probe: %d case(s) skipped -- no usable Vulkan device on this host\n", skipped);
+        return 77;  // SKIP_RETURN_CODE, so ctest says "Skipped" rather than "Passed"
+    }
+    std::printf("device_affinity_probe: all checks passed\n");
+    return 0;
 }

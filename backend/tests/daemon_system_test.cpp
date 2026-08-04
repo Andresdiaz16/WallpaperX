@@ -64,6 +64,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -106,6 +107,10 @@ constexpr int32_t kMonitorBarrierPre = 30;
 constexpr int32_t kMonitorBarrierPost = 31;
 
 constexpr int kStormThreads = 4;
+
+// Enough to keep a reply in flight across the device-creation window without the
+// polling itself becoming the bottleneck the first render is waiting on.
+constexpr int kGpuInitWatchers = 3;
 // Sized so each client observes each monitor several times. Monotonicity is a property of
 // one observer's sequence, so a client's *first* look at a monitor can never register a
 // regression -- with a wide monitor pool and few iterations, nearly every observation was
@@ -446,11 +451,22 @@ private:
     //       std::condition_variable::~condition_variable()" with the previous access
     //       inside NameWatcher's own lambda. Declaring the proxy last makes it the
     //       first thing destroyed, and sdbus unregisters the handler there.
-    // CONTROL: with the declaration back above m_mutex, six consecutive TSan runs
-    //       (`WALLPAPERX_ALLOW_NO_VALIDATION=1 TSAN_OPTIONS=suppressions=backend/tsan.supp
-    //       dbus-run-session -- ./wallpaperx-daemon-system-test` in build-tsan) each
-    //       reported the race twice; with the order below, six runs reported it zero
-    //       times. Reverted to the order below.
+    // CONTROL: none that reproduces, and saying so is the point. Putting the
+    //       declaration back above m_mutex and running daemon_system_lavapipe six times
+    //       under the TSan tier produced zero ThreadSanitizer reports -- the racy layout
+    //       is silent here on demand. An earlier version of this comment claimed the
+    //       opposite ("six runs ... each reported the race twice"); that figure did not
+    //       hold up and is withdrawn. The race needs a NameOwnerChanged still in flight
+    //       at the instant the watcher is destroyed, and this test's shutdown almost
+    //       never produces that window; the one time TSan did catch it was on an
+    //       unrelated run whose timing happened to hit it.
+    //       So this ordering is justified by the language rule rather than by a
+    //       control: members are destroyed in reverse declaration order, and the
+    //       callback registered on m_proxy touches all three members below it. That is
+    //       checkable by reading it and does not depend on a scheduler. Do not read the
+    //       silence above as evidence the ordering is optional -- an unreproducible race
+    //       is still a race, and a control that cannot make this go red means this
+    //       comment is a claim about C++ semantics, not an observation.
     std::mutex m_mutex;
     std::condition_variable m_changed;
     uint64_t m_events = 0;
@@ -603,6 +619,127 @@ void checkFirstFrame(sdbus::IProxy& proxy, FrameReadyLog& signals, const std::st
         std::printf("daemon_system_test: %ux%u pixels verified across the process boundary\n", frame.width,
                     frame.height);
     }
+}
+
+// Samples GetStatus from several clients across the daemon's first device creation, and
+// grades every reply against the one cross-field invariant snapshot() promises.
+//
+// GOAL: S6.18 -- a GetStatus reply is internally consistent: it never reports an
+//       uninitialised GPU beside a monitor that already has a frame.
+// WHY-THIS-SHAPE: the invariant is only *falsifiable* while gpu.initialized is false.
+//       statusSelfConsistent returns true at its first branch once that flag is set,
+//       WallpaperManager::ensureGpu sets it exactly once and nothing clears it, so any
+//       sampling after the first render grades nothing -- which is precisely how this
+//       check spent its previous life in the concurrent-clients storm, pinned at zero
+//       inconsistencies over ~29 replies that had all short-circuited. The window is the
+//       first SetWallpaper: the daemon has monitors in its map, is about to commit a
+//       frame, and has not yet published a GPU. So the watchers start before
+//       checkFirstFrame issues that request and stop after its frame has arrived, which
+//       is the only interval in the whole suite where a two-lock snapshot() could be
+//       caught. checkFirstFrame is called between them rather than duplicated, so the
+//       phase it already owns keeps its own assertions and its own first-render
+//       semantics.
+// COVERAGE-ASSERT: the run is required to have observed the flag both false and true.
+//       Without that, a watcher fleet that started too late would report zero
+//       inconsistencies out of replies that were all post-initialisation -- exactly the
+//       vacuum this move exists to escape -- and it would look identical to a pass.
+// CONTROL: ensureGpu() changed to publish m_gpuStatus.initialized from a detached
+//       thread 1200 ms late, so the first frame commits while the GPU still reads as
+//       absent -> "FAIL: no GetStatus reply reports a frame before the GPU exists" over
+//       8441 replies. The coverage assert went red in the same run (0 post-init), which
+//       is the other half of it observed failing. Reverted.
+// WHAT DID NOT REPRODUCE, recorded so nobody over-trusts this check: splitting
+//       snapshot() into two acquisitions of m_stateMutex -- the regression that
+//       function's own comment warns about -- produced 0 inconsistencies over ~25,000
+//       replies across three runs. It cannot be caught that way. ensureGpu() publishes
+//       the GPU *before* any render commits, so the two reads have to be separated by
+//       the whole of device creation to disagree, and a lock released and immediately
+//       retaken is nowhere near that wide. This check catches a snapshot whose halves
+//       drift far apart; it does not catch a narrow split, and a future reader must not
+//       read its green as proof that snapshot() is still single-locked.
+struct GpuInitWatch {
+    std::atomic<bool> stop{false};
+    std::atomic<int> replies{0};
+    std::atomic<int> preInit{0};
+    std::atomic<int> postInit{0};
+    std::atomic<int> inconsistent{0};
+    std::atomic<int> errors{0};
+};
+
+void gpuInitWatchThread(GpuInitWatch& watch) {
+    // Constructed inside the thread and inside the guard, for the reason stormThread
+    // gives: an exception escaping a thread entry point is std::terminate, which would
+    // replace this phase's FAIL lines with a bare abort.
+    std::unique_ptr<sdbus::IProxy> proxy;
+    try {
+        proxy = sdbus::createProxy(sdbus::ServiceName{DbusService::kBusName},
+                                   sdbus::ObjectPath{DbusService::kObjectPath});
+    } catch (const std::exception&) {
+        ++watch.errors;
+        return;
+    }
+
+    while (!watch.stop.load(std::memory_order_relaxed)) {
+        try {
+            const nlohmann::json status = getStatus(*proxy);
+            ++watch.replies;
+            const bool initialized = status.contains("gpu") && status["gpu"].is_object() &&
+                                     status["gpu"].value("initialized", false);
+            if (initialized) {
+                ++watch.postInit;
+            } else {
+                ++watch.preInit;
+            }
+            if (!wallpaperx::testing::statusSelfConsistent(status)) ++watch.inconsistent;
+        } catch (const std::exception&) {
+            // A failed GetStatus is not a consistency violation. Counted, and reported
+            // below only if it swallowed the whole sample.
+            ++watch.errors;
+        }
+    }
+}
+
+void checkFirstFrameUnderStatusLoad(sdbus::IProxy& proxy, FrameReadyLog& signals, const std::string& bluePath,
+                                    const Check& check) {
+    GpuInitWatch watch;
+    std::vector<std::thread> watchers;
+    watchers.reserve(kGpuInitWatchers);
+    for (int i = 0; i < kGpuInitWatchers; ++i) {
+        watchers.emplace_back([&watch] { gpuInitWatchThread(watch); });
+    }
+
+    checkFirstFrame(proxy, signals, bluePath, check);
+
+    watch.stop.store(true, std::memory_order_relaxed);
+    for (std::thread& t : watchers) t.join();
+
+    const int replies = watch.replies.load();
+    const int preInit = watch.preInit.load();
+    const int postInit = watch.postInit.load();
+
+    // The coverage assert comes first: if the sampling missed the transition, the
+    // invariant below was applied to nothing and reporting it as green would be the
+    // same false signal this phase was moved to escape.
+    const bool straddled = preInit > 0 && postInit > 0;
+    check(straddled, "the GetStatus sampling straddled the daemon's first device creation");
+    if (!straddled) {
+        std::fprintf(stderr,
+                     "  %d replies: %d before the GPU was published, %d after -- the consistency check below "
+                     "graded nothing, because statusSelfConsistent is only falsifiable while gpu.initialized "
+                     "is false\n",
+                     replies, preInit, postInit);
+    }
+
+    check(watch.inconsistent.load() == 0, "no GetStatus reply reports a frame before the GPU exists");
+
+    if (replies == 0) {
+        check(false, "the status watchers got at least one reply");
+        std::fprintf(stderr, "  %d client error(s) and no replies at all\n", watch.errors.load());
+    }
+
+    std::printf("daemon_system_test: %d GetStatus replies across first device creation (%d pre-init, %d post-init, "
+                "%d client error(s))\n",
+                replies, preInit, postInit, watch.errors.load());
 }
 
 // ---------------------------------------------------------------------------- //
@@ -809,8 +946,6 @@ struct StormResult {
     std::atomic<int> unexpectedErrors{0};
     std::atomic<int> generationRegressions{0};
     std::atomic<int> generationComparisons{0};
-    std::atomic<int> inconsistentSnapshots{0};
-    std::atomic<int> statusReplies{0};
     std::atomic<int> calls{0};
     std::mutex mutex;
     std::string firstUnexpected;
@@ -878,14 +1013,9 @@ void stormThread(int index, const std::string& bluePath, const std::string& redP
                     break;
                 case 1: {
                     const nlohmann::json status = getStatus(*proxy);
-                    // See the annotation on statusSelfConsistent in
-                    // tests/client/daemon_client.h. Sampled here above all: a two-lock
-                    // GetStatus opens its window only when a render commits between the
-                    // two acquisitions, so a run with four clients hammering the daemon
-                    // while renders are in flight is the only place in the suite where
-                    // that window is being aimed at rather than hoped for.
-                    ++result.statusReplies;
-                    if (!wallpaperx::testing::statusSelfConsistent(status)) ++result.inconsistentSnapshots;
+                    // Called for the generation observation below. Snapshot consistency
+                    // is deliberately NOT graded from these replies -- see the note at
+                    // the end of this function.
                     const nlohmann::json* entry = wallpaperStatus(status, std::to_string(monitorId));
                     if (entry != nullptr) {
                         observeGeneration(result, marks, monitorId, entry->value("generation", uint64_t{0}));
@@ -962,18 +1092,19 @@ void checkConcurrentClients(sdbus::IProxy& proxy, FrameReadyLog& signals, const 
     check(result.generationComparisons >= kStormThreads * 3,
           "the monotonicity check made enough repeat observations to be worth asserting");
 
-    // See the annotation on statusSelfConsistent in tests/client/daemon_client.h.
-    check(result.inconsistentSnapshots == 0,
-          "no GetStatus reply during the storm reported an uninitialised GPU beside a monitor with a frame");
-    // Same reasoning as the comparison count above: the invariant is worth what the
-    // number of replies it was applied to is worth, and that number is runtime state.
-    // Which iterations take the GetStatus branch is fixed by the per-thread PRNG, so
-    // this count is deterministic at 29 here; 12 is the same three-per-client floor.
-    check(result.statusReplies >= kStormThreads * 3,
-          "enough GetStatus replies were sampled for the snapshot-consistency check to mean something");
-    std::printf("daemon_system_test: %d concurrent calls across %d clients completed, %d generation comparisons, "
-                "%d GetStatus replies checked for snapshot consistency\n",
-                result.calls.load(), kStormThreads, result.generationComparisons.load(), result.statusReplies.load());
+    // The snapshot-consistency invariant is NOT graded here, and the two checks that
+    // used to be are gone rather than relaxed. statusSelfConsistent returns true the
+    // moment gpu.initialized is true (see tests/client/daemon_client.h), that flag is
+    // set once in WallpaperManager::ensureGpu and never cleared, and this phase runs
+    // long after the first render -- so every one of the ~29 replies short-circuited at
+    // the first branch and inconsistentSnapshots was pinned at 0 by construction. The
+    // companion "enough replies were sampled" bound made that worse than merely useless:
+    // it printed a reassuring count and reported the invariant as covered under
+    // concurrency when no reply had been graded at all. The window the invariant guards
+    // is only open around the daemon's first device creation, so the check now lives
+    // where it can fail -- see checkFirstFrameUnderStatusLoad below.
+    std::printf("daemon_system_test: %d concurrent calls across %d clients completed, %d generation comparisons\n",
+                result.calls.load(), kStormThreads, result.generationComparisons.load());
 
     // The daemon is still there and still correct afterwards. Quiescing each stormed
     // monitor to a known request and checking where it lands is what makes the storm an
@@ -1165,7 +1296,7 @@ int main() {
                 .onInterface(DbusService::kInterface)
                 .call([&signals](int32_t monitorId, uint64_t generation) { signals.record(monitorId, generation); });
 
-            checkFirstFrame(*proxy, signals, bluePath, check);
+            checkFirstFrameUnderStatusLoad(*proxy, signals, bluePath, check);
             checkResponsivenessUnderLoad(*proxy, signals, bluePath, check);
             checkConcurrentClients(*proxy, signals, bluePath, redPath, corruptPath, check);
         }
@@ -1272,11 +1403,28 @@ int main() {
                     "that is reported above.\n",
                     daemonCameUp ? "the daemon's output was never collected" : "the daemon never started");
     } else {
-        const bool reported = daemonOutput.find("GPU: ") != std::string::npos &&
-                              daemonOutput.find("Descriptor tier: ") != std::string::npos;
-        check(reported, "the daemon reports its GPU and descriptor tier once the device exists");
+        // Both labels on ONE line, not merely both present somewhere in the capture.
+        // Two unanchored find()s are a strictly weaker property than DoD #1 states: a
+        // daemon that printed the GPU name at startup and the tier from some unrelated
+        // path would satisfy them, and so would one that printed a tier without ever
+        // creating a device -- which the printf's own comment says must not happen. The
+        // GPU name itself stays out of the assertion because it is host-specific.
+        bool reported = false;
+        for (size_t start = 0; start < daemonOutput.size();) {
+            const size_t eol = daemonOutput.find('\n', start);
+            const std::string_view line(daemonOutput.data() + start,
+                                        (eol == std::string::npos ? daemonOutput.size() : eol) - start);
+            const size_t gpu = line.find("GPU: ");
+            if (gpu != std::string_view::npos && line.find("Descriptor tier: ", gpu) != std::string_view::npos) {
+                reported = true;
+                break;
+            }
+            if (eol == std::string::npos) break;
+            start = eol + 1;
+        }
+        check(reported, "the daemon reports its GPU and descriptor tier on one line once the device exists");
         if (!reported) {
-            std::fprintf(stderr, "  no 'GPU: ... | Descriptor tier: ...' line in the daemon's output\n");
+            std::fprintf(stderr, "  no single 'GPU: ... | Descriptor tier: ...' line in the daemon's output\n");
         }
     }
 
