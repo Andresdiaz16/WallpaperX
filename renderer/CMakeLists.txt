@@ -162,6 +162,9 @@ target_link_libraries(wallpaperx-memory-export-test PRIVATE wallpaperx-renderer)
 add_executable(wallpaperx-offscreen-probe tests/offscreen_probe.cpp)
 target_link_libraries(wallpaperx-offscreen-probe PRIVATE wallpaperx-renderer)
 
+add_executable(wallpaperx-device-affinity-probe tests/device_affinity_probe.cpp)
+target_link_libraries(wallpaperx-device-affinity-probe PRIVATE wallpaperx-renderer)
+
 add_executable(wallpaperx-static-renderer-probe tests/static_renderer_probe.cpp)
 target_link_libraries(wallpaperx-static-renderer-probe PRIVATE wallpaperx-renderer)
 add_dependencies(wallpaperx-static-renderer-probe wallpaperx-shaders)
@@ -215,6 +218,7 @@ set_tests_properties(handle_type_env_dmabuf PROPERTIES ENVIRONMENT "WALLPAPERX_F
 set_tests_properties(handle_type_env_default PROPERTIES ENVIRONMENT "WALLPAPERX_FORCE_HANDLE_TYPE=")
 add_test(NAME device_probe COMMAND wallpaperx-device-probe)
 add_test(NAME offscreen_probe COMMAND wallpaperx-offscreen-probe)
+add_test(NAME device_affinity_probe COMMAND wallpaperx-device-affinity-probe)
 add_test(NAME static_renderer_probe COMMAND wallpaperx-static-renderer-probe)
 add_test(NAME descriptor_allocator_probe COMMAND wallpaperx-descriptor-allocator-probe)
 add_test(NAME frame_export_probe COMMAND wallpaperx-frame-export-probe)
@@ -253,6 +257,7 @@ set_tests_properties(modifier_roundtrip_probe modifier_sensitivity_probe
 if(WALLPAPERX_LAVAPIPE_ICD)
     add_test(NAME device_probe_lavapipe COMMAND wallpaperx-device-probe)
     add_test(NAME offscreen_probe_lavapipe COMMAND wallpaperx-offscreen-probe)
+    add_test(NAME device_affinity_probe_lavapipe COMMAND wallpaperx-device-affinity-probe)
     add_test(NAME static_renderer_probe_lavapipe COMMAND wallpaperx-static-renderer-probe)
     add_test(NAME descriptor_allocator_probe_lavapipe COMMAND wallpaperx-descriptor-allocator-probe)
     # Unlike the Heap tier, frame export needs no capability-skip under Lavapipe:
@@ -267,6 +272,7 @@ if(WALLPAPERX_LAVAPIPE_ICD)
     set_tests_properties(
         device_probe_lavapipe
         offscreen_probe_lavapipe
+        device_affinity_probe_lavapipe
         static_renderer_probe_lavapipe
         descriptor_allocator_probe_lavapipe
         frame_export_probe_lavapipe
