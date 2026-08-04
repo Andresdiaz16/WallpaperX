@@ -24,11 +24,15 @@
 #include "vulkan/device.h"
 #include "vulkan/frame_export.h"
 
-// Two support directories, spelled differently on purpose: the renderer's is on the
-// include path as `support/...`, the backend's is reached through the backend source
-// root, so the two never resolve to each other by accident.
+// The renderer's shared test scaffolding, on the include path as `support/...`. The
+// backend's own lives in tests/client/, deliberately NOT tests/support/: a quoted
+// include searches the including file's own directory before any -I path, and this file
+// sits in backend/tests/ -- so a backend/tests/support/exported_frame_map.h would
+// silently shadow the renderer's for the backend tests only, leaving the renderer's own
+// probes on the original. Different directory names make that unrepresentable instead
+// of merely unlikely.
 #include "support/exported_frame_map.h"
-#include "tests/support/daemon_client.h"
+#include "tests/client/daemon_client.h"
 
 #include <sdbus-c++/sdbus-c++.h>
 
@@ -40,7 +44,6 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
-#include <condition_variable>
 #include <cstdint>
 #include <future>
 #include <cstdio>
@@ -49,8 +52,6 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
-#include <functional>
-#include <mutex>
 #include <regex>
 #include <stdexcept>
 #include <string>
@@ -63,7 +64,7 @@ using wallpaperx::DbusService;
 
 namespace {
 
-// The client-side wire helpers now live in tests/support/daemon_client.h, shared with
+// The client-side wire helpers now live in tests/client/daemon_client.h, shared with
 // daemon_system_test so both tiers read the same reply layout. Pulled in one name at a
 // time rather than with a blanket using-directive, so it stays visible which of them
 // this file depends on.
@@ -73,7 +74,6 @@ using wallpaperx::testing::Frame;
 using wallpaperx::testing::FrameReadyLog;
 using wallpaperx::testing::getFrameFd;
 using wallpaperx::testing::getStatus;
-using wallpaperx::testing::kSignalTimeout;
 using wallpaperx::testing::openFdCount;
 using wallpaperx::testing::setWallpaper;
 using wallpaperx::testing::wallpaperStatus;

@@ -25,9 +25,13 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <system_error>
 #include <utility>
@@ -43,6 +47,40 @@ inline constexpr auto kSignalTimeout = std::chrono::seconds(30);
 // the caller's failure counter rather than aborting the run at the first problem --
 // one FAIL line per broken property is worth far more than a stack trace from the first.
 using Check = std::function<void(bool, const char*)>;
+
+// Whether to run without the Vulkan validation layer.
+//
+// Shared, not copied, because the two tiers must agree on what the switch *means*: a
+// ThreadSanitizer run waives both with one variable, and a tier that disagreed would
+// either drown the report in layer noise or claim a GPU-side oracle it did not have.
+//
+// Compared against "1" exactly, matching WALLPAPERX_ALLOW_NO_HEAP_TIER: a plain getenv()
+// truthiness check would make "=0" mean "waived", the opposite of what anyone typing it
+// intends. Every caller must announce a waiver loudly -- this disables the suite's only
+// GPU-side oracle, and a silent version of the switch is exactly the vacuous-green trap
+// the validation checks exist to close.
+inline bool validationWaived() {
+    const char* env = std::getenv("WALLPAPERX_ALLOW_NO_VALIDATION");
+    return env != nullptr && std::strcmp(env, "1") == 0;
+}
+
+// A file that exists and is a regular file -- so it passes SetWallpaper's synchronous
+// validation -- but cannot be decoded, so the render fails asynchronously. That
+// asymmetry is the point: it is the only way to reach the RenderFailed path.
+//
+// The PNG *writers* are deliberately not shared alongside this. They differ per tier (a
+// single solid fill against a five-colour burst palette with its own static_assert), and
+// sharing them would drag stb_image_write's implementation macro into a header included
+// by two translation units that each define it -- stb emits its implementation block
+// outside its own include guard, so that double-defines rather than deduplicating.
+inline std::string writeUndecodableFile(const std::string& dir, const std::string& name) {
+    std::filesystem::create_directories(dir);
+    const std::string path = dir + "/" + name;
+    std::ofstream out(path, std::ios::binary);
+    out << "this is not a PNG";
+    if (!out) throw std::runtime_error("could not write " + path);
+    return path;
+}
 
 // Number of descriptors this process currently holds open. Used before/after a block of
 // work to catch a leak: GetFrameFd is called by a polling consumer, so a descriptor
@@ -84,6 +122,16 @@ public:
     // The exact-match wait() above cannot be used when several clients drive the same
     // monitor concurrently: which generation a given request lands on is then a race,
     // and asserting on a specific number would be asserting on the scheduler.
+    //
+    // PRECONDITION, and it is easy to get wrong: this scans the whole signal history, so
+    // it answers "a frame at or past N exists", not "a frame arrived after I asked". The
+    // caller must therefore derive `generation` from a state it knows to be QUIESCED. A
+    // threshold read from GetStatus mid-flight does not qualify -- WallpaperManager bumps
+    // the counter at commit time, so a render already queued when the threshold was read
+    // satisfies this wait without the caller's own request ever having rendered, and the
+    // check built on it passes for a daemon that has stopped rendering entirely. Use the
+    // single FIFO render thread as the barrier: post a request, wait() for its exact
+    // signal, and only then read the threshold.
     bool waitAtLeast(int32_t monitorId, uint64_t generation) {
         std::unique_lock<std::mutex> lock(m_mutex);
         return m_arrived.wait_for(lock, kSignalTimeout, [&] {

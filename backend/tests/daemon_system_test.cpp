@@ -34,7 +34,7 @@
 //    been bitten by most.
 
 #include "daemon/dbus_service.h"
-#include "tests/support/daemon_client.h"
+#include "tests/client/daemon_client.h"
 
 #include "support/exported_frame_map.h"
 
@@ -75,6 +75,7 @@ extern char** environ;
 
 using wallpaperx::DbusService;
 using wallpaperx::testing::Check;
+using wallpaperx::testing::validationWaived;
 using wallpaperx::testing::Frame;
 using wallpaperx::testing::FrameReadyLog;
 using wallpaperx::testing::getFrameFd;
@@ -100,7 +101,8 @@ constexpr int32_t kMonitorTiming = 1;
 constexpr int32_t kMonitorLoadBase = 2;    // .. kMonitorLoadBase + loadCount - 1
 constexpr int32_t kMonitorStormBase = 20;  // .. kMonitorStormBase + kStormMonitors - 1
 constexpr int32_t kStormMonitors = 6;
-constexpr int32_t kMonitorBarrier = 30;
+constexpr int32_t kMonitorBarrierPre = 30;
+constexpr int32_t kMonitorBarrierPost = 31;
 
 constexpr int kStormThreads = 4;
 constexpr int kStormIterations = 12;
@@ -144,18 +146,6 @@ std::string writeSolidImage(const char* name, unsigned char r, unsigned char g, 
     if (stbi_write_png(path.c_str(), kSide, kSide, 4, pixels.data(), kSide * 4) == 0) {
         throw std::runtime_error("could not write " + path);
     }
-    return path;
-}
-
-// A file that exists and is a regular file -- so it passes SetWallpaper's synchronous
-// validation -- but cannot be decoded, so the render fails asynchronously. That
-// asymmetry is the whole point: it is the only way to reach the RenderFailed path.
-std::string writeCorruptImage() {
-    std::filesystem::create_directories(testAssetDir());
-    const std::string path = testAssetDir() + "/system_corrupt.png";
-    std::ofstream out(path, std::ios::binary);
-    out << "this is not a PNG";
-    if (!out) throw std::runtime_error("could not write " + path);
     return path;
 }
 
@@ -213,15 +203,36 @@ public:
         if (m_pid == 0) {
             // dup2 clears FD_CLOEXEC on the new descriptor, which is why the pipe can be
             // opened O_CLOEXEC and still survive into the exec'd program on 1 and 2.
-            dup2(fds[1], STDOUT_FILENO);
-            dup2(fds[1], STDERR_FILENO);
+            //
+            // Checked, because a silent failure here is worse than the failure itself: the
+            // daemon would run correctly with its original stdout, the capture pipe would
+            // stay empty, and the parent would report "the daemon runs its destructor
+            // chain" and the validation scan as failures of the daemon.
+            if (dup2(fds[1], STDOUT_FILENO) == -1 || dup2(fds[1], STDERR_FILENO) == -1) {
+                _exit(126);
+            }
             execve(binary.c_str(), argv, envp.data());
             _exit(127);  // only reached if execve failed
         }
 
         close(fds[1]);
         m_readFd = fds[0];
-        m_reader = std::thread([this] { readLoop(); });
+
+        // Past fork(), so the child exists but this object does not yet -- a throw here
+        // would skip ~SpawnedDaemon entirely, leaving a daemon running and holding the
+        // bus name with nothing tracking it, and every later phase talking to a process
+        // nobody can shut down.
+        try {
+            m_reader = std::thread([this] { readLoop(); });
+        } catch (...) {
+            kill(m_pid, SIGKILL);
+            int status = 0;
+            waitpid(m_pid, &status, 0);
+            m_pid = -1;
+            close(m_readFd);
+            m_readFd = -1;
+            throw;
+        }
     }
 
     ~SpawnedDaemon() {
@@ -238,9 +249,16 @@ public:
 
     pid_t pid() const { return m_pid; }
 
+    // True when the process had to be SIGKILLed because it did not exit in time. Kept
+    // separate from the exit code because reap() reports both "killed by a signal" and
+    // "timed out" as -1, and a check written as `exitCode != 0` is satisfied by the
+    // timeout -- which turns "this process never exited" into evidence that it exited
+    // for the right reason.
+    bool timedOut() const { return m_timedOut; }
+
     // Signals the daemon and waits for it to exit. Returns the exit code, or -1 if it
     // was killed by a signal or did not exit within kProcessTimeout (in which case it is
-    // SIGKILLed so the test can continue).
+    // SIGKILLed so the test can continue -- see timedOut()).
     int shutdown(int signo) {
         if (m_pid <= 0) return m_exitCode;
         kill(m_pid, signo);
@@ -268,6 +286,11 @@ private:
         std::string pending;
         while (true) {
             const ssize_t n = read(m_readFd, buf, sizeof(buf));
+            // EINTR is not EOF. Treating it as one truncates the capture, and every
+            // assertion about the daemon's output below -- "stopped cleanly", the signal
+            // line, the validation scan -- then reads a short buffer and fails, or passes,
+            // for a reason that has nothing to do with the daemon.
+            if (n < 0 && errno == EINTR) continue;
             if (n <= 0) break;
             {
                 std::lock_guard<std::mutex> lock(m_mutex);
@@ -301,6 +324,7 @@ private:
             kill(m_pid, SIGKILL);
             waitpid(m_pid, &status, 0);
             m_exitCode = -1;
+            m_timedOut = true;
         } else {
             m_exitCode = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
         }
@@ -317,6 +341,7 @@ private:
     pid_t m_pid = -1;
     int m_readFd = -1;
     int m_exitCode = -1;
+    bool m_timedOut = false;
     std::thread m_reader;
     mutable std::mutex m_mutex;
     std::string m_output;
@@ -347,12 +372,25 @@ public:
 
     // True if the daemon currently holds the name. Asked of the bus rather than the
     // cached signal state, so it is also correct before any signal has arrived.
+    //
+    // The answer is written back into the cached flag, and that is load-bearing rather
+    // than an optimisation. waitFor() returns early on this call without waiting for the
+    // matching NameOwnerChanged, so without the write-back the flag keeps the *previous*
+    // daemon's value: waitFor(false) after a shutdown would leave it stale at true, and
+    // the next waitFor(true) would be satisfied instantly by that stale value before the
+    // new daemon had acquired anything. The test would then signal a daemon that has not
+    // yet installed its signal mask, and the default disposition would kill it -- a
+    // spurious failure of the shutdown checks, on a correct daemon.
     bool ownedNow() {
         bool has = false;
         m_proxy->callMethod("NameHasOwner")
             .onInterface("org.freedesktop.DBus")
             .withArguments(std::string(DbusService::kBusName))
             .storeResultsTo(has);
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_owned = has;
+        }
         return has;
     }
 
@@ -369,16 +407,6 @@ private:
     std::condition_variable m_changed;
     bool m_owned = false;
 };
-
-// Whether to tell the daemon to run without the validation layer. Same variable and
-// same exact-"1" comparison as dbus_service_test, so one setting covers both tiers.
-// Its caller is a ThreadSanitizer build: the layer is uninstrumented, keeps lock-heavy
-// state maps, and buries any real report from the daemon's two-lock design in races
-// inside code we do not ship.
-bool validationWaived() {
-    const char* env = std::getenv("WALLPAPERX_ALLOW_NO_VALIDATION");
-    return env != nullptr && std::strcmp(env, "1") == 0;
-}
 
 // Whether VK_LAYER_KHRONOS_validation can be loaded on this host. Asked through the
 // loader, from this process, with the same environment the daemon child inherits -- so
@@ -468,9 +496,19 @@ void checkFirstFrame(sdbus::IProxy& proxy, FrameReadyLog& signals, const std::st
                     static_cast<unsigned long long>(frame.drmModifier), frame.planes.size());
         return;
     }
-    check(fdSize >= 0 && static_cast<uint64_t>(fdSize) >= frame.memorySize,
+    // "I cannot answer" and "the buffer is too small" are different results and only the
+    // second is a defect. A dma_buf whose driver refuses SEEK_END returns -1, which the
+    // sibling tier treats as a skip -- scoring it as a failure here would report a defect
+    // in the export path for a property of the driver.
+    if (fdSize < 0) {
+        std::printf("daemon_system_test: cross-process content check skipped -- lseek(SEEK_END) cannot size this "
+                    "fd (%s), so the mapping below could not be bounded safely.\n",
+                    std::strerror(errno));
+        return;
+    }
+    check(static_cast<uint64_t>(fdSize) >= frame.memorySize,
           "the dma_buf behind the fd is at least as large as the published memory_size");
-    if (fdSize < 0 || static_cast<uint64_t>(fdSize) < frame.memorySize) return;
+    if (static_cast<uint64_t>(fdSize) < frame.memorySize) return;
 
     const wallpaperx::testing::MappedFrame mapping(frame.fd.get(), frame.memorySize);
     if (!mapping.valid()) {
@@ -586,7 +624,14 @@ void checkResponsivenessUnderLoad(sdbus::IProxy& proxy, FrameReadyLog& signals, 
     // everything the thread wrote happens-before everything read after it.
     Clock::time_point frameDoneAt{};
     bool frameFailed = false;
-    std::thread frameRequest([&] {
+    // jthread, not thread: getStatus() below is a blocking DBus call that throws whenever
+    // the daemon dies or times out mid-burst -- which is exactly what a daemon answering
+    // GetFrameFd on the event loop does. Unwinding past a still-joinable std::thread is
+    // std::terminate, so the one regression this phase exists to catch would have
+    // produced a bare SIGABRT with no FAIL lines instead of reaching main's handler. The
+    // explicit join() below stays: it is the happens-before edge that makes the plain
+    // frameDoneAt/frameFailed safe to read, and it leaves the destructor with nothing to do.
+    std::jthread frameRequest([&] {
         try {
             const Frame frame = getFrameFd(*observer, kMonitorLoadBase + loadCount - 1);
             (void)frame;
@@ -616,26 +661,54 @@ void checkResponsivenessUnderLoad(sdbus::IProxy& proxy, FrameReadyLog& signals, 
                 perRenderMs, loadCount, millis(issueTime), millis(drain), millis(frameLatency),
                 millis(frameDoneAt - statusDoneAt));
 
-    // The control on the two checks below. Both compare an interval against the render
-    // queue's own duration, so if the queue costs no measurable time then a daemon that
-    // rendered inline would look identical to one that posts, and passing would prove
-    // nothing. Reported as inconclusive rather than counted -- a host fast enough to
-    // erase the difference must not be allowed to manufacture evidence.
-    if (drain < kMinConclusiveDrain) {
-        std::printf("daemon_system_test: responsiveness check INCONCLUSIVE on this host -- the queue drained in "
-                    "%.1f ms, under the %lld ms needed for a blocking handler to be distinguishable.\n",
-                    millis(drain), static_cast<long long>(kMinConclusiveDrain.count()));
-        return;
-    }
-
-    check(issueTime * 4 < drain,
-          "issuing a burst of requests costs a fraction of rendering it (SetWallpaper does not render inline)");
-
     // Printed, never counted -- see the header comment above for why this one cannot
     // fail for any daemon that does not already abort.
     std::printf("daemon_system_test: GetStatus %s the GetFrameFd issued before it (corroborating, not asserted -- "
                 "the Device's thread pinning is what makes a GPU-touching handler fatal)\n",
                 statusDoneAt < frameDoneAt ? "overtook" : "did not overtake");
+
+    // A second, undisturbed round. issueTime is a handful of DBus round trips measured in
+    // tens of microseconds, and each one makes the daemon printf and fflush a line into
+    // the pipe this test owns -- so one scheduler preemption inside that loop inflates it
+    // without inflating drain, and the check below would accuse production code of
+    // rendering inline on a host that merely hiccuped. Two rounds and the better ratio
+    // fixes that without weakening the check: a daemon that really does render inline
+    // measures issueTime ~= drain in *both* rounds, because that is what it does rather
+    // than what the scheduler did to it.
+    const auto secondStart = Clock::now();
+    for (int i = 0; i < loadCount; ++i) {
+        setWallpaper(proxy, "static", bluePath, kMonitorLoadBase + i);
+    }
+    const auto issueTime2 = Clock::now() - secondStart;
+    for (int i = 0; i < loadCount; ++i) {
+        if (!signals.wait(kMonitorLoadBase + i, 2)) allArrived = false;
+    }
+    const auto drain2 = Clock::now() - secondStart;
+    check(allArrived, "the second measuring burst also completes");
+
+    // Ratios rather than raw intervals, since the two rounds may drain at different
+    // speeds; the smaller ratio is the round less disturbed by the host.
+    const double ratio1 = millis(drain) > 0 ? millis(issueTime) / millis(drain) : 1.0;
+    const double ratio2 = millis(drain2) > 0 ? millis(issueTime2) / millis(drain2) : 1.0;
+    const bool useSecond = ratio2 < ratio1;
+    const auto bestDrain = useSecond ? drain2 : drain;
+    std::printf("daemon_system_test: issue/drain ratio %.4f then %.4f (threshold 0.25, grading the %s round)\n",
+                ratio1, ratio2, useSecond ? "second" : "first");
+
+    // The control on the check below: it compares an interval against the render queue's
+    // own duration, so if the queue costs no measurable time then a daemon that rendered
+    // inline would look identical to one that posts, and passing would prove nothing.
+    // Reported as inconclusive rather than counted -- a host fast enough to erase the
+    // difference must not be allowed to manufacture evidence.
+    if (bestDrain < kMinConclusiveDrain) {
+        std::printf("daemon_system_test: responsiveness check INCONCLUSIVE on this host -- the queue drained in "
+                    "%.1f ms, under the %lld ms needed for a blocking handler to be distinguishable.\n",
+                    millis(bestDrain), static_cast<long long>(kMinConclusiveDrain.count()));
+        return;
+    }
+
+    check(std::min(ratio1, ratio2) * 4 < 1.0,
+          "issuing a burst of requests costs a fraction of rendering it (SetWallpaper does not render inline)");
 }
 
 // ---------------------------------------------------------------------------- //
@@ -658,13 +731,19 @@ struct StormResult {
     std::atomic<int> generationRegressions{0};
     std::atomic<int> calls{0};
     std::mutex mutex;
-    std::map<int32_t, uint64_t> highestGeneration;
     std::string firstUnexpected;
 };
 
-void observeGeneration(StormResult& result, int32_t monitorId, uint64_t generation) {
-    std::lock_guard<std::mutex> lock(result.mutex);
-    uint64_t& highest = result.highestGeneration[monitorId];
+// Each client's own high-water mark, held on its stack -- deliberately NOT shared across
+// the storm threads. Monotonicity is a property of one observer's sequence: two clients
+// can read generations 5 and 6 in either real-time order and record them in either order,
+// so a mark shared between them reports a perfectly monotonic daemon as regressing the
+// moment the faster reader records first. Per client, the property is exactly what the
+// daemon promises and nothing about the interleaving can fake a violation.
+using GenerationMarks = std::map<int32_t, uint64_t>;
+
+void observeGeneration(StormResult& result, GenerationMarks& marks, int32_t monitorId, uint64_t generation) {
+    uint64_t& highest = marks[monitorId];
     if (generation < highest) {
         ++result.generationRegressions;
         return;
@@ -679,11 +758,22 @@ void recordUnexpected(StormResult& result, const std::string& what) {
 }
 
 void stormThread(int index, const std::string& bluePath, const std::string& redPath, StormResult& result) {
-    auto proxy =
-        sdbus::createProxy(sdbus::ServiceName{DbusService::kBusName}, sdbus::ObjectPath{DbusService::kObjectPath});
+    // Inside the guard, not before it: an exception escaping a thread entry point is
+    // std::terminate, and createProxy throws if the bus refuses another connection or the
+    // daemon has already died -- turning a storm-phase failure into a bare abort with no
+    // FAIL lines.
+    std::unique_ptr<sdbus::IProxy> proxy;
+    try {
+        proxy = sdbus::createProxy(sdbus::ServiceName{DbusService::kBusName},
+                                   sdbus::ObjectPath{DbusService::kObjectPath});
+    } catch (const std::exception& e) {
+        recordUnexpected(result, std::string("could not create a client connection: ") + e.what());
+        return;
+    }
 
     // Deterministic per thread, so a failure is reproducible. std::random_device would
     // make the interleaving that broke the daemon unrecoverable from the log.
+    GenerationMarks marks;
     uint32_t rng = 0x9e3779b9u * static_cast<uint32_t>(index + 1);
     const auto next = [&rng] {
         rng = rng * 1664525u + 1013904223u;
@@ -701,7 +791,7 @@ void stormThread(int index, const std::string& bluePath, const std::string& redP
                     const nlohmann::json status = getStatus(*proxy);
                     const nlohmann::json* entry = wallpaperStatus(status, std::to_string(monitorId));
                     if (entry != nullptr) {
-                        observeGeneration(result, monitorId, entry->value("generation", uint64_t{0}));
+                        observeGeneration(result, marks, monitorId, entry->value("generation", uint64_t{0}));
                     }
                     break;
                 }
@@ -710,7 +800,7 @@ void stormThread(int index, const std::string& bluePath, const std::string& redP
                     if (fcntl(frame.fd.get(), F_GETFD) == -1) {
                         recordUnexpected(result, "GetFrameFd returned a closed fd");
                     }
-                    observeGeneration(result, monitorId, frame.generation);
+                    observeGeneration(result, marks, monitorId, frame.generation);
                     break;
                 }
             }
@@ -736,12 +826,15 @@ void checkConcurrentClients(sdbus::IProxy& proxy, FrameReadyLog& signals, const 
                             const std::string& redPath, const std::string& corruptPath, const Check& check) {
     StormResult result;
 
-    std::vector<std::thread> threads;
+    // jthread for the same reason as above: emplace_back can throw (thread exhaustion,
+    // or a reallocation running out of memory) while the vector already holds joinable
+    // threads, and destroying those is std::terminate.
+    std::vector<std::jthread> threads;
     threads.reserve(kStormThreads);
     for (int i = 0; i < kStormThreads; ++i) {
         threads.emplace_back([&, i] { stormThread(i, bluePath, redPath, result); });
     }
-    for (std::thread& t : threads) t.join();
+    for (std::jthread& t : threads) t.join();
 
     check(result.unexpectedErrors == 0, "concurrent clients see only the two named errors that are legitimate "
                                         "mid-render");
@@ -759,6 +852,17 @@ void checkConcurrentClients(sdbus::IProxy& proxy, FrameReadyLog& signals, const 
     // assertion rather than a smoke test: a supersede bug leaves a monitor flagged as
     // holding a frame whose request was replaced, and a lost request leaves one holding
     // nothing at all.
+    // Drain first, THEN read the generations. The order matters and the reverse is a
+    // vacuous check: SetWallpaper is asynchronous, so storm renders are still queued when
+    // the threads join. A threshold read at that moment is a *stale* generation, and the
+    // waitAtLeast below would be satisfied by one of those leftover renders committing --
+    // so "every monitor still renders after the storm" would pass for a daemon whose
+    // render worker had wedged the instant the storm ended. One FIFO render thread means
+    // this barrier's own signal proves every storm render has already been serviced.
+    setWallpaper(proxy, "static", bluePath, kMonitorBarrierPre);
+    const bool drained = signals.wait(kMonitorBarrierPre, 1);
+    check(drained, "the storm's queued renders all drain (barrier render completes)");
+
     std::map<int32_t, uint64_t> before;
     {
         const nlohmann::json status = getStatus(proxy);
@@ -792,8 +896,8 @@ void checkConcurrentClients(sdbus::IProxy& proxy, FrameReadyLog& signals, const 
     // one FIFO render thread means a later request's FrameReady proves the earlier ones
     // have already been serviced. No sleep, and no assumption about how long a render
     // takes.
-    setWallpaper(proxy, "static", bluePath, kMonitorBarrier);
-    check(signals.wait(kMonitorBarrier, 1), "the post-storm barrier render completes");
+    setWallpaper(proxy, "static", bluePath, kMonitorBarrierPost);
+    check(signals.wait(kMonitorBarrierPost, 1), "the post-storm barrier render completes");
 
     const nlohmann::json after = getStatus(proxy);
     int goodMonitors = 0;
@@ -847,7 +951,7 @@ int main() {
     try {
         const std::string bluePath = writeSolidImage("system_blue.png", 0, 0, 255);
         const std::string redPath = writeSolidImage("system_red.png", 255, 0, 0);
-        const std::string corruptPath = writeCorruptImage();
+        const std::string corruptPath = wallpaperx::testing::writeUndecodableFile(testAssetDir(), "system_corrupt.png");
 
         // Declared before the daemon and the proxy so it outlives both: the FrameReady
         // callback runs on the proxy's dispatch thread, and a log destroyed first would
@@ -872,7 +976,13 @@ int main() {
             // wallpaper daemon away from the one already serving it.
             SpawnedDaemon second;
             const int secondExit = second.waitForExit();
-            check(secondExit != 0, "a second daemon instance refuses to start while the first owns the name");
+            // Both conditions, because reap() reports a timeout as -1 too: a second daemon
+            // that wrongly took the name and then ran forever would be SIGKILLed by the
+            // test and satisfy `secondExit != 0` -- reporting the name as refused when it
+            // was in fact stolen.
+            check(!second.timedOut(), "the second daemon instance exits on its own rather than having to be killed");
+            check(!second.timedOut() && secondExit != 0,
+                  "a second daemon instance refuses to start while the first owns the name");
             check(names.ownedNow(), "the first daemon still owns the name after the second one exits");
             const std::string secondOutput = second.output();
             check(secondOutput.find("fatal:") != std::string::npos,
@@ -896,38 +1006,63 @@ int main() {
         // before that point, the default disposition would kill it outright.
         const int exitCode = daemon.shutdown(SIGTERM);
         daemonOutput = daemon.output();
-        // A sanitizer that reported anything replaces the process's exit code with its
-        // own, so under a sanitized build "did the daemon exit 0" stops being a question
-        // about the shutdown path. Reported as what it actually is instead: a
-        // non-zero exit that reads "the shutdown path is broken" would send the next
-        // reader to main.cpp, which is not where the problem is.
-        const bool sanitizerReported = daemonOutput.find("Sanitizer: reported") != std::string::npos;
-        if (sanitizerReported) {
-            check(false, "the daemon's sanitizer reported no warnings (its exit code is the sanitizer's here, so "
-                         "the SIGTERM exit-code check cannot run)");
+        if (!cameUp) {
+            // The daemon never reached the bus, which is already reported above. Signalling
+            // it anyway is right -- it must not outlive the test -- but grading its exit
+            // would add four more FAIL lines blaming main.cpp's shutdown path for a fault
+            // that happened before the shutdown path was ever reached.
+            std::printf("daemon_system_test: shutdown checks skipped -- the daemon never acquired the bus name, so "
+                        "its exit says nothing about the shutdown path.\n");
         } else {
-            check(exitCode == 0, "the daemon exits 0 on SIGTERM");
+            // A sanitizer that reported anything replaces the process's exit code with its
+            // own, so under a sanitized build "did the daemon exit 0" stops being a question
+            // about the shutdown path. Reported as what it actually is instead: a
+            // non-zero exit that reads "the shutdown path is broken" would send the next
+            // reader to main.cpp, which is not where the problem is.
+            const bool sanitizerReported = daemonOutput.find("Sanitizer: reported") != std::string::npos;
+            if (sanitizerReported) {
+                check(false, "the daemon's sanitizer reported no warnings (its exit code is the sanitizer's here, so "
+                             "the SIGTERM exit-code check cannot run)");
+            } else {
+                check(exitCode == 0, "the daemon exits 0 on SIGTERM");
+            }
+            check(daemonOutput.find("received, shutting down") != std::string::npos,
+                  "the daemon reports which signal it is shutting down for");
+            check(daemonOutput.find("stopped cleanly") != std::string::npos,
+                  "the daemon runs its destructor chain on the way out (worker join, GPU teardown, leak report)");
+            check(names.waitFor(false), "the bus name is released once the daemon exits");
         }
-        check(daemonOutput.find("received, shutting down") != std::string::npos,
-              "the daemon reports which signal it is shutting down for");
-        check(daemonOutput.find("stopped cleanly") != std::string::npos,
-              "the daemon runs its destructor chain on the way out (worker join, GPU teardown, leak report)");
-        check(names.waitFor(false), "the bus name is released once the daemon exits");
 
         // The other signal in the same sigset. Cheap -- it never renders -- and without
         // it a typo that dropped SIGINT from the mask would be invisible, since SIGTERM
         // alone exercises one sigaddset call out of two.
         {
             SpawnedDaemon interrupted;
-            check(names.waitFor(true), "a fresh daemon acquires the name after the first released it");
+            const bool interruptedCameUp = names.waitFor(true);
+            check(interruptedCameUp, "a fresh daemon acquires the name after the first released it");
             const int interruptExit = interrupted.shutdown(SIGINT);
             const std::string interruptOutput = interrupted.output();
-            if (interruptOutput.find("Sanitizer: reported") == std::string::npos) {
-                check(interruptExit == 0, "the daemon exits 0 on SIGINT");
+            if (!interruptedCameUp) {
+                // Same reasoning as the SIGTERM block: a daemon that never started tells
+                // us nothing about how it shuts down, and grading it anyway turns one
+                // startup fault into three failures pointing at the signal path.
+                std::printf("daemon_system_test: SIGINT checks skipped -- that daemon never acquired the bus "
+                            "name either.\n");
+            } else {
+                // Same shape as the SIGTERM branch above, deliberately. Wrapping this in a
+                // bare `if (no sanitizer report)` made the assertion vanish with no FAIL, no
+                // print and no change in the count, so a sanitized run looked like it had
+                // verified SIGINT when it had verified nothing.
+                if (interruptOutput.find("Sanitizer: reported") != std::string::npos) {
+                    check(false, "the SIGINT daemon's sanitizer reported no warnings (its exit code is the "
+                                 "sanitizer's here, so the SIGINT exit-code check cannot run)");
+                } else {
+                    check(interruptExit == 0, "the daemon exits 0 on SIGINT");
+                }
+                check(interruptOutput.find("stopped cleanly") != std::string::npos,
+                      "the daemon shuts down cleanly on SIGINT as well as SIGTERM");
+                check(names.waitFor(false), "the bus name is released after the SIGINT shutdown");
             }
-            check(interruptOutput.find("stopped cleanly") != std::string::npos,
-                  "the daemon shuts down cleanly on SIGINT as well as SIGTERM");
-            check(names.waitFor(false), "the bus name is released after the SIGINT shutdown");
         }
 
         // Every Frame's UnixFd closes at scope exit, and the daemon is gone, so this
@@ -949,11 +1084,24 @@ int main() {
     // The daemon's own Vulkan usage, judged from its output. Only meaningful when the
     // layer is installed; the warning at the top of main says so when it is not.
     if (wantValidation) {
-        const std::vector<std::string> warnings = validationLines(daemonOutput);
-        check(warnings.empty(), "the daemon produced no Vulkan validation warnings across render, export and "
-                                "teardown");
-        for (const std::string& line : warnings) {
-            std::fprintf(stderr, "  %s\n", line.c_str());
+        // Absence of warnings is only evidence when the daemon actually ran and rendered.
+        // On an empty or truncated capture -- the daemon died at startup, or the pipe was
+        // lost -- validationLines() trivially returns nothing and this would report the
+        // GPU-side oracle as clean for a run in which no Vulkan work was ever observed.
+        // Anchored on the daemon's own startup line, which it prints before any render.
+        const bool daemonSpoke = daemonOutput.find("serving io.wallpaperx.Daemon") != std::string::npos;
+        if (!daemonSpoke) {
+            // One failure, not two. The daemon never got far enough to use Vulkan, which
+            // is already reported above; grading its silence as well would be a second
+            // FAIL line for a cause the reader has already been told about.
+            check(false, "the daemon's output was captured, so its silence about validation means something");
+        } else {
+            const std::vector<std::string> warnings = validationLines(daemonOutput);
+            check(warnings.empty(),
+                  "the daemon produced no Vulkan validation warnings across render, export and teardown");
+            for (const std::string& line : warnings) {
+                std::fprintf(stderr, "  %s\n", line.c_str());
+            }
         }
     }
 

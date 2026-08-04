@@ -194,11 +194,17 @@ if(DBUS_RUN_SESSION)
             LABELS "lavapipe")
     endif()
 
-    # Both variants render from the same generated PNG under WALLPAPERX_TEST_IMAGE_DIR,
-    # so keep ctest -jN from running one while the other is mid-write.
-    set_tests_properties(dbus_service PROPERTIES RESOURCE_LOCK dbus_service_test_image)
+    # One lock across every bus-driven test, not one per tier. Two reasons, and the
+    # second is the reason it is shared rather than merely present: they render from
+    # generated PNGs under the same WALLPAPERX_TEST_IMAGE_DIR, so ctest -jN must not run
+    # one while another is mid-write -- and daemon_system's responsiveness phase compares
+    # intervals measured in tens of microseconds against a render queue's drain time. A
+    # dbus_service run saturating a software rasteriser on the same host inflates the
+    # first without inflating the second, which fails the check by accusing SetWallpaper
+    # of rendering inline. Serialising them costs well under a second in total.
+    set_tests_properties(dbus_service PROPERTIES RESOURCE_LOCK wallpaperx_bus_tests)
     if(WALLPAPERX_LAVAPIPE_ICD)
-        set_tests_properties(dbus_service_lavapipe PROPERTIES RESOURCE_LOCK dbus_service_test_image)
+        set_tests_properties(dbus_service_lavapipe PROPERTIES RESOURCE_LOCK wallpaperx_bus_tests)
     endif()
 
     # Same private-bus wrapper, one tier up: this one spawns the real daemon binary.
@@ -207,7 +213,7 @@ if(DBUS_RUN_SESSION)
     # request the same well-known name.
     add_test(NAME daemon_system
              COMMAND ${DBUS_RUN_SESSION} -- $<TARGET_FILE:wallpaperx-daemon-system-test>)
-    set_tests_properties(daemon_system PROPERTIES RESOURCE_LOCK daemon_system_test_image)
+    set_tests_properties(daemon_system PROPERTIES RESOURCE_LOCK wallpaperx_bus_tests)
 
     # The cross-process content check only runs where the export is a LINEAR dma_buf,
     # which on the machines this is developed on means Lavapipe. On NVIDIA (OPAQUE_FD)
@@ -219,10 +225,16 @@ if(DBUS_RUN_SESSION)
         set_tests_properties(daemon_system_lavapipe PROPERTIES
             ENVIRONMENT "VK_ICD_FILENAMES=${WALLPAPERX_LAVAPIPE_ICD}"
             LABELS "lavapipe"
-            RESOURCE_LOCK daemon_system_test_image)
+            RESOURCE_LOCK wallpaperx_bus_tests)
     endif()
 else()
-    message(STATUS "  dbus-run-session not found -- dbus_service test skipped (install dbus)")
+    message(WARNING
+        "dbus-run-session not found -- ALL bus-driven tests are unregistered: dbus_service, "
+        "dbus_service_lavapipe, daemon_system, daemon_system_lavapipe. That removes the only "
+        "coverage of the DBus wire contract, the DMA_BUF metadata, and the daemon's "
+        "process-level behaviour (name acquisition, second-instance refusal, SIGTERM/SIGINT "
+        "shutdown, cross-process frame import). A green ctest run without them means much less "
+        "than it looks like. Install dbus.")
 endif()
 
 # --------------------------------------------------------------------------- #
