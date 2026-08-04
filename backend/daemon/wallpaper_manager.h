@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <map>
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -174,6 +175,14 @@ public:
         std::map<int, MonitorStatus> monitors;
     };
     Snapshot snapshot() const;
+
+    // The renderer's validation-warning counter, or null when no device has been created
+    // yet. Shared so it stays readable after this manager and its Device are destroyed:
+    // the layer's teardown complaints are the ones worth having, and they are emitted
+    // during destruction. Also reported by GetStatus's gpu section, which is where an
+    // operator sees it.
+    std::shared_ptr<const std::atomic<int>> validationCounter() const;
+    bool validationLayerActive() const;
 
 private:
     struct MonitorState {

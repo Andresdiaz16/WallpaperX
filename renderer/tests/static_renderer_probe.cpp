@@ -1,5 +1,7 @@
 #include "vulkan/device.h"
-#include "support/validation_probe.h"
+
+#include <atomic>
+#include <memory>
 #include "vulkan/offscreen.h"
 #include "renderers/static_renderer.h"
 
@@ -34,12 +36,16 @@ std::string writeTestImage() {
 }
 
 bool testRenderValidImage() {
-    wallpaperx::resetValidationWarningCount();
 
+    std::shared_ptr<const std::atomic<int>> validationCounter;
     try {
         const std::string imagePath = writeTestImage();
 
         wallpaperx::Device device(/*enableValidation=*/true);
+        // Taken inside the Device's scope and graded after it: the validation
+        // layer's teardown complaints are emitted from ~Device, so a check that
+        // ran before destruction would miss the half most worth having.
+        validationCounter = device.validationCounter();
         wallpaperx::OffscreenTargetManager targets(device);
         const auto& target = targets.create(0, 64, 64);
 
@@ -104,7 +110,7 @@ bool testRenderValidImage() {
         return false;
     }
 
-    const int warnings = wallpaperx::validationWarningCount();
+    const int warnings = (validationCounter ? validationCounter->load() : 0);
     if (warnings > 0) {
         std::cerr << "static_renderer_probe: " << warnings << " Vulkan validation warning(s)" << std::endl;
         return false;
@@ -118,10 +124,14 @@ bool testRenderValidImage() {
 // (as opposed to stb_image's) throws a catchable, clear exception for a missing
 // file, rather than crashing or leaving partially-constructed state.
 bool testMissingImageThrows() {
-    wallpaperx::resetValidationWarningCount();
 
+    std::shared_ptr<const std::atomic<int>> validationCounter;
     try {
         wallpaperx::Device device(/*enableValidation=*/true);
+        // Taken inside the Device's scope and graded after it: the validation
+        // layer's teardown complaints are emitted from ~Device, so a check that
+        // ran before destruction would miss the half most worth having.
+        validationCounter = device.validationCounter();
         // renderPass() is valid immediately after construction (built in the
         // constructor, independent of create()) -- StaticRenderer fails at
         // stbi_load before it ever consumes the render pass, so no actual
@@ -146,7 +156,7 @@ bool testMissingImageThrows() {
         return false;
     }
 
-    if (wallpaperx::validationWarningCount() > 0) {
+    if ((validationCounter ? validationCounter->load() : 0) > 0) {
         std::cerr << "static_renderer_probe (missing image): validation warnings" << std::endl;
         return false;
     }

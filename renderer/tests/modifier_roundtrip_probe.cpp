@@ -48,7 +48,6 @@
 //                 nobody here has. Treat the transfer as unverified.
 
 #include "vulkan/device.h"
-#include "support/validation_probe.h"
 #include "vulkan/frame_export.h"
 #include "vulkan/memory.h"
 #include "vulkan/memory_export.h"
@@ -437,8 +436,13 @@ const wallpaperx::OffscreenTarget& renderFreshTarget(wallpaperx::OffscreenTarget
 // or reporting the whole probe as unverified when the round trip demonstrably passed.
 enum class Mode { RoundTrip, Sensitivity };
 
+// Recorded inside run(), where the Device that owns the counter is still alive. main()
+// grades it after run() returns, by which point the Device has been destroyed -- reading
+// the count there would mean keeping a dead object's state alive purely for a check.
+int g_validationWarnings = 0;
+bool g_validationLayerActive = false;
+
 int run(Mode mode) {
-    wallpaperx::resetValidationWarningCount();
 
     const std::string imagePath = writeTestImage();
     wallpaperx::Device device(/*enableValidation=*/true);
@@ -657,6 +661,8 @@ int run(Mode mode) {
               << (!control.error.empty() ? control.error : std::to_string(control.rows) + " row(s) differ")
               << std::endl;
 
+    g_validationWarnings = device.validationWarnings();
+    g_validationLayerActive = device.validationLayerActive();
     return g_failures;
 }
 
@@ -703,7 +709,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    const int warnings = wallpaperx::validationWarningCount();
+    const int warnings = g_validationWarnings;
     if (warnings > 0) {
         std::cerr << "modifier_roundtrip_probe (" << what << "): " << warnings << " Vulkan validation warning(s)"
                   << std::endl;

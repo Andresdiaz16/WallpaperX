@@ -7,17 +7,10 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <atomic>
 #include <thread>
 
 namespace wallpaperx {
-
-// A validation-warning counter and its three read accessors used to live here and in
-// device.cpp. Every caller was a test, so both the state and the accessors were test-only
-// code compiled into the shipped renderer; moving just the declarations to a test-facing
-// header did not change that. They are gone. Tests now count warnings by reading the
-// "[vulkan] " lines Device's debug callback already writes to stderr -- see
-// renderer/tests/support/validation_probe.h, which no production translation unit is on
-// the include path for. Nothing here needs to be added back to serve a test.
 
 struct DeviceInfo {
     std::string gpuName;
@@ -55,6 +48,31 @@ public:
 
     const DeviceInfo& info() const { return m_info; }
     DescriptorTier descriptorTier() const { return m_selectedTier; }
+
+    // How many validation warnings and errors this device's debug messenger has seen,
+    // and whether there was a validator listening at all. Ordinary observables of the
+    // device, fed by the messenger's own pUserData channel. Both are needed: the count
+    // is 0 whether the GPU work was clean or no layer was ever loaded, so on its own it
+    // cannot tell a correct run from an unwatched one.
+    int validationWarnings() const noexcept { return m_validationWarnings->load(std::memory_order_relaxed); }
+    void resetValidationWarnings() noexcept { m_validationWarnings->store(0, std::memory_order_relaxed); }
+    bool validationLayerActive() const noexcept { return m_validationLayerActive; }
+
+    // The counter itself, shared so it stays readable after this Device is gone.
+    //
+    // Not an over-generalisation: the layer's most valuable complaints are the ones it
+    // makes during teardown -- a resource still in flight, an object destroyed twice --
+    // and those are emitted from ~Device. A caller holding only an accessor could never
+    // read them, because by the time destruction has finished there is nothing left to
+    // ask. Taking the handle before destruction and reading it after is the only way to
+    // judge the teardown path.
+    std::shared_ptr<const std::atomic<int>> validationCounter() const { return m_validationWarnings; }
+
+    // Called by the debug messenger callback, which is a free function because Vulkan
+    // requires a C entry point -- it reaches the right Device through pUserData. Public
+    // only for that reason; nothing else should call it.
+    void noteValidationWarning() noexcept { m_validationWarnings->fetch_add(1, std::memory_order_relaxed); }
+
     Memory& memory() { return m_memory; }
     IDescriptorAllocator& descriptorAllocator() { return *m_descriptorAllocator; }
 
@@ -98,6 +116,10 @@ private:
 
     VkInstance m_instance = VK_NULL_HANDLE;
     VkDebugUtilsMessengerEXT m_debugMessenger = VK_NULL_HANDLE;
+    // Written from the debug callback, which the loader may invoke on any thread, and
+    // shared so validationCounter() can outlive this object.
+    std::shared_ptr<std::atomic<int>> m_validationWarnings = std::make_shared<std::atomic<int>>(0);
+    bool m_validationLayerActive = false;
     VkPhysicalDevice m_physicalDevice = VK_NULL_HANDLE;
     VkDevice m_device = VK_NULL_HANDLE;
     VkQueue m_graphicsQueue = VK_NULL_HANDLE;

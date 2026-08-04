@@ -36,9 +36,13 @@ VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(
     VkDebugUtilsMessageSeverityFlagBitsEXT severity,
     VkDebugUtilsMessageTypeFlagsEXT,
     const VkDebugUtilsMessengerCallbackDataEXT* data,
-    void*) {
+    void* userData) {
     if (severity >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) {
         std::cerr << "[vulkan] " << data->pMessage << std::endl;
+        // pUserData is the messenger's own channel for this, set to the owning Device at
+        // creation. It is what makes the count a property of the device rather than of
+        // the process, and it is why no global is needed.
+        if (auto* device = static_cast<Device*>(userData)) device->noteValidationWarning();
     }
     return VK_FALSE;
 }
@@ -122,6 +126,8 @@ void Device::createInstance(bool enableValidation) {
             }
         }
         if (validationAvailable) {
+            // Recorded so a caller can tell "no warnings" from "nothing was watching".
+            m_validationLayerActive = true;
             instanceLayers.push_back("VK_LAYER_KHRONOS_validation");
             instanceExtensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
 
@@ -182,6 +188,7 @@ void Device::createInstance(bool enableValidation) {
                                          VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
                                          VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT;
             messengerInfo.pfnUserCallback = debugCallback;
+            messengerInfo.pUserData = this;
             createFn(m_instance, &messengerInfo, nullptr, &m_debugMessenger);
         }
     }

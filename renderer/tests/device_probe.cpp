@@ -1,5 +1,7 @@
 #include "vulkan/device.h"
-#include "support/validation_probe.h"
+
+#include <atomic>
+#include <memory>
 
 #include <cstdlib>
 #include <cstring>
@@ -23,10 +25,14 @@ bool probeTier(const char* forceEnv, std::optional<DescriptorTier> expectedTier)
     }
 
     const char* label = forceEnv ? forceEnv : "default";
-    wallpaperx::resetValidationWarningCount();
 
+    std::shared_ptr<const std::atomic<int>> validationCounter;
     try {
         wallpaperx::Device device(/*enableValidation=*/true);
+        // Taken inside the scope and graded after it: the layer's teardown
+        // complaints come from ~Device, so a check that ran before it would
+        // miss the half most worth having.
+        validationCounter = device.validationCounter();
         const auto& info = device.info();
         const DescriptorTier tier = device.descriptorAllocator().tier();
         std::cout << "GPU: " << info.gpuName
@@ -51,7 +57,7 @@ bool probeTier(const char* forceEnv, std::optional<DescriptorTier> expectedTier)
         return false;
     }
 
-    const int warnings = wallpaperx::validationWarningCount();
+    const int warnings = validationCounter ? validationCounter->load() : 0;
     if (warnings > 0) {
         std::cerr << "device_probe (" << label << "): " << warnings << " Vulkan validation warning(s)" << std::endl;
         return false;

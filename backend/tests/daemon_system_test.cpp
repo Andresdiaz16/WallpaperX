@@ -671,10 +671,16 @@ void checkFirstFrame(sdbus::IProxy& proxy, FrameReadyLog& signals, const std::st
 //       FAIL line with a bare abort. Both reverted.
 struct GpuInitWatch {
     std::atomic<bool> stop{false};
-    // Counts watchers that have completed one reply. The first SetWallpaper waits on
-    // this: the straddle must be a property of the harness, not of whether the scheduler
-    // happened to run three fresh threads (each of which still has a session-bus connect
-    // ahead of it) before the daemon finished creating its device.
+    // Counts watchers that have completed one SUCCESSFUL reply. The first SetWallpaper
+    // waits on this: the straddle must be a property of the harness, not of whether the
+    // scheduler happened to run three fresh threads (each of which still has a
+    // session-bus connect ahead of it) before the daemon finished creating its device.
+    //
+    // Successful, not merely attempted. Counting failed calls here would let the barrier
+    // release with no watcher having ever been answered, and the phase would then report
+    // "the sampling straddled the first device creation" as the failure -- a timing
+    // story -- when the truth is that GetStatus never worked at all. The bounded wait at
+    // the call site is what keeps a never-answering daemon from hanging the phase.
     std::atomic<int> ready{0};
     std::atomic<int> replies{0};
     std::atomic<int> preInit{0};
@@ -713,26 +719,21 @@ void gpuInitWatchThread(GpuInitWatch& watch) {
                 ++watch.preInit;
             }
             if (!wallpaperx::testing::statusSelfConsistent(status)) ++watch.inconsistent;
-            // Paced rather than spun. Three threads issuing blocking round trips as fast
-            // as the bus allows take WallpaperManager's state mutex thousands of times
-            // during the very render this phase is timing, and on a loaded or single-core
-            // host that contention can push the first FrameReady past checkFirstFrame's
-            // own timeout -- a failure of the measurement, blamed on the daemon. A
-            // millisecond still yields hundreds of samples across a device creation that
-            // takes tens to hundreds of milliseconds, which is far more than the straddle
-            // needs.
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
         } catch (const std::exception&) {
             // A failed GetStatus is not a consistency violation. Counted, and reported
             // below only if it swallowed the whole sample. It still marks this watcher
             // ready: the barrier is "this thread is running and talking to the bus", and
             // a watcher that only ever errors would otherwise hang the phase.
             ++watch.errors;
-            if (!announced) {
-                announced = true;
-                ++watch.ready;
-            }
         }
+        // Outside the try/catch, so the error path is paced too. Inside it, a daemon
+        // that starts refusing calls (crashed mid-render, bus name dropped, an immediate
+        // ServiceUnknown instead of a timeout) put three threads into a 100%-CPU spin for
+        // the whole of checkFirstFrame's timeout -- starving the very render being
+        // measured, so a daemon fault surfaced as a timing failure blamed on the render
+        // path. A millisecond still yields hundreds of samples across a device creation
+        // measured in tens to hundreds of milliseconds.
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 }
 
@@ -741,26 +742,33 @@ void checkFirstFrameUnderStatusLoad(sdbus::IProxy& proxy, FrameReadyLog& signals
     GpuInitWatch watch;
     std::vector<std::thread> watchers;
     watchers.reserve(kGpuInitWatchers);
-    for (int i = 0; i < kGpuInitWatchers; ++i) {
-        watchers.emplace_back([&watch] { gpuInitWatchThread(watch); });
-    }
 
-    // Stop and join on EVERY path out of here, exceptions included. checkFirstFrame
-    // calls setWallpaper() and getFrameFd() without a try/catch and both throw
-    // sdbus::Error when the daemon answers with an error or dies mid-phase. Letting that
-    // unwind past a vector of joinable threads is std::terminate -- a bare SIGABRT in
-    // place of this phase's FAIL lines and main's own handler -- while the live watchers
-    // keep writing to a `watch` whose storage is being destroyed.
+    // Stop and join on EVERY path out of here, exceptions included, and constructed
+    // BEFORE the spawn loop rather than after it. checkFirstFrame calls setWallpaper()
+    // and getFrameFd() without a try/catch and both throw sdbus::Error when the daemon
+    // answers with an error or dies mid-phase; letting that unwind past a vector of
+    // joinable threads is std::terminate -- a bare SIGABRT in place of this phase's FAIL
+    // lines and main's own handler -- while the live watchers keep writing to a `watch`
+    // whose storage is being destroyed. Declared after the loop it would still leave one
+    // hole: std::thread's own constructor throws std::system_error on EAGAIN when the
+    // process is at its thread limit, and this binary has already spawned the daemon and
+    // several bus connections, so a throw on the second or third iteration would unwind
+    // past the one or two threads already in the vector before any guard existed.
     struct Stopper {
         GpuInitWatch& watch;
         std::vector<std::thread>& watchers;
-        ~Stopper() {
+        void stopAndJoin() {
             watch.stop.store(true, std::memory_order_relaxed);
             for (std::thread& t : watchers) {
                 if (t.joinable()) t.join();
             }
         }
+        ~Stopper() { stopAndJoin(); }
     } stopper{watch, watchers};
+
+    for (int i = 0; i < kGpuInitWatchers; ++i) {
+        watchers.emplace_back([&watch] { gpuInitWatchThread(watch); });
+    }
 
     // Every watcher has answered once before the first render is asked for, so the
     // pre-init sample below is guaranteed rather than raced for. Bounded: a watcher that
@@ -774,10 +782,7 @@ void checkFirstFrameUnderStatusLoad(sdbus::IProxy& proxy, FrameReadyLog& signals
 
     checkFirstFrame(proxy, signals, bluePath, check);
 
-    watch.stop.store(true, std::memory_order_relaxed);
-    for (std::thread& t : watchers) {
-        if (t.joinable()) t.join();
-    }
+    stopper.stopAndJoin();
 
     const int replies = watch.replies.load();
     const int preInit = watch.preInit.load();

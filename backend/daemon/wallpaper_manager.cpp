@@ -358,6 +358,16 @@ FrameExport WallpaperManager::exportCurrentFrame(int monitorId) {
     return out;
 }
 
+std::shared_ptr<const std::atomic<int>> WallpaperManager::validationCounter() const {
+    std::lock_guard<std::mutex> gpuLock(m_gpuMutex);
+    return m_device ? m_device->validationCounter() : nullptr;
+}
+
+bool WallpaperManager::validationLayerActive() const {
+    std::lock_guard<std::mutex> gpuLock(m_gpuMutex);
+    return m_device && m_device->validationLayerActive();
+}
+
 WallpaperManager::Snapshot WallpaperManager::snapshot() const {
     // One acquisition for both halves. Two would let a render commit between them and
     // produce a reply that reports no GPU beside a monitor that already has a frame.

@@ -1,14 +1,20 @@
 #include "vulkan/device.h"
-#include "support/validation_probe.h"
+
+#include <atomic>
+#include <memory>
 #include "vulkan/offscreen.h"
 
 #include <iostream>
 
 int main() {
-    wallpaperx::resetValidationWarningCount();
 
+    std::shared_ptr<const std::atomic<int>> validationCounter;
     try {
         wallpaperx::Device device(/*enableValidation=*/true);
+        // Taken inside the Device's scope and graded after it: the validation
+        // layer's teardown complaints are emitted from ~Device, so a check that
+        // ran before destruction would miss the half most worth having.
+        validationCounter = device.validationCounter();
         wallpaperx::OffscreenTargetManager targets(device);
 
         const auto& monitor0 = targets.create(0, 1920, 1080);
@@ -48,7 +54,7 @@ int main() {
         return 1;
     }
 
-    const int warnings = wallpaperx::validationWarningCount();
+    const int warnings = (validationCounter ? validationCounter->load() : 0);
     if (warnings > 0) {
         std::cerr << "offscreen_probe: " << warnings << " Vulkan validation warning(s)" << std::endl;
         return 1;

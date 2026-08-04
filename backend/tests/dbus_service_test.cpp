@@ -22,7 +22,6 @@
 #include "daemon/wallpaper_manager.h"
 
 #include "vulkan/device.h"
-#include "support/validation_probe.h"
 #include "vulkan/frame_export.h"
 
 // The renderer's shared test scaffolding, on the include path as `support/...`. The
@@ -797,15 +796,11 @@ void runWorkerCoalescingChecks(const wallpaperx::WallpaperManager::Config& confi
         std::fprintf(stderr,
                      "dbus_service_test: the render worker did not progress within the signal "
                      "timeout; ending the run here rather than joining a wedged thread\n");
-        // Both are mandatory before _Exit, and for different reasons. fflush: stdout is
-        // fully buffered under ctest, so every progress and WARNING line written so far
-        // is still in the buffer _Exit discards. drainValidationCapture: this binary
-        // links wallpaperx-test-support, which redirects stderr to a temporary file and
-        // copies it out only at a drain point or in its destructor -- and _Exit runs no
-        // destructors. Without it the FAIL line printed one statement above, and the
-        // whole run's stderr with it, dies in that file.
+        // Mandatory before _Exit: stdout is fully buffered under ctest, so every
+        // progress and WARNING line written so far is still in the buffer _Exit
+        // discards. stderr needs no such care -- it is unbuffered and goes straight to
+        // the terminal, which is what makes the FAIL line above survive.
         std::fflush(nullptr);
-        wallpaperx::drainValidationCapture();
         std::_Exit(1);
     };
 
@@ -1113,14 +1108,17 @@ int main() {
         }
     };
 
-    wallpaperx::resetValidationWarningCount();
-
     // Scoped so the manager, and with it the render thread, the Vulkan Device, the
     // offscreen targets and Memory's leaked-allocation check, are all destroyed before
     // the validation counter is read below. Destroying an image still owned by an
     // external queue family, or leaking device memory, only raises validation errors
     // during teardown -- sampling the counter while the manager is still alive silently
     // exempts the whole destruction half of the code under test.
+    // Filled as the manager scope closes; see CaptureOnExit below. Declared out here
+    // because they are graded after the try block, once everything is destroyed.
+    std::shared_ptr<const std::atomic<int>> validationCounter;
+    bool validationLayerWasActive = false;
+
     try {
         const std::string imagePath = writeTestImage();
         const std::string corruptPath =
@@ -1141,6 +1139,23 @@ int main() {
         // queue-family transfers, none of which this test can observe directly.
         config.enableValidation = !validationWaived();
         wallpaperx::WallpaperManager manager(config);
+        // Captured as this scope unwinds, in a destructor so it runs on the exception
+        // path too -- a throw out of the phases below must not silently leave the
+        // validation oracle reading "0 warnings" from a null handle.
+        struct CaptureOnExit {
+            const wallpaperx::WallpaperManager& manager;
+            std::shared_ptr<const std::atomic<int>>& counter;
+            bool& layerActive;
+            ~CaptureOnExit() {
+                counter = manager.validationCounter();
+                layerActive = manager.validationLayerActive();
+            }
+        } captureOnExit{manager, validationCounter, validationLayerWasActive};
+        // Taken while the manager is alive and graded after this scope closes. The
+        // layer's teardown complaints -- a resource still in flight, an object destroyed
+        // twice -- are emitted from ~WallpaperManager and ~Device, which is exactly what
+        // "the render, export and teardown path produced zero warnings" claims to cover.
+        // Reading a live accessor before the scope ends would silently drop that half.
 
         // Service side: requests the name and serves on a background event loop.
         auto serviceConn = sdbus::createSessionBusConnection(sdbus::ServiceName{DbusService::kBusName});
@@ -1181,7 +1196,7 @@ int main() {
             "dbus_service_test: WARNING -- running with WALLPAPERX_ALLOW_NO_VALIDATION=1. The GPU-side "
             "correctness oracle is DISABLED; this run proves only that the DBus and threading behaviour "
             "holds. Do not read a pass here as the suite being green.\n");
-    } else if (!wallpaperx::validationLayerActive()) {
+    } else if (!validationLayerWasActive) {
         std::fprintf(stderr,
                      "FAIL: VK_LAYER_KHRONOS_validation was requested but is not loaded -- the "
                      "zero-warning check below would pass without validating anything. "
@@ -1189,7 +1204,7 @@ int main() {
         ++failures;
     }
 
-    const int warnings = wallpaperx::validationWarningCount();
+    const int warnings = validationCounter ? validationCounter->load() : 0;
     check(warnings == 0, "the render, export and teardown path produced zero Vulkan validation warnings");
     if (warnings > 0) {
         std::fprintf(stderr, "  %d validation warning(s)\n", warnings);

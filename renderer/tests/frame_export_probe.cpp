@@ -1,5 +1,7 @@
 #include "vulkan/device.h"
-#include "support/validation_probe.h"
+
+#include <atomic>
+#include <memory>
 #include "vulkan/offscreen.h"
 #include "vulkan/frame_export.h"
 #include "renderers/static_renderer.h"
@@ -159,7 +161,6 @@ bool checkDmaBufLayout(const wallpaperx::ExportedFrame& frame, uint32_t width, u
 // (NVIDIA's block-linear, AMD DCC) has no CPU-walkable row layout and is skipped
 // loudly -- verifying those needs a real importer, which is a separate piece of work.
 bool testExportedBytesMatchReadback() {
-    wallpaperx::resetValidationWarningCount();
 
     // Set by the paths that cannot run the comparison on this device. They are not
     // failures, but they must not re-encode the pass criterion either: each used to
@@ -169,10 +170,15 @@ bool testExportedBytesMatchReadback() {
     // often -- that meant a validation warning failed the probe with no stated reason.
     bool skipped = false;
 
+    std::shared_ptr<const std::atomic<int>> validationCounter;
     try {
         const std::string imagePath = writeTestImage();
 
         wallpaperx::Device device(/*enableValidation=*/true);
+        // Taken inside the Device's scope and graded after it: the validation
+        // layer's teardown complaints are emitted from ~Device, so a check that
+        // ran before destruction would miss the half most worth having.
+        validationCounter = device.validationCounter();
         wallpaperx::OffscreenTargetManager targets(device);
         wallpaperx::StaticRenderer renderer(device, targets.renderPass(), imagePath, WALLPAPERX_SHADER_DIR);
 
@@ -281,7 +287,7 @@ bool testExportedBytesMatchReadback() {
     }
 
     // One tail for every exit, skipped or not.
-    const int warnings = wallpaperx::validationWarningCount();
+    const int warnings = (validationCounter ? validationCounter->load() : 0);
     if (warnings > 0) {
         std::cerr << "frame_export_probe (contents): " << warnings << " Vulkan validation warning(s)" << std::endl;
         return false;
@@ -293,12 +299,16 @@ bool testExportedBytesMatchReadback() {
 }
 
 bool testHappyPathExport() {
-    wallpaperx::resetValidationWarningCount();
 
+    std::shared_ptr<const std::atomic<int>> validationCounter;
     try {
         const std::string imagePath = writeTestImage();
 
         wallpaperx::Device device(/*enableValidation=*/true);
+        // Taken inside the Device's scope and graded after it: the validation
+        // layer's teardown complaints are emitted from ~Device, so a check that
+        // ran before destruction would miss the half most worth having.
+        validationCounter = device.validationCounter();
         wallpaperx::OffscreenTargetManager targets(device);
 
         const auto& target = targets.create(0, kTargetWidth, kTargetHeight);
@@ -429,7 +439,7 @@ bool testHappyPathExport() {
         return false;
     }
 
-    const int warnings = wallpaperx::validationWarningCount();
+    const int warnings = (validationCounter ? validationCounter->load() : 0);
     if (warnings > 0) {
         std::cerr << "frame_export_probe: " << warnings << " Vulkan validation warning(s)" << std::endl;
         return false;
@@ -450,9 +460,13 @@ bool testExportFromDestroyedTargetThrows() {
     // this test provokes is printed and discarded, and the probe reports "passed" on a
     // spec violation. The zero-warnings assertion is the backstop for the export path's
     // barriers, so it has to cover every test that exercises them.
-    wallpaperx::resetValidationWarningCount();
+    std::shared_ptr<const std::atomic<int>> validationCounter;
     try {
         wallpaperx::Device device(/*enableValidation=*/true);
+        // Taken inside the Device's scope and graded after it: the validation
+        // layer's teardown complaints are emitted from ~Device, so a check that
+        // ran before destruction would miss the half most worth having.
+        validationCounter = device.validationCounter();
         wallpaperx::OffscreenTargetManager targets(device);
 
         const wallpaperx::OffscreenTarget stale = targets.create(0, kTargetWidth, kTargetHeight);
@@ -477,7 +491,7 @@ bool testExportFromDestroyedTargetThrows() {
         return false;
     }
 
-    const int warnings = wallpaperx::validationWarningCount();
+    const int warnings = (validationCounter ? validationCounter->load() : 0);
     if (warnings > 0) {
         std::cerr << "frame_export_probe (destroyed target): " << warnings << " Vulkan validation warning(s)"
                   << std::endl;
@@ -498,9 +512,13 @@ bool testNeverReturnsInvalidFdUnderExhaustion() {
     // This test exports from a target that was never rendered into, so it is the one
     // that catches an export-time barrier declaring a layout the image was never in.
     // It only catches it if the warning count is actually checked.
-    wallpaperx::resetValidationWarningCount();
+    std::shared_ptr<const std::atomic<int>> validationCounter;
     try {
         wallpaperx::Device device(/*enableValidation=*/true);
+        // Taken inside the Device's scope and graded after it: the validation
+        // layer's teardown complaints are emitted from ~Device, so a check that
+        // ran before destruction would miss the half most worth having.
+        validationCounter = device.validationCounter();
         wallpaperx::OffscreenTargetManager targets(device);
         const auto& target = targets.create(0, kTargetWidth, kTargetHeight);
 
@@ -509,7 +527,7 @@ bool testNeverReturnsInvalidFdUnderExhaustion() {
         rlimit lowered = original;
         lowered.rlim_cur = 40;  // this process only; system untouched
         if (setrlimit(RLIMIT_NOFILE, &lowered) != 0) {
-            const int skipWarnings = wallpaperx::validationWarningCount();
+            const int skipWarnings = (validationCounter ? validationCounter->load() : 0);
             if (skipWarnings > 0) {
                 std::cerr << "frame_export_probe (exhaustion): " << skipWarnings
                           << " Vulkan validation warning(s) before the skip" << std::endl;
@@ -548,7 +566,7 @@ bool testNeverReturnsInvalidFdUnderExhaustion() {
         return false;
     }
 
-    const int warnings = wallpaperx::validationWarningCount();
+    const int warnings = (validationCounter ? validationCounter->load() : 0);
     if (warnings > 0) {
         std::cerr << "frame_export_probe (exhaustion): " << warnings << " Vulkan validation warning(s)" << std::endl;
         return false;

@@ -150,17 +150,8 @@ endforeach()
 
 add_custom_target(wallpaperx-shaders DEPENDS ${SHADER_SPV_FILES})
 
-# Test-only, and deliberately a separate library rather than part of wallpaperx-renderer:
-# it must not be linkable from the daemon or the app. It counts validation warnings by
-# reading the stderr the renderer already writes, so the production tree has no counter,
-# hook or accessor for it -- which is what keeps GOALS.md X.6 structural instead of a
-# comment asking people not to call something.
-add_library(wallpaperx-test-support STATIC tests/support/validation_probe.cpp)
-target_include_directories(wallpaperx-test-support PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-target_link_libraries(wallpaperx-test-support PUBLIC wallpaperx-renderer)
-
 add_executable(wallpaperx-device-probe tests/device_probe.cpp)
-target_link_libraries(wallpaperx-device-probe PRIVATE wallpaperx-test-support)
+target_link_libraries(wallpaperx-device-probe PRIVATE wallpaperx-renderer)
 
 add_executable(wallpaperx-tier-selection-test tests/tier_selection_test.cpp)
 target_link_libraries(wallpaperx-tier-selection-test PRIVATE wallpaperx-renderer)
@@ -169,13 +160,13 @@ add_executable(wallpaperx-memory-export-test tests/memory_export_test.cpp)
 target_link_libraries(wallpaperx-memory-export-test PRIVATE wallpaperx-renderer)
 
 add_executable(wallpaperx-offscreen-probe tests/offscreen_probe.cpp)
-target_link_libraries(wallpaperx-offscreen-probe PRIVATE wallpaperx-test-support)
+target_link_libraries(wallpaperx-offscreen-probe PRIVATE wallpaperx-renderer)
 
 add_executable(wallpaperx-device-affinity-probe tests/device_affinity_probe.cpp)
-target_link_libraries(wallpaperx-device-affinity-probe PRIVATE wallpaperx-test-support)
+target_link_libraries(wallpaperx-device-affinity-probe PRIVATE wallpaperx-renderer)
 
 add_executable(wallpaperx-static-renderer-probe tests/static_renderer_probe.cpp)
-target_link_libraries(wallpaperx-static-renderer-probe PRIVATE wallpaperx-test-support)
+target_link_libraries(wallpaperx-static-renderer-probe PRIVATE wallpaperx-renderer)
 add_dependencies(wallpaperx-static-renderer-probe wallpaperx-shaders)
 target_compile_definitions(wallpaperx-static-renderer-probe PRIVATE
     WALLPAPERX_SHADER_DIR="${SHADER_OUTPUT_DIR}"
@@ -183,10 +174,14 @@ target_compile_definitions(wallpaperx-static-renderer-probe PRIVATE
 )
 
 add_executable(wallpaperx-descriptor-allocator-probe tests/descriptor_allocator_probe.cpp)
-target_link_libraries(wallpaperx-descriptor-allocator-probe PRIVATE wallpaperx-test-support)
+target_link_libraries(wallpaperx-descriptor-allocator-probe PRIVATE wallpaperx-renderer)
 
 add_executable(wallpaperx-frame-export-probe tests/frame_export_probe.cpp)
-target_link_libraries(wallpaperx-frame-export-probe PRIVATE wallpaperx-test-support)
+target_link_libraries(wallpaperx-frame-export-probe PRIVATE wallpaperx-renderer)
+# tests/support/ holds header-only test scaffolding shared with backend/tests -- kept
+# out of the renderer library because nothing WallpaperX ships CPU-maps an exported
+# frame; only a test needs to.
+target_include_directories(wallpaperx-frame-export-probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 add_dependencies(wallpaperx-frame-export-probe wallpaperx-shaders)
 target_compile_definitions(wallpaperx-frame-export-probe PRIVATE
     WALLPAPERX_SHADER_DIR="${SHADER_OUTPUT_DIR}"
@@ -194,7 +189,7 @@ target_compile_definitions(wallpaperx-frame-export-probe PRIVATE
 )
 
 add_executable(wallpaperx-modifier-roundtrip-probe tests/modifier_roundtrip_probe.cpp)
-target_link_libraries(wallpaperx-modifier-roundtrip-probe PRIVATE wallpaperx-test-support)
+target_link_libraries(wallpaperx-modifier-roundtrip-probe PRIVATE wallpaperx-renderer)
 add_dependencies(wallpaperx-modifier-roundtrip-probe wallpaperx-shaders)
 target_compile_definitions(wallpaperx-modifier-roundtrip-probe PRIVATE
     WALLPAPERX_SHADER_DIR="${SHADER_OUTPUT_DIR}"
@@ -235,10 +230,6 @@ set_tests_properties(tier_selection memory_export
 add_test(NAME device_probe COMMAND wallpaperx-device-probe)
 add_test(NAME offscreen_probe COMMAND wallpaperx-offscreen-probe)
 add_test(NAME device_affinity_probe COMMAND wallpaperx-device-affinity-probe)
-# 77 means the probe found no usable Vulkan device and ran none of its cases. Without
-# this ctest reads that as a failure, which blames the affinity guard for the absence of
-# a GPU; with it the run says "Skipped" and no case claims to have proved anything.
-set_tests_properties(device_affinity_probe PROPERTIES SKIP_RETURN_CODE 77)
 add_test(NAME static_renderer_probe COMMAND wallpaperx-static-renderer-probe)
 add_test(NAME descriptor_allocator_probe COMMAND wallpaperx-descriptor-allocator-probe)
 add_test(NAME frame_export_probe COMMAND wallpaperx-frame-export-probe)
@@ -306,7 +297,6 @@ if(WALLPAPERX_LAVAPIPE_ICD)
             ENVIRONMENT "VK_ICD_FILENAMES=${WALLPAPERX_LAVAPIPE_ICD};WALLPAPERX_ALLOW_NO_HEAP_TIER=1"
             LABELS "lavapipe"
     )
-    set_tests_properties(device_affinity_probe_lavapipe PROPERTIES SKIP_RETURN_CODE 77)
     set_tests_properties(static_renderer_probe_lavapipe PROPERTIES RESOURCE_LOCK static_renderer_probe_test_image)
     set_tests_properties(frame_export_probe_lavapipe PROPERTIES RESOURCE_LOCK frame_export_probe_test_image)
     set_tests_properties(modifier_roundtrip_probe_lavapipe modifier_sensitivity_probe_lavapipe

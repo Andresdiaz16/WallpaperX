@@ -57,7 +57,6 @@
 #include "vulkan/device.h"
 #include "vulkan/frame_export.h"
 #include "vulkan/offscreen.h"
-#include "support/validation_probe.h"
 
 #include <atomic>
 #include <cerrno>
@@ -93,9 +92,23 @@ constexpr int kMonitor = 0;
 // returned (a real miss) and 126 means dup2 failed.
 constexpr int kDeviceUnavailableExit = 77;
 
+// The guarded call returned by throwing rather than aborting. Distinct from every other
+// code a child here can produce, and deliberately NOT the skip code: this is a guard
+// regression and must be graded red.
+constexpr int kGuardThrewExit = 125;
+
+// Set for the duration of the call under test, so withDevice's handler can tell a
+// setup failure from the guard failing to fire. A plain bool is enough: each child runs
+// one case, and the marked region is entered once on the child's main thread.
+bool g_inGuardedPhase = false;
+struct GuardedPhase {
+    GuardedPhase() { g_inGuardedPhase = true; }
+    ~GuardedPhase() { g_inGuardedPhase = false; }
+};
+
 int failures = 0;
 int harnessFaults = 0;
-int skipped = 0;
+int unrunnable = 0;
 
 void check(bool ok, const char* what) {
     std::printf("%s: %s\n", ok ? "ok  " : "FAIL", what);
@@ -117,12 +130,14 @@ void harnessFault(const char* what, const char* detail) {
     ++harnessFaults;
 }
 
-void skip(const char* what, const std::string& detail) {
+// Named "unrunnable" rather than "skip": the case did not run, and that is reported as a
+// failure of the run, not as an acceptable outcome.
+void unrunnableCase(const char* what, const std::string& detail) {
     // Trimmed because `detail` is usually the child's captured stderr, which ends in the
     // newline the child wrote; printed raw it puts a blank line between every skip.
     const size_t end = detail.find_last_not_of(" \t\r\n");
-    std::printf("skip: %s -- %s\n", what, end == std::string::npos ? detail.c_str() : detail.substr(0, end + 1).c_str());
-    ++skipped;
+    std::printf("UNRUN: %s -- %s\n", what, end == std::string::npos ? detail.c_str() : detail.substr(0, end + 1).c_str());
+    ++unrunnable;
 }
 
 struct ChildResult {
@@ -250,9 +265,21 @@ void withDevice(const std::function<void(Device&)>& body) {
     // throw. So any exception reaching this handler came from setup, and the exception
     // text is printed alongside the skip so a throw from somewhere unexpected is still
     // legible rather than silently swallowed.
+    // Which exit code a throw maps to depends on WHERE it came from, and the difference
+    // is the whole point. A throw from setup is a host that cannot run the case (skip).
+    // A throw from the guarded call is the guard failing to abort -- the exact regression
+    // this file exists to catch. One try around the whole body mapped both to the skip
+    // code, so a guard changed from abort() to throwing would have turned every negative
+    // case into ctest "Skipped", i.e. green. Each case marks the boundary with a
+    // GuardedPhase object immediately before the call under test.
     try {
         body(*device);
     } catch (const std::exception& e) {
+        if (g_inGuardedPhase) {
+            std::fprintf(stderr, "the guarded call threw instead of aborting: %s\n", e.what());
+            std::fflush(stderr);
+            _exit(kGuardThrewExit);
+        }
         std::fprintf(stderr, "setup for this case could not complete: %s\n", e.what());
         std::fflush(stderr);
         _exit(kDeviceUnavailableExit);
@@ -268,8 +295,14 @@ void expectGuardAbort(const ChildResult& result, const char* label, const char* 
         harnessFault(what, result.harnessError.c_str());
         return;
     }
+    if (result.exited && result.exitCode == kGuardThrewExit) {
+        check(false, what);
+        std::printf("      the guarded call threw instead of aborting; stderr was:\n      %s\n",
+                    result.stderrText.c_str());
+        return;
+    }
     if (result.exited && result.exitCode == kDeviceUnavailableExit) {
-        skip(what, result.stderrText.empty() ? std::string("no usable Vulkan device in the child")
+        unrunnableCase(what, result.stderrText.empty() ? std::string("no usable Vulkan device in the child")
                                              : result.stderrText);
         return;
     }
@@ -330,6 +363,7 @@ int main() {
     expectGuardAbort(runInChild([] {
                          withDevice([](Device& device) {
                              OffscreenTargetManager targets(device);
+                             GuardedPhase phase;
                              onAnotherThread([&] { targets.create(kMonitor, kWidth, kHeight); });
                          });
                      }),
@@ -340,6 +374,7 @@ int main() {
                          withDevice([](Device& device) {
                              OffscreenTargetManager targets(device);
                              targets.create(kMonitor, kWidth, kHeight);  // correct thread
+                             GuardedPhase phase;
                              onAnotherThread([&] { targets.destroy(kMonitor); });
                          });
                      }),
@@ -348,6 +383,7 @@ int main() {
 
     expectGuardAbort(runInChild([] {
                          withDevice([](Device& device) {
+                             GuardedPhase phase;
                              onAnotherThread([&] { device.immediateSubmit([](VkCommandBuffer) {}); });
                          });
                      }),
@@ -358,6 +394,7 @@ int main() {
                          withDevice([](Device& device) {
                              OffscreenTargetManager targets(device);
                              const auto& target = targets.create(kMonitor, kWidth, kHeight);
+                             GuardedPhase phase;
                              onAnotherThread([&] { (void)wallpaperx::exportFrame(device, target); });
                          });
                      }),
@@ -377,6 +414,7 @@ int main() {
                              std::thread adopter([&] { device.adoptGpuThread(); });
                              adopter.join();
                              // The creating thread is now the *wrong* one.
+                             GuardedPhase phase;
                              targets.destroy(kMonitor);
                          });
                      }),
@@ -404,7 +442,7 @@ int main() {
         if (adopted.harnessFailed) {
             harnessFault(what, adopted.harnessError.c_str());
         } else if (adopted.exited && adopted.exitCode == kDeviceUnavailableExit) {
-            skip(what, adopted.stderrText);
+            unrunnableCase(what, adopted.stderrText);
         } else {
             check(adopted.exited && adopted.exitCode == 0, what);
             if (!(adopted.exited && adopted.exitCode == 0)) {
@@ -418,7 +456,6 @@ int main() {
     //
     // Without this the whole file is satisfied by a Device that aborts on *every* call,
     // which is not a guard, it is a brick.
-    wallpaperx::resetValidationWarningCount();
     // Construction is separated from the four calls so the two failure meanings stay
     // apart: a Device that cannot be built here means the same "could not run" the
     // children report, while a throw from any call *after* it is a real failure of the
@@ -428,7 +465,7 @@ int main() {
     try {
         device.emplace(/*enableValidation=*/true);
     } catch (const std::exception& e) {
-        skip("the creating thread performs the same four calls without aborting", e.what());
+        unrunnableCase("the creating thread performs the same four calls without aborting", e.what());
     }
     if (device) {
         try {
@@ -440,10 +477,10 @@ int main() {
             targets.destroy(kMonitor);
             check(true, "the creating thread performs the same four calls without aborting");
 
-            if (!wallpaperx::validationLayerActive()) {
+            if (!device->validationLayerActive()) {
                 std::printf("skip: validation-warning check -- VK_LAYER_KHRONOS_validation is not loadable here\n");
             } else {
-                check(wallpaperx::validationWarningCount() == 0, "the positive path produces no validation warnings");
+                check(device->validationWarnings() == 0, "the positive path produces no validation warnings");
             }
         } catch (const std::exception& e) {
             check(false, "the creating thread performs the same four calls without aborting");
@@ -462,9 +499,19 @@ int main() {
                              "no conclusion about the affinity guard either way\n", harnessFaults);
         return 1;
     }
-    if (skipped > 0) {
-        std::printf("device_affinity_probe: %d case(s) skipped -- no usable Vulkan device on this host\n", skipped);
-        return 77;  // SKIP_RETURN_CODE, so ctest says "Skipped" rather than "Passed"
+    // Deliberately NOT a skip. A host with no usable Vulkan device cannot test the
+    // affinity guard, but it cannot test anything else in renderer/tests either --
+    // device_probe, offscreen_probe and the rest all fail outright in that situation, and
+    // making this one probe report "Skipped" instead would single it out as optional
+    // while its siblings went red for the same cause. The message still names the real
+    // reason, which is the whole point of separating it from a guard regression; what
+    // changes is only the grade.
+    if (unrunnable > 0) {
+        std::fprintf(stderr,
+                     "device_affinity_probe: %d case(s) could not run -- no usable Vulkan device on this host. "
+                     "This is an environment failure, not a verdict on the affinity guard.\n",
+                     unrunnable);
+        return 1;
     }
     std::printf("device_affinity_probe: all checks passed\n");
     return 0;
