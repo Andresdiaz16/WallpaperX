@@ -588,8 +588,15 @@ void runRenderChecks(sdbus::IProxy& proxy, FrameReadyLog& signals, const std::st
 
     // Still 1: the good render above, and nothing for the corrupt one that followed.
     check(signals.countFor(kMonitorCorrupt) == 1, "a render that fails emits no FrameReady");
-    check(errorNameFrom([&] { getFrameFd(proxy, kMonitorCorrupt); }) == "io.wallpaperx.Daemon.Error.NoFrame",
-          "a failed render leaves no frame, not the previous wallpaper's");
+    // RenderFailed, not NoFrame, and this is the whole point of the distinction: this
+    // monitor and kMonitorVideo above are both frameless, but one will produce a frame
+    // if the client waits and the other never will. Answering both with NoFrame told a
+    // polling consumer to retry a wallpaper that cannot succeed. Asserted next to the
+    // video case deliberately -- if the two ever collapse back to one error name, one of
+    // these two lines fails.
+    check(errorNameFrom([&] { getFrameFd(proxy, kMonitorCorrupt); }) ==
+              "io.wallpaperx.Daemon.Error.RenderFailed",
+          "a failed render is reported as RenderFailed, distinctly from a monitor with nothing rendered yet");
 
     // The reply to SetWallpaper was already sent by the time the render failed, so
     // GetStatus is the only place that failure is reported.
@@ -744,7 +751,11 @@ void runCoalescingChecks(sdbus::IProxy& proxy, FrameReadyLog& signals, const std
     setWallpaper(proxy, "static", corruptPath, kMonitorBurstFailLast);
     barrier("the barrier frame arrives after a burst ending in an unrenderable request");
 
-    check(errorNameFrom([&] { getFrameFd(proxy, kMonitorBurstFailLast); }) == "io.wallpaperx.Daemon.Error.NoFrame",
+    // RenderFailed rather than NoFrame is itself part of the claim: it is only reachable
+    // when a render actually ran and failed, so it rules out "the burst was dropped
+    // entirely" in a way a bare NoFrame cannot.
+    check(errorNameFrom([&] { getFrameFd(proxy, kMonitorBurstFailLast); }) ==
+              "io.wallpaperx.Daemon.Error.RenderFailed",
           "a burst ending in an unrenderable request leaves no frame -- the last request is served, not the first");
     {
         const nlohmann::json json = getStatus(proxy);

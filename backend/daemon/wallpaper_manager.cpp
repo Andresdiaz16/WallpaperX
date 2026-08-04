@@ -293,17 +293,33 @@ RenderOutcome WallpaperManager::renderPending(int monitorId) {
     return RenderOutcome{committed, generation};
 }
 
-std::optional<FrameHandle> WallpaperManager::exportCurrentFrame(int monitorId) {
+FrameExport WallpaperManager::exportCurrentFrame(int monitorId) {
     requireValidMonitorId(monitorId);
 
     std::lock_guard<std::mutex> gpuLock(m_gpuMutex);
 
+    FrameExport out;
     uint64_t generation = 0;
     {
         std::lock_guard<std::mutex> stateLock(m_stateMutex);
         auto it = m_monitors.find(monitorId);
-        if (it == m_monitors.end() || !it->second.hasFrame) {
-            return std::nullopt;
+        if (it == m_monitors.end()) {
+            out.reason = NoFrameReason::NeverRequested;
+            return out;
+        }
+        if (!it->second.hasFrame) {
+            // Decided here, under the lock that guards it, so the answer cannot be
+            // overtaken between reading "no frame" and reading why. lastError is set
+            // only by a render that ran and failed, and cleared both when a new request
+            // is recorded and when a render commits -- so a non-empty one is exactly
+            // "the most recent attempt failed and nothing has superseded it".
+            if (!it->second.lastError.empty()) {
+                out.reason = NoFrameReason::RenderFailed;
+                out.lastError = it->second.lastError;
+            } else {
+                out.reason = NoFrameReason::NotRendered;
+            }
+            return out;
         }
         generation = it->second.generation;
     }
@@ -325,7 +341,8 @@ std::optional<FrameHandle> WallpaperManager::exportCurrentFrame(int monitorId) {
     FrameHandle handle;
     handle.frame = wallpaperx::exportFrame(*m_device, m_targets->get(monitorId));
     handle.generation = generation;
-    return handle;
+    out.handle = std::move(handle);
+    return out;
 }
 
 WallpaperManager::Snapshot WallpaperManager::snapshot() const {

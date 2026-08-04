@@ -119,9 +119,9 @@ void DbusService::completeGetFrameFd(FrameFdCall call, int32_t monitorId) {
     // Runs on the render worker's thread, so nothing here may throw past this frame --
     // an escaping exception would be std::terminate on a bare thread. Every path below
     // either returns results or returns an error on `call`.
-    std::optional<FrameHandle> handle;
+    FrameExport exported;
     try {
-        handle = m_manager.exportCurrentFrame(monitorId);
+        exported = m_manager.exportCurrentFrame(monitorId);
     } catch (const InvalidRequest& e) {
         call.returnError(sdbus::Error(sdbus::Error::Name{kErrorInvalidArgs}, e.what()));
         return;
@@ -130,14 +130,30 @@ void DbusService::completeGetFrameFd(FrameFdCall call, int32_t monitorId) {
         return;
     }
 
-    if (!handle) {
-        call.returnError(sdbus::Error(sdbus::Error::Name{kErrorNoFrame},
-                                      "no frame available for monitor " + std::to_string(monitorId) +
-                                          " (call SetWallpaper first)"));
+    if (!exported.handle) {
+        // RenderFailed and NoFrame are answered separately because a polling consumer
+        // must respond to them differently: NoFrame means ask again, RenderFailed means
+        // stop asking and show the reason. Both used to come back as NoFrame carrying
+        // the text "call SetWallpaper first" -- advice that is not merely unhelpful for
+        // a wallpaper that already failed, but tells the client to retry a request that
+        // cannot succeed until a *different* one replaces it. The reply also carries the
+        // render's own error text, which was otherwise reachable only through GetStatus.
+        if (exported.reason == NoFrameReason::RenderFailed) {
+            call.returnError(sdbus::Error(sdbus::Error::Name{kErrorRenderFailed},
+                                          "the last render for monitor " + std::to_string(monitorId) +
+                                              " failed: " + exported.lastError));
+            return;
+        }
+        call.returnError(
+            sdbus::Error(sdbus::Error::Name{kErrorNoFrame},
+                         "no frame available for monitor " + std::to_string(monitorId) +
+                             (exported.reason == NoFrameReason::NeverRequested
+                                  ? " (call SetWallpaper first)"
+                                  : " yet -- a request is recorded but no frame has been produced for it")));
         return;
     }
 
-    const ExportedFrame& frame = handle->frame;
+    const ExportedFrame& frame = exported.handle->frame;
 
     // adopt_fd, not the duplicating constructor: exportFrame() handed us ownership of a
     // freshly created fd and nothing else will close it. Taken on the first line after
@@ -155,7 +171,7 @@ void DbusService::completeGetFrameFd(FrameFdCall call, int32_t monitorId) {
     call.returnResults(fd, frame.width, frame.height, frame.memorySize,
                        frame.type == ExportedFrame::HandleType::DmaBuf ? 1 : 0,
                        std::vector<sdbus::UnixFd>{},  // sync_fds: reserved, always empty today
-                       handle->generation, frame.drmFormat, frame.modifier, planes);
+                       exported.handle->generation, frame.drmFormat, frame.modifier, planes);
 }
 
 std::string DbusService::getStatus() {

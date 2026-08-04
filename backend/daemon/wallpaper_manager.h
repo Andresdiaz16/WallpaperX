@@ -57,6 +57,33 @@ struct FrameHandle {
     uint64_t generation = 0;
 };
 
+// Why an export produced nothing. Carried out of the manager rather than re-derived by
+// the caller, because the three cases are distinguishable only from state guarded by
+// m_stateMutex, and a caller that took a second look would be reading a second, later
+// truth -- the exact split this class exists to prevent.
+//
+// The distinction is not cosmetic. A consumer polls GetFrameFd, and "nothing yet, ask
+// again" and "this wallpaper will never render" require opposite responses: retry, or
+// stop and show the error. Collapsing them tells a client to retry a dead wallpaper
+// forever.
+enum class NoFrameReason {
+    NeverRequested,  // nothing has ever been set on this monitor
+    NotRendered,     // a request is recorded but no frame has committed -- still queued,
+                     // still rendering, or a type this build cannot render (video)
+    RenderFailed,    // the last render was attempted and failed; lastError says why
+};
+
+// The result of asking for a monitor's current frame: the frame, or the reason there
+// isn't one.
+struct FrameExport {
+    std::optional<FrameHandle> handle;
+
+    // Both meaningful only when `handle` is empty. lastError is non-empty exactly when
+    // reason is RenderFailed.
+    NoFrameReason reason = NoFrameReason::NeverRequested;
+    std::string lastError;
+};
+
 // What renderPending() did, so the caller knows whether to announce a new frame.
 struct RenderOutcome {
     bool rendered = false;
@@ -132,10 +159,10 @@ public:
     // Failures are recorded in the monitor's lastError, not thrown: nobody is waiting.
     RenderOutcome renderPending(int monitorId);
 
-    // Exports the monitor's most recent frame as a fresh fd. std::nullopt means
-    // there is simply nothing rendered for that monitor (an expected state, not a
-    // failure); a thrown exception means the export itself went wrong.
-    std::optional<FrameHandle> exportCurrentFrame(int monitorId);
+    // Exports the monitor's most recent frame as a fresh fd. An empty handle means
+    // there is nothing to export, with `reason` saying which of the three states that
+    // is; a thrown exception means the export itself went wrong.
+    FrameExport exportCurrentFrame(int monitorId);
 
     // One consistent snapshot of everything GetStatus reports. Deliberately not two
     // accessors: reading the GPU block and the monitor map under separate lock

@@ -576,6 +576,20 @@ int run(Mode mode) {
                       << real.requiredSize
                       << " -- a consumer sizing its allocation from the published value would be short" << std::endl;
         }
+        // Printed, not asserted as equality. A 2026-08-03 QA sweep found the two are in
+        // fact equal at every extent from 1x1 to 3840x2160 on this NVIDIA driver, which
+        // is worth knowing but is not something to pin: a driver or allocator that
+        // rounded a dedicated allocation up would be behaving legally, and asserting
+        // equality would fail the probe red on hardware nobody here has for a
+        // non-defect. Both directions that *are* defects already have assertions -- an
+        // under-report is caught above, and a memorySize larger than the real object is
+        // caught by the lseek gate in dbus_service_test before it can SIGBUS an mmap.
+        std::cout << "modifier_roundtrip_probe: importer requires " << real.requiredSize << " for the same image ("
+                  << (real.memorySize == real.requiredSize
+                          ? "exactly the published memorySize"
+                          : "published memorySize is larger by " + std::to_string(real.memorySize - real.requiredSize) +
+                                " bytes")
+                  << ")" << std::endl;
         return g_failures;
     }
 
