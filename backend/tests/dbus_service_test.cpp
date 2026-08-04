@@ -782,7 +782,10 @@ void runWorkerCoalescingChecks(const wallpaperx::WallpaperManager::Config& confi
     //       which is the state this shape exists to rule out. An earlier CONTROL here
     //       leaked the promise instead; that never reached the join, so it could not
     //       have observed either behaviour and its no-hang claim was unfounded. Both
-    //       mutations reverted.
+    //       mutations reverted. The run above was then repeated after this binary began
+    //       linking wallpaperx-test-support, because that library redirects stderr and
+    //       the first measurement predated it -- see the drain call below, without which
+    //       the FAIL line this control observes is never printed at all.
     const auto drain = [&worker](const char* what, const Check& c) {
         std::promise<void> done;
         std::future<void> future = done.get_future();
@@ -794,9 +797,15 @@ void runWorkerCoalescingChecks(const wallpaperx::WallpaperManager::Config& confi
         std::fprintf(stderr,
                      "dbus_service_test: the render worker did not progress within the signal "
                      "timeout; ending the run here rather than joining a wedged thread\n");
-        // Mandatory before _Exit: stdout is fully buffered under ctest, so every progress
-        // and WARNING line written so far is still in the buffer that _Exit discards.
+        // Both are mandatory before _Exit, and for different reasons. fflush: stdout is
+        // fully buffered under ctest, so every progress and WARNING line written so far
+        // is still in the buffer _Exit discards. drainValidationCapture: this binary
+        // links wallpaperx-test-support, which redirects stderr to a temporary file and
+        // copies it out only at a drain point or in its destructor -- and _Exit runs no
+        // destructors. Without it the FAIL line printed one statement above, and the
+        // whole run's stderr with it, dies in that file.
         std::fflush(nullptr);
+        wallpaperx::drainValidationCapture();
         std::_Exit(1);
     };
 

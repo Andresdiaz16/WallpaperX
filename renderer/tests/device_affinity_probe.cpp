@@ -46,6 +46,13 @@
 //       -> 6 "HARN:" lines and exit 1; before, `status` stayed 0, WIFEXITED(0) was true
 //       with WEXITSTATUS(0) == 0, and every case reported "the call returned instead of
 //       aborting (child exited 0) -- the guard did not fire". Both reverted.
+// CONTROL (setup throwing inside body): `throw std::runtime_error("CONTROL: setup could
+//       not complete")` placed in the destroyTarget case ahead of its targets.create()
+//       -> "skip: destroying an offscreen target from a non-GPU thread aborts -- setup
+//       for this case could not complete: ...", exit 77. Before body() was guarded the
+//       same throw reached std::terminate and the parent reported "child aborted, but
+//       not from the affinity guard" -- a host-capability failure charged to the
+//       renderer. Reverted.
 
 #include "vulkan/device.h"
 #include "vulkan/frame_export.h"
@@ -99,12 +106,14 @@ void check(bool ok, const char* what) {
 // evidence about Device::assertGpuThread, and counting it as a failed check would put a
 // renderer bug on the screen when the actual fault is in this file or in the machine.
 void harnessFault(const char* what, const char* detail) {
+    // Both lines on stdout, deliberately. They used to be split across the two streams
+    // with an fflush(stdout) in between to keep them adjacent, which stopped working the
+    // moment this binary linked wallpaperx-test-support: that library redirects stderr
+    // to a file drained only at a count() call and at exit, so the detail lines all
+    // arrived in a block at the end, each one detached from the case it explains.
+    // Keeping the pair on one stream makes the adjacency independent of any of that.
     std::printf("HARN: %s\n", what);
-    // Flushed before writing to stderr: under ctest stdout is a pipe and therefore fully
-    // buffered while stderr is not, so without this the detail line overtakes the HARN
-    // line it belongs to and attaches itself to the previous case in the log.
-    std::fflush(stdout);
-    std::fprintf(stderr, "  harness could not run this case: %s -- this says nothing about the guard\n", detail);
+    std::printf("      could not run this case: %s -- this says nothing about the guard\n", detail);
     ++harnessFaults;
 }
 
@@ -227,7 +236,27 @@ void withDevice(const std::function<void(Device&)>& body) {
         std::fflush(stderr);
         _exit(kDeviceUnavailableExit);
     }
-    body(*device);
+    // body() is guarded too, and it has to be: several cases do real GPU work on the
+    // correct thread before they reach the guarded call -- targets.create() in three of
+    // them -- and OffscreenTargetManager::create throws on a host whose ICD builds an
+    // instance and a device but cannot satisfy the image format or memory type it wants.
+    // Guarding only the constructor left that throw escaping the lambda into
+    // std::terminate -> abort(), which the parent reads as SIGABRT without the guard
+    // sentence and reports as "child aborted, but not from the affinity guard": the same
+    // host-capability-blamed-on-the-guard verdict this wrapper exists to prevent, just
+    // one step later.
+    //
+    // Nothing here can mask a real regression. assertGpuThread aborts; it does not
+    // throw. So any exception reaching this handler came from setup, and the exception
+    // text is printed alongside the skip so a throw from somewhere unexpected is still
+    // legible rather than silently swallowed.
+    try {
+        body(*device);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "setup for this case could not complete: %s\n", e.what());
+        std::fflush(stderr);
+        _exit(kDeviceUnavailableExit);
+    }
 }
 
 // Asserts that a child died the way the guard makes things die, and names every other

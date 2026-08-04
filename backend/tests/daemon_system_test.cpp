@@ -657,8 +657,25 @@ void checkFirstFrame(sdbus::IProxy& proxy, FrameReadyLog& signals, const std::st
 //       retaken is nowhere near that wide. This check catches a snapshot whose halves
 //       drift far apart; it does not catch a narrow split, and a future reader must not
 //       read its green as proof that snapshot() is still single-locked.
+// CONTROL (the readiness barrier): with the barrier removed, the straddle depends on
+//       three fresh threads each completing a session-bus connect before the daemon
+//       finishes ensureGpu -- an assertion on the scheduler. The barrier makes it a
+//       property of the harness, and its own check ("every status watcher was live
+//       before the first render was requested") is what would fail if a watcher never
+//       reached the bus.
+// CONTROL (the Stopper scope guard): checkFirstFrame patched to `throw
+//       std::runtime_error(...)` on entry, with the watchers live -> with the guard,
+//       exit 1 and "FAIL: unexpected exception: CONTROL: simulated sdbus failure
+//       mid-phase"; with `Stopper` left uninstantiated, exit 134 and "terminate called"
+//       -- the joinable-thread destructor taking the process down and replacing every
+//       FAIL line with a bare abort. Both reverted.
 struct GpuInitWatch {
     std::atomic<bool> stop{false};
+    // Counts watchers that have completed one reply. The first SetWallpaper waits on
+    // this: the straddle must be a property of the harness, not of whether the scheduler
+    // happened to run three fresh threads (each of which still has a session-bus connect
+    // ahead of it) before the daemon finished creating its device.
+    std::atomic<int> ready{0};
     std::atomic<int> replies{0};
     std::atomic<int> preInit{0};
     std::atomic<int> postInit{0};
@@ -679,10 +696,15 @@ void gpuInitWatchThread(GpuInitWatch& watch) {
         return;
     }
 
+    bool announced = false;
     while (!watch.stop.load(std::memory_order_relaxed)) {
         try {
             const nlohmann::json status = getStatus(*proxy);
             ++watch.replies;
+            if (!announced) {
+                announced = true;
+                ++watch.ready;
+            }
             const bool initialized = status.contains("gpu") && status["gpu"].is_object() &&
                                      status["gpu"].value("initialized", false);
             if (initialized) {
@@ -691,10 +713,25 @@ void gpuInitWatchThread(GpuInitWatch& watch) {
                 ++watch.preInit;
             }
             if (!wallpaperx::testing::statusSelfConsistent(status)) ++watch.inconsistent;
+            // Paced rather than spun. Three threads issuing blocking round trips as fast
+            // as the bus allows take WallpaperManager's state mutex thousands of times
+            // during the very render this phase is timing, and on a loaded or single-core
+            // host that contention can push the first FrameReady past checkFirstFrame's
+            // own timeout -- a failure of the measurement, blamed on the daemon. A
+            // millisecond still yields hundreds of samples across a device creation that
+            // takes tens to hundreds of milliseconds, which is far more than the straddle
+            // needs.
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
         } catch (const std::exception&) {
             // A failed GetStatus is not a consistency violation. Counted, and reported
-            // below only if it swallowed the whole sample.
+            // below only if it swallowed the whole sample. It still marks this watcher
+            // ready: the barrier is "this thread is running and talking to the bus", and
+            // a watcher that only ever errors would otherwise hang the phase.
             ++watch.errors;
+            if (!announced) {
+                announced = true;
+                ++watch.ready;
+            }
         }
     }
 }
@@ -708,10 +745,39 @@ void checkFirstFrameUnderStatusLoad(sdbus::IProxy& proxy, FrameReadyLog& signals
         watchers.emplace_back([&watch] { gpuInitWatchThread(watch); });
     }
 
+    // Stop and join on EVERY path out of here, exceptions included. checkFirstFrame
+    // calls setWallpaper() and getFrameFd() without a try/catch and both throw
+    // sdbus::Error when the daemon answers with an error or dies mid-phase. Letting that
+    // unwind past a vector of joinable threads is std::terminate -- a bare SIGABRT in
+    // place of this phase's FAIL lines and main's own handler -- while the live watchers
+    // keep writing to a `watch` whose storage is being destroyed.
+    struct Stopper {
+        GpuInitWatch& watch;
+        std::vector<std::thread>& watchers;
+        ~Stopper() {
+            watch.stop.store(true, std::memory_order_relaxed);
+            for (std::thread& t : watchers) {
+                if (t.joinable()) t.join();
+            }
+        }
+    } stopper{watch, watchers};
+
+    // Every watcher has answered once before the first render is asked for, so the
+    // pre-init sample below is guaranteed rather than raced for. Bounded: a watcher that
+    // cannot reach the bus at all would otherwise stall the whole test here, and that
+    // fault is reported by the reply/error counts further down.
+    const auto barrierDeadline = std::chrono::steady_clock::now() + wallpaperx::testing::kSignalTimeout;
+    while (watch.ready.load() < kGpuInitWatchers && std::chrono::steady_clock::now() < barrierDeadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const int readyAtStart = watch.ready.load();
+
     checkFirstFrame(proxy, signals, bluePath, check);
 
     watch.stop.store(true, std::memory_order_relaxed);
-    for (std::thread& t : watchers) t.join();
+    for (std::thread& t : watchers) {
+        if (t.joinable()) t.join();
+    }
 
     const int replies = watch.replies.load();
     const int preInit = watch.preInit.load();
@@ -720,6 +786,8 @@ void checkFirstFrameUnderStatusLoad(sdbus::IProxy& proxy, FrameReadyLog& signals
     // The coverage assert comes first: if the sampling missed the transition, the
     // invariant below was applied to nothing and reporting it as green would be the
     // same false signal this phase was moved to escape.
+    check(readyAtStart == kGpuInitWatchers,
+          "every status watcher was live before the first render was requested");
     const bool straddled = preInit > 0 && postInit > 0;
     check(straddled, "the GetStatus sampling straddled the daemon's first device creation");
     if (!straddled) {

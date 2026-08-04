@@ -14,21 +14,43 @@
 // to a test-facing header did not fix that; the state and the functions were still in
 // production code, with a comment as the only boundary. The counting moved out here
 // instead, where the build enforces it.
+//
+// HOW IT WORKS, because it is not free: linking this library redirects the process's
+// stderr to a temporary file at static-initialisation time and copies it through to the
+// real stderr whenever the count is read and at exit. There is no reader thread and no
+// second thread of any kind -- an earlier version used one and deadlocked
+// device_affinity_probe's fork() children in malloc. The consequence a caller must know
+// is that stderr is *batched*: a line printed now reaches the terminal at the next
+// validationWarningCount()/resetValidationWarningCount() call, at exit, or when
+// drainValidationCapture() is called explicitly.
 
 namespace wallpaperx {
 
 // Discards everything observed so far. Call before the region under test when an earlier
 // phase is expected to have produced warnings of its own.
+//
+// Aborts the process if the capture could not be installed -- see validationWarningCount().
 void resetValidationWarningCount();
 
 // Number of validation warnings the renderer has printed since the last reset.
 //
-// Synchronous with respect to anything already written to stderr: the call flushes and
-// then blocks until the reader thread has drained past a marker written at call time, so
-// a warning emitted immediately before this call is always included. Without that a
-// check could sample the count while the line producing it was still in flight and pass
-// on a race rather than on the absence of warnings.
+// Counted on the calling thread: the call flushes stderr and reads the capture file to
+// its end before returning, so a warning emitted immediately before this call is always
+// included. There is no concurrent reader to synchronise with.
+//
+// If the capture could not be installed (no writable temporary directory, exhausted file
+// descriptors), this does NOT return 0 -- it prints why and aborts. A zero returned from
+// a capture that was never listening is indistinguishable from a clean run, and every
+// caller of this function uses it as the suite's only GPU-side correctness oracle.
 int validationWarningCount();
+
+// Copies everything captured so far to the real stderr without counting it.
+//
+// Call before any deliberate abnormal exit -- `_Exit`, `abort`, a re-raised signal --
+// because those run no destructors, so the capture's own flush at exit never happens and
+// the whole run's stderr would be discarded with the temporary file. Safe to call from a
+// signal handler: it allocates nothing and uses only pread/write.
+void drainValidationCapture();
 
 // Whether VK_LAYER_KHRONOS_validation can actually be loaded here. Asked of the loader
 // directly, so it does not depend on a Device having been built.

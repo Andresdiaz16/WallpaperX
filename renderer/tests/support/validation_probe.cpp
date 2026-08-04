@@ -2,12 +2,12 @@
 
 #include <vulkan/vulkan.h>
 
+#include <cerrno>
+#include <csignal>
 #include <cstdio>
 #include <cstring>
 #include <string>
 #include <vector>
-
-#include <cerrno>
 
 #include <unistd.h>
 
@@ -26,14 +26,17 @@ constexpr const char* kWarningPrefix = "[vulkan] ";
 // rather than silently miscounting.
 constexpr const char* kNotAWarning = "validation layer present but VK_EXT_validation_features is not";
 
+class Capture;
+Capture* g_instance = nullptr;
+
 // Redirects stderr to a temporary file, counts the validation warnings written to it,
 // and copies everything through to the real stderr as it is read.
 //
 // WHY A FILE AND NO THREAD. The obvious shape is a pipe with a reader thread forwarding
 // bytes live. That version deadlocked: renderer/tests/device_affinity_probe.cpp forks,
 // and fork() in a process with a second thread gives the child a copy of a heap whose
-// allocator lock that thread may have been holding -- the child then wedges in its first
-// malloc, the parent blocks reading a pipe that never reaches EOF, and the probe hangs
+// allocator lock that thread may have been holding -- the child then wedged in its first
+// malloc, the parent blocked reading a pipe that never reached EOF, and the probe hung
 // forever (observed 3 runs out of 3, killed at 25 s). A file needs no reader running
 // concurrently with the fork, so there is no second thread to inherit a lock from.
 //
@@ -41,20 +44,47 @@ constexpr const char* kNotAWarning = "validation layer present but VK_EXT_valida
 // code in device.cpp, and giving it a test-visible sink is precisely the test-only hook
 // this file exists to avoid. stderr is an interface production already commits to.
 //
-// The cost is that messages reach the terminal in batches -- at each count() and at
-// exit -- rather than the instant they are printed. Ordering among them is preserved,
-// and ctest reads the process's output at the end regardless.
+// THE COST IS THAT OUTPUT IS BATCHED, and that is dangerous rather than merely
+// inconvenient: a process that dies by a signal or _Exit runs no destructor, so without
+// the handlers installed below the whole run's stderr goes into the temporary file and
+// is discarded with it. That would be a straight regression against writing to stderr
+// directly, which at least printed everything up to the fault.
+//
+// CONTROL (install failure): the constructor forced down its failure path
+//       (`m_file = nullptr; errno = EROFS;`) -> device_probe printed "FATAL: the
+//       validation stderr capture could not be installed (Read-only file system)" and
+//       exited 1. Before requireActive() existed, count() returned a hard 0 and the run
+//       reported all checks passed, including "zero validation warnings" -- across all
+//       eight linked binaries at once. Reverted.
+// CONTROL (death handlers): a marker written to stderr immediately before a deliberate
+//       std::abort() in device_probe's main -> the marker reached the terminal (exit
+//       134). With installDeathHandlers() commented out, the same run printed it zero
+//       times: the temporary file was discarded with the process. Both reverted.
 class Capture {
 public:
     Capture() {
         m_file = std::tmpfile();
-        if (!m_file) return;
+        if (!m_file) {
+            m_initErrno = errno;
+            return;
+        }
         m_fd = fileno(m_file);
-        if (m_fd < 0) return;
+        if (m_fd < 0) {
+            m_initErrno = errno;
+            return;
+        }
         m_realStderr = dup(STDERR_FILENO);
-        if (m_realStderr < 0) return;
-        if (dup2(m_fd, STDERR_FILENO) < 0) return;
+        if (m_realStderr < 0) {
+            m_initErrno = errno;
+            return;
+        }
+        if (dup2(m_fd, STDERR_FILENO) < 0) {
+            m_initErrno = errno;
+            return;
+        }
         m_active = true;
+        g_instance = this;
+        installDeathHandlers();
     }
 
     ~Capture() {
@@ -64,24 +94,56 @@ public:
         dup2(m_realStderr, STDERR_FILENO);
         close(m_realStderr);
         std::fclose(m_file);
+        g_instance = nullptr;
     }
 
     Capture(const Capture&) = delete;
     Capture& operator=(const Capture&) = delete;
 
     void reset() {
-        if (!m_active) return;
+        requireActive();
         drain();
         m_count = 0;
     }
 
     int count() {
-        if (!m_active) return 0;
+        requireActive();
         drain();
         return m_count;
     }
 
+    // Byte-for-byte copy with no counting and no allocation, so it is safe from a signal
+    // handler. Deliberately does not touch m_pending or m_count: a handler runs at an
+    // arbitrary point and must not leave those half-updated for a resumed thread.
+    void drainRaw() {
+        if (!m_active) return;
+        char buffer[4096];
+        while (true) {
+            const ssize_t n = pread(m_fd, buffer, sizeof(buffer), static_cast<off_t>(m_rawOffset));
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) break;
+            m_rawOffset += static_cast<size_t>(n);
+            writeAll(buffer, static_cast<size_t>(n));
+        }
+    }
+
 private:
+    // A capture that never installed is not a run with no warnings, and must never be
+    // reported as one. Every caller of count() treats the result as the suite's only
+    // GPU-side oracle, so a silent 0 here converts a harness fault into a green run
+    // across eight binaries at once.
+    void requireActive() {
+        if (m_active) return;
+        // stderr is untouched on every failure path, so this reaches the terminal.
+        std::fprintf(stderr,
+                     "FATAL: the validation stderr capture could not be installed (%s). The "
+                     "zero-validation-warning oracle cannot run, and reporting 0 warnings here would be "
+                     "indistinguishable from a clean run.\n",
+                     std::strerror(m_initErrno));
+        std::fflush(nullptr);
+        std::_Exit(1);
+    }
+
     // Reads everything written since the last call, counts the warnings among it, and
     // forwards it to the real stderr. pread() is used so the shared write offset that
     // STDERR_FILENO points at is never disturbed -- a plain read() would move it and the
@@ -92,11 +154,20 @@ private:
         while (true) {
             const ssize_t n = pread(m_fd, buffer, sizeof(buffer), static_cast<off_t>(m_offset));
             if (n < 0 && errno == EINTR) continue;
-            if (n <= 0) break;
+            if (n < 0) {
+                // Distinguished from EOF deliberately: treating a hard read error as
+                // "nothing more to read" would stop counting for the rest of the run and
+                // leave every later check passing on an unread file.
+                std::fprintf(stderr, "FATAL: could not read the validation capture (%s)\n", std::strerror(errno));
+                std::fflush(nullptr);
+                std::_Exit(1);
+            }
+            if (n == 0) break;
             m_offset += static_cast<size_t>(n);
             m_pending.append(buffer, static_cast<size_t>(n));
-            forward(buffer, static_cast<size_t>(n));
+            writeAll(buffer, static_cast<size_t>(n));
         }
+        if (m_offset > m_rawOffset) m_rawOffset = m_offset;
 
         size_t start = 0;
         while (true) {
@@ -115,21 +186,41 @@ private:
         }
     }
 
-    void forward(const char* data, size_t size) {
+    void writeAll(const char* data, size_t size) {
         size_t written = 0;
         while (written < size) {
             const ssize_t n = write(m_realStderr, data + written, size - written);
             if (n < 0 && errno == EINTR) continue;
-            if (n <= 0) return;
+            if (n <= 0) return;  // the terminal is gone; nothing useful is left to do
             written += static_cast<size_t>(n);
         }
+    }
+
+    // The signals that end a probe without unwinding. SIGABRT above all: it is how the
+    // affinity guard is *designed* to fire, and how an assertion failure or a validation
+    // abort arrives, so it is the single most important case for the output to survive.
+    static void installDeathHandlers() {
+        for (const int sig : {SIGABRT, SIGSEGV, SIGBUS, SIGILL, SIGFPE}) {
+            struct sigaction sa {};
+            sa.sa_handler = &Capture::onDeadlySignal;
+            sigemptyset(&sa.sa_mask);
+            sa.sa_flags = SA_RESETHAND;  // re-raise below hits the default disposition
+            sigaction(sig, &sa, nullptr);
+        }
+    }
+
+    static void onDeadlySignal(int sig) {
+        if (g_instance) g_instance->drainRaw();
+        std::raise(sig);
     }
 
     std::FILE* m_file = nullptr;
     int m_fd = -1;
     int m_realStderr = -1;
     bool m_active = false;
-    size_t m_offset = 0;
+    int m_initErrno = 0;
+    size_t m_offset = 0;     // consumed by drain(), which also counts
+    size_t m_rawOffset = 0;  // consumed by drainRaw(), which only copies
     int m_count = 0;
     std::string m_pending;  // bytes read but not yet terminated by a newline
 };
@@ -145,11 +236,20 @@ void resetValidationWarningCount() { g_capture.reset(); }
 
 int validationWarningCount() { return g_capture.count(); }
 
+void drainValidationCapture() { g_capture.drainRaw(); }
+
 bool validationLayerActive() {
     uint32_t count = 0;
-    if (vkEnumerateInstanceLayerProperties(&count, nullptr) != VK_SUCCESS) return false;
+    VkResult result = vkEnumerateInstanceLayerProperties(&count, nullptr);
+    if (result != VK_SUCCESS && result != VK_INCOMPLETE) return false;
     std::vector<VkLayerProperties> layers(count);
-    if (vkEnumerateInstanceLayerProperties(&count, layers.data()) != VK_SUCCESS) return false;
+    result = vkEnumerateInstanceLayerProperties(&count, layers.data());
+    // VK_INCOMPLETE is a normal outcome, not a failure: a layer registering between the
+    // two calls leaves the array truncated but valid. Treating it as "no layers" made
+    // this report the validation layer missing on a host where it is installed, with an
+    // instruction to install it that could not help.
+    if (result != VK_SUCCESS && result != VK_INCOMPLETE) return false;
+    layers.resize(count);
     for (const VkLayerProperties& layer : layers) {
         if (std::strcmp(layer.layerName, "VK_LAYER_KHRONOS_validation") == 0) return true;
     }

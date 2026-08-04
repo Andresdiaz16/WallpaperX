@@ -271,7 +271,8 @@ if(DBUS_RUN_SESSION)
 else()
     message(WARNING
         "dbus-run-session not found -- ALL bus-driven tests are unregistered: dbus_service, "
-        "dbus_service_classic, dbus_service_lavapipe, daemon_system, daemon_system_lavapipe. That "
+        "dbus_service_classic, dbus_service_lavapipe, dbus_service_classic_lavapipe, daemon_system, "
+        "daemon_system_lavapipe. That "
         "removes the only coverage of the DBus wire contract, the DMA_BUF metadata, the Classic "
         "descriptor tier through the daemon, and the daemon's "
         "process-level behaviour (name acquisition, second-instance refusal, SIGTERM/SIGINT "
