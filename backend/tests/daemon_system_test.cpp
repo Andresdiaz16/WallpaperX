@@ -49,6 +49,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -100,12 +101,18 @@ constexpr int32_t kMonitorFirstFrame = 0;
 constexpr int32_t kMonitorTiming = 1;
 constexpr int32_t kMonitorLoadBase = 2;    // .. kMonitorLoadBase + loadCount - 1
 constexpr int32_t kMonitorStormBase = 20;  // .. kMonitorStormBase + kStormMonitors - 1
-constexpr int32_t kStormMonitors = 6;
+constexpr int32_t kStormMonitors = 4;
 constexpr int32_t kMonitorBarrierPre = 30;
 constexpr int32_t kMonitorBarrierPost = 31;
 
 constexpr int kStormThreads = 4;
-constexpr int kStormIterations = 12;
+// Sized so each client observes each monitor several times. Monotonicity is a property of
+// one observer's sequence, so a client's *first* look at a monitor can never register a
+// regression -- with a wide monitor pool and few iterations, nearly every observation was
+// a first look and the check had almost nothing to compare. Narrower pool, more
+// iterations: most observations become real comparisons. The count is asserted and
+// printed, so an edit that makes it vacuous again is visible rather than silent.
+constexpr int kStormIterations = 24;
 
 // Upper bound on how many monitors the responsiveness phase queues at once. Each costs
 // a full-size exportable image in the daemon (~8 MB at 1080p) that lives until it
@@ -256,6 +263,13 @@ public:
     // for the right reason.
     bool timedOut() const { return m_timedOut; }
 
+    // True only when the process ran to a normal exit(). A daemon that died on SIGABRT
+    // also reports exit code -1, so a check written as "exit code is non-zero" is
+    // satisfied by a crash -- which is how "the second instance was refused" would be
+    // reported for an instance that in fact aborted while failing its name request.
+    bool exitedNormally() const { return m_exitedNormally; }
+    int termSignal() const { return m_termSignal; }
+
     // Signals the daemon and waits for it to exit. Returns the exit code, or -1 if it
     // was killed by a signal or did not exit within kProcessTimeout (in which case it is
     // SIGKILLed so the test can continue -- see timedOut()).
@@ -317,16 +331,24 @@ private:
                 exited = true;
                 break;
             }
-            if (r < 0) break;
+            if (r < 0) {
+                // waitpid itself failed (ECHILD, EINVAL). Not a timeout and not an exit:
+                // reporting it as either would accuse the daemon of something it did not
+                // do, so it is recorded on its own.
+                m_waitFailed = true;
+                break;
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
         if (!exited) {
             kill(m_pid, SIGKILL);
             waitpid(m_pid, &status, 0);
             m_exitCode = -1;
-            m_timedOut = true;
+            m_timedOut = !m_waitFailed;
         } else {
-            m_exitCode = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+            m_exitedNormally = WIFEXITED(status);
+            m_exitCode = m_exitedNormally ? WEXITSTATUS(status) : -1;
+            if (WIFSIGNALED(status)) m_termSignal = WTERMSIG(status);
         }
         m_pid = -1;
 
@@ -342,6 +364,9 @@ private:
     int m_readFd = -1;
     int m_exitCode = -1;
     bool m_timedOut = false;
+    bool m_waitFailed = false;
+    bool m_exitedNormally = false;
+    int m_termSignal = 0;
     std::thread m_reader;
     mutable std::mutex m_mutex;
     std::string m_output;
@@ -363,49 +388,57 @@ public:
                 if (name != DbusService::kBusName) return;
                 {
                     std::lock_guard<std::mutex> lock(m_mutex);
-                    m_owned = !newOwner.empty();
+                    ++m_events;
                 }
                 (void)oldOwner;
+                (void)newOwner;
                 m_changed.notify_all();
             });
     }
 
-    // True if the daemon currently holds the name. Asked of the bus rather than the
-    // cached signal state, so it is also correct before any signal has arrived.
-    //
-    // The answer is written back into the cached flag, and that is load-bearing rather
-    // than an optimisation. waitFor() returns early on this call without waiting for the
-    // matching NameOwnerChanged, so without the write-back the flag keeps the *previous*
-    // daemon's value: waitFor(false) after a shutdown would leave it stale at true, and
-    // the next waitFor(true) would be satisfied instantly by that stale value before the
-    // new daemon had acquired anything. The test would then signal a daemon that has not
-    // yet installed its signal mask, and the default disposition would kill it -- a
-    // spurious failure of the shutdown checks, on a correct daemon.
+    // True if the daemon currently holds the name, asked of the bus itself.
     bool ownedNow() {
         bool has = false;
         m_proxy->callMethod("NameHasOwner")
             .onInterface("org.freedesktop.DBus")
             .withArguments(std::string(DbusService::kBusName))
             .storeResultsTo(has);
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            m_owned = has;
-        }
         return has;
     }
 
     // Waits until the name is (or is not) owned. Returns false on timeout.
+    //
+    // Deliberately not "cache a bool in the signal handler and wait on it". Two attempts
+    // at that were both wrong and in opposite directions: caching only in the handler
+    // left the flag holding the *previous* daemon's value after an early return, so a
+    // later wait was satisfied before the next daemon existed; writing the bus's answer
+    // back into the flag then let a NameOwnerChanged delivered between the reply and the
+    // lock be overwritten, losing the very transition being waited for.
+    //
+    // The signal carries no state here at all -- it only bumps a counter, which cannot be
+    // lost or clobbered. Ownership itself is always read from the bus, which is the one
+    // authority that cannot go stale. Snapshotting the counter *before* asking means any
+    // transition racing the query bumps it and wakes the wait, so nothing is missed.
     bool waitFor(bool owned) {
-        if (ownedNow() == owned) return true;
-        std::unique_lock<std::mutex> lock(m_mutex);
-        return m_changed.wait_for(lock, kProcessTimeout, [&] { return m_owned == owned; });
+        const auto deadline = std::chrono::steady_clock::now() + kProcessTimeout;
+        while (true) {
+            uint64_t seen = 0;
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                seen = m_events;
+            }
+            if (ownedNow() == owned) return true;
+
+            std::unique_lock<std::mutex> lock(m_mutex);
+            if (!m_changed.wait_until(lock, deadline, [&] { return m_events != seen; })) return false;
+        }
     }
 
 private:
     std::unique_ptr<sdbus::IProxy> m_proxy;
     std::mutex m_mutex;
     std::condition_variable m_changed;
-    bool m_owned = false;
+    uint64_t m_events = 0;
 };
 
 // Whether VK_LAYER_KHRONOS_validation can be loaded on this host. Asked through the
@@ -471,6 +504,11 @@ void checkFirstFrame(sdbus::IProxy& proxy, FrameReadyLog& signals, const std::st
     // does name a sized object and where a published memory_size larger than that
     // object SIGBUSes the mmap below instead of failing by name.
     const off_t fdSize = lseek(frame.fd.get(), 0, SEEK_END);
+    // Captured here, not where it is printed: printf is allowed to set errno even when it
+    // succeeds, and three of them run in between -- so the skip message below was liable
+    // to name an unrelated error, or "Success", on the one path where that message is the
+    // entire diagnostic.
+    const int lseekErrno = errno;
 
     std::printf("daemon_system_test: monitor %d -> %ux%u, memory_size=%llu, handle_type=%d, modifier=0x%llx, "
                 "fd is %s (%lld bytes)\n",
@@ -503,7 +541,7 @@ void checkFirstFrame(sdbus::IProxy& proxy, FrameReadyLog& signals, const std::st
     if (fdSize < 0) {
         std::printf("daemon_system_test: cross-process content check skipped -- lseek(SEEK_END) cannot size this "
                     "fd (%s), so the mapping below could not be bounded safely.\n",
-                    std::strerror(errno));
+                    std::strerror(lseekErrno));
         return;
     }
     check(static_cast<uint64_t>(fdSize) >= frame.memorySize,
@@ -648,12 +686,12 @@ void checkResponsivenessUnderLoad(sdbus::IProxy& proxy, FrameReadyLog& signals, 
     frameRequest.join();
     check(!frameFailed, "the GetFrameFd issued while the queue was deep is answered rather than failing");
 
-    bool allArrived = true;
+    bool round1Ok = true;
     for (int i = 0; i < loadCount; ++i) {
-        if (!signals.wait(kMonitorLoadBase + i, 1)) allArrived = false;
+        if (!signals.wait(kMonitorLoadBase + i, 1)) round1Ok = false;
     }
     const auto drain = Clock::now() - loadStart;
-    check(allArrived, "every queued render completes and announces itself");
+    check(round1Ok, "every queued render completes and announces itself");
 
     const auto frameLatency = frameDoneAt - loadStart;
     std::printf("daemon_system_test: one render %.1f ms; issuing %d requests took %.1f ms, draining them %.1f ms; "
@@ -666,6 +704,17 @@ void checkResponsivenessUnderLoad(sdbus::IProxy& proxy, FrameReadyLog& signals, 
     std::printf("daemon_system_test: GetStatus %s the GetFrameFd issued before it (corroborating, not asserted -- "
                 "the Device's thread pinning is what makes a GPU-touching handler fatal)\n",
                 statusDoneAt < frameDoneAt ? "overtook" : "did not overtake");
+
+    // Round 2 is only meaningful, and only *possible*, if round 1 committed everywhere:
+    // it waits for each monitor's generation 2, which a monitor left at generation 0 by a
+    // lost round-1 render can never reach. Continuing would add a 30 s timeout per
+    // monitor and then grade the resulting stall as a very slow drain -- which is to say
+    // it would pass the assertion below on the strength of the hang.
+    if (!round1Ok) {
+        std::printf("daemon_system_test: responsiveness check abandoned -- the first burst did not drain, so no "
+                    "issue/drain ratio from this run means anything.\n");
+        return;
+    }
 
     // A second, undisturbed round. issueTime is a handful of DBus round trips measured in
     // tens of microseconds, and each one makes the daemon printf and fflush a line into
@@ -680,34 +729,48 @@ void checkResponsivenessUnderLoad(sdbus::IProxy& proxy, FrameReadyLog& signals, 
         setWallpaper(proxy, "static", bluePath, kMonitorLoadBase + i);
     }
     const auto issueTime2 = Clock::now() - secondStart;
+
+    // Its own flag. Reusing round 1's meant a lost first-round signal was reported twice,
+    // the second time as a failure of a burst that had in fact delivered everything.
+    bool round2Ok = true;
     for (int i = 0; i < loadCount; ++i) {
-        if (!signals.wait(kMonitorLoadBase + i, 2)) allArrived = false;
+        if (!signals.wait(kMonitorLoadBase + i, 2)) round2Ok = false;
     }
     const auto drain2 = Clock::now() - secondStart;
-    check(allArrived, "the second measuring burst also completes");
+    check(round2Ok, "the second measuring burst also completes");
 
     // Ratios rather than raw intervals, since the two rounds may drain at different
-    // speeds; the smaller ratio is the round less disturbed by the host.
+    // speeds. A round is *eligible* only if it both drained and took long enough to be
+    // conclusive: below kMinConclusiveDrain a daemon that rendered inline would have
+    // answered just as fast, so a ratio from such a round is not evidence either way.
+    //
+    // Eligibility is per round, not applied to the winner after the fact. Grading the
+    // better ratio and *then* testing that round's drain let a cheap second round -- round
+    // 2 re-renders monitors whose images round 1 already allocated, so it is routinely
+    // faster -- suppress the assertion even when round 1 was conclusive on its own.
     const double ratio1 = millis(drain) > 0 ? millis(issueTime) / millis(drain) : 1.0;
     const double ratio2 = millis(drain2) > 0 ? millis(issueTime2) / millis(drain2) : 1.0;
-    const bool useSecond = ratio2 < ratio1;
-    const auto bestDrain = useSecond ? drain2 : drain;
-    std::printf("daemon_system_test: issue/drain ratio %.4f then %.4f (threshold 0.25, grading the %s round)\n",
-                ratio1, ratio2, useSecond ? "second" : "first");
+    const bool round1Eligible = round1Ok && drain >= kMinConclusiveDrain;
+    const bool round2Eligible = round2Ok && drain2 >= kMinConclusiveDrain;
 
-    // The control on the check below: it compares an interval against the render queue's
-    // own duration, so if the queue costs no measurable time then a daemon that rendered
-    // inline would look identical to one that posts, and passing would prove nothing.
-    // Reported as inconclusive rather than counted -- a host fast enough to erase the
-    // difference must not be allowed to manufacture evidence.
-    if (bestDrain < kMinConclusiveDrain) {
-        std::printf("daemon_system_test: responsiveness check INCONCLUSIVE on this host -- the queue drained in "
-                    "%.1f ms, under the %lld ms needed for a blocking handler to be distinguishable.\n",
-                    millis(bestDrain), static_cast<long long>(kMinConclusiveDrain.count()));
+    std::printf("daemon_system_test: issue/drain ratio %.4f (%s) then %.4f (%s), threshold 0.25\n", ratio1,
+                round1Eligible ? "eligible" : "too fast to be conclusive", ratio2,
+                round2Eligible ? "eligible" : "too fast to be conclusive");
+
+    if (!round1Eligible && !round2Eligible) {
+        std::printf("daemon_system_test: responsiveness check INCONCLUSIVE on this host -- neither round's queue "
+                    "took the %lld ms needed for a blocking handler to be distinguishable.\n",
+                    static_cast<long long>(kMinConclusiveDrain.count()));
         return;
     }
 
-    check(std::min(ratio1, ratio2) * 4 < 1.0,
+    // The best ratio among the rounds that are actually evidence. A daemon rendering
+    // inline scores ~1.0 in every round, so taking the minimum cannot rescue it.
+    double bestRatio = 1.0;
+    if (round1Eligible) bestRatio = std::min(bestRatio, ratio1);
+    if (round2Eligible) bestRatio = std::min(bestRatio, ratio2);
+
+    check(bestRatio * 4 < 1.0,
           "issuing a burst of requests costs a fraction of rendering it (SetWallpaper does not render inline)");
 }
 
@@ -729,6 +792,7 @@ void checkResponsivenessUnderLoad(sdbus::IProxy& proxy, FrameReadyLog& signals, 
 struct StormResult {
     std::atomic<int> unexpectedErrors{0};
     std::atomic<int> generationRegressions{0};
+    std::atomic<int> generationComparisons{0};
     std::atomic<int> calls{0};
     std::mutex mutex;
     std::string firstUnexpected;
@@ -743,12 +807,19 @@ struct StormResult {
 using GenerationMarks = std::map<int32_t, uint64_t>;
 
 void observeGeneration(StormResult& result, GenerationMarks& marks, int32_t monitorId, uint64_t generation) {
-    uint64_t& highest = marks[monitorId];
-    if (generation < highest) {
+    const auto it = marks.find(monitorId);
+    if (it == marks.end()) {
+        // A first look establishes the mark and compares against nothing. Excluded from
+        // the count below so the assertion's actual content is measurable.
+        marks.emplace(monitorId, generation);
+        return;
+    }
+    ++result.generationComparisons;
+    if (generation < it->second) {
         ++result.generationRegressions;
         return;
     }
-    highest = generation;
+    it->second = generation;
 }
 
 void recordUnexpected(StormResult& result, const std::string& what) {
@@ -844,8 +915,13 @@ void checkConcurrentClients(sdbus::IProxy& proxy, FrameReadyLog& signals, const 
                      result.firstUnexpected.c_str());
     }
     check(result.generationRegressions == 0, "a monitor's generation never goes backwards under concurrent clients");
-    std::printf("daemon_system_test: %d concurrent calls across %d clients completed\n", result.calls.load(),
-                kStormThreads);
+    // The check above is worth exactly as much as this number: a first look establishes a
+    // client's mark and proves nothing, so a run with near-zero repeat observations has
+    // asserted near-nothing. Made an assertion rather than a print so it cannot decay.
+    check(result.generationComparisons >= kStormThreads,
+          "the monotonicity check made enough repeat observations to be worth asserting");
+    std::printf("daemon_system_test: %d concurrent calls across %d clients completed, %d generation comparisons\n",
+                result.calls.load(), kStormThreads, result.generationComparisons.load());
 
     // The daemon is still there and still correct afterwards. Quiescing each stormed
     // monitor to a known request and checking where it lands is what makes the storm an
@@ -862,6 +938,16 @@ void checkConcurrentClients(sdbus::IProxy& proxy, FrameReadyLog& signals, const 
     setWallpaper(proxy, "static", bluePath, kMonitorBarrierPre);
     const bool drained = signals.wait(kMonitorBarrierPre, 1);
     check(drained, "the storm's queued renders all drain (barrier render completes)");
+    if (!drained) {
+        // Checked *and acted on*. Without the return, the snapshot below would be taken
+        // from exactly the non-quiesced state this barrier exists to rule out, and the
+        // waitAtLeast built on it would then be satisfied by a leftover storm render --
+        // reporting "every monitor still renders" for the wedged worker that caused the
+        // barrier to time out in the first place.
+        std::printf("daemon_system_test: post-storm state checks abandoned -- the render queue never drained, so "
+                    "any generation read now would be a stale threshold.\n");
+        return;
+    }
 
     std::map<int32_t, uint64_t> before;
     {
@@ -948,6 +1034,15 @@ int main() {
     }
 
     std::string daemonOutput;
+    // Distinguishes "the daemon printed nothing" from "we never got as far as reading its
+    // output". daemonOutput is filled only after the phases, so on the exception path it
+    // is empty no matter what the daemon actually said -- and the anchor below would then
+    // report a capture failure on top of the exception that was already reported.
+    bool daemonOutputRead = false;
+    // Hoisted out of the try for the same reason: a daemon that never reached the bus has
+    // already been reported, and its silence about Vulkan is a consequence of that rather
+    // than a separate finding.
+    bool daemonCameUp = false;
     try {
         const std::string bluePath = writeSolidImage("system_blue.png", 0, 0, 255);
         const std::string redPath = writeSolidImage("system_red.png", 255, 0, 0);
@@ -967,6 +1062,7 @@ int main() {
 
         SpawnedDaemon daemon({std::string("WALLPAPERX_VALIDATION=") + (wantValidation ? "1" : "0")});
         const bool cameUp = names.waitFor(true);
+        daemonCameUp = cameUp;
         check(cameUp, "the daemon acquires io.wallpaperx.Daemon on the session bus");
 
         if (cameUp) {
@@ -980,8 +1076,12 @@ int main() {
             // that wrongly took the name and then ran forever would be SIGKILLed by the
             // test and satisfy `secondExit != 0` -- reporting the name as refused when it
             // was in fact stolen.
-            check(!second.timedOut(), "the second daemon instance exits on its own rather than having to be killed");
-            check(!second.timedOut() && secondExit != 0,
+            check(second.exitedNormally(),
+                  "the second daemon instance exits on its own rather than crashing or having to be killed");
+            if (!second.exitedNormally() && second.termSignal() != 0) {
+                std::fprintf(stderr, "  it died on signal %d\n", second.termSignal());
+            }
+            check(second.exitedNormally() && secondExit != 0,
                   "a second daemon instance refuses to start while the first owns the name");
             check(names.ownedNow(), "the first daemon still owns the name after the second one exits");
             const std::string secondOutput = second.output();
@@ -1006,6 +1106,7 @@ int main() {
         // before that point, the default disposition would kill it outright.
         const int exitCode = daemon.shutdown(SIGTERM);
         daemonOutput = daemon.output();
+        daemonOutputRead = true;
         if (!cameUp) {
             // The daemon never reached the bus, which is already reported above. Signalling
             // it anyway is right -- it must not outlive the test -- but grading its exit
@@ -1083,7 +1184,12 @@ int main() {
 
     // The daemon's own Vulkan usage, judged from its output. Only meaningful when the
     // layer is installed; the warning at the top of main says so when it is not.
-    if (wantValidation) {
+    if (wantValidation && (!daemonOutputRead || !daemonCameUp)) {
+        std::printf("daemon_system_test: validation check skipped -- %s, and the failure that caused that is "
+                    "reported above.\n",
+                    daemonCameUp ? "the run did not reach the point where the daemon's output is collected"
+                                 : "the daemon never started");
+    } else if (wantValidation) {
         // Absence of warnings is only evidence when the daemon actually ran and rendered.
         // On an empty or truncated capture -- the daemon died at startup, or the pipe was
         // lost -- validationLines() trivially returns nothing and this would report the

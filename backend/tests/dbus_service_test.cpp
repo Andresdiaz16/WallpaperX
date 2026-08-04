@@ -76,6 +76,7 @@ using wallpaperx::testing::getFrameFd;
 using wallpaperx::testing::getStatus;
 using wallpaperx::testing::openFdCount;
 using wallpaperx::testing::setWallpaper;
+using wallpaperx::testing::validationWaived;
 using wallpaperx::testing::wallpaperStatus;
 
 // Deliberately not square. With equal dimensions a width/height swap anywhere between
@@ -103,21 +104,6 @@ constexpr int32_t kMonitorWorkerCoalesce = 10;
 constexpr int kBurstSize = 5;
 
 std::string testAssetDir() { return std::string(WALLPAPERX_TEST_IMAGE_DIR); }
-
-// Whether to run without the validation layer. Exists for one caller: a ThreadSanitizer
-// build, where the layer is uninstrumented, keeps its own lock-heavy state maps, and
-// drowns the report in races inside code we do not ship -- while suppressing it produces
-// its own artifacts, since TSan then sees the layer's unlocks without their locks.
-//
-// Compared against "1" exactly, matching WALLPAPERX_ALLOW_NO_HEAP_TIER: a plain getenv()
-// truthiness check would make "=0" mean "waived", which is the opposite of what anyone
-// typing it intends. Waiving is announced loudly below, because this deliberately
-// disables the suite's only GPU-side oracle and a silent version of this switch is
-// exactly the vacuous-green trap the validation check was added to close.
-bool validationWaived() {
-    const char* env = std::getenv("WALLPAPERX_ALLOW_NO_VALIDATION");
-    return env != nullptr && std::strcmp(env, "1") == 0;
-}
 
 std::string writeTestImage() {
     std::filesystem::create_directories(testAssetDir());
@@ -187,19 +173,6 @@ std::vector<std::string> writeBurstImages() {
     return paths;
 }
 
-// A file that exists but is not an image. SetWallpaper's synchronous check only proves
-// the path is a regular file, so this is what reaches the render thread and fails
-// there -- the only way to exercise the asynchronous failure path.
-std::string writeCorruptImage() {
-    std::filesystem::create_directories(testAssetDir());
-    const std::string path = testAssetDir() + "/dbus_test_corrupt.png";
-    std::ofstream out(path, std::ios::binary | std::ios::trunc);
-    out << "this is not a PNG";
-    if (!out) {
-        throw std::runtime_error("dbus_service_test: failed to write corrupt test image");
-    }
-    return path;
-}
 
 // Every <arg> of an introspection element, in document order, as
 // (direction, "type:name"). Attribute order and whitespace inside the tag don't
@@ -862,7 +835,8 @@ int main() {
     // exempts the whole destruction half of the code under test.
     try {
         const std::string imagePath = writeTestImage();
-        const std::string corruptPath = writeCorruptImage();
+        const std::string corruptPath =
+            wallpaperx::testing::writeUndecodableFile(testAssetDir(), "dbus_test_corrupt.png");
         const std::vector<std::string> burstPaths = writeBurstImages();
 
         // Declared before everything it outlives. The signal callback below captures it,
