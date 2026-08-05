@@ -121,6 +121,7 @@ struct GuardedPhase {
 int failures = 0;
 int harnessFaults = 0;
 int unrunnable = 0;
+int ungraded = 0;   // cases that ran, whose validation output could not be judged
 
 void check(bool ok, const char* what) {
     std::printf("%s: %s\n", ok ? "ok  " : "FAIL", what);
@@ -495,11 +496,12 @@ int main() {
     // mistake every sibling probe was changed to avoid.
     {
         wallpaperx::testing::ValidationGrade grade("device_affinity_probe (positive path)", failures);
-        // A missing validation-layer package is exactly the "this host cannot run the
-        // case" bucket this file spends its whole structure separating from "the guard is
-        // broken". Left on `failures` it exits 1 through the branch that accuses
-        // assertGpuThread, which is the misattribution the rest of the file prevents.
-        grade.reportHostProblemTo(unrunnable);
+        // A missing validation-layer package is neither a broken guard nor a case that
+        // could not run: every case runs and passes, only their validation output goes
+        // ungraded. It had been charged first to `failures` (which accuses
+        // assertGpuThread) and then to `unrunnable` (which claims cases did not run);
+        // both were false. Its own counter, with its own sentence.
+        grade.reportUngradedTo(ungraded);
         std::optional<Device> device;
         try {
             device.emplace(/*enableValidation=*/true);
@@ -554,6 +556,14 @@ int main() {
                      unrunnable);
         return 1;
     }
+    if (ungraded > 0) {
+        std::fprintf(stderr,
+                     "device_affinity_probe: every case ran and passed, but %d validation grade(s) could not be "
+                     "made -- see the reason above. The guard is verified; its GPU-side cleanliness is not.\n",
+                     ungraded);
+        return 1;
+    }
+
     std::printf("device_affinity_probe: all checks passed\n");
     return 0;
 }

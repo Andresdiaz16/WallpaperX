@@ -32,37 +32,47 @@ bool hasExtension(const std::vector<VkExtensionProperties>& extensions, const ch
     return false;
 }
 
-VkDebugUtilsMessengerCreateInfoEXT debugMessengerInfo(void* owner, bool includeGeneral);
+VkDebugUtilsMessengerCreateInfoEXT debugMessengerInfo(void* owner);
 
 VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(
     VkDebugUtilsMessageSeverityFlagBitsEXT severity,
-    VkDebugUtilsMessageTypeFlagsEXT,
+    VkDebugUtilsMessageTypeFlagsEXT types,
     const VkDebugUtilsMessengerCallbackDataEXT* data,
     void* userData) {
-    if (severity >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) {
-        std::cerr << "[vulkan] " << data->pMessage << std::endl;
-        // pUserData is the messenger's own channel for this, set to the owning Device at
-        // creation. It is what makes the count a property of the device rather than of
-        // the process, and it is why no global is needed.
-        if (auto* device = static_cast<Device*>(userData)) device->noteValidationWarning();
+    if (severity < VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) return VK_FALSE;
+
+    // Printed unconditionally. GENERAL is the loader's own channel and during instance
+    // creation it carries host-configuration complaints -- "Failed to CreateInstance in
+    // ICD 1. Skipping ICD.", malformed manifests. Those are exactly what an operator
+    // needs to see when a machine misbehaves, so suppressing them at the messenger's
+    // delivery mask (which is what excluding the type did) threw away the diagnostic in
+    // order to avoid counting it.
+    std::cerr << "[vulkan] " << data->pMessage << std::endl;
+
+    // Counted only when it is the validation layer talking about us. A stale ICD
+    // manifest left over from an uninstalled driver is a host packaging problem, and
+    // counting it made every probe fail as though the renderer had regressed.
+    if ((types & VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT) != 0 &&
+        (types & (VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
+                  VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT)) == 0) {
+        return VK_FALSE;
     }
+    // pUserData is the messenger's own channel for this, set to the owning Device at
+    // creation. It is what makes the count a property of the device rather than of the
+    // process, and it is why no global is needed.
+    if (auto* device = static_cast<Device*>(userData)) device->noteValidationWarning();
     return VK_FALSE;
 }
 
-VkDebugUtilsMessengerCreateInfoEXT debugMessengerInfo(void* owner, bool includeGeneral) {
+VkDebugUtilsMessengerCreateInfoEXT debugMessengerInfo(void* owner) {
     VkDebugUtilsMessengerCreateInfoEXT info{VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT};
     info.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT |
                            VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
-    // GENERAL is the *loader's* channel, not the validation layer's, and during
-    // vkCreateInstance it carries host-configuration complaints -- "Failed to
-    // CreateInstance in ICD N. Skipping ICD.", malformed manifests. Counting those as
-    // validation warnings makes a machine with a stale ICD manifest left over from an
-    // uninstalled driver fail every probe as though the renderer had regressed. The
-    // standing messenger keeps GENERAL (it is useful once an instance exists and the
-    // loader has stopped talking); the one chained into instance creation does not.
-    info.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
+    // Every type is delivered, including GENERAL: debugCallback decides what to COUNT,
+    // and it needs to see the loader's messages in order to print them.
+    info.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT |
+                       VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
                        VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT;
-    if (includeGeneral) info.messageType |= VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT;
     info.pfnUserCallback = debugCallback;
     info.pUserData = owner;
     return info;
@@ -189,11 +199,12 @@ void Device::createInstance(bool enableValidation) {
     // the single most valuable teardown complaint and the whole reason the counter is
     // shared so it can be read after ~Device. Without this the count was structurally
     // blind to it. Per the spec this description is used only for vkCreateInstance and
-    // vkDestroyInstance, so it does not double-count what the standing messenger sees --
-    // measured by widening both to INFO severity: the count went 43 -> 156, where simple
-    // duplication of the same stream would have given ~86. The extra is instance-lifecycle
-    // output that nothing was receiving before.
-    VkDebugUtilsMessengerCreateInfoEXT instanceMessenger = debugMessengerInfo(this, /*includeGeneral=*/false);
+    // vkDestroyInstance, so it does not double-count what the standing messenger sees.
+    // (An earlier revision quoted a 43 -> 156 measurement here as evidence of that. It
+    // was taken before debugCallback began filtering GENERAL out of the count, so the
+    // stated experiment no longer reproduces the stated numbers; the claim now rests on
+    // the specification rather than on a figure a reader cannot check.)
+    VkDebugUtilsMessengerCreateInfoEXT instanceMessenger = debugMessengerInfo(this);
 
     VkInstanceCreateInfo createInfo{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     createInfo.pApplicationInfo = &appInfo;
@@ -217,7 +228,7 @@ void Device::createInstance(bool enableValidation) {
         auto createFn = reinterpret_cast<PFN_vkCreateDebugUtilsMessengerEXT>(
             vkGetInstanceProcAddr(m_instance, "vkCreateDebugUtilsMessengerEXT"));
         if (createFn) {
-            VkDebugUtilsMessengerCreateInfoEXT messengerInfo = debugMessengerInfo(this, /*includeGeneral=*/true);
+            VkDebugUtilsMessengerCreateInfoEXT messengerInfo = debugMessengerInfo(this);
             // Set from the call SUCCEEDING, not from the layer being installed. The flag
             // answers "is anything feeding the counter", and every caller uses it to tell
             // a clean run from an unwatched one -- so recording it at layer-enumeration

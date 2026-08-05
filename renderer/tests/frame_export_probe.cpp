@@ -169,7 +169,7 @@ bool testExportedBytesMatchReadback() {
     // often -- that meant a validation warning failed the probe with no stated reason.
     bool skipped = false;
 
-    return wallpaperx::testing::gradedRun(
+    const bool ok = wallpaperx::testing::gradedRun(
         "frame_export_probe (contents)", [&](wallpaperx::testing::ValidationGrade& grade) {
     try {
         const std::string imagePath = writeTestImage();
@@ -283,15 +283,17 @@ bool testExportedBytesMatchReadback() {
         return false;
     }
 
-        std::cout << "frame_export_probe (contents): " << (skipped ? "skipped" : "passed")
-              << ", zero validation warnings" << std::endl;
     return true;
     });
+    if (!ok) return false;
+    std::cout << "frame_export_probe (contents): " << (skipped ? "skipped" : "passed")
+              << ", zero validation warnings" << std::endl;
+    return true;
 }
 
 bool testHappyPathExport() {
 
-    return wallpaperx::testing::gradedRun(
+    const bool ok = wallpaperx::testing::gradedRun(
         "frame_export_probe (export)", [&](wallpaperx::testing::ValidationGrade& grade) {
     try {
         const std::string imagePath = writeTestImage();
@@ -428,9 +430,11 @@ bool testHappyPathExport() {
         return false;
     }
 
-        std::cout << "frame_export_probe: passed, zero validation warnings" << std::endl;
     return true;
     });
+    if (!ok) return false;
+    std::cout << "frame_export_probe: passed, zero validation warnings" << std::endl;
+    return true;
 }
 
 // Regression test for the QA finding (2026-07-18, qa_scratch/frame_export_stale_target.cpp):
@@ -444,7 +448,7 @@ bool testExportFromDestroyedTargetThrows() {
     // this test provokes is printed and discarded, and the probe reports "passed" on a
     // spec violation. The zero-warnings assertion is the backstop for the export path's
     // barriers, so it has to cover every test that exercises them.
-    return wallpaperx::testing::gradedRun(
+    const bool ok = wallpaperx::testing::gradedRun(
         "frame_export_probe (destroyed target)", [&](wallpaperx::testing::ValidationGrade& grade) {
     try {
         wallpaperx::Device device(/*enableValidation=*/true);
@@ -473,9 +477,11 @@ bool testExportFromDestroyedTargetThrows() {
         return false;
     }
 
-        std::cout << "frame_export_probe (destroyed target): passed, zero validation warnings" << std::endl;
     return true;
     });
+    if (!ok) return false;
+    std::cout << "frame_export_probe (destroyed target): passed, zero validation warnings" << std::endl;
+    return true;
 }
 
 // Regression test (QA pass 2026-07-18): under fd exhaustion, Lavapipe's DMA_BUF
@@ -488,7 +494,7 @@ bool testNeverReturnsInvalidFdUnderExhaustion() {
     // This test exports from a target that was never rendered into, so it is the one
     // that catches an export-time barrier declaring a layout the image was never in.
     // It only catches it if the warning count is actually checked.
-    return wallpaperx::testing::gradedRun(
+    const bool ok = wallpaperx::testing::gradedRun(
         "frame_export_probe (exhaustion)", [&](wallpaperx::testing::ValidationGrade& grade) {
     try {
         wallpaperx::Device device(/*enableValidation=*/true);
@@ -537,9 +543,11 @@ bool testNeverReturnsInvalidFdUnderExhaustion() {
         return false;
     }
 
-        std::cout << "frame_export_probe (exhaustion): passed, zero validation warnings" << std::endl;
     return true;
     });
+    if (!ok) return false;
+    std::cout << "frame_export_probe (exhaustion): passed, zero validation warnings" << std::endl;
+    return true;
 }
 
 }

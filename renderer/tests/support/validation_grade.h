@@ -24,7 +24,7 @@
 // THREE OUTCOMES, NOT TWO. "No Device was built", "no validator was listening" and "the
 // device produced warnings" are distinct failures with distinct fixes. The middle one is
 // a host problem, not a renderer regression, so a probe that separates those buckets can
-// route it away from its failure counter -- see reportHostProblemTo().
+// route it into a counter of its own -- see reportUngradedTo().
 
 #include "vulkan/device.h"
 
@@ -38,12 +38,17 @@
 
 namespace wallpaperx::testing {
 
-// True when the operator has explicitly accepted running without a validator. The TSan
-// tier sets this: it builds without validation on purpose, so grading the layer's
-// absence there turns the sanitizer red for the one condition it is configured to
-// accept. Read here rather than at each site because every site needs it and one that
-// forgot would be red for a reason that has nothing to do with its own subject.
-inline bool validationGradeWaived() {
+// True when the operator has explicitly accepted running without a validator: a host
+// with no vulkan-validation-layers package, or the TSan tier, which builds its bus tests
+// without validation on purpose.
+//
+// THE ONE DEFINITION for both test trees. backend/tests/client/daemon_client.h used to
+// carry a byte-identical copy under a comment saying the two tiers must agree on what
+// the switch means; two copies of that meaning in one namespace is exactly how they stop
+// agreeing, so that header now includes this one. Lives here rather than there because
+// the renderer probes cannot reach backend/tests, and the backend tests already have
+// renderer/tests on their include path.
+inline bool validationWaived() {
     const char* env = std::getenv("WALLPAPERX_ALLOW_NO_VALIDATION");
     return env != nullptr && std::strcmp(env, "1") == 0;
 }
@@ -62,23 +67,28 @@ public:
         m_layerActive = device.validationLayerActive();
     }
 
-    // Route "no validator was loaded" to a host-problem counter instead of the failure
-    // counter. For a probe that distinguishes "the code is broken" from "this host
-    // cannot run the case" -- device_affinity_probe is the whole example -- a missing
-    // layer package is squarely the second, and charging it to the failure counter makes
-    // the probe accuse the code it is defending.
-    void reportHostProblemTo(int& hostProblems) { m_hostProblems = &hostProblems; }
+    // Accept a counter captured elsewhere -- for a caller that had to snapshot it as its
+    // own scope unwound (a manager owning the Device, say) rather than holding the Device
+    // directly. Same three outcomes, same wording, one policy.
+    void adopt(std::shared_ptr<const std::atomic<int>> counter, bool layerActive) {
+        m_counter = std::move(counter);
+        m_layerActive = layerActive;
+    }
+
+    // Route "no validator was loaded" to a counter of its own.
+    //
+    // Deliberately NOT the caller's "could not run" bucket, which was the previous
+    // shape: on a host with a working GPU but no layer package every case runs and
+    // passes, so reporting them as not-run is simply false. And deliberately not the
+    // failure bucket either, which accuses the code under test. It is a third outcome --
+    // the work happened, the grading did not -- and it needs a counter and a sentence
+    // that say exactly that.
+    void reportUngradedTo(int& ungraded) { m_ungraded = &ungraded; }
 
     // The probe legitimately expects no Device here and has already said so.
     void expectNoDevice() { m_deviceOptional = true; }
 
     ~ValidationGrade() {
-        if (validationGradeWaived()) {
-            std::printf("WARNING: %s: WALLPAPERX_ALLOW_NO_VALIDATION=1 -- the GPU-side oracle is "
-                        "DISABLED for this run; a pass here is not evidence of GPU correctness\n",
-                        m_label.c_str());
-            return;
-        }
         if (!m_counter) {
             if (!m_deviceOptional) {
                 fail(m_failures, "no Vulkan device was ever created, so the validation oracle graded nothing");
@@ -86,7 +96,24 @@ public:
             return;
         }
         if (!m_layerActive) {
-            fail(m_hostProblems ? *m_hostProblems : m_failures,
+            // The waiver is checked HERE and nowhere else. As a guard at the top of this
+            // destructor it also skipped the warning count below -- so on a TSan host
+            // where the layer IS loaded, the layer printed its errors, the counter
+            // recorded them, and the grade returned before reading it. Every probe
+            // exited 0 over a run whose stderr was full of validation errors. The switch
+            // is named "allow no validation"; it may excuse the absence of a validator
+            // and nothing else.
+            //
+            // CONTROL: with the validation layer loaded and the messenger widened to
+            // INFO so it reports a nonzero count, WALLPAPERX_ALLOW_NO_VALIDATION=1 gave
+            // 4 "FAIL: ... Vulkan validation warning(s)" lines and exit 1. Restoring the
+            // blanket `if (validationWaived()) return;` at the top of this destructor,
+            // same run, same environment: exit 0 and no FAIL at all. Both reverted.
+            if (validationWaived()) {
+                announceWaiverOnce();
+                return;
+            }
+            fail(m_ungraded ? *m_ungraded : m_failures,
                  "VK_LAYER_KHRONOS_validation is not loaded, so a zero-warning result validates nothing");
             return;
         }
@@ -98,6 +125,17 @@ public:
     }
 
 private:
+    // Once per process. Printed per grade site it appeared six times in one
+    // descriptor_allocator_probe run, which teaches the reader to skim past the one line
+    // that must not be skimmed.
+    static void announceWaiverOnce() {
+        static bool announced = false;
+        if (announced) return;
+        announced = true;
+        std::printf("WARNING: WALLPAPERX_ALLOW_NO_VALIDATION=1 and no validator is loaded -- the GPU-side "
+                    "oracle is DISABLED for this run; a pass is not evidence of GPU correctness\n");
+    }
+
     void fail(int& counter, const char* why) {
         std::fprintf(stderr, "FAIL: %s: %s\n", m_label.c_str(), why);
         ++counter;
@@ -105,7 +143,7 @@ private:
 
     std::string m_label;
     int& m_failures;
-    int* m_hostProblems = nullptr;
+    int* m_ungraded = nullptr;
     std::shared_ptr<const std::atomic<int>> m_counter;
     bool m_layerActive = false;
     bool m_deviceOptional = false;

@@ -17,6 +17,7 @@
 // be shared.
 
 #include "daemon/dbus_service.h"
+#include "support/validation_grade.h"
 
 #include <sdbus-c++/sdbus-c++.h>
 
@@ -59,10 +60,9 @@ using Check = std::function<void(bool, const char*)>;
 // intends. Every caller must announce a waiver loudly -- this disables the suite's only
 // GPU-side oracle, and a silent version of the switch is exactly the vacuous-green trap
 // the validation checks exist to close.
-inline bool validationWaived() {
-    const char* env = std::getenv("WALLPAPERX_ALLOW_NO_VALIDATION");
-    return env != nullptr && std::strcmp(env, "1") == 0;
-}
+// validationWaived() is defined in support/validation_grade.h and pulled in above, so
+// both test trees share one definition of what this switch means rather than two copies
+// that can drift.
 
 // A file that exists and is a regular file -- so it passes SetWallpaper's synchronous
 // validation -- but cannot be decoded, so the render fails asynchronously. That

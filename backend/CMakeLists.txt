@@ -318,9 +318,10 @@ elseif(WALLPAPERX_SANITIZE STREQUAL "thread")
     set(_tsan_env
         "TSAN_OPTIONS=suppressions=${CMAKE_CURRENT_SOURCE_DIR}/tsan.supp:report_mutex_bugs=0")
 
-    # The waiver goes on every test, because every test now reads it: the bus tests
-    # through wallpaperx::testing::validationWaived(), the renderer probes through
-    # wallpaperx::testing::validationGradeWaived() inside ValidationGrade.
+    # The waiver goes on every test, because every test now reads it -- all of them
+    # through the single wallpaperx::testing::validationWaived() in
+    # renderer/tests/support/validation_grade.h: the renderer probes via ValidationGrade,
+    # modifier_roundtrip_probe via its own gate, the bus tests directly.
     #
     # It used to be withheld from the renderer probes, on the stated grounds that they
     # made "a claim about warnings and not about the layer being present". Folding the

@@ -32,6 +32,7 @@
 // probes on the original. Different directory names make that unrepresentable instead
 // of merely unlikely.
 #include "support/exported_frame_map.h"
+#include "support/validation_grade.h"
 #include "tests/client/daemon_client.h"
 
 #include <sdbus-c++/sdbus-c++.h>
@@ -740,22 +741,18 @@ void runWorkerCoalescingChecks(const wallpaperx::WallpaperManager::Config& confi
         const bool& layerActive;
         const Check& check;
         ~GradeOnExit() {
-            // The waiver comes first, and must: the TSan tier runs with
-            // WALLPAPERX_ALLOW_NO_VALIDATION=1 and builds this manager with
-            // enableValidation false, so there is deliberately no layer and no counter.
-            // Grading regardless made the sanitizer tier red for the one reason it is
-            // explicitly configured to accept. The outer tail already honours the waiver;
-            // this one was added without it.
-            if (wallpaperx::testing::validationWaived()) return;
-            if (!counter) {
-                check(false, "the worker-coalescing phase created a Vulkan device to grade");
-                return;
+            // The same ladder ValidationGrade encodes, expressed once there rather than
+            // open-coded here: waiver, then no-device, then no-validator, then the count.
+            // Two copies of that policy in one suite is how the two tiers come to
+            // disagree about what a clean run means -- and the waiver semantics changed
+            // under both of them twice in as many rounds.
+            int failures = 0;
+            {
+                wallpaperx::testing::ValidationGrade grade(
+                    "dbus_service_test (worker-coalescing phase)", failures);
+                grade.adopt(counter, layerActive);
             }
-            if (!layerActive) {
-                check(false, "the worker-coalescing phase ran with the validation layer loaded");
-                return;
-            }
-            check(counter->load() == 0,
+            check(failures == 0,
                   "the worker-coalescing phase's own device produced zero Vulkan validation warnings");
         }
     } gradeOnExit{counter, layerActive, check};

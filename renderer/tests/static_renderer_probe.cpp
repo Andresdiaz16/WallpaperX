@@ -36,7 +36,7 @@ std::string writeTestImage() {
 
 bool testRenderValidImage() {
 
-    return wallpaperx::testing::gradedRun(
+    const bool ok = wallpaperx::testing::gradedRun(
         "static_renderer_probe", [&](wallpaperx::testing::ValidationGrade& grade) {
     try {
         const std::string imagePath = writeTestImage();
@@ -107,9 +107,11 @@ bool testRenderValidImage() {
         return false;
     }
 
-        std::cout << "static_renderer_probe: passed, zero validation warnings" << std::endl;
     return true;
     });
+    if (!ok) return false;
+    std::cout << "static_renderer_probe: passed, zero validation warnings" << std::endl;
+    return true;
 }
 
 // From TEST.md's QA pass (2026-07-18): confirms StaticRenderer's own error path
@@ -117,7 +119,7 @@ bool testRenderValidImage() {
 // file, rather than crashing or leaving partially-constructed state.
 bool testMissingImageThrows() {
 
-    return wallpaperx::testing::gradedRun(
+    const bool ok = wallpaperx::testing::gradedRun(
         "static_renderer_probe (missing image)", [&](wallpaperx::testing::ValidationGrade& grade) {
     try {
         wallpaperx::Device device(/*enableValidation=*/true);
@@ -146,9 +148,11 @@ bool testMissingImageThrows() {
         return false;
     }
 
-        std::cout << "static_renderer_probe (missing image): passed" << std::endl;
     return true;
     });
+    if (!ok) return false;
+    std::cout << "static_renderer_probe (missing image): passed" << std::endl;
+    return true;
 }
 
 }

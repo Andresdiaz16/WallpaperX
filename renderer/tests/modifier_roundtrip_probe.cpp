@@ -48,6 +48,7 @@
 //                 nobody here has. Treat the transfer as unverified.
 
 #include "vulkan/device.h"
+#include "support/validation_grade.h"
 
 #include <atomic>
 #include <memory>
@@ -718,6 +719,17 @@ int main(int argc, char** argv) {
     // Graded here, after run() returned and therefore after ~Device, which is what makes
     // the layer's teardown complaints countable.
     if (!g_validationLayerActive) {
+        // Honours the same waiver every other probe does, through the same single
+        // definition. Without it this binary was the one TSan-tier entry that still went
+        // red on a host without the layer package -- the exact condition the waiver was
+        // widened to accept, and the reason the CMake comment claiming "every test reads
+        // it" was false.
+        if (wallpaperx::testing::validationWaived()) {
+            std::cout << "modifier_roundtrip_probe (" << what
+                      << "): WALLPAPERX_ALLOW_NO_VALIDATION=1 and no validator is loaded -- the GPU-side "
+                         "oracle is DISABLED for this run" << std::endl;
+            return 0;
+        }
         std::cerr << "modifier_roundtrip_probe (" << what
                   << "): VK_LAYER_KHRONOS_validation is not loaded, so a zero-warning result "
                      "validates nothing" << std::endl;
