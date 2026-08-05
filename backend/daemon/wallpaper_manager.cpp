@@ -146,8 +146,10 @@ void WallpaperManager::requestWallpaper(const std::string& type, const std::stri
         // Sanitized because this message is echoed to the log and returned over the bus,
         // and `type` is whatever the client sent -- a 200 000-character type string was
         // reproduced in full through both channels.
-        throw InvalidRequest("unknown wallpaper type '" + sanitizeForLog(type) +
-                             "' (expected static, video or shader)");
+        // No quotes of our own around the sanitized text -- sanitizeForLog supplies them,
+        // and a second pair would be a frame the client's payload could imitate.
+        throw InvalidRequest("unknown wallpaper type " + sanitizeForLog(type) +
+                             " (expected static, video or shader)");
     }
     requireValidMonitorId(monitorId);
 
@@ -169,9 +171,19 @@ void WallpaperManager::requestWallpaper(const std::string& type, const std::stri
     // reply and then fail it on the render thread, so the same user mistake -- "I gave it
     // a path it cannot open" -- would surface through two different channels depending on
     // why it could not be opened.
+    //
+    // Known and accepted: these two syscalls run on the DBus event-loop thread, so a path
+    // on a hung NFS/autofs mount blocks every other method for that mount's timeout, and
+    // hoisting the check widened that from static-only to every type. Moving it onto the
+    // render worker -- the obvious fix, and the one already applied to GetFrameFd -- was
+    // considered and rejected: the worker is a FIFO that also runs renders, so a bad path
+    // would be rejected only after every queued render drained, turning a ~1 ms rejection
+    // into a multi-second one for every client. That trades a rare unbounded stall for a
+    // certain routine one and would break S6.9's burst-cost bound. If this ever needs
+    // fixing, the answer is a separate validation thread, not the render queue.
     std::error_code ec;
     if (!std::filesystem::is_regular_file(path, ec) || ::access(path.c_str(), R_OK) != 0) {
-        throw InvalidRequest("'" + sanitizeForLog(path) + "' is not a readable file");
+        throw InvalidRequest(sanitizeForLog(path) + " is not a readable file");
     }
 
     std::lock_guard<std::mutex> stateLock(m_stateMutex);
@@ -215,7 +227,7 @@ RenderOutcome WallpaperManager::renderPending(int monitorId) {
         seq = it->second.requestSeq;
     }
 
-    if (type != "static") {
+    if (!isRenderableType(type)) {
         // Recorded only; video/shader render in Step 13 / Phase 3. Release the target --
         // nothing will read it again, and holding a full-size image per monitor for a
         // wallpaper type this build cannot draw is memory kept for no one.
@@ -225,13 +237,15 @@ RenderOutcome WallpaperManager::renderPending(int monitorId) {
         auto it = m_monitors.find(monitorId);
         if (it != m_monitors.end() && it->second.requestSeq == seq) {
             it->second.servicedSeq = seq;
-            // Recorded as an error even though nothing failed, because from the outside
-            // this is indistinguishable from a render still in flight without it: the
-            // monitor was accepted, is serviced, has no frame and never will in this
-            // build. GetStatus previously showed has_frame=false and no last_error, which
-            // is exactly what a queued static request looks like.
-            it->second.lastError = "wallpaper type '" + type +
-                                   "' is accepted but cannot be rendered by this build";
+            // Deliberately does NOT write lastError. GetStatus documents that field to
+            // clients as present only when the last request failed, and this request did
+            // not fail -- it was accepted by contract and is exactly as the client asked.
+            // Putting it there made a frontend that branches on last_error paint an error
+            // state on a wallpaper the daemon deliberately accepted, indistinguishable
+            // from a genuinely broken image without string-matching the text. What
+            // GetStatus needs is the separate `unsupported` key, which dbus_service.cpp
+            // derives from the recorded type through the same isRenderableType() this
+            // branch uses.
         }
         return {};
     }
@@ -295,7 +309,16 @@ RenderOutcome WallpaperManager::renderPending(int monitorId) {
         it->second.servicedSeq = seq;
 
         if (!error.empty()) {
-            it->second.lastError = error;
+            // Sanitized at the one place client-derived text enters daemon-held state,
+            // rather than at each place it leaves. The renderer's message embeds the
+            // client's path verbatim ("not a decodable image <path>: <reason>"), and a
+            // regular readable file may perfectly well be named with newlines or an ESC
+            // sequence -- so every consumer of lastError, the RenderFailed reply and the
+            // GetStatus JSON today and any log line tomorrow, inherits the escaping
+            // without anyone having to remember. 1024 rather than the default, so a
+            // PATH_MAX-length path cannot push stb's own reason off the end, which is
+            // the part that says what is actually wrong with the file.
+            it->second.lastError = sanitizeForLog(error, 1024, LogFraming::Bare);
         } else {
             ++it->second.generation;
             it->second.hasFrame = true;
@@ -350,9 +373,8 @@ FrameExport WallpaperManager::exportCurrentFrame(int monitorId) {
             // will not produce a frame in this build whether or not the worker has
             // reached it yet, so keying on the worker's progress would answer "not yet"
             // for a window and "never" afterwards for the same unchanged request.
-            if (it->second.type != "static") {
+            if (!isRenderableType(it->second.type)) {
                 out.reason = NoFrameReason::Unsupported;
-                out.lastError = it->second.lastError;
                 return out;
             }
             if (!it->second.lastError.empty()) {

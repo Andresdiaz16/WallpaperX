@@ -1,18 +1,13 @@
 #include "vulkan/memory_export.h"
 
+#include "support/check.h"
+
 #include <iostream>
 #include <stdexcept>
 
 namespace {
 
-int g_failures = 0;
-
-void check(bool condition, const char* description) {
-    if (!condition) {
-        std::cerr << "FAIL: " << description << std::endl;
-        ++g_failures;
-    }
-}
+using wallpaperx::testing::check;
 
 }
 
@@ -73,10 +68,9 @@ int main() {
               VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT,
           "an empty WALLPAPERX_FORCE_HANDLE_TYPE falls through to the default policy");
 
-    if (g_failures == 0) {
+    if (wallpaperx::testing::reportFailures("memory_export_test") == 0) {
         std::cout << "memory_export_test: all checks passed" << std::endl;
         return 0;
     }
-    std::cerr << "memory_export_test: " << g_failures << " check(s) failed" << std::endl;
     return 1;
 }

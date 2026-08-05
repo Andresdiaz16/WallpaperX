@@ -58,16 +58,14 @@
 #include "vulkan/offscreen.h"
 #include "renderers/static_renderer.h"
 
+#include "support/check.h"
 #include "support/gpu_readback.h"
-
-#define STB_IMAGE_WRITE_IMPLEMENTATION
-#include <stb_image_write.h>
+#include "support/test_image.h"
 
 #include <unistd.h>
 
 #include <cstdlib>
 #include <cstring>
-#include <filesystem>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -75,7 +73,9 @@
 
 namespace {
 
+using wallpaperx::testing::check;
 using wallpaperx::testing::countDifferingRows;
+using wallpaperx::testing::failureCount;
 using wallpaperx::testing::readbackImage;
 using wallpaperx::testing::renderReference;
 using wallpaperx::testing::variesInBothAxes;
@@ -92,8 +92,6 @@ constexpr uint32_t kHeight = 36;
 // against a usage the exported image was never created with and blame the round trip.
 constexpr VkImageUsageFlags kUsage = wallpaperx::OffscreenTargetManager::kUsage;
 
-int g_failures = 0;
-
 // Set when the probe could not make its central claim on this machine -- the driver has
 // no dma_buf with a describable layout at all, or it offers no second modifier for the
 // control to substitute. Reported to ctest as a SKIP (see kNotVerifiedExitCode and the
@@ -106,33 +104,11 @@ bool g_notVerified = false;
 // what makes ctest act on it.
 constexpr int kNotVerifiedExitCode = 77;
 
-void check(bool condition, const std::string& description) {
-    if (!condition) {
-        std::cerr << "FAIL: " << description << std::endl;
-        ++g_failures;
-    }
-}
-
 std::string writeTestImage() {
-    std::filesystem::create_directories(WALLPAPERX_TEST_IMAGE_DIR);
-    const std::string path = std::string(WALLPAPERX_TEST_IMAGE_DIR) + "/modifier_roundtrip_gradient.png";
-
-    const int w = 16;
-    const int h = 16;
-    std::vector<unsigned char> pixels(static_cast<size_t>(w) * h * 4);
-    for (int y = 0; y < h; ++y) {
-        for (int x = 0; x < w; ++x) {
-            unsigned char* px = &pixels[(static_cast<size_t>(y) * w + x) * 4];
-            px[0] = static_cast<unsigned char>(16 + x * 15);
-            px[1] = static_cast<unsigned char>(16 + y * 15);
-            px[2] = static_cast<unsigned char>((x * 16 + y * 3) & 0xff);
-            px[3] = 255;
-        }
-    }
-    if (!stbi_write_png(path.c_str(), w, h, 4, pixels.data(), w * 4)) {
-        throw std::runtime_error("modifier_roundtrip_probe: failed to write test image");
-    }
-    return path;
+    // Same gradient as frame_export_probe's, for the same reason (support/test_image.h),
+    // written to a filename of this probe's own.
+    return wallpaperx::testing::writeGradientPng(
+        std::string(WALLPAPERX_TEST_IMAGE_DIR) + "/modifier_roundtrip_gradient.png", 16, 16);
 }
 
 // A memory type the driver will accept for both the image's requirements and the
@@ -560,7 +536,7 @@ int run(Mode mode) {
         const Outcome real = roundTrip(renderFreshTarget(targets, renderer, 0), /*useWrongModifier=*/false);
         if (!real.error.empty()) {
             check(false, "a Vulkan importer accepts the published layout: " + real.error);
-            return g_failures;
+            return failureCount();
         }
         std::cout << "modifier_roundtrip_probe: " << device.info().gpuName << " chose modifier 0x" << std::hex
                   << real.modifier << std::dec << " with " << real.planes << " plane(s), memorySize " << real.memorySize
@@ -604,7 +580,7 @@ int run(Mode mode) {
                           : "published memorySize is larger by " + std::to_string(real.memorySize - real.requiredSize) +
                                 " bytes")
                   << ")" << std::endl;
-        return g_failures;
+        return failureCount();
     }
 
     // --- Claim 2: the same round trip, on its own buffer, told the WRONG modifier. ---
@@ -624,7 +600,7 @@ int run(Mode mode) {
                   << "-plane modifier usable for this format, usage and extent, so there is no wrong value to "
                      "substitute and modifier sensitivity was not tested"
                   << std::endl;
-        return g_failures;
+        return failureCount();
     }
 
     // The control counts as having fired if the substituted modifier demonstrably
@@ -670,7 +646,7 @@ int run(Mode mode) {
               << (!control.error.empty() ? control.error : std::to_string(control.rows) + " row(s) differ")
               << std::endl;
 
-    return g_failures;
+    return failureCount();
 }
 
 }  // namespace

@@ -4,34 +4,16 @@
 #include "vulkan/offscreen.h"
 #include "renderers/static_renderer.h"
 
-#define STB_IMAGE_WRITE_IMPLEMENTATION
-#include <stb_image_write.h>
+#include "support/test_image.h"
 
-#include <filesystem>
 #include <iostream>
 #include <stdexcept>
-#include <vector>
 
 namespace {
 
 std::string writeTestImage() {
-    std::filesystem::create_directories(WALLPAPERX_TEST_IMAGE_DIR);
-    const std::string path = std::string(WALLPAPERX_TEST_IMAGE_DIR) + "/test_red.png";
-
-    const int w = 8;
-    const int h = 8;
-    std::vector<unsigned char> pixels(static_cast<size_t>(w) * h * 4);
-    for (int i = 0; i < w * h; ++i) {
-        pixels[i * 4 + 0] = 255;
-        pixels[i * 4 + 1] = 0;
-        pixels[i * 4 + 2] = 0;
-        pixels[i * 4 + 3] = 255;
-    }
-
-    if (!stbi_write_png(path.c_str(), w, h, 4, pixels.data(), w * 4)) {
-        throw std::runtime_error("static_renderer_probe: failed to write test image");
-    }
-    return path;
+    return wallpaperx::testing::writeSolidPng(
+        std::string(WALLPAPERX_TEST_IMAGE_DIR) + "/test_red.png", 8, 8, {255, 0, 0, 255});
 }
 
 bool testRenderValidImage() {

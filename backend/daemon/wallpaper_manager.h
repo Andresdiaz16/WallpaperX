@@ -67,6 +67,13 @@ struct FrameHandle {
 // again" and "this wallpaper will never render" require opposite responses: retry, or
 // stop and show the error. Collapsing them tells a client to retry a dead wallpaper
 // forever.
+// The single answer to "can this build draw this type", so the render dispatch, the
+// GetFrameFd reason and the GetStatus field cannot drift apart. They did: the dispatch
+// test and the reason test were two separate `type != "static"` literals, and Step 13
+// making video renderable would have had to find both or GetFrameFd would go on telling
+// clients a working wallpaper can never produce a frame.
+inline bool isRenderableType(const std::string& type) { return type == "static"; }
+
 enum class NoFrameReason {
     NeverRequested,  // nothing has ever been set on this monitor
     NotRendered,     // a request is recorded but no frame has committed -- still queued
@@ -81,9 +88,9 @@ enum class NoFrameReason {
 struct FrameExport {
     std::optional<FrameHandle> handle;
 
-    // Both meaningful only when `handle` is empty. lastError is always non-empty for
-    // RenderFailed, usually non-empty for Unsupported (the worker writes it when it
-    // services the request, so a caller can beat it there), and empty otherwise.
+    // Both meaningful only when `handle` is empty. lastError is non-empty exactly when
+    // reason is RenderFailed -- Unsupported deliberately does not carry one, because it
+    // is not a failure and the reason name already states the whole fact.
     NoFrameReason reason = NoFrameReason::NeverRequested;
     std::string lastError;
 };

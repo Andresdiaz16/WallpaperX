@@ -106,8 +106,14 @@ constexpr int32_t kMonitorStormBase = 20;  // .. kMonitorStormBase + kStormMonit
 constexpr int32_t kStormMonitors = 4;
 constexpr int32_t kMonitorBarrierPre = 30;
 constexpr int32_t kMonitorBarrierPost = 31;
-// Inside the daemon's 0..31 monitor range, and in the gap the phases above leave between
-// the responsiveness burst (2..17) and the storm (20..23).
+// Inside the daemon's 0..31 monitor range, and above every id the phases before it use --
+// the responsiveness burst runs 2..17 and the storm 20..23, so 24 and 25 are clear of
+// both. (They are not "in the gap between" them, as this comment used to say; the only gap
+// there is 18..19 and neither is in it. The ids are fine, the reasoning was not.) Two ids,
+// because the closed-stdout phase renders once with its stdout still readable -- to
+// establish that the handler does write to fd 1 -- and once after breaking it. Ids still
+// unclaimed by any phase: 18..19 and 26..29.
+constexpr int32_t kMonitorClosedStdoutPre = 25;
 constexpr int32_t kMonitorClosedStdout = 24;
 
 constexpr int kStormThreads = 4;
@@ -138,6 +144,32 @@ constexpr auto kMinConclusiveDrain = std::chrono::milliseconds(20);
 constexpr auto kProcessTimeout = std::chrono::seconds(30);
 
 std::string testAssetDir() { return std::string(WALLPAPERX_TEST_IMAGE_DIR); }
+
+// Goals this run could not exercise at all, because the host or the harness could not
+// build the precondition -- as opposed to goals it exercised and that held.
+//
+// The two were previously indistinguishable from outside: the exit status was a pure
+// function of the failure count, so a phase that returned early after printing a reason
+// left ctest reporting PASS for coverage that never ran. That is the vacuous-green trap,
+// and it sat on the phase written for the worst crash the QA pass found. Reported the way
+// the renderer probes report it (modifier_roundtrip_probe's g_notVerified /
+// kNotVerifiedExitCode): exit 77, which ctest turns into a SKIP through the
+// SKIP_RETURN_CODE property set in backend/CMakeLists.txt. A skip is not a pass, and no
+// reader can mistake it for one.
+//
+// Not a check() failure, deliberately: X.3 forbids reporting a fault of the host or the
+// harness as a fault of the daemon, and every caller here names a cause on this side of
+// the boundary.
+int g_notVerified = 0;
+constexpr int kNotVerifiedExitCode = 77;
+
+void notVerified(const char* goals, const std::string& reason) {
+    std::printf("daemon_system_test: NOT VERIFIED -- %s could not be exercised: %s. This run establishes "
+                "nothing about them, and is reported to ctest as a skip rather than as a pass.\n",
+                goals, reason.c_str());
+    std::fflush(stdout);
+    ++g_notVerified;
+}
 
 using Clock = std::chrono::steady_clock;
 
@@ -338,13 +370,50 @@ public:
     }
 
     // Closes the read end of a Breakable stdout, so every subsequent write the daemon
-    // makes to fd 1 fails. Returns false if there was nothing to close, which a caller
-    // must treat as a setup failure rather than as a result.
+    // makes to fd 1 fails. Idempotent: the destructor calls it too, and the constructor's
+    // failure path calls it on a daemon that may never have had a Breakable stdout at
+    // all. The bool exists for those callers; for a Breakable daemon the constructor has
+    // already guaranteed the descriptor, so a phase must not grade this return -- there
+    // is no reachable false.
     bool breakStdout() {
         if (m_stdoutFd < 0) return false;
         close(m_stdoutFd);
         m_stdoutFd = -1;
         return true;
+    }
+
+    // Reads the daemon's *stdout* -- fd 1 specifically, not the merged capture -- until
+    // `needle` appears. Breakable mode is the only mode that has a separate stdout pipe,
+    // so this is the only way to observe what went to fd 1 rather than to fd 2.
+    //
+    // Returns false on timeout, on EOF (the daemon exited), and on read error. There is
+    // no path here that reports "not seen" as "seen", and a false must fail the caller's
+    // check rather than fall through into it: a daemon that prints nothing would
+    // otherwise turn the phase into a stall that is graded as data.
+    bool waitForStdout(std::string_view needle, Clock::duration timeout) {
+        if (m_stdoutFd < 0) return false;
+        const auto deadline = Clock::now() + timeout;
+        while (true) {
+            if (m_stdoutText.find(needle) != std::string::npos) return true;
+            const auto remaining =
+                std::chrono::duration_cast<std::chrono::milliseconds>(deadline - Clock::now()).count();
+            if (remaining <= 0) return false;
+            pollfd pfd{m_stdoutFd, POLLIN, 0};
+            const int ready = poll(&pfd, 1, static_cast<int>(remaining));
+            if (ready < 0) {
+                if (errno == EINTR) continue;
+                return false;
+            }
+            if (ready == 0) return false;
+            char buf[4096];
+            const ssize_t n = read(m_stdoutFd, buf, sizeof(buf));
+            if (n < 0 && errno == EINTR) continue;
+            // n == 0 is EOF: every write end is closed, i.e. the daemon is gone, so the
+            // needle can never arrive and waiting out the deadline would only convert a
+            // dead child into a slow one.
+            if (n <= 0) return m_stdoutText.find(needle) != std::string::npos;
+            m_stdoutText.append(buf, static_cast<size_t>(n));
+        }
     }
 
     // Waits for `needle` to appear in the captured output. Returns false on timeout AND
@@ -437,6 +506,9 @@ private:
     pid_t m_pid = -1;
     int m_readFd = -1;
     int m_stdoutFd = -1;
+    // Only ever touched from the test thread through waitForStdout(); the reader thread
+    // drains the *capture* pipe and never sees this one.
+    std::string m_stdoutText;
     int m_exitCode = -1;
     bool m_timedOut = false;
     bool m_waitFailed = false;
@@ -523,11 +595,40 @@ public:
             }
             line.append(buf, static_cast<size_t>(n));
         }
-        close(fds[0]);
 
         const size_t newline = line.find('\n');
         if (newline != std::string::npos) m_address = line.substr(0, newline);
         if (m_address.empty() && m_reason.empty()) m_reason = "dbus-daemon printed an empty address";
+
+        // The read end is kept and drained for the child's whole lifetime, not closed
+        // here. dbus-daemon's fd 1 stays pointed at this pipe long after the address
+        // line, so closing the only reader would leave it writing into a readerless pipe:
+        // one --session config warning at SIGPIPE's default disposition and the nested bus
+        // dies of the test's own doing, either before the daemon comes up (reported as a
+        // daemon that never started) or after (reported as a connection loss the test did
+        // not cause). Leaving it open and unread is not enough either -- it trades SIGPIPE
+        // for a blocked write once the 64K buffer fills, which stalls the bus instead of
+        // killing it. Same m_readFd/drain-thread pair SpawnedDaemon already uses.
+        //
+        // CONTROL: not expressible as a check here -- making the real dbus-daemon write to
+        // stdout after its address line is host- and version-dependent, so a check built on
+        // it would be the flaky kind. Controlled outside the suite instead, on the
+        // mechanism: a scratch program that forks a child printing one line, then a second
+        // line after a delay, reports "child died on signal 13" when the parent closes the
+        // read end after the first line and "child exited 0" when it drains instead. That
+        // is exactly the difference this member makes, measured rather than argued.
+        m_readFd = fds[0];
+        try {
+            m_drain = std::thread([this] { drainLoop(); });
+        } catch (...) {
+            // Past fork() with no drain running: kill the child now rather than leave it
+            // writing into a pipe nobody reads for the rest of the phase.
+            kill();
+            close(m_readFd);
+            m_readFd = -1;
+            m_address.clear();
+            m_reason = "could not start the drain thread for the nested bus";
+        }
     }
 
     ~NestedBus() { kill(); }
@@ -543,15 +644,38 @@ public:
     // an orderly bus shutdown is a different event from a bus that vanishes, and the
     // second is the one a client has no chance to prepare for.
     void kill() {
-        if (m_pid <= 0) return;
-        ::kill(m_pid, SIGKILL);
-        int status = 0;
-        waitpid(m_pid, &status, 0);
-        m_pid = -1;
+        if (m_pid > 0) {
+            ::kill(m_pid, SIGKILL);
+            int status = 0;
+            waitpid(m_pid, &status, 0);
+            m_pid = -1;
+        }
+        // After the reap, for the same reason SpawnedDaemon joins after its own: the
+        // drain ends at EOF, and EOF arrives only once the child's write end is gone.
+        // Joining here rather than in the destructor keeps the join on the one path every
+        // exit goes through -- the destructor calls this too.
+        if (m_drain.joinable()) m_drain.join();
+        if (m_readFd >= 0) {
+            close(m_readFd);
+            m_readFd = -1;
+        }
     }
 
 private:
+    // Discards whatever dbus-daemon says on stdout after the address line. The bytes are
+    // of no interest; keeping a reader on the pipe is the entire point.
+    void drainLoop() {
+        char buf[4096];
+        while (true) {
+            const ssize_t n = read(m_readFd, buf, sizeof(buf));
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) break;
+        }
+    }
+
     pid_t m_pid = -1;
+    int m_readFd = -1;
+    std::thread m_drain;
     std::string m_address;
     std::string m_reason;
 };
@@ -1453,20 +1577,29 @@ void checkConcurrentClients(sdbus::IProxy& proxy, FrameReadyLog& signals, const 
 // Signals and connection loss (S6.35, S6.36, S6.37)
 // ---------------------------------------------------------------------------- //
 
-// One thread's signal masks, read from /proc. Every field is a hex bitmask in which
-// signal N is bit N-1.
+// A daemon's signal masks, read from /proc. Every field is a hex bitmask in which signal
+// N is bit N-1.
+//
+// `blocked` is the union over a caller-supplied set of threads, and `ignored` comes from
+// the leader. That split is not tidiness: a signal's *disposition* is per-process, but its
+// *blocked* mask is per-thread, and /proc/<pid>/status reports only the thread-group
+// leader's. A daemon that blocked SIGPIPE on the render worker or an sdbus dispatch thread
+// -- both of which printf, so either can take the failing write -- would leave the leader's
+// mask clean and satisfy a leader-only read while doing exactly what S6.37 forbids.
 struct SignalMasks {
     bool read = false;
     uint64_t blocked = 0;
     uint64_t ignored = 0;
+    int threadsRead = 0;
 };
 
 constexpr uint64_t signalBit(int signo) { return 1ull << (signo - 1); }
 
-SignalMasks readSignalMasks(pid_t pid) {
-    SignalMasks masks;
-    std::ifstream status("/proc/" + std::to_string(pid) + "/status");
-    if (!status) return masks;
+// Parses one /proc/<pid>/task/<tid>/status. Returns false if either field was missing,
+// which the caller must not treat as a clean mask.
+bool readTaskMasks(const std::string& path, uint64_t& blocked, uint64_t& ignored) {
+    std::ifstream status(path);
+    if (!status) return false;
     std::string line;
     bool sawBlocked = false;
     bool sawIgnored = false;
@@ -1478,14 +1611,74 @@ SignalMasks readSignalMasks(pid_t pid) {
         if (tab == std::string::npos) continue;
         const uint64_t value = std::strtoull(line.c_str() + tab, nullptr, 16);
         if (isBlocked) {
-            masks.blocked = value;
+            blocked = value;
             sawBlocked = true;
         } else {
-            masks.ignored = value;
+            ignored = value;
             sawIgnored = true;
         }
     }
-    masks.read = sawBlocked && sawIgnored;
+    return sawBlocked && sawIgnored;
+}
+
+// Every thread of `pid`, as tids. Taken before the daemon's first render, where the only
+// threads in existence are the ones the daemon itself created -- see readSignalMasks.
+std::vector<pid_t> daemonThreads(pid_t pid) {
+    std::vector<pid_t> tids;
+    std::error_code ec;
+    const std::string taskDir = "/proc/" + std::to_string(pid) + "/task";
+    for (auto it = std::filesystem::directory_iterator(taskDir, ec);
+         !ec && it != std::filesystem::directory_iterator(); it.increment(ec)) {
+        const std::string name = it->path().filename().string();
+        if (name.find_first_not_of("0123456789") != std::string::npos) continue;
+        tids.push_back(static_cast<pid_t>(std::strtol(name.c_str(), nullptr, 10)));
+    }
+    return tids;
+}
+
+// Unions SigBlk over exactly `tids`, and takes SigIgn from the leader.
+//
+// The thread set is passed in rather than scanned here, and that is the load-bearing part.
+// A scan of /proc/<pid>/task at the point the check runs would include the ICD's own
+// threads, and those are not the daemon's to answer for: measured on this host, every one
+// of Mesa's 64 `llvmpipe-N` rasterizer threads and its `...:disk$0` cache thread carries
+// SigBlk=0xfffffffe3ffbfaff -- SIGPIPE included -- while the daemon's own three threads
+// carry 0x4003 and 0x0. A union over all tasks is therefore RED on a correct daemon under
+// Lavapipe, which is the red-when-correct state this suite exists to avoid. Filtering by
+// thread name would be an allowlist of driver internals that goes stale the first time a
+// driver renames a thread. Taking the tid set before any GPU work exists excludes them by
+// construction instead.
+//
+// Not covered by that choice, and said out loud: a thread the daemon creates *after* its
+// first render would not be sampled. It creates none today -- every thread appearing after
+// ensureGpu() belongs to the ICD -- so the set is exactly "the threads this program made".
+SignalMasks readSignalMasks(pid_t pid, const std::vector<pid_t>& tids) {
+    SignalMasks masks;
+    const std::string taskDir = "/proc/" + std::to_string(pid) + "/task/";
+
+    // The leader is required, and it is what `read` is keyed on. A thread can exit between
+    // the tid snapshot and this read, so a failed open on a *non-leader* task is tolerated
+    // -- but never counted as a clean mask, because a union that silently skipped the one
+    // thread with SIGPIPE blocked is the vacuous pass this shape exists to remove. The
+    // count of what was actually sampled is returned and asserted by the caller.
+    uint64_t leaderBlocked = 0;
+    uint64_t leaderIgnored = 0;
+    if (!readTaskMasks(taskDir + std::to_string(pid) + "/status", leaderBlocked, leaderIgnored)) {
+        return masks;
+    }
+    masks.read = true;
+    masks.blocked = leaderBlocked;
+    masks.ignored = leaderIgnored;  // process-wide; any task reports the same value
+    masks.threadsRead = 1;
+
+    for (const pid_t tid : tids) {
+        if (tid == pid) continue;
+        uint64_t blocked = 0;
+        uint64_t ignored = 0;
+        if (!readTaskMasks(taskDir + std::to_string(tid) + "/status", blocked, ignored)) continue;
+        masks.blocked |= blocked;
+        ++masks.threadsRead;
+    }
     return masks;
 }
 
@@ -1549,16 +1742,22 @@ void checkHangupShutdown(NameWatcher& names, const Check& check) {
 //       stdout is gone still gets a reply, still renders, and GetStatus still answers.
 //       That is what `wallpaperx-daemon | head` does, and at the default disposition the
 //       daemon dies inside the handler at exit 141 with an empty stderr.
-//       (2) The disposition half, read from /proc/<pid>/status: the behavioural half
-//       alone cannot tell ignored from blocked -- both survive the write -- and the goal
-//       explicitly rejects blocking. SigBlk/SigIgn is the only externally visible
-//       difference between the two.
+//       (2) The disposition half, read from /proc: the behavioural half alone cannot tell
+//       ignored from blocked -- both survive the write -- and the goal explicitly rejects
+//       blocking. SigBlk/SigIgn is the only externally visible difference between the two.
+//       Read as a union over the daemon's own threads, not from /proc/<pid>/status: the
+//       disposition is per-process but the blocked mask is per-thread, and that file is
+//       the thread-group leader's alone. The daemon's render worker and sdbus dispatch
+//       threads both printf, so either can take the failing write, and a mask installed on
+//       one of them is invisible to the leader-only read. "Own threads" is the tid set
+//       snapshotted before the first render rather than a scan at check time -- the ICD's
+//       thread pool blocks nearly every signal and would make this red on a correct daemon
+//       under Lavapipe; readSignalMasks carries the measurement.
 //       (3) The coverage assert below, because everything here rests on the daemon
 //       actually writing to stdout while serving that call. If that printf ever goes
 //       away, nothing generates EPIPE and all of the above passes on a daemon with the
-//       bug reintroduced -- so the write is asserted, from the captured run, instead of
-//       assumed.
-// CONTROL: two, and the second is the one that matters.
+//       bug reintroduced -- so the write is asserted rather than assumed.
+// CONTROL: three, all re-run 2026-08-05 against this shape of the phase.
 //       (a) `std::signal(SIGPIPE, SIG_IGN)` deleted from main.cpp -> 5 FAILs: SetWallpaper
 //       came back [org.freedesktop.DBus.Error.NoReply], GetStatus came back
 //       ServiceUnknown, "the daemon ignores SIGPIPE", and the exit checks with
@@ -1567,25 +1766,40 @@ void checkHangupShutdown(NameWatcher& names, const Check& check) {
 //       "the daemon ignores SIGPIPE" and "SIGPIPE is ignored rather than merely blocked"
 //       (SigBlk=0x5003 SigIgn=0x0), while every behavioural check above stayed green --
 //       which is precisely the configuration S6.37 says must fail and which part (1)
-//       alone cannot see. Both reverted.
-// COVERAGE-ASSERT: asserts that the captured daemon printed its SetWallpaper line, i.e.
-//       that this phase's trigger still exists in the shipped binary. Controlled from the
-//       harness side by searching for a string the daemon never prints ("type=zzz"):
-//       "FAIL: the daemon writes to stdout while handling SetWallpaper", alone, with
-//       every other check green. Reverted.
-void checkClosedStdout(NameWatcher& names, const std::string& bluePath, bool capturedRunUsable,
-                       const std::string& capturedRunOutput, const Check& check) {
-    if (!capturedRunUsable) {
-        std::printf("daemon_system_test: closed-stdout checks skipped -- the earlier daemon's output was never "
-                    "collected, so there is no evidence that SetWallpaper writes to stdout at all, and without "
-                    "that this phase would prove nothing.\n");
-        return;
-    }
-    check(capturedRunOutput.find("SetWallpaper(type=static") != std::string::npos,
-          "the daemon writes to stdout while handling SetWallpaper (this is what makes the closed-stdout "
-          "phase below trigger anything at all)");
-
-    SpawnedDaemon deaf({}, SpawnedDaemon::Stdout::Breakable);
+//       alone cannot see.
+//       (c) the per-thread half of (b), which is why part (2) reads the daemon's other
+//       threads and not just the leader: `pthread_sigmask(SIG_BLOCK, {SIGPIPE})` installed
+//       inside main.cpp's sigwait watcher lambda only -> "FAIL: SIGPIPE is ignored rather
+//       than merely blocked", SigBlk=0x5003 SigIgn=0x1000, on BOTH the default-ICD and the
+//       lavapipe entry. The counterfactual was measured, not assumed: with the sample
+//       restricted back to the leader alone and the same mutation still in place, the run
+//       printed "all checks passed". All reverted.
+// COVERAGE-ASSERT: the trigger is asserted on THIS daemon's fd 1, from a render issued
+//       while its stdout still has a reader, and not from the earlier daemon's captured
+//       output. That capture is stdout and stderr merged onto one pipe (the constructor
+//       dup2()s one write end onto both), so it can only establish "the binary printed
+//       this somewhere" -- and dbus_service.cpp has three fprintf(stderr, ...) SetWallpaper
+//       lines right beside the printf, so a refactor moving the entry log to stderr would
+//       leave the assert green while nothing in this phase generated EPIPE at all. Reading
+//       the Breakable daemon's own stdout pipe is stream-pure by construction. The exact
+//       needle, quotes included, is coupled to sanitizeForLog's Quoted framing on purpose:
+//       that framing landing is what silently broke the unquoted needle before.
+//       Controlled twice. (i) Harness: needle -> `SetWallpaper(type="zzz"`, a string the
+//       daemon never prints -> "FAIL: the daemon writes to stdout, specifically, while
+//       handling SetWallpaper", alone, followed by the phase's named skip and no cascade.
+//       (ii) Production, and this is the one the old merged-capture form could not see:
+//       DbusService::setWallpaper's entry printf changed to fprintf(stderr, ...) -> the
+//       same single FAIL. The merged capture still contained the line 76 times in that
+//       same run, so the assert this replaced would have stayed green while nothing in
+//       this phase generated an EPIPE at all. Both reverted.
+void checkClosedStdout(NameWatcher& names, const std::string& bluePath, const std::string& validationEnv,
+                       bool wantValidation, const Check& check) {
+    // Spawned with the validation env, unlike its siblings: this is the only phase that
+    // renders in a child process of its own, so it is the only one where an unwatched
+    // child means the daemon's Vulkan usage in this configuration -- a second Device after
+    // another daemon has exited, a render while the process's stdout is in a permanent
+    // error state -- has no oracle at all. Scanned after shutdown, at the end.
+    SpawnedDaemon deaf({validationEnv}, SpawnedDaemon::Stdout::Breakable);
     const bool cameUp = names.waitFor(true);
     check(cameUp, "a fresh daemon acquires the name before the closed-stdout phase");
     if (!cameUp) {
@@ -1594,18 +1808,54 @@ void checkClosedStdout(NameWatcher& names, const std::string& bluePath, bool cap
         return;
     }
 
-    // From here the daemon's stdout is a pipe with no reader and no other holder of the
-    // write end: exactly `wallpaperx-daemon | head` once head has exited.
-    const bool closed = deaf.breakStdout();
-    check(closed, "the test could close the read end of the daemon's stdout");
-    if (!closed) return;
-
     FrameReadyLog signals;
     auto proxy = sdbus::createProxy(sdbus::ServiceName{DbusService::kBusName},
                                     sdbus::ObjectPath{DbusService::kObjectPath});
     proxy->uponSignal("FrameReady")
         .onInterface(DbusService::kInterface)
         .call([&signals](int32_t monitorId, uint64_t generation) { signals.record(monitorId, generation); });
+
+    // Snapshotted before the first SetWallpaper, which is where main.cpp creates the
+    // Vulkan device: after that the process is full of the ICD's threads (64 of them under
+    // Lavapipe), and those are not this daemon's to answer for. See readSignalMasks.
+    const std::vector<pid_t> daemonOwnThreads = daemonThreads(deaf.pid());
+
+    // One render with the pipe still readable, to establish the trigger. Draining a few
+    // hundred bytes and then closing the read end is faithful to what this phase models:
+    // `wallpaperx-daemon | head` is a reader that reads and then goes away.
+    bool triggerIssued = false;
+    try {
+        setWallpaper(*proxy, "static", bluePath, kMonitorClosedStdoutPre);
+        triggerIssued = true;
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "  SetWallpaper before the stdout reader was closed: %s\n", e.what());
+    }
+    check(triggerIssued, "the daemon answers SetWallpaper while its stdout still has a reader");
+    // Both early returns abandon the phase rather than continue: without the trigger, the
+    // EPIPE checks below would pass on a daemon that never wrote to the broken pipe, which
+    // is the vacuous configuration this assert exists to detect. The wait is deadline-
+    // bounded and its expiry fails the check -- it is never fallen through into.
+    if (!triggerIssued) {
+        std::printf("daemon_system_test: closed-stdout checks skipped -- the daemon did not answer the render "
+                    "that establishes the trigger, so breaking its stdout would prove nothing.\n");
+        return;
+    }
+    const bool sawOnStdout = deaf.waitForStdout("SetWallpaper(type=\"static\"", std::chrono::seconds(30));
+    check(sawOnStdout,
+          "the daemon writes to stdout, specifically, while handling SetWallpaper (this is what makes the "
+          "closed-stdout phase below trigger anything at all)");
+    if (!sawOnStdout) {
+        std::printf("daemon_system_test: closed-stdout checks skipped -- nothing arrived on the daemon's own "
+                    "stdout, so a broken stdout would generate no failing write to survive.\n");
+        return;
+    }
+
+    // From here the daemon's stdout is a pipe with no reader and no other holder of the
+    // write end: exactly `wallpaperx-daemon | head` once head has exited. Not graded --
+    // breakStdout() returns false only when there is no descriptor to close, which the
+    // Breakable constructor has already ruled out (it sets the descriptor or throws), so a
+    // check here would be one that cannot fail and an `if` here would be dead code.
+    deaf.breakStdout();
 
     bool answered = false;
     try {
@@ -1618,9 +1868,13 @@ void checkClosedStdout(NameWatcher& names, const std::string& bluePath, bool cap
           "the daemon answers SetWallpaper after its stdout reader is gone (the handler's own printf is the "
           "write that fails there)");
 
+    // Hoisted, because the validation scan at the end of this function is only evidence if
+    // the daemon actually did GPU work: an empty stderr capture from a child that died at
+    // startup would otherwise be graded as a clean bill of health.
+    bool rendered = false;
     if (answered) {
-        check(signals.wait(kMonitorClosedStdout, 1),
-              "the frame requested after stdout closed is rendered and announced");
+        rendered = signals.wait(kMonitorClosedStdout, 1);
+        check(rendered, "the frame requested after stdout closed is rendered and announced");
     }
 
     bool statusAnswered = false;
@@ -1632,7 +1886,7 @@ void checkClosedStdout(NameWatcher& names, const std::string& bluePath, bool cap
     }
     check(statusAnswered, "the daemon still answers GetStatus after the failed write");
 
-    const SignalMasks masks = readSignalMasks(deaf.pid());
+    const SignalMasks masks = readSignalMasks(deaf.pid(), daemonOwnThreads);
     check(masks.read, "the daemon's signal masks could be read from /proc");
     if (masks.read) {
         check((masks.ignored & signalBit(SIGPIPE)) != 0, "the daemon ignores SIGPIPE");
@@ -1644,6 +1898,20 @@ void checkClosedStdout(NameWatcher& names, const std::string& bluePath, bool cap
                          static_cast<unsigned long long>(masks.blocked),
                          static_cast<unsigned long long>(masks.ignored),
                          static_cast<unsigned long long>(signalBit(SIGPIPE)));
+        }
+        // COVERAGE-ASSERT: what the blocked-mask check is worth is a function of how many
+        // threads it actually sampled, and that number comes from runtime state (a /proc
+        // scan) rather than from the source. This daemon has three threads before it
+        // renders -- leader, render worker, sigwait watcher -- so a sample of one means the
+        // snapshot or the read silently fell back to the leader and the line above is back
+        // to the weaker property it used to assert. Measured, not assumed: with the
+        // non-leader tasks skipped, the "SIGPIPE blocked on the watcher thread" control
+        // printed "all checks passed" until this line existed.
+        check(masks.threadsRead >= 2,
+              "the blocked-signal check sampled the daemon's other threads, not just the group leader");
+        if (masks.threadsRead < 2) {
+            std::fprintf(stderr, "  only %d of the daemon's %zu pre-render thread(s) could be read\n",
+                         masks.threadsRead, daemonOwnThreads.size());
         }
     }
 
@@ -1666,6 +1934,36 @@ void checkClosedStdout(NameWatcher& names, const std::string& bluePath, bool cap
         check(exitCode == 0, "a daemon whose stdout is closed exits 0 rather than 141");
     }
     check(names.waitFor(false), "the bus name is released after the closed-stdout daemon exits");
+
+    // GOAL: S6.33 -- zero Vulkan validation warnings across every daemon path the suite
+    //       exercises, this child's render and teardown included.
+    // WHY-THIS-SHAPE: scanned here rather than folded into main()'s single scan, because
+    //       main() reads only the first daemon's output and this is the only other child
+    //       that builds a Device. Gated on `rendered` and not merely on `wantValidation`:
+    //       deaf.output() is stderr only and is empty for a child that died at startup, so
+    //       an ungated `warnings.empty()` would report the GPU-side oracle as clean for a
+    //       run in which no Vulkan work happened at all -- the same hollowing main() guards
+    //       against with its "serving" anchor. Read after shutdown(), because output() is
+    //       complete only once the reader thread has seen EOF. stderr, not stdout, is where
+    //       Device's messenger writes ("[vulkan] ..." via std::cerr), which is why breaking
+    //       fd 1 does not take this oracle with it.
+    // CONTROL: deaf spawned with WALLPAPERX_VALIDATION=0 while wantValidation was true ->
+    //       the run printed the named skip below instead of a green check, i.e. the gate
+    //       refuses to grade an unwatched child. Reverted.
+    // The waived / no-layer case prints nothing here on purpose: main() announces it once,
+    // loudly, at the top of the run, and repeating it per phase would train a reader to
+    // scroll past the one warning that says the GPU oracle is off.
+    if (wantValidation && !rendered) {
+        std::printf("daemon_system_test: closed-stdout validation scan skipped -- that daemon never rendered, "
+                    "so its silence about Vulkan is not evidence. The failure that caused it is above.\n");
+    } else {
+        const std::vector<std::string> warnings = validationLines(deaf.output());
+        check(warnings.empty(),
+              "the daemon that rendered with its stdout closed produced no Vulkan validation warnings");
+        for (const std::string& line : warnings) {
+            std::fprintf(stderr, "  %s\n", line.c_str());
+        }
+    }
 }
 
 // GOAL: S6.35 -- losing the bus connection unwinds through main() instead of aborting.
@@ -1688,31 +1986,61 @@ void checkClosedStdout(NameWatcher& names, const std::string& bluePath, bool cap
 //       exitedNormally() is asserted before and separately from `exit == 1` for the same
 //       reason as in the SIGHUP phase: the failure mode here IS a signal death, and
 //       reap() folds signal deaths and timeouts into the same -1.
-// CONTROL: main.cpp's ShutdownWatch guard replaced by a bare `std::thread shutdownWatch`
+//       NOT COVERED here, stated because the phase reads as if it were: the orphan is
+//       killed before it is ever sent a SetWallpaper, and main.cpp creates the Vulkan
+//       device on the first one -- so no Device exists, no validation layer is ever
+//       loaded, and the GPU half of the teardown on this unwind path is graded by nothing.
+//       The phase therefore takes no validation env; it used to be handed one, which was
+//       inert and made the coverage look wider than it was.
+// CONTROL: three, and the first two are about this phase being able to report at all.
+//       (i) the startup needle changed to one the daemon never prints -> "FAIL: the daemon
+//       comes up on a bus of the test's own...", alone, with the four unwind checks
+//       skipped and the daemon's own output printed. (ii) the tree reconfigured with
+//       DBUS_DAEMON_EXECUTABLE empty (the dbus-daemon-less host) -> "NOT VERIFIED -- the
+//       connection-loss checks (S6.35) could not be exercised: no dbus-daemon binary was
+//       found at configure time", exit 77, and ctest reported `daemon_system ...Skipped`
+//       instead of Passed. Both reverted.
+//       (iii) main.cpp's ShutdownWatch guard replaced by a bare `std::thread shutdownWatch`
 //       with the pthread_kill/join moved to after enterEventLoop() -- i.e. the code as it
-//       was before f1aa32c. Observed directly: "terminate called without an active
-//       exception", "Aborted (core dumped)", wait status 134, and none of the shutdown
-//       output. Against this check that is "FAIL: losing the bus connection unwinds
-//       through main() instead of aborting the process" plus the exit-1, fatal-message
-//       and watcher-joined checks. Reverted.
-void checkBusLoss(const std::string& daemonEnvValidation, const Check& check) {
+//       was before f1aa32c. Re-run 2026-08-05: the daemon printed "terminate called
+//       without an active exception" and died on signal 6, and exactly 4 FAILs followed --
+//       "losing the bus connection unwinds through main() instead of aborting the
+//       process", the exit-1 line, the fatal-message line and the watcher-joined line,
+//       with the new startup check above still green. Reverted.
+void checkBusLoss(const Check& check) {
     NestedBus bus;
     if (!bus.ok()) {
         // X.3: a bus this test could not start is a fault in the harness or the host, and
-        // must never be reported as the daemon aborting.
-        std::printf("daemon_system_test: SKIPPED the connection-loss checks (S6.35) -- %s. Nothing about the "
-                    "daemon's behaviour when it loses the bus was verified by this run.\n",
-                    bus.reason().c_str());
+        // must never be reported as the daemon aborting -- so this is not a check().
+        // Counted as NOT VERIFIED instead of merely printed: the run's exit status used to
+        // be a pure function of `failures`, so "S6.35 held" and "S6.35 never ran" produced
+        // byte-identical results and ctest reported both as PASS. notVerified() makes the
+        // run exit 77, which ctest reports as a skip.
+        notVerified("the connection-loss checks (S6.35)", bus.reason());
         return;
     }
 
-    SpawnedDaemon orphan({std::string("DBUS_SESSION_BUS_ADDRESS=") + bus.address(), daemonEnvValidation});
+    SpawnedDaemon orphan({std::string("DBUS_SESSION_BUS_ADDRESS=") + bus.address()});
     // The daemon's own startup line is the up-signal here rather than NameOwnerChanged:
     // the name is acquired on the nested bus, which this process is not connected to, and
     // connecting to it would put another client on the very connection being destroyed.
-    if (!orphan.waitForOutput("serving io.wallpaperx.Daemon", std::chrono::seconds(30))) {
-        std::printf("daemon_system_test: SKIPPED the connection-loss checks (S6.35) -- the daemon never came up "
-                    "on the nested bus, so killing it would say nothing about the unwind path.\n");
+    // Built from kBusName rather than spelled out, so renaming the bus is a compile-time
+    // problem rather than a needle that silently stops matching and disables the phase.
+    //
+    // Graded, unlike the bus above: the bus is the harness's to start, but `orphan` is the
+    // shipped binary with nothing changed but DBUS_SESSION_BUS_ADDRESS, so its failing to
+    // print its own startup line within 30s is a fault of the code under test -- and 30s
+    // for a line printed before any Vulkan work is already a stall, not a slow host. The
+    // early return stays: grading the four unwind checks against a daemon that never
+    // started would turn one fault into five FAILs pointing at main's unwind path.
+    const bool cameUp =
+        orphan.waitForOutput(std::string("serving ") + DbusService::kBusName, std::chrono::seconds(30));
+    check(cameUp, "the daemon comes up on a bus of the test's own, so the connection-loss path can be exercised");
+    if (!cameUp) {
+        std::fprintf(stderr,
+                     "  the remaining connection-loss checks (S6.35) cannot run: killing a bus a daemon never "
+                     "connected to says nothing about the unwind path. What it printed:\n%s\n",
+                     orphan.output().c_str());
         return;
     }
 
@@ -1928,8 +2256,8 @@ int main() {
         // S6.37 and S6.35. Both spawn daemons of their own and shut them down, so they
         // run after the phases above have released the name, and before the descriptor
         // accounting below.
-        checkClosedStdout(names, bluePath, daemonOutputRead && daemonCameUp, daemonOutput, check);
-        checkBusLoss(validationEnv, check);
+        checkClosedStdout(names, bluePath, validationEnv, wantValidation, check);
+        checkBusLoss(check);
 
         // Every Frame's UnixFd closes at scope exit, and the daemon is gone, so this
         // process must be back where it started. A descriptor leaked per GetFrameFd is
@@ -2004,7 +2332,10 @@ int main() {
         // lost -- validationLines() trivially returns nothing and this would report the
         // GPU-side oracle as clean for a run in which no Vulkan work was ever observed.
         // Anchored on the daemon's own startup line, which it prints before any render.
-        const bool daemonSpoke = daemonOutput.find("serving io.wallpaperx.Daemon") != std::string::npos;
+        // Built from kBusName so that renaming the bus breaks the build rather than
+        // quietly turning this anchor into a needle that never matches.
+        const bool daemonSpoke =
+            daemonOutput.find(std::string("serving ") + DbusService::kBusName) != std::string::npos;
         if (!daemonSpoke) {
             // One failure, not two. The daemon never got far enough to use Vulkan, which
             // is already reported above; grading its silence as well would be a second
@@ -2020,10 +2351,18 @@ int main() {
         }
     }
 
-    if (failures == 0) {
-        std::printf("daemon_system_test: all checks passed\n");
-        return 0;
+    if (failures > 0) {
+        // Asked before the not-verified count, so a run that is both broken and incomplete
+        // reports as broken: a skip would hide the failures behind ctest's "Skipped".
+        std::fprintf(stderr, "daemon_system_test: %d check(s) failed\n", failures);
+        return 1;
     }
-    std::fprintf(stderr, "daemon_system_test: %d check(s) failed\n", failures);
-    return 1;
+    if (g_notVerified > 0) {
+        std::printf("daemon_system_test: every check that ran passed, but %d goal(s) could not be exercised on "
+                    "this host (listed above) -- reported to ctest as a skip, not a pass.\n",
+                    g_notVerified);
+        return kNotVerifiedExitCode;
+    }
+    std::printf("daemon_system_test: all checks passed\n");
+    return 0;
 }

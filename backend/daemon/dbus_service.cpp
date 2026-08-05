@@ -157,16 +157,15 @@ void DbusService::completeGetFrameFd(FrameFdCall call, int32_t monitorId) {
             return;
         }
         if (exported.reason == NoFrameReason::Unsupported) {
-            // lastError is written by the worker when it services the request, so a call
-            // that arrives first legitimately finds it empty -- appended only when there
-            // is something to append, rather than emitting a message ending in ": ".
-            std::string message = "monitor " + std::to_string(monitorId) +
-                                  " holds a wallpaper this build cannot render, so no frame will ever be "
-                                  "produced for it";
-            if (!exported.lastError.empty()) {
-                message += ": " + exported.lastError;
-            }
-            call.returnError(sdbus::Error(sdbus::Error::Name{kErrorUnsupported}, std::move(message)));
+            // No lastError appended: this is not a failure, nothing wrote one, and the
+            // name plus this sentence already state the whole fact. The type is not
+            // echoed either -- it is in the client's own request and in GetStatus, and
+            // repeating client-supplied text into a reply is the habit that produced the
+            // log-injection this commit closed.
+            call.returnError(sdbus::Error(sdbus::Error::Name{kErrorUnsupported},
+                                          "monitor " + std::to_string(monitorId) +
+                                              " holds a wallpaper type this build cannot render, so no "
+                                              "frame will ever be produced for it"));
             return;
         }
         call.returnError(
@@ -239,6 +238,15 @@ std::string DbusService::getStatus() {
         if (!monitor.lastError.empty()) {
             entry["last_error"] = monitor.lastError;
         }
+        // The other reason a successful SetWallpaper never produces a FrameReady, and it
+        // is not a failure, so it does not belong in last_error: this build has no
+        // renderer for the type. Its own key, so a frontend can say "not supported yet"
+        // rather than painting a broken-image state, and so the two cases stay
+        // distinguishable without string-matching an error message. Emitted always rather
+        // than only when true -- a key that appears only in the bad case is one a client
+        // learns about by hitting it. Mirrors GetFrameFd's Unsupported through the same
+        // isRenderableType(), so the two answers cannot disagree.
+        entry["unsupported"] = !isRenderableType(monitor.type);
         wallpapers[std::to_string(monitorId)] = std::move(entry);
     }
     status["wallpapers"] = wallpapers;

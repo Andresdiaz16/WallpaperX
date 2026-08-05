@@ -150,6 +150,29 @@ endforeach()
 
 add_custom_target(wallpaperx-shaders DEPENDS ${SHADER_SPV_FILES})
 
+# Where every probe that writes a PNG fixture puts it. Captured once, and used inside
+# wallpaperx_add_shader_probe() below instead of ${CMAKE_CURRENT_BINARY_DIR}: the function
+# expands its body at call time, so a future call from another add_subdirectory scope
+# would otherwise silently point that probe's assets at a different directory.
+set(WALLPAPERX_RENDERER_TEST_ASSET_DIR ${CMAKE_CURRENT_BINARY_DIR}/test_assets)
+
+# The recipe every shader+asset probe needs, in one place. Four blocks used to repeat it
+# character for character, so a change to the asset layout or the shader output path had
+# to be made in lockstep in four places and a missed one produces a probe that silently
+# reads a stale shader or writes into the previous layout.
+#
+# No option for the tests/ include path deliberately: quoted includes resolve relative to
+# the including file, and every probe source lives in tests/, so none of them needs one.
+function(wallpaperx_add_shader_probe target source)
+    add_executable(${target} ${source})
+    target_link_libraries(${target} PRIVATE wallpaperx-renderer)
+    add_dependencies(${target} wallpaperx-shaders)
+    target_compile_definitions(${target} PRIVATE
+        WALLPAPERX_SHADER_DIR="${SHADER_OUTPUT_DIR}"
+        WALLPAPERX_TEST_IMAGE_DIR="${WALLPAPERX_RENDERER_TEST_ASSET_DIR}"
+    )
+endfunction()
+
 add_executable(wallpaperx-device-probe tests/device_probe.cpp)
 target_link_libraries(wallpaperx-device-probe PRIVATE wallpaperx-renderer)
 
@@ -165,49 +188,45 @@ target_link_libraries(wallpaperx-offscreen-probe PRIVATE wallpaperx-renderer)
 add_executable(wallpaperx-device-affinity-probe tests/device_affinity_probe.cpp)
 target_link_libraries(wallpaperx-device-affinity-probe PRIVATE wallpaperx-renderer)
 
-add_executable(wallpaperx-static-renderer-probe tests/static_renderer_probe.cpp)
-target_link_libraries(wallpaperx-static-renderer-probe PRIVATE wallpaperx-renderer)
-add_dependencies(wallpaperx-static-renderer-probe wallpaperx-shaders)
-target_compile_definitions(wallpaperx-static-renderer-probe PRIVATE
-    WALLPAPERX_SHADER_DIR="${SHADER_OUTPUT_DIR}"
-    WALLPAPERX_TEST_IMAGE_DIR="${CMAKE_CURRENT_BINARY_DIR}/test_assets"
-)
+wallpaperx_add_shader_probe(wallpaperx-static-renderer-probe tests/static_renderer_probe.cpp)
 
 # S4.9's probe interposes malloc/calloc/realloc to see stb_image's pixel allocation. Its
-# own test assets are written to a directory of their own (bounds_*.png) so it never
-# shares a file with static_renderer_probe, and it needs tests/ on the include path for
-# support/validation_grade.h.
-add_executable(wallpaperx-image-bounds-probe tests/image_bounds_probe.cpp)
-target_link_libraries(wallpaperx-image-bounds-probe PRIVATE wallpaperx-renderer)
-target_include_directories(wallpaperx-image-bounds-probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-add_dependencies(wallpaperx-image-bounds-probe wallpaperx-shaders)
-target_compile_definitions(wallpaperx-image-bounds-probe PRIVATE
-    WALLPAPERX_SHADER_DIR="${SHADER_OUTPUT_DIR}"
-    WALLPAPERX_TEST_IMAGE_DIR="${CMAKE_CURRENT_BINARY_DIR}/test_assets"
-)
+# assets share WALLPAPERX_TEST_IMAGE_DIR with static_renderer_probe, frame_export_probe
+# and modifier_roundtrip_probe -- the bounds_ filename prefix is the ONLY thing keeping
+# them apart, so keep that prefix on anything added here and do not add directory-scoped
+# cleanup (a remove_all or a glob) to any of these probes: they hold different
+# RESOURCE_LOCKs and can run concurrently under `ctest -jN`.
+wallpaperx_add_shader_probe(wallpaperx-image-bounds-probe tests/image_bounds_probe.cpp)
+
+# The probe's malloc interposition cannot coexist with a sanitizer runtime that replaces
+# the allocator: the executable's strong malloc wins the link and hands out glibc pointers
+# that the sanitizer's free() then operates on. The process dies before main -- a SEGV
+# under TSan, "LeakSanitizer: CHECK failed: lsan_interceptors.cpp:83" and exit 23 under
+# LSan. The probe compiles its instrument out and exits 77 (Skipped) when this is 0.
+#
+# Decided here rather than from predefined macros in the source, because that enumeration
+# cannot be completed: GCC defines no macro at all for -fsanitize=leak (checked with -dM
+# -E on gcc 16), so `-DWALLPAPERX_SANITIZE=leak` crashed instead of skipping -- observed,
+# then fixed by this line. The definition lands on the
+# target, so both the image_bounds_probe and image_bounds_probe_lavapipe entries are
+# covered by this one line. Any non-empty value counts -- UBSan does not replace the
+# allocator and could in principle still run the probe, but an allowlist of sanitizer
+# names is the same maintenance burden that produced the bug, and over-skipping announces
+# itself as a ctest Skip with the probe's printed reason.
+if(WALLPAPERX_SANITIZE)
+    target_compile_definitions(wallpaperx-image-bounds-probe PRIVATE WALLPAPERX_ALLOCATION_INSTRUMENT=0)
+endif()
 
 add_executable(wallpaperx-descriptor-allocator-probe tests/descriptor_allocator_probe.cpp)
 target_link_libraries(wallpaperx-descriptor-allocator-probe PRIVATE wallpaperx-renderer)
 
-add_executable(wallpaperx-frame-export-probe tests/frame_export_probe.cpp)
-target_link_libraries(wallpaperx-frame-export-probe PRIVATE wallpaperx-renderer)
 # tests/support/ holds header-only test scaffolding shared with backend/tests -- kept
 # out of the renderer library because nothing WallpaperX ships CPU-maps an exported
-# frame; only a test needs to.
-target_include_directories(wallpaperx-frame-export-probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-add_dependencies(wallpaperx-frame-export-probe wallpaperx-shaders)
-target_compile_definitions(wallpaperx-frame-export-probe PRIVATE
-    WALLPAPERX_SHADER_DIR="${SHADER_OUTPUT_DIR}"
-    WALLPAPERX_TEST_IMAGE_DIR="${CMAKE_CURRENT_BINARY_DIR}/test_assets"
-)
+# frame; only a test needs to. It needs no include path: the probes reach it by quoted
+# include, which resolves relative to the including file.
+wallpaperx_add_shader_probe(wallpaperx-frame-export-probe tests/frame_export_probe.cpp)
 
-add_executable(wallpaperx-modifier-roundtrip-probe tests/modifier_roundtrip_probe.cpp)
-target_link_libraries(wallpaperx-modifier-roundtrip-probe PRIVATE wallpaperx-renderer)
-add_dependencies(wallpaperx-modifier-roundtrip-probe wallpaperx-shaders)
-target_compile_definitions(wallpaperx-modifier-roundtrip-probe PRIVATE
-    WALLPAPERX_SHADER_DIR="${SHADER_OUTPUT_DIR}"
-    WALLPAPERX_TEST_IMAGE_DIR="${CMAKE_CURRENT_BINARY_DIR}/test_assets"
-)
+wallpaperx_add_shader_probe(wallpaperx-modifier-roundtrip-probe tests/modifier_roundtrip_probe.cpp)
 
 add_executable(wallpaperx-handle-type-env-test tests/handle_type_env_test.cpp)
 target_link_libraries(wallpaperx-handle-type-env-test PRIVATE wallpaperx-renderer)
@@ -268,10 +287,11 @@ set_tests_properties(static_renderer_probe PROPERTIES RESOURCE_LOCK static_rende
 # their own. Its measurement is an allocation *count*, not a timing, so it does not need
 # to be serialised against the rest of the suite.
 #
-# SKIP_RETURN_CODE 77 because a sanitized build cannot host the probe's malloc
-# interposition (TSan/ASan intercept the allocator themselves), and the probe says so and
-# exits 77 there. Without this, that run would exit 0 and a tier that verified nothing
-# about the decoded-size bound would be indistinguishable from one that verified it.
+# SKIP_RETURN_CODE 77 because a build with a sanitizer runtime cannot host the probe's
+# malloc interposition -- any allocator-replacing sanitizer, not only TSan/ASan -- and the
+# probe says so and exits 77 there (see the WALLPAPERX_SANITIZE block above the target).
+# Without this, that run would exit 0 and a tier that verified nothing about the
+# decoded-size bound would be indistinguishable from one that verified it.
 set_tests_properties(image_bounds_probe PROPERTIES
                      RESOURCE_LOCK image_bounds_probe_test_image SKIP_RETURN_CODE 77)
 

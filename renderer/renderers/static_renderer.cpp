@@ -86,12 +86,18 @@ void StaticRenderer::cleanup() {
 // dominate a machine. The bound is on *decoded* size because that is the cost, and the
 // file gives no honest hint of it: a 995 KB PNG of 16000x16000 decodes to 1.0 GB, and
 // with the staging buffer the daemon peaked at +2.0 GB RSS and was OOM-killed under a
-// 1.2 GB limit. Nothing else stopped it -- the only previous ceiling was stb_image's own
-// guard, which for a 4-channel image is `(1<<30)/w/4 < h`, so it starts refusing at about
-// 16384x16384: far past the point where the machine is already in trouble, and a *decode*
-// guard rather than a header one, so anything under it was allocated whole. Note the gap
-// this leaves is narrow but real -- 16000x16000 clears stb's guard at 976 MiB, which is
-// exactly the case measured above, and is the size the S4.9 probe uses for that reason.
+// 1.2 GB limit. Nothing else stopped it, and stb's own limits are not a substitute --
+// read from stb_image.h rather than assumed:
+//   - PNG has a product bound in the IHDR parse, `(1<<30)/w/img_n < h` (`/4` when
+//     paletted), so the ceiling moves with the channel count: ~16384x16384 for RGBA,
+//     ~18918x18918 for RGB. It does run at header time, inside the stbi_info() below.
+//   - JPEG's equivalent (stbi__mad3sizes_valid) sits behind `if (scan != STBI__SCAN_load)
+//     return 1;`, so stbi_info skips it entirely -- and on load it only rejects integer
+//     overflow, not size. Per-axis STBI_MAX_DIMENSIONS is 1<<24. For a JPEG, which is
+//     what most wallpapers are, there is effectively no bound before this one.
+// So the cap is not a tightening of stb's threshold, it is the only threshold for the
+// common formats. 16000x16000 is the case measured above at 976 MiB and is what the S4.9
+// probe uses: inside PNG's guard, four times over this cap.
 constexpr uint64_t kMaxDecodedBytes = 256ull * 1024 * 1024;
 
 void StaticRenderer::loadAndUploadTexture(const std::string& imagePath) {

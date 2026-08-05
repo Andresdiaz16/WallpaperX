@@ -8,15 +8,13 @@
 #include "support/exported_frame_map.h"
 #include "support/gpu_readback.h"
 
-#define STB_IMAGE_WRITE_IMPLEMENTATION
-#include <stb_image_write.h>
+#include "support/test_image.h"
 
 #include <fcntl.h>
 #include <sys/resource.h>
 #include <unistd.h>
 
 #include <cstring>
-#include <filesystem>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -45,32 +43,12 @@ constexpr uint32_t kTargetHeight = 36;
 // a shared ctest RESOURCE_LOCK -- without it `ctest -jN` can have one process reading
 // a half-written PNG the other is still emitting.
 //
-// The pattern is a per-pixel gradient, not the flat red the other probes use. Flat
-// colour is worthless to this probe specifically: the content check below compares a
-// CPU mapping of the exported memory against a Vulkan readback of the same image, and
-// against a uniform frame that comparison succeeds for *any* rowPitch, any plane
-// offset, and either orientation. Only content that varies in both axes can fail it.
+// A gradient, not the flat red static_renderer_probe uses: flat colour is worthless to
+// this probe specifically -- see writeGradientPng in support/test_image.h, which carries
+// the reasoning next to the pattern it produces.
 std::string writeTestImage() {
-    std::filesystem::create_directories(WALLPAPERX_TEST_IMAGE_DIR);
-    const std::string path = std::string(WALLPAPERX_TEST_IMAGE_DIR) + "/frame_export_gradient.png";
-
-    const int w = 16;
-    const int h = 16;
-    std::vector<unsigned char> pixels(static_cast<size_t>(w) * h * 4);
-    for (int y = 0; y < h; ++y) {
-        for (int x = 0; x < w; ++x) {
-            unsigned char* px = &pixels[(static_cast<size_t>(y) * w + x) * 4];
-            px[0] = static_cast<unsigned char>(16 + x * 15);  // R varies along x only
-            px[1] = static_cast<unsigned char>(16 + y * 15);  // G varies along y only
-            px[2] = static_cast<unsigned char>((x * 16 + y * 3) & 0xff);
-            px[3] = 255;
-        }
-    }
-
-    if (!stbi_write_png(path.c_str(), w, h, 4, pixels.data(), w * 4)) {
-        throw std::runtime_error("frame_export_probe: failed to write test image");
-    }
-    return path;
+    return wallpaperx::testing::writeGradientPng(
+        std::string(WALLPAPERX_TEST_IMAGE_DIR) + "/frame_export_gradient.png", 16, 16);
 }
 
 // The layout assertions that hold for any DmaBuf frame carrying a real modifier.

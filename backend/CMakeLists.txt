@@ -168,9 +168,14 @@ target_include_directories(wallpaperx-daemon-system-test PRIVATE
 # named skip in the test's output instead of an exec failure inside a fork.
 find_program(DBUS_DAEMON_EXECUTABLE dbus-daemon)
 if(NOT DBUS_DAEMON_EXECUTABLE)
+    # This warning is emitted once and then cached, so it must not be the only signal --
+    # and it no longer is: the test itself now exits 77 when it cannot start a private bus,
+    # and SKIP_RETURN_CODE below turns that into a ctest SKIP. A host without dbus-daemon
+    # therefore reports daemon_system as skipped rather than passed, every run, which is
+    # the difference between "S6.35 held" and "S6.35 never ran".
     message(WARNING
-        "dbus-daemon not found -- daemon_system_test will SKIP its connection-loss checks (S6.35). "
-        "The rest of that test is unaffected.")
+        "dbus-daemon not found -- daemon_system_test cannot exercise the connection-loss goal (S6.35) "
+        "and will report itself to ctest as SKIPPED, not passed. Install dbus to get that coverage.")
     set(DBUS_DAEMON_EXECUTABLE "")
 endif()
 
@@ -266,7 +271,13 @@ if(DBUS_RUN_SESSION)
     # request the same well-known name.
     add_test(NAME daemon_system
              COMMAND ${DBUS_RUN_SESSION} -- $<TARGET_FILE:wallpaperx-daemon-system-test>)
-    set_tests_properties(daemon_system PROPERTIES RESOURCE_LOCK wallpaperx_bus_tests)
+    # SKIP_RETURN_CODE, for the same reason the renderer probes carry it: the test exits 77
+    # when a goal could not be exercised at all on this host (no dbus-daemon, so no private
+    # bus to destroy under a running daemon -- S6.35). Without it that run exits non-zero
+    # and reads as a daemon failure; with it ctest says Skipped, which is neither a pass
+    # nor an accusation. A run with real failures still returns 1 and is still red.
+    set_tests_properties(daemon_system PROPERTIES RESOURCE_LOCK wallpaperx_bus_tests
+                         SKIP_RETURN_CODE 77)
 
     # The cross-process content check only runs where the export is a LINEAR dma_buf,
     # which on the machines this is developed on means Lavapipe. On NVIDIA (OPAQUE_FD)
@@ -278,7 +289,8 @@ if(DBUS_RUN_SESSION)
         set_tests_properties(daemon_system_lavapipe PROPERTIES
             ENVIRONMENT "VK_ICD_FILENAMES=${WALLPAPERX_LAVAPIPE_ICD}"
             LABELS "lavapipe"
-            RESOURCE_LOCK wallpaperx_bus_tests)
+            RESOURCE_LOCK wallpaperx_bus_tests
+            SKIP_RETURN_CODE 77)
     endif()
 else()
     message(WARNING

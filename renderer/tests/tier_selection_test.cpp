@@ -1,18 +1,13 @@
 #include "vulkan/tier_selection.h"
 
+#include "support/check.h"
+
 #include <iostream>
 #include <optional>
 
 namespace {
 
-int g_failures = 0;
-
-void check(bool condition, const char* description) {
-    if (!condition) {
-        std::cerr << "FAIL: " << description << std::endl;
-        ++g_failures;
-    }
-}
+using wallpaperx::testing::check;
 
 using wallpaperx::DescriptorTier;
 using wallpaperx::GpuVendor;
@@ -62,10 +57,9 @@ int main() {
     testSelectTierNoOverride();
     testSelectTierWithOverride();
 
-    if (g_failures == 0) {
+    if (wallpaperx::testing::reportFailures("tier_selection_test") == 0) {
         std::cout << "tier_selection_test: all checks passed" << std::endl;
         return 0;
     }
-    std::cerr << "tier_selection_test: " << g_failures << " check(s) failed" << std::endl;
     return 1;
 }
