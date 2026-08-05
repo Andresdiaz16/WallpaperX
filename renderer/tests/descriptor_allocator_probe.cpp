@@ -1,8 +1,7 @@
 #include "vulkan/descriptor_heap.h"
 #include "vulkan/device.h"
+#include "support/validation_grade.h"
 
-#include <atomic>
-#include <memory>
 #include "vulkan/memory.h"
 
 #include <cstdlib>
@@ -143,13 +142,12 @@ private:
 bool testTierRejectsDoubleAllocate(const char* forceTier) {
     setenv("WALLPAPERX_FORCE_TIER", forceTier, 1);
 
-    std::shared_ptr<const std::atomic<int>> validationCounter;
+    int failures = 0;
+    {  // inner scope: grade must run before `failures` is read -- see validation_grade.h
+    wallpaperx::testing::ValidationGrade grade("descriptor_allocator_probe (double-allocate)", failures);
     try {
         wallpaperx::Device device(/*enableValidation=*/true);
-        // Taken inside the Device's scope and graded after it: the validation
-        // layer's teardown complaints are emitted from ~Device, so a check that
-        // ran before destruction would miss the half most worth having.
-        validationCounter = device.validationCounter();
+        grade.watch(device);
         TestResource a(device);
         TestResource b(device);
 
@@ -194,10 +192,9 @@ bool testTierRejectsDoubleAllocate(const char* forceTier) {
         return false;
     }
 
-    if ((validationCounter ? validationCounter->load() : 0) > 0) {
-        std::cerr << "descriptor_allocator_probe (" << forceTier << "): validation warnings" << std::endl;
-        return false;
     }
+
+    if (failures > 0) return false;
 
     std::cout << "descriptor_allocator_probe (" << forceTier << "): passed" << std::endl;
     return true;
@@ -209,13 +206,12 @@ bool testHeapTierUniformSlotsDoNotCollideWithImageSlots() {
     unsetenv("WALLPAPERX_FORCE_TIER");
 
     bool ok = true;
-    std::shared_ptr<const std::atomic<int>> validationCounter;
+    int failures = 0;
+    {  // inner scope: grade must run before `failures` is read -- see validation_grade.h
+    wallpaperx::testing::ValidationGrade grade("descriptor_allocator_probe (heap uniform)", failures);
     try {
         wallpaperx::Device device(/*enableValidation=*/true);
-        // Taken inside the Device's scope and graded after it: the validation
-        // layer's teardown complaints are emitted from ~Device, so a check that
-        // ran before destruction would miss the half most worth having.
-        validationCounter = device.validationCounter();
+        grade.watch(device);
         if (auto result = heapTierGuard(device, "heap uniform")) {
             return *result;
         }
@@ -274,10 +270,9 @@ bool testHeapTierUniformSlotsDoNotCollideWithImageSlots() {
 
     if (!ok) return false;
 
-    if ((validationCounter ? validationCounter->load() : 0) > 0) {
-        std::cerr << "descriptor_allocator_probe (heap uniform): validation warnings" << std::endl;
-        return false;
     }
+
+    if (failures > 0) return false;
 
     std::cout << "descriptor_allocator_probe (heap uniform): passed" << std::endl;
     return true;
@@ -286,13 +281,12 @@ bool testHeapTierUniformSlotsDoNotCollideWithImageSlots() {
 bool testHeapTierRejectsDoubleFree() {
     unsetenv("WALLPAPERX_FORCE_TIER");
 
-    std::shared_ptr<const std::atomic<int>> validationCounter;
+    int failures = 0;
+    {  // inner scope: grade must run before `failures` is read -- see validation_grade.h
+    wallpaperx::testing::ValidationGrade grade("descriptor_allocator_probe (heap double-free)", failures);
     try {
         wallpaperx::Device device(/*enableValidation=*/true);
-        // Taken inside the Device's scope and graded after it: the validation
-        // layer's teardown complaints are emitted from ~Device, so a check that
-        // ran before destruction would miss the half most worth having.
-        validationCounter = device.validationCounter();
+        grade.watch(device);
         if (auto result = heapTierGuard(device, "heap double-free")) {
             return *result;
         }
@@ -335,10 +329,9 @@ bool testHeapTierRejectsDoubleFree() {
         return false;
     }
 
-    if ((validationCounter ? validationCounter->load() : 0) > 0) {
-        std::cerr << "descriptor_allocator_probe (heap double-free): validation warnings" << std::endl;
-        return false;
     }
+
+    if (failures > 0) return false;
 
     std::cout << "descriptor_allocator_probe (heap double-free): passed" << std::endl;
     return true;
@@ -347,13 +340,12 @@ bool testHeapTierRejectsDoubleFree() {
 bool testHeapTierExhaustion() {
     unsetenv("WALLPAPERX_FORCE_TIER");
 
-    std::shared_ptr<const std::atomic<int>> validationCounter;
+    int failures = 0;
+    {  // inner scope: grade must run before `failures` is read -- see validation_grade.h
+    wallpaperx::testing::ValidationGrade grade("descriptor_allocator_probe (heap exhaustion)", failures);
     try {
         wallpaperx::Device device(/*enableValidation=*/true);
-        // Taken inside the Device's scope and graded after it: the validation
-        // layer's teardown complaints are emitted from ~Device, so a check that
-        // ran before destruction would miss the half most worth having.
-        validationCounter = device.validationCounter();
+        grade.watch(device);
         if (auto result = heapTierGuard(device, "heap exhaustion")) {
             return *result;
         }
@@ -399,10 +391,9 @@ bool testHeapTierExhaustion() {
         return false;
     }
 
-    if ((validationCounter ? validationCounter->load() : 0) > 0) {
-        std::cerr << "descriptor_allocator_probe (heap exhaustion): validation warnings" << std::endl;
-        return false;
     }
+
+    if (failures > 0) return false;
 
     std::cout << "descriptor_allocator_probe (heap exhaustion): passed" << std::endl;
     return true;
@@ -411,13 +402,12 @@ bool testHeapTierExhaustion() {
 bool testHeapTierAllowsMultipleAllocate() {
     unsetenv("WALLPAPERX_FORCE_TIER");
 
-    std::shared_ptr<const std::atomic<int>> validationCounter;
+    int failures = 0;
+    {  // inner scope: grade must run before `failures` is read -- see validation_grade.h
+    wallpaperx::testing::ValidationGrade grade("descriptor_allocator_probe (heap multi-slot)", failures);
     try {
         wallpaperx::Device device(/*enableValidation=*/true);
-        // Taken inside the Device's scope and graded after it: the validation
-        // layer's teardown complaints are emitted from ~Device, so a check that
-        // ran before destruction would miss the half most worth having.
-        validationCounter = device.validationCounter();
+        grade.watch(device);
         if (auto result = heapTierGuard(device, "heap multi-slot")) {
             return *result;
         }
@@ -439,10 +429,9 @@ bool testHeapTierAllowsMultipleAllocate() {
         return false;
     }
 
-    if ((validationCounter ? validationCounter->load() : 0) > 0) {
-        std::cerr << "descriptor_allocator_probe (heap multi-slot): validation warnings" << std::endl;
-        return false;
     }
+
+    if (failures > 0) return false;
 
     std::cout << "descriptor_allocator_probe (heap multi-slot): passed" << std::endl;
     return true;

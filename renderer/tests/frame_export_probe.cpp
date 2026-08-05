@@ -1,7 +1,6 @@
 #include "vulkan/device.h"
+#include "support/validation_grade.h"
 
-#include <atomic>
-#include <memory>
 #include "vulkan/offscreen.h"
 #include "vulkan/frame_export.h"
 #include "renderers/static_renderer.h"
@@ -170,15 +169,14 @@ bool testExportedBytesMatchReadback() {
     // often -- that meant a validation warning failed the probe with no stated reason.
     bool skipped = false;
 
-    std::shared_ptr<const std::atomic<int>> validationCounter;
+    int failures = 0;
+    {  // inner scope: grade must run before `failures` is read -- see validation_grade.h
+    wallpaperx::testing::ValidationGrade grade("frame_export_probe (contents)", failures);
     try {
         const std::string imagePath = writeTestImage();
 
         wallpaperx::Device device(/*enableValidation=*/true);
-        // Taken inside the Device's scope and graded after it: the validation
-        // layer's teardown complaints are emitted from ~Device, so a check that
-        // ran before destruction would miss the half most worth having.
-        validationCounter = device.validationCounter();
+        grade.watch(device);
         wallpaperx::OffscreenTargetManager targets(device);
         wallpaperx::StaticRenderer renderer(device, targets.renderPass(), imagePath, WALLPAPERX_SHADER_DIR);
 
@@ -286,12 +284,9 @@ bool testExportedBytesMatchReadback() {
         return false;
     }
 
-    // One tail for every exit, skipped or not.
-    const int warnings = (validationCounter ? validationCounter->load() : 0);
-    if (warnings > 0) {
-        std::cerr << "frame_export_probe (contents): " << warnings << " Vulkan validation warning(s)" << std::endl;
-        return false;
     }
+
+    if (failures > 0) return false;
 
     std::cout << "frame_export_probe (contents): " << (skipped ? "skipped" : "passed")
               << ", zero validation warnings" << std::endl;
@@ -300,15 +295,14 @@ bool testExportedBytesMatchReadback() {
 
 bool testHappyPathExport() {
 
-    std::shared_ptr<const std::atomic<int>> validationCounter;
+    int failures = 0;
+    {  // inner scope: grade must run before `failures` is read -- see validation_grade.h
+    wallpaperx::testing::ValidationGrade grade("frame_export_probe (export)", failures);
     try {
         const std::string imagePath = writeTestImage();
 
         wallpaperx::Device device(/*enableValidation=*/true);
-        // Taken inside the Device's scope and graded after it: the validation
-        // layer's teardown complaints are emitted from ~Device, so a check that
-        // ran before destruction would miss the half most worth having.
-        validationCounter = device.validationCounter();
+        grade.watch(device);
         wallpaperx::OffscreenTargetManager targets(device);
 
         const auto& target = targets.create(0, kTargetWidth, kTargetHeight);
@@ -439,11 +433,9 @@ bool testHappyPathExport() {
         return false;
     }
 
-    const int warnings = (validationCounter ? validationCounter->load() : 0);
-    if (warnings > 0) {
-        std::cerr << "frame_export_probe: " << warnings << " Vulkan validation warning(s)" << std::endl;
-        return false;
     }
+
+    if (failures > 0) return false;
 
     std::cout << "frame_export_probe: passed, zero validation warnings" << std::endl;
     return true;
@@ -460,13 +452,12 @@ bool testExportFromDestroyedTargetThrows() {
     // this test provokes is printed and discarded, and the probe reports "passed" on a
     // spec violation. The zero-warnings assertion is the backstop for the export path's
     // barriers, so it has to cover every test that exercises them.
-    std::shared_ptr<const std::atomic<int>> validationCounter;
+    int failures = 0;
+    {  // inner scope: grade must run before `failures` is read -- see validation_grade.h
+    wallpaperx::testing::ValidationGrade grade("frame_export_probe (destroyed target)", failures);
     try {
         wallpaperx::Device device(/*enableValidation=*/true);
-        // Taken inside the Device's scope and graded after it: the validation
-        // layer's teardown complaints are emitted from ~Device, so a check that
-        // ran before destruction would miss the half most worth having.
-        validationCounter = device.validationCounter();
+        grade.watch(device);
         wallpaperx::OffscreenTargetManager targets(device);
 
         const wallpaperx::OffscreenTarget stale = targets.create(0, kTargetWidth, kTargetHeight);
@@ -491,12 +482,9 @@ bool testExportFromDestroyedTargetThrows() {
         return false;
     }
 
-    const int warnings = (validationCounter ? validationCounter->load() : 0);
-    if (warnings > 0) {
-        std::cerr << "frame_export_probe (destroyed target): " << warnings << " Vulkan validation warning(s)"
-                  << std::endl;
-        return false;
     }
+
+    if (failures > 0) return false;
 
     std::cout << "frame_export_probe (destroyed target): passed, zero validation warnings" << std::endl;
     return true;
@@ -512,13 +500,12 @@ bool testNeverReturnsInvalidFdUnderExhaustion() {
     // This test exports from a target that was never rendered into, so it is the one
     // that catches an export-time barrier declaring a layout the image was never in.
     // It only catches it if the warning count is actually checked.
-    std::shared_ptr<const std::atomic<int>> validationCounter;
+    int failures = 0;
+    {  // inner scope: grade must run before `failures` is read -- see validation_grade.h
+    wallpaperx::testing::ValidationGrade grade("frame_export_probe (exhaustion)", failures);
     try {
         wallpaperx::Device device(/*enableValidation=*/true);
-        // Taken inside the Device's scope and graded after it: the validation
-        // layer's teardown complaints are emitted from ~Device, so a check that
-        // ran before destruction would miss the half most worth having.
-        validationCounter = device.validationCounter();
+        grade.watch(device);
         wallpaperx::OffscreenTargetManager targets(device);
         const auto& target = targets.create(0, kTargetWidth, kTargetHeight);
 
@@ -527,12 +514,9 @@ bool testNeverReturnsInvalidFdUnderExhaustion() {
         rlimit lowered = original;
         lowered.rlim_cur = 40;  // this process only; system untouched
         if (setrlimit(RLIMIT_NOFILE, &lowered) != 0) {
-            const int skipWarnings = (validationCounter ? validationCounter->load() : 0);
-            if (skipWarnings > 0) {
-                std::cerr << "frame_export_probe (exhaustion): " << skipWarnings
-                          << " Vulkan validation warning(s) before the skip" << std::endl;
-                return false;
-            }
+            // No hand-rolled warning check here: returning destroys the Device and then
+            // `grade`, which grades the full count including teardown. Reading the
+            // counter mid-life would report a smaller number and call it clean.
             std::cout << "frame_export_probe (exhaustion): skipped, could not lower RLIMIT_NOFILE" << std::endl;
             return true;
         }
@@ -566,11 +550,9 @@ bool testNeverReturnsInvalidFdUnderExhaustion() {
         return false;
     }
 
-    const int warnings = (validationCounter ? validationCounter->load() : 0);
-    if (warnings > 0) {
-        std::cerr << "frame_export_probe (exhaustion): " << warnings << " Vulkan validation warning(s)" << std::endl;
-        return false;
     }
+
+    if (failures > 0) return false;
 
     std::cout << "frame_export_probe (exhaustion): passed, zero validation warnings" << std::endl;
     return true;

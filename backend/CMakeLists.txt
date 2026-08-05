@@ -321,7 +321,7 @@ elseif(WALLPAPERX_SANITIZE STREQUAL "thread")
     # The waiver goes only where something reads it. backend/tests/client/daemon_client.h
     # is the sole reader, so it is meaningful for the two bus-driven tests and inert
     # everywhere else: the renderer probes hard-code enableValidation=true and assert
-    # validationWarningCount() == 0, which is a claim about warnings and not about the
+    # Device::validationCounter(), which is a claim about warnings and not about the
     # layer being present, so no value of this variable changes what they do. Attaching
     # it to all sixteen implied the probes were running without the layer under TSan,
     # which was never true -- they load it and lean on the called_from_lib entry in

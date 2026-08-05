@@ -726,7 +726,50 @@ void runRenderChecks(sdbus::IProxy& proxy, FrameReadyLog& signals, const std::st
 // created on and confined to the worker started below.
 void runWorkerCoalescingChecks(const wallpaperx::WallpaperManager::Config& config,
                                const std::vector<std::string>& burstPaths, const Check& check) {
+    // This phase builds a manager, and therefore a Device, of its own. The counter is
+    // per-Device now, so the handle captured around the outer manager says nothing about
+    // this one -- when the oracle was process-wide it covered both, and the migration
+    // silently left this phase with no validation oracle at all. Declared before the
+    // manager so it is destroyed after it, which is what makes teardown complaints
+    // countable; graded in a destructor so an exception out of the phases below cannot
+    // skip it.
+    std::shared_ptr<const std::atomic<int>> counter;
+    bool layerActive = false;
+    struct GradeOnExit {
+        const std::shared_ptr<const std::atomic<int>>& counter;
+        const bool& layerActive;
+        const Check& check;
+        ~GradeOnExit() {
+            // The waiver comes first, and must: the TSan tier runs with
+            // WALLPAPERX_ALLOW_NO_VALIDATION=1 and builds this manager with
+            // enableValidation false, so there is deliberately no layer and no counter.
+            // Grading regardless made the sanitizer tier red for the one reason it is
+            // explicitly configured to accept. The outer tail already honours the waiver;
+            // this one was added without it.
+            if (wallpaperx::testing::validationWaived()) return;
+            if (!counter) {
+                check(false, "the worker-coalescing phase created a Vulkan device to grade");
+                return;
+            }
+            if (!layerActive) {
+                check(false, "the worker-coalescing phase ran with the validation layer loaded");
+                return;
+            }
+            check(counter->load() == 0,
+                  "the worker-coalescing phase's own device produced zero Vulkan validation warnings");
+        }
+    } gradeOnExit{counter, layerActive, check};
+
     wallpaperx::WallpaperManager manager(config);
+    struct CaptureOnExit {
+        const wallpaperx::WallpaperManager& manager;
+        std::shared_ptr<const std::atomic<int>>& counter;
+        bool& layerActive;
+        ~CaptureOnExit() {
+            counter = manager.validationCounter();
+            layerActive = manager.validationLayerActive();
+        }
+    } captureOnExit{manager, counter, layerActive};
     std::atomic<int> frameReadySignals{0};
 
     // Released on every path, including an exception between here and the release below.
@@ -781,10 +824,11 @@ void runWorkerCoalescingChecks(const wallpaperx::WallpaperManager::Config& confi
     //       which is the state this shape exists to rule out. An earlier CONTROL here
     //       leaked the promise instead; that never reached the join, so it could not
     //       have observed either behaviour and its no-hang claim was unfounded. Both
-    //       mutations reverted. The run above was then repeated after this binary began
-    //       linking wallpaperx-test-support, because that library redirects stderr and
-    //       the first measurement predated it -- see the drain call below, without which
-    //       the FAIL line this control observes is never printed at all.
+    //       mutations reverted. An intermediate revision of this comment referred to a
+    //       stderr-capture library and a drain call that had to run before the _Exit;
+    //       both were deleted when the validation counter moved onto Device, so stderr
+    //       is unbuffered and straight to the terminal again and the FAIL line above
+    //       needs nothing extra to survive.
     const auto drain = [&worker](const char* what, const Check& c) {
         std::promise<void> done;
         std::future<void> future = done.get_future();
@@ -1196,18 +1240,27 @@ int main() {
             "dbus_service_test: WARNING -- running with WALLPAPERX_ALLOW_NO_VALIDATION=1. The GPU-side "
             "correctness oracle is DISABLED; this run proves only that the DBus and threading behaviour "
             "holds. Do not read a pass here as the suite being green.\n");
+    } else if (!validationCounter) {
+        // Distinct from "the layer is missing", and it used to be reported as that. The
+        // manager builds its Device lazily on the render worker, so if every SetWallpaper
+        // failed before ensureGpu committed there is no counter at all -- and grading a
+        // null handle as 0 warnings passed the oracle on a run where no GPU work happened.
+        std::fprintf(stderr,
+                     "FAIL: no Vulkan device was ever created, so the validation oracle graded "
+                     "nothing -- see the render failures above for the cause.\n");
+        ++failures;
     } else if (!validationLayerWasActive) {
         std::fprintf(stderr,
                      "FAIL: VK_LAYER_KHRONOS_validation was requested but is not loaded -- the "
                      "zero-warning check below would pass without validating anything. "
                      "Install the Vulkan validation layers.\n");
         ++failures;
-    }
-
-    const int warnings = validationCounter ? validationCounter->load() : 0;
-    check(warnings == 0, "the render, export and teardown path produced zero Vulkan validation warnings");
-    if (warnings > 0) {
-        std::fprintf(stderr, "  %d validation warning(s)\n", warnings);
+    } else {
+        const int warnings = validationCounter->load();
+        check(warnings == 0, "the render, export and teardown path produced zero Vulkan validation warnings");
+        if (warnings > 0) {
+            std::fprintf(stderr, "  %d validation warning(s)\n", warnings);
+        }
     }
 
     if (failures == 0) {

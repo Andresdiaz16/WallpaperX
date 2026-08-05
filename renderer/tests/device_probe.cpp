@@ -1,7 +1,5 @@
 #include "vulkan/device.h"
-
-#include <atomic>
-#include <memory>
+#include "support/validation_grade.h"
 
 #include <cstdlib>
 #include <cstring>
@@ -26,44 +24,41 @@ bool probeTier(const char* forceEnv, std::optional<DescriptorTier> expectedTier)
 
     const char* label = forceEnv ? forceEnv : "default";
 
-    std::shared_ptr<const std::atomic<int>> validationCounter;
-    try {
-        wallpaperx::Device device(/*enableValidation=*/true);
-        // Taken inside the scope and graded after it: the layer's teardown
-        // complaints come from ~Device, so a check that ran before it would
-        // miss the half most worth having.
-        validationCounter = device.validationCounter();
-        const auto& info = device.info();
-        const DescriptorTier tier = device.descriptorAllocator().tier();
-        std::cout << "GPU: " << info.gpuName
+    int failures = 0;
+    // The explicit scope is load-bearing: `grade` must be destroyed -- and therefore
+    // must have run -- before `failures` is read. Without it, `return failures == 0`
+    // evaluates while grade is still alive and the verdict is silently dropped.
+    {
+        wallpaperx::testing::ValidationGrade grade(std::string("device_probe (") + label + ")", failures);
+        try {
+            wallpaperx::Device device(/*enableValidation=*/true);
+            grade.watch(device);
+            const auto& info = device.info();
+            const DescriptorTier tier = device.descriptorAllocator().tier();
+            std::cout << "GPU: " << info.gpuName
                   << " | Vendor: " << wallpaperx::toString(info.vendor)
                   << " | Descriptor tier: " << wallpaperx::toString(tier)
                   << std::endl;
 
-        if (expectedTier && tier != *expectedTier) {
+            if (expectedTier && tier != *expectedTier) {
             std::cerr << "device_probe (" << label << "): forced tier not honored -- expected "
                       << wallpaperx::toString(*expectedTier) << " but got " << wallpaperx::toString(tier)
                       << std::endl;
             return false;
-        }
-        // Forcing buffer must never fall UP to Heap (it can fall down to Classic if
-        // the buffer tier is unsupported, which is hardware-dependent).
-        if (forceEnv && std::strcmp(forceEnv, "buffer") == 0 && tier == DescriptorTier::Heap) {
+            }
+            // Forcing buffer must never fall UP to Heap (it can fall down to Classic if
+            // the buffer tier is unsupported, which is hardware-dependent).
+            if (forceEnv && std::strcmp(forceEnv, "buffer") == 0 && tier == DescriptorTier::Heap) {
             std::cerr << "device_probe (buffer): forcing buffer must not select Heap" << std::endl;
             return false;
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "device_probe (" << label << ") failed: " << e.what() << std::endl;
+            return false;
         }
-    } catch (const std::exception& e) {
-        std::cerr << "device_probe (" << label << ") failed: " << e.what() << std::endl;
-        return false;
     }
 
-    const int warnings = validationCounter ? validationCounter->load() : 0;
-    if (warnings > 0) {
-        std::cerr << "device_probe (" << label << "): " << warnings << " Vulkan validation warning(s)" << std::endl;
-        return false;
-    }
-
-    return true;
+    return failures == 0;
 }
 
 }

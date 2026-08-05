@@ -48,6 +48,9 @@
 //                 nobody here has. Treat the transfer as unverified.
 
 #include "vulkan/device.h"
+
+#include <atomic>
+#include <memory>
 #include "vulkan/frame_export.h"
 #include "vulkan/memory.h"
 #include "vulkan/memory_export.h"
@@ -436,16 +439,21 @@ const wallpaperx::OffscreenTarget& renderFreshTarget(wallpaperx::OffscreenTarget
 // or reporting the whole probe as unverified when the round trip demonstrably passed.
 enum class Mode { RoundTrip, Sensitivity };
 
-// Recorded inside run(), where the Device that owns the counter is still alive. main()
-// grades it after run() returns, by which point the Device has been destroyed -- reading
-// the count there would mean keeping a dead object's state alive purely for a check.
-int g_validationWarnings = 0;
+// Held rather than snapshotted, and assigned right after the Device is built rather than
+// at the end of run(). The previous shape did both wrong: it copied the count out while
+// the Device was still alive (missing every teardown complaint) from a statement placed
+// after a `return` that the RoundTrip mode never reaches -- so for one of the two modes
+// this probe ships, the warning check could not fail at all.
+std::shared_ptr<const std::atomic<int>> g_validationCounter;
 bool g_validationLayerActive = false;
 
 int run(Mode mode) {
 
     const std::string imagePath = writeTestImage();
     wallpaperx::Device device(/*enableValidation=*/true);
+    // Before the first early return below, so every path out of run() carries it.
+    g_validationCounter = device.validationCounter();
+    g_validationLayerActive = device.validationLayerActive();
 
     if (!device.info().hasExternalMemoryDmaBuf || !device.info().hasImageDrmFormatModifier) {
         g_notVerified = true;
@@ -661,8 +669,6 @@ int run(Mode mode) {
               << (!control.error.empty() ? control.error : std::to_string(control.rows) + " row(s) differ")
               << std::endl;
 
-    g_validationWarnings = device.validationWarnings();
-    g_validationLayerActive = device.validationLayerActive();
     return g_failures;
 }
 
@@ -709,7 +715,15 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    const int warnings = g_validationWarnings;
+    // Graded here, after run() returned and therefore after ~Device, which is what makes
+    // the layer's teardown complaints countable.
+    if (!g_validationLayerActive) {
+        std::cerr << "modifier_roundtrip_probe (" << what
+                  << "): VK_LAYER_KHRONOS_validation is not loaded, so a zero-warning result "
+                     "validates nothing" << std::endl;
+        return 1;
+    }
+    const int warnings = g_validationCounter ? g_validationCounter->load() : 0;
     if (warnings > 0) {
         std::cerr << "modifier_roundtrip_probe (" << what << "): " << warnings << " Vulkan validation warning(s)"
                   << std::endl;

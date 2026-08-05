@@ -179,8 +179,15 @@ public:
     // The renderer's validation-warning counter, or null when no device has been created
     // yet. Shared so it stays readable after this manager and its Device are destroyed:
     // the layer's teardown complaints are the ones worth having, and they are emitted
-    // during destruction. Also reported by GetStatus's gpu section, which is where an
-    // operator sees it.
+    // during destruction.
+    //
+    // NOT currently surfaced by GetStatus: GpuStatus carries initialized/name/tier only.
+    // An earlier version of this comment claimed otherwise, which was both false and the
+    // stated justification for these being production surface -- so if the only callers
+    // stay in tests, either add the field to GpuStatus or move these behind whatever
+    // does consume them. Note the lock: both take m_gpuMutex, which a render holds for
+    // its whole duration, so wiring them into GetStatus as-is would make status wait on
+    // a full image decode -- the exact thing snapshot() takes only m_stateMutex to avoid.
     std::shared_ptr<const std::atomic<int>> validationCounter() const;
     bool validationLayerActive() const;
 

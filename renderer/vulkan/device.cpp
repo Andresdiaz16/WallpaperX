@@ -32,6 +32,8 @@ bool hasExtension(const std::vector<VkExtensionProperties>& extensions, const ch
     return false;
 }
 
+VkDebugUtilsMessengerCreateInfoEXT debugMessengerInfo(void* owner);
+
 VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(
     VkDebugUtilsMessageSeverityFlagBitsEXT severity,
     VkDebugUtilsMessageTypeFlagsEXT,
@@ -45,6 +47,18 @@ VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(
         if (auto* device = static_cast<Device*>(userData)) device->noteValidationWarning();
     }
     return VK_FALSE;
+}
+
+VkDebugUtilsMessengerCreateInfoEXT debugMessengerInfo(void* owner) {
+    VkDebugUtilsMessengerCreateInfoEXT info{VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT};
+    info.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT |
+                           VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
+    info.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT |
+                       VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
+                       VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT;
+    info.pfnUserCallback = debugCallback;
+    info.pUserData = owner;
+    return info;
 }
 
 }
@@ -126,8 +140,6 @@ void Device::createInstance(bool enableValidation) {
             }
         }
         if (validationAvailable) {
-            // Recorded so a caller can tell "no warnings" from "nothing was watching".
-            m_validationLayerActive = true;
             instanceLayers.push_back("VK_LAYER_KHRONOS_validation");
             instanceExtensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
 
@@ -163,9 +175,25 @@ void Device::createInstance(bool enableValidation) {
     validationFeatures.enabledValidationFeatureCount = 1;
     validationFeatures.pEnabledValidationFeatures = &kSyncValidation;
 
+    // A second messenger description, chained into pNext, covering vkCreateInstance and
+    // vkDestroyInstance themselves. The messenger created below cannot: it does not exist
+    // until after vkCreateInstance returns, and destroyResources() destroys it before
+    // vkDestroyInstance runs -- which is where the layer emits its object-leak report,
+    // the single most valuable teardown complaint and the whole reason the counter is
+    // shared so it can be read after ~Device. Without this the count was structurally
+    // blind to it. Per the spec this description is used only for vkCreateInstance and
+    // vkDestroyInstance, so it does not double-count what the standing messenger sees --
+    // measured by widening both to INFO severity: the count went 43 -> 156, where simple
+    // duplication of the same stream would have given ~86. The extra is instance-lifecycle
+    // output that nothing was receiving before.
+    VkDebugUtilsMessengerCreateInfoEXT instanceMessenger = debugMessengerInfo(this);
+
     VkInstanceCreateInfo createInfo{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     createInfo.pApplicationInfo = &appInfo;
-    if (syncValidationAvailable) {
+    if (validationAvailable) {
+        instanceMessenger.pNext = syncValidationAvailable ? &validationFeatures : nullptr;
+        createInfo.pNext = &instanceMessenger;
+    } else if (syncValidationAvailable) {
         createInfo.pNext = &validationFeatures;
     }
     createInfo.enabledLayerCount = static_cast<uint32_t>(instanceLayers.size());
@@ -181,15 +209,16 @@ void Device::createInstance(bool enableValidation) {
         auto createFn = reinterpret_cast<PFN_vkCreateDebugUtilsMessengerEXT>(
             vkGetInstanceProcAddr(m_instance, "vkCreateDebugUtilsMessengerEXT"));
         if (createFn) {
-            VkDebugUtilsMessengerCreateInfoEXT messengerInfo{VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT};
-            messengerInfo.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT |
-                                             VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
-            messengerInfo.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT |
-                                         VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
-                                         VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT;
-            messengerInfo.pfnUserCallback = debugCallback;
-            messengerInfo.pUserData = this;
-            createFn(m_instance, &messengerInfo, nullptr, &m_debugMessenger);
+            VkDebugUtilsMessengerCreateInfoEXT messengerInfo = debugMessengerInfo(this);
+            // Set from the call SUCCEEDING, not from the layer being installed. The flag
+            // answers "is anything feeding the counter", and every caller uses it to tell
+            // a clean run from an unwatched one -- so recording it at layer-enumeration
+            // time made it report true in exactly the case it exists to catch: createFn
+            // null, or vkCreateDebugUtilsMessengerEXT failing, leaves no messenger and a
+            // count that stays 0 no matter what the GPU did.
+            m_validationLayerActive =
+                createFn(m_instance, &messengerInfo, nullptr, &m_debugMessenger) == VK_SUCCESS &&
+                m_debugMessenger != VK_NULL_HANDLE;
         }
     }
 }

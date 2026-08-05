@@ -721,9 +721,12 @@ void gpuInitWatchThread(GpuInitWatch& watch) {
             if (!wallpaperx::testing::statusSelfConsistent(status)) ++watch.inconsistent;
         } catch (const std::exception&) {
             // A failed GetStatus is not a consistency violation. Counted, and reported
-            // below only if it swallowed the whole sample. It still marks this watcher
-            // ready: the barrier is "this thread is running and talking to the bus", and
-            // a watcher that only ever errors would otherwise hang the phase.
+            // below only if it swallowed the whole sample. Deliberately does NOT mark
+            // this watcher ready: readiness means "answered once", so that the pre-init
+            // sample the phase depends on is guaranteed rather than raced for. A watcher
+            // that only ever errors therefore never becomes ready, and the barrier below
+            // falls through on its deadline rather than hanging -- the phase then reports
+            // the zero readiness directly instead of blaming the timing.
             ++watch.errors;
         }
         // Outside the try/catch, so the error path is paced too. Inside it, a daemon

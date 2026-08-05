@@ -1,7 +1,6 @@
 #include "vulkan/device.h"
+#include "support/validation_grade.h"
 
-#include <atomic>
-#include <memory>
 #include "vulkan/offscreen.h"
 #include "renderers/static_renderer.h"
 
@@ -37,15 +36,14 @@ std::string writeTestImage() {
 
 bool testRenderValidImage() {
 
-    std::shared_ptr<const std::atomic<int>> validationCounter;
+    int failures = 0;
+    {  // inner scope: grade must run before `failures` is read -- see validation_grade.h
+    wallpaperx::testing::ValidationGrade grade("static_renderer_probe", failures);
     try {
         const std::string imagePath = writeTestImage();
 
         wallpaperx::Device device(/*enableValidation=*/true);
-        // Taken inside the Device's scope and graded after it: the validation
-        // layer's teardown complaints are emitted from ~Device, so a check that
-        // ran before destruction would miss the half most worth having.
-        validationCounter = device.validationCounter();
+        grade.watch(device);
         wallpaperx::OffscreenTargetManager targets(device);
         const auto& target = targets.create(0, 64, 64);
 
@@ -110,11 +108,9 @@ bool testRenderValidImage() {
         return false;
     }
 
-    const int warnings = (validationCounter ? validationCounter->load() : 0);
-    if (warnings > 0) {
-        std::cerr << "static_renderer_probe: " << warnings << " Vulkan validation warning(s)" << std::endl;
-        return false;
     }
+
+    if (failures > 0) return false;
 
     std::cout << "static_renderer_probe: passed, zero validation warnings" << std::endl;
     return true;
@@ -125,13 +121,12 @@ bool testRenderValidImage() {
 // file, rather than crashing or leaving partially-constructed state.
 bool testMissingImageThrows() {
 
-    std::shared_ptr<const std::atomic<int>> validationCounter;
+    int failures = 0;
+    {  // inner scope: grade must run before `failures` is read -- see validation_grade.h
+    wallpaperx::testing::ValidationGrade grade("static_renderer_probe (missing image)", failures);
     try {
         wallpaperx::Device device(/*enableValidation=*/true);
-        // Taken inside the Device's scope and graded after it: the validation
-        // layer's teardown complaints are emitted from ~Device, so a check that
-        // ran before destruction would miss the half most worth having.
-        validationCounter = device.validationCounter();
+        grade.watch(device);
         // renderPass() is valid immediately after construction (built in the
         // constructor, independent of create()) -- StaticRenderer fails at
         // stbi_load before it ever consumes the render pass, so no actual
@@ -156,10 +151,9 @@ bool testMissingImageThrows() {
         return false;
     }
 
-    if ((validationCounter ? validationCounter->load() : 0) > 0) {
-        std::cerr << "static_renderer_probe (missing image): validation warnings" << std::endl;
-        return false;
     }
+
+    if (failures > 0) return false;
 
     std::cout << "static_renderer_probe (missing image): passed" << std::endl;
     return true;
