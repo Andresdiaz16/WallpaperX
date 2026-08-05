@@ -32,7 +32,7 @@ bool hasExtension(const std::vector<VkExtensionProperties>& extensions, const ch
     return false;
 }
 
-VkDebugUtilsMessengerCreateInfoEXT debugMessengerInfo(void* owner);
+VkDebugUtilsMessengerCreateInfoEXT debugMessengerInfo(void* owner, bool includeGeneral);
 
 VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(
     VkDebugUtilsMessageSeverityFlagBitsEXT severity,
@@ -49,13 +49,20 @@ VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(
     return VK_FALSE;
 }
 
-VkDebugUtilsMessengerCreateInfoEXT debugMessengerInfo(void* owner) {
+VkDebugUtilsMessengerCreateInfoEXT debugMessengerInfo(void* owner, bool includeGeneral) {
     VkDebugUtilsMessengerCreateInfoEXT info{VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT};
     info.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT |
                            VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
-    info.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT |
-                       VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
+    // GENERAL is the *loader's* channel, not the validation layer's, and during
+    // vkCreateInstance it carries host-configuration complaints -- "Failed to
+    // CreateInstance in ICD N. Skipping ICD.", malformed manifests. Counting those as
+    // validation warnings makes a machine with a stale ICD manifest left over from an
+    // uninstalled driver fail every probe as though the renderer had regressed. The
+    // standing messenger keeps GENERAL (it is useful once an instance exists and the
+    // loader has stopped talking); the one chained into instance creation does not.
+    info.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
                        VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT;
+    if (includeGeneral) info.messageType |= VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT;
     info.pfnUserCallback = debugCallback;
     info.pUserData = owner;
     return info;
@@ -186,15 +193,16 @@ void Device::createInstance(bool enableValidation) {
     // measured by widening both to INFO severity: the count went 43 -> 156, where simple
     // duplication of the same stream would have given ~86. The extra is instance-lifecycle
     // output that nothing was receiving before.
-    VkDebugUtilsMessengerCreateInfoEXT instanceMessenger = debugMessengerInfo(this);
+    VkDebugUtilsMessengerCreateInfoEXT instanceMessenger = debugMessengerInfo(this, /*includeGeneral=*/false);
 
     VkInstanceCreateInfo createInfo{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     createInfo.pApplicationInfo = &appInfo;
+    // No `else if (syncValidationAvailable)` branch: that flag is only ever assigned
+    // inside `if (validationAvailable)` above, so "sync validation without the layer" is
+    // not a reachable state and a fallback for it would be dead code that reads live.
     if (validationAvailable) {
         instanceMessenger.pNext = syncValidationAvailable ? &validationFeatures : nullptr;
         createInfo.pNext = &instanceMessenger;
-    } else if (syncValidationAvailable) {
-        createInfo.pNext = &validationFeatures;
     }
     createInfo.enabledLayerCount = static_cast<uint32_t>(instanceLayers.size());
     createInfo.ppEnabledLayerNames = instanceLayers.data();
@@ -209,7 +217,7 @@ void Device::createInstance(bool enableValidation) {
         auto createFn = reinterpret_cast<PFN_vkCreateDebugUtilsMessengerEXT>(
             vkGetInstanceProcAddr(m_instance, "vkCreateDebugUtilsMessengerEXT"));
         if (createFn) {
-            VkDebugUtilsMessengerCreateInfoEXT messengerInfo = debugMessengerInfo(this);
+            VkDebugUtilsMessengerCreateInfoEXT messengerInfo = debugMessengerInfo(this, /*includeGeneral=*/true);
             // Set from the call SUCCEEDING, not from the layer being installed. The flag
             // answers "is anything feeding the counter", and every caller uses it to tell
             // a clean run from an unwatched one -- so recording it at layer-enumeration

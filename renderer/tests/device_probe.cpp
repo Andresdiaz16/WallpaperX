@@ -24,12 +24,8 @@ bool probeTier(const char* forceEnv, std::optional<DescriptorTier> expectedTier)
 
     const char* label = forceEnv ? forceEnv : "default";
 
-    int failures = 0;
-    // The explicit scope is load-bearing: `grade` must be destroyed -- and therefore
-    // must have run -- before `failures` is read. Without it, `return failures == 0`
-    // evaluates while grade is still alive and the verdict is silently dropped.
-    {
-        wallpaperx::testing::ValidationGrade grade(std::string("device_probe (") + label + ")", failures);
+    return wallpaperx::testing::gradedRun(
+        std::string("device_probe (") + label + ")", [&](wallpaperx::testing::ValidationGrade& grade) {
         try {
             wallpaperx::Device device(/*enableValidation=*/true);
             grade.watch(device);
@@ -56,9 +52,8 @@ bool probeTier(const char* forceEnv, std::optional<DescriptorTier> expectedTier)
             std::cerr << "device_probe (" << label << ") failed: " << e.what() << std::endl;
             return false;
         }
-    }
-
-    return failures == 0;
+        return true;
+    });
 }
 
 }

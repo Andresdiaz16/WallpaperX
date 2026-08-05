@@ -318,14 +318,17 @@ elseif(WALLPAPERX_SANITIZE STREQUAL "thread")
     set(_tsan_env
         "TSAN_OPTIONS=suppressions=${CMAKE_CURRENT_SOURCE_DIR}/tsan.supp:report_mutex_bugs=0")
 
-    # The waiver goes only where something reads it. backend/tests/client/daemon_client.h
-    # is the sole reader, so it is meaningful for the two bus-driven tests and inert
-    # everywhere else: the renderer probes hard-code enableValidation=true and assert
-    # Device::validationCounter(), which is a claim about warnings and not about the
-    # layer being present, so no value of this variable changes what they do. Attaching
-    # it to all sixteen implied the probes were running without the layer under TSan,
-    # which was never true -- they load it and lean on the called_from_lib entry in
-    # tsan.supp instead.
+    # The waiver goes on every test, because every test now reads it: the bus tests
+    # through wallpaperx::testing::validationWaived(), the renderer probes through
+    # wallpaperx::testing::validationGradeWaived() inside ValidationGrade.
+    #
+    # It used to be withheld from the renderer probes, on the stated grounds that they
+    # made "a claim about warnings and not about the layer being present". Folding the
+    # layer gate into the grader made that false -- a probe now fails outright when no
+    # validator was listening, because a zero count from an unwatched run is
+    # indistinguishable from a clean one. Withholding the waiver after that left every
+    # renderer lavapipe probe red under TSan on a host without the layer package, which
+    # is precisely the condition this waiver exists to accept.
     set(_tsan_waiver "WALLPAPERX_ALLOW_NO_VALIDATION=1")
 
     # Lavapipe only, and the NVIDIA entries are disabled rather than left to fail. Under
@@ -359,10 +362,8 @@ elseif(WALLPAPERX_SANITIZE STREQUAL "thread")
                 # empty-property case and the list quoting.
                 set_property(TEST "${_t}" DIRECTORY "${_dir}"
                              APPEND PROPERTY ENVIRONMENT ${_tsan_env})
-                if(_dir STREQUAL "${CMAKE_CURRENT_SOURCE_DIR}")
-                    set_property(TEST "${_t}" DIRECTORY "${_dir}"
-                                 APPEND PROPERTY ENVIRONMENT ${_tsan_waiver})
-                endif()
+                set_property(TEST "${_t}" DIRECTORY "${_dir}"
+                             APPEND PROPERTY ENVIRONMENT ${_tsan_waiver})
                 math(EXPR _tsan_enabled "${_tsan_enabled} + 1")
                 if("lavapipe" IN_LIST _labels)
                     math(EXPR _tsan_lavapipe "${_tsan_lavapipe} + 1")
@@ -392,8 +393,8 @@ elseif(WALLPAPERX_SANITIZE STREQUAL "thread")
             "green run from this tree as a passing sanitizer gate.")
     else()
         message(STATUS "  TSan tier: ${_tsan_enabled} test(s) carry suppressions "
-                       "(${_tsan_lavapipe} lavapipe; bus tests also carry the validation "
-                       "waiver); default-ICD tests disabled (SEGVs under TSan)")
+                       "(${_tsan_lavapipe} lavapipe) and the validation waiver; "
+                       "default-ICD tests disabled (SEGVs under TSan)")
     endif()
 endif()
 

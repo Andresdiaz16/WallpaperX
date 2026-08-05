@@ -49,13 +49,12 @@ public:
     const DeviceInfo& info() const { return m_info; }
     DescriptorTier descriptorTier() const { return m_selectedTier; }
 
-    // How many validation warnings and errors this device's debug messenger has seen,
-    // and whether there was a validator listening at all. Ordinary observables of the
-    // device, fed by the messenger's own pUserData channel. Both are needed: the count
-    // is 0 whether the GPU work was clean or no layer was ever loaded, so on its own it
-    // cannot tell a correct run from an unwatched one.
-    int validationWarnings() const noexcept { return m_validationWarnings->load(std::memory_order_relaxed); }
-    void resetValidationWarnings() noexcept { m_validationWarnings->store(0, std::memory_order_relaxed); }
+    // Whether a validator was actually listening. Needed alongside the count below,
+    // because 0 warnings is equally true of a clean run and an unwatched one.
+    //
+    // A snapshot accessor and a reset used to sit here too; every reader now goes
+    // through validationCounter(), so they were dead surface in a header the whole
+    // renderer includes.
     bool validationLayerActive() const noexcept { return m_validationLayerActive; }
 
     // The counter itself, shared so it stays readable after this Device is gone.

@@ -2,6 +2,8 @@
 #include "vulkan/device.h"
 #include "support/validation_grade.h"
 
+#include <string>
+
 #include "vulkan/memory.h"
 
 #include <cstdlib>
@@ -142,9 +144,9 @@ private:
 bool testTierRejectsDoubleAllocate(const char* forceTier) {
     setenv("WALLPAPERX_FORCE_TIER", forceTier, 1);
 
-    int failures = 0;
-    {  // inner scope: grade must run before `failures` is read -- see validation_grade.h
-    wallpaperx::testing::ValidationGrade grade("descriptor_allocator_probe (double-allocate)", failures);
+    return wallpaperx::testing::gradedRun(
+        std::string("descriptor_allocator_probe (double-allocate, ") + forceTier + ")",
+        [&](wallpaperx::testing::ValidationGrade& grade) {
     try {
         wallpaperx::Device device(/*enableValidation=*/true);
         grade.watch(device);
@@ -192,12 +194,9 @@ bool testTierRejectsDoubleAllocate(const char* forceTier) {
         return false;
     }
 
-    }
-
-    if (failures > 0) return false;
-
-    std::cout << "descriptor_allocator_probe (" << forceTier << "): passed" << std::endl;
+        std::cout << "descriptor_allocator_probe (" << forceTier << "): passed" << std::endl;
     return true;
+    });
 }
 
 bool testHeapTierUniformSlotsDoNotCollideWithImageSlots() {
@@ -206,9 +205,8 @@ bool testHeapTierUniformSlotsDoNotCollideWithImageSlots() {
     unsetenv("WALLPAPERX_FORCE_TIER");
 
     bool ok = true;
-    int failures = 0;
-    {  // inner scope: grade must run before `failures` is read -- see validation_grade.h
-    wallpaperx::testing::ValidationGrade grade("descriptor_allocator_probe (heap uniform)", failures);
+    return wallpaperx::testing::gradedRun(
+        "descriptor_allocator_probe (heap uniform)", [&](wallpaperx::testing::ValidationGrade& grade) {
     try {
         wallpaperx::Device device(/*enableValidation=*/true);
         grade.watch(device);
@@ -270,20 +268,16 @@ bool testHeapTierUniformSlotsDoNotCollideWithImageSlots() {
 
     if (!ok) return false;
 
-    }
-
-    if (failures > 0) return false;
-
-    std::cout << "descriptor_allocator_probe (heap uniform): passed" << std::endl;
+        std::cout << "descriptor_allocator_probe (heap uniform): passed" << std::endl;
     return true;
+    });
 }
 
 bool testHeapTierRejectsDoubleFree() {
     unsetenv("WALLPAPERX_FORCE_TIER");
 
-    int failures = 0;
-    {  // inner scope: grade must run before `failures` is read -- see validation_grade.h
-    wallpaperx::testing::ValidationGrade grade("descriptor_allocator_probe (heap double-free)", failures);
+    return wallpaperx::testing::gradedRun(
+        "descriptor_allocator_probe (heap double-free)", [&](wallpaperx::testing::ValidationGrade& grade) {
     try {
         wallpaperx::Device device(/*enableValidation=*/true);
         grade.watch(device);
@@ -329,20 +323,16 @@ bool testHeapTierRejectsDoubleFree() {
         return false;
     }
 
-    }
-
-    if (failures > 0) return false;
-
-    std::cout << "descriptor_allocator_probe (heap double-free): passed" << std::endl;
+        std::cout << "descriptor_allocator_probe (heap double-free): passed" << std::endl;
     return true;
+    });
 }
 
 bool testHeapTierExhaustion() {
     unsetenv("WALLPAPERX_FORCE_TIER");
 
-    int failures = 0;
-    {  // inner scope: grade must run before `failures` is read -- see validation_grade.h
-    wallpaperx::testing::ValidationGrade grade("descriptor_allocator_probe (heap exhaustion)", failures);
+    return wallpaperx::testing::gradedRun(
+        "descriptor_allocator_probe (heap exhaustion)", [&](wallpaperx::testing::ValidationGrade& grade) {
     try {
         wallpaperx::Device device(/*enableValidation=*/true);
         grade.watch(device);
@@ -391,20 +381,16 @@ bool testHeapTierExhaustion() {
         return false;
     }
 
-    }
-
-    if (failures > 0) return false;
-
-    std::cout << "descriptor_allocator_probe (heap exhaustion): passed" << std::endl;
+        std::cout << "descriptor_allocator_probe (heap exhaustion): passed" << std::endl;
     return true;
+    });
 }
 
 bool testHeapTierAllowsMultipleAllocate() {
     unsetenv("WALLPAPERX_FORCE_TIER");
 
-    int failures = 0;
-    {  // inner scope: grade must run before `failures` is read -- see validation_grade.h
-    wallpaperx::testing::ValidationGrade grade("descriptor_allocator_probe (heap multi-slot)", failures);
+    return wallpaperx::testing::gradedRun(
+        "descriptor_allocator_probe (heap multi-slot)", [&](wallpaperx::testing::ValidationGrade& grade) {
     try {
         wallpaperx::Device device(/*enableValidation=*/true);
         grade.watch(device);
@@ -429,12 +415,9 @@ bool testHeapTierAllowsMultipleAllocate() {
         return false;
     }
 
-    }
-
-    if (failures > 0) return false;
-
-    std::cout << "descriptor_allocator_probe (heap multi-slot): passed" << std::endl;
+        std::cout << "descriptor_allocator_probe (heap multi-slot): passed" << std::endl;
     return true;
+    });
 }
 
 }

@@ -495,6 +495,11 @@ int main() {
     // mistake every sibling probe was changed to avoid.
     {
         wallpaperx::testing::ValidationGrade grade("device_affinity_probe (positive path)", failures);
+        // A missing validation-layer package is exactly the "this host cannot run the
+        // case" bucket this file spends its whole structure separating from "the guard is
+        // broken". Left on `failures` it exits 1 through the branch that accuses
+        // assertGpuThread, which is the misattribution the rest of the file prevents.
+        grade.reportHostProblemTo(unrunnable);
         std::optional<Device> device;
         try {
             device.emplace(/*enableValidation=*/true);
@@ -539,9 +544,13 @@ int main() {
     // reason, which is the whole point of separating it from a guard regression; what
     // changes is only the grade.
     if (unrunnable > 0) {
+        // Deliberately does not name a single cause: this bucket now collects both "no
+        // usable Vulkan device" and "no validation layer installed", and each case
+        // printed its own reason above. Naming one of them here reported a missing layer
+        // package as a missing GPU.
         std::fprintf(stderr,
-                     "device_affinity_probe: %d case(s) could not run -- no usable Vulkan device on this host. "
-                     "This is an environment failure, not a verdict on the affinity guard.\n",
+                     "device_affinity_probe: %d case(s) could not run -- see the reasons above. These are "
+                     "environment failures, not verdicts on the affinity guard.\n",
                      unrunnable);
         return 1;
     }
