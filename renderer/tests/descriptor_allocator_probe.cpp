@@ -206,6 +206,7 @@ bool testHeapTierUniformSlotsDoNotCollideWithImageSlots() {
     // whenever supported (see heapTierGuard's comment above).
     unsetenv("WALLPAPERX_FORCE_TIER");
 
+    bool skipped = false;
     const bool graded = wallpaperx::testing::gradedRun(
         "descriptor_allocator_probe (heap uniform)", [&](wallpaperx::testing::ValidationGrade& grade) {
     bool ok = true;
@@ -213,6 +214,7 @@ bool testHeapTierUniformSlotsDoNotCollideWithImageSlots() {
         wallpaperx::Device device(/*enableValidation=*/true);
         grade.watch(device);
         if (auto result = heapTierGuard(device, "heap uniform")) {
+            skipped = true;
             return *result;
         }
         TestResource image1(device);
@@ -268,9 +270,15 @@ bool testHeapTierUniformSlotsDoNotCollideWithImageSlots() {
         return false;
     }
 
-    return true;
+    // The accumulator's only reader. It is an accumulator rather than four early returns
+    // so one run reports every failed collision invariant instead of stopping at the
+    // first -- which means deleting this line does not break the build, does not warn
+    // (no -Wall here), and silently turns all four assertions into dead stores. That is
+    // exactly what happened when the success print was hoisted out of this lambda.
+    return ok;
     });
     if (!graded) return false;
+    if (skipped) return true;
     std::cout << "descriptor_allocator_probe (heap uniform): passed" << std::endl;
     return true;
 }
@@ -278,12 +286,14 @@ bool testHeapTierUniformSlotsDoNotCollideWithImageSlots() {
 bool testHeapTierRejectsDoubleFree() {
     unsetenv("WALLPAPERX_FORCE_TIER");
 
+    bool skipped = false;
     const bool ok = wallpaperx::testing::gradedRun(
         "descriptor_allocator_probe (heap double-free)", [&](wallpaperx::testing::ValidationGrade& grade) {
     try {
         wallpaperx::Device device(/*enableValidation=*/true);
         grade.watch(device);
         if (auto result = heapTierGuard(device, "heap double-free")) {
+            skipped = true;
             return *result;
         }
 
@@ -328,6 +338,7 @@ bool testHeapTierRejectsDoubleFree() {
     return true;
     });
     if (!ok) return false;
+    if (skipped) return true;
     std::cout << "descriptor_allocator_probe (heap double-free): passed" << std::endl;
     return true;
 }
@@ -335,12 +346,14 @@ bool testHeapTierRejectsDoubleFree() {
 bool testHeapTierExhaustion() {
     unsetenv("WALLPAPERX_FORCE_TIER");
 
+    bool skipped = false;
     const bool ok = wallpaperx::testing::gradedRun(
         "descriptor_allocator_probe (heap exhaustion)", [&](wallpaperx::testing::ValidationGrade& grade) {
     try {
         wallpaperx::Device device(/*enableValidation=*/true);
         grade.watch(device);
         if (auto result = heapTierGuard(device, "heap exhaustion")) {
+            skipped = true;
             return *result;
         }
 
@@ -388,6 +401,7 @@ bool testHeapTierExhaustion() {
     return true;
     });
     if (!ok) return false;
+    if (skipped) return true;
     std::cout << "descriptor_allocator_probe (heap exhaustion): passed" << std::endl;
     return true;
 }
@@ -395,12 +409,14 @@ bool testHeapTierExhaustion() {
 bool testHeapTierAllowsMultipleAllocate() {
     unsetenv("WALLPAPERX_FORCE_TIER");
 
+    bool skipped = false;
     const bool ok = wallpaperx::testing::gradedRun(
         "descriptor_allocator_probe (heap multi-slot)", [&](wallpaperx::testing::ValidationGrade& grade) {
     try {
         wallpaperx::Device device(/*enableValidation=*/true);
         grade.watch(device);
         if (auto result = heapTierGuard(device, "heap multi-slot")) {
+            skipped = true;
             return *result;
         }
         TestResource a(device);
@@ -424,6 +440,7 @@ bool testHeapTierAllowsMultipleAllocate() {
     return true;
     });
     if (!ok) return false;
+    if (skipped) return true;
     std::cout << "descriptor_allocator_probe (heap multi-slot): passed" << std::endl;
     return true;
 }

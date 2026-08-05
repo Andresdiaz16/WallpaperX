@@ -49,11 +49,15 @@ inline constexpr auto kSignalTimeout = std::chrono::seconds(30);
 // one FAIL line per broken property is worth far more than a stack trace from the first.
 using Check = std::function<void(bool, const char*)>;
 
-// Whether to run without the Vulkan validation layer.
+// validationWaived() -- "run without the Vulkan validation layer" -- is declared in
+// support/validation_grade.h, included above, and is deliberately not redeclared here.
 //
 // Shared, not copied, because the two tiers must agree on what the switch *means*: a
 // ThreadSanitizer run waives both with one variable, and a tier that disagreed would
 // either drown the report in layer noise or claim a GPU-side oracle it did not have.
+// It moved to the renderer's test-support header because the renderer probes cannot
+// reach backend/tests, while the backend tests already have renderer/tests on their
+// include path.
 //
 // Compared against "1" exactly, matching WALLPAPERX_ALLOW_NO_HEAP_TIER: a plain getenv()
 // truthiness check would make "=0" mean "waived", the opposite of what anyone typing it

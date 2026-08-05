@@ -32,8 +32,6 @@ bool hasExtension(const std::vector<VkExtensionProperties>& extensions, const ch
     return false;
 }
 
-VkDebugUtilsMessengerCreateInfoEXT debugMessengerInfo(void* owner);
-
 VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(
     VkDebugUtilsMessageSeverityFlagBitsEXT severity,
     VkDebugUtilsMessageTypeFlagsEXT types,

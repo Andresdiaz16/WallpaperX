@@ -718,6 +718,7 @@ int main(int argc, char** argv) {
 
     // Graded here, after run() returned and therefore after ~Device, which is what makes
     // the layer's teardown complaints countable.
+    bool waivedNoValidator = false;
     if (!g_validationLayerActive) {
         // Honours the same waiver every other probe does, through the same single
         // definition. Without it this binary was the one TSan-tier entry that still went
@@ -728,14 +729,23 @@ int main(int argc, char** argv) {
             std::cout << "modifier_roundtrip_probe (" << what
                       << "): WALLPAPERX_ALLOW_NO_VALIDATION=1 and no validator is loaded -- the GPU-side "
                          "oracle is DISABLED for this run" << std::endl;
-            return 0;
+            // Falls through to the g_notVerified check below rather than returning 0.
+            // Returning here reported an inconclusive run as a pass: under the TSan tier
+            // the waiver is set on every test, so a driver that could not attempt the
+            // substitution at all exited 0 instead of the skip code, and ctest recorded
+            // a claim the run never established. The waiver excuses the missing
+            // validator; it says nothing about whether the subject was verified.
+            waivedNoValidator = true;
+        } else {
+            std::cerr << "modifier_roundtrip_probe (" << what
+                      << "): VK_LAYER_KHRONOS_validation is not loaded, so a zero-warning result "
+                         "validates nothing" << std::endl;
+            return 1;
         }
-        std::cerr << "modifier_roundtrip_probe (" << what
-                  << "): VK_LAYER_KHRONOS_validation is not loaded, so a zero-warning result "
-                     "validates nothing" << std::endl;
-        return 1;
     }
-    const int warnings = g_validationCounter ? g_validationCounter->load() : 0;
+    // Only meaningful when a validator was listening; the waived case has nothing to
+    // count and must not be graded as though it did.
+    const int warnings = waivedNoValidator ? 0 : (g_validationCounter ? g_validationCounter->load() : 0);
     if (warnings > 0) {
         std::cerr << "modifier_roundtrip_probe (" << what << "): " << warnings << " Vulkan validation warning(s)"
                   << std::endl;

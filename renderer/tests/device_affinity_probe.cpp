@@ -538,31 +538,36 @@ int main() {
                              "no conclusion about the affinity guard either way\n", harnessFaults);
         return 1;
     }
-    // Deliberately NOT a skip. A host with no usable Vulkan device cannot test the
-    // affinity guard, but it cannot test anything else in renderer/tests either --
-    // device_probe, offscreen_probe and the rest all fail outright in that situation, and
-    // making this one probe report "Skipped" instead would single it out as optional
-    // while its siblings went red for the same cause. The message still names the real
-    // reason, which is the whole point of separating it from a guard regression; what
-    // changes is only the grade.
+    // Both environment buckets are REPORTED before either returns, so a host that is
+    // missing an ICD for one case and the validation-layer package for another sees both
+    // facts. Ordering them as two early returns hid whichever came second.
+    //
+    // They stay separate because they say different things. `ungraded` means the case
+    // ran and passed and only its validation output went unjudged; `unrunnable` means the
+    // case never ran at all. Folding either into the other produced a false sentence in
+    // an earlier round -- first "the guard is broken", then "these cases did not run".
+    if (ungraded > 0) {
+        std::fprintf(stderr,
+                     "device_affinity_probe: %d validation grade(s) could not be made -- see the reason above. "
+                     "The cases that ran are still judged; their GPU-side cleanliness is not.\n",
+                     ungraded);
+    }
     if (unrunnable > 0) {
-        // Deliberately does not name a single cause: this bucket now collects both "no
-        // usable Vulkan device" and "no validation layer installed", and each case
-        // printed its own reason above. Naming one of them here reported a missing layer
-        // package as a missing GPU.
+        // Names no single cause: each case printed its own reason above, and this bucket
+        // collects any of them. Naming one reported a missing layer package as a missing
+        // GPU.
         std::fprintf(stderr,
                      "device_affinity_probe: %d case(s) could not run -- see the reasons above. These are "
                      "environment failures, not verdicts on the affinity guard.\n",
                      unrunnable);
-        return 1;
     }
-    if (ungraded > 0) {
-        std::fprintf(stderr,
-                     "device_affinity_probe: every case ran and passed, but %d validation grade(s) could not be "
-                     "made -- see the reason above. The guard is verified; its GPU-side cleanliness is not.\n",
-                     ungraded);
-        return 1;
-    }
+
+    // Deliberately NOT a ctest skip. A host that cannot run these cases cannot run
+    // anything else in renderer/tests either -- device_probe, offscreen_probe and the
+    // rest all fail outright in that situation, and reporting this one as "Skipped"
+    // would single it out as optional while its siblings went red for the same cause.
+    // The messages above name the real reason; only the grade is shared.
+    if (unrunnable > 0 || ungraded > 0) return 1;
 
     std::printf("device_affinity_probe: all checks passed\n");
     return 0;

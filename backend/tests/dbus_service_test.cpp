@@ -746,14 +746,24 @@ void runWorkerCoalescingChecks(const wallpaperx::WallpaperManager::Config& confi
             // Two copies of that policy in one suite is how the two tiers come to
             // disagree about what a clean run means -- and the waiver semantics changed
             // under both of them twice in as many rounds.
+            // The waiver covers a missing device here as well as a missing validator.
+            // ValidationGrade only waives the latter -- correctly, since a null counter
+            // in a probe means something went wrong -- but this phase legitimately has no
+            // device when the waived TSan tier builds its manager with validation off.
+            // Saying so explicitly is what keeps the scoped waiver from narrowing a case
+            // this call site had been relying on.
             int failures = 0;
             {
                 wallpaperx::testing::ValidationGrade grade(
                     "dbus_service_test (worker-coalescing phase)", failures);
+                if (wallpaperx::testing::validationWaived()) grade.expectNoDevice();
                 grade.adopt(counter, layerActive);
             }
-            check(failures == 0,
-                  "the worker-coalescing phase's own device produced zero Vulkan validation warnings");
+            // Named for what was actually judged. ValidationGrade has already printed the
+            // specific verdict -- no device, no validator, or a nonzero count -- so a
+            // single label asserting "zero validation warnings" would contradict two of
+            // the three and point the operator at the GPU path for a missing package.
+            check(failures == 0, "the worker-coalescing phase's own device passed its validation grade");
         }
     } gradeOnExit{counter, layerActive, check};
 

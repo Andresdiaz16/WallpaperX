@@ -104,11 +104,17 @@ public:
             // is named "allow no validation"; it may excuse the absence of a validator
             // and nothing else.
             //
-            // CONTROL: with the validation layer loaded and the messenger widened to
-            // INFO so it reports a nonzero count, WALLPAPERX_ALLOW_NO_VALIDATION=1 gave
-            // 4 "FAIL: ... Vulkan validation warning(s)" lines and exit 1. Restoring the
-            // blanket `if (validationWaived()) return;` at the top of this destructor,
-            // same run, same environment: exit 0 and no FAIL at all. Both reverted.
+            // CONTROL: the layer left loaded, and TWO edits in device.cpp to make the
+            // count nonzero -- INFO added to debugMessengerInfo's messageSeverity AND
+            // debugCallback's `severity < WARNING` early return lowered to INFO. Both are
+            // needed; the first alone changes nothing, because the callback discards
+            // sub-WARNING messages before counting. An earlier version of this comment
+            // named only the first, which would have made a maintainer re-running it
+            // conclude the fix was bogus. With those two edits and
+            // WALLPAPERX_ALLOW_NO_VALIDATION=1: 4 "FAIL: ... Vulkan validation
+            // warning(s)" lines, exit 1. Restoring the blanket `if (validationWaived())
+            // return;` at the top of this destructor, same environment: exit 0, no FAIL.
+            // All reverted.
             if (validationWaived()) {
                 announceWaiverOnce();
                 return;
