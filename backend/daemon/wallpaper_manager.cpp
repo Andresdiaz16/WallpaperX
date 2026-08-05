@@ -1,5 +1,6 @@
 #include "wallpaper_manager.h"
 
+#include "log_escape.h"
 #include "renderers/static_renderer.h"
 #include "vulkan/device.h"
 #include "vulkan/offscreen.h"
@@ -142,7 +143,11 @@ void WallpaperManager::releaseTarget(int monitorId) {
 
 void WallpaperManager::requestWallpaper(const std::string& type, const std::string& path, int monitorId) {
     if (!isKnownType(type)) {
-        throw InvalidRequest("unknown wallpaper type '" + type + "' (expected static, video or shader)");
+        // Sanitized because this message is echoed to the log and returned over the bus,
+        // and `type` is whatever the client sent -- a 200 000-character type string was
+        // reproduced in full through both channels.
+        throw InvalidRequest("unknown wallpaper type '" + sanitizeForLog(type) +
+                             "' (expected static, video or shader)");
     }
     requireValidMonitorId(monitorId);
 
@@ -151,16 +156,22 @@ void WallpaperManager::requestWallpaper(const std::string& type, const std::stri
     // come back as a successful reply followed by silence, discoverable only by polling
     // GetStatus. It is an early-out, not a guarantee: a file that exists but is not a
     // decodable image still fails later, on the render thread.
-    if (type == "static") {
-        // Both halves matter, and the message has to match what is actually tested.
-        // Checking only the file type would accept a mode-000 file with a success reply
-        // and then fail it on the render thread, so the same user mistake -- "I gave it
-        // a path it cannot open" -- would surface through two different channels
-        // depending on why it could not be opened.
-        std::error_code ec;
-        if (!std::filesystem::is_regular_file(path, ec) || ::access(path.c_str(), R_OK) != 0) {
-            throw InvalidRequest("'" + path + "' is not a readable file");
-        }
+    //
+    // Applied to every known type, not just "static". While it sat inside a
+    // `type == "static"` branch, an empty string, a nonexistent path and a directory were
+    // all *accepted* for video and shader -- the identical inputs the branch exists to
+    // reject -- and the monitor then sat frameless forever with nothing to say why. That
+    // asymmetry has to be closed here rather than when Step 13 makes video real, because
+    // by then the rejection is the behaviour a client already depends on.
+    //
+    // Both halves of the check matter, and the message has to match what is actually
+    // tested. Checking only the file type would accept a mode-000 file with a success
+    // reply and then fail it on the render thread, so the same user mistake -- "I gave it
+    // a path it cannot open" -- would surface through two different channels depending on
+    // why it could not be opened.
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(path, ec) || ::access(path.c_str(), R_OK) != 0) {
+        throw InvalidRequest("'" + sanitizeForLog(path) + "' is not a readable file");
     }
 
     std::lock_guard<std::mutex> stateLock(m_stateMutex);
@@ -214,6 +225,13 @@ RenderOutcome WallpaperManager::renderPending(int monitorId) {
         auto it = m_monitors.find(monitorId);
         if (it != m_monitors.end() && it->second.requestSeq == seq) {
             it->second.servicedSeq = seq;
+            // Recorded as an error even though nothing failed, because from the outside
+            // this is indistinguishable from a render still in flight without it: the
+            // monitor was accepted, is serviced, has no frame and never will in this
+            // build. GetStatus previously showed has_frame=false and no last_error, which
+            // is exactly what a queued static request looks like.
+            it->second.lastError = "wallpaper type '" + type +
+                                   "' is accepted but cannot be rendered by this build";
         }
         return {};
     }
@@ -326,6 +344,17 @@ FrameExport WallpaperManager::exportCurrentFrame(int monitorId) {
             // only by a render that ran and failed, and cleared both when a new request
             // is recorded and when a render commits -- so a non-empty one is exactly
             // "the most recent attempt failed and nothing has superseded it".
+            //
+            // The type is consulted first and independently of lastError, because this
+            // answer is true from the instant the request is recorded: a video request
+            // will not produce a frame in this build whether or not the worker has
+            // reached it yet, so keying on the worker's progress would answer "not yet"
+            // for a window and "never" afterwards for the same unchanged request.
+            if (it->second.type != "static") {
+                out.reason = NoFrameReason::Unsupported;
+                out.lastError = it->second.lastError;
+                return out;
+            }
             if (!it->second.lastError.empty()) {
                 out.reason = NoFrameReason::RenderFailed;
                 out.lastError = it->second.lastError;

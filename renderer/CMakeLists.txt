@@ -173,6 +173,19 @@ target_compile_definitions(wallpaperx-static-renderer-probe PRIVATE
     WALLPAPERX_TEST_IMAGE_DIR="${CMAKE_CURRENT_BINARY_DIR}/test_assets"
 )
 
+# S4.9's probe interposes malloc/calloc/realloc to see stb_image's pixel allocation. Its
+# own test assets are written to a directory of their own (bounds_*.png) so it never
+# shares a file with static_renderer_probe, and it needs tests/ on the include path for
+# support/validation_grade.h.
+add_executable(wallpaperx-image-bounds-probe tests/image_bounds_probe.cpp)
+target_link_libraries(wallpaperx-image-bounds-probe PRIVATE wallpaperx-renderer)
+target_include_directories(wallpaperx-image-bounds-probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+add_dependencies(wallpaperx-image-bounds-probe wallpaperx-shaders)
+target_compile_definitions(wallpaperx-image-bounds-probe PRIVATE
+    WALLPAPERX_SHADER_DIR="${SHADER_OUTPUT_DIR}"
+    WALLPAPERX_TEST_IMAGE_DIR="${CMAKE_CURRENT_BINARY_DIR}/test_assets"
+)
+
 add_executable(wallpaperx-descriptor-allocator-probe tests/descriptor_allocator_probe.cpp)
 target_link_libraries(wallpaperx-descriptor-allocator-probe PRIVATE wallpaperx-renderer)
 
@@ -231,6 +244,7 @@ add_test(NAME device_probe COMMAND wallpaperx-device-probe)
 add_test(NAME offscreen_probe COMMAND wallpaperx-offscreen-probe)
 add_test(NAME device_affinity_probe COMMAND wallpaperx-device-affinity-probe)
 add_test(NAME static_renderer_probe COMMAND wallpaperx-static-renderer-probe)
+add_test(NAME image_bounds_probe COMMAND wallpaperx-image-bounds-probe)
 add_test(NAME descriptor_allocator_probe COMMAND wallpaperx-descriptor-allocator-probe)
 add_test(NAME frame_export_probe COMMAND wallpaperx-frame-export-probe)
 # Two entries, one binary. The probe makes two claims that are verifiable on different
@@ -248,6 +262,18 @@ add_test(NAME modifier_sensitivity_probe COMMAND wallpaperx-modifier-roundtrip-p
 # which would otherwise risk one process reading a half-written PNG from
 # the other.
 set_tests_properties(static_renderer_probe PROPERTIES RESOURCE_LOCK static_renderer_probe_test_image)
+
+# image_bounds_probe writes bounds_*.png under the same WALLPAPERX_TEST_IMAGE_DIR and,
+# like the others, is one binary registered twice -- so its two entries share a lock of
+# their own. Its measurement is an allocation *count*, not a timing, so it does not need
+# to be serialised against the rest of the suite.
+#
+# SKIP_RETURN_CODE 77 because a sanitized build cannot host the probe's malloc
+# interposition (TSan/ASan intercept the allocator themselves), and the probe says so and
+# exits 77 there. Without this, that run would exit 0 and a tier that verified nothing
+# about the decoded-size bound would be indistinguishable from one that verified it.
+set_tests_properties(image_bounds_probe PROPERTIES
+                     RESOURCE_LOCK image_bounds_probe_test_image SKIP_RETURN_CODE 77)
 
 # Same hazard for frame_export_probe, which writes its own gradient PNG: the probe and
 # its _lavapipe twin are one binary run twice, so they share the file regardless of it
@@ -270,6 +296,7 @@ if(WALLPAPERX_LAVAPIPE_ICD)
     add_test(NAME offscreen_probe_lavapipe COMMAND wallpaperx-offscreen-probe)
     add_test(NAME device_affinity_probe_lavapipe COMMAND wallpaperx-device-affinity-probe)
     add_test(NAME static_renderer_probe_lavapipe COMMAND wallpaperx-static-renderer-probe)
+    add_test(NAME image_bounds_probe_lavapipe COMMAND wallpaperx-image-bounds-probe)
     add_test(NAME descriptor_allocator_probe_lavapipe COMMAND wallpaperx-descriptor-allocator-probe)
     # Unlike the Heap tier, frame export needs no capability-skip under Lavapipe:
     # Lavapipe advertises both VK_KHR_external_memory_fd and
@@ -285,6 +312,7 @@ if(WALLPAPERX_LAVAPIPE_ICD)
         offscreen_probe_lavapipe
         device_affinity_probe_lavapipe
         static_renderer_probe_lavapipe
+        image_bounds_probe_lavapipe
         descriptor_allocator_probe_lavapipe
         frame_export_probe_lavapipe
         modifier_roundtrip_probe_lavapipe
@@ -298,6 +326,8 @@ if(WALLPAPERX_LAVAPIPE_ICD)
             LABELS "lavapipe"
     )
     set_tests_properties(static_renderer_probe_lavapipe PROPERTIES RESOURCE_LOCK static_renderer_probe_test_image)
+    set_tests_properties(image_bounds_probe_lavapipe PROPERTIES
+                         RESOURCE_LOCK image_bounds_probe_test_image SKIP_RETURN_CODE 77)
     set_tests_properties(frame_export_probe_lavapipe PROPERTIES RESOURCE_LOCK frame_export_probe_test_image)
     set_tests_properties(modifier_roundtrip_probe_lavapipe modifier_sensitivity_probe_lavapipe
                          PROPERTIES RESOURCE_LOCK modifier_roundtrip_probe_test_image SKIP_RETURN_CODE 77)

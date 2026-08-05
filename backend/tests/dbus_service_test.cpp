@@ -56,6 +56,7 @@
 #include <regex>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -105,6 +106,27 @@ constexpr int32_t kMonitorWorkerCoalesce = 10;
 // fault, pointing at the wrong property.
 constexpr int32_t kMonitorRejectedPaths = 11;
 
+// Used only by runUnservicedRequestChecks, which brings a WallpaperManager and a
+// DbusService of its own. Numbered on from the ids above even though they live in a
+// different manager: an id that means two things in one file is how a check quietly
+// starts observing the wrong monitor.
+constexpr int32_t kMonitorUnservicedStatic = 12;
+constexpr int32_t kMonitorUnservicedVideo = 13;
+constexpr int32_t kMonitorUnservicedNeverSet = 14;
+
+// The three error names GetFrameFd answers with when there is no frame. S6.39 is the
+// claim that these are three and not two, so they are named once, here, and compared by
+// constant -- a literal repeated at each site is how two of them come to be spelled the
+// same by accident.
+constexpr const char* kErrNoFrame = "io.wallpaperx.Daemon.Error.NoFrame";
+constexpr const char* kErrRenderFailed = "io.wallpaperx.Daemon.Error.RenderFailed";
+constexpr const char* kErrUnsupported = "io.wallpaperx.Daemon.Error.Unsupported";
+static_assert(std::string_view(kErrNoFrame) != std::string_view(kErrRenderFailed) &&
+                  std::string_view(kErrNoFrame) != std::string_view(kErrUnsupported) &&
+                  std::string_view(kErrRenderFailed) != std::string_view(kErrUnsupported),
+              "the three frameless error names must be distinct, or the S6.39 checks that assert them "
+              "side by side would pass for a daemon that had collapsed two of them");
+
 // How many requests each coalescing burst fires at one monitor. Five is enough that a
 // worker draining one per render still leaves several to collapse.
 constexpr int kBurstSize = 5;
@@ -141,6 +163,23 @@ std::string writeTestImage() {
     if (!stbi_write_png(path.c_str(), w, h, 4, pixels.data(), w * 4)) {
         throw std::runtime_error("dbus_service_test: failed to write test image");
     }
+    return path;
+}
+
+// A file that exists, is a regular file and is readable -- and nothing more.
+//
+// Needed because SetWallpaper now applies the readable-regular-file check to *every*
+// known type (S6.38), so the old `"/tmp/wallpaperx-test.mp4"`, which was never created,
+// is rejected on the reply and never reaches the recorded-but-unrenderable state the
+// checks below are about. Its contents are irrelevant: this build does not render video,
+// so nothing ever opens it.
+std::string writeVideoStub() {
+    std::filesystem::create_directories(testAssetDir());
+    const std::string path = testAssetDir() + "/dbus_test_video.mp4";
+    std::ofstream out(path, std::ios::binary);
+    out << "not a real video";
+    out.close();
+    if (!out) throw std::runtime_error("dbus_service_test: failed to write " + path);
     return path;
 }
 
@@ -367,6 +406,65 @@ void runHostChecks(sdbus::IProxy& proxy, const std::string& imagePath, const Che
                                                      std::filesystem::perms::owner_write,
                                  std::filesystem::perm_options::replace, permEc);
 
+    // GOAL: S6.38 -- the path check applies to every known type. An empty string, a
+    //       nonexistent path and a directory are InvalidArgs for `video` and `shader`
+    //       exactly as they are for `static`.
+    // WHY-THIS-SHAPE: driven as a table over both types and all three paths rather than
+    //       as one representative case, because the defect being closed was a *branch*
+    //       (`if (type == "static")`) and a single case cannot distinguish "the check
+    //       moved out of the branch" from "the check is still in the branch and this one
+    //       path happens to fail for another reason". The final assertion is the one that
+    //       makes it about S6.38 rather than about error names: after six rejections the
+    //       monitor must still read as never set. If any rejection had instead been
+    //       *accepted*, the request would be recorded and GetFrameFd would answer
+    //       Unsupported (video/shader are non-static) rather than NoFrame -- so that line
+    //       fails loudly in the exact configuration this goal forbids, which is the
+    //       silence ("accepted, then frameless forever") the goal describes.
+    // CONTROL: the path check in WallpaperManager::requestWallpaper put back inside
+    //       `if (type == "static")` -> 6 FAILs ("video/shader rejects an empty path /
+    //       a nonexistent path / a directory as InvalidArgs") plus "FAIL: a monitor whose
+    //       every request was rejected is still reported as never set", which came back
+    //       as io.wallpaperx.Daemon.Error.Unsupported. Reverted.
+    // COVERAGE-ASSERT: the number of (type, path) pairs actually driven is counted and
+    //       asserted against the table's own size, so an edit that empties or short-
+    //       circuits the loop fails instead of silently asserting nothing.
+    {
+        const std::string cases[][2] = {
+            {"", "an empty path"},
+            {"/nonexistent/wallpaperx-video.mp4", "a nonexistent path"},
+            {testAssetDir(), "a directory"},
+        };
+        int rejected = 0;
+        int driven = 0;
+        for (const char* type : {"video", "shader"}) {
+            for (const auto& [path, description] : cases) {
+                ++driven;
+                if (errorNameFrom([&] { setWallpaper(proxy, type, path, kMonitorRejectedPaths); }) ==
+                    "org.freedesktop.DBus.Error.InvalidArgs") {
+                    ++rejected;
+                } else {
+                    std::fprintf(stderr, "FAIL: a %s wallpaper with %s is not rejected as InvalidArgs\n", type,
+                                 description.c_str());
+                }
+            }
+        }
+        check(rejected == driven, "every non-static type rejects an empty path, a nonexistent path and a directory");
+        check(driven == 6, "all six (type, path) rejection cases were actually driven");
+
+        // The point of the goal, as opposed to its symptom: a rejected request must not
+        // be *recorded*. A recorded video request answers Unsupported, not NoFrame.
+        const std::string afterRejections = errorNameFrom([&] { getFrameFd(proxy, kMonitorRejectedPaths); });
+        check(afterRejections == kErrNoFrame,
+              "a monitor whose every request was rejected is still reported as never set");
+        if (afterRejections != kErrNoFrame) {
+            std::fprintf(stderr, "  it answered '%s', so one of the rejected requests was recorded\n",
+                         afterRejections.c_str());
+        }
+        check(errorMessageFrom([&] { getFrameFd(proxy, kMonitorRejectedPaths); }).find("call SetWallpaper first") !=
+                  std::string::npos,
+              "a monitor whose every request was rejected is told to call SetWallpaper first");
+    }
+
     // Lock the whole wire contract: every argument of every method and signal, in
     // order. The KDE plugin (Step 12) is generated against it, so a reordering, a type
     // change or a dropped slot must fail here rather than at plugin-import time -- a
@@ -430,7 +528,7 @@ void runHostChecks(sdbus::IProxy& proxy, const std::string& imagePath, const Che
 // Checks that render on the GPU and export a real frame.
 // --------------------------------------------------------------------------- //
 void runRenderChecks(sdbus::IProxy& proxy, FrameReadyLog& signals, const std::string& imagePath,
-                     const std::string& corruptPath, const Check& check) {
+                     const std::string& corruptPath, const std::string& videoPath, const Check& check) {
     // Timed, because this is the one behaviour nothing else here can distinguish: every
     // other assertion in this function is satisfied just as well by rendering inside the
     // handler. This is also the most expensive request the daemon ever serves -- the
@@ -600,50 +698,64 @@ void runRenderChecks(sdbus::IProxy& proxy, FrameReadyLog& signals, const std::st
 
     // These three are posted before a request that does signal. The daemon does all GPU
     // work on one FIFO thread, so once the barrier's FrameReady arrives, they have
-    // provably been processed -- no sleep, no flake.
-    setWallpaper(proxy, "video", "/tmp/wallpaperx-test.mp4", kMonitorVideo);
+    // provably been processed -- no sleep, no flake. That is also what makes the
+    // last_error assertion below deterministic: the worker writes the video monitor's
+    // last_error while servicing it, which is strictly before the barrier renders.
+    setWallpaper(proxy, "video", videoPath, kMonitorVideo);
     setWallpaper(proxy, "static", corruptPath, kMonitorCorrupt);
     setWallpaper(proxy, "static", imagePath, kMonitorBarrier);
     check(signals.wait(kMonitorBarrier, 1), "FrameReady arrives for the barrier request");
 
     check(signals.countFor(kMonitorVideo) == 0, "a video request emits no FrameReady");
-    check(errorNameFrom([&] { getFrameFd(proxy, kMonitorVideo); }) == "io.wallpaperx.Daemon.Error.NoFrame",
-          "a video wallpaper is recorded but yields no frame");
-
-    // GOAL: S6.7 -- NoFrame for a monitor whose request is recorded but has produced
-    //       nothing yet is ordinary protocol state, and is reported *distinctly* from
-    //       a monitor nothing was ever set on. The two need different client
-    //       responses: one says "your request is in flight", the other "you never made
-    //       one".
-    // WHY-THIS-SHAPE: asserting only the error name cannot separate them -- both are
-    //       NoFrame by design, which is the whole reason the reason lives in the
-    //       message. So the message is what is compared, and both directions are
-    //       asserted together so a daemon that collapsed NoFrameReason back to one
-    //       branch fails whichever way it collapsed. The video monitor is used because
-    //       it is the one state reachable from outside that stays NotRendered: a
-    //       static request is serviced by the same FIFO thread that answers
-    //       GetFrameFd, so its export task can never overtake its own render.
-    // CONTROL: NoFrameReason::NotRendered folded into NeverRequested in
-    //       wallpaper_manager.cpp -> "FAIL: a recorded-but-unrendered monitor is not
-    //       told to call SetWallpaper first". Reverted.
-    const std::string videoReason = errorMessageFrom([&] { getFrameFd(proxy, kMonitorVideo); });
-    check(videoReason.find("call SetWallpaper first") == std::string::npos,
-          "a recorded-but-unrendered monitor is not told to call SetWallpaper first");
-    check(errorMessageFrom([&] { getFrameFd(proxy, kMonitorNeverSet); }).find("call SetWallpaper first") !=
-              std::string::npos,
-          "a monitor that was never set is told to call SetWallpaper first");
-
     // Still 1: the good render above, and nothing for the corrupt one that followed.
     check(signals.countFor(kMonitorCorrupt) == 1, "a render that fails emits no FrameReady");
-    // RenderFailed, not NoFrame, and this is the whole point of the distinction: this
-    // monitor and kMonitorVideo above are both frameless, but one will produce a frame
-    // if the client waits and the other never will. Answering both with NoFrame told a
-    // polling consumer to retry a wallpaper that cannot succeed. Asserted next to the
-    // video case deliberately -- if the two ever collapse back to one error name, one of
-    // these two lines fails.
-    check(errorNameFrom([&] { getFrameFd(proxy, kMonitorCorrupt); }) ==
-              "io.wallpaperx.Daemon.Error.RenderFailed",
-          "a failed render is reported as RenderFailed, distinctly from a monitor with nothing rendered yet");
+
+    // GOAL: S6.39 -- the frameless taxonomy has *three* names, not two, because a client
+    //       must respond to them differently: NoFrame means retry, RenderFailed means
+    //       stop and show the reason, Unsupported means stop and stop asking, since
+    //       nothing about a running build will change it.
+    // WHY-THIS-SHAPE: the three names are collected first and asserted together, against
+    //       three monitors driven into the three states by the barrier above, rather than
+    //       being checked one per scenario where they happen to arise. A daemon that
+    //       collapses any *pair* -- which is the regression, and is what shipping code did
+    //       for Unsupported-into-NoFrame -- then fails on the line naming the state it
+    //       lost, whichever pair it was. Checking them apart cannot do that: a lone
+    //       `== NoFrame` assertion passes for a daemon that answers NoFrame to
+    //       everything. All three are printed so a failure shows the taxonomy that was
+    //       actually observed rather than one mismatched string.
+    // CONTROL: two, from opposite ends, and they land on different names -- which is why
+    //       the printed line above reports what was observed rather than only what was
+    //       expected. (a) the `reason == Unsupported` branch deleted from
+    //       DbusService::completeGetFrameFd: the taxonomy line read "unrenderable type:
+    //       'io.wallpaperx.Daemon.Error.NoFrame'" -> "FAIL: a wallpaper type this build
+    //       cannot render is reported as Unsupported", NoFrame and RenderFailed still
+    //       green. (b) `exportCurrentFrame`'s `type != "static"` branch disabled: the
+    //       video monitor fell through to the lastError test the worker had already
+    //       written, so it answered "io.wallpaperx.Daemon.Error.RenderFailed" -> the same
+    //       FAIL, this time collapsing the other pair. Both reverted.
+    {
+        const std::string neverSet = errorNameFrom([&] { getFrameFd(proxy, kMonitorNeverSet); });
+        const std::string failed = errorNameFrom([&] { getFrameFd(proxy, kMonitorCorrupt); });
+        const std::string unsupported = errorNameFrom([&] { getFrameFd(proxy, kMonitorVideo); });
+        std::printf("dbus_service_test: frameless taxonomy -- never set: '%s', failed render: '%s', "
+                    "unrenderable type: '%s'\n",
+                    neverSet.c_str(), failed.c_str(), unsupported.c_str());
+
+        check(neverSet == kErrNoFrame, "a monitor that was never set is reported as NoFrame");
+        check(failed == kErrRenderFailed,
+              "a failed render is reported as RenderFailed, distinctly from a monitor with nothing rendered yet");
+        check(unsupported == kErrUnsupported,
+              "a wallpaper type this build cannot render is reported as Unsupported, distinctly from both");
+
+        // The name is only half of it: an Unsupported reply that carried NoFrame's "call
+        // SetWallpaper first" text would send a client back round the same loop the new
+        // name exists to break.
+        const std::string unsupportedText = errorMessageFrom([&] { getFrameFd(proxy, kMonitorVideo); });
+        check(unsupportedText.find("call SetWallpaper first") == std::string::npos,
+              "the Unsupported reply does not tell the client to call SetWallpaper first");
+        check(unsupportedText.find("no frame will ever be produced") != std::string::npos,
+              "the Unsupported reply says the wait is pointless rather than merely that there is no frame");
+    }
 
     // GOAL: S6.14 -- the RenderFailed reply carries the render's *own* error text, so
     //       a client that never sees GetStatus can still say why the wallpaper is
@@ -693,6 +805,149 @@ void runRenderChecks(sdbus::IProxy& proxy, FrameReadyLog& signals, const std::st
             video->value("type", std::string()) == "video" && !video->value("has_frame", true);
         check(reflected, "GetStatus reflects per-monitor type, path, size, generation and frame availability");
     }
+
+    // GOAL: S6.39's second half -- the unrenderable state is visible on GetStatus too.
+    //       `has_frame=false` with no `last_error` is exactly what a static render still
+    //       in flight looks like, so without an error line a client polling GetStatus
+    //       cannot tell "wait a moment" from "never".
+    // WHY-THIS-SHAPE: asserted as a *pair* -- the video monitor carries a last_error while
+    //       the successfully-rendered monitor does not -- because "last_error is present"
+    //       alone is satisfied by a daemon that writes one on every monitor, which would
+    //       destroy the distinction in the other direction and make S6.17 false. The text
+    //       is required to name the type rather than matched literally: the type is what
+    //       makes the message actionable, and pinning the whole sentence would break on
+    //       any wording edit. The barrier above is what makes this deterministic; without
+    //       it, an absent last_error would mean "the worker has not reached the request
+    //       yet" and the check would be timing, not behaviour.
+    // CONTROL: the `it->second.lastError = ...` assignment deleted from renderPending's
+    //       non-static branch -> "FAIL: GetStatus reports last_error for a wallpaper type
+    //       this build cannot render", while the paired "a monitor that rendered
+    //       successfully carries no last_error" line stayed green. Reverted.
+    {
+        const nlohmann::json json = getStatus(proxy);
+        const nlohmann::json* video = wallpaperStatus(json, std::to_string(kMonitorVideo));
+        const nlohmann::json* rendered = wallpaperStatus(json, std::to_string(kMonitorBarrier));
+        const std::string videoError = video == nullptr ? std::string() : video->value("last_error", std::string());
+        check(!videoError.empty(),
+              "GetStatus reports last_error for a wallpaper type this build cannot render, so it is "
+              "distinguishable from a render still in flight");
+        check(videoError.find("video") != std::string::npos,
+              "the unrenderable monitor's last_error names the type that cannot be rendered");
+        check(rendered != nullptr && rendered->value("has_frame", false) && !rendered->contains("last_error"),
+              "a monitor that rendered successfully carries no last_error (so last_error still means something)");
+        if (!videoError.empty()) {
+            std::printf("dbus_service_test: unrenderable monitor's last_error: '%s'\n", videoError.c_str());
+        }
+    }
+}
+
+// --------------------------------------------------------------------------- //
+// The states a request passes through before anything has rendered it.
+//
+// This phase exists because those states became unreachable through the daemon the test
+// drives above, and the reason is structural rather than incidental. RenderWorker holds
+// one FIFO for renders and export tasks alike (its own header says so), and
+// DbusService::setWallpaper posts the render from the same event-loop thread that would
+// post a later GetFrameFd's export task. So over the bus, an export can never overtake
+// the render of the request that preceded it: by the time GetFrameFd is serviced, the
+// monitor has either a frame or a failure. Until 2026-08-05 the `video` monitor stood in
+// for this -- it stayed recorded-but-unrendered forever -- but a video request now answers
+// Unsupported, which is a different state with a different name.
+//
+// The way back to it is to record the request WITHOUT queueing a render: calling
+// WallpaperManager::requestWallpaper directly does exactly that, since it is
+// DbusService::setWallpaper's `m_worker.post()` -- not the manager -- that schedules the
+// work. Everything the checks then observe still crosses the real wire, through the real
+// handler, on the real worker thread: only the render is absent, which is the state under
+// test. Same argument as the coalescing phase below: the bus is skipped where, and only
+// where, driving through it cannot state the claim.
+//
+// Its own manager, connection and service, on the connection's unique bus name rather
+// than io.wallpaperx.Daemon -- the phases above own that name, and a second holder would
+// either be refused or steal it. No render is ever posted here, so this manager never
+// builds a Device: the phase costs nothing on the GPU and has no validation grade to
+// make, which is why it does not take one.
+void runUnservicedRequestChecks(const wallpaperx::WallpaperManager::Config& config, const std::string& imagePath,
+                                const std::string& videoPath, const Check& check) {
+    wallpaperx::WallpaperManager manager(config);
+
+    auto serviceConn = sdbus::createSessionBusConnection();
+    DbusService service(*serviceConn, manager);
+    serviceConn->enterEventLoopAsync();
+
+    auto proxyOwner = sdbus::createProxy(sdbus::ServiceName{serviceConn->getUniqueName()},
+                                         sdbus::ObjectPath{DbusService::kObjectPath});
+    sdbus::IProxy& proxy = *proxyOwner;
+
+    // Recorded, not queued. This is the whole mechanism of the phase, so it is asserted
+    // rather than assumed: a request that had been rendered would answer with a frame and
+    // the checks below would silently be measuring something else.
+    manager.requestWallpaper("static", imagePath, kMonitorUnservicedStatic);
+    manager.requestWallpaper("video", videoPath, kMonitorUnservicedVideo);
+
+    // GOAL: S6.7 -- a monitor whose request is recorded but has produced nothing yet is
+    //       NoFrame, and that is ordinary protocol state, reported *distinctly* from a
+    //       monitor nothing was ever set on. The two demand different client responses:
+    //       "your request is in flight, ask again" versus "you never made one".
+    // WHY-THIS-SHAPE: both directions are asserted together, and on the *message* rather
+    //       than the name, because both states are NoFrame by design -- which is precisely
+    //       why the reason lives in the text. A single-direction check passes for a daemon
+    //       that gives every monitor the same advice. This phase drives it from an
+    //       unserviced request because the route the old check used is gone: it used the
+    //       `video` monitor, which is now Unsupported, and no *static* request can be
+    //       caught mid-flight over the bus (see the note above this function). The
+    //       alternative of racing a real render and hoping to beat it would be an
+    //       assertion on the scheduler.
+    // CONTROL: NoFrameReason::NotRendered folded into NeverRequested in
+    //       WallpaperManager::exportCurrentFrame (the else-branch returning
+    //       NeverRequested) -> "FAIL: a recorded-but-unrendered monitor is not told to
+    //       call SetWallpaper first", with the never-set line still green. Reverted.
+    const std::string pendingName = errorNameFrom([&] { getFrameFd(proxy, kMonitorUnservicedStatic); });
+    check(pendingName == kErrNoFrame,
+          "a recorded-but-unrendered static monitor is reported as NoFrame, not as a failure");
+    const std::string pendingText = errorMessageFrom([&] { getFrameFd(proxy, kMonitorUnservicedStatic); });
+    check(pendingText.find("call SetWallpaper first") == std::string::npos,
+          "a recorded-but-unrendered monitor is not told to call SetWallpaper first");
+    check(errorMessageFrom([&] { getFrameFd(proxy, kMonitorUnservicedNeverSet); }).find("call SetWallpaper first") !=
+              std::string::npos,
+          "a monitor that was never set is told to call SetWallpaper first");
+    if (pendingName != kErrNoFrame) {
+        std::fprintf(stderr, "  the unserviced monitor answered '%s': '%s'\n", pendingName.c_str(),
+                     pendingText.c_str());
+    }
+
+    // GOAL: S6.39's keying -- Unsupported is decided from the recorded *type*, not from
+    //       whether the worker has serviced the request yet.
+    // WHY-THIS-SHAPE: this is the one place the distinction is observable. In the bus
+    //       phase every video request has been serviced by the time it is asked about (the
+    //       barrier guarantees it), so an implementation keyed on servicedSeq would pass
+    //       there. Here nothing has been serviced at all, so a servicedSeq-keyed daemon
+    //       answers NoFrame/NotRendered -- "not yet" for a request whose answer is
+    //       "never", which is the retry loop S6.39 exists to break. Asserted beside the
+    //       unserviced *static* monitor above, which must answer NoFrame in the same
+    //       instant: the pair is what shows the daemon is branching on type rather than
+    //       on progress.
+    // CONTROL: `if (it->second.type != "static")` in exportCurrentFrame made conditional
+    //       on `servicedSeq == requestSeq` as well -> "FAIL: an unrenderable type is
+    //       Unsupported from the moment it is recorded, before any worker has seen it"
+    //       (diagnostic: it answered io.wallpaperx.Daemon.Error.NoFrame), and that FAIL
+    //       was the ONLY one in the run: the bus tier's taxonomy line still read
+    //       Unsupported throughout. A servicedSeq-keyed daemon is invisible to every
+    //       check outside this phase. Reverted.
+    const std::string unservicedVideo = errorNameFrom([&] { getFrameFd(proxy, kMonitorUnservicedVideo); });
+    check(unservicedVideo == kErrUnsupported,
+          "an unrenderable type is Unsupported from the moment it is recorded, before any worker has seen it");
+    if (unservicedVideo != kErrUnsupported) {
+        std::fprintf(stderr, "  an unserviced video monitor answered '%s'\n", unservicedVideo.c_str());
+    }
+
+    // The premise, stated as an assertion: nothing in this phase rendered. Without it a
+    // future edit that posts a render here would leave every check above passing for the
+    // wrong reason -- or failing, with nothing to say why.
+    const nlohmann::json json = getStatus(proxy);
+    const nlohmann::json* pending = wallpaperStatus(json, std::to_string(kMonitorUnservicedStatic));
+    check(pending != nullptr && !pending->value("has_frame", true) && !pending->contains("last_error"),
+          "the unserviced monitor really is unserviced: recorded, no frame, and no error");
 }
 
 // --------------------------------------------------------------------------- //
@@ -1174,6 +1429,7 @@ int main() {
         const std::string imagePath = writeTestImage();
         const std::string corruptPath =
             wallpaperx::testing::writeUndecodableFile(testAssetDir(), "dbus_test_corrupt.png");
+        const std::string videoPath = writeVideoStub();
         const std::vector<std::string> burstPaths = writeBurstImages();
 
         // Declared before everything it outlives. The signal callback below captures it,
@@ -1223,8 +1479,13 @@ int main() {
             .call([&signals](int32_t monitorId, uint64_t generation) { signals.record(monitorId, generation); });
 
         runHostChecks(*proxy, imagePath, check);
-        runRenderChecks(*proxy, signals, imagePath, corruptPath, check);
+        runRenderChecks(*proxy, signals, imagePath, corruptPath, videoPath, check);
         runCoalescingChecks(*proxy, signals, imagePath, corruptPath, burstPaths, check);
+
+        // Its own manager, connection and service; no GPU work at all. Placed before the
+        // worker-coalescing phase only for reading order -- it shares no state with
+        // either neighbour.
+        runUnservicedRequestChecks(config, imagePath, videoPath, check);
 
         // Its own manager and Device, scoped inside the call so both are torn down
         // before the validation warning count is read below.

@@ -1,5 +1,6 @@
 #include "dbus_service.h"
 
+#include "log_escape.h"
 #include "wallpaper_manager.h"
 
 #include <nlohmann/json.hpp>
@@ -19,6 +20,12 @@ namespace {
 constexpr const char* kErrorNoFrame = "io.wallpaperx.Daemon.Error.NoFrame";
 constexpr const char* kErrorExportFailed = "io.wallpaperx.Daemon.Error.ExportFailed";
 constexpr const char* kErrorRenderFailed = "io.wallpaperx.Daemon.Error.RenderFailed";
+// The third answer to "why is there no frame", distinct from the two above because it
+// calls for a third response: NoFrame means retry, RenderFailed means stop and show the
+// reason, Unsupported means stop and stop asking -- nothing about this build will change
+// while it runs. It was previously collapsed into NoFrame, so a client polling a video
+// wallpaper was told to retry forever.
+constexpr const char* kErrorUnsupported = "io.wallpaperx.Daemon.Error.Unsupported";
 constexpr const char* kErrorInvalidArgs = "org.freedesktop.DBus.Error.InvalidArgs";
 
 }  // namespace
@@ -95,8 +102,13 @@ void DbusService::setWallpaper(const std::string& type, const std::string& path,
     // floor, so the daemon's log is the only place a failed request is visible -- and
     // logging after the call meant the requests that failed were exactly the ones that
     // left no trace, making them indistinguishable from requests that never arrived.
-    std::printf("wallpaperx-daemon: SetWallpaper(type=%s, path=%s, monitor=%d)\n", type.c_str(), path.c_str(),
-                monitorId);
+    //
+    // Both strings come straight off the wire, so both go through sanitizeForLog: a path
+    // containing newlines used to be printed verbatim, which let any client that could
+    // reach the bus write whole lines of its own choosing into this log in the daemon's
+    // own format. See log_escape.h.
+    std::printf("wallpaperx-daemon: SetWallpaper(type=%s, path=%s, monitor=%d)\n",
+                sanitizeForLog(type).c_str(), sanitizeForLog(path).c_str(), monitorId);
     std::fflush(stdout);
 
     try {
@@ -142,6 +154,19 @@ void DbusService::completeGetFrameFd(FrameFdCall call, int32_t monitorId) {
             call.returnError(sdbus::Error(sdbus::Error::Name{kErrorRenderFailed},
                                           "the last render for monitor " + std::to_string(monitorId) +
                                               " failed: " + exported.lastError));
+            return;
+        }
+        if (exported.reason == NoFrameReason::Unsupported) {
+            // lastError is written by the worker when it services the request, so a call
+            // that arrives first legitimately finds it empty -- appended only when there
+            // is something to append, rather than emitting a message ending in ": ".
+            std::string message = "monitor " + std::to_string(monitorId) +
+                                  " holds a wallpaper this build cannot render, so no frame will ever be "
+                                  "produced for it";
+            if (!exported.lastError.empty()) {
+                message += ": " + exported.lastError;
+            }
+            call.returnError(sdbus::Error(sdbus::Error::Name{kErrorUnsupported}, std::move(message)));
             return;
         }
         call.returnError(

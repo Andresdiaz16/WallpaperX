@@ -69,9 +69,11 @@ struct FrameHandle {
 // forever.
 enum class NoFrameReason {
     NeverRequested,  // nothing has ever been set on this monitor
-    NotRendered,     // a request is recorded but no frame has committed -- still queued,
-                     // still rendering, or a type this build cannot render (video)
+    NotRendered,     // a request is recorded but no frame has committed -- still queued
+                     // or still rendering. Temporary by definition: retrying is correct.
     RenderFailed,    // the last render was attempted and failed; lastError says why
+    Unsupported,     // the recorded type (video, shader) cannot be rendered by this build,
+                     // so no amount of waiting or retrying will produce a frame
 };
 
 // The result of asking for a monitor's current frame: the frame, or the reason there
@@ -79,8 +81,9 @@ enum class NoFrameReason {
 struct FrameExport {
     std::optional<FrameHandle> handle;
 
-    // Both meaningful only when `handle` is empty. lastError is non-empty exactly when
-    // reason is RenderFailed.
+    // Both meaningful only when `handle` is empty. lastError is always non-empty for
+    // RenderFailed, usually non-empty for Unsupported (the worker writes it when it
+    // services the request, so a caller can beat it there), and empty otherwise.
     NoFrameReason reason = NoFrameReason::NeverRequested;
     std::string lastError;
 };

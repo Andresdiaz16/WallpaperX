@@ -69,6 +69,7 @@
 #include <vector>
 
 #include <fcntl.h>
+#include <poll.h>
 #include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -105,6 +106,9 @@ constexpr int32_t kMonitorStormBase = 20;  // .. kMonitorStormBase + kStormMonit
 constexpr int32_t kStormMonitors = 4;
 constexpr int32_t kMonitorBarrierPre = 30;
 constexpr int32_t kMonitorBarrierPost = 31;
+// Inside the daemon's 0..31 monitor range, and in the gap the phases above leave between
+// the responsiveness burst (2..17) and the storm (20..23).
+constexpr int32_t kMonitorClosedStdout = 24;
 
 constexpr int kStormThreads = 4;
 
@@ -175,10 +179,27 @@ std::string writeSolidImage(const char* name, unsigned char r, unsigned char g, 
 // failure still shows the daemon's own log next to the FAIL lines.
 class SpawnedDaemon {
 public:
+    enum class Stdout {
+        // stdout and stderr share the capture pipe, drained by the reader thread.
+        Captured,
+        // stdout gets a pipe of its own that nothing ever reads, whose read end the test
+        // closes on demand (breakStdout()). That is `wallpaperx-daemon | head` after head
+        // has exited: every later write to stdout fails with EPIPE. stderr is still
+        // captured, so the daemon can still be heard complaining.
+        Breakable,
+    };
+
     // `extraEnv` entries are "KEY=VALUE"; each replaces any inherited entry for that key.
-    explicit SpawnedDaemon(const std::vector<std::string>& extraEnv = {}) {
+    explicit SpawnedDaemon(const std::vector<std::string>& extraEnv = {}, Stdout stdoutMode = Stdout::Captured) {
         int fds[2];
         if (pipe2(fds, O_CLOEXEC) != 0) throw std::runtime_error("pipe2 failed");
+
+        int outFds[2] = {-1, -1};
+        if (stdoutMode == Stdout::Breakable && pipe2(outFds, O_CLOEXEC) != 0) {
+            close(fds[0]);
+            close(fds[1]);
+            throw std::runtime_error("pipe2 failed");
+        }
 
         // Built before fork(). Between fork() and exec() only async-signal-safe calls
         // are legal, and this process has sdbus dispatch threads running -- setenv() in
@@ -210,6 +231,10 @@ public:
         if (m_pid < 0) {
             close(fds[0]);
             close(fds[1]);
+            if (outFds[0] >= 0) {
+                close(outFds[0]);
+                close(outFds[1]);
+            }
             throw std::runtime_error("fork failed");
         }
         if (m_pid == 0) {
@@ -220,7 +245,8 @@ public:
             // daemon would run correctly with its original stdout, the capture pipe would
             // stay empty, and the parent would report "the daemon runs its destructor
             // chain" and the validation scan as failures of the daemon.
-            if (dup2(fds[1], STDOUT_FILENO) == -1 || dup2(fds[1], STDERR_FILENO) == -1) {
+            const int childStdout = outFds[1] >= 0 ? outFds[1] : fds[1];
+            if (dup2(childStdout, STDOUT_FILENO) == -1 || dup2(fds[1], STDERR_FILENO) == -1) {
                 _exit(126);
             }
             execve(binary.c_str(), argv, envp.data());
@@ -229,6 +255,13 @@ public:
 
         close(fds[1]);
         m_readFd = fds[0];
+        if (outFds[1] >= 0) {
+            // The parent must not keep a write end open, or closing the read end would
+            // still leave one and the daemon's writes would block instead of failing --
+            // turning the closed-stdout phase into a hang rather than a check.
+            close(outFds[1]);
+            m_stdoutFd = outFds[0];
+        }
 
         // Past fork(), so the child exists but this object does not yet -- a throw here
         // would skip ~SpawnedDaemon entirely, leaving a daemon running and holding the
@@ -243,6 +276,7 @@ public:
             m_pid = -1;
             close(m_readFd);
             m_readFd = -1;
+            breakStdout();
             throw;
         }
     }
@@ -254,6 +288,7 @@ public:
             kill(m_pid, SIGKILL);
             reap();
         }
+        breakStdout();
     }
 
     SpawnedDaemon(const SpawnedDaemon&) = delete;
@@ -294,9 +329,42 @@ public:
     // Everything the daemon has written so far. Complete only after it has exited: the
     // reader thread is still draining the pipe until then, so any assertion about the
     // daemon's output belongs after a shutdown()/waitForExit().
+    //
+    // In Stdout::Breakable mode this is stderr only -- stdout went to the pipe that gets
+    // closed, which is the entire point of that mode.
     std::string output() const {
         std::lock_guard<std::mutex> lock(m_mutex);
         return m_output;
+    }
+
+    // Closes the read end of a Breakable stdout, so every subsequent write the daemon
+    // makes to fd 1 fails. Returns false if there was nothing to close, which a caller
+    // must treat as a setup failure rather than as a result.
+    bool breakStdout() {
+        if (m_stdoutFd < 0) return false;
+        close(m_stdoutFd);
+        m_stdoutFd = -1;
+        return true;
+    }
+
+    // Waits for `needle` to appear in the captured output. Returns false on timeout AND
+    // on the daemon exiting without ever printing it -- there is no path here that
+    // reports "not seen" as "seen", and no caller may treat the false as data: it means
+    // the phase could not be set up.
+    bool waitForOutput(std::string_view needle, Clock::duration timeout) const {
+        const auto deadline = Clock::now() + timeout;
+        while (true) {
+            if (output().find(needle) != std::string::npos) return true;
+            // EOF on the capture pipe means every write end is closed, i.e. the child is
+            // gone. Without this the wait would burn the whole timeout on a daemon that
+            // died at startup -- and a 30-second stall is exactly how a setup failure
+            // gets mistaken for a slow one.
+            if (m_readerDone.load(std::memory_order_acquire)) {
+                return output().find(needle) != std::string::npos;
+            }
+            if (Clock::now() >= deadline) return false;
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
     }
 
 private:
@@ -324,6 +392,7 @@ private:
         }
         if (!pending.empty()) std::printf("  [daemon] %s\n", pending.c_str());
         std::fflush(stdout);
+        m_readerDone.store(true, std::memory_order_release);
     }
 
     int reap() {
@@ -367,14 +436,124 @@ private:
 
     pid_t m_pid = -1;
     int m_readFd = -1;
+    int m_stdoutFd = -1;
     int m_exitCode = -1;
     bool m_timedOut = false;
     bool m_waitFailed = false;
     bool m_exitedNormally = false;
     int m_termSignal = 0;
     std::thread m_reader;
+    std::atomic<bool> m_readerDone{false};
     mutable std::mutex m_mutex;
     std::string m_output;
+};
+
+// A session bus of this test's own, started as a child process so it can be killed.
+//
+// Exists for one reason: to be destroyed under a running daemon. ctest's bus comes from
+// dbus-run-session and is shared with every other phase in this file, so killing it would
+// take the test's own connection with it.
+class NestedBus {
+public:
+    NestedBus() {
+        const std::string binaryPath = WALLPAPERX_DBUS_DAEMON_BINARY;
+        if (binaryPath.empty()) {
+            m_reason = "no dbus-daemon binary was found at configure time";
+            return;
+        }
+
+        int fds[2];
+        if (pipe2(fds, O_CLOEXEC) != 0) {
+            m_reason = "pipe2 failed";
+            return;
+        }
+
+        // Assembled before fork() for the same reason SpawnedDaemon assembles its
+        // environment there: this process has sdbus dispatch threads, and allocating
+        // between fork() and exec() can deadlock on a lock one of them held.
+        std::string binary = binaryPath;
+        std::string session = "--session";
+        std::string nofork = "--nofork";
+        std::string printAddress = "--print-address";
+        char* argv[] = {binary.data(), session.data(), nofork.data(), printAddress.data(), nullptr};
+
+        m_pid = fork();
+        if (m_pid < 0) {
+            close(fds[0]);
+            close(fds[1]);
+            m_reason = "fork failed";
+            return;
+        }
+        if (m_pid == 0) {
+            if (dup2(fds[1], STDOUT_FILENO) == -1) _exit(126);
+            execv(binary.c_str(), argv);
+            _exit(127);
+        }
+        close(fds[1]);
+
+        // Bounded read of the address line. A bus that fails to start closes the pipe,
+        // which ends this at EOF rather than at the deadline; either way the failure is
+        // reported as a setup failure and never as a property of the daemon.
+        const auto deadline = Clock::now() + std::chrono::seconds(10);
+        std::string line;
+        while (line.find('\n') == std::string::npos) {
+            const auto remaining =
+                std::chrono::duration_cast<std::chrono::milliseconds>(deadline - Clock::now()).count();
+            if (remaining <= 0) {
+                m_reason = "dbus-daemon printed no address within 10s";
+                break;
+            }
+            pollfd pfd{fds[0], POLLIN, 0};
+            const int ready = poll(&pfd, 1, static_cast<int>(remaining));
+            if (ready < 0) {
+                if (errno == EINTR) continue;
+                m_reason = "poll on the nested bus address pipe failed";
+                break;
+            }
+            if (ready == 0) {
+                m_reason = "dbus-daemon printed no address within 10s";
+                break;
+            }
+            char buf[512];
+            const ssize_t n = read(fds[0], buf, sizeof(buf));
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) {
+                m_reason = "dbus-daemon exited before printing an address";
+                break;
+            }
+            line.append(buf, static_cast<size_t>(n));
+        }
+        close(fds[0]);
+
+        const size_t newline = line.find('\n');
+        if (newline != std::string::npos) m_address = line.substr(0, newline);
+        if (m_address.empty() && m_reason.empty()) m_reason = "dbus-daemon printed an empty address";
+    }
+
+    ~NestedBus() { kill(); }
+
+    NestedBus(const NestedBus&) = delete;
+    NestedBus& operator=(const NestedBus&) = delete;
+
+    bool ok() const { return !m_address.empty(); }
+    const std::string& reason() const { return m_reason; }
+    const std::string& address() const { return m_address; }
+
+    // Destroys the bus out from under whatever is connected to it. SIGKILL, not SIGTERM:
+    // an orderly bus shutdown is a different event from a bus that vanishes, and the
+    // second is the one a client has no chance to prepare for.
+    void kill() {
+        if (m_pid <= 0) return;
+        ::kill(m_pid, SIGKILL);
+        int status = 0;
+        waitpid(m_pid, &status, 0);
+        m_pid = -1;
+    }
+
+private:
+    pid_t m_pid = -1;
+    std::string m_address;
+    std::string m_reason;
 };
 
 // Watches org.freedesktop.DBus for the daemon's name appearing and disappearing.
@@ -1270,6 +1449,301 @@ void checkConcurrentClients(sdbus::IProxy& proxy, FrameReadyLog& signals, const 
           "after the storm, every monitor left on an undecodable image reports no frame and an error");
 }
 
+// ---------------------------------------------------------------------------- //
+// Signals and connection loss (S6.35, S6.36, S6.37)
+// ---------------------------------------------------------------------------- //
+
+// One thread's signal masks, read from /proc. Every field is a hex bitmask in which
+// signal N is bit N-1.
+struct SignalMasks {
+    bool read = false;
+    uint64_t blocked = 0;
+    uint64_t ignored = 0;
+};
+
+constexpr uint64_t signalBit(int signo) { return 1ull << (signo - 1); }
+
+SignalMasks readSignalMasks(pid_t pid) {
+    SignalMasks masks;
+    std::ifstream status("/proc/" + std::to_string(pid) + "/status");
+    if (!status) return masks;
+    std::string line;
+    bool sawBlocked = false;
+    bool sawIgnored = false;
+    while (std::getline(status, line)) {
+        const bool isBlocked = line.rfind("SigBlk:", 0) == 0;
+        const bool isIgnored = line.rfind("SigIgn:", 0) == 0;
+        if (!isBlocked && !isIgnored) continue;
+        const size_t tab = line.find_first_of(" \t");
+        if (tab == std::string::npos) continue;
+        const uint64_t value = std::strtoull(line.c_str() + tab, nullptr, 16);
+        if (isBlocked) {
+            masks.blocked = value;
+            sawBlocked = true;
+        } else {
+            masks.ignored = value;
+            sawIgnored = true;
+        }
+    }
+    masks.read = sawBlocked && sawIgnored;
+    return masks;
+}
+
+// GOAL: S6.36 -- SIGHUP shuts the daemon down through the same chain as SIGINT and
+//       SIGTERM: a normal exit with status 0, having printed which signal it saw and
+//       "stopped cleanly". Left at its default disposition it dies at 129 and none of
+//       that chain runs.
+// WHY-THIS-SHAPE: exitedNormally() is asserted separately from `exit == 0`, and before
+//       it, because reap() reports "killed by a signal" and "never exited, SIGKILLed by
+//       the test" as exit code -1 alike. A check written only as `exit == 0` would be red
+//       for all three causes with no way to tell which; and the one this goal is about --
+//       death by default disposition -- is precisely a signal death. The signal name is
+//       matched via strsignal() rather than the literal "Hangup" because the daemon
+//       inherits this process's locale and a translated string would fail a correct
+//       daemon.
+// CONTROL: `sigaddset(&shutdownSignals, SIGHUP)` deleted from main.cpp -> "FAIL: the
+//       daemon exits through main() on SIGHUP rather than being killed by it (terminated
+//       by signal 1)", plus the exit-0, signal-name and stopped-cleanly checks. Reverted.
+void checkHangupShutdown(NameWatcher& names, const Check& check) {
+    SpawnedDaemon hungUp;
+    const bool cameUp = names.waitFor(true);
+    check(cameUp, "a fresh daemon acquires the name before the SIGHUP phase");
+    if (!cameUp) {
+        std::printf("daemon_system_test: SIGHUP checks skipped -- that daemon never acquired the bus name, so "
+                    "its exit says nothing about the shutdown path.\n");
+        return;
+    }
+
+    const int exitCode = hungUp.shutdown(SIGHUP);
+    const std::string output = hungUp.output();
+
+    check(hungUp.exitedNormally(),
+          "the daemon exits through main() on SIGHUP rather than being killed by it");
+    if (!hungUp.exitedNormally()) {
+        std::fprintf(stderr, "  terminated by signal %d%s\n", hungUp.termSignal(),
+                     hungUp.timedOut() ? " (it had to be killed after the timeout)" : "");
+    }
+
+    // Same shape as the SIGTERM and SIGINT blocks: under a sanitizer the exit code is the
+    // sanitizer's, so the question stops being about the shutdown path and is reported as
+    // that rather than as an accusation against main.cpp.
+    if (output.find("Sanitizer: reported") != std::string::npos) {
+        check(false, "the SIGHUP daemon's sanitizer reported no warnings (its exit code is the sanitizer's "
+                     "here, so the SIGHUP exit-code check cannot run)");
+    } else {
+        check(exitCode == 0, "the daemon exits 0 on SIGHUP");
+    }
+    check(output.find(std::string(strsignal(SIGHUP)) + " received, shutting down") != std::string::npos,
+          "the daemon names SIGHUP as the signal it is shutting down for");
+    check(output.find("stopped cleanly") != std::string::npos,
+          "the daemon runs its destructor chain on SIGHUP as well as on SIGINT and SIGTERM");
+    check(names.waitFor(false), "the bus name is released after the SIGHUP shutdown");
+}
+
+// GOAL: S6.37 -- a closed stdout does not kill the daemon. The write that fails must
+//       report EPIPE and the daemon must go on serving; and SIGPIPE must be *ignored*,
+//       not blocked, because blocked it stays pending forever instead of letting the
+//       write report.
+// WHY-THIS-SHAPE: three parts, and none of them is redundant.
+//       (1) The behavioural half: a SetWallpaper issued after the reader of the daemon's
+//       stdout is gone still gets a reply, still renders, and GetStatus still answers.
+//       That is what `wallpaperx-daemon | head` does, and at the default disposition the
+//       daemon dies inside the handler at exit 141 with an empty stderr.
+//       (2) The disposition half, read from /proc/<pid>/status: the behavioural half
+//       alone cannot tell ignored from blocked -- both survive the write -- and the goal
+//       explicitly rejects blocking. SigBlk/SigIgn is the only externally visible
+//       difference between the two.
+//       (3) The coverage assert below, because everything here rests on the daemon
+//       actually writing to stdout while serving that call. If that printf ever goes
+//       away, nothing generates EPIPE and all of the above passes on a daemon with the
+//       bug reintroduced -- so the write is asserted, from the captured run, instead of
+//       assumed.
+// CONTROL: two, and the second is the one that matters.
+//       (a) `std::signal(SIGPIPE, SIG_IGN)` deleted from main.cpp -> 5 FAILs: SetWallpaper
+//       came back [org.freedesktop.DBus.Error.NoReply], GetStatus came back
+//       ServiceUnknown, "the daemon ignores SIGPIPE", and the exit checks with
+//       "terminated by signal 13".
+//       (b) SIGPIPE *blocked* (pthread_sigmask) instead of ignored -> exactly 2 FAILs,
+//       "the daemon ignores SIGPIPE" and "SIGPIPE is ignored rather than merely blocked"
+//       (SigBlk=0x5003 SigIgn=0x0), while every behavioural check above stayed green --
+//       which is precisely the configuration S6.37 says must fail and which part (1)
+//       alone cannot see. Both reverted.
+// COVERAGE-ASSERT: asserts that the captured daemon printed its SetWallpaper line, i.e.
+//       that this phase's trigger still exists in the shipped binary. Controlled from the
+//       harness side by searching for a string the daemon never prints ("type=zzz"):
+//       "FAIL: the daemon writes to stdout while handling SetWallpaper", alone, with
+//       every other check green. Reverted.
+void checkClosedStdout(NameWatcher& names, const std::string& bluePath, bool capturedRunUsable,
+                       const std::string& capturedRunOutput, const Check& check) {
+    if (!capturedRunUsable) {
+        std::printf("daemon_system_test: closed-stdout checks skipped -- the earlier daemon's output was never "
+                    "collected, so there is no evidence that SetWallpaper writes to stdout at all, and without "
+                    "that this phase would prove nothing.\n");
+        return;
+    }
+    check(capturedRunOutput.find("SetWallpaper(type=static") != std::string::npos,
+          "the daemon writes to stdout while handling SetWallpaper (this is what makes the closed-stdout "
+          "phase below trigger anything at all)");
+
+    SpawnedDaemon deaf({}, SpawnedDaemon::Stdout::Breakable);
+    const bool cameUp = names.waitFor(true);
+    check(cameUp, "a fresh daemon acquires the name before the closed-stdout phase");
+    if (!cameUp) {
+        std::printf("daemon_system_test: closed-stdout checks skipped -- that daemon never acquired the bus "
+                    "name, so nothing it does afterwards is attributable to its stdout.\n");
+        return;
+    }
+
+    // From here the daemon's stdout is a pipe with no reader and no other holder of the
+    // write end: exactly `wallpaperx-daemon | head` once head has exited.
+    const bool closed = deaf.breakStdout();
+    check(closed, "the test could close the read end of the daemon's stdout");
+    if (!closed) return;
+
+    FrameReadyLog signals;
+    auto proxy = sdbus::createProxy(sdbus::ServiceName{DbusService::kBusName},
+                                    sdbus::ObjectPath{DbusService::kObjectPath});
+    proxy->uponSignal("FrameReady")
+        .onInterface(DbusService::kInterface)
+        .call([&signals](int32_t monitorId, uint64_t generation) { signals.record(monitorId, generation); });
+
+    bool answered = false;
+    try {
+        setWallpaper(*proxy, "static", bluePath, kMonitorClosedStdout);
+        answered = true;
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "  SetWallpaper after the stdout reader was closed: %s\n", e.what());
+    }
+    check(answered,
+          "the daemon answers SetWallpaper after its stdout reader is gone (the handler's own printf is the "
+          "write that fails there)");
+
+    if (answered) {
+        check(signals.wait(kMonitorClosedStdout, 1),
+              "the frame requested after stdout closed is rendered and announced");
+    }
+
+    bool statusAnswered = false;
+    try {
+        const nlohmann::json status = getStatus(*proxy);
+        statusAnswered = !status.is_discarded();
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "  GetStatus after the stdout reader was closed: %s\n", e.what());
+    }
+    check(statusAnswered, "the daemon still answers GetStatus after the failed write");
+
+    const SignalMasks masks = readSignalMasks(deaf.pid());
+    check(masks.read, "the daemon's signal masks could be read from /proc");
+    if (masks.read) {
+        check((masks.ignored & signalBit(SIGPIPE)) != 0, "the daemon ignores SIGPIPE");
+        check((masks.blocked & signalBit(SIGPIPE)) == 0,
+              "SIGPIPE is ignored rather than merely blocked (blocked, the failing write's signal stays "
+              "pending forever instead of the write reporting EPIPE)");
+        if ((masks.ignored & signalBit(SIGPIPE)) == 0 || (masks.blocked & signalBit(SIGPIPE)) != 0) {
+            std::fprintf(stderr, "  SigBlk=0x%llx SigIgn=0x%llx, SIGPIPE bit=0x%llx\n",
+                         static_cast<unsigned long long>(masks.blocked),
+                         static_cast<unsigned long long>(masks.ignored),
+                         static_cast<unsigned long long>(signalBit(SIGPIPE)));
+        }
+    }
+
+    // The shutdown path writes to the broken stdout too ("... received, shutting down",
+    // "stopped cleanly", plus the flush at exit), so this is a second, independent EPIPE
+    // -- and the last chance for one to turn a clean exit into 141.
+    const int exitCode = deaf.shutdown(SIGTERM);
+    check(deaf.exitedNormally(), "a daemon whose stdout is closed still exits through main() on SIGTERM");
+    if (!deaf.exitedNormally()) {
+        std::fprintf(stderr, "  terminated by signal %d%s\n", deaf.termSignal(),
+                     deaf.timedOut() ? " (it had to be killed after the timeout)" : "");
+    }
+    // Its stdout is broken by construction, so "stopped cleanly" cannot be looked for
+    // here: the exit code is the only evidence left, which is exactly the position an
+    // operator is in when this happens for real.
+    if (deaf.output().find("Sanitizer: reported") != std::string::npos) {
+        check(false, "the closed-stdout daemon's sanitizer reported no warnings (its exit code is the "
+                     "sanitizer's here, so the exit-code check cannot run)");
+    } else {
+        check(exitCode == 0, "a daemon whose stdout is closed exits 0 rather than 141");
+    }
+    check(names.waitFor(false), "the bus name is released after the closed-stdout daemon exits");
+}
+
+// GOAL: S6.35 -- losing the bus connection unwinds through main() instead of aborting.
+//       enterEventLoop() throws on connection loss, and every object between it and
+//       main's handler must be destructible on that path; a joinable std::thread
+//       destroyed during that unwind is std::terminate -- exit 134, core dumped, and none
+//       of the destructors S6.30 exists to guarantee.
+// WHY-THIS-SHAPE: the loss is driven by killing a bus this test started itself, not by
+//       the mechanism that found the bug (~1000 unread GetFrameFd calls exhausting
+//       dbus-broker's unix-fd quota). That mechanism cannot be used here and a check
+//       built on it would be worse than none: ctest runs under dbus-run-session, which
+//       starts the reference dbus-daemon, which enforces no such quota -- so the flood
+//       would be absorbed, the connection would survive, and the check would pass green
+//       against a daemon with the bug reintroduced. What the daemon actually sees is a
+//       connection that ends, which is what SIGKILLing its bus produces (verified:
+//       "fatal: [System.Error.ENOTCONN] Failed to get bus poll data"), on any bus
+//       implementation and with no quota involved. What this does NOT establish is that
+//       dbus-broker's fd quota is reachable at ~1000 calls; that is the broker's
+//       behaviour, not this daemon's.
+//       exitedNormally() is asserted before and separately from `exit == 1` for the same
+//       reason as in the SIGHUP phase: the failure mode here IS a signal death, and
+//       reap() folds signal deaths and timeouts into the same -1.
+// CONTROL: main.cpp's ShutdownWatch guard replaced by a bare `std::thread shutdownWatch`
+//       with the pthread_kill/join moved to after enterEventLoop() -- i.e. the code as it
+//       was before f1aa32c. Observed directly: "terminate called without an active
+//       exception", "Aborted (core dumped)", wait status 134, and none of the shutdown
+//       output. Against this check that is "FAIL: losing the bus connection unwinds
+//       through main() instead of aborting the process" plus the exit-1, fatal-message
+//       and watcher-joined checks. Reverted.
+void checkBusLoss(const std::string& daemonEnvValidation, const Check& check) {
+    NestedBus bus;
+    if (!bus.ok()) {
+        // X.3: a bus this test could not start is a fault in the harness or the host, and
+        // must never be reported as the daemon aborting.
+        std::printf("daemon_system_test: SKIPPED the connection-loss checks (S6.35) -- %s. Nothing about the "
+                    "daemon's behaviour when it loses the bus was verified by this run.\n",
+                    bus.reason().c_str());
+        return;
+    }
+
+    SpawnedDaemon orphan({std::string("DBUS_SESSION_BUS_ADDRESS=") + bus.address(), daemonEnvValidation});
+    // The daemon's own startup line is the up-signal here rather than NameOwnerChanged:
+    // the name is acquired on the nested bus, which this process is not connected to, and
+    // connecting to it would put another client on the very connection being destroyed.
+    if (!orphan.waitForOutput("serving io.wallpaperx.Daemon", std::chrono::seconds(30))) {
+        std::printf("daemon_system_test: SKIPPED the connection-loss checks (S6.35) -- the daemon never came up "
+                    "on the nested bus, so killing it would say nothing about the unwind path.\n");
+        return;
+    }
+
+    bus.kill();
+
+    const int exitCode = orphan.waitForExit();
+    const std::string output = orphan.output();
+
+    check(!orphan.timedOut(),
+          "the daemon notices that its bus connection is gone and exits, rather than running on forever");
+    check(orphan.exitedNormally(),
+          "losing the bus connection unwinds through main() instead of aborting the process");
+    if (!orphan.exitedNormally()) {
+        std::fprintf(stderr, "  terminated by signal %d%s\n", orphan.termSignal(),
+                     orphan.timedOut() ? " (it had to be killed after the timeout)" : "");
+    }
+    if (output.find("Sanitizer: reported") != std::string::npos) {
+        check(false, "the orphaned daemon's sanitizer reported no warnings (its exit code is the sanitizer's "
+                     "here, so the connection-loss exit-code check cannot run)");
+    } else {
+        check(exitCode == 1, "the daemon exits 1 through main's exception handler when its bus is destroyed");
+    }
+    check(output.find("fatal:") != std::string::npos,
+          "the daemon says why it exited after losing the bus rather than dying silently");
+    // The guard doing its job, not merely the absence of a crash: on the way out it wakes
+    // the sigwait watcher and joins it, and that watcher prints before it returns. A bare
+    // joinable thread reaches std::terminate instead and this line never appears.
+    check(output.find("received, shutting down") != std::string::npos,
+          "the sigwait watcher is woken and joined while the connection-loss exception unwinds");
+}
+
 }  // namespace
 
 int main() {
@@ -1319,7 +1793,8 @@ int main() {
 
         const size_t fdsBefore = openFdCount();
 
-        SpawnedDaemon daemon({std::string("WALLPAPERX_VALIDATION=") + (wantValidation ? "1" : "0")});
+        const std::string validationEnv = std::string("WALLPAPERX_VALIDATION=") + (wantValidation ? "1" : "0");
+        SpawnedDaemon daemon({validationEnv});
         const bool cameUp = names.waitFor(true);
         daemonCameUp = cameUp;
         check(cameUp, "the daemon acquires io.wallpaperx.Daemon on the session bus");
@@ -1443,6 +1918,18 @@ int main() {
                 check(names.waitFor(false), "the bus name is released after the SIGINT shutdown");
             }
         }
+
+        // The third signal in that sigset, and the one a terminal close or a logout
+        // sends. Its own phase rather than a third branch of the block above, because it
+        // is a distinct goal (S6.36) with a distinct failure -- exit 129, none of the
+        // chain -- rather than more coverage of the same one.
+        checkHangupShutdown(names, check);
+
+        // S6.37 and S6.35. Both spawn daemons of their own and shut them down, so they
+        // run after the phases above have released the name, and before the descriptor
+        // accounting below.
+        checkClosedStdout(names, bluePath, daemonOutputRead && daemonCameUp, daemonOutput, check);
+        checkBusLoss(validationEnv, check);
 
         // Every Frame's UnixFd closes at scope exit, and the daemon is gone, so this
         // process must be back where it started. A descriptor leaked per GetFrameFd is

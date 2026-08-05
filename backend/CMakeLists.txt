@@ -162,9 +162,22 @@ add_executable(wallpaperx-daemon-system-test tests/daemon_system_test.cpp)
 target_link_libraries(wallpaperx-daemon-system-test PRIVATE wallpaperx-daemon-lib)
 target_include_directories(wallpaperx-daemon-system-test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../renderer/tests)
+# S6.35 needs a session bus it is allowed to destroy under a running daemon, which the
+# one dbus-run-session hands the test is not: the test's own connection lives on it.
+# Located here rather than found at runtime so a host without dbus-daemon produces a
+# named skip in the test's output instead of an exec failure inside a fork.
+find_program(DBUS_DAEMON_EXECUTABLE dbus-daemon)
+if(NOT DBUS_DAEMON_EXECUTABLE)
+    message(WARNING
+        "dbus-daemon not found -- daemon_system_test will SKIP its connection-loss checks (S6.35). "
+        "The rest of that test is unaffected.")
+    set(DBUS_DAEMON_EXECUTABLE "")
+endif()
+
 target_compile_definitions(wallpaperx-daemon-system-test PRIVATE
     WALLPAPERX_TEST_IMAGE_DIR="${CMAKE_CURRENT_BINARY_DIR}/test_assets"
     WALLPAPERX_DAEMON_BINARY="$<TARGET_FILE:wallpaperx-daemon>"
+    WALLPAPERX_DBUS_DAEMON_BINARY="${DBUS_DAEMON_EXECUTABLE}"
 )
 # Baking the path in is not enough -- without this the test can be built and run against
 # a stale or missing daemon binary, and would report the daemon's absence as a bus
