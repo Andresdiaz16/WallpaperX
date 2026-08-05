@@ -79,7 +79,41 @@ void StaticRenderer::cleanup() {
     m_device.memory().destroyImage(m_texture);
 }
 
+// The largest decoded image this renderer will accept, in bytes of RGBA.
+//
+// 256 MiB is 8192x8192, which is four times the pixel count of an 8K display -- generous
+// for a wallpaper, and small enough that the staging copy plus the texture cannot
+// dominate a machine. The bound is on *decoded* size because that is the cost, and the
+// file gives no honest hint of it: a 995 KB PNG of 16000x16000 decodes to 1.0 GB, and
+// with the staging buffer the daemon peaked at +2.0 GB RSS and was OOM-killed under a
+// 1.2 GB limit. Nothing else stopped it -- the only previous ceiling was stb_image's own
+// INT_MAX overflow guard at roughly 23000x23000, far past the point where the machine is
+// already in trouble.
+constexpr uint64_t kMaxDecodedBytes = 256ull * 1024 * 1024;
+
 void StaticRenderer::loadAndUploadTexture(const std::string& imagePath) {
+    // Checked from the header alone, before decoding, because a limit applied after
+    // stbi_load has already paid the whole cost it exists to prevent. stbi_info reads
+    // dimensions without allocating the pixels.
+    int probeWidth = 0;
+    int probeHeight = 0;
+    int probeChannels = 0;
+    if (!stbi_info(imagePath.c_str(), &probeWidth, &probeHeight, &probeChannels)) {
+        throw std::runtime_error(
+            "StaticRenderer: not a decodable image " + imagePath + ": " + stbi_failure_reason());
+    }
+    if (probeWidth <= 0 || probeHeight <= 0) {
+        throw std::runtime_error("StaticRenderer: image reports non-positive dimensions " + imagePath);
+    }
+    const uint64_t decodedBytes = static_cast<uint64_t>(probeWidth) * static_cast<uint64_t>(probeHeight) * 4;
+    if (decodedBytes > kMaxDecodedBytes) {
+        throw std::runtime_error("StaticRenderer: " + imagePath + " decodes to " +
+                                 std::to_string(decodedBytes / (1024 * 1024)) + " MiB (" +
+                                 std::to_string(probeWidth) + "x" + std::to_string(probeHeight) +
+                                 "), over the " + std::to_string(kMaxDecodedBytes / (1024 * 1024)) +
+                                 " MiB limit");
+    }
+
     int imageWidth = 0;
     int imageHeight = 0;
     int channels = 0;

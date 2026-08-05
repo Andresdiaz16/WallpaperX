@@ -28,8 +28,25 @@ int main() {
     sigemptyset(&shutdownSignals);
     sigaddset(&shutdownSignals, SIGINT);
     sigaddset(&shutdownSignals, SIGTERM);
+    // SIGHUP belongs here with the other two, not with the default disposition. It is
+    // what a terminal close or a logout sends, so it is one of the likeliest ways this
+    // daemon ever ends -- and left alone it killed the process outright (exit 129),
+    // skipping the very shutdown chain the block below exists to guarantee.
+    sigaddset(&shutdownSignals, SIGHUP);
     if (pthread_sigmask(SIG_BLOCK, &shutdownSignals, nullptr) != 0) {
         std::fprintf(stderr, "wallpaperx-daemon: fatal: could not block shutdown signals\n");
+        return 1;
+    }
+
+    // SIGPIPE ignored rather than blocked, because it is synchronous: it is raised by the
+    // write that failed, on the thread that made it, and blocking would leave it pending
+    // forever instead of letting the write report EPIPE. Left at its default this daemon
+    // died silently -- exit 141, empty stderr -- the first time anything closed its
+    // stdout, which `wallpaperx-daemon | head` is enough to do, and which is ordinary for
+    // a process whose output is piped or whose terminal goes away. A dead daemon with no
+    // message is the worst of both: no wallpaper, and nothing to explain it.
+    if (std::signal(SIGPIPE, SIG_IGN) == SIG_ERR) {
+        std::fprintf(stderr, "wallpaperx-daemon: fatal: could not ignore SIGPIPE\n");
         return 1;
     }
 
@@ -63,22 +80,37 @@ int main() {
         // takes locks and is not async-signal-safe, so calling it from a handler is a
         // deadlock waiting for the wrong moment; a thread blocked in sigwait() runs it
         // in ordinary thread context instead.
-        std::thread shutdownWatch([&connection, &shutdownSignals] {
+        // Woken and joined on EVERY path out of this scope, including an exception, which
+        // is why it is a guard and not a bare std::thread with the wake-and-join written
+        // after enterEventLoop().
+        //
+        // enterEventLoop() does not only return early -- it THROWS when the connection is
+        // lost, and a bare joinable std::thread destroyed while that exception unwinds is
+        // std::terminate(): exit 134, core dumped, and not one of the destructors this
+        // whole signal dance exists to guarantee. It was reachable by any unprivileged
+        // local client: ~1000 unread GetFrameFd calls make the broker drop the daemon's
+        // connection over its unix-fd quota. The suite could not see it, because
+        // dbus-run-session starts the reference dbus-daemon, which enforces no such quota.
+        //
+        // The wake is still needed for the ordinary early return: the watcher is parked in
+        // sigwait() and would never leave it. Signals are blocked process-wide, so this is
+        // consumed by that thread's sigwait rather than acting on the process.
+        struct ShutdownWatch {
+            std::thread thread;
+            ~ShutdownWatch() {
+                if (!thread.joinable()) return;
+                pthread_kill(thread.native_handle(), SIGTERM);
+                thread.join();
+            }
+        } shutdownWatch{std::thread([&connection, &shutdownSignals] {
             int received = 0;
             if (sigwait(&shutdownSignals, &received) != 0) return;
             std::printf("wallpaperx-daemon: %s received, shutting down\n", strsignal(received));
             std::fflush(stdout);
             connection->leaveEventLoop();
-        });
+        })};
 
         connection->enterEventLoop();  // returns once leaveEventLoop() is called
-
-        // enterEventLoop() can also return on its own (the connection dropping, say),
-        // leaving the watcher parked in sigwait() forever and join() hanging with it.
-        // The signals are blocked process-wide, so this is delivered to that thread and
-        // consumed by its sigwait rather than acting on the process.
-        pthread_kill(shutdownWatch.native_handle(), SIGTERM);
-        shutdownWatch.join();
 
         // Everything below main's try block is destroyed here, in reverse declaration
         // order: the service (which stops the render worker), then the connection, then
