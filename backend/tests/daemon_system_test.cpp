@@ -34,7 +34,12 @@
 //    been bitten by most.
 
 #include "daemon/dbus_service.h"
+// For HttpServer::kDefaultPort only -- the shipped port number, taken from the header the
+// daemon compiles against rather than written as 18462 here, so a change of port fails
+// this file at build time instead of leaving it probing a port nothing serves.
+#include "daemon/http_server.h"
 #include "tests/client/daemon_client.h"
+#include "tests/client/http_probe.h"
 
 #include "support/exported_frame_map.h"
 
@@ -2153,6 +2158,199 @@ void checkBusLoss(const Check& check) {
     }
 }
 
+// ---------------------------------------------------------------------------- //
+// Phase 10 -- the HTTP config server, in the shipped binary, on the shipped port.
+// ---------------------------------------------------------------------------- //
+//
+// Everything else about http_server.cpp is checked in process, on an ephemeral port
+// (http_server_test). Three things are only observable from out here:
+//
+//   1. main.cpp wires it up at all, on 18462, with no port argument to help it.
+//   2. Nothing is left listening after the process exits (S7.8). In process the port
+//      always closes, because the process that opened it is the one asserting.
+//   3. A poll landing during shutdown cannot read state being torn down (S7.11). That
+//      ordering lives in main.cpp's declaration order -- the HttpServer is declared last
+//      so it is destroyed first -- and an in-process test cannot exercise a main() it
+//      never runs.
+//
+// The port is the one thing this phase cannot choose, so it never assumes it: if the
+// spawned daemon could not bind 18462 (a developer's real daemon is running, most
+// likely), the phase says so and is reported as a skip. Reading a bind failure as a
+// defect here is exactly the "port conflict wearing a defect's clothes" this suite must
+// not do.
+void checkHttpLifecycle(NameWatcher& names, const std::string& bluePath, const std::string& validationEnv,
+                        const Check& check) {
+    using wallpaperx::testing::ConnectResult;
+    using wallpaperx::testing::describe;
+    using wallpaperx::testing::HttpReply;
+    using wallpaperx::testing::Poller;
+    using wallpaperx::testing::tryConnect;
+
+    constexpr int kPort = wallpaperx::HttpServer::kDefaultPort;
+    constexpr int32_t kMonitorHttp = 26;
+
+    SpawnedDaemon daemon({validationEnv});
+    if (!names.waitFor(true)) {
+        notVerified("S7.8/S7.11 (the HTTP server's process lifecycle)",
+                    "the daemon for this phase never acquired the bus name");
+        return;
+    }
+
+    // Which of the two lines the daemon prints decides whether this phase can run at all.
+    // waitForOutput returns false on timeout AND on the daemon exiting, and neither is
+    // treated as data -- see the bind-failure branch.
+    const std::string bindOk = std::string("config server on http://127.0.0.1:") + std::to_string(kPort);
+    const std::string bindFailed = std::string("could not bind 127.0.0.1:") + std::to_string(kPort);
+    const bool listening = daemon.waitForOutput(bindOk, std::chrono::seconds(10));
+    if (!listening) {
+        const std::string why = daemon.output().find(bindFailed) != std::string::npos
+                                    ? std::string("port ") + std::to_string(kPort) +
+                                          " is held by another process on this machine (a real wallpaperx-daemon?), "
+                                          "so the spawned daemon could not bind it"
+                                    : "the daemon printed neither the bind-success nor the bind-failure line for "
+                                      "port " + std::to_string(kPort);
+        notVerified("S7.8/S7.11 (the HTTP server's process lifecycle)", why);
+        daemon.shutdown(SIGTERM);
+        return;
+    }
+
+    // GOAL: S7.10 end to end, and PLAN.md's Definition of Done #2 with it -- /health on
+    //       127.0.0.1:18462, asked of the real binary by a process that is not it.
+    // WHY-THIS-SHAPE: the in-process tier already pins the JSON. What only this tier can
+    //       establish is that main.cpp actually constructs the server on the shipped port
+    //       -- an HttpServer that was never wired into main would leave every in-process
+    //       check green.
+    // CONTROL: the `wallpaperx::HttpServer httpServer(manager);` line removed from
+    //       main.cpp -> this phase reports NOT VERIFIED ("the daemon printed neither the
+    //       bind-success nor the bind-failure line for port 18462") and exits 77, which
+    //       ctest shows as a SKIP rather than a pass. Reverted.
+    // NOTE: Definition of Done #2 says /health returns {"descriptor_tier":"heap"}. On a
+    //       freshly started daemon it returns null -- the device is lazy -- and after a
+    //       render it returns "Heap", capitalised, from the same toString() GetStatus
+    //       uses. Both halves of DoD #2 are false of cd28790; that is recorded, not
+    //       ruled on. See S7.10.
+    httplib::Client cli = wallpaperx::testing::makeClient(kPort);
+    const HttpReply fresh = wallpaperx::testing::get(cli, "/health");
+    check(fresh.ok(), "the real daemon answers GET /health on 127.0.0.1:18462");
+    if (fresh.ok()) {
+        check(fresh.json.value("status", std::string()) == "ok", "the real daemon's /health reports status ok");
+        check(fresh.json.contains("descriptor_tier") && fresh.json["descriptor_tier"].is_null(),
+              "the real daemon reports no descriptor tier before its first wallpaper");
+        std::printf("daemon_system_test: /health on the shipped port before any wallpaper: %s\n",
+                    fresh.body.c_str());
+        std::fflush(stdout);
+    }
+
+    // A render, so the device exists and the tier becomes reportable.
+    FrameReadyLog signals;
+    auto proxy =
+        sdbus::createProxy(sdbus::ServiceName{DbusService::kBusName}, sdbus::ObjectPath{DbusService::kObjectPath});
+    proxy->uponSignal("FrameReady")
+        .onInterface(DbusService::kInterface)
+        .call([&signals](int32_t monitorId, uint64_t generation) { signals.record(monitorId, generation); });
+
+    setWallpaper(*proxy, "static", bluePath, kMonitorHttp);
+    const bool rendered = signals.wait(kMonitorHttp, 1);
+    if (!rendered) {
+        // X.1/X.3: the wait expiring is not evidence about /health, and a host with no
+        // working Vulkan is not a failure of the HTTP server.
+        notVerified("S7.10 through the real binary",
+                    "the daemon never rendered a frame, so no device existed for /health to report a tier for");
+    } else {
+        const HttpReply afterRender = wallpaperx::testing::get(cli, "/health");
+        const nlohmann::json status = getStatus(*proxy);
+        const std::string dbusTier = status.contains("gpu") && status["gpu"].is_object()
+                                         ? status["gpu"].value("descriptor_tier", std::string())
+                                         : std::string();
+        check(afterRender.ok() && afterRender.json["descriptor_tier"].is_string(),
+              "the real daemon's /health reports a descriptor tier once a device exists");
+        const std::string httpTier = afterRender.ok() && afterRender.json["descriptor_tier"].is_string()
+                                         ? afterRender.json["descriptor_tier"].get<std::string>()
+                                         : std::string();
+        check(!httpTier.empty() && httpTier == dbusTier,
+              "the real daemon's /health and GetStatus report the same descriptor tier");
+        if (httpTier != dbusTier) {
+            std::fprintf(stderr, "  http: %s  dbus: %s\n", httpTier.c_str(), dbusTier.c_str());
+        }
+        std::printf("daemon_system_test: /health after one wallpaper: %s (Definition of Done #2 asks for "
+                    "{\"descriptor_tier\":\"heap\"} -- lowercase, and on a daemon that has just started; "
+                    "neither is what this daemon does, see S7.10)\n",
+                    afterRender.body.c_str());
+        std::fflush(stdout);
+    }
+
+    // GOAL: S7.11 -- a request in flight cannot read state that is being torn down, and
+    //       S7.8 -- nothing is left listening once the process is gone.
+    // WHY-THIS-SHAPE: the polling runs ACROSS the SIGTERM rather than before it. A
+    //       shutdown with nothing in flight is the easy case and would pass for a daemon
+    //       that destroyed its manager under a live handler; what has to be observed is a
+    //       poll landing during the teardown, which on this daemon takes milliseconds
+    //       (GPU teardown) -- long enough for a loopback poller to land several requests
+    //       in. The graded facts are then the ones a broken ordering destroys: the daemon
+    //       still exits 0 through its own shutdown path, still prints the line that means
+    //       the destructor chain ran, and never answered a poll with a malformed body.
+    //       The alternative -- asserting that some specific request got a 200 during the
+    //       window -- would be an assertion on the scheduler (X.2), since when the poller
+    //       stops being served is exactly what shutdown decides.
+    // CONTROL: main.cpp's `HttpServer httpServer(manager);` replaced with
+    //       `auto* leaked = new HttpServer(manager); (void)leaked;` -- the server then
+    //       outlives the manager it reads, which is precisely the ordering the
+    //       declare-it-last comment exists to guarantee. Observed: the daemon died on
+    //       SIGSEGV during shutdown -> "FAIL: the daemon exits 0 on SIGTERM with HTTP
+    //       polls in flight" and "FAIL: the daemon still runs its destructor chain with
+    //       HTTP polls in flight". Reverted.
+    // COVERAGE-ASSERT: the number of responses the poller actually collected is asserted,
+    //       not assumed. A poller that never connected would make the malformed-response
+    //       check trivially true, and this phase would then be grading an ordinary
+    //       shutdown with nothing in flight at all.
+    Poller poller(kPort, "/config?monitor=" + std::to_string(kMonitorHttp));
+    for (int i = 0; i < 500 && poller.recorded() < 5; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const size_t recordedBeforeSignal = poller.recorded();
+
+    const int exitCode = daemon.shutdown(SIGTERM);
+    const std::string output = daemon.output();
+    poller.stop();
+
+    check(poller.error().empty(), "the /health poller across the shutdown ran without throwing");
+    check(recordedBeforeSignal >= 5, "HTTP polls really were in flight when the daemon was signalled");
+
+    int answered = 0;
+    int malformed = 0;
+    for (const Poller::Sample& s : poller.samples()) {
+        if (!s.reached) continue;  // refused/closed after shutdown -- expected, not a fault
+        ++answered;
+        if (s.status != 200 || !s.bodyParsed) ++malformed;
+    }
+    check(malformed == 0, "no HTTP poll during the daemon's shutdown got a malformed or error reply");
+    if (malformed != 0) {
+        std::fprintf(stderr, "  %d of %d answered polls were not a parseable 200\n", malformed, answered);
+    }
+
+    if (output.find("Sanitizer: reported") != std::string::npos) {
+        // Same shape as the SIGTERM and SIGINT phases: a sanitized build replaces the
+        // exit code, so the exit-code question stops being about the shutdown path.
+        check(false, "the HTTP-lifecycle daemon's sanitizer reported no warnings (its exit code is the "
+                     "sanitizer's here, so the exit-code check cannot run)");
+    } else {
+        check(exitCode == 0, "the daemon exits 0 on SIGTERM with HTTP polls in flight");
+    }
+    check(!daemon.timedOut(), "the daemon exits rather than hanging when its serving thread has to be joined");
+    check(output.find("stopped cleanly") != std::string::npos,
+          "the daemon still runs its destructor chain with HTTP polls in flight");
+    check(names.waitFor(false), "the bus name is released after the HTTP-lifecycle daemon exits");
+
+    // S7.8's own assertion. Deliberately after the reap: `shutdown()` does not return
+    // until the process is gone, so a still-open socket here is a socket the exited
+    // process left behind, not one it is still using.
+    const ConnectResult afterExit = tryConnect("127.0.0.1", kPort, 1000);
+    check(afterExit == ConnectResult::Refused, "nothing is listening on 18462 once the daemon has exited");
+    if (afterExit != ConnectResult::Refused) {
+        std::fprintf(stderr, "  connect to 127.0.0.1:%d %s (expected refused)\n", kPort, describe(afterExit));
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -2339,6 +2537,12 @@ int main() {
         // accounting below.
         checkClosedStdout(names, bluePath, validationEnv, wantValidation, check);
         checkBusLoss(check);
+
+        // S7.8 and S7.11. Spawns a daemon of its own and shuts it down, so it runs after
+        // the phases above have released the name, and before the descriptor accounting
+        // below -- its httplib clients close their sockets on destruction, which that
+        // accounting would otherwise report as a leak in this process.
+        checkHttpLifecycle(names, bluePath, validationEnv, check);
 
         // Every Frame's UnixFd closes at scope exit, and the daemon is gone, so this
         // process must be back where it started. A descriptor leaked per GetFrameFd is

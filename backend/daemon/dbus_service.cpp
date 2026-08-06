@@ -40,14 +40,11 @@ DbusService::DbusService(sdbus::IConnection& connection, WallpaperManager& manag
 }
 
 DbusService::~DbusService() {
-    // Explicit, because neither destruction order alone can be correct. Handlers run on
-    // the event-loop thread, which may still be dispatching while this destructor runs
-    // (any daemon shut down from a signal handler, and the tests' enterEventLoopAsync):
-    // setWallpaper() posts to m_worker, and getFrameFd's task touches m_object, so
-    // destroying either one first leaves the other reachable through a dangling
-    // reference. stop() breaks the cycle: it joins the render thread, after which
-    // nothing can reach m_object, and it leaves the worker object alive and its post()
-    // methods harmless no-ops for any handler still in flight.
+    // Explicit, because neither destruction order alone is correct: handlers may still be
+    // dispatching, setWallpaper() posts to m_worker, and getFrameFd's task touches
+    // m_object, so destroying either first leaves the other dangling. stop() breaks the
+    // cycle -- it joins the render thread, then leaves post() a harmless no-op for any
+    // handler still in flight.
     m_worker.stop();
 }
 
@@ -98,15 +95,9 @@ void DbusService::emitFrameReady(int monitorId, uint64_t generation) {
 }
 
 void DbusService::setWallpaper(const std::string& type, const std::string& path, int32_t monitorId) {
-    // Logged on entry, not on success. Most DBus clients drop an error reply on the
-    // floor, so the daemon's log is the only place a failed request is visible -- and
-    // logging after the call meant the requests that failed were exactly the ones that
-    // left no trace, making them indistinguishable from requests that never arrived.
-    //
-    // Both strings come straight off the wire, so both go through sanitizeForLog: a path
-    // containing newlines used to be printed verbatim, which let any client that could
-    // reach the bus write whole lines of its own choosing into this log in the daemon's
-    // own format. See log_escape.h.
+    // On entry, not on success: most clients drop the error reply, so logging afterwards
+    // left failed requests indistinguishable from ones that never arrived. Both strings
+    // come off the wire, hence sanitizeForLog -- see log_escape.h.
     std::printf("wallpaperx-daemon: SetWallpaper(type=%s, path=%s, monitor=%d)\n",
                 sanitizeForLog(type).c_str(), sanitizeForLog(path).c_str(), monitorId);
     std::fflush(stdout);
@@ -202,13 +193,8 @@ std::string DbusService::getStatus() {
     nlohmann::json status;
     status["running"] = true;
 
-    // The GPU block is absent until something has actually needed the GPU -- the Device
-    // is created on the first render, so reporting a tier before then would be a guess.
-    // "initialized" says which of those two states this is; a client that finds it false
-    // has not hit a problem, it has just caught the daemon before its first wallpaper.
-    //
     // One snapshot for both halves: reading the GPU block and the monitor map under
-    // separate locks would let a render commit in between and produce a reply claiming
+    // separate locks would let a render commit between them and produce a reply claiming
     // no GPU beside a monitor that already has a frame.
     const WallpaperManager::Snapshot snap = m_manager.snapshot();
     const GpuStatus& gpu = snap.gpu;
@@ -223,23 +209,12 @@ std::string DbusService::getStatus() {
 
     nlohmann::json wallpapers = nlohmann::json::object();
     for (const auto& [monitorId, monitor] : snap.monitors) {
-        // `path` is sanitized on the way out, not stored sanitized: the recorded path has
-        // to stay byte-exact because it is what actually gets opened. JSON escaping is not
-        // a substitute -- nlohmann escapes bytes below 0x20, but not U+202E, not the
-        // isolates, not DEL, which are exactly the code points that let a client decide how
-        // the value *renders*. Without this, `busctl call ... GetStatus` could show an
-        // administrator a different path than the one on disk, while `last_error` fifteen
-        // lines below -- carrying the same client string -- was escaped correctly. Two
-        // views of one value, disagreeing.
-        //
-        // This makes `path` display-safe rather than round-trip-safe: a frontend must not
-        // feed it back into SetWallpaper. Frontends set the wallpaper, so they already hold
-        // the unescaped path they sent; nothing in this tree reads it back.
-        //
-        // `type` needs no such treatment and gets none. requestWallpaper rejects anything
-        // outside {static, video, shader} before storing (wallpaper_manager.cpp:28), so it
-        // is one of three literals rather than client text. Sanitizing it anyway would
-        // imply a doubt the validation already settles.
+        // Sanitized on the way out, not in storage -- the recorded path must stay
+        // byte-exact because it is what gets opened. JSON escaping is not a substitute:
+        // nlohmann escapes below 0x20 but not U+202E, the isolates or DEL, so `busctl`
+        // could show an admin a different path than the one on disk. Display-safe, not
+        // round-trip-safe. `type` needs none: requestWallpaper rejects anything outside
+        // three literals before storing.
         nlohmann::json entry{{"type", monitor.type},
                              {"path", sanitizeForLog(monitor.path, 4096, LogFraming::Bare)},
                              {"generation", monitor.generation},
@@ -255,14 +230,10 @@ std::string DbusService::getStatus() {
         if (!monitor.lastError.empty()) {
             entry["last_error"] = monitor.lastError;
         }
-        // The other reason a successful SetWallpaper never produces a FrameReady, and it
-        // is not a failure, so it does not belong in last_error: this build has no
-        // renderer for the type. Its own key, so a frontend can say "not supported yet"
-        // rather than painting a broken-image state, and so the two cases stay
-        // distinguishable without string-matching an error message. Emitted always rather
-        // than only when true -- a key that appears only in the bad case is one a client
-        // learns about by hitting it. Mirrors GetFrameFd's Unsupported through the same
-        // isRenderableType(), so the two answers cannot disagree.
+        // The other reason a successful SetWallpaper never yields a FrameReady, and not a
+        // failure, so it gets its own key rather than last_error. Always emitted: a key
+        // that appears only in the bad case is one a client learns about by hitting it.
+        // Shares isRenderableType() with GetFrameFd so the two cannot disagree.
         entry["unsupported"] = !isRenderableType(monitor.type);
         wallpapers[std::to_string(monitorId)] = std::move(entry);
     }

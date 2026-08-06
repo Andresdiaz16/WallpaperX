@@ -159,6 +159,24 @@ target_compile_definitions(wallpaperx-dbus-service-test PRIVATE
     WALLPAPERX_TEST_IMAGE_DIR="${CMAKE_CURRENT_BINARY_DIR}/test_assets"
 )
 
+# Step 7's HTTP config server. In-process, like dbus_service_test, and for the same
+# reason: half of what it must establish is that /config and GetStatus agree, which needs
+# both channels live at once. It binds only ephemeral ports -- never the shipped 18462 --
+# so a developer's running daemon and a parallel ctest entry cannot turn a port conflict
+# into a failure that looks like a defect.
+add_executable(wallpaperx-http-server-test tests/http_server_test.cpp)
+target_link_libraries(wallpaperx-http-server-test PRIVATE wallpaperx-daemon-lib)
+target_include_directories(wallpaperx-http-server-test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../renderer/tests)
+target_compile_definitions(wallpaperx-http-server-test PRIVATE
+    WALLPAPERX_TEST_IMAGE_DIR="${CMAKE_CURRENT_BINARY_DIR}/test_assets"
+    # /health reports a version, and it must be the one this build actually is. Taken
+    # from the same project(... VERSION) the daemon library compiles in, so a check that
+    # http_server.cpp stopped deriving it from the build -- a hardcoded literal, say --
+    # fails here.
+    WALLPAPERX_EXPECTED_VERSION="${PROJECT_VERSION}"
+)
+
 # The system-level tier: spawns the real wallpaperx-daemon executable and drives it over
 # the bus. It links the daemon library only for the DBus name/interface constants and
 # the client-side test scaffolding -- deliberately not to call into the daemon's code,
@@ -198,7 +216,7 @@ add_dependencies(wallpaperx-daemon-system-test wallpaperx-daemon)
 # qt_standard_project_setup(), so turn it off here to skip a pointless moc step.
 if(WALLPAPERX_BUILD_KDE_PLUGIN)
     set_target_properties(wallpaperx-daemon-lib wallpaperx-daemon wallpaperx-dbus-service-test
-                          wallpaperx-daemon-system-test
+                          wallpaperx-daemon-system-test wallpaperx-http-server-test
         PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
 endif()
 
@@ -270,6 +288,35 @@ if(DBUS_RUN_SESSION)
         set_tests_properties(dbus_service_lavapipe PROPERTIES RESOURCE_LOCK wallpaperx_bus_tests)
     endif()
 
+    # Step 7's HTTP config server. Needs a session bus for the same reason the entries
+    # above do -- it compares /config against GetStatus, and GetStatus is only reachable
+    # over the wire.
+    add_test(NAME http_config
+             COMMAND ${DBUS_RUN_SESSION} -- $<TARGET_FILE:wallpaperx-http-server-test>)
+    # 77 for the phases that cannot be exercised on a given host: no non-loopback
+    # interface (S7.1), or no working Vulkan, which leaves the tier and render-window
+    # goals unexercised. ctest turns that into SKIP; without it those runs would exit
+    # non-zero and read as a failure of the HTTP server.
+    set_tests_properties(http_config PROPERTIES
+        ENVIRONMENT "WALLPAPERX_FORCE_TIER="
+        RESOURCE_LOCK wallpaperx_bus_tests
+        SKIP_RETURN_CODE 77)
+
+    # The lavapipe twin exists for the sanitizer tier, not for ICD coverage: the HTTP
+    # behaviour does not vary by driver, but this file is the only place httplib's worker
+    # threads read WallpaperManager concurrently with a writer, and under TSan only
+    # lavapipe-labelled entries run. Without this the torn-read phase -- the one written
+    # against a concurrency defect -- is the one thing the race detector never sees.
+    if(WALLPAPERX_LAVAPIPE_ICD)
+        add_test(NAME http_config_lavapipe
+                 COMMAND ${DBUS_RUN_SESSION} -- $<TARGET_FILE:wallpaperx-http-server-test>)
+        set_tests_properties(http_config_lavapipe PROPERTIES
+            ENVIRONMENT "VK_ICD_FILENAMES=${WALLPAPERX_LAVAPIPE_ICD};WALLPAPERX_FORCE_TIER="
+            LABELS "lavapipe"
+            RESOURCE_LOCK wallpaperx_bus_tests
+            SKIP_RETURN_CODE 77)
+    endif()
+
     # Same private-bus wrapper, one tier up: this one spawns the real daemon binary.
     # Its own dbus-run-session, so the daemon it starts cannot collide with the
     # in-process service above under ctest -jN -- each gets a bus of its own, and both
@@ -300,9 +347,11 @@ if(DBUS_RUN_SESSION)
 else()
     message(WARNING
         "dbus-run-session not found -- ALL bus-driven tests are unregistered: dbus_service, "
-        "dbus_service_classic, dbus_service_lavapipe, dbus_service_classic_lavapipe, daemon_system, "
+        "dbus_service_classic, dbus_service_lavapipe, dbus_service_classic_lavapipe, http_config, "
+        "http_config_lavapipe, daemon_system, "
         "daemon_system_lavapipe. That "
-        "removes the only coverage of the DBus wire contract, the DMA_BUF metadata, the Classic "
+        "removes the only coverage of the DBus wire contract, the DMA_BUF metadata, the HTTP config "
+        "server, the Classic "
         "descriptor tier through the daemon, and the daemon's "
         "process-level behaviour (name acquisition, second-instance refusal, SIGTERM/SIGINT "
         "shutdown, cross-process frame import). A green ctest run without them means much less "

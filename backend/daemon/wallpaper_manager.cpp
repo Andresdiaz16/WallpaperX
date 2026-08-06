@@ -71,14 +71,11 @@ WallpaperManager::WallpaperManager(Config config) : m_config(std::move(config)) 
 // only forward-declared in the header, so the unique_ptr deleters need their
 // definitions, which are visible here.
 WallpaperManager::~WallpaperManager() {
-    // The Device was created on the render thread, but this destructor runs on whichever
-    // thread owns the manager -- the daemon's main thread -- and destroying the targets
-    // and the device is GPU work. That handoff is legitimate only because the owner joins
-    // the render worker before destroying the manager (DbusService::~DbusService stops it
-    // first, and main.cpp declares the service after the manager so it dies first).
-    // Saying so explicitly is the point: without this the affinity check fires on every
-    // shutdown, and silencing it by not checking teardown at all would have given up the
-    // check exactly where use-after-free lives.
+    // The Device was created on the render thread but destroyed on the owner's, which is
+    // GPU work on the wrong thread. Legitimate only because the worker is joined first
+    // (~DbusService stops it, and main declares the service after the manager). Adopting
+    // explicitly, rather than not checking teardown, keeps the affinity check where
+    // use-after-free actually lives.
     if (m_device) {
         m_device->adoptGpuThread();
     }
@@ -153,34 +150,19 @@ void WallpaperManager::requestWallpaper(const std::string& type, const std::stri
     }
     requireValidMonitorId(monitorId);
 
-    // A path that is not a file at all is a client mistake, and rendering is
-    // asynchronous now -- so without this check the single most common user error would
-    // come back as a successful reply followed by silence, discoverable only by polling
-    // GetStatus. It is an early-out, not a guarantee: a file that exists but is not a
-    // decodable image still fails later, on the render thread.
+    // An early-out, not a guarantee: rendering is asynchronous, so without this the
+    // commonest user error returns success and then silence. Both halves matter -- checking
+    // only the file type would send a mode-000 file down the render path instead, so one
+    // mistake would surface through two channels.
     //
-    // Applied to every known type, not just "static". While it sat inside a
-    // `type == "static"` branch, an empty string, a nonexistent path and a directory were
-    // all *accepted* for video and shader -- the identical inputs the branch exists to
-    // reject -- and the monitor then sat frameless forever with nothing to say why. That
-    // asymmetry has to be closed here rather than when Step 13 makes video real, because
-    // by then the rejection is the behaviour a client already depends on.
+    // Applies to every known type, not just static: while this sat inside a
+    // `type == "static"` branch, video and shader accepted an empty string, a missing path
+    // or a directory and then sat frameless forever.
     //
-    // Both halves of the check matter, and the message has to match what is actually
-    // tested. Checking only the file type would accept a mode-000 file with a success
-    // reply and then fail it on the render thread, so the same user mistake -- "I gave it
-    // a path it cannot open" -- would surface through two different channels depending on
-    // why it could not be opened.
-    //
-    // Known and accepted: these two syscalls run on the DBus event-loop thread, so a path
-    // on a hung NFS/autofs mount blocks every other method for that mount's timeout, and
-    // hoisting the check widened that from static-only to every type. Moving it onto the
-    // render worker -- the obvious fix, and the one already applied to GetFrameFd -- was
-    // considered and rejected: the worker is a FIFO that also runs renders, so a bad path
-    // would be rejected only after every queued render drained, turning a ~1 ms rejection
-    // into a multi-second one for every client. That trades a rare unbounded stall for a
-    // certain routine one and would break S6.9's burst-cost bound. If this ever needs
-    // fixing, the answer is a separate validation thread, not the render queue.
+    // Known and accepted: these two syscalls run on the DBus event-loop thread, so a hung
+    // NFS mount blocks every other method. Moving them to the render worker was considered
+    // and rejected -- it is a FIFO, so a bad path would wait behind every queued render and
+    // break S6.9's burst bound. The fix, if ever needed, is a separate validation thread.
     std::error_code ec;
     if (!std::filesystem::is_regular_file(path, ec) || ::access(path.c_str(), R_OK) != 0) {
         throw InvalidRequest(sanitizeForLog(path) + " is not a readable file");
@@ -237,15 +219,10 @@ RenderOutcome WallpaperManager::renderPending(int monitorId) {
         auto it = m_monitors.find(monitorId);
         if (it != m_monitors.end() && it->second.requestSeq == seq) {
             it->second.servicedSeq = seq;
-            // Deliberately does NOT write lastError. GetStatus documents that field to
-            // clients as present only when the last request failed, and this request did
-            // not fail -- it was accepted by contract and is exactly as the client asked.
-            // Putting it there made a frontend that branches on last_error paint an error
-            // state on a wallpaper the daemon deliberately accepted, indistinguishable
-            // from a genuinely broken image without string-matching the text. What
-            // GetStatus needs is the separate `unsupported` key, which dbus_service.cpp
-            // derives from the recorded type through the same isRenderableType() this
-            // branch uses.
+            // Deliberately does NOT write lastError: that field means the request failed,
+            // and this one was accepted exactly as asked. Writing it made frontends paint
+            // a broken-image state on a wallpaper the daemon had accepted. GetStatus's
+            // separate `unsupported` key carries this instead.
         }
         return {};
     }
@@ -272,20 +249,14 @@ RenderOutcome WallpaperManager::renderPending(int monitorId) {
     bool committed = false;
     uint64_t generation = 0;
     {
-        // m_stateMutex is held across the submit, and that is the whole point rather
-        // than an oversight. The target is single-buffered: the submit writes into the
-        // very memory an already-imported consumer is displaying. If a newer request
-        // could land between the check and the submit, this render would repaint the
-        // published frame with a wallpaper the user has just replaced -- and, because a
-        // superseded render deliberately does not bump the generation or emit
-        // FrameReady, it would do so with nothing on the wire to say it happened. The
-        // consumer would go on believing it holds generation N. Making the check and the
-        // submit atomic is what reduces that to "either the render is published or the
-        // image is never touched".
+        // Held across the submit deliberately. The target is single-buffered, so the
+        // submit writes into memory a consumer is already displaying; a newer request
+        // landing between the check and the submit would repaint the published frame with
+        // nothing on the wire to say so, since a superseded render emits no FrameReady.
+        // Atomic check-and-submit reduces that to "published, or never touched".
         //
-        // The cost is bounded by one fullscreen-quad submit, not by the render as a
-        // whole -- decode, upload and pipeline creation are all above, unlocked -- so
-        // GetStatus can wait on a draw, never on an image load or device creation.
+        // Bounded by one fullscreen-quad submit -- decode, upload and pipeline creation are
+        // all above, unlocked -- so GetStatus can wait on a draw, never on a decode.
         std::lock_guard<std::mutex> stateLock(m_stateMutex);
         auto it = m_monitors.find(monitorId);
         if (it == m_monitors.end() || it->second.requestSeq != seq) {
@@ -309,24 +280,14 @@ RenderOutcome WallpaperManager::renderPending(int monitorId) {
         it->second.servicedSeq = seq;
 
         if (!error.empty()) {
-            // Sanitized at the one place client-derived text enters daemon-held state,
-            // rather than at each place it leaves. The renderer's message embeds the
-            // client's path verbatim ("not a decodable image <path>: <reason>"), and a
-            // regular readable file may perfectly well be named with newlines or an ESC
-            // sequence -- so every consumer of lastError, the RenderFailed reply and the
-            // GetStatus JSON today and any log line tomorrow, inherits the escaping
-            // without anyone having to remember.
+            // Sanitized where client text enters daemon state, not at each place it
+            // leaves, so every consumer inherits the escaping: the renderer's message
+            // embeds the client's path, and a readable file may be named with an ESC
+            // sequence.
             //
-            // 1024 rather than the default because this field is polled -- every GetStatus
-            // caller pays for it on every call, unlike a log line that is written once.
-            //
-            // What makes the smaller cap safe is that the renderer now puts its diagnosis
-            // BEFORE the path (see describeRejection in static_renderer.cpp).
-            // sanitizeForLog keeps the head, so whatever is cut is the tail. While the path
-            // came first, this cap deleted stb's failure reason -- the only part that says
-            // what is wrong with the file -- for any path long enough to reach it, which is
-            // the exact opposite of what an earlier version of this comment claimed it did.
-            // The two have to stay in that order; reversing the message reintroduces it.
+            // 1024 rather than the default because this field is polled. Safe only because
+            // describeRejection() puts the diagnosis before the path -- truncation keeps
+            // the head, so reversing that message would cut stb's reason instead.
             it->second.lastError = sanitizeForLog(error, 1024, LogFraming::Bare);
         } else {
             ++it->second.generation;
@@ -371,17 +332,13 @@ FrameExport WallpaperManager::exportCurrentFrame(int monitorId) {
             return out;
         }
         if (!it->second.hasFrame) {
-            // Decided here, under the lock that guards it, so the answer cannot be
-            // overtaken between reading "no frame" and reading why. lastError is set
-            // only by a render that ran and failed, and cleared both when a new request
-            // is recorded and when a render commits -- so a non-empty one is exactly
-            // "the most recent attempt failed and nothing has superseded it".
+            // Decided under the lock so the answer cannot be overtaken between reading
+            // "no frame" and reading why.
             //
-            // The type is consulted first and independently of lastError, because this
-            // answer is true from the instant the request is recorded: a video request
-            // will not produce a frame in this build whether or not the worker has
-            // reached it yet, so keying on the worker's progress would answer "not yet"
-            // for a window and "never" afterwards for the same unchanged request.
+            // Type is consulted first and independently of lastError: the answer is true
+            // from the instant the request is recorded, so keying on the worker's progress
+            // would say "not yet" for a window and "never" afterwards for one unchanged
+            // request.
             if (!isRenderableType(it->second.type)) {
                 out.reason = NoFrameReason::Unsupported;
                 return out;
