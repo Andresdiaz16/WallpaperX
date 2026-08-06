@@ -51,6 +51,25 @@ struct GpuStatus {
     std::string descriptorTier;
 };
 
+// Pending is a real answer: both dependencies are only touched on the first render, so
+// until then nothing has been tried.
+enum class HealthStatus { Pending, Ok, Fail };
+
+const char* toString(HealthStatus status);
+
+struct HealthCheck {
+    HealthStatus status = HealthStatus::Pending;
+    // Sanitized at the recording site: it can embed $WALLPAPERX_SHADER_DIR and reaches JSON.
+    std::string detail;
+};
+
+// Recorded as the daemon tries its dependencies, never probed on demand -- stat()ing a path
+// inside the health handler would let a hung mount wedge the endpoint.
+struct DaemonHealth {
+    HealthCheck shaders;
+    HealthCheck gpu;
+};
+
 // An exported frame plus the generation counter of the render that produced it.
 // The caller owns frame.fd and must close it (or hand it to something that will).
 struct FrameHandle {
@@ -182,6 +201,7 @@ public:
     // contradiction the GPU block exists to settle.
     struct Snapshot {
         GpuStatus gpu;
+        DaemonHealth health;
         std::map<int, MonitorStatus> monitors;
     };
     Snapshot snapshot() const;
@@ -256,7 +276,12 @@ private:
     // published once at initialisation, so status() can answer without touching the
     // Device and therefore without waiting for a render to finish.
     std::map<int, MonitorState> m_monitors;
+    // Member pointer picks the check, so a caller cannot record into a field it did not
+    // mean and the sanitizing happens in one place.
+    void recordHealth(HealthCheck DaemonHealth::*which, HealthStatus status, const std::string& detail);
+
     GpuStatus m_gpuStatus;
+    DaemonHealth m_health;
 };
 
 }

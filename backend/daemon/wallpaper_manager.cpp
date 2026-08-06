@@ -81,20 +81,52 @@ WallpaperManager::~WallpaperManager() {
     }
 }
 
+const char* toString(HealthStatus status) {
+    switch (status) {
+        case HealthStatus::Pending: return "pending";
+        case HealthStatus::Ok: return "ok";
+        case HealthStatus::Fail: return "fail";
+    }
+    return "unknown";
+}
+
+void WallpaperManager::recordHealth(HealthCheck DaemonHealth::*which, HealthStatus status,
+                                    const std::string& detail) {
+    std::lock_guard<std::mutex> stateLock(m_stateMutex);
+    (m_health.*which).status = status;
+    (m_health.*which).detail = sanitizeForLog(detail, 1024, LogFraming::Bare);
+}
+
 void WallpaperManager::ensureGpu() {
     if (m_device) return;
 
+    // Each phase records its outcome before rethrowing, so /health can name which
+    // dependency failed rather than burying it in one monitor's lastError.
+    //
     // Resolved before the Device exists: it is the cheapest of the three things that
     // can fail here, and a missing shader directory would otherwise be reported only
     // after paying for a full Vulkan device creation and teardown.
-    m_resolvedShaderDir = resolveShaderDir(m_config.shaderDir);
+    try {
+        m_resolvedShaderDir = resolveShaderDir(m_config.shaderDir);
+    } catch (const std::exception& e) {
+        recordHealth(&DaemonHealth::shaders, HealthStatus::Fail, e.what());
+        throw;
+    }
+    recordHealth(&DaemonHealth::shaders, HealthStatus::Ok, m_resolvedShaderDir);
 
     // Built into locals and only committed on full success. Assigning m_device first
     // would leave a half-initialised manager if the target manager throws: m_device set,
     // m_targets null, and every later call taking the "already initialised" early return
     // straight into a null dereference.
-    auto device = std::make_unique<Device>(m_config.enableValidation);
-    auto targets = std::make_unique<OffscreenTargetManager>(*device);
+    std::unique_ptr<Device> device;
+    std::unique_ptr<OffscreenTargetManager> targets;
+    try {
+        device = std::make_unique<Device>(m_config.enableValidation);
+        targets = std::make_unique<OffscreenTargetManager>(*device);
+    } catch (const std::exception& e) {
+        recordHealth(&DaemonHealth::gpu, HealthStatus::Fail, e.what());
+        throw;
+    }
 
     // targets holds a Device& to the object the local unique_ptr owns; moving the
     // pointer does not move the object, so that reference stays valid.
@@ -109,6 +141,8 @@ void WallpaperManager::ensureGpu() {
         m_gpuStatus.name = m_device->info().gpuName;
         m_gpuStatus.descriptorTier = toString(m_device->descriptorTier());
     }
+    recordHealth(&DaemonHealth::gpu, HealthStatus::Ok,
+                 m_gpuStatus.name + " (" + m_gpuStatus.descriptorTier + ")");
 
     // Definition of Done #1 wants the daemon to report its GPU and descriptor tier. Here
     // rather than at startup, because the device is created lazily and printing a tier
@@ -242,6 +276,12 @@ RenderOutcome WallpaperManager::renderPending(int monitorId) {
         // by the time render() returns, so nothing is destroyed out from under the GPU.
         // Step 13's video renderer does need to persist and will live in MonitorState.
         renderer.emplace(*m_device, m_targets->renderPass(), path, m_resolvedShaderDir);
+    } catch (const GpuFailure& e) {
+        // Caught before std::exception, which it derives from. This is the GPU going wrong
+        // rather than the image, so it re-records gpu health -- otherwise a device that
+        // dies after the first successful render reads ok forever.
+        error = e.what();
+        recordHealth(&DaemonHealth::gpu, HealthStatus::Fail, error);
     } catch (const std::exception& e) {
         error = e.what();
     }
@@ -302,6 +342,9 @@ RenderOutcome WallpaperManager::renderPending(int monitorId) {
             it->second.lastError.clear();
             committed = true;
             generation = it->second.generation;
+            // Under the lock already held. A commit is the GPU working, so it clears a
+            // failure recorded by an earlier render without a second acquisition.
+            m_health.gpu.status = HealthStatus::Ok;
         }
     }
 
@@ -392,6 +435,7 @@ WallpaperManager::Snapshot WallpaperManager::snapshot() const {
 
     Snapshot out;
     out.gpu = m_gpuStatus;
+    out.health = m_health;
     for (const auto& [monitorId, state] : m_monitors) {
         MonitorStatus entry;
         entry.type = state.type;

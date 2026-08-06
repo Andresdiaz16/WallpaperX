@@ -6,8 +6,10 @@
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
+#include <array>
 #include <charconv>
 #include <cstdio>
+#include <utility>
 #include <exception>
 #include <string>
 #include <system_error>
@@ -156,21 +158,56 @@ void HttpServer::registerRoutes() {
         sendJson(res, out);
     });
 
-    // GET /health
+    // GET /health -- what is currently broken, not merely whether this thread answers.
     m_server->Get("/health", [this](const httplib::Request&, httplib::Response& res) {
         const WallpaperManager::Snapshot snap = m_manager.snapshot();
 
-        nlohmann::json out{{"status", "ok"}, {"version", WALLPAPERX_VERSION}};
+        std::size_t failedMonitors = 0;
+        for (const auto& [id, monitor] : snap.monitors) {
+            if (!monitor.lastError.empty()) ++failedMonitors;
+        }
 
-        // Always present, null until the lazily-created device exists -- a key that
-        // appears only after something happens is one a client learns about by hitting
-        // its absence. Conflicts with PLAN.md DoD #2, which expects a tier immediately;
-        // see GOALS.md S7.10.
-        out["descriptor_tier"] = snap.gpu.initialized ? nlohmann::json(snap.gpu.descriptorTier)
-                                                      : nlohmann::json(nullptr);
-        out["gpu_initialized"] = snap.gpu.initialized;
+        HealthCheck wallpapers;
+        if (snap.monitors.empty()) {
+            wallpapers.detail = "no wallpaper set";
+        } else if (failedMonitors > 0) {
+            // Carries the first error verbatim: "1 of 2 failed" tells an operator to go
+            // read GetStatus, which is the call they made this one to avoid.
+            std::string first;
+            for (const auto& [id, monitor] : snap.monitors) {
+                if (!monitor.lastError.empty()) { first = monitor.lastError; break; }
+            }
+            wallpapers.status = HealthStatus::Fail;
+            wallpapers.detail = std::to_string(failedMonitors) + " of " +
+                                std::to_string(snap.monitors.size()) + " monitors failed: " + first;
+        } else {
+            wallpapers.status = HealthStatus::Ok;
+            wallpapers.detail = std::to_string(snap.monitors.size()) + " monitor(s) rendered";
+        }
 
-        sendJson(res, out);
+        const std::array<std::pair<const char*, const HealthCheck*>, 3> checks{{
+            {"shaders", &snap.health.shaders},
+            {"gpu", &snap.health.gpu},
+            {"wallpapers", &wallpapers},
+        }};
+
+        // Worst check wins, Fail > Pending > Ok. Pending propagates rather than counting as
+        // ok: an untried dependency is unknown, and reporting a daemon healthy on the
+        // strength of checks nobody has run is the failure this endpoint was rebuilt to fix.
+        HealthStatus overall = HealthStatus::Ok;
+        nlohmann::json checksJson = nlohmann::json::object();
+        for (const auto& [name, check] : checks) {
+            if (check->status == HealthStatus::Fail) {
+                overall = HealthStatus::Fail;
+            } else if (check->status == HealthStatus::Pending && overall != HealthStatus::Fail) {
+                overall = HealthStatus::Pending;
+            }
+            checksJson[name] = {{"status", toString(check->status)}, {"detail", check->detail}};
+        }
+
+        sendJson(res, {{"status", toString(overall)},
+                       {"version", WALLPAPERX_VERSION},
+                       {"checks", checksJson}});
     });
 }
 

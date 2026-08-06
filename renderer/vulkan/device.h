@@ -6,11 +6,19 @@
 
 #include <functional>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <atomic>
 #include <thread>
 
 namespace wallpaperx {
+
+// A failure of the GPU itself -- submission, fences, command buffers -- as opposed to a
+// failure of the thing being rendered. Lets a caller attribute the fault without matching
+// on message text; a bad image and a lost device are both runtime_error otherwise.
+struct GpuFailure : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
 
 struct DeviceInfo {
     std::string gpuName;

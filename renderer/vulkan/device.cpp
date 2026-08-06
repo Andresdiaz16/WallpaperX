@@ -483,7 +483,7 @@ void Device::immediateSubmit(const std::function<void(VkCommandBuffer)>& record)
 
     VkCommandBuffer cmd = VK_NULL_HANDLE;
     if (vkAllocateCommandBuffers(m_device, &allocInfo, &cmd) != VK_SUCCESS) {
-        throw std::runtime_error("Device::immediateSubmit: failed to allocate command buffer");
+        throw GpuFailure("Device::immediateSubmit: failed to allocate command buffer");
     }
 
     VkFence fence = VK_NULL_HANDLE;
@@ -507,18 +507,18 @@ void Device::immediateSubmit(const std::function<void(VkCommandBuffer)>& record)
     VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     if (vkBeginCommandBuffer(cmd, &beginInfo) != VK_SUCCESS) {
-        throw std::runtime_error("Device::immediateSubmit: vkBeginCommandBuffer failed");
+        throw GpuFailure("Device::immediateSubmit: vkBeginCommandBuffer failed");
     }
 
     record(cmd);
 
     if (vkEndCommandBuffer(cmd) != VK_SUCCESS) {
-        throw std::runtime_error("Device::immediateSubmit: vkEndCommandBuffer failed");
+        throw GpuFailure("Device::immediateSubmit: vkEndCommandBuffer failed");
     }
 
     VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     if (vkCreateFence(m_device, &fenceInfo, nullptr, &fence) != VK_SUCCESS) {
-        throw std::runtime_error("Device::immediateSubmit: failed to create fence");
+        throw GpuFailure("Device::immediateSubmit: failed to create fence");
     }
 
     VkSubmitInfo submitInfo{VK_STRUCTURE_TYPE_SUBMIT_INFO};
@@ -526,11 +526,11 @@ void Device::immediateSubmit(const std::function<void(VkCommandBuffer)>& record)
     submitInfo.pCommandBuffers = &cmd;
 
     if (vkQueueSubmit(m_graphicsQueue, 1, &submitInfo, fence) != VK_SUCCESS) {
-        throw std::runtime_error("Device::immediateSubmit: vkQueueSubmit failed");
+        throw GpuFailure("Device::immediateSubmit: vkQueueSubmit failed");
     }
 
     if (vkWaitForFences(m_device, 1, &fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) {
-        throw std::runtime_error("Device::immediateSubmit: vkWaitForFences failed");
+        throw GpuFailure("Device::immediateSubmit: vkWaitForFences failed");
     }
 }
 
