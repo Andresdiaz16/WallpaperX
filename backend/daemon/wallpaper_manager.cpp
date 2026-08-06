@@ -97,6 +97,11 @@ void WallpaperManager::recordHealth(HealthCheck DaemonHealth::*which, HealthStat
     (m_health.*which).detail = sanitizeForLog(detail, 1024, LogFraming::Bare);
 }
 
+void WallpaperManager::recordConfigServer(bool listening, const std::string& error) {
+    recordHealth(&DaemonHealth::configServer, listening ? HealthStatus::Ok : HealthStatus::Fail,
+                 listening ? "listening" : error);
+}
+
 void WallpaperManager::ensureGpu() {
     if (m_device) return;
 

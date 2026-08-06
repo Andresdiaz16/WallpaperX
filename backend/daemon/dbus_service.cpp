@@ -207,6 +207,11 @@ std::string DbusService::getStatus() {
     }
     status["gpu"] = std::move(gpuJson);
 
+    // The one dependency /health cannot report on: if the bind failed, something else is
+    // answering that port and will say whatever it likes.
+    status["config_server"] = {{"status", toString(snap.health.configServer.status)},
+                               {"detail", snap.health.configServer.detail}};
+
     nlohmann::json wallpapers = nlohmann::json::object();
     for (const auto& [monitorId, monitor] : snap.monitors) {
         // Sanitized on the way out, not in storage -- the recorded path must stay

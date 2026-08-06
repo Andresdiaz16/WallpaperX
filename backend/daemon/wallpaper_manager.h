@@ -68,6 +68,12 @@ struct HealthCheck {
 struct DaemonHealth {
     HealthCheck shaders;
     HealthCheck gpu;
+
+    // Deliberately absent from /health's checks: a bind failure means /health is answered by
+    // whatever took the port, so there it could only ever read ok. GetStatus carries it --
+    // the bus name cannot be taken from a running daemon, so DBus is the channel that can
+    // still say "the thing on that port is not mine".
+    HealthCheck configServer;
 };
 
 // An exported frame plus the generation counter of the render that produced it.
@@ -205,6 +211,10 @@ public:
         std::map<int, MonitorStatus> monitors;
     };
     Snapshot snapshot() const;
+
+    // Called once by main() with the result of constructing the HttpServer, which does not
+    // throw on a bind failure.
+    void recordConfigServer(bool listening, const std::string& error);
 
     // The renderer's validation-warning counter, or null when no device has been created
     // yet. Shared so it stays readable after this manager and its Device are destroyed:
