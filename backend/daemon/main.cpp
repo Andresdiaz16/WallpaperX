@@ -3,6 +3,7 @@
 
 #include <sdbus-c++/sdbus-c++.h>
 
+#include <atomic>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
@@ -38,9 +39,15 @@ int main() {
         return 1;
     }
 
-    // SIGPIPE ignored rather than blocked, because it is synchronous: it is raised by the
-    // write that failed, on the thread that made it, and blocking would leave it pending
-    // forever instead of letting the write report EPIPE. Left at its default this daemon
+    // SIGPIPE ignored rather than blocked. Not because blocking would cost the EPIPE --
+    // measured, and it does not: with SIGPIPE blocked, a write to a pipe with no reader
+    // still returns -1/EPIPE, exactly as it does under SIG_IGN. What blocking additionally
+    // does is leave SIGPIPE *pending*, which is the actual hazard here. This daemon runs a
+    // sigwait() thread over a set of shutdown signals a few lines below; a pending SIGPIPE
+    // is a signal waiting for someone to consume it, and the day SIGPIPE is added to that
+    // set -- or any thread unblocks it -- a broken pipe becomes a shutdown or a kill at a
+    // moment unrelated to the write that caused it. SIG_IGN discards it outright, so there
+    // is nothing left to go off later. Left at its default this daemon
     // died silently -- exit 141, empty stderr -- the first time anything closed its
     // stdout, which `wallpaperx-daemon | head` is enough to do, and which is ordinary for
     // a process whose output is piped or whose terminal goes away. A dead daemon with no
@@ -95,20 +102,38 @@ int main() {
         // The wake is still needed for the ordinary early return: the watcher is parked in
         // sigwait() and would never leave it. Signals are blocked process-wide, so this is
         // consumed by that thread's sigwait rather than acting on the process.
+        //
+        // And the wake has to be distinguishable from the real thing. The watcher cannot
+        // tell a SIGTERM the session manager sent from the SIGTERM the destructor sends to
+        // wake it, so it announced both -- which meant that on the throw path above, where
+        // the daemon died because the broker dropped the connection, it printed
+        // "Terminated received, shutting down" and sent post-mortem triage looking for a
+        // signal nobody sent. In a daemon whose log is the only account of why it stopped,
+        // that is a line describing an event that did not happen. Declared before the guard
+        // so it outlives it: destruction runs in reverse, so the reference is still valid.
+        std::atomic<bool> wakingForShutdown{false};
+
         struct ShutdownWatch {
             std::thread thread;
+            std::atomic<bool>& wakingForShutdown;
             ~ShutdownWatch() {
                 if (!thread.joinable()) return;
+                // Set BEFORE the signal, or the watcher can wake, read false, and print
+                // the line this exists to suppress. That ordering is the whole guarantee.
+                wakingForShutdown.store(true, std::memory_order_release);
                 pthread_kill(thread.native_handle(), SIGTERM);
                 thread.join();
             }
-        } shutdownWatch{std::thread([&connection, &shutdownSignals] {
+        } shutdownWatch{std::thread([&connection, &shutdownSignals, &wakingForShutdown] {
             int received = 0;
             if (sigwait(&shutdownSignals, &received) != 0) return;
+            // Not just the message: leaveEventLoop() is skipped too. On the throw path the
+            // loop is already unwinding and the connection is the thing that failed.
+            if (wakingForShutdown.load(std::memory_order_acquire)) return;
             std::printf("wallpaperx-daemon: %s received, shutting down\n", strsignal(received));
             std::fflush(stdout);
             connection->leaveEventLoop();
-        })};
+        }), wakingForShutdown};
 
         connection->enterEventLoop();  // returns once leaveEventLoop() is called
 

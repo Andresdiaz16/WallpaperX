@@ -15,6 +15,7 @@
 #include <cstring>
 #include <fstream>
 #include <stdexcept>
+#include <string>
 
 namespace wallpaperx {
 
@@ -79,26 +80,82 @@ void StaticRenderer::cleanup() {
     m_device.memory().destroyImage(m_texture);
 }
 
-// The largest decoded image this renderer will accept, in bytes of RGBA.
+// The peak host memory this renderer will spend to decode one image, in bytes.
 //
-// 256 MiB is 8192x8192, which is four times the pixel count of an 8K display -- generous
-// for a wallpaper, and small enough that the staging copy plus the texture cannot
-// dominate a machine. The bound is on *decoded* size because that is the cost, and the
-// file gives no honest hint of it: a 995 KB PNG of 16000x16000 decodes to 1.0 GB, and
-// with the staging buffer the daemon peaked at +2.0 GB RSS and was OOM-killed under a
-// 1.2 GB limit. Nothing else stopped it, and stb's own limits are not a substitute --
-// read from stb_image.h rather than assumed:
+// This bounds the PEAK, not the finished buffer, and the distinction is the whole point.
+// An earlier version compared `w*h*4` -- stb's final RGBA output -- against 256 MiB, which
+// measured one allocation out of the several that are live simultaneously. A 16-bit RGBA
+// PNG at 8192x8192 computes to exactly 268435456, was therefore *not* over the old cap,
+// and then peaked near 1.5 GB. It compresses to a few megabytes. That is the same
+// OOM-kill the cap was added to prevent, from a file the cap accepted.
+//
+// The motivating case, measured: a 995 KB PNG of 16000x16000 decodes to 976 MiB of RGBA,
+// the daemon peaked at +2.0 GB RSS, and it was OOM-killed under a 1.2 GB limit. Nothing
+// else stopped it. stb's own limits are not a substitute -- read out of stb_image.h, not
+// assumed:
 //   - PNG has a product bound in the IHDR parse, `(1<<30)/w/img_n < h` (`/4` when
 //     paletted), so the ceiling moves with the channel count: ~16384x16384 for RGBA,
 //     ~18918x18918 for RGB. It does run at header time, inside the stbi_info() below.
-//   - JPEG's equivalent (stbi__mad3sizes_valid) sits behind `if (scan != STBI__SCAN_load)
-//     return 1;`, so stbi_info skips it entirely -- and on load it only rejects integer
-//     overflow, not size. Per-axis STBI_MAX_DIMENSIONS is 1<<24. For a JPEG, which is
-//     what most wallpapers are, there is effectively no bound before this one.
-// So the cap is not a tightening of stb's threshold, it is the only threshold for the
-// common formats. 16000x16000 is the case measured above at 976 MiB and is what the S4.9
-// probe uses: inside PNG's guard, four times over this cap.
-constexpr uint64_t kMaxDecodedBytes = 256ull * 1024 * 1024;
+//   - JPEG has nothing at header time. `stbi__mad3sizes_valid` sits after
+//     `if (scan != STBI__SCAN_load) return 1;` (stb_image.h:3296-3298), so stbi_info
+//     returns before reaching it. Two things do bound a JPEG, and neither helps here: the
+//     SOF marker stores each axis as 16-bit big-endian, so 65535 is a hard format ceiling
+//     (:3270-3271) -- STBI_MAX_DIMENSIONS of 1<<24 is checked but can never bind -- and at
+//     *load* time mad3sizes_valid caps `x*y*img_n` at INT_MAX, about 26755x26755 for a
+//     3-component image. Both are far above anything this daemon should accept, and the
+//     second runs only after the decode has been committed to.
+// So for JPEG, which is what most wallpapers are, this is the only threshold that acts
+// before memory is spent.
+//
+// 768 MiB admits every real display geometry -- 8K at 7680x4320 estimates to ~532 MiB,
+// five 4K panels side by side at 19200x2160 to ~664 MiB -- and puts the square ceiling
+// near 7094x7094. It is deliberately below the 1.2 GB limit the original kill happened
+// under. Note this is slightly tighter than the old nominal 8192x8192: that figure was
+// only ever reachable because the old model under-counted, so nothing that actually
+// worked is lost.
+constexpr uint64_t kMaxPeakDecodeBytes = 768ull * 1024 * 1024;
+
+// Multiples of the final RGBA buffer that are live at once, worst case. Counted out of
+// stb_image.h rather than estimated, because a factor invented to look safe is how the
+// previous version of this check ended up not binding:
+//   - 8-bit: the zlib-inflated scanline data (`img_width_bytes+1` per row, up to ~1x for
+//     4-channel) is alive while `a->out` (1x) is filled, and an interlaced PNG holds
+//     `final` at full size plus the largest Adam7 pass, which is half the image
+//     (:4870-4899). Progressive JPEG is the other shape: per-component coefficient buffers
+//     at w*h*2 bytes each. 3x covers all of them, and this function's own staging buffer
+//     adds the 4th.
+//   - 16-bit: `stbi__load_and_postprocess_8bit` materialises the 16-bit image (2x) and
+//     then allocates the 8-bit target (1x) before freeing it (:1260-1272), and interlacing
+//     applies on top of that. 5x plus staging.
+// Interlacing is not observable through any stb API -- there is no stbi_is_interlaced --
+// so it cannot be probed and has to be carried in the factor.
+constexpr uint64_t kPeakFactor8Bit = 4;
+constexpr uint64_t kPeakFactor16Bit = 6;
+
+namespace {
+
+// stbi__g_failure_reason is a file-scope `const char *` with no initialiser
+// (stb_image.h:970), so it is NULL until some path calls stbi__err. Concatenating that
+// into a std::string is undefined, and the failure paths are exactly where nobody looks
+// until it matters.
+std::string stbFailureReason() {
+    const char* reason = stbi_failure_reason();
+    return reason != nullptr ? std::string(reason) : std::string("no reason reported");
+}
+
+// Why every message below puts its diagnosis first and the path last.
+//
+// These strings become MonitorState::lastError, which is truncated to 1024 bytes by
+// sanitizeForLog -- and that keeps the HEAD. With the path first, a long but perfectly
+// legal path pushed stb's reason past the cut, so `last_error` arrived saying a file could
+// not be decoded without a word about why. Since SetWallpaper replies before rendering is
+// attempted, this is the only channel a render failure has. The path is the part the
+// client already knows and therefore the right part to lose.
+std::string describeRejection(const std::string& what, const std::string& imagePath) {
+    return "StaticRenderer: " + what + ": " + imagePath;
+}
+
+}  // namespace
 
 void StaticRenderer::loadAndUploadTexture(const std::string& imagePath) {
     // Checked from the header alone, before decoding, because a limit applied after
@@ -109,18 +166,30 @@ void StaticRenderer::loadAndUploadTexture(const std::string& imagePath) {
     int probeChannels = 0;
     if (!stbi_info(imagePath.c_str(), &probeWidth, &probeHeight, &probeChannels)) {
         throw std::runtime_error(
-            "StaticRenderer: not a decodable image " + imagePath + ": " + stbi_failure_reason());
+            describeRejection("not a decodable image (" + stbFailureReason() + ")", imagePath));
     }
     if (probeWidth <= 0 || probeHeight <= 0) {
-        throw std::runtime_error("StaticRenderer: image reports non-positive dimensions " + imagePath);
+        throw std::runtime_error(describeRejection(
+            "image reports non-positive dimensions (" + std::to_string(probeWidth) + "x" +
+                std::to_string(probeHeight) + ")",
+            imagePath));
     }
-    const uint64_t decodedBytes = static_cast<uint64_t>(probeWidth) * static_cast<uint64_t>(probeHeight) * 4;
-    if (decodedBytes > kMaxDecodedBytes) {
-        throw std::runtime_error("StaticRenderer: " + imagePath + " decodes to " +
-                                 std::to_string(decodedBytes / (1024 * 1024)) + " MiB (" +
-                                 std::to_string(probeWidth) + "x" + std::to_string(probeHeight) +
-                                 "), over the " + std::to_string(kMaxDecodedBytes / (1024 * 1024)) +
-                                 " MiB limit");
+
+    // probeChannels is reported but deliberately not part of the arithmetic: what drives
+    // the peak is bit depth and interlacing, not how many channels the source had, and
+    // stb converts to 4 channels regardless of it.
+    const uint64_t outputBytes =
+        static_cast<uint64_t>(probeWidth) * static_cast<uint64_t>(probeHeight) * 4;
+    const bool sixteenBit = stbi_is_16_bit(imagePath.c_str()) != 0;
+    const uint64_t peakBytes = outputBytes * (sixteenBit ? kPeakFactor16Bit : kPeakFactor8Bit);
+    if (peakBytes > kMaxPeakDecodeBytes) {
+        throw std::runtime_error(describeRejection(
+            "estimated peak " + std::to_string(peakBytes / (1024 * 1024)) + " MiB to decode " +
+                std::to_string(probeWidth) + "x" + std::to_string(probeHeight) + " (" +
+                std::to_string(probeChannels) + " channels, " + (sixteenBit ? "16" : "8") +
+                "-bit), over the " + std::to_string(kMaxPeakDecodeBytes / (1024 * 1024)) +
+                " MiB limit",
+            imagePath));
     }
 
     int imageWidth = 0;
@@ -129,7 +198,29 @@ void StaticRenderer::loadAndUploadTexture(const std::string& imagePath) {
     stbi_uc* pixels = stbi_load(imagePath.c_str(), &imageWidth, &imageHeight, &channels, STBI_rgb_alpha);
     if (!pixels) {
         throw std::runtime_error(
-            "StaticRenderer: failed to load image " + imagePath + ": " + stbi_failure_reason());
+            describeRejection("failed to load image (" + stbFailureReason() + ")", imagePath));
+    }
+
+    // Re-checked against what stbi_load ACTUALLY returned, because the check above ran on a
+    // different open of the file. stbi_info and stbi_load are two independent fopen()s, so
+    // anything with write access to the wallpaper directory -- a slideshow tool, a
+    // downloader, the user -- can replace a 1920x1080 PNG with a 16000x16000 JPEG between
+    // them, and every allocation below would then be sized from dimensions nothing had
+    // vetted. The decode itself is already paid for by this point; what this still buys is
+    // that the staging buffer and the texture cannot be sized by an unvetted number.
+    //
+    // Uses the 8-bit factor unconditionally: the decode is done, so the only cost left is
+    // this function's own. That also makes this gate strictly looser than the header one,
+    // so a file that was not swapped can never be rejected here after passing there.
+    const uint64_t loadedBytes =
+        static_cast<uint64_t>(imageWidth) * static_cast<uint64_t>(imageHeight) * 4;
+    if (loadedBytes * kPeakFactor8Bit > kMaxPeakDecodeBytes) {
+        stbi_image_free(pixels);
+        throw std::runtime_error(describeRejection(
+            "decoded to " + std::to_string(imageWidth) + "x" + std::to_string(imageHeight) +
+                ", larger than the " + std::to_string(probeWidth) + "x" +
+                std::to_string(probeHeight) + " its header reported -- file changed under us",
+            imagePath));
     }
 
     const VkDeviceSize imageSize = static_cast<VkDeviceSize>(imageWidth) * imageHeight * 4;

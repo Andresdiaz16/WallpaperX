@@ -315,9 +315,18 @@ RenderOutcome WallpaperManager::renderPending(int monitorId) {
             // regular readable file may perfectly well be named with newlines or an ESC
             // sequence -- so every consumer of lastError, the RenderFailed reply and the
             // GetStatus JSON today and any log line tomorrow, inherits the escaping
-            // without anyone having to remember. 1024 rather than the default, so a
-            // PATH_MAX-length path cannot push stb's own reason off the end, which is
-            // the part that says what is actually wrong with the file.
+            // without anyone having to remember.
+            //
+            // 1024 rather than the default because this field is polled -- every GetStatus
+            // caller pays for it on every call, unlike a log line that is written once.
+            //
+            // What makes the smaller cap safe is that the renderer now puts its diagnosis
+            // BEFORE the path (see describeRejection in static_renderer.cpp).
+            // sanitizeForLog keeps the head, so whatever is cut is the tail. While the path
+            // came first, this cap deleted stb's failure reason -- the only part that says
+            // what is wrong with the file -- for any path long enough to reach it, which is
+            // the exact opposite of what an earlier version of this comment claimed it did.
+            // The two have to stay in that order; reversing the message reintroduces it.
             it->second.lastError = sanitizeForLog(error, 1024, LogFraming::Bare);
         } else {
             ++it->second.generation;

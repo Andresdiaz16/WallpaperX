@@ -223,8 +223,25 @@ std::string DbusService::getStatus() {
 
     nlohmann::json wallpapers = nlohmann::json::object();
     for (const auto& [monitorId, monitor] : snap.monitors) {
+        // `path` is sanitized on the way out, not stored sanitized: the recorded path has
+        // to stay byte-exact because it is what actually gets opened. JSON escaping is not
+        // a substitute -- nlohmann escapes bytes below 0x20, but not U+202E, not the
+        // isolates, not DEL, which are exactly the code points that let a client decide how
+        // the value *renders*. Without this, `busctl call ... GetStatus` could show an
+        // administrator a different path than the one on disk, while `last_error` fifteen
+        // lines below -- carrying the same client string -- was escaped correctly. Two
+        // views of one value, disagreeing.
+        //
+        // This makes `path` display-safe rather than round-trip-safe: a frontend must not
+        // feed it back into SetWallpaper. Frontends set the wallpaper, so they already hold
+        // the unescaped path they sent; nothing in this tree reads it back.
+        //
+        // `type` needs no such treatment and gets none. requestWallpaper rejects anything
+        // outside {static, video, shader} before storing (wallpaper_manager.cpp:28), so it
+        // is one of three literals rather than client text. Sanitizing it anyway would
+        // imply a doubt the validation already settles.
         nlohmann::json entry{{"type", monitor.type},
-                             {"path", monitor.path},
+                             {"path", sanitizeForLog(monitor.path, 4096, LogFraming::Bare)},
                              {"generation", monitor.generation},
                              {"has_frame", monitor.hasFrame}};
         if (monitor.hasFrame) {

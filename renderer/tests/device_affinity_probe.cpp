@@ -76,6 +76,7 @@
 #include <string>
 #include <thread>
 
+#include <sys/prctl.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -199,6 +200,25 @@ ChildResult runInChild(const std::function<void()>& body) {
         close(fds[0]);
         if (dup2(fds[1], STDERR_FILENO) == -1) _exit(126);
         close(fds[1]);
+        // Every negative case here ends in std::abort(), which is the point -- but on a
+        // systemd host each one is a real SIGABRT, so systemd-coredump writes a ~4 MB core
+        // and the desktop pops a crash notification. Five cases per run, times each build
+        // tree, and a developer running ctest gets a screen of "wallpaperx-device-affinity-
+        // probe crashed" for a suite that passed.
+        //
+        // PR_SET_DUMPABLE rather than RLIMIT_CORE, and the difference is not cosmetic:
+        // setrlimit(RLIMIT_CORE, 0) was tried first and does NOT work here. This host's
+        // /proc/sys/kernel/core_pattern is a pipe to systemd-coredump, and for a pipe
+        // handler the kernel does not read a zero RLIMIT_CORE as "no dump" -- it forwards
+        // the limit to the handler as a size hint (the %c field) and dumps anyway. Measured:
+        // ten cores still written with the rlimit in place. A non-dumpable process is not
+        // dumped at all, pipe handler or not.
+        //
+        // This suppresses the dump only. The child still raises SIGABRT, waitpid still
+        // reports WIFSIGNALED with WTERMSIG == SIGABRT, and every assertion in this file
+        // reads those -- so it changes what the host stores, not what the probe measures.
+        // Set after dup2 so a failure before this point is still visible on the pipe.
+        prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
         body();
         // Reached only when the guard did not fire.
         _exit(0);

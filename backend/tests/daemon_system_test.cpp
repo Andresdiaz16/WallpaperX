@@ -2065,11 +2065,43 @@ void checkBusLoss(const Check& check) {
     }
     check(output.find("fatal:") != std::string::npos,
           "the daemon says why it exited after losing the bus rather than dying silently");
-    // The guard doing its job, not merely the absence of a crash: on the way out it wakes
-    // the sigwait watcher and joins it, and that watcher prints before it returns. A bare
-    // joinable thread reaches std::terminate instead and this line never appears.
-    check(output.find("received, shutting down") != std::string::npos,
-          "the sigwait watcher is woken and joined while the connection-loss exception unwinds");
+    // GOAL: on the connection-loss path the daemon does not report a signal it was never
+    //       sent. It died because the broker dropped its connection; ~ShutdownWatch wakes
+    //       the sigwait watcher with a pthread_kill(SIGTERM) that is an implementation
+    //       detail of the wake, not a signal from anybody, and the log must not present it
+    //       as one.
+    //
+    // WHY-THIS-SHAPE: this line used to assert the PRESENCE of "received, shutting down",
+    //       using it as the oracle for "the watcher was woken and joined". That oracle was
+    //       the bug. The watcher could not distinguish the destructor's wake from a real
+    //       SIGTERM, so on this path -- where no signal was sent at all -- it printed
+    //       `Terminated received, shutting down`, and an operator triaging a daemon that
+    //       vanished read a genuine-format line pointing at the session manager instead of
+    //       at the bus quota. The check passed *because* of that, so it was asserting on a
+    //       defect.
+    //
+    //       The wake-and-join goal it was standing in for is not lost, and that is what
+    //       makes inverting it safe rather than a quiet reduction in coverage. It is
+    //       carried by the three checks immediately above: a watcher that is never woken
+    //       leaves join() blocking forever (caught by !timedOut), and a bare joinable
+    //       thread destroyed mid-unwind reaches std::terminate (caught by exitedNormally
+    //       and by exitCode == 1). The CONTROL at the head of this function records exactly
+    //       that -- reverting main.cpp to the pre-f1aa32c bare thread produced 4 FAILs, and
+    //       three of them are those three.
+    //
+    // COVERAGE-ASSERT: absence checks pass trivially when nothing was printed, so this one
+    //       is only meaningful downstream of the two checks above proving the daemon
+    //       actually got here and spoke -- exitCode == 1 through main's handler, and a
+    //       "fatal:" line in the output. Reordering this above them would hollow it out.
+    //
+    // CONTROL: main.cpp's `wakingForShutdown` flag removed and the watcher's early return
+    //       with it -- i.e. the code as it was before this fix. Run 2026-08-05: the daemon
+    //       printed "wallpaperx-daemon: Terminated received, shutting down" on the
+    //       connection-loss path and this check went red with "FAIL: the daemon does not
+    //       report a signal it was never sent when its bus connection drops", the other
+    //       four checks in this phase staying green. Reverted.
+    check(output.find("received, shutting down") == std::string::npos,
+          "the daemon does not report a signal it was never sent when its bus connection drops");
 }
 
 }  // namespace
