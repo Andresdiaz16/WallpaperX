@@ -190,8 +190,11 @@ target_link_libraries(wallpaperx-device-affinity-probe PRIVATE wallpaperx-render
 
 wallpaperx_add_shader_probe(wallpaperx-static-renderer-probe tests/static_renderer_probe.cpp)
 
-# S4.9's probe interposes malloc/calloc/realloc to see stb_image's pixel allocation. Its
-# assets share WALLPAPERX_TEST_IMAGE_DIR with static_renderer_probe, frame_export_probe
+# S4.9's probe interposes malloc/calloc/realloc to see stb_image's pixel allocation, and
+# fopen to make the file change between stbi_info() and stbi_load() for the post-load
+# re-check. Its assets -- mostly header-only stubs, one per budget edge, plus a
+# deliberately mode-000 one -- share WALLPAPERX_TEST_IMAGE_DIR with static_renderer_probe,
+# frame_export_probe
 # and modifier_roundtrip_probe -- the bounds_ filename prefix is the ONLY thing keeping
 # them apart, so keep that prefix on anything added here and do not add directory-scoped
 # cleanup (a remove_all or a glob) to any of these probes: they hold different

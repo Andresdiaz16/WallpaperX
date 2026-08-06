@@ -60,6 +60,14 @@
 //       'std::runtime_error'" -- the throw died on the worker thread before any handler
 //       here could classify it, so the whole GuardedPhase mechanism was inert for the
 //       four cases whose call runs on a thread. Both mutations reverted.
+// CONTROL (re-run after PR_SET_DUMPABLE was added to the child, 2026-08-06, because a flag
+//       that quietened the aborts could just as easily have quietened the evidence):
+//       assertGpuThread stubbed to `return;` -> 5 FAILs, each "the call returned instead of
+//       aborting (child exited 0) -- the guard did not fire". The create case's guarded
+//       body replaced by a throw -> 1 FAIL plus "the guarded call threw instead of
+//       aborting: CONTROL: guard threw", the other six green. Both reverted. The guard
+//       sentence and the call label are still read out of the child's captured stderr in
+//       every passing case, so the redirect demonstrably survives the prctl.
 
 #include "vulkan/device.h"
 #include "vulkan/frame_export.h"
@@ -201,22 +209,32 @@ ChildResult runInChild(const std::function<void()>& body) {
         if (dup2(fds[1], STDERR_FILENO) == -1) _exit(126);
         close(fds[1]);
         // Every negative case here ends in std::abort(), which is the point -- but on a
-        // systemd host each one is a real SIGABRT, so systemd-coredump writes a ~4 MB core
-        // and the desktop pops a crash notification. Five cases per run, times each build
-        // tree, and a developer running ctest gets a screen of "wallpaperx-device-affinity-
-        // probe crashed" for a suite that passed.
+        // systemd host each one is a real SIGABRT, so systemd-coredump runs, stores a 5.4 MB
+        // core and the desktop pops a crash notification. Five cases per run, times each
+        // build tree, and a developer running ctest gets a screen of "wallpaperx-device-
+        // affinity-probe crashed" for a suite that passed.
         //
-        // PR_SET_DUMPABLE rather than RLIMIT_CORE, and the difference is not cosmetic:
-        // setrlimit(RLIMIT_CORE, 0) was tried first and does NOT work here. This host's
-        // /proc/sys/kernel/core_pattern is a pipe to systemd-coredump, and for a pipe
-        // handler the kernel does not read a zero RLIMIT_CORE as "no dump" -- it forwards
-        // the limit to the handler as a size hint (the %c field) and dumps anyway. Measured:
-        // ten cores still written with the rlimit in place. A non-dumpable process is not
-        // dumped at all, pipe handler or not.
+        // PR_SET_DUMPABLE rather than RLIMIT_CORE, and the difference is not the one an
+        // earlier version of this comment claimed. Both measured on this host, whose
+        // /proc/sys/kernel/core_pattern is `|/usr/lib/systemd/systemd-coredump ...`:
+        //   setrlimit(RLIMIT_CORE, 0): no core file is stored -- the entry reads
+        //     `Storage: none`, "terminated abnormally without generating a coredump" -- but
+        //     the kernel still invokes the pipe handler, so all five aborts still land in
+        //     the journal and still raise the notification. Measured 818 -> 823
+        //     coredumpctl entries for one run. (The old comment here said "ten cores still
+        //     written", which is not what happens: entries, not cores.)
+        //   prctl(PR_SET_DUMPABLE, 0): the kernel does not invoke the handler at all.
+        //     Measured 813 -> 813 entries across two runs, i.e. ten aborting children with
+        //     nothing stored and nothing journalled.
+        // The rlimit would fix the disk usage; only this fixes the noise, which is what the
+        // change was for.
         //
-        // This suppresses the dump only. The child still raises SIGABRT, waitpid still
-        // reports WIFSIGNALED with WTERMSIG == SIGABRT, and every assertion in this file
-        // reads those -- so it changes what the host stores, not what the probe measures.
+        // It suppresses the dump only. The child still raises SIGABRT, waitpid still reports
+        // WIFSIGNALED with WTERMSIG == SIGABRT, and the stderr redirected just above still
+        // reaches the parent's pipe. That last part is not assumed: every negative case
+        // requires kGuardSentence AND its own call label to be found in the captured stderr,
+        // so a dumpable flag that cost the child's stderr would turn all five red with
+        // "child aborted, but not from the affinity guard" rather than pass quietly.
         // Set after dup2 so a failure before this point is still visible on the pipe.
         prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
         body();

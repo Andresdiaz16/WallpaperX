@@ -143,6 +143,15 @@ constexpr auto kMinConclusiveDrain = std::chrono::milliseconds(20);
 
 constexpr auto kProcessTimeout = std::chrono::seconds(30);
 
+// The tail of the line main.cpp prints when a signal really did arrive. One constant
+// rather than the literal spelled out at each site, because two of those sites assert its
+// PRESENCE (SIGTERM, SIGHUP) and one asserts its ABSENCE (the connection-loss phase), and
+// the absence check is only able to fail while the needle is still a string this daemon
+// ever prints. Sharing it means a reworded message cannot quietly hollow that check out:
+// it turns the presence checks red first, which points at the reword instead of leaving a
+// silent green behind.
+constexpr const char* kSignalShutdownLine = "received, shutting down";
+
 std::string testAssetDir() { return std::string(WALLPAPERX_TEST_IMAGE_DIR); }
 
 // Goals this run could not exercise at all, because the host or the harness could not
@@ -1726,7 +1735,7 @@ void checkHangupShutdown(NameWatcher& names, const Check& check) {
     } else {
         check(exitCode == 0, "the daemon exits 0 on SIGHUP");
     }
-    check(output.find(std::string(strsignal(SIGHUP)) + " received, shutting down") != std::string::npos,
+    check(output.find(std::string(strsignal(SIGHUP)) + " " + kSignalShutdownLine) != std::string::npos,
           "the daemon names SIGHUP as the signal it is shutting down for");
     check(output.find("stopped cleanly") != std::string::npos,
           "the daemon runs its destructor chain on SIGHUP as well as on SIGINT and SIGTERM");
@@ -2002,11 +2011,15 @@ void checkClosedStdout(NameWatcher& names, const std::string& bluePath, const st
 //       instead of Passed. Both reverted.
 //       (iii) main.cpp's ShutdownWatch guard replaced by a bare `std::thread shutdownWatch`
 //       with the pthread_kill/join moved to after enterEventLoop() -- i.e. the code as it
-//       was before f1aa32c. Re-run 2026-08-05: the daemon printed "terminate called
-//       without an active exception" and died on signal 6, and exactly 4 FAILs followed --
+//       was before f1aa32c. Re-run 2026-08-06: the daemon printed "terminate called
+//       without an active exception" and died on signal 6, and exactly 3 FAILs followed --
 //       "losing the bus connection unwinds through main() instead of aborting the
-//       process", the exit-1 line, the fatal-message line and the watcher-joined line,
-//       with the new startup check above still green. Reverted.
+//       process", the exit-1 line and the fatal-message line -- with the startup check
+//       above still green. Reverted. (This entry read "4 FAILs ... and the watcher-joined
+//       line" until 2026-08-06. That fourth check no longer exists: it asserted the
+//       PRESENCE of the shutdown line and was inverted below, and an inverted check does
+//       not fire on this mutation -- a daemon that aborts prints no shutdown line either.
+//       The count was measured again rather than adjusted on paper.)
 void checkBusLoss(const Check& check) {
     NestedBus bus;
     if (!bus.ok()) {
@@ -2063,45 +2076,81 @@ void checkBusLoss(const Check& check) {
     } else {
         check(exitCode == 1, "the daemon exits 1 through main's exception handler when its bus is destroyed");
     }
-    check(output.find("fatal:") != std::string::npos,
-          "the daemon says why it exited after losing the bus rather than dying silently");
+    // Named, because the check below is gated on it rather than merely printed after it.
+    const bool reachedTheHandler = output.find("fatal:") != std::string::npos;
+    check(reachedTheHandler, "the daemon says why it exited after losing the bus rather than dying silently");
+
     // GOAL: on the connection-loss path the daemon does not report a signal it was never
     //       sent. It died because the broker dropped its connection; ~ShutdownWatch wakes
     //       the sigwait watcher with a pthread_kill(SIGTERM) that is an implementation
     //       detail of the wake, not a signal from anybody, and the log must not present it
     //       as one.
     //
-    // WHY-THIS-SHAPE: this line used to assert the PRESENCE of "received, shutting down",
-    //       using it as the oracle for "the watcher was woken and joined". That oracle was
-    //       the bug. The watcher could not distinguish the destructor's wake from a real
+    // WHY-THIS-SHAPE: this line used to assert the PRESENCE of kSignalShutdownLine, using
+    //       it as the oracle for "the watcher was woken and joined". That oracle was the
+    //       bug. The watcher could not distinguish the destructor's wake from a real
     //       SIGTERM, so on this path -- where no signal was sent at all -- it printed
     //       `Terminated received, shutting down`, and an operator triaging a daemon that
     //       vanished read a genuine-format line pointing at the session manager instead of
     //       at the bus quota. The check passed *because* of that, so it was asserting on a
     //       defect.
     //
-    //       The wake-and-join goal it was standing in for is not lost, and that is what
-    //       makes inverting it safe rather than a quiet reduction in coverage. It is
-    //       carried by the three checks immediately above: a watcher that is never woken
-    //       leaves join() blocking forever (caught by !timedOut), and a bare joinable
-    //       thread destroyed mid-unwind reaches std::terminate (caught by exitedNormally
-    //       and by exitCode == 1). The CONTROL at the head of this function records exactly
-    //       that -- reverting main.cpp to the pre-f1aa32c bare thread produced 4 FAILs, and
-    //       three of them are those three.
+    //       The wake-and-join it was standing in for is carried by the checks above, and
+    //       each half was run rather than argued: ~ShutdownWatch's pthread_kill deleted, so
+    //       the watcher is never woken, leaves join() blocking and the daemon never exits
+    //       -> "FAIL: the daemon notices that its bus connection is gone and exits", plus
+    //       the exitedNormally, exit-1 and fatal-line checks, at 30.6s (2026-08-06). The
+    //       same four, at 30.7s, with the watcher woken but parked for an hour before
+    //       returning. And the pre-f1aa32c bare joinable thread -> "terminate called
+    //       without an active exception", signal 6, three FAILs (exitedNormally, exit-1,
+    //       fatal-line; NOT !timedOut, which that mutation does not reach because the
+    //       abort is immediate). All three reverted.
     //
-    // COVERAGE-ASSERT: absence checks pass trivially when nothing was printed, so this one
-    //       is only meaningful downstream of the two checks above proving the daemon
-    //       actually got here and spoke -- exitCode == 1 through main's handler, and a
-    //       "fatal:" line in the output. Reordering this above them would hollow it out.
+    //       One thing the presence check did cover that this one cannot: a watcher that
+    //       returns early from a FAILED sigwait prints nothing, so it now satisfies this
+    //       line. That case is not uncovered, it moved -- stubbing the watcher to return
+    //       before sigwait leaves this phase entirely green and produces 11 FAILs in the
+    //       SIGTERM/SIGINT/SIGHUP phases, whose daemons then never leave the event loop
+    //       (measured 2026-08-06, 120s of timeouts). It could not stay here: a working
+    //       watcher and a dead one are indistinguishable on this path by design.
     //
-    // CONTROL: main.cpp's `wakingForShutdown` flag removed and the watcher's early return
-    //       with it -- i.e. the code as it was before this fix. Run 2026-08-05: the daemon
-    //       printed "wallpaperx-daemon: Terminated received, shutting down" on the
-    //       connection-loss path and this check went red with "FAIL: the daemon does not
-    //       report a signal it was never sent when its bus connection drops", the other
-    //       four checks in this phase staying green. Reverted.
-    check(output.find("received, shutting down") == std::string::npos,
-          "the daemon does not report a signal it was never sent when its bus connection drops");
+    //       Not gated on `exitCode == 1`, which would read as the stronger gate: that check
+    //       is itself replaced by a sanitizer-attribution failure under a sanitized build,
+    //       so gating on it would silently disable this one exactly there. The fatal line
+    //       is the load-bearing evidence anyway -- main's catch handler prints it, and the
+    //       handler runs only after ~ShutdownWatch has already woken and joined the
+    //       watcher, so anything the watcher printed is in `output` before it.
+    //
+    // COVERAGE-ASSERT: two, because an absence check has two ways to go quiet.
+    //       (i) It passes trivially when the daemon printed nothing at all, which is not a
+    //       hypothetical: ungated, it stayed green under all three mutations above while
+    //       the daemon was catastrophically broken. So it is not graded unless the daemon
+    //       demonstrably reached main's handler -- otherwise it prints that it was not
+    //       graded, and the failure that caused that is already reported above.
+    //       Gating cannot hide a regression here: the gate is the check on the line above,
+    //       so a daemon that never spoke is red either way.
+    //       (ii) A needle that no longer matches anything can never fire. kSignalShutdownLine
+    //       is shared with the SIGTERM and SIGHUP phases, which assert its PRESENCE, so a
+    //       reworded message in main.cpp turns those red instead of leaving this one
+    //       vacuously green.
+    //
+    // CONTROL: main.cpp's `wakingForShutdown` early return deleted from the watcher -- i.e.
+    //       the code as it was before this fix. Re-run 2026-08-06: the orphan printed
+    //       "wallpaperx-daemon: Terminated received, shutting down" ahead of its ENOTCONN
+    //       fatal line, and this was the ONLY failure in the run -- "FAIL: the daemon does
+    //       not report a signal it was never sent when its bus connection drops". Reverted.
+    // CONTROL (the gate): the same bare-thread mutation, run against this shape on
+    //       2026-08-06, printed "the fabricated-signal check is not graded -- the orphan
+    //       never reached main's exception handler ..." and 3 FAILs, where before the gate
+    //       it printed 3 FAILs and a silent pass on this line. Reverted.
+    if (!reachedTheHandler) {
+        std::printf("daemon_system_test: the fabricated-signal check is not graded -- the orphan never reached "
+                    "main's exception handler, so it never got as far as the point where the watcher would have "
+                    "spoken. The failure that caused that is reported above.\n");
+    } else {
+        check(output.find(kSignalShutdownLine) == std::string::npos,
+              "the daemon does not report a signal it was never sent when its bus connection drops");
+    }
 }
 
 }  // namespace
@@ -2240,7 +2289,7 @@ int main() {
             } else {
                 check(exitCode == 0, "the daemon exits 0 on SIGTERM");
             }
-            check(daemonOutput.find("received, shutting down") != std::string::npos,
+            check(daemonOutput.find(kSignalShutdownLine) != std::string::npos,
                   "the daemon reports which signal it is shutting down for");
             check(daemonOutput.find("stopped cleanly") != std::string::npos,
                   "the daemon runs its destructor chain on the way out (worker join, GPU teardown, leak report)");

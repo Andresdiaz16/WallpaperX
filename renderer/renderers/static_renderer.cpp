@@ -11,6 +11,7 @@
 #include <stb_image.h>
 
 #include <array>
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -159,12 +160,34 @@ std::string describeRejection(const std::string& what, const std::string& imageP
 
 void StaticRenderer::loadAndUploadTexture(const std::string& imagePath) {
     // Checked from the header alone, before decoding, because a limit applied after
-    // stbi_load has already paid the whole cost it exists to prevent. stbi_info reads
-    // dimensions without allocating the pixels.
+    // stbi_load has already paid the whole cost it exists to prevent. The probes read
+    // dimensions and bit depth without allocating the pixels.
+    //
+    // BOTH probes run against ONE open, and that is a correctness requirement rather than
+    // an efficiency one. The convenience forms stbi_info(path) and stbi_is_16_bit(path)
+    // each fopen() the file themselves, which put a second swap window between them --
+    // and stbi_is_16_bit reports 0 both for "8-bit" and for "could not read it"
+    // (stb_image.h:7716 returns stbi__err), so a file that became unreadable in that
+    // window silently charged the 8-bit factor. A 16-bit image charged at 4x instead of
+    // 6x under-estimates by 1.5x, which is a 768 MiB budget admitting a decode that peaks
+    // near 1.15 GB -- above the 1.2 GB limit the OOM-kill that motivated all of this
+    // happened under. The _from_file forms take the FILE* we already hold, and both
+    // ftell/fseek around their work (stb_image.h:7701, :7722), so the second probe sees
+    // the same bytes as the first and the window is gone rather than narrowed.
+    FILE* probe = std::fopen(imagePath.c_str(), "rb");
+    if (probe == nullptr) {
+        throw std::runtime_error(
+            describeRejection(std::string("cannot open image (") + std::strerror(errno) + ")", imagePath));
+    }
+
     int probeWidth = 0;
     int probeHeight = 0;
     int probeChannels = 0;
-    if (!stbi_info(imagePath.c_str(), &probeWidth, &probeHeight, &probeChannels)) {
+    const bool headerRead = stbi_info_from_file(probe, &probeWidth, &probeHeight, &probeChannels) != 0;
+    const bool sixteenBit = headerRead && stbi_is_16_bit_from_file(probe) != 0;
+    std::fclose(probe);
+
+    if (!headerRead) {
         throw std::runtime_error(
             describeRejection("not a decodable image (" + stbFailureReason() + ")", imagePath));
     }
@@ -180,7 +203,6 @@ void StaticRenderer::loadAndUploadTexture(const std::string& imagePath) {
     // stb converts to 4 channels regardless of it.
     const uint64_t outputBytes =
         static_cast<uint64_t>(probeWidth) * static_cast<uint64_t>(probeHeight) * 4;
-    const bool sixteenBit = stbi_is_16_bit(imagePath.c_str()) != 0;
     const uint64_t peakBytes = outputBytes * (sixteenBit ? kPeakFactor16Bit : kPeakFactor8Bit);
     if (peakBytes > kMaxPeakDecodeBytes) {
         throw std::runtime_error(describeRejection(
@@ -201,25 +223,29 @@ void StaticRenderer::loadAndUploadTexture(const std::string& imagePath) {
             describeRejection("failed to load image (" + stbFailureReason() + ")", imagePath));
     }
 
-    // Re-checked against what stbi_load ACTUALLY returned, because the check above ran on a
-    // different open of the file. stbi_info and stbi_load are two independent fopen()s, so
-    // anything with write access to the wallpaper directory -- a slideshow tool, a
-    // downloader, the user -- can replace a 1920x1080 PNG with a 16000x16000 JPEG between
-    // them, and every allocation below would then be sized from dimensions nothing had
-    // vetted. The decode itself is already paid for by this point; what this still buys is
-    // that the staging buffer and the texture cannot be sized by an unvetted number.
+    // Re-checked against what stbi_load ACTUALLY returned, because the probe above ran on a
+    // different open of the file. Anything with write access to the wallpaper directory --
+    // a slideshow tool, a downloader, the user -- can replace the file between the two, and
+    // every allocation below would then be sized from dimensions nothing had vetted.
     //
-    // Uses the 8-bit factor unconditionally: the decode is done, so the only cost left is
-    // this function's own. That also makes this gate strictly looser than the header one,
-    // so a file that was not swapped can never be rejected here after passing there.
-    const uint64_t loadedBytes =
-        static_cast<uint64_t>(imageWidth) * static_cast<uint64_t>(imageHeight) * 4;
-    if (loadedBytes * kPeakFactor8Bit > kMaxPeakDecodeBytes) {
+    // EQUALITY, not a budget test, and the distinction is load-bearing. This began life as
+    // `loadedBytes * kPeakFactor8Bit > kMaxPeakDecodeBytes` while throwing the message
+    // below, which claims the decode disagreed with the header -- a comparison that version
+    // never performed. A file swapped from 8x8 to 7000x7000 is unmistakably a different
+    // file, is still inside the budget, and was accepted in silence; the gate was a memory
+    // bound wearing an integrity check's words.
+    //
+    // Equality is also strictly stronger AND simpler than what it replaces: matching
+    // dimensions mean loadedBytes == outputBytes, which the header gate has already vetted
+    // against the budget, so the factor arithmetic is not needed here at all. For a
+    // well-formed image the two reads cannot disagree -- they parse the same header fields
+    // -- so a mismatch means the bytes changed underneath us, whatever the sizes involved.
+    if (imageWidth != probeWidth || imageHeight != probeHeight) {
         stbi_image_free(pixels);
         throw std::runtime_error(describeRejection(
             "decoded to " + std::to_string(imageWidth) + "x" + std::to_string(imageHeight) +
-                ", larger than the " + std::to_string(probeWidth) + "x" +
-                std::to_string(probeHeight) + " its header reported -- file changed under us",
+                " but its header reported " + std::to_string(probeWidth) + "x" +
+                std::to_string(probeHeight) + " -- file changed under us",
             imagePath));
     }
 
