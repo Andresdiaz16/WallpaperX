@@ -27,7 +27,7 @@
 //     the join. See the CONCERN note above runShutdownChecks.
 //
 // No Vulkan validation oracle is claimed by this file. It renders only because two goals
-// (S7.10, S7.12) need a device to exist, and the daemon ships with validation off;
+// (S7.10e, S7.12) need a device to exist, and the daemon ships with validation off;
 // dbus_service_test and daemon_system_test own that oracle.
 
 #include "daemon/dbus_service.h"
@@ -274,6 +274,82 @@ std::string writeHostileNamedImage() {
     return writeSolidImage(name, 0, 255, 0);
 }
 
+// A regular, readable file that is not a decodable image. requestWallpaper accepts it --
+// it checks only that the path is a readable regular file -- and the render fails on the
+// worker afterwards, which is the one way to reach "wallpapers failed while shaders and
+// gpu are both fine". A path that did not exist would be rejected on the request instead
+// and never reach the render at all.
+std::string writeUndecodableFile(const std::string& name) {
+    std::filesystem::create_directories(testAssetDir());
+    const std::string path = testAssetDir() + "/" + name;
+    std::FILE* f = std::fopen(path.c_str(), "wb");
+    if (f == nullptr) throw std::runtime_error("could not write " + path);
+    static const char kJunk[] = "wallpaperx: deliberately not an image";
+    const size_t written = std::fwrite(kJunk, 1, sizeof(kJunk) - 1, f);
+    const bool closed = std::fclose(f) == 0;
+    if (written != sizeof(kJunk) - 1 || !closed) throw std::runtime_error("could not write " + path);
+    return path;
+}
+
+// An empty directory under the test's asset tree, removed first so a previous run cannot
+// leave it populated.
+std::string makeEmptyDir(const std::string& name) {
+    const std::string dir = testAssetDir() + "/" + name;
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    return dir;
+}
+
+// ---------------------------------------------------------------------------- //
+// /health: reading one, and building the states it has to tell apart.
+// ---------------------------------------------------------------------------- //
+
+std::string healthCheckStatus(const nlohmann::json& health, const char* name) {
+    if (!health.is_object() || !health.contains("checks") || !health["checks"].is_object()) return {};
+    const nlohmann::json& checks = health["checks"];
+    if (!checks.contains(name) || !checks[name].is_object()) return {};
+    return checks[name].value("status", std::string());
+}
+
+std::string healthCheckDetail(const nlohmann::json& health, const char* name) {
+    if (!health.is_object() || !health.contains("checks") || !health["checks"].is_object()) return {};
+    const nlohmann::json& checks = health["checks"];
+    if (!checks.contains(name) || !checks[name].is_object()) return {};
+    return checks[name].value("detail", std::string());
+}
+
+// A WallpaperManager and an HttpServer that belong to nobody else.
+//
+// The health states below cannot be built on the run's shared manager. A manager's shader
+// directory is fixed at construction, so "the shaders are missing" is not a state the
+// shared one can be put into at all; and a failed render is permanent per-monitor state,
+// so building one there would change what every later phase reads. Each scenario
+// therefore gets its own pair, driven through requestWallpaper/renderPending directly --
+// the same route runTornReadChecks uses -- so no render worker exists and the Device, when
+// one gets created, is created, used and destroyed on this one thread.
+class IsolatedDaemon {
+public:
+    explicit IsolatedDaemon(WallpaperManager::Config config) : m_manager(std::move(config)) {
+        m_server = startServer(m_manager, m_reason);
+    }
+
+    bool ready() const { return m_server != nullptr; }
+    const std::string& reason() const { return m_reason; }
+    WallpaperManager& manager() { return m_manager; }
+
+    HttpReply health() {
+        httplib::Client cli = makeClient(m_server->port());
+        return get(cli, "/health");
+    }
+
+private:
+    WallpaperManager m_manager;
+    std::string m_reason;
+    // Declared after the manager so it is destroyed first: it holds a reference to it.
+    // That is the ordering main.cpp gets from declaring the HttpServer last.
+    std::unique_ptr<HttpServer> m_server;
+};
+
 // ---------------------------------------------------------------------------- //
 // Phase 1 -- where the socket is, and what happens when it cannot be had.
 // ---------------------------------------------------------------------------- //
@@ -431,7 +507,6 @@ void runHealthBeforeDeviceChecks(httplib::Client& cli, const Check& check) {
     }
 
     check(health.status == 200, "/health answers 200 before any wallpaper is set");
-    check(health.json.value("status", std::string()) == "ok", "/health reports status \"ok\"");
 
     // Compared against the same project(... VERSION) the daemon library compiles in, not
     // against a literal: what this pins is that /health still *derives* its version from
@@ -442,30 +517,457 @@ void runHealthBeforeDeviceChecks(httplib::Client& cli, const Check& check) {
     check(health.json.value("version", std::string()) == std::string(WALLPAPERX_EXPECTED_VERSION),
           "/health reports the version CMake built this daemon as");
 
-    // GOAL: S7.10 -- /health reports a descriptor tier exactly when a device exists, and
-    //       never invents one. The Device is created lazily on the first SetWallpaper, so
-    //       a freshly started daemon has no tier to report; the key is present and null
-    //       rather than absent, so a client learns of it from the schema and not by
-    //       hitting its absence.
-    // WHY-THIS-SHAPE: asserting only "descriptor_tier is present" would pass for a daemon
-    //       that guessed a tier before creating a device, which is the failure this goal
-    //       exists to prevent -- so the *value* is asserted null, and the paired check
-    //       after the first render asserts it is a non-empty string. Neither half is
-    //       worth anything alone.
-    //       UNRATIFIED, and it CONFLICTS with PLAN.md's Definition of Done #2, which
-    //       expects /health to return {"descriptor_tier":"heap"} -- true only after a
-    //       wallpaper has been set, and spelled lowercase where the daemon emits "Heap"
-    //       from the same toString() GetStatus uses. This asserts what cd28790 does. Do
-    //       not read it as a ruling that PLAN.md is wrong.
-    // CONTROL: the null branch removed, so the key always carries
-    //       snap.gpu.descriptorTier -> "FAIL: /health reports no descriptor tier before a
-    //       device exists" (observed: the key came back as ""). Reverted.
-    check(health.json.contains("descriptor_tier"), "/health always carries a descriptor_tier key");
-    check(health.json.contains("descriptor_tier") && health.json["descriptor_tier"].is_null(),
-          "/health reports no descriptor tier before a device exists");
-    check(health.json.contains("gpu_initialized") && health.json["gpu_initialized"].is_boolean() &&
-              !health.json["gpu_initialized"].get<bool>(),
-          "/health reports gpu_initialized=false before a device exists");
+    // GOAL: S7.10a -- each dependency is reported separately and by name, so a failure is
+    //       attributable. `shaders`, `gpu` and `wallpapers` are three distinct checks,
+    //       each carrying its own status and its own cause.
+    // WHY-THIS-SHAPE: the schema is asserted here, on a daemon where all three are in the
+    //       same state, rather than only where they differ. Checking names only in the
+    //       failure phases would leave a /health that dropped a check entirely -- so that
+    //       a reader could no longer see it at all -- passing everywhere the remaining two
+    //       happened to be enough to decide the aggregate.
+    // CONTROL: `{"wallpapers", &wallpapers},` removed from the checks array in
+    //       http_server.cpp -> "FAIL: /health names shaders, gpu and wallpapers as three
+    //       separate checks" (observed: checks = {"gpu":..., "shaders":...}). Reverted.
+    const bool shape = health.json.contains("checks") && health.json["checks"].is_object() &&
+                       health.json["checks"].size() == 3;
+    check(shape, "/health carries a `checks` object with exactly the three dependencies in it");
+    check(!healthCheckStatus(health.json, "shaders").empty() && !healthCheckStatus(health.json, "gpu").empty() &&
+              !healthCheckStatus(health.json, "wallpapers").empty(),
+          "/health names shaders, gpu and wallpapers as three separate checks");
+    if (!shape) {
+        std::fprintf(stderr, "  checks: %s\n",
+                     health.json.contains("checks") ? health.json["checks"].dump().c_str() : "(absent)");
+    }
+
+    // GOAL: S7.10b -- `pending` is a distinct state from `ok` and it reaches the
+    //       aggregate. Both the shader directory and the device are touched only on the
+    //       first render, so on a daemon that has not rendered, nothing has been tried and
+    //       nothing is known. False if this reports "ok", which is health on the strength
+    //       of checks nobody has run -- the defect S7.10 exists to remove, and the
+    //       aggregate is the field a watchdog reads.
+    // WHY-THIS-SHAPE: the per-check statuses and the top-level one are asserted together.
+    //       Asserting only the three sub-checks would pass for an aggregate hardcoded to
+    //       "ok", which is exactly the old endpoint; asserting only the aggregate would
+    //       pass for a daemon that reported everything pending forever, so
+    //       runHealthAfterDeviceChecks asserts the same fields read "ok" once a render has
+    //       happened. Neither half establishes anything alone.
+    // CONTROL: two, because the aggregate and the three checks it is computed from fail
+    //       independently. (a) the `else if (check->status == HealthStatus::Pending ...)`
+    //       arm deleted from the aggregation in http_server.cpp, so pending counts as ok
+    //       -> "FAIL: /health reports the aggregate as pending before anything has been
+    //       tried" with "aggregate before any render: ok", the three per-check assertions
+    //       staying green. (b) `HealthStatus status = HealthStatus::Ok;` as HealthCheck's
+    //       default in wallpaper_manager.h -- which is the pre-rebuild endpoint restored,
+    //       health asserted rather than established -> all four go red, with
+    //       "{"gpu":{"status":"ok"},"shaders":{"status":"ok"},...},"status":"ok"" on a
+    //       daemon that had done nothing at all. Both reverted.
+    check(healthCheckStatus(health.json, "shaders") == "pending",
+          "/health reports the shader directory as pending before anything has looked at it");
+    check(healthCheckStatus(health.json, "gpu") == "pending",
+          "/health reports the GPU as pending before a device has been created");
+    check(healthCheckStatus(health.json, "wallpapers") == "pending",
+          "/health reports wallpapers as pending before any wallpaper is set");
+    const std::string aggregate = health.json.value("status", std::string());
+    check(aggregate == "pending", "/health reports the aggregate as pending before anything has been tried");
+    if (aggregate != "pending") {
+        std::fprintf(stderr, "  aggregate before any render: %s (body: %s)\n", aggregate.c_str(),
+                     health.body.c_str());
+    }
+}
+
+// ---------------------------------------------------------------------------- //
+// Phase 2b -- the states /health has to be able to tell apart.
+// ---------------------------------------------------------------------------- //
+void runHealthStateChecks(const std::string& bluePath, const std::string& videoPath, const std::string& junkPath,
+                          const Check& check) {
+    WallpaperManager::Config base;
+    base.width = kTargetWidth;
+    base.height = kTargetHeight;
+    base.enableValidation = false;
+
+    // Kept for the attribution comparison at the end of this phase: what makes a failure
+    // attributable is that two different faults produce two different bodies, which is not
+    // a property either scenario has on its own.
+    nlohmann::json shaderFailHealth;
+    nlohmann::json imageFailHealth;
+
+    // ------------------------------------------------------------------ //
+    // (a) pending reaches the aggregate even when another check is already ok.
+    // ------------------------------------------------------------------ //
+    {
+        IsolatedDaemon daemon(base);
+        if (!daemon.ready()) {
+            notVerified("S7.10b (pending propagates to the aggregate)", daemon.reason());
+        } else {
+            // A `video` wallpaper is recorded and serviced without ever reaching the GPU:
+            // renderPending returns early for a type this build cannot draw, before
+            // ensureGpu. So the monitor carries no error -- and the handler derives
+            // wallpapers from exactly that -- while the shader directory and the device
+            // are still untouched.
+            daemon.manager().requestWallpaper("video", videoPath, 0);
+            daemon.manager().renderPending(0);
+
+            const HttpReply health = daemon.health();
+            if (!health.ok()) {
+                check(false, "the mixed-state daemon answered /health with a parseable 200");
+            } else {
+                // GOAL: S7.10b -- `pending` propagates to the aggregate rather than being
+                //       rounded off to `ok`. This is the case that separates the two
+                //       readings: one check is genuinely `ok` and the other two have not
+                //       been tried, so an aggregate of `ok` is defensible-looking and
+                //       still wrong -- a watchdog reading it would call a daemon healthy
+                //       whose graphics stack nobody has so much as opened.
+                // WHY-THIS-SHAPE: runHealthBeforeDeviceChecks already pins an all-pending
+                //       daemon, and an aggregation with the pending arm deleted fails
+                //       there too -- but only because *nothing* was ok. An implementation
+                //       that took the worst of {ok, pending} as ok and the worst of
+                //       {pending} as pending would pass there and fail here. So the state
+                //       is deliberately mixed, and the ok-ness of the ok check is asserted
+                //       rather than assumed, or the aggregate assertion below would be the
+                //       all-pending case again under another name.
+                // CONTROL: the `else if (check->status == HealthStatus::Pending ...)` arm
+                //       deleted from the aggregation in http_server.cpp -> "FAIL: an
+                //       untried dependency keeps the aggregate at pending even when
+                //       another check is ok" with "mixed state {wallpapers ok, shaders
+                //       pending, gpu pending} aggregated to: ok". The two supporting
+                //       assertions were controlled separately, since the mutation above
+                //       leaves both green: the wallpapers `else` arm set to Fail -> "FAIL:
+                //       the mixed-state daemon really does have one check reading ok", and
+                //       HealthCheck's default set to Ok -> "FAIL: a wallpaper this build
+                //       cannot render leaves the shader and GPU checks untried". All
+                //       reverted.
+                check(healthCheckStatus(health.json, "wallpapers") == "ok",
+                      "the mixed-state daemon really does have one check reading ok");
+                check(healthCheckStatus(health.json, "shaders") == "pending" &&
+                          healthCheckStatus(health.json, "gpu") == "pending",
+                      "a wallpaper this build cannot render leaves the shader and GPU checks untried");
+                const std::string aggregate = health.json.value("status", std::string());
+                check(aggregate == "pending",
+                      "an untried dependency keeps the aggregate at pending even when another check is ok");
+                if (aggregate != "pending") {
+                    std::fprintf(stderr, "  mixed state {wallpapers %s, shaders %s, gpu %s} aggregated to: %s\n",
+                                 healthCheckStatus(health.json, "wallpapers").c_str(),
+                                 healthCheckStatus(health.json, "shaders").c_str(),
+                                 healthCheckStatus(health.json, "gpu").c_str(), aggregate.c_str());
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------ //
+    // (b) a missing shader directory is attributed to the shaders.
+    // ------------------------------------------------------------------ //
+    {
+        WallpaperManager::Config config = base;
+        config.shaderDir = testAssetDir() + "/wpx_no_such_shader_dir";
+        std::filesystem::remove_all(config.shaderDir);
+
+        IsolatedDaemon daemon(config);
+        if (!daemon.ready()) {
+            notVerified("S7.10a (a shader failure is attributed to the shaders)", daemon.reason());
+        } else {
+            daemon.manager().requestWallpaper("static", bluePath, 0);
+            daemon.manager().renderPending(0);
+
+            const HttpReply health = daemon.health();
+            if (!health.ok()) {
+                check(false, "the missing-shader-directory daemon answered /health with a parseable 200");
+            } else {
+                shaderFailHealth = health.json;
+
+                // GOAL: S7.10a -- a failure is attributed to the dependency that failed.
+                //       A missing shader directory is the shaders' fault; the GPU is not
+                //       implicated, because nothing ever asked it for anything.
+                // WHY-THIS-SHAPE: `gpu == "pending"` is asserted, not merely "gpu is not
+                //       fail". Pending is the true answer here -- ensureGpu resolves the
+                //       shader directory before it creates a Device, so the device is
+                //       never attempted -- and an implementation that recorded a blanket
+                //       failure across every check, or that marked the GPU ok because the
+                //       render "got that far", both satisfy a not-fail check and neither
+                //       tells a reader where to look. S7.10c rides along: the detail has
+                //       to name the directory, or the reader is back to guessing.
+                // CONTROL: ensureGpu's shader catch changed to record into
+                //       `&DaemonHealth::gpu` instead of `&DaemonHealth::shaders` -> three
+                //       red: "a missing shader directory is reported as a shader failure",
+                //       "... does not implicate the GPU", and "the shader check's detail
+                //       names the directory that could not be found", the body showing
+                //       shaders={pending,""} and the directory named under gpu instead.
+                //       Reverted.
+                check(healthCheckStatus(health.json, "shaders") == "fail",
+                      "a missing shader directory is reported as a shader failure");
+                check(healthCheckStatus(health.json, "gpu") == "pending",
+                      "a missing shader directory does not implicate the GPU");
+                check(healthCheckDetail(health.json, "shaders").find("wpx_no_such_shader_dir") != std::string::npos,
+                      "the shader check's detail names the directory that could not be found");
+                check(health.json.value("status", std::string()) == "fail",
+                      "a failing check makes the aggregate fail");
+                std::printf("http_server_test: missing shader directory -> %s\n", health.body.c_str());
+                std::fflush(stdout);
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------ //
+    // (c) an undecodable image is attributed to the wallpapers, and carries its cause.
+    // (d) and a good render afterwards puts the aggregate back to ok.
+    // ------------------------------------------------------------------ //
+    {
+        IsolatedDaemon daemon(base);
+        if (!daemon.ready()) {
+            notVerified("S7.10a/S7.10c (an image failure is attributed to the wallpapers)", daemon.reason());
+        } else {
+            daemon.manager().requestWallpaper("static", junkPath, 0);
+            daemon.manager().renderPending(0);
+
+            const HttpReply health = daemon.health();
+            // X.3: no working Vulkan on this host is not a defect in /health. Without a
+            // device the render fails for the wrong reason, so the attribution this
+            // scenario exists to establish cannot be observed at all.
+            //
+            // Asked of the manager, NOT of /health's own gpu check. A gate that reads the
+            // field under test converts a broken endpoint into a skip: with the gpu check
+            // wired to the wrong source, this phase reported NOT VERIFIED instead of
+            // failing, and the attribution checks below never ran at all. Observed while
+            // controlling them -- it is why the gate moved.
+            const bool deviceExists = daemon.manager().snapshot().gpu.initialized;
+            if (!health.ok()) {
+                check(false, "the undecodable-image daemon answered /health with a parseable 200");
+            } else if (!deviceExists) {
+                notVerified("S7.10a/S7.10c (an image failure is attributed to the wallpapers)",
+                            "no Vulkan device could be created on this host, so the render failed for a reason "
+                            "other than the image (/health said gpu=" + healthCheckStatus(health.json, "gpu") + ": " +
+                                healthCheckDetail(health.json, "gpu") + ")");
+            } else {
+                imageFailHealth = health.json;
+
+                // GOAL: S7.10c -- a failing check carries its cause. `wallpapers` reports
+                //       the first monitor's actual error text, so a reader does not have
+                //       to go and call GetStatus to learn why -- that is the call /health
+                //       exists to save them. S7.10a rides along: shaders and gpu both read
+                //       ok, so the fault is pinned on the one dependency that broke.
+                // WHY-THIS-SHAPE: the detail is compared against the monitor's own
+                //       lastError read back off the manager, not against a substring this
+                //       file chose. A `find("not a decodable image")` check would pass for
+                //       a handler that pasted a fixed sentence in, and would have to be
+                //       edited every time the renderer reworded a message -- an assertion
+                //       that has to be maintained in lockstep with the string it checks is
+                //       one that gets loosened.
+                // CONTROL: `+ first` dropped from the wallpapers detail in
+                //       http_server.cpp, leaving the count -> "FAIL: the wallpapers check
+                //       carries the monitor's own error text" with "  detail: 1 of 1
+                //       monitors failed  lastError: ... is not a decodable image ...".
+                //       Reverted.
+                // COVERAGE-ASSERT: the monitor's lastError is asserted non-trivial first.
+                //       If the render failed with an empty or one-word error, "the detail
+                //       contains it" would be satisfied by any detail at all.
+                const WallpaperManager::Snapshot snap = daemon.manager().snapshot();
+                const auto it = snap.monitors.find(0);
+                const std::string lastError = it != snap.monitors.end() ? it->second.lastError : std::string();
+                check(lastError.size() > 20, "the failed render left a non-trivial error on the monitor");
+                check(healthCheckStatus(health.json, "wallpapers") == "fail",
+                      "an undecodable image is reported as a wallpaper failure");
+                check(healthCheckStatus(health.json, "shaders") == "ok",
+                      "an undecodable image does not implicate the shaders");
+                check(healthCheckStatus(health.json, "gpu") == "ok",
+                      "an undecodable image does not implicate the GPU");
+                check(!lastError.empty() &&
+                          healthCheckDetail(health.json, "wallpapers").find(lastError) != std::string::npos,
+                      "the wallpapers check carries the monitor's own error text");
+                check(health.json.value("status", std::string()) == "fail",
+                      "an undecodable image makes the aggregate fail");
+                if (healthCheckDetail(health.json, "wallpapers").find(lastError) == std::string::npos) {
+                    std::fprintf(stderr, "  detail: %s\n  lastError: %s\n",
+                                 healthCheckDetail(health.json, "wallpapers").c_str(), lastError.c_str());
+                }
+                std::printf("http_server_test: undecodable image -> %s\n", health.body.c_str());
+                std::fflush(stdout);
+
+                // GOAL: S7.10 -- /health reports what is *currently* failing. A daemon
+                //       that has recovered must say so; a failure that sticks is a
+                //       different kind of lie from one that is never reported, and it
+                //       trains a reader to ignore the endpoint.
+                // WHY-THIS-SHAPE: this is also what keeps every "not ok" assertion in this
+                //       phase from being vacuous. If /health could never answer "ok" on
+                //       this host -- a missing GPU, a build with no shaders -- then
+                //       "pending", "fail" and "fail" above would all be satisfied by an
+                //       endpoint that was simply stuck, and the whole phase would
+                //       establish nothing. One reachable "ok" from the same manager, after
+                //       the same monitor is given a file that does decode, is what rules
+                //       that out.
+                // CONTROL: the `else` arm of the wallpapers derivation in http_server.cpp
+                //       changed to `wallpapers.status = HealthStatus::Fail;` -> "FAIL: a
+                //       later successful render clears the wallpaper failure" and "FAIL: a
+                //       daemon with nothing wrong reports the aggregate as ok", the body
+                //       showing wallpapers={fail,"1 monitor(s) rendered"}. The two failure
+                //       scenarios above stayed green under it, which is the point -- it is
+                //       the ok verdict, not the fail verdicts, that this pair pins.
+                //       Reverted.
+                daemon.manager().requestWallpaper("static", bluePath, 0);
+                daemon.manager().renderPending(0);
+                const HttpReply recovered = daemon.health();
+                if (!recovered.ok()) {
+                    check(false, "the recovered daemon answered /health with a parseable 200");
+                } else {
+                    check(healthCheckStatus(recovered.json, "wallpapers") == "ok",
+                          "a later successful render clears the wallpaper failure");
+                    check(recovered.json.value("status", std::string()) == "ok",
+                          "a daemon with nothing wrong reports the aggregate as ok");
+                    if (recovered.json.value("status", std::string()) != "ok") {
+                        std::fprintf(stderr, "  after a good render: %s\n", recovered.body.c_str());
+                    }
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------ //
+    // (e) health is recorded as the daemon uses a dependency, not probed on demand.
+    // ------------------------------------------------------------------ //
+    {
+        const std::string shaderDir = makeEmptyDir("wpx_health_shader_dir");
+        WallpaperManager::Config config = base;
+        config.shaderDir = shaderDir;
+
+        IsolatedDaemon daemon(config);
+        if (!daemon.ready()) {
+            notVerified("S7.10d (health is recorded, never probed)", daemon.reason());
+        } else {
+            // resolveShaderDir only requires the path to be a directory, so an empty one
+            // records shaders=ok. What happens after that -- device creation, and a render
+            // that then cannot find any .spv -- is irrelevant here and deliberately not
+            // asserted on: this scenario is about the shaders check alone.
+            daemon.manager().requestWallpaper("static", bluePath, 0);
+            daemon.manager().renderPending(0);
+
+            // The precondition is that the daemon RECORDED the directory as ok, which is
+            // read off the manager rather than off /health -- what this scenario grades is
+            // how the handler renders that recording after the directory is gone, so a
+            // gate that read the handler's own answer could turn a handler bug into a skip.
+            const bool recordedOk =
+                daemon.manager().snapshot().health.shaders.status == wallpaperx::HealthStatus::Ok;
+            const HttpReply before = daemon.health();
+            if (!recordedOk) {
+                notVerified("S7.10d (health is recorded, never probed)",
+                            "the shader directory was never recorded as ok in the first place, so removing it "
+                            "afterwards would prove nothing");
+            } else if (!before.ok()) {
+                check(false, "the recorded-not-probed daemon answered /health with a parseable 200");
+            } else {
+                // GOAL: S7.10d -- health is recorded as the daemon uses its dependencies
+                //       and never probed on demand. False if a handler performs I/O:
+                //       stat()ing the shader directory inside the health handler would put
+                //       a filesystem call on the HTTP thread, and a hung network mount
+                //       would then wedge the one endpoint still worth asking when things
+                //       are bad.
+                // WHY-THIS-SHAPE: asserting the absence of a syscall is not directly
+                //       possible from here, so the dependency is destroyed *after* it was
+                //       recorded ok and the recorded answer is required to survive. A
+                //       handler that re-derived the check would now report fail -- the
+                //       directory genuinely is gone -- so the two implementations are
+                //       distinguishable by their output. The obvious alternative, timing a
+                //       request against a slow filesystem, is an assertion on the
+                //       scheduler and needs a hangable mount no test host is guaranteed
+                //       to have. The detail is compared byte for byte with the earlier
+                //       reply as well, so a handler that re-derived a *passing* answer
+                //       some other way still has to reproduce the recorded string.
+                // CONTROL: two, one per assertion, both patching the /health handler to
+                //       re-derive the check it was handed and using `&shadersProbed` in
+                //       the checks array. (a) status re-derived --
+                //           if (shadersProbed.status == HealthStatus::Ok &&
+                //               !std::filesystem::is_directory(shadersProbed.detail))
+                //               shadersProbed.status = HealthStatus::Fail;
+                //       -> "FAIL: /health still reports the shader directory it recorded,
+                //       after that directory has been deleted" with "shaders after
+                //       deleting the directory: fail". (b) detail re-derived --
+                //           if (::access(shadersProbed.detail.c_str(), R_OK) != 0)
+                //               shadersProbed.detail += " (missing)";
+                //       -> "FAIL: the recorded shader detail is unchanged by the directory
+                //       disappearing". Two controls because (a) leaves the detail check
+                //       green and (b) leaves the status check green -- they are not one
+                //       assertion written twice. Both reverted.
+                // COVERAGE-ASSERT: the directory is asserted to be really gone at the
+                //       moment of the second request. A remove_all that silently failed
+                //       would leave this checking that /health still answers ok about a
+                //       directory that still exists, which is no check at all.
+                std::error_code ec;
+                std::filesystem::remove_all(shaderDir, ec);
+                check(!std::filesystem::exists(shaderDir),
+                      "the shader directory really was removed before /health was asked again");
+
+                const HttpReply after = daemon.health();
+                if (!after.ok()) {
+                    check(false, "/health still answers after its shader directory is deleted");
+                } else {
+                    check(healthCheckStatus(after.json, "shaders") == "ok",
+                          "/health still reports the shader directory it recorded, after that directory has been "
+                          "deleted");
+                    check(healthCheckDetail(after.json, "shaders") == healthCheckDetail(before.json, "shaders"),
+                          "the recorded shader detail is unchanged by the directory disappearing");
+                    if (healthCheckStatus(after.json, "shaders") != "ok") {
+                        std::fprintf(stderr, "  shaders after deleting the directory: %s (%s)\n",
+                                     healthCheckStatus(after.json, "shaders").c_str(),
+                                     healthCheckDetail(after.json, "shaders").c_str());
+                    }
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------ //
+    // (f) the two faults do not look alike.
+    // ------------------------------------------------------------------ //
+    //
+    // GOAL: S7.10a, stated the way the goal states it -- "false if a missing shader
+    //       directory and an undecodable image produce the same output", because those
+    //       need different responses from whoever is reading. One is a broken
+    //       installation, the other is one bad file.
+    // WHY-THIS-SHAPE: the two scenarios are compared against each other rather than each
+    //       against a literal. Both end with the aggregate at "fail" and both end with
+    //       `wallpapers` failing -- a render that cannot find its shaders also fails the
+    //       monitor -- so a per-scenario assertion on the aggregate, or on wallpapers,
+    //       would be satisfied by an endpoint that reported one undifferentiated failure
+    //       for both. What has to differ is the per-dependency breakdown, which needs both
+    //       bodies held at once. The comparison is on the two named verdicts rather than
+    //       on the whole body: the details embed the renderer's own error strings, which
+    //       differ between any two faults whatever the endpoint does with them, so
+    //       "the bodies are not byte-identical" would be true of a /health that reported
+    //       one undifferentiated failure and pasted the message in.
+    // CONTROL: the `shaders` and `gpu` entries in http_server.cpp's checks array both
+    //       pointed at `&wallpapers`, so the breakdown stops being a breakdown -> "FAIL: a
+    //       missing shader directory and an undecodable image get different shader
+    //       verdicts" and "FAIL: ... different GPU verdicts", both scenarios reading
+    //       fail/fail. Reverted.
+    if (shaderFailHealth.is_object() && imageFailHealth.is_object()) {
+        check(healthCheckStatus(shaderFailHealth, "shaders") != healthCheckStatus(imageFailHealth, "shaders"),
+              "a missing shader directory and an undecodable image get different shader verdicts");
+        check(healthCheckStatus(shaderFailHealth, "gpu") != healthCheckStatus(imageFailHealth, "gpu"),
+              "a missing shader directory and an undecodable image get different GPU verdicts");
+        if (healthCheckStatus(shaderFailHealth, "shaders") == healthCheckStatus(imageFailHealth, "shaders")) {
+            std::fprintf(stderr, "  shader fault: %s\n  image fault:  %s\n", shaderFailHealth["checks"].dump().c_str(),
+                         imageFailHealth["checks"].dump().c_str());
+        }
+    } else {
+        notVerified("S7.10a (two different faults are distinguishable)",
+                    "one of the two fault scenarios could not be constructed on this host, so there was nothing "
+                    "to compare against");
+    }
+
+    // S7.10e IS NOT COVERED BY THIS FILE, and the gap is stated here rather than left to
+    // be inferred from the absence of a check.
+    //
+    // The goal is that `gpu: ok` means the GPU worked *recently*: a GpuFailure out of
+    // Device::immediateSubmit re-records it as failed, so a device that dies after one
+    // successful render stops reading ok. Reaching that needs a submit, a fence wait or a
+    // command-buffer allocation to fail on demand, and nothing a test may legally do can
+    // provoke one -- no input to SetWallpaper reaches it, and the only lever that would is
+    // a fault hook in Device, which X.6 forbids adding to a production header.
+    //
+    // What IS established, and it is less than the goal: gpu failure is attributed when
+    // the Device cannot be created at all (scenario (c)'s notVerified branch is that state
+    // when it occurs), gpu reads ok after a real render, and the two places production
+    // records ok were each shown load-bearing by control. The direction that matters --
+    // ok -> fail on a device that has already worked -- has no check. A reviewer should
+    // not read this file's green as evidence for it.
 }
 
 // ---------------------------------------------------------------------------- //
@@ -784,42 +1286,68 @@ void runHealthAfterDeviceChecks(httplib::Client& cli, sdbus::IProxy& proxy, cons
         return;
     }
 
-    // GOAL: S7.10's second half -- once a device exists, /health reports its tier, and
-    //       reports the SAME tier GetStatus does. Two spellings of one fact would be
-    //       S7.3's divergence in another place.
-    // WHY-THIS-SHAPE: compared against GetStatus rather than against a literal "Heap".
-    //       A literal would pin the check to whichever GPU the machine has -- NVIDIA
-    //       resolves Heap, Lavapipe Buffer, and WALLPAPERX_FORCE_TIER=classic makes it
-    //       Classic -- so it would have to be relaxed to a non-empty check to run
-    //       anywhere, and a non-empty check passes for a daemon that invents a tier.
-    //       Equality with the other channel is falsifiable on every host.
-    // CONTROL: /health's tier lowercased (`toLower(snap.gpu.descriptorTier)`, which is
-    //       what DoD #2's "heap" would need) -> "FAIL: /health reports the same
-    //       descriptor tier GetStatus does" with "  http: heap  dbus: Heap". Reverted.
-    // NOTE, and it is a real conflict rather than a test convenience: PLAN.md's
-    //       Definition of Done #2 expects /health to return {"descriptor_tier":"heap"},
-    //       lowercase, on a daemon that has just started. Neither half is true of
-    //       cd28790 -- the value is "Heap" and it is null until the first render. This
-    //       records what the daemon does; PLAN.md and the daemon disagree and only a
-    //       human can settle which moves.
+    // GOAL: S7.10b's other direction -- the same three checks that read `pending` on a
+    //       daemon that had done nothing read `ok` once the daemon has actually used its
+    //       dependencies. Without this, every `!= "ok"` assertion earlier in the run is
+    //       satisfied by an endpoint that can only ever answer `pending`.
+    // WHY-THIS-SHAPE: the GPU verdict is cross-checked against GetStatus rather than
+    //       asserted alone. `gpu.initialized` and `checks.gpu` are two views of one fact
+    //       recorded at one place in ensureGpu, and the failure worth catching is them
+    //       disagreeing -- a client told by one channel that the graphics stack is up and
+    //       by the other that nothing has been tried has no way to decide which to
+    //       believe. Nothing here asserts a tier *name*: NVIDIA resolves Heap, Lavapipe
+    //       Buffer and WALLPAPERX_FORCE_TIER=classic makes it Classic, so a literal would
+    //       be a check on the host.
+    // CONTROL: the GPU is recorded ok in TWO places -- ensureGpu, and renderPending's
+    //       commit under the lock it already holds -- so deleting either alone leaves this
+    //       green, and that was observed before it was written down: with only ensureGpu's
+    //       record removed, gpu still read ok here (the commit had set it) and only the
+    //       detail check below went red. Both removed together -> "FAIL: /health reports
+    //       the GPU as ok once a device exists" with "GetStatus: initialized=true
+    //       /health: gpu=pending", plus "FAIL: /health reports the aggregate as ok on a
+    //       daemon whose render succeeded". The shaders half is separate again:
+    //       `recordHealth(&DaemonHealth::shaders, HealthStatus::Ok, ...)` deleted ->
+    //       "FAIL: /health reports the shader directory as ok once a render has resolved
+    //       it". All reverted.
     const bool gpuUp = status.contains("gpu") && status["gpu"].is_object() &&
                        status["gpu"].value("initialized", false);
     check(gpuUp, "GetStatus reports an initialised GPU after the first render");
-    check(health.json.value("gpu_initialized", false), "/health reports gpu_initialized=true after the first render");
+    check(healthCheckStatus(health.json, "gpu") == "ok", "/health reports the GPU as ok once a device exists");
+    if (gpuUp != (healthCheckStatus(health.json, "gpu") == "ok")) {
+        std::fprintf(stderr, "  GetStatus: initialized=%s  /health: gpu=%s\n", gpuUp ? "true" : "false",
+                     healthCheckStatus(health.json, "gpu").c_str());
+    }
     if (!gpuUp) return;
 
+    check(healthCheckStatus(health.json, "shaders") == "ok",
+          "/health reports the shader directory as ok once a render has resolved it");
+    check(healthCheckStatus(health.json, "wallpapers") == "ok",
+          "/health reports wallpapers as ok on a daemon whose only render succeeded");
+    check(health.json.value("status", std::string()) == "ok",
+          "/health reports the aggregate as ok on a daemon whose render succeeded");
+
+    // The GPU detail has to be about *this* GPU, not a fixed word. Compared against the
+    // tier GetStatus reports rather than against a literal, for the reason above; the
+    // detail is what a reader gets instead of the descriptor_tier key this endpoint used
+    // to carry, so a detail that named neither the device nor the tier would quietly drop
+    // the only GPU identification /health has.
+    // CONTROL: the detail replaced with a literal (`recordHealth(&DaemonHealth::gpu,
+    //       HealthStatus::Ok, "gpu")`) -> "FAIL: the GPU check's detail names the device
+    //       GetStatus reports" with "detail: gpu  dbus: NVIDIA GeForce RTX 3080 Ti /
+    //       Heap", and nothing else red -- the status checks above stayed green, so this
+    //       is not one of them restated. Reverted.
     const std::string dbusTier = status["gpu"].value("descriptor_tier", std::string());
-    check(!health.json["descriptor_tier"].is_null(), "/health reports a descriptor tier once a device exists");
-    const std::string httpTier =
-        health.json["descriptor_tier"].is_string() ? health.json["descriptor_tier"].get<std::string>() : std::string();
-    check(!httpTier.empty() && httpTier == dbusTier, "/health reports the same descriptor tier GetStatus does");
-    if (httpTier != dbusTier) {
-        std::fprintf(stderr, "  http: %s  dbus: %s\n", httpTier.c_str(), dbusTier.c_str());
+    const std::string dbusName = status["gpu"].value("name", std::string());
+    const std::string gpuDetail = healthCheckDetail(health.json, "gpu");
+    check(!dbusTier.empty() && !dbusName.empty(),
+          "GetStatus reports a GPU name and tier for the detail check to be compared against");
+    check(!dbusTier.empty() && gpuDetail.find(dbusTier) != std::string::npos && !dbusName.empty() &&
+              gpuDetail.find(dbusName) != std::string::npos,
+          "the GPU check's detail names the device GetStatus reports");
+    if (gpuDetail.find(dbusTier) == std::string::npos || gpuDetail.find(dbusName) == std::string::npos) {
+        std::fprintf(stderr, "  detail: %s  dbus: %s / %s\n", gpuDetail.c_str(), dbusName.c_str(), dbusTier.c_str());
     }
-    std::printf("http_server_test: /health descriptor_tier = \"%s\" (PLAN.md's Definition of Done #2 asks for "
-                "\"heap\", lowercase, on a freshly started daemon -- this daemon reports the GetStatus spelling "
-                "and reports null until the first render; see S7.10)\n",
-                httpTier.c_str());
+    std::printf("http_server_test: /health after the first render: %s\n", health.body.c_str());
     std::fflush(stdout);
 }
 
@@ -1088,6 +1616,7 @@ int main() {
         const std::string bluePath = writeSolidImage("http_blue.png", 0, 0, 255);
         const std::string videoPath = writeSolidImage("http_video.mp4", 255, 0, 0);
         const std::string hostilePath = writeHostileNamedImage();
+        const std::string junkPath = writeUndecodableFile("http_not_an_image.png");
         // 2400x1800. Large enough that stb's decode dominates the render on a fast GPU,
         // small enough that writing it costs about a second. If it is still too fast to
         // be conclusive, runGpuLockChecks says so rather than grading it.
@@ -1133,9 +1662,15 @@ int main() {
 
             runBindChecks(manager, *proxy, *server, check);
 
-            // Before anything renders: the whole point of the S7.10 pre-device check is
-            // that no Device exists yet.
+            // Before anything renders: the whole point of the S7.10b pre-device check is
+            // that nothing has been tried yet on this manager, so `pending` is the true
+            // answer for all three checks.
             runHealthBeforeDeviceChecks(cli, check);
+
+            // Runs on managers of its own, so it neither needs nor disturbs the state
+            // above -- and so it can be reached on a host with no Vulkan at all, where the
+            // main render below never happens.
+            runHealthStateChecks(bluePath, videoPath, junkPath, check);
 
             // Recorded through the manager rather than through SetWallpaper, so no render
             // is queued and the "before any device" state above survives into this phase.
@@ -1153,7 +1688,8 @@ int main() {
                 // FAIL lines pointing at the wrong component.
                 const nlohmann::json status = getStatus(*proxy);
                 const nlohmann::json* entry = wallpaperStatus(status, std::to_string(kMonitorAgree));
-                notVerified("S7.3 (channel agreement), S7.4 (escaping), S7.2 (read-only), S7.10 (tier), "
+                notVerified("S7.3 (channel agreement), S7.4 (escaping), S7.2 (read-only), "
+                            "S7.10b (/health reads ok once the daemon has used its dependencies), "
                             "S7.12 (poll never waits on a render)",
                             "no frame was ever rendered on this host" +
                                 (entry != nullptr && entry->contains("last_error")

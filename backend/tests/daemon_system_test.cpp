@@ -2214,28 +2214,43 @@ void checkHttpLifecycle(NameWatcher& names, const std::string& bluePath, const s
         return;
     }
 
-    // GOAL: S7.10 end to end, and PLAN.md's Definition of Done #2 with it -- /health on
-    //       127.0.0.1:18462, asked of the real binary by a process that is not it.
-    // WHY-THIS-SHAPE: the in-process tier already pins the JSON. What only this tier can
-    //       establish is that main.cpp actually constructs the server on the shipped port
-    //       -- an HttpServer that was never wired into main would leave every in-process
-    //       check green.
+    // GOAL: S7.10/S7.10b end to end -- /health on 127.0.0.1:18462, asked of the real
+    //       binary by a process that is not it. A daemon that has just started has not
+    //       touched its shader directory or created a device, so every check is `pending`
+    //       and so is the aggregate. A watchdog polling this must not be told the daemon
+    //       is healthy on the strength of checks nobody has run.
+    // WHY-THIS-SHAPE: the in-process tier already pins the JSON in far more detail. What
+    //       only this tier can establish is that the shipped binary reaches this state at
+    //       all -- an HttpServer that was never wired into main.cpp, or a daemon that
+    //       eagerly created a device at startup, would leave every in-process check green.
+    //       So this asserts the aggregate and the three names, not the details.
     // CONTROL: the `wallpaperx::HttpServer httpServer(manager);` line removed from
     //       main.cpp -> this phase reports NOT VERIFIED ("the daemon printed neither the
     //       bind-success nor the bind-failure line for port 18462") and exits 77, which
-    //       ctest shows as a SKIP rather than a pass. Reverted.
-    // NOTE: Definition of Done #2 says /health returns {"descriptor_tier":"heap"}. On a
-    //       freshly started daemon it returns null -- the device is lazy -- and after a
-    //       render it returns "Heap", capitalised, from the same toString() GetStatus
-    //       uses. Both halves of DoD #2 are false of cd28790; that is recorded, not
-    //       ruled on. See S7.10.
+    //       ctest shows as a SKIP rather than a pass. For the body itself: the
+    //       `else if (check->status == HealthStatus::Pending ...)` arm deleted from
+    //       http_server.cpp's aggregation -> "FAIL: the real daemon reports the aggregate
+    //       as pending before it has used anything" with "  fresh /health: ... status ok".
+    //       And for the three names: the `{"gpu", &snap.health.gpu}` entry removed from
+    //       that same array -> "FAIL: the real daemon's /health names shaders, gpu and
+    //       wallpapers as separate checks" and "FAIL: the real daemon reports the GPU as
+    //       untried before its first wallpaper", the body coming back with two checks in
+    //       it. All reverted.
     httplib::Client cli = wallpaperx::testing::makeClient(kPort);
     const HttpReply fresh = wallpaperx::testing::get(cli, "/health");
     check(fresh.ok(), "the real daemon answers GET /health on 127.0.0.1:18462");
     if (fresh.ok()) {
-        check(fresh.json.value("status", std::string()) == "ok", "the real daemon's /health reports status ok");
-        check(fresh.json.contains("descriptor_tier") && fresh.json["descriptor_tier"].is_null(),
-              "the real daemon reports no descriptor tier before its first wallpaper");
+        const nlohmann::json& checks = fresh.json["checks"];
+        const bool named = checks.is_object() && checks.contains("shaders") && checks.contains("gpu") &&
+                           checks.contains("wallpapers");
+        check(named, "the real daemon's /health names shaders, gpu and wallpapers as separate checks");
+        check(fresh.json.value("status", std::string()) == "pending",
+              "the real daemon reports the aggregate as pending before it has used anything");
+        check(named && checks["gpu"].value("status", std::string()) == "pending",
+              "the real daemon reports the GPU as untried before its first wallpaper");
+        if (fresh.json.value("status", std::string()) != "pending" || !named) {
+            std::fprintf(stderr, "  fresh /health: %s\n", fresh.body.c_str());
+        }
         std::printf("daemon_system_test: /health on the shipped port before any wallpaper: %s\n",
                     fresh.body.c_str());
         std::fflush(stdout);
@@ -2255,27 +2270,57 @@ void checkHttpLifecycle(NameWatcher& names, const std::string& bluePath, const s
         // X.1/X.3: the wait expiring is not evidence about /health, and a host with no
         // working Vulkan is not a failure of the HTTP server.
         notVerified("S7.10 through the real binary",
-                    "the daemon never rendered a frame, so no device existed for /health to report a tier for");
+                    "the daemon never rendered a frame, so nothing in the shipped binary ever moved a health "
+                    "check off pending");
     } else {
+        // GOAL: S7.10/S7.10b's other direction in the shipped binary -- once the real
+        //       daemon has rendered a wallpaper, the checks that read `pending` above read
+        //       `ok`, and the GPU one names the device the same daemon reports over DBus.
+        // WHY-THIS-SHAPE: the pending assertions above are worth nothing unless `ok` is
+        //       reachable in this binary -- an endpoint stuck at pending satisfies every
+        //       one of them. The GPU detail is compared against GetStatus's own name and
+        //       tier rather than a literal, because the tier varies by host (Heap on
+        //       NVIDIA, Buffer on Lavapipe, Classic when forced) and a non-empty check
+        //       would pass for a daemon that made a string up. This replaces the
+        //       `descriptor_tier` key /health used to carry, which was dropped 2026-08-06
+        //       along with PLAN.md's Definition of Done #2 conflict.
+        // CONTROL: two, and the first one's result is why the second exists. (a)
+        //       `recordHealth(&DaemonHealth::gpu, HealthStatus::Ok, ...)` deleted from
+        //       ensureGpu -> only "FAIL: the real daemon's /health names the GPU GetStatus
+        //       reports" (detail empty). The status stayed ok because renderPending's
+        //       commit records it too, so the status assertion needed that line deleted as
+        //       well: with both gone -> "FAIL: ... reports the GPU as ok after a render",
+        //       "FAIL: ... reports the aggregate as ok after a successful render" and the
+        //       detail one. (b) the detail alone replaced with the literal "gpu" -> only
+        //       the names-the-GPU check red, with "/health gpu detail: gpu  dbus: NVIDIA
+        //       GeForce RTX 3080 Ti / Heap". All reverted.
         const HttpReply afterRender = wallpaperx::testing::get(cli, "/health");
         const nlohmann::json status = getStatus(*proxy);
         const std::string dbusTier = status.contains("gpu") && status["gpu"].is_object()
                                          ? status["gpu"].value("descriptor_tier", std::string())
                                          : std::string();
-        check(afterRender.ok() && afterRender.json["descriptor_tier"].is_string(),
-              "the real daemon's /health reports a descriptor tier once a device exists");
-        const std::string httpTier = afterRender.ok() && afterRender.json["descriptor_tier"].is_string()
-                                         ? afterRender.json["descriptor_tier"].get<std::string>()
+        const std::string dbusName = status.contains("gpu") && status["gpu"].is_object()
+                                         ? status["gpu"].value("name", std::string())
                                          : std::string();
-        check(!httpTier.empty() && httpTier == dbusTier,
-              "the real daemon's /health and GetStatus report the same descriptor tier");
-        if (httpTier != dbusTier) {
-            std::fprintf(stderr, "  http: %s  dbus: %s\n", httpTier.c_str(), dbusTier.c_str());
+        const std::string gpuStatus = afterRender.ok() && afterRender.json["checks"].is_object()
+                                          ? afterRender.json["checks"]["gpu"].value("status", std::string())
+                                          : std::string();
+        const std::string gpuDetail = afterRender.ok() && afterRender.json["checks"].is_object()
+                                          ? afterRender.json["checks"]["gpu"].value("detail", std::string())
+                                          : std::string();
+        check(gpuStatus == "ok", "the real daemon's /health reports the GPU as ok after a render");
+        check(afterRender.ok() && afterRender.json.value("status", std::string()) == "ok",
+              "the real daemon's /health reports the aggregate as ok after a successful render");
+        check(!dbusTier.empty() && !dbusName.empty(),
+              "GetStatus reports a GPU name and tier for /health's detail to be compared against");
+        check(!dbusTier.empty() && !dbusName.empty() && gpuDetail.find(dbusTier) != std::string::npos &&
+                  gpuDetail.find(dbusName) != std::string::npos,
+              "the real daemon's /health names the GPU GetStatus reports");
+        if (gpuDetail.find(dbusTier) == std::string::npos || gpuDetail.find(dbusName) == std::string::npos) {
+            std::fprintf(stderr, "  /health gpu detail: %s  dbus: %s / %s\n", gpuDetail.c_str(), dbusName.c_str(),
+                         dbusTier.c_str());
         }
-        std::printf("daemon_system_test: /health after one wallpaper: %s (Definition of Done #2 asks for "
-                    "{\"descriptor_tier\":\"heap\"} -- lowercase, and on a daemon that has just started; "
-                    "neither is what this daemon does, see S7.10)\n",
-                    afterRender.body.c_str());
+        std::printf("daemon_system_test: /health after one wallpaper: %s\n", afterRender.body.c_str());
         std::fflush(stdout);
     }
 
