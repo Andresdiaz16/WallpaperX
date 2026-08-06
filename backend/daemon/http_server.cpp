@@ -162,27 +162,43 @@ void HttpServer::registerRoutes() {
     m_server->Get("/health", [this](const httplib::Request&, httplib::Response& res) {
         const WallpaperManager::Snapshot snap = m_manager.snapshot();
 
-        std::size_t failedMonitors = 0;
+        // Split the same four ways GetFrameFd's NoFrameReason splits, so the two channels
+        // cannot disagree about whether a monitor has a picture on it.
+        std::size_t failed = 0, unsupported = 0, inFlight = 0, showing = 0;
+        std::string firstFailure, firstUnsupported;
         for (const auto& [id, monitor] : snap.monitors) {
-            if (!monitor.lastError.empty()) ++failedMonitors;
+            if (!monitor.lastError.empty()) {
+                if (failed++ == 0) firstFailure = monitor.lastError;
+            } else if (!isRenderableType(monitor.type)) {
+                // Type is whitelisted at requestWallpaper, so it is safe to quote into JSON.
+                if (unsupported++ == 0)
+                    firstUnsupported = "monitor " + std::to_string(id) + " is set to a '" + monitor.type +
+                                       "' wallpaper, which this build cannot render";
+            } else if (monitor.hasFrame) {
+                ++showing;
+            } else {
+                ++inFlight;
+            }
         }
 
         HealthCheck wallpapers;
         if (snap.monitors.empty()) {
             wallpapers.detail = "no wallpaper set";
-        } else if (failedMonitors > 0) {
-            // Carries the first error verbatim: "1 of 2 failed" tells an operator to go
-            // read GetStatus, which is the call they made this one to avoid.
-            std::string first;
-            for (const auto& [id, monitor] : snap.monitors) {
-                if (!monitor.lastError.empty()) { first = monitor.lastError; break; }
-            }
+        } else if (failed > 0 || unsupported > 0) {
+            // Carries the cause verbatim: "1 of 2 failed" tells an operator to go read
+            // GetStatus, which is the call they made this one to avoid. A real failure is
+            // quoted ahead of an unsupported type -- it is the one that might be a bug.
             wallpapers.status = HealthStatus::Fail;
-            wallpapers.detail = std::to_string(failedMonitors) + " of " +
-                                std::to_string(snap.monitors.size()) + " monitors failed: " + first;
+            wallpapers.detail = std::to_string(failed + unsupported) + " of " +
+                                std::to_string(snap.monitors.size()) +
+                                " monitors failed or cannot be rendered: " +
+                                (failed > 0 ? firstFailure : firstUnsupported);
+        } else if (inFlight > 0) {
+            wallpapers.detail = std::to_string(inFlight) + " of " + std::to_string(snap.monitors.size()) +
+                                " monitors have not rendered yet";
         } else {
             wallpapers.status = HealthStatus::Ok;
-            wallpapers.detail = std::to_string(snap.monitors.size()) + " monitor(s) rendered";
+            wallpapers.detail = std::to_string(showing) + " monitor(s) showing a frame";
         }
 
         const std::array<std::pair<const char*, const HealthCheck*>, 3> checks{{
