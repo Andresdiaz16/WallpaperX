@@ -74,6 +74,7 @@ using wallpaperx::testing::describe;
 using wallpaperx::testing::FrameReadyLog;
 using wallpaperx::testing::get;
 using wallpaperx::testing::getStatus;
+using wallpaperx::testing::HeldPort;
 using wallpaperx::testing::HttpReply;
 using wallpaperx::testing::makeClient;
 using wallpaperx::testing::Poller;
@@ -123,49 +124,6 @@ std::string testAssetDir() { return std::string(WALLPAPERX_TEST_IMAGE_DIR); }
 // ---------------------------------------------------------------------------- //
 // Sockets: free ports, held ports, and a connect that reports *why* it failed.
 // ---------------------------------------------------------------------------- //
-
-// A listening socket the test owns, kept open so the port it holds is genuinely taken.
-class HeldPort {
-public:
-    HeldPort() = default;
-    ~HeldPort() { release(); }
-    HeldPort(const HeldPort&) = delete;
-    HeldPort& operator=(const HeldPort&) = delete;
-
-    // Binds `host`:0 and listens. Returns false (with fd untouched) on any failure.
-    bool open(uint32_t hostOrder) {
-        release();
-        m_fd = ::socket(AF_INET, SOCK_STREAM, 0);
-        if (m_fd < 0) return false;
-        sockaddr_in addr{};
-        addr.sin_family = AF_INET;
-        addr.sin_addr.s_addr = htonl(hostOrder);
-        addr.sin_port = 0;
-        if (::bind(m_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 || ::listen(m_fd, 4) != 0) {
-            release();
-            return false;
-        }
-        socklen_t len = sizeof(addr);
-        if (::getsockname(m_fd, reinterpret_cast<sockaddr*>(&addr), &len) != 0) {
-            release();
-            return false;
-        }
-        m_port = ntohs(addr.sin_port);
-        return true;
-    }
-
-    void release() {
-        if (m_fd >= 0) ::close(m_fd);
-        m_fd = -1;
-        m_port = -1;
-    }
-
-    int port() const { return m_port; }
-
-private:
-    int m_fd = -1;
-    int m_port = -1;
-};
 
 // A loopback port nothing is listening on right now: bind :0, read the number back,
 // close. Racy in principle -- another process could take it between the close and

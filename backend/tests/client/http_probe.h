@@ -83,6 +83,65 @@ inline ConnectResult tryConnect(const std::string& ip, int port, int timeoutMs) 
     return ConnectResult::Failed;
 }
 
+// A listening socket the test owns, so the port it holds is genuinely taken. Both tiers
+// need one: the in-process tier holds an ephemeral port to make an HttpServer's bind fail,
+// the system tier holds the shipped 18462 before the daemon binary is started.
+class HeldPort {
+public:
+    HeldPort() = default;
+    ~HeldPort() { release(); }
+    HeldPort(const HeldPort&) = delete;
+    HeldPort& operator=(const HeldPort&) = delete;
+
+    // Binds `hostOrder`:`port` -- port 0 lets the kernel choose -- and listens. Returns
+    // false, holding nothing, on any failure. A caller asking for a fixed port gets false
+    // when something else already has it, which is a reason to skip and not to grade.
+    bool open(uint32_t hostOrder, int port = 0) {
+        release();
+        // SOCK_CLOEXEC is load-bearing on the system tier: without it a daemon forked while
+        // this socket is held inherits the descriptor, and "who is listening on that port"
+        // asked of /proc/<daemon>/fd then answers "the daemon" about a socket the daemon
+        // never bound.
+        m_fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        if (m_fd < 0) return false;
+
+        // SO_REUSEADDR, and never SO_REUSEPORT: a holder that shared the port would let the
+        // server under test bind alongside it, so the conflict this class exists to create
+        // would not exist. It does rebind over a TIME_WAIT an earlier phase left on a fixed
+        // port, which is the only reason it is set at all.
+        int on = 1;
+        ::setsockopt(m_fd, SOL_SOCKET, SO_REUSEADDR, &on, static_cast<socklen_t>(sizeof(on)));
+
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(hostOrder);
+        addr.sin_port = htons(static_cast<uint16_t>(port));
+        if (::bind(m_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 || ::listen(m_fd, 4) != 0) {
+            release();
+            return false;
+        }
+        socklen_t len = sizeof(addr);
+        if (::getsockname(m_fd, reinterpret_cast<sockaddr*>(&addr), &len) != 0) {
+            release();
+            return false;
+        }
+        m_port = ntohs(addr.sin_port);
+        return true;
+    }
+
+    void release() {
+        if (m_fd >= 0) ::close(m_fd);
+        m_fd = -1;
+        m_port = -1;
+    }
+
+    int port() const { return m_port; }
+
+private:
+    int m_fd = -1;
+    int m_port = -1;
+};
+
 inline httplib::Client makeClient(int port) {
     httplib::Client cli("127.0.0.1", port);
     cli.set_connection_timeout(std::chrono::seconds(5));

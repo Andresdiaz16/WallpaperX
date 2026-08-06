@@ -67,13 +67,16 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <thread>
 #include <vector>
 
 #include <fcntl.h>
+#include <netinet/in.h>
 #include <poll.h>
 #include <signal.h>
 #include <sys/wait.h>
@@ -116,10 +119,12 @@ constexpr int32_t kMonitorBarrierPost = 31;
 // both. (They are not "in the gap between" them, as this comment used to say; the only gap
 // there is 18..19 and neither is in it. The ids are fine, the reasoning was not.) Two ids,
 // because the closed-stdout phase renders once with its stdout still readable -- to
-// establish that the handler does write to fd 1 -- and once after breaking it. Ids still
-// unclaimed by any phase: 18..19 and 26..29.
+// establish that the handler does write to fd 1 -- and once after breaking it.
 constexpr int32_t kMonitorClosedStdoutPre = 25;
 constexpr int32_t kMonitorClosedStdout = 24;
+// The port-conflict phase's own id: it renders once, to show the daemon is still doing its
+// job while reporting that it lost its config port. Ids still unclaimed: 18..19 and 28..29.
+constexpr int32_t kMonitorLostPort = 27;
 
 constexpr int kStormThreads = 4;
 
@@ -2396,6 +2401,412 @@ void checkHttpLifecycle(NameWatcher& names, const std::string& bluePath, const s
     }
 }
 
+// ---------------------------------------------------------------------------- //
+// Phase 11 -- S7.14: the daemon says on DBus whether it got its own config port.
+// ---------------------------------------------------------------------------- //
+//
+// Both directions run against the real binary, because main.cpp is the only place the
+// bind result is ever handed to the manager. The failing direction needs a process holding
+// 18462 before the daemon starts, which an in-process test cannot arrange for a main() it
+// never runs.
+
+// Who holds the listening socket on 127.0.0.1:`port`. Read from /proc, deliberately: the
+// whole question is whether the daemon's own report about that port can be trusted, so the
+// answer has to come from somewhere the daemon does not write.
+enum class Listener { Daemon, Other, Nobody, Unknown };
+
+// The inode of the socket listening on 127.0.0.1:`port`, or 0 if there is none. Returns
+// false only when /proc/net/tcp could not be read -- "unreadable" and "nothing is
+// listening" are different answers and only one of them says anything about the daemon.
+bool listeningSocketInode(int port, unsigned long long& outInode, std::string& why) {
+    std::ifstream tcp("/proc/net/tcp");
+    if (!tcp) {
+        why = "/proc/net/tcp could not be opened";
+        return false;
+    }
+    char wanted[32];
+    std::snprintf(wanted, sizeof(wanted), "0100007F:%04X", port);  // 127.0.0.1, as /proc prints it
+
+    outInode = 0;
+    std::string line;
+    std::getline(tcp, line);  // column header
+    while (std::getline(tcp, line)) {
+        std::istringstream fields(line);
+        std::string sl, local, remote, state, queues, timer, retransmit, uid, timeout, inode;
+        if (!(fields >> sl >> local >> remote >> state >> queues >> timer >> retransmit >> uid >> timeout >> inode)) {
+            continue;
+        }
+        if (state != "0A" || local != wanted) continue;  // 0A == TCP_LISTEN
+        outInode = std::strtoull(inode.c_str(), nullptr, 10);
+        return true;
+    }
+    return true;
+}
+
+Listener whoListens(int port, pid_t pid, std::string& why) {
+    unsigned long long inode = 0;
+    if (!listeningSocketInode(port, inode, why)) return Listener::Unknown;
+    if (inode == 0) return Listener::Nobody;
+    if (pid <= 0) {
+        why = "the daemon's pid is no longer known";
+        return Listener::Unknown;
+    }
+
+    const std::string target = "socket:[" + std::to_string(inode) + "]";
+    const std::string fdDir = "/proc/" + std::to_string(pid) + "/fd";
+    std::error_code ec;
+    std::filesystem::directory_iterator entries(fdDir, ec);
+    if (ec) {
+        why = fdDir + " could not be read (" + ec.message() + ")";
+        return Listener::Unknown;
+    }
+    const std::filesystem::directory_iterator end;
+    while (entries != end) {
+        std::error_code linkEc;
+        // Descriptors open and close under the walk; one that cannot be read at this
+        // instant is not evidence either way.
+        const std::filesystem::path link = std::filesystem::read_symlink(entries->path(), linkEc);
+        if (!linkEc && link.native() == target) return Listener::Daemon;
+        entries.increment(ec);
+        if (ec) {
+            why = fdDir + " could not be walked (" + ec.message() + ")";
+            return Listener::Unknown;
+        }
+    }
+    return Listener::Other;
+}
+
+const char* describeListener(Listener who) {
+    switch (who) {
+        case Listener::Daemon: return "the spawned daemon";
+        case Listener::Other: return "some other process";
+        case Listener::Nobody: return "nobody";
+        case Listener::Unknown: return "could not be determined";
+    }
+    return "?";
+}
+
+// GetStatus's config_server object, or nullptr when the reply does not carry one. Same
+// reason wallpaperStatus() exists: operator[] on a const json missing the key dereferences
+// end() under NDEBUG, so a daemon that dropped the field would crash the test instead of
+// failing the check written to catch exactly that.
+const nlohmann::json* configServerReport(const nlohmann::json& status) {
+    if (status.is_discarded() || !status.is_object() || !status.contains("config_server")) return nullptr;
+    const nlohmann::json& report = status["config_server"];
+    return report.is_object() ? &report : nullptr;
+}
+
+// GetStatus with the throw turned into a value. "Is the daemon still answering DBus" is
+// the question this phase exists to decide, so a dropped connection is data here and must
+// not escape into the run's catch-all as an unexplained exception.
+nlohmann::json statusOrError(sdbus::IProxy& proxy, std::string& error) {
+    try {
+        return getStatus(proxy);
+    } catch (const std::exception& e) {
+        error = e.what();
+        return nlohmann::json();
+    }
+}
+
+// A barrier between phases that each spawn a daemon, deliberately not a check: shutdown()
+// does not return until the process is reaped, and a reaped process has had its name
+// released by the kernel whatever the daemon did -- so no mutation makes this red. Release
+// on shutdown is graded, controllably, by the SIGTERM phase. A timeout is reported as what
+// it is: the next phase cannot be set up.
+void awaitNameRelease(NameWatcher& names, const char* nextUp) {
+    if (!names.waitFor(false)) {
+        notVerified(nextUp, "the bus name was still owned after this phase's daemon had been reaped");
+    }
+}
+
+// Direction 1: the port is free, so the daemon is the process listening on it.
+void checkConfigServerOwnsPort(NameWatcher& names, const std::string& validationEnv, const Check& check) {
+    constexpr int kPort = wallpaperx::HttpServer::kDefaultPort;
+
+    SpawnedDaemon daemon({validationEnv});
+    if (!names.waitFor(true)) {
+        notVerified("S7.14 (the ok direction)", "the daemon for this phase never acquired the bus name");
+        return;
+    }
+    auto proxy =
+        sdbus::createProxy(sdbus::ServiceName{DbusService::kBusName}, sdbus::ObjectPath{DbusService::kObjectPath});
+
+    std::string dbusError;
+    const nlohmann::json status = statusOrError(*proxy, dbusError);
+    if (!dbusError.empty()) {
+        check(false, "the daemon answers GetStatus once it holds the bus name");
+        std::fprintf(stderr, "  GetStatus failed: %s\n", dbusError.c_str());
+        daemon.shutdown(SIGTERM);
+        awaitNameRelease(names, "S7.14 (the fail direction, which follows this one)");
+        return;
+    }
+
+    // GOAL: S7.14's ok direction -- config_server reads ok exactly when this daemon is the
+    //       process listening on 18462, not merely whenever the daemon is up.
+    // WHY-THIS-SHAPE: /proc is asked who holds the socket, rather than the test believing
+    //       the daemon or believing that a free port stayed free. Asserting only
+    //       `status == "ok"` here passes for a hardcoded string and for a daemon that
+    //       reports ok about a port some other process took between the spawn and the
+    //       call. Sampled AFTER a GetStatus reply on purpose: main.cpp constructs the
+    //       HttpServer and records the result before it enters the event loop, so a reply
+    //       having come back is proof the bind decision is already made -- the bus name,
+    //       which is taken earlier, is not.
+    // CONTROL: three. (a) main.cpp's HttpServer constructed on kDefaultPort + 1, still
+    //       reporting through recordConfigServer -> "FAIL: config_server reads ok exactly
+    //       when this daemon is the process holding 18462" with "  config_server: ok /
+    //       listening, but 127.0.0.1:18462 is held by nobody". (b) the `status
+    //       ["config_server"] = ...` line deleted from DbusService::getStatus -> "FAIL:
+    //       GetStatus carries a config_server object". (c) recordConfigServer's "listening"
+    //       detail replaced with "" -> "FAIL: the config_server report carries a detail, not
+    //       a bare status". All reverted.
+    std::string why;
+    const Listener who = whoListens(kPort, daemon.pid(), why);
+    const nlohmann::json* report = configServerReport(status);
+    const std::string reportStatus = report ? report->value("status", std::string()) : std::string();
+    const std::string reportDetail = report ? report->value("detail", std::string()) : std::string();
+
+    if (who == Listener::Unknown) {
+        // A harness fault, not the daemon's: X.3 forbids spending a FAIL line on it.
+        notVerified("S7.14 (the ok direction)", "who is listening on 127.0.0.1:" + std::to_string(kPort) +
+                                                    " could not be established: " + why);
+    } else if (who == Listener::Other) {
+        notVerified("S7.14 (the ok direction)", "port " + std::to_string(kPort) +
+                                                    " is held by another process on this machine, so the spawned "
+                                                    "daemon could never have owned it");
+    } else {
+        // Nobody-listening is not a skip: a daemon claiming ok about a port no process
+        // holds is exactly what this goal says must be false, and the equality below still
+        // grades it. It only stops the ok direction being *claimed* when the daemon agrees
+        // it never got the port.
+        check(report != nullptr, "GetStatus carries a config_server object");
+        if (report != nullptr) {
+            check((reportStatus == "ok") == (who == Listener::Daemon),
+                  "config_server reads ok exactly when this daemon is the process holding 18462");
+            check(!reportDetail.empty(), "the config_server report carries a detail, not a bare status");
+            if ((reportStatus == "ok") != (who == Listener::Daemon) || reportDetail.empty()) {
+                std::fprintf(stderr, "  config_server: %s / %s, but 127.0.0.1:%d is held by %s\n",
+                             reportStatus.c_str(), reportDetail.empty() ? "(empty)" : reportDetail.c_str(), kPort,
+                             describeListener(who));
+            }
+        }
+        if (who == Listener::Nobody && reportStatus != "ok") {
+            notVerified("S7.14 (the ok direction)", "the spawned daemon did not take port " + std::to_string(kPort) +
+                                                        " and nothing else did either, so there was no ok direction "
+                                                        "to observe");
+        }
+    }
+
+    // GOAL: S7.14's placement -- the bind result travels on DBus and NOT in /health's
+    //       checks. On the failing side /health is answered by whatever took the port, so a
+    //       config_server check there could only ever read ok: a check that cannot fail.
+    // WHY-THIS-SHAPE: asserting the key's absence on its own is satisfied by a /health that
+    //       returned nothing at all, so the same check demands the three real checks are
+    //       present and that GetStatus carries config_server at the same moment. What is
+    //       graded is the two channels *differing*, which is the decision worth protecting.
+    // CONTROL: `{"config_server", &snap.health.configServer},` added to http_server.cpp's
+    //       checks array (sized 4) -> "FAIL: the bind result is on DBus only -- /health
+    //       names its three checks and not config_server". Reverted.
+    httplib::Client cli = wallpaperx::testing::makeClient(kPort);
+    const wallpaperx::testing::HttpReply health = wallpaperx::testing::get(cli, "/health");
+    const bool healthUsable = health.ok() && health.json["checks"].is_object();
+    if (!healthUsable) {
+        // Whether /health answers at all is graded by the HTTP-lifecycle phase, against a
+        // daemon of its own. Grading it again here would give one fault two names.
+        std::printf("daemon_system_test: the /health-placement check is not graded -- /health did not answer with a "
+                    "checks object on this daemon.\n");
+    } else {
+        const nlohmann::json& checks = health.json["checks"];
+        check(checks.contains("shaders") && checks.contains("gpu") && checks.contains("wallpapers") &&
+                  !checks.contains("config_server") && configServerReport(status) != nullptr,
+              "the bind result is on DBus only -- /health names its three checks and not config_server");
+    }
+
+    daemon.shutdown(SIGTERM);
+    awaitNameRelease(names, "S7.14 (the fail direction, which follows this one)");
+}
+
+// Direction 2: this test holds the port first, so the daemon cannot have it.
+//
+// `hostRendered` says whether any daemon in this run got a frame out of this host. It is
+// what separates "the conflict crippled the daemon" from "this machine has no working
+// Vulkan", and it must come from outside this phase -- asking the crippled daemon itself
+// would answer the question with the thing being questioned.
+void checkConfigServerLostPort(NameWatcher& names, const std::string& bluePath, const std::string& validationEnv,
+                               bool hostRendered, const Check& check) {
+    constexpr int kPort = wallpaperx::HttpServer::kDefaultPort;
+
+    // The conflict is created here rather than hoped for, and the decision to skip is taken
+    // on THIS process's bind() -- never on config_server, the field under test. A gate that
+    // read the field would turn a daemon reporting the wrong thing into a green skip.
+    wallpaperx::testing::HeldPort impostor;
+    if (!impostor.open(INADDR_LOOPBACK, kPort)) {
+        notVerified("S7.14 (the fail direction)", "this test could not take port " + std::to_string(kPort) +
+                                                      " itself, so the port conflict could not be created");
+        return;
+    }
+
+    SpawnedDaemon daemon({validationEnv});
+    if (!names.waitFor(true)) {
+        const std::string startupOutput = daemon.output();
+        const std::string bindFailed = std::string("could not bind ") + wallpaperx::HttpServer::kLoopbackHost + ":" +
+                                       std::to_string(kPort);
+        if (startupOutput.find(bindFailed) != std::string::npos) {
+            // It reached its bind attempt, failed it, and then never made it onto the bus.
+            // That is the daemon dying of a port conflict, which is a finding and not a
+            // reason to skip.
+            // UNCONTROLLED: a throwing bind branch does reach this state, but which of the
+            // two branches wins is a race with the name request that happens first -- the
+            // run that was tried took the other one, reporting through the GetStatus check
+            // below. Kept because the alternative is calling a daemon that died of the
+            // conflict a skip.
+            check(false, "the daemon still reaches the bus when its config port is already taken");
+        } else {
+            notVerified("S7.14 (the fail direction)",
+                        "the daemon for this phase never acquired the bus name and never reached its bind attempt");
+        }
+        return;
+    }
+
+    // Declared before the proxy so it is destroyed after it: the FrameReady callback runs on
+    // the proxy's dispatch thread, and a log destroyed first is written to by a signal still
+    // in flight during teardown. ThreadSanitizer reported exactly that race when these two
+    // were the other way round.
+    FrameReadyLog signals;
+    auto proxy =
+        sdbus::createProxy(sdbus::ServiceName{DbusService::kBusName}, sdbus::ObjectPath{DbusService::kObjectPath});
+    proxy->uponSignal("FrameReady")
+        .onInterface(DbusService::kInterface)
+        .call([&signals](int32_t monitorId, uint64_t generation) { signals.record(monitorId, generation); });
+
+    std::string dbusError;
+    const nlohmann::json status = statusOrError(*proxy, dbusError);
+
+    // COVERAGE-ASSERT for everything below: that the conflict was in force when the report
+    // was read. Held sockets are not shareable -- HeldPort sets SO_REUSEADDR and never
+    // SO_REUSEPORT -- so a daemon found listening here means the phase graded a daemon that
+    // got the port after all, and every "fail" assertion under it would be nonsense.
+    // Sampled after the GetStatus reply, which is proof main() is past its bind attempt.
+    // CONTROL: SOCK_CLOEXEC dropped from HeldPort, so the forked daemon inherits this
+    //       socket -> "FAIL: the port conflict is real: the daemon is not the process
+    //       listening on 18462". That was a live bug in the first draft, not a hypothetical.
+    //       Restored.
+    std::string listenerWhy;
+    const Listener who = whoListens(kPort, daemon.pid(), listenerWhy);
+    if (who == Listener::Unknown) {
+        std::printf("daemon_system_test: could not confirm from /proc who holds 127.0.0.1:%d (%s); the conflict is "
+                    "still real -- this test holds the socket -- so the checks below stand.\n",
+                    kPort, listenerWhy.c_str());
+    } else {
+        check(who != Listener::Daemon,
+              "the port conflict is real: the daemon is not the process listening on 18462");
+    }
+
+    // GOAL: S7.14's substantive half -- a daemon that lost its config port says so on DBus,
+    //       with a cause an operator can act on, while still serving DBus at all.
+    // WHY-THIS-SHAPE: the port is held by this test before the daemon is spawned, so the
+    //       failure is certain rather than opportunistic; and "still serving" is asserted
+    //       from the same reply that carries the report, because a GetStatus that came back
+    //       is itself the evidence the daemon is alive. The alternative -- reading the
+    //       daemon's stderr line -- says only that it printed something on the way past,
+    //       which is the state this goal exists to improve on.
+    // CONTROL: three. (a) `manager.recordConfigServer(...)` deleted from main.cpp -> "FAIL:
+    //       a daemon that could not bind its config port reports config_server fail" and
+    //       "FAIL: the failed bind report names the port it could not take", with
+    //       "  config_server: pending / (empty), while 127.0.0.1:18462 is held by some other
+    //       process". (b) m_bindError reworded to "the config port could not be bound" ->
+    //       only the names-the-port check red, the fail one still green. (c) the bind
+    //       branch's `return` replaced with `throw std::runtime_error(m_bindError)` -> "FAIL:
+    //       a daemon that could not bind its config port still answers GetStatus" with
+    //       "  GetStatus failed: [org.freedesktop.DBus.Error.NoReply] Message recipient
+    //       disconnected from message bus without replying", plus the two shutdown checks
+    //       below. All reverted.
+    check(dbusError.empty(), "a daemon that could not bind its config port still answers GetStatus");
+    if (!dbusError.empty()) {
+        std::fprintf(stderr, "  GetStatus failed: %s\n", dbusError.c_str());
+    } else {
+        const nlohmann::json* report = configServerReport(status);
+        const std::string reportStatus = report ? report->value("status", std::string()) : std::string();
+        const std::string reportDetail = report ? report->value("detail", std::string()) : std::string();
+        const std::string hostPort =
+            std::string(wallpaperx::HttpServer::kLoopbackHost) + ":" + std::to_string(kPort);
+
+        check(status.value("running", false), "a daemon that could not bind its config port still reports running");
+        check(report != nullptr, "GetStatus carries a config_server object");
+        check(reportStatus == "fail", "a daemon that could not bind its config port reports config_server fail");
+        // Not merely non-empty: "fail" with no cause sends an operator back to the stderr
+        // this report exists to replace, and the port is the one fact they need to go and
+        // look for the process that took it. Built from the daemon's own two constants, so
+        // a change of host or port fails the build rather than this assertion.
+        check(reportDetail.find(hostPort) != std::string::npos,
+              "the failed bind report names the port it could not take");
+        if (reportStatus != "fail" || reportDetail.find(hostPort) == std::string::npos) {
+            std::fprintf(stderr, "  config_server: %s / %s, while %s is held by %s\n",
+                         report ? reportStatus.c_str() : "(absent)",
+                         reportDetail.empty() ? "(empty)" : reportDetail.c_str(), hostPort.c_str(),
+                         describeListener(who));
+        }
+    }
+
+    // GOAL: S7.14 is only worth having because the daemon keeps working -- a report from a
+    //       corpse would be a crash, not a diagnosis. So it must still render after losing
+    //       the port.
+    // WHY-THIS-SHAPE: a render, not a second GetStatus: answering the bus is the cheap half
+    //       and GOALS.md claims DBus *and* rendering continue. `hostRendered` is what
+    //       decides whether a missing frame is a failure or an unexercised goal: an earlier
+    //       phase of this same run got a frame out of the same binary, so a frame that never
+    //       arrives here cannot be blamed on the Vulkan stack. Without that distinction this
+    //       would either accuse a host with no ICD or -- the version that matters -- let a
+    //       daemon crippled by the conflict pass as a skip. SetWallpaper is inside the try
+    //       because a daemon killed by the conflict would otherwise throw out of the phase
+    //       and take these diagnostics with it.
+    // CONTROL: two. (a) `throw InvalidRequest("control")` at the top of
+    //       WallpaperManager::requestWallpaper -> "FAIL: a daemon that could not bind its
+    //       config port still accepts SetWallpaper" with the daemon's error text. (b) the
+    //       FrameReady emission in dbus_service.cpp suppressed for this phase's monitor
+    //       only, so the run still renders elsewhere and hostRendered stays true -> "FAIL: a
+    //       daemon that could not bind its config port renders a wallpaper anyway". Both
+    //       reverted.
+    if (dbusError.empty()) {
+        bool rendered = false;
+        std::string renderError;
+        try {
+            setWallpaper(*proxy, "static", bluePath, kMonitorLostPort);
+            rendered = signals.wait(kMonitorLostPort, 1);
+        } catch (const std::exception& e) {
+            renderError = e.what();
+        }
+        if (!renderError.empty()) {
+            check(false, "a daemon that could not bind its config port still accepts SetWallpaper");
+            std::fprintf(stderr, "  SetWallpaper failed: %s\n", renderError.c_str());
+        } else if (!rendered && !hostRendered) {
+            notVerified("S7.14 (rendering continues after a lost port)",
+                        "no daemon rendered a frame at all in this run, so this host cannot tell a daemon crippled by "
+                        "the port conflict from one with no working Vulkan");
+        } else {
+            check(rendered, "a daemon that could not bind its config port renders a wallpaper anyway");
+        }
+    }
+
+    // The port conflict must not change how the daemon goes down: the HttpServer destructor
+    // still runs on a server that never started a serving thread.
+    // CONTROL: control (c) above -- a throwing bind branch -> "FAIL: a daemon that could not
+    //       bind its config port still exits 0 on SIGTERM" and "FAIL: ... still runs its
+    //       destructor chain" (exit 1, "fatal:" instead of "stopped cleanly"). Reverted.
+    const int exitCode = daemon.shutdown(SIGTERM);
+    const std::string output = daemon.output();
+    if (output.find("Sanitizer: reported") != std::string::npos) {
+        // Same shape as every other exit-code site here: a sanitized build replaces the
+        // exit code, so this stops being a question about the shutdown path.
+        check(false, "the port-conflict daemon's sanitizer reported no warnings (its exit code is the sanitizer's "
+                     "here, so the exit-code check cannot run)");
+    } else {
+        check(exitCode == 0, "a daemon that could not bind its config port still exits 0 on SIGTERM");
+    }
+    check(output.find("stopped cleanly") != std::string::npos,
+          "a daemon that could not bind its config port still runs its destructor chain");
+    awaitNameRelease(names, "any phase added after this one");
+}
+
 }  // namespace
 
 int main() {
@@ -2588,6 +2999,16 @@ int main() {
         // below -- its httplib clients close their sockets on destruction, which that
         // accounting would otherwise report as a leak in this process.
         checkHttpLifecycle(names, bluePath, validationEnv, check);
+
+        // S7.14, both directions. After checkHttpLifecycle rather than beside it: that
+        // phase asserts nothing is listening on 18462 once its daemon has gone, and the
+        // second of these deliberately puts a socket of this test's own there. Before the
+        // descriptor accounting, since both hold sockets that close at scope exit.
+        checkConfigServerOwnsPort(names, validationEnv, check);
+        // signals is this run's whole FrameReady history, from the daemons of the phases
+        // above: a non-empty one is proof this host can render, which is what lets the
+        // port-conflict phase grade a missing frame instead of skipping on it.
+        checkConfigServerLostPort(names, bluePath, validationEnv, signals.total() > 0, check);
 
         // Every Frame's UnixFd closes at scope exit, and the daemon is gone, so this
         // process must be back where it started. A descriptor leaked per GetFrameFd is
