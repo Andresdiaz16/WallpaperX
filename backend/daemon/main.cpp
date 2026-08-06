@@ -1,4 +1,5 @@
 #include "dbus_service.h"
+#include "http_server.h"
 #include "wallpaper_manager.h"
 
 #include <sdbus-c++/sdbus-c++.h>
@@ -82,6 +83,10 @@ int main() {
         std::printf("wallpaperx-daemon: serving %s at %s\n", wallpaperx::DbusService::kBusName,
                     wallpaperx::DbusService::kObjectPath);
         std::fflush(stdout);
+
+        // Declared last so it is destroyed first: its handlers call manager.snapshot(),
+        // so HTTP has to stop before anything it reads starts being torn down.
+        wallpaperx::HttpServer httpServer(manager);
 
         // sigwait on a dedicated thread rather than a signal handler. leaveEventLoop()
         // takes locks and is not async-signal-safe, so calling it from a handler is a

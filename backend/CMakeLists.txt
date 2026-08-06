@@ -99,6 +99,7 @@ endif()
 # (mirrors the renderer lib + probes layout).
 add_library(wallpaperx-daemon-lib STATIC
     daemon/dbus_service.cpp
+    daemon/http_server.cpp
     daemon/render_worker.cpp
     daemon/wallpaper_manager.cpp
 )
@@ -126,6 +127,10 @@ target_link_libraries(wallpaperx-daemon-lib PUBLIC
 # the shaders a real installed location.
 target_compile_definitions(wallpaperx-daemon-lib PRIVATE
     WALLPAPERX_DEFAULT_SHADER_DIR="${WALLPAPERX_SHADER_OUTPUT_DIR}"
+    # /health reports this. Taken from project(... VERSION) rather than written into the
+    # source, so the string a user quotes in a bug report cannot be a version the build
+    # stopped being. http_server.cpp #errors if it is missing rather than defaulting.
+    WALLPAPERX_VERSION="${PROJECT_VERSION}"
 )
 
 # The .spv files are produced by a custom target, so nothing links them in -- without
