@@ -125,6 +125,19 @@ struct FileCloser {
 };
 using FilePtr = std::unique_ptr<FILE, FileCloser>;
 
+struct StbFreer {
+    void operator()(stbi_uc* p) const noexcept { stbi_image_free(p); }
+};
+using PixelsPtr = std::unique_ptr<stbi_uc, StbFreer>;
+
+// A local buffer is unreachable from cleanup(), and an orphaned VMA allocation aborts the
+// process in Memory::shutdown rather than merely leaking.
+struct BufferGuard {
+    Memory& memory;
+    AllocatedBuffer& buffer;
+    ~BufferGuard() { memory.destroyBuffer(buffer); }
+};
+
 }  // namespace
 
 void StaticRenderer::loadAndUploadTexture(const std::string& imagePath) {
@@ -173,7 +186,7 @@ void StaticRenderer::loadAndUploadTexture(const std::string& imagePath) {
     int imageWidth = 0;
     int imageHeight = 0;
     int channels = 0;
-    stbi_uc* pixels = stbi_load_from_file(probe.get(), &imageWidth, &imageHeight, &channels, STBI_rgb_alpha);
+    PixelsPtr pixels(stbi_load_from_file(probe.get(), &imageWidth, &imageHeight, &channels, STBI_rgb_alpha));
     if (!pixels) {
         throw std::runtime_error(
             describeRejection("failed to load image (" + stbFailureReason() + ")", imagePath));
@@ -182,7 +195,6 @@ void StaticRenderer::loadAndUploadTexture(const std::string& imagePath) {
     // Guards stb's two parsers disagreeing with each other, not a swap -- the shared open
     // above rules that out.
     if (imageWidth != probeWidth || imageHeight != probeHeight) {
-        stbi_image_free(pixels);
         throw std::runtime_error(describeRejection(
             "decoded to " + std::to_string(imageWidth) + "x" + std::to_string(imageHeight) +
                 " but its header reported " + std::to_string(probeWidth) + "x" +
@@ -194,9 +206,12 @@ void StaticRenderer::loadAndUploadTexture(const std::string& imagePath) {
 
     AllocatedBuffer staging = m_device.memory().createBuffer(
         imageSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, HostAccess::Write, "static-renderer-staging");
-    std::memcpy(staging.mapped, pixels, static_cast<size_t>(imageSize));
+    BufferGuard stagingGuard{m_device.memory(), staging};
+    std::memcpy(staging.mapped, pixels.get(), static_cast<size_t>(imageSize));
     m_device.memory().flushForHostWrite(staging);
-    stbi_image_free(pixels);
+    // Released before the GPU work, not at scope exit: it is the other half of the peak the
+    // decode budget bounds.
+    pixels.reset();
 
     VkImageCreateInfo imageInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     imageInfo.imageType = VK_IMAGE_TYPE_2D;
@@ -212,11 +227,7 @@ void StaticRenderer::loadAndUploadTexture(const std::string& imagePath) {
 
     m_texture = m_device.memory().createImage(imageInfo, "static-renderer-texture");
 
-    // staging is a local, so the constructor's cleanup() cannot reach it: a throwing submit
-    // would orphan the allocation and Memory::shutdown aborts the process over it at
-    // teardown. m_texture needs no such guard -- cleanup() destroys it.
-    try {
-        m_device.immediateSubmit([&](VkCommandBuffer cmd) {
+    m_device.immediateSubmit([&](VkCommandBuffer cmd) {
         VkImageMemoryBarrier toTransferDst{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         toTransferDst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         toTransferDst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
@@ -248,13 +259,7 @@ void StaticRenderer::loadAndUploadTexture(const std::string& imagePath) {
 
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
                               0, 0, nullptr, 0, nullptr, 1, &toShaderRead);
-        });
-    } catch (...) {
-        m_device.memory().destroyBuffer(staging);
-        throw;
-    }
-
-    m_device.memory().destroyBuffer(staging);
+    });
 
     VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     viewInfo.image = m_texture.image;
