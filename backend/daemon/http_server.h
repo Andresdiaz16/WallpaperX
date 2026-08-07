@@ -57,6 +57,9 @@ private:
 
     std::thread m_thread;
     std::atomic<bool> m_listening{false};
+
+    // Tells the destructor's stop() apart from the accept loop dying on its own.
+    std::atomic<bool> m_stopping{false};
     std::string m_bindError;
 };
 

@@ -7,10 +7,13 @@
 #include <nlohmann/json.hpp>
 
 #include <array>
+#include <cerrno>
 #include <charconv>
 #include <cstdio>
+#include <cstring>
 #include <utility>
 #include <exception>
+#include <thread>
 #include <string>
 #include <system_error>
 
@@ -32,6 +35,8 @@ constexpr const char* kContentTypeJson = "application/json";
 constexpr size_t kMaxPayloadBytes = 8 * 1024;
 
 // Bounds a poller that stops reading mid-response. Generous for loopback.
+// Per-read, not per-request: every byte received restarts it, so this bounds a silent
+// client and not a slow one.
 constexpr time_t kIoTimeoutSeconds = 5;
 
 void sendJson(httplib::Response& res, const nlohmann::json& body, int status = 200) {
@@ -78,10 +83,16 @@ HttpServer::HttpServer(WallpaperManager& manager, int port)
     // httplib's default sets SO_REUSEPORT, which lets another process of the same user
     // bind alongside the daemon and take a share of the plugin's polls. SO_REUSEADDR is
     // exclusive and still rebinds over TIME_WAIT.
+    // Reported rather than ignored: this callback replaces httplib's default, so a silent
+    // failure leaves the socket with neither option, and the symptom is a bind refused over
+    // TIME_WAIT after a restart -- which reads as a stale socket, not as this.
     m_server->set_socket_options([](socket_t sock) {
         int on = 1;
-        ::setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const void*>(&on),
-                     static_cast<socklen_t>(sizeof(on)));
+        if (::setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const void*>(&on),
+                         static_cast<socklen_t>(sizeof(on))) != 0) {
+            std::fprintf(stderr, "wallpaperx-daemon: could not set SO_REUSEADDR (%s)\n",
+                         std::strerror(errno));
+        }
     });
 
     // Without this an exception in a handler unwinds through httplib's worker thread into
@@ -114,7 +125,19 @@ HttpServer::HttpServer(WallpaperManager& manager, int port)
     }
 
     m_listening.store(true, std::memory_order_release);
-    m_thread = std::thread([this] { m_server->listen_after_bind(); });
+    m_thread = std::thread([this] {
+        // false only when httplib hit an accept error outside EMFILE/EINTR/EAGAIN and
+        // closed its own listening socket; a deliberate stop() leaves it true. Without
+        // this the port can close while GetStatus still reports config_server ok, which
+        // is the one thing a client cannot find out any other way.
+        const bool clean = m_server->listen_after_bind();
+        if (!clean && !m_stopping.load(std::memory_order_acquire)) {
+            m_listening.store(false, std::memory_order_release);
+            m_manager.recordConfigServer(
+                false, std::string("stopped serving ") + kLoopbackHost + ":" +
+                           std::to_string(m_port) + " (accept failed; the port is closed)");
+        }
+    });
 
     // httplib gates stop() on is_running_, which the serving thread sets only once it
     // reaches its accept loop -- destroy before that and stop() no-ops, then join() waits
@@ -126,6 +149,7 @@ HttpServer::HttpServer(WallpaperManager& manager, int port)
 
 HttpServer::~HttpServer() {
     // Guarded on joinable() rather than m_listening: a failed bind leaves no thread.
+    m_stopping.store(true, std::memory_order_release);
     m_server->stop();
     if (m_thread.joinable()) m_thread.join();
 }
