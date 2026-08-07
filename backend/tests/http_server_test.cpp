@@ -47,10 +47,12 @@
 #include <stb_image_write.h>
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <filesystem>
 #include <memory>
@@ -135,6 +137,78 @@ int freePort() {
     const int port = probe.port();
     probe.release();
     return port;
+}
+
+// One attempt to bind and listen on 127.0.0.1:`port`, keeping *why* it failed. A bool
+// would grade "the port is held by somebody else" the same as "this process could not
+// make a socket at all", and only the first says anything about the server under test.
+struct BindAttempt {
+    enum class Stage { Bound, SocketFailed, BindFailed, ListenFailed };
+    Stage stage = Stage::SocketFailed;
+    int err = 0;
+
+    bool bound() const { return stage == Stage::Bound; }
+    bool refusedAsInUse() const { return stage == Stage::BindFailed && err == EADDRINUSE; }
+
+    std::string describe() const {
+        switch (stage) {
+            case Stage::Bound: return "bound and listened";
+            case Stage::SocketFailed: return std::string("could not create a socket: ") + std::strerror(err);
+            case Stage::BindFailed: return std::string("was refused at bind: ") + std::strerror(err);
+            case Stage::ListenFailed: return std::string("bound but failed at listen: ") + std::strerror(err);
+        }
+        return "?";
+    }
+};
+
+// `reuseOption` is SO_REUSEPORT, SO_REUSEADDR, or 0 for neither. The socket is closed on
+// return either way: this is asking the kernel a question, not holding anything.
+BindAttempt tryBindLoopback(int port, int reuseOption) {
+    BindAttempt out;
+    const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) {
+        out.err = errno;
+        return out;
+    }
+    struct FdGuard {
+        int fd;
+        ~FdGuard() { ::close(fd); }
+    } guard{fd};
+
+    if (reuseOption != 0) {
+        int on = 1;
+        ::setsockopt(fd, SOL_SOCKET, reuseOption, &on, static_cast<socklen_t>(sizeof(on)));
+    }
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons(static_cast<uint16_t>(port));
+    if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+        out.stage = BindAttempt::Stage::BindFailed;
+        out.err = errno;
+        return out;
+    }
+    if (::listen(fd, 4) != 0) {
+        out.stage = BindAttempt::Stage::ListenFailed;
+        out.err = errno;
+        return out;
+    }
+    out.stage = BindAttempt::Stage::Bound;
+    return out;
+}
+
+// The positive control for the exclusivity check: the same option, against a port nothing
+// holds. Retried because freePort() is racy by construction -- one lost race is not a
+// statement about whether this process can bind at all.
+BindAttempt bindSomeFreePort(int reuseOption) {
+    BindAttempt last;
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        const int port = freePort();
+        if (port < 0) continue;
+        last = tryBindLoopback(port, reuseOption);
+        if (last.bound()) break;
+    }
+    return last;
 }
 
 // The first non-loopback IPv4 address on an up interface, or "" if this host has none.
@@ -356,48 +430,64 @@ void runBindChecks(WallpaperManager& manager, sdbus::IProxy& proxy, HttpServer& 
         }
     }
 
-    // GOAL: S7.1's other half, and this block deliberately PRINTS rather than asserting.
-    //       "Reachable from this machine and no other" assumes the daemon *owns* the
-    //       port. It does not: httplib's default_socket_options sets SO_REUSEPORT on
-    //       Linux, so any process running as the same user can bind the very port the
-    //       daemon is serving on, and the kernel then load-balances incoming connections
-    //       between them. Measured against a real daemon on 18462: a second listener
-    //       answered 14 of 30 /config polls with a wallpaper path of its own choosing.
-    //       The plugin has no way to tell which answered, so this is an unprivileged
-    //       local process deciding what the desktop displays -- the exact threat model
-    //       S7.2 cites for keeping every route read-only.
-    // WHY-THIS-SHAPE: asserting it would ship a permanently red suite for a defect this
-    //       agent may not fix, and it is a finding against http_server.cpp rather than a
-    //       property this test can restore. Printed with its own label so it cannot read
-    //       as a forgotten assertion, and written so that the day HttpServer passes its
-    //       own socket options (SO_REUSEADDR only, via Server::set_socket_options) this
-    //       print flips to the "now exclusive" branch and should become an assertion.
-    {
-        const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-        bool hijacked = false;
-        if (fd >= 0) {
-            int on = 1;
-            ::setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &on, sizeof(on));
-            sockaddr_in addr{};
-            addr.sin_family = AF_INET;
-            addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-            addr.sin_port = htons(static_cast<uint16_t>(server.port()));
-            hijacked = ::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0 && ::listen(fd, 4) == 0;
-            ::close(fd);
+    // GOAL: S7.15 -- while the daemon is serving, nothing else on this machine can bind
+    //       and listen on its port. The plugin identifies the daemon by port alone, so a
+    //       second listener the kernel load-balances to decides what the desktop displays
+    //       for whatever share of the polls it receives: measured at 14 of 30 /config
+    //       responses under httplib's SO_REUSEPORT default. False if any of the three
+    //       attempts below is allowed to listen.
+    // WHY-THIS-SHAPE: "the second bind failed" is the obvious check and it cannot be
+    //       trusted -- it is equally what a run with no server, a failed socket() or a
+    //       sandbox with no networking produces, so it would pass while establishing
+    //       nothing. Three things narrow it: the refusal must be EADDRINUSE from bind()
+    //       specifically (BindAttempt keeps the stage and errno apart), the same option
+    //       is first proved to bind a port that IS free, and /health is read afterwards
+    //       so the port that refused is known to be the daemon's and still served.
+    //       SO_REUSEADDR and a plain bind are attempted alongside SO_REUSEPORT because
+    //       the goal is "nothing can bind", not "the one option httplib defaulted to".
+    // CONTROL: two, because the three variants are not refused for the same reason.
+    //       (a) production: HttpServer's set_socket_options call deleted, restoring
+    //       httplib's SO_REUSEPORT default -> "FAIL: no second listener can take a share
+    //       of the daemon's port (SO_REUSEPORT)" with "SO_REUSEPORT bind+listen on
+    //       127.0.0.1:33643 bound and listened while the server was serving there", the
+    //       other two staying green -- that asymmetry is exactly what the fix turns on.
+    //       (b) harness: server.port() replaced with freePort() as the target -> all
+    //       three FAIL, which is what proves the SO_REUSEADDR and plain variants are
+    //       capable of failing at all. Both reverted.
+    // COVERAGE-ASSERT: each variant's positive control must bind a free port before its
+    //       refusal is graded; a variant whose control cannot bind is reported as not
+    //       verified (exit 77) rather than counted, so a host where sockets are
+    //       unavailable skips instead of passing three checks it never performed.
+    struct ReuseVariant {
+        int option;
+        const char* name;
+    };
+    const ReuseVariant kReuseVariants[] = {
+        {SO_REUSEPORT, "SO_REUSEPORT"},
+        {SO_REUSEADDR, "SO_REUSEADDR"},
+        {0, "no reuse option"},
+    };
+    for (const ReuseVariant& variant : kReuseVariants) {
+        const BindAttempt control = bindSomeFreePort(variant.option);
+        if (!control.bound()) {
+            const std::string goal = std::string("S7.15 (port exclusivity, ") + variant.name + ")";
+            notVerified(goal.c_str(),
+                        std::string("a ") + variant.name + " bind could not take even a free loopback port (" +
+                            control.describe() + "), so a refusal on the server's port would mean nothing");
+            continue;
         }
-        if (hijacked) {
-            std::printf("http_server_test: KNOWN DIVERGENCE from S7.1 (defect in http_server.cpp, not in this "
-                        "test) -- a second process bound and listened on 127.0.0.1:%d while the daemon was "
-                        "serving there. httplib sets SO_REUSEPORT, so the port is not exclusive and an "
-                        "unprivileged local process can answer a share of the plugin's polls.\n",
-                        server.port());
-        } else {
-            std::printf("http_server_test: 127.0.0.1:%d is now exclusive -- the SO_REUSEPORT divergence noted "
-                        "here has been fixed; turn this print into an assertion.\n",
-                        server.port());
+        const BindAttempt hijack = tryBindLoopback(server.port(), variant.option);
+        const std::string message =
+            std::string("no second listener can take a share of the daemon's port (") + variant.name + ")";
+        check(hijack.refusedAsInUse(), message.c_str());
+        if (!hijack.refusedAsInUse()) {
+            std::fprintf(stderr, "  %s bind+listen on 127.0.0.1:%d %s while the server was serving there\n",
+                         variant.name, server.port(), hijack.describe().c_str());
         }
-        std::fflush(stdout);
     }
+    const HttpReply stillServing = get(cli, "/health");
+    check(stillServing.reached && stillServing.status == 200,
+          "the port those binds were refused from is the one the daemon is still serving");
 
     // GOAL: S7.7 -- a bind failure does not take the daemon down and does not leave it
     //       looking healthy: the constructor returns, listening() is false, lastError()
@@ -1182,15 +1272,15 @@ void runMonitorParamChecks(httplib::Client& cli, const std::string& recordedPath
     //       library's parsers stop at the first non-digit and report success, so leniency
     //       here is the default and has to be actively prevented.
     // WHY-THIS-SHAPE: each value is a separate case rather than one representative,
-    //       because they fail through different paths -- "0abc" and "1 " return from
-    //       stol successfully with a short `consumed`, "" and "x" throw invalid_argument,
-    //       and "0x10" parses as 0 with three bytes left over. A single case would leave
-    //       two of the three paths untested.
-    // CONTROL: the `consumed != raw.size()` guard disabled -> seven "FAIL: a monitor
-    //       value that is not wholly an integer is rejected with 400" lines, one each for
-    //       "0abc", "1%20", "1%09", "1.0", "0x10", "1e0" and "0%00" (0abc and 0x10 came
-    //       back as monitor 0, carrying its recorded path), while the three cases that
-    //       reach stol's invalid_argument -- "", "abc", "--1" -- stayed green. Reverted.
+    //       because they are rejected by different halves of the parser -- "0abc", "1 "
+    //       and "0x10" parse a number and leave bytes over, so only the end-of-input
+    //       check catches them, while "", "abc" and "--1" are rejected by from_chars
+    //       itself. A single case would leave one half untested.
+    // CONTROL: the `end != raw.data() + raw.size()` half of the guard disabled -> seven
+    //       "FAIL: a monitor value that is not wholly an integer is rejected with 400"
+    //       lines, one each for "0abc", "1%20", "1%09", "1.0", "0x10", "1e0" and "0%00"
+    //       (0abc, 0x10 and 0%00 came back as monitor 0, carrying its recorded path),
+    //       while "", "abc" and "--1" stayed green. Reverted.
     constexpr const char* kNotIntegers[] = {
         "0abc", "1%20", "1%09", "", "1.0", "0x10", "abc", "--1", "1e0", "0%00",
     };
@@ -1202,36 +1292,33 @@ void runMonitorParamChecks(httplib::Client& cli, const std::string& recordedPath
         }
     }
 
-    // GOAL: S7.6 again, and this block deliberately PRINTS rather than asserting.
-    //       std::stol skips leading whitespace and accepts a leading '+', and httplib
-    //       decodes both %20 and '+' in a query value -- so `monitor=%201` and
-    //       `monitor=+1` arrive as " 1", which stol consumes entirely and the daemon
-    //       accepts as monitor 1. By S7.6's wording ("not wholly an integer is
-    //       rejected") that is a divergence from the goal, in the code under test and
-    //       not in this file.
-    // WHY-THIS-SHAPE: asserting it would ship a permanently red suite for a defect this
-    //       agent is not permitted to fix, and quietly widening S7.6 to exclude
-    //       whitespace would be closing a gap by weakening the check. Printed with its
-    //       own label instead, so it is impossible to mistake for a forgotten assertion,
-    //       and reported as a finding against http_server.cpp. If parseMonitorParam
-    //       grows a leading-character guard, these become assertions.
-    // Leading whitespace and a leading sign only -- TRAILING whitespace is rejected
-    // (stol consumes the digits and stops, leaving `consumed` short) and is asserted
-    // above as "1%20"/"1%09". The asymmetry is the whole shape of the divergence.
-    for (const char* value : {"%201", "+1", "%091"}) {
+    // GOAL: S7.6 again, on the half a did-it-consume-everything guard cannot reach: a
+    //       value whose non-integer part comes *first* is rejected too. These reach the
+    //       parser as " 1" (%20, and a bare '+', which httplib decodes to a space in a
+    //       query value), "\t1" and "+1" (%2B) -- none wholly an integer, so a 200 makes
+    //       the goal false.
+    // WHY-THIS-SHAPE: kept as its own loop rather than folded into the values above,
+    //       because these four fail through a path the others never touch. A parser built
+    //       on the C library's stol reports the whitespace and sign it skipped as
+    //       *consumed*, so a length guard sees a full-length parse and admits " 1" while
+    //       still rejecting "1 " -- leading-vs-trailing asymmetry, not rejection count,
+    //       is what this block pins, and merging it would hide which side was tested.
+    //       "%2B1" is spelled encoded because a raw '+' arrives as a space and would test
+    //       the whitespace case a second time instead of the leading-sign one.
+    // CONTROL: parseMonitorParam's std::from_chars replaced with the std::stol form it
+    //       superseded (parse in a try/catch, then `consumed != raw.size()`) -> four
+    //       "FAIL: a monitor value whose leading characters are not digits is rejected
+    //       with 400" lines: `monitor=%201 answered 200: {"monitor_id":1,...}` and the
+    //       same for "+1", "%2B1" and "%091", with every value in the loop above still
+    //       green. Reverted.
+    for (const char* value : {"%201", "+1", "%2B1", "%091"}) {
         const HttpReply res = get(cli, std::string("/config?monitor=") + value);
-        if (res.reached && res.status == 200) {
-            std::printf("http_server_test: KNOWN DIVERGENCE from S7.6 (defect in http_server.cpp, not in this "
-                        "test) -- monitor=%s answered %d: %s. std::stol skips leading whitespace and a leading "
-                        "'+', so a value that is not wholly an integer is accepted.\n",
-                        value, res.status, res.body.c_str());
-        } else {
-            std::printf("http_server_test: monitor=%s is now rejected (%d) -- the S7.6 divergence noted here "
-                        "has been fixed; turn this print into an assertion.\n",
-                        value, res.status);
+        check(res.reached && res.status == 400,
+              "a monitor value whose leading characters are not digits is rejected with 400");
+        if (!(res.reached && res.status == 400)) {
+            std::fprintf(stderr, "  monitor=%s answered %d: %s\n", value, res.status, res.body.c_str());
         }
     }
-    std::fflush(stdout);
 }
 
 // ---------------------------------------------------------------------------- //
