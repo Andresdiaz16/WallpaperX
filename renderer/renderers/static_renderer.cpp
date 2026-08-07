@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <memory>
 #include <stdexcept>
 #include <string>
 
@@ -119,16 +120,19 @@ std::string describeRejection(const std::string& what, const std::string& imageP
     return "StaticRenderer: " + what + ": " + imagePath;
 }
 
+struct FileCloser {
+    void operator()(FILE* f) const noexcept { std::fclose(f); }
+};
+using FilePtr = std::unique_ptr<FILE, FileCloser>;
+
 }  // namespace
 
 void StaticRenderer::loadAndUploadTexture(const std::string& imagePath) {
-    // Both probes share ONE open, which is correctness rather than efficiency: the
-    // convenience forms stbi_info(path)/stbi_is_16_bit(path) each fopen separately, and
-    // stbi_is_16_bit returns 0 for "8-bit" AND for "unreadable" (stb_image.h:7716), so a
-    // file swapped between them silently charges the 8-bit factor to a 16-bit image. The
-    // _from_file forms ftell/fseek around their work (:7701, :7722).
-    FILE* probe = std::fopen(imagePath.c_str(), "rb");
-    if (probe == nullptr) {
+    // Probes and decode share one open: reopening by path lets a swapped file be charged
+    // the wrong peak factor. Safe without a rewind because both _from_file probes
+    // ftell/fseek around their work (stb_image.h:7701, :7722).
+    FilePtr probe(std::fopen(imagePath.c_str(), "rb"));
+    if (!probe) {
         throw std::runtime_error(
             describeRejection(std::string("cannot open image (") + std::strerror(errno) + ")", imagePath));
     }
@@ -136,9 +140,8 @@ void StaticRenderer::loadAndUploadTexture(const std::string& imagePath) {
     int probeWidth = 0;
     int probeHeight = 0;
     int probeChannels = 0;
-    const bool headerRead = stbi_info_from_file(probe, &probeWidth, &probeHeight, &probeChannels) != 0;
-    const bool sixteenBit = headerRead && stbi_is_16_bit_from_file(probe) != 0;
-    std::fclose(probe);
+    const bool headerRead = stbi_info_from_file(probe.get(), &probeWidth, &probeHeight, &probeChannels) != 0;
+    const bool sixteenBit = headerRead && stbi_is_16_bit_from_file(probe.get()) != 0;
 
     if (!headerRead) {
         throw std::runtime_error(
@@ -170,23 +173,20 @@ void StaticRenderer::loadAndUploadTexture(const std::string& imagePath) {
     int imageWidth = 0;
     int imageHeight = 0;
     int channels = 0;
-    stbi_uc* pixels = stbi_load(imagePath.c_str(), &imageWidth, &imageHeight, &channels, STBI_rgb_alpha);
+    stbi_uc* pixels = stbi_load_from_file(probe.get(), &imageWidth, &imageHeight, &channels, STBI_rgb_alpha);
     if (!pixels) {
         throw std::runtime_error(
             describeRejection("failed to load image (" + stbFailureReason() + ")", imagePath));
     }
 
-    // stbi_load opened the file again, so anything with write access to the directory can
-    // have swapped it since the probe. Equality rather than a budget test: matching
-    // dimensions imply the header gate already vetted this size, and a mismatch means the
-    // bytes changed underneath us whatever the sizes are. A budget test here would accept
-    // an 8x8 swapped for a 7000x7000 in silence.
+    // Guards stb's two parsers disagreeing with each other, not a swap -- the shared open
+    // above rules that out.
     if (imageWidth != probeWidth || imageHeight != probeHeight) {
         stbi_image_free(pixels);
         throw std::runtime_error(describeRejection(
             "decoded to " + std::to_string(imageWidth) + "x" + std::to_string(imageHeight) +
                 " but its header reported " + std::to_string(probeWidth) + "x" +
-                std::to_string(probeHeight) + " -- file changed under us",
+                std::to_string(probeHeight) + " -- header and decoder disagree",
             imagePath));
     }
 
@@ -212,7 +212,11 @@ void StaticRenderer::loadAndUploadTexture(const std::string& imagePath) {
 
     m_texture = m_device.memory().createImage(imageInfo, "static-renderer-texture");
 
-    m_device.immediateSubmit([&](VkCommandBuffer cmd) {
+    // staging is a local, so the constructor's cleanup() cannot reach it: a throwing submit
+    // would orphan the allocation and Memory::shutdown aborts the process over it at
+    // teardown. m_texture needs no such guard -- cleanup() destroys it.
+    try {
+        m_device.immediateSubmit([&](VkCommandBuffer cmd) {
         VkImageMemoryBarrier toTransferDst{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         toTransferDst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         toTransferDst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
@@ -244,7 +248,11 @@ void StaticRenderer::loadAndUploadTexture(const std::string& imagePath) {
 
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
                               0, 0, nullptr, 0, nullptr, 1, &toShaderRead);
-    });
+        });
+    } catch (...) {
+        m_device.memory().destroyBuffer(staging);
+        throw;
+    }
 
     m_device.memory().destroyBuffer(staging);
 
