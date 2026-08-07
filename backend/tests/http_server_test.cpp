@@ -34,6 +34,12 @@
 #include "daemon/http_server.h"
 #include "daemon/wallpaper_manager.h"
 
+// Driven directly, not through the manager, by the submit-split measurement that S7.10e's
+// aim depends on -- see measureSubmitSplit().
+#include "renderers/static_renderer.h"
+#include "vulkan/device.h"
+#include "vulkan/offscreen.h"
+
 #include "tests/client/daemon_client.h"
 #include "tests/client/http_probe.h"
 
@@ -58,6 +64,7 @@
 #include <exception>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -73,7 +80,11 @@
 #include <unistd.h>
 
 using wallpaperx::DbusService;
+using wallpaperx::Device;
 using wallpaperx::HttpServer;
+using wallpaperx::OffscreenTarget;
+using wallpaperx::OffscreenTargetManager;
+using wallpaperx::StaticRenderer;
 using wallpaperx::WallpaperManager;
 using wallpaperx::testing::Check;
 using wallpaperx::testing::ConnectResult;
@@ -1284,6 +1295,68 @@ void runHealthStateChecks(const std::string& bluePath, const std::string& videoP
 // ---------------------------------------------------------------------------- //
 // Phase 2c -- S7.10e, by failing one real driver call.
 // ---------------------------------------------------------------------------- //
+
+// What a manager render is *made of*, in vkQueueSubmit calls: the three stages
+// renderPending performs in order -- ensureGpu + acquireTarget, the texture upload inside
+// StaticRenderer's constructor, and OffscreenTargetManager::render.
+//
+// Measured by driving those same three production pieces directly, on this thread, with
+// the interposer armed around each stage separately. Nothing here is a stand-in: they are
+// the classes renderPending itself constructs and calls.
+struct SubmitSplit {
+    int setup = 0;   // Device + OffscreenTargetManager + target creation
+    int upload = 0;  // StaticRenderer's constructor
+    int render = 0;  // OffscreenTargetManager::render
+    bool measured = false;
+    std::string reason;
+
+    int total() const { return setup + upload + render; }
+};
+
+SubmitSplit measureSubmitSplit(const std::string& imagePath, const std::string& shaderDir, uint32_t width,
+                               uint32_t height, bool enableValidation) {
+    SubmitSplit split;
+    if (shaderDir.empty()) {
+        split.reason = "the daemon published no resolved shader directory, so the same StaticRenderer it built "
+                       "cannot be built here";
+        return split;
+    }
+    try {
+        // Declared in the order they must be destroyed in reverse: the renderer holds
+        // images and a pipeline on the Device, and the targets hold images on it too.
+        std::optional<Device> device;
+        std::optional<OffscreenTargetManager> targets;
+        const OffscreenTarget* target = nullptr;
+        std::optional<StaticRenderer> renderer;
+        {
+            // Both constructions are inside the window, because ensureGpu() runs both
+            // inside the manager's -- a submit in either would otherwise be missing from
+            // the split and show up as a permanent mismatch.
+            SubmitFault setupCount(/*failAt=*/0);
+            device.emplace(enableValidation);
+            targets.emplace(*device);
+            target = &targets->create(0, width, height);
+            split.setup = setupCount.observed();
+        }
+        {
+            SubmitFault uploadCount(/*failAt=*/0);
+            renderer.emplace(*device, targets->renderPass(), imagePath, shaderDir);
+            split.upload = uploadCount.observed();
+        }
+        {
+            SubmitFault renderCount(/*failAt=*/0);
+            targets->render(*renderer, *target);
+            split.render = renderCount.observed();
+        }
+        split.measured = true;
+    } catch (const std::exception& e) {
+        // X.3: this is the harness failing to build its own instrument. It is reported as
+        // the reason the phase could not run, never as a verdict on /health.
+        split.reason = std::string("the submit split could not be measured: ") + e.what();
+    }
+    return split;
+}
+
 void runGpuFailureChecks(const std::string& bluePath, const WallpaperManager::Config& base, const Check& check) {
     // Pass 1 -- count. The interposer observes and fails nothing, so `submitsPerRender`
     // is what a *successful* first render of a fresh daemon costs. Nothing is asserted
@@ -1291,6 +1364,7 @@ void runGpuFailureChecks(const std::string& bluePath, const WallpaperManager::Co
     // name it.
     int submitsPerRender = 0;
     bool countPassRendered = false;
+    std::string resolvedShaderDir;
     std::string countPassReason = "no frame could be rendered on this host, so there is no working GPU to break";
     {
         IsolatedDaemon daemon(base);
@@ -1305,6 +1379,13 @@ void runGpuFailureChecks(const std::string& bluePath, const WallpaperManager::Co
             const WallpaperManager::Snapshot snap = daemon.manager().snapshot();
             const auto it = snap.monitors.find(0);
             countPassRendered = it != snap.monitors.end() && it->second.hasFrame;
+            // Taken from the daemon rather than resolved again here: the split below has to
+            // build the same StaticRenderer this manager built, and base.shaderDir is empty
+            // (resolve-at-first-use), so re-deriving it would be a second implementation.
+            const HttpReply health = daemon.health();
+            if (health.ok() && healthCheckStatus(health.json, "shaders") == "ok") {
+                resolvedShaderDir = healthCheckDetail(health.json, "shaders");
+            }
         }
     }
 
@@ -1318,6 +1399,50 @@ void runGpuFailureChecks(const std::string& bluePath, const WallpaperManager::Co
                               " vkQueueSubmit call(s), so there is no earlier submit to let through and the "
                               "texture upload's own pre-existing catch would be the one that recorded the failure"
                         : countPassReason);
+        return;
+    }
+
+    // GOAL: the fault about to be injected lands inside OffscreenTargetManager::render, not
+    //       inside the texture upload. Everything below is about the `catch (GpuFailure&)`
+    //       around `m_targets->render(...)`; a fault that landed on the upload is caught by
+    //       the pre-existing arm around ensureGpu/emplace, records gpu=fail through a
+    //       different code path, and produces a byte-identical /health body -- so every
+    //       assertion below passes while the arm under test never runs.
+    // WHY-THIS-SHAPE: the manager's render is decomposed into the three stages
+    //       renderPending performs, each measured by driving the same production class
+    //       directly, and the aim is trusted only if they sum to what the manager cost and
+    //       the render stage contributed at least one submit. The simpler alternative --
+    //       "observed == submitsPerRender", which is what stood here -- cannot do this: the
+    //       aim IS submitsPerRender, so injected == 1 already implies the count reached it,
+    //       and the equality adds only "no further submit followed". What the split cannot
+    //       measure is the *order* of the three stages; renderPending fixes that by
+    //       construction, since it cannot render before the renderer it renders with exists.
+    // CONTROL: two edits to offscreen.cpp made the upload the last submit -- a dummy
+    //       immediateSubmit added to OffscreenTargetManager's constructor, and the one in
+    //       its render() skipped. Without this guard that world passed entirely green, the
+    //       four checks below reading exactly as on a healthy run while the render's catch
+    //       was never entered. With it: exit 77, "OffscreenTargetManager::render made 0
+    //       vkQueueSubmit call(s), the texture upload 1 and device/target setup 1, which is
+    //       2 against the 2 a whole manager render costs". Both edits reverted.
+    // COVERAGE-ASSERT: `split.render >= 1` is deliberately not folded into the sum. Under
+    //       that control the sum balanced (1 + 1 + 0 == 2) and only the render stage's own
+    //       count fell short. The sum has its own control -- the upload stage's measurement
+    //       dropped, giving "the texture upload 0 ... which is 1 against the 2" -- so
+    //       neither clause is carried by the other.
+    const SubmitSplit split =
+        measureSubmitSplit(bluePath, resolvedShaderDir, base.width, base.height, base.enableValidation);
+    if (!split.measured || split.render < 1 || split.total() != submitsPerRender) {
+        notVerified("S7.10e (a GPU that fails after working reads fail, and a commit clears it)",
+                    !split.measured
+                        ? split.reason
+                        : "the aimed submit cannot be attributed to the render: "
+                          "OffscreenTargetManager::render made " +
+                              std::to_string(split.render) + " vkQueueSubmit call(s), the texture upload " +
+                              std::to_string(split.upload) + " and device/target setup " +
+                              std::to_string(split.setup) + ", which is " + std::to_string(split.total()) +
+                              " against the " + std::to_string(submitsPerRender) +
+                              " a whole manager render costs -- so submit " + std::to_string(submitsPerRender) +
+                              " is not the render's, and failing it would exercise the upload's catch instead");
         return;
     }
 
@@ -1346,14 +1471,14 @@ void runGpuFailureChecks(const std::string& bluePath, const WallpaperManager::Co
     //       created reads fail, not ok" and "FAIL: the gpu detail names the driver call
     //       that failed", with gpu reading {ok, "NVIDIA GeForce RTX 3080 Ti (Heap)"}
     //       while every render had failed. Reverted.
-    // COVERAGE-ASSERT: `observed == submitsPerRender` is the load-bearing one, and it is
-    //       what pins the fault to the render rather than to the upload. If the upload's
-    //       submit had been the one that failed, renderPending would have thrown out of
-    //       renderer.emplace() and m_targets->render() would never have been called, so
-    //       the count would have stopped short. Reaching the last submit proves every
-    //       earlier one went to the real driver and succeeded. `injected == 1` is the
-    //       second: if dispatch ever moves to volk or vkGetDeviceProcAddr the interposer
-    //       is bypassed, and without this the phase would inject nothing and stay green.
+    // COVERAGE-ASSERT: `injected == 1` is the load-bearing one -- if dispatch ever moves to
+    //       volk or vkGetDeviceProcAddr the interposer is bypassed, and without it the
+    //       phase would inject nothing and grade a successful render. `observed ==
+    //       submitsPerRender` is NOT independent of it and does not pin the fault to the
+    //       render: the aim is submitsPerRender, so injection implies the count reached it.
+    //       What it adds is only that no submit followed the failed one -- a silent retry
+    //       inside renderPending would clear the record before /health is asked. The
+    //       attribution to the render is established by the split guard above, not here.
     SubmitFault fault(/*failAt=*/submitsPerRender);
     daemon.manager().requestWallpaper("static", bluePath, 0);
     daemon.manager().renderPending(0);
@@ -1396,8 +1521,8 @@ void runGpuFailureChecks(const std::string& bluePath, const WallpaperManager::Co
         std::fprintf(stderr, "  after failing submit %d of %d: gpu %s (%s)\n", submitsPerRender, submitsPerRender,
                      healthCheckStatus(failed.json, "gpu").c_str(), healthCheckDetail(failed.json, "gpu").c_str());
     }
-    std::printf("http_server_test: submit %d of %d failed -> %s\n", submitsPerRender, submitsPerRender,
-                failed.body.c_str());
+    std::printf("http_server_test: submit %d of %d failed (setup %d + upload %d + render %d) -> %s\n",
+                submitsPerRender, submitsPerRender, split.setup, split.upload, split.render, failed.body.c_str());
     std::fflush(stdout);
 
     // GOAL: S7.10e's other direction -- a successful commit clears the recorded failure,
