@@ -16,7 +16,8 @@
 // default STBI_MALLOC (= malloc), so its pixel-buffer allocation is a call into this
 // file's symbol -- which means the request is observable without a single test-only line
 // in any production file (X.6). fopen is interposed the same way, to count the opens the
-// decode path makes and to make the file change between the header probe and stbi_load().
+// decode path makes and to redirect a chosen one of them, which is how the bytes the
+// decoder actually consumed are identified.
 //
 // Requests, and not peak RSS, for a reason that was measured rather than assumed: with
 // the header gate disabled, the rejected load asked for 976 MiB and this probe's VmHWM
@@ -130,9 +131,12 @@ std::atomic<bool> g_anyWindowOpen{false};
 thread_local size_t g_maxRequest = 0;
 thread_local uint64_t g_requestCount = 0;
 
-// The identity half of the oracle: a size only the decoder asks for (see kWatchedStbSize).
-thread_local size_t g_watchSize = 0;
-thread_local bool g_sawWatched = false;
+// The identity half of the oracle: sizes only the decoder asks for (see kWatchedStbSize).
+// Two slots, because a window has to answer "allocated for THIS image and never for THAT
+// one" -- the absent half is what says which file's bytes actually reached the decoder.
+constexpr size_t kWatchSlots = 2;
+thread_local size_t g_watchSize[kWatchSlots] = {};
+thread_local bool g_sawWatched[kWatchSlots] = {};
 
 // A fixed-size record of the big requests seen in the window, for triage when the identity
 // check goes red: it answers "what did the decoder ask for instead?" without which an stb
@@ -149,36 +153,41 @@ void noteRequest(size_t bytes) {
     if (!g_armedHere) return;
     ++g_requestCount;
     if (bytes > g_maxRequest) g_maxRequest = bytes;
-    if (g_watchSize != 0 && bytes == g_watchSize) g_sawWatched = true;
+    for (size_t i = 0; i < kWatchSlots; ++i) {
+        if (g_watchSize[i] != 0 && bytes == g_watchSize[i]) g_sawWatched[i] = true;
+    }
     if (bytes >= kBigRequestFloor) {
         if (g_bigRequestCount < kBigRequestSlots) g_bigRequests[g_bigRequestCount] = bytes;
         ++g_bigRequestCount;
     }
 }
 
-// `watchSize` is the one allocation whose presence proves the shipped decoder ran through
-// this interposer; 0 means "no identity check in this window".
+// The watched sizes are the allocations whose presence (or absence) identifies which
+// image the shipped decoder ran on; 0 means "this slot is not watched in this window".
 struct Window {
-    explicit Window(size_t watchSize = 0) {
+    explicit Window(size_t watchSize = 0, size_t secondWatchSize = 0) {
         g_maxRequest = 0;
         g_requestCount = 0;
         g_bigRequestCount = 0;
-        g_watchSize = watchSize;
-        g_sawWatched = false;
+        g_watchSize[0] = watchSize;
+        g_watchSize[1] = secondWatchSize;
+        g_sawWatched[0] = false;
+        g_sawWatched[1] = false;
         g_armedHere = true;
         g_anyWindowOpen.store(true, std::memory_order_relaxed);
     }
     ~Window() {
         g_anyWindowOpen.store(false, std::memory_order_relaxed);
         g_armedHere = false;
-        g_watchSize = 0;
+        g_watchSize[0] = 0;
+        g_watchSize[1] = 0;
     }
     Window(const Window&) = delete;
     Window& operator=(const Window&) = delete;
 
     static size_t maxRequest() { return g_maxRequest; }
     static uint64_t requests() { return g_requestCount; }
-    static bool sawWatched() { return g_sawWatched; }
+    static bool sawWatched(size_t slot = 0) { return g_sawWatched[slot]; }
 
     // Prints every request at or above 1 MiB that the window recorded, so a red identity
     // check carries the evidence needed to tell "stb allocates differently now" from "the
@@ -193,20 +202,19 @@ struct Window {
 };
 
 // The file-open half of the instrument. It does two jobs: it COUNTS the opens production
-// makes of one path, and it can redirect the Nth of them elsewhere.
+// makes of one path, and it can redirect a chosen subset of them elsewhere.
 //
-// The count is a property in its own right -- the header probe and the depth probe share
-// a single open, so a file cannot change between them -- and it is also what aims the
-// redirect, since "the decode's open" is identified by index and nothing else.
+// The count is a property in its own right -- the whole decode path shares ONE open -- and
+// it is also what aims the redirect, since an open is identified by index and nothing else.
 //
-// Redirecting an open is a *faithful* stand-in for a real swap: production opens one path
-// twice and gets different bytes, which is precisely what a swap gives it, and unlike a
-// swap it has no race in it. See the annotation on checkPostLoadRecheck() for the two racy
-// alternatives this rejects.
+// `redirectMaxCount` is not a convenience: redirecting every open from index 1 shows the
+// replacement to a two-open implementation as well, so both shapes pass and the check goes
+// green on exactly what it exists to refuse. Capping at one is what splits them.
 struct FileSwapPlan {
     const char* watchedPath = nullptr;      // the exact string production passes to fopen
-    const char* replacementPath = nullptr;  // what to open from redirectFromOpen onwards
+    const char* replacementPath = nullptr;  // what to open instead
     int redirectFromOpen = 0;               // 1-based index of the first open to redirect; 0 = observe only
+    int redirectMaxCount = 0;               // cap on redirects performed; 0 = no cap
     int opens = 0;                          // opens of watchedPath seen on this thread
     int redirects = 0;
 };
@@ -284,7 +292,11 @@ FILE* fopen(const char* path, const char* mode) {
         path != nullptr && g_swapPlan->watchedPath != nullptr &&
         std::strcmp(path, g_swapPlan->watchedPath) == 0) {
         ++g_swapPlan->opens;
-        if (g_swapPlan->redirectFromOpen > 0 && g_swapPlan->opens >= g_swapPlan->redirectFromOpen) {
+        const bool inRange =
+            g_swapPlan->redirectFromOpen > 0 && g_swapPlan->opens >= g_swapPlan->redirectFromOpen;
+        const bool underCap =
+            g_swapPlan->redirectMaxCount == 0 || g_swapPlan->redirects < g_swapPlan->redirectMaxCount;
+        if (inRange && underCap) {
             ++g_swapPlan->redirects;
             return realFn(g_swapPlan->replacementPath, mode);
         }
@@ -407,13 +419,11 @@ size_t vmHighWaterKb() {
 // Which gate rejected, and why the test has to care
 // --------------------------------------------------------------------------- //
 
-// StaticRenderer::loadAndUploadTexture has five distinct rejection paths, and since
-// aded2e5 two of them are size gates: one before the decode (from the header) and one
-// after it (against what stbi_load actually returned). They reject overlapping sets of
-// files and their messages both name dimensions, so "it threw, and the message contains
-// 16000x16000" cannot tell them apart -- and telling them apart is the entire S4.9
-// property. Delete the header gate and the post-load gate still rejects a genuinely
-// oversize image, with dimensions in the message, after spending the gigabyte.
+// StaticRenderer::loadAndUploadTexture has several distinct rejection paths, and more than
+// one of them refuses the same oversize file: the header gate refuses it before the decode,
+// and with that gate deleted stbi_load refuses it as well -- after asking for the gigabyte.
+// Both messages name dimensions, so "it threw, and the message contains 16000x16000" cannot
+// tell them apart, and telling them apart is the entire S4.9 property.
 //
 // Matching on message text couples this file to production's wording, which is a real
 // cost and is accepted deliberately: the gate that acted is not observable any other way
@@ -427,7 +437,10 @@ enum class Gate {
     NonPositiveDimensions,  // header parsed, w or h <= 0
     HeaderPeakBudget,       // the pre-decode peak estimate exceeded the budget
     DecodeFailed,           // stbi_load() returned null
-    PostLoadMismatch,       // the decode disagreed with the header (file changed under us)
+    // The decode disagreed with the header. No fixture here can produce it any more (see
+    // checkOneOpenFeedsProbeAndDecode) -- it is kept so that if stb's two parsers ever do
+    // disagree, the result is *classified* rather than landing in Unrecognised.
+    PostLoadMismatch,
     Unrecognised,           // threw something none of the above explains
 };
 
@@ -439,7 +452,7 @@ const char* gateName(Gate gate) {
         case Gate::NonPositiveDimensions: return "non-positive-dimensions";
         case Gate::HeaderPeakBudget: return "header peak-budget gate";
         case Gate::DecodeFailed: return "stbi_load failed";
-        case Gate::PostLoadMismatch: return "post-load re-check";
+        case Gate::PostLoadMismatch: return "header-vs-decoder disagreement";
         case Gate::Unrecognised: return "UNRECOGNISED rejection";
     }
     return "UNRECOGNISED rejection";
@@ -448,7 +461,7 @@ const char* gateName(Gate gate) {
 Gate classifyRejection(bool threw, const std::string& message) {
     if (!threw) return Gate::None;
     if (message.find("estimated peak") != std::string::npos) return Gate::HeaderPeakBudget;
-    if (message.find("file changed under us") != std::string::npos) return Gate::PostLoadMismatch;
+    if (message.find("header and decoder disagree") != std::string::npos) return Gate::PostLoadMismatch;
     if (message.find("failed to load image") != std::string::npos) return Gate::DecodeFailed;
     if (message.find("cannot open image") != std::string::npos) return Gate::CannotOpen;
     if (message.find("not a decodable image") != std::string::npos) return Gate::NotDecodable;
@@ -464,13 +477,15 @@ struct Attempt {
     bool constructed = false;
     size_t maxRequest = 0;
     uint64_t requests = 0;
+    bool sawWatched[2] = {false, false};
 };
 
-Attempt attemptLoad(wallpaperx::Device& device, VkRenderPass renderPass, const std::string& path) {
+Attempt attemptLoad(wallpaperx::Device& device, VkRenderPass renderPass, const std::string& path,
+                    size_t watchSize = 0, size_t secondWatchSize = 0) {
     Attempt out;
     bool threw = false;
     {
-        Window window;
+        Window window(watchSize, secondWatchSize);
         try {
             wallpaperx::StaticRenderer renderer(device, renderPass, path, WALLPAPERX_SHADER_DIR);
             out.constructed = true;
@@ -480,6 +495,8 @@ Attempt attemptLoad(wallpaperx::Device& device, VkRenderPass renderPass, const s
         }
         out.maxRequest = Window::maxRequest();
         out.requests = Window::requests();
+        out.sawWatched[0] = Window::sawWatched(0);
+        out.sawWatched[1] = Window::sawWatched(1);
     }
     out.gate = classifyRejection(threw, out.message);
     return out;
@@ -592,43 +609,37 @@ static_assert((1u << 30) / kEdgeWidth / 3 >= kOver8Height, "edge fixture outside
 constexpr int kValidSide = 1021;
 constexpr size_t kWatchedStbSize = (static_cast<size_t>(kValidSide) * 4 + 1) * kValidSide;
 
-// The TOCTOU pair, and BOTH of them are deliberately tiny.
+// The interposition pair: two images of different size, each identifiable from its
+// allocation footprint alone, both far inside the budget so the load completes.
 //
-// They were 8x8 and 8000x8000 while the post-load gate was a budget test: reaching it at
-// all then required a genuine decode of more than 50.3 million pixels, which cost the
-// probe ~630 MB of resident memory and 0.7 s of PNG encoding per run. The gate is now a
-// dimension EQUALITY test, so any mismatch reaches it and the expensive fixture buys
-// nothing -- an over-budget swap and an under-budget one traverse the identical
-// comparison. What is lost by dropping the huge one is stated plainly: this file no longer
-// demonstrates that a *massively* over-budget swapped decode is refused. It is refused by
-// the same single `imageWidth != probeWidth` line the small cases exercise, so there is no
-// distinct path left uncovered, and the header gate's own checks still carry the memory
-// bound.
-//
-// 8 -> 64 is the case the old budget-test shape accepted in SILENCE (64x64 is far inside
-// the budget), so it is the regression check for that defect specifically. 64 -> 8 is the
-// shrink direction, which both the old comparison and its "larger than" wording missed.
-constexpr int kSwapSmallSide = 8;
-constexpr int kSwapGrownSide = 64;
+// Odd sides, deliberately: stb's raw-scanline buffer is (width * channels + 1) * height,
+// which is odd for an odd side, so no size-class rounding or alignment padding elsewhere
+// in the process can produce it by accident. writeSolidPng emits 4 channels.
+constexpr int kSwapSmallSide = 257;
+constexpr int kSwapGrownSide = 511;
+constexpr size_t kSmallScanlineBytes =
+    static_cast<size_t>(pngRawScanlineBytes(kSwapSmallSide, kSwapSmallSide, 4, 8));
+constexpr size_t kGrownScanlineBytes =
+    static_cast<size_t>(pngRawScanlineBytes(kSwapGrownSide, kSwapGrownSide, 4, 8));
 static_assert(!rejectedFromHeader(kSwapSmallSide, kSwapSmallSide, 8),
-              "the header the swap shows production must be admitted, or the post-load gate is "
-              "never reached and the check grades the wrong rejection");
-static_assert(!rejectedFromHeader(kSwapGrownSide, kSwapGrownSide, 8),
-              "the swapped-in image must be UNDER the budget: an over-budget one would also be "
-              "refused by a plain budget comparison, and the point of this case is that it is not");
+              "both interposition fixtures must be admitted by the header gate, or the load never "
+              "reaches the decode whose bytes these checks identify");
+static_assert(!rejectedFromHeader(kSwapGrownSide, kSwapGrownSide, 8));
+static_assert(kSmallScanlineBytes != kGrownScanlineBytes,
+              "the two fixtures must be distinguishable by allocation size, or 'the decoder ran on "
+              "the replacement and not the original' is not a statement about anything");
+static_assert(kSmallScanlineBytes % 2 == 1 && kGrownScanlineBytes % 2 == 1,
+              "an even watched size could be matched by a rounded or padded allocation from the "
+              "driver, which would turn the identity oracle into a coincidence detector");
 
-// The number of times StaticRenderer::loadAndUploadTexture opens the image path before it
-// decodes: ONE, shared by the dimension probe and the depth probe (stbi_info_from_file
-// then stbi_is_16_bit_from_file on the same FILE*). It used to be two, via the
-// convenience forms stbi_info(path) and stbi_is_16_bit(path), which left a swap window
-// between them in which stbi_is_16_bit's "0" for an unreadable file was indistinguishable
-// from "8-bit" and quietly charged the smaller factor.
+// The opens StaticRenderer::loadAndUploadTexture makes of the image across the whole load:
+// ONE, shared by stbi_info_from_file, stbi_is_16_bit_from_file and stbi_load_from_file.
 //
-// So this constant is not bookkeeping: it is the property, asserted by
-// checkProbeAndDecodeShareOneOpen(). It also aims the redirect, since "the decode's open"
-// is identified by index and nothing else -- get it wrong and the swap check goes green
-// while swapping the wrong call.
-constexpr int kOpensBeforeDecode = 1;
+// Not bookkeeping -- it is the property, asserted by checkDecodePathOpensTheImageOnce().
+// A second open is a window in which a 16-bit file of identical geometry replaces the
+// 8-bit one whose header was charged, on the one axis the post-decode dimension guard
+// cannot see. It also aims the redirect, which identifies an open by index and nothing else.
+constexpr int kExpectedOpens = 1;
 
 // Any allocation at or above this, inside a window, means pixel memory.
 //
@@ -934,42 +945,43 @@ struct SwapResult {
     int redirects = 0;
 };
 
-SwapResult loadWithRedirectedDecode(wallpaperx::Device& device, VkRenderPass renderPass,
-                                    const std::string& path, const std::string& replacement,
-                                    int redirectFromOpen) {
+// One load with the fopen interposer armed. `redirectFromOpen` is 1-based, 0 = observe
+// only; `redirectMaxCount` caps the redirects performed, 0 = no cap. The two watched sizes
+// go to the allocation window, so the caller can ask which image stb allocated for.
+SwapResult loadWithRedirect(wallpaperx::Device& device, VkRenderPass renderPass,
+                            const std::string& path, const std::string& replacement,
+                            int redirectFromOpen, int redirectMaxCount, size_t expectDecoded,
+                            size_t expectAbsent) {
     FileSwapPlan plan;
     plan.watchedPath = path.c_str();
     plan.replacementPath = replacement.c_str();
     plan.redirectFromOpen = redirectFromOpen;
+    plan.redirectMaxCount = redirectMaxCount;
 
     SwapResult result;
     {
         ArmedSwap armed(plan);
-        result.attempt = attemptLoad(device, renderPass, path);
+        result.attempt = attemptLoad(device, renderPass, path, expectDecoded, expectAbsent);
     }
     result.opens = plan.opens;
     result.redirects = plan.redirects;
     return result;
 }
 
-std::string squareDims(int side) { return std::to_string(side) + "x" + std::to_string(side); }
-
-// GOAL: the dimension probe and the depth probe read the image through ONE open, so no
-//       file can change between them. Stated so it could be false: if production went back
-//       to stbi_info(path) + stbi_is_16_bit(path), the decode path would open the image
-//       three times and there would again be a window in which an unreadable file reports
-//       "not 16-bit" and is charged the smaller factor.
-// WHY-THIS-SHAPE: counts opens rather than inspecting the code, and does it on a load that
-//       SUCCEEDS. Counting on a rejected load would confound "one probe open" with "we
-//       gave up before the second one". No redirect is armed (redirectFromOpen = 0), so
-//       nothing about this measurement depends on the swap machinery being aimed right --
-//       which matters, because this count is what aims it in the check below.
-// CONTROL: production reverted to the convenience forms `stbi_info(imagePath.c_str(), ...)`
-//       and `stbi_is_16_bit(imagePath.c_str())` -> "FAIL: the dimension probe and the depth
-//       probe share one open, so nothing can change between them (3 opens of the image,
-//       expected 2: one probe, one decode)". Reverted, re-measured green at 2.
-void checkProbeAndDecodeShareOneOpen(wallpaperx::Device& device, VkRenderPass renderPass,
-                                     const std::string& validPath) {
+// GOAL: probes and decode read the image through ONE open, so the bytes the budget verdict
+//       was computed on cannot be replaced before they are decoded. False at 2 (a decode
+//       that reopens by path) or 3 (probes via stbi_info(path)/stbi_is_16_bit(path)).
+// WHY-THIS-SHAPE: exactly 1, not "at most 2". Every open after the first admits a 16-bit
+//       file of identical geometry in place of the 8-bit one that was charged, and the
+//       post-decode guard compares dimensions -- which such a substitute matches -- so that
+//       axis is undetectable there. Measured on a load that SUCCEEDS: on a rejected one, a
+//       count of 1 could mean it gave up before the second.
+// CONTROL: production's `stbi_load_from_file(probe.get(), ...)` -> `stbi_load(imagePath
+//       .c_str(), ...)` gives "(2 opens of the image, expected 1)". Reverted, green at 1.
+// COVERAGE-ASSERT: the load must have constructed -- controlled by pointing this at a
+//       nonexistent path, which still counts 1 open and reddens only that assert.
+void checkDecodePathOpensTheImageOnce(wallpaperx::Device& device, VkRenderPass renderPass,
+                                      const std::string& validPath) {
     FileSwapPlan plan;
     plan.watchedPath = validPath.c_str();
     plan.replacementPath = nullptr;
@@ -981,133 +993,112 @@ void checkProbeAndDecodeShareOneOpen(wallpaperx::Device& device, VkRenderPass re
         attempt = attemptLoad(device, renderPass, validPath);
     }
 
-    std::printf("image_bounds_probe: a successful load opened the image %d time(s) (expected %d: "
-                "%d probe, 1 decode)\n",
-                plan.opens, kOpensBeforeDecode + 1, kOpensBeforeDecode);
+    std::printf("image_bounds_probe: a successful load opened the image %d time(s) (expected %d)\n",
+                plan.opens, kExpectedOpens);
 
     check(attempt.constructed,
-          "the open-counting fixture loads at all (so the count below is of a complete decode path)");
+          "the open-counting fixture loads at all (so the count is of a complete decode path)");
     if (!attempt.constructed) {
         std::fprintf(stderr, "  it failed with: %s\n", attempt.message.c_str());
     }
-    check(plan.opens == kOpensBeforeDecode + 1,
-          "the dimension probe and the depth probe share one open, so nothing can change between "
-          "them (" + std::to_string(plan.opens) + " opens of the image, expected " +
-              std::to_string(kOpensBeforeDecode + 1) + ": one probe, one decode)");
+    check(plan.opens == kExpectedOpens,
+          "the whole decode path reads the image through one open, so no bytes can be substituted "
+          "between the header verdict and the decode (" + std::to_string(plan.opens) +
+              " opens of the image, expected " + std::to_string(kExpectedOpens) + ")");
 }
 
-// GOAL: the post-load re-check refuses a decode whose dimensions disagree with the ones
-//       the header probe vetted -- in EITHER direction, and whether or not the decoded
-//       image is inside the memory budget -- and it does NOT fire when nothing changed.
-// WHY-THIS-SHAPE: the swap is produced by redirecting the decode's fopen() inside this
-//       executable, which is deterministic. The two obvious alternatives are both races
-//       this probe would then be grading: rename(2)ing the file from a helper thread
-//       cannot be ordered against a decode already in flight, and an inotify
-//       IN_CLOSE_NOWRITE watch delivers its event asynchronously, so the swap can land
-//       after stbi_load has already opened. A flaky check here would be worse than none.
-//       Redirecting is faithful because it is indistinguishable from a swap on
-//       production's side: the same path, opened twice, yielding different bytes.
-//       Both swapped images are UNDER the budget, deliberately. An over-budget swap
-//       (which is what this check used to use) is refused by a plain budget comparison
-//       too, so it cannot tell an equality test from the budget test that preceded it --
-//       and the budget test accepted the 8x8 -> 64x64 case here in complete silence while
-//       throwing a message that claimed it had compared against the header. Both
-//       directions are exercised because the shrink case is the one a "larger than"
-//       comparison misses.
-//       The transparency phase redirects to a byte-identical copy and requires success:
-//       without it, a refusal in the mismatch phases could be the interposer's doing
-//       rather than the content's.
-// CONTROL: (a) the post-load `if (imageWidth != probeWidth || imageHeight != probeHeight)`
-//       block disabled in static_renderer.cpp -> "FAIL: swap 8x8 -> 64x64: the decode is
-//       refused when it disagrees with the header (saw: no rejection)" plus both message
-//       checks, and the same three for the shrink case. (b) the same block turned back
-//       into the budget comparison it replaced,
-//       `loadedBytes * kPeakFactor8Bit > kMaxPeakDecodeBytes` -> the identical six FAILs,
-//       because neither 64x64 nor 8x8 is anywhere near the budget: that is the Concern-1
-//       regression, reproduced. (c) redirectFromOpen set to 99 in the harness so no
-//       redirect happens -> 8 FAILs, the six above plus both redirect-count asserts.
-//       (d) for the role anchoring specifically, production's two dimension pairs swapped
-//       inside the message -> exactly the four "in that role" FAILs and nothing else,
-//       which a plain "both numbers appear" pair would have passed. All reverted,
-//       re-measured green.
-// COVERAGE-ASSERT: `opens == kOpensBeforeDecode + 1` and `redirects == 1` on every phase,
-//       and `mismatchesRun == kMismatchCount`. The redirect is aimed by index, so if
-//       production opens the file a different number of times before decoding the swap
-//       lands on the wrong call and this check goes green while testing nothing -- observed
-//       under the convenience-form control, where `redirects == 1` was the assert that
-//       caught the mis-aiming while the mismatch verdicts stayed green. The case count was
-//       controlled with a `break` after the first direction -> "FAIL: both mismatch
-//       directions ran (1 of 2)".
-void checkPostLoadRecheck(wallpaperx::Device& device, VkRenderPass renderPass,
-                          const std::string& smallPath, const std::string& identicalCopyPath,
-                          const std::string& grownPath) {
-    const std::string smallDims = squareDims(kSwapSmallSide);
-    const std::string grownDims = squareDims(kSwapGrownSide);
+struct RedirectPhase {
+    const char* label;
+    const std::string* replacement;
+    size_t expectDecoded;  // the raw-scanline size the decoder MUST have asked for
+    size_t expectAbsent;   // the raw-scanline size it must NOT have asked for
+    int redirectFromOpen;  // 1-based; 0 = observe only
+    int expectRedirects;
+};
 
-    const SwapResult transparent =
-        loadWithRedirectedDecode(device, renderPass, smallPath, identicalCopyPath, kOpensBeforeDecode + 1);
-    std::printf("image_bounds_probe: redirecting the decode open to an identical copy: %s "
-                "(%d open(s) of the watched path, %d redirected)\n",
-                transparent.attempt.constructed ? "constructed" : gateName(transparent.attempt.gate),
-                transparent.opens, transparent.redirects);
-    check(transparent.opens == kOpensBeforeDecode + 1,
-          "the transparency phase saw exactly the opens the decode path makes (" +
-              std::to_string(transparent.opens) + " of " + std::to_string(kOpensBeforeDecode + 1) + ")");
-    check(transparent.redirects == 1, "exactly one open was redirected in the transparency phase");
-    check(transparent.attempt.constructed,
-          "redirecting the decode open to a byte-identical copy still constructs (so a refusal in "
-          "the mismatch phases below is the content's doing, not the interposer's)");
-    if (!transparent.attempt.constructed) {
-        std::fprintf(stderr, "  it failed with: %s\n", transparent.attempt.message.c_str());
-    }
-
-    // headerPath is what production vets; decodePath is what stbi_load actually receives.
-    struct MismatchCase {
-        const std::string& headerPath;
-        const std::string& headerDims;
-        const std::string& decodePath;
-        const std::string& decodeDims;
+// GOAL: the single open feeds BOTH the header probes and the decoder -- stb decodes the
+//       bytes the budget verdict was computed on. False for anything that reaches the file
+//       a second time, including by open(2), which the open counter cannot see.
+// WHY-THIS-SHAPE: the oracle is which image stb ALLOCATED for, watching the replacement's
+//       size present and the original's absent. "It constructed" would instead lean on
+//       production's post-decode dimension guard, and go green if that guard were deleted.
+//       The redirect is capped at one: uncapped, a two-open implementation sees the
+//       replacement on both opens and passes identically -- measured, see CONTROL (b).
+//       Phase 1 (identical copy) is the attribution control; phase 3 arms the old swap at
+//       open 2 and requires it to deliver nothing.
+// CONTROL: (a) production reverted to `stbi_load(imagePath.c_str(), ...)` -> 10 FAILs here,
+//       four on the differently-sized phase ("...(1044995 bytes): NO", "...(264453 bytes):
+//       it did", "saw: header-vs-decoder disagreement", "exactly 1 open (saw 2)") and five
+//       on the old-swap phase, "0 redirects expected, saw 1" among them. Phase 1 reddened
+//       only on the open count, as designed. (b) (a) re-run with redirectMaxCount=0 -> the
+//       differently-sized phase's three substantive checks all went GREEN. Both reverted.
+// COVERAGE-ASSERT: per-phase open and redirect counts, plus phasesRun == kPhaseCount.
+//       Controlled: `p.redirectFromOpen` -> 99 gives "1 redirects expected, saw 0"; an
+//       `if (phasesRun == 1) break;` gives "every interposition phase ran (1 of 3)"; and
+//       kSmallScanlineBytes computed from kSwapSmallSide + 2 reddens the marker itself.
+void checkOneOpenFeedsProbeAndDecode(wallpaperx::Device& device, VkRenderPass renderPass,
+                                     const std::string& smallPath,
+                                     const std::string& identicalCopyPath,
+                                     const std::string& grownPath) {
+    const RedirectPhase phases[] = {
+        {"byte-identical copy through the same open", &identicalCopyPath, kSmallScanlineBytes,
+         kGrownScanlineBytes, 1, 1},
+        {"differently-sized image through the same open", &grownPath, kGrownScanlineBytes,
+         kSmallScanlineBytes, 1, 1},
+        {"the old probe/decode swap, armed at open 2", &grownPath, kSmallScanlineBytes,
+         kGrownScanlineBytes, 2, 0},
     };
-    const MismatchCase mismatches[] = {
-        {smallPath, smallDims, grownPath, grownDims},  // grows, and stays under the budget
-        {grownPath, grownDims, smallPath, smallDims},  // shrinks
-    };
-    constexpr size_t kMismatchCount = sizeof(mismatches) / sizeof(mismatches[0]);
+    constexpr size_t kPhaseCount = sizeof(phases) / sizeof(phases[0]);
 
-    size_t mismatchesRun = 0;
-    for (const MismatchCase& c : mismatches) {
-        const std::string label = "swap " + c.headerDims + " -> " + c.decodeDims;
-        const SwapResult swapped = loadWithRedirectedDecode(device, renderPass, c.headerPath,
-                                                            c.decodePath, kOpensBeforeDecode + 1);
-        std::printf("image_bounds_probe: %s: %s (%d open(s), %d redirected)\n", label.c_str(),
-                    swapped.attempt.constructed ? "constructed" : gateName(swapped.attempt.gate),
-                    swapped.opens, swapped.redirects);
-        if (!swapped.attempt.message.empty()) {
-            std::printf("image_bounds_probe:   said: %s\n", swapped.attempt.message.c_str());
+    size_t phasesRun = 0;
+    for (const RedirectPhase& p : phases) {
+        const std::string label(p.label);
+        const SwapResult r =
+            loadWithRedirect(device, renderPass, smallPath, *p.replacement, p.redirectFromOpen,
+                             /*redirectMaxCount=*/1, p.expectDecoded, p.expectAbsent);
+
+        std::printf("image_bounds_probe: %s: %s (%d open(s), %d redirected; decoded-size marker %s, "
+                    "replaced-size marker %s)\n",
+                    label.c_str(),
+                    r.attempt.constructed ? "constructed" : gateName(r.attempt.gate), r.opens,
+                    r.redirects, r.attempt.sawWatched[0] ? "seen" : "ABSENT",
+                    r.attempt.sawWatched[1] ? "SEEN" : "absent");
+        if (!r.attempt.message.empty()) {
+            std::printf("image_bounds_probe:   said: %s\n", r.attempt.message.c_str());
         }
 
-        check(swapped.opens == kOpensBeforeDecode + 1,
-              label + ": saw exactly the opens the decode path makes (" +
-                  std::to_string(swapped.opens) + " of " + std::to_string(kOpensBeforeDecode + 1) + ")");
-        check(swapped.redirects == 1, label + ": exactly one open was redirected");
-        check(swapped.attempt.gate == Gate::PostLoadMismatch,
-              label + ": the decode is refused when it disagrees with the header (saw: " +
-                  gateName(swapped.attempt.gate) + ")");
-        // Both dimension strings appear in the message, so a plain "contains" pair would
-        // pass with the two numbers swapped -- which is precisely the direction bug the
-        // shrink case exists to find. Anchoring each one to its role costs a little more
-        // coupling to the wording and is the only way to tell them apart.
-        check(swapped.attempt.message.find("decoded to " + c.decodeDims) != std::string::npos,
-              label + ": the refusal names what was decoded, in that role");
-        check(swapped.attempt.message.find("reported " + c.headerDims) != std::string::npos,
-              label + ": the refusal names what the header promised, in that role");
-        ++mismatchesRun;
+        check(r.opens == kExpectedOpens,
+              label + ": exactly " + std::to_string(kExpectedOpens) + " open (saw " +
+                  std::to_string(r.opens) + ")");
+        check(r.redirects == p.expectRedirects,
+              label + ": " + std::to_string(p.expectRedirects) + " redirects expected, saw " +
+                  std::to_string(r.redirects));
+        check(r.attempt.sawWatched[0],
+              label + ": stb allocated the buffer for the image this phase expects the decoder to "
+                      "have read (" + std::to_string(p.expectDecoded) + " bytes): " +
+                  (r.attempt.sawWatched[0] ? "yes" : "NO"));
+        check(!r.attempt.sawWatched[1],
+              label + ": stb never allocated for the other image (" +
+                  std::to_string(p.expectAbsent) + " bytes): " +
+                  (r.attempt.sawWatched[1] ? "it did" : "correct"));
+        check(r.attempt.constructed,
+              label + ": the header verdict and the decode agree, so nothing was substituted "
+                      "between them (saw: " +
+                  gateName(r.attempt.gate) + ")");
+        ++phasesRun;
     }
 
-    check(mismatchesRun == kMismatchCount,
-          "both mismatch directions ran (" + std::to_string(mismatchesRun) + " of " +
-              std::to_string(kMismatchCount) + ")");
+    check(phasesRun == kPhaseCount,
+          "every interposition phase ran (" + std::to_string(phasesRun) + " of " +
+              std::to_string(kPhaseCount) + ")");
 }
+
+// NOT COVERED, stated rather than left to be inferred from an absence: StaticRenderer's
+// post-decode dimension guard. Its only remaining subject is stb's two parsers disagreeing
+// with each other about the same bytes, and no fixture this probe can write produces that.
+// Reaching it would mean simulating a two-open production that no longer exists, which
+// grades a shape the code cannot take. Gate::PostLoadMismatch stays in the classifier so
+// that if it ever does fire it is named rather than landing in Unrecognised.
 
 // GOAL: a file that cannot be opened at all is reported as such, naming the OS reason --
 //       not folded into "not a decodable image", which is what the single-open rework
@@ -1219,9 +1210,9 @@ int main() {
                 const std::string swapGrownPath = wallpaperx::testing::writeSolidPng(
                     dir + "/bounds_swap_grown.png", kSwapGrownSide, kSwapGrownSide, {90, 80, 70, 255});
 
-                checkProbeAndDecodeShareOneOpen(device, targets.renderPass(), swapSmallPath);
-                checkPostLoadRecheck(device, targets.renderPass(), swapSmallPath, swapCopyPath,
-                                     swapGrownPath);
+                checkDecodePathOpensTheImageOnce(device, targets.renderPass(), swapSmallPath);
+                checkOneOpenFeedsProbeAndDecode(device, targets.renderPass(), swapSmallPath,
+                                                swapCopyPath, swapGrownPath);
                 checkUnopenableFileIsAttributed(device, targets.renderPass(), dir);
             } catch (const std::exception& e) {
                 // A host with no usable ICD lands here. Reported as a failure of this
