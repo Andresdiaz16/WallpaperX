@@ -58,7 +58,6 @@ int main() {
         // Declared last so it is destroyed first: its handlers call manager.snapshot(),
         // so HTTP has to stop before anything it reads starts being torn down.
         wallpaperx::HttpServer httpServer(manager);
-        manager.recordConfigServer(httpServer.listening(), httpServer.lastError());
 
         // sigwait on its own thread, not a handler: leaveEventLoop() takes locks and is
         // not async-signal-safe. A guard rather than a bare std::thread because

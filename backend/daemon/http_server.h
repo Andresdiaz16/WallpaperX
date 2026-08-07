@@ -41,7 +41,8 @@ public:
 
     bool listening() const { return m_listening.load(std::memory_order_acquire); }
 
-    // Empty when listening() is true. Set before the thread starts, so it needs no lock.
+    // The bind attempt only -- the serving thread never writes it, and reports its own exit
+    // through WallpaperManager instead. Set before the thread starts, so it needs no lock.
     const std::string& lastError() const { return m_bindError; }
 
     int port() const { return m_port; }

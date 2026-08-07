@@ -121,10 +121,15 @@ HttpServer::HttpServer(WallpaperManager& manager, int port)
                      "wallpaperx-daemon: %s -- the KDE plugin will not be able to read config; "
                      "DBus and rendering are unaffected\n",
                      m_bindError.c_str());
+        m_manager.recordConfigServer(false, m_bindError);
         return;
     }
 
     m_listening.store(true, std::memory_order_release);
+    // Recorded here, not by the caller: the serving thread below is the only other writer,
+    // and starting it after this write is what orders the two.
+    m_manager.recordConfigServer(true, {});
+
     m_thread = std::thread([this] {
         // false only when httplib hit an accept error outside EMFILE/EINTR/EAGAIN and
         // closed its own listening socket; a deliberate stop() leaves it true. Without
