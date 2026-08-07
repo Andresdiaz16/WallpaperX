@@ -43,6 +43,8 @@
 
 #include <sdbus-c++/sdbus-c++.h>
 
+#include <vulkan/vulkan.h>
+
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include <stb_image_write.h>
 
@@ -61,9 +63,12 @@
 #include <thread>
 #include <vector>
 
+#include <arpa/inet.h>
+#include <dlfcn.h>
 #include <ifaddrs.h>
 #include <net/if.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -83,6 +88,92 @@ using wallpaperx::testing::Poller;
 using wallpaperx::testing::setWallpaper;
 using wallpaperx::testing::tryConnect;
 using wallpaperx::testing::wallpaperStatus;
+
+// ---------------------------------------------------------------------------- //
+// Failing one vkQueueSubmit, from the test binary
+// ---------------------------------------------------------------------------- //
+//
+// S7.10e is about a GPU that stops working *after* it has worked, and no input to
+// SetWallpaper reaches a failing submit -- an undecodable image fails in stb, long
+// before the queue. The lever is the driver call itself: Device holds no function
+// pointers, so vkQueueSubmit is an undefined symbol in this executable resolved through
+// the Vulkan loader, and a definition here is what device.cpp's call binds to.
+//
+// This is NOT the test-only hook in a production file that X.6 forbids. Nothing is added
+// to, or compiled differently in, renderer/ or backend/daemon/ -- the fault lives
+// entirely in the test binary, which is the same technique renderer/tests/
+// image_bounds_probe.cpp uses on malloc and fopen.
+//
+// The plan is thread_local rather than global, so no other thread in this process can
+// see it: the manager's HTTP serving thread, the DBus dispatch thread and any render
+// worker submit nothing that this counter can observe, which is what keeps the counts
+// below from being an assertion on the scheduler (X.2).
+namespace {
+
+struct SubmitFaultPlan {
+    int observed = 0;  // submits made on the arming thread while armed
+    int failAt = 0;    // 1-based index of the submit to fail; 0 counts and fails nothing
+    int injected = 0;  // faults actually returned, so a bypassed interposer is visible
+};
+
+thread_local SubmitFaultPlan* t_submitFault = nullptr;
+
+// Arms the interposer for the current thread only, and disarms on every exit path
+// including an exception (X.4) -- a plan left armed would inject into an unrelated phase.
+class SubmitFault {
+public:
+    explicit SubmitFault(int failAt) : m_previous(t_submitFault) {
+        m_plan.failAt = failAt;
+        t_submitFault = &m_plan;
+    }
+    ~SubmitFault() { disarm(); }
+    SubmitFault(const SubmitFault&) = delete;
+    SubmitFault& operator=(const SubmitFault&) = delete;
+
+    // Restores whatever was armed before rather than clearing, so a nested fault cannot
+    // silently disarm an outer one still in scope. Idempotent: after an explicit disarm()
+    // the destructor's own call is a no-op.
+    void disarm() {
+        if (t_submitFault == &m_plan) t_submitFault = m_previous;
+    }
+
+    int observed() const { return m_plan.observed; }
+    int injected() const { return m_plan.injected; }
+
+private:
+    SubmitFaultPlan m_plan;
+    SubmitFaultPlan* m_previous;
+};
+
+}  // namespace
+
+// VK_ERROR_DEVICE_LOST because that is what a real stalled submit ends in (S7.16), and
+// production only tests the code against VK_SUCCESS. Nothing is actually lost: the call
+// never reaches the driver, so immediateSubmit's cleanup destroys a fence and command
+// buffer that were never submitted -- legal, and what makes the recovery half testable.
+extern "C" VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmit(VkQueue queue, uint32_t submitCount,
+                                                        const VkSubmitInfo* pSubmits, VkFence fence) {
+    // RTLD_NEXT skips this executable and lands on the loader's own entry point. Idempotent,
+    // so the relaxed racing store can only ever write the same value twice.
+    static std::atomic<void*> realSubmit{nullptr};
+    void* real = realSubmit.load(std::memory_order_relaxed);
+    if (real == nullptr) {
+        real = ::dlsym(RTLD_NEXT, "vkQueueSubmit");
+        realSubmit.store(real, std::memory_order_relaxed);
+    }
+
+    if (SubmitFaultPlan* plan = t_submitFault; plan != nullptr) {
+        ++plan->observed;
+        if (plan->failAt != 0 && plan->observed == plan->failAt) {
+            ++plan->injected;
+            return VK_ERROR_DEVICE_LOST;
+        }
+    }
+
+    auto* realFn = reinterpret_cast<PFN_vkQueueSubmit>(real);
+    if (realFn == nullptr) return VK_ERROR_INITIALIZATION_FAILED;
+    return realFn(queue, submitCount, pSubmits, fence);
+}
 
 namespace {
 
@@ -625,6 +716,10 @@ void runHealthBeforeDeviceChecks(httplib::Client& cli, const Check& check) {
     }
 }
 
+// Defined below Phase 2b but called from its tail, where the state it needs -- a daemon
+// that has already rendered successfully -- is the subject.
+void runGpuFailureChecks(const std::string& bluePath, const WallpaperManager::Config& base, const Check& check);
+
 // ---------------------------------------------------------------------------- //
 // Phase 2b -- the states /health has to be able to tell apart.
 // ---------------------------------------------------------------------------- //
@@ -1166,22 +1261,253 @@ void runHealthStateChecks(const std::string& bluePath, const std::string& videoP
                     "to compare against");
     }
 
-    // S7.10e IS NOT COVERED BY THIS FILE, and the gap is stated here rather than left to
-    // be inferred from the absence of a check.
+    // ------------------------------------------------------------------ //
+    // (g) a GPU that breaks after it has already worked, and the recovery from it.
+    // ------------------------------------------------------------------ //
+    runGpuFailureChecks(bluePath, base, check);
+
+    // WHAT REMAINS UNCOVERED OF S7.10e, stated rather than left to be inferred from an
+    // absence. The goal itself records the limit: GpuFailure is thrown from
+    // Device::immediateSubmit and nowhere else, so a device-level fault in
+    // OffscreenTargetManager's image or render-pass creation, or in pipeline creation,
+    // still leaves /health blaming `wallpapers`. Scenario (g) below fails a submit, which
+    // reaches every GpuFailure site there is; it cannot reach the ones that do not exist.
     //
-    // The goal is that `gpu: ok` means the GPU worked *recently*: a GpuFailure out of
-    // Device::immediateSubmit re-records it as failed, so a device that dies after one
-    // successful render stops reading ok. Reaching that needs a submit, a fence wait or a
-    // command-buffer allocation to fail on demand, and nothing a test may legally do can
-    // provoke one -- no input to SetWallpaper reaches it, and the only lever that would is
-    // a fault hook in Device, which X.6 forbids adding to a production header.
-    //
-    // What IS established, and it is less than the goal: gpu failure is attributed when
-    // the Device cannot be created at all (scenario (c)'s notVerified branch is that state
-    // when it occurs), gpu reads ok after a real render, and the two places production
-    // records ok were each shown load-bearing by control. The direction that matters --
-    // ok -> fail on a device that has already worked -- has no check. A reviewer should
-    // not read this file's green as evidence for it.
+    // Also uncovered: the other two throw sites inside immediateSubmit --
+    // vkAllocateCommandBuffers and vkWaitForFences. Both are interposable exactly as
+    // vkQueueSubmit is, and both were deliberately left alone. A failed wait is the one
+    // fault that is not survivable: work is genuinely in flight, so immediateSubmit's
+    // cleanup would destroy a fence and command buffer the GPU still owns, and the
+    // recovery half of (g) would be measuring a process that is already undefined.
+}
+
+// ---------------------------------------------------------------------------- //
+// Phase 2c -- S7.10e, by failing one real driver call.
+// ---------------------------------------------------------------------------- //
+void runGpuFailureChecks(const std::string& bluePath, const WallpaperManager::Config& base, const Check& check) {
+    // Pass 1 -- count. The interposer observes and fails nothing, so `submitsPerRender`
+    // is what a *successful* first render of a fresh daemon costs. Nothing is asserted
+    // about the number: it is measured here precisely so that pass 2 does not have to
+    // name it.
+    int submitsPerRender = 0;
+    bool countPassRendered = false;
+    std::string countPassReason = "no frame could be rendered on this host, so there is no working GPU to break";
+    {
+        IsolatedDaemon daemon(base);
+        if (!daemon.ready()) {
+            countPassReason = daemon.reason();
+        } else {
+            SubmitFault counting(/*failAt=*/0);
+            daemon.manager().requestWallpaper("static", bluePath, 0);
+            daemon.manager().renderPending(0);
+            counting.disarm();
+            submitsPerRender = counting.observed();
+            const WallpaperManager::Snapshot snap = daemon.manager().snapshot();
+            const auto it = snap.monitors.find(0);
+            countPassRendered = it != snap.monitors.end() && it->second.hasFrame;
+        }
+    }
+
+    if (!countPassRendered || submitsPerRender < 2) {
+        // X.3: a host that cannot render, or a render whose shape leaves nothing to
+        // spare, is not a defect in /health -- and grading it would be grading a
+        // scenario that was never built.
+        notVerified("S7.10e (a GPU that fails after working reads fail, and a commit clears it)",
+                    countPassRendered
+                        ? "one render costs " + std::to_string(submitsPerRender) +
+                              " vkQueueSubmit call(s), so there is no earlier submit to let through and the "
+                              "texture upload's own pre-existing catch would be the one that recorded the failure"
+                        : countPassReason);
+        return;
+    }
+
+    IsolatedDaemon daemon(base);
+    if (!daemon.ready()) {
+        notVerified("S7.10e (a GPU that fails after working reads fail, and a commit clears it)", daemon.reason());
+        return;
+    }
+
+    // GOAL: S7.10e -- `gpu: ok` means the GPU worked recently, not that a device was once
+    //       created. A GpuFailure out of the render's submit re-records the check as
+    //       failed. False if a device that dies after the first successful render still
+    //       reads ok, which is a watchdog being told a blank desktop is healthy.
+    // WHY-THIS-SHAPE: the fault is aimed by a two-pass count, not at a literal submit
+    //       index. Aiming at "submit 2" would couple this to production's internal call
+    //       sequence, and a refactor merging the texture upload into the render would
+    //       silently re-aim it while the check stayed green. Failing *every* submit --
+    //       the obvious alternative -- proves nothing at all: StaticRenderer's
+    //       constructor uploads its texture first, so it throws before m_targets->render()
+    //       is ever reached, and the pre-existing catch around ensureGpu/emplace records
+    //       gpu=fail identically. Both variants then print the same body, and the catch
+    //       this scenario exists for never runs.
+    // CONTROL: the `catch (const GpuFailure& e)` added around `m_targets->render(...)` in
+    //       wallpaper_manager.cpp deleted, so the failure falls through to the plain
+    //       std::exception arm -> "FAIL: a GPU that fails a submit after the device was
+    //       created reads fail, not ok" and "FAIL: the gpu detail names the driver call
+    //       that failed", with gpu reading {ok, "NVIDIA GeForce RTX 3080 Ti (Heap)"}
+    //       while every render had failed. Reverted.
+    // COVERAGE-ASSERT: `observed == submitsPerRender` is the load-bearing one, and it is
+    //       what pins the fault to the render rather than to the upload. If the upload's
+    //       submit had been the one that failed, renderPending would have thrown out of
+    //       renderer.emplace() and m_targets->render() would never have been called, so
+    //       the count would have stopped short. Reaching the last submit proves every
+    //       earlier one went to the real driver and succeeded. `injected == 1` is the
+    //       second: if dispatch ever moves to volk or vkGetDeviceProcAddr the interposer
+    //       is bypassed, and without this the phase would inject nothing and stay green.
+    SubmitFault fault(/*failAt=*/submitsPerRender);
+    daemon.manager().requestWallpaper("static", bluePath, 0);
+    daemon.manager().renderPending(0);
+    fault.disarm();
+
+    if (fault.injected() != 1 || fault.observed() != submitsPerRender) {
+        // Deliberately a skip and not a check(): with nothing injected the assertions
+        // below would be grading a *successful* render and would go red naming the
+        // daemon, which is X.3's exact prohibition -- the fault would be in this file's
+        // aim or in the loader's dispatch, not in /health.
+        notVerified("S7.10e (a GPU that fails after working reads fail, and a commit clears it)",
+                    "the interposed vkQueueSubmit did not land where it was aimed -- " +
+                        std::to_string(fault.observed()) + " submit(s) observed and " +
+                        std::to_string(fault.injected()) + " fault(s) injected, against " +
+                        std::to_string(submitsPerRender) +
+                        " counted for the same render; either the render's submit sequence changed or this "
+                        "executable's vkQueueSubmit is no longer what production calls");
+        return;
+    }
+
+    const WallpaperManager::Snapshot broken = daemon.manager().snapshot();
+    const auto brokenMonitor = broken.monitors.find(0);
+    const HttpReply failed = daemon.health();
+    if (!failed.ok()) {
+        check(false, "the failed-submit daemon answered /health with a parseable 200");
+        return;
+    }
+
+    check(brokenMonitor != broken.monitors.end() && !brokenMonitor->second.hasFrame,
+          "the render whose submit was failed committed no frame");
+    check(healthCheckStatus(failed.json, "gpu") == "fail",
+          "a GPU that fails a submit after the device was created reads fail, not ok");
+    check(healthCheckDetail(failed.json, "gpu").find("vkQueueSubmit") != std::string::npos,
+          "the gpu detail names the driver call that failed");
+    // Attribution, and it is what separates "gpu recorded the failure" from "everything
+    // was blanket-failed": the shader directory resolved fine and is untouched by this.
+    check(healthCheckStatus(failed.json, "shaders") == "ok",
+          "a failing submit does not implicate the shaders");
+    if (healthCheckStatus(failed.json, "gpu") != "fail") {
+        std::fprintf(stderr, "  after failing submit %d of %d: gpu %s (%s)\n", submitsPerRender, submitsPerRender,
+                     healthCheckStatus(failed.json, "gpu").c_str(), healthCheckDetail(failed.json, "gpu").c_str());
+    }
+    std::printf("http_server_test: submit %d of %d failed -> %s\n", submitsPerRender, submitsPerRender,
+                failed.body.c_str());
+    std::fflush(stdout);
+
+    // GOAL: S7.10e's other direction -- a successful commit clears the recorded failure,
+    //       and clears the *text* with it. False if a recovered GPU reports status ok
+    //       alongside detail "Device::immediateSubmit: vkQueueSubmit failed", which is a
+    //       reader being handed two contradictory facts and no way to date either.
+    // WHY-THIS-SHAPE: the detail is compared byte for byte against the string the manager
+    //       itself would build from its published GpuStatus -- the same expression
+    //       ensureGpu records on success. The obvious alternative, asserting the detail no
+    //       longer contains "vkQueueSubmit", is satisfied by a commit that cleared the
+    //       detail to the empty string or replaced it with any other wording, so it would
+    //       not have caught the bare `m_health.gpu.status = Ok` this replaced -- that
+    //       version left the failure text in place, but so would a dozen wrong repairs.
+    // CONTROL: the recovery's `recordHealthLocked(&DaemonHealth::gpu, Ok, ...)` in
+    //       wallpaper_manager.cpp put back to `m_health.gpu.status = HealthStatus::Ok;`
+    //       -> "FAIL: a recovered GPU carries the detail ensureGpu writes, not the text of
+    //       the failure it recovered from" with "  gpu after recovery: ok
+    //       (Device::immediateSubmit: vkQueueSubmit failed) (expected NVIDIA GeForce RTX
+    //       3080 Ti (Heap))". The status check above it stayed green, which is the point:
+    //       the two are not one assertion written twice. Reverted.
+    // COVERAGE-ASSERT: the expected string is required to be non-trivial before it is
+    //       compared. On a manager reporting no GPU name it would be " ()", and an
+    //       equality check against that establishes nothing.
+    daemon.manager().requestWallpaper("static", bluePath, 0);
+    daemon.manager().renderPending(0);
+    const WallpaperManager::Snapshot recoveredSnap = daemon.manager().snapshot();
+    const auto recoveredMonitor = recoveredSnap.monitors.find(0);
+    const bool committed = recoveredMonitor != recoveredSnap.monitors.end() && recoveredMonitor->second.hasFrame;
+    const std::string expectGpuDetail =
+        recoveredSnap.gpu.name + " (" + recoveredSnap.gpu.descriptorTier + ")";
+    if (!committed || recoveredSnap.gpu.name.empty()) {
+        notVerified("S7.10e (a commit clears the recorded GPU failure)",
+                    committed ? "the manager publishes no GPU name, so \"the detail ensureGpu writes\" is an "
+                                "empty string and comparing against it would establish nothing"
+                              : "the render after the injected fault committed no frame, so there was no "
+                                "successful commit to clear anything");
+        return;
+    }
+
+    const HttpReply recovered = daemon.health();
+    if (!recovered.ok()) {
+        check(false, "the recovered-GPU daemon answered /health with a parseable 200");
+        return;
+    }
+    check(healthCheckStatus(recovered.json, "gpu") == "ok",
+          "a later successful commit clears the recorded GPU failure");
+    check(healthCheckDetail(recovered.json, "gpu") == expectGpuDetail,
+          "a recovered GPU carries the detail ensureGpu writes, not the text of the failure it recovered from");
+    if (healthCheckStatus(recovered.json, "gpu") != "ok" ||
+        healthCheckDetail(recovered.json, "gpu") != expectGpuDetail) {
+        std::fprintf(stderr, "  gpu after recovery: %s (%s) (expected %s)\n",
+                     healthCheckStatus(recovered.json, "gpu").c_str(),
+                     healthCheckDetail(recovered.json, "gpu").c_str(), expectGpuDetail.c_str());
+    }
+
+    // GOAL: S7.10e reaches the export too -- exportCurrentFrame is GPU work (it submits an
+    //       ownership-release barrier), so a GpuFailure there is the GPU going wrong and
+    //       must be recorded as such. False if a daemon whose every GetFrameFd dies in the
+    //       driver still reports gpu ok.
+    // WHY-THIS-SHAPE: this runs immediately after the two checks above have established
+    //       gpu == ok on this same daemon, so the fail below cannot be left over from the
+    //       render fault -- the ok is the barrier that makes it attributable to the
+    //       export. Aiming at the first submit after arming is exact rather than
+    //       index-coupled here: exportFrame issues exactly one, and if it ever issues none
+    //       the injected count catches it.
+    // CONTROL: the `try`/`catch (const GpuFailure&)` around wallpaperx::exportFrame in
+    //       WallpaperManager::exportCurrentFrame reduced to the bare call it replaced ->
+    //       "FAIL: a frame export that fails in the driver is recorded against the GPU",
+    //       gpu still reading {ok, "NVIDIA GeForce RTX 3080 Ti (Heap)"} after the export
+    //       had thrown. Reverted.
+    {
+        SubmitFault exportFault(/*failAt=*/1);
+        std::string exportError;
+        bool threw = false;
+        try {
+            wallpaperx::FrameExport exported = daemon.manager().exportCurrentFrame(0);
+            // Only reached if the fault missed. The caller owns the fd (exportFrame's
+            // contract), and leaking one out of a phase that then keeps running is X.4's
+            // business, not something to leave to process exit.
+            if (exported.handle && exported.handle->frame.fd >= 0) ::close(exported.handle->frame.fd);
+        } catch (const std::exception& e) {
+            threw = true;
+            exportError = e.what();
+        }
+        exportFault.disarm();
+
+        if (exportFault.injected() != 1) {
+            notVerified("S7.10e (a failed frame export is attributed to the GPU)",
+                        "exportCurrentFrame made " + std::to_string(exportFault.observed()) +
+                            " vkQueueSubmit call(s) with the interposer armed on the first, so no fault reached "
+                            "the export path on this host" +
+                            (threw ? " (it threw for another reason: " + exportError + ")" : ""));
+        } else {
+            const HttpReply afterExport = daemon.health();
+            if (!afterExport.ok()) {
+                check(false, "the failed-export daemon answered /health with a parseable 200");
+            } else {
+                check(threw && exportError.find("vkQueueSubmit") != std::string::npos,
+                      "exportCurrentFrame propagates the driver failure instead of returning a frame");
+                check(healthCheckStatus(afterExport.json, "gpu") == "fail",
+                      "a frame export that fails in the driver is recorded against the GPU");
+                if (healthCheckStatus(afterExport.json, "gpu") != "fail") {
+                    std::fprintf(stderr, "  gpu after a failed export: %s (%s); export threw: %s\n",
+                                 healthCheckStatus(afterExport.json, "gpu").c_str(),
+                                 healthCheckDetail(afterExport.json, "gpu").c_str(),
+                                 threw ? exportError.c_str() : "no");
+                }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------- //
@@ -1890,6 +2216,141 @@ void runShutdownChecks(WallpaperManager& manager, const Check& check) {
     }
 }
 
+// ---------------------------------------------------------------------------- //
+// Phase 10 -- an idle client cannot hold the shutdown open.
+// ---------------------------------------------------------------------------- //
+
+// One complete HTTP/1.1 response off `fd`, bounded by `timeoutMs`. False on timeout, on
+// EOF before the response finished, or on a reply with no Content-Length -- never a
+// partial read reported as a whole one, because the caller uses "a second response
+// arrived" as its proof that the connection was reused.
+bool readOneResponse(int fd, int timeoutMs, std::string& out) {
+    out.clear();
+    const Clock::time_point deadline = Clock::now() + std::chrono::milliseconds(timeoutMs);
+    size_t headerEnd = std::string::npos;
+    long contentLength = -1;
+    for (;;) {
+        if (headerEnd != std::string::npos && contentLength >= 0 &&
+            out.size() >= headerEnd + 4 + static_cast<size_t>(contentLength)) {
+            return true;
+        }
+        const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - Clock::now()).count();
+        if (left <= 0) return false;
+
+        pollfd pfd{fd, POLLIN, 0};
+        if (::poll(&pfd, 1, static_cast<int>(left)) <= 0) return false;
+        char buf[1024];
+        const ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
+        if (n <= 0) return false;
+        out.append(buf, static_cast<size_t>(n));
+
+        if (headerEnd == std::string::npos) {
+            headerEnd = out.find("\r\n\r\n");
+            if (headerEnd != std::string::npos) {
+                static constexpr const char* kHeader = "Content-Length: ";
+                const size_t at = out.find(kHeader);
+                if (at == std::string::npos || at > headerEnd) return false;
+                contentLength = std::strtol(out.c_str() + at + std::strlen(kHeader), nullptr, 10);
+            }
+        }
+    }
+}
+
+void runKeepAliveShutdownChecks(WallpaperManager& manager, const Check& check) {
+    std::string reason;
+    std::unique_ptr<HttpServer> server = startServer(manager, reason);
+    if (!server) {
+        notVerified("S7.17 (an idle keep-alive client cannot hold shutdown open)", reason);
+        return;
+    }
+    const int port = server->port();
+
+    const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) {
+        notVerified("S7.17 (an idle keep-alive client cannot hold shutdown open)", "could not create a socket");
+        return;
+    }
+    // Closed on every path including the early returns below (X.4). Declared before the
+    // measurement so the descriptor cannot outlive the phase that opened it.
+    struct FdGuard {
+        int fd;
+        ~FdGuard() {
+            if (fd >= 0) ::close(fd);
+        }
+    } guard{fd};
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(static_cast<uint16_t>(port));
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+        notVerified("S7.17 (an idle keep-alive client cannot hold shutdown open)",
+                    "could not connect to the server this phase just started");
+        return;
+    }
+
+    const std::string request = "GET /health HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(port) +
+                                "\r\nConnection: keep-alive\r\n\r\n";
+    std::string response;
+    bool exchanged = true;
+    for (int i = 0; i < 2 && exchanged; ++i) {
+        exchanged = ::send(fd, request.data(), request.size(), MSG_NOSIGNAL) ==
+                        static_cast<ssize_t>(request.size()) &&
+                    readOneResponse(fd, 5000, response) && response.find(" 200 ") != std::string::npos;
+    }
+    if (!exchanged) {
+        // X.3, and it matters here more than usual: without a live idle connection the
+        // measurement below would be timing an ordinary shutdown with nothing to hold it
+        // open, which is exactly the state that cannot fail.
+        notVerified("S7.17 (an idle keep-alive client cannot hold shutdown open)",
+                    "the two requests needed to prove the connection was kept alive did not both complete, so "
+                    "no idle keep-alive connection was ever established");
+        return;
+    }
+
+    // GOAL: S7.17's fast row -- a client holding an idle keep-alive connection cannot make
+    //       the daemon take materially longer to stop. False if ~HttpServer's join waits on
+    //       a worker parked in httplib's keep_alive() poll: shutdown would go from instant
+    //       to seconds per connection, and nothing else in this suite would notice.
+    // WHY-THIS-SHAPE: httplib is vendored, so this pins a *dependency's* behaviour. 0.50.1
+    //       checks svr_sock == INVALID_SOCKET inside keep_alive()'s loop (httplib.h:5738),
+    //       which is upstream issue #1959; a version bump that lost it would regress this
+    //       silently. Two requests, not one, and on a raw socket rather than an
+    //       httplib::Client: a Client transparently reconnects when the server closed the
+    //       connection, so a second successful Get through one would prove nothing about
+    //       keep-alive. A second response on the same fd is positive proof the connection
+    //       was reused, which is what makes the connection being *open* at the moment of
+    //       destruction a fact rather than an assumption.
+    //       Deliberately does NOT cover the dribbling client, which S7.17 records as a
+    //       decided non-goal at 199.52 s and rising -- and which, per that goal, a test
+    //       must never leave open across a teardown.
+    // CONTROL: the `if (svr_sock == INVALID_SOCKET) { break; }` arm removed from
+    //       keep_alive() in backend/third_party/httplib.h, reproducing upstream #1959 ->
+    //       "FAIL: an idle keep-alive connection does not hold the server's destruction
+    //       open" with "  ~HttpServer took 5006.43 ms with one idle keep-alive connection
+    //       open (budget 1000 ms)", against 10.24 ms unmutated. Reverted.
+    // Threshold: the healthy cost is one 10 ms keep-alive poll slice
+    // (CPPHTTPLIB_KEEPALIVE_TIMEOUT_CHECK_INTERVAL_USECOND) plus a thread join, and the
+    // regression is bounded below by CPPHTTPLIB_KEEPALIVE_TIMEOUT_SECOND = 5 s, which
+    // http_server.cpp does not override. 1000 ms sits 100x above the first and 5x below
+    // the second, so neither a slow host nor the scheduler can move it across (X.2): which
+    // side of the destructor the worker reaches keep_alive() on changes the answer by at
+    // most one 10 ms slice.
+    constexpr double kShutdownBudgetMs = 1000.0;
+    const Clock::time_point before = Clock::now();
+    server.reset();  // ~HttpServer: stop() then join()
+    const double elapsedMs = millis(Clock::now() - before);
+
+    check(elapsedMs < kShutdownBudgetMs,
+          "an idle keep-alive connection does not hold the server's destruction open");
+    if (elapsedMs >= kShutdownBudgetMs) {
+        std::fprintf(stderr, "  ~HttpServer took %.2f ms with one idle keep-alive connection open (budget %.0f ms)\n",
+                     elapsedMs, kShutdownBudgetMs);
+    }
+    std::printf("http_server_test: shutdown with one idle keep-alive connection open: %.2f ms\n", elapsedMs);
+    std::fflush(stdout);
+}
+
 }  // namespace
 
 int main() {
@@ -1997,6 +2458,7 @@ int main() {
         }
 
         runShutdownChecks(manager, check);
+        runKeepAliveShutdownChecks(manager, check);
     } catch (const std::exception& e) {
         // Without this an escaping sdbus::Error -- what a host with no session bus
         // produces -- would abort the process, so ctest would report an opaque SIGABRT
