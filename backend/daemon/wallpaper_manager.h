@@ -289,6 +289,8 @@ private:
     // Member pointer picks the check, so a caller cannot record into a field it did not
     // mean and the sanitizing happens in one place.
     void recordHealth(HealthCheck DaemonHealth::*which, HealthStatus status, const std::string& detail);
+    // Caller must hold m_stateMutex, which is not recursive.
+    void recordHealthLocked(HealthCheck DaemonHealth::*which, HealthStatus status, const std::string& detail);
 
     GpuStatus m_gpuStatus;
     DaemonHealth m_health;

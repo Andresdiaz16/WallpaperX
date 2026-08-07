@@ -93,6 +93,11 @@ const char* toString(HealthStatus status) {
 void WallpaperManager::recordHealth(HealthCheck DaemonHealth::*which, HealthStatus status,
                                     const std::string& detail) {
     std::lock_guard<std::mutex> stateLock(m_stateMutex);
+    recordHealthLocked(which, status, detail);
+}
+
+void WallpaperManager::recordHealthLocked(HealthCheck DaemonHealth::*which, HealthStatus status,
+                                          const std::string& detail) {
     (m_health.*which).status = status;
     (m_health.*which).detail = sanitizeForLog(detail, 1024, LogFraming::Bare);
 }
@@ -314,6 +319,9 @@ RenderOutcome WallpaperManager::renderPending(int monitorId) {
         if (error.empty()) {
             try {
                 m_targets->render(*renderer, *target);
+            } catch (const GpuFailure& e) {
+                error = e.what();
+                recordHealthLocked(&DaemonHealth::gpu, HealthStatus::Fail, error);
             } catch (const std::exception& e) {
                 error = e.what();
             }
@@ -347,9 +355,11 @@ RenderOutcome WallpaperManager::renderPending(int monitorId) {
             it->second.lastError.clear();
             committed = true;
             generation = it->second.generation;
-            // Under the lock already held. A commit is the GPU working, so it clears a
-            // failure recorded by an earlier render without a second acquisition.
-            m_health.gpu.status = HealthStatus::Ok;
+            // A commit is the GPU working, so it clears a failure recorded by an earlier
+            // render. Same detail ensureGpu records on success, so a recovered GPU cannot
+            // be told from one that never failed.
+            recordHealthLocked(&DaemonHealth::gpu, HealthStatus::Ok,
+                               m_gpuStatus.name + " (" + m_gpuStatus.descriptorTier + ")");
         }
     }
 
@@ -417,7 +427,12 @@ FrameExport WallpaperManager::exportCurrentFrame(int monitorId) {
     }
 
     FrameHandle handle;
-    handle.frame = wallpaperx::exportFrame(*m_device, m_targets->get(monitorId));
+    try {
+        handle.frame = wallpaperx::exportFrame(*m_device, m_targets->get(monitorId));
+    } catch (const GpuFailure& e) {
+        recordHealth(&DaemonHealth::gpu, HealthStatus::Fail, e.what());
+        throw;
+    }
     handle.generation = generation;
     out.handle = std::move(handle);
     return out;
