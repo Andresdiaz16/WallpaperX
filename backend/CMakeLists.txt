@@ -177,6 +177,20 @@ target_compile_definitions(wallpaperx-http-server-test PRIVATE
     WALLPAPERX_EXPECTED_VERSION="${PROJECT_VERSION}"
 )
 
+# S7.9's only lever is a failed allocation inside a handler, and it gets there by replacing
+# ::operator new/delete in the test binary. A sanitized runtime owns those two functions:
+# its versions carry the shadow-memory bookkeeping the tool reasons from, and a replacement
+# that forwards to malloc/free silently removes it. Measured under -fsanitize=thread: 90
+# "data race in operator delete" reports against threads that were correctly synchronised,
+# which is a gate that is red when the code is right. So the instrument is compiled out
+# here and the S7.9 phase reports itself as unexercised, which SKIP_RETURN_CODE turns into
+# a ctest Skip -- the same trade renderer/CMakeLists.txt makes for image_bounds_probe.
+# Any non-empty value counts: an allowlist of sanitizer names is the maintenance burden
+# that produced a bug there, and over-skipping announces itself in the test's output.
+if(WALLPAPERX_SANITIZE)
+    target_compile_definitions(wallpaperx-http-server-test PRIVATE WALLPAPERX_ALLOCATION_INSTRUMENT=0)
+endif()
+
 # The system-level tier: spawns the real wallpaperx-daemon executable and drives it over
 # the bus. It links the daemon library only for the DBus name/interface constants and
 # the client-side test scaffolding -- deliberately not to call into the daemon's code,

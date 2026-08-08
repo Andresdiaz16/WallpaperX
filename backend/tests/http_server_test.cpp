@@ -32,6 +32,7 @@
 
 #include "daemon/dbus_service.h"
 #include "daemon/http_server.h"
+#include "daemon/log_escape.h"
 #include "daemon/wallpaper_manager.h"
 
 // Driven directly, not through the manager, by the submit-split measurement that S7.10e's
@@ -64,6 +65,7 @@
 #include <exception>
 #include <filesystem>
 #include <memory>
+#include <new>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -76,6 +78,7 @@
 #include <net/if.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <pthread.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -185,6 +188,133 @@ extern "C" VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmit(VkQueue queue, uint32_t 
     if (realFn == nullptr) return VK_ERROR_INITIALIZATION_FAILED;
     return realFn(queue, submitCount, pSubmits, fence);
 }
+
+// ---------------------------------------------------------------------------- //
+// Failing one allocation inside an HTTP handler, from the test binary
+// ---------------------------------------------------------------------------- //
+//
+// S7.9 needs an exception raised *inside* a route handler, and no client input produces
+// one: `sanitizeForLog` guarantees valid UTF-8 for any byte sequence so json::dump()
+// cannot throw, `from_chars` reports overflow through a value, and the wallpaper type is
+// whitelisted before it is ever quoted into JSON. What both handlers do unavoidably is
+// allocate -- snapshot() copies strings, sanitizeForLog builds one, dump() builds another
+// -- so failing one allocation on the serving thread raises std::bad_alloc where nothing
+// else can, and bad_alloc is a std::exception, which is what http_server.cpp's exception
+// handler catches.
+//
+// Replacing ::operator new is the standard-sanctioned way to interpose on allocation.
+// Nothing in backend/daemon or renderer/ changes, so this is not the test-only hook in a
+// production file that X.6 forbids -- it is the technique this file already uses on
+// vkQueueSubmit and renderer/tests/image_bounds_probe.cpp uses on malloc and fopen.
+// operator delete is replaced alongside it so every pointer this binary hands out is a
+// malloc/free pair; a lone operator new would leave malloc'd memory to be freed through
+// the default delete's bookkeeping.
+//
+// A sanitized runtime cannot host it. The guard is CMake's -- backend/CMakeLists.txt --
+// with the macro chain below as the fallback for a configure that does not set it.
+// The tool owns operator new/delete: its versions carry the shadow-memory bookkeeping it
+// reasons from, and this replacement removes it. Measured under -fsanitize=thread before
+// the guard existed: 90 "data race in operator delete" reports against correctly
+// synchronised threads, on a run whose every check passed. So under a sanitizer the
+// instrument is not compiled, S7.9 reports itself unexercised, and the run exits 77 --
+// inconclusive, never green.
+#ifndef WALLPAPERX_ALLOCATION_INSTRUMENT
+#if defined(__SANITIZE_THREAD__) || defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_LEAK__) || \
+    defined(__SANITIZE_MEMORY__) || defined(__SANITIZE_HWADDRESS__)
+#define WALLPAPERX_ALLOCATION_INSTRUMENT 0
+#elif defined(__has_feature)
+#if __has_feature(thread_sanitizer) || __has_feature(address_sanitizer) ||                        \
+    __has_feature(leak_sanitizer) || __has_feature(memory_sanitizer) ||                           \
+    __has_feature(hwaddress_sanitizer)
+#define WALLPAPERX_ALLOCATION_INSTRUMENT 0
+#else
+#define WALLPAPERX_ALLOCATION_INSTRUMENT 1
+#endif
+#else
+#define WALLPAPERX_ALLOCATION_INSTRUMENT 1
+#endif
+#endif  // WALLPAPERX_ALLOCATION_INSTRUMENT
+
+namespace {
+
+// One relaxed load is all an unarmed allocation pays. It has to be that cheap: with the
+// probe compiled in, every allocation in this process -- the Vulkan loader's, the ICD's,
+// sdbus's -- goes through here.
+std::atomic<bool> g_allocProbeArmed{false};
+
+// Calibration measures what ONE sanitizeForLog call asks for, so the size the injection
+// keys on is produced by the same function the handler runs rather than by arithmetic
+// over libstdc++'s growth policy.
+thread_local bool t_calibrating = false;
+thread_local std::size_t t_calibMax = 0;
+thread_local int t_calibCount = 0;
+
+// The main thread issues the request and allocates response buffers of its own, so
+// without this the observation below could name the client as the handler's thread.
+thread_local bool t_testOwnedThread = false;
+
+constexpr std::size_t kBigAllocFloor = 1024;
+
+std::atomic<std::size_t> g_watchSize{0};  // 0 = watch nothing
+std::atomic<int> g_watchObserved{0};
+std::atomic<unsigned long long> g_watchThread{0};   // last non-test thread to ask for it
+std::atomic<unsigned long long> g_injectThread{0};  // 0 = inject nowhere
+std::atomic<int> g_injected{0};
+
+unsigned long long selfThreadId() { return static_cast<unsigned long long>(::pthread_self()); }
+
+// Never inlined into operator new, so the unarmed path stays a load and a branch. Must
+// not allocate: it runs inside the allocator.
+[[gnu::noinline]] void noteAllocation(std::size_t bytes) {
+    if (t_calibrating) {
+        if (bytes >= kBigAllocFloor) {
+            ++t_calibCount;
+            if (bytes > t_calibMax) t_calibMax = bytes;
+        }
+        return;
+    }
+
+    const std::size_t watch = g_watchSize.load(std::memory_order_relaxed);
+    if (watch == 0 || bytes != watch || t_testOwnedThread) return;
+
+    const unsigned long long self = selfThreadId();
+    g_watchThread.store(self, std::memory_order_relaxed);
+    g_watchObserved.fetch_add(1, std::memory_order_relaxed);
+
+    // One-shot, disarmed by the exchange before the throw, so exactly one allocation in
+    // the process ever fails. The 500 path allocates too -- sanitizeForLog on what(),
+    // json::dump(), set_content -- and every later request this worker serves would be
+    // faulted as well, which would make g_injected a count of nothing in particular.
+    if (g_injectThread.load(std::memory_order_relaxed) != self) return;
+    if (g_injectThread.exchange(0, std::memory_order_relaxed) != self) return;
+    g_injected.fetch_add(1, std::memory_order_relaxed);
+    throw std::bad_alloc();
+}
+
+}  // namespace
+
+#if WALLPAPERX_ALLOCATION_INSTRUMENT
+
+void* operator new(std::size_t bytes) {
+    if (g_allocProbeArmed.load(std::memory_order_relaxed)) noteAllocation(bytes);
+    const std::size_t request = bytes == 0 ? 1 : bytes;
+    void* p = std::malloc(request);
+    while (p == nullptr) {
+        // The replacement owes the same new_handler protocol the default one implements;
+        // returning null instead would turn an out-of-memory condition into undefined
+        // behaviour everywhere in this binary, not just in the phase under test.
+        const std::new_handler handler = std::get_new_handler();
+        if (handler == nullptr) throw std::bad_alloc();
+        handler();
+        p = std::malloc(request);
+    }
+    return p;
+}
+
+void operator delete(void* p) noexcept { std::free(p); }
+void operator delete(void* p, std::size_t) noexcept { std::free(p); }
+
+#endif  // WALLPAPERX_ALLOCATION_INSTRUMENT
 
 namespace {
 
@@ -426,6 +556,48 @@ std::string writeUndecodableFile(const std::string& name) {
     return path;
 }
 
+// A decodable PNG whose *path* is long, and long on purpose.
+//
+// The /config handler sanitizes the recorded path with one reserve(), so the byte count of
+// that single allocation request is what tells the handler's own work apart from every
+// other allocation in a process that has several threads in it. A path of ordinary length
+// would produce a request size that httplib's header parsing, sdbus and the client all ask
+// for routinely; ~2 KiB is a size nothing else here requests, which is what makes a
+// one-shot injection keyed on it land where it is aimed.
+//
+// Returns "" when the target length cannot be built (PATH_MAX, NAME_MAX, a read-only
+// tree), which the caller reports as an unexercised goal rather than as a daemon fault.
+std::string writeDeepPathImage(std::size_t targetLength) {
+    constexpr std::size_t kComponent = 200;  // well under NAME_MAX
+    constexpr std::size_t kSuffixLen = 4;    // ".png"
+    std::error_code ec;
+    std::string dir = testAssetDir() + "/s79";
+    std::filesystem::remove_all(dir, ec);
+    std::filesystem::create_directories(dir, ec);
+    if (ec) return {};
+
+    // Grow by whole components while a component plus a minimal leaf still fits.
+    while (dir.size() + 1 + kComponent + 1 + kSuffixLen + 1 <= targetLength) {
+        dir += "/" + std::string(kComponent, 'd');
+        std::filesystem::create_directories(dir, ec);
+        if (ec) return {};
+    }
+
+    if (targetLength < dir.size() + 1 + kSuffixLen + 1) return {};
+    const std::size_t leafLen = targetLength - dir.size() - 1;
+    if (leafLen <= kSuffixLen || leafLen > 255) return {};
+
+    std::string leaf(leafLen - kSuffixLen, 'f');
+    leaf += ".png";
+    const std::string path = dir + "/" + leaf;
+    if (path.size() != targetLength) return {};
+
+    constexpr int kSide = 8;
+    std::vector<unsigned char> pixels(static_cast<std::size_t>(kSide) * kSide * 4, 0xFF);
+    if (stbi_write_png(path.c_str(), kSide, kSide, 4, pixels.data(), kSide * 4) == 0) return {};
+    return path;
+}
+
 // An empty directory under the test's asset tree, removed first so a previous run cannot
 // leave it populated.
 std::string makeEmptyDir(const std::string& name) {
@@ -471,6 +643,7 @@ public:
     bool ready() const { return m_server != nullptr; }
     const std::string& reason() const { return m_reason; }
     WallpaperManager& manager() { return m_manager; }
+    int port() const { return m_server->port(); }
 
     HttpReply health() {
         httplib::Client cli = makeClient(m_server->port());
@@ -725,6 +898,191 @@ void runHealthBeforeDeviceChecks(httplib::Client& cli, const Check& check) {
         std::fprintf(stderr, "  aggregate before any render: %s (body: %s)\n", aggregate.c_str(),
                      health.body.c_str());
     }
+}
+
+// ---------------------------------------------------------------------------- //
+// Phase 1b -- S7.9, by failing one allocation inside a handler.
+// ---------------------------------------------------------------------------- //
+//
+// On a daemon of its own (IsolatedDaemon), for two reasons: the fixture records a
+// wallpaper that is never rendered, which would move the shared daemon's `wallpapers`
+// check for every later phase; and the observation below counts allocation requests of one
+// exact size process-wide, so it wants the quietest server it can get.
+void runHandlerExceptionChecks(const Check& check) {
+    constexpr const char* kGoal = "S7.9 (an exception escaping a handler becomes a 500, not a dead daemon)";
+    // Odd, and ~2 KiB: see writeDeepPathImage.
+    constexpr std::size_t kPathLength = 1993;
+    constexpr int kMaxInjectionAttempts = 8;
+
+    if (!WALLPAPERX_ALLOCATION_INSTRUMENT) {
+        notVerified(kGoal, "this build replaces the allocator itself (a sanitizer), so the test binary cannot "
+                           "interpose ::operator new and no exception can be placed inside a handler");
+        return;
+    }
+
+    const std::string longPath = writeDeepPathImage(kPathLength);
+    if (longPath.empty()) {
+        notVerified(kGoal, "this host could not carry a " + std::to_string(kPathLength) +
+                               "-byte image path under " + testAssetDir());
+        return;
+    }
+
+    // Calibrate: what does ONE sanitizeForLog of this path ask the allocator for? Measured
+    // rather than derived, so the injection keys on a size produced by the same function
+    // the handler calls, whatever libstdc++'s reserve() does with it.
+    std::size_t cookie = 0;
+    int calibCount = 0;
+    std::size_t sanitizedLength = 0;
+    {
+        t_calibMax = 0;
+        t_calibCount = 0;
+        t_calibrating = true;
+        g_allocProbeArmed.store(true, std::memory_order_relaxed);
+        const std::string sanitized = wallpaperx::sanitizeForLog(longPath, 4096, wallpaperx::LogFraming::Bare);
+        g_allocProbeArmed.store(false, std::memory_order_relaxed);
+        t_calibrating = false;
+        cookie = t_calibMax;
+        calibCount = t_calibCount;
+        // Read, so the call cannot be optimised away as a dead store.
+        sanitizedLength = sanitized.size();
+    }
+
+    if (calibCount != 1 || cookie < kBigAllocFloor || sanitizedLength != longPath.size()) {
+        notVerified(kGoal, "sanitizeForLog made " + std::to_string(calibCount) + " allocation(s) of >= " +
+                               std::to_string(kBigAllocFloor) + " bytes (largest " + std::to_string(cookie) +
+                               ") for a " + std::to_string(longPath.size()) + "-byte path returning " +
+                               std::to_string(sanitizedLength) +
+                               " bytes, so no single request size identifies the handler's own work");
+        return;
+    }
+
+    WallpaperManager::Config config;
+    config.width = kTargetWidth;
+    config.height = kTargetHeight;
+    config.enableValidation = false;
+    IsolatedDaemon daemon(config);
+    if (!daemon.ready()) {
+        notVerified(kGoal, daemon.reason());
+        return;
+    }
+    try {
+        daemon.manager().requestWallpaper("static", longPath, 0);
+    } catch (const std::exception& e) {
+        notVerified(kGoal, std::string("the long-path fixture was refused by requestWallpaper: ") + e.what());
+        return;
+    }
+
+    httplib::Client cli = makeClient(daemon.port());
+    const std::string route = "/config?monitor=0";
+
+    g_watchObserved.store(0, std::memory_order_relaxed);
+    g_watchThread.store(0, std::memory_order_relaxed);
+    g_injectThread.store(0, std::memory_order_relaxed);
+    g_injected.store(0, std::memory_order_relaxed);
+    g_watchSize.store(cookie, std::memory_order_relaxed);
+    g_allocProbeArmed.store(true, std::memory_order_relaxed);
+    // A probe left armed past this phase would fault an unrelated one, and the exit paths
+    // below are many. Disarms on every one of them, exceptions included (X.4).
+    struct Disarm {
+        ~Disarm() {
+            g_injectThread.store(0, std::memory_order_relaxed);
+            g_watchSize.store(0, std::memory_order_relaxed);
+            g_allocProbeArmed.store(false, std::memory_order_relaxed);
+        }
+    } disarm;
+
+    // Round 1, observe only: prove the handler really asks for `cookie` bytes, exactly
+    // once, on a thread this test does not own. Without it the injection would be armed on
+    // a guess, and "no 500 came back" could not be told from "nothing was ever injected".
+    const HttpReply observed = get(cli, route);
+    const int observedCount = g_watchObserved.load(std::memory_order_relaxed);
+    unsigned long long handlerThread = g_watchThread.load(std::memory_order_relaxed);
+
+    const bool observationUsable = observed.ok() && observed.json.value("path", std::string()) == longPath &&
+                                   observedCount == 1 && handlerThread != 0;
+    if (!observationUsable) {
+        notVerified(kGoal, "a /config request for the long-path fixture answered status " +
+                               std::to_string(observed.status) + " and made " + std::to_string(observedCount) +
+                               " allocation request(s) of " + std::to_string(cookie) +
+                               " bytes off the test's own threads (wanted exactly 1), so the handler's own "
+                               "allocation could not be identified");
+        return;
+    }
+
+    // Round 2: arm the one-shot for the thread that just served us and repeat the request.
+    // httplib hands a keep-alive connection to one pool worker, so this normally fires on
+    // the first attempt; the loop re-aims at whichever worker actually answered rather
+    // than assuming, and gives up with a reason instead of falling through (X.1).
+    HttpReply faulted;
+    int attempts = 0;
+    while (attempts < kMaxInjectionAttempts && g_injected.load(std::memory_order_relaxed) == 0) {
+        ++attempts;
+        g_injectThread.store(handlerThread, std::memory_order_relaxed);
+        faulted = get(cli, route);
+        handlerThread = g_watchThread.load(std::memory_order_relaxed);
+    }
+    // Ordering, not tidying: the survival requests below must not be faulted, and the
+    // guard above only runs at scope exit. The watch stays on, because the survival check
+    // reads its counter.
+    g_injectThread.store(0, std::memory_order_relaxed);
+    const int injected = g_injected.load(std::memory_order_relaxed);
+
+    const int observedBeforeSurvival = g_watchObserved.load(std::memory_order_relaxed);
+    const HttpReply afterConfig = get(cli, route);
+    const HttpReply afterHealth = get(cli, "/health");
+    const int observedAfterSurvival = g_watchObserved.load(std::memory_order_relaxed);
+
+    if (injected != 1) {
+        notVerified(kGoal, "no allocation failure could be placed inside a handler: " + std::to_string(attempts) +
+                               " attempt(s) were all served by a worker thread other than the one observed");
+        return;
+    }
+
+    std::printf("http_server_test: S7.9 -- failed one %zu-byte allocation inside the /config handler after %d "
+                "attempt(s); it answered %d\n",
+                cookie, attempts, faulted.status);
+    std::fflush(stdout);
+
+    // GOAL: S7.9 -- an exception raised inside a route handler becomes a 500 carrying the
+    //       daemon's own JSON error, and the config server keeps serving afterwards. False
+    //       if the handler's throw kills the process, closes the connection, or answers
+    //       with something the daemon did not write.
+    // WHY-THIS-SHAPE: the body, not just the status. httplib catches a handler exception
+    //       whether or not set_exception_handler was called -- with no handler it still
+    //       answers 500, with an empty body -- so a check that asserted only `status ==
+    //       500` would stay green with http_server.cpp's exception handler deleted, which
+    //       is precisely the code S7.9 exists to protect. What identifies the daemon's own
+    //       handler is `{"error":"internal error"}` arriving as parseable JSON.
+    // CONTROL: four, all reverted. (a) `m_server->set_exception_handler(...)` disabled in
+    //       http_server.cpp -> "FAIL: a handler that threw answers with the daemon's own
+    //       JSON error body", "  body: (empty)"; the 500 check stayed GREEN, which is the
+    //       measurement this shape exists for. (b) httplib.h's `try { routed = routing(
+    //       ...); } catch` replaced by a bare call, so nothing catches -> "terminate
+    //       called after throwing an instance of 'std::bad_alloc'", ctest reporting
+    //       http_config as Failed and none of the five checks below printing at all: the
+    //       daemon really does die without a catch. (c) `res.status = 500` -> 200 in the
+    //       exception handler -> "FAIL: a handler that threw answers 500", body still the
+    //       daemon's JSON. (d) harness-side, for the survival pair: the injection made
+    //       permanent and un-gated by thread -> "FAIL: the config server serves /config
+    //       correctly again after a handler threw". It has to be un-gated because httplib
+    //       drops the keep-alive connection after the 500, so the next request is served
+    //       by a different worker (measured: 139749780092608 then 139749771699904).
+    // COVERAGE-ASSERT: `injected == 1` above gates every check here, so a run where the
+    //       fault never reached a handler skips instead of grading; and the survival check
+    //       requires the cookie allocation to be observed AGAIN, so a 200 served from
+    //       anywhere but that same handler path does not satisfy it.
+    check(faulted.reached, "a handler that threw still answers, rather than dropping the connection");
+    check(faulted.status == 500, "a handler that threw answers 500");
+    check(!faulted.json.is_discarded() && faulted.json.value("error", std::string()) == "internal error",
+          "a handler that threw answers with the daemon's own JSON error body");
+    if (faulted.status != 500 || faulted.json.is_discarded()) {
+        std::fprintf(stderr, "  body: %s\n", faulted.body.empty() ? "(empty)" : faulted.body.c_str());
+    }
+
+    check(afterConfig.ok() && afterConfig.json.value("path", std::string()) == longPath &&
+              observedAfterSurvival > observedBeforeSurvival,
+          "the config server serves /config correctly again after a handler threw");
+    check(afterHealth.ok(), "the config server still answers /health after a handler threw");
 }
 
 // Defined below Phase 2b but called from its tail, where the state it needs -- a daemon
@@ -2487,6 +2845,10 @@ int main() {
         }
     };
 
+    // This thread drives every request, so it allocates on the client side of each one.
+    // Marking it keeps the allocation probe from mistaking the client for the handler.
+    t_testOwnedThread = true;
+
     try {
         const std::string bluePath = writeSolidImage("http_blue.png", 0, 0, 255);
         const std::string videoPath = writeSolidImage("http_video.mp4", 255, 0, 0);
@@ -2541,6 +2903,10 @@ int main() {
             // that nothing has been tried yet on this manager, so `pending` is the true
             // answer for all three checks.
             runHealthBeforeDeviceChecks(cli, check);
+
+            // Before any device exists, on a daemon of its own: the fewer threads are
+            // allocating in this process, the more exactly the one-shot below lands.
+            runHandlerExceptionChecks(check);
 
             // Runs on managers of its own, so it neither needs nor disturbs the state
             // above -- and so it can be reached on a host with no Vulkan at all, where the
