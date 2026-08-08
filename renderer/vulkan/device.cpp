@@ -530,6 +530,10 @@ void Device::immediateSubmit(const std::function<void(VkCommandBuffer)>& record)
     }
 
     if (vkWaitForFences(m_device, 1, &fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) {
+        // The submit went through, so the command buffer and whatever it reads are still in
+        // flight: reclaiming them here or in the caller is undefined until the device is
+        // idle. On a lost device this returns at once rather than waiting.
+        vkDeviceWaitIdle(m_device);
         throw GpuFailure("Device::immediateSubmit: vkWaitForFences failed");
     }
 }
