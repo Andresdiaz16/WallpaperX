@@ -212,8 +212,8 @@ public:
     };
     Snapshot snapshot() const;
 
-    // Called once by main() with the result of constructing the HttpServer, which does not
-    // throw on a bind failure.
+    // Called by HttpServer only: once from its constructor with the bind result, and again
+    // from its serving thread if the accept loop later dies.
     void recordConfigServer(bool listening, const std::string& error);
 
     // The renderer's validation-warning counter, or null when no device has been created

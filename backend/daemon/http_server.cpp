@@ -95,8 +95,9 @@ HttpServer::HttpServer(WallpaperManager& manager, int port)
         }
     });
 
-    // Without this an exception in a handler unwinds through httplib's worker thread into
-    // std::terminate -- a status poll would take down every rendered wallpaper.
+    // httplib catches a throwing handler either way, but without this it answers 500 with an
+    // empty body. This adds the daemon's own JSON error and the stderr line -- so a check
+    // asserting only the status would pass with this deleted.
     m_server->set_exception_handler(
         [](const httplib::Request&, httplib::Response& res, std::exception_ptr ep) {
             std::string what = "unknown error";

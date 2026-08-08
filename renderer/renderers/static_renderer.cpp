@@ -130,8 +130,8 @@ struct StbFreer {
 };
 using PixelsPtr = std::unique_ptr<stbi_uc, StbFreer>;
 
-// A local buffer is unreachable from cleanup(), and an orphaned VMA allocation aborts the
-// process in Memory::shutdown rather than merely leaking.
+// A local buffer is unreachable from cleanup(). An orphaned VMA allocation leaks, and in a
+// build with assertions also aborts the process in Memory::shutdown.
 struct BufferGuard {
     Memory& memory;
     AllocatedBuffer& buffer;

@@ -30,6 +30,10 @@ public:
     // Does NOT throw on a bind failure -- see listening()/lastError(). DBus, wpxctl and
     // rendering work without this, so refusing to start would take every monitor down for
     // a convenience channel.
+    //
+    // At most one instance per manager: constructing one publishes its bind result as that
+    // manager's config-server health, and a second instance would overwrite the first's
+    // with its own -- including a failed bind stamping fail over a server that is serving.
     HttpServer(WallpaperManager& manager, int port = kDefaultPort);
 
     // Stops and joins on every path; a joinable thread destroyed mid-unwind is
