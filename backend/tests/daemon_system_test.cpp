@@ -2548,11 +2548,12 @@ void checkConfigServerOwnsPort(NameWatcher& names, const std::string& validation
     //       `status == "ok"` here passes for a hardcoded string and for a daemon that
     //       reports ok about a port some other process took between the spawn and the
     //       call. Sampled AFTER a GetStatus reply on purpose: main.cpp constructs the
-    //       HttpServer and records the result before it enters the event loop, so a reply
-    //       having come back is proof the bind decision is already made -- the bus name,
-    //       which is taken earlier, is not.
-    // CONTROL: three. (a) main.cpp's HttpServer constructed on kDefaultPort + 1, still
-    //       reporting through recordConfigServer -> "FAIL: config_server reads ok exactly
+    //       HttpServer, whose constructor records the bind result, before entering the
+    //       event loop -- so a reply having come back is proof the decision is made, and
+    //       nothing answers GetStatus before then. The bus name, which is taken earlier,
+    //       is not that proof.
+    // CONTROL: three. (a) main.cpp's HttpServer constructed on kDefaultPort + 1, its
+    //       constructor still recording the bind -> "FAIL: config_server reads ok exactly
     //       when this daemon is the process holding 18462" with "  config_server: ok /
     //       listening, but 127.0.0.1:18462 is held by nobody". (b) the `status
     //       ["config_server"] = ...` line deleted from DbusService::getStatus -> "FAIL:
@@ -2709,17 +2710,20 @@ void checkConfigServerLostPort(NameWatcher& names, const std::string& bluePath, 
     //       is itself the evidence the daemon is alive. The alternative -- reading the
     //       daemon's stderr line -- says only that it printed something on the way past,
     //       which is the state this goal exists to improve on.
-    // CONTROL: three. (a) `manager.recordConfigServer(...)` deleted from main.cpp -> "FAIL:
-    //       a daemon that could not bind its config port reports config_server fail" and
-    //       "FAIL: the failed bind report names the port it could not take", with
-    //       "  config_server: pending / (empty), while 127.0.0.1:18462 is held by some other
-    //       process". (b) m_bindError reworded to "the config port could not be bound" ->
-    //       only the names-the-port check red, the fail one still green. (c) the bind
-    //       branch's `return` replaced with `throw std::runtime_error(m_bindError)` -> "FAIL:
-    //       a daemon that could not bind its config port still answers GetStatus" with
-    //       "  GetStatus failed: [org.freedesktop.DBus.Error.NoReply] Message recipient
-    //       disconnected from message bus without replying", plus the two shutdown checks
-    //       below. All reverted.
+    // CONTROL: three, all in HttpServer's constructor. (a) the bind-failure branch's
+    //       `m_manager.recordConfigServer(false, m_bindError)` deleted -> "FAIL: a daemon
+    //       that could not bind its config port reports config_server fail" and "FAIL: the
+    //       failed bind report names the port it could not take", with "  config_server:
+    //       pending / (empty), while 127.0.0.1:18462 is held by some other process". The
+    //       success-path record next to it is the wrong line to cut: deleting that one
+    //       instead leaves both checks green and reddens only the ok direction above.
+    //       (b) m_bindError reworded to "the config port could not be bound" -> only the
+    //       names-the-port check red, the fail one still green. (c) the bind branch's
+    //       `return` replaced with `throw std::runtime_error(m_bindError)` -> "FAIL: a
+    //       daemon that could not bind its config port still answers GetStatus", plus the
+    //       two shutdown checks below; which DBus error comes back depends on whether the
+    //       daemon dies before or after its name request, NoReply and ServiceUnknown both
+    //       observed. All reverted.
     check(dbusError.empty(), "a daemon that could not bind its config port still answers GetStatus");
     if (!dbusError.empty()) {
         std::fprintf(stderr, "  GetStatus failed: %s\n", dbusError.c_str());
@@ -2791,7 +2795,8 @@ void checkConfigServerLostPort(NameWatcher& names, const std::string& bluePath, 
     // still runs on a server that never started a serving thread.
     // CONTROL: control (c) above -- a throwing bind branch -> "FAIL: a daemon that could not
     //       bind its config port still exits 0 on SIGTERM" and "FAIL: ... still runs its
-    //       destructor chain" (exit 1, "fatal:" instead of "stopped cleanly"). Reverted.
+    //       destructor chain", the daemon having printed "fatal: could not bind
+    //       127.0.0.1:18462 ..." and never "stopped cleanly". Reverted.
     const int exitCode = daemon.shutdown(SIGTERM);
     const std::string output = daemon.output();
     if (output.find("Sanitizer: reported") != std::string::npos) {
