@@ -2163,6 +2163,17 @@ void checkBusLoss(const Check& check) {
     }
 }
 
+// The daemon's bind-failure wording, as this file has to match it in another process's
+// stderr. Duplicated from http_server.cpp's m_bindError -- a test cannot read a literal out
+// of a program it only spawns -- and that duplication is silent by nature: a reworded
+// message would turn checkHttpLifecycle's skip reason vague and, worse, turn
+// checkConfigServerLostPort's "the daemon died of the port conflict" FAIL into a skip.
+// So the marker is cross-checked against the daemon's own live report, where the same
+// string arrives over DBus. See the check on `reportDetail` in checkConfigServerLostPort.
+std::string bindFailureMarker(int port) {
+    return std::string("could not bind ") + wallpaperx::HttpServer::kLoopbackHost + ":" + std::to_string(port);
+}
+
 // ---------------------------------------------------------------------------- //
 // Phase 10 -- the HTTP config server, in the shipped binary, on the shipped port.
 // ---------------------------------------------------------------------------- //
@@ -2205,7 +2216,7 @@ void checkHttpLifecycle(NameWatcher& names, const std::string& bluePath, const s
     // waitForOutput returns false on timeout AND on the daemon exiting, and neither is
     // treated as data -- see the bind-failure branch.
     const std::string bindOk = std::string("config server on http://127.0.0.1:") + std::to_string(kPort);
-    const std::string bindFailed = std::string("could not bind 127.0.0.1:") + std::to_string(kPort);
+    const std::string bindFailed = bindFailureMarker(kPort);
     const bool listening = daemon.waitForOutput(bindOk, std::chrono::seconds(10));
     if (!listening) {
         const std::string why = daemon.output().find(bindFailed) != std::string::npos
@@ -2649,9 +2660,7 @@ void checkConfigServerLostPort(NameWatcher& names, const std::string& bluePath, 
     SpawnedDaemon daemon({validationEnv});
     if (!names.waitFor(true)) {
         const std::string startupOutput = daemon.output();
-        const std::string bindFailed = std::string("could not bind ") + wallpaperx::HttpServer::kLoopbackHost + ":" +
-                                       std::to_string(kPort);
-        if (startupOutput.find(bindFailed) != std::string::npos) {
+        if (startupOutput.find(bindFailureMarker(kPort)) != std::string::npos) {
             // It reached its bind attempt, failed it, and then never made it onto the bus.
             // That is the daemon dying of a port conflict, which is a finding and not a
             // reason to skip.
@@ -2717,8 +2726,10 @@ void checkConfigServerLostPort(NameWatcher& names, const std::string& bluePath, 
     //       pending / (empty), while 127.0.0.1:18462 is held by some other process". The
     //       success-path record next to it is the wrong line to cut: deleting that one
     //       instead leaves both checks green and reddens only the ok direction above.
-    //       (b) m_bindError reworded to "the config port could not be bound" -> only the
-    //       names-the-port check red, the fail one still green. (c) the bind branch's
+    //       (b) m_bindError reworded so the host:port moves into parentheses -> the
+    //       wording check below red, the fail one and the names-the-port one both still
+    //       green (that rewording keeps "127.0.0.1:18462" inside the detail).
+    //       (c) the bind branch's
     //       `return` replaced with `throw std::runtime_error(m_bindError)` -> "FAIL: a
     //       daemon that could not bind its config port still answers GetStatus", plus the
     //       two shutdown checks below; which DBus error comes back depends on whether the
@@ -2743,6 +2754,34 @@ void checkConfigServerLostPort(NameWatcher& names, const std::string& bluePath, 
         // a change of host or port fails the build rather than this assertion.
         check(reportDetail.find(hostPort) != std::string::npos,
               "the failed bind report names the port it could not take");
+
+        // GOAL: X.3 -- two fail-or-skip decisions in this file match the daemon's own
+        //       bind-failure wording in its stderr, and a test cannot read a literal out of
+        //       a program it only spawns. This asserts the duplicate is still the daemon's
+        //       string, so a rewording arrives as a named failure here rather than as those
+        //       two sites quietly deciding "skip" and "never reached its bind attempt".
+        // WHY-THIS-SHAPE: compared against the DETAIL the daemon just reported over DBus,
+        //       which http_server.cpp builds from the same m_bindError it prints. Matching
+        //       the daemon's stderr instead would be circular -- it is exactly the text
+        //       whose stability is in question, and both sides would move together. The
+        //       existing names-the-port check above does not cover this: it looks for
+        //       "127.0.0.1:18462", which survives any rewording around it.
+        // CONTROL: m_bindError reworded to "the config port could not be bound (" +
+        //       kLoopbackHost + ":" ... in http_server.cpp -> "FAIL: the bind-failure
+        //       wording this file matches on in the daemon's stderr is still the daemon's"
+        //       with '  bindFailureMarker(18462) = "could not bind 127.0.0.1:18462", but
+        //       the daemon reports "the config port could not be bound (127.0.0.1:18462)
+        //       (is another process using it?)"', and it was the run's only failure -- the
+        //       names-the-port check above stayed green, since the rewording kept the
+        //       host:port inside it. Reverted.
+        const std::string marker = bindFailureMarker(kPort);
+        check(reportDetail.find(marker) != std::string::npos,
+              "the bind-failure wording this file matches on in the daemon's stderr is still the daemon's");
+        if (reportDetail.find(marker) == std::string::npos) {
+            std::fprintf(stderr, "  bindFailureMarker(%d) = \"%s\", but the daemon reports \"%s\"\n", kPort,
+                         marker.c_str(), reportDetail.c_str());
+        }
+
         if (reportStatus != "fail" || reportDetail.find(hostPort) == std::string::npos) {
             std::fprintf(stderr, "  config_server: %s / %s, while %s is held by %s\n",
                          report ? reportStatus.c_str() : "(absent)",
