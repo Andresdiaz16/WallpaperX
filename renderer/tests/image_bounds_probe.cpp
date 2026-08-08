@@ -968,9 +968,10 @@ SwapResult loadWithRedirect(wallpaperx::Device& device, VkRenderPass renderPass,
     return result;
 }
 
-// GOAL: probes and decode read the image through ONE open, so the bytes the budget verdict
-//       was computed on cannot be replaced before they are decoded. False at 2 (a decode
-//       that reopens by path) or 3 (probes via stbi_info(path)/stbi_is_16_bit(path)).
+// GOAL: S4.11 -- the header verdict binds the bytes that are actually decoded. Probes and
+//       decode read the image through ONE open, so the bytes the budget verdict was
+//       computed on cannot be replaced before they are decoded. False at 2 (a decode that
+//       reopens by path) or 3 (probes via stbi_info(path)/stbi_is_16_bit(path)).
 // WHY-THIS-SHAPE: exactly 1, not "at most 2". Every open after the first admits a 16-bit
 //       file of identical geometry in place of the 8-bit one that was charged, and the
 //       post-decode guard compares dimensions -- which such a substitute matches -- so that
@@ -1016,9 +1017,10 @@ struct RedirectPhase {
     int expectRedirects;
 };
 
-// GOAL: the single open feeds BOTH the header probes and the decoder -- stb decodes the
-//       bytes the budget verdict was computed on. False for anything that reaches the file
-//       a second time, including by open(2), which the open counter cannot see.
+// GOAL: S4.11 -- the header verdict binds the bytes that are actually decoded, from the
+//       other side: the single open feeds BOTH the header probes and the decoder, so stb
+//       decodes the bytes the verdict was computed on. False for anything that reaches the
+//       file a second time, including by open(2), which the open counter cannot see.
 // WHY-THIS-SHAPE: the oracle is which image stb ALLOCATED for, watching the replacement's
 //       size present and the original's absent. "It constructed" would instead lean on
 //       production's post-decode dimension guard, and go green if that guard were deleted.
