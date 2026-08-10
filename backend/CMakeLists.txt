@@ -245,6 +245,12 @@ endif()
 
 # Registered outside the dbus-run-session guard below: this one talks to nothing.
 add_test(NAME log_escape COMMAND $<TARGET_FILE:wallpaperx-log-escape-test>)
+# `novulkan`, for the same reason the five renderer entries carry it: the TSan block below
+# is an allow-list on labels, so an unlabelled test is DISABLED there. sanitizeForLog is a
+# pure function of bytes and opens no driver, so the proprietary-ICD SEGV that forces that
+# tier to lavapipe-only cannot reach it -- and the documented manual fallback
+# `ctest -L 'lavapipe|novulkan'` needs the label to select it too.
+set_tests_properties(log_escape PROPERTIES LABELS "novulkan")
 
 # The DBus service test needs a session bus. dbus-run-session gives each run a
 # private one (isolated from the developer's real session, and works headless in
@@ -485,8 +491,8 @@ elseif(WALLPAPERX_SANITIZE STREQUAL "thread")
     # exits 0, which reads exactly like a clean gate. It happens whenever the lavapipe
     # ICD is missing, since every lavapipe entry is registered under find_file. Say so at
     # configure time -- by the time ctest is green it is too late to notice.
-    # Counted on the lavapipe entries specifically, not on the total. The novulkan five
-    # are single-threaded and always survive, so a total of 5 would satisfy an
+    # Counted on the lavapipe entries specifically, not on the total. The six novulkan
+    # entries are single-threaded and always survive, so a total of 6 would satisfy an
     # "anything left?" check while detecting no race whatever -- every threaded path in
     # this project reaches TSan through a lavapipe entry. Without the ICD that is what
     # the tier degrades to, and it still exits 0.

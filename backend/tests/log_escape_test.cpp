@@ -91,25 +91,57 @@ bool isValidUtf8(std::string_view text) {
     return true;
 }
 
+// A `\xNN` escape in the output, told apart from the two characters a backslash-x pair in
+// the INPUT turns into. Backslash is always escaped, so every backslash in the output opens
+// an escape: pairing left to right, `\\` consumes both bytes and the `x` after it is
+// ordinary text. A plain find("\\x") cannot make that distinction -- input 5c 78 becomes
+// `\\x`, which contains the substring with nothing having been hex-escaped.
+bool hasHexEscape(std::string_view out) {
+    for (std::size_t i = 0; i + 1 < out.size(); ++i) {
+        if (out[i] != '\\') continue;
+        if (out[i + 1] == 'x') return true;
+        ++i;  // \\ \" \n \r \t -- the next byte belongs to this escape
+    }
+    return false;
+}
+
 // What the sweep actually did, so a future edit that narrows the corpus fails instead of
 // going quiet. Counted, not estimated: the strength of a "for every input" check is exactly
 // the number of inputs it saw.
+//
+// The two input classes are measured with this file's own validator, never with
+// sanitizeForLog's result, so they say what the corpus contained and cannot move when
+// production changes.
 struct Sweep {
     long long combinations = 0;
-    long long truncatedOutputs = 0;  // outputs carrying the truncation marker
-    long long escapingOutputs = 0;   // outputs carrying at least one \xNN escape
-    long long rejected = 0;          // outputs that failed either oracle
+    long long truncatedOutputs = 0;   // outputs carrying the truncation marker
+    long long escapingOutputs = 0;    // outputs carrying at least one \xNN escape
+    long long illFormedInputs = 0;    // inputs that are not valid UTF-8
+    long long multiByteInputs = 0;    // inputs that are valid UTF-8 and not all ASCII
+    long long rejected = 0;           // outputs that failed either oracle
     std::string firstRejectedInput;
     std::string firstRejectedWhy;
 };
 
 constexpr const char* kTruncationMarker = "... [truncated, ";
 
+bool anyByteHighBitSet(std::string_view text) {
+    for (const char c : text) {
+        if (static_cast<unsigned char>(c) >= 0x80) return true;
+    }
+    return false;
+}
+
 void sanitizeAndValidate(Sweep& sweep, std::string_view input, std::size_t cap, LogFraming framing) {
     const std::string out = sanitizeForLog(input, cap, framing);
     ++sweep.combinations;
     if (out.find(kTruncationMarker) != std::string::npos) ++sweep.truncatedOutputs;
-    if (out.find("\\x") != std::string::npos) ++sweep.escapingOutputs;
+    if (hasHexEscape(out)) ++sweep.escapingOutputs;
+    if (!isValidUtf8(input)) {
+        ++sweep.illFormedInputs;
+    } else if (anyByteHighBitSet(input)) {
+        ++sweep.multiByteInputs;
+    }
 
     std::string why;
     if (!isValidUtf8(out)) {
@@ -147,9 +179,13 @@ void sanitizeAndValidate(Sweep& sweep, std::string_view input, std::size_t cap, 
 // CONTROL: log_escape.h's invalid-scalar branch changed from escapeByte(head[i]) to
 //       `out += head[i]` -> "FAIL: sanitizeForLog returns valid UTF-8 that json::dump()
 //       accepts, for every input in the sweep". Reverted.
-// COVERAGE-ASSERT: the combination count, the number of outputs that actually truncated and
-//       the number that actually escaped something are all asserted below. A corpus edited
-//       down to ASCII would satisfy the validity check trivially and fail those three.
+// COVERAGE-ASSERT: five counts below, and two of them are about the CORPUS rather than about
+//       any output: how many inputs were ill-formed UTF-8 and how many were valid non-ASCII.
+//       Both are exact, and both are computed with this file's validator, so narrowing the
+//       byte sweeps -- the edit that leaves an "every input" claim never fed a multi-byte
+//       sequence -- reddens them. The truncated and escaping counts alone cannot do that
+//       job: cap 0/1 truncates any ASCII string and 0x00-0x1F escapes, so both stay above
+//       zero on a corpus with no high byte in it.
 void runValidityChecks(Sweep& sweep) {
     constexpr std::size_t kCaps[] = {0, 1, 2, 3, 4, 8, 1024, 4096};
     constexpr LogFraming kFramings[] = {LogFraming::Quoted, LogFraming::Bare};
@@ -162,13 +198,16 @@ void runValidityChecks(Sweep& sweep) {
         }
     }
 
-    // Every two-byte sequence. Caps 1 and 2 put the cut inside it; 4096 leaves it whole.
+    // Every two-byte sequence. Cap 1 puts the cut inside it; 4096 leaves it whole. Cap 2 is
+    // deliberately not here: sanitizeForLog truncates on `size > maxBytes`, strictly, so a
+    // two-byte input at cap 2 takes the same branch as at cap 4096 and produces the identical
+    // string -- 65,536 combinations that assert nothing the cap-4096 pass has not.
     for (int first = 0; first < 256; ++first) {
         for (int second = 0; second < 256; ++second) {
             std::string pair;
             pair += static_cast<char>(first);
             pair += static_cast<char>(second);
-            for (const std::size_t cap : {std::size_t{1}, std::size_t{2}, std::size_t{4096}}) {
+            for (const std::size_t cap : {std::size_t{1}, std::size_t{4096}}) {
                 sanitizeAndValidate(sweep, pair, cap, LogFraming::Quoted);
             }
         }
@@ -203,15 +242,31 @@ void runValidityChecks(Sweep& sweep) {
                      sweep.combinations, sweep.firstRejectedInput.c_str(), sweep.firstRejectedWhy.c_str());
     }
 
-    // 256*8*2 + 65536*3 + 12*8*2 = 200,896.
-    constexpr long long kExpectedCombinations = 200896;
+    // 256*8*2 + 65536*2 + 12*8*2 = 135,360.
+    constexpr long long kExpectedCombinations = 135360;
+
+    // Both derived from the corpus, not measured off a run. Ill-formed: 128 single bytes
+    // >= 0x80, plus the 65536-18304 pairs that are neither two ASCII bytes nor a lead in
+    // C2..DF with a continuation, plus 10 of the 12 named strings -- 128*16 + 47232*2 +
+    // 10*16. Valid non-ASCII: no single byte qualifies, 30*64 pairs do, and 2 named strings
+    // -- 1920*2 + 2*16.
+    constexpr long long kExpectedIllFormed = 96672;
+    constexpr long long kExpectedMultiByte = 3872;
+
     check(sweep.combinations == kExpectedCombinations,
           "the validity sweep covered every combination it is written to cover");
     check(sweep.truncatedOutputs > 0 && sweep.escapingOutputs > 0,
           "the sweep actually exercised truncation and escaping, rather than only bytes that pass through");
-    if (sweep.combinations != kExpectedCombinations || sweep.truncatedOutputs == 0 || sweep.escapingOutputs == 0) {
-        std::fprintf(stderr, "  %lld combinations (expected %lld), %lld truncated, %lld escaping\n",
-                     sweep.combinations, kExpectedCombinations, sweep.truncatedOutputs, sweep.escapingOutputs);
+    check(sweep.illFormedInputs == kExpectedIllFormed && sweep.multiByteInputs == kExpectedMultiByte,
+          "the sweep fed the ill-formed and the valid multi-byte inputs it is written to feed");
+    if (sweep.combinations != kExpectedCombinations || sweep.truncatedOutputs == 0 ||
+        sweep.escapingOutputs == 0 || sweep.illFormedInputs != kExpectedIllFormed ||
+        sweep.multiByteInputs != kExpectedMultiByte) {
+        std::fprintf(stderr,
+                     "  %lld combinations (expected %lld), %lld truncated, %lld escaping, %lld ill-formed "
+                     "(expected %lld), %lld valid multi-byte (expected %lld)\n",
+                     sweep.combinations, kExpectedCombinations, sweep.truncatedOutputs, sweep.escapingOutputs,
+                     sweep.illFormedInputs, kExpectedIllFormed, sweep.multiByteInputs, kExpectedMultiByte);
     }
 }
 
@@ -229,8 +284,8 @@ void runValidityChecks(Sweep& sweep) {
 //       Bare mode, and asserting the exact text is what makes that testable at all.
 // CONTROL: the `while (truncated && cut > 0 && ...)` back-off loop deleted from
 //       sanitizeForLog -> "FAIL: truncating valid UTF-8 cuts at a character boundary rather
-//       than severing a character into escapes", with `"aaaaaaaa\xe2\x82"...` against the
-//       expected `"aaaaaaaa"...`. Reverted.
+//       than severing a character into escapes", first mangling reported as
+//       `got "aaaaaaaa\xc3"...` against the expected `"aaaaaaaa"...`. Reverted.
 // COVERAGE-ASSERT: the straddle count is asserted. Every offset inside every character
 //       length is what makes this a statement about the back-off rather than about one
 //       lucky cap, and a corpus quietly reduced to the boundary-aligned offset 0 -- the one
@@ -295,7 +350,8 @@ int main() {
         return 1;
     }
     std::printf("log_escape_test: all checks passed (%lld sanitize/dump combinations, %lld truncated, %lld "
-                "escaping)\n",
-                sweep.combinations, sweep.truncatedOutputs, sweep.escapingOutputs);
+                "escaping, %lld ill-formed inputs, %lld valid multi-byte inputs)\n",
+                sweep.combinations, sweep.truncatedOutputs, sweep.escapingOutputs, sweep.illFormedInputs,
+                sweep.multiByteInputs);
     return 0;
 }

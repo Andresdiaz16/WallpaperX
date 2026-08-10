@@ -461,36 +461,59 @@ std::string nonLoopbackAddress() {
     return found;
 }
 
+// The wording http_server.cpp stamps into config_server health when bind_to_port fails.
+// One definition, shared by startServer's rejection predicate below and by S7.7's
+// discrimination check in runBindChecks: a reword then reddens S7.7 rather than quietly
+// turning the rejection predicate into something that never fires.
+constexpr const char* kBindRefusedMarker = "could not bind ";
+
 // Starts an HttpServer on a port the OS says is free, retrying if something took the port
-// in between. Returns null with `reason` filled only when this host would not name an
+// in between. Returns null with `reason` filled only when no attempt could obtain an
 // ephemeral port at all -- the one condition here that may be reported as a skip.
 //
-// WHY-THIS-SHAPE: the accept predicate is the socket, never the manager's published health.
-//       Gating on `snapshot().health.configServer` would make the harness read the very
-//       value the graded checks grade: a change that broke publication of a *successful*
-//       bind would leave all 8 attempts looking failed, and a daemon defect would end the
-//       process at exit 77 -- a ctest SKIP -- with no check ever naming it. X.3 forbids
-//       blaming the daemon for a host fault; that is its mirror image.
-//       The retry still has to exist, because freePort() is racy. What it must not do is
-//       end in a skip, and no probe can tell "another process took the port" from "our
-//       server bound it and does not serve": both leave a listener on the port that is not
-//       ours to identify, and a server whose thread never started still holds its socket,
-//       so even asking the kernel with our own server destroyed answers in-use. So the
-//       ambiguity is removed rather than resolved -- the last attempt hands its server back
-//       instead of destroying it. Null, and therefore a skip, is then reachable only when
-//       the host would not hand out an ephemeral port at all, which is a fact about the
-//       host that no daemon change can produce.
-// CONTROL: two, reverted. (a) recordConfigServer(true, {}) changed to record a failure ->
-//       "FAIL: the daemon that is serving reports config_server ok" and ctest Failed, where
-//       the health-gated shape exited 77. (b) the constructor made to return after a
-//       successful bind, so it publishes nothing and serves nothing -> twelve FAIL lines and
-//       ctest Failed, where a kernel-discriminating draft of this reported Skipped.
+// WHY-THIS-SHAPE: two predicates, and which one does which job is the whole point.
+//       ACCEPTANCE is the socket: a server is handed back because it answered /health.
+//       Gating acceptance on `snapshot().health.configServer` would make the harness read
+//       the very value the graded checks grade -- a change that broke publication of a
+//       *successful* bind would leave every attempt looking failed and end the process at
+//       exit 77, a ctest SKIP, with no check ever naming the defect.
+//       REJECTION is health, and only health: `/health` answering proves a listener exists,
+//       never that the listener is ours, so losing the freePort() race to a stranger (a
+//       second ctest entry is a real case -- see this file's header) would otherwise hand
+//       back a server that never bound and let every later phase grade a foreign socket.
+//       Our own constructor is the one witness that can settle it, and it settles only the
+//       negative: a config_server detail carrying kBindRefusedMarker is this HttpServer
+//       saying it did not get the port. Health is never used to accept, so a broken
+//       publication still reaches the graded checks as FAIL rather than as a skip.
+//       Null is reachable only when freePort() failed on every attempt: a server that was
+//       constructed is handed back even if it was rejected or never answered, because a
+//       daemon that cannot serve on eight different free ports is a defect for the checks
+//       to report, not a host fact to skip on. The last-attempt hand-back is tested BEFORE
+//       the probe, since on that attempt the probe's answer cannot change the outcome and
+//       costs up to three seconds of timeout.
+// CONTROL: three, reverted. (a) recordConfigServer(true, {}) changed to record a failure ->
+//       "FAIL: the daemon that is serving reports config_server ok" and ctest Failed, not a
+//       skip. (b) the constructor made to return after a successful bind, so it publishes
+//       nothing and serves nothing -> many FAIL lines and ctest Failed. (c) freePort() made
+//       to return -1 always -> the one NOT VERIFIED path, ctest Skipped.
 std::unique_ptr<HttpServer> startServer(WallpaperManager& manager, std::string& reason) {
     constexpr int kAttempts = 8;
+    // Held across iterations so a later freePort() failure cannot throw away a server that
+    // was already built: the loop below only ever destroys one because it has a port to
+    // build the next on, and HttpServer permits one claim per manager at a time.
+    std::unique_ptr<HttpServer> server;
     for (int attempt = 0; attempt < kAttempts; ++attempt) {
         const int port = freePort();
         if (port < 0) continue;
-        auto server = std::make_unique<HttpServer>(manager, port);
+        server.reset();
+        server = std::make_unique<HttpServer>(manager, port);
+        if (attempt == kAttempts - 1) return server;
+
+        const wallpaperx::HealthCheck record = manager.snapshot().health.configServer;
+        const bool selfReportedBindRefusal = record.status == wallpaperx::HealthStatus::Fail &&
+                                             record.detail.find(kBindRefusedMarker) != std::string::npos;
+        if (selfReportedBindRefusal) continue;
+
         httplib::Client cli = makeClient(port);
         // Both bounded well below makeClient's defaults. A loopback server that is alive
         // answers /health in microseconds, so these can only shorten the wait on a server
@@ -498,10 +521,8 @@ std::unique_ptr<HttpServer> startServer(WallpaperManager& manager, std::string& 
         cli.set_connection_timeout(std::chrono::seconds(2));
         cli.set_read_timeout(std::chrono::seconds(1));
         if (get(cli, "/health").reached) return server;
-        // Destroyed before the next attempt, except on the last one: it still holds this
-        // manager's config-server claim, and HttpServer permits only one at a time.
-        if (attempt == kAttempts - 1) return server;
     }
+    if (server != nullptr) return server;
     reason = "this host would not hand out an ephemeral loopback port on any of " + std::to_string(kAttempts) +
              " attempts";
     return nullptr;
@@ -824,10 +845,11 @@ void runBindChecks(sdbus::IProxy& proxy, WallpaperManager& manager, HttpServer& 
     //       bindError text -> only names-the-port red, which is what keeps it distinct from
     //       "something failed". (d) recordConfigServer(false, "") -> records-why,
     //       names-the-port and names-the-bind-refusal red.
-    // COVERAGE-ASSERT: the marker below is production's own wording. If it is reworded the
-    //       check goes red rather than quiet, which is the intended failure -- a detail
-    //       nobody can attribute to a writer is the state this check exists to forbid.
-    static constexpr const char* kBindRefusedMarker = "could not bind ";
+    // COVERAGE-ASSERT: kBindRefusedMarker is production's own wording, and it is file-scope
+    //       because startServer's rejection predicate keys on the same string. A reword
+    //       reddens this check -- which is the intended failure, a detail nobody can
+    //       attribute to a writer being the state this check exists to forbid -- rather than
+    //       silently leaving that predicate matching nothing.
 
     HeldPort taken;
     if (!taken.open(INADDR_LOOPBACK)) {
@@ -887,88 +909,132 @@ void runBindChecks(sdbus::IProxy& proxy, WallpaperManager& manager, HttpServer& 
     const bool statusUsable = !status.is_discarded() && status.is_object();
     check(statusUsable && status.value("running", false),
           "DBus still answers GetStatus after an HTTP bind failure");
-    // A reply that never arrived is one fault, not two: the checks below read fields of
-    // that reply, so grading them as well would blame config_server for a dead bus. Gated
-    // rather than returned from, so the release half at the end of this function -- which
-    // needs no bus and no held port -- is still graded when either is unavailable.
+    // A reply that never arrived is one fault, not two: the check below reads a field of
+    // that reply, so grading it as well would blame config_server for a dead bus.
+    //
+    // Read over DBus rather than off the manager: config_server is not on /health at all
+    // (see DaemonHealth::configServer), so the bus is the only channel a client can learn
+    // the bind result from. This is also the field startServer never ACCEPTS a server on --
+    // a harness that did could absorb a broken publication into a skip instead of a failure.
+    bool servedReportPresent = false;
+    std::string servedStatus;
+    std::string servedDetail;
     if (statusUsable) {
-        // Read over DBus rather than off the manager: config_server is not on /health at
-        // all (see DaemonHealth::configServer), so the bus is the only channel a client can
-        // learn the bind result from. This is also the field startServer deliberately does
-        // NOT gate on -- a harness that accepted a server on the strength of it could
-        // absorb a broken publication into a skip instead of a failure.
         const nlohmann::json* servedReport =
             status.contains("config_server") && status["config_server"].is_object() ? &status["config_server"]
                                                                                     : nullptr;
-        const std::string servedStatus = servedReport != nullptr ? servedReport->value("status", std::string()) : "";
-        const std::string servedDetail = servedReport != nullptr ? servedReport->value("detail", std::string()) : "";
+        servedReportPresent = servedReport != nullptr;
+        if (servedReport != nullptr) {
+            servedStatus = servedReport->value("status", std::string());
+            servedDetail = servedReport->value("detail", std::string());
+        }
         check(servedStatus == "ok", "the daemon that is serving reports config_server ok");
         if (servedStatus != "ok") {
             std::fprintf(stderr, "  config_server: %s / %s, on a daemon serving %d\n", servedStatus.c_str(),
-                         servedReport != nullptr ? servedDetail.c_str() : "(absent)", server.port());
+                         servedReportPresent ? servedDetail.c_str() : "(absent)", server.port());
+        }
+    }
+
+    // GOAL: S7.20's refusal half -- HttpServer *enforces* at most one instance per
+    //       WallpaperManager rather than trusting callers to observe the rule. False if a
+    //       second server can construct on, or publish into, a manager that already has one.
+    // WHY-THIS-SHAPE: outside the statusUsable gate, because the refusal itself needs no bus
+    //       at all: nested inside it, an unusable GetStatus reply would drop the only check
+    //       in the suite that establishes the one-server rule, and drop it with no
+    //       NOT VERIFIED row -- a phase that could not run has to say so. Only the
+    //       publish-nothing comparison needs the bus, and it is gated separately.
+    //       The second server is aimed at a port this test holds, so with the guard gone it
+    //       does not merely construct quietly -- it stamps a bind failure over a daemon that
+    //       is serving, which is the damage the invariant exists to prevent. Aimed at a free
+    //       port instead, both servers would record ok with an empty detail and no health
+    //       read could tell them apart. The record is compared before against after rather
+    //       than asserted to be "ok", so this states something about the refused server
+    //       rather than restating the check above it.
+    //       The catch is layered rather than narrow: std::logic_error is the contract and is
+    //       what `refused` grades, but a bare `catch (const std::logic_error&)` lets any
+    //       other type escape runBindChecks into main's handler, which abandons every
+    //       remaining phase in this file behind one opaque line and no NOT VERIFIED row. So
+    //       the broader handlers exist to keep the run alive and to name what was thrown;
+    //       they do not make a wrong type pass.
+    // CONTROL: two, reverted. (a) tryAttachConfigServer() made to always return true ->
+    //       "FAIL: a second HttpServer on a manager that already has one is refused with
+    //       std::logic_error" and "FAIL: a refused second server publishes nothing into the
+    //       serving daemon's config_server health". (b) the guard's throw changed to
+    //       std::runtime_error -> the refusal check red, with the thrown type printed, and
+    //       the phases after this one still running.
+    HeldPort blocked;
+    if (!blocked.open(INADDR_LOOPBACK)) {
+        notVerified("S7.20 (one config server per manager, refusal half)",
+                    "could not hold a loopback port for a second server to fail to bind on");
+    } else {
+        bool refused = false;
+        std::string wrongThrow;
+        try {
+            HttpServer second(manager, blocked.port());
+            std::fprintf(stderr, "  a second HttpServer constructed on the run's manager, reporting port %d\n",
+                         second.port());
+        } catch (const std::logic_error&) {
+            refused = true;
+        } catch (const std::exception& e) {
+            wrongThrow = std::string("a std::exception that is not a std::logic_error: ") + e.what();
+        } catch (...) {
+            wrongThrow = "something that is not a std::exception at all";
+        }
+        check(refused, "a second HttpServer on a manager that already has one is refused with std::logic_error");
+        if (!wrongThrow.empty()) {
+            std::fprintf(stderr, "  the second HttpServer threw %s\n", wrongThrow.c_str());
         }
 
-        // GOAL: S7.20's refusal half -- HttpServer *enforces* at most one instance per
-        //       WallpaperManager rather than trusting callers to observe the rule. False if
-        //       a second server can publish into a manager that already has one.
-        // WHY-THIS-SHAPE: the second server is aimed at a port this test holds, so with the
-        //       guard gone it does not merely construct quietly -- it stamps a bind failure
-        //       over a daemon that is serving, which is the damage the invariant exists to
-        //       prevent. Aimed at a free port instead, both servers would record ok with an
-        //       empty detail and no health read could tell them apart. The record is
-        //       compared before against after rather than asserted to be "ok", so this
-        //       states something about the refused server rather than restating the check
-        //       above it.
-        // CONTROL: tryAttachConfigServer() made to always return true -> "FAIL: a second
-        //       HttpServer on a manager that already has one is refused" and "FAIL: a
-        //       refused second server publishes nothing into the serving daemon's
-        //       config_server health". Reverted.
-        HeldPort blocked;
-        if (!blocked.open(INADDR_LOOPBACK)) {
-            notVerified("S7.20 (one config server per manager, refusal half)",
-                        "could not hold a loopback port for a second server to fail to bind on");
+        // Gated on the FIRST read having produced a config_server object as well as on the
+        // second arriving. Without the first gate an absent config_server is graded twice --
+        // once above as "not ok" and again here as the refused server having changed it --
+        // two named properties failing for one defect that predates the refusal. Without the
+        // second, a bus hiccup between the two calls prints as the registration guard
+        // leaking, which is the harness blaming production for a dropped reply.
+        const nlohmann::json afterStatus = getStatus(proxy);
+        const bool afterUsable = !afterStatus.is_discarded() && afterStatus.is_object();
+        if (!servedReportPresent || !afterUsable) {
+            notVerified("S7.20 (one config server per manager, publish-nothing half)",
+                        servedReportPresent
+                            ? "the GetStatus reply after the refusal did not arrive, so there is nothing to "
+                              "compare the before-reading against"
+                            : "GetStatus carried no config_server object before the refusal, so no before-reading "
+                              "exists to compare against");
         } else {
-            bool refused = false;
-            try {
-                HttpServer second(manager, blocked.port());
-                std::fprintf(stderr, "  a second HttpServer constructed on the run's manager, reporting port %d\n",
-                             second.port());
-            } catch (const std::logic_error&) {
-                refused = true;
-            }
-            check(refused, "a second HttpServer on a manager that already has one is refused");
-
-            const nlohmann::json afterStatus = getStatus(proxy);
-            const nlohmann::json* afterReport = !afterStatus.is_discarded() && afterStatus.is_object() &&
-                                                        afterStatus.contains("config_server") &&
-                                                        afterStatus["config_server"].is_object()
-                                                    ? &afterStatus["config_server"]
-                                                    : nullptr;
+            const bool afterPresent =
+                afterStatus.contains("config_server") && afterStatus["config_server"].is_object();
             const std::string afterStatusText =
-                afterReport != nullptr ? afterReport->value("status", std::string()) : "";
-            const std::string afterDetail = afterReport != nullptr ? afterReport->value("detail", std::string()) : "";
-            check(afterReport != nullptr && afterStatusText == servedStatus && afterDetail == servedDetail,
-                  "a refused second server publishes nothing into the serving daemon's config_server health");
-            if (afterStatusText != servedStatus || afterDetail != servedDetail) {
+                afterPresent ? afterStatus["config_server"].value("status", std::string()) : "";
+            const std::string afterDetail =
+                afterPresent ? afterStatus["config_server"].value("detail", std::string()) : "";
+            const bool unchanged = afterPresent && afterStatusText == servedStatus && afterDetail == servedDetail;
+            check(unchanged, "a refused second server publishes nothing into the serving daemon's config_server "
+                             "health");
+            if (!unchanged) {
                 std::fprintf(stderr, "  config_server went from %s / %s to %s / %s across a refused second server\n",
-                             servedStatus.c_str(), servedDetail.c_str(), afterStatusText.c_str(),
-                             afterDetail.c_str());
+                             servedStatus.c_str(), servedDetail.c_str(),
+                             afterPresent ? afterStatusText.c_str() : "(absent)", afterDetail.c_str());
             }
-            const HttpReply survived = get(cli, "/health");
-            check(survived.reached && survived.status == 200,
-                  "the daemon kept serving across a second server being refused");
         }
+
+        const HttpReply survived = get(cli, "/health");
+        check(survived.reached && survived.status == 200,
+              "the daemon kept serving across a second server being refused");
     }
 
     // GOAL: S7.20's release half -- a destroyed server releases its claim, so servers may
     //       attach and release in sequence. False if a destroyed server's claim outlives it,
     //       which would break the ordinary attach-release-attach shape startServer's retry
     //       and both shutdown phases depend on, not just a pathological one.
-    // WHY-THIS-SHAPE: only the construction is graded. Requiring the re-attached server to
-    //       also answer would make a lost race for `reattachPort` -- freePort() is racy by
-    //       construction -- print as a failure of the claim being released. On its own
-    //       manager, because the shared one has a live server on it and "a manager that had
-    //       a server and no longer does" is not a state it can be put into.
+    // WHY-THIS-SHAPE: only the construction is graded, and only the construction is inside
+    //       the try that feeds `reattachError`. Requiring the re-attached server to also
+    //       answer would make a lost race for `reattachPort` -- freePort() is racy by
+    //       construction -- print as a failure of the claim being released; leaving the
+    //       client calls in the same try does the same thing more quietly, since any
+    //       std::exception out of makeClient or get() would then read as "the manager failed
+    //       to release its claim" and be indistinguishable from the CONTROL's red line. On
+    //       its own manager, because the shared one has a live server on it and "a manager
+    //       that had a server and no longer does" is not a state it can be put into.
     // CONTROL: ~Registration's detachConfigServer() call deleted -> "FAIL: a destroyed
     //       server releases its claim on the manager, so a later one can attach". Reverted.
     WallpaperManager sequentialManager{WallpaperManager::Config{}};
@@ -983,14 +1049,20 @@ void runBindChecks(sdbus::IProxy& proxy, WallpaperManager& manager, HttpServer& 
         notVerified("S7.20 (one config server per manager, release half)",
                     firstStarted ? "no ephemeral port could be probed for the second attach" : firstReason);
     } else {
-        std::string reattachError;
+        std::string reattachError;  // graded
+        std::string probeError;     // printed only -- a client fault is not a claim leak
         try {
             HttpServer again(sequentialManager, reattachPort);
             // Served before it is destroyed, per this file's standing rule; the reply is
             // not graded, because a lost race for `reattachPort` would make it a statement
-            // about the port and not about the claim being released.
-            httplib::Client c = makeClient(again.port());
-            (void)get(c, "/health");
+            // about the port and not about the claim being released. Its own try for the
+            // same reason: nothing this client does may reach `reattachError`.
+            try {
+                httplib::Client c = makeClient(again.port());
+                (void)get(c, "/health");
+            } catch (const std::exception& e) {
+                probeError = e.what();
+            }
         } catch (const std::exception& e) {
             reattachError = e.what();
         }
@@ -999,6 +1071,10 @@ void runBindChecks(sdbus::IProxy& proxy, WallpaperManager& manager, HttpServer& 
         if (!reattachError.empty()) {
             std::fprintf(stderr, "  attaching a second server after the first was destroyed: %s\n",
                          reattachError.c_str());
+        }
+        if (!probeError.empty()) {
+            std::fprintf(stderr, "  the re-attached server was built, but the harness could not probe it: %s\n",
+                         probeError.c_str());
         }
     }
 }
