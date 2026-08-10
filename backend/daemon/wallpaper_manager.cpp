@@ -107,6 +107,12 @@ void WallpaperManager::recordConfigServer(bool listening, const std::string& err
                  listening ? "listening" : error);
 }
 
+void WallpaperManager::recordConfigServerShutdown(const std::string& detail) {
+    std::lock_guard<std::mutex> stateLock(m_stateMutex);
+    if (m_health.configServer.status != HealthStatus::Ok) return;
+    recordHealthLocked(&DaemonHealth::configServer, HealthStatus::Fail, detail);
+}
+
 bool WallpaperManager::tryAttachConfigServer() {
     std::lock_guard<std::mutex> stateLock(m_stateMutex);
     if (m_configServerAttached) return false;

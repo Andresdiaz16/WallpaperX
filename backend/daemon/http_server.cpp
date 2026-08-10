@@ -86,8 +86,8 @@ HttpServer::Registration::~Registration() {
     // The manager can outlive the server. Without this it would go on publishing the last
     // thing the server said -- ok, for a port that is now closed -- and there is nothing
     // else left to contradict it.
-    m_manager.recordConfigServer(false, std::string("the config server on ") + kLoopbackHost + ":" +
-                                            std::to_string(m_port) + " was shut down");
+    m_manager.recordConfigServerShutdown(std::string("the config server on ") + kLoopbackHost + ":" +
+                                         std::to_string(m_port) + " was shut down");
     m_manager.detachConfigServer();
 }
 
