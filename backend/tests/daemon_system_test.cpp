@@ -2163,13 +2163,66 @@ void checkBusLoss(const Check& check) {
     }
 }
 
+// Used by both phases below: phase 10 asks the daemon what it thinks of its config port
+// when the line it was waiting for never arrived, phase 11 grades the answer.
+
+// GetStatus's config_server object, or nullptr when the reply does not carry one. Same
+// reason wallpaperStatus() exists: operator[] on a const json missing the key dereferences
+// end() under NDEBUG, so a daemon that dropped the field would crash the test instead of
+// failing the check written to catch exactly that.
+const nlohmann::json* configServerReport(const nlohmann::json& status) {
+    if (status.is_discarded() || !status.is_object() || !status.contains("config_server")) return nullptr;
+    const nlohmann::json& report = status["config_server"];
+    return report.is_object() ? &report : nullptr;
+}
+
+// GetStatus with the throw turned into a value. "Is the daemon still answering DBus" is
+// the question the phases below exist to decide, so a dropped connection is data here and
+// must not escape into the run's catch-all as an unexplained exception.
+nlohmann::json statusOrError(sdbus::IProxy& proxy, std::string& error) {
+    try {
+        return getStatus(proxy);
+    } catch (const std::exception& e) {
+        error = e.what();
+        return nlohmann::json();
+    }
+}
+
+// The daemon's own verdict on its config port ("ok", "fail", "pending"), or empty when it
+// could not be asked -- with `why` saying which, since "the daemon says it failed to bind"
+// and "the daemon is gone" lead to different decisions. Opens its own proxy: the caller
+// that needs this has not built one yet, and a proxy is cheap next to a spawn.
+std::string askConfigServerStatus(std::string& detail, std::string& why) {
+    try {
+        auto proxy =
+            sdbus::createProxy(sdbus::ServiceName{DbusService::kBusName}, sdbus::ObjectPath{DbusService::kObjectPath});
+        std::string dbusError;
+        const nlohmann::json status = statusOrError(*proxy, dbusError);
+        if (!dbusError.empty()) {
+            why = dbusError;
+            return {};
+        }
+        const nlohmann::json* report = configServerReport(status);
+        if (report == nullptr) {
+            why = "GetStatus carried no config_server object";
+            return {};
+        }
+        detail = report->value("detail", std::string());
+        return report->value("status", std::string());
+    } catch (const std::exception& e) {
+        why = e.what();
+        return {};
+    }
+}
+
 // The daemon's bind-failure wording, as this file has to match it in another process's
-// stderr. Duplicated from http_server.cpp's m_bindError -- a test cannot read a literal out
-// of a program it only spawns -- and that duplication is silent by nature: a reworded
-// message would turn checkHttpLifecycle's skip reason vague and, worse, turn
-// checkConfigServerLostPort's "the daemon died of the port conflict" FAIL into a skip.
-// So the marker is cross-checked against the daemon's own live report, where the same
-// string arrives over DBus. See the check on `reportDetail` in checkConfigServerLostPort.
+// stderr. Duplicated from the `bindError` local http_server.cpp builds on its failed-bind
+// path -- a test cannot read a literal out of a program it only spawns -- and that
+// duplication is silent by nature: a reworded message would turn checkHttpLifecycle's skip
+// reason vague and, worse, turn checkConfigServerLostPort's "the daemon died of the port
+// conflict" FAIL into a skip. So the marker is cross-checked against the daemon's own live
+// report, where the same string arrives over DBus. See the check on `reportDetail` in
+// checkConfigServerLostPort.
 std::string bindFailureMarker(int port) {
     return std::string("could not bind ") + wallpaperx::HttpServer::kLoopbackHost + ":" + std::to_string(port);
 }
@@ -2217,17 +2270,50 @@ void checkHttpLifecycle(NameWatcher& names, const std::string& bluePath, const s
     // treated as data -- see the bind-failure branch.
     const std::string bindOk = std::string("config server on http://127.0.0.1:") + std::to_string(kPort);
     const std::string bindFailed = bindFailureMarker(kPort);
-    const bool listening = daemon.waitForOutput(bindOk, std::chrono::seconds(10));
+    bool listening = daemon.waitForOutput(bindOk, std::chrono::seconds(10));
     if (!listening) {
-        const std::string why = daemon.output().find(bindFailed) != std::string::npos
-                                    ? std::string("port ") + std::to_string(kPort) +
-                                          " is held by another process on this machine (a real wallpaperx-daemon?), "
-                                          "so the spawned daemon could not bind it"
-                                    : "the daemon printed neither the bind-success nor the bind-failure line for "
-                                      "port " + std::to_string(kPort);
-        notVerified("S7.8/S7.11 (the HTTP server's process lifecycle)", why);
-        daemon.shutdown(SIGTERM);
-        return;
+        // GOAL: X.3, in the direction that hides coverage rather than accusing production --
+        //       a rewording of the daemon's bind-success line must arrive here as a named
+        //       failure, never as a skip. `bindOk` duplicates a literal no test can read out
+        //       of a process it only spawns, so a stale duplicate would silently delete this
+        //       whole phase.
+        // WHY-THIS-SHAPE: bindFailureMarker's trick -- cross-check the duplicate against the
+        //       daemon's own DBus detail -- does not transfer: the success path records an
+        //       EMPTY detail, so there is no string to compare. What DBus does carry is the
+        //       verdict. main.cpp answers GetStatus only from its event loop, which it
+        //       reaches after the HttpServer constructor and so after that printf has run;
+        //       a daemon reporting ok that never printed the line therefore means the literal
+        //       here has drifted, not that the daemon is slow. The second wait covers only
+        //       the capture pipe's drain, and it expires into the FAIL, never into a pass.
+        // CONTROL: the success printf in http_server.cpp reworded to "config server
+        //       listening on http://%s:%d" -> "FAIL: the bind-success wording this phase
+        //       waits for is still the daemon's".
+        std::string reportDetail;
+        std::string askWhy;
+        const std::string reportStatus = askConfigServerStatus(reportDetail, askWhy);
+        if (reportStatus == "ok") listening = daemon.waitForOutput(bindOk, std::chrono::seconds(2));
+        if (!listening) {
+            if (reportStatus == "ok") {
+                check(false, "the bind-success wording this phase waits for is still the daemon's");
+                std::fprintf(stderr,
+                             "  waited for \"%s\", but the daemon never printed it and reports config_server ok / %s\n",
+                             bindOk.c_str(), reportDetail.empty() ? "(empty detail)" : reportDetail.c_str());
+            } else {
+                const std::string daemonSays =
+                    reportStatus.empty() ? std::string("; the daemon could not be asked over DBus (") + askWhy + ")"
+                                         : std::string("; the daemon reports config_server ") + reportStatus;
+                const std::string why =
+                    daemon.output().find(bindFailed) != std::string::npos
+                        ? std::string("port ") + std::to_string(kPort) +
+                              " is held by another process on this machine (a real wallpaperx-daemon?), "
+                              "so the spawned daemon could not bind it" + daemonSays
+                        : "the daemon printed neither the bind-success nor the bind-failure line for port " +
+                              std::to_string(kPort) + daemonSays;
+                notVerified("S7.8/S7.11 (the HTTP server's process lifecycle)", why);
+            }
+            daemon.shutdown(SIGTERM);
+            return;
+        }
     }
 
     // GOAL: S7.10/S7.10b end to end -- /health on 127.0.0.1:18462, asked of the real
@@ -2242,8 +2328,10 @@ void checkHttpLifecycle(NameWatcher& names, const std::string& bluePath, const s
     //       So this asserts the aggregate and the three names, not the details.
     // CONTROL: the `wallpaperx::HttpServer httpServer(manager);` line removed from
     //       main.cpp -> this phase reports NOT VERIFIED ("the daemon printed neither the
-    //       bind-success nor the bind-failure line for port 18462") and exits 77, which
-    //       ctest shows as a SKIP rather than a pass. For the body itself: the
+    //       bind-success nor the bind-failure line for port 18462; the daemon reports
+    //       config_server pending") rather than spending a FAIL on the daemon; the run's
+    //       failures for that mutation all come from phase 11, which grades it directly.
+    //       For the body itself: the
     //       `else if (check->status == HealthStatus::Pending ...)` arm deleted from
     //       http_server.cpp's aggregation -> "FAIL: the real daemon reports the aggregate
     //       as pending before it has used anything" with "  fresh /health: ... status ok".
@@ -2497,28 +2585,6 @@ const char* describeListener(Listener who) {
     return "?";
 }
 
-// GetStatus's config_server object, or nullptr when the reply does not carry one. Same
-// reason wallpaperStatus() exists: operator[] on a const json missing the key dereferences
-// end() under NDEBUG, so a daemon that dropped the field would crash the test instead of
-// failing the check written to catch exactly that.
-const nlohmann::json* configServerReport(const nlohmann::json& status) {
-    if (status.is_discarded() || !status.is_object() || !status.contains("config_server")) return nullptr;
-    const nlohmann::json& report = status["config_server"];
-    return report.is_object() ? &report : nullptr;
-}
-
-// GetStatus with the throw turned into a value. "Is the daemon still answering DBus" is
-// the question this phase exists to decide, so a dropped connection is data here and must
-// not escape into the run's catch-all as an unexplained exception.
-nlohmann::json statusOrError(sdbus::IProxy& proxy, std::string& error) {
-    try {
-        return getStatus(proxy);
-    } catch (const std::exception& e) {
-        error = e.what();
-        return nlohmann::json();
-    }
-}
-
 // A barrier between phases that each spawn a daemon, deliberately not a check: shutdown()
 // does not return until the process is reaped, and a reaped process has had its name
 // released by the kernel whatever the daemon did -- so no mutation makes this red. Release
@@ -2720,17 +2786,17 @@ void checkConfigServerLostPort(NameWatcher& names, const std::string& bluePath, 
     //       daemon's stderr line -- says only that it printed something on the way past,
     //       which is the state this goal exists to improve on.
     // CONTROL: three, all in HttpServer's constructor. (a) the bind-failure branch's
-    //       `m_manager.recordConfigServer(false, m_bindError)` deleted -> "FAIL: a daemon
+    //       `m_manager.recordConfigServer(false, bindError)` deleted -> "FAIL: a daemon
     //       that could not bind its config port reports config_server fail" and "FAIL: the
     //       failed bind report names the port it could not take", with "  config_server:
     //       pending / (empty), while 127.0.0.1:18462 is held by some other process". The
     //       success-path record next to it is the wrong line to cut: deleting that one
     //       instead leaves both checks green and reddens only the ok direction above.
-    //       (b) m_bindError reworded so the host:port moves into parentheses -> the
+    //       (b) bindError reworded so the host:port moves into parentheses -> the
     //       wording check below red, the fail one and the names-the-port one both still
     //       green (that rewording keeps "127.0.0.1:18462" inside the detail).
     //       (c) the bind branch's
-    //       `return` replaced with `throw std::runtime_error(m_bindError)` -> "FAIL: a
+    //       `return` replaced with `throw std::runtime_error(bindError)` -> "FAIL: a
     //       daemon that could not bind its config port still answers GetStatus", plus the
     //       two shutdown checks below; which DBus error comes back depends on whether the
     //       daemon dies before or after its name request, NoReply and ServiceUnknown both
@@ -2761,12 +2827,12 @@ void checkConfigServerLostPort(NameWatcher& names, const std::string& bluePath, 
         //       string, so a rewording arrives as a named failure here rather than as those
         //       two sites quietly deciding "skip" and "never reached its bind attempt".
         // WHY-THIS-SHAPE: compared against the DETAIL the daemon just reported over DBus,
-        //       which http_server.cpp builds from the same m_bindError it prints. Matching
-        //       the daemon's stderr instead would be circular -- it is exactly the text
-        //       whose stability is in question, and both sides would move together. The
+        //       which http_server.cpp records from the same local `bindError` it prints.
+        //       Matching the daemon's stderr instead would be circular -- it is exactly the
+        //       text whose stability is in question, and both sides would move together. The
         //       existing names-the-port check above does not cover this: it looks for
         //       "127.0.0.1:18462", which survives any rewording around it.
-        // CONTROL: m_bindError reworded to "the config port could not be bound (" +
+        // CONTROL: bindError reworded to "the config port could not be bound (" +
         //       kLoopbackHost + ":" ... in http_server.cpp -> "FAIL: the bind-failure
         //       wording this file matches on in the daemon's stderr is still the daemon's"
         //       with '  bindFailureMarker(18462) = "could not bind 127.0.0.1:18462", but
