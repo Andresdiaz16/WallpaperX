@@ -64,6 +64,7 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -79,6 +80,8 @@
 #include <netinet/in.h>
 #include <poll.h>
 #include <signal.h>
+#include <sys/prctl.h>
+#include <sys/resource.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -91,8 +94,10 @@ using wallpaperx::testing::Frame;
 using wallpaperx::testing::FrameReadyLog;
 using wallpaperx::testing::getFrameFd;
 using wallpaperx::testing::getStatus;
+using wallpaperx::testing::getStatusOrExplain;
 using wallpaperx::testing::openFdCount;
 using wallpaperx::testing::setWallpaper;
+using wallpaperx::testing::StatusReply;
 using wallpaperx::testing::wallpaperStatus;
 
 namespace {
@@ -220,6 +225,43 @@ std::string writeSolidImage(const char* name, unsigned char r, unsigned char g, 
 // The daemon under test, as a child process.
 // ---------------------------------------------------------------------------- //
 
+// Called in the child between fork() and exec(): asks the kernel to SIGKILL this process
+// when the thread that forked it dies. Both calls are async-signal-safe, which is the
+// only thing that may run here.
+//
+// The backstop the destructors cannot be: a test killed by SIGABRT -- an assertion inside
+// a library, a sanitizer report, std::terminate -- unwinds nothing, so ~SpawnedDaemon
+// never runs and the daemon it spawned is inherited by init still holding the bus name
+// and the config port. The next run then meets an occupied port it did not create.
+//
+// PR_SET_PDEATHSIG is per *thread*: the signal is delivered when the forking thread
+// exits, not when its process does. Every fork in this file happens on the main thread,
+// which is the thread whose death ends the process, so the two coincide. A fork moved
+// onto a worker thread would silently weaken this to "when that worker finishes".
+//
+// `parentBeforeFork` closes the race the prctl alone leaves: the parent may already have
+// died between fork() and here, in which case the signal is never sent because the death
+// preceded the request. A changed parent id is that case, and the child must not survive
+// it either.
+//
+// CONTROL (the race guard, which no in-suite check can reach -- the window is microseconds
+// wide and losing it is what the guard exists to make impossible): a 200 ms sleep inserted
+// above the prctl and the probe made to abort as soon as fork() returns, so the parent
+// dies inside the window every time. With the getppid line deleted the daemon was left
+// running with ppid 1, still holding the config port; with it in place the child exited
+// and the port stayed free. Both mutations reverted.
+[[noreturn]] void execChildOrDie(pid_t parentBeforeFork, const char* binary, char* const argv[],
+                                 char* const envp[]) {
+    if (prctl(PR_SET_PDEATHSIG, SIGKILL) != 0) _exit(125);
+    if (getppid() != parentBeforeFork) _exit(125);
+    if (envp != nullptr) {
+        execve(binary, argv, envp);
+    } else {
+        execv(binary, argv);
+    }
+    _exit(127);  // only reached if the exec failed
+}
+
 // Spawns the real wallpaperx-daemon binary with its stdout and stderr merged into one
 // pipe, and reads that pipe on a thread for the process's lifetime.
 //
@@ -278,6 +320,7 @@ public:
         std::string binary = WALLPAPERX_DAEMON_BINARY;
         char* argv[] = {binary.data(), nullptr};
 
+        const pid_t parentBeforeFork = getpid();
         m_pid = fork();
         if (m_pid < 0) {
             close(fds[0]);
@@ -300,8 +343,7 @@ public:
             if (dup2(childStdout, STDOUT_FILENO) == -1 || dup2(fds[1], STDERR_FILENO) == -1) {
                 _exit(126);
             }
-            execve(binary.c_str(), argv, envp.data());
-            _exit(127);  // only reached if execve failed
+            execChildOrDie(parentBeforeFork, binary.c_str(), argv, envp.data());
         }
 
         close(fds[1]);
@@ -539,6 +581,128 @@ private:
     std::string m_output;
 };
 
+// The line the orphan probe prints so the parent can look for the daemon afterwards. One
+// constant, because the probe writes it and the phase parses it in two different
+// processes: a reworded literal on one side alone would make the phase report a probe
+// that never started rather than a daemon that never died.
+constexpr const char* kOrphanPidPrefix = "orphan-probe: daemon pid ";
+
+// The child half of the aborted-parent phase, running as a fresh exec of this binary with
+// --orphan-probe. Spawns a daemon through the ordinary SpawnedDaemon path, says which pid
+// it got, and then dies the way a failed assertion inside a library kills a test: SIGABRT,
+// so no destructor of any kind runs and ~SpawnedDaemon's kill/waitpid never happens.
+//
+// Its own process rather than a fork() of the test: a fork of a process that already has
+// sdbus dispatch threads may only call async-signal-safe functions until it execs, and
+// SpawnedDaemon's constructor allocates throughout.
+int runOrphanProbe() {
+    // The abort below is deliberate, so the core it would otherwise write is noise -- and
+    // on a host with a core pattern that pipes to a collector, a slow one.
+    rlimit noCore{0, 0};
+    setrlimit(RLIMIT_CORE, &noCore);
+
+    SpawnedDaemon daemon;
+    if (!daemon.waitForOutput(std::string("serving ") + DbusService::kBusName, std::chrono::seconds(30))) {
+        std::printf("orphan-probe: the daemon never announced itself, so there is nothing to orphan\n");
+        std::fflush(stdout);
+        return 1;
+    }
+    std::printf("%s%d\n", kOrphanPidPrefix, static_cast<int>(daemon.pid()));
+    std::fflush(stdout);
+    std::abort();
+}
+
+// Runs this binary again with `flag`, captures what it prints, and reports how it died.
+// Only the orphan probe uses it; SpawnedDaemon is not reused because that class is about
+// the daemon binary specifically and needs a reader thread this does not.
+struct ProbeRun {
+    bool started = false;
+    std::string harnessError;
+    std::string output;
+    bool exitedNormally = false;
+    int exitCode = -1;
+    int termSignal = 0;
+};
+
+ProbeRun runSelfProbe(const char* flag) {
+    ProbeRun run;
+
+    char exePath[4096];
+    const ssize_t len = readlink("/proc/self/exe", exePath, sizeof(exePath) - 1);
+    if (len <= 0) {
+        run.harnessError = "could not read /proc/self/exe";
+        return run;
+    }
+    exePath[len] = '\0';
+
+    int fds[2];
+    if (pipe2(fds, O_CLOEXEC) != 0) {
+        run.harnessError = "pipe2 failed";
+        return run;
+    }
+
+    std::string binary = exePath;
+    std::string arg = flag;
+    char* argv[] = {binary.data(), arg.data(), nullptr};
+
+    const pid_t parentBeforeFork = getpid();
+    const pid_t pid = fork();
+    if (pid < 0) {
+        close(fds[0]);
+        close(fds[1]);
+        run.harnessError = "fork failed";
+        return run;
+    }
+    if (pid == 0) {
+        if (dup2(fds[1], STDOUT_FILENO) == -1 || dup2(fds[1], STDERR_FILENO) == -1) _exit(126);
+        execChildOrDie(parentBeforeFork, binary.c_str(), argv, nullptr);
+    }
+    close(fds[1]);
+    run.started = true;
+
+    // Drained to EOF before the wait, not after: the probe echoes the daemon's whole log,
+    // so a wait-first order deadlocks the moment that exceeds the pipe buffer.
+    char buf[4096];
+    while (true) {
+        const ssize_t n = read(fds[0], buf, sizeof(buf));
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        run.output.append(buf, static_cast<size_t>(n));
+    }
+    close(fds[0]);
+
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno != EINTR) {
+            run.harnessError = "waitpid on the probe failed";
+            return run;
+        }
+    }
+    run.exitedNormally = WIFEXITED(status);
+    run.exitCode = run.exitedNormally ? WEXITSTATUS(status) : -1;
+    if (WIFSIGNALED(status)) run.termSignal = WTERMSIG(status);
+    return run;
+}
+
+// True while `pid` is a *running* daemon. Zombies say no: the process is dead and only its
+// exit status is outstanding, which is exactly the state a killed orphan passes through on
+// its way to being reaped by init. The cmdline comparison covers the other direction -- a
+// pid recycled onto some unrelated process between the kill and this look.
+bool daemonRunning(pid_t pid) {
+    const std::string dir = "/proc/" + std::to_string(static_cast<int>(pid));
+    std::ifstream stat(dir + "/stat");
+    std::string statLine;
+    if (!std::getline(stat, statLine)) return false;
+    // State is the field after the parenthesised comm, which may itself contain spaces.
+    const size_t commEnd = statLine.rfind(')');
+    if (commEnd == std::string::npos || commEnd + 2 >= statLine.size()) return false;
+    if (statLine[commEnd + 2] == 'Z') return false;
+
+    std::ifstream cmdline(dir + "/cmdline", std::ios::binary);
+    std::string args((std::istreambuf_iterator<char>(cmdline)), std::istreambuf_iterator<char>());
+    return args.find(WALLPAPERX_DAEMON_BINARY) != std::string::npos;
+}
+
 // A session bus of this test's own, started as a child process so it can be killed.
 //
 // Exists for one reason: to be destroyed under a running daemon. ctest's bus comes from
@@ -568,6 +732,7 @@ public:
         std::string printAddress = "--print-address";
         char* argv[] = {binary.data(), session.data(), nofork.data(), printAddress.data(), nullptr};
 
+        const pid_t parentBeforeFork = getpid();
         m_pid = fork();
         if (m_pid < 0) {
             close(fds[0]);
@@ -577,8 +742,7 @@ public:
         }
         if (m_pid == 0) {
             if (dup2(fds[1], STDOUT_FILENO) == -1) _exit(126);
-            execv(binary.c_str(), argv);
-            _exit(127);
+            execChildOrDie(parentBeforeFork, binary.c_str(), argv, nullptr);
         }
         close(fds[1]);
 
@@ -1026,29 +1190,37 @@ void gpuInitWatchThread(GpuInitWatch& watch) {
 
     bool announced = false;
     while (!watch.stop.load(std::memory_order_relaxed)) {
+        // The catch stays even though getStatus() no longer throws: this is a thread entry
+        // point, so anything that escapes it -- a bad_alloc out of the json, most plausibly
+        // -- is std::terminate and takes the phase's FAIL lines with it.
         try {
-            const nlohmann::json status = getStatus(*proxy);
-            ++watch.replies;
-            if (!announced) {
-                announced = true;
-                ++watch.ready;
-            }
-            const bool initialized = status.contains("gpu") && status["gpu"].is_object() &&
-                                     status["gpu"].value("initialized", false);
-            if (initialized) {
-                ++watch.postInit;
+            const StatusReply status = getStatus(*proxy);
+            if (!status.ok()) {
+                // A failed GetStatus is not a consistency violation. Counted, and reported
+                // below only if it swallowed the whole sample. Deliberately does NOT mark
+                // this watcher ready: readiness means "answered once", so that the pre-init
+                // sample the phase depends on is guaranteed rather than raced for. A watcher
+                // that only ever errors therefore never becomes ready, and the barrier below
+                // falls through on its deadline rather than hanging -- the phase then reports
+                // the zero readiness directly instead of blaming the timing.
+                ++watch.errors;
             } else {
-                ++watch.preInit;
+                ++watch.replies;
+                if (!announced) {
+                    announced = true;
+                    ++watch.ready;
+                }
+                const nlohmann::json& json = status.json();
+                const bool initialized =
+                    json.contains("gpu") && json["gpu"].is_object() && json["gpu"].value("initialized", false);
+                if (initialized) {
+                    ++watch.postInit;
+                } else {
+                    ++watch.preInit;
+                }
+                if (!wallpaperx::testing::statusSelfConsistent(status)) ++watch.inconsistent;
             }
-            if (!wallpaperx::testing::statusSelfConsistent(status)) ++watch.inconsistent;
         } catch (const std::exception&) {
-            // A failed GetStatus is not a consistency violation. Counted, and reported
-            // below only if it swallowed the whole sample. Deliberately does NOT mark
-            // this watcher ready: readiness means "answered once", so that the pre-init
-            // sample the phase depends on is guaranteed rather than raced for. A watcher
-            // that only ever errors therefore never becomes ready, and the barrier below
-            // falls through on its deadline rather than hanging -- the phase then reports
-            // the zero readiness directly instead of blaming the timing.
             ++watch.errors;
         }
         // Outside the try/catch, so the error path is paced too. Inside it, a daemon
@@ -1213,12 +1385,12 @@ void checkResponsivenessUnderLoad(sdbus::IProxy& proxy, FrameReadyLog& signals, 
     // everything the thread wrote happens-before everything read after it.
     Clock::time_point frameDoneAt{};
     bool frameFailed = false;
-    // jthread, not thread: getStatus() below is a blocking DBus call that throws whenever
-    // the daemon dies or times out mid-burst -- which is exactly what a daemon answering
-    // GetFrameFd on the event loop does. Unwinding past a still-joinable std::thread is
-    // std::terminate, so the one regression this phase exists to catch would have
-    // produced a bare SIGABRT with no FAIL lines instead of reaching main's handler. The
-    // explicit join() below stays: it is the happens-before edge that makes the plain
+    // jthread, not thread: everything between here and the join() below is a blocking DBus
+    // exchange with a daemon that may die or time out mid-burst -- which is exactly what a
+    // daemon answering GetFrameFd on the event loop does. Unwinding past a still-joinable
+    // std::thread is std::terminate, so the one regression this phase exists to catch would
+    // have produced a bare SIGABRT with no FAIL lines instead of reaching main's handler.
+    // The explicit join() below stays: it is the happens-before edge that makes the plain
     // frameDoneAt/frameFailed safe to read, and it leaves the destructor with nothing to do.
     std::jthread frameRequest([&] {
         try {
@@ -1230,9 +1402,9 @@ void checkResponsivenessUnderLoad(sdbus::IProxy& proxy, FrameReadyLog& signals, 
         frameDoneAt = Clock::now();
     });
 
-    const nlohmann::json status = getStatus(proxy);
+    const StatusReply status = getStatusOrExplain(proxy);
     const auto statusDoneAt = Clock::now();
-    check(!status.is_discarded(), "GetStatus still returns parseable JSON while renders are queued");
+    check(status.ok(), "GetStatus still returns parseable JSON while renders are queued");
 
     frameRequest.join();
     check(!frameFailed, "the GetFrameFd issued while the queue was deep is answered rather than failing");
@@ -1410,7 +1582,17 @@ void stormThread(int index, const std::string& bluePath, const std::string& redP
                     setWallpaper(*proxy, "static", (next() % 2) ? bluePath : redPath, monitorId);
                     break;
                 case 1: {
-                    const nlohmann::json status = getStatus(*proxy);
+                    const StatusReply status = getStatus(*proxy);
+                    // Recorded here rather than left to the catch below: getStatus() hands
+                    // a failed call back as a value, so without this a daemon that stopped
+                    // answering mid-storm would read as an empty reply with no monitor in
+                    // it -- no finding at all, where the throw used to be counted as an
+                    // unexpected error because its name is neither of the two legitimate
+                    // ones.
+                    // CONTROL: DbusService::getStatus made to throw -> "FAIL: concurrent
+                    //       clients see only the two named errors that are legitimate
+                    //       mid-render", the first one naming the bus. Reverted.
+                    if (!status.ok()) recordUnexpected(result, status.error());
                     // Called for the generation observation below. Snapshot consistency
                     // is deliberately NOT graded from these replies -- see the note at
                     // the end of this function.
@@ -1532,8 +1714,20 @@ void checkConcurrentClients(sdbus::IProxy& proxy, FrameReadyLog& signals, const 
 
     std::map<int32_t, uint64_t> before;
     {
-        const nlohmann::json status = getStatus(proxy);
-        check(!status.is_discarded(), "the daemon still answers GetStatus after the storm");
+        const StatusReply status = getStatusOrExplain(proxy);
+        check(status.ok(), "the daemon still answers GetStatus after the storm");
+        // Acted on for the same reason the drain barrier above is: every generation below
+        // is read from this one reply, and an unanswered call leaves them all at 0 --
+        // which is a threshold any leftover render satisfies, so "every monitor still
+        // renders after the storm" would pass on the strength of the failure just graded.
+        // CONTROL: DbusService::getStatus made to throw -> "FAIL: the daemon still answers
+        //       GetStatus after the storm" and this abandonment line, with the phases after
+        //       it still running. Reverted.
+        if (!status.ok()) {
+            std::printf("daemon_system_test: post-storm state checks abandoned -- GetStatus did not answer, so "
+                        "every threshold below would be a fabricated zero.\n");
+            return;
+        }
         for (int i = 0; i < kStormMonitors; ++i) {
             const int32_t monitorId = kMonitorStormBase + i;
             const nlohmann::json* entry = wallpaperStatus(status, std::to_string(monitorId));
@@ -1566,7 +1760,7 @@ void checkConcurrentClients(sdbus::IProxy& proxy, FrameReadyLog& signals, const 
     setWallpaper(proxy, "static", bluePath, kMonitorBarrierPost);
     check(signals.wait(kMonitorBarrierPost, 1), "the post-storm barrier render completes");
 
-    const nlohmann::json after = getStatus(proxy);
+    const StatusReply after = getStatusOrExplain(proxy);
     int goodMonitors = 0;
     int failedMonitors = 0;
     for (int i = 0; i < kStormMonitors; ++i) {
@@ -1896,14 +2090,8 @@ void checkClosedStdout(NameWatcher& names, const std::string& bluePath, const st
         check(rendered, "the frame requested after stdout closed is rendered and announced");
     }
 
-    bool statusAnswered = false;
-    try {
-        const nlohmann::json status = getStatus(*proxy);
-        statusAnswered = !status.is_discarded();
-    } catch (const std::exception& e) {
-        std::fprintf(stderr, "  GetStatus after the stdout reader was closed: %s\n", e.what());
-    }
-    check(statusAnswered, "the daemon still answers GetStatus after the failed write");
+    const StatusReply status = getStatusOrExplain(*proxy);
+    check(status.ok(), "the daemon still answers GetStatus after the failed write");
 
     const SignalMasks masks = readSignalMasks(deaf.pid(), daemonOwnThreads);
     check(masks.read, "the daemon's signal masks could be read from /proc");
@@ -2163,6 +2351,102 @@ void checkBusLoss(const Check& check) {
     }
 }
 
+// GOAL: X.4 -- a daemon this test spawned never outlives the test process, including when
+//       the test dies without unwinding. False if a daemon is still running once its
+//       spawner has been killed by SIGABRT, which is how the next run comes to meet an
+//       occupied bus name and an occupied config port it did not create.
+// WHY-THIS-SHAPE: the property is only observable from outside the process whose death
+//       triggers it, so the abort happens in a child of this test (--orphan-probe) that
+//       spawned the daemon through the ordinary SpawnedDaemon path, and the daemon is then
+//       looked for by pid from out here. The obvious simpler check -- "the suite still
+//       passes" -- establishes nothing at all about this: ~SpawnedDaemon does not run on
+//       the abort path, so a green suite is exactly what a leaked daemon also produces.
+//       The probe's own death is graded as SETUP, not as the property: a probe that never
+//       got a daemon up, or that exited instead of aborting, has not created the state
+//       this phase is about, and reporting that as a leak would blame the daemon for the
+//       harness. A survivor is killed here rather than left running -- the phases after
+//       this one need the bus name free.
+// CONTROL: two, reverted. (a) the prctl(PR_SET_PDEATHSIG, SIGKILL) line deleted from
+//       execChildOrDie -> "FAIL: a daemon spawned by a test process that then died on
+//       SIGABRT does not outlive it", the survivor killed here, and the phases after it
+//       still running. From outside the suite the same mutation left the daemon with ppid
+//       1 and 127.0.0.1:18462 still LISTEN after its spawner had aborted. (b) the probe's
+//       startup needle made unmatchable -> this phase NOT VERIFIED and no FAIL, so a probe
+//       that cannot be set up is not reported as a leaked daemon.
+void checkAbortedParentLeavesNoDaemon(NameWatcher& names, const Check& check) {
+    const ProbeRun probe = runSelfProbe("--orphan-probe");
+    for (size_t start = 0; start < probe.output.size();) {
+        const size_t eol = probe.output.find('\n', start);
+        const size_t end = eol == std::string::npos ? probe.output.size() : eol;
+        std::printf("  [orphan-probe] %.*s\n", static_cast<int>(end - start), probe.output.data() + start);
+        if (eol == std::string::npos) break;
+        start = eol + 1;
+    }
+    std::fflush(stdout);
+
+    if (!probe.started) {
+        notVerified("X.4 (a daemon does not outlive an aborted test process)",
+                    "this test could not start a probe process: " + probe.harnessError);
+        return;
+    }
+
+    const size_t marker = probe.output.find(kOrphanPidPrefix);
+    if (marker == std::string::npos) {
+        notVerified("X.4 (a daemon does not outlive an aborted test process)",
+                    "the probe never reported a daemon pid, so no daemon was ever orphaned");
+        return;
+    }
+    const pid_t orphan = static_cast<pid_t>(std::strtol(probe.output.c_str() + marker + std::strlen(kOrphanPidPrefix),
+                                                        nullptr, 10));
+    // SIGABRT specifically. A probe that exited normally, or died on some other signal,
+    // did not reach the state this phase is about -- and PR_SET_PDEATHSIG would fire for a
+    // normal exit anyway, so grading that would be grading a path that is not the point.
+    if (orphan <= 0 || probe.termSignal != SIGABRT) {
+        notVerified("X.4 (a daemon does not outlive an aborted test process)",
+                    probe.exitedNormally ? "the probe exited " + std::to_string(probe.exitCode) +
+                                               " instead of aborting with a daemon running"
+                                         : "the probe died on signal " + std::to_string(probe.termSignal) +
+                                               " rather than SIGABRT");
+        return;
+    }
+
+    // Bounded, and the deadline is not data: the loop exits on the first look that finds
+    // the daemon gone, and reaching the deadline means it was still there every time --
+    // which is the failure, not a slow host. The kill is immediate on the parent's death,
+    // so seconds here is orders of magnitude of margin.
+    const auto deadline = Clock::now() + std::chrono::seconds(10);
+    bool survived = true;
+    while (Clock::now() < deadline) {
+        if (!daemonRunning(orphan)) {
+            survived = false;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+
+    check(!survived, "a daemon spawned by a test process that then died on SIGABRT does not outlive it");
+    if (survived) {
+        std::fprintf(stderr, "  daemon %d was still running after its spawner aborted; killing it so the rest of "
+                             "this run has a free bus name\n",
+                     static_cast<int>(orphan));
+        ::kill(orphan, SIGKILL);
+        // Not this process's child, so it cannot be waited for -- init reaps it. Polled
+        // instead, and the wait is bounded by the same reasoning as above.
+        const auto killDeadline = Clock::now() + std::chrono::seconds(10);
+        while (Clock::now() < killDeadline && daemonRunning(orphan)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+    }
+
+    // Settling, not a check: the name's release is asserted by the shutdown phases, and
+    // asserting it here as well would print a second failure for the one defect above.
+    // The next phase's waitFor(true) would otherwise be satisfied by this daemon's name.
+    if (!names.waitFor(false)) {
+        std::printf("daemon_system_test: the bus name was still owned after the orphan phase, so the phases after "
+                    "it may be talking to a daemon this one left behind.\n");
+    }
+}
+
 // Used by both phases below: phase 10 asks the daemon what it thinks of its config port
 // when the line it was waiting for never arrived, phase 11 grades the answer.
 
@@ -2170,22 +2454,11 @@ void checkBusLoss(const Check& check) {
 // reason wallpaperStatus() exists: operator[] on a const json missing the key dereferences
 // end() under NDEBUG, so a daemon that dropped the field would crash the test instead of
 // failing the check written to catch exactly that.
-const nlohmann::json* configServerReport(const nlohmann::json& status) {
-    if (status.is_discarded() || !status.is_object() || !status.contains("config_server")) return nullptr;
-    const nlohmann::json& report = status["config_server"];
+const nlohmann::json* configServerReport(const StatusReply& status) {
+    const nlohmann::json& json = status.json();
+    if (!json.is_object() || !json.contains("config_server")) return nullptr;
+    const nlohmann::json& report = json["config_server"];
     return report.is_object() ? &report : nullptr;
-}
-
-// GetStatus with the throw turned into a value. "Is the daemon still answering DBus" is
-// the question the phases below exist to decide, so a dropped connection is data here and
-// must not escape into the run's catch-all as an unexplained exception.
-nlohmann::json statusOrError(sdbus::IProxy& proxy, std::string& error) {
-    try {
-        return getStatus(proxy);
-    } catch (const std::exception& e) {
-        error = e.what();
-        return nlohmann::json();
-    }
 }
 
 // The daemon's own verdict on its config port ("ok", "fail", "pending"), or empty when it
@@ -2196,10 +2469,9 @@ std::string askConfigServerStatus(std::string& detail, std::string& why) {
     try {
         auto proxy =
             sdbus::createProxy(sdbus::ServiceName{DbusService::kBusName}, sdbus::ObjectPath{DbusService::kObjectPath});
-        std::string dbusError;
-        const nlohmann::json status = statusOrError(*proxy, dbusError);
-        if (!dbusError.empty()) {
-            why = dbusError;
+        const StatusReply status = getStatus(*proxy);
+        if (!status.ok()) {
+            why = status.error();
             return {};
         }
         const nlohmann::json* report = configServerReport(status);
@@ -2417,12 +2689,16 @@ void checkHttpLifecycle(NameWatcher& names, const std::string& bluePath, const s
         //       the names-the-GPU check red, with "/health gpu detail: gpu  dbus: NVIDIA
         //       GeForce RTX 3080 Ti / Heap". All reverted.
         const HttpReply afterRender = wallpaperx::testing::get(cli, "/health");
-        const nlohmann::json status = getStatus(*proxy);
-        const std::string dbusTier = status.contains("gpu") && status["gpu"].is_object()
-                                         ? status["gpu"].value("descriptor_tier", std::string())
+        // The GetStatus half is graded below through dbusTier/dbusName: an unanswered call
+        // leaves both empty, which is the "nothing to compare /health's detail against"
+        // check, so the failure is named rather than swallowed.
+        const StatusReply status = getStatusOrExplain(*proxy);
+        const nlohmann::json& statusJson = status.json();
+        const std::string dbusTier = statusJson.contains("gpu") && statusJson["gpu"].is_object()
+                                         ? statusJson["gpu"].value("descriptor_tier", std::string())
                                          : std::string();
-        const std::string dbusName = status.contains("gpu") && status["gpu"].is_object()
-                                         ? status["gpu"].value("name", std::string())
+        const std::string dbusName = statusJson.contains("gpu") && statusJson["gpu"].is_object()
+                                         ? statusJson["gpu"].value("name", std::string())
                                          : std::string();
         const nlohmann::json* afterChecks = healthChecks(afterRender.json);
         // ok() stays in the condition: a gpu verdict read out of a body /health did not
@@ -2629,11 +2905,10 @@ void checkConfigServerOwnsPort(NameWatcher& names, const std::string& validation
     auto proxy =
         sdbus::createProxy(sdbus::ServiceName{DbusService::kBusName}, sdbus::ObjectPath{DbusService::kObjectPath});
 
-    std::string dbusError;
-    const nlohmann::json status = statusOrError(*proxy, dbusError);
-    if (!dbusError.empty()) {
+    const StatusReply status = getStatus(*proxy);
+    if (!status.ok()) {
         check(false, "the daemon answers GetStatus once it holds the bus name");
-        std::fprintf(stderr, "  GetStatus failed: %s\n", dbusError.c_str());
+        std::fprintf(stderr, "  %s\n", status.error().c_str());
         daemon.shutdown(SIGTERM);
         awaitNameRelease(names, "S7.14 (the fail direction, which follows this one)");
         return;
@@ -2775,8 +3050,7 @@ void checkConfigServerLostPort(NameWatcher& names, const std::string& bluePath, 
         .onInterface(DbusService::kInterface)
         .call([&signals](int32_t monitorId, uint64_t generation) { signals.record(monitorId, generation); });
 
-    std::string dbusError;
-    const nlohmann::json status = statusOrError(*proxy, dbusError);
+    const StatusReply status = getStatus(*proxy);
 
     // COVERAGE-ASSERT for everything below: that the conflict was in force when the report
     // was read. Held sockets are not shareable -- HeldPort sets SO_REUSEADDR and never
@@ -2822,9 +3096,9 @@ void checkConfigServerLostPort(NameWatcher& names, const std::string& bluePath, 
     //       two shutdown checks below; which DBus error comes back depends on whether the
     //       daemon dies before or after its name request, NoReply and ServiceUnknown both
     //       observed. All reverted.
-    check(dbusError.empty(), "a daemon that could not bind its config port still answers GetStatus");
-    if (!dbusError.empty()) {
-        std::fprintf(stderr, "  GetStatus failed: %s\n", dbusError.c_str());
+    check(status.ok(), "a daemon that could not bind its config port still answers GetStatus");
+    if (!status.ok()) {
+        std::fprintf(stderr, "  %s\n", status.error().c_str());
     } else {
         const nlohmann::json* report = configServerReport(status);
         const std::string reportStatus = report ? report->value("status", std::string()) : std::string();
@@ -2832,7 +3106,8 @@ void checkConfigServerLostPort(NameWatcher& names, const std::string& bluePath, 
         const std::string hostPort =
             std::string(wallpaperx::HttpServer::kLoopbackHost) + ":" + std::to_string(kPort);
 
-        check(status.value("running", false), "a daemon that could not bind its config port still reports running");
+        check(status.json().value("running", false),
+              "a daemon that could not bind its config port still reports running");
         check(report != nullptr, "GetStatus carries a config_server object");
         check(reportStatus == "fail", "a daemon that could not bind its config port reports config_server fail");
         // Not merely non-empty: "fail" with no cause sends an operator back to the stderr
@@ -2896,7 +3171,7 @@ void checkConfigServerLostPort(NameWatcher& names, const std::string& bluePath, 
     //       only, so the run still renders elsewhere and hostRendered stays true -> "FAIL: a
     //       daemon that could not bind its config port renders a wallpaper anyway". Both
     //       reverted.
-    if (dbusError.empty()) {
+    if (status.ok()) {
         bool rendered = false;
         std::string renderError;
         try {
@@ -2940,7 +3215,11 @@ void checkConfigServerLostPort(NameWatcher& names, const std::string& bluePath, 
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    // The child half of checkAbortedParentLeavesNoDaemon, and nothing else: it spawns a
+    // daemon and aborts, so it must never be reached by an ordinary run.
+    if (argc == 2 && std::string_view(argv[1]) == "--orphan-probe") return runOrphanProbe();
+
     int failures = 0;
     const Check check = [&](bool cond, const char* msg) {
         if (!cond) {
@@ -3124,6 +3403,11 @@ int main() {
         // accounting below.
         checkClosedStdout(names, bluePath, validationEnv, wantValidation, check);
         checkBusLoss(check);
+
+        // Spawns a daemon of its own on this bus and leaves nothing behind, so it belongs
+        // between the phases that own the name one at a time -- and before the port phases
+        // below, whose whole subject is who is listening on 18462.
+        checkAbortedParentLeavesNoDaemon(names, check);
 
         // S7.8 and S7.11. Spawns a daemon of its own and shuts it down, so it runs after
         // the phases above have released the name, and before the descriptor accounting

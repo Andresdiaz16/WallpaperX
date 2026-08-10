@@ -75,9 +75,10 @@ using wallpaperx::testing::errorNameFrom;
 using wallpaperx::testing::Frame;
 using wallpaperx::testing::FrameReadyLog;
 using wallpaperx::testing::getFrameFd;
-using wallpaperx::testing::getStatus;
+using wallpaperx::testing::getStatusOrExplain;
 using wallpaperx::testing::openFdCount;
 using wallpaperx::testing::setWallpaper;
+using wallpaperx::testing::StatusReply;
 using wallpaperx::testing::validationWaived;
 using wallpaperx::testing::wallpaperStatus;
 
@@ -284,13 +285,16 @@ void runHostChecks(sdbus::IProxy& proxy, const std::string& imagePath, const Che
     check(std::string(DbusService::kInterface) == "io.wallpaperx.Daemon",
           "the interface is exactly io.wallpaperx.Daemon");
 
-    nlohmann::json json = getStatus(proxy);
-    check(!json.is_discarded(), "GetStatus returns parseable JSON");
-    check(!json.is_discarded() && json.value("running", false), "GetStatus reports running=true");
+    const StatusReply status = getStatusOrExplain(proxy);
+    check(status.ok(), "GetStatus returns parseable JSON");
+    const nlohmann::json& json = status.json();
+    check(json.value("running", false), "GetStatus reports running=true");
 
     // Nothing has needed the GPU yet, so there is no tier to report. Reporting one here
     // would mean the daemon had guessed.
-    check(!json.is_discarded() && json.contains("gpu") && json["gpu"]["initialized"] == false,
+    // is_object() before value(): value() on a "gpu" that is not an object throws
+    // nlohmann's type_error, which would take the run down instead of failing this line.
+    check(json.contains("gpu") && json["gpu"].is_object() && json["gpu"].value("initialized", true) == false,
           "GetStatus reports the GPU as uninitialised before the first render");
 
     // GOAL: S6.16 -- gpu.name and gpu.descriptor_tier are *absent* before the first
@@ -303,8 +307,7 @@ void runHostChecks(sdbus::IProxy& proxy, const std::string& imagePath, const Che
     // CONTROL: dbus_service.cpp patched to write gpuJson["descriptor_tier"] before
     //       the `if (gpu.initialized)` block -> "FAIL: no GPU name or descriptor tier
     //       is reported before the device exists". Reverted.
-    check(!json.is_discarded() && json.contains("gpu") && !json["gpu"].contains("name") &&
-              !json["gpu"].contains("descriptor_tier"),
+    check(json.contains("gpu") && !json["gpu"].contains("name") && !json["gpu"].contains("descriptor_tier"),
           "no GPU name or descriptor tier is reported before the device exists");
 
     // A monitor nothing was ever set on has no frame -- a named, distinguishable error
@@ -607,21 +610,26 @@ void runRenderChecks(sdbus::IProxy& proxy, FrameReadyLog& signals, const std::st
     // resolved to -- the first thing worth knowing when a bug reproduces on one GPU and
     // not another.
     {
-        const nlohmann::json json = getStatus(proxy);
-        const bool reported = !json.is_discarded() && json["gpu"]["initialized"] == true &&
-                              json["gpu"].contains("name") && !json["gpu"]["name"].get<std::string>().empty() &&
-                              json["gpu"].contains("descriptor_tier") &&
-                              !json["gpu"]["descriptor_tier"].get<std::string>().empty();
+        const StatusReply status = getStatusOrExplain(proxy);
+        const nlohmann::json& json = status.json();
+        // value(), not operator[], for the reason wallpaperStatus() exists: a reply with
+        // no "gpu" object -- which is also what an unanswered call leaves behind -- would
+        // otherwise dereference end() under NDEBUG instead of failing this check.
+        const nlohmann::json gpu = json.contains("gpu") && json["gpu"].is_object()
+                                       ? json["gpu"]
+                                       : nlohmann::json::object();
+        const bool reported = gpu.value("initialized", false) && !gpu.value("name", std::string()).empty() &&
+                              !gpu.value("descriptor_tier", std::string()).empty();
         check(reported, "GetStatus reports the GPU name and resolved descriptor tier once initialised");
-        if (!json.is_discarded() && json["gpu"]["initialized"] == true) {
-            std::printf("dbus_service_test: gpu=%s tier=%s\n", json["gpu"].value("name", "?").c_str(),
-                        json["gpu"].value("descriptor_tier", "?").c_str());
+        if (gpu.value("initialized", false)) {
+            std::printf("dbus_service_test: gpu=%s tier=%s\n", gpu.value("name", "?").c_str(),
+                        gpu.value("descriptor_tier", "?").c_str());
         }
 
         // See the annotation on statusSelfConsistent in tests/client/daemon_client.h.
         // Asserted here because this is the first reply in the run where the forbidden
         // conjunction is even expressible: monitor 0 holds a frame from the render above.
-        check(wallpaperx::testing::statusSelfConsistent(json),
+        check(wallpaperx::testing::statusSelfConsistent(status),
               "GetStatus never reports an uninitialised GPU beside a monitor that already has a frame");
 
         // GOAL: S6.34 -- the Classic descriptor-tier path works end to end *through
@@ -639,8 +647,7 @@ void runRenderChecks(sdbus::IProxy& proxy, FrameReadyLog& signals, const std::st
         //       Classic)". Reverted.
         if (const char* forced = std::getenv("WALLPAPERX_FORCE_TIER");
             forced != nullptr && std::strcmp(forced, "classic") == 0) {
-            const std::string tier =
-                json.is_discarded() ? std::string() : json["gpu"].value("descriptor_tier", std::string());
+            const std::string tier = gpu.value("descriptor_tier", std::string());
             check(tier == "Classic", "WALLPAPERX_FORCE_TIER is honoured through the daemon (tier is Classic)");
             if (tier != "Classic") {
                 std::fprintf(stderr, "  WALLPAPERX_FORCE_TIER=classic but the daemon reports tier '%s'\n",
@@ -777,8 +784,8 @@ void runRenderChecks(sdbus::IProxy& proxy, FrameReadyLog& signals, const std::st
     //       text GetStatus reports". Reverted.
     {
         const std::string replyText = errorMessageFrom([&] { getFrameFd(proxy, kMonitorCorrupt); });
-        const nlohmann::json json = getStatus(proxy);
-        const nlohmann::json* corrupt = wallpaperStatus(json, std::to_string(kMonitorCorrupt));
+        const StatusReply status = getStatusOrExplain(proxy);
+        const nlohmann::json* corrupt = wallpaperStatus(status, std::to_string(kMonitorCorrupt));
         const std::string statusText = corrupt == nullptr ? std::string() : corrupt->value("last_error", std::string());
         check(!statusText.empty() && replyText.find(statusText) != std::string::npos,
               "the RenderFailed reply carries the same error text GetStatus reports");
@@ -791,17 +798,17 @@ void runRenderChecks(sdbus::IProxy& proxy, FrameReadyLog& signals, const std::st
     // The reply to SetWallpaper was already sent by the time the render failed, so
     // GetStatus is the only place that failure is reported.
     {
-        const nlohmann::json json = getStatus(proxy);
-        const nlohmann::json* corrupt = wallpaperStatus(json, std::to_string(kMonitorCorrupt));
+        const StatusReply status = getStatusOrExplain(proxy);
+        const nlohmann::json* corrupt = wallpaperStatus(status, std::to_string(kMonitorCorrupt));
         const bool reported = corrupt != nullptr && !corrupt->value("last_error", std::string()).empty();
         check(reported, "GetStatus reports last_error for an asynchronous render failure");
     }
 
     // A monitor that rendered successfully must not carry a stale error.
     {
-        const nlohmann::json json = getStatus(proxy);
-        const nlohmann::json* still = wallpaperStatus(json, std::to_string(kMonitorStatic));
-        const nlohmann::json* video = wallpaperStatus(json, std::to_string(kMonitorVideo));
+        const StatusReply status = getStatusOrExplain(proxy);
+        const nlohmann::json* still = wallpaperStatus(status, std::to_string(kMonitorStatic));
+        const nlohmann::json* video = wallpaperStatus(status, std::to_string(kMonitorVideo));
         const bool reflected =
             still != nullptr && video != nullptr && still->value("type", std::string()) == "static" &&
             still->value("path", std::string()) == imagePath && still->value("has_frame", false) &&
@@ -840,9 +847,9 @@ void runRenderChecks(sdbus::IProxy& proxy, FrameReadyLog& signals, const std::st
     //       no longer anywhere in GetStatus, so nothing asserts it there; the client-facing
     //       sentence survives only on the GetFrameFd Unsupported reply, checked above.
     {
-        const nlohmann::json json = getStatus(proxy);
-        const nlohmann::json* video = wallpaperStatus(json, std::to_string(kMonitorVideo));
-        const nlohmann::json* rendered = wallpaperStatus(json, std::to_string(kMonitorBarrier));
+        const StatusReply status = getStatusOrExplain(proxy);
+        const nlohmann::json* video = wallpaperStatus(status, std::to_string(kMonitorVideo));
+        const nlohmann::json* rendered = wallpaperStatus(status, std::to_string(kMonitorBarrier));
         auto flag = [](const nlohmann::json* entry) {
             if (entry == nullptr) return std::string("<no such monitor>");
             if (!entry->contains("unsupported")) return std::string("<key absent>");
@@ -1000,11 +1007,11 @@ void runUnservicedRequestChecks(const wallpaperx::WallpaperManager::Config& conf
     //       own: recording that monitor as "static" instead -> "FAIL: the unserviced video
     //       monitor is the request this phase recorded, and it produced no frame", beside
     //       the keying FAIL. Reverted.
-    const nlohmann::json json = getStatus(proxy);
-    const nlohmann::json* pending = wallpaperStatus(json, std::to_string(kMonitorUnservicedStatic));
+    const StatusReply status = getStatusOrExplain(proxy);
+    const nlohmann::json* pending = wallpaperStatus(status, std::to_string(kMonitorUnservicedStatic));
     check(pending != nullptr && !pending->value("has_frame", true) && !pending->contains("last_error"),
           "the unserviced static monitor really is unserviced: recorded, no frame, and no error");
-    const nlohmann::json* pendingVideo = wallpaperStatus(json, std::to_string(kMonitorUnservicedVideo));
+    const nlohmann::json* pendingVideo = wallpaperStatus(status, std::to_string(kMonitorUnservicedVideo));
     check(pendingVideo != nullptr && pendingVideo->value("type", std::string()) == "video" &&
               pendingVideo->value("path", std::string()) == videoPath &&
               !pendingVideo->value("has_frame", true) && pendingVideo->value("generation", uint64_t{1}) == 0,
@@ -1277,8 +1284,8 @@ void runCoalescingChecks(sdbus::IProxy& proxy, FrameReadyLog& signals, const std
               "io.wallpaperx.Daemon.Error.RenderFailed",
           "a burst ending in an unrenderable request leaves no frame -- the last request is served, not the first");
     {
-        const nlohmann::json json = getStatus(proxy);
-        const nlohmann::json* monitor = wallpaperStatus(json, std::to_string(kMonitorBurstFailLast));
+        const StatusReply status = getStatusOrExplain(proxy);
+        const nlohmann::json* monitor = wallpaperStatus(status, std::to_string(kMonitorBurstFailLast));
         const bool reported = monitor != nullptr && monitor->value("path", std::string()) == corruptPath &&
                               !monitor->value("has_frame", true) && monitor->contains("last_error");
         check(reported, "GetStatus attributes the burst's outcome to the last request in it");
@@ -1299,8 +1306,8 @@ void runCoalescingChecks(sdbus::IProxy& proxy, FrameReadyLog& signals, const std
     check(errorNameFrom([&] { getFrameFd(proxy, kMonitorBurstRenderLast); }).empty(),
           "a burst ending in a renderable request leaves a frame, even after four failures");
     {
-        const nlohmann::json json = getStatus(proxy);
-        const nlohmann::json* monitor = wallpaperStatus(json, std::to_string(kMonitorBurstRenderLast));
+        const StatusReply status = getStatusOrExplain(proxy);
+        const nlohmann::json* monitor = wallpaperStatus(status, std::to_string(kMonitorBurstRenderLast));
         const bool served = monitor != nullptr && monitor->value("path", std::string()) == imagePath &&
                             monitor->value("has_frame", false);
         check(served, "the burst's last request is the one reflected in GetStatus");
@@ -1321,8 +1328,8 @@ void runCoalescingChecks(sdbus::IProxy& proxy, FrameReadyLog& signals, const std
     setWallpaper(proxy, "static", corruptPath, kMonitorErrorRecovery);
     barrier("the barrier frame arrives after a standalone failing request");
     {
-        const nlohmann::json json = getStatus(proxy);
-        const nlohmann::json* monitor = wallpaperStatus(json, std::to_string(kMonitorErrorRecovery));
+        const StatusReply status = getStatusOrExplain(proxy);
+        const nlohmann::json* monitor = wallpaperStatus(status, std::to_string(kMonitorErrorRecovery));
         const bool failed = monitor != nullptr && !monitor->value("has_frame", true) &&
                             !monitor->value("last_error", std::string()).empty();
         // Without this the clearing check below is unfalsifiable again, one step further
@@ -1333,8 +1340,8 @@ void runCoalescingChecks(sdbus::IProxy& proxy, FrameReadyLog& signals, const std
     setWallpaper(proxy, "static", imagePath, kMonitorErrorRecovery);
     check(signals.wait(kMonitorErrorRecovery, 1), "the recovering render emits FrameReady");
     {
-        const nlohmann::json json = getStatus(proxy);
-        const nlohmann::json* monitor = wallpaperStatus(json, std::to_string(kMonitorErrorRecovery));
+        const StatusReply status = getStatusOrExplain(proxy);
+        const nlohmann::json* monitor = wallpaperStatus(status, std::to_string(kMonitorErrorRecovery));
         const bool cleared = monitor != nullptr && monitor->value("path", std::string()) == imagePath &&
                              monitor->value("has_frame", false) && !monitor->contains("last_error");
         // Pins the outcome, not one particular line. WallpaperManager clears lastError
@@ -1354,8 +1361,8 @@ void runCoalescingChecks(sdbus::IProxy& proxy, FrameReadyLog& signals, const std
 
     const Frame frame = getFrameFd(proxy, kMonitorBurstContent);
     {
-        const nlohmann::json json = getStatus(proxy);
-        const nlohmann::json* monitor = wallpaperStatus(json, std::to_string(kMonitorBurstContent));
+        const StatusReply status = getStatusOrExplain(proxy);
+        const nlohmann::json* monitor = wallpaperStatus(status, std::to_string(kMonitorBurstContent));
         check(monitor != nullptr && monitor->value("path", std::string()) == burstPaths.back(),
               "GetStatus reports the last image of the burst as the monitor's wallpaper");
     }

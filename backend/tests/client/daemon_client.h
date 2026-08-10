@@ -26,6 +26,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -195,10 +196,73 @@ inline void setWallpaper(sdbus::IProxy& proxy, const std::string& type, const st
     proxy.callMethod("SetWallpaper").onInterface(DbusService::kInterface).withArguments(type, path, monitorId);
 }
 
-inline nlohmann::json getStatus(sdbus::IProxy& proxy) {
+// The answer to GetStatus, or the reason there is none.
+//
+// A dropped, saturated or unresponsive bus makes the call THROW rather than hand back an
+// unparseable reply, so `if (json.is_discarded())` is not the guard it looks like: the
+// discarded case never arrives. An escaping sdbus::Error instead unwinds past every phase
+// after the call site into the test's one catch-all -- one opaque line, no failure
+// attributed to anything, and no NOT VERIFIED row for the phases that never ran.
+//
+// So the fault is a value and there is deliberately no throwing form of getStatus() left
+// to reach for. That is the point of the shape: a non-throwing helper *beside* a throwing
+// one leaves the unsafe call the shorter thing to type, which is how the operator[] guard
+// documented on wallpaperStatus() below came to be missing from four of its five original
+// sites and then from three more that were written after it.
+//
+// A site that ignores ok() is not silent either -- json() is an empty object, so the
+// checks below it compare false and print, rather than crashing or vanishing.
+class StatusReply {
+public:
+    StatusReply() = default;
+    explicit StatusReply(nlohmann::json json) : m_json(std::move(json)) {}
+    static StatusReply failure(std::string error) {
+        StatusReply reply;
+        reply.m_error = std::move(error);
+        return reply;
+    }
+
+    // The call returned and its payload parsed into an object.
+    bool ok() const { return m_error.empty(); }
+
+    // Why there is no usable reply, empty when ok(). Names which of the two causes it was:
+    // a bus that did not answer and a daemon that answered with something unparseable are
+    // different components, and a caller that prints this cannot mix them up.
+    const std::string& error() const { return m_error; }
+
+    // An empty object unless ok().
+    const nlohmann::json& json() const { return m_json; }
+
+private:
+    nlohmann::json m_json = nlohmann::json::object();
+    std::string m_error;
+};
+
+inline StatusReply getStatus(sdbus::IProxy& proxy) {
     std::string status;
-    proxy.callMethod("GetStatus").onInterface(DbusService::kInterface).storeResultsTo(status);
-    return nlohmann::json::parse(status, nullptr, /*allow_exceptions=*/false);
+    try {
+        proxy.callMethod("GetStatus").onInterface(DbusService::kInterface).storeResultsTo(status);
+    } catch (const std::exception& e) {
+        return StatusReply::failure(std::string("the bus did not answer GetStatus: ") + e.what());
+    }
+    nlohmann::json json = nlohmann::json::parse(status, nullptr, /*allow_exceptions=*/false);
+    if (json.is_discarded()) return StatusReply::failure("GetStatus replied with something that is not JSON");
+    if (!json.is_object()) return StatusReply::failure("GetStatus replied with JSON that is not an object");
+    return StatusReply(std::move(json));
+}
+
+// getStatus(), plus the one line of diagnosis a site needs when it is going to let the
+// checks below it go red rather than skip.
+//
+// Without it those checks report the field they could not read ("GetStatus reports
+// last_error for a failed render") when the truth is that no reply arrived at all, which
+// sends the reader to the wrong component. Sites that must SKIP instead -- where the reply
+// is a precondition for a later measurement rather than the thing being graded -- call
+// getStatus() and route the reason through their own NOT VERIFIED channel.
+inline StatusReply getStatusOrExplain(sdbus::IProxy& proxy) {
+    StatusReply reply = getStatus(proxy);
+    if (!reply.ok()) std::fprintf(stderr, "  %s\n", reply.error().c_str());
+    return reply;
 }
 
 // GetStatus's entry for one monitor, or nullptr when the reply does not contain one.
@@ -213,8 +277,14 @@ inline nlohmann::json getStatus(sdbus::IProxy& proxy) {
 //
 // Callers read individual fields with value(), for the same reason: a missing "type" or
 // "has_frame" must make the comparison false, not abort.
-inline const nlohmann::json* wallpaperStatus(const nlohmann::json& json, const std::string& monitorId) {
-    if (json.is_discarded() || !json.is_object() || !json.contains("wallpapers")) return nullptr;
+//
+// Takes the StatusReply rather than a bare json so that a reply which never arrived is
+// one thing here and not two: json() is an empty object then, so this returns nullptr and
+// the caller's own check reports the monitor as missing rather than reading a field off a
+// reply that does not exist.
+inline const nlohmann::json* wallpaperStatus(const StatusReply& status, const std::string& monitorId) {
+    const nlohmann::json& json = status.json();
+    if (!json.is_object() || !json.contains("wallpapers")) return nullptr;
     const nlohmann::json& wallpapers = json["wallpapers"];
     if (!wallpapers.is_object() || !wallpapers.contains(monitorId)) return nullptr;
     const nlohmann::json& entry = wallpapers[monitorId];
@@ -237,8 +307,9 @@ inline const nlohmann::json* wallpaperStatus(const nlohmann::json& json, const s
 //       copying the monitor map (which is what a second lock acquisition makes
 //       reachable): "FAIL: GetStatus never reports an uninitialised GPU beside a
 //       monitor that already has a frame" in both tiers. Reverted.
-inline bool statusSelfConsistent(const nlohmann::json& json) {
-    if (json.is_discarded() || !json.is_object()) return true;
+inline bool statusSelfConsistent(const StatusReply& status) {
+    const nlohmann::json& json = status.json();
+    if (!json.is_object()) return true;
     if (!json.contains("gpu") || !json["gpu"].is_object()) return true;
     if (json["gpu"].value("initialized", true)) return true;
     if (!json.contains("wallpapers") || !json["wallpapers"].is_object()) return true;

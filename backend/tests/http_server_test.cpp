@@ -95,11 +95,13 @@ using wallpaperx::testing::describe;
 using wallpaperx::testing::FrameReadyLog;
 using wallpaperx::testing::get;
 using wallpaperx::testing::getStatus;
+using wallpaperx::testing::getStatusOrExplain;
 using wallpaperx::testing::HeldPort;
 using wallpaperx::testing::HttpReply;
 using wallpaperx::testing::makeClient;
 using wallpaperx::testing::Poller;
 using wallpaperx::testing::setWallpaper;
+using wallpaperx::testing::StatusReply;
 using wallpaperx::testing::tryConnect;
 using wallpaperx::testing::wallpaperStatus;
 
@@ -996,26 +998,16 @@ void runBindChecks(sdbus::IProxy& proxy, WallpaperManager& manager, HttpServer& 
 
     // The other half of S7.7, and the half that says the daemon is still a daemon: the
     // bus surface has to be unaffected by the HTTP server failing to come up.
-    // Wrapped because getStatus() throws on a bus that dropped the call rather than
-    // returning a discarded json -- and the check below is exactly the claim that it did
-    // not, so a throw belongs in this check's red rather than unwinding past every phase
-    // that follows into main's handler.
-    // CONTROL: getStatus() made to throw sdbus::Error on this call -> "FAIL: DBus still
-    //       answers GetStatus after an HTTP bind failure", with the later phases still
-    //       running. Reverted.
-    nlohmann::json status;
-    std::string statusThrow;
-    try {
-        status = getStatus(proxy);
-    } catch (const std::exception& e) {
-        statusThrow = e.what();
-    }
-    const bool statusUsable = statusThrow.empty() && !status.is_discarded() && status.is_object();
-    check(statusUsable && status.value("running", false),
+    // getStatus() reports a bus that dropped the call as a value rather than throwing (see
+    // tests/client/daemon_client.h), which is what lets the check below be the claim it
+    // reads as: a call that never came back is this check's red, not an unwind past every
+    // phase that follows into main's handler.
+    // CONTROL: DbusService::getStatus made to throw -> "FAIL: DBus still answers GetStatus
+    //       after an HTTP bind failure", with the later phases still running. Reverted.
+    const StatusReply status = getStatusOrExplain(proxy);
+    const bool statusUsable = status.ok();
+    check(statusUsable && status.json().value("running", false),
           "DBus still answers GetStatus after an HTTP bind failure");
-    if (!statusThrow.empty()) {
-        std::fprintf(stderr, "  GetStatus threw after the bind failure: %s\n", statusThrow.c_str());
-    }
     // A reply that never arrived is one fault, not two: the check below reads a field of
     // that reply, so grading it as well would blame config_server for a dead bus.
     //
@@ -1027,9 +1019,11 @@ void runBindChecks(sdbus::IProxy& proxy, WallpaperManager& manager, HttpServer& 
     std::string servedStatus;
     std::string servedDetail;
     if (statusUsable) {
+        const nlohmann::json& statusJson = status.json();
         const nlohmann::json* servedReport =
-            status.contains("config_server") && status["config_server"].is_object() ? &status["config_server"]
-                                                                                    : nullptr;
+            statusJson.contains("config_server") && statusJson["config_server"].is_object()
+                ? &statusJson["config_server"]
+                : nullptr;
         servedReportPresent = servedReport != nullptr;
         if (servedReport != nullptr) {
             servedStatus = servedReport->value("status", std::string());
@@ -1099,13 +1093,14 @@ void runBindChecks(sdbus::IProxy& proxy, WallpaperManager& manager, HttpServer& 
         // all, since a degraded bus is exactly the state that produced an unusable first
         // reply and there is nothing left for a second one to be compared against.
         //
-        // The second call is wrapped rather than merely tested for a discarded json: on a
-        // dropped or unresponsive bus getStatus() THROWS, so the discarded case never
-        // arrives, and an escaping sdbus::Error would abandon every remaining phase in this
-        // file behind main's one opaque line with no NOT VERIFIED row.
-        // CONTROL: getStatus() made to throw sdbus::Error on this call -> this skip row
-        //       naming the bus, no FAIL, and the phases after it still running; with the try
-        //       removed, "FAIL: unexpected exception" and no rows at all. Reverted.
+        // The second call's failure is a SKIP and not a FAIL: with no second reading there
+        // is nothing to compare the first against, and a bus that stopped answering is not
+        // evidence about what the refused server published. It reaches this branch as a
+        // value rather than as a throw, which is what keeps the phases after it running.
+        // CONTROL: DbusService::getStatus made to throw from its second call onward, so the
+        //       before-reading still exists and this is the call that fails -> this skip row
+        //       naming the bus, no FAIL in this phase, and the phases after it still
+        //       running. Reverted.
         if (!servedReportPresent) {
             notVerified("S7.20 (one config server per manager, publish-nothing half)",
                         statusUsable ? "GetStatus carried no config_server object before the refusal, so no "
@@ -1113,20 +1108,11 @@ void runBindChecks(sdbus::IProxy& proxy, WallpaperManager& manager, HttpServer& 
                                      : "the GetStatus reply before the refusal was not a usable object, which is "
                                        "graded above, so no before-reading exists to compare against");
         } else {
-            nlohmann::json afterStatus;
-            std::string afterThrow;
-            try {
-                afterStatus = getStatus(proxy);
-            } catch (const std::exception& e) {
-                afterThrow = e.what();
-            }
-            const bool afterUsable = afterThrow.empty() && !afterStatus.is_discarded() && afterStatus.is_object();
-            if (!afterUsable) {
-                notVerified("S7.20 (one config server per manager, publish-nothing half)",
-                            afterThrow.empty()
-                                ? "the GetStatus reply after the refusal was not a usable object"
-                                : "the bus did not answer GetStatus after the refusal: " + afterThrow);
+            const StatusReply after = getStatus(proxy);
+            if (!after.ok()) {
+                notVerified("S7.20 (one config server per manager, publish-nothing half)", after.error());
             } else {
+                const nlohmann::json& afterStatus = after.json();
                 const bool afterPresent =
                     afterStatus.contains("config_server") && afterStatus["config_server"].is_object();
                 const std::string afterStatusText =
@@ -2642,7 +2628,7 @@ void runAgreementChecks(httplib::Client& cli, sdbus::IProxy& proxy, const std::s
     check(hostilePath.find(kBidiOverride) != std::string::npos, "the fixture path really contains U+202E");
 
     const HttpReply config = get(cli, "/config?monitor=" + std::to_string(kMonitorAgree));
-    const nlohmann::json status = getStatus(proxy);
+    const StatusReply status = getStatusOrExplain(proxy);
     const nlohmann::json* entry = wallpaperStatus(status, std::to_string(kMonitorAgree));
 
     if (!config.hasJsonObject() || entry == nullptr) {
@@ -2698,11 +2684,12 @@ void runAgreementChecks(httplib::Client& cli, sdbus::IProxy& proxy, const std::s
 // ---------------------------------------------------------------------------- //
 void runHealthAfterDeviceChecks(httplib::Client& cli, sdbus::IProxy& proxy, const Check& check) {
     const HttpReply health = get(cli, "/health");
-    const nlohmann::json status = getStatus(proxy);
-    if (!health.hasJsonObject() || status.is_discarded()) {
+    const StatusReply status = getStatusOrExplain(proxy);
+    if (!health.hasJsonObject() || !status.ok()) {
         check(false, "/health and GetStatus both answered after the first render");
         return;
     }
+    const nlohmann::json& statusJson = status.json();
 
     // GOAL: S7.10b's other direction -- the two dependency checks that read `pending` on a
     //       daemon that had done nothing read `ok` once the daemon has actually used them.
@@ -2730,8 +2717,8 @@ void runHealthAfterDeviceChecks(httplib::Client& cli, sdbus::IProxy& proxy, cons
     //       `recordHealth(&DaemonHealth::shaders, HealthStatus::Ok, ...)` deleted ->
     //       "FAIL: /health reports the shader directory as ok once a render has resolved
     //       it". All reverted.
-    const bool gpuUp = status.contains("gpu") && status["gpu"].is_object() &&
-                       status["gpu"].value("initialized", false);
+    const bool gpuUp = statusJson.contains("gpu") && statusJson["gpu"].is_object() &&
+                       statusJson["gpu"].value("initialized", false);
     check(gpuUp, "GetStatus reports an initialised GPU after the first render");
     check(healthCheckStatus(health.json, "gpu") == "ok", "/health reports the GPU as ok once a device exists");
     if (gpuUp != (healthCheckStatus(health.json, "gpu") == "ok")) {
@@ -2777,8 +2764,8 @@ void runHealthAfterDeviceChecks(httplib::Client& cli, sdbus::IProxy& proxy, cons
     std::size_t failedCount = 0, unsupportedCount = 0, showingCount = 0, monitorCount = 0;
     int firstUnsupportedId = -1;
     std::string firstUnsupportedType;
-    if (status.contains("wallpapers") && status["wallpapers"].is_object()) {
-        for (const auto& [key, entry] : status["wallpapers"].items()) {
+    if (statusJson.contains("wallpapers") && statusJson["wallpapers"].is_object()) {
+        for (const auto& [key, entry] : statusJson["wallpapers"].items()) {
             if (!entry.is_object()) continue;
             ++monitorCount;
             const int id = std::atoi(key.c_str());
@@ -2832,8 +2819,8 @@ void runHealthAfterDeviceChecks(httplib::Client& cli, sdbus::IProxy& proxy, cons
     //       GetStatus reports" with "detail: gpu  dbus: NVIDIA GeForce RTX 3080 Ti /
     //       Heap", and nothing else red -- the status checks above stayed green, so this
     //       is not one of them restated. Reverted.
-    const std::string dbusTier = status["gpu"].value("descriptor_tier", std::string());
-    const std::string dbusName = status["gpu"].value("name", std::string());
+    const std::string dbusTier = statusJson["gpu"].value("descriptor_tier", std::string());
+    const std::string dbusName = statusJson["gpu"].value("name", std::string());
     const std::string gpuDetail = healthCheckDetail(health.json, "gpu");
     check(!dbusTier.empty() && !dbusName.empty(),
           "GetStatus reports a GPU name and tier for the detail check to be compared against");
@@ -2867,7 +2854,7 @@ void runReadOnlyChecks(httplib::Client& cli, sdbus::IProxy& proxy, const Check& 
     //               m_manager.requestWallpaper("video", req.body, 0); res.status = 200; });
     //       -> "FAIL: POST /config is not a route this server serves" and "FAIL: no
     //       sequence of HTTP requests changed what GetStatus reports". Reverted.
-    const std::string before = getStatus(proxy).dump();
+    const StatusReply before = getStatusOrExplain(proxy);
 
     struct MethodCase {
         const char* name;
@@ -2900,10 +2887,22 @@ void runReadOnlyChecks(httplib::Client& cli, sdbus::IProxy& proxy, const Check& 
         (void)get(cli, path);
     }
 
-    const std::string after = getStatus(proxy).dump();
-    check(before == after, "no sequence of HTTP requests changed what GetStatus reports");
-    if (before != after) {
-        std::fprintf(stderr, "  before: %s\n  after:  %s\n", before.c_str(), after.c_str());
+    const StatusReply after = getStatusOrExplain(proxy);
+
+    // Both replies are asserted to have arrived, and the comparison is gated on that. An
+    // unanswered GetStatus leaves an empty object behind, so an ungated "before == after"
+    // is satisfied by "{}" equalling "{}" -- the state check would pass at exactly the
+    // moment there was no state to read, which is the vacuous direction of this check.
+    // CONTROL: DbusService::getStatus made to throw -> "FAIL: GetStatus answered on both
+    //       sides of the read-only battery, so there is a state to compare" and the
+    //       unchanged-state check red beside it. Reverted.
+    const bool bothAnswered = before.ok() && after.ok();
+    check(bothAnswered, "GetStatus answered on both sides of the read-only battery, so there is a state to compare");
+    const std::string beforeDump = before.json().dump();
+    const std::string afterDump = after.json().dump();
+    check(bothAnswered && beforeDump == afterDump, "no sequence of HTTP requests changed what GetStatus reports");
+    if (beforeDump != afterDump) {
+        std::fprintf(stderr, "  before: %s\n  after:  %s\n", beforeDump.c_str(), afterDump.c_str());
     }
 }
 
@@ -2943,7 +2942,17 @@ void runGpuLockChecks(sdbus::IProxy& proxy, FrameReadyLog& signals, HttpServer& 
 
     uint64_t generation = 0;
     {
-        const nlohmann::json status = getStatus(proxy);
+        // A reply that never arrived is a skip and not a failure here: this generation is
+        // the baseline the render window below is measured from, so reading 0 off an empty
+        // reply would make signals.wait() wait for a generation that has already passed and
+        // grade a window that was never observed.
+        // CONTROL: DbusService::getStatus made to throw -> this phase reported NOT VERIFIED
+        //       naming the bus instead of grading a window. Reverted.
+        const StatusReply status = getStatus(proxy);
+        if (!status.ok()) {
+            notVerified("S7.12 (a poll never waits on a render)", status.error());
+            return;
+        }
         const nlohmann::json* entry = wallpaperStatus(status, std::to_string(kMonitorGpuLock));
         generation = entry != nullptr ? entry->value("generation", uint64_t{0}) : 0;
     }
@@ -3349,7 +3358,7 @@ int main() {
                 // X.3 again: on a host with no working Vulkan this is not a fault of the
                 // HTTP server, and grading the four phases below would produce a page of
                 // FAIL lines pointing at the wrong component.
-                const nlohmann::json status = getStatus(*proxy);
+                const StatusReply status = getStatus(*proxy);
                 const nlohmann::json* entry = wallpaperStatus(status, std::to_string(kMonitorAgree));
                 notVerified("S7.3 (channel agreement), S7.4 (escaping), S7.2 (read-only), "
                             "S7.10b (/health reads ok once the daemon has used its dependencies), "
