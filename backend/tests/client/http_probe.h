@@ -161,12 +161,23 @@ struct HttpReply {
     bool reached = false;  // the request completed at the HTTP level at all
     int status = 0;
     std::string body;
-    nlohmann::json json;  // discarded when the body did not parse
+    // Null on a reply that never reached the server -- no parse ran, so this is still the
+    // default-constructed value. Discarded only when a parse ran and the body was not JSON.
+    nlohmann::json json;
+
+    // True when fields may be read off `json`. All three conditions are needed and only one
+    // of them is obvious: `!is_discarded()` is *true* of the null this carries when the
+    // request never happened, and nlohmann's value() throws type_error.306 on null and
+    // const operator[] throws type_error.305 on any non-object. A throw here crosses
+    // whatever phase is running into main's handler, which abandons every later phase with
+    // one opaque line and no NOT VERIFIED row -- so the guard has to be this, not
+    // `!is_discarded()` (X.4).
+    bool hasJsonObject() const { return reached && !json.is_discarded() && json.is_object(); }
 
     // `reached` is separate from `status` because httplib reports a refused connection as
     // a falsy Result with no status at all. Folding that into status 0 would let a check
     // written as `status != 200` be satisfied by a daemon that was not running.
-    bool ok() const { return reached && status == 200 && !json.is_discarded(); }
+    bool ok() const { return hasJsonObject() && status == 200; }
 };
 
 inline HttpReply get(httplib::Client& cli, const std::string& path) {

@@ -349,6 +349,12 @@ void notVerified(const char* goals, const std::string& reason) {
     ++g_notVerified;
 }
 
+// What an HttpServer constructor threw, the first time one did, or "" if none did. Graded
+// once in main rather than at each startServer() call site: a constructor that throws is a
+// daemon defect, and the call sites can only report a missing server as NOT VERIFIED, so
+// without this the run would end at exit 77 -- a ctest skip -- with nothing naming it.
+std::string g_serverConstructorThrew;
+
 double millis(Clock::duration d) {
     return std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(d).count();
 }
@@ -468,8 +474,9 @@ std::string nonLoopbackAddress() {
 constexpr const char* kBindRefusedMarker = "could not bind ";
 
 // Starts an HttpServer on a port the OS says is free, retrying if something took the port
-// in between. Returns null with `reason` filled only when no attempt could obtain an
-// ephemeral port at all -- the one condition here that may be reported as a skip.
+// in between. Returns null with `reason` filled in two cases: no attempt could obtain an
+// ephemeral port at all -- a host fact, and the only one here that is purely a skip -- or
+// the constructor threw, which callers also report as a skip but main additionally grades.
 //
 // WHY-THIS-SHAPE: two predicates, and which one does which job is the whole point.
 //       ACCEPTANCE is the socket: a server is handed back because it answered /health.
@@ -485,17 +492,17 @@ constexpr const char* kBindRefusedMarker = "could not bind ";
 //       negative: a config_server detail carrying kBindRefusedMarker is this HttpServer
 //       saying it did not get the port. Health is never used to accept, so a broken
 //       publication still reaches the graded checks as FAIL rather than as a skip.
-//       Null is reachable only when freePort() failed on every attempt: a server that was
-//       constructed is handed back even if it was rejected or never answered, because a
-//       daemon that cannot serve on eight different free ports is a defect for the checks
-//       to report, not a host fact to skip on. The last-attempt hand-back is tested BEFORE
-//       the probe, since on that attempt the probe's answer cannot change the outcome and
-//       costs up to three seconds of timeout.
+//       A server that was constructed is handed back even if it was rejected or never
+//       answered, because a daemon that cannot serve on eight different free ports is a
+//       defect for the checks to report, not a host fact to skip on. The last-attempt
+//       hand-back is tested BEFORE the probe, since on that attempt the probe's answer
+//       cannot change the outcome and costs up to three seconds of timeout.
 // CONTROL: three, reverted. (a) recordConfigServer(true, {}) changed to record a failure ->
 //       "FAIL: the daemon that is serving reports config_server ok" and ctest Failed, not a
 //       skip. (b) the constructor made to return after a successful bind, so it publishes
 //       nothing and serves nothing -> many FAIL lines and ctest Failed. (c) freePort() made
-//       to return -1 always -> the one NOT VERIFIED path, ctest Skipped.
+//       to return -1 always -> the host-fact NOT VERIFIED path, ctest Skipped. The
+//       constructor-throw path has its own control, on the check in main that grades it.
 std::unique_ptr<HttpServer> startServer(WallpaperManager& manager, std::string& reason) {
     constexpr int kAttempts = 8;
     // Held across iterations so a later freePort() failure cannot throw away a server that
@@ -506,7 +513,25 @@ std::unique_ptr<HttpServer> startServer(WallpaperManager& manager, std::string& 
         const int port = freePort();
         if (port < 0) continue;
         server.reset();
-        server = std::make_unique<HttpServer>(manager, port);
+        // Layered like S7.20's refusal check below, and for the same reason: HttpServer's
+        // registration guard throws std::logic_error on a manager that already has a server,
+        // and every caller here is inside a phase. Left to escape, it unwinds past the
+        // remaining phases into main's handler, which prints one opaque line and abandons
+        // them with no NOT VERIFIED row. Caught, the phase says what happened and the run
+        // continues -- and `g_serverConstructorThrew` keeps it a graded FAIL rather than a
+        // skip. Not retried: a claim that is held is held, so eight more attempts would only
+        // be slower.
+        try {
+            server = std::make_unique<HttpServer>(manager, port);
+        } catch (const std::exception& e) {
+            if (g_serverConstructorThrew.empty()) g_serverConstructorThrew = e.what();
+            reason = std::string("the HttpServer constructor threw: ") + e.what();
+            return nullptr;
+        } catch (...) {
+            if (g_serverConstructorThrew.empty()) g_serverConstructorThrew = "something that is not a std::exception";
+            reason = "the HttpServer constructor threw something that is not a std::exception";
+            return nullptr;
+        }
         if (attempt == kAttempts - 1) return server;
 
         const wallpaperx::HealthCheck record = manager.snapshot().health.configServer;
@@ -1084,7 +1109,7 @@ void runBindChecks(sdbus::IProxy& proxy, WallpaperManager& manager, HttpServer& 
 // ---------------------------------------------------------------------------- //
 void runHealthBeforeDeviceChecks(httplib::Client& cli, const Check& check) {
     const HttpReply health = get(cli, "/health");
-    if (!health.reached || health.json.is_discarded()) {
+    if (!health.hasJsonObject()) {
         check(false, "/health answers with parseable JSON before any wallpaper is set");
         return;
     }
@@ -1332,9 +1357,9 @@ void runHandlerExceptionChecks(const Check& check) {
     //       anywhere but that same handler path does not satisfy it.
     check(faulted.reached, "a handler that threw still answers, rather than dropping the connection");
     check(faulted.status == 500, "a handler that threw answers 500");
-    check(!faulted.json.is_discarded() && faulted.json.value("error", std::string()) == "internal error",
+    check(faulted.hasJsonObject() && faulted.json.value("error", std::string()) == "internal error",
           "a handler that threw answers with the daemon's own JSON error body");
-    if (faulted.status != 500 || faulted.json.is_discarded()) {
+    if (faulted.status != 500 || !faulted.hasJsonObject()) {
         std::fprintf(stderr, "  body: %s\n", faulted.body.empty() ? "(empty)" : faulted.body.c_str());
     }
 
@@ -2261,9 +2286,20 @@ void runMonitorParamChecks(httplib::Client& cli, const std::string& recordedPath
     // optional extra defaulting to 0.
     const HttpReply documented = get(cli, "/config?t=1234567890");
     check(documented.reached && documented.status == 200, "/config?t=<ts> answers 200 with no monitor parameter");
-    check(!documented.json.is_discarded() && documented.json.value("monitor_id", -1) == 0,
+    // GOAL: X.4 as much as S7.5 -- a /config that never answered must be reported by these
+    //       checks, not thrown out of the phase. False if a request that did not reach the
+    //       server ends the run instead of failing here.
+    // WHY-THIS-SHAPE: hasJsonObject(), not `!json.is_discarded()`. A reply that never
+    //       reached the server carries a null json, which is *not* discarded, so the
+    //       obvious guard passes and value() then throws type_error.306 -- which unwinds
+    //       into main and drops every remaining phase with no NOT VERIFIED row.
+    // CONTROL: HttpServer::kLoopbackHost changed to "192.0.2.1" (unbindable), so no phase
+    //       can reach the server -> these two go red as
+    //       "FAIL: /config with no monitor parameter answers for monitor 0" rather than
+    //       aborting, and the phases after this one still run. Reverted.
+    check(documented.hasJsonObject() && documented.json.value("monitor_id", -1) == 0,
           "/config with no monitor parameter answers for monitor 0");
-    check(!documented.json.is_discarded() && documented.json.value("path", std::string()) == recordedPath,
+    check(documented.hasJsonObject() && documented.json.value("path", std::string()) == recordedPath,
           "/config with no monitor parameter reports monitor 0's recorded path");
 
     // In-range ids, including both boundaries.
@@ -2281,7 +2317,7 @@ void runMonitorParamChecks(httplib::Client& cli, const std::string& recordedPath
         const HttpReply res = get(cli, "/config?monitor=" + std::to_string(id));
         check(res.reached && res.status == 200,
               "an in-range monitor id is answered with 200");
-        check(!res.json.is_discarded() && res.json.value("monitor_id", -1) == id,
+        check(res.hasJsonObject() && res.json.value("monitor_id", -1) == id,
               "/config echoes back the monitor id it was asked about");
         if (!(res.reached && res.status == 200)) {
             std::fprintf(stderr, "  monitor=%d answered %d\n", id, res.status);
@@ -2291,7 +2327,7 @@ void runMonitorParamChecks(httplib::Client& cli, const std::string& recordedPath
     // A monitor nothing has been set on: empty strings and 200, not 404. The plugin polls
     // this once a second from session start, and a fresh monitor is the ordinary state.
     const HttpReply unset = get(cli, "/config?monitor=" + std::to_string(kMonitorNeverSet));
-    check(!unset.json.is_discarded() && unset.json.value("type", std::string("x")).empty() &&
+    check(unset.hasJsonObject() && unset.json.value("type", std::string("x")).empty() &&
               unset.json.value("path", std::string("x")).empty(),
           "a monitor nothing has been set on answers with empty type and path");
 
@@ -2457,7 +2493,7 @@ void runTornReadChecks(WallpaperManager& manager, httplib::Client& cli, const st
         const std::string path = "/config?monitor=" + std::to_string(kMonitorTorn);
         for (int i = 0; i < kReads; ++i) {
             const HttpReply res = get(cli, path);
-            if (!res.reached || res.status != 200 || res.json.is_discarded()) continue;
+            if (!res.ok()) continue;
             ++answered;
             const std::string type = res.json.value("type", std::string());
             const std::string reported = res.json.value("path", std::string());
@@ -2506,7 +2542,7 @@ void runAgreementChecks(httplib::Client& cli, sdbus::IProxy& proxy, const std::s
     const nlohmann::json status = getStatus(proxy);
     const nlohmann::json* entry = wallpaperStatus(status, std::to_string(kMonitorAgree));
 
-    if (!config.reached || config.json.is_discarded() || entry == nullptr) {
+    if (!config.hasJsonObject() || entry == nullptr) {
         check(false, "both channels answered for the monitor whose path is hostile");
         return;
     }
@@ -2548,7 +2584,7 @@ void runAgreementChecks(httplib::Client& cli, sdbus::IProxy& proxy, const std::s
     // empty strings, GetStatus has no entry at all. Two different shapes for the same
     // fact, which is fine -- what would not be is /config inventing a type.
     const HttpReply unset = get(cli, "/config?monitor=" + std::to_string(kMonitorNeverSet));
-    check(!unset.json.is_discarded() && unset.json.value("type", std::string("x")).empty(),
+    check(unset.hasJsonObject() && unset.json.value("type", std::string("x")).empty(),
           "/config reports no type for a monitor GetStatus has no entry for");
     check(wallpaperStatus(status, std::to_string(kMonitorNeverSet)) == nullptr,
           "GetStatus has no entry for the monitor /config reports as empty");
@@ -2560,7 +2596,7 @@ void runAgreementChecks(httplib::Client& cli, sdbus::IProxy& proxy, const std::s
 void runHealthAfterDeviceChecks(httplib::Client& cli, sdbus::IProxy& proxy, const Check& check) {
     const HttpReply health = get(cli, "/health");
     const nlohmann::json status = getStatus(proxy);
-    if (!health.reached || health.json.is_discarded() || status.is_discarded()) {
+    if (!health.hasJsonObject() || status.is_discarded()) {
         check(false, "/health and GetStatus both answered after the first render");
         return;
     }
@@ -3209,6 +3245,24 @@ int main() {
 
         runShutdownChecks(manager, check);
         runKeepAliveShutdownChecks(manager, check);
+
+        // GOAL: S7.20's release half again, from the direction the phases feel it -- no
+        //       HttpServer constructed anywhere in this run may throw. False if a claim
+        //       outlives the server that made it, which is what the two shutdown phases
+        //       above walk into: they build a server on the manager main just released.
+        // WHY-THIS-SHAPE: graded here, not inside startServer's catch. A phase whose server
+        //       is null can only report NOT VERIFIED, so a leaked claim would otherwise end
+        //       the run at exit 77 -- a ctest *skip* -- with the defect named in a skip
+        //       reason nobody grades. One flag, one check, so the phases still report
+        //       individually and the run still fails.
+        // CONTROL: ~Registration's detachConfigServer() call deleted -> "FAIL: no
+        //       HttpServer constructor threw during this run", with the release-half check
+        //       red and both shutdown phases printing NOT VERIFIED instead of the run
+        //       ending on an unexpected exception. Reverted.
+        check(g_serverConstructorThrew.empty(), "no HttpServer constructor threw during this run");
+        if (!g_serverConstructorThrew.empty()) {
+            std::fprintf(stderr, "  an HttpServer constructor threw: %s\n", g_serverConstructorThrew.c_str());
+        }
     } catch (const std::exception& e) {
         // Without this an escaping sdbus::Error -- what a host with no session bus
         // produces -- would abort the process, so ctest would report an opaque SIGABRT

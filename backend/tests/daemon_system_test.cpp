@@ -2227,6 +2227,23 @@ std::string bindFailureMarker(int port) {
     return std::string("could not bind ") + wallpaperx::HttpServer::kLoopbackHost + ":" + std::to_string(port);
 }
 
+// A /health body's `checks` object, or nullptr when the body does not carry one. Third site
+// of the wallpaperStatus()/configServerReport() pattern, and needed for the same reason:
+// `body["checks"]` on a const json is JSON_ASSERT plus a dereference, so a daemon that
+// dropped the key would abort this test rather than fail the check written to catch it.
+// The order matters -- ask whether the key is there, then read it; reading it and then
+// asking `.is_object()` is already too late.
+// CONTROL: `{"checks", checksJson}` dropped from the /health body in http_server.cpp ->
+//       four named FAIL lines starting "the real daemon's /health names shaders, gpu and
+//       wallpapers as separate checks", and the run finishes. With the read-then-ask idiom
+//       the same mutation aborted on json.hpp's `it != object->end()` assertion with no
+//       FAIL line at all. Reverted.
+const nlohmann::json* healthChecks(const nlohmann::json& body) {
+    if (!body.is_object() || !body.contains("checks")) return nullptr;
+    const nlohmann::json& checks = body["checks"];
+    return checks.is_object() ? &checks : nullptr;
+}
+
 // ---------------------------------------------------------------------------- //
 // Phase 10 -- the HTTP config server, in the shipped binary, on the shipped port.
 // ---------------------------------------------------------------------------- //
@@ -2344,13 +2361,14 @@ void checkHttpLifecycle(NameWatcher& names, const std::string& bluePath, const s
     const HttpReply fresh = wallpaperx::testing::get(cli, "/health");
     check(fresh.ok(), "the real daemon answers GET /health on 127.0.0.1:18462");
     if (fresh.ok()) {
-        const nlohmann::json& checks = fresh.json["checks"];
-        const bool named = checks.is_object() && checks.contains("shaders") && checks.contains("gpu") &&
-                           checks.contains("wallpapers");
+        const nlohmann::json* checks = healthChecks(fresh.json);
+        const bool named = checks != nullptr && checks->contains("shaders") && checks->contains("gpu") &&
+                           checks->contains("wallpapers");
         check(named, "the real daemon's /health names shaders, gpu and wallpapers as separate checks");
         check(fresh.json.value("status", std::string()) == "pending",
               "the real daemon reports the aggregate as pending before it has used anything");
-        check(named && checks["gpu"].value("status", std::string()) == "pending",
+        check(named && (*checks)["gpu"].is_object() &&
+                  (*checks)["gpu"].value("status", std::string()) == "pending",
               "the real daemon reports the GPU as untried before its first wallpaper");
         if (fresh.json.value("status", std::string()) != "pending" || !named) {
             std::fprintf(stderr, "  fresh /health: %s\n", fresh.body.c_str());
@@ -2406,12 +2424,15 @@ void checkHttpLifecycle(NameWatcher& names, const std::string& bluePath, const s
         const std::string dbusName = status.contains("gpu") && status["gpu"].is_object()
                                          ? status["gpu"].value("name", std::string())
                                          : std::string();
-        const std::string gpuStatus = afterRender.ok() && afterRender.json["checks"].is_object()
-                                          ? afterRender.json["checks"]["gpu"].value("status", std::string())
-                                          : std::string();
-        const std::string gpuDetail = afterRender.ok() && afterRender.json["checks"].is_object()
-                                          ? afterRender.json["checks"]["gpu"].value("detail", std::string())
-                                          : std::string();
+        const nlohmann::json* afterChecks = healthChecks(afterRender.json);
+        // ok() stays in the condition: a gpu verdict read out of a body /health did not
+        // answer with 200 would satisfy the assertions below without the endpoint working.
+        const bool gpuReported = afterRender.ok() && afterChecks != nullptr && afterChecks->contains("gpu") &&
+                                 (*afterChecks)["gpu"].is_object();
+        const std::string gpuStatus =
+            gpuReported ? (*afterChecks)["gpu"].value("status", std::string()) : std::string();
+        const std::string gpuDetail =
+            gpuReported ? (*afterChecks)["gpu"].value("detail", std::string()) : std::string();
         check(gpuStatus == "ok", "the real daemon's /health reports the GPU as ok after a render");
         check(afterRender.ok() && afterRender.json.value("status", std::string()) == "ok",
               "the real daemon's /health reports the aggregate as ok after a successful render");
@@ -2686,16 +2707,16 @@ void checkConfigServerOwnsPort(NameWatcher& names, const std::string& validation
     //       names its three checks and not config_server". Reverted.
     httplib::Client cli = wallpaperx::testing::makeClient(kPort);
     const wallpaperx::testing::HttpReply health = wallpaperx::testing::get(cli, "/health");
-    const bool healthUsable = health.ok() && health.json["checks"].is_object();
+    const nlohmann::json* checks = healthChecks(health.json);
+    const bool healthUsable = health.ok() && checks != nullptr;
     if (!healthUsable) {
         // Whether /health answers at all is graded by the HTTP-lifecycle phase, against a
         // daemon of its own. Grading it again here would give one fault two names.
         std::printf("daemon_system_test: the /health-placement check is not graded -- /health did not answer with a "
                     "checks object on this daemon.\n");
     } else {
-        const nlohmann::json& checks = health.json["checks"];
-        check(checks.contains("shaders") && checks.contains("gpu") && checks.contains("wallpapers") &&
-                  !checks.contains("config_server") && configServerReport(status) != nullptr,
+        check(checks->contains("shaders") && checks->contains("gpu") && checks->contains("wallpapers") &&
+                  !checks->contains("config_server") && configServerReport(status) != nullptr,
               "the bind result is on DBus only -- /health names its three checks and not config_server");
     }
 
