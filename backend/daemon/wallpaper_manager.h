@@ -216,6 +216,12 @@ public:
     // from its serving thread if the accept loop later dies.
     void recordConfigServer(bool listening, const std::string& error);
 
+    // Claims the right to be that writer. Two servers on one manager would overwrite each
+    // other's record -- including a failed bind stamping fail over a server that is
+    // serving -- so the second one is refused rather than allowed to publish.
+    bool tryAttachConfigServer();
+    void detachConfigServer();
+
     // The renderer's validation-warning counter, or null when no device has been created
     // yet. Shared so it stays readable after this manager and its Device are destroyed:
     // the layer's teardown complaints are the ones worth having, and they are emitted
@@ -294,6 +300,7 @@ private:
 
     GpuStatus m_gpuStatus;
     DaemonHealth m_health;
+    bool m_configServerAttached = false;
 };
 
 }

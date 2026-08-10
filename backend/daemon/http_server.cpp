@@ -13,6 +13,7 @@
 #include <cstring>
 #include <utility>
 #include <exception>
+#include <stdexcept>
 #include <thread>
 #include <string>
 #include <system_error>
@@ -74,8 +75,19 @@ bool parseMonitorParam(const httplib::Request& req, int& outMonitorId, std::stri
 
 }  // namespace
 
+HttpServer::Registration::Registration(WallpaperManager& manager) : m_manager(manager) {
+    if (!m_manager.tryAttachConfigServer()) {
+        throw std::logic_error("HttpServer: this WallpaperManager already has a config server");
+    }
+}
+
+HttpServer::Registration::~Registration() { m_manager.detachConfigServer(); }
+
 HttpServer::HttpServer(WallpaperManager& manager, int port)
-    : m_manager(manager), m_port(port), m_server(std::make_unique<httplib::Server>()) {
+    : m_registration(manager),
+      m_manager(manager),
+      m_port(port),
+      m_server(std::make_unique<httplib::Server>()) {
     m_server->set_payload_max_length(kMaxPayloadBytes);
     m_server->set_read_timeout(kIoTimeoutSeconds);
     m_server->set_write_timeout(kIoTimeoutSeconds);
@@ -116,17 +128,16 @@ HttpServer::HttpServer(WallpaperManager& manager, int port)
     registerRoutes();
 
     if (!m_server->bind_to_port(kLoopbackHost, m_port)) {
-        m_bindError = std::string("could not bind ") + kLoopbackHost + ":" + std::to_string(m_port) +
-                      " (is another process using it?)";
+        const std::string bindError = std::string("could not bind ") + kLoopbackHost + ":" +
+                                      std::to_string(m_port) + " (is another process using it?)";
         std::fprintf(stderr,
                      "wallpaperx-daemon: %s -- the KDE plugin will not be able to read config; "
                      "DBus and rendering are unaffected\n",
-                     m_bindError.c_str());
-        m_manager.recordConfigServer(false, m_bindError);
+                     bindError.c_str());
+        m_manager.recordConfigServer(false, bindError);
         return;
     }
 
-    m_listening.store(true, std::memory_order_release);
     // Recorded here, not by the caller: the serving thread below is the only other writer,
     // and starting it after this write is what orders the two.
     m_manager.recordConfigServer(true, {});
@@ -138,7 +149,6 @@ HttpServer::HttpServer(WallpaperManager& manager, int port)
         // is the one thing a client cannot find out any other way.
         const bool clean = m_server->listen_after_bind();
         if (!clean && !m_stopping.load(std::memory_order_acquire)) {
-            m_listening.store(false, std::memory_order_release);
             m_manager.recordConfigServer(
                 false, std::string("stopped serving ") + kLoopbackHost + ":" +
                            std::to_string(m_port) + " (accept failed; the port is closed)");
@@ -154,7 +164,7 @@ HttpServer::HttpServer(WallpaperManager& manager, int port)
 }
 
 HttpServer::~HttpServer() {
-    // Guarded on joinable() rather than m_listening: a failed bind leaves no thread.
+    // Guarded on joinable(): a failed bind leaves no thread.
     m_stopping.store(true, std::memory_order_release);
     m_server->stop();
     if (m_thread.joinable()) m_thread.join();

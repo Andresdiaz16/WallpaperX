@@ -2,7 +2,6 @@
 
 #include <atomic>
 #include <memory>
-#include <string>
 #include <thread>
 
 namespace httplib {
@@ -27,13 +26,16 @@ public:
     // Binds synchronously, then serves on a background thread, so a port conflict is a
     // value the constructor reports rather than a failure inside a thread nobody awaits.
     //
-    // Does NOT throw on a bind failure -- see listening()/lastError(). DBus, wpxctl and
-    // rendering work without this, so refusing to start would take every monitor down for
-    // a convenience channel.
+    // Does NOT throw on a bind failure -- the result is published as the manager's
+    // config-server health, which GetStatus carries. DBus, wpxctl and rendering work
+    // without this, so refusing to start would take every monitor down for a convenience
+    // channel.
     //
-    // At most one instance per manager: constructing one publishes its bind result as that
-    // manager's config-server health, and a second instance would overwrite the first's
-    // with its own -- including a failed bind stamping fail over a server that is serving.
+    // At most one instance per manager, enforced: constructing one publishes its bind
+    // result as that manager's config-server health, and a second would overwrite the
+    // first's with its own -- including a failed bind stamping fail over a server that is
+    // serving. A second instance throws std::logic_error. That is a programming error and
+    // not an environment one, which is why it throws where a bind failure does not.
     HttpServer(WallpaperManager& manager, int port = kDefaultPort);
 
     // Stops and joins on every path; a joinable thread destroyed mid-unwind is
@@ -43,17 +45,26 @@ public:
     HttpServer(const HttpServer&) = delete;
     HttpServer& operator=(const HttpServer&) = delete;
 
-    bool listening() const { return m_listening.load(std::memory_order_acquire); }
-
-    // The bind attempt only -- the serving thread never writes it, and reports its own exit
-    // through WallpaperManager instead. Set before the thread starts, so it needs no lock.
-    const std::string& lastError() const { return m_bindError; }
-
     int port() const { return m_port; }
 
 private:
+    // Declared first so it is released last -- after the destructor has joined the serving
+    // thread, and even if a later member or the constructor body throws.
+    class Registration {
+    public:
+        explicit Registration(WallpaperManager& manager);
+        ~Registration();
+
+        Registration(const Registration&) = delete;
+        Registration& operator=(const Registration&) = delete;
+
+    private:
+        WallpaperManager& m_manager;
+    };
+
     void registerRoutes();
 
+    Registration m_registration;
     WallpaperManager& m_manager;
     int m_port;
 
@@ -61,11 +72,9 @@ private:
     std::unique_ptr<httplib::Server> m_server;
 
     std::thread m_thread;
-    std::atomic<bool> m_listening{false};
 
     // Tells the destructor's stop() apart from the accept loop dying on its own.
     std::atomic<bool> m_stopping{false};
-    std::string m_bindError;
 };
 
 }  // namespace wallpaperx

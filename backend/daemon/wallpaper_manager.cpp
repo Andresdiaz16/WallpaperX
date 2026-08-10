@@ -107,6 +107,18 @@ void WallpaperManager::recordConfigServer(bool listening, const std::string& err
                  listening ? "listening" : error);
 }
 
+bool WallpaperManager::tryAttachConfigServer() {
+    std::lock_guard<std::mutex> stateLock(m_stateMutex);
+    if (m_configServerAttached) return false;
+    m_configServerAttached = true;
+    return true;
+}
+
+void WallpaperManager::detachConfigServer() {
+    std::lock_guard<std::mutex> stateLock(m_stateMutex);
+    m_configServerAttached = false;
+}
+
 void WallpaperManager::ensureGpu() {
     if (m_device) return;
 

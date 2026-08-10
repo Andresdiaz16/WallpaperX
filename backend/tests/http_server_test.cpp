@@ -464,14 +464,22 @@ std::string nonLoopbackAddress() {
 // Starts an HttpServer on a port the OS says is free, retrying if something took the
 // port in between. Returns null with `reason` filled when no port could be had -- a
 // harness failure, never graded as a daemon failure.
+//
+// The predicate is the manager's config-server health, read after *each* construction:
+// a hoisted read would see `pending` on a fresh manager and never accept at all.
+//
+// CONTROL: harness control flow, so a dead predicate shows up as a skip, not a FAIL.
+// (a) production, recordConfigServer(true, {}) made to record a failure -> exit 77.
+// (b) the snapshot read hoisted above the loop -> exit 77. Both reverted.
 std::unique_ptr<HttpServer> startServer(WallpaperManager& manager, std::string& reason) {
     std::string lastError = "no port could be probed";
     for (int attempt = 0; attempt < 8; ++attempt) {
         const int port = freePort();
         if (port < 0) continue;
         auto server = std::make_unique<HttpServer>(manager, port);
-        if (server->listening()) return server;
-        lastError = server->lastError();
+        const wallpaperx::HealthCheck record = manager.snapshot().health.configServer;
+        if (record.status == wallpaperx::HealthStatus::Ok) return server;
+        lastError = record.detail.empty() ? "the manager recorded no config-server detail" : record.detail;
     }
     reason = "could not start an HttpServer on any ephemeral port (last error: " + lastError + ")";
     return nullptr;
@@ -661,7 +669,10 @@ private:
 // ---------------------------------------------------------------------------- //
 // Phase 1 -- where the socket is, and what happens when it cannot be had.
 // ---------------------------------------------------------------------------- //
-void runBindChecks(WallpaperManager& manager, sdbus::IProxy& proxy, HttpServer& server, const Check& check) {
+// No manager parameter: the only thing this phase ever did with the run's shared manager
+// was construct a second HttpServer on it, which http_server.h forbids. The conflict case
+// builds its own.
+void runBindChecks(sdbus::IProxy& proxy, HttpServer& server, const Check& check) {
     httplib::Client cli = makeClient(server.port());
     const HttpReply health = get(cli, "/health");
     check(health.reached && health.status == 200, "the server answers /health on 127.0.0.1");
@@ -765,21 +776,26 @@ void runBindChecks(WallpaperManager& manager, sdbus::IProxy& proxy, HttpServer& 
           "the port those binds were refused from is the one the daemon is still serving");
 
     // GOAL: S7.7 -- a bind failure does not take the daemon down and does not leave it
-    //       looking healthy: the constructor returns, listening() is false, lastError()
-    //       says what happened, and DBus keeps working.
+    //       looking healthy: the constructor returns, the manager's config-server health
+    //       reads fail with a detail naming the port, and DBus keeps working.
     //       UNRATIFIED: PLAN.md does not settle whether a port conflict should be fatal.
     //       This pins what cd28790 does, so a change of mind is a visible decision rather
     //       than a silent one; it is not a claim that surviving is correct.
-    // WHY-THIS-SHAPE: the port is held by a socket this test owns for the duration,
-    //       rather than by a second HttpServer, so the conflict is real and the failing
-    //       constructor is the only HttpServer involved -- with two servers a wrong
-    //       result could belong to either.
-    // CONTROL: two, because "does not throw" and "reports the failure" are separate
-    //       claims. (a) `throw std::runtime_error(m_bindError);` in place of the return
-    //       in the bind-failure branch -> "FAIL: a port conflict does not throw out of
-    //       the HttpServer constructor". (b) the `return` deleted from that branch, so
-    //       m_listening is set anyway -> "FAIL: a server that could not bind reports
-    //       listening() == false". Both reverted.
+    // WHY-THIS-SHAPE: the port is held by a socket this test owns, not by a second
+    //       HttpServer, so the failing constructor is the only HttpServer involved. And
+    //       the failing server gets its own manager: on the shared one these claims would
+    //       be reading the fail-over-a-serving-server stamp http_server.h's
+    //       at-most-one-instance-per-manager invariant calls a bug -- passing *because* of
+    //       a defect, and leaving every later phase a stale fail.
+    //       The detail is read as stored: recordConfigServer runs it through
+    //       sanitizeForLog(.., 1024, Bare), which leaves this ASCII string untouched.
+    // CONTROL: four, reverted. (a) `throw std::runtime_error(bindError);` for the return
+    //       in the bind-failure branch -> only the does-not-throw check red. (b) that
+    //       return deleted, so the constructor records success anyway -> the not-healthy
+    //       and names-the-port checks red. (c) the port dropped from the bindError text ->
+    //       only names-the-port red, which is what keeps it distinct from "something
+    //       failed". (d) recordConfigServer(false, "") -> records-why and names-the-port
+    //       red.
     HeldPort taken;
     if (!taken.open(INADDR_LOOPBACK)) {
         notVerified("S7.7 (bind failure is survivable)", "could not hold a loopback port to create the conflict");
@@ -787,37 +803,82 @@ void runBindChecks(WallpaperManager& manager, sdbus::IProxy& proxy, HttpServer& 
     }
 
     bool threw = false;
-    bool listening = true;
-    std::string bindError;
+    // Ok, not Pending: an unwritten status must fail the "does not report itself healthy"
+    // check rather than satisfy it by accident.
+    wallpaperx::HealthStatus recordStatus = wallpaperx::HealthStatus::Ok;
+    std::string recordDetail;
     int reportedPort = -1;
-    try {
-        HttpServer conflicted(manager, taken.port());
-        listening = conflicted.listening();
-        bindError = conflicted.lastError();
-        reportedPort = conflicted.port();
-        // Destroyed here, on a server that never served a request. Safe in this one case
-        // precisely because the serving thread was never started -- see the CONCERN note
-        // above runShutdownChecks for why that matters everywhere else.
-    } catch (const std::exception&) {
-        threw = true;
+    {
+        // Outlives the server below, which holds a reference to it -- the same ordering
+        // discipline IsolatedDaemon and main.cpp use.
+        WallpaperManager conflictedManager{WallpaperManager::Config{}};
+        try {
+            HttpServer conflicted(conflictedManager, taken.port());
+            reportedPort = conflicted.port();
+            // Read while the failed server is still alive: what is graded is what the
+            // constructor published, with nothing destruction might add mixed into it.
+            const wallpaperx::HealthCheck record = conflictedManager.snapshot().health.configServer;
+            recordStatus = record.status;
+            recordDetail = record.detail;
+            // Destroyed here, on a server that never served a request. Safe in this one
+            // case precisely because the serving thread was never started -- see the
+            // CONCERN note above runShutdownChecks for why that matters everywhere else.
+        } catch (const std::exception&) {
+            threw = true;
+        }
     }
     check(!threw, "a port conflict does not throw out of the HttpServer constructor");
     // Gated rather than each written as `!threw && ...`: a constructor that threw has
-    // nothing to report through, so grading its accessors too would turn one fault into
-    // five FAIL lines pointing at four properties that were never observed.
+    // nothing to report through, so grading its published state too would turn one fault
+    // into five FAIL lines pointing at four properties that were never observed.
     if (!threw) {
-        check(!listening, "a server that could not bind reports listening() == false");
-        check(!bindError.empty(), "a server that could not bind reports why in lastError()");
-        check(bindError.find(std::to_string(taken.port())) != std::string::npos,
-              "the bind error names the port that was taken");
+        check(recordStatus == wallpaperx::HealthStatus::Fail,
+              "a server that could not bind does not report itself healthy");
+        check(!recordDetail.empty(), "a server that could not bind records why it could not");
+        check(recordDetail.find(std::to_string(taken.port())) != std::string::npos,
+              "the recorded bind failure names the port that was taken");
         check(reportedPort == taken.port(), "port() reports the port that was asked for even after a failure");
+        if (recordStatus != wallpaperx::HealthStatus::Fail || recordDetail.empty() ||
+            recordDetail.find(std::to_string(taken.port())) == std::string::npos) {
+            std::fprintf(stderr, "  config_server after a conflict on 127.0.0.1:%d: %s / %s\n", taken.port(),
+                         wallpaperx::toString(recordStatus), recordDetail.c_str());
+        }
     }
 
     // The other half of S7.7, and the half that says the daemon is still a daemon: the
     // bus surface has to be unaffected by the HTTP server failing to come up.
     const nlohmann::json status = getStatus(proxy);
-    check(!status.is_discarded() && status.value("running", false),
+    const bool statusUsable = !status.is_discarded() && status.is_object();
+    check(statusUsable && status.value("running", false),
           "DBus still answers GetStatus after an HTTP bind failure");
+    // A reply that never arrived is one fault, not two: the check below reads a field of
+    // that reply, so grading it as well would blame config_server for a dead bus.
+    if (!statusUsable) return;
+
+    // GOAL: the failed bind above is reported against the daemon it happened to, and not
+    //       against this one. False if a server that could not bind can make a daemon that
+    //       IS serving report config_server anything but ok -- which is what
+    //       http_server.h's at-most-one-instance-per-manager invariant forbids.
+    // WHY-THIS-SHAPE: read over DBus rather than off the manager, because the published
+    //       field is what a client acts on and it is the only channel that can carry a
+    //       bind failure at all (see DaemonHealth::configServer). Placed after the
+    //       conflict rather than before it: taken on its own it would only restate what
+    //       startServer already established.
+    // CONTROL: `WallpaperManager conflictedManager` dropped and the conflicted server
+    //       constructed on the run's shared manager -- the shape this block had before ->
+    //       this check red, reporting fail on the daemon that was serving. Reverted.
+    const nlohmann::json* servedReport =
+        !status.is_discarded() && status.contains("config_server") && status["config_server"].is_object()
+            ? &status["config_server"]
+            : nullptr;
+    const std::string servedStatus = servedReport != nullptr ? servedReport->value("status", std::string()) : "";
+    check(servedStatus == "ok", "the daemon that is serving still reports config_server ok while another server "
+                                "failed to bind");
+    if (servedStatus != "ok") {
+        std::fprintf(stderr, "  config_server: %s / %s, on a daemon serving %d\n", servedStatus.c_str(),
+                     servedReport != nullptr ? servedReport->value("detail", std::string()).c_str() : "(absent)",
+                     server.port());
+    }
 }
 
 // ---------------------------------------------------------------------------- //
@@ -2897,7 +2958,7 @@ int main() {
 
             httplib::Client cli = makeClient(server->port());
 
-            runBindChecks(manager, *proxy, *server, check);
+            runBindChecks(*proxy, *server, check);
 
             // Before anything renders: the whole point of the S7.10b pre-device check is
             // that nothing has been tried yet on this manager, so `pending` is the true
