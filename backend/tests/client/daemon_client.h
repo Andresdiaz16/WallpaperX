@@ -210,8 +210,11 @@ inline void setWallpaper(sdbus::IProxy& proxy, const std::string& type, const st
 // documented on wallpaperStatus() below came to be missing from four of its five original
 // sites and then from three more that were written after it.
 //
-// A site that ignores ok() is not silent either -- json() is an empty object, so the
-// checks below it compare false and print, rather than crashing or vanishing.
+// A site that ignores ok() must still not go quiet, which is what the empty object buys:
+// json() is `{}`, so wallpaperStatus() returns nullptr and every field comparison below it
+// is false. statusSelfConsistent() is the one predicate that cannot be left to that rule --
+// an absent field satisfies an invariant stated as a forbidden conjunction -- so it tests
+// ok() itself rather than relying on its caller to.
 class StatusReply {
 public:
     StatusReply() = default;
@@ -225,9 +228,10 @@ public:
     // The call returned and its payload parsed into an object.
     bool ok() const { return m_error.empty(); }
 
-    // Why there is no usable reply, empty when ok(). Names which of the two causes it was:
-    // a bus that did not answer and a daemon that answered with something unparseable are
-    // different components, and a caller that prints this cannot mix them up.
+    // Why there is no usable reply, empty when ok(). Names which of the three causes it
+    // was -- no answer at all, a daemon-side error reply, or an answer that would not
+    // parse -- because those are different components and a caller that prints this must
+    // not have to guess which one it is looking at.
     const std::string& error() const { return m_error; }
 
     // An empty object unless ok().
@@ -238,12 +242,37 @@ private:
     std::string m_error;
 };
 
+// True for the DBus error names that mean the call never reached a live daemon, as opposed
+// to a daemon that received it and answered with an error. Enumerated rather than matched
+// on the org.freedesktop.DBus.Error. prefix, which a daemon-side reply can also carry.
+inline bool busLevelErrorName(const std::string& name) {
+    static const char* const kTransport[] = {
+        "org.freedesktop.DBus.Error.ServiceUnknown", "org.freedesktop.DBus.Error.NameHasNoOwner",
+        "org.freedesktop.DBus.Error.NoReply",        "org.freedesktop.DBus.Error.Timeout",
+        "org.freedesktop.DBus.Error.TimedOut",       "org.freedesktop.DBus.Error.Disconnected",
+        "org.freedesktop.DBus.Error.NoServer",       "org.freedesktop.DBus.Error.NotSupported",
+    };
+    for (const char* candidate : kTransport) {
+        if (name == candidate) return true;
+    }
+    return false;
+}
+
 inline StatusReply getStatus(sdbus::IProxy& proxy) {
     std::string status;
     try {
         proxy.callMethod("GetStatus").onInterface(DbusService::kInterface).storeResultsTo(status);
+    } catch (const sdbus::Error& e) {
+        // error() promises to name the component, so the two cases must not share a
+        // sentence: "the bus did not answer" sends a reader to the transport, and a daemon
+        // that replied with an error name is the daemon's own fault.
+        const std::string name = e.getName();
+        if (busLevelErrorName(name)) {
+            return StatusReply::failure("the bus did not answer GetStatus (" + name + "): " + e.getMessage());
+        }
+        return StatusReply::failure("the daemon answered GetStatus with an error (" + name + "): " + e.getMessage());
     } catch (const std::exception& e) {
-        return StatusReply::failure(std::string("the bus did not answer GetStatus: ") + e.what());
+        return StatusReply::failure(std::string("the GetStatus call failed before any reply: ") + e.what());
     }
     nlohmann::json json = nlohmann::json::parse(status, nullptr, /*allow_exceptions=*/false);
     if (json.is_discarded()) return StatusReply::failure("GetStatus replied with something that is not JSON");
@@ -300,14 +329,21 @@ inline const nlohmann::json* wallpaperStatus(const StatusReply& status, const st
 //       microseconds wide, so a test built on it passes on a correct daemon and on a
 //       broken one alike. Asserting the forbidden *conjunction* on every reply the
 //       suite already collects is falsifiable the moment the state is ever reachable,
-//       and costs nothing. Returns true for an unparseable reply -- that is a
-//       different defect, reported by its own check, and failing here too would give
-//       one fault two names.
-// CONTROL: WallpaperManager::snapshot() patched to clear out.gpu.initialized after
-//       copying the monitor map (which is what a second lock acquisition makes
-//       reachable): "FAIL: GetStatus never reports an uninitialised GPU beside a
-//       monitor that already has a frame" in both tiers. Reverted.
+//       and costs nothing.
+//       A reply that never arrived is false, not true. Every other branch here returns
+//       true on an absent field, which is right for a *present* reply -- the invariant
+//       forbids a conjunction, so a missing half cannot violate it -- and is exactly
+//       wrong for no reply at all: `{}` would report the invariant verified on nothing.
+//       Deciding it at the call sites instead was rejected because it already failed
+//       that way; one of the three forgot, and it was the site that graded S6.18.
+// CONTROL: two, reverted. (a) WallpaperManager::snapshot() patched to clear
+//       out.gpu.initialized after copying the monitor map, which is what a second lock
+//       acquisition makes reachable -> "FAIL: GetStatus never reports an uninitialised
+//       GPU beside a monitor that already has a frame" in both tiers. (b) DbusService's
+//       GetStatus made to throw -> the same FAIL line, where before the reply-gating
+//       branch this check passed on the empty reply.
 inline bool statusSelfConsistent(const StatusReply& status) {
+    if (!status.ok()) return false;
     const nlohmann::json& json = status.json();
     if (!json.is_object()) return true;
     if (!json.contains("gpu") || !json["gpu"].is_object()) return true;

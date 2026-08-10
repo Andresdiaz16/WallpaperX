@@ -629,6 +629,8 @@ void runRenderChecks(sdbus::IProxy& proxy, FrameReadyLog& signals, const std::st
         // See the annotation on statusSelfConsistent in tests/client/daemon_client.h.
         // Asserted here because this is the first reply in the run where the forbidden
         // conjunction is even expressible: monitor 0 holds a frame from the render above.
+        // Deliberately ungated on ok(): the predicate itself grades an unarrived reply as
+        // a failure, and getStatusOrExplain has already printed which component it was.
         check(wallpaperx::testing::statusSelfConsistent(status),
               "GetStatus never reports an uninitialised GPU beside a monitor that already has a frame");
 

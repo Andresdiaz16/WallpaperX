@@ -72,19 +72,23 @@
 #include "vulkan/device.h"
 #include "vulkan/frame_export.h"
 #include "vulkan/offscreen.h"
+#include "support/forked_child.h"
 #include "support/validation_grade.h"
 
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <csignal>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 
-#include <sys/prctl.h>
+#include <fcntl.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -113,6 +117,11 @@ constexpr int kDeviceUnavailableExit = 77;
 // code a child here can produce, and deliberately NOT the skip code: this is a guard
 // regression and must be graded red.
 constexpr int kGuardThrewExit = 125;
+
+// The child could not arm itself against its parent's death (GOALS.md X.8). Its own code
+// because it is neither a guard verdict nor a host limit: it is this harness failing to
+// establish a precondition, and 126 (dup2 failed) already means something else.
+constexpr int kArmFailedExit = 124;
 
 // Set for the duration of the call under test, so withDevice's handler can tell a
 // setup failure from the guard failing to fire. A plain bool is enough: each child runs
@@ -171,6 +180,23 @@ struct ChildResult {
     std::string stderrText;
 };
 
+// Everything the child side of a fork in this file must do before it runs anything else.
+// Returns 0, or the exit code the child should die with.
+//
+// One function rather than a preamble copied into each fork site, so the orphan phase at
+// the bottom of this file and every guarded case above it share literally the same arming.
+// A phase that armed its own child separately would go green while runInChild's five
+// children were unarmed -- which is the state X.8 was recorded KNOWN FALSE for.
+//
+// Order is load-bearing: stderr is redirected first so a later failure is still visible on
+// the parent's pipe, and the arming is as close to the fork as it can be because the window
+// it closes opens at the fork.
+int prepareForkedChild(pid_t parentBeforeFork, int stderrFd) {
+    if (stderrFd >= 0 && dup2(stderrFd, STDERR_FILENO) == -1) return 126;
+    if (!wallpaperx::testing::armAgainstParentDeath(parentBeforeFork)) return kArmFailedExit;
+    return 0;
+}
+
 // Runs `body` in a forked child with its stderr captured, and reports how it died.
 //
 // The child never returns from here: if `body` completes without aborting -- which is
@@ -195,6 +221,7 @@ ChildResult runInChild(const std::function<void()>& body) {
     // several times, with the count depending on how the output happens to be piped.
     std::fflush(stdout);
 
+    const pid_t parentBeforeFork = getpid();
     const pid_t pid = fork();
     if (pid < 0) {
         close(fds[0]);
@@ -206,37 +233,20 @@ ChildResult runInChild(const std::function<void()>& body) {
 
     if (pid == 0) {
         close(fds[0]);
-        if (dup2(fds[1], STDERR_FILENO) == -1) _exit(126);
+        const int prep = prepareForkedChild(parentBeforeFork, fds[1]);
+        if (prep != 0) _exit(prep);
         close(fds[1]);
         // Every negative case here ends in std::abort(), which is the point -- but on a
-        // systemd host each one is a real SIGABRT, so systemd-coredump runs, stores a 5.4 MB
-        // core and the desktop pops a crash notification. Five cases per run, times each
-        // build tree, and a developer running ctest gets a screen of "wallpaperx-device-
-        // affinity-probe crashed" for a suite that passed.
+        // systemd host each one is a real SIGABRT, so the desktop pops a crash notification.
+        // Five cases per run, times each build tree, and a developer running ctest gets a
+        // screen of "wallpaperx-device-affinity-probe crashed" for a suite that passed. The
+        // measurement that picks PR_SET_DUMPABLE over RLIMIT_CORE is on suppressCoreDump().
         //
-        // PR_SET_DUMPABLE rather than RLIMIT_CORE, and the difference is not the one an
-        // earlier version of this comment claimed. Both measured on this host, whose
-        // /proc/sys/kernel/core_pattern is `|/usr/lib/systemd/systemd-coredump ...`:
-        //   setrlimit(RLIMIT_CORE, 0): no core file is stored -- the entry reads
-        //     `Storage: none`, "terminated abnormally without generating a coredump" -- but
-        //     the kernel still invokes the pipe handler, so all five aborts still land in
-        //     the journal and still raise the notification. Measured 818 -> 823
-        //     coredumpctl entries for one run. (The old comment here said "ten cores still
-        //     written", which is not what happens: entries, not cores.)
-        //   prctl(PR_SET_DUMPABLE, 0): the kernel does not invoke the handler at all.
-        //     Measured 813 -> 813 entries across two runs, i.e. ten aborting children with
-        //     nothing stored and nothing journalled.
-        // The rlimit would fix the disk usage; only this fixes the noise, which is what the
-        // change was for.
-        //
-        // It suppresses the dump only. The child still raises SIGABRT, waitpid still reports
-        // WIFSIGNALED with WTERMSIG == SIGABRT, and the stderr redirected just above still
-        // reaches the parent's pipe. That last part is not assumed: every negative case
-        // requires kGuardSentence AND its own call label to be found in the captured stderr,
-        // so a dumpable flag that cost the child's stderr would turn all five red with
-        // "child aborted, but not from the affinity guard" rather than pass quietly.
-        // Set after dup2 so a failure before this point is still visible on the pipe.
-        prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
+        // It suppresses the dump only, and that is not assumed: every negative case requires
+        // kGuardSentence AND its own call label in the captured stderr, so a flag that cost
+        // the child's stderr would turn all five red rather than pass quietly. Called after
+        // the redirect above so a failure before this point is still visible on the pipe.
+        wallpaperx::testing::suppressCoreDump();
         body();
         // Reached only when the guard did not fire.
         _exit(0);
@@ -360,6 +370,13 @@ void expectGuardAbort(const ChildResult& result, const char* label, const char* 
         harnessFault(what, "dup2() of the capture pipe failed in the child");
         return;
     }
+    // Ahead of the bare `result.exited` branch below, which would otherwise read this as
+    // "the call returned instead of aborting" -- a guard verdict for a child that never ran
+    // the call at all (X.3).
+    if (result.exited && result.exitCode == kArmFailedExit) {
+        harnessFault(what, "the child could not arm itself against its parent's death");
+        return;
+    }
     if (result.exited) {
         check(false, what);
         std::fprintf(stderr, "  the call returned instead of aborting (child exited %d) -- the guard did not fire\n",
@@ -417,9 +434,174 @@ void onAnotherThread(const std::function<void()>& body) {
     if (escaped) std::rethrow_exception(escaped);
 }
 
+// ---------------------------------------------------------------------------- //
+// X.8 -- a forked child cannot outlive a parent that dies abnormally.
+// ---------------------------------------------------------------------------- //
+
+// The line the orphan probe prints so its own parent can look for the child afterwards.
+// One constant, written in one process and parsed in another: a reworded literal on one
+// side alone would make the phase report a probe that never started rather than a child
+// that never died.
+constexpr const char* kOrphanPidPrefix = "orphan-probe: child pid ";
+
+// Long enough that the phase's whole 10 s deadline sits comfortably inside it, so "still
+// there" and "already gone" are distinguishable rather than a race against the child's own
+// exit. No GPU work: what is under test is the arming, and a Device would make the child's
+// lifetime depend on the host's ICD.
+constexpr unsigned kOrphanChildSeconds = 60;
+
+constexpr auto kOrphanProbeTimeout = std::chrono::seconds(30);
+
+// The child half of the phase below, running as a fresh exec of this binary. Forks a child
+// through the same preamble every guarded case uses, says which pid it got, and then dies
+// the way a failed assertion inside a library kills a probe: SIGABRT, so nothing unwinds
+// and no reaping code of any kind runs.
+int runOrphanProbe() {
+    // Deliberate abort, so its core -- and on a host whose core_pattern pipes to a
+    // collector, its journal entry and crash notification -- is noise. In the parent only:
+    // dumpable is inherited across fork, and it gates /proc/<pid>/cmdline against a
+    // same-uid reader, so a non-dumpable child would be invisible to the very look that
+    // grades this. That would make the phase pass with the arming deleted.
+    const pid_t parentBeforeFork = getpid();
+    const pid_t pid = fork();
+    if (pid < 0) {
+        std::printf("orphan-probe: fork failed: %s\n", strerror(errno));
+        std::fflush(stdout);
+        return 1;
+    }
+    if (pid == 0) {
+        const int prep = prepareForkedChild(parentBeforeFork, -1);
+        if (prep != 0) _exit(prep);
+        // The pipe back to the grandparent must not stay open here: runSelfProbe drains to
+        // EOF, and a child holding a write end would turn that drain into a wait for the
+        // sleep below -- an unbounded-looking stall in place of a verdict.
+        const int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) {
+            dup2(devnull, STDOUT_FILENO);
+            dup2(devnull, STDERR_FILENO);
+            close(devnull);
+        }
+        sleep(kOrphanChildSeconds);
+        _exit(0);
+    }
+
+    // The pid line is printed only once the child is known to be RUNNING, and that is not
+    // decoration: the phase grades "the child is gone", which a child that never started is
+    // trivially green for. An arming failure exits the child at once, so without this the
+    // very mutation the phase exists to catch could make it pass. No pid line means no
+    // verdict -- the parent reports it as a probe that could not be set up.
+    poll(nullptr, 0, 200);
+    int status = 0;
+    if (waitpid(pid, &status, WNOHANG) != 0) {
+        std::printf("orphan-probe: the child was already gone before the abort, so nothing could be orphaned\n");
+        std::fflush(stdout);
+        return 1;
+    }
+
+    std::printf("%s%d\n", kOrphanPidPrefix, static_cast<int>(pid));
+    std::fflush(stdout);
+    wallpaperx::testing::suppressCoreDump();
+    std::abort();
+}
+
+// GOAL: X.8 -- every child forked by this probe is armed so it cannot outlive a parent that
+//       dies abnormally. False if the child is still running once its spawner has been
+//       killed by SIGABRT. It matters here because a guarded case's child creates a Vulkan
+//       device, so an orphan holds a GPU device for as long as it lives.
+// WHY-THIS-SHAPE: the property is only observable from outside the process whose death
+//       triggers it, so the abort happens in a fresh exec of this binary (--orphan-probe)
+//       and the child is then looked for by pid from out here. The simpler version -- fork
+//       here, kill ourselves, and let ctest notice -- cannot work: a process cannot report
+//       on what outlived it. The probe's child reaches the same armAgainstParentDeath call
+//       every guarded case's child does (prepareForkedChild), so this is not a check on
+//       apparatus of its own.
+//       Graded with check(), not harnessFault(): a leaked child is a real failure of this
+//       property, where a probe that could not be run at all says nothing and is reported
+//       through the harness channel instead.
+// CONTROL: two, reverted. (a) the prctl line deleted from armAgainstParentDeath -> "FAIL: a
+//       child of a probe process that then died on SIGABRT does not outlive it", the
+//       survivor killed here, and the run finishing normally. (b) armAgainstParentDeath
+//       made to return false -> every guarded case HARN, naming the arming, and this phase
+//       HARN too rather than green -- the probe refuses to print a pid for a child that is
+//       already gone, so the mutation cannot buy itself a pass here.
+void checkAbortedParentLeavesNoChild() {
+    const char* const what = "a child of a probe process that then died on SIGABRT does not outlive it";
+
+    char exePath[4096];
+    const ssize_t len = readlink("/proc/self/exe", exePath, sizeof(exePath) - 1);
+    if (len <= 0) {
+        harnessFault(what, "could not read /proc/self/exe, so a survivor could not be identified");
+        return;
+    }
+    exePath[len] = '\0';
+
+    std::fflush(stdout);
+    const wallpaperx::testing::SelfProbeRun probe =
+        wallpaperx::testing::runSelfProbe("--orphan-probe", kOrphanProbeTimeout);
+    for (size_t start = 0; start < probe.output.size();) {
+        const size_t eol = probe.output.find('\n', start);
+        const size_t end = eol == std::string::npos ? probe.output.size() : eol;
+        std::printf("      [orphan-probe] %.*s\n", static_cast<int>(end - start), probe.output.data() + start);
+        if (eol == std::string::npos) break;
+        start = eol + 1;
+    }
+
+    // X.1: an expired wait is not data, and it comes first because every field below would
+    // otherwise describe runSelfProbe's own SIGKILL rather than the probe's death.
+    if (probe.timedOut) {
+        harnessFault(what, "the probe did not finish within its deadline and was killed");
+        return;
+    }
+    if (!probe.harnessError.empty()) {
+        harnessFault(what, probe.harnessError.c_str());
+        return;
+    }
+    const size_t marker = probe.output.find(kOrphanPidPrefix);
+    if (marker == std::string::npos) {
+        harnessFault(what, "the probe never reported a child pid, so nothing was ever orphaned");
+        return;
+    }
+    if (probe.termSignal != SIGABRT) {
+        harnessFault(what, probe.exitedNormally ? "the probe exited instead of aborting with a child running"
+                                                : "the probe died by a signal other than SIGABRT");
+        return;
+    }
+    const pid_t orphan =
+        static_cast<pid_t>(std::strtol(probe.output.c_str() + marker + std::strlen(kOrphanPidPrefix), nullptr, 10));
+    if (orphan <= 0) {
+        harnessFault(what, "the probe's pid line did not parse as a pid");
+        return;
+    }
+
+    // Bounded, and the deadline is not data: the loop exits on the first look that finds the
+    // child gone, and reaching the deadline means it was there every time -- the failure,
+    // not a slow host. The kill is immediate on the parent's death, so this is orders of
+    // magnitude of margin.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    bool survived = true;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (!wallpaperx::testing::runningProcessMatches(orphan, exePath)) {
+            survived = false;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+
+    check(!survived, what);
+    if (survived) {
+        std::fprintf(stderr, "      child %d was still running %us after its spawner aborted; killing it\n",
+                     static_cast<int>(orphan), kOrphanChildSeconds);
+        kill(orphan, SIGKILL);
+    }
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    // The child half of checkAbortedParentLeavesNoChild, and nothing else. Ahead of the
+    // banner so a probe run is not mistaken for a second suite run in the captured output.
+    if (argc == 2 && std::string_view(argv[1]) == "--orphan-probe") return runOrphanProbe();
+
     std::printf("device_affinity_probe: Device is pinned to its creating thread (S2.11)\n");
 
     // ---- Negative cases. Each is its own process, and each must die by the guard. ----
@@ -506,6 +688,10 @@ int main() {
         const char* const what = "after adoptGpuThread the adopting thread is allowed through";
         if (adopted.harnessFailed) {
             harnessFault(what, adopted.harnessError.c_str());
+        } else if (adopted.exited && adopted.exitCode == kArmFailedExit) {
+            // Same reason as in expectGuardAbort: a child that never got as far as the case
+            // must not be graded as the case failing.
+            harnessFault(what, "the child could not arm itself against its parent's death");
         } else if (adopted.exited && adopted.exitCode == kDeviceUnavailableExit) {
             unrunnableCase(what, adopted.stderrText);
         } else {
@@ -564,6 +750,10 @@ int main() {
             }
         }
     }
+
+    // Last, and outside every Device scope above: it self-execs, and a fork from a process
+    // holding a live Device would inherit GPU state this file is careful never to inherit.
+    checkAbortedParentLeavesNoChild();
 
     if (failures > 0) {
         std::fprintf(stderr, "device_affinity_probe: %d check(s) failed\n", failures);

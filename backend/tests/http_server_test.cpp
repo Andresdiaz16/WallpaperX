@@ -1093,14 +1093,15 @@ void runBindChecks(sdbus::IProxy& proxy, WallpaperManager& manager, HttpServer& 
         // all, since a degraded bus is exactly the state that produced an unusable first
         // reply and there is nothing left for a second one to be compared against.
         //
-        // The second call's failure is a SKIP and not a FAIL: with no second reading there
-        // is nothing to compare the first against, and a bus that stopped answering is not
-        // evidence about what the refused server published. It reaches this branch as a
-        // value rather than as a throw, which is what keeps the phases after it running.
+        // The comparison is abandoned rather than graded: with no second reading there is
+        // nothing to compare the first against, and a call that did not answer is not
+        // evidence about what the refused server published. The unanswered call itself is
+        // graded, because the DbusService is in this process -- a skip-only row would let
+        // an in-process defect end the binary at exit 77, i.e. ctest Skipped.
         // CONTROL: DbusService::getStatus made to throw from its second call onward, so the
-        //       before-reading still exists and this is the call that fails -> this skip row
-        //       naming the bus, no FAIL in this phase, and the phases after it still
-        //       running. Reverted.
+        //       before-reading still exists and this is the call that fails -> "FAIL: the
+        //       in-process DbusService answers GetStatus" beside this skip row, ctest
+        //       Failed, and the phases after it still running. Reverted.
         if (!servedReportPresent) {
             notVerified("S7.20 (one config server per manager, publish-nothing half)",
                         statusUsable ? "GetStatus carried no config_server object before the refusal, so no "
@@ -1110,6 +1111,7 @@ void runBindChecks(sdbus::IProxy& proxy, WallpaperManager& manager, HttpServer& 
         } else {
             const StatusReply after = getStatus(proxy);
             if (!after.ok()) {
+                check(false, "the in-process DbusService answers GetStatus");
                 notVerified("S7.20 (one config server per manager, publish-nothing half)", after.error());
             } else {
                 const nlohmann::json& afterStatus = after.json();
@@ -2942,14 +2944,20 @@ void runGpuLockChecks(sdbus::IProxy& proxy, FrameReadyLog& signals, HttpServer& 
 
     uint64_t generation = 0;
     {
-        // A reply that never arrived is a skip and not a failure here: this generation is
-        // the baseline the render window below is measured from, so reading 0 off an empty
-        // reply would make signals.wait() wait for a generation that has already passed and
-        // grade a window that was never observed.
-        // CONTROL: DbusService::getStatus made to throw -> this phase reported NOT VERIFIED
-        //       naming the bus instead of grading a window. Reverted.
+        // Two outcomes from one condition, and they are not the same statement. The
+        // measurement is abandoned -- this generation is the baseline the render window is
+        // measured from, so reading 0 off an empty reply would make signals.wait() wait for
+        // a generation already past and grade a window nobody observed. But the unanswered
+        // call is *also* graded, because the DbusService answering it lives in this process
+        // (see the file header): an unanswered GetStatus here is a defect, not a host
+        // condition, and notVerified alone would end the binary at exit 77 with ctest
+        // reporting the whole file as Skipped.
+        // CONTROL: DbusService::getStatus made to throw -> "FAIL: the in-process
+        //       DbusService answers GetStatus" beside this phase's NOT VERIFIED row, and
+        //       ctest Failed rather than Skipped. Reverted.
         const StatusReply status = getStatus(proxy);
         if (!status.ok()) {
+            check(false, "the in-process DbusService answers GetStatus");
             notVerified("S7.12 (a poll never waits on a render)", status.error());
             return;
         }
@@ -3451,8 +3459,11 @@ int main() {
         return 1;
     }
     if (g_notVerified > 0) {
+        // Not "on this host": the reasons above are a mix of host limits and preconditions
+        // this run could not build, and naming one cause for all of them points a reader at
+        // the wrong component.
         std::printf("http_server_test: every check that ran passed, but %d goal group(s) could not be exercised "
-                    "on this host (listed above) -- reported to ctest as a skip, not a pass.\n",
+                    "(each reason is printed above) -- reported to ctest as a skip, not a pass.\n",
                     g_notVerified);
         return kNotVerifiedExitCode;
     }
