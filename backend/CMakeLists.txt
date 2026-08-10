@@ -468,7 +468,7 @@ elseif(WALLPAPERX_SANITIZE STREQUAL "thread")
             # Two labels, not one, and the second is the correction: what disqualifies a
             # test here is *loading the proprietary ICD*, which the absence of a lavapipe
             # label is a bad proxy for. Keyed on that absence, this branch also disabled
-            # the five CPU-only tests, which never open a driver and cannot SEGV in one.
+            # the six CPU-only tests, which never open a driver and cannot SEGV in one.
             if("lavapipe" IN_LIST _labels OR "novulkan" IN_LIST _labels)
                 # APPEND rather than read-modify-write: CMake already handles the
                 # empty-property case and the list quoting.
