@@ -191,6 +191,14 @@ if(WALLPAPERX_SANITIZE)
     target_compile_definitions(wallpaperx-http-server-test PRIVATE WALLPAPERX_ALLOCATION_INSTRUMENT=0)
 endif()
 
+# S7.19, on its own because sanitizeForLog is a pure function of bytes: no bus, no GPU, no
+# port. Folding it into either tier above would put an exhaustive byte sweep behind a daemon
+# startup and make a pure-function regression unreachable on a host without Vulkan. No
+# SKIP_RETURN_CODE and no RESOURCE_LOCK -- nothing here can be inconclusive, and it competes
+# with nothing.
+add_executable(wallpaperx-log-escape-test tests/log_escape_test.cpp)
+target_link_libraries(wallpaperx-log-escape-test PRIVATE wallpaperx-daemon-lib)
+
 # The system-level tier: spawns the real wallpaperx-daemon executable and drives it over
 # the bus. It links the daemon library only for the DBus name/interface constants and
 # the client-side test scaffolding -- deliberately not to call into the daemon's code,
@@ -231,8 +239,12 @@ add_dependencies(wallpaperx-daemon-system-test wallpaperx-daemon)
 if(WALLPAPERX_BUILD_KDE_PLUGIN)
     set_target_properties(wallpaperx-daemon-lib wallpaperx-daemon wallpaperx-dbus-service-test
                           wallpaperx-daemon-system-test wallpaperx-http-server-test
+                          wallpaperx-log-escape-test
         PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
 endif()
+
+# Registered outside the dbus-run-session guard below: this one talks to nothing.
+add_test(NAME log_escape COMMAND $<TARGET_FILE:wallpaperx-log-escape-test>)
 
 # The DBus service test needs a session bus. dbus-run-session gives each run a
 # private one (isolated from the developer's real session, and works headless in
