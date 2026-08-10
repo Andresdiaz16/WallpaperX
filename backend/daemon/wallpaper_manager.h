@@ -212,16 +212,21 @@ public:
     };
     Snapshot snapshot() const;
 
-    // Called by HttpServer only: once from its constructor with the bind result, and again
-    // from its serving thread if the accept loop later dies.
+    // The config-server health has exactly one writer, and the rule is stated on
+    // HttpServer's constructor. Private with a single friend rather than public and
+    // documented: a claim any caller can revoke would let a second server stamp its own
+    // bind failure over one that is serving, which is the state being prevented.
+private:
+    friend class HttpServer;
+
+    // Called from HttpServer's constructor with the bind result, from its serving thread
+    // if the accept loop later dies, and from its registration on the way out.
     void recordConfigServer(bool listening, const std::string& error);
 
-    // Claims the right to be that writer. Two servers on one manager would overwrite each
-    // other's record -- including a failed bind stamping fail over a server that is
-    // serving -- so the second one is refused rather than allowed to publish.
     bool tryAttachConfigServer();
     void detachConfigServer();
 
+public:
     // The renderer's validation-warning counter, or null when no device has been created
     // yet. Shared so it stays readable after this manager and its Device are destroyed:
     // the layer's teardown complaints are the ones worth having, and they are emitted

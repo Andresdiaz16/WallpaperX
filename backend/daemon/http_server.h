@@ -39,7 +39,8 @@ public:
     HttpServer(WallpaperManager& manager, int port = kDefaultPort);
 
     // Stops and joins on every path; a joinable thread destroyed mid-unwind is
-    // std::terminate.
+    // std::terminate. Records the config server as down on the way out, so a manager that
+    // outlives its server cannot go on reporting a port that is closed as ok.
     ~HttpServer();
 
     HttpServer(const HttpServer&) = delete;
@@ -48,11 +49,14 @@ public:
     int port() const { return m_port; }
 
 private:
-    // Declared first so it is released last -- after the destructor has joined the serving
-    // thread, and even if a later member or the constructor body throws.
+    // Declared first so it is released last, after the destructor has joined the serving
+    // thread. It also unwinds a constructor that throws before the thread starts, which
+    // retracts the success record written just above the thread; past that point the
+    // constructor cannot throw and unwind at all, since destroying a joinable std::thread
+    // is std::terminate.
     class Registration {
     public:
-        explicit Registration(WallpaperManager& manager);
+        Registration(WallpaperManager& manager, int port);
         ~Registration();
 
         Registration(const Registration&) = delete;
@@ -60,6 +64,7 @@ private:
 
     private:
         WallpaperManager& m_manager;
+        int m_port;
     };
 
     void registerRoutes();

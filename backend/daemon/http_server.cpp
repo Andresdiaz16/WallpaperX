@@ -75,16 +75,24 @@ bool parseMonitorParam(const httplib::Request& req, int& outMonitorId, std::stri
 
 }  // namespace
 
-HttpServer::Registration::Registration(WallpaperManager& manager) : m_manager(manager) {
+HttpServer::Registration::Registration(WallpaperManager& manager, int port)
+    : m_manager(manager), m_port(port) {
     if (!m_manager.tryAttachConfigServer()) {
         throw std::logic_error("HttpServer: this WallpaperManager already has a config server");
     }
 }
 
-HttpServer::Registration::~Registration() { m_manager.detachConfigServer(); }
+HttpServer::Registration::~Registration() {
+    // The manager can outlive the server. Without this it would go on publishing the last
+    // thing the server said -- ok, for a port that is now closed -- and there is nothing
+    // else left to contradict it.
+    m_manager.recordConfigServer(false, std::string("the config server on ") + kLoopbackHost + ":" +
+                                            std::to_string(m_port) + " was shut down");
+    m_manager.detachConfigServer();
+}
 
 HttpServer::HttpServer(WallpaperManager& manager, int port)
-    : m_registration(manager),
+    : m_registration(manager, port),
       m_manager(manager),
       m_port(port),
       m_server(std::make_unique<httplib::Server>()) {
@@ -164,7 +172,6 @@ HttpServer::HttpServer(WallpaperManager& manager, int port)
 }
 
 HttpServer::~HttpServer() {
-    // Guarded on joinable(): a failed bind leaves no thread.
     m_stopping.store(true, std::memory_order_release);
     m_server->stop();
     if (m_thread.joinable()) m_thread.join();
