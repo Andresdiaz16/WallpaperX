@@ -38,6 +38,15 @@
 // daemon compiles against rather than written as 18462 here, so a change of port fails
 // this file at build time instead of leaving it probing a port nothing serves.
 #include "daemon/http_server.h"
+// For defaultConfigPath() only, and only so the isolation guard in main() asks the same
+// question the daemon does: where would a daemon inheriting THIS process's environment
+// write? A path spelled out here would stop matching the daemon's the moment the rule
+// changed, which is the run where the guard has to work.
+#include "daemon/config_store.h"
+// For sanitizeForLog only: the restart phase asserts that GetStatus publishes the
+// display-safe form of a path while the config file holds the raw bytes, and the expected
+// display form has to come from the daemon's own function rather than be spelled out here.
+#include "daemon/log_escape.h"
 #include "tests/client/daemon_client.h"
 #include "tests/client/http_probe.h"
 
@@ -117,7 +126,7 @@ constexpr uint32_t kDaemonHeight = 1080;
 // touched that id.
 constexpr int32_t kMonitorFirstFrame = 0;
 constexpr int32_t kMonitorTiming = 1;
-constexpr int32_t kMonitorLoadBase = 2;    // .. kMonitorLoadBase + loadCount - 1
+constexpr int32_t kMonitorLoadBase = 2;    // .. kMonitorLoadBase + loadCount - 1, then kMonitorInert
 constexpr int32_t kMonitorStormBase = 20;  // .. kMonitorStormBase + kStormMonitors - 1
 constexpr int32_t kStormMonitors = 4;
 constexpr int32_t kMonitorBarrierPre = 30;
@@ -131,8 +140,12 @@ constexpr int32_t kMonitorBarrierPost = 31;
 constexpr int32_t kMonitorClosedStdoutPre = 25;
 constexpr int32_t kMonitorClosedStdout = 24;
 // The port-conflict phase's own id: it renders once, to show the daemon is still doing its
-// job while reporting that it lost its config port. Ids still unclaimed: 18..19 and 28..29.
+// job while reporting that it lost its config port.
 constexpr int32_t kMonitorLostPort = 27;
+// 18, 19, 28 and 29 belong to the Step 8 phases and are declared where they are used --
+// each of those phases drives a daemon of its own, so its ids are only ever compared with
+// its own. Nothing is unclaimed now; a new phase needs an id retired by an old one, or a
+// daemon of its own.
 
 constexpr int kStormThreads = 4;
 
@@ -152,12 +165,16 @@ constexpr int kStormIterations = 24;
 // exits, so this is a memory bound as much as a time one.
 constexpr int kMaxLoadMonitors = 16;
 
-// How long the queue must take to drain for the responsiveness checks to mean
-// anything. Both compare an interval against that drain time, so the drain has to be
-// large next to the bare DBus overhead of issuing the burst -- around 0.05 ms per round
-// trip, so under 1 ms for the whole of it. Twenty gives that a wide margin while still
-// being reached on a 3080 Ti, where a 1080p static render costs under 2 ms.
-constexpr auto kMinConclusiveDrain = std::chrono::milliseconds(20);
+// How much dearer a SetWallpaper that will render may be to issue than one that will not,
+// before S6.9 calls it rendering inline. The property says "no more", i.e. 1.0; the slack
+// is for measurement, not for the daemon.
+//
+// Sized from the measured spread, not chosen for comfort. Unmutated the ratio stays within
+// 0.99-1.03 over twenty runs across NVIDIA, lavapipe and tsan+lavapipe alike; a daemon
+// whose handler waits for the render reads 11.96, 19.71 and 5.33 on those same three. Two
+// clears the worst benign reading by ~1.9x and sits ~2.7x under the narrowest defective
+// one.
+constexpr double kIssueCostRatioBound = 2.0;
 
 constexpr auto kProcessTimeout = std::chrono::seconds(30);
 
@@ -222,6 +239,25 @@ double millis(Clock::duration d) {
     return std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(d).count();
 }
 
+// The cheapest call in a burst: the one that met the least contention and the least
+// preemption, and so the closest thing to the handler's own cost. Corroborated by the
+// median beside it, which is what the mean or the total cannot be -- a burst is a few
+// hundred microseconds per call, and one preemption anywhere in it moves a total by more
+// than the effect being measured.
+double minMillis(const std::vector<Clock::duration>& samples) {
+    if (samples.empty()) return 0.0;
+    return millis(*std::min_element(samples.begin(), samples.end()));
+}
+
+// Takes its argument by value because it sorts.
+double medianMillis(std::vector<Clock::duration> samples) {
+    if (samples.empty()) return 0.0;
+    std::sort(samples.begin(), samples.end());
+    const size_t n = samples.size();
+    if (n % 2 == 1) return millis(samples[n / 2]);
+    return (millis(samples[n / 2 - 1]) + millis(samples[n / 2])) / 2.0;
+}
+
 // A solid RGBA PNG. The daemon scales it to the full target, so a solid source makes
 // every pixel of the exported frame a known value -- which is what lets the content
 // check below be a straight comparison rather than a resampling model.
@@ -266,8 +302,36 @@ public:
         Breakable,
     };
 
+    // Exit code for a child that could not enter the working directory it was given.
+    // Distinct from forked_child.h's three preamble codes, which name causes that have
+    // nothing to do with a directory: a phase that read this as one of those would report
+    // "execve failed" for a chdir that was refused. No program this harness execs uses 124.
+    static constexpr int kChildChdirFailedExit = 124;
+
     // `extraEnv` entries are "KEY=VALUE"; each replaces any inherited entry for that key.
-    explicit SpawnedDaemon(const std::vector<std::string>& extraEnv = {}, Stdout stdoutMode = Stdout::Captured) {
+    // A non-empty `workingDir` is the directory the daemon is started FROM -- the only way
+    // to ask what a daemon with no usable HOME writes into its own working directory,
+    // since this process's own is the build tree.
+    explicit SpawnedDaemon(const std::vector<std::string>& extraEnvIn = {},
+                           Stdout stdoutMode = Stdout::Captured, const std::string& workingDir = {}) {
+        // The daemon persists wallpapers under $XDG_CONFIG_HOME. Unset, it would read and
+        // rewrite the developer's own config -- restoring test wallpapers into their
+        // desktop, and carrying one test's 28 monitors into the next. A fresh directory
+        // per spawn; a test that wants state to survive a restart passes its own.
+        std::vector<std::string> extraEnv = extraEnvIn;
+        bool configHomeSet = false;
+        for (const std::string& entry : extraEnv) {
+            if (entry.rfind("XDG_CONFIG_HOME=", 0) == 0) configHomeSet = true;
+        }
+        if (!configHomeSet) {
+            m_configHome = std::filesystem::temp_directory_path() /
+                           ("wpx_system_test_" + std::to_string(::getpid()) + "_" +
+                            std::to_string(s_configHomeCounter++));
+            std::error_code ec;
+            std::filesystem::create_directories(m_configHome, ec);
+            extraEnv.push_back("XDG_CONFIG_HOME=" + m_configHome.string());
+        }
+
         int fds[2];
         if (pipe2(fds, O_CLOEXEC) != 0) throw std::runtime_error("pipe2 failed");
 
@@ -327,6 +391,10 @@ public:
             if (dup2(childStdout, STDOUT_FILENO) == -1 || dup2(fds[1], STDERR_FILENO) == -1) {
                 _exit(wallpaperx::testing::kChildDup2FailedExit);
             }
+            // chdir is async-signal-safe, which is the whole constraint between fork() and
+            // exec(). Its own exit code, not one of forked_child.h's: a refused chdir is
+            // not a failed exec and must not be reported as one.
+            if (!workingDir.empty() && chdir(workingDir.c_str()) != 0) _exit(kChildChdirFailedExit);
             execChildOrDie(parentBeforeFork, binary.c_str(), argv, envp.data());
         }
 
@@ -366,6 +434,11 @@ public:
             reap();
         }
         breakStdout();
+
+        if (!m_configHome.empty()) {
+            std::error_code ec;
+            std::filesystem::remove_all(m_configHome, ec);
+        }
     }
 
     SpawnedDaemon(const SpawnedDaemon&) = delete;
@@ -581,6 +654,11 @@ private:
         return m_exitCode;
     }
 
+    // Only set when this spawn created the directory, so an explicit override is never
+    // deleted by us.
+    std::filesystem::path m_configHome;
+    static inline int s_configHomeCounter = 0;
+
     pid_t m_pid = -1;
     int m_readFd = -1;
     int m_stdoutFd = -1;
@@ -597,6 +675,26 @@ private:
     mutable std::mutex m_mutex;
     std::string m_output;
 };
+
+// The developer's own config file, as this process's environment names it, and whatever was
+// in it when the run started. Used by the isolation guard in main().
+struct RealConfigWitness {
+    std::filesystem::path file;
+    bool existed = false;
+    std::string contents;
+};
+
+RealConfigWitness witnessRealConfig() {
+    RealConfigWitness witness;
+    witness.file = wallpaperx::defaultConfigPath();
+    if (witness.file.empty()) return witness;
+    std::error_code ec;
+    witness.existed = std::filesystem::exists(witness.file, ec) && !ec;
+    if (!witness.existed) return witness;
+    std::ifstream in(witness.file, std::ios::binary);
+    if (in) witness.contents.assign((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    return witness;
+}
 
 // True when this daemon's child died in its fork preamble, having reported the fault on the
 // harness channel first -- so a caller only has to bail out. `phase` names what could not be
@@ -1281,11 +1379,9 @@ void checkFirstFrameUnderStatusLoad(sdbus::IProxy& proxy, FrameReadyLog& signals
 // have answered quickly too and the check would have passed for the daemon it exists to
 // catch. What does separate them:
 //
-//   - The time to *issue* the burst. Inline rendering makes issuing the burst take as
-//     long as rendering it; posting makes it a rounding error next to the same drain.
-//     Controlled: a daemon patched to render inside SetWallpaper takes 27.3 ms to issue
-//     sixteen requests that then drain in 28.7 ms, against 0.4 ms and 28.0 ms for the
-//     real one, and this check fails.
+//   - The cost of *issuing* a request that will render, against the cost of issuing one
+//     that will not. See the S6.9 block below for why the comparison is against a `video`
+//     burst rather than against the render drain.
 //
 // The GetStatus/GetFrameFd ordering is *printed and not asserted*, which is worth
 // stating plainly because the first draft did assert it. The reasoning was that a
@@ -1300,8 +1396,17 @@ void checkFirstFrameUnderStatusLoad(sdbus::IProxy& proxy, FrameReadyLog& signals
 // Which corrects something PLAN.md records: the "no DBus handler touches the GPU" rule
 // is *not* unenforced. The Device's thread pinning enforces it, fatally and at the first
 // violation. What has no mechanical enforcement is the weaker half -- a handler doing
-// slow *non-GPU* work -- and the issue-time check above is what covers that.
+// slow *non-GPU* work -- and the issue-cost check above is what covers that.
 // ---------------------------------------------------------------------------- //
+
+// Per-call timing rather than one interval around a loop, because the statistic taken from
+// the samples has to be a median.
+Clock::duration timeSetWallpaper(sdbus::IProxy& proxy, const char* type, const std::string& path, int32_t monitorId) {
+    const auto callStart = Clock::now();
+    setWallpaper(proxy, type, path, monitorId);
+    return Clock::now() - callStart;
+}
+
 void checkResponsivenessUnderLoad(sdbus::IProxy& proxy, FrameReadyLog& signals, const std::string& bluePath,
                                   const Check& check) {
     // One warm render, to size the load. The GPU is already initialised by phase 2, so
@@ -1314,9 +1419,10 @@ void checkResponsivenessUnderLoad(sdbus::IProxy& proxy, FrameReadyLog& signals, 
     }
     const auto singleRender = Clock::now() - renderStart;
 
-    // Enough queued work that a GPU-blocking handler could not hide. Distinct monitors,
-    // so nothing coalesces away: coalescing is what makes a burst at *one* monitor
-    // finish in one render, and that would leave nothing to be busy with.
+    // Enough queued work that a GPU-blocking handler could not hide, and the sample count
+    // for both bursts below. Distinct monitors, so nothing coalesces away: coalescing is
+    // what makes a burst at *one* monitor finish in one render, and that would leave
+    // nothing to be busy with.
     const double perRenderMs = std::max(1.0, millis(singleRender));
     const int loadCount = std::clamp(static_cast<int>(400.0 / perRenderMs) + 1, 4, kMaxLoadMonitors);
 
@@ -1325,9 +1431,65 @@ void checkResponsivenessUnderLoad(sdbus::IProxy& proxy, FrameReadyLog& signals, 
     auto observer =
         sdbus::createProxy(sdbus::ServiceName{DbusService::kBusName}, sdbus::ObjectPath{DbusService::kObjectPath});
 
+    // Unmeasured, and it has to come first: it puts every monitor the measured calls will
+    // touch into the daemon's map, so the config save each of those calls performs writes a
+    // file of constant size. Without it the file would grow entry by entry underneath the
+    // measurement and part of the difference being measured would be that.
+    for (int i = 0; i < loadCount; ++i) {
+        setWallpaper(proxy, "video", bluePath, kMonitorLoadBase + i);
+    }
+
+    // GOAL: the premise the S6.9 assertion below rests on -- that a `video` request is
+    //       recorded and then NOT rendered. If it ever renders, the two bursts stop
+    //       differing and the assertion measures nothing while staying green.
+    // WHY-THIS-SHAPE: asked of the daemon over the wire rather than asserted in the test,
+    //       because the test cannot see isRenderableType(). The alternative -- waiting for
+    //       the absence of a FrameReady -- cannot distinguish "never renders" from "has not
+    //       rendered yet", and would have to spend a timeout to say so. `unsupported` is
+    //       the daemon's own published answer and shares isRenderableType() with the
+    //       render path, so the two cannot disagree.
+    // CONTROL: isRenderableType() changed to `type == "static" || type == "video"` ->
+    //       "FAIL: the video burst is recorded as a wallpaper this build does not render",
+    //       with "0/16 monitors report unsupported" beside it. The ratio on that run read
+    //       1.00 -- two rendering bursts compared against each other, the vacuous green
+    //       this converts into a red. Reverted.
+    const StatusReply videoStatus = getStatusOrExplain(proxy);
+    int unsupportedSeen = 0;
+    for (int i = 0; i < loadCount; ++i) {
+        const nlohmann::json* entry = wallpaperStatus(videoStatus, std::to_string(kMonitorLoadBase + i));
+        if (entry != nullptr && entry->value("unsupported", false)) ++unsupportedSeen;
+    }
+    const bool videoIsInert = unsupportedSeen == loadCount;
+    if (!videoIsInert) {
+        // Says which of the two ways this failed: the daemon renders video now, or the
+        // reply that would have said so never arrived (getStatusOrExplain has printed the
+        // reason for that case immediately above).
+        std::fprintf(stderr, "  %d/%d monitors report unsupported%s\n", unsupportedSeen, loadCount,
+                     videoStatus.ok() ? "" : " -- and GetStatus did not answer, see above");
+    }
+    check(videoIsInert, "the video burst is recorded as a wallpaper this build does not render "
+                        "(the S6.9 comparison below is meaningless otherwise)");
+
+    // The control burst. Same monitors as the renderable burst below, so the config save
+    // each call performs writes an identically sized file.
+    //
+    // A separate burst rather than interleaved with it. Alternating the two types pair by
+    // pair sounds fairer -- both calls would meet the same worker -- and measured worse: it
+    // puts the issue loop and the worker loop into a fixed phase relationship, and one call
+    // of each pair comes out ~3x the other. Which one is a coin flip per run (a tsan run
+    // read 3.47 and the next 0.31, the second with the INERT call dearer), so the number
+    // stops being about the wallpaper type at all. X.2 forbids asserting on that.
+    std::vector<Clock::duration> videoSamples;
+    videoSamples.reserve(static_cast<size_t>(loadCount));
+    for (int i = 0; i < loadCount; ++i) {
+        videoSamples.push_back(timeSetWallpaper(proxy, "video", bluePath, kMonitorLoadBase + i));
+    }
+
+    std::vector<Clock::duration> staticSamples;
+    staticSamples.reserve(static_cast<size_t>(loadCount));
     const auto loadStart = Clock::now();
     for (int i = 0; i < loadCount; ++i) {
-        setWallpaper(proxy, "static", bluePath, kMonitorLoadBase + i);
+        staticSamples.push_back(timeSetWallpaper(proxy, "static", bluePath, kMonitorLoadBase + i));
     }
     const auto issueTime = Clock::now() - loadStart;
 
@@ -1381,73 +1543,72 @@ void checkResponsivenessUnderLoad(sdbus::IProxy& proxy, FrameReadyLog& signals, 
                 "the Device's thread pinning is what makes a GPU-touching handler fatal)\n",
                 statusDoneAt < frameDoneAt ? "overtook" : "did not overtake");
 
-    // Round 2 is only meaningful, and only *possible*, if round 1 committed everywhere:
-    // it waits for each monitor's generation 2, which a monitor left at generation 0 by a
-    // lost round-1 render can never reach. Continuing would add a 30 s timeout per
-    // monitor and then grade the resulting stall as a very slow drain -- which is to say
-    // it would pass the assertion below on the strength of the hang.
-    if (!round1Ok) {
-        std::printf("daemon_system_test: responsiveness check abandoned -- the first burst did not drain, so no "
-                    "issue/drain ratio from this run means anything.\n");
+    const double videoFloor = minMillis(videoSamples);
+    const double staticFloor = minMillis(staticSamples);
+    const double ratio = videoFloor > 0 ? staticFloor / videoFloor : 1.0;
+    std::printf("daemon_system_test: cheapest SetWallpaper cost %.3f ms for a request that renders vs %.3f ms for one "
+                "that does not (ratio %.2f, bound %.1f) over %zu samples each; medians %.3f and %.3f\n",
+                staticFloor, videoFloor, ratio, kIssueCostRatioBound, staticSamples.size(),
+                medianMillis(staticSamples), medianMillis(videoSamples));
+
+    // The comparison means something only if exactly one of the two bursts rendered. Not a
+    // silent pass either way: both premises are asserted above, so a run that lands here is
+    // already red and the reason is already printed against the right component.
+    if (!round1Ok || !videoIsInert) {
+        std::printf("daemon_system_test: the S6.9 issue-cost comparison is abandoned -- %s, so the two bursts do "
+                    "not differ in the way the comparison assumes.\n",
+                    round1Ok ? "the video burst was not inert" : "the static burst never drained");
         return;
     }
 
-    // A second, undisturbed round. issueTime is a handful of DBus round trips measured in
-    // tens of microseconds, and each one makes the daemon printf and fflush a line into
-    // the pipe this test owns -- so one scheduler preemption inside that loop inflates it
-    // without inflating drain, and the check below would accuse production code of
-    // rendering inline on a host that merely hiccuped. Two rounds and the better ratio
-    // fixes that without weakening the check: a daemon that really does render inline
-    // measures issueTime ~= drain in *both* rounds, because that is what it does rather
-    // than what the scheduler did to it.
-    const auto secondStart = Clock::now();
-    for (int i = 0; i < loadCount; ++i) {
-        setWallpaper(proxy, "static", bluePath, kMonitorLoadBase + i);
-    }
-    const auto issueTime2 = Clock::now() - secondStart;
-
-    // Its own flag. Reusing round 1's meant a lost first-round signal was reported twice,
-    // the second time as a failure of a burst that had in fact delivered everything.
-    bool round2Ok = true;
-    for (int i = 0; i < loadCount; ++i) {
-        if (!signals.wait(kMonitorLoadBase + i, 2)) round2Ok = false;
-    }
-    const auto drain2 = Clock::now() - secondStart;
-    check(round2Ok, "the second measuring burst also completes");
-
-    // Ratios rather than raw intervals, since the two rounds may drain at different
-    // speeds. A round is *eligible* only if it both drained and took long enough to be
-    // conclusive: below kMinConclusiveDrain a daemon that rendered inline would have
-    // answered just as fast, so a ratio from such a round is not evidence either way.
+    // GOAL: S6.9 -- issuing a burst of SetWallpaper calls that WILL render costs no more
+    //       than issuing an identical burst that renders nothing. False for a daemon whose
+    //       handler renders (or waits for the render) before replying.
+    // WHY-THIS-SHAPE: the obvious form -- issue time as a fraction of the render drain --
+    //       is what this used to be, and its denominator is not daemon code. Under
+    //       ThreadSanitizer the drain is mostly uninstrumented rasterisation inside the ICD
+    //       while the handler is instrumented daemon code, so the two sides scale by
+    //       different factors: the tsan tier read 0.2932 then 0.9375 against a 0.25 bound
+    //       on a daemon that is not defective, and 0.9375 is what the defect itself scores.
+    //       The `video` burst is the same handler, the same validation, the same requestSeq
+    //       bookkeeping and the same config save, differing only in isRenderableType() --
+    //       so sanitizer distortion and host GPU speed appear on both sides and cancel.
+    //       The cheapest call of each burst, not the median or the total: the renderable
+    //       burst -- and only it -- is issued while the worker is drawing, so its calls
+    //       carry lock and stdout contention the inert ones never meet, and a sanitizer
+    //       charges roughly ten times as much for it. That put the tsan median ratio at
+    //       1.11-1.58 and the totals at 2.19 with nothing wrong. Comparing the least
+    //       contended call on each side removes the confound instead of budgeting for it:
+    //       1.01-1.03 over the same runs. It cannot let the defect through, because a
+    //       handler that renders inline has no cheap call to offer -- every one of the
+    //       sixteen monitors is distinct, so every request is a fresh render.
+    // CONTROL: DbusService::setWallpaper made synchronous -- after m_worker.post(), post a
+    //       task carrying a promise and wait on its future, which is the FIFO's completion
+    //       edge for the render just queued. Rendering on the worker keeps the Device's
+    //       thread pinning from aborting first, so the daemon survives to be measured;
+    //       emitFrameReady had to be detached for the same run, because a worker blocking
+    //       on the connection lock while the handler waits on the worker is a deadlock, not
+    //       a slow reply. Observed: NVIDIA 1.725 ms vs 0.144 ms, ratio 11.96; lavapipe
+    //       2.983 vs 0.151, ratio 19.71; tsan+lavapipe 4.143 vs 0.778, ratio 5.33 -- FAIL
+    //       in all three. Reverted.
+    // COVERAGE-ASSERT: the sample counts are asserted equal and >= 4 below. A minimum over
+    //       one or two calls is a single sample dressed up, and loadCount is computed from
+    //       this host's render speed rather than written down here, so it can shrink
+    //       without anyone editing this file. Controlled by clamping loadCount to 2 ->
+    //       "FAIL: the issue-cost comparison has equal, non-trivial sample counts on both
+    //       sides", printed beside a ratio over 2 samples that nobody should trust.
+    //       Reverted.
     //
-    // Eligibility is per round, not applied to the winner after the fact. Grading the
-    // better ratio and *then* testing that round's drain let a cheap second round -- round
-    // 2 re-renders monitors whose images round 1 already allocated, so it is routinely
-    // faster -- suppress the assertion even when round 1 was conclusive on its own.
-    const double ratio1 = millis(drain) > 0 ? millis(issueTime) / millis(drain) : 1.0;
-    const double ratio2 = millis(drain2) > 0 ? millis(issueTime2) / millis(drain2) : 1.0;
-    const bool round1Eligible = round1Ok && drain >= kMinConclusiveDrain;
-    const bool round2Eligible = round2Ok && drain2 >= kMinConclusiveDrain;
-
-    std::printf("daemon_system_test: issue/drain ratio %.4f (%s) then %.4f (%s), threshold 0.25\n", ratio1,
-                round1Eligible ? "eligible" : "too fast to be conclusive", ratio2,
-                round2Eligible ? "eligible" : "too fast to be conclusive");
-
-    if (!round1Eligible && !round2Eligible) {
-        std::printf("daemon_system_test: responsiveness check INCONCLUSIVE on this host -- neither round's queue "
-                    "took the %lld ms needed for a blocking handler to be distinguishable.\n",
-                    static_cast<long long>(kMinConclusiveDrain.count()));
-        return;
-    }
-
-    // The best ratio among the rounds that are actually evidence. A daemon rendering
-    // inline scores ~1.0 in every round, so taking the minimum cannot rescue it.
-    double bestRatio = 1.0;
-    if (round1Eligible) bestRatio = std::min(bestRatio, ratio1);
-    if (round2Eligible) bestRatio = std::min(bestRatio, ratio2);
-
-    check(bestRatio * 4 < 1.0,
-          "issuing a burst of requests costs a fraction of rendering it (SetWallpaper does not render inline)");
+    // What this deliberately no longer covers: absolute handler cost. The config save runs
+    // on both sides, so it cancels -- ConfigStore::save given a 5 ms sleep, some 500x its
+    // real cost, took both sides from 0.14 ms to 5.25 ms and left the ratio at 1.00 and
+    // green. S8.10 owns that, and a second bound here to compensate would reintroduce
+    // exactly the host-dependent absolute number this rework removed.
+    check(staticSamples.size() == videoSamples.size() && staticSamples.size() >= 4,
+          "the issue-cost comparison has equal, non-trivial sample counts on both sides");
+    check(videoFloor > 0 && ratio < kIssueCostRatioBound,
+          "issuing a burst that will render costs no more than issuing one that renders nothing "
+          "(SetWallpaper does not render inline)");
 }
 
 // ---------------------------------------------------------------------------- //
@@ -3106,6 +3267,737 @@ void checkConfigServerLostPort(NameWatcher& names, const std::string& bluePath, 
     awaitNameRelease(names, "any phase added after this one");
 }
 
+// ---------------------------------------------------------------------------- //
+// Phase 12 -- Step 8: config persistence, in the shipped binary.
+// ---------------------------------------------------------------------------- //
+//
+// Every check below needs a daemon that is a *process*: a wallpaper surviving a restart is
+// two processes and a file between them, and the worse half of "no config content stops the
+// daemon" is a SIGABRT, which an in-process test cannot report because it dies with it
+// (measured: the const `operator[]` control killed config_store_test outright, printing
+// json.hpp's assertion and no FAIL line).
+//
+// Each of these phases points the daemon at an XDG_CONFIG_HOME it owns and deletes.
+// SpawnedDaemon injects a fresh one per spawn precisely so no test can reach the
+// developer's real ~/.config/wallpaperx -- an earlier run of this suite wrote 28 test
+// wallpapers there and restored them on the next login. A phase that wants state to survive
+// a restart passes its own, which is the only reason to override that default.
+
+// A directory this file creates and removes, used as an XDG_CONFIG_HOME shared by two
+// spawns or as a working directory to inspect afterwards.
+class ScratchDir {
+public:
+    explicit ScratchDir(const char* tag) {
+        static int counter = 0;
+        m_path = std::filesystem::temp_directory_path() /
+                 ("wpx_step8_" + std::to_string(::getpid()) + "_" + std::to_string(counter++) + "_" + tag);
+        std::error_code ec;
+        std::filesystem::remove_all(m_path, ec);
+        std::filesystem::create_directories(m_path, ec);
+        m_ok = !ec;
+    }
+    ~ScratchDir() {
+        std::error_code ec;
+        std::filesystem::remove_all(m_path, ec);
+    }
+    ScratchDir(const ScratchDir&) = delete;
+    ScratchDir& operator=(const ScratchDir&) = delete;
+
+    bool ok() const { return m_ok; }
+    const std::filesystem::path& path() const { return m_path; }
+    std::filesystem::path configFile() const { return m_path / "wallpaperx" / "config.json"; }
+    std::string env() const { return "XDG_CONFIG_HOME=" + m_path.string(); }
+
+private:
+    std::filesystem::path m_path;
+    bool m_ok = false;
+};
+
+std::string readTextFile(const std::filesystem::path& file) {
+    std::ifstream in(file, std::ios::binary);
+    if (!in) return {};
+    return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+}
+
+bool writeTextFile(const std::filesystem::path& file, const std::string& text) {
+    std::error_code ec;
+    std::filesystem::create_directories(file.parent_path(), ec);
+    std::ofstream out(file, std::ios::binary | std::ios::trunc);
+    if (!out) return false;
+    out.write(text.data(), static_cast<std::streamsize>(text.size()));
+    out.close();
+    return static_cast<bool>(out);
+}
+
+struct PersistedEntry {
+    std::string type;
+    std::string path;
+};
+
+// What the daemon wrote, read straight off the disk. Parsed here rather than through
+// ConfigStore::load() on purpose: this tier's job is to grade the file the shipped binary
+// produced, and a reader that shares the writer's field-name constants agrees with it by
+// construction, including when both are wrong.
+std::map<int, PersistedEntry> configEntries(const std::filesystem::path& file, std::string& why) {
+    std::map<int, PersistedEntry> entries;
+    const std::string text = readTextFile(file);
+    if (text.empty()) {
+        why = "no config file at " + file.string();
+        return entries;
+    }
+    const nlohmann::json root = nlohmann::json::parse(text, nullptr, false);
+    if (root.is_discarded() || !root.is_object() || !root.contains("monitors") || !root["monitors"].is_array()) {
+        why = "the config file is not an object with a monitors array";
+        return entries;
+    }
+    for (const nlohmann::json& entry : root["monitors"]) {
+        if (!entry.is_object() || !entry.contains("monitor_id") || !entry.contains("type") ||
+            !entry.contains("path")) {
+            continue;
+        }
+        if (!entry["monitor_id"].is_number_integer() || !entry["type"].is_string() || !entry["path"].is_string()) {
+            continue;
+        }
+        entries[entry["monitor_id"].get<int>()] =
+            PersistedEntry{entry["type"].get<std::string>(), entry["path"].get<std::string>()};
+    }
+    return entries;
+}
+
+// Every file under `dir`, so a phase can say "nothing was written here" and name what was
+// if something was.
+std::vector<std::string> filesUnder(const std::filesystem::path& dir) {
+    std::vector<std::string> found;
+    std::error_code ec;
+    for (const std::filesystem::directory_entry& entry :
+         std::filesystem::recursive_directory_iterator(dir, ec)) {
+        found.push_back(entry.path().string());
+    }
+    return found;
+}
+
+// The daemon's /health body, when the daemon is the process serving 18462. Returns false
+// with a reason otherwise -- a developer's own daemon holding the port is a skip, not a
+// finding, and this phase has a GetStatus-based answer for that case that does not need
+// the port at all.
+bool fetchHealth(const StatusReply& status, nlohmann::json& out, std::string& why, const Check& check) {
+    const nlohmann::json* report = configServerReport(status);
+    const std::string reportStatus = report ? report->value("status", std::string()) : std::string();
+    if (reportStatus != "ok") {
+        why = "the daemon reports config_server " + (reportStatus.empty() ? std::string("(absent)") : reportStatus) +
+              ", so port " + std::to_string(wallpaperx::HttpServer::kDefaultPort) + " is not its own to answer on";
+        return false;
+    }
+    httplib::Client cli = wallpaperx::testing::makeClient(wallpaperx::HttpServer::kDefaultPort);
+    const wallpaperx::testing::HttpReply reply = wallpaperx::testing::get(cli, "/health");
+    if (!reply.ok()) {
+        // Not a skip: the daemon just said it owns that port, so a /health that will not
+        // answer is the daemon failing, and the http lifecycle phase grades the same thing.
+        check(false, "a daemon reporting config_server ok answers GET /health");
+        why = "GET /health did not answer although the daemon reports config_server ok";
+        return false;
+    }
+    out = reply.json;
+    return true;
+}
+
+std::string healthCheckStatusOf(const nlohmann::json& body, const char* name) {
+    const nlohmann::json* checks = healthChecks(body);
+    if (checks == nullptr || !checks->contains(name) || !(*checks)[name].is_object()) return {};
+    return (*checks)[name].value("status", std::string());
+}
+
+void checkConfigRestart(NameWatcher& names, const std::string& validationEnv, const Check& check) {
+    constexpr int32_t kMonitorRestore = 18;
+    constexpr const char* kGoals = "S8.1/S8.3/S8.11 (a wallpaper survives a restart, byte for byte)";
+
+    ScratchDir configHome("restart");
+    if (!configHome.ok()) {
+        notVerified(kGoals, "a scratch XDG_CONFIG_HOME could not be created under the temp directory");
+        return;
+    }
+
+    // A filename carrying every byte class sanitizeForLog rewrites: U+202E, DEL, and a
+    // newline. Legal on Linux, and the whole point -- what is persisted has to be the bytes
+    // that open this file, not the display-safe rendering of them.
+    const std::string nastyName = std::string("system_persist_\xE2\x80\xAE\x7F\nblue.png");
+    std::string nastyPath;
+    try {
+        nastyPath = writeSolidImage(nastyName.c_str(), 0, 0, 255);
+    } catch (const std::exception& e) {
+        notVerified(kGoals, std::string("this filesystem would not take a wallpaper filename containing U+202E, DEL "
+                                        "and a newline: ") +
+                                e.what());
+        return;
+    }
+
+    bool firstRendered = false;
+    {
+        SpawnedDaemon first({validationEnv, configHome.env()});
+        if (!names.waitFor(true)) {
+            if (!reportedStartupFault(first, kGoals)) {
+                notVerified(kGoals, "the first daemon of this phase never acquired the bus name");
+            }
+            return;
+        }
+
+        // Declared before the proxy so it outlives it: the FrameReady callback runs on the
+        // proxy's dispatch thread.
+        FrameReadyLog signals;
+        auto proxy = sdbus::createProxy(sdbus::ServiceName{DbusService::kBusName},
+                                        sdbus::ObjectPath{DbusService::kObjectPath});
+        proxy->uponSignal("FrameReady")
+            .onInterface(DbusService::kInterface)
+            .call([&signals](int32_t monitorId, uint64_t generation) { signals.record(monitorId, generation); });
+
+        // GOAL: S8.11, first half -- HealthStatus::Pending still means "no dependency has
+        //       been tried yet", and after Step 8 it is reachable exactly when there is no
+        //       config file. False if a daemon that restored nothing already reports a GPU.
+        // WHY-THIS-SHAPE: asked of a daemon whose XDG_CONFIG_HOME this phase created empty
+        //       seconds ago, so "no config file" is a fact rather than an assumption, and
+        //       asked before this phase's own SetWallpaper. gpu.initialized on GetStatus is
+        //       asserted unconditionally; the `pending` wording is asserted only when the
+        //       daemon owns port 18462, because a developer's own daemon on that port is a
+        //       skip and not a finding.
+        // CONTROL: this block moved below the SetWallpaper and the FrameReady wait, so the
+        //       same daemon is asked once a device provably exists -> "FAIL: a daemon with
+        //       no config file has created no GPU device at startup" and "FAIL: /health
+        //       reports the GPU as pending on a daemon that restored nothing". Moved back.
+        //       A control that instead gave THIS daemon a populated config file was tried
+        //       and rejected: whether the restore's render has committed by the time the
+        //       reply is built is a race, so it would have been a check graded on the
+        //       scheduler. The restore direction is controlled below, after a FrameReady.
+        const StatusReply beforeAnything = getStatusOrExplain(*proxy);
+        if (beforeAnything.ok()) {
+            check(!beforeAnything.json().value("gpu", nlohmann::json::object()).value("initialized", true),
+                  "a daemon with no config file has created no GPU device at startup");
+            nlohmann::json health;
+            std::string why;
+            if (!fetchHealth(beforeAnything, health, why, check)) {
+                notVerified("S8.11's /health half", why);
+            } else {
+                check(healthCheckStatusOf(health, "gpu") == "pending",
+                      "/health reports the GPU as pending on a daemon that restored nothing");
+                check(healthCheckStatusOf(health, "persistence") == "ok",
+                      "/health reports persistence as ok on a daemon whose config file does not exist yet");
+            }
+        }
+
+        setWallpaper(*proxy, "static", nastyPath, kMonitorRestore);
+        firstRendered = signals.wait(kMonitorRestore, 1);
+        if (!firstRendered) {
+            std::printf("daemon_system_test: the first daemon of the restart phase never rendered; the restart "
+                        "checks below grade the restored STATE, and the restored FRAME is skipped rather than "
+                        "blamed on the restore.\n");
+        }
+        first.shutdown(SIGTERM);
+        awaitNameRelease(names, "the restarted daemon of the config phase");
+    }
+
+    // GOAL: S8.3 -- the daemon persists the path it was given, byte for byte. False if the
+    //       file holds the sanitized form: /config and GetStatus both publish
+    //       sanitizeForLog(path), and persisting what they publish would restore a
+    //       different file (PLAN.md Step 8 trap 4).
+    // WHY-THIS-SHAPE: read off the disk and compared to the exact bytes this test passed
+    //       over the bus, and the same reply's published path is asserted to be the
+    //       SANITIZED one. Asserting only the file would pass for a daemon that had stopped
+    //       sanitizing its published surface; asserting only the wire would pass for one
+    //       that persists the display form. The pair is what pins the two boundaries apart.
+    // CONTROL: `{kKeyPath, entry.path}` in ConfigStore::save() replaced with
+    //       `sanitizeForLog(entry.path, 4096, LogFraming::Bare)` -> three FAILs: "the
+    //       daemon persists the path it was given, byte for byte" ("persisted:
+    //       ...system_persist_\xe2\x80\xae\x7f\nblue.png"), "GetStatus publishes the
+    //       restored path in its sanitized form" (it publishes the escaped form escaped
+    //       again), and "the restored wallpaper renders in the new process without any
+    //       client asking" -- the sanitized name names no file. Reverted.
+    std::string why;
+    const std::map<int, PersistedEntry> saved = configEntries(configHome.configFile(), why);
+    const bool savedEntry = saved.count(kMonitorRestore) == 1;
+    check(savedEntry, "the daemon writes the wallpaper it was given into $XDG_CONFIG_HOME/wallpaperx/config.json");
+    if (!savedEntry) {
+        std::fprintf(stderr, "  %s\n", why.empty() ? "the entry is not in the file" : why.c_str());
+    } else {
+        const bool byteIdentical = saved.at(kMonitorRestore).path == nastyPath;
+        check(byteIdentical, "the daemon persists the path it was given, byte for byte");
+        if (!byteIdentical) {
+            std::fprintf(stderr, "  set:       %s\n  persisted: %s\n", nastyPath.c_str(),
+                         saved.at(kMonitorRestore).path.c_str());
+        }
+        check(saved.at(kMonitorRestore).type == "static", "the persisted entry carries the wallpaper's type");
+    }
+
+    // Sampled while no daemon is running, so anything that moves them belongs to the
+    // restart. See the S8.5 check at the end of this phase.
+    std::error_code timeEc;
+    const std::string bytesBeforeRestart = readTextFile(configHome.configFile());
+    const auto mtimeBeforeRestart = std::filesystem::last_write_time(configHome.configFile(), timeEc);
+
+    // The restart. No client call of any kind against this daemon before the assertions:
+    // that is the property.
+    SpawnedDaemon second({validationEnv, configHome.env()});
+    if (!names.waitFor(true)) {
+        if (!reportedStartupFault(second, kGoals)) {
+            notVerified(kGoals, "the restarted daemon never acquired the bus name");
+        }
+        return;
+    }
+
+    FrameReadyLog restored;
+    auto proxy =
+        sdbus::createProxy(sdbus::ServiceName{DbusService::kBusName}, sdbus::ObjectPath{DbusService::kObjectPath});
+    proxy->uponSignal("FrameReady")
+        .onInterface(DbusService::kInterface)
+        .call([&restored](int32_t monitorId, uint64_t generation) { restored.record(monitorId, generation); });
+
+    // GOAL: S8.1 -- a wallpaper set before a restart is on the same monitor after it, with
+    //       no client acting. This is the whole of Step 8; everything else constrains how
+    //       it is reached. False if the monitor comes back reporting nothing set.
+    // WHY-THIS-SHAPE: the STATE is graded unconditionally and the FRAME only when the
+    //       daemon before the restart managed to render. A frame-only check would report a
+    //       host with no working Vulkan as a broken restore -- and a state-only check would
+    //       pass for a daemon that restored a path it can no longer open, which is exactly
+    //       what persisting the sanitized form produces. The frame is subscribed before the
+    //       reply is read, so a restore that renders immediately cannot be missed.
+    // CONTROL: `service.restoreSaved();` deleted from main.cpp -> seven FAILs, led by "the
+    //       wallpaper set before the restart is on that monitor after it, with no client
+    //       asking" and "the restored wallpaper renders in the new process without any
+    //       client asking", and including this phase's two S8.11 lines and the
+    //       unreadable-restore phase's three. Reverted.
+    const StatusReply afterRestart = getStatusOrExplain(*proxy);
+    const nlohmann::json* entry = wallpaperStatus(afterRestart, std::to_string(kMonitorRestore));
+    check(entry != nullptr,
+          "the wallpaper set before the restart is on that monitor after it, with no client asking");
+    if (entry != nullptr) {
+        check(entry->value("type", std::string()) == "static", "the restored monitor carries the type it was set with");
+        // GetStatus publishes the sanitized path -- display-safe, not round-trip-safe --
+        // while the file above holds the raw bytes. Both are asserted, because the defect
+        // this pair rules out is the two surfaces being fed from the same string.
+        const std::string published = entry->value("path", std::string());
+        const std::string expected = wallpaperx::sanitizeForLog(nastyPath, 4096, wallpaperx::LogFraming::Bare);
+        check(published == expected, "GetStatus publishes the restored path in its sanitized form");
+        if (published != expected) {
+            std::fprintf(stderr, "  published: %s\n  expected:  %s\n", published.c_str(), expected.c_str());
+        }
+    }
+
+    if (!firstRendered) {
+        notVerified("S8.1's render half",
+                    "the daemon before the restart never rendered either, so a missing frame here says nothing "
+                    "about the restore");
+    } else {
+        // Generation 1: this is a fresh process, and the counter lives in it, not in the
+        // file. A restored wallpaper is that process's first render.
+        check(restored.wait(kMonitorRestore, 1),
+              "the restored wallpaper renders in the new process without any client asking");
+
+        // GOAL: S8.11, second half -- Pending is NOT what a daemon that restored a
+        //       wallpaper reports, because it resolved the GPU at startup on its own.
+        // WHY-THIS-SHAPE: read after the FrameReady above, so the render is known to have
+        //       committed rather than assumed; polling GetStatus until initialized flips
+        //       would pass on a timeout if it were written the other way round.
+        // CONTROL: the same `service.restoreSaved()` deletion -> "FAIL: a daemon that
+        //       restored a wallpaper has resolved its GPU with no client involved" and
+        //       "FAIL: /health no longer reports the GPU as untried once a restore has
+        //       rendered". Reverted.
+        const StatusReply afterRender = getStatusOrExplain(*proxy);
+        if (afterRender.ok()) {
+            check(afterRender.json().value("gpu", nlohmann::json::object()).value("initialized", false),
+                  "a daemon that restored a wallpaper has resolved its GPU with no client involved");
+            nlohmann::json health;
+            std::string healthWhy;
+            if (!fetchHealth(afterRender, health, healthWhy, check)) {
+                notVerified("S8.11's /health half after a restore", healthWhy);
+            } else {
+                const std::string gpu = healthCheckStatusOf(health, "gpu");
+                check(gpu != "pending" && !gpu.empty(),
+                      "/health no longer reports the GPU as untried once a restore has rendered");
+                if (gpu == "pending" || gpu.empty()) {
+                    std::fprintf(stderr, "  /health gpu: '%s'\n", gpu.c_str());
+                }
+            }
+        }
+    }
+
+    // GOAL: S8.5 end to end -- a daemon that only restores does not write the config file.
+    //       In process this is asserted on a hand-written file (config_store_test); here it
+    //       is asserted of the shipped binary, where main.cpp's own call order is what could
+    //       break it.
+    // WHY-THIS-SHAPE: the MTIME is what is graded, not the bytes. Bytes cannot work at this
+    //       tier and that is not obvious: the file under test was written by the first
+    //       daemon's own save(), so a second save reproduces it byte for byte -- measured, a
+    //       `persist(persistableLocked())` added to restoreSaved() left a byte comparison
+    //       completely green. Both samples are taken while no daemon is running, so nothing
+    //       but the restart can have moved either.
+    // CONTROL: `persist(persistableLocked())` added at the end of
+    //       WallpaperManager::restoreSaved(), outside the lock -> "FAIL: a daemon that only
+    //       restores leaves the config file exactly as it found it", with "  the file's
+    //       mtime moved across a start that only restored". Reverted.
+    second.shutdown(SIGTERM);
+    awaitNameRelease(names, "the phase after the config restart");
+    std::error_code afterEc;
+    const auto mtimeAfterRestart = std::filesystem::last_write_time(configHome.configFile(), afterEc);
+    const bool untouched = !bytesBeforeRestart.empty() && !timeEc && !afterEc &&
+                           mtimeAfterRestart == mtimeBeforeRestart &&
+                           readTextFile(configHome.configFile()) == bytesBeforeRestart;
+    check(untouched, "a daemon that only restores leaves the config file exactly as it found it");
+    if (!untouched) {
+        std::fprintf(stderr, "  %s\n",
+                     mtimeAfterRestart != mtimeBeforeRestart
+                         ? "the file's mtime moved across a start that only restored"
+                         : "the file's contents changed, or it could not be read on both sides of the restart");
+    }
+}
+
+void checkStartsOnAnyConfig(NameWatcher& names, const std::string& validationEnv, const Check& check) {
+    constexpr const char* kGoals = "S8.2 (no config file content stops the daemon)";
+    ScratchDir configHome("anycontent");
+    if (!configHome.ok()) {
+        notVerified(kGoals, "a scratch XDG_CONFIG_HOME could not be created under the temp directory");
+        return;
+    }
+
+    std::string deep = "{\"version\":1,\"monitors\":";
+    deep.append(50000, '[');
+    deep.append(50000, ']');
+    deep += "}";
+
+    // GOAL: S8.2 -- no content whatsoever in config.json prevents the daemon from starting
+    //       and serving DBus. The two failure mechanisms are DIFFERENT and both are here: a
+    //       throw escaping the load reaches main.cpp's catch and exits 1, while a const
+    //       `operator[]` on a missing key is a JSON_ASSERT -> SIGABRT that no catch can
+    //       intercept. A check that covers only the throw is blind to the worse half.
+    // WHY-THIS-SHAPE: exitedNormally() AND exit code 0 AND the name on the bus, per case.
+    //       "The daemon exited non-zero" is satisfied by an abort (reap() reports -1 for
+    //       both), so the abort half needs exitedNormally(); "it came up" alone would pass
+    //       for a daemon that aborted later. The corpus leads with the shapes that reach a
+    //       field read of parsed input -- `{}`, wrong types, a wrong-typed version -- since
+    //       those are the ones a const operator[] would abort on.
+    // CONTROL: two, both reverted, and they redden different cases -- which is the point.
+    //       (a) config_store.cpp's version read replaced with `root[kKeyVersion].get<int>()`
+    //       -> exactly two FAILs, "with valid JSON of the wrong shape in config.json, the
+    //       daemon starts and serves DBus" and "... exits 0 on SIGTERM rather than
+    //       aborting", with json.hpp's `it != m_data.m_value.object->end()` assertion in the
+    //       daemon's captured output. config_store_test could not report that one at all:
+    //       the same mutation killed it. (b) `json::parse(text, nullptr, false)` made
+    //       throwing and load()'s catch made to rethrow -> eight FAILs, over the truncated,
+    //       empty, not-JSON and 100 MB cases, each printing "exit code 1" with the daemon's
+    //       "fatal: [json.exception.parse_error.101] ..." line.
+    // COVERAGE-ASSERT: the number of cases actually spawned is asserted against the corpus
+    //       size, so a case that silently fails to be written cannot thin this out.
+    //       CONTROL: `if (content.size() > 1000) continue;` added to the loop, which is what
+    //       a well-meaning "skip the slow ones" edit looks like -> "FAIL: every
+    //       config-content case was actually spawned, so this phase is as wide as it reads",
+    //       and nothing else. Reverted.
+    const std::vector<std::pair<const char*, std::string>> corpus{
+        {"valid JSON of the wrong shape", "{}"},
+        {"an object whose fields are all the wrong type",
+         "{\"version\":\"1\",\"monitors\":{\"0\":{\"path\":42}}}"},
+        {"entries whose fields are the wrong type",
+         "{\"version\":1,\"monitors\":[{\"monitor_id\":\"a\",\"type\":null,\"path\":[]}]}"},
+        {"a file truncated mid-object", "{\"version\":1,\"monitors\":[{\"monitor_id\":0,\"type\":\"stat"},
+        {"an empty file", ""},
+        {"a file that is not JSON at all", "wallpapers = all of them"},
+        {"a JSON array where an object belongs", "[{\"monitor_id\":0}]"},
+        {"50 000 levels of nesting", deep},
+        {"100 MB of no JSON whatsoever", std::string(100u * 1024u * 1024u, 'x')},
+    };
+
+    int exercised = 0;
+    for (const auto& [what, content] : corpus) {
+        if (!writeTextFile(configHome.configFile(), content)) {
+            notVerified(kGoals, std::string("the config file for the '") + what + "' case could not be written");
+            continue;
+        }
+        SpawnedDaemon daemon({validationEnv, configHome.env()});
+        const bool cameUp = names.waitFor(true);
+        if (!cameUp && reportedStartupFault(daemon, kGoals)) return;
+
+        std::string served;
+        if (cameUp) {
+            auto proxy = sdbus::createProxy(sdbus::ServiceName{DbusService::kBusName},
+                                            sdbus::ObjectPath{DbusService::kObjectPath});
+            const StatusReply status = getStatus(*proxy);
+            if (!status.ok()) served = status.error();
+        }
+        const bool serving = cameUp && served.empty();
+        check(serving, (std::string("with ") + what + " in config.json, the daemon starts and serves DBus").c_str());
+        if (!serving) {
+            std::fprintf(stderr, "  %s: %s\n", what,
+                         cameUp ? served.c_str() : "the daemon never acquired the bus name");
+        }
+
+        const int exitCode = daemon.shutdown(SIGTERM);
+        const std::string output = daemon.output();
+        const bool sanitizerReported = output.find("Sanitizer: reported") != std::string::npos;
+        // exitedNormally() is the half that sees an abort: a process killed by SIGABRT and
+        // one that timed out both report exit code -1, so a check written on the code alone
+        // cannot tell a crash from a clean refusal.
+        check(daemon.exitedNormally() && (sanitizerReported || exitCode == 0),
+              (std::string("with ") + what + " in config.json, the daemon exits 0 on SIGTERM rather than aborting")
+                  .c_str());
+        if (!daemon.exitedNormally()) {
+            std::fprintf(stderr, "  %s: the daemon did not exit normally (signal %d, timed out %d)\n", what,
+                         daemon.termSignal(), static_cast<int>(daemon.timedOut()));
+        } else if (!sanitizerReported && exitCode != 0) {
+            std::fprintf(stderr, "  %s: exit code %d\n", what, exitCode);
+        }
+        ++exercised;
+        awaitNameRelease(names, "the next config-content case");
+    }
+    check(exercised == static_cast<int>(corpus.size()),
+          "every config-content case was actually spawned, so this phase is as wide as it reads");
+}
+
+void checkUnreadableRestore(NameWatcher& names, const std::string& validationEnv, const std::string& bluePath,
+                            const Check& check) {
+    constexpr int32_t kMonitorMissing = 19;
+    constexpr int32_t kMonitorPresent = 28;
+    constexpr const char* kGoals = "S8.4 (a wallpaper whose file is unreadable at restore is not forgotten)";
+
+    ScratchDir configHome("unreadable");
+    if (!configHome.ok()) {
+        notVerified(kGoals, "a scratch XDG_CONFIG_HOME could not be created under the temp directory");
+        return;
+    }
+    const std::string missingPath = (configHome.path() / "unmounted-drive" / "wallpaper.png").string();
+    const std::string config = "{\"version\":1,\"monitors\":[{\"monitor_id\":" + std::to_string(kMonitorMissing) +
+                               ",\"type\":\"static\",\"path\":\"" + missingPath + "\"}]}";
+    if (!writeTextFile(configHome.configFile(), config)) {
+        notVerified(kGoals, "the config file naming an unreadable wallpaper could not be written");
+        return;
+    }
+
+    SpawnedDaemon daemon({validationEnv, configHome.env()});
+    if (!names.waitFor(true)) {
+        if (!reportedStartupFault(daemon, kGoals)) {
+            notVerified(kGoals, "the daemon for this phase never acquired the bus name");
+        }
+        return;
+    }
+    FrameReadyLog signals;
+    auto proxy =
+        sdbus::createProxy(sdbus::ServiceName{DbusService::kBusName}, sdbus::ObjectPath{DbusService::kObjectPath});
+    proxy->uponSignal("FrameReady")
+        .onInterface(DbusService::kInterface)
+        .call([&signals](int32_t monitorId, uint64_t generation) { signals.record(monitorId, generation); });
+
+    // GOAL: S8.4, the reporting half -- the monitor whose file is not there says WHY it is
+    //       blank, rather than reporting nothing set. The case is a drive that mounts after
+    //       the daemon starts (PLAN.md decision 3), and the user has to be able to tell
+    //       "your disk is not mounted" from "no wallpaper was ever set here".
+    // WHY-THIS-SHAPE: a bounded poll whose expiry FAILS the check, not a sleep and a look.
+    //       The restore's render is asynchronous and produces no signal when it fails --
+    //       FrameReady only fires for a frame -- so there is nothing to wait on but the
+    //       state itself. Written as a wait that falls through into the assertion, a stuck
+    //       render would be graded as "no last_error yet" and pass.
+    // CONTROL: two, both reverted. An `is_regular_file` guard added to
+    //       WallpaperManager::restoreSaved()'s loop, i.e. the entry dropped at restore ->
+    //       "FAIL: a restored monitor whose file is missing appears in GetStatus at all"
+    //       plus the two checks below it. And renderPending's failure path made to leave
+    //       lastError empty -> only "FAIL: a restored monitor whose file is missing says
+    //       why it is blank", printing the monitor's whole GetStatus entry with no
+    //       last_error in it -- so the two checks fail independently rather than together.
+    const auto deadline = Clock::now() + std::chrono::seconds(20);
+    std::string lastError;
+    bool present = false;
+    StatusReply status;
+    while (Clock::now() < deadline) {
+        status = getStatus(*proxy);
+        if (!status.ok()) break;
+        const nlohmann::json* entry = wallpaperStatus(status, std::to_string(kMonitorMissing));
+        present = entry != nullptr;
+        if (present) lastError = entry->value("last_error", std::string());
+        if (!lastError.empty()) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    if (!status.ok()) {
+        check(false, "the daemon that restored an unreadable wallpaper answers GetStatus");
+        std::fprintf(stderr, "  %s\n", status.error().c_str());
+    } else {
+        check(present, "a restored monitor whose file is missing appears in GetStatus at all");
+        check(!lastError.empty(), "a restored monitor whose file is missing says why it is blank");
+        if (present && lastError.empty()) {
+            std::fprintf(stderr, "  monitor %d after the restore: %s\n", kMonitorMissing,
+                         wallpaperStatus(status, std::to_string(kMonitorMissing))->dump().c_str());
+        }
+    }
+
+    // GOAL: S8.4, the survival half -- the entry stays in the file across a save made for a
+    //       DIFFERENT monitor. False if setting any other wallpaper drops it: the user's
+    //       wallpaper is then gone for good the moment anything else is set, which is the
+    //       state that makes a late-mounting disk permanent.
+    // WHY-THIS-SHAPE: the second monitor is set over the real bus, which is the only write
+    //       path a user has. Checking the file straight after the restore would pass for a
+    //       daemon that drops the entry at its first save -- and something always sets a
+    //       wallpaper eventually.
+    // CONTROL: the same restoreSaved() readability guard as above -> "FAIL: the unreadable
+    //       monitor's entry survives a save made for another monitor", printing "ids on
+    //       disk: 28". Reverted.
+    try {
+        setWallpaper(*proxy, "static", bluePath, kMonitorPresent);
+    } catch (const std::exception& e) {
+        check(false, "the daemon accepts a wallpaper for another monitor after restoring an unreadable one");
+        std::fprintf(stderr, "  SetWallpaper failed: %s\n", e.what());
+    }
+    std::string why;
+    const std::map<int, PersistedEntry> onDisk = configEntries(configHome.configFile(), why);
+    const bool survived = onDisk.count(kMonitorMissing) == 1 && onDisk.at(kMonitorMissing).path == missingPath &&
+                          onDisk.count(kMonitorPresent) == 1;
+    check(survived, "the unreadable monitor's entry survives a save made for another monitor");
+    if (!survived) {
+        std::fprintf(stderr, "  %s; ids on disk:", why.empty() ? "read back" : why.c_str());
+        for (const auto& entry : onDisk) std::fprintf(stderr, " %d", entry.first);
+        std::fprintf(stderr, "\n");
+    }
+
+    daemon.shutdown(SIGTERM);
+    awaitNameRelease(names, "the phase after the unreadable-restore phase");
+}
+
+void checkConfigLocation(NameWatcher& names, const std::string& validationEnv, const std::string& bluePath,
+                         const Check& check) {
+    constexpr int32_t kMonitorLocation = 29;
+    constexpr const char* kGoals = "S8.9 (nothing is written outside the XDG location)";
+
+    ScratchDir home("home");
+    if (!home.ok()) {
+        notVerified(kGoals, "the scratch HOME this phase inspects could not be created");
+        return;
+    }
+
+    // GOAL: S8.9 -- with neither $XDG_CONFIG_HOME nor $HOME usable, persistence is DISABLED
+    //       and no file is created anywhere, in particular not in the working directory; and
+    //       a RELATIVE $XDG_CONFIG_HOME is ignored per the basedir spec rather than resolved
+    //       against that working directory. False if a daemon started from a directory it
+    //       does not own leaves a config.json in it.
+    // WHY-THIS-SHAPE: the daemon is spawned with a working directory of this phase's own
+    //       (SpawnedDaemon chdirs in the child, between fork and exec), and the whole tree
+    //       is listed afterwards. Asserting only "no config.json in the cwd" would miss a
+    //       daemon that created wallpaperx/ or relative/config/ there; listing everything
+    //       makes the failure name what it found. The daemon's cwd is read back out of
+    //       /proc before anything is graded, because a chdir that silently failed would
+    //       leave this phase inspecting an empty directory and passing.
+    // CONTROL: two, both reverted. `return {};` in defaultConfigPath() replaced with
+    //       `current_path() / kAppDir / kFileName` -> three FAILs on the first case: "with
+    //       no usable XDG_CONFIG_HOME or HOME, the daemon writes nothing into its working
+    //       directory" (listing wallpaperx/ and wallpaperx/config.json under the cwd), "a
+    //       daemon with nowhere to persist reports persistence disabled over DBus", and "...
+    //       says so on its way up". And the `is_absolute()` guard removed from the XDG
+    //       branch -> two on the second case: "with a relative XDG_CONFIG_HOME, the daemon
+    //       writes nothing into its working directory" (listing relative/config/wallpaperx/
+    //       config.json) and "with a relative XDG_CONFIG_HOME the daemon persists under
+    //       $HOME/.config instead".
+    struct LocationCase {
+        const char* what;
+        std::vector<std::string> env;
+        bool expectHomeFile;
+        const char* expectDisabledLine;
+    };
+    const std::vector<LocationCase> cases{
+        {"no usable XDG_CONFIG_HOME or HOME",
+         {validationEnv, "XDG_CONFIG_HOME=", "HOME="},
+         false,
+         "wallpapers will not survive a restart"},
+        {"a relative XDG_CONFIG_HOME",
+         {validationEnv, "XDG_CONFIG_HOME=relative/config", "HOME=" + home.path().string()},
+         true,
+         nullptr},
+    };
+
+    int caseIndex = 0;
+    for (const LocationCase& c : cases) {
+        // A working directory per case, not one shared by both. With one shared directory
+        // the second case inherits whatever the first left there, so a control that makes
+        // the daemon write into its cwd reddens both cases and the second one's failure
+        // names the first one's file -- an attribution this phase exists to get right.
+        ScratchDir working("cwd");
+        if (!working.ok()) {
+            notVerified(kGoals, std::string("the working directory for the '") + c.what +
+                                    "' case could not be created");
+            return;
+        }
+        SpawnedDaemon daemon(c.env, SpawnedDaemon::Stdout::Captured, working.path().string());
+        if (!names.waitFor(true)) {
+            if (reportedStartupFault(daemon, kGoals)) return;
+            if (daemon.waitForExit() == SpawnedDaemon::kChildChdirFailedExit) {
+                harnessFault(kGoals, "the forked child could not enter the working directory this phase created");
+                return;
+            }
+            notVerified(kGoals, std::string("the daemon for the '") + c.what + "' case never acquired the bus name");
+            return;
+        }
+
+        // COVERAGE-ASSERT: everything below is a claim about what the daemon wrote into its
+        // working directory, which is worthless if the daemon is not in fact working there.
+        // CONTROL: the workingDir argument replaced with "" so the child never chdirs ->
+        //       "FAIL: the daemon really is running in the working directory this phase
+        //       inspects" on both cases, printing "daemon cwd: .../backend/build", while
+        //       every "writes nothing into its working directory" check stayed green on a
+        //       directory the daemon had never been near. Reverted.
+        char cwdLink[4096];
+        const ssize_t linkLen = ::readlink(("/proc/" + std::to_string(daemon.pid()) + "/cwd").c_str(), cwdLink,
+                                           sizeof(cwdLink) - 1);
+        if (linkLen <= 0) {
+            notVerified(kGoals, "the daemon's /proc/<pid>/cwd could not be read, so the directory this phase "
+                                "inspects cannot be confirmed to be the daemon's");
+            daemon.shutdown(SIGTERM);
+            awaitNameRelease(names, "the next config-location case");
+            return;
+        }
+        cwdLink[linkLen] = '\0';
+        const bool inPlace = std::filesystem::path(cwdLink) == working.path();
+        check(inPlace, "the daemon really is running in the working directory this phase inspects");
+        if (!inPlace) std::fprintf(stderr, "  daemon cwd: %s\n", cwdLink);
+
+        auto proxy = sdbus::createProxy(sdbus::ServiceName{DbusService::kBusName},
+                                        sdbus::ObjectPath{DbusService::kObjectPath});
+        std::string setError;
+        try {
+            setWallpaper(*proxy, "static", bluePath, kMonitorLocation + caseIndex);
+        } catch (const std::exception& e) {
+            setError = e.what();
+        }
+        check(setError.empty(),
+              (std::string("with ") + c.what + ", SetWallpaper still succeeds").c_str());
+        if (!setError.empty()) std::fprintf(stderr, "  %s\n", setError.c_str());
+
+        // GetStatus's persistence field is the only channel that says a wallpaper will not
+        // survive a restart, and "disabled" is the answer that has to reach it.
+        const StatusReply status = getStatusOrExplain(*proxy);
+        if (status.ok() && c.expectDisabledLine != nullptr) {
+            const nlohmann::json& json = status.json();
+            const std::string reported =
+                json.contains("persistence") && json["persistence"].is_object()
+                    ? json["persistence"].value("detail", std::string())
+                    : std::string("(absent)");
+            check(reported == "disabled",
+                  "a daemon with nowhere to persist reports persistence disabled over DBus");
+            if (reported != "disabled") std::fprintf(stderr, "  persistence detail: %s\n", reported.c_str());
+        }
+
+        daemon.shutdown(SIGTERM);
+        if (c.expectDisabledLine != nullptr) {
+            check(daemon.output().find(c.expectDisabledLine) != std::string::npos,
+                  "a daemon with nowhere to persist says so on its way up");
+        }
+        awaitNameRelease(names, "the next config-location case");
+
+        const std::vector<std::string> left = filesUnder(working.path());
+        check(left.empty(),
+              (std::string("with ") + c.what + ", the daemon writes nothing into its working directory").c_str());
+        for (const std::string& file : left) std::fprintf(stderr, "  left behind: %s\n", file.c_str());
+
+        const std::filesystem::path homeConfig = home.path() / ".config" / "wallpaperx" / "config.json";
+        const bool wroteHome = std::filesystem::exists(homeConfig);
+        if (c.expectHomeFile) {
+            check(wroteHome, "with a relative XDG_CONFIG_HOME the daemon persists under $HOME/.config instead");
+        } else {
+            check(!wroteHome, "a daemon with no usable HOME writes nothing under the HOME this phase provides");
+        }
+        ++caseIndex;
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -3127,6 +4019,26 @@ int main() {
                     "for validation warnings in the daemon's output cannot fail. This run proves only that the "
                     "process, wire and threading behaviour holds.\n");
     }
+
+    // GOAL: this suite must not touch the developer's own wallpaper config. Every daemon it
+    //       spawns gets an XDG_CONFIG_HOME of the harness's own, and this is the check that
+    //       the arrangement actually holds. False if a run creates or edits the config file
+    //       named by THIS process's environment.
+    // WHY-THIS-SHAPE: witnessed and compared, not asserted absent. Persistence is a shipped
+    //       feature, so a developer running this suite may legitimately have a real
+    //       config.json with their own wallpapers in it; "it does not exist" would be red on
+    //       their machine and would teach the next reader to delete the check. Comparing
+    //       contents protects the populated case and the empty one alike. Sampled before
+    //       anything is spawned and graded outside the try, so an exception on the way
+    //       through does not skip it.
+    // CONTROL: the XDG_CONFIG_HOME injection removed from SpawnedDaemon's constructor, which
+    //       is this suite's state before Step 8 -> "FAIL: no daemon this run spawned touched
+    //       the config file of the developer running it", printing "  wrote 4347 bytes to
+    //       /home/.../.config/wallpaperx/config.json, which did not exist before this run".
+    //       That is not hypothetical: the same mutation, reached by an unrelated experiment,
+    //       put 28 test wallpapers into this machine's real config while these phases were
+    //       being written. Reverted, and the file removed.
+    const RealConfigWitness realConfig = witnessRealConfig();
 
     std::string daemonOutput;
     // Distinguishes "the daemon printed nothing" from "we never got as far as reading its
@@ -3384,6 +4296,15 @@ int main() {
         // lets the port-conflict phase grade a missing frame instead of skipping on it.
         checkConfigServerLostPort(names, bluePath, validationEnv, signals.total() > 0, check);
 
+        // Step 8. Each spawns daemons of its own, pointed at an XDG_CONFIG_HOME it creates
+        // and deletes, so they run after every phase above has released the name and before
+        // the descriptor accounting below -- their proxies and httplib clients close their
+        // sockets at scope exit, which that accounting would otherwise report as a leak.
+        checkConfigRestart(names, validationEnv, check);
+        checkStartsOnAnyConfig(names, validationEnv, check);
+        checkUnreadableRestore(names, validationEnv, bluePath, check);
+        checkConfigLocation(names, validationEnv, bluePath, check);
+
         // Every Frame's UnixFd closes at scope exit, and the daemon is gone, so this
         // process must be back where it started. A descriptor leaked per GetFrameFd is
         // an eventual EMFILE in a polling consumer, not a one-off.
@@ -3473,6 +4394,22 @@ int main() {
             for (const std::string& line : warnings) {
                 std::fprintf(stderr, "  %s\n", line.c_str());
             }
+        }
+    }
+
+    if (realConfig.file.empty()) {
+        // No usable XDG_CONFIG_HOME or HOME in this process either, so there is no file the
+        // spawned daemons could have damaged. Printed rather than silent: the guard below
+        // did not run, and a reader must not take its silence for a verdict.
+        std::printf("daemon_system_test: this process has no usable XDG_CONFIG_HOME or HOME, so there is no real "
+                    "config file for the spawned daemons to have touched.\n");
+    } else {
+        const RealConfigWitness after = witnessRealConfig();
+        const bool untouched = after.existed == realConfig.existed && after.contents == realConfig.contents;
+        check(untouched, "no daemon this run spawned touched the config file of the developer running it");
+        if (!untouched) {
+            std::fprintf(stderr, "  wrote %zu bytes to %s, which %s before this run\n", after.contents.size(),
+                         after.file.string().c_str(), realConfig.existed ? "held something else" : "did not exist");
         }
     }
 

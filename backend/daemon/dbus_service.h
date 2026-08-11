@@ -35,6 +35,9 @@ public:
     DbusService(sdbus::IConnection& connection, WallpaperManager& manager);
     ~DbusService();
 
+    // Call once, before the event loop.
+    void restoreSaved();
+
 private:
     void registerVTable();
 

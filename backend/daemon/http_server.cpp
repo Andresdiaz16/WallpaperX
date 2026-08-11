@@ -248,10 +248,11 @@ void HttpServer::registerRoutes() {
             wallpapers.detail = std::to_string(showing) + " monitor(s) showing a frame";
         }
 
-        const std::array<std::pair<const char*, const HealthCheck*>, 3> checks{{
+        const std::array<std::pair<const char*, const HealthCheck*>, 4> checks{{
             {"shaders", &snap.health.shaders},
             {"gpu", &snap.health.gpu},
             {"wallpapers", &wallpapers},
+            {"persistence", &snap.health.persistence},
         }};
 
         // Worst check wins, Fail > Pending > Ok. Pending propagates rather than counting as

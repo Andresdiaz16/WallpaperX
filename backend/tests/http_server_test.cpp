@@ -55,6 +55,7 @@
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include <stb_image_write.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -1217,25 +1218,57 @@ void runHealthBeforeDeviceChecks(httplib::Client& cli, const Check& check) {
           "/health reports the version CMake built this daemon as");
 
     // GOAL: S7.10a -- each dependency is reported separately and by name, so a failure is
-    //       attributable. `shaders`, `gpu` and `wallpapers` are three distinct checks,
-    //       each carrying its own status and its own cause.
-    // WHY-THIS-SHAPE: the schema is asserted here, on a daemon where all three are in the
-    //       same state, rather than only where they differ. Checking names only in the
-    //       failure phases would leave a /health that dropped a check entirely -- so that
-    //       a reader could no longer see it at all -- passing everywhere the remaining two
-    //       happened to be enough to decide the aggregate.
-    // CONTROL: `{"wallpapers", &wallpapers},` removed from the checks array in
-    //       http_server.cpp -> "FAIL: /health names shaders, gpu and wallpapers as three
-    //       separate checks" (observed: checks = {"gpu":..., "shaders":...}). Reverted.
-    const bool shape = health.json.contains("checks") && health.json["checks"].is_object() &&
-                       health.json["checks"].size() == 3;
-    check(shape, "/health carries a `checks` object with exactly the three dependencies in it");
-    check(!healthCheckStatus(health.json, "shaders").empty() && !healthCheckStatus(health.json, "gpu").empty() &&
-              !healthCheckStatus(health.json, "wallpapers").empty(),
-          "/health names shaders, gpu and wallpapers as three separate checks");
+    //       attributable. `shaders`, `gpu`, `wallpapers` and (since Step 8) `persistence`
+    //       are four distinct checks, each carrying its own status and its own cause.
+    // WHY-THIS-SHAPE: an EXACT set, not a subset. The set is a published surface -- a
+    //       watchdog reads these names -- so the value of this check is that adding or
+    //       dropping one cannot happen without a reviewer seeing it here. `contains the
+    //       four we know about` is the weaker version, and it goes green for a /health that
+    //       has grown a fifth check nobody reviewed. The names are compared as a sorted
+    //       list rather than by four contains() calls so the failure prints what arrived.
+    // CONTROL: `{"wallpapers", &wallpapers},` in http_server.cpp's checks array replaced
+    //       with a second `{"persistence2", &snap.health.persistence}` -- one edit that
+    //       drops a name and adds one -> "FAIL: /health carries a `checks` object naming
+    //       exactly the daemon's dependencies", printing the body it got: gpu, persistence,
+    //       persistence2, shaders. Reverted.
+    std::vector<std::string> names;
+    if (health.json.contains("checks") && health.json["checks"].is_object()) {
+        for (const auto& [name, entry] : health.json["checks"].items()) {
+            (void)entry;
+            names.push_back(name);
+        }
+    }
+    std::sort(names.begin(), names.end());
+    const std::vector<std::string> expectedNames{"gpu", "persistence", "shaders", "wallpapers"};
+    const bool shape = names == expectedNames;
+    check(shape, "/health carries a `checks` object naming exactly the daemon's dependencies");
     if (!shape) {
         std::fprintf(stderr, "  checks: %s\n",
                      health.json.contains("checks") ? health.json["checks"].dump().c_str() : "(absent)");
+    }
+
+    // GOAL: S8.6 / PLAN.md decision 4 -- a daemon that never opted into persistence reports
+    //       that check as ok with the detail `disabled`, not as pending and not as fail.
+    //       False if an opted-out daemon drags the worst-wins aggregate down: every user
+    //       who has not configured persistence would then read as broken.
+    // WHY-THIS-SHAPE: the detail is asserted too. Status alone cannot distinguish "no
+    //       persistence was asked for" from "a save succeeded", and those are the two
+    //       states an operator reading this endpoint has to tell apart -- one means the
+    //       wallpaper will not survive a restart.
+    // CONTROL: `HealthStatus::Ok, "disabled"` in WallpaperManager's constructor changed to
+    //       `HealthStatus::Fail` -> "FAIL: /health reports persistence as ok with detail
+    //       'disabled' on a daemon that never opted in" ("status 'fail', detail
+    //       'disabled'"), and four more downstream of the aggregate, starting with "/health
+    //       reports the aggregate as pending before anything has been tried" (aggregate:
+    //       fail) -- which is the worst-wins damage decision 4 exists to avoid. Reverted.
+    const bool persistenceShape = healthCheckStatus(health.json, "persistence") == "ok" &&
+                                  healthCheckDetail(health.json, "persistence") == "disabled";
+    check(persistenceShape,
+          "/health reports persistence as ok with detail 'disabled' on a daemon that never opted in");
+    if (!persistenceShape) {
+        std::fprintf(stderr, "  persistence: status '%s', detail '%s'\n",
+                     healthCheckStatus(health.json, "persistence").c_str(),
+                     healthCheckDetail(health.json, "persistence").c_str());
     }
 
     // GOAL: S7.10b -- `pending` is a distinct state from `ok` and it reaches the

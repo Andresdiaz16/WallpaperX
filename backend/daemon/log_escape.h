@@ -93,6 +93,18 @@ inline bool isDisplayControl(std::uint32_t code) {
 
 }  // namespace detail
 
+// Whether the whole input decodes as UTF-8. nlohmann::json::dump() throws on anything else,
+// so a caller putting a raw string into JSON checks this first: sanitizeForLog is
+// display-safe but not round-trip-safe, and a persisted path needs the bytes back exactly.
+inline bool isValidUtf8(std::string_view text) {
+    for (std::size_t i = 0; i < text.size();) {
+        const detail::Utf8Scalar scalar = detail::decodeUtf8(text, i);
+        if (!scalar.valid) return false;
+        i += scalar.length;
+    }
+    return true;
+}
+
 inline std::string sanitizeForLog(std::string_view text, std::size_t maxBytes = 4096,
                                   LogFraming framing = LogFraming::Quoted) {
     const bool truncated = text.size() > maxBytes;

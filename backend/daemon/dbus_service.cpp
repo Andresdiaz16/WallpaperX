@@ -78,6 +78,12 @@ void DbusService::registerVTable() {
         .forInterface(std::string(kInterface));
 }
 
+void DbusService::restoreSaved() {
+    for (const int monitorId : m_manager.restoreSaved()) {
+        m_worker.post(monitorId);
+    }
+}
+
 void DbusService::emitFrameReady(int monitorId, uint64_t generation) {
     // Called on the render worker's thread. sdbus-c++ documents signal emission on
     // IObject as thread-safe by design, so this needs no hop back to the event loop.
@@ -211,6 +217,9 @@ std::string DbusService::getStatus() {
     // answering that port and will say whatever it likes.
     status["config_server"] = {{"status", toString(snap.health.configServer.status)},
                                {"detail", snap.health.configServer.detail}};
+
+    status["persistence"] = {{"status", toString(snap.health.persistence.status)},
+                             {"detail", snap.health.persistence.detail}};
 
     nlohmann::json wallpapers = nlohmann::json::object();
     for (const auto& [monitorId, monitor] : snap.monitors) {

@@ -1,8 +1,10 @@
 #pragma once
 
+#include "config_store.h"
 #include "vulkan/frame_export.h"
 
 #include <cstdint>
+#include <filesystem>
 #include <map>
 #include <atomic>
 #include <memory>
@@ -10,6 +12,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace wallpaperx {
 
@@ -51,8 +54,9 @@ struct GpuStatus {
     std::string descriptorTier;
 };
 
-// Pending is a real answer: both dependencies are only touched on the first render, so
-// until then nothing has been tried.
+// Pending is a real answer: nothing has been tried yet. For shaders and gpu that means no
+// render has happened -- which, since restoreSaved() renders at startup, now describes a
+// daemon with no saved config rather than every fresh daemon.
 enum class HealthStatus { Pending, Ok, Fail };
 
 const char* toString(HealthStatus status);
@@ -74,6 +78,12 @@ struct DaemonHealth {
     // the bus name cannot be taken from a running daemon, so DBus is the channel that can
     // still say "the thing on that port is not mine".
     HealthCheck configServer;
+
+    // Whether the wallpaper choice will survive a restart. Separate from configServer,
+    // which is the HTTP surface. A failed save leaves SetWallpaper succeeding -- the
+    // wallpaper is on screen and a full disk is not a broken wallpaper -- so this is the
+    // only channel that says the choice will be lost.
+    HealthCheck persistence;
 };
 
 // An exported frame plus the generation counter of the render that produced it.
@@ -146,11 +156,12 @@ struct RenderOutcome {
 //                wait on a render -- which is the entire point of the split.
 class WallpaperManager {
 public:
-    // Upper bound on monitor ids. Each accepted id costs a full-size exportable image
-    // (~8 MB at 1080p) that lives until the daemon exits, so an unbounded id space lets
-    // any client on the session bus walk ids until the GPU allocator fails -- after
-    // which even the user's real monitor 0 can no longer be set. Comfortably above any
-    // real display count; the cap exists to make the worst case finite, not to be tight.
+    // Upper bound on monitor ids. An id that renders successfully retains a full-size
+    // exportable image (~9 MB at 1080p) until the daemon exits; an unsupported type or a
+    // failed render releases it instead. So an unbounded id space lets any client on the
+    // session bus walk ids until the GPU allocator fails -- after which even the user's
+    // real monitor 0 can no longer be set. Comfortably above any real display count; the
+    // cap exists to make the worst case finite, not to be tight.
     static constexpr int kMaxMonitors = 32;
 
     struct Config {
@@ -169,6 +180,13 @@ public:
         // Where the compiled SPIR-V lives. Empty means "resolve at first use" --
         // $WALLPAPERX_SHADER_DIR if set, else the build-time default.
         std::string shaderDir;
+
+        // Where wallpaper choices are persisted. Empty disables persistence entirely.
+        //
+        // Empty is the default, and production opts in via defaultConfigPath(): a test
+        // that says nothing about config must not read the developer's real wallpapers
+        // back in, nor overwrite them on its first SetWallpaper.
+        std::filesystem::path configFile;
     };
 
     explicit WallpaperManager(Config config);
@@ -184,6 +202,11 @@ public:
     // The caller must post the monitor to the render worker afterwards, including for
     // non-static types -- those still need their target released.
     void requestWallpaper(const std::string& type, const std::string& path, int monitorId);
+
+    // Applies the config file's wallpapers, returning the monitor ids to post to the
+    // worker. Call once. Neither rejects an unreadable path nor saves -- an entry dropped
+    // here is dropped from the file by the next save.
+    std::vector<int> restoreSaved();
 
     // Renders whatever request the monitor currently holds. Called on the render
     // worker's thread; never on the DBus thread.
@@ -286,7 +309,18 @@ private:
     const OffscreenTarget& acquireTarget(int monitorId);
     void releaseTarget(int monitorId);
 
+    // Snapshots the monitors worth persisting. Caller must hold m_stateMutex.
+    std::vector<PersistedWallpaper> persistableLocked() const;
+
+    // Writes `entries` and records the persistence health. Must NOT be called holding
+    // m_stateMutex: it records health, which takes it, and the write is a syscall.
+    void persist(const std::vector<PersistedWallpaper>& entries);
+
     const Config m_config;
+    const ConfigStore m_store;
+
+    // What load() returned, until restoreSaved() consumes it.
+    std::vector<PersistedWallpaper> m_restore;
 
     // Order matters: m_gpuMutex may be taken before m_stateMutex, never the reverse.
     mutable std::mutex m_gpuMutex;

@@ -65,7 +65,28 @@ std::string resolveShaderDir(const std::string& configured) {
 
 }  // namespace
 
-WallpaperManager::WallpaperManager(Config config) : m_config(std::move(config)) {}
+WallpaperManager::WallpaperManager(Config config)
+    : m_config(std::move(config)), m_store(m_config.configFile) {
+    if (!m_store.enabled()) {
+        // Ok, not Fail: this feeds a worst-wins aggregate, so Fail would make every daemon
+        // that never opted in report itself broken.
+        recordHealth(&DaemonHealth::persistence, HealthStatus::Ok, "disabled");
+        return;
+    }
+
+    const LoadResult loaded = m_store.load();
+    m_restore = loaded.entries;
+
+    std::string detail = sanitizeForLog(m_store.file().string(), 4096, LogFraming::Bare);
+    if (loaded.malformedEntries > 0) {
+        detail += " (" + std::to_string(loaded.malformedEntries) + " malformed entries ignored)";
+    }
+    // A load failure is reported but not fatal, and does not stop a later save from
+    // replacing the unreadable file.
+    recordHealth(&DaemonHealth::persistence,
+                 loaded.error.empty() ? HealthStatus::Ok : HealthStatus::Fail,
+                 loaded.error.empty() ? detail : loaded.error);
+}
 
 // Out of line, and non-trivial for a reason: Device and OffscreenTargetManager are
 // only forward-declared in the header, so the unique_ptr deleters need their
@@ -230,20 +251,82 @@ void WallpaperManager::requestWallpaper(const std::string& type, const std::stri
         throw InvalidRequest(sanitizeForLog(path) + " is not a readable file");
     }
 
+    std::vector<PersistedWallpaper> toPersist;
+    {
+        std::lock_guard<std::mutex> stateLock(m_stateMutex);
+
+        MonitorState& state = m_monitors[monitorId];
+        state.type = type;
+        state.path = path;
+        ++state.requestSeq;
+        state.lastError.clear();
+
+        // Cleared before the render, not after a failure. Whatever happens next, the frame
+        // this monitor currently holds no longer matches the request just recorded, and
+        // handing out a frame of the previous wallpaper under the new path is a worse
+        // failure than reporting no frame at all. The generation counter is left alone --
+        // it counts renders, and no render has happened yet.
+        state.hasFrame = false;
+
+        toPersist = persistableLocked();
+    }
+
+    // Outside the lock, and before the render: what the user asked for is worth keeping
+    // whether or not it turns out to draw.
+    persist(toPersist);
+}
+
+std::vector<PersistedWallpaper> WallpaperManager::persistableLocked() const {
+    std::vector<PersistedWallpaper> entries;
+    entries.reserve(m_monitors.size());
+    for (const auto& [monitorId, state] : m_monitors) {
+        if (state.type.empty() || state.path.empty()) continue;
+        entries.push_back(PersistedWallpaper{monitorId, state.type, state.path});
+    }
+    return entries;
+}
+
+void WallpaperManager::persist(const std::vector<PersistedWallpaper>& entries) {
+    if (!m_store.enabled()) return;
+
+    const SaveResult saved = m_store.save(entries);
+    if (!saved.error.empty()) {
+        recordHealth(&DaemonHealth::persistence, HealthStatus::Fail, saved.error);
+        return;
+    }
+
+    std::string detail = sanitizeForLog(m_store.file().string(), 4096, LogFraming::Bare);
+    if (saved.skippedNonUtf8 > 0) {
+        detail += " (" + std::to_string(saved.skippedNonUtf8) +
+                  " entries skipped: path is not valid UTF-8)";
+    }
+    // Fail, not Ok: the write succeeded but those monitors will not come back, and a
+    // health field that reads ok is the only thing that would say otherwise.
+    recordHealth(&DaemonHealth::persistence,
+                 saved.skippedNonUtf8 > 0 ? HealthStatus::Fail : HealthStatus::Ok, detail);
+}
+
+std::vector<int> WallpaperManager::restoreSaved() {
+    std::vector<int> monitorIds;
+    std::vector<PersistedWallpaper> pending;
+    pending.swap(m_restore);
+
     std::lock_guard<std::mutex> stateLock(m_stateMutex);
+    for (const PersistedWallpaper& entry : pending) {
+        // The manager's own rules, not the store's: a file naming monitor 99 or a type
+        // this build has never heard of is discarded here rather than reaching a render.
+        if (!isKnownType(entry.type) || entry.path.empty()) continue;
+        if (entry.monitorId < 0 || entry.monitorId >= kMaxMonitors) continue;
 
-    MonitorState& state = m_monitors[monitorId];
-    state.type = type;
-    state.path = path;
-    ++state.requestSeq;
-    state.lastError.clear();
-
-    // Cleared before the render, not after a failure. Whatever happens next, the frame
-    // this monitor currently holds no longer matches the request just recorded, and
-    // handing out a frame of the previous wallpaper under the new path is a worse
-    // failure than reporting no frame at all. The generation counter is left alone --
-    // it counts renders, and no render has happened yet.
-    state.hasFrame = false;
+        MonitorState& state = m_monitors[entry.monitorId];
+        state.type = entry.type;
+        state.path = entry.path;
+        ++state.requestSeq;
+        state.lastError.clear();
+        state.hasFrame = false;
+        monitorIds.push_back(entry.monitorId);
+    }
+    return monitorIds;
 }
 
 RenderOutcome WallpaperManager::renderPending(int monitorId) {

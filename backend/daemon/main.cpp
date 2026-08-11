@@ -42,6 +42,14 @@ int main() {
         const char* validation = std::getenv("WALLPAPERX_VALIDATION");
         config.enableValidation = validation != nullptr && std::strcmp(validation, "1") == 0;
 
+        // Opting in here, not in Config's default: a test that says nothing about config
+        // must not read the developer's real wallpapers back in or overwrite them.
+        config.configFile = wallpaperx::defaultConfigPath();
+        if (config.configFile.empty()) {
+            std::fprintf(stderr, "wallpaperx-daemon: no usable XDG_CONFIG_HOME or HOME; "
+                                 "wallpapers will not survive a restart\n");
+        }
+
         // The device is created lazily on the first SetWallpaper, so the daemon still comes
         // up and answers GetStatus on a machine whose GPU stack is broken.
         wallpaperx::WallpaperManager manager(config);
@@ -50,6 +58,7 @@ int main() {
         auto connection =
             sdbus::createSessionBusConnection(sdbus::ServiceName{wallpaperx::DbusService::kBusName});
         wallpaperx::DbusService service(*connection, manager);
+        service.restoreSaved();
 
         std::printf("wallpaperx-daemon: serving %s at %s\n", wallpaperx::DbusService::kBusName,
                     wallpaperx::DbusService::kObjectPath);
