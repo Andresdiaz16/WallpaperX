@@ -76,6 +76,40 @@ inline void suppressCoreDump() {
     prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
 }
 
+// The codes a child exits with when it dies before the program it was meant to run has
+// started. 126 and 127 are the shell's own meanings ("found but could not be executed",
+// "not found"); 125 sits below them and no program this harness execs uses any of the
+// three.
+//
+// 126 is not produced here: the dup2 that earns it has to happen at the fork site, before
+// this call. It is named here anyway so both halves of the preamble are one list -- a
+// grading site that handles one code and not the others reads the unhandled one as a
+// verdict on a program that never ran.
+//
+// Only for children that exec. A fork site whose child runs in-process is free to choose
+// its own codes, and 125 already means something else in one of them.
+constexpr int kChildArmFailedExit = 125;
+constexpr int kChildDup2FailedExit = 126;
+constexpr int kChildExecFailedExit = 127;
+
+// Which of the three `exitCode` is, or nullptr when the exec'd program chose it itself.
+//
+// Says nothing about what the child was going to run: this header is shared with probes
+// that know nothing of a daemon or a bus, and a sentence naming either could not live here.
+inline const char* forkPreambleFault(int exitCode) {
+    switch (exitCode) {
+        case kChildArmFailedExit:
+            return "the forked child could not arm itself against its parent's death (PR_SET_PDEATHSIG refused, or "
+                   "the parent was already gone)";
+        case kChildDup2FailedExit:
+            return "the forked child could not redirect its output onto this harness's capture pipe (dup2 failed)";
+        case kChildExecFailedExit:
+            return "the forked child could not execute the binary it was given (execve failed, or its loader did)";
+        default:
+            return nullptr;
+    }
+}
+
 // Arms the child and execs `binary`, or exits with a code no real outcome uses.
 //
 // The suppression is here rather than at each fork site, so no site can forget it: every
@@ -84,14 +118,14 @@ inline void suppressCoreDump() {
 // survives into the exec'd program, which is why suppressCoreDump() sets both.
 [[noreturn]] inline void execChildOrDie(pid_t parentBeforeFork, const char* binary, char* const argv[],
                                         char* const envp[]) {
-    if (!armAgainstParentDeath(parentBeforeFork)) _exit(125);
+    if (!armAgainstParentDeath(parentBeforeFork)) _exit(kChildArmFailedExit);
     suppressCoreDump();
     if (envp != nullptr) {
         execve(binary, argv, envp);
     } else {
         execv(binary, argv);
     }
-    _exit(127);  // only reached if the exec failed
+    _exit(kChildExecFailedExit);  // only reached if the exec failed
 }
 
 }  // namespace wallpaperx::testing

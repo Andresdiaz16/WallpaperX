@@ -198,6 +198,24 @@ void notVerified(const char* goals, const std::string& reason) {
     ++g_notVerified;
 }
 
+// This file failed to start a child process, so whatever the phase was going to grade was
+// never exercised. Its own channel, separate from both check() and notVerified(): a fork
+// preamble that died is not the daemon misbehaving (X.3 forbids grading it as one), and it
+// is not this host declining to run a case either -- it is the harness itself, and the run
+// must go red naming it rather than skip.
+//
+// Both lines on stdout, for the reason device_affinity_probe's harnessFault() carries: split
+// across stdout and stderr they need an fflush between them to stay adjacent under ctest.
+int g_harnessFaults = 0;
+
+void harnessFault(const char* what, const char* detail) {
+    std::printf("daemon_system_test: HARNESS FAULT -- %s could not be set up: %s. This says nothing about the "
+                "daemon.\n",
+                what, detail);
+    std::fflush(stdout);
+    ++g_harnessFaults;
+}
+
 using Clock = std::chrono::steady_clock;
 
 double millis(Clock::duration d) {
@@ -307,7 +325,7 @@ public:
             // chain" and the validation scan as failures of the daemon.
             const int childStdout = outFds[1] >= 0 ? outFds[1] : fds[1];
             if (dup2(childStdout, STDOUT_FILENO) == -1 || dup2(fds[1], STDERR_FILENO) == -1) {
-                _exit(126);
+                _exit(wallpaperx::testing::kChildDup2FailedExit);
             }
             execChildOrDie(parentBeforeFork, binary.c_str(), argv, envp.data());
         }
@@ -368,6 +386,39 @@ public:
     // reported for an instance that in fact aborted while failing its name request.
     bool exitedNormally() const { return m_exitedNormally; }
     int termSignal() const { return m_termSignal; }
+
+    // GOAL: X.3 -- a child that died in its fork preamble (PR_SET_PDEATHSIG refused, dup2
+    //       failed, execve failed) never became the daemon, so its absence must be reported
+    //       as this harness failing to set the phase up, never as the daemon failing to
+    //       start. Non-null names which of the three happened.
+    // WHY-THIS-SHAPE: waitid with WNOWAIT, not waitpid(WNOHANG). WNOHANG *consumes* the
+    //       status, so reap() would then hit ECHILD and record m_waitFailed -- an invented
+    //       second fault on top of the real one -- and shutdown()/waitForExit() would stop
+    //       reporting the code at all. WNOWAIT reads the status and leaves the child
+    //       reapable, so every caller below is unaffected.
+    //       It never waits: a preamble death happens within microseconds of the fork, and
+    //       every caller asks only after a wait for the daemon to appear has already timed
+    //       out, by which point that child has been dead for the whole of that wait. A
+    //       version that blocked here would put a fresh timeout on the healthy path.
+    //       The post-reap arm answers for a child already collected -- the second-instance
+    //       phase grades an exit code, so it has to ask after waitForExit().
+    // CONTROL: three, all reverted. armAgainstParentDeath() forced false -> 8 HARNESS FAULT
+    //       lines naming PR_SET_PDEATHSIG and 0 FAILs, where the same mutation before this
+    //       existed produced 4 FAILs against the daemon. The dup2 above forced to fail -> the
+    //       same 8, naming dup2; with only forkPreambleFault's 126 arm removed, those 4 FAILs
+    //       came straight back, so that arm is load-bearing rather than decorative. The
+    //       binary path suffixed so execve fails -> 3, naming execve.
+    const char* startupFault() const {
+        if (m_pid > 0) {
+            siginfo_t info{};
+            info.si_pid = 0;  // waitid leaves it untouched when WNOHANG finds nothing
+            if (waitid(P_PID, static_cast<id_t>(m_pid), &info, WEXITED | WNOHANG | WNOWAIT) != 0) return nullptr;
+            if (info.si_pid == 0 || info.si_code != CLD_EXITED) return nullptr;
+            return wallpaperx::testing::forkPreambleFault(info.si_status);
+        }
+        if (!m_exitedNormally) return nullptr;
+        return wallpaperx::testing::forkPreambleFault(m_exitCode);
+    }
 
     // Signals the daemon and waits for it to exit. Returns the exit code, or -1 if it
     // was killed by a signal or did not exit within kProcessTimeout (in which case it is
@@ -547,6 +598,21 @@ private:
     std::string m_output;
 };
 
+// True when this daemon's child died in its fork preamble, having reported the fault on the
+// harness channel first -- so a caller only has to bail out. `phase` names what could not be
+// set up.
+//
+// Every site below that grades a daemon's startup goes through this one function rather than
+// testing exit codes itself: a site that handled one preamble code and not the others would
+// read the unhandled ones as a verdict on the daemon, which is how 126 was left behind in the
+// renderer tier.
+bool reportedStartupFault(const SpawnedDaemon& daemon, const char* phase) {
+    const char* fault = daemon.startupFault();
+    if (fault == nullptr) return false;
+    harnessFault(phase, fault);
+    return true;
+}
+
 // The soft RLIMIT_CORE a running process has, as /proc spells it ("0", "unlimited"), or
 // empty when the file could not be read.
 std::string softCoreLimit(pid_t pid) {
@@ -601,7 +667,7 @@ public:
             return;
         }
         if (m_pid == 0) {
-            if (dup2(fds[1], STDOUT_FILENO) == -1) _exit(126);
+            if (dup2(fds[1], STDOUT_FILENO) == -1) _exit(wallpaperx::testing::kChildDup2FailedExit);
             execChildOrDie(parentBeforeFork, binary.c_str(), argv, nullptr);
         }
         close(fds[1]);
@@ -643,6 +709,28 @@ public:
         if (newline != std::string::npos) m_address = line.substr(0, newline);
         if (m_address.empty() && m_reason.empty()) m_reason = "dbus-daemon printed an empty address";
 
+        // GOAL: X.3 -- a bus child that died in its fork preamble is this harness failing,
+        //       and must not be reported as dbus-daemon misbehaving.
+        // WHY-THIS-SHAPE: the reasons recorded above are all written as statements about
+        //       dbus-daemon ("exited before printing an address", "printed no address within
+        //       10s"), and an arming refusal produces exactly the first of them -- measured:
+        //       with armAgainstParentDeath forced false this phase skipped with "dbus-daemon
+        //       exited before printing an address", accusing the host's bus binary of
+        //       something this file did. Consulted only when no address arrived, so a bus
+        //       that started normally never pays for it.
+        // CONTROL: the same forced-false arming -> "HARNESS FAULT -- the connection-loss
+        //       checks (S6.35) could not be set up: the forked child could not arm itself
+        //       against its parent's death", and no NOT VERIFIED line naming dbus-daemon.
+        //       Reverted.
+        if (m_address.empty() && m_pid > 0) {
+            siginfo_t info{};
+            info.si_pid = 0;
+            if (waitid(P_PID, static_cast<id_t>(m_pid), &info, WEXITED | WNOHANG | WNOWAIT) == 0 &&
+                info.si_pid != 0 && info.si_code == CLD_EXITED) {
+                m_preambleFault = wallpaperx::testing::forkPreambleFault(info.si_status);
+            }
+        }
+
         // The read end is kept and drained for the child's whole lifetime, not closed
         // here. dbus-daemon's fd 1 stays pointed at this pipe long after the address
         // line, so closing the only reader would leave it writing into a readerless pipe:
@@ -681,6 +769,9 @@ public:
 
     bool ok() const { return !m_address.empty(); }
     const std::string& reason() const { return m_reason; }
+    // Non-null when the bus never started because its child died in the fork preamble --
+    // a fault of this harness rather than of dbus-daemon. See reason() for everything else.
+    const char* preambleFault() const { return m_preambleFault; }
     const std::string& address() const { return m_address; }
 
     // Destroys the bus out from under whatever is connected to it. SIGKILL, not SIGTERM:
@@ -721,6 +812,8 @@ private:
     std::thread m_drain;
     std::string m_address;
     std::string m_reason;
+    // A string literal from forkPreambleFault(), so no ownership to manage.
+    const char* m_preambleFault = nullptr;
 };
 
 // Watches org.freedesktop.DBus for the daemon's name appearing and disappearing.
@@ -1791,6 +1884,7 @@ SignalMasks readSignalMasks(pid_t pid, const std::vector<pid_t>& tids) {
 void checkHangupShutdown(NameWatcher& names, const Check& check) {
     SpawnedDaemon hungUp;
     const bool cameUp = names.waitFor(true);
+    if (!cameUp && reportedStartupFault(hungUp, "the SIGHUP shutdown checks (S6.36)")) return;
     check(cameUp, "a fresh daemon acquires the name before the SIGHUP phase");
     if (!cameUp) {
         std::printf("daemon_system_test: SIGHUP checks skipped -- that daemon never acquired the bus name, so "
@@ -1892,6 +1986,7 @@ void checkClosedStdout(NameWatcher& names, const std::string& bluePath, const st
     // error state -- has no oracle at all. Scanned after shutdown, at the end.
     SpawnedDaemon deaf({validationEnv}, SpawnedDaemon::Stdout::Breakable);
     const bool cameUp = names.waitFor(true);
+    if (!cameUp && reportedStartupFault(deaf, "the closed-stdout checks (S6.37)")) return;
     check(cameUp, "a fresh daemon acquires the name before the closed-stdout phase");
     if (!cameUp) {
         std::printf("daemon_system_test: closed-stdout checks skipped -- that daemon never acquired the bus "
@@ -2099,6 +2194,12 @@ void checkClosedStdout(NameWatcher& names, const std::string& bluePath, const st
 void checkBusLoss(const Check& check) {
     NestedBus bus;
     if (!bus.ok()) {
+        // A bus child that never execed is this file's fault specifically, not the host's,
+        // and bus.reason() would name dbus-daemon for it -- see the block that sets this.
+        if (const char* fault = bus.preambleFault()) {
+            harnessFault("the connection-loss checks (S6.35)", fault);
+            return;
+        }
         // X.3: a bus this test could not start is a fault in the harness or the host, and
         // must never be reported as the daemon aborting -- so this is not a check().
         // Counted as NOT VERIFIED instead of merely printed: the run's exit status used to
@@ -2124,6 +2225,10 @@ void checkBusLoss(const Check& check) {
     // started would turn one fault into five FAILs pointing at main's unwind path.
     const bool cameUp =
         orphan.waitForOutput(std::string("serving ") + DbusService::kBusName, std::chrono::seconds(30));
+    // Ahead of the check, not after it: waitForOutput returns false for a child that died in
+    // its preamble exactly as it does for a daemon that would not speak, and only one of
+    // those is the daemon's doing.
+    if (!cameUp && reportedStartupFault(orphan, "the connection-loss checks (S6.35)")) return;
     check(cameUp, "the daemon comes up on a bus of the test's own, so the connection-loss path can be exercised");
     if (!cameUp) {
         std::fprintf(stderr,
@@ -2331,6 +2436,7 @@ void checkHttpLifecycle(NameWatcher& names, const std::string& bluePath, const s
 
     SpawnedDaemon daemon({validationEnv});
     if (!names.waitFor(true)) {
+        if (reportedStartupFault(daemon, "S7.8/S7.11 (the HTTP server's process lifecycle)")) return;
         notVerified("S7.8/S7.11 (the HTTP server's process lifecycle)",
                     "the daemon for this phase never acquired the bus name");
         return;
@@ -2681,6 +2787,7 @@ void checkConfigServerOwnsPort(NameWatcher& names, const std::string& validation
 
     SpawnedDaemon daemon({validationEnv});
     if (!names.waitFor(true)) {
+        if (reportedStartupFault(daemon, "S7.14 (the ok direction)")) return;
         notVerified("S7.14 (the ok direction)", "the daemon for this phase never acquired the bus name");
         return;
     }
@@ -2803,6 +2910,10 @@ void checkConfigServerLostPort(NameWatcher& names, const std::string& bluePath, 
 
     SpawnedDaemon daemon({validationEnv});
     if (!names.waitFor(true)) {
+        // Before the bind-failure branch below, which grades a daemon that reached its bind
+        // attempt: a child that never execed printed nothing, so that branch would fall
+        // through to the skip and name the daemon for it.
+        if (reportedStartupFault(daemon, "S7.14 (the fail direction)")) return;
         const std::string startupOutput = daemon.output();
         if (startupOutput.find(bindFailureMarker(kPort)) != std::string::npos) {
             // It reached its bind attempt, failed it, and then never made it onto the bus.
@@ -3048,7 +3159,23 @@ int main() {
         SpawnedDaemon daemon({validationEnv});
         const bool cameUp = names.waitFor(true);
         daemonCameUp = cameUp;
-        check(cameUp, "the daemon acquires io.wallpaperx.Daemon on the session bus");
+        // GOAL: X.3 -- on a host where the fork preamble cannot complete (PR_SET_PDEATHSIG
+        //       refused by a hardened kernel or a seccomp profile, a failed dup2, a binary
+        //       that will not exec) this run reports the harness, not the daemon.
+        // WHY-THIS-SHAPE: the fault is consulted only when the name never appeared, and the
+        //       check is then skipped rather than reworded. Grading it as `check(cameUp ||
+        //       startupFault() != nullptr, ...)` -- the smaller edit -- would turn every
+        //       preamble death into a *pass*, which is the vacuous-green direction of the
+        //       same defect.
+        // CONTROL: armAgainstParentDeath() forced to return false. Before this branch the
+        //       run printed "FAIL: the daemon acquires io.wallpaperx.Daemon on the session
+        //       bus" and three more name-acquisition FAILs; after it, 8 HARNESS FAULT lines
+        //       naming PR_SET_PDEATHSIG, 0 FAILs, and exit 1. Reverted.
+        const bool startupWasHarnessFault =
+            !cameUp && reportedStartupFault(daemon, "the bus-name, rendering and SIGTERM checks");
+        if (!startupWasHarnessFault) {
+            check(cameUp, "the daemon acquires io.wallpaperx.Daemon on the session bus");
+        }
 
         if (cameUp) {
             // GOAL: a process this harness execs inherits RLIMIT_CORE=0, so a daemon that
@@ -3084,40 +3211,64 @@ int main() {
             // wallpaper daemon away from the one already serving it.
             SpawnedDaemon second;
             const int secondExit = second.waitForExit();
-            // Both conditions, because reap() reports a timeout as -1 too: a second daemon
-            // that wrongly took the name and then ran forever would be SIGKILLed by the
-            // test and satisfy `secondExit != 0` -- reporting the name as refused when it
-            // was in fact stolen.
-            check(second.exitedNormally(),
-                  "the second daemon instance exits on its own rather than crashing or having to be killed");
-            if (!second.exitedNormally() && second.termSignal() != 0) {
-                std::fprintf(stderr, "  it died on signal %d\n", second.termSignal());
+            // GOAL: X.3 in its vacuous-green direction -- a second instance that died in the
+            //       fork preamble must not be reported as one the bus refused.
+            // WHY-THIS-SHAPE: this phase's verdict is an exit code, and 125/126/127 are
+            //       non-zero normal exits, so "exited normally and non-zero" -- the check
+            //       below -- is satisfied by a child that never ran the daemon at all. Unlike
+            //       the name-acquisition sites this one goes GREEN rather than red, so no
+            //       FAIL would ever point at it. Asked after waitForExit(), which is why
+            //       startupFault() has a post-reap arm.
+            // CONTROL: the binary path suffixed with "-nope" for the daemons spawned with no
+            //       extra environment, so only THIS child fails to exec and the first daemon
+            //       still comes up -> "HARNESS FAULT -- the second-instance checks (S6.28)
+            //       could not be set up: the forked child could not execute the binary it was
+            //       given", 0 FAILs. With this branch made inert and the same mutation, the
+            //       two exit-code checks below stayed silent -- check() prints only on
+            //       failure, so they passed on a child that never ran the daemon -- while
+            //       "says why it exited" and the FileExists check went red instead, blaming
+            //       the daemon for dying silently. Both reverted.
+            const bool secondWasHarnessFault = reportedStartupFault(second, "the second-instance checks (S6.28)");
+            if (secondWasHarnessFault) {
+                std::printf("daemon_system_test: the second-instance checks are skipped -- see the harness fault "
+                            "above; that process never became a daemon.\n");
             }
-            check(second.exitedNormally() && secondExit != 0,
-                  "a second daemon instance refuses to start while the first owns the name");
-            check(names.ownedNow(), "the first daemon still owns the name after the second one exits");
-            const std::string secondOutput = second.output();
-            check(secondOutput.find("fatal:") != std::string::npos,
-                  "the second instance says why it exited rather than dying silently");
+            if (!secondWasHarnessFault) {
+                // Both conditions, because reap() reports a timeout as -1 too: a second
+                // daemon that wrongly took the name and then ran forever would be SIGKILLed
+                // by the test and satisfy `secondExit != 0` -- reporting the name as refused
+                // when it was in fact stolen.
+                check(second.exitedNormally(),
+                      "the second daemon instance exits on its own rather than crashing or having to be killed");
+                if (!second.exitedNormally() && second.termSignal() != 0) {
+                    std::fprintf(stderr, "  it died on signal %d\n", second.termSignal());
+                }
+                check(second.exitedNormally() && secondExit != 0,
+                      "a second daemon instance refuses to start while the first owns the name");
+                check(names.ownedNow(), "the first daemon still owns the name after the second one exits");
+                const std::string secondOutput = second.output();
+                check(secondOutput.find("fatal:") != std::string::npos,
+                      "the second instance says why it exited rather than dying silently");
 
-            // GOAL: S6.28 -- the second instance is refused with
-            //       org.freedesktop.DBus.Error.FileExists, i.e. it loses the name
-            //       request, rather than failing for some unrelated reason that
-            //       happens to be fatal.
-            // WHY-THIS-SHAPE: "the output contains fatal:" is satisfied by any startup
-            //       failure at all -- a missing shader directory, a broken ICD, an
-            //       unwritable path. Each of those would make this phase pass while
-            //       proving nothing about name ownership, and one of them is a
-            //       plausible future regression. The error name is what pins the
-            //       reason, and it is the name a caller of
-            //       createSessionBusConnection() would branch on.
-            // CONTROL: main.cpp patched to throw before requesting the name
-            //       (`throw std::runtime_error("no")` above createSessionBusConnection)
-            //       -> "FAIL: the second instance is refused with
-            //       org.freedesktop.DBus.Error.FileExists", while the pre-existing
-            //       "says why it exited" check stayed green. Reverted.
-            check(secondOutput.find("org.freedesktop.DBus.Error.FileExists") != std::string::npos,
-                  "the second instance is refused with org.freedesktop.DBus.Error.FileExists");
+                // GOAL: S6.28 -- the second instance is refused with
+                //       org.freedesktop.DBus.Error.FileExists, i.e. it loses the name
+                //       request, rather than failing for some unrelated reason that
+                //       happens to be fatal.
+                // WHY-THIS-SHAPE: "the output contains fatal:" is satisfied by any startup
+                //       failure at all -- a missing shader directory, a broken ICD, an
+                //       unwritable path. Each of those would make this phase pass while
+                //       proving nothing about name ownership, and one of them is a
+                //       plausible future regression. The error name is what pins the
+                //       reason, and it is the name a caller of
+                //       createSessionBusConnection() would branch on.
+                // CONTROL: main.cpp patched to throw before requesting the name
+                //       (`throw std::runtime_error("no")` above createSessionBusConnection)
+                //       -> "FAIL: the second instance is refused with
+                //       org.freedesktop.DBus.Error.FileExists", while the pre-existing
+                //       "says why it exited" check stayed green. Reverted.
+                check(secondOutput.find("org.freedesktop.DBus.Error.FileExists") != std::string::npos,
+                      "the second instance is refused with org.freedesktop.DBus.Error.FileExists");
+            }
 
             auto proxy = sdbus::createProxy(sdbus::ServiceName{DbusService::kBusName},
                                             sdbus::ObjectPath{DbusService::kObjectPath});
@@ -3143,8 +3294,10 @@ int main() {
             // it anyway is right -- it must not outlive the test -- but grading its exit
             // would add four more FAIL lines blaming main.cpp's shutdown path for a fault
             // that happened before the shutdown path was ever reached.
-            std::printf("daemon_system_test: shutdown checks skipped -- the daemon never acquired the bus name, so "
-                        "its exit says nothing about the shutdown path.\n");
+            std::printf("daemon_system_test: shutdown checks skipped -- %s, so its exit says nothing about the "
+                        "shutdown path.\n",
+                        startupWasHarnessFault ? "that daemon was never started (the harness fault above)"
+                                               : "the daemon never acquired the bus name");
         } else {
             // A sanitizer that reported anything replaces the process's exit code with its
             // own, so under a sanitized build "did the daemon exit 0" stops being a question
@@ -3171,15 +3324,21 @@ int main() {
         {
             SpawnedDaemon interrupted;
             const bool interruptedCameUp = names.waitFor(true);
-            check(interruptedCameUp, "a fresh daemon acquires the name after the first released it");
+            const bool interruptedWasHarnessFault =
+                !interruptedCameUp && reportedStartupFault(interrupted, "the SIGINT shutdown checks");
+            if (!interruptedWasHarnessFault) {
+                check(interruptedCameUp, "a fresh daemon acquires the name after the first released it");
+            }
             const int interruptExit = interrupted.shutdown(SIGINT);
             const std::string interruptOutput = interrupted.output();
             if (!interruptedCameUp) {
                 // Same reasoning as the SIGTERM block: a daemon that never started tells
                 // us nothing about how it shuts down, and grading it anyway turns one
                 // startup fault into three failures pointing at the signal path.
-                std::printf("daemon_system_test: SIGINT checks skipped -- that daemon never acquired the bus "
-                            "name either.\n");
+                std::printf("daemon_system_test: SIGINT checks skipped -- %s.\n",
+                            interruptedWasHarnessFault ? "that daemon was never started either (the harness fault "
+                                                         "above)"
+                                                       : "that daemon never acquired the bus name either");
             } else {
                 // Same shape as the SIGTERM branch above, deliberately. Wrapping this in a
                 // bare `if (no sanitizer report)` made the assertion vanish with no FAIL, no
@@ -3321,6 +3480,17 @@ int main() {
         // Asked before the not-verified count, so a run that is both broken and incomplete
         // reports as broken: a skip would hide the failures behind ctest's "Skipped".
         std::fprintf(stderr, "daemon_system_test: %d check(s) failed\n", failures);
+        return 1;
+    }
+    // Red, and not a skip. Same grading as device_affinity_probe's harness faults: a host
+    // that cannot fork-and-exec a child cannot run dbus_service or the renderer probes
+    // either, so reporting this one alone as "Skipped" would mark it optional while its
+    // siblings went red for the same cause. The lines above name the real reason.
+    if (g_harnessFaults > 0) {
+        std::fprintf(stderr,
+                     "daemon_system_test: %d phase(s) could not be set up by the harness -- see the HARNESS FAULT "
+                     "lines above. No conclusion about the daemon either way.\n",
+                     g_harnessFaults);
         return 1;
     }
     if (g_notVerified > 0) {
