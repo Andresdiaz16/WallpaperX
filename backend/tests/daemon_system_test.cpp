@@ -99,12 +99,8 @@ using wallpaperx::testing::getStatus;
 using wallpaperx::testing::execChildOrDie;
 using wallpaperx::testing::getStatusOrExplain;
 using wallpaperx::testing::openFdCount;
-using wallpaperx::testing::runningProcessMatches;
-using wallpaperx::testing::runSelfProbe;
-using wallpaperx::testing::SelfProbeRun;
 using wallpaperx::testing::setWallpaper;
 using wallpaperx::testing::StatusReply;
-using wallpaperx::testing::suppressCoreDump;
 using wallpaperx::testing::wallpaperStatus;
 
 namespace {
@@ -231,11 +227,6 @@ std::string writeSolidImage(const char* name, unsigned char r, unsigned char g, 
 // ---------------------------------------------------------------------------- //
 // The daemon under test, as a child process.
 // ---------------------------------------------------------------------------- //
-
-// execChildOrDie -- the PR_SET_PDEATHSIG arming every fork in this file goes through -- is
-// declared in support/forked_child.h, included above, and is deliberately not restated
-// here. Shared rather than copied because X.8 is a property of *every* forked child in the
-// repo, and a file-local copy left the renderer's forking probe uncovered by construction.
 
 // Spawns the real wallpaperx-daemon binary with its stdout and stderr merged into one
 // pipe, and reads that pipe on a thread for the process's lifetime.
@@ -556,51 +547,21 @@ private:
     std::string m_output;
 };
 
-// The line the orphan probe prints so the parent can look for the daemon afterwards. One
-// constant, because the probe writes it and the phase parses it in two different
-// processes: a reworded literal on one side alone would make the phase report a probe
-// that never started rather than a daemon that never died.
-constexpr const char* kOrphanPidPrefix = "orphan-probe: daemon pid ";
-
-// The child half of the aborted-parent phase, running as a fresh exec of this binary with
-// --orphan-probe. Spawns a daemon through the ordinary SpawnedDaemon path, says which pid
-// it got, and then dies the way a failed assertion inside a library kills a test: SIGABRT,
-// so no destructor of any kind runs and ~SpawnedDaemon's kill/waitpid never happens.
-//
-// Its own process rather than a fork() of the test: a fork of a process that already has
-// sdbus dispatch threads may only call async-signal-safe functions until it execs, and
-// SpawnedDaemon's constructor allocates throughout.
-int runOrphanProbe() {
-    // The abort below is deliberate, so its core -- and, on a host whose core_pattern pipes
-    // to a collector, its journal entry and desktop crash notification -- is pure noise.
-    // PR_SET_DUMPABLE and not setrlimit(RLIMIT_CORE, 0); the measurement that separates
-    // them is on suppressCoreDump(). execve resets the flag, so the daemon spawned below
-    // does not inherit it and its /proc entries stay readable to the phase that polls them.
-    suppressCoreDump();
-
-    SpawnedDaemon daemon;
-    if (!daemon.waitForOutput(std::string("serving ") + DbusService::kBusName, std::chrono::seconds(30))) {
-        std::printf("orphan-probe: the daemon never announced itself, so there is nothing to orphan\n");
-        std::fflush(stdout);
-        return 1;
+// The soft RLIMIT_CORE a running process has, as /proc spells it ("0", "unlimited"), or
+// empty when the file could not be read.
+std::string softCoreLimit(pid_t pid) {
+    std::ifstream limits("/proc/" + std::to_string(static_cast<int>(pid)) + "/limits");
+    constexpr const char* kRow = "Max core file size";
+    std::string line;
+    while (std::getline(limits, line)) {
+        if (line.rfind(kRow, 0) != 0) continue;
+        std::istringstream rest(line.substr(std::strlen(kRow)));
+        std::string soft;
+        rest >> soft;
+        return soft;
     }
-    std::printf("%s%d\n", kOrphanPidPrefix, static_cast<int>(daemon.pid()));
-    std::fflush(stdout);
-    std::abort();
+    return "";
 }
-
-// runSelfProbe() and its SelfProbeRun live in support/forked_child.h: the renderer's own
-// forking probe needs the same self-exec-and-classify apparatus for X.8, and both need the
-// bounded drain and bounded reap it carries. SpawnedDaemon is not reused for it because
-// that class is about the daemon binary specifically and needs a reader thread this does
-// not.
-
-// How long the orphan probe gets to spawn a daemon, wait for its startup line and abort.
-// Comfortably above the 30 s the probe itself allows for the announcement, so a probe that
-// merely lost the announcement still gets to print its own reason before this expires.
-constexpr auto kSelfProbeTimeout = std::chrono::seconds(60);
-
-bool daemonRunning(pid_t pid) { return runningProcessMatches(pid, WALLPAPERX_DAEMON_BINARY); }
 
 // A session bus of this test's own, started as a child process so it can be killed.
 //
@@ -1490,7 +1451,8 @@ void stormThread(int index, const std::string& bluePath, const std::string& redP
                     // ones.
                     // CONTROL: DbusService::getStatus made to throw -> "FAIL: concurrent
                     //       clients see only the two named errors that are legitimate
-                    //       mid-render", the first one naming the bus. Reverted.
+                    //       mid-render", with "29 unexpected failure(s); first was:
+                    //       GetStatus failed with org.sdbuscpp.Error". Reverted.
                     if (!status.ok()) recordUnexpected(result, status.error());
                     // Called for the generation observation below. Snapshot consistency
                     // is deliberately NOT graded from these replies -- see the note at
@@ -1663,9 +1625,12 @@ void checkConcurrentClients(sdbus::IProxy& proxy, FrameReadyLog& signals, const 
     // unanswered call leaves an empty object, so every entry below reads as absent and the
     // two counts land at zero -- which prints as two monitor-state failures for what is in
     // fact the bus never answering.
-    // CONTROL: DbusService::getStatus made to throw -> "FAIL: the daemon still answers
-    //       GetStatus after the post-storm barrier" and this abandonment line, in place of
-    //       the two monitor-state FAILs. Reverted.
+    // CONTROL: an unconditional throw cannot reach this line -- the `before` reading above
+    //       grades and returns first -- so the mutation is scoped: DbusService::getStatus
+    //       made to throw only once the reply contains monitor 31, which is the post-storm
+    //       barrier and is set after that reading. One FAIL, "the daemon still answers
+    //       GetStatus after the post-storm barrier", plus this abandonment line and neither
+    //       monitor-state FAIL. Reverted.
     const StatusReply after = getStatusOrExplain(proxy);
     check(after.ok(), "the daemon still answers GetStatus after the post-storm barrier");
     if (!after.ok()) {
@@ -2262,152 +2227,6 @@ void checkBusLoss(const Check& check) {
         check(output.find(kSignalShutdownLine) == std::string::npos,
               "the daemon does not report a signal it was never sent when its bus connection drops");
     }
-}
-
-// The goal string every skip row in this phase shares, so a reader grepping for the goal
-// finds the phase whether it ran or not.
-constexpr const char* kOrphanGoal = "X.8 (a daemon does not outlive an aborted test process)";
-
-// GOAL: X.8 -- every forked child is armed so it cannot outlive a parent that dies
-//       abnormally. False if a daemon is still running once its spawner has been killed by
-//       SIGABRT, which is how the next run comes to meet an occupied bus name and an
-//       occupied config port it did not create.
-//       X.8 and not X.4: X.4's "no child process is leaked" is satisfied on every path
-//       where destructors run, and this is the path where none do.
-// WHY-THIS-SHAPE: the property is only observable from outside the process whose death
-//       triggers it, so the abort happens in a child of this test (--orphan-probe) that
-//       spawned the daemon through the ordinary SpawnedDaemon path, and the daemon is then
-//       looked for by pid from out here. The obvious simpler check -- "the suite still
-//       passes" -- establishes nothing at all about this: ~SpawnedDaemon does not run on
-//       the abort path, so a green suite is exactly what a leaked daemon also produces.
-//       The probe's own death is graded as SETUP, not as the property: a probe that never
-//       got a daemon up, or that exited instead of aborting, has not created the state
-//       this phase is about, and reporting that as a leak would blame the daemon for the
-//       harness. A survivor is killed here rather than left running -- the phases after
-//       this one need the bus name free.
-// CONTROL: four, all reverted. (a) the prctl deleted from armAgainstParentDeath -> "FAIL: a
-//       daemon spawned by a test process that then died on SIGABRT does not outlive it",
-//       the survivor killed here, and the phases after it still running. From outside the
-//       suite the same mutation left the daemon with ppid 1 and 127.0.0.1:18462 still
-//       LISTEN after its spawner had aborted. (b) the probe's startup needle made
-//       unmatchable -> this phase NOT VERIFIED and no FAIL. (c) the probe made to loop
-//       instead of aborting -> the "did not finish within 60 s" skip, where an unbounded
-//       wait gave a ctest timeout with no output at all. (d) waitpid given a pid that fails
-//       ECHILD -> the reap-failure skip, where before it read "the probe died on signal 0".
-void orphanProbeVerdict(const Check& check) {
-    const SelfProbeRun probe = runSelfProbe("--orphan-probe", kSelfProbeTimeout);
-    for (size_t start = 0; start < probe.output.size();) {
-        const size_t eol = probe.output.find('\n', start);
-        const size_t end = eol == std::string::npos ? probe.output.size() : eol;
-        std::printf("  [orphan-probe] %.*s\n", static_cast<int>(end - start), probe.output.data() + start);
-        if (eol == std::string::npos) break;
-        start = eol + 1;
-    }
-    std::fflush(stdout);
-
-    // X.1: an expired wait is never data. runSelfProbe kills a probe that overruns and says
-    // so, and this branch comes first because every field below it -- termSignal above all
-    // -- then describes OUR SIGKILL rather than the probe's own death.
-    if (probe.timedOut) {
-        notVerified(kOrphanGoal, "the probe did not finish within " +
-                                     std::to_string(std::chrono::duration_cast<std::chrono::seconds>(
-                                                        kSelfProbeTimeout).count()) +
-                                     " s and was killed, so nothing it might have orphaned is attributable");
-        return;
-    }
-    // Before the `started` branch, because harnessError is also set for a reap that failed
-    // AFTER a successful fork. Consulted only when `started` is false, that case fell
-    // through with termSignal at 0 and printed "the probe died on signal 0".
-    if (!probe.harnessError.empty()) {
-        notVerified(kOrphanGoal, "this test could not run a probe process: " + probe.harnessError);
-        return;
-    }
-    if (!probe.started) {
-        notVerified(kOrphanGoal, "this test could not start a probe process");
-        return;
-    }
-
-    const size_t marker = probe.output.find(kOrphanPidPrefix);
-    if (marker == std::string::npos) {
-        notVerified(kOrphanGoal, "the probe never reported a daemon pid, so no daemon was ever orphaned");
-        return;
-    }
-    // SIGABRT specifically. A probe that exited normally, or died on some other signal, did
-    // not reach the state this phase is about -- and PR_SET_PDEATHSIG would fire for a
-    // normal exit anyway, so grading that would be grading a path that is not the point.
-    if (probe.termSignal != SIGABRT) {
-        notVerified(kOrphanGoal, probe.exitedNormally
-                                     ? "the probe exited " + std::to_string(probe.exitCode) +
-                                           " instead of aborting with a daemon running"
-                                     : "the probe died on signal " + std::to_string(probe.termSignal) +
-                                           " rather than SIGABRT");
-        return;
-    }
-    // Its own branch, and after the signal branch rather than sharing it. Folded together,
-    // a malformed pid line following a correct abort printed "the probe died on signal 6
-    // rather than SIGABRT" -- a reason that is not merely vague but false.
-    const pid_t orphan = static_cast<pid_t>(std::strtol(probe.output.c_str() + marker + std::strlen(kOrphanPidPrefix),
-                                                        nullptr, 10));
-    if (orphan <= 0) {
-        notVerified(kOrphanGoal, "the probe's pid line did not parse as a pid, so there is no process to look for");
-        return;
-    }
-
-    // Bounded, and the deadline is not data: the loop exits on the first look that finds
-    // the daemon gone, and reaching the deadline means it was still there every time --
-    // which is the failure, not a slow host. The kill is immediate on the parent's death,
-    // so seconds here is orders of magnitude of margin.
-    const auto deadline = Clock::now() + std::chrono::seconds(10);
-    bool survived = true;
-    while (Clock::now() < deadline) {
-        if (!daemonRunning(orphan)) {
-            survived = false;
-            break;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
-    }
-
-    check(!survived, "a daemon spawned by a test process that then died on SIGABRT does not outlive it");
-    if (survived) {
-        std::fprintf(stderr, "  daemon %d was still running after its spawner aborted; killing it so the rest of "
-                             "this run has a free bus name\n",
-                     static_cast<int>(orphan));
-        ::kill(orphan, SIGKILL);
-        // Not this process's child, so it cannot be waited for -- init reaps it. Polled
-        // instead, and the wait is bounded by the same reasoning as above.
-        const auto killDeadline = Clock::now() + std::chrono::seconds(10);
-        while (Clock::now() < killDeadline && daemonRunning(orphan)) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(20));
-        }
-    }
-}
-
-// Returns false when this phase left something owning the bus name, in which case the port
-// phases after it must not run.
-//
-// GOAL: X.3 -- a fault of this harness is never graded as a fault of the daemon.
-// WHY-THIS-SHAPE: the settle is out here, past every early return in orphanProbeVerdict,
-//       because it is what the phases AFTER this one depend on and a skip is exactly when
-//       it is most likely to be needed. Three of those returns used to jump over it. And
-//       the result is returned rather than printed: a leaked daemon still holding
-//       127.0.0.1:18462 makes the port phases report a bind failure against a daemon they
-//       spawned themselves, which is this harness's leak wearing a production defect's
-//       name.
-// CONTROL: the prctl deleted from armAgainstParentDeath AND this phase's kill of the
-//       survivor suppressed -- both needed, since a phase that clears the leak never
-//       reaches this branch -> the leak FAIL above, then one NOT VERIFIED row naming
-//       S7.8/S7.11/S7.14/S7.15. Ungated, the same mutation produced an extra FAIL from
-//       checkHttpLifecycle and a skip reason blaming "another process on this machine" for
-//       this harness's own leaked daemon. Reverted.
-bool checkAbortedParentLeavesNoDaemon(NameWatcher& names, const Check& check) {
-    orphanProbeVerdict(check);
-
-    // Settling, not a check: the name's release is asserted by the shutdown phases, and
-    // asserting it here as well would print a second failure for the one defect above.
-    // The next phase's waitFor(true) would otherwise be satisfied by this daemon's name.
-    if (names.waitFor(false)) return true;
-    std::printf("daemon_system_test: the bus name was still owned after the orphan phase.\n");
-    return false;
 }
 
 // Used by both phases below: phase 10 asks the daemon what it thinks of its config port
@@ -3178,11 +2997,7 @@ void checkConfigServerLostPort(NameWatcher& names, const std::string& bluePath, 
 
 }  // namespace
 
-int main(int argc, char** argv) {
-    // The child half of checkAbortedParentLeavesNoDaemon, and nothing else: it spawns a
-    // daemon and aborts, so it must never be reached by an ordinary run.
-    if (argc == 2 && std::string_view(argv[1]) == "--orphan-probe") return runOrphanProbe();
-
+int main() {
     int failures = 0;
     const Check check = [&](bool cond, const char* msg) {
         if (!cond) {
@@ -3236,6 +3051,33 @@ int main(int argc, char** argv) {
         check(cameUp, "the daemon acquires io.wallpaperx.Daemon on the session bus");
 
         if (cameUp) {
+            // GOAL: a process this harness execs inherits RLIMIT_CORE=0, so a daemon that
+            //       dies on SIGABRT -- which is what a control run makes it do, repeatedly
+            //       -- writes no core and does not feed the host's core collector.
+            // WHY-THIS-SHAPE: read out of the DAEMON's /proc, not asserted in this process.
+            //       The property is inheritance across execve, and the two mechanisms
+            //       suppressCoreDump() sets behave oppositely there: execve resets
+            //       PR_SET_DUMPABLE and leaves RLIMIT_CORE alone. A check on the forking
+            //       process's own limit -- the obvious cheaper version -- would stay green
+            //       with the only half that survives the exec removed.
+            // CONTROL: two, reverted. The setrlimit deleted from suppressCoreDump() -> one
+            //       FAIL, "the daemon inherits a core limit of 0 from the harness that
+            //       spawned it", printing "its /proc reports 'unlimited'". And the pid
+            //       replaced by -1, so no /proc entry exists -> the NOT VERIFIED row below
+            //       and ctest Skipped, rather than a FAIL blaming the daemon.
+            const std::string coreLimit = softCoreLimit(daemon.pid());
+            if (coreLimit.empty()) {
+                // X.3: an unreadable /proc is this host's answer, not the daemon's, and a
+                // daemon that died before it could be read is already graded above.
+                notVerified("the inherited core limit",
+                            "the daemon's /proc/<pid>/limits could not be read for a 'Max core file size' row");
+            } else {
+                check(coreLimit == "0", "the daemon inherits a core limit of 0 from the harness that spawned it");
+                if (coreLimit != "0") {
+                    std::fprintf(stderr, "  its /proc reports '%s'\n", coreLimit.c_str());
+                }
+            }
+
             // A second instance must lose. createSessionBusConnection() requests the name
             // without SD_BUS_NAME_REPLACE_EXISTING, so the second process is expected to
             // fail its name request and exit non-zero rather than take the desktop's
@@ -3367,36 +3209,21 @@ int main(int argc, char** argv) {
         checkClosedStdout(names, bluePath, validationEnv, wantValidation, check);
         checkBusLoss(check);
 
-        // Spawns a daemon of its own on this bus and leaves nothing behind, so it belongs
-        // between the phases that own the name one at a time -- and before the port phases
-        // below, whose whole subject is who is listening on 18462.
-        const bool busClearAfterOrphan = checkAbortedParentLeavesNoDaemon(names, check);
+        // S7.8 and S7.11. Spawns a daemon of its own and shuts it down, so it runs
+        // after the phases above have released the name, and before the descriptor
+        // accounting below -- its httplib clients close their sockets on destruction,
+        // which that accounting would otherwise report as a leak in this process.
+        checkHttpLifecycle(names, bluePath, validationEnv, check);
 
-        // Every phase below spawns a daemon that must take the bus name and bind 18462. A
-        // daemon the phase above failed to clear still holds both, so all three would
-        // report the *harness's* leak as the production defect they were written to detect
-        // (X.3). The leak itself is already graded above; this is not a second verdict.
-        if (!busClearAfterOrphan) {
-            notVerified("S7.8, S7.11 (HTTP lifecycle), S7.14, S7.15 (who owns the config port)",
-                        "a daemon this run could not clear still owns the bus name, so every bind failure below "
-                        "would be this harness's leak rather than the daemon's behaviour");
-        } else {
-            // S7.8 and S7.11. Spawns a daemon of its own and shuts it down, so it runs
-            // after the phases above have released the name, and before the descriptor
-            // accounting below -- its httplib clients close their sockets on destruction,
-            // which that accounting would otherwise report as a leak in this process.
-            checkHttpLifecycle(names, bluePath, validationEnv, check);
-
-            // S7.14, both directions. After checkHttpLifecycle rather than beside it: that
-            // phase asserts nothing is listening on 18462 once its daemon has gone, and the
-            // second of these deliberately puts a socket of this test's own there. Before
-            // the descriptor accounting, since both hold sockets that close at scope exit.
-            checkConfigServerOwnsPort(names, validationEnv, check);
-            // signals is this run's whole FrameReady history, from the daemons of the
-            // phases above: a non-empty one is proof this host can render, which is what
-            // lets the port-conflict phase grade a missing frame instead of skipping on it.
-            checkConfigServerLostPort(names, bluePath, validationEnv, signals.total() > 0, check);
-        }
+        // S7.14, both directions. After checkHttpLifecycle rather than beside it: that
+        // phase asserts nothing is listening on 18462 once its daemon has gone, and the
+        // second of these deliberately puts a socket of this test's own there. Before
+        // the descriptor accounting, since both hold sockets that close at scope exit.
+        checkConfigServerOwnsPort(names, validationEnv, check);
+        // signals is this run's whole FrameReady history, from the daemons of the
+        // phases above: a non-empty one is proof this host can render, which is what
+        // lets the port-conflict phase grade a missing frame instead of skipping on it.
+        checkConfigServerLostPort(names, bluePath, validationEnv, signals.total() > 0, check);
 
         // Every Frame's UnixFd closes at scope exit, and the daemon is gone, so this
         // process must be back where it started. A descriptor leaked per GetFrameFd is

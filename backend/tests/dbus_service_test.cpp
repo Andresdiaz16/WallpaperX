@@ -629,10 +629,18 @@ void runRenderChecks(sdbus::IProxy& proxy, FrameReadyLog& signals, const std::st
         // See the annotation on statusSelfConsistent in tests/client/daemon_client.h.
         // Asserted here because this is the first reply in the run where the forbidden
         // conjunction is even expressible: monitor 0 holds a frame from the render above.
-        // Deliberately ungated on ok(): the predicate itself grades an unarrived reply as
-        // a failure, and getStatusOrExplain has already printed which component it was.
-        check(wallpaperx::testing::statusSelfConsistent(status),
-              "GetStatus never reports an uninitialised GPU beside a monitor that already has a frame");
+        //
+        // Gated on ok(), and the gate cannot hide a regression: the check above reads its
+        // fields off the same reply and is already red when none arrived. Ungated, a reply
+        // that never came printed an S6.18 snapshot-atomicity FAIL for an invariant nothing
+        // had evaluated -- a second, wrong verdict on top of the one true one.
+        if (!status.ok()) {
+            std::printf("dbus_service_test: the snapshot-consistency check (S6.18) is not graded -- GetStatus did "
+                        "not answer, and the failure that caused that is reported above.\n");
+        } else {
+            check(wallpaperx::testing::statusSelfConsistent(status),
+                  "GetStatus never reports an uninitialised GPU beside a monitor that already has a frame");
+        }
 
         // GOAL: S6.34 -- the Classic descriptor-tier path works end to end *through
         //       the daemon*, not only in a renderer probe. [DoD 12]

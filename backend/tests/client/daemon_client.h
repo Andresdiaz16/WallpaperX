@@ -204,11 +204,9 @@ inline void setWallpaper(sdbus::IProxy& proxy, const std::string& type, const st
 // after the call site into the test's one catch-all -- one opaque line, no failure
 // attributed to anything, and no NOT VERIFIED row for the phases that never ran.
 //
-// So the fault is a value and there is deliberately no throwing form of getStatus() left
-// to reach for. That is the point of the shape: a non-throwing helper *beside* a throwing
-// one leaves the unsafe call the shorter thing to type, which is how the operator[] guard
-// documented on wallpaperStatus() below came to be missing from four of its five original
-// sites and then from three more that were written after it.
+// So the fault is a value and there is deliberately no throwing form of getStatus() beside
+// it: a safe helper next to an unsafe one leaves the unsafe call the shorter thing to type,
+// and the shorter thing is what gets written.
 //
 // A site that ignores ok() must still not go quiet, which is what the empty object buys:
 // json() is `{}`, so wallpaperStatus() returns nullptr and every field comparison below it
@@ -228,10 +226,11 @@ public:
     // The call returned and its payload parsed into an object.
     bool ok() const { return m_error.empty(); }
 
-    // Why there is no usable reply, empty when ok(). Names which of the three causes it
-    // was -- no answer at all, a daemon-side error reply, or an answer that would not
-    // parse -- because those are different components and a caller that prints this must
-    // not have to guess which one it is looking at.
+    // Why there is no usable reply, empty when ok(). It names a component only where the
+    // component is knowable -- an error name in the daemon's own namespace, or a reply that
+    // arrived and would not parse. Every other failure says which possibilities remain
+    // instead of picking one, because a reader sent to the transport for a daemon wedged in
+    // its own handler looks in the wrong process.
     const std::string& error() const { return m_error; }
 
     // An empty object unless ok().
@@ -242,20 +241,25 @@ private:
     std::string m_error;
 };
 
-// True for the DBus error names that mean the call never reached a live daemon, as opposed
-// to a daemon that received it and answered with an error. Enumerated rather than matched
-// on the org.freedesktop.DBus.Error. prefix, which a daemon-side reply can also carry.
-inline bool busLevelErrorName(const std::string& name) {
-    static const char* const kTransport[] = {
-        "org.freedesktop.DBus.Error.ServiceUnknown", "org.freedesktop.DBus.Error.NameHasNoOwner",
-        "org.freedesktop.DBus.Error.NoReply",        "org.freedesktop.DBus.Error.Timeout",
-        "org.freedesktop.DBus.Error.TimedOut",       "org.freedesktop.DBus.Error.Disconnected",
-        "org.freedesktop.DBus.Error.NoServer",       "org.freedesktop.DBus.Error.NotSupported",
-    };
-    for (const char* candidate : kTransport) {
-        if (name == candidate) return true;
-    }
-    return false;
+// True for the error names only this daemon can have produced: the ones its own interface
+// defines.
+//
+// The daemon's namespace is the closed set here, and the transport's is not. Listing
+// transport names instead -- ServiceUnknown, NoReply, Disconnected and so on -- is
+// unclosable: org.freedesktop.DBus.Error has members no list here will track, sdbus-c++
+// reports local failures under names of its own, and everything the list missed was
+// attributed to the daemon by default. This direction fails the other way, which is the
+// safe one: an unrecognised name is reported as unattributed rather than as a verdict.
+// Built from kInterface so renaming the interface breaks the build instead of quietly
+// leaving a prefix that matches nothing.
+//
+// CONTROL (both branches, reverted): DbusService::getStatus made to throw
+//       sdbus::Error{"io.wallpaperx.Daemon.Error.Unsupported"} -> "the daemon answered
+//       GetStatus with an error (io.wallpaperx.Daemon.Error.Unsupported)"; made to throw
+//       std::runtime_error, which sdbus-c++ delivers as org.sdbuscpp.Error -> "GetStatus
+//       failed with org.sdbuscpp.Error, which is not one of the daemon's own error names".
+inline bool daemonErrorName(const std::string& name) {
+    return name.rfind(std::string(DbusService::kInterface) + ".Error.", 0) == 0;
 }
 
 inline StatusReply getStatus(sdbus::IProxy& proxy) {
@@ -263,16 +267,27 @@ inline StatusReply getStatus(sdbus::IProxy& proxy) {
     try {
         proxy.callMethod("GetStatus").onInterface(DbusService::kInterface).storeResultsTo(status);
     } catch (const sdbus::Error& e) {
-        // error() promises to name the component, so the two cases must not share a
-        // sentence: "the bus did not answer" sends a reader to the transport, and a daemon
-        // that replied with an error name is the daemon's own fault.
+        // Only one direction is knowable from an error name. A name in the daemon's own
+        // namespace came from the daemon; everything else is genuinely ambiguous, and the
+        // message says so rather than picking. NoReply and Timeout are the case that makes
+        // this necessary: they are exactly what a daemon deadlocked inside this very
+        // handler produces, so reporting them as "the bus did not answer" sends the reader
+        // to the wrong process. ServiceUnknown is the mirror image -- the bus answering,
+        // that the daemon is gone. And an exception escaping the handler arrives as
+        // org.sdbuscpp.Error, a daemon reply under no daemon name at all (measured).
         const std::string name = e.getName();
-        if (busLevelErrorName(name)) {
-            return StatusReply::failure("the bus did not answer GetStatus (" + name + "): " + e.getMessage());
+        if (daemonErrorName(name)) {
+            return StatusReply::failure("the daemon answered GetStatus with an error (" + name +
+                                        "): " + e.getMessage());
         }
-        return StatusReply::failure("the daemon answered GetStatus with an error (" + name + "): " + e.getMessage());
+        return StatusReply::failure("GetStatus failed with " + name +
+                                    ", which is not one of the daemon's own error names -- so it is the bus, the "
+                                    "connection, or the daemon failing outside its own taxonomy: " + e.getMessage());
     } catch (const std::exception& e) {
-        return StatusReply::failure(std::string("the GetStatus call failed before any reply: ") + e.what());
+        // Not "before any reply", which this cannot know: it is only known that what came
+        // out was not a DBus error.
+        return StatusReply::failure(std::string("the GetStatus call threw something other than a DBus error: ") +
+                                    e.what());
     }
     nlohmann::json json = nlohmann::json::parse(status, nullptr, /*allow_exceptions=*/false);
     if (json.is_discarded()) return StatusReply::failure("GetStatus replied with something that is not JSON");
@@ -301,8 +316,7 @@ inline StatusReply getStatusOrExplain(sdbus::IProxy& proxy) {
 // followed by a dereference. Under NDEBUG the assert compiles away and a missing key
 // dereferences end(), so a daemon regression that dropped "wallpapers" or a monitor from
 // the reply would crash the test instead of printing the FAIL line the check exists to
-// produce. One accessor is what stops the next site from forgetting the guard; of the
-// five sites that existed, four had.
+// produce. One accessor is what stops the next site from forgetting the guard.
 //
 // Callers read individual fields with value(), for the same reason: a missing "type" or
 // "has_frame" must make the comparison false, not abort.
@@ -330,22 +344,25 @@ inline const nlohmann::json* wallpaperStatus(const StatusReply& status, const st
 //       broken one alike. Asserting the forbidden *conjunction* on every reply the
 //       suite already collects is falsifiable the moment the state is ever reachable,
 //       and costs nothing.
-//       A reply that never arrived is false, not true. Every other branch here returns
-//       true on an absent field, which is right for a *present* reply -- the invariant
-//       forbids a conjunction, so a missing half cannot violate it -- and is exactly
-//       wrong for no reply at all: `{}` would report the invariant verified on nothing.
-//       Deciding it at the call sites instead was rejected because it already failed
-//       that way; one of the three forgot, and it was the site that graded S6.18.
-// CONTROL: two, reverted. (a) WallpaperManager::snapshot() patched to clear
+//       PRECONDITION: the reply arrived. Every branch below returns true on an absent
+//       field, which is right for a reply that exists -- the invariant forbids a
+//       conjunction, so a missing half cannot violate it -- and would be vacuous green
+//       for `{}`. Both call sites therefore gate on ok() and print instead of grading.
+//       The !ok() line is the fail-safe for a site that forgets: red is recoverable,
+//       a silent pass on an empty reply is what this check was already doing once.
+// CONTROL: three, all reverted. (a) WallpaperManager::snapshot() patched to clear
 //       out.gpu.initialized after copying the monitor map, which is what a second lock
 //       acquisition makes reachable -> "FAIL: GetStatus never reports an uninitialised
-//       GPU beside a monitor that already has a frame" in both tiers. (b) DbusService's
-//       GetStatus made to throw -> the same FAIL line, where before the reply-gating
-//       branch this check passed on the empty reply.
+//       GPU beside a monitor that already has a frame" in both tiers. (b) the fail-safe:
+//       DbusService::GetStatus made to throw AND dbus_service_test's ok() gate removed ->
+//       the same FAIL line; with the gate restored, the not-graded line instead and no
+//       S6.18 verdict. (c) `if (!status.ok()) return false;` deleted with the same gate
+//       removed -> that FAIL line disappeared and the run reported S6.18 as held.
 inline bool statusSelfConsistent(const StatusReply& status) {
     if (!status.ok()) return false;
+    // No is_object() guard: getStatus() rejects a non-object payload as a failure, so an
+    // ok() reply is an object by construction and the guard could never fire.
     const nlohmann::json& json = status.json();
-    if (!json.is_object()) return true;
     if (!json.contains("gpu") || !json["gpu"].is_object()) return true;
     if (json["gpu"].value("initialized", true)) return true;
     if (!json.contains("wallpapers") || !json["wallpapers"].is_object()) return true;
