@@ -46,7 +46,18 @@ struct MonitorStatus {
     // still rendering. Rendering is asynchronous, so this is the only channel a failure
     // has: the DBus reply to SetWallpaper is sent before the render is attempted.
     std::string lastError;
+
+    // Whether that failure is the daemon's to answer for, as opposed to the image being
+    // unreadable or undecodable. Only the daemon's own failures make /health report a
+    // broken daemon; a file the user can replace does not.
+    bool lastErrorIsDaemonFault = false;
 };
+
+// True once a config read has been abandoned mid-call. That thread is still blocked in the
+// kernel and may wake at any time, including during static destruction, where it would run
+// library code the runtime is tearing down. main() ends the process rather than unwind past
+// a thread it cannot account for.
+bool configLoadAbandoned();
 
 // The GPU the daemon resolved, once it has resolved one.
 struct GpuStatus {
@@ -301,6 +312,7 @@ private:
         uint64_t generation = 0;
         bool hasFrame = false;
         std::string lastError;
+        bool lastErrorIsDaemonFault = false;
 
         // Copied from the target at commit time rather than read back from it, so
         // status() can report the frame's size without touching the GPU state and
@@ -331,6 +343,13 @@ private:
     // m_stateMutex: it records health, which takes it, and the write is a syscall.
     void persist(const std::vector<PersistedWallpaper>& entries);
 
+    // Facts about the config that outlive the operation that discovered them -- a copy of
+    // an unreadable file, entries kept for a newer build. Every persistence detail is
+    // rebuilt through these, because the next save would otherwise report only itself and
+    // silently drop the pointer to the copy.
+    void addPersistenceNote(const std::string& note);
+    std::string persistenceDetail(const std::string& base) const;
+
     const Config m_config;
     const ConfigStore m_store;
 
@@ -340,6 +359,14 @@ private:
     // Entries restoreSaved() could not apply, carried so a save does not delete them.
     // Guarded by m_stateMutex.
     std::vector<PersistedWallpaper> m_unapplied;
+
+    // The file still holds content this run could not read and could not move aside, so
+    // persist() must not replace it. Written only by the constructor, read afterwards.
+    bool m_configUnread = false;
+
+    // Raw, unsanitized; sanitized once when recorded. Written by the constructor, read
+    // under m_stateMutex afterwards.
+    std::string m_persistenceNote;
 
     // Order matters: m_gpuMutex may be taken before m_stateMutex, never the reverse.
     mutable std::mutex m_gpuMutex;

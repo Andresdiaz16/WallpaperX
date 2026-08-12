@@ -36,6 +36,12 @@ bool isKnownType(const std::string& type) {
 // and short enough that a stalled mount does not visibly stall a login.
 constexpr std::chrono::seconds kLoadDeadline{2};
 
+// Bounds the .bad, .bad.1, ... search. One name meant the second unreadable config had
+// nowhere to go, and nowhere to go meant saving was disabled for the run.
+constexpr int kMaxPreservedCopies = 10;
+
+std::atomic<bool> g_loadAbandoned{false};
+
 // Applied identically by every entry point. Validating on SetWallpaper but not on
 // GetFrameFd would report a bad id as "no frame yet" -- a state a polling consumer is
 // told to retry, so an off-by-one monitor id becomes an infinite retry loop with a
@@ -73,6 +79,8 @@ std::string resolveShaderDir(const std::string& configured) {
 
 }  // namespace
 
+bool configLoadAbandoned() { return g_loadAbandoned.load(std::memory_order_acquire); }
+
 WallpaperManager::WallpaperManager(Config config)
     : m_config(std::move(config)), m_store(m_config.configFile) {
     if (!m_store.enabled()) {
@@ -85,43 +93,82 @@ WallpaperManager::WallpaperManager(Config config)
     const LoadResult loaded = loadWithDeadline();
     m_restore = loaded.entries;
 
-    std::string detail = sanitizeForLog(m_store.file().string(), 4096, LogFraming::Bare);
+    // Raw, not sanitized: recordHealthLocked is the single sanitizer, and escaping twice
+    // turns one backslash in a path into two in what the user reads.
     if (loaded.malformedEntries > 0) {
-        detail += " (" + std::to_string(loaded.malformedEntries) + " malformed entries ignored)";
+        addPersistenceNote(std::to_string(loaded.malformedEntries) + " malformed entries ignored");
+        // Copied, not moved: the entries this build did understand are being restored from
+        // this same file. Rejected ones never become entries at all, so the keep-for-a-newer-
+        // build path cannot see them and the first save would drop them for good.
+        if (loaded.preservable) {
+            const std::filesystem::path kept = m_store.file().string() + ".bad";
+            std::error_code ec;
+            std::filesystem::copy_file(m_store.file(), kept, ec);
+            addPersistenceNote(ec ? "not copied: " + ec.message() : "copied to " + kept.string());
+        }
     }
 
     if (!loaded.error.empty()) {
-        // The first save would otherwise overwrite a file this run could not read, and it
-        // is the only copy. Moved aside instead, so a hand-edit that broke the syntax is
-        // still recoverable afterwards.
-        std::string reported = loaded.error;
+        // Two outcomes, and the file decides which. Moved aside, the path is clear and
+        // saving works normally. Still there, saving stays off for the run -- overwriting
+        // it would destroy the user's only copy of every other monitor.
+        m_configUnread = true;
         if (loaded.preservable) {
-            const std::filesystem::path kept = m_store.file().string() + ".bad";
-            const std::string keptName = sanitizeForLog(kept.string(), 4096, LogFraming::Bare);
-            std::error_code ec;
-            const bool present = std::filesystem::exists(kept, ec);
-            // Never over an existing copy: the first bad start moves the real config here,
-            // and a second one would otherwise replace it with the throwaway written since.
-            // A copy that cannot be inspected counts as present for the same reason.
-            //
-            // Every branch reports. Saying the config could not be read while staying silent
-            // about whether the copy was made sends the user looking for a file that is not
-            // there.
-            if (ec) {
-                reported += "; not kept, " + keptName + " could not be checked: " + ec.message();
-            } else if (present) {
-                reported += "; not kept, " + keptName + " already exists";
-            } else {
+            std::string keptName;
+            std::string why;
+            for (int n = 0; n < kMaxPreservedCopies && keptName.empty(); ++n) {
+                const std::filesystem::path kept = m_store.file().string() + ".bad" +
+                                                   (n == 0 ? "" : "." + std::to_string(n));
+                std::error_code ec;
+                // Never over an existing copy: it holds an earlier broken config, and this
+                // one would replace it with whatever was written since.
+                if (std::filesystem::exists(kept, ec)) continue;
+                if (ec) {
+                    why = ec.message();
+                    continue;
+                }
                 std::filesystem::rename(m_store.file(), kept, ec);
-                reported += ec ? "; not kept, could not move it to " + keptName + ": " + ec.message()
-                               : "; kept as " + keptName;
+                if (ec) {
+                    why = ec.message();
+                    continue;
+                }
+                keptName = kept.string();
+            }
+            if (!keptName.empty()) {
+                m_configUnread = false;
+                addPersistenceNote("kept as " + keptName);
+            } else {
+                addPersistenceNote(why.empty() ? "not kept, no free name" : "not kept: " + why);
             }
         }
-        recordHealth(&DaemonHealth::persistence, HealthStatus::Fail, reported);
+        // Every path reports. Saying the config could not be read while staying silent about
+        // whether a copy survived sends the user looking for a file that is not there. The
+        // note outlives this call: a later save would otherwise overwrite the only pointer
+        // to the copy that was made.
+        if (m_configUnread) addPersistenceNote("not saving over it");
+        recordHealth(&DaemonHealth::persistence, HealthStatus::Fail,
+                     persistenceDetail(loaded.error));
         return;
     }
 
-    recordHealth(&DaemonHealth::persistence, HealthStatus::Ok, detail);
+    recordHealth(&DaemonHealth::persistence, HealthStatus::Ok,
+                 persistenceDetail(m_store.file().string()));
+}
+
+void WallpaperManager::addPersistenceNote(const std::string& note) {
+    if (!m_persistenceNote.empty()) m_persistenceNote += "; ";
+    m_persistenceNote += note;
+}
+
+std::string WallpaperManager::persistenceDetail(const std::string& base) const {
+    // Notes before the path: recordHealthLocked caps the detail and truncation drops the
+    // tail, so a long config path must not be what silences them.
+    std::string detail;
+    if (!m_persistenceNote.empty()) detail = m_persistenceNote + "; ";
+    if (!m_unapplied.empty()) {
+        detail += std::to_string(m_unapplied.size()) + " entries this build cannot apply, kept; ";
+    }
+    return detail + base;
 }
 
 // Out of line, and non-trivial for a reason: Device and OffscreenTargetManager are
@@ -278,12 +325,11 @@ void WallpaperManager::requestWallpaper(const std::string& type, const std::stri
     // `type == "static"` branch, video and shader accepted an empty string, a missing path
     // or a directory and then sat frameless forever.
     //
-    // Known and accepted: these two syscalls run on the DBus event-loop thread, so a hung
-    // NFS mount blocks every other method -- and leaves the daemon unkillable with it, since
-    // the loop cannot act on leaveEventLoop() until this handler returns. SIGTERM is received
-    // and reported, and the process stays up. Moving them to the render worker was considered
-    // and rejected -- it is a FIFO, so a bad path would wait behind every queued render and
-    // break S6.9's burst bound. The fix, if ever needed, is a separate validation thread.
+    // Known and accepted: these run on the DBus event-loop thread, so a stalled mount blocks
+    // every method. Moving them alone would not make the daemon killable -- the render thread
+    // opens the same file, and a stat served from cache can precede a read that hangs. The
+    // render worker is the wrong home either way: FIFO, so a bad path waits behind every
+    // queued render.
     std::error_code ec;
     if (!std::filesystem::is_regular_file(path, ec) || ::access(path.c_str(), R_OK) != 0) {
         throw InvalidRequest(sanitizeForLog(path) + " is not a readable file");
@@ -322,17 +368,27 @@ LoadResult WallpaperManager::loadWithDeadline() const {
     // The store is copied in, so the thread outliving this call cannot reach a destroyed one.
     auto answer = std::make_shared<std::promise<LoadResult>>();
     std::future<LoadResult> pending = answer->get_future();
-    std::thread([answer, store = m_store] { answer->set_value(store.load()); }).detach();
+    try {
+        std::thread([answer, store = m_store] { answer->set_value(store.load()); }).detach();
+    } catch (const std::system_error& e) {
+        // The store's contract is that config trouble is reported and never stops the
+        // daemon booting; this is the one statement here that can throw.
+        LoadResult noThread;
+        noThread.error =
+            m_store.file().string() + ": could not be read, no thread available: " + e.what();
+        return noThread;
+    }
 
     if (pending.wait_for(kLoadDeadline) == std::future_status::ready) return pending.get();
 
     // Abandoned, not cancelled: the thread stays blocked in the kernel until the process
     // exits. Startup continues without a config rather than becoming unstoppable -- the
-    // stuck thread is harmless, a stuck main() is not.
+    // stuck thread is harmless, a stuck main() is not. Recorded because it is only harmless
+    // until static destruction: see configLoadAbandoned().
+    g_loadAbandoned.store(true, std::memory_order_release);
     LoadResult timedOut;
-    timedOut.fileExisted = true;
-    timedOut.error = sanitizeForLog(m_store.file().string(), 4096, LogFraming::Bare) +
-                     ": did not respond within " + std::to_string(kLoadDeadline.count()) +
+    timedOut.error = m_store.file().string() + ": did not respond within " +
+                     std::to_string(kLoadDeadline.count()) +
                      "s, starting without it";
     return timedOut;
 }
@@ -357,21 +413,36 @@ std::vector<PersistedWallpaper> WallpaperManager::persistableLocked() const {
 void WallpaperManager::persist(const std::vector<PersistedWallpaper>& entries) {
     if (!m_store.enabled()) return;
 
-    const SaveResult saved = m_store.save(entries);
-    if (!saved.error.empty()) {
-        recordHealth(&DaemonHealth::persistence, HealthStatus::Fail, saved.error);
+    // The save rebuilds the file from live state, so writing now would replace monitors
+    // this run never managed to read with the one the user just set.
+    if (m_configUnread) {
+        std::lock_guard<std::mutex> stateLock(m_stateMutex);
+        recordHealthLocked(
+            &DaemonHealth::persistence, HealthStatus::Fail,
+            persistenceDetail(m_store.file().string() +
+                              ": not saved, this run could not read it and will not overwrite it"));
         return;
     }
 
-    std::string detail = sanitizeForLog(m_store.file().string(), 4096, LogFraming::Bare);
+    const SaveResult saved = m_store.save(entries);
+
+    std::lock_guard<std::mutex> stateLock(m_stateMutex);
+    if (!saved.error.empty()) {
+        recordHealthLocked(&DaemonHealth::persistence, HealthStatus::Fail,
+                           persistenceDetail(saved.error));
+        return;
+    }
+
+    std::string base = m_store.file().string();
     if (saved.skippedNonUtf8 > 0) {
-        detail += " (" + std::to_string(saved.skippedNonUtf8) +
-                  " entries skipped: path is not valid UTF-8)";
+        base += " (" + std::to_string(saved.skippedNonUtf8) +
+                " entries skipped: path is not valid UTF-8)";
     }
     // Fail, not Ok: the write succeeded but those monitors will not come back, and a
     // health field that reads ok is the only thing that would say otherwise.
-    recordHealth(&DaemonHealth::persistence,
-                 saved.skippedNonUtf8 > 0 ? HealthStatus::Fail : HealthStatus::Ok, detail);
+    recordHealthLocked(&DaemonHealth::persistence,
+                       saved.skippedNonUtf8 > 0 ? HealthStatus::Fail : HealthStatus::Ok,
+                       persistenceDetail(base));
 }
 
 std::vector<int> WallpaperManager::restoreSaved() {
@@ -381,11 +452,16 @@ std::vector<int> WallpaperManager::restoreSaved() {
 
     std::lock_guard<std::mutex> stateLock(m_stateMutex);
     for (const PersistedWallpaper& entry : pending) {
-        // The manager's own rules, not the store's: a file naming monitor 99 or a type
-        // this build has never heard of is not rendered here -- but it is kept, so the
-        // next save does not delete a wallpaper a newer build understands.
-        if (!isKnownType(entry.type) || entry.path.empty() || entry.monitorId < 0 ||
-            entry.monitorId >= kMaxMonitors) {
+        // Dropped, not kept: a kept entry is only ever superseded by a live monitor
+        // claiming its id, and a negative id can never be one -- so keeping it means
+        // carrying it through every save for the life of the install. An id above this
+        // build's limit is different and stays below: a larger kMaxMonitors would take it.
+        if (entry.monitorId < 0) continue;
+
+        // The manager's own rules, not the store's: a type this build has never heard of,
+        // or an id a larger kMaxMonitors would admit, is not rendered here -- but it is
+        // kept, so the next save does not delete a wallpaper a newer build understands.
+        if (!isKnownType(entry.type) || entry.path.empty() || entry.monitorId >= kMaxMonitors) {
             m_unapplied.push_back(entry);
             continue;
         }
@@ -401,10 +477,11 @@ std::vector<int> WallpaperManager::restoreSaved() {
 
     // Kept entries are invisible otherwise: they are in no monitor's status and are not
     // malformed, so nothing would tell the user those wallpapers did not come back.
+    // Recomposed from the raw path rather than appended to the recorded detail, which is
+    // already sanitized and would be escaped a second time.
     if (!m_unapplied.empty() && m_health.persistence.status == HealthStatus::Ok) {
         recordHealthLocked(&DaemonHealth::persistence, HealthStatus::Ok,
-                           m_health.persistence.detail + " (" + std::to_string(m_unapplied.size()) +
-                               " entries this build cannot apply, kept)");
+                           persistenceDetail(m_store.file().string()));
     }
     return monitorIds;
 }
@@ -456,6 +533,7 @@ RenderOutcome WallpaperManager::renderPending(int monitorId) {
     // uploading the texture, building the pipeline, creating the target. None of it
     // touches the offscreen image's contents.
     std::string error;
+    bool daemonFault = false;
     std::optional<StaticRenderer> renderer;
     const OffscreenTarget* target = nullptr;
     try {
@@ -468,13 +546,21 @@ RenderOutcome WallpaperManager::renderPending(int monitorId) {
         // Step 13's video renderer does need to persist and will live in MonitorState.
         renderer.emplace(*m_device, m_targets->renderPass(), path, m_resolvedShaderDir);
     } catch (const GpuFailure& e) {
-        // Caught before std::exception, which it derives from. This is the GPU going wrong
-        // rather than the image, so it re-records gpu health -- otherwise a device that
-        // dies after the first successful render reads ok forever.
+        // Caught before std::exception, which it derives from. The GPU going wrong rather
+        // than the image, so it re-records gpu health -- otherwise a device that dies after
+        // the first successful render reads ok forever.
         error = e.what();
+        daemonFault = true;
         recordHealth(&DaemonHealth::gpu, HealthStatus::Fail, error);
-    } catch (const std::exception& e) {
+    } catch (const WallpaperContentError& e) {
+        // The image, not the daemon: a file the user can replace.
         error = e.what();
+    } catch (const std::exception& e) {
+        // Unclassified, so it counts against the daemon. Failing closed is the point: this
+        // is where an allocation failure or a broken invariant arrives, and treating those
+        // as the wallpaper's fault published an ok daemon with no picture on any monitor.
+        error = e.what();
+        daemonFault = true;
     }
 
     bool committed = false;
@@ -502,9 +588,13 @@ RenderOutcome WallpaperManager::renderPending(int monitorId) {
                 m_targets->render(*renderer, *target);
             } catch (const GpuFailure& e) {
                 error = e.what();
+                daemonFault = true;
                 recordHealthLocked(&DaemonHealth::gpu, HealthStatus::Fail, error);
+            } catch (const WallpaperContentError& e) {
+                error = e.what();
             } catch (const std::exception& e) {
                 error = e.what();
+                daemonFault = true;
             }
         }
 
@@ -523,6 +613,7 @@ RenderOutcome WallpaperManager::renderPending(int monitorId) {
             // describeRejection() puts the diagnosis before the path -- truncation keeps
             // the head, so reversing that message would cut stb's reason instead.
             it->second.lastError = sanitizeForLog(error, 1024, LogFraming::Bare);
+            it->second.lastErrorIsDaemonFault = daemonFault;
         } else {
             ++it->second.generation;
             it->second.hasFrame = true;
@@ -534,6 +625,7 @@ RenderOutcome WallpaperManager::renderPending(int monitorId) {
             // has_frame alongside a stale last_error, and a client branching on
             // last_error calls a working wallpaper broken.
             it->second.lastError.clear();
+            it->second.lastErrorIsDaemonFault = false;
             committed = true;
             generation = it->second.generation;
             // A commit is the GPU working, so it clears a failure recorded by an earlier
@@ -644,6 +736,7 @@ WallpaperManager::Snapshot WallpaperManager::snapshot() const {
         entry.generation = state.generation;
         entry.hasFrame = state.hasFrame;
         entry.lastError = state.lastError;
+        entry.lastErrorIsDaemonFault = state.lastErrorIsDaemonFault;
         if (state.hasFrame) {
             entry.width = state.width;
             entry.height = state.height;

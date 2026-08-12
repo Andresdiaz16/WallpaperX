@@ -220,8 +220,8 @@ void HttpServer::registerRoutes() {
 
         // Split the same four ways GetFrameFd's NoFrameReason splits, so the two channels
         // cannot disagree about whether a monitor has a picture on it.
-        std::size_t failed = 0, unsupported = 0, inFlight = 0, showing = 0;
-        std::string firstFailure, firstUnsupported;
+        std::size_t failed = 0, unsupported = 0, inFlight = 0, showing = 0, daemonFaults = 0;
+        std::string firstFailure, firstUnsupported, firstDaemonFault;
 
         // Per monitor as well as counted: the aggregate says a wallpaper is missing, this
         // says which one and why, so a frontend need not call GetStatus to find out.
@@ -230,6 +230,9 @@ void HttpServer::registerRoutes() {
             const std::string key = std::to_string(id);
             if (!monitor.lastError.empty()) {
                 if (failed++ == 0) firstFailure = monitor.lastError;
+                if (monitor.lastErrorIsDaemonFault && daemonFaults++ == 0) {
+                    firstDaemonFault = monitor.lastError;
+                }
                 // Sanitized where it was recorded, so it is safe to quote here.
                 perMonitor[key] = {{"state", "failed"}, {"detail", monitor.lastError}};
             } else if (!isRenderableType(monitor.type)) {
@@ -253,10 +256,18 @@ void HttpServer::registerRoutes() {
             // daemon has not finished something it started.
             wallpapers.status = HealthStatus::Ok;
             wallpapers.detail = "no wallpaper set";
+        } else if (daemonFaults > 0) {
+            // Fail: something inside the daemon went wrong and no file the user can replace
+            // will fix it. Reported here rather than against gpu or shaders, because the
+            // fault may belong to neither -- attributing it to a named dependency would
+            // accuse a component that is working.
+            wallpapers.status = HealthStatus::Fail;
+            wallpapers.detail = std::to_string(daemonFaults) + " of " +
+                                std::to_string(snap.monitors.size()) +
+                                " monitors failed inside the daemon: " + firstDaemonFault;
         } else if (failed > 0 || unsupported > 0) {
             // Ok, not Fail: a deleted file or a type this build cannot draw is that
-            // wallpaper's problem, not the daemon's, and the daemon cannot fix either. Its
-            // own faults still fail the aggregate -- gpu and shaders record their own. The
+            // wallpaper's problem, not the daemon's, and the daemon cannot fix either. The
             // detail carries the cause so an operator need not go read GetStatus.
             wallpapers.status = HealthStatus::Ok;
             wallpapers.detail = std::to_string(failed + unsupported) + " of " +
@@ -264,6 +275,10 @@ void HttpServer::registerRoutes() {
                                 " monitors failed or cannot be rendered: " +
                                 (failed > 0 ? firstFailure : firstUnsupported);
         } else if (inFlight > 0) {
+            // The one Pending that means "started and not finished" rather than "not needed
+            // yet". Stated rather than left to the default, because the aggregate below
+            // reads it.
+            wallpapers.status = HealthStatus::Pending;
             wallpapers.detail = std::to_string(inFlight) + " of " + std::to_string(snap.monitors.size()) +
                                 " monitors have not rendered yet";
         } else {
@@ -288,6 +303,12 @@ void HttpServer::registerRoutes() {
         for (const auto& [name, check] : checks) {
             if (check->status == HealthStatus::Fail) overall = HealthStatus::Fail;
             checksJson[name] = {{"status", toString(check->status)}, {"detail", check->detail}};
+        }
+        // The exception to "failures only": a render that was started and never finished is
+        // the daemon owing an answer, not a dependency sitting idle. Without this a wedged
+        // render worker reports ok forever.
+        if (wallpapers.status == HealthStatus::Pending && overall == HealthStatus::Ok) {
+            overall = HealthStatus::Pending;
         }
         checksJson["wallpapers"]["monitors"] = std::move(perMonitor);
 

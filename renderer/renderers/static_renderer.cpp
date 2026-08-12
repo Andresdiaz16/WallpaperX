@@ -146,7 +146,7 @@ void StaticRenderer::loadAndUploadTexture(const std::string& imagePath) {
     // ftell/fseek around their work (stb_image.h:7701, :7722).
     FilePtr probe(std::fopen(imagePath.c_str(), "rb"));
     if (!probe) {
-        throw std::runtime_error(
+        throw WallpaperContentError(
             describeRejection(std::string("cannot open image (") + std::strerror(errno) + ")", imagePath));
     }
 
@@ -157,11 +157,11 @@ void StaticRenderer::loadAndUploadTexture(const std::string& imagePath) {
     const bool sixteenBit = headerRead && stbi_is_16_bit_from_file(probe.get()) != 0;
 
     if (!headerRead) {
-        throw std::runtime_error(
+        throw WallpaperContentError(
             describeRejection("not a decodable image (" + stbFailureReason() + ")", imagePath));
     }
     if (probeWidth <= 0 || probeHeight <= 0) {
-        throw std::runtime_error(describeRejection(
+        throw WallpaperContentError(describeRejection(
             "image reports non-positive dimensions (" + std::to_string(probeWidth) + "x" +
                 std::to_string(probeHeight) + ")",
             imagePath));
@@ -174,7 +174,7 @@ void StaticRenderer::loadAndUploadTexture(const std::string& imagePath) {
         static_cast<uint64_t>(probeWidth) * static_cast<uint64_t>(probeHeight) * 4;
     const uint64_t peakBytes = outputBytes * (sixteenBit ? kPeakFactor16Bit : kPeakFactor8Bit);
     if (peakBytes > kMaxPeakDecodeBytes) {
-        throw std::runtime_error(describeRejection(
+        throw WallpaperContentError(describeRejection(
             "estimated peak " + std::to_string(peakBytes / (1024 * 1024)) + " MiB to decode " +
                 std::to_string(probeWidth) + "x" + std::to_string(probeHeight) + " (" +
                 std::to_string(probeChannels) + " channels, " + (sixteenBit ? "16" : "8") +
@@ -188,14 +188,14 @@ void StaticRenderer::loadAndUploadTexture(const std::string& imagePath) {
     int channels = 0;
     PixelsPtr pixels(stbi_load_from_file(probe.get(), &imageWidth, &imageHeight, &channels, STBI_rgb_alpha));
     if (!pixels) {
-        throw std::runtime_error(
+        throw WallpaperContentError(
             describeRejection("failed to load image (" + stbFailureReason() + ")", imagePath));
     }
 
     // Guards stb's two parsers disagreeing with each other, not a swap -- the shared open
     // above rules that out.
     if (imageWidth != probeWidth || imageHeight != probeHeight) {
-        throw std::runtime_error(describeRejection(
+        throw WallpaperContentError(describeRejection(
             "decoded to " + std::to_string(imageWidth) + "x" + std::to_string(imageHeight) +
                 " but its header reported " + std::to_string(probeWidth) + "x" +
                 std::to_string(probeHeight) + " -- header and decoder disagree",

@@ -9,11 +9,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <fstream>
 #include <limits>
 #include <system_error>
 
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 namespace wallpaperx {
@@ -34,8 +34,26 @@ constexpr const char* kKeyMonitorId = "monitor_id";
 constexpr const char* kKeyType = "type";
 constexpr const char* kKeyPath = "path";
 
+// load() returns from a dozen places; this is what keeps the descriptor from leaking out
+// of any of them.
+class Fd {
+public:
+    explicit Fd(int fd) : m_fd(fd) {}
+    ~Fd() {
+        if (m_fd >= 0) ::close(m_fd);
+    }
+    Fd(const Fd&) = delete;
+    Fd& operator=(const Fd&) = delete;
+    int get() const { return m_fd; }
+
+private:
+    int m_fd;
+};
+
+// Raw: the only consumer records these into the health fields, which sanitize once. Escaping
+// here too would double every backslash in the path by the time anyone reads it.
 std::string describe(const std::filesystem::path& file, const std::string& what) {
-    return sanitizeForLog(file.string(), 4096, LogFraming::Bare) + ": " + what;
+    return file.string() + ": " + what;
 }
 
 // Reads a string field only if it is present AND actually a string.
@@ -100,43 +118,61 @@ LoadResult ConfigStore::load() const {
     // main()'s try -- anything escaping here stops the daemon booting because of a text
     // file, so the guarantee is structural rather than a matter of having checked.
     try {
-        std::error_code ec;
-        const std::filesystem::file_status status = std::filesystem::status(m_file, ec);
-        if (status.type() == std::filesystem::file_type::not_found) return result;
-        // "No config yet" and "could not tell" are different answers. Folding them
-        // together reported a healthy daemon that had silently restored nothing.
-        if (ec) {
-            result.error = describe(m_file, "could not be checked: " + ec.message());
+        // Opened once and inspected through the descriptor. Checking the path and then
+        // opening it are two lookups of a name anything can rebind in between, so a FIFO
+        // swapped in after a passing check used to be openable. O_NONBLOCK is what makes
+        // opening safe here: on a FIFO it returns immediately instead of awaiting a writer.
+        const Fd fd(::open(m_file.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC));
+        if (fd.get() < 0) {
+            if (errno == ENOENT) return result;
+            // "No config yet" and "could not tell" are different answers. Folding them
+            // together reported a healthy daemon that had silently restored nothing.
+            result.error = describe(m_file, std::string("could not be opened: ") + std::strerror(errno));
             return result;
         }
         result.fileExisted = true;
 
-        // Checked before opening, because opening is what hangs: a FIFO here blocks in
-        // open() until a writer appears, and this runs before the daemon can be signalled.
-        if (!std::filesystem::is_regular_file(status)) {
+        struct stat info {};
+        if (::fstat(fd.get(), &info) != 0) {
+            result.error = describe(m_file, std::string("could not be checked: ") + std::strerror(errno));
+            return result;
+        }
+        if (!S_ISREG(info.st_mode)) {
             result.error = describe(m_file, "is not a regular file");
             return result;
         }
-        // Past here the file is an ordinary one we could inspect, so every remaining
-        // failure is about its contents and it is safe to move aside.
-        result.preservable = true;
-        const std::uintmax_t size = std::filesystem::file_size(m_file, ec);
-        if (ec) {
-            result.error = describe(m_file, "could not be sized: " + ec.message());
-            return result;
-        }
+        const std::uintmax_t size = static_cast<std::uintmax_t>(info.st_size);
         if (size > kMaxBytes) {
+            // Unusable on a property of the file itself, so moving it aside is safe even
+            // though none of it was read.
+            result.preservable = true;
             result.error = describe(m_file, "is " + std::to_string(size) + " bytes, over the " +
                                                 std::to_string(kMaxBytes) + " byte limit");
             return result;
         }
 
-        std::ifstream in(m_file, std::ios::binary);
-        if (!in) {
-            result.error = describe(m_file, "could not be opened for reading");
-            return result;
+        // Read to a byte past the cap so a file that grew since the fstat is rejected
+        // rather than read unbounded.
+        std::string text;
+        char buffer[8192];
+        for (;;) {
+            const ssize_t n = ::read(fd.get(), buffer, sizeof(buffer));
+            if (n < 0 && errno == EINTR) continue;
+            if (n < 0) {
+                result.error = describe(m_file, std::string("could not be read: ") + std::strerror(errno));
+                return result;
+            }
+            if (n == 0) break;
+            text.append(buffer, static_cast<std::size_t>(n));
+            if (text.size() > kMaxBytes) {
+                result.preservable = true;
+                result.error = describe(m_file, "is over the " + std::to_string(kMaxBytes) + " byte limit");
+                return result;
+            }
         }
-        const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+
+        // Only here: every rejection past this point is a statement about bytes we hold.
+        result.preservable = true;
 
         // nlohmann's lexer treats NUL as end of input, so `{...}\0junk` parses clean and
         // the tail is silently dropped -- the file the daemon believes it read is then not

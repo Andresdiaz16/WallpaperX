@@ -5,14 +5,23 @@
 #include <sdbus-c++/sdbus-c++.h>
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <mutex>
 #include <thread>
 
 #include <pthread.h>
+
+namespace {
+// Far above a normal shutdown, measured in hundreds of milliseconds, so this only ever
+// fires for teardown that is genuinely stuck rather than merely slow.
+constexpr std::chrono::seconds kTeardownDeadline{5};
+}  // namespace
 
 int main() {
     // Blocked before any thread exists, since a thread inherits the mask of its creator
@@ -35,9 +44,8 @@ int main() {
         return 1;
     }
 
-    // Same reasoning, reachable since the config write: exceeding RLIMIT_FSIZE otherwise
-    // kills the daemon mid-SetWallpaper with a core dump and no message. Ignored, so the
-    // write fails with EFBIG and ConfigStore reports it.
+    // Same reasoning: exceeding RLIMIT_FSIZE would otherwise kill the daemon mid-write.
+    // Ignored, so the write fails with EFBIG and ConfigStore reports it.
     if (std::signal(SIGXFSZ, SIG_IGN) == SIG_ERR) {
         std::fprintf(stderr, "wallpaperx-daemon: fatal: could not ignore SIGXFSZ\n");
         return 1;
@@ -67,32 +75,41 @@ int main() {
         // enterEventLoop() THROWS when the connection drops, and a joinable thread
         // destroyed mid-unwind is std::terminate.
         //
-        // Started before anything that touches the filesystem, and that ordering is the
-        // point: shutdown signals are blocked at the top of main, so any work done before
-        // this thread exists is work during which the daemon cannot be stopped. Reading the
-        // config used to happen there, and a config that never answered -- a FIFO, a stalled
-        // mount -- left a process that ignored SIGTERM and SIGINT and needed SIGKILL.
+        // Started before anything that touches the filesystem: signals are blocked at the
+        // top of main, so work done before this thread exists cannot be stopped.
         //
-        // The flags distinguish the destructor's wake-up SIGTERM from a real one -- without
-        // it the daemon announced a signal nobody sent on the throw path -- and record a
-        // signal that arrived before the loop began, which would otherwise be a shutdown
-        // request delivered to a loop that had nothing to leave. Declared before the guard
-        // so they outlive it.
+        // wakingForShutdown separates the destructor's wake-up SIGTERM from a real one;
+        // shutdownRequested records a signal that arrived before the loop began. Declared
+        // before the guard so they outlive it.
         std::atomic<bool> wakingForShutdown{false};
         std::atomic<bool> shutdownRequested{false};
+
+        // Reached only if teardown gets past the part that can block forever -- a wallpaper
+        // or config file on a stalled mount, which no thread can be interrupted out of.
+        struct Teardown {
+            std::mutex mutex;
+            std::condition_variable done;
+            bool finished = false;
+        } teardown;
 
         struct ShutdownWatch {
             std::thread thread;
             std::atomic<bool>& wakingForShutdown;
+            Teardown& teardown;
             ~ShutdownWatch() {
                 if (!thread.joinable()) return;
+                {
+                    std::lock_guard<std::mutex> lock(teardown.mutex);
+                    teardown.finished = true;
+                }
+                teardown.done.notify_all();
                 // Set BEFORE the signal, or the watcher wakes, reads false, and prints.
                 wakingForShutdown.store(true, std::memory_order_release);
                 pthread_kill(thread.native_handle(), SIGTERM);
                 thread.join();
             }
         } shutdownWatch{std::thread([&connection, &shutdownSignals, &wakingForShutdown,
-                                     &shutdownRequested] {
+                                     &shutdownRequested, &teardown] {
             int received = 0;
             if (sigwait(&shutdownSignals, &received) != 0) return;
             // Skips leaveEventLoop() too: on the throw path the connection is what failed.
@@ -101,16 +118,33 @@ int main() {
             std::fflush(stdout);
             shutdownRequested.store(true, std::memory_order_release);
             connection->leaveEventLoop();
-        }), wakingForShutdown};
 
-        // The device is created on the first render, not here -- so a machine with a broken
-        // GPU stack still comes up and answers GetStatus. That first render is now
-        // restoreSaved() below rather than a client's SetWallpaper whenever a config exists.
-        //
-        // Constructed here, after the watcher: this reads the config file, and a signal
-        // arriving during that read must be able to stop the daemon.
+            // This thread is the only one that cannot be stuck -- it waits for signals and
+            // nothing else -- so it is where the deadline belongs. Any other thread blocked
+            // in an uninterruptible filesystem call would otherwise hold the process open
+            // against a stop it already acknowledged.
+            std::unique_lock<std::mutex> lock(teardown.mutex);
+            if (teardown.done.wait_for(lock, kTeardownDeadline,
+                                       [&teardown] { return teardown.finished; })) {
+                return;
+            }
+            std::printf("wallpaperx-daemon: shutdown blocked for %llds, exiting now\n",
+                        static_cast<long long>(kTeardownDeadline.count()));
+            // Nothing left to unwind that matters: wallpaper choices are written when they
+            // are set, and the kernel reclaims the rest.
+            std::fflush(nullptr);
+            std::_Exit(0);
+        }), wakingForShutdown, teardown};
+
+        // Constructed after the watcher: this reads the config file, and a signal arriving
+        // during that read must be able to stop the daemon.
         wallpaperx::WallpaperManager manager(config);
         wallpaperx::DbusService service(*connection, manager);
+
+        // Before the banner, which a supervisor may treat as readiness: this is what fills
+        // the monitor map. Skipped after a stop -- it starts the first render, and that is
+        // GPU work for a process already leaving.
+        if (!shutdownRequested.load(std::memory_order_acquire)) service.restoreSaved();
 
         std::printf("wallpaperx-daemon: serving %s at %s\n", wallpaperx::DbusService::kBusName,
                     wallpaperx::DbusService::kObjectPath);
@@ -120,14 +154,9 @@ int main() {
         // manager.snapshot(), so HTTP has to stop before anything it reads is torn down.
         wallpaperx::HttpServer httpServer(manager);
 
-        service.restoreSaved();
-
         // A signal delivered while the work above ran calls leaveEventLoop() on a loop that
-        // has not started. sdbus-c++ was measured to latch that -- 40 of 40 shutdowns during
-        // startup exited cleanly with this check removed -- so this guards against a
-        // behaviour that is relied on rather than documented. Without the latch, entering
-        // here would be a daemon holding the bus name and ignoring a shutdown it was already
-        // told about.
+        // has not started. sdbus-c++ appears to latch that, but it is not documented, so
+        // this does not rely on it.
         if (!shutdownRequested.load(std::memory_order_acquire)) {
             connection->enterEventLoop();  // returns once leaveEventLoop() is called
         }
@@ -141,5 +170,13 @@ int main() {
     }
 
     std::printf("wallpaperx-daemon: stopped cleanly\n");
+
+    // An abandoned config read left a thread blocked in the kernel; if it wakes during
+    // static destruction it runs library code already being torn down. Everything with
+    // observable effects is destroyed by here.
+    if (wallpaperx::configLoadAbandoned()) {
+        std::fflush(nullptr);
+        std::_Exit(0);
+    }
     return 0;
 }

@@ -20,6 +20,14 @@ struct GpuFailure : std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
+// A rejection of the thing being rendered -- unreadable, undecodable, or too large an image.
+// The user can fix it and the daemon cannot, so it must not mark the daemon unhealthy. It is
+// named rather than inferred because the alternative default -- treat anything unrecognised
+// as the wallpaper's fault -- reports a healthy daemon showing nothing.
+struct WallpaperContentError : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
 struct DeviceInfo {
     std::string gpuName;
     GpuVendor vendor = GpuVendor::Other;
