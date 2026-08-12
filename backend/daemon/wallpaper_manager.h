@@ -8,11 +8,14 @@
 #include <filesystem>
 #include <map>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace wallpaperx {
@@ -56,6 +59,34 @@ struct MonitorStatus {
     // "the daemon owes an answer" from "this monitor has no picture" -- the second is also
     // true of a monitor whose render was superseded, which nobody is waiting on.
     bool renderOutstanding = false;
+};
+
+// The config writer's thread and everything it touches. Held by shared_ptr and deliberately
+// free of any reference back to the manager: a write on a stalled mount cannot be
+// interrupted, so the thread has to be abandonable, and abandoning one that could reach the
+// manager would be a use-after-free waiting for the mount to recover.
+struct PersistWorker {
+    std::mutex mutex;
+
+    // wake: the worker waiting for something to write. settled: whoever queued it waiting
+    // for the write to land, which is what keeps a healthy save synchronous.
+    std::condition_variable wake;
+    std::condition_variable settled;
+
+    // Set when a wait ran out, cleared when the filesystem answers again. Stops every later
+    // save paying the same deadline for an answer this one already has.
+    bool stalled = false;
+
+    // One slot, not a queue: bus handlers run one at a time, so the newest snapshot already
+    // describes everything the older ones would have written.
+    std::optional<std::vector<PersistedWallpaper>> pending;
+
+    // Set when a snapshot is handed over, cleared when the write returns. A value that stays
+    // put is what tells the health report the filesystem has stopped answering.
+    std::optional<std::chrono::steady_clock::time_point> writingSince;
+
+    bool haveResult = false;
+    SaveResult result;
 };
 
 // True once a config read has been abandoned mid-call. That thread is still blocked in the
@@ -367,6 +398,13 @@ private:
     // had nowhere to go, and nowhere to go meant it was destroyed.
     std::string preserveConfigTo(bool move, std::string& why) const;
 
+    // Spawns the config writer on first use.
+    void startPersistWorker();
+
+    // Folds the writer's latest outcome into a health copy. Caller must hold m_stateMutex.
+    // Not recorded into m_health, because the writer cannot touch this object at all.
+    void applyPersistOutcomeLocked(DaemonHealth& health) const;
+
     const Config m_config;
     const ConfigStore m_store;
 
@@ -384,6 +422,10 @@ private:
     // Raw, unsanitized; sanitized once when recorded. Written by the constructor, read
     // under m_stateMutex afterwards.
     std::string m_persistenceNote;
+
+    // Started on the first save rather than at construction, so a daemon that never sets a
+    // wallpaper never spawns it. Detached, never joined: see PersistWorker.
+    std::shared_ptr<PersistWorker> m_persist;
 
     // Entries no build can apply, dropped rather than kept. Counted so the loss is
     // reported: unlike a kept entry, nothing else would ever mention it. Guarded by

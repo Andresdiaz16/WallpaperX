@@ -453,12 +453,95 @@ void WallpaperManager::persist(const std::vector<PersistedWallpaper>& entries) {
         return;
     }
 
-    const SaveResult saved = m_store.save(entries);
+    startPersistWorker();
 
-    std::lock_guard<std::mutex> stateLock(m_stateMutex);
+    std::unique_lock<std::mutex> workerLock(m_persist->mutex);
+    // Replaced, not appended: an older snapshot waiting behind a stalled write describes a
+    // state this one already supersedes, so writing it would only be a slower route to the
+    // same file.
+    m_persist->pending = entries;
+    m_persist->wake.notify_one();
+
+    // Waited on, briefly. A healthy write takes microseconds, and callers -- including the
+    // reply to SetWallpaper -- are entitled to assume the choice is on disk when it returns.
+    // The deadline is the whole point: past it the write keeps going on the worker and this
+    // thread stops caring, so a stalled filesystem costs one wait rather than the daemon.
+    if (m_persist->stalled) return;
+    const auto quiesced = [this] { return !m_persist->pending && !m_persist->writingSince; };
+    if (!m_persist->settled.wait_for(workerLock, kLoadDeadline, quiesced)) {
+        // Not waited on again until something completes: a second stalled call would add
+        // another deadline's delay to a bus thread that has already learned the answer.
+        m_persist->stalled = true;
+    }
+}
+
+void WallpaperManager::startPersistWorker() {
+    if (m_persist) return;
+    m_persist = std::make_shared<PersistWorker>();
+
+    // The store is copied in and nothing else is captured: this thread outlives the manager
+    // whenever a write is stuck, and a write on a dead mount cannot be interrupted.
+    std::thread([worker = m_persist, store = m_store] {
+        for (;;) {
+            std::vector<PersistedWallpaper> entries;
+            {
+                std::unique_lock<std::mutex> lock(worker->mutex);
+                // No stop condition: there is nothing safe to wait for at exit, since a
+                // write on a dead mount cannot be interrupted. The thread ends with the
+                // process, and holds nothing the process needs to release.
+                worker->wake.wait(lock, [&worker] { return worker->pending.has_value(); });
+                entries = std::move(*worker->pending);
+                worker->pending.reset();
+                worker->writingSince = std::chrono::steady_clock::now();
+            }
+
+            const SaveResult saved = store.save(entries);
+
+            {
+                std::lock_guard<std::mutex> lock(worker->mutex);
+                worker->result = saved;
+                worker->haveResult = true;
+                worker->writingSince.reset();
+                // The filesystem answered, so the next caller is allowed to wait again.
+                worker->stalled = false;
+            }
+            worker->settled.notify_all();
+        }
+    }).detach();
+}
+
+void WallpaperManager::applyPersistOutcomeLocked(DaemonHealth& health) const {
+    if (!m_persist) return;
+
+    SaveResult saved;
+    bool haveResult = false;
+    std::optional<std::chrono::steady_clock::time_point> writingSince;
+    {
+        std::lock_guard<std::mutex> workerLock(m_persist->mutex);
+        haveResult = m_persist->haveResult;
+        saved = m_persist->result;
+        writingSince = m_persist->writingSince;
+    }
+
+    // Written into the caller's copy rather than recorded: the write finishes on a thread
+    // that must never reach this object, so the outcome is folded in when someone asks.
+    const auto report = [&health](HealthStatus status, const std::string& detail) {
+        health.persistence.status = status;
+        health.persistence.detail = sanitizeForLog(detail, 1024, LogFraming::Bare);
+    };
+
+    // A write that has not come back is the only symptom a stalled config filesystem has
+    // left: the bus thread no longer waits on it, so nothing else would look slow.
+    if (writingSince && std::chrono::steady_clock::now() - *writingSince > kLoadDeadline) {
+        report(HealthStatus::Fail,
+               persistenceDetail(m_store.file().string() +
+                                 ": has not answered a write, the filesystem may be stalled"));
+        return;
+    }
+    if (!haveResult) return;
+
     if (!saved.error.empty()) {
-        recordHealthLocked(&DaemonHealth::persistence, HealthStatus::Fail,
-                           persistenceDetail(saved.error));
+        report(HealthStatus::Fail, persistenceDetail(saved.error));
         return;
     }
 
@@ -469,9 +552,7 @@ void WallpaperManager::persist(const std::vector<PersistedWallpaper>& entries) {
     }
     // Fail, not Ok: the write succeeded but those monitors will not come back, and a
     // health field that reads ok is the only thing that would say otherwise.
-    recordHealthLocked(&DaemonHealth::persistence,
-                       saved.skippedNonUtf8 > 0 ? HealthStatus::Fail : HealthStatus::Ok,
-                       persistenceDetail(base));
+    report(saved.skippedNonUtf8 > 0 ? HealthStatus::Fail : HealthStatus::Ok, persistenceDetail(base));
 }
 
 std::vector<int> WallpaperManager::restoreSaved() {
@@ -762,6 +843,7 @@ WallpaperManager::Snapshot WallpaperManager::snapshot() const {
     Snapshot out;
     out.gpu = m_gpuStatus;
     out.health = m_health;
+    applyPersistOutcomeLocked(out.health);
     for (const auto& [monitorId, state] : m_monitors) {
         MonitorStatus entry;
         entry.type = state.type;
