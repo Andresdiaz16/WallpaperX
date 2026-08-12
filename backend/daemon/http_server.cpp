@@ -220,8 +220,7 @@ void HttpServer::registerRoutes() {
 
         // Split the same four ways GetFrameFd's NoFrameReason splits, so the two channels
         // cannot disagree about whether a monitor has a picture on it.
-        std::size_t failed = 0, unsupported = 0, inFlight = 0, showing = 0, daemonFaults = 0,
-                    outstanding = 0;
+        std::size_t failed = 0, unsupported = 0, showing = 0, daemonFaults = 0, outstanding = 0;
         std::string firstFailure, firstUnsupported, firstDaemonFault;
 
         // Per monitor as well as counted: the aggregate says a wallpaper is missing, this
@@ -246,7 +245,11 @@ void HttpServer::registerRoutes() {
                 ++showing;
                 perMonitor[key] = {{"state", "showing"}, {"detail", ""}};
             } else {
-                ++inFlight;
+                // Every monitor reaching here has an outstanding render: no frame is only
+                // ever set alongside a bumped request counter, and every path that marks a
+                // request serviced leaves an error, a frame, or an unsupported type. Kept as
+                // a count rather than a bool because a fourth render outcome -- one that
+                // finishes with neither frame nor error -- would make the two differ again.
                 if (monitor.renderOutstanding) ++outstanding;
                 perMonitor[key] = {{"state", "rendering"}, {"detail", ""}};
             }
@@ -294,13 +297,6 @@ void HttpServer::registerRoutes() {
                                 std::to_string(snap.monitors.size()) +
                                 " monitors failed or cannot be rendered: " +
                                 (failed > 0 ? firstFailure : firstUnsupported);
-        } else if (inFlight > 0) {
-            // No frame, but no pass is owed either -- a superseded render, or a target that
-            // was released. Ok rather than Pending: nothing is unfinished, these monitors
-            // simply have no picture, and the per-monitor breakdown names them.
-            wallpapers.status = HealthStatus::Ok;
-            wallpapers.detail = std::to_string(inFlight) + " of " + std::to_string(snap.monitors.size()) +
-                                " monitors have not rendered yet";
         } else {
             wallpapers.status = HealthStatus::Ok;
             wallpapers.detail = std::to_string(showing) + " monitor(s) showing a frame";
