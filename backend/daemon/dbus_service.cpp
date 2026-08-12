@@ -206,7 +206,10 @@ std::string DbusService::getStatus() {
     const GpuStatus& gpu = snap.gpu;
     nlohmann::json gpuJson{{"initialized", gpu.initialized}};
     if (gpu.initialized) {
-        gpuJson["name"] = gpu.name;
+        // Escaped like every other string that came from outside this process. The driver
+        // is a likelier source of an odd byte than of an attack, but a client should not
+        // have to know which published strings are safe and which are not.
+        gpuJson["name"] = sanitizeForLog(gpu.name, 1024, LogFraming::Bare);
         // Which descriptor tier a machine resolved to is the first thing worth knowing
         // when a bug reproduces on one GPU and not another.
         gpuJson["descriptor_tier"] = gpu.descriptorTier;
