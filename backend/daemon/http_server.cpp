@@ -220,7 +220,8 @@ void HttpServer::registerRoutes() {
 
         // Split the same four ways GetFrameFd's NoFrameReason splits, so the two channels
         // cannot disagree about whether a monitor has a picture on it.
-        std::size_t failed = 0, unsupported = 0, inFlight = 0, showing = 0, daemonFaults = 0;
+        std::size_t failed = 0, unsupported = 0, inFlight = 0, showing = 0, daemonFaults = 0,
+                    outstanding = 0;
         std::string firstFailure, firstUnsupported, firstDaemonFault;
 
         // Per monitor as well as counted: the aggregate says a wallpaper is missing, this
@@ -246,9 +247,18 @@ void HttpServer::registerRoutes() {
                 perMonitor[key] = {{"state", "showing"}, {"detail", ""}};
             } else {
                 ++inFlight;
+                if (monitor.renderOutstanding) ++outstanding;
                 perMonitor[key] = {{"state", "rendering"}, {"detail", ""}};
             }
         }
+
+        // Carried into the in-flight branch so a wedged render does not silence a failure
+        // the same daemon is also reporting.
+        const std::string failureNote =
+            (failed > 0 || unsupported > 0)
+                ? "; " + std::to_string(failed + unsupported) + " failed or cannot be rendered: " +
+                      (failed > 0 ? firstFailure : firstUnsupported)
+                : std::string();
 
         HealthCheck wallpapers;
         if (snap.monitors.empty()) {
@@ -265,6 +275,16 @@ void HttpServer::registerRoutes() {
             wallpapers.detail = std::to_string(daemonFaults) + " of " +
                                 std::to_string(snap.monitors.size()) +
                                 " monitors failed inside the daemon: " + firstDaemonFault;
+        } else if (outstanding > 0) {
+            // Ahead of the failure branch, not after it: ordering this second meant one
+            // monitor with a bad image hid a render that never finished on every other
+            // monitor. Keyed on an accepted request no pass has run for, not on "has no
+            // frame" -- the second is also true of a monitor nobody is waiting on, and
+            // promoting that would make an idle daemon report itself unfinished.
+            wallpapers.status = HealthStatus::Pending;
+            wallpapers.detail = std::to_string(outstanding) + " of " +
+                                std::to_string(snap.monitors.size()) +
+                                " monitors have not finished rendering" + failureNote;
         } else if (failed > 0 || unsupported > 0) {
             // Ok, not Fail: a deleted file or a type this build cannot draw is that
             // wallpaper's problem, not the daemon's, and the daemon cannot fix either. The
@@ -275,10 +295,10 @@ void HttpServer::registerRoutes() {
                                 " monitors failed or cannot be rendered: " +
                                 (failed > 0 ? firstFailure : firstUnsupported);
         } else if (inFlight > 0) {
-            // The one Pending that means "started and not finished" rather than "not needed
-            // yet". Stated rather than left to the default, because the aggregate below
-            // reads it.
-            wallpapers.status = HealthStatus::Pending;
+            // No frame, but no pass is owed either -- a superseded render, or a target that
+            // was released. Ok rather than Pending: nothing is unfinished, these monitors
+            // simply have no picture, and the per-monitor breakdown names them.
+            wallpapers.status = HealthStatus::Ok;
             wallpapers.detail = std::to_string(inFlight) + " of " + std::to_string(snap.monitors.size()) +
                                 " monitors have not rendered yet";
         } else {

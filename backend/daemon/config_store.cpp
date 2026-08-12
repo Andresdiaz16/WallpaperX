@@ -46,6 +46,14 @@ public:
     Fd& operator=(const Fd&) = delete;
     int get() const { return m_fd; }
 
+    // For the one close that must be checked rather than silent: a full disk surfaces
+    // there, not at write().
+    int release() {
+        const int fd = m_fd;
+        m_fd = -1;
+        return fd;
+    }
+
 private:
     int m_fd;
 };
@@ -265,14 +273,16 @@ SaveResult ConfigStore::save(const std::vector<PersistedWallpaper>& entries) con
                 describe(temp, std::string("could not be opened for writing: ") + std::strerror(errno));
             return result;
         }
+        // Owned from here so the error returns below, and anything that throws between
+        // here and the close, cannot leak it.
+        Fd out(fd);
 
         size_t written = 0;
         while (written < text.size()) {
-            const ssize_t n = ::write(fd, text.data() + written, text.size() - written);
+            const ssize_t n = ::write(out.get(), text.data() + written, text.size() - written);
             if (n < 0 && errno == EINTR) continue;
             if (n <= 0) {
                 const std::string why = n < 0 ? std::strerror(errno) : "short write";
-                ::close(fd);
                 ::unlink(temp.c_str());
                 result.error = describe(temp, "could not be written: " + why);
                 return result;
@@ -281,7 +291,7 @@ SaveResult ConfigStore::save(const std::vector<PersistedWallpaper>& entries) con
         }
 
         // Checked, not just called: a full disk surfaces here rather than at write().
-        if (::close(fd) != 0) {
+        if (::close(out.release()) != 0) {
             const std::string why = std::strerror(errno);
             ::unlink(temp.c_str());
             result.error = describe(temp, "could not be written: " + why);

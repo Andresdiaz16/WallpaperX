@@ -90,62 +90,27 @@ WallpaperManager::WallpaperManager(Config config)
         return;
     }
 
+    // Read-only. Everything that writes to the config directory is deferred to
+    // preserveUnreadableConfig(), which main() calls once this process owns the bus name --
+    // a second instance must not move the running daemon's config before it finds out it
+    // has no right to run.
     const LoadResult loaded = loadWithDeadline();
     m_restore = loaded.entries;
+    m_loadPreservable = loaded.preservable;
+    m_loadMalformed = loaded.malformedEntries;
+    m_loadError = loaded.error;
 
     // Raw, not sanitized: recordHealthLocked is the single sanitizer, and escaping twice
     // turns one backslash in a path into two in what the user reads.
     if (loaded.malformedEntries > 0) {
         addPersistenceNote(std::to_string(loaded.malformedEntries) + " malformed entries ignored");
-        // Copied, not moved: the entries this build did understand are being restored from
-        // this same file. Rejected ones never become entries at all, so the keep-for-a-newer-
-        // build path cannot see them and the first save would drop them for good.
-        if (loaded.preservable) {
-            const std::filesystem::path kept = m_store.file().string() + ".bad";
-            std::error_code ec;
-            std::filesystem::copy_file(m_store.file(), kept, ec);
-            addPersistenceNote(ec ? "not copied: " + ec.message() : "copied to " + kept.string());
-        }
     }
 
     if (!loaded.error.empty()) {
-        // Two outcomes, and the file decides which. Moved aside, the path is clear and
-        // saving works normally. Still there, saving stays off for the run -- overwriting
-        // it would destroy the user's only copy of every other monitor.
+        // Set before any preservation is attempted, and cleared only if the file is
+        // actually moved aside: until then, overwriting it would destroy the user's only
+        // copy of every other monitor.
         m_configUnread = true;
-        if (loaded.preservable) {
-            std::string keptName;
-            std::string why;
-            for (int n = 0; n < kMaxPreservedCopies && keptName.empty(); ++n) {
-                const std::filesystem::path kept = m_store.file().string() + ".bad" +
-                                                   (n == 0 ? "" : "." + std::to_string(n));
-                std::error_code ec;
-                // Never over an existing copy: it holds an earlier broken config, and this
-                // one would replace it with whatever was written since.
-                if (std::filesystem::exists(kept, ec)) continue;
-                if (ec) {
-                    why = ec.message();
-                    continue;
-                }
-                std::filesystem::rename(m_store.file(), kept, ec);
-                if (ec) {
-                    why = ec.message();
-                    continue;
-                }
-                keptName = kept.string();
-            }
-            if (!keptName.empty()) {
-                m_configUnread = false;
-                addPersistenceNote("kept as " + keptName);
-            } else {
-                addPersistenceNote(why.empty() ? "not kept, no free name" : "not kept: " + why);
-            }
-        }
-        // Every path reports. Saying the config could not be read while staying silent about
-        // whether a copy survived sends the user looking for a file that is not there. The
-        // note outlives this call: a later save would otherwise overwrite the only pointer
-        // to the copy that was made.
-        if (m_configUnread) addPersistenceNote("not saving over it");
         recordHealth(&DaemonHealth::persistence, HealthStatus::Fail,
                      persistenceDetail(loaded.error));
         return;
@@ -153,6 +118,65 @@ WallpaperManager::WallpaperManager(Config config)
 
     recordHealth(&DaemonHealth::persistence, HealthStatus::Ok,
                  persistenceDetail(m_store.file().string()));
+}
+
+std::string WallpaperManager::preserveConfigTo(bool move, std::string& why) const {
+    for (int n = 0; n < kMaxPreservedCopies; ++n) {
+        const std::filesystem::path kept =
+            m_store.file().string() + ".bad" + (n == 0 ? "" : "." + std::to_string(n));
+        std::error_code ec;
+        // Never over an existing copy: it holds an earlier broken config, and this one
+        // would replace it with whatever was written since.
+        if (std::filesystem::exists(kept, ec)) continue;
+        if (ec) {
+            why = ec.message();
+            continue;
+        }
+        if (move) {
+            std::filesystem::rename(m_store.file(), kept, ec);
+        } else {
+            std::filesystem::copy_file(m_store.file(), kept, ec);
+        }
+        if (ec) {
+            why = ec.message();
+            continue;
+        }
+        return kept.string();
+    }
+    if (why.empty()) why = "no free name";
+    return {};
+}
+
+void WallpaperManager::preserveUnreadableConfig() {
+    if (!m_store.enabled()) return;
+
+    std::string why;
+    if (m_loadError.empty()) {
+        // Copied, not moved: the entries this build did understand are being restored from
+        // this same file. Rejected ones never become entries at all, so the keep-for-a-newer-
+        // build path cannot see them and the first save would drop them for good.
+        if (m_loadMalformed > 0 && m_loadPreservable) {
+            const std::string copied = preserveConfigTo(/*move=*/false, why);
+            addPersistenceNote(copied.empty() ? "not copied: " + why : "copied to " + copied);
+            recordHealth(&DaemonHealth::persistence, HealthStatus::Ok,
+                         persistenceDetail(m_store.file().string()));
+        }
+        return;
+    }
+
+    if (m_loadPreservable) {
+        const std::string kept = preserveConfigTo(/*move=*/true, why);
+        if (kept.empty()) {
+            addPersistenceNote("not kept: " + why);
+        } else {
+            m_configUnread = false;
+            addPersistenceNote("kept as " + kept);
+        }
+    }
+    // Every path reports. Saying the config could not be read while staying silent about
+    // whether a copy survived sends the user looking for a file that is not there.
+    if (m_configUnread) addPersistenceNote("not saving over it");
+    recordHealth(&DaemonHealth::persistence, HealthStatus::Fail, persistenceDetail(m_loadError));
 }
 
 void WallpaperManager::addPersistenceNote(const std::string& note) {
@@ -167,6 +191,11 @@ std::string WallpaperManager::persistenceDetail(const std::string& base) const {
     if (!m_persistenceNote.empty()) detail = m_persistenceNote + "; ";
     if (!m_unapplied.empty()) {
         detail += std::to_string(m_unapplied.size()) + " entries this build cannot apply, kept; ";
+    }
+    // Reported for the same reason the kept ones are: a wallpaper that did not come back is
+    // otherwise invisible, and these are the ones no restart will bring back.
+    if (m_droppedEntries > 0) {
+        detail += std::to_string(m_droppedEntries) + " entries dropped, no build can apply them; ";
     }
     return detail + base;
 }
@@ -456,7 +485,10 @@ std::vector<int> WallpaperManager::restoreSaved() {
         // claiming its id, and a negative id can never be one -- so keeping it means
         // carrying it through every save for the life of the install. An id above this
         // build's limit is different and stays below: a larger kMaxMonitors would take it.
-        if (entry.monitorId < 0) continue;
+        if (entry.monitorId < 0) {
+            ++m_droppedEntries;
+            continue;
+        }
 
         // The manager's own rules, not the store's: a type this build has never heard of,
         // or an id a larger kMaxMonitors would admit, is not rendered here -- but it is
@@ -479,7 +511,8 @@ std::vector<int> WallpaperManager::restoreSaved() {
     // malformed, so nothing would tell the user those wallpapers did not come back.
     // Recomposed from the raw path rather than appended to the recorded detail, which is
     // already sanitized and would be escaped a second time.
-    if (!m_unapplied.empty() && m_health.persistence.status == HealthStatus::Ok) {
+    if ((!m_unapplied.empty() || m_droppedEntries > 0) &&
+        m_health.persistence.status == HealthStatus::Ok) {
         recordHealthLocked(&DaemonHealth::persistence, HealthStatus::Ok,
                            persistenceDetail(m_store.file().string()));
     }
@@ -737,6 +770,7 @@ WallpaperManager::Snapshot WallpaperManager::snapshot() const {
         entry.hasFrame = state.hasFrame;
         entry.lastError = state.lastError;
         entry.lastErrorIsDaemonFault = state.lastErrorIsDaemonFault;
+        entry.renderOutstanding = state.requestSeq != state.servicedSeq;
         if (state.hasFrame) {
             entry.width = state.width;
             entry.height = state.height;

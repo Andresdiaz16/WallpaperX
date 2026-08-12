@@ -51,6 +51,11 @@ struct MonitorStatus {
     // unreadable or undecodable. Only the daemon's own failures make /health report a
     // broken daemon; a file the user can replace does not.
     bool lastErrorIsDaemonFault = false;
+
+    // A render has been accepted and no pass has run for it yet. This is what separates
+    // "the daemon owes an answer" from "this monitor has no picture" -- the second is also
+    // true of a monitor whose render was superseded, which nobody is waiting on.
+    bool renderOutstanding = false;
 };
 
 // True once a config read has been abandoned mid-call. That thread is still blocked in the
@@ -229,6 +234,13 @@ public:
     // here is dropped from the file by the next save.
     std::vector<int> restoreSaved();
 
+    // Moves an unreadable config aside, or copies one whose entries were partly rejected,
+    // and updates the persistence health with the outcome. Separate from the constructor
+    // because it writes to the user's config directory: a duplicate instance would
+    // otherwise move the running daemon's config before finding out it cannot run. Call
+    // once, after the bus name is held. Until it runs, saving stays refused.
+    void preserveUnreadableConfig();
+
     // Renders whatever request the monitor currently holds. Called on the render
     // worker's thread; never on the DBus thread.
     //
@@ -350,6 +362,11 @@ private:
     void addPersistenceNote(const std::string& note);
     std::string persistenceDetail(const std::string& base) const;
 
+    // Moves or copies the config to the first free <file>.bad[.N]. Returns the name used,
+    // or empty with `why` set. Numbered because one name meant the second unreadable config
+    // had nowhere to go, and nowhere to go meant it was destroyed.
+    std::string preserveConfigTo(bool move, std::string& why) const;
+
     const Config m_config;
     const ConfigStore m_store;
 
@@ -367,6 +384,16 @@ private:
     // Raw, unsanitized; sanitized once when recorded. Written by the constructor, read
     // under m_stateMutex afterwards.
     std::string m_persistenceNote;
+
+    // Entries no build can apply, dropped rather than kept. Counted so the loss is
+    // reported: unlike a kept entry, nothing else would ever mention it. Guarded by
+    // m_stateMutex.
+    int m_droppedEntries = 0;
+
+    // What the load found, held for preserveUnreadableConfig() to act on later.
+    bool m_loadPreservable = false;
+    int m_loadMalformed = 0;
+    std::string m_loadError;
 
     // Order matters: m_gpuMutex may be taken before m_stateMutex, never the reverse.
     mutable std::mutex m_gpuMutex;

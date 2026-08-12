@@ -16,10 +16,13 @@
 #include <thread>
 
 #include <pthread.h>
+#include <unistd.h>
 
 namespace {
-// Far above a normal shutdown, measured in hundreds of milliseconds, so this only ever
-// fires for teardown that is genuinely stuck rather than merely slow.
+// Budgets the whole stop, from the signal arriving to the process being gone -- not just
+// the teardown, so work still running when the signal lands spends it too. Far above a
+// normal shutdown, measured in hundreds of milliseconds, so it only fires for a stop that
+// is genuinely stuck rather than merely slow.
 constexpr std::chrono::seconds kTeardownDeadline{5};
 }  // namespace
 
@@ -97,6 +100,11 @@ int main() {
             Teardown& teardown;
             ~ShutdownWatch() {
                 if (!thread.joinable()) return;
+                // Releasing the watchdog leaves the rest of teardown -- the bus connection,
+                // then static destruction -- with nothing bounding it. SIGALRM's default
+                // action ends the process, and it is not among the signals main() blocks,
+                // so this covers the tail. A process that exits first never sees it.
+                ::alarm(static_cast<unsigned>(kTeardownDeadline.count()));
                 {
                     std::lock_guard<std::mutex> lock(teardown.mutex);
                     teardown.finished = true;
@@ -127,12 +135,17 @@ int main() {
                                        [&teardown] { return teardown.finished; })) {
                 return;
             }
-            std::printf("wallpaperx-daemon: shutdown blocked for %llds, exiting now\n",
-                        static_cast<long long>(kTeardownDeadline.count()));
-            // Nothing left to unwind that matters: wallpaper choices are written when they
-            // are set, and the kernel reclaims the rest.
-            std::fflush(nullptr);
-            std::_Exit(0);
+            // write(2) on the descriptor, not printf + fflush(nullptr): flushing every
+            // stream takes every stream's lock, and the thread this is escaping from may
+            // hold one. A last resort that can block on what it is escaping is not one.
+            static constexpr char kBlocked[] =
+                "wallpaperx-daemon: shutdown blocked, exiting now\n";
+            ssize_t ignored = ::write(STDERR_FILENO, kBlocked, sizeof(kBlocked) - 1);
+            (void)ignored;
+            // Nonzero: teardown was abandoned, and a supervisor reading only the status
+            // should not be told this was a clean stop. Wallpaper choices are written when
+            // they are set, so nothing durable is lost.
+            std::_Exit(1);
         }), wakingForShutdown, teardown};
 
         // Constructed after the watcher: this reads the config file, and a signal arriving
@@ -147,9 +160,17 @@ int main() {
         // Claimed last, so the name appearing on the bus means the daemon can actually
         // answer: the object is registered and the saved wallpapers are back. Claiming it
         // first published a daemon that was still reading its config and would answer
-        // UnknownObject. Throws if another instance owns it -- later than before, which
-        // costs a duplicate instance the startup work it was going to discard anyway.
-        connection->requestName(sdbus::ServiceName{wallpaperx::DbusService::kBusName});
+        // UnknownObject. Throws if another instance owns it, which is why nothing above
+        // this line may write to the config directory.
+        //
+        // Skipped after a stop, or a daemon on its way out would take the well-known name
+        // for the moment it has left and drop it again.
+        if (!shutdownRequested.load(std::memory_order_acquire)) {
+            connection->requestName(sdbus::ServiceName{wallpaperx::DbusService::kBusName});
+            // Only now: this moves the user's config aside, and until the name is held
+            // this process does not know it is the daemon.
+            manager.preserveUnreadableConfig();
+        }
 
         std::printf("wallpaperx-daemon: serving %s at %s\n", wallpaperx::DbusService::kBusName,
                     wallpaperx::DbusService::kObjectPath);
@@ -179,6 +200,12 @@ int main() {
         // watcher, and the connection it holds last.
     } catch (const std::exception& e) {
         std::fprintf(stderr, "wallpaperx-daemon: fatal: %s\n", e.what());
+        // The same hazard as the clean path below, and more likely here: a start that
+        // failed is a start whose config read may still be outstanding.
+        if (wallpaperx::configLoadAbandoned()) {
+            std::fflush(nullptr);
+            std::_Exit(1);
+        }
         return 1;
     }
 
