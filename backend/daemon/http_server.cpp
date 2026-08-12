@@ -35,10 +35,16 @@ constexpr const char* kContentTypeJson = "application/json";
 // by declaring a large one.
 constexpr size_t kMaxPayloadBytes = 8 * 1024;
 
-// Bounds a poller that stops reading mid-response. Generous for loopback.
-// Per-read, not per-request: every byte received restarts it, so this bounds a silent
-// client and not a slow one.
-constexpr time_t kIoTimeoutSeconds = 5;
+// Bounds a poller that stops reading mid-response. Per-read, not per-request: every byte
+// received restarts it, so it bounds a silent client and not a slow one.
+//
+// Also bounds how long shutdown takes. Server::stop() closes the listening socket and
+// nothing else, so an accepted connection that goes quiet holds the serving thread this
+// long and the destructor joins it -- letting a status client decide when the daemon may
+// finish closing. Sub-second because the traffic is loopback, GET-only and 8 kB-capped;
+// no legitimate client comes near it.
+constexpr time_t kIoTimeoutSeconds = 0;
+constexpr time_t kIoTimeoutMicroseconds = 500000;
 
 void sendJson(httplib::Response& res, const nlohmann::json& body, int status = 200) {
     res.status = status;
@@ -97,8 +103,8 @@ HttpServer::HttpServer(WallpaperManager& manager, int port)
       m_port(port),
       m_server(std::make_unique<httplib::Server>()) {
     m_server->set_payload_max_length(kMaxPayloadBytes);
-    m_server->set_read_timeout(kIoTimeoutSeconds);
-    m_server->set_write_timeout(kIoTimeoutSeconds);
+    m_server->set_read_timeout(kIoTimeoutSeconds, kIoTimeoutMicroseconds);
+    m_server->set_write_timeout(kIoTimeoutSeconds, kIoTimeoutMicroseconds);
 
     // httplib's default sets SO_REUSEPORT, which lets another process of the same user
     // bind alongside the daemon and take a share of the plugin's polls. SO_REUSEADDR is
@@ -191,15 +197,18 @@ void HttpServer::registerRoutes() {
 
         // An unset monitor answers with empty strings rather than 404: the plugin polls
         // every second from startup, and "no wallpaper yet" is ordinary, not an error.
-        nlohmann::json out{{"monitor_id", monitorId}, {"type", ""}, {"path", ""}};
+        nlohmann::json out{
+            {"monitor_id", monitorId}, {"type", ""}, {"path", ""}, {"path_literal", ""}};
 
         const auto it = snap.monitors.find(monitorId);
         if (it != snap.monitors.end()) {
             out["type"] = it->second.type;
-            // Must stay the same decision as GetStatus's path: the same client string
-            // escaped on one channel and raw on another is how the two views diverged.
-            // Display-safe, not round-trip-safe.
+            // Must stay the same decision as GetStatus: the same client string escaped on
+            // one channel and raw on another is how the two views diverged. `path` is
+            // display-safe; `path_literal` is the one to act on, null when not UTF-8.
             out["path"] = sanitizeForLog(it->second.path, 4096, LogFraming::Bare);
+            const std::optional<std::string> literal = literalPath(it->second.path);
+            out["path_literal"] = literal ? nlohmann::json(*literal) : nlohmann::json(nullptr);
         }
 
         sendJson(res, out);
@@ -213,18 +222,28 @@ void HttpServer::registerRoutes() {
         // cannot disagree about whether a monitor has a picture on it.
         std::size_t failed = 0, unsupported = 0, inFlight = 0, showing = 0;
         std::string firstFailure, firstUnsupported;
+
+        // Per monitor as well as counted: the aggregate says a wallpaper is missing, this
+        // says which one and why, so a frontend need not call GetStatus to find out.
+        nlohmann::json perMonitor = nlohmann::json::object();
         for (const auto& [id, monitor] : snap.monitors) {
+            const std::string key = std::to_string(id);
             if (!monitor.lastError.empty()) {
                 if (failed++ == 0) firstFailure = monitor.lastError;
+                // Sanitized where it was recorded, so it is safe to quote here.
+                perMonitor[key] = {{"state", "failed"}, {"detail", monitor.lastError}};
             } else if (!isRenderableType(monitor.type)) {
                 // Type is whitelisted at requestWallpaper, so it is safe to quote into JSON.
-                if (unsupported++ == 0)
-                    firstUnsupported = "monitor " + std::to_string(id) + " is set to a '" + monitor.type +
-                                       "' wallpaper, which this build cannot render";
+                const std::string why = "monitor " + std::to_string(id) + " is set to a '" + monitor.type +
+                                        "' wallpaper, which this build cannot render";
+                if (unsupported++ == 0) firstUnsupported = why;
+                perMonitor[key] = {{"state", "unsupported"}, {"detail", why}};
             } else if (monitor.hasFrame) {
                 ++showing;
+                perMonitor[key] = {{"state", "showing"}, {"detail", ""}};
             } else {
                 ++inFlight;
+                perMonitor[key] = {{"state", "rendering"}, {"detail", ""}};
             }
         }
 
@@ -232,10 +251,11 @@ void HttpServer::registerRoutes() {
         if (snap.monitors.empty()) {
             wallpapers.detail = "no wallpaper set";
         } else if (failed > 0 || unsupported > 0) {
-            // Carries the cause verbatim: "1 of 2 failed" tells an operator to go read
-            // GetStatus, which is the call they made this one to avoid. A real failure is
-            // quoted ahead of an unsupported type -- it is the one that might be a bug.
-            wallpapers.status = HealthStatus::Fail;
+            // Ok, not Fail: a deleted file or a type this build cannot draw is that
+            // wallpaper's problem, not the daemon's, and the daemon cannot fix either. Its
+            // own faults still fail the aggregate -- gpu and shaders record their own. The
+            // detail carries the cause so an operator need not go read GetStatus.
+            wallpapers.status = HealthStatus::Ok;
             wallpapers.detail = std::to_string(failed + unsupported) + " of " +
                                 std::to_string(snap.monitors.size()) +
                                 " monitors failed or cannot be rendered: " +
@@ -268,6 +288,7 @@ void HttpServer::registerRoutes() {
             }
             checksJson[name] = {{"status", toString(check->status)}, {"detail", check->detail}};
         }
+        checksJson["wallpapers"]["monitors"] = std::move(perMonitor);
 
         sendJson(res, {{"status", toString(overall)},
                        {"version", WALLPAPERX_VERSION},

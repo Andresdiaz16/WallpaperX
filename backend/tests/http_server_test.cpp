@@ -739,6 +739,52 @@ std::string healthCheckDetail(const nlohmann::json& health, const char* name) {
     return checks[name].value("detail", std::string());
 }
 
+// The per-monitor breakdown the wallpapers check carries: monitor id -> {state, detail}.
+// Read defensively -- `checks.wallpapers.monitors` on a const json is JSON_ASSERT plus a
+// dereference if any level is missing, so a daemon that dropped the object would abort this
+// process instead of failing the check that noticed.
+const nlohmann::json* healthMonitors(const nlohmann::json& health) {
+    if (!health.is_object() || !health.contains("checks") || !health["checks"].is_object()) return nullptr;
+    const nlohmann::json& checks = health["checks"];
+    if (!checks.contains("wallpapers") || !checks["wallpapers"].is_object()) return nullptr;
+    const nlohmann::json& wallpapers = checks["wallpapers"];
+    if (!wallpapers.contains("monitors") || !wallpapers["monitors"].is_object()) return nullptr;
+    return &wallpapers["monitors"];
+}
+
+// The sorted key list of a JSON object, for the exact-set comparisons below: a set is what
+// makes an unreviewed addition to a published surface visible, and sorting means a failure
+// prints what actually arrived.
+std::vector<std::string> sortedKeys(const nlohmann::json& object) {
+    std::vector<std::string> keys;
+    if (!object.is_object()) return keys;
+    for (const auto& [key, value] : object.items()) {
+        (void)value;
+        keys.push_back(key);
+    }
+    std::sort(keys.begin(), keys.end());
+    return keys;
+}
+
+// One monitor's reported state, and "" when this monitor is not in the breakdown at all --
+// which a caller must tell apart from a state it did not expect, so every use below asserts
+// the id is present first.
+std::string monitorState(const nlohmann::json& health, int monitorId) {
+    const nlohmann::json* monitors = healthMonitors(health);
+    if (monitors == nullptr) return {};
+    const std::string key = std::to_string(monitorId);
+    if (!monitors->contains(key) || !(*monitors)[key].is_object()) return {};
+    return (*monitors)[key].value("state", std::string());
+}
+
+std::string monitorDetail(const nlohmann::json& health, int monitorId) {
+    const nlohmann::json* monitors = healthMonitors(health);
+    if (monitors == nullptr) return {};
+    const std::string key = std::to_string(monitorId);
+    if (!monitors->contains(key) || !(*monitors)[key].is_object()) return {};
+    return (*monitors)[key].value("detail", std::string());
+}
+
 // A WallpaperManager and an HttpServer that belong to nobody else.
 //
 // The health states below cannot be built on the run's shared manager. A manager's shader
@@ -1231,14 +1277,8 @@ void runHealthBeforeDeviceChecks(httplib::Client& cli, const Check& check) {
     //       drops a name and adds one -> "FAIL: /health carries a `checks` object naming
     //       exactly the daemon's dependencies", printing the body it got: gpu, persistence,
     //       persistence2, shaders. Reverted.
-    std::vector<std::string> names;
-    if (health.json.contains("checks") && health.json["checks"].is_object()) {
-        for (const auto& [name, entry] : health.json["checks"].items()) {
-            (void)entry;
-            names.push_back(name);
-        }
-    }
-    std::sort(names.begin(), names.end());
+    const std::vector<std::string> names =
+        health.json.contains("checks") ? sortedKeys(health.json["checks"]) : std::vector<std::string>{};
     const std::vector<std::string> expectedNames{"gpu", "persistence", "shaders", "wallpapers"};
     const bool shape = names == expectedNames;
     check(shape, "/health carries a `checks` object naming exactly the daemon's dependencies");
@@ -1246,6 +1286,27 @@ void runHealthBeforeDeviceChecks(httplib::Client& cli, const Check& check) {
         std::fprintf(stderr, "  checks: %s\n",
                      health.json.contains("checks") ? health.json["checks"].dump().c_str() : "(absent)");
     }
+
+    // The same exactness one level down, on the check that grew a field in Step 8: the
+    // wallpapers entry carries a `monitors` object beside its status and detail, and it is
+    // present -- empty -- before any wallpaper exists. Asserting only that the key appears
+    // once monitors exist would let a build that omits it here answer `{}` to a frontend
+    // that has no way to tell "no monitors" from "this daemon does not report per monitor".
+    // CONTROL: `checksJson["wallpapers"]["monitors"] = std::move(perMonitor);` deleted from
+    //       http_server.cpp -> "FAIL: the wallpapers check carries exactly a status, a
+    //       detail and a per-monitor breakdown", printing the entry it got. Reverted.
+    const nlohmann::json* checksObject =
+        health.json.contains("checks") && health.json["checks"].is_object() ? &health.json["checks"] : nullptr;
+    const bool wallpapersShape =
+        checksObject != nullptr && checksObject->contains("wallpapers") &&
+        sortedKeys((*checksObject)["wallpapers"]) == std::vector<std::string>{"detail", "monitors", "status"};
+    check(wallpapersShape, "the wallpapers check carries exactly a status, a detail and a per-monitor breakdown");
+    if (!wallpapersShape && checksObject != nullptr && checksObject->contains("wallpapers")) {
+        std::fprintf(stderr, "  wallpapers: %s\n", (*checksObject)["wallpapers"].dump().c_str());
+    }
+    const nlohmann::json* monitorsBefore = healthMonitors(health.json);
+    check(monitorsBefore != nullptr && monitorsBefore->empty(),
+          "the per-monitor breakdown is present and empty before any wallpaper is set");
 
     // GOAL: S8.6 / PLAN.md decision 4 -- a daemon that never opted into persistence reports
     //       that check as ok with the detail `disabled`, not as pending and not as fail.
@@ -1682,40 +1743,76 @@ void runHealthStateChecks(const std::string& bluePath, const std::string& videoP
             } else if (!health.ok()) {
                 check(false, "the unsupported-type daemon answered /health with a parseable 200");
             } else {
-                // GOAL: S7.10g -- a monitor set to a type this build cannot render is
-                //       reported as a failure, named with the monitor and the type. False
-                //       if a daemon whose only wallpaper is a `video` reads ok: that
-                //       screen is provably blank forever and no amount of retrying changes
-                //       it, so `ok` is the one answer that cannot be repaired by waiting.
+                // GOAL: S8.16 -- a monitor set to a type this build cannot render is
+                //       reported per monitor, as `unsupported` with a detail naming it, and
+                //       does NOT fail the daemon aggregate. Both halves are independently
+                //       false: reporting nothing per monitor leaves a frontend calling
+                //       GetStatus to find out which screen is blank, and reporting a
+                //       wallpaper's problem as a daemon failure makes a watchdog restart a
+                //       daemon that is working exactly as designed. The daemon's own faults
+                //       still fail the aggregate -- scenario (b) above is where a missing
+                //       shader directory does precisely that.
                 // WHY-THIS-SHAPE: the shaders and gpu checks are asserted to be *pending*
-                //       alongside. The obvious check -- wallpapers == "fail" alone -- is
-                //       also satisfied by a handler that failed the wallpapers check
-                //       because the render blew up, which is a different fact with the same
-                //       verdict; pending on both dependencies is what pins that nothing was
-                //       ever tried and the fail is a verdict on the *type*.
+                //       alongside, and the aggregate is asserted to be `pending` rather than
+                //       merely "not fail". Asserting `!= "fail"` would also be satisfied by
+                //       an endpoint stuck on `ok`, which would hide an untried dependency --
+                //       the defect S7.10 exists to remove. Pending on both dependencies is
+                //       also what pins that the verdict below is about the TYPE and not
+                //       about a render that blew up.
                 // CONTROL: the `!isRenderableType(monitor.type)` arm deleted from the
                 //       classification loop in http_server.cpp, so an unrenderable monitor
-                //       falls through to the in-flight count -> "FAIL: a wallpaper type
-                //       this build cannot render is reported as a failure", "FAIL: an
-                //       unrenderable type makes the aggregate fail" and "FAIL: the
-                //       unsupported detail names the monitor and the type it is set to",
-                //       with wallpapers reading {pending, "1 of 1 monitors have not
-                //       rendered yet"}. Reverted.
-                // COVERAGE-ASSERT: the monitor is asserted to carry no lastError. That is
-                //       what makes this scenario the old defect rather than a restatement
-                //       of scenario (c): the pre-fix handler derived the check purely from
-                //       lastError, so a monitor with none read ok. If a future
-                //       requestWallpaper started recording an error for `video`, this would
-                //       silently become a second copy of the failed-render check.
+                //       falls through to the in-flight count -> "FAIL: a wallpaper type this
+                //       build cannot render is not a failure of the daemon" (the check reads
+                //       `pending`), "FAIL: a monitor whose type this build cannot render is
+                //       reported per monitor as unsupported" (state 'rendering'), "FAIL: the
+                //       unsupported monitor's own detail names it and the type it is set
+                //       to", and the same three in the after-device phase. A second control
+                //       replaced `firstUnsupported` in the detail with `std::string()` ->
+                //       only "FAIL: the unsupported detail names the monitor and the type it
+                //       is set to", printing "detail: 1 of 1 monitors failed or cannot be
+                //       rendered:  (expected 'monitor 0' and 'video')". Both reverted.
+                // COVERAGE-ASSERT: the monitor is asserted to carry no lastError, so this
+                //       scenario cannot silently become a second copy of scenario (c) -- a
+                //       future requestWallpaper that recorded an error for `video` would
+                //       otherwise leave this grading the failed-render path instead.
                 check(it->second.lastError.empty(),
-                      "an unrenderable type leaves no error on the monitor, so fail cannot come from one");
-                check(healthCheckStatus(health.json, "wallpapers") == "fail",
-                      "a wallpaper type this build cannot render is reported as a failure");
+                      "an unrenderable type leaves no error on the monitor, so `unsupported` cannot come from one");
+                check(healthCheckStatus(health.json, "wallpapers") == "ok",
+                      "a wallpaper type this build cannot render is not a failure of the daemon");
                 check(healthCheckStatus(health.json, "shaders") == "pending" &&
                           healthCheckStatus(health.json, "gpu") == "pending",
                       "an unrenderable type does not implicate the shaders or the GPU");
-                check(health.json.value("status", std::string()) == "fail",
-                      "an unrenderable type makes the aggregate fail");
+                check(health.json.value("status", std::string()) == "pending",
+                      "an unrenderable type leaves the aggregate on its untried dependencies, not on fail");
+                if (health.json.value("status", std::string()) != "pending") {
+                    std::fprintf(stderr, "  aggregate: %s (body: %s)\n",
+                                 health.json.value("status", std::string()).c_str(), health.body.c_str());
+                }
+
+                // The per-monitor object, as an exact set on both levels: which monitors it
+                // names, and which keys each entry carries. A `contains` check would go
+                // green for a breakdown that had grown a field nobody reviewed, and this is
+                // a published surface -- a frontend reads these names.
+                const nlohmann::json* monitors = healthMonitors(health.json);
+                check(monitors != nullptr, "the wallpapers check carries a per-monitor breakdown");
+                if (monitors != nullptr) {
+                    const bool named = sortedKeys(*monitors) == std::vector<std::string>{"0"};
+                    check(named, "the breakdown names exactly the monitors the daemon has a record of");
+                    // Indexed only once the key is known to be there: `(*monitors)["0"]` on a
+                    // const json whose key is missing is a JSON_ASSERT, and this process
+                    // aborting is how the FAIL lines this phase exists to print get lost.
+                    check(named && sortedKeys((*monitors)["0"]) == std::vector<std::string>{"detail", "state"},
+                          "each monitor's entry carries exactly a state and a detail");
+                    check(monitorState(health.json, 0) == "unsupported",
+                          "a monitor whose type this build cannot render is reported per monitor as unsupported");
+                    const std::string perMonitor = monitorDetail(health.json, 0);
+                    check(perMonitor.find("monitor 0") != std::string::npos &&
+                              perMonitor.find("'" + it->second.type + "'") != std::string::npos,
+                          "the unsupported monitor's own detail names it and the type it is set to");
+                    if (monitorState(health.json, 0) != "unsupported" || perMonitor.empty()) {
+                        std::fprintf(stderr, "  monitors: %s\n", monitors->dump().c_str());
+                    }
+                }
 
                 // The detail has to say which monitor and which type, or a reader is back
                 // to calling GetStatus. Both substrings are built from the recorded state
@@ -1850,8 +1947,8 @@ void runHealthStateChecks(const std::string& bluePath, const std::string& videoP
                 const auto it = snap.monitors.find(0);
                 const std::string lastError = it != snap.monitors.end() ? it->second.lastError : std::string();
                 check(lastError.size() > 20, "the failed render left a non-trivial error on the monitor");
-                check(healthCheckStatus(health.json, "wallpapers") == "fail",
-                      "an undecodable image is reported as a wallpaper failure");
+                check(healthCheckStatus(health.json, "wallpapers") == "ok",
+                      "an image the daemon cannot decode is not a failure of the daemon");
                 check(healthCheckStatus(health.json, "shaders") == "ok",
                       "an undecodable image does not implicate the shaders");
                 check(healthCheckStatus(health.json, "gpu") == "ok",
@@ -1859,34 +1956,64 @@ void runHealthStateChecks(const std::string& bluePath, const std::string& videoP
                 check(!lastError.empty() &&
                           healthCheckDetail(health.json, "wallpapers").find(lastError) != std::string::npos,
                       "the wallpapers check carries the monitor's own error text");
-                check(health.json.value("status", std::string()) == "fail",
-                      "an undecodable image makes the aggregate fail");
-                if (healthCheckDetail(health.json, "wallpapers").find(lastError) == std::string::npos) {
-                    std::fprintf(stderr, "  detail: %s\n  lastError: %s\n",
-                                 healthCheckDetail(health.json, "wallpapers").c_str(), lastError.c_str());
+
+                // GOAL: S8.16's second clause, in its sharpest form -- with every dependency
+                //       of the daemon reporting ok, one wallpaper that cannot be drawn does
+                //       not make the daemon report itself broken. False if the aggregate
+                //       reads `fail` here: a watchdog restarts a daemon whose only problem
+                //       is a picture the user deleted, and restarting will not bring it back.
+                // WHY-THIS-SHAPE: asserted on this daemon rather than on the shared one
+                //       because every other check here is ok, so `fail` could come from
+                //       nowhere else -- on the shared manager the same assertion would also
+                //       be satisfied by a gpu or shaders verdict. The per-monitor state is
+                //       asserted in the same breath: an endpoint that reported ok and said
+                //       nothing about the monitor would satisfy the aggregate half while
+                //       leaving the operator with no way to find the blank screen, and that
+                //       is the trade this contract change is only safe because it avoids.
+                // CONTROL: `wallpapers.status = HealthStatus::Ok;` in http_server.cpp's
+                //       failed-or-unsupported arm changed back to `HealthStatus::Fail` ->
+                //       "FAIL: an image the daemon cannot decode is not a failure of the
+                //       daemon" and "FAIL: a wallpaper that cannot be drawn leaves the
+                //       aggregate ok when every dependency is ok" (aggregate: fail), and the
+                //       two equivalents in the unrenderable-type and after-device phases.
+                //       Reverted.
+                check(health.json.value("status", std::string()) == "ok",
+                      "a wallpaper that cannot be drawn leaves the aggregate ok when every dependency is ok");
+                check(monitorState(health.json, 0) == "failed",
+                      "the monitor whose image could not be decoded is reported per monitor as failed");
+                check(monitorDetail(health.json, 0) == lastError,
+                      "the failed monitor's own detail is the error the monitor recorded");
+                if (healthCheckDetail(health.json, "wallpapers").find(lastError) == std::string::npos ||
+                    monitorDetail(health.json, 0) != lastError ||
+                    health.json.value("status", std::string()) != "ok") {
+                    std::fprintf(stderr, "  detail: %s\n  per monitor: %s\n  lastError: %s\n  aggregate: %s\n",
+                                 healthCheckDetail(health.json, "wallpapers").c_str(),
+                                 monitorDetail(health.json, 0).c_str(), lastError.c_str(),
+                                 health.json.value("status", std::string()).c_str());
                 }
                 std::printf("http_server_test: undecodable image -> %s\n", health.body.c_str());
                 std::fflush(stdout);
 
-                // GOAL: S7.10 -- /health reports what is *currently* failing. A daemon
-                //       that has recovered must say so; a failure that sticks is a
-                //       different kind of lie from one that is never reported, and it
-                //       trains a reader to ignore the endpoint.
-                // WHY-THIS-SHAPE: this is also what keeps every "not ok" assertion in this
-                //       phase from being vacuous. If /health could never answer "ok" on
-                //       this host -- a missing GPU, a build with no shaders -- then
-                //       "pending", "fail" and "fail" above would all be satisfied by an
-                //       endpoint that was simply stuck, and the whole phase would
-                //       establish nothing. One reachable "ok" from the same manager, after
-                //       the same monitor is given a file that does decode, is what rules
-                //       that out.
-                // CONTROL: the `else` arm of the wallpapers derivation in http_server.cpp
-                //       changed to `wallpapers.status = HealthStatus::Fail;` -> "FAIL: a
-                //       later successful render clears the wallpaper failure" and "FAIL: a
-                //       daemon with nothing wrong reports the aggregate as ok", the body
-                //       showing wallpapers={fail,"1 monitor(s) rendered"}. The two failure
-                //       scenarios above stayed green under it, which is the point -- it is
-                //       the ok verdict, not the fail verdicts, that this pair pins.
+                // GOAL: S7.10 with S8.16 -- /health reports what is *currently* wrong. A
+                //       daemon that has recovered must say so; a failure that sticks is a
+                //       different kind of lie from one that is never reported, and it trains
+                //       a reader to ignore the endpoint.
+                // WHY-THIS-SHAPE: graded on the PER-MONITOR state, not on the check's status
+                //       or the aggregate. Since a wallpaper's problem no longer moves either
+                //       of those, both read `ok` before and after this render, so a check
+                //       written on them -- which is what this was -- would pass whether the
+                //       daemon cleared the monitor's error or kept it forever. The detail is
+                //       asserted to become empty for the same reason: a state that flipped
+                //       to `showing` while still carrying the old error text would leave a
+                //       frontend displaying a failure that no longer exists.
+                // CONTROL: both `lastError.clear()` calls removed from
+                //       wallpaper_manager.cpp -- the one in requestWallpaper and the one in
+                //       renderPending's commit -- i.e. a failure that never clears -> "FAIL:
+                //       a later successful render clears the monitor's failed state" with
+                //       "  monitor 0 after a good render: failed", and "FAIL: the recovered
+                //       monitor's detail is empty, not the failure it no longer has".
+                //       Removing either alone leaves the check green, since the other still
+                //       clears it; that is a fact about the daemon, not a weakness here.
                 //       Reverted.
                 daemon.manager().requestWallpaper("static", bluePath, 0);
                 daemon.manager().renderPending(0);
@@ -1894,12 +2021,18 @@ void runHealthStateChecks(const std::string& bluePath, const std::string& videoP
                 if (!recovered.ok()) {
                     check(false, "the recovered daemon answered /health with a parseable 200");
                 } else {
+                    check(monitorState(recovered.json, 0) == "showing",
+                          "a later successful render clears the monitor's failed state");
+                    check(monitorDetail(recovered.json, 0).empty(),
+                          "the recovered monitor's detail is empty, not the failure it no longer has");
                     check(healthCheckStatus(recovered.json, "wallpapers") == "ok",
-                          "a later successful render clears the wallpaper failure");
+                          "the wallpapers check reads ok once the monitor is showing a frame");
                     check(recovered.json.value("status", std::string()) == "ok",
                           "a daemon with nothing wrong reports the aggregate as ok");
-                    if (recovered.json.value("status", std::string()) != "ok") {
-                        std::fprintf(stderr, "  after a good render: %s\n", recovered.body.c_str());
+                    if (monitorState(recovered.json, 0) != "showing" ||
+                        recovered.json.value("status", std::string()) != "ok") {
+                        std::fprintf(stderr, "  monitor 0 after a good render: %s\n  body: %s\n",
+                                     monitorState(recovered.json, 0).c_str(), recovered.body.c_str());
                     }
                 }
             }
@@ -2765,44 +2898,49 @@ void runHealthAfterDeviceChecks(httplib::Client& cli, sdbus::IProxy& proxy, cons
     check(healthCheckStatus(health.json, "shaders") == "ok",
           "/health reports the shader directory as ok once a render has resolved it");
 
-    // GOAL: S7.10g, on the run's shared manager -- one monitor showing nothing is enough
-    //       to fail the endpoint even though both dependencies are up and another monitor
-    //       genuinely has a frame on it. False if the working monitors outvote the blank
-    //       one, which is how a user with one dead screen gets told the daemon is healthy.
-    // WHY-THIS-SHAPE: the expected verdict is derived from the GetStatus reply taken
-    //       alongside, not written as a literal. What this manager holds by now is the sum
-    //       of every phase above -- a rendered monitor, one the torn-read writer left on a
-    //       `video`, one only ever recorded -- and a hand-written expectation would have to
-    //       be re-derived whenever a phase above touches an id; the version written on that
-    //       day is the one that agrees with whatever /health happened to answer. Deriving
-    //       it also makes the two channels answer the same question: GetStatus's
-    //       `unsupported` key and this check are both isRenderableType, so a monitor one
-    //       channel calls unrenderable is the monitor the other must name. Read at the same
-    //       quiesced moment as /health (the last FrameReady has arrived, nothing is
-    //       queued), so a disagreement cannot be two honest views of two moments.
-    // CONTROL: two, because the verdict and the cause fail independently. (a)
-    //       `firstUnsupported` dropped from the wallpapers detail (`failed > 0 ?
+    // GOAL: S8.16 on the run's shared manager -- with a real device up and a monitor
+    //       genuinely showing a frame, one monitor that cannot be drawn is named in the
+    //       per-monitor breakdown and does not drag the daemon's verdict down with it.
+    //       False if the blank monitor makes the aggregate `fail` (a watchdog restarts a
+    //       daemon over a user's choice of wallpaper) and equally false if the breakdown
+    //       omits it (the operator is told everything is fine with no way to find the blank
+    //       screen).
+    // WHY-THIS-SHAPE: the expected set of monitors is derived from the GetStatus reply taken
+    //       alongside, not written as a literal, and compared as an exact set. What this
+    //       manager holds by now is the sum of every phase above -- a rendered monitor, one
+    //       the torn-read writer left on a `video`, one only ever recorded -- so a
+    //       hand-written expectation would have to be re-derived whenever a phase above
+    //       touches an id, and the version written on that day is the one that agrees with
+    //       whatever /health happened to answer. Deriving it also makes the two channels
+    //       answer the same question: GetStatus's `unsupported` key and this check are both
+    //       isRenderableType, so a monitor one channel calls unrenderable is the monitor the
+    //       other must name. Read at the same quiesced moment as /health (the last
+    //       FrameReady has arrived, nothing is queued), so a disagreement cannot be two
+    //       honest views of two moments.
+    // CONTROL: three, because the verdict, the breakdown and the cause fail independently.
+    //       (a) `firstUnsupported` dropped from the wallpapers detail (`failed > 0 ?
     //       firstFailure : std::string()`) -> only "FAIL: the wallpapers detail names the
     //       monitor GetStatus reports as unrenderable", with "detail: 1 of 3 monitors show
-    //       nothing:" and nothing after the colon; both status checks stayed green. (b) the
-    //       `unsupported > 0` term dropped from the fail condition -> "FAIL: a monitor set
-    //       to a type this build cannot render fails the wallpapers check", "FAIL: one
-    //       blank monitor fails the aggregate even with every dependency ok" and the naming
-    //       check, /health answering {pending, "1 of 3 monitors have not rendered yet"}.
-    //       The count check survives both, since "1 of 3" also appears in that pending
-    //       detail; it was seen red under a third -- the whole `!isRenderableType` arm
-    //       deleted, giving "2 of 3 monitors have not rendered yet". All reverted.
+    //       nothing:" and nothing after the colon. (b) `wallpapers.status = HealthStatus::Ok`
+    //       changed back to `Fail` in the failed-or-unsupported arm -> "FAIL: a monitor this
+    //       build cannot draw does not fail the daemon's wallpapers check" and "FAIL: a
+    //       blank monitor does not fail the aggregate when every dependency is ok". (c) the
+    //       `perMonitor[key] = ...` line deleted from the unsupported arm -> "FAIL: the
+    //       breakdown names exactly the monitors GetStatus has a record of", printing the
+    //       two key lists. All reverted.
     // COVERAGE-ASSERT: the mix is required before anything is graded. If this run left the
-    //       manager with no unrenderable monitor, or with none showing a frame, the
-    //       "one blank monitor outvotes the working ones" claim has nothing in it and the
-    //       phase reports NOT VERIFIED rather than passing on a state it did not build.
+    //       manager with no unrenderable monitor, or with none showing a frame, the claim
+    //       has nothing in it and the phase reports NOT VERIFIED rather than passing on a
+    //       state it did not build.
     std::size_t failedCount = 0, unsupportedCount = 0, showingCount = 0, monitorCount = 0;
     int firstUnsupportedId = -1;
     std::string firstUnsupportedType;
+    std::vector<std::string> statusMonitorKeys;
     if (statusJson.contains("wallpapers") && statusJson["wallpapers"].is_object()) {
         for (const auto& [key, entry] : statusJson["wallpapers"].items()) {
             if (!entry.is_object()) continue;
             ++monitorCount;
+            statusMonitorKeys.push_back(key);
             const int id = std::atoi(key.c_str());
             if (entry.contains("last_error")) {
                 ++failedCount;
@@ -2817,18 +2955,45 @@ void runHealthAfterDeviceChecks(httplib::Client& cli, sdbus::IProxy& proxy, cons
             }
         }
     }
+    std::sort(statusMonitorKeys.begin(), statusMonitorKeys.end());
 
     if (failedCount != 0 || unsupportedCount == 0 || showingCount == 0) {
-        notVerified("S7.10g (a blank monitor fails the endpoint next to a working one)",
+        notVerified("S8.16 (a blank monitor is named per monitor and does not fail the daemon)",
                     "this run left the shared manager without the mix the check needs (" +
                         std::to_string(monitorCount) + " monitors: " + std::to_string(showingCount) +
                         " showing, " + std::to_string(unsupportedCount) + " unrenderable, " +
                         std::to_string(failedCount) + " failed)");
     } else {
-        check(healthCheckStatus(health.json, "wallpapers") == "fail",
-              "a monitor set to a type this build cannot render fails the wallpapers check");
-        check(health.json.value("status", std::string()) == "fail",
-              "one blank monitor fails the aggregate even with every dependency ok");
+        check(healthCheckStatus(health.json, "wallpapers") == "ok",
+              "a monitor this build cannot draw does not fail the daemon's wallpapers check");
+        check(health.json.value("status", std::string()) == "ok",
+              "a blank monitor does not fail the aggregate when every dependency is ok");
+        if (health.json.value("status", std::string()) != "ok") {
+            std::fprintf(stderr, "  aggregate: %s (body: %s)\n", health.json.value("status", std::string()).c_str(),
+                         health.body.c_str());
+        }
+
+        const nlohmann::json* monitors = healthMonitors(health.json);
+        check(monitors != nullptr, "the wallpapers check carries a per-monitor breakdown after a render");
+        if (monitors != nullptr) {
+            const std::vector<std::string> healthKeys = sortedKeys(*monitors);
+            check(healthKeys == statusMonitorKeys,
+                  "the breakdown names exactly the monitors GetStatus has a record of");
+            if (healthKeys != statusMonitorKeys) {
+                std::fprintf(stderr, "  /health monitors: %s\n  GetStatus monitors: %s\n", monitors->dump().c_str(),
+                             statusJson["wallpapers"].dump().c_str());
+            }
+            check(monitorState(health.json, firstUnsupportedId) == "unsupported",
+                  "the monitor GetStatus calls unrenderable is `unsupported` in the breakdown");
+            const std::string perMonitor = monitorDetail(health.json, firstUnsupportedId);
+            check(perMonitor.find("monitor " + std::to_string(firstUnsupportedId)) != std::string::npos &&
+                      perMonitor.find("'" + firstUnsupportedType + "'") != std::string::npos,
+                  "the unrenderable monitor's own detail names it and its type");
+            if (monitorState(health.json, firstUnsupportedId) != "unsupported") {
+                std::fprintf(stderr, "  monitor %d in the breakdown: %s (%s)\n", firstUnsupportedId,
+                             monitorState(health.json, firstUnsupportedId).c_str(), perMonitor.c_str());
+            }
+        }
 
         const std::string detail = healthCheckDetail(health.json, "wallpapers");
         const std::string expectCount =

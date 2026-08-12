@@ -49,6 +49,7 @@
 #include "daemon/log_escape.h"
 #include "tests/client/daemon_client.h"
 #include "tests/client/http_probe.h"
+#include "tests/client/scratch_dir.h"
 
 #include "support/exported_frame_map.h"
 // Fork-side scaffolding, shared with renderer/tests/device_affinity_probe.cpp. It lives in
@@ -108,6 +109,7 @@ using wallpaperx::testing::getStatus;
 using wallpaperx::testing::execChildOrDie;
 using wallpaperx::testing::getStatusOrExplain;
 using wallpaperx::testing::openFdCount;
+using wallpaperx::testing::ScratchDir;
 using wallpaperx::testing::setWallpaper;
 using wallpaperx::testing::StatusReply;
 using wallpaperx::testing::wallpaperStatus;
@@ -126,7 +128,7 @@ constexpr uint32_t kDaemonHeight = 1080;
 // touched that id.
 constexpr int32_t kMonitorFirstFrame = 0;
 constexpr int32_t kMonitorTiming = 1;
-constexpr int32_t kMonitorLoadBase = 2;    // .. kMonitorLoadBase + loadCount - 1, then kMonitorInert
+constexpr int32_t kMonitorLoadBase = 2;    // .. kMonitorLoadBase + loadCount - 1, clamped by kMaxLoadMonitors
 constexpr int32_t kMonitorStormBase = 20;  // .. kMonitorStormBase + kStormMonitors - 1
 constexpr int32_t kStormMonitors = 4;
 constexpr int32_t kMonitorBarrierPre = 30;
@@ -142,10 +144,12 @@ constexpr int32_t kMonitorClosedStdout = 24;
 // The port-conflict phase's own id: it renders once, to show the daemon is still doing its
 // job while reporting that it lost its config port.
 constexpr int32_t kMonitorLostPort = 27;
-// 18, 19, 28 and 29 belong to the Step 8 phases and are declared where they are used --
-// each of those phases drives a daemon of its own, so its ids are only ever compared with
-// its own. Nothing is unclaimed now; a new phase needs an id retired by an old one, or a
-// daemon of its own.
+// 18, 19, 28 and 29 belong to the Step 8 phases and are declared where they are used. Each
+// of those phases drives a daemon of its own, so its ids are only ever compared with its
+// own -- which is also why 19 is spent twice down there, by the unreadable-restore phase and
+// by the file-size-limit phase. 30 and 31 are the barrier phase's, above. A new phase needs
+// an id retired by an old one, or a daemon of its own; ids are never derived by arithmetic
+// over a case list, since the block of ids consumed then grows silently past 31.
 
 constexpr int kStormThreads = 4;
 
@@ -302,18 +306,15 @@ public:
         Breakable,
     };
 
-    // Exit code for a child that could not enter the working directory it was given.
-    // Distinct from forked_child.h's three preamble codes, which name causes that have
-    // nothing to do with a directory: a phase that read this as one of those would report
-    // "execve failed" for a chdir that was refused. No program this harness execs uses 124.
-    static constexpr int kChildChdirFailedExit = 124;
-
     // `extraEnv` entries are "KEY=VALUE"; each replaces any inherited entry for that key.
     // A non-empty `workingDir` is the directory the daemon is started FROM -- the only way
     // to ask what a daemon with no usable HOME writes into its own working directory,
-    // since this process's own is the build tree.
+    // since this process's own is the build tree. A non-zero `fileSizeLimit` is an
+    // RLIMIT_FSIZE applied to the child, which is how a config write can be made to fail
+    // the way a systemd unit's LimitFSIZE= makes it fail on a user's machine.
     explicit SpawnedDaemon(const std::vector<std::string>& extraEnvIn = {},
-                           Stdout stdoutMode = Stdout::Captured, const std::string& workingDir = {}) {
+                           Stdout stdoutMode = Stdout::Captured, const std::string& workingDir = {},
+                           rlim_t fileSizeLimit = 0) {
         // The daemon persists wallpapers under $XDG_CONFIG_HOME. Unset, it would read and
         // rewrite the developer's own config -- restoring test wallpapers into their
         // desktop, and carrying one test's 28 monitors into the next. A fresh directory
@@ -324,12 +325,12 @@ public:
             if (entry.rfind("XDG_CONFIG_HOME=", 0) == 0) configHomeSet = true;
         }
         if (!configHomeSet) {
-            m_configHome = std::filesystem::temp_directory_path() /
-                           ("wpx_system_test_" + std::to_string(::getpid()) + "_" +
-                            std::to_string(s_configHomeCounter++));
-            std::error_code ec;
-            std::filesystem::create_directories(m_configHome, ec);
-            extraEnv.push_back("XDG_CONFIG_HOME=" + m_configHome.string());
+            // A member that owns itself, rather than a path cleaned up in ~SpawnedDaemon: a
+            // pipe2 or fork failure below throws before this object exists, so the enclosing
+            // destructor never runs and the directory would be left in /tmp for good.
+            m_configHome.emplace("spawn");
+            if (!m_configHome->ok()) throw std::runtime_error("scratch XDG_CONFIG_HOME could not be created");
+            extraEnv.push_back(m_configHome->env());
         }
 
         int fds[2];
@@ -392,9 +393,21 @@ public:
                 _exit(wallpaperx::testing::kChildDup2FailedExit);
             }
             // chdir is async-signal-safe, which is the whole constraint between fork() and
-            // exec(). Its own exit code, not one of forked_child.h's: a refused chdir is
-            // not a failed exec and must not be reported as one.
-            if (!workingDir.empty() && chdir(workingDir.c_str()) != 0) _exit(kChildChdirFailedExit);
+            // exec(). Its code is in forked_child.h's preamble map with the other three, so
+            // every site that grades a startup already names a refused chdir correctly
+            // rather than reporting "the daemon never acquired the bus name".
+            if (!workingDir.empty() && chdir(workingDir.c_str()) != 0) {
+                _exit(wallpaperx::testing::kChildChdirFailedExit);
+            }
+            // setrlimit is a bare syscall, so it is safe here too. Applied to both the soft
+            // and the hard limit, since a raised soft limit would let the daemon write past
+            // it and the phase would establish nothing.
+            if (fileSizeLimit > 0) {
+                struct rlimit limit {
+                    fileSizeLimit, fileSizeLimit
+                };
+                if (setrlimit(RLIMIT_FSIZE, &limit) != 0) _exit(wallpaperx::testing::kChildRlimitFailedExit);
+            }
             execChildOrDie(parentBeforeFork, binary.c_str(), argv, envp.data());
         }
 
@@ -434,11 +447,6 @@ public:
             reap();
         }
         breakStdout();
-
-        if (!m_configHome.empty()) {
-            std::error_code ec;
-            std::filesystem::remove_all(m_configHome, ec);
-        }
     }
 
     SpawnedDaemon(const SpawnedDaemon&) = delete;
@@ -654,10 +662,9 @@ private:
         return m_exitCode;
     }
 
-    // Only set when this spawn created the directory, so an explicit override is never
-    // deleted by us.
-    std::filesystem::path m_configHome;
-    static inline int s_configHomeCounter = 0;
+    // Only engaged when this spawn created the directory, so an explicit override is never
+    // deleted by us. Declared before every other member so it outlives them.
+    std::optional<wallpaperx::testing::ScratchDir> m_configHome;
 
     pid_t m_pid = -1;
     int m_readFd = -1;
@@ -675,6 +682,13 @@ private:
     mutable std::mutex m_mutex;
     std::string m_output;
 };
+
+// The prefix every scratch directory this run creates shares, so the isolation guard can
+// tell a config file written by one of this run's daemons from one written by a process it
+// does not own. Must stay in step with ScratchDir's naming in tests/client/scratch_dir.h.
+std::string harnessTempPrefix() {
+    return (std::filesystem::temp_directory_path() / ("wpx_test_" + std::to_string(::getpid()) + "_")).string();
+}
 
 // The developer's own config file, as this process's environment names it, and whatever was
 // in it when the run started. Used by the isolation guard in main().
@@ -1395,8 +1409,10 @@ void checkFirstFrameUnderStatusLoad(sdbus::IProxy& proxy, FrameReadyLog& signals
 //
 // Which corrects something PLAN.md records: the "no DBus handler touches the GPU" rule
 // is *not* unenforced. The Device's thread pinning enforces it, fatally and at the first
-// violation. What has no mechanical enforcement is the weaker half -- a handler doing
-// slow *non-GPU* work -- and the issue-cost check above is what covers that.
+// violation. The weaker half -- a handler doing slow *non-GPU* work -- has no mechanical
+// enforcement and none of these checks bounds it either: the issue-cost comparison below is
+// a ratio of two runs of the same handler, so any cost both pay cancels out. What it does
+// establish is that the handler neither performs nor waits for the render before replying.
 // ---------------------------------------------------------------------------- //
 
 // Per-call timing rather than one interval around a loop, because the statistic taken from
@@ -1545,10 +1561,14 @@ void checkResponsivenessUnderLoad(sdbus::IProxy& proxy, FrameReadyLog& signals, 
 
     const double videoFloor = minMillis(videoSamples);
     const double staticFloor = minMillis(staticSamples);
-    const double ratio = videoFloor > 0 ? staticFloor / videoFloor : 1.0;
+    const double ratio = videoFloor > 0 ? staticFloor / videoFloor : 0.0;
+    // The sample count is printed rather than asserted: both bursts are the same
+    // unconditional loop over one clamped counter, so no state of the daemon, the host or
+    // the GPU can make them differ -- an assertion on it could only be reddened by editing
+    // the clamp three lines away, which is a check that cannot fail dressed as a guard.
     std::printf("daemon_system_test: cheapest SetWallpaper cost %.3f ms for a request that renders vs %.3f ms for one "
-                "that does not (ratio %.2f, bound %.1f) over %zu samples each; medians %.3f and %.3f\n",
-                staticFloor, videoFloor, ratio, kIssueCostRatioBound, staticSamples.size(),
+                "that does not (ratio %.2f, bound %.1f) over %zu and %zu samples; medians %.3f and %.3f\n",
+                staticFloor, videoFloor, ratio, kIssueCostRatioBound, staticSamples.size(), videoSamples.size(),
                 medianMillis(staticSamples), medianMillis(videoSamples));
 
     // The comparison means something only if exactly one of the two bursts rendered. Not a
@@ -1591,22 +1611,28 @@ void checkResponsivenessUnderLoad(sdbus::IProxy& proxy, FrameReadyLog& signals, 
     //       a slow reply. Observed: NVIDIA 1.725 ms vs 0.144 ms, ratio 11.96; lavapipe
     //       2.983 vs 0.151, ratio 19.71; tsan+lavapipe 4.143 vs 0.778, ratio 5.33 -- FAIL
     //       in all three. Reverted.
-    // COVERAGE-ASSERT: the sample counts are asserted equal and >= 4 below. A minimum over
-    //       one or two calls is a single sample dressed up, and loadCount is computed from
-    //       this host's render speed rather than written down here, so it can shrink
-    //       without anyone editing this file. Controlled by clamping loadCount to 2 ->
-    //       "FAIL: the issue-cost comparison has equal, non-trivial sample counts on both
-    //       sides", printed beside a ratio over 2 samples that nobody should trust.
-    //       Reverted.
     //
-    // What this deliberately no longer covers: absolute handler cost. The config save runs
-    // on both sides, so it cancels -- ConfigStore::save given a 5 ms sleep, some 500x its
-    // real cost, took both sides from 0.14 ms to 5.25 ms and left the ratio at 1.00 and
-    // green. S8.10 owns that, and a second bound here to compensate would reintroduce
-    // exactly the host-dependent absolute number this rework removed.
-    check(staticSamples.size() == videoSamples.size() && staticSamples.size() >= 4,
-          "the issue-cost comparison has equal, non-trivial sample counts on both sides");
-    check(videoFloor > 0 && ratio < kIssueCostRatioBound,
+    // What this deliberately does NOT cover: the handler's absolute cost. The config save
+    // runs on both sides, so it cancels -- ConfigStore::save given a 5 ms sleep, some 500x
+    // its real cost, took both sides from 0.14 ms to 5.25 ms and left the ratio at 1.00 and
+    // green. Nothing in this suite bounds the absolute cost of a DBus handler: the in-process
+    // S8.10 phase establishes that the save is not the durable variant, which is a different
+    // question, and a second bound here would reintroduce exactly the host-dependent absolute
+    // number this shape removed. That gap is real and is stated here rather than implied.
+    //
+    // A validity gate, not part of the assertion: a cheapest call measured at 0 ms means this
+    // host's clock cannot resolve a round trip, and a ratio computed from it grades nothing.
+    // Folded into the check -- which is what `videoFloor > 0 &&` used to do -- it printed
+    // "ratio 1.00" beside a FAIL accusing the daemon of rendering inline. The gate cannot
+    // hide the defect it is next to: a handler that rendered inline has no zero-cost call to
+    // offer, since every one of these monitors is a distinct, fresh render.
+    if (videoFloor <= 0.0 || staticFloor <= 0.0) {
+        notVerified("S6.9 (SetWallpaper does not render inline)",
+                    "the cheapest call in a burst measured 0 ms, so this host's clock cannot resolve a SetWallpaper "
+                    "round trip and no ratio from this run means anything");
+        return;
+    }
+    check(ratio < kIssueCostRatioBound,
           "issuing a burst that will render costs no more than issuing one that renders nothing "
           "(SetWallpaper does not render inline)");
 }
@@ -3283,36 +3309,6 @@ void checkConfigServerLostPort(NameWatcher& names, const std::string& bluePath, 
 // wallpapers there and restored them on the next login. A phase that wants state to survive
 // a restart passes its own, which is the only reason to override that default.
 
-// A directory this file creates and removes, used as an XDG_CONFIG_HOME shared by two
-// spawns or as a working directory to inspect afterwards.
-class ScratchDir {
-public:
-    explicit ScratchDir(const char* tag) {
-        static int counter = 0;
-        m_path = std::filesystem::temp_directory_path() /
-                 ("wpx_step8_" + std::to_string(::getpid()) + "_" + std::to_string(counter++) + "_" + tag);
-        std::error_code ec;
-        std::filesystem::remove_all(m_path, ec);
-        std::filesystem::create_directories(m_path, ec);
-        m_ok = !ec;
-    }
-    ~ScratchDir() {
-        std::error_code ec;
-        std::filesystem::remove_all(m_path, ec);
-    }
-    ScratchDir(const ScratchDir&) = delete;
-    ScratchDir& operator=(const ScratchDir&) = delete;
-
-    bool ok() const { return m_ok; }
-    const std::filesystem::path& path() const { return m_path; }
-    std::filesystem::path configFile() const { return m_path / "wallpaperx" / "config.json"; }
-    std::string env() const { return "XDG_CONFIG_HOME=" + m_path.string(); }
-
-private:
-    std::filesystem::path m_path;
-    bool m_ok = false;
-};
-
 std::string readTextFile(const std::filesystem::path& file) {
     std::ifstream in(file, std::ios::binary);
     if (!in) return {};
@@ -3365,15 +3361,28 @@ std::map<int, PersistedEntry> configEntries(const std::filesystem::path& file, s
 }
 
 // Every file under `dir`, so a phase can say "nothing was written here" and name what was
-// if something was.
-std::vector<std::string> filesUnder(const std::filesystem::path& dir) {
-    std::vector<std::string> found;
+// if something was. False, with a reason, when the walk could not be made: "the directory
+// could not be read" and "the directory was empty" have to be different answers, or the
+// absence check above becomes evidence of absence on no evidence at all. The non-throwing
+// increment(ec) is what keeps a mid-walk error -- a daemon creating a mode-0000 directory
+// under its cwd, which is exactly what this phase hunts -- from throwing out of the phase
+// and taking every later phase with it.
+bool filesUnder(const std::filesystem::path& dir, std::vector<std::string>& found, std::string& why) {
     std::error_code ec;
-    for (const std::filesystem::directory_entry& entry :
-         std::filesystem::recursive_directory_iterator(dir, ec)) {
-        found.push_back(entry.path().string());
+    std::filesystem::recursive_directory_iterator it(dir, ec);
+    if (ec) {
+        why = dir.string() + " could not be read (" + ec.message() + ")";
+        return false;
     }
-    return found;
+    const std::filesystem::recursive_directory_iterator last;
+    for (; it != last; it.increment(ec)) {
+        if (ec) {
+            why = dir.string() + " could not be walked (" + ec.message() + ")";
+            return false;
+        }
+        found.push_back(it->path().string());
+    }
+    return true;
 }
 
 // The daemon's /health body, when the daemon is the process serving 18462. Returns false
@@ -3393,8 +3402,10 @@ bool fetchHealth(const StatusReply& status, nlohmann::json& out, std::string& wh
     if (!reply.ok()) {
         // Not a skip: the daemon just said it owns that port, so a /health that will not
         // answer is the daemon failing, and the http lifecycle phase grades the same thing.
+        // `why` is deliberately left empty as the marker for "already graded red" -- with a
+        // reason set, callers reported the one fault twice, once as a failure and once as
+        // coverage that did not run, and the run summary exists to keep those apart.
         check(false, "a daemon reporting config_server ok answers GET /health");
-        why = "GET /health did not answer although the daemon reports config_server ok";
         return false;
     }
     out = reply.json;
@@ -3474,7 +3485,7 @@ void checkConfigRestart(NameWatcher& names, const std::string& validationEnv, co
             nlohmann::json health;
             std::string why;
             if (!fetchHealth(beforeAnything, health, why, check)) {
-                notVerified("S8.11's /health half", why);
+                if (!why.empty()) notVerified("S8.11's /health half", why);
             } else {
                 check(healthCheckStatusOf(health, "gpu") == "pending",
                       "/health reports the GPU as pending on a daemon that restored nothing");
@@ -3532,6 +3543,22 @@ void checkConfigRestart(NameWatcher& names, const std::string& validationEnv, co
     const std::string bytesBeforeRestart = readTextFile(configHome.configFile());
     const auto mtimeBeforeRestart = std::filesystem::last_write_time(configHome.configFile(), timeEc);
 
+    // Subscribed BEFORE the restarted daemon is spawned, and after the first daemon's name
+    // is provably gone. The restore renders on the daemon's own initiative, and main.cpp
+    // acquires the bus name before it queues that render -- so a subscription made after
+    // "the name is up" opens its window after the signal can already have been emitted, and
+    // FrameReadyLog scans a history that starts empty. The window is wide today only because
+    // the first restore render pays for Vulkan device creation. A match rule naming a
+    // well-known sender is resolved by the bus at delivery time, so installing it while
+    // nobody owns the name still delivers the new daemon's signals. `restored` is declared
+    // before the proxy so it outlives the dispatch thread that writes to it.
+    FrameReadyLog restored;
+    auto proxy =
+        sdbus::createProxy(sdbus::ServiceName{DbusService::kBusName}, sdbus::ObjectPath{DbusService::kObjectPath});
+    proxy->uponSignal("FrameReady")
+        .onInterface(DbusService::kInterface)
+        .call([&restored](int32_t monitorId, uint64_t generation) { restored.record(monitorId, generation); });
+
     // The restart. No client call of any kind against this daemon before the assertions:
     // that is the property.
     SpawnedDaemon second({validationEnv, configHome.env()});
@@ -3542,13 +3569,6 @@ void checkConfigRestart(NameWatcher& names, const std::string& validationEnv, co
         return;
     }
 
-    FrameReadyLog restored;
-    auto proxy =
-        sdbus::createProxy(sdbus::ServiceName{DbusService::kBusName}, sdbus::ObjectPath{DbusService::kObjectPath});
-    proxy->uponSignal("FrameReady")
-        .onInterface(DbusService::kInterface)
-        .call([&restored](int32_t monitorId, uint64_t generation) { restored.record(monitorId, generation); });
-
     // GOAL: S8.1 -- a wallpaper set before a restart is on the same monitor after it, with
     //       no client acting. This is the whole of Step 8; everything else constrains how
     //       it is reached. False if the monitor comes back reporting nothing set.
@@ -3556,8 +3576,10 @@ void checkConfigRestart(NameWatcher& names, const std::string& validationEnv, co
     //       daemon before the restart managed to render. A frame-only check would report a
     //       host with no working Vulkan as a broken restore -- and a state-only check would
     //       pass for a daemon that restored a path it can no longer open, which is exactly
-    //       what persisting the sanitized form produces. The frame is subscribed before the
-    //       reply is read, so a restore that renders immediately cannot be missed.
+    //       what persisting the sanitized form produces. The frame subscription is installed
+    //       before the restarted daemon is spawned, so no startup render can be emitted
+    //       unobserved -- subscribing after the name appears would not do, since the daemon
+    //       owns its name before it queues that render.
     // CONTROL: `service.restoreSaved();` deleted from main.cpp -> seven FAILs, led by "the
     //       wallpaper set before the restart is on that monitor after it, with no client
     //       asking" and "the restored wallpaper renders in the new process without any
@@ -3606,7 +3628,7 @@ void checkConfigRestart(NameWatcher& names, const std::string& validationEnv, co
             nlohmann::json health;
             std::string healthWhy;
             if (!fetchHealth(afterRender, health, healthWhy, check)) {
-                notVerified("S8.11's /health half after a restore", healthWhy);
+                if (!healthWhy.empty()) notVerified("S8.11's /health half after a restore", healthWhy);
             } else {
                 const std::string gpu = healthCheckStatusOf(health, "gpu");
                 check(gpu != "pending" && !gpu.empty(),
@@ -3666,10 +3688,14 @@ void checkStartsOnAnyConfig(NameWatcher& names, const std::string& validationEnv
     //       throw escaping the load reaches main.cpp's catch and exits 1, while a const
     //       `operator[]` on a missing key is a JSON_ASSERT -> SIGABRT that no catch can
     //       intercept. A check that covers only the throw is blind to the worse half.
-    // WHY-THIS-SHAPE: exitedNormally() AND exit code 0 AND the name on the bus, per case.
-    //       "The daemon exited non-zero" is satisfied by an abort (reap() reports -1 for
-    //       both), so the abort half needs exitedNormally(); "it came up" alone would pass
-    //       for a daemon that aborted later. The corpus leads with the shapes that reach a
+    // WHY-THIS-SHAPE: exitedNormally() and the name on the bus per case, plus exit code 0 on
+    //       every build a sanitizer has not taken the exit code away from. "The daemon
+    //       exited non-zero" is satisfied by an abort (reap() reports -1 for both), so the
+    //       abort half needs exitedNormally(); "it came up" alone would pass for a daemon
+    //       that aborted later. Under a sanitizer the exit code is the tool's, so that arm
+    //       is replaced by a FAIL naming the sanitizer report rather than by treating the
+    //       report as satisfying the check -- which is what it used to do, making a data
+    //       race in the config-load path print as a pass. The corpus leads with the shapes that reach a
     //       field read of parsed input -- `{}`, wrong types, a wrong-typed version -- since
     //       those are the ones a const operator[] would abort on.
     // CONTROL: two, both reverted, and they redden different cases -- which is the point.
@@ -3681,14 +3707,20 @@ void checkStartsOnAnyConfig(NameWatcher& names, const std::string& validationEnv
     //       the same mutation killed it. (b) `json::parse(text, nullptr, false)` made
     //       throwing and load()'s catch made to rethrow -> eight FAILs, over the truncated,
     //       empty, not-JSON and 100 MB cases, each printing "exit code 1" with the daemon's
-    //       "fatal: [json.exception.parse_error.101] ..." line.
-    // COVERAGE-ASSERT: the number of cases actually spawned is asserted against the corpus
-    //       size, so a case that silently fails to be written cannot thin this out.
+    //       "fatal: [json.exception.parse_error.101] ..." line. (c) for the sanitizer arm,
+    //       which no unsanitized run can reach: the match string pointed at a line the daemon
+    //       always prints -> nine FAILs, "with <case> in config.json, the daemon's sanitizer
+    //       reported no warnings", where the shape this replaced printed nine passes.
+    //       Reverted.
+    // COVERAGE-ASSERT: every case is accounted for -- spawned, or reported as one this host
+    //       could not write -- against the corpus size, so a case that silently stops running
+    //       cannot thin this out. Counting only spawns turned a /tmp too small for the
+    //       100 MB case into a FAIL against the daemon, which is a fault of the host.
     //       CONTROL: `if (content.size() > 1000) continue;` added to the loop, which is what
     //       a well-meaning "skip the slow ones" edit looks like -> "FAIL: every
-    //       config-content case was actually spawned, so this phase is as wide as it reads",
-    //       and nothing else. Reverted.
-    const std::vector<std::pair<const char*, std::string>> corpus{
+    //       config-content case was either spawned or reported unwritable, so this phase is
+    //       as wide as it reads", and nothing else. Reverted.
+    std::vector<std::pair<const char*, std::string>> corpus{
         {"valid JSON of the wrong shape", "{}"},
         {"an object whose fields are all the wrong type",
          "{\"version\":\"1\",\"monitors\":{\"0\":{\"path\":42}}}"},
@@ -3699,12 +3731,17 @@ void checkStartsOnAnyConfig(NameWatcher& names, const std::string& validationEnv
         {"a file that is not JSON at all", "wallpapers = all of them"},
         {"a JSON array where an object belongs", "[{\"monitor_id\":0}]"},
         {"50 000 levels of nesting", deep},
-        {"100 MB of no JSON whatsoever", std::string(100u * 1024u * 1024u, 'x')},
     };
+    // Appended rather than braced in: an initializer_list's backing array is const, so the
+    // vector copies each element and the 100 MB case would exist twice at once.
+    corpus.reserve(corpus.size() + 1);
+    corpus.emplace_back("100 MB of no JSON whatsoever", std::string(100u * 1024u * 1024u, 'x'));
 
     int exercised = 0;
+    int unwritable = 0;
     for (const auto& [what, content] : corpus) {
         if (!writeTextFile(configHome.configFile(), content)) {
+            ++unwritable;
             notVerified(kGoals, std::string("the config file for the '") + what + "' case could not be written");
             continue;
         }
@@ -3731,21 +3768,30 @@ void checkStartsOnAnyConfig(NameWatcher& names, const std::string& validationEnv
         const bool sanitizerReported = output.find("Sanitizer: reported") != std::string::npos;
         // exitedNormally() is the half that sees an abort: a process killed by SIGABRT and
         // one that timed out both report exit code -1, so a check written on the code alone
-        // cannot tell a crash from a clean refusal.
-        check(daemon.exitedNormally() && (sanitizerReported || exitCode == 0),
-              (std::string("with ") + what + " in config.json, the daemon exits 0 on SIGTERM rather than aborting")
+        // cannot tell a crash from a clean refusal. It is asserted unconditionally.
+        check(daemon.exitedNormally(),
+              (std::string("with ") + what + " in config.json, the daemon exits through main() rather than aborting")
                   .c_str());
         if (!daemon.exitedNormally()) {
             std::fprintf(stderr, "  %s: the daemon did not exit normally (signal %d, timed out %d)\n", what,
                          daemon.termSignal(), static_cast<int>(daemon.timedOut()));
-        } else if (!sanitizerReported && exitCode != 0) {
-            std::fprintf(stderr, "  %s: exit code %d\n", what, exitCode);
+        }
+        if (sanitizerReported) {
+            check(false, (std::string("with ") + what +
+                          " in config.json, the daemon's sanitizer reported no warnings (its exit code is the "
+                          "sanitizer's here, so the exit-code check cannot run)")
+                             .c_str());
+        } else {
+            check(exitCode == 0,
+                  (std::string("with ") + what + " in config.json, the daemon exits 0 on SIGTERM").c_str());
+            if (exitCode != 0) std::fprintf(stderr, "  %s: exit code %d\n", what, exitCode);
         }
         ++exercised;
         awaitNameRelease(names, "the next config-content case");
     }
-    check(exercised == static_cast<int>(corpus.size()),
-          "every config-content case was actually spawned, so this phase is as wide as it reads");
+    check(exercised + unwritable == static_cast<int>(corpus.size()),
+          "every config-content case was either spawned or reported unwritable, so this phase is as wide as it "
+          "reads");
 }
 
 void checkUnreadableRestore(NameWatcher& names, const std::string& validationEnv, const std::string& bluePath,
@@ -3760,8 +3806,14 @@ void checkUnreadableRestore(NameWatcher& names, const std::string& validationEnv
         return;
     }
     const std::string missingPath = (configHome.path() / "unmounted-drive" / "wallpaper.png").string();
-    const std::string config = "{\"version\":1,\"monitors\":[{\"monitor_id\":" + std::to_string(kMonitorMissing) +
-                               ",\"type\":\"static\",\"path\":\"" + missingPath + "\"}]}";
+    // Serialised, not concatenated: $TMPDIR may hold a quote or a backslash, and a fixture
+    // that is not valid JSON would make the daemon correctly restore nothing while this
+    // phase reported it as a daemon that forgot an entry.
+    const nlohmann::json doc{{"version", 1},
+                             {"monitors", nlohmann::json::array({{{"monitor_id", kMonitorMissing},
+                                                                  {"type", "static"},
+                                                                  {"path", missingPath}}})}};
+    const std::string config = doc.dump();
     if (!writeTextFile(configHome.configFile(), config)) {
         notVerified(kGoals, "the config file naming an unreadable wallpaper could not be written");
         return;
@@ -3904,7 +3956,6 @@ void checkConfigLocation(NameWatcher& names, const std::string& validationEnv, c
          nullptr},
     };
 
-    int caseIndex = 0;
     for (const LocationCase& c : cases) {
         // A working directory per case, not one shared by both. With one shared directory
         // the second case inherits whatever the first left there, so a control that makes
@@ -3917,12 +3968,12 @@ void checkConfigLocation(NameWatcher& names, const std::string& validationEnv, c
             return;
         }
         SpawnedDaemon daemon(c.env, SpawnedDaemon::Stdout::Captured, working.path().string());
+        // A refused chdir is one of forked_child.h's preamble codes, so reportedStartupFault
+        // names it. Comparing waitForExit() here instead blocked for the full process
+        // timeout on every ordinary "the name never appeared" failure, and only this phase
+        // would ever have recognised the code.
         if (!names.waitFor(true)) {
             if (reportedStartupFault(daemon, kGoals)) return;
-            if (daemon.waitForExit() == SpawnedDaemon::kChildChdirFailedExit) {
-                harnessFault(kGoals, "the forked child could not enter the working directory this phase created");
-                return;
-            }
             notVerified(kGoals, std::string("the daemon for the '") + c.what + "' case never acquired the bus name");
             return;
         }
@@ -3953,7 +4004,7 @@ void checkConfigLocation(NameWatcher& names, const std::string& validationEnv, c
                                         sdbus::ObjectPath{DbusService::kObjectPath});
         std::string setError;
         try {
-            setWallpaper(*proxy, "static", bluePath, kMonitorLocation + caseIndex);
+            setWallpaper(*proxy, "static", bluePath, kMonitorLocation);
         } catch (const std::exception& e) {
             setError = e.what();
         }
@@ -3982,20 +4033,261 @@ void checkConfigLocation(NameWatcher& names, const std::string& validationEnv, c
         }
         awaitNameRelease(names, "the next config-location case");
 
-        const std::vector<std::string> left = filesUnder(working.path());
-        check(left.empty(),
-              (std::string("with ") + c.what + ", the daemon writes nothing into its working directory").c_str());
-        for (const std::string& file : left) std::fprintf(stderr, "  left behind: %s\n", file.c_str());
-
-        const std::filesystem::path homeConfig = home.path() / ".config" / "wallpaperx" / "config.json";
-        const bool wroteHome = std::filesystem::exists(homeConfig);
-        if (c.expectHomeFile) {
-            check(wroteHome, "with a relative XDG_CONFIG_HOME the daemon persists under $HOME/.config instead");
+        std::vector<std::string> left;
+        std::string walkWhy;
+        if (!filesUnder(working.path(), left, walkWhy)) {
+            // This phase created that directory, so one that cannot be listed is this
+            // harness's problem and not the daemon's -- and an unreadable directory must not
+            // read as an empty one, which is what "nothing was written here" would become.
+            // CONTROL: the call pointed at a subdirectory that does not exist -> two
+            //       "HARNESS FAULT -- ... could not be read (No such file or directory)"
+            //       lines and no FAIL, where the previous shape returned an empty vector and
+            //       passed the absence check. Reverted.
+            harnessFault(kGoals, walkWhy.c_str());
         } else {
-            check(!wroteHome, "a daemon with no usable HOME writes nothing under the HOME this phase provides");
+            check(left.empty(),
+                  (std::string("with ") + c.what + ", the daemon writes nothing into its working directory").c_str());
+            for (const std::string& file : left) std::fprintf(stderr, "  left behind: %s\n", file.c_str());
         }
-        ++caseIndex;
+
+        // Only the positive direction is asserted. Case one is defined by having no usable
+        // HOME, so it is never told this directory exists and could not write into it under
+        // any daemon behaviour, correct or broken; the property it looked like it covered --
+        // that a daemon with no HOME does not fall back to the developer's real one -- is
+        // covered by the witness in main(), which compares the real config file across the
+        // whole run.
+        if (c.expectHomeFile) {
+            const std::filesystem::path homeConfig = home.path() / ".config" / "wallpaperx" / "config.json";
+            check(std::filesystem::exists(homeConfig),
+                  "with a relative XDG_CONFIG_HOME the daemon persists under $HOME/.config instead");
+        }
     }
+}
+
+// A config.json of a shape or a size the daemon must refuse without opening it.
+struct ConfigFileCase {
+    const char* what;
+    // Returns false when this host would not let the case be staged at all.
+    bool (*plant)(const std::filesystem::path& file);
+    // A fragment the daemon's persistence detail has to carry, so the refusal is reported
+    // for the reason the case is about rather than incidentally.
+    const char* detailFragment;
+};
+
+void checkStoppableOnAnyConfigFile(NameWatcher& names, const std::string& validationEnv, const Check& check) {
+    constexpr const char* kGoals = "S8.12 (no config file content or type can stop the daemon being stopped)";
+
+    // GOAL: S8.12 -- a config.json that is not an ordinary file, or is over the size cap, is
+    //       refused WITHOUT being opened: the daemon reaches the bus, answers, and exits on
+    //       SIGTERM. False if any of these makes it unreachable or SIGKILL-only. This is not
+    //       hypothetical and not about exotic input: measured before the guard existed, a
+    //       named pipe at config.json left the daemon parked in wait_for_partner with one
+    //       thread, no bus name, no log line, and immune to SIGTERM and SIGINT -- because
+    //       main.cpp blocks those signals at line 26, reads the config at line 57, and only
+    //       starts the thread that consumes them at line 95. A symlink to /dev/zero did the
+    //       same while growing 43 MB/s; a 200 MB file did it for 14 seconds.
+    // WHY-THIS-SHAPE: the daemon is required to be STOPPED, not merely to have started. The
+    //       obvious shape -- S8.2's, "it came up and exited 0" -- passes on exactly the
+    //       daemon this goal exists to catch if it is written as "did not exit non-zero", and
+    //       S8.2's own corpus is regular files, which the FIFO case is not. So each case
+    //       asserts three separable things: the name appears (it did not, before the fix),
+    //       GetStatus answers on it, and the process leaves through main() on SIGTERM without
+    //       having to be killed. `timedOut()` is asserted explicitly because shutdown()
+    //       SIGKILLs after its wait expires and returns an exit code either way -- a check on
+    //       the code alone would grade a hang that had to be killed as a clean exit.
+    //       KNOWN GAP, stated rather than papered over: a config file on a genuinely hung
+    //       mount blocks the daemon inside the stat that precedes all of this, before any
+    //       guard runs. Nothing here covers that, and no test in this suite does; moving the
+    //       read after the signal thread starts is a pending decision.
+    // CONTROL: all three of load()'s pre-open guards disabled in config_store.cpp -- the
+    //       is_regular_file refusal, the file_size error check and the size cap -- which is
+    //       the code as it stood when the hang was found. Each one alone is enough to keep
+    //       the daemon out of open(): with only the first removed, file_size() refuses a
+    //       FIFO; with the first two removed, its -1 trips the cap. With all three gone the
+    //       named-pipe and /dev/zero cases went red on "the daemon reaches the bus", "exits
+    //       on SIGTERM without having to be killed" (printing "timed out 1", i.e. SIGKILLed)
+    //       and "exits 0", and the run took 125 s instead of 2.7 s. All reverted.
+    // COVERAGE-ASSERT: every case is accounted for -- exercised, or reported as one this
+    //       host could not stage -- against the table's size, so a case that quietly stops
+    //       being planted fails instead of shrinking the phase in silence.
+    const std::vector<ConfigFileCase> cases{
+        {"a named pipe",
+         [](const std::filesystem::path& file) { return ::mkfifo(file.c_str(), 0644) == 0; },
+         "is not a regular file"},
+        {"a symlink to /dev/zero",
+         [](const std::filesystem::path& file) {
+             std::error_code ec;
+             std::filesystem::create_symlink("/dev/zero", file, ec);
+             return !ec;
+         },
+         "is not a regular file"},
+        {"a directory",
+         [](const std::filesystem::path& file) {
+             std::error_code ec;
+             std::filesystem::create_directories(file, ec);
+             return !ec;
+         },
+         "is not a regular file"},
+        {"a regular file over the size cap",
+         [](const std::filesystem::path& file) { return writeTextFile(file, std::string(2u * 1024u * 1024u, 'x')); },
+         "over the"},
+    };
+
+    int exercised = 0;
+    int unstageable = 0;
+    for (const ConfigFileCase& c : cases) {
+        ScratchDir configHome("stoppable");
+        if (!configHome.ok()) {
+            ++unstageable;
+            notVerified(kGoals, std::string("the scratch XDG_CONFIG_HOME for the '") + c.what +
+                                    "' case could not be created");
+            continue;
+        }
+        std::error_code ec;
+        std::filesystem::create_directories(configHome.configFile().parent_path(), ec);
+        if (ec || !c.plant(configHome.configFile())) {
+            ++unstageable;
+            notVerified(kGoals, std::string("this host would not let the '") + c.what + "' case be staged");
+            continue;
+        }
+        ++exercised;
+
+        SpawnedDaemon daemon({validationEnv, configHome.env()});
+        const bool cameUp = names.waitFor(true);
+        if (!cameUp && reportedStartupFault(daemon, kGoals)) return;
+        check(cameUp, (std::string("with ") + c.what + " at config.json, the daemon reaches the bus").c_str());
+
+        std::string served;
+        std::string persistence;
+        if (cameUp) {
+            auto proxy = sdbus::createProxy(sdbus::ServiceName{DbusService::kBusName},
+                                            sdbus::ObjectPath{DbusService::kObjectPath});
+            const StatusReply status = getStatus(*proxy);
+            if (!status.ok()) {
+                served = status.error();
+            } else {
+                const nlohmann::json& json = status.json();
+                persistence = json.contains("persistence") && json["persistence"].is_object()
+                                  ? json["persistence"].value("detail", std::string())
+                                  : std::string("(absent)");
+            }
+            check(served.empty(),
+                  (std::string("with ") + c.what + " at config.json, the daemon answers GetStatus").c_str());
+            if (!served.empty()) std::fprintf(stderr, "  %s: %s\n", c.what, served.c_str());
+
+            // The refusal has to be reported, or a user whose config is a directory is told
+            // nothing at all and their wallpapers silently stop surviving restarts.
+            const bool named = persistence.find(c.detailFragment) != std::string::npos;
+            check(named, (std::string("with ") + c.what + " at config.json, the daemon says why it refused the file")
+                             .c_str());
+            if (!named) std::fprintf(stderr, "  %s: persistence detail '%s'\n", c.what, persistence.c_str());
+        }
+
+        const int exitCode = daemon.shutdown(SIGTERM);
+        const bool stopped = daemon.exitedNormally() && !daemon.timedOut();
+        check(stopped, (std::string("with ") + c.what +
+                        " at config.json, the daemon exits on SIGTERM without having to be killed")
+                           .c_str());
+        if (!stopped) {
+            std::fprintf(stderr, "  %s: exited normally %d, timed out %d, signal %d\n", c.what,
+                         static_cast<int>(daemon.exitedNormally()), static_cast<int>(daemon.timedOut()),
+                         daemon.termSignal());
+        }
+        if (daemon.output().find("Sanitizer: reported") != std::string::npos) {
+            check(false, (std::string("with ") + c.what +
+                          " at config.json, the daemon's sanitizer reported no warnings (its exit code is the "
+                          "sanitizer's here, so the exit-code check cannot run)")
+                             .c_str());
+        } else {
+            check(exitCode == 0, (std::string("with ") + c.what + " at config.json, the daemon exits 0").c_str());
+            if (exitCode != 0) std::fprintf(stderr, "  %s: exit code %d\n", c.what, exitCode);
+        }
+        awaitNameRelease(names, "the next unreadable-config-file case");
+    }
+    check(exercised + unstageable == static_cast<int>(cases.size()),
+          "every unreadable-config-file case was either exercised or reported unstageable");
+}
+
+void checkFileSizeLimit(NameWatcher& names, const std::string& validationEnv, const std::string& bluePath,
+                        const Check& check) {
+    constexpr int32_t kMonitorFileLimit = 19;
+    constexpr const char* kGoals = "S8.17 (a file-size limit hit during a config write does not kill the daemon)";
+
+    ScratchDir configHome("fsize");
+    if (!configHome.ok()) {
+        notVerified(kGoals, "a scratch XDG_CONFIG_HOME could not be created under the temp directory");
+        return;
+    }
+
+    // GOAL: S8.17 -- a config write that exceeds RLIMIT_FSIZE does not kill the daemon. The
+    //       kernel's default disposition for SIGXFSZ is to terminate, so before this was
+    //       ignored the first SetWallpaper under a `LimitFSIZE=` unit killed the daemon
+    //       outright, with a core dump, no log line and no clean shutdown -- after the
+    //       client's call had already returned success. Every monitor goes blank at once.
+    // WHY-THIS-SHAPE: the wallpaper is a `video`, which requestWallpaper records and
+    //       persists but renderPending refuses before touching the GPU. A `static` would
+    //       create a Vulkan device under the same 1-byte file limit, and a driver that
+    //       writes a shader cache would then die for a reason that has nothing to do with
+    //       the config -- a failure this phase would report against the daemon. The limit is
+    //       applied in the forked child rather than to this process, because a limit here
+    //       would apply to the harness's own writes too.
+    // CONTROL: `std::signal(SIGXFSZ, SIG_IGN)` disabled in main.cpp -> four FAILs: the
+    //       SetWallpaper call itself (the daemon dies mid-reply), "a config write that
+    //       exceeds the file-size limit does not kill the daemon", and both shutdown checks,
+    //       printing "  exited normally 0, timed out 0, signal 25". Reverted.
+    SpawnedDaemon daemon({validationEnv, configHome.env()}, SpawnedDaemon::Stdout::Captured, {}, 1);
+    if (!names.waitFor(true)) {
+        if (!reportedStartupFault(daemon, kGoals)) {
+            notVerified(kGoals, "the daemon for this phase never acquired the bus name");
+        }
+        return;
+    }
+
+    auto proxy =
+        sdbus::createProxy(sdbus::ServiceName{DbusService::kBusName}, sdbus::ObjectPath{DbusService::kObjectPath});
+    std::string setError;
+    try {
+        setWallpaper(*proxy, "video", bluePath, kMonitorFileLimit);
+    } catch (const std::exception& e) {
+        setError = e.what();
+    }
+    check(setError.empty(), "a SetWallpaper whose config write cannot fit under the file-size limit still succeeds");
+    if (!setError.empty()) std::fprintf(stderr, "  %s\n", setError.c_str());
+
+    const StatusReply after = getStatusOrExplain(*proxy);
+    check(after.ok(), "a config write that exceeds the file-size limit does not kill the daemon");
+    if (!after.ok()) {
+        std::fprintf(stderr, "  %s\n", after.error().c_str());
+    } else {
+        const nlohmann::json& json = after.json();
+        const std::string detail = json.contains("persistence") && json["persistence"].is_object()
+                                       ? json["persistence"].value("detail", std::string())
+                                       : std::string("(absent)");
+        // The write failed, and saying so is the difference between "your wallpaper will not
+        // survive a restart" and silence.
+        check(!detail.empty() && detail.find("config.json") != std::string::npos,
+              "the daemon reports the config write that the file-size limit refused");
+        if (detail.find("config.json") == std::string::npos) {
+            std::fprintf(stderr, "  persistence detail: %s\n", detail.c_str());
+        }
+    }
+
+    const int exitCode = daemon.shutdown(SIGTERM);
+    const bool stopped = daemon.exitedNormally() && !daemon.timedOut();
+    check(stopped, "a daemon whose config write hit the file-size limit still exits on SIGTERM");
+    if (!stopped) {
+        std::fprintf(stderr, "  exited normally %d, timed out %d, signal %d\n",
+                     static_cast<int>(daemon.exitedNormally()), static_cast<int>(daemon.timedOut()),
+                     daemon.termSignal());
+    }
+    if (daemon.output().find("Sanitizer: reported") != std::string::npos) {
+        check(false, "the file-size-limit daemon's sanitizer reported no warnings (its exit code is the sanitizer's "
+                     "here, so the exit-code check cannot run)");
+    } else {
+        check(exitCode == 0, "a daemon whose config write hit the file-size limit exits 0");
+        if (exitCode != 0) std::fprintf(stderr, "  exit code %d\n", exitCode);
+    }
+    awaitNameRelease(names, "the phase after the file-size-limit phase");
 }
 
 }  // namespace
@@ -4031,13 +4323,23 @@ int main() {
     //       contents protects the populated case and the empty one alike. Sampled before
     //       anything is spawned and graded outside the try, so an exception on the way
     //       through does not skip it.
-    // CONTROL: the XDG_CONFIG_HOME injection removed from SpawnedDaemon's constructor, which
-    //       is this suite's state before Step 8 -> "FAIL: no daemon this run spawned touched
-    //       the config file of the developer running it", printing "  wrote 4347 bytes to
-    //       /home/.../.config/wallpaperx/config.json, which did not exist before this run".
-    //       That is not hypothetical: the same mutation, reached by an unrelated experiment,
-    //       put 28 test wallpapers into this machine's real config while these phases were
-    //       being written. Reverted, and the file removed.
+    //       A change is attributed before it is graded: only a new file holding one of this
+    //       run's own paths is this suite's doing. The developer's own daemon is tolerated
+    //       elsewhere in this file (it holding port 18462 is a skip, not a finding) and it
+    //       rewrites this file on every SetWallpaper, so an unattributable change is reported
+    //       as a guard that could not conclude -- still red, through the harness channel --
+    //       rather than as this suite having clobbered a real config.
+    // CONTROL: both branches, run with this process's own XDG_CONFIG_HOME pointed at a
+    //       scratch directory so nothing real was touched, and that directory's config.json
+    //       rewritten from outside two seconds into the run. Holding a path under
+    //       test_assets -> "FAIL: no daemon this run spawned touched the config file of the
+    //       developer running it", printing "  wrote 141 bytes to ..., which held something
+    //       else before this run". Holding an unrelated path -> "HARNESS FAULT -- the
+    //       config-isolation guard ... changed during this run but holds none of this run's
+    //       paths", and no FAIL. The scratch directory was removed afterwards. An earlier
+    //       round controlled the accusing branch by removing SpawnedDaemon's XDG_CONFIG_HOME
+    //       injection instead; that mutation writes this suite's wallpapers into the
+    //       developer's real config -- it did, once, by accident -- and is not repeated.
     const RealConfigWitness realConfig = witnessRealConfig();
 
     std::string daemonOutput;
@@ -4302,8 +4604,10 @@ int main() {
         // sockets at scope exit, which that accounting would otherwise report as a leak.
         checkConfigRestart(names, validationEnv, check);
         checkStartsOnAnyConfig(names, validationEnv, check);
+        checkStoppableOnAnyConfigFile(names, validationEnv, check);
         checkUnreadableRestore(names, validationEnv, bluePath, check);
         checkConfigLocation(names, validationEnv, bluePath, check);
+        checkFileSizeLimit(names, validationEnv, bluePath, check);
 
         // Every Frame's UnixFd closes at scope exit, and the daemon is gone, so this
         // process must be back where it started. A descriptor leaked per GetFrameFd is
@@ -4406,10 +4710,30 @@ int main() {
     } else {
         const RealConfigWitness after = witnessRealConfig();
         const bool untouched = after.existed == realConfig.existed && after.contents == realConfig.contents;
-        check(untouched, "no daemon this run spawned touched the config file of the developer running it");
-        if (!untouched) {
+        const bool holdsOurPaths = after.contents.find(harnessTempPrefix()) != std::string::npos ||
+                                   after.contents.find(testAssetDir()) != std::string::npos;
+        if (untouched) {
+            // Nothing to say: the guard held. A message here would be one more line between a
+            // reader and the failures above.
+        } else if (holdsOurPaths) {
+            // The file changed AND holds a path this run owns, so a daemon this run spawned
+            // demonstrably wrote it.
+            check(false, "no daemon this run spawned touched the config file of the developer running it");
             std::fprintf(stderr, "  wrote %zu bytes to %s, which %s before this run\n", after.contents.size(),
                          after.file.string().c_str(), realConfig.existed ? "held something else" : "did not exist");
+        } else {
+            // It changed while this run was in flight but holds none of this run's paths.
+            // This suite already tolerates the developer's own daemon running (fetchHealth
+            // treats it holding port 18462 as a skip), and that daemon rewrites the config on
+            // every SetWallpaper -- so blaming the suite here would send the reader hunting
+            // for a leak in SpawnedDaemon that is not there. Still red, through the harness
+            // channel, because the guard could not conclude.
+            harnessFault("the config-isolation guard",
+                         ("the developer's config file at " + after.file.string() +
+                          " changed during this run but holds none of this run's paths, so another process on this "
+                          "machine -- most likely the developer's own daemon -- wrote it and the guard could not "
+                          "conclude")
+                             .c_str());
         }
     }
 

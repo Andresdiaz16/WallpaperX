@@ -5,10 +5,12 @@
 #include <nlohmann/json.hpp>
 
 #include <cerrno>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <system_error>
 
 #include <fcntl.h>
@@ -19,6 +21,10 @@ namespace {
 
 constexpr const char* kAppDir = "wallpaperx";
 constexpr const char* kFileName = "config.json";
+
+// A 32-monitor config is about 4 kB. The cap is not about legitimate files: it bounds how
+// long startup can spend, and how much it can allocate, on a file someone else wrote.
+constexpr std::uintmax_t kMaxBytes = 1u << 20;
 
 // Every field name in one place: a typo in the reader that matches a typo in the writer is
 // invisible until someone else's build reads the file.
@@ -46,14 +52,26 @@ bool readString(const nlohmann::json& object, const char* key, std::string& out)
     return true;
 }
 
+// is_number_integer() is false for 1.5 and for true, but true for any width -- and
+// get<int>() narrows silently, so 2^32 + 1 arrives as 1 and passes whatever range check
+// the caller applies afterwards. The width has to be rejected here, before the narrowing.
+bool readInt(const nlohmann::json& field, int& out) {
+    if (!field.is_number_integer()) return false;
+    if (field.is_number_unsigned()) {
+        const std::uint64_t raw = field.get<std::uint64_t>();
+        if (raw > static_cast<std::uint64_t>(std::numeric_limits<int>::max())) return false;
+        out = static_cast<int>(raw);
+        return true;
+    }
+    const std::int64_t raw = field.get<std::int64_t>();
+    if (raw < std::numeric_limits<int>::min() || raw > std::numeric_limits<int>::max()) return false;
+    out = static_cast<int>(raw);
+    return true;
+}
+
 bool readMonitorId(const nlohmann::json& object, int& out) {
     if (!object.contains(kKeyMonitorId)) return false;
-    const nlohmann::json& field = object.at(kKeyMonitorId);
-    // is_number_integer() is false for 1.5 and for true -- JSON has one number type and
-    // nlohmann will happily hand back 1 for either if asked with get<int>().
-    if (!field.is_number_integer()) return false;
-    out = field.get<int>();
-    return true;
+    return readInt(object.at(kKeyMonitorId), out);
 }
 
 }  // namespace
@@ -83,10 +101,35 @@ LoadResult ConfigStore::load() const {
     // file, so the guarantee is structural rather than a matter of having checked.
     try {
         std::error_code ec;
-        if (!std::filesystem::exists(m_file, ec) || ec) {
-            return result;  // No config yet is the ordinary first-run case, not an error.
+        const std::filesystem::file_status status = std::filesystem::status(m_file, ec);
+        if (status.type() == std::filesystem::file_type::not_found) return result;
+        // "No config yet" and "could not tell" are different answers. Folding them
+        // together reported a healthy daemon that had silently restored nothing.
+        if (ec) {
+            result.error = describe(m_file, "could not be checked: " + ec.message());
+            return result;
         }
         result.fileExisted = true;
+
+        // Checked before opening, because opening is what hangs: a FIFO here blocks in
+        // open() until a writer appears, and this runs before the daemon can be signalled.
+        if (!std::filesystem::is_regular_file(status)) {
+            result.error = describe(m_file, "is not a regular file");
+            return result;
+        }
+        // Past here the file is an ordinary one we could inspect, so every remaining
+        // failure is about its contents and it is safe to move aside.
+        result.preservable = true;
+        const std::uintmax_t size = std::filesystem::file_size(m_file, ec);
+        if (ec) {
+            result.error = describe(m_file, "could not be sized: " + ec.message());
+            return result;
+        }
+        if (size > kMaxBytes) {
+            result.error = describe(m_file, "is " + std::to_string(size) + " bytes, over the " +
+                                                std::to_string(kMaxBytes) + " byte limit");
+            return result;
+        }
 
         std::ifstream in(m_file, std::ios::binary);
         if (!in) {
@@ -94,6 +137,14 @@ LoadResult ConfigStore::load() const {
             return result;
         }
         const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+
+        // nlohmann's lexer treats NUL as end of input, so `{...}\0junk` parses clean and
+        // the tail is silently dropped -- the file the daemon believes it read is then not
+        // the file on disk.
+        if (text.find('\0') != std::string::npos) {
+            result.error = describe(m_file, "contains a NUL byte");
+            return result;
+        }
 
         // allow_exceptions=false: a parse failure is a value here, not a throw.
         const nlohmann::json root = nlohmann::json::parse(text, nullptr, false);
@@ -106,8 +157,9 @@ LoadResult ConfigStore::load() const {
             return result;
         }
 
-        if (!root.contains(kKeyVersion) || !root.at(kKeyVersion).is_number_integer() ||
-            root.at(kKeyVersion).get<int>() != kSchemaVersion) {
+        int version = 0;
+        if (!root.contains(kKeyVersion) || !readInt(root.at(kKeyVersion), version) ||
+            version != kSchemaVersion) {
             result.error = describe(m_file, "has an unrecognised schema version");
             return result;
         }

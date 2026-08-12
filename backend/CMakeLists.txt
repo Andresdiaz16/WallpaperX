@@ -202,21 +202,10 @@ target_link_libraries(wallpaperx-log-escape-test PRIVATE wallpaperx-daemon-lib)
 
 # Step 8's persistence layer, and on its own for the reason above: ConfigStore is a file
 # and a parser, and WallpaperManager's save path is GPU-free, so none of it needs a bus, a
-# port or a device. It does carry SKIP_RETURN_CODE -- two of its phases are inconclusive on
-# some hosts (a process running as root cannot make a write fail; a tmpfs cannot tell a
-# durable write from a plain one) and must report that rather than pass.
+# port or a device. It does carry SKIP_RETURN_CODE -- a process running as root cannot make
+# a write fail, and that phase must report itself unexercised rather than pass.
 add_executable(wallpaperx-config-store-test tests/config_store_test.cpp)
 target_link_libraries(wallpaperx-config-store-test PRIVATE wallpaperx-daemon-lib)
-
-# Its S8.10 phase compares the daemon's save against a write+rename this test performs
-# itself, and a sanitizer instruments only one side of that: the daemon's JSON build and
-# dump run under the tool, while the probe writer's cost is a raw write() and rename().
-# Measured under -fsanitize=thread: 133.8 us added against a 123.5 us threshold -- red on
-# correct code. So the phase reports itself unexercised there rather than accusing the
-# daemon, the same trade the allocation instrument above makes.
-if(WALLPAPERX_SANITIZE)
-    target_compile_definitions(wallpaperx-config-store-test PRIVATE WALLPAPERX_TIMING_INSTRUMENTED=1)
-endif()
 
 # The system-level tier: spawns the real wallpaperx-daemon executable and drives it over
 # the bus. It links the daemon library only for the DBus name/interface constants and
@@ -271,14 +260,12 @@ add_test(NAME log_escape COMMAND $<TARGET_FILE:wallpaperx-log-escape-test>)
 # `ctest -L 'lavapipe|novulkan'` needs the label to select it too.
 set_tests_properties(log_escape PROPERTIES LABELS "novulkan")
 
-# Also outside the guard: it talks to no bus either. RESOURCE_LOCK all the same -- its
-# S8.10 phase measures a save in microseconds against a durable write on the same
-# filesystem, and a parallel ctest job hammering that disk inflates one without inflating
-# the other. `novulkan` for the same reason log_escape carries it: the TSan block below is
-# an allow-list on labels, and nothing here opens a driver.
+# Also outside the guard: it talks to no bus either, and every check it makes is
+# deterministic, so it needs no RESOURCE_LOCK. `novulkan` for the same reason log_escape
+# carries it: the TSan block below is an allow-list on labels, and nothing here opens a
+# driver.
 add_test(NAME config_store COMMAND $<TARGET_FILE:wallpaperx-config-store-test>)
 set_tests_properties(config_store PROPERTIES LABELS "novulkan"
-                     RESOURCE_LOCK wallpaperx_bus_tests
                      SKIP_RETURN_CODE 77)
 
 # The DBus service test needs a session bus. dbus-run-session gives each run a

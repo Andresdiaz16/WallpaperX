@@ -1,6 +1,7 @@
 #pragma once
 
 #include "config_store.h"
+#include "log_escape.h"
 #include "vulkan/frame_export.h"
 
 #include <cstdint>
@@ -108,6 +109,15 @@ struct FrameHandle {
 // making video renderable would have had to find both or GetFrameFd would go on telling
 // clients a working wallpaper can never produce a frame.
 inline bool isRenderableType(const std::string& type) { return type == "static"; }
+
+// The path a client may act on: the bytes as stored, or nothing when they are not valid
+// UTF-8 and so cannot be carried by JSON at all. Published beside the escaped `path`,
+// which stays display-safe -- one definition because a value raw on one channel and
+// escaped on the other is the defect aded2e5 fixed.
+inline std::optional<std::string> literalPath(const std::string& path) {
+    if (!isValidUtf8(path)) return std::nullopt;
+    return path;
+}
 
 enum class NoFrameReason {
     NeverRequested,  // nothing has ever been set on this monitor
@@ -321,6 +331,10 @@ private:
 
     // What load() returned, until restoreSaved() consumes it.
     std::vector<PersistedWallpaper> m_restore;
+
+    // Entries restoreSaved() could not apply, carried so a save does not delete them.
+    // Guarded by m_stateMutex.
+    std::vector<PersistedWallpaper> m_unapplied;
 
     // Order matters: m_gpuMutex may be taken before m_stateMutex, never the reverse.
     mutable std::mutex m_gpuMutex;

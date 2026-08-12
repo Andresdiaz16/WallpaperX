@@ -16,8 +16,7 @@
 //
 // Rules followed here:
 //   - Nothing this file writes lands outside a directory it created under
-//     temp_directory_path() (or, for the one measurement that needs a real disk, under the
-//     build directory) and removes again. A test that touched $HOME/.config/wallpaperx
+//     temp_directory_path() and removes again. A test that touched $HOME/.config/wallpaperx
 //     would be restoring its own wallpapers onto a developer's desktop, which has happened.
 //   - A phase that cannot be set up on this host prints a reason and is reported to ctest
 //     as a skip (exit 77), never as a pass.
@@ -25,12 +24,12 @@
 #include "daemon/config_store.h"
 #include "daemon/log_escape.h"
 #include "daemon/wallpaper_manager.h"
+#include "tests/client/scratch_dir.h"
 
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
-#include <chrono>
-#include <cmath>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -44,6 +43,7 @@
 #include <system_error>
 #include <vector>
 
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -54,7 +54,28 @@ using wallpaperx::LogFraming;
 using wallpaperx::PersistedWallpaper;
 using wallpaperx::SaveResult;
 using wallpaperx::sanitizeForLog;
+using wallpaperx::testing::ScratchDir;
 using wallpaperx::WallpaperManager;
+
+// Counts the durability syscalls anything in this process makes, the daemon's save
+// included: the test links the daemon statically, so a strong definition here is what its
+// calls resolve to. Phase 8 is built on this. Defined at namespace scope and outside the
+// anonymous namespace because the C symbols have to have external linkage.
+std::atomic<unsigned> g_fsyncCalls{0};
+
+extern "C" int fsync(int fd) {
+    ++g_fsyncCalls;
+    using Fn = int (*)(int);
+    static Fn real = reinterpret_cast<Fn>(::dlsym(RTLD_NEXT, "fsync"));
+    return real != nullptr ? real(fd) : 0;
+}
+
+extern "C" int fdatasync(int fd) {
+    ++g_fsyncCalls;
+    using Fn = int (*)(int);
+    static Fn real = reinterpret_cast<Fn>(::dlsym(RTLD_NEXT, "fdatasync"));
+    return real != nullptr ? real(fd) : 0;
+}
 
 namespace {
 
@@ -82,49 +103,6 @@ void notVerified(const char* goals, const std::string& reason) {
     std::fflush(stdout);
     ++g_notVerified;
 }
-
-// A directory this process creates and removes. `base` is a parameter because one phase
-// needs a real disk (temp_directory_path() is tmpfs on most hosts, where the measurement
-// it makes cannot discriminate) while every other phase wants the fastest scratch space
-// available.
-class TempDir {
-public:
-    TempDir(const std::filesystem::path& base, const char* tag) {
-        static int counter = 0;
-        m_path = base / ("wpx_config_test_" + std::to_string(::getpid()) + "_" + std::to_string(counter++) + "_" +
-                         std::string(tag));
-        std::error_code ec;
-        std::filesystem::remove_all(m_path, ec);
-        std::filesystem::create_directories(m_path, ec);
-        m_ok = !ec;
-    }
-
-    ~TempDir() {
-        std::error_code ec;
-        // A phase makes a directory read-only on purpose; without this, remove_all fails
-        // and the scratch space leaks for every later run.
-        std::filesystem::permissions(m_path, std::filesystem::perms::owner_all,
-                                     std::filesystem::perm_options::add, ec);
-        for (const std::filesystem::directory_entry& entry :
-             std::filesystem::recursive_directory_iterator(m_path, std::filesystem::directory_options::skip_permission_denied, ec)) {
-            if (entry.is_directory(ec)) {
-                std::filesystem::permissions(entry.path(), std::filesystem::perms::owner_all,
-                                             std::filesystem::perm_options::add, ec);
-            }
-        }
-        std::filesystem::remove_all(m_path, ec);
-    }
-
-    TempDir(const TempDir&) = delete;
-    TempDir& operator=(const TempDir&) = delete;
-
-    bool ok() const { return m_ok; }
-    const std::filesystem::path& path() const { return m_path; }
-
-private:
-    std::filesystem::path m_path;
-    bool m_ok = false;
-};
 
 // Sets an environment variable for as long as it is alive and puts back exactly what was
 // there before, including "it was not set at all". Every phase that reads
@@ -215,7 +193,7 @@ std::map<int, std::string> pathsInFile(const std::filesystem::path& file, std::s
 // Phase 1 -- S8.9: where the config file is allowed to be, and where it is not.
 // ---------------------------------------------------------------------------- //
 void runLocationChecks() {
-    const TempDir scratch(std::filesystem::temp_directory_path(), "location");
+    const ScratchDir scratch("location");
     if (!scratch.ok()) {
         notVerified("S8.9 (nothing is written outside the XDG location)", "a scratch directory could not be created");
         return;
@@ -243,9 +221,6 @@ void runLocationChecks() {
     //       HOME is refused rather than resolved" and "with neither XDG_CONFIG_HOME nor HOME
     //       usable, persistence is disabled rather than relocated into the working
     //       directory", both printing the build directory.
-    // COVERAGE-ASSERT: the table's size is asserted against the number of cases actually
-    //       run, so a future edit that returns early out of the loop fails instead of going
-    //       quiet.
     struct LocationCase {
         const char* what;
         std::optional<std::string> xdg;
@@ -267,7 +242,6 @@ void runLocationChecks() {
          std::nullopt, std::nullopt, {}},
     };
 
-    int exercised = 0;
     for (const LocationCase& c : cases) {
         const ScopedEnv xdgEnv("XDG_CONFIG_HOME", c.xdg);
         const ScopedEnv homeEnv("HOME", c.home);
@@ -276,32 +250,68 @@ void runLocationChecks() {
         if (got != c.expected) {
             std::fprintf(stderr, "  expected '%s', got '%s'\n", c.expected.string().c_str(), got.string().c_str());
         }
-        ++exercised;
     }
-    check(exercised == static_cast<int>(cases.size()), "every location case was exercised");
 
-    // The other half of S8.9: a disabled store is silent, not merely path-less. A save()
-    // that fell back to a relative name would land in the working directory, which under
-    // ctest is the build tree -- the exact "config file left where nobody looks" the
-    // decision exists to prevent.
+    // GOAL: S8.9's other half -- a disabled store is SILENT, not merely path-less. A save()
+    //       that fell back to a relative name would land in the process's working directory,
+    //       which is the "config file left where nobody looks" the decision exists to
+    //       prevent.
+    // WHY-THIS-SHAPE: the process is moved into a directory this phase created and the whole
+    //       directory is listed afterwards. The obvious version -- assert config.json,
+    //       wallpaperx and .config do not exist in the working directory as found -- is red
+    //       for anything already sitting in the build tree (an install-staging `wallpaperx`,
+    //       a leftover from an aborted run) and blind to a write under any fourth name. This
+    //       one owns the directory, so anything in it afterwards was put there by the save.
+    //       chdir is process-wide and this phase runs before any WallpaperManager exists, so
+    //       no other thread can be resolving a relative path while it moves.
+    // CONTROL: ConfigStore's constructor given the cwd fallback the decision forbids
+    //       (`if (m_file.empty()) m_file = std::filesystem::path(kAppDir) / kFileName;`) ->
+    //       "FAIL: a disabled store writes nothing into the working directory", printing
+    //       "  left behind: wallpaperx", plus the three checks that say a store with no path
+    //       is disabled and silent. Reverted.
+    const std::filesystem::path silent = scratch.path() / "silent";
+    std::error_code silentEc;
+    std::filesystem::create_directories(silent, silentEc);
     const std::filesystem::path cwd = std::filesystem::current_path();
+    if (silentEc || ::chdir(silent.c_str()) != 0) {
+        notVerified("S8.9's silence clause", "a working directory this phase owns could not be entered");
+        return;
+    }
+
     const ConfigStore disabled{std::filesystem::path{}};
     check(!disabled.enabled(), "a ConfigStore built from an empty path reports itself disabled");
     const SaveResult saved = disabled.save({PersistedWallpaper{0, "static", "/tmp/x.png"}});
     check(saved.error.empty(), "saving through a disabled store is not an error");
-    check(!std::filesystem::exists(cwd / "config.json") && !std::filesystem::exists(cwd / "wallpaperx") &&
-              !std::filesystem::exists(cwd / ".config"),
-          "a disabled store writes nothing into the working directory");
     const LoadResult loaded = disabled.load();
     check(loaded.entries.empty() && loaded.error.empty() && !loaded.fileExisted,
           "loading through a disabled store reports nothing, not an error");
+
+    std::vector<std::string> left;
+    std::error_code walkEc;
+    for (auto it = std::filesystem::directory_iterator(silent, walkEc);
+         !walkEc && it != std::filesystem::directory_iterator(); it.increment(walkEc)) {
+        left.push_back(it->path().filename().string());
+    }
+    // Restored before anything is graded: a check that fails here must not also leave every
+    // later phase resolving relative paths inside a directory this one is about to delete.
+    if (::chdir(cwd.c_str()) != 0) {
+        std::fprintf(stderr, "FAIL: the working directory could not be restored after S8.9's silence check\n");
+        ++g_failures;
+    }
+    if (walkEc) {
+        notVerified("S8.9's silence clause",
+                    "the working directory this phase owns could not be listed: " + walkEc.message());
+        return;
+    }
+    check(left.empty(), "a disabled store writes nothing into the working directory");
+    for (const std::string& name : left) std::fprintf(stderr, "  left behind: %s\n", name.c_str());
 }
 
 // ---------------------------------------------------------------------------- //
 // Phase 2 -- S8.2: load() survives any file content at all.
 // ---------------------------------------------------------------------------- //
 void runLoadCorpusChecks() {
-    const TempDir scratch(std::filesystem::temp_directory_path(), "corpus");
+    const ScratchDir scratch("corpus");
     if (!scratch.ok()) {
         notVerified("S8.2 (no config content stops the daemon)", "a scratch directory could not be created");
         return;
@@ -312,6 +322,12 @@ void runLoadCorpusChecks() {
     deep.append(100000, '[');
     deep.append(100000, ']');
     deep += "}";
+    // A complete, valid document with a NUL and rubbish after it. The length is the
+    // compiler's, not a hand count: the previous count was one byte short of its own
+    // literal, which quietly turned the case into a second copy of the truncation row.
+    using namespace std::string_literals;
+    const std::string nulAfterValid =
+        "{\"version\":1,\"monitors\":[{\"monitor_id\":0,\"type\":\"static\",\"path\":\"/a.png\"}]}\0 junk"s;
 
     // GOAL: S8.2, in-process half -- no file content makes load() throw, abort, or hand
     //       back entries it did not read. The daemon half (the process still starts) is
@@ -333,7 +349,25 @@ void runLoadCorpusChecks() {
     //       `it != m_data.m_value.object->end()` assertion and NO check output at all. That
     //       is why S8.2's process-level half lives in daemon_system_test: an in-process
     //       binary cannot report the failure mode it dies from.
-    // COVERAGE-ASSERT: the number of cases run is asserted against the table's size.
+    // COVERAGE-ASSERT: every case is accounted for -- run, or reported as one this host
+    //       could not stage -- against the table's size, so a `continue` or an early return
+    //       that silently thins the corpus fails instead of going quiet.
+    //       CONTROL: `if (c.content.size() > 1000) continue;` added at the top of the loop,
+    //       which is what a well-meaning "skip the slow ones" edit looks like -> "FAIL: every
+    //       load case was either exercised or reported as one this host could not stage",
+    //       and nothing else. Reverted.
+    //
+    // S8.15's three rows are not a variation on the fractional one: is_number_integer() is
+    // TRUE for any width, so 2^32+1 passes that guard and only readInt's range check stops
+    // get<int>() narrowing it to 1. Both the unsigned and the signed branch are covered,
+    // because nlohmann stores a positive literal as unsigned and a negative one as signed --
+    // one row would leave the other branch as uncovered as the whole guard was.
+    // CONTROL: readInt's body in config_store.cpp replaced with `out = field.get<int>();
+    //       return true;` -> exactly three FAILs, "a monitor_id past int range" and "a
+    //       negative monitor_id past int range" each reporting "1 entries (expected 0), 0
+    //       malformed (expected 1)" -- the entry restored onto monitor 1 and -1 -- and "a
+    //       version past int range" reporting a file accepted where an error was expected.
+    //       Reverted.
     struct LoadCase {
         const char* what;
         std::string content;
@@ -341,7 +375,7 @@ void runLoadCorpusChecks() {
         int expectedMalformed;
         bool expectError;
     };
-    const std::vector<LoadCase> cases{
+    std::vector<LoadCase> cases{
         {"an empty file", "", 0, 0, true},
         {"a file that is not JSON at all", "wallpapers: all of them\n", 0, 0, true},
         {"a file truncated mid-object", "{\"version\":1,\"monitors\":[{\"monitor_id\":0,\"type\":\"static\"", 0, 0,
@@ -365,24 +399,51 @@ void runLoadCorpusChecks() {
         {"a fractional monitor_id", "{\"version\":1,\"monitors\":[{\"monitor_id\":1.5,\"type\":\"static\","
                                     "\"path\":\"/a\"}]}",
          0, 1, false},
-        {"a NUL byte in the middle of the file", std::string("{\"version\":1,\"mon\0itors\":[]}", 27), 0, 0, true},
-        {"100 MB of no JSON whatsoever", std::move(huge), 0, 0, true},
-        // Parses fine and holds one element -- an array 100 000 deep -- which is one
-        // malformed entry, not a broken file. The case is here for the parser's stack, not
-        // for its verdict: a recursive-descent parser (or a recursive destructor) would
-        // take the process down rather than return anything at all.
-        {"100 000 levels of nesting", std::move(deep), 0, 1, false},
+        // S8.15. 2^32+1 narrows to exactly 1 under get<int>() -- inside the 0..31 range the
+        // manager applies -- so a lost width check does not report anything: it puts a
+        // wallpaper on somebody else's monitor.
+        {"a monitor_id past int range",
+         "{\"version\":1,\"monitors\":[{\"monitor_id\":4294967297,\"type\":\"static\",\"path\":\"/a\"}]}", 0, 1,
+         false},
+        {"a negative monitor_id past int range",
+         "{\"version\":1,\"monitors\":[{\"monitor_id\":-4294967297,\"type\":\"static\",\"path\":\"/a\"}]}", 0, 1,
+         false},
+        // The same reader parses `version`, where narrowing is worse still: 2^32+1 becomes
+        // 1, equals kSchemaVersion, and a file written by a schema this build predates is
+        // read as if it were current.
+        {"a version past int range", "{\"version\":4294967297,\"monitors\":[]}", 0, 0, true},
+        // nlohmann's lexer treats a NUL as end of input, so `{...}\0junk` parsed clean and
+        // the tail was dropped -- the file the daemon believed it read was not the file on
+        // disk. Refused outright as of 2026-08-11, the decision this row was written to
+        // force. CONTROL: observed red in the other direction first -- with the load still
+        // accepting NUL, this row reported 1 entry and no error where it now expects none.
+        {"a NUL byte is refused rather than silently ending the document", nulAfterValid, 0, 0, true},
         {"a well-formed file",
          "{\"version\":1,\"monitors\":[{\"monitor_id\":0,\"type\":\"static\",\"path\":\"/a.png\"},"
          "{\"monitor_id\":3,\"type\":\"static\",\"path\":\"/b.png\"}]}",
          2, 0, false},
     };
+    // Appended rather than braced in: an initializer_list's backing array is const, so the
+    // vector copies every element and the 100 MB row would exist twice at once.
+    cases.reserve(cases.size() + 2);
+    cases.push_back({"100 MB of no JSON whatsoever", std::move(huge), 0, 0, true});
+    // Parses fine and holds one element -- an array 100 000 deep -- which is one malformed
+    // entry, not a broken file. The case is here for the parser's stack, not for its
+    // verdict: a recursive-descent parser (or a recursive destructor) would take the process
+    // down rather than return anything at all.
+    cases.push_back({"100 000 levels of nesting", std::move(deep), 0, 1, false});
 
     const std::filesystem::path file = scratch.path() / "wallpaperx" / "config.json";
     const ConfigStore store(file);
     int exercised = 0;
+    int couldNotStage = 0;
     for (const LoadCase& c : cases) {
         if (!writeFile(file, c.content)) {
+            // A host whose scratch filesystem cannot take the 100 MB case is not a defect in
+            // the store. Counted, so the coverage assertion below can tell this apart from a
+            // case that silently stopped running -- without the counter a small /tmp turns
+            // its own skip into a FAIL against the daemon.
+            ++couldNotStage;
             notVerified("one S8.2 load case", std::string("the case file could not be written: ") + c.what);
             continue;
         }
@@ -398,7 +459,8 @@ void runLoadCorpusChecks() {
         }
         ++exercised;
     }
-    check(exercised == static_cast<int>(cases.size()), "every load case was exercised");
+    check(exercised + couldNotStage == static_cast<int>(cases.size()),
+          "every load case was either exercised or reported as one this host could not stage");
 
     // The ordinary first-run case, and the only one where an absent file is not an error.
     std::error_code ec;
@@ -412,7 +474,7 @@ void runLoadCorpusChecks() {
 // Phase 3 -- S8.3: a persisted path comes back byte for byte.
 // ---------------------------------------------------------------------------- //
 void runRoundTripChecks() {
-    const TempDir scratch(std::filesystem::temp_directory_path(), "roundtrip");
+    const ScratchDir scratch("roundtrip");
     if (!scratch.ok()) {
         notVerified("S8.3 (a restored path is byte-identical)", "a scratch directory could not be created");
         return;
@@ -461,12 +523,21 @@ void runRoundTripChecks() {
     check(saved.error.empty() && saved.skippedNonUtf8 == 0, "the adversarial paths are all saved (they are UTF-8)");
     const LoadResult loaded = store.load();
     check(loaded.entries.size() == cases.size(), "every saved entry comes back");
-    for (size_t i = 0; i < cases.size() && i < loaded.entries.size(); ++i) {
-        const bool identical = loaded.entries[i].path == cases[i].second;
+
+    // Matched by monitor id, not by position: the store promises which monitor a path
+    // belongs to, not what order the array comes back in. Indexing would report a store that
+    // reordered or de-duplicated entries as one that mangled bytes, under a heading naming a
+    // byte sequence that in fact survived -- and a short result would silently run fewer
+    // comparisons instead of failing.
+    std::map<int, std::string> byId;
+    for (const PersistedWallpaper& entry : loaded.entries) byId[entry.monitorId] = entry.path;
+    for (size_t i = 0; i < cases.size(); ++i) {
+        const auto it = byId.find(static_cast<int>(i));
+        const bool identical = it != byId.end() && it->second == cases[i].second;
         check(identical, cases[i].first);
         if (!identical) {
             std::fprintf(stderr, "  in:  %s\n  out: %s\n", hex(cases[i].second).c_str(),
-                         hex(loaded.entries[i].path).c_str());
+                         it != byId.end() ? hex(it->second).c_str() : "(no entry for this monitor)");
         }
     }
 }
@@ -475,7 +546,7 @@ void runRoundTripChecks() {
 // Phase 4 -- S8.7: an invalid-UTF-8 path costs only its own monitor.
 // ---------------------------------------------------------------------------- //
 void runNonUtf8Checks() {
-    const TempDir scratch(std::filesystem::temp_directory_path(), "utf8");
+    const ScratchDir scratch("utf8");
     if (!scratch.ok()) {
         notVerified("S8.7 (a non-UTF-8 path costs only its own entry)",
                     "a scratch directory could not be created");
@@ -536,7 +607,7 @@ void runNonUtf8Checks() {
 // Phase 5 -- S8.8: a malformed entry does not cost the well-formed ones.
 // ---------------------------------------------------------------------------- //
 void runMalformedEntryChecks() {
-    const TempDir scratch(std::filesystem::temp_directory_path(), "malformed");
+    const ScratchDir scratch("malformed");
     if (!scratch.ok()) {
         notVerified("S8.8 (a malformed entry does not cost the well-formed ones)",
                     "a scratch directory could not be created");
@@ -593,7 +664,7 @@ void runMalformedEntryChecks() {
 // Phase 6 -- S8.5 and S8.4: restore reads, and never writes.
 // ---------------------------------------------------------------------------- //
 void runRestoreChecks() {
-    const TempDir scratch(std::filesystem::temp_directory_path(), "restore");
+    const ScratchDir scratch("restore");
     if (!scratch.ok()) {
         notVerified("S8.5 (restore does not write) and S8.4 (an unreadable entry is not forgotten)",
                     "a scratch directory could not be created");
@@ -610,16 +681,24 @@ void runRestoreChecks() {
 
     // Written by hand, in a formatting ConfigStore::save() would never produce (compact,
     // and with the keys in a different order). That is what makes the byte comparison
-    // below able to see a rewrite that happens to preserve the same entries.
-    const std::string original = "{\"monitors\":[{\"path\":\"" + missing +
-                                 "\",\"type\":\"static\",\"monitor_id\":0},{\"path\":\"" + present.string() +
-                                 "\",\"type\":\"static\",\"monitor_id\":1}],\"version\":1}";
+    // below able to see a rewrite that happens to preserve the same entries. The two paths
+    // are serialised rather than spliced in: $TMPDIR may hold a quote or a backslash, and a
+    // fixture that is not valid JSON would report a correct restore as a broken one.
+    if (!wallpaperx::isValidUtf8(present.string())) {
+        notVerified("S8.5 and S8.4", "this host's temporary directory has a path that is not valid UTF-8, so no "
+                                     "JSON fixture can name it");
+        return;
+    }
+    const std::string original = "{\"monitors\":[{\"path\":" + nlohmann::json(missing).dump() +
+                                 ",\"type\":\"static\",\"monitor_id\":0},{\"path\":" +
+                                 nlohmann::json(present.string()).dump() +
+                                 ",\"type\":\"static\",\"monitor_id\":1}],\"version\":1}";
     if (!writeFile(file, original)) {
         notVerified("S8.5 and S8.4", "the config file this phase reads could not be written");
         return;
     }
-    std::error_code ec;
-    const auto mtimeBefore = std::filesystem::last_write_time(file, ec);
+    std::error_code beforeEc;
+    const auto mtimeBefore = std::filesystem::last_write_time(file, beforeEc);
 
     WallpaperManager::Config config;
     config.configFile = file;
@@ -636,17 +715,32 @@ void runRestoreChecks() {
     //       miss a rewrite that preserved them, which is precisely what an accidental save
     //       on restore would do -- it would look identical in every way except that the
     //       file had been replaced.
-    // CONTROL: `persist(persistableLocked());` added at the end of
-    //       WallpaperManager::restoreSaved(), outside the lock -> "FAIL: restoring does not
-    //       rewrite the config file" and "FAIL: restoring does not touch the config file's
-    //       mtime", and nothing else red. Reverted.
+    // CONTROL: `m_store.save(persistableLocked());` added at the end of
+    //       WallpaperManager::restoreSaved() -> "FAIL: restoring does not rewrite the config
+    //       file", and nothing else red. The mtime half stayed green under it, because this
+    //       host's scratch filesystem stamps both writes with the same coarse time -- which
+    //       is the reason both comparisons are here rather than either alone. The mtime half
+    //       is what carries the equivalent check in daemon_system_test, where the file was
+    //       written by the daemon's own save() and a second save reproduces it byte for
+    //       byte. Reverted.
     check(readFile(file) == original, "constructing a manager reads the config file without rewriting it");
 
     const std::vector<int> restored = manager.restoreSaved();
     check(restored == std::vector<int>({0, 1}), "restoreSaved returns the monitors to post, in file order");
     check(readFile(file) == original, "restoring does not rewrite the config file");
-    const auto mtimeAfter = std::filesystem::last_write_time(file, ec);
-    check(!ec && mtimeAfter == mtimeBefore, "restoring does not touch the config file's mtime");
+
+    // An error code per sample, and a failed read is a skip rather than a verdict. Sharing
+    // one code let the second call's success erase the first call's failure, so a stat this
+    // harness could not perform was reported as the daemon having rewritten the user's
+    // config -- an accusation of data loss with nothing behind it. The byte comparison above
+    // is unaffected and still runs either way.
+    std::error_code afterEc;
+    const auto mtimeAfter = std::filesystem::last_write_time(file, afterEc);
+    if (beforeEc || afterEc) {
+        notVerified("S8.5's mtime clause", "the config file's modification time could not be read on this host");
+    } else {
+        check(mtimeAfter == mtimeBefore, "restoring does not touch the config file's mtime");
+    }
 
     // GOAL: S8.4 -- the monitor whose file is unreadable keeps its entry, across the
     //       restore itself and across a later save made for a different monitor. False if
@@ -683,10 +777,169 @@ void runRestoreChecks() {
 }
 
 // ---------------------------------------------------------------------------- //
+// Phase 6b -- S8.13: a config this build could not read is kept, not overwritten.
+// ---------------------------------------------------------------------------- //
+void runUnreadableConfigChecks() {
+    constexpr const char* kGoal = "S8.13 (a config that could not be read is preserved byte-identical)";
+    const ScratchDir scratch("keptbad");
+    if (!scratch.ok()) {
+        notVerified(kGoal, "a scratch directory could not be created");
+        return;
+    }
+    const std::filesystem::path file = scratch.path() / "wallpaperx" / "config.json";
+    const std::filesystem::path kept = std::filesystem::path(file.string() + ".bad");
+    const std::filesystem::path wallpaper = scratch.path() / "wallpaper.png";
+    // A hand edit that broke the syntax: one trailing comma in an otherwise complete file
+    // holding two wallpapers the user picked. What makes this the case worth pinning is that
+    // the bytes are still valuable -- the paths are readable in it -- so losing them is data
+    // loss and not merely a reset.
+    const std::string handEdited =
+        "{\"version\":1,\"monitors\":[{\"monitor_id\":0,\"type\":\"static\",\"path\":\"/a.png\"},]}";
+    if (!writeFile(file, handEdited) || !writeWallpaperFile(wallpaper)) {
+        notVerified(kGoal, "the damaged config file this phase reads could not be written");
+        return;
+    }
+
+    WallpaperManager::Config config;
+    config.configFile = file;
+    WallpaperManager manager(config);
+
+    // GOAL: S8.13 -- a config file this build could not parse survives the run that could
+    //       not parse it. False if the next SetWallpaper overwrites it: the file is the only
+    //       copy, so a user who broke the syntax by hand would have their wallpaper choices
+    //       destroyed by the daemon at the moment they set the next one.
+    // WHY-THIS-SHAPE: the preserved copy is compared BYTE for byte against what was written,
+    //       and the comparison is made after a later save, not straight after startup. A
+    //       check that only asserted config.json.bad exists would pass for a build that
+    //       wrote a summary, a truncation, or the sanitized form into it -- none of which
+    //       gets the user's paths back -- and a check made before the save would pass for a
+    //       build that preserved the file and then clobbered the copy on the first write.
+    //       The health status is asserted alongside because a preserved file nobody is told
+    //       about reads to the user as a config that silently emptied itself.
+    // CONTROL: the `std::filesystem::rename(m_store.file(), kept, ec)` block deleted from
+    //       WallpaperManager's constructor -> "FAIL: a config that could not be read is kept
+    //       as config.json.bad" and "FAIL: the preserved copy is byte-identical to the file
+    //       the daemon could not read", printing "  no config.json.bad exists". Reverted.
+    const WallpaperManager::Snapshot afterLoad = manager.snapshot();
+    check(afterLoad.health.persistence.status == wallpaperx::HealthStatus::Fail,
+          "a config that could not be read leaves the persistence check reporting failure");
+    check(afterLoad.health.persistence.detail.find(".bad") != std::string::npos,
+          "the persistence failure says where the unreadable config was kept");
+    if (afterLoad.health.persistence.detail.find(".bad") == std::string::npos) {
+        std::fprintf(stderr, "  persistence detail: %s\n", afterLoad.health.persistence.detail.c_str());
+    }
+
+    manager.restoreSaved();
+    manager.requestWallpaper("static", wallpaper.string(), 1);
+
+    const bool keptExists = std::filesystem::exists(kept);
+    check(keptExists, "a config that could not be read is kept as config.json.bad");
+    check(keptExists && readFile(kept) == handEdited,
+          "the preserved copy is byte-identical to the file the daemon could not read");
+    if (!keptExists) {
+        std::fprintf(stderr, "  no config.json.bad exists\n");
+    } else if (readFile(kept) != handEdited) {
+        std::fprintf(stderr, "  kept: %s\n  written: %s\n", readFile(kept).c_str(), handEdited.c_str());
+    }
+
+    // The daemon has to keep working afterwards: preserving the old file must not mean
+    // refusing to persist anything new.
+    std::string why;
+    const std::map<int, std::string> onDisk = pathsInFile(file, why);
+    const bool wroteNew = onDisk.size() == 1 && onDisk.count(1) == 1 && onDisk.at(1) == wallpaper.string();
+    check(wroteNew, "a wallpaper set after the damaged config is persisted into a fresh config.json");
+    if (!wroteNew) std::fprintf(stderr, "  %s\n", why.empty() ? "the file holds something else" : why.c_str());
+}
+
+// ---------------------------------------------------------------------------- //
+// Phase 6c -- S8.14: entries this build cannot apply survive, and are reported.
+// ---------------------------------------------------------------------------- //
+void runUnappliedEntryChecks() {
+    constexpr const char* kGoal = "S8.14 (entries this build cannot apply survive a save and are reported)";
+    const ScratchDir scratch("unapplied");
+    if (!scratch.ok()) {
+        notVerified(kGoal, "a scratch directory could not be created");
+        return;
+    }
+    const std::filesystem::path file = scratch.path() / "wallpaperx" / "config.json";
+    const std::filesystem::path present = scratch.path() / "present.png";
+    const std::filesystem::path other = scratch.path() / "other.png";
+    if (!writeWallpaperFile(present) || !writeWallpaperFile(other)) {
+        notVerified(kGoal, "the wallpaper files this phase drives could not be written");
+        return;
+    }
+    // dump() throws on a string that is not valid UTF-8, and the fixture below names a
+    // scratch path this host chose. A skip with the reason, rather than an exception the
+    // phase would report as a failure of the daemon.
+    if (!wallpaperx::isValidUtf8(present.string())) {
+        notVerified(kGoal, "this host's temporary directory has a path that is not valid UTF-8, so no JSON fixture "
+                           "can name it");
+        return;
+    }
+
+    // GOAL: S8.14, both clauses -- an entry this build cannot apply is neither deleted nor
+    //       kept in silence. False if the next save drops it (the wallpaper a newer build
+    //       set is gone for good the moment this one writes) and equally false if nothing
+    //       anywhere says an entry did not come back.
+    // WHY-THIS-SHAPE: three kinds of unusable entry at once -- an id past the daemon's
+    //       32-monitor range, a type this build has never heard of, an empty path -- and the
+    //       on-disk ids are compared as an exact set after a save made for a DIFFERENT
+    //       monitor. Only that write can drop them, so a check made straight after the
+    //       restore would pass for a build that forgets them at the first SetWallpaper. The
+    //       count in the health detail is derived from the fixture, not spelled out, so a
+    //       build that reports a fixed number cannot pass.
+    // CONTROL: `m_unapplied.push_back(entry);` deleted from restoreSaved()'s skip branch
+    //       (its state before today) -> "FAIL: the entries this build cannot apply are all
+    //       still in the file after another monitor is set" with "  ids on disk: 1 3", and
+    //       "FAIL: the persistence detail says how many entries could not be applied".
+    //       Reverted.
+    const std::vector<int> unusableIds{40, 5, 6};
+    const std::string config = "{\"version\":1,\"monitors\":["
+                               "{\"monitor_id\":3,\"type\":\"static\",\"path\":" +
+                               nlohmann::json(present.string()).dump() +
+                               "},"
+                               "{\"monitor_id\":40,\"type\":\"static\",\"path\":\"/a.png\"},"
+                               "{\"monitor_id\":5,\"type\":\"slideshow\",\"path\":\"/b.png\"},"
+                               "{\"monitor_id\":6,\"type\":\"static\",\"path\":\"\"}]}";
+    if (!writeFile(file, config)) {
+        notVerified(kGoal, "the config file this phase reads could not be written");
+        return;
+    }
+
+    WallpaperManager::Config managerConfig;
+    managerConfig.configFile = file;
+    WallpaperManager manager(managerConfig);
+    const std::vector<int> restored = manager.restoreSaved();
+    check(restored == std::vector<int>{3}, "only the entry this build can apply is posted for rendering");
+
+    const WallpaperManager::Snapshot snap = manager.snapshot();
+    const std::string expectedCount = std::to_string(unusableIds.size()) + " entries this build cannot apply";
+    const bool reported = snap.health.persistence.detail.find(expectedCount) != std::string::npos;
+    check(reported, "the persistence detail says how many entries could not be applied");
+    if (!reported) std::fprintf(stderr, "  persistence detail: %s\n", snap.health.persistence.detail.c_str());
+    check(snap.health.persistence.status == wallpaperx::HealthStatus::Ok,
+          "an entry this build cannot apply is reported without failing the persistence check");
+
+    manager.requestWallpaper("static", other.string(), 1);
+    std::string why;
+    const std::map<int, std::string> onDisk = pathsInFile(file, why);
+    std::vector<int> ids;
+    for (const auto& entry : onDisk) ids.push_back(entry.first);
+    const std::vector<int> expectedIds{1, 3, 5, 6, 40};
+    const bool survived = ids == expectedIds;
+    check(survived, "the entries this build cannot apply are all still in the file after another monitor is set");
+    if (!survived) {
+        std::fprintf(stderr, "  %s; ids on disk:", why.empty() ? "read back" : why.c_str());
+        for (const int id : ids) std::fprintf(stderr, " %d", id);
+        std::fprintf(stderr, "\n");
+    }
+}
+
+// ---------------------------------------------------------------------------- //
 // Phase 7 -- S8.6: a save that cannot happen fails loudly and harmlessly.
 // ---------------------------------------------------------------------------- //
 void runFailedSaveChecks() {
-    const TempDir scratch(std::filesystem::temp_directory_path(), "readonly");
+    const ScratchDir scratch("readonly");
     if (!scratch.ok()) {
         notVerified("S8.6 (a failed save does not fail SetWallpaper, and does not go unreported)",
                     "a scratch directory could not be created");
@@ -772,24 +1025,11 @@ void runFailedSaveChecks() {
 // Phase 8 -- S8.10: the save the DBus thread performs is the cheap one.
 // ---------------------------------------------------------------------------- //
 
-using Clock = std::chrono::steady_clock;
-
-double microsOf(Clock::duration d) {
-    return std::chrono::duration_cast<std::chrono::duration<double, std::micro>>(d).count();
-}
-
-double median(std::vector<double> samples) {
-    if (samples.empty()) return 0.0;
-    std::sort(samples.begin(), samples.end());
-    return samples[samples.size() / 2];
-}
-
 // Writes `text` through a temp file and rename, exactly as ConfigStore::save() does, with
-// the durability the design rejected switched on or off. This is the test's own writer,
-// not the daemon's: it is what establishes that the difference between the two variants is
-// visible AT ALL on this host's filesystem, and it must stay independent of the production
-// code so that a mutation of that code cannot move the yardstick it is measured against.
-bool writeVariant(const std::filesystem::path& file, const std::string& text, bool durable) {
+// the durability the design rejected switched on. Its only job is to show the counter this
+// phase reads is live: a build where the interposed fsync stopped binding would count zero
+// for the daemon too, and the phase would be green on nothing.
+bool writeDurably(const std::filesystem::path& file, const std::string& text) {
     const std::string temp = file.string() + ".probe";
     const int fd = ::open(temp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) return false;
@@ -804,43 +1044,20 @@ bool writeVariant(const std::filesystem::path& file, const std::string& text, bo
         data += n;
         left -= static_cast<size_t>(n);
     }
-    if (durable && ::fsync(fd) != 0) {
+    if (::fsync(fd) != 0) {
         ::close(fd);
         return false;
     }
     ::close(fd);
-    if (::rename(temp.c_str(), file.c_str()) != 0) return false;
-    if (durable) {
-        const int dirFd = ::open(file.parent_path().c_str(), O_RDONLY | O_DIRECTORY);
-        if (dirFd < 0) return false;
-        ::fsync(dirFd);
-        ::close(dirFd);
-    }
-    return true;
+    return ::rename(temp.c_str(), file.c_str()) == 0;
 }
 
 void runSaveCostChecks() {
-    constexpr int kIterations = 200;
     constexpr const char* kGoal = "S8.10 (the save on SetWallpaper does not make a DBus handler slow)";
 
-#ifdef WALLPAPERX_TIMING_INSTRUMENTED
-    // Not a tolerance widened until the sanitized run fits -- that would blunt the check
-    // for every ordinary build too. The two sides of this comparison are instrumented
-    // differently (see backend/CMakeLists.txt), so a sanitized run measures the tool, and
-    // measured 133.8 us against a 123.5 us threshold on code that is correct.
-    notVerified(kGoal, "this build is sanitized, so the daemon's save runs instrumented while the write+rename this "
-                       "phase measures it against does not -- the comparison would grade the sanitizer");
-    return;
-#else
-
-    // The build directory, not temp_directory_path(): /tmp is tmpfs on most hosts, and on
-    // tmpfs an fsync costs nothing, so the durable variant this phase measures itself
-    // against would be indistinguishable from the cheap one and the phase could establish
-    // nothing. Falls back to /tmp only so the gate below reports the reason rather than the
-    // phase failing to start.
-    TempDir onDisk(std::filesystem::current_path(), "savecost");
+    const ScratchDir onDisk("savecost");
     if (!onDisk.ok()) {
-        notVerified(kGoal, "a scratch directory could not be created in the build directory");
+        notVerified(kGoal, "a scratch directory could not be created");
         return;
     }
     const std::filesystem::path persistedFile = onDisk.path() / "wallpaperx" / "config.json";
@@ -849,7 +1066,7 @@ void runSaveCostChecks() {
     std::error_code ec;
     std::filesystem::create_directories(persistedFile.parent_path(), ec);
     if (ec || !writeWallpaperFile(wallpaper)) {
-        notVerified(kGoal, "the fixture files this phase measures against could not be written");
+        notVerified(kGoal, "the fixture files this phase needs could not be written");
         return;
     }
 
@@ -857,112 +1074,74 @@ void runSaveCostChecks() {
     persisting.configFile = persistedFile;
     WallpaperManager persistingManager(persisting);
 
-    WallpaperManager::Config none;
-    WallpaperManager silentManager(none);
-
-    // One warm-up of each, so the first sample does not carry directory creation, page
-    // faults on first touch, or the allocator's first growth.
+    // One warm-up, so the graded request is not also paying for the directory creation.
     persistingManager.requestWallpaper("static", wallpaper.string(), 0);
-    silentManager.requestWallpaper("static", wallpaper.string(), 0);
-    // X.3 in both directions: a missing file here is the DAEMON not having saved, which is
-    // a failure and must not be reported as this file's probe writer failing (measured: with
-    // persist() removed from requestWallpaper, the two conditions folded into one reported
-    // NOT VERIFIED and blamed the probe writer). A probe write that fails is genuinely this
-    // side of the boundary and stays a skip.
+    // GOAL: S8.10 -- the save a SetWallpaper performs on the DBus event-loop thread is the
+    //       write+rename variant, not the durable one the design rejected (9.3 us against
+    //       823.8 us, PLAN.md Step 8). False if the handler flushes to the platter before
+    //       replying: every caller then waits on the disk.
+    // WHY-THIS-SHAPE: the durability syscalls are counted, not the elapsed time. Timing the
+    //       save against a write+rename this file performs is the obvious version and is
+    //       what shipped: its bound is the geometric mean of two disk costs, while the
+    //       quantity it grades also carries a fixed CPU cost -- the JSON build -- that no
+    //       yardstick in the phase measures and that does not shrink when the disk gets
+    //       faster. On a host with a fast fsync the bound falls below what correct code
+    //       already costs, so it accuses the daemon of a property of the storage; it also
+    //       had to skip itself entirely under a sanitizer, which instruments the daemon's
+    //       side and not the probe's. A count is exact on every filesystem, tmpfs included,
+    //       and under every build.
+    //       COVERAGE LOST, stated plainly: nothing here now bounds the save's absolute
+    //       latency, only its durability class. A save made slow some other way -- an
+    //       accidentally quadratic serialiser, a synchronous network path -- would not be
+    //       caught by this phase.
+    // CONTROL: `::fsync(fd);` added before the `if (::close(fd) != 0)` in
+    //       ConfigStore::save() -> "FAIL: the save a SetWallpaper performs issues no fsync
+    //       or fdatasync", printing "  1 durability syscall(s) during one requestWallpaper",
+    //       and nothing else red. Reverted.
+    // COVERAGE-ASSERT: two, because a count of zero is what a dead instrument and a correct
+    //       daemon both produce. (a) the same counter is asserted to MOVE for a write this
+    //       file makes durable on purpose, so a build where the interposed fsync stopped
+    //       binding fails instead of passing; (b) the config file's contents are asserted
+    //       afterwards, so a manager that ignored its configFile -- and so called nothing at
+    //       all -- cannot pass either. CONTROL for (a): this file's interposing `fsync`
+    //       renamed so it no longer binds -> "FAIL: a write this file makes durable on
+    //       purpose is counted, so the counter can see an fsync at all". Renamed back.
+    const unsigned before = g_fsyncCalls.load();
+    persistingManager.requestWallpaper("static", wallpaper.string(), 0);
+    const unsigned duringSave = g_fsyncCalls.load() - before;
+    check(duringSave == 0, "the save a SetWallpaper performs issues no fsync or fdatasync");
+    if (duringSave != 0) {
+        std::fprintf(stderr, "  %u durability syscall(s) during one requestWallpaper\n", duringSave);
+    }
+
+    // X.3: a missing file here is the DAEMON not having saved, which is a failure and must
+    // not be reported as this file's probe writer failing. A probe write that fails is
+    // genuinely this side of the boundary and stays a skip.
     const std::string payload = readFile(persistedFile);
     if (payload.empty()) {
-        check(false, "the warm-up request wrote the config file whose cost this phase measures");
+        check(false, "the request this phase grades wrote the config file");
         return;
     }
-    if (!writeVariant(probeFile, payload, false) || !writeVariant(probeFile, payload, true)) {
-        notVerified(kGoal, "the probe writer could not write into the scratch directory, so the cheap and durable "
-                           "variants cannot be compared");
+    const unsigned beforeProbe = g_fsyncCalls.load();
+    if (!writeDurably(probeFile, payload)) {
+        notVerified(kGoal, "the probe writer could not write into the scratch directory, so the counter this phase "
+                           "relies on could not be shown to be live");
         return;
     }
-
-    std::vector<double> withSave, withoutSave, cheap, durable;
-    withSave.reserve(kIterations);
-    withoutSave.reserve(kIterations);
-    cheap.reserve(kIterations);
-    durable.reserve(kIterations);
-    bool probeFailed = false;
-    // Interleaved, not four separate loops: a background flush, a CPU frequency change or
-    // another ctest job landing mid-run would otherwise be charged entirely to whichever
-    // variant was running at the time. PLAN.md's own measurement interleaved for this
-    // reason and this reproduces it.
-    for (int i = 0; i < kIterations; ++i) {
-        const auto t0 = Clock::now();
-        persistingManager.requestWallpaper("static", wallpaper.string(), 0);
-        const auto t1 = Clock::now();
-        silentManager.requestWallpaper("static", wallpaper.string(), 0);
-        const auto t2 = Clock::now();
-        probeFailed = probeFailed || !writeVariant(probeFile, payload, false);
-        const auto t3 = Clock::now();
-        probeFailed = probeFailed || !writeVariant(probeFile, payload, true);
-        const auto t4 = Clock::now();
-        withSave.push_back(microsOf(t1 - t0));
-        withoutSave.push_back(microsOf(t2 - t1));
-        cheap.push_back(microsOf(t3 - t2));
-        durable.push_back(microsOf(t4 - t3));
-    }
-    if (probeFailed) {
-        notVerified(kGoal, "a probe write failed part way through the measurement, so the yardstick is incomplete");
-        return;
-    }
-
-    const double medianWith = median(withSave);
-    const double medianWithout = median(withoutSave);
-    const double medianCheap = median(cheap);
-    const double medianDurable = median(durable);
-    const double added = medianWith - medianWithout;
-    std::printf("config_store_test: SetWallpaper's non-GPU work: %.1f us with persistence, %.1f us without "
-                "(added %.1f us). This host's own write+rename: %.1f us; write+fsync+rename+fsync(dir): %.1f us.\n",
-                medianWith, medianWithout, added, medianCheap, medianDurable);
-
-    // GOAL: S8.10 -- the save the DBus handler performs is the write+rename variant
-    //       (9.3 us measured) and not the durable one (823.8 us) the design rejected.
-    //       False if a SetWallpaper's non-GPU work costs what a durable write costs.
-    // WHY-THIS-SHAPE: the bound is not a constant. A literal microsecond threshold is
-    //       either a machine-specific number that fails on a slower disk or a number wide
-    //       enough to admit an fsync, and "a check that cannot tell 9 us from 824 us is not
-    //       testing this". So the test measures BOTH variants itself, in the same
-    //       directory, and asserts the daemon's added cost sits on the cheap side of their
-    //       geometric midpoint. Both yardsticks are written by this file, so a mutation of
-    //       ConfigStore cannot move them -- if the gate were computed from the daemon's own
-    //       cost, making the daemon durable would make the phase SKIP instead of fail,
-    //       which is the vacuous-green direction.
-    // CONTROL: an fsync of the temp file and an fsync of the directory added around
-    //       ConfigStore::save()'s rename -- PLAN.md's variant B -> "FAIL: the persistence a
-    //       SetWallpaper pays for is the write+rename variant, not the durable one", with
-    //       "added 877.2 us against a 96.2 us threshold (cheap 10.9 us, durable 848.2 us)".
-    //       Reverted; the shipped code measures 28-40 us added on this host, roughly three
-    //       times the bare write+rename because save() also builds the JSON and calls
-    //       create_directories, and an order of magnitude under the threshold.
-    // COVERAGE-ASSERT: the measurement is only meaningful if the daemon really wrote, so
-    //       the file's contents are asserted afterwards -- a configFile the manager ignored
-    //       would otherwise show a delta of zero and pass with flying colours.
-    if (medianCheap <= 0.0 || medianDurable < 10.0 * medianCheap) {
-        notVerified(kGoal, "this filesystem makes a durable write no more expensive than a plain one (measured " +
-                               std::to_string(medianDurable) + " us against " + std::to_string(medianCheap) +
-                               " us), so no measurement here can tell the two designs apart");
-        return;
-    }
-    const double threshold = std::sqrt(medianCheap * medianDurable);
-    const bool cheapSide = added < threshold;
-    check(cheapSide,
-          "the persistence a SetWallpaper pays for is the write+rename variant, not the durable one");
-    if (!cheapSide) {
-        std::fprintf(stderr, "  added %.1f us against a %.1f us threshold (cheap %.1f us, durable %.1f us)\n", added,
-                     threshold, medianCheap, medianDurable);
+    const unsigned duringProbe = g_fsyncCalls.load() - beforeProbe;
+    check(duringProbe > 0,
+          "a write this file makes durable on purpose is counted, so the counter can see an fsync at all");
+    if (duringProbe == 0) {
+        std::fprintf(stderr, "  the interposed fsync counted nothing for a write that calls it directly, so the "
+                             "zero above establishes nothing about the daemon\n");
     }
 
     std::string why;
     const std::map<int, std::string> onDiskPaths = pathsInFile(persistedFile, why);
     const bool wrote = onDiskPaths.size() == 1 && onDiskPaths.count(0) == 1 &&
                        onDiskPaths.at(0) == wallpaper.string();
-    check(wrote, "the measured requests really did write the config file, so the measurement is of a save");
+    check(wrote, "the graded request really did write the config file, so a save is what was observed");
     if (!wrote) std::fprintf(stderr, "  %s\n", why.empty() ? "the file holds something else" : why.c_str());
-#endif
 }
 
 }  // namespace
@@ -982,28 +1161,49 @@ int main() {
     //       and does now". Removed, and the file deleted.
     const std::filesystem::path realConfig = wallpaperx::defaultConfigPath();
     bool realConfigExisted = false;
+    bool witnessTaken = false;
     std::string realConfigBefore;
     if (!realConfig.empty()) {
         std::error_code ec;
-        realConfigExisted = std::filesystem::exists(realConfig, ec) && !ec;
+        const bool present = std::filesystem::exists(realConfig, ec);
+        // A stat this process could not perform is not evidence the file was absent.
+        // Folded together, a failed probe here and a successful one at the end would print
+        // "this test wrote nothing into the developer's own wallpaper config" as a FAIL
+        // against a suite that had touched nothing.
+        witnessTaken = !ec;
+        realConfigExisted = present && !ec;
         realConfigBefore = realConfigExisted ? readFile(realConfig) : std::string();
     }
 
-    try {
-        runLocationChecks();
-        runLoadCorpusChecks();
-        runRoundTripChecks();
-        runNonUtf8Checks();
-        runMalformedEntryChecks();
-        runRestoreChecks();
-        runFailedSaveChecks();
-        runSaveCostChecks();
-    } catch (const std::exception& e) {
-        // X.4: this file drives a WallpaperManager, whose constructor can throw on a
-        // machine whose shader directory is missing. Without this the process would abort
-        // and ctest would report an opaque SIGABRT instead of the FAIL lines above.
-        std::fprintf(stderr, "FAIL: unexpected exception: %s\n", e.what());
-        ++g_failures;
+    // X.4: this file drives a WallpaperManager, whose constructor can throw on a machine
+    // whose shader directory is missing. Without a handler the process would abort and ctest
+    // would report an opaque SIGABRT instead of the FAIL lines above. One handler per phase
+    // rather than one around all of them: a throw in phase 2 used to delete phases 3 to 8
+    // from the run with nothing in the output saying they had not been reached, so a reader
+    // saw one named failure and reasonably concluded everything else had been checked.
+    struct Phase {
+        const char* name;
+        void (*run)();
+    };
+    static constexpr Phase kPhases[] = {
+        {"where the config file may live", runLocationChecks},
+        {"loading arbitrary file content", runLoadCorpusChecks},
+        {"the save/load round trip", runRoundTripChecks},
+        {"a path that is not valid UTF-8", runNonUtf8Checks},
+        {"a malformed entry", runMalformedEntryChecks},
+        {"restore does not write", runRestoreChecks},
+        {"a config that could not be read", runUnreadableConfigChecks},
+        {"entries this build cannot apply", runUnappliedEntryChecks},
+        {"a save that cannot succeed", runFailedSaveChecks},
+        {"the cost of the save", runSaveCostChecks},
+    };
+    for (const Phase& phase : kPhases) {
+        try {
+            phase.run();
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "FAIL: the \"%s\" phase threw: %s\n", phase.name, e.what());
+            ++g_failures;
+        }
     }
 
     if (realConfig.empty()) {
@@ -1011,6 +1211,10 @@ int main() {
         // reader must not mistake the guard's silence for it having run.
         std::printf("config_store_test: this process has no usable XDG_CONFIG_HOME or HOME, so there is no real "
                     "config file for this run to have touched.\n");
+    } else if (!witnessTaken) {
+        notVerified("the developer-config isolation guard",
+                    "the real config file could not be probed before the run, so there is no baseline to compare "
+                    "against");
     } else {
         std::error_code ec;
         const bool existsNow = std::filesystem::exists(realConfig, ec) && !ec;

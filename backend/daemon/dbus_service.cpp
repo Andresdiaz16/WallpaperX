@@ -229,8 +229,13 @@ std::string DbusService::getStatus() {
         // could show an admin a different path than the one on disk. Display-safe, not
         // round-trip-safe. `type` needs none: requestWallpaper rejects anything outside
         // three literals before storing.
+        // path_literal is the one to act on: the bytes as stored, so a client can hand it
+        // straight back to SetWallpaper. Null when the name is not valid UTF-8, which JSON
+        // cannot carry -- an absent key would be indistinguishable from an older daemon.
+        const std::optional<std::string> literal = literalPath(monitor.path);
         nlohmann::json entry{{"type", monitor.type},
                              {"path", sanitizeForLog(monitor.path, 4096, LogFraming::Bare)},
+                             {"path_literal", literal ? nlohmann::json(*literal) : nlohmann::json(nullptr)},
                              {"generation", monitor.generation},
                              {"has_frame", monitor.hasFrame}};
         if (monitor.hasFrame) {

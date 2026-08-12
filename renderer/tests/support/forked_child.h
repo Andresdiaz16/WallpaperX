@@ -88,6 +88,11 @@ inline void suppressCoreDump() {
 //
 // Only for children that exec. A fork site whose child runs in-process is free to choose
 // its own codes, and 125 already means something else in one of them.
+// 123, not 124: renderer/tests/device_affinity_probe.cpp already spends 124 on a meaning of
+// its own, and one number with two meanings across the two harnesses is how a grading site
+// comes to name the wrong cause. 122 sits below it for the same reason.
+constexpr int kChildRlimitFailedExit = 122;
+constexpr int kChildChdirFailedExit = 123;
 constexpr int kChildArmFailedExit = 125;
 constexpr int kChildDup2FailedExit = 126;
 constexpr int kChildExecFailedExit = 127;
@@ -98,6 +103,10 @@ constexpr int kChildExecFailedExit = 127;
 // that know nothing of a daemon or a bus, and a sentence naming either could not live here.
 inline const char* forkPreambleFault(int exitCode) {
     switch (exitCode) {
+        case kChildRlimitFailedExit:
+            return "the forked child could not apply the resource limit it was given (setrlimit failed)";
+        case kChildChdirFailedExit:
+            return "the forked child could not enter the working directory it was given (chdir failed)";
         case kChildArmFailedExit:
             return "the forked child could not arm itself against its parent's death (PR_SET_PDEATHSIG refused, or "
                    "the parent was already gone)";

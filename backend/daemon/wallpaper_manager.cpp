@@ -81,11 +81,32 @@ WallpaperManager::WallpaperManager(Config config)
     if (loaded.malformedEntries > 0) {
         detail += " (" + std::to_string(loaded.malformedEntries) + " malformed entries ignored)";
     }
-    // A load failure is reported but not fatal, and does not stop a later save from
-    // replacing the unreadable file.
-    recordHealth(&DaemonHealth::persistence,
-                 loaded.error.empty() ? HealthStatus::Ok : HealthStatus::Fail,
-                 loaded.error.empty() ? detail : loaded.error);
+
+    if (!loaded.error.empty()) {
+        // The first save would otherwise overwrite a file this run could not read, and it
+        // is the only copy. Moved aside instead, so a hand-edit that broke the syntax is
+        // still recoverable afterwards.
+        std::string reported = loaded.error;
+        if (loaded.preservable) {
+            const std::filesystem::path kept = m_store.file().string() + ".bad";
+            std::error_code ec;
+            // Never over an existing copy: the first bad start moves the real config here,
+            // and a second one would otherwise replace it with the throwaway written since.
+            if (std::filesystem::exists(kept, ec)) {
+                reported += "; not kept, " + sanitizeForLog(kept.string(), 4096, LogFraming::Bare) +
+                            " already exists";
+            } else {
+                std::filesystem::rename(m_store.file(), kept, ec);
+                if (!ec) {
+                    reported += "; kept as " + sanitizeForLog(kept.string(), 4096, LogFraming::Bare);
+                }
+            }
+        }
+        recordHealth(&DaemonHealth::persistence, HealthStatus::Fail, reported);
+        return;
+    }
+
+    recordHealth(&DaemonHealth::persistence, HealthStatus::Ok, detail);
 }
 
 // Out of line, and non-trivial for a reason: Device and OffscreenTargetManager are
@@ -278,10 +299,17 @@ void WallpaperManager::requestWallpaper(const std::string& type, const std::stri
 
 std::vector<PersistedWallpaper> WallpaperManager::persistableLocked() const {
     std::vector<PersistedWallpaper> entries;
-    entries.reserve(m_monitors.size());
+    entries.reserve(m_monitors.size() + m_unapplied.size());
     for (const auto& [monitorId, state] : m_monitors) {
         if (state.type.empty() || state.path.empty()) continue;
         entries.push_back(PersistedWallpaper{monitorId, state.type, state.path});
+    }
+
+    // Entries this build could not apply are still the user's. Without this the save
+    // below, which rebuilds the file from live state alone, would delete a wallpaper set
+    // by a newer build the moment anything else is set here. Live state wins per monitor.
+    for (const PersistedWallpaper& entry : m_unapplied) {
+        if (m_monitors.count(entry.monitorId) == 0) entries.push_back(entry);
     }
     return entries;
 }
@@ -314,9 +342,13 @@ std::vector<int> WallpaperManager::restoreSaved() {
     std::lock_guard<std::mutex> stateLock(m_stateMutex);
     for (const PersistedWallpaper& entry : pending) {
         // The manager's own rules, not the store's: a file naming monitor 99 or a type
-        // this build has never heard of is discarded here rather than reaching a render.
-        if (!isKnownType(entry.type) || entry.path.empty()) continue;
-        if (entry.monitorId < 0 || entry.monitorId >= kMaxMonitors) continue;
+        // this build has never heard of is not rendered here -- but it is kept, so the
+        // next save does not delete a wallpaper a newer build understands.
+        if (!isKnownType(entry.type) || entry.path.empty() || entry.monitorId < 0 ||
+            entry.monitorId >= kMaxMonitors) {
+            m_unapplied.push_back(entry);
+            continue;
+        }
 
         MonitorState& state = m_monitors[entry.monitorId];
         state.type = entry.type;
@@ -325,6 +357,14 @@ std::vector<int> WallpaperManager::restoreSaved() {
         state.lastError.clear();
         state.hasFrame = false;
         monitorIds.push_back(entry.monitorId);
+    }
+
+    // Kept entries are invisible otherwise: they are in no monitor's status and are not
+    // malformed, so nothing would tell the user those wallpapers did not come back.
+    if (!m_unapplied.empty() && m_health.persistence.status == HealthStatus::Ok) {
+        recordHealthLocked(&DaemonHealth::persistence, HealthStatus::Ok,
+                           m_health.persistence.detail + " (" + std::to_string(m_unapplied.size()) +
+                               " entries this build cannot apply, kept)");
     }
     return monitorIds;
 }
