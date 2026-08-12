@@ -47,6 +47,7 @@
 // display-safe form of a path while the config file holds the raw bytes, and the expected
 // display form has to come from the daemon's own function rather than be spelled out here.
 #include "daemon/log_escape.h"
+#include "tests/client/blocking_config_write.h"
 #include "tests/client/daemon_client.h"
 #include "tests/client/http_probe.h"
 #include "tests/client/scratch_dir.h"
@@ -3833,7 +3834,12 @@ void checkUnreadableRestore(NameWatcher& names, const std::string& validationEnv
                             const Check& check) {
     constexpr int32_t kMonitorMissing = 19;
     constexpr int32_t kMonitorPresent = 28;
-    constexpr const char* kGoals = "S8.4 (a wallpaper whose file is unreadable at restore is not forgotten)";
+    // No build can ever apply this one: a monitor id is an index, so it is dropped rather
+    // than kept. Carried in this phase's fixture because it already restores a config and
+    // reads GetStatus back, so covering the drop here costs no extra daemon.
+    constexpr int32_t kMonitorNegative = -3;
+    constexpr const char* kGoals = "S8.4 (a wallpaper whose file is unreadable at restore is not forgotten) and "
+                                   "S8.26 (an entry no build can apply is dropped, counted and named)";
 
     ScratchDir configHome("unreadable");
     if (!configHome.ok()) {
@@ -3844,10 +3850,12 @@ void checkUnreadableRestore(NameWatcher& names, const std::string& validationEnv
     // Serialised, not concatenated: $TMPDIR may hold a quote or a backslash, and a fixture
     // that is not valid JSON would make the daemon correctly restore nothing while this
     // phase reported it as a daemon that forgot an entry.
-    const nlohmann::json doc{{"version", 1},
-                             {"monitors", nlohmann::json::array({{{"monitor_id", kMonitorMissing},
-                                                                  {"type", "static"},
-                                                                  {"path", missingPath}}})}};
+    const nlohmann::json doc{
+        {"version", 1},
+        {"monitors", nlohmann::json::array({{{"monitor_id", kMonitorMissing}, {"type", "static"}, {"path", missingPath}},
+                                            {{"monitor_id", kMonitorNegative},
+                                             {"type", "static"},
+                                             {"path", "/no/build/can/apply/this.png"}}})}};
     const std::string config = doc.dump();
     if (!writeTextFile(configHome.configFile(), config)) {
         notVerified(kGoals, "the config file naming an unreadable wallpaper could not be written");
@@ -3907,6 +3915,31 @@ void checkUnreadableRestore(NameWatcher& names, const std::string& validationEnv
             std::fprintf(stderr, "  monitor %d after the restore: %s\n", kMonitorMissing,
                          wallpaperStatus(status, std::to_string(kMonitorMissing))->dump().c_str());
         }
+
+        // GOAL: S8.26 -- the daemon drops an entry no build could ever apply, counts it, and
+        //       says so over the wire. False if the negative id becomes a monitor (it indexes
+        //       an array, so nothing good happens next), and false if it vanishes in silence:
+        //       unlike a kept entry, nothing else will ever mention a dropped one, so the
+        //       count in this detail is the user's only notice that a wallpaper they set is
+        //       not coming back.
+        // WHY-THIS-SHAPE: graded here rather than only in config_store_test, because the
+        //       count is produced by restoreSaved() and read back through the persistence
+        //       detail, and only the daemon runs both -- an in-process check calls
+        //       restoreSaved() itself. Asserted together with the monitor's absence, so it
+        //       cannot pass for a daemon that counted a drop it did not make.
+        // CONTROL: `++m_droppedEntries;` deleted from restoreSaved()'s negative-id branch ->
+        //       "FAIL: the daemon says over DBus how many entries no build can apply",
+        //       printing "persistence detail: .../config.json". The absence check stayed
+        //       green, which is what separates "not counted" from "not dropped". Reverted.
+        check(wallpaperStatus(status, std::to_string(kMonitorNegative)) == nullptr,
+              "an entry with a negative monitor id never becomes a monitor");
+        const nlohmann::json& statusJson = status.json();
+        const std::string persistence = statusJson.contains("persistence") && statusJson["persistence"].is_object()
+                                            ? statusJson["persistence"].value("detail", std::string())
+                                            : std::string("(absent)");
+        const bool counted = persistence.find("1 entries dropped, no build can apply them") != std::string::npos;
+        check(counted, "the daemon says over DBus how many entries no build can apply");
+        if (!counted) std::fprintf(stderr, "  persistence detail: %s\n", persistence.c_str());
     }
 
     // GOAL: S8.4, the survival half -- the entry stays in the file across a save made for a
@@ -4099,6 +4132,146 @@ void checkConfigLocation(NameWatcher& names, const std::string& validationEnv, c
     }
 }
 
+std::string joined(const std::vector<std::string>& names) {
+    if (names.empty()) return "(none)";
+    std::string text;
+    for (const std::string& name : names) {
+        if (!text.empty()) text += ", ";
+        text += name;
+    }
+    return text;
+}
+
+// Every <config.json>.bad[.N] beside the real file, sorted, so a phase can say how many
+// copies exist and which ones rather than only whether one does.
+std::vector<std::string> preservedCopyNames(const std::filesystem::path& file) {
+    std::vector<std::string> found;
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(file.parent_path(), ec)) {
+        const std::string name = entry.path().filename().string();
+        if (name.rfind(file.filename().string() + ".bad", 0) == 0) found.push_back(name);
+    }
+    std::sort(found.begin(), found.end());
+    return found;
+}
+
+void checkConfigPreservationOwnership(NameWatcher& names, const std::string& validationEnv, const Check& check) {
+    constexpr const char* kGoals = "S8.13 (an unreadable config is preserved) and S8.25 (only the process that owns "
+                                   "the bus name touches the config directory)";
+
+    ScratchDir configHome("preserveowner");
+    if (!configHome.ok()) {
+        notVerified(kGoals, "a scratch XDG_CONFIG_HOME could not be created under the temp directory");
+        return;
+    }
+    const std::filesystem::path file = configHome.configFile();
+    // A hand edit that broke the syntax, with the user's wallpaper paths still legible in
+    // it. That is what makes losing these bytes data loss rather than a reset.
+    const std::string usersOwn =
+        "{\"version\":1,\"monitors\":[{\"monitor_id\":0,\"type\":\"static\",\"path\":\"/photos/kept.png\"},]}";
+    const std::string laterBroken = "{\"version\":1,\"monitors\":[{,";
+    if (!writeTextFile(file, usersOwn)) {
+        notVerified(kGoals, "the damaged config this phase reads could not be written");
+        return;
+    }
+
+    SpawnedDaemon first({validationEnv, configHome.env()});
+    if (!names.waitFor(true)) {
+        if (!reportedStartupFault(first, kGoals)) {
+            notVerified(kGoals, "the daemon for this phase never acquired the bus name");
+        }
+        return;
+    }
+
+    // GOAL: S8.13 at the daemon tier -- the shipped binary, not a manager a test drove by
+    //       hand, moves a config it could not read aside and says where it went. False if
+    //       nothing calls preserveUnreadableConfig(): every in-process check of preservation
+    //       now calls it explicitly, so with this missing the whole suite would be green for
+    //       a daemon that preserved nothing at all.
+    // WHY-THIS-SHAPE: the copy is compared byte for byte and config.json is asserted GONE.
+    //       "config.json.bad exists" alone would pass for a daemon that wrote a summary into
+    //       it, and leaving the original in place is the state in which the next save
+    //       overwrites the user's only copy -- moving it is what clears the path.
+    // CONTROL: `manager.preserveUnreadableConfig();` deleted from main.cpp -> "FAIL: the
+    //       daemon moves a config it could not read aside", "FAIL: the copy the daemon kept
+    //       holds the bytes of the file it could not read" and "FAIL: the daemon says where
+    //       it kept the config it could not read", printing "copies beside it: (none)".
+    //       Reverted.
+    auto proxy =
+        sdbus::createProxy(sdbus::ServiceName{DbusService::kBusName}, sdbus::ObjectPath{DbusService::kObjectPath});
+    const StatusReply firstStatus = getStatusOrExplain(*proxy);
+    const std::filesystem::path kept(file.string() + ".bad");
+    const bool moved = !std::filesystem::exists(file) && std::filesystem::exists(kept);
+    check(moved, "the daemon moves a config it could not read aside");
+    if (!moved) {
+        std::fprintf(stderr, "  copies beside it: %s\n", joined(preservedCopyNames(file)).c_str());
+    }
+    check(readTextFile(kept) == usersOwn, "the copy the daemon kept holds the bytes of the file it could not read");
+    if (!firstStatus.ok()) {
+        check(false, "the daemon that preserved its config answers GetStatus");
+        std::fprintf(stderr, "  %s\n", firstStatus.error().c_str());
+    } else {
+        const nlohmann::json& json = firstStatus.json();
+        const std::string detail = json.contains("persistence") && json["persistence"].is_object()
+                                       ? json["persistence"].value("detail", std::string())
+                                       : std::string("(absent)");
+        const bool said = detail.find(kept.filename().string()) != std::string::npos;
+        check(said, "the daemon says where it kept the config it could not read");
+        if (!said) std::fprintf(stderr, "  persistence detail: %s\n", detail.c_str());
+    }
+
+    // GOAL: S8.25 -- a process that loses the name request writes NOTHING into the config
+    //       directory. False if a duplicate instance moves the running daemon's config aside
+    //       before finding out it has no right to run: the user starts the daemon twice, the
+    //       second start renames the file the first is using, and the wallpapers are gone
+    //       from the name the first daemon will read on its next start. This is a real
+    //       sequence -- a desktop autostart plus a manual launch -- not a contrived one.
+    // WHY-THIS-SHAPE: the fixture is a config the duplicate WOULD move: unreadable, and so
+    //       preservable, with the first free copy name (.bad) already taken by the daemon
+    //       that is running. A readable config would make this green for any build at all,
+    //       because there would be nothing to preserve. Both directions are asserted -- the
+    //       file still holds its bytes, and no second copy appeared -- because a build that
+    //       copied instead of moving would leave the first true and the second false. The
+    //       duplicate is required to have exited before anything is read, so this cannot pass
+    //       on a race in which it simply had not got there yet.
+    // CONTROL: `manager.preserveUnreadableConfig()` moved back above the `requestName` call
+    //       in main.cpp, which is the ordering this goal exists to forbid -> "FAIL: a daemon
+    //       that lost the name request leaves config.json exactly as it found it" and "FAIL:
+    //       a daemon that lost the name request makes no copy of the config", printing
+    //       "config.json now holds: (nothing)" and "copies beside it: config.json.bad,
+    //       config.json.bad.1". Reverted.
+    if (!writeTextFile(file, laterBroken)) {
+        notVerified("S8.25", "the second damaged config this phase needs could not be written");
+    } else {
+        const std::vector<std::string> before = preservedCopyNames(file);
+        SpawnedDaemon second({validationEnv, configHome.env()});
+        const int secondExit = second.waitForExit();
+        if (reportedStartupFault(second, "S8.25 (only the name owner touches the config directory)")) {
+            // X.3: that child never ran the daemon, so what it did or did not write to the
+            // config directory says nothing about the daemon's ordering.
+        } else {
+            check(second.exitedNormally() && secondExit != 0,
+                  "the duplicate instance this phase needs did lose the name request");
+            const std::string onDisk = readTextFile(file);
+            const bool untouched = onDisk == laterBroken;
+            check(untouched, "a daemon that lost the name request leaves config.json exactly as it found it");
+            if (!untouched) {
+                std::fprintf(stderr, "  config.json now holds: %s\n",
+                             onDisk.empty() ? "(nothing)" : onDisk.c_str());
+            }
+            const std::vector<std::string> copies = preservedCopyNames(file);
+            check(copies == before, "a daemon that lost the name request makes no copy of the config");
+            if (copies != before) {
+                std::fprintf(stderr, "  copies beside it: %s (they were: %s)\n", joined(copies).c_str(),
+                             joined(before).c_str());
+            }
+        }
+    }
+
+    first.shutdown(SIGTERM);
+    awaitNameRelease(names, "the phase after the config-preservation phase");
+}
+
 // A config.json of a shape or a size the daemon must refuse without opening it.
 struct ConfigFileCase {
     const char* what;
@@ -4149,18 +4322,22 @@ void checkStoppableOnAnyConfigFile(NameWatcher& names, const std::string& valida
     // CONTROL: two, both reverted, and the pair is the finding. (a) `O_NONBLOCK` dropped from
     //       load()'s open in config_store.cpp, so the FIFO blocks in open() exactly as it did
     //       when the hang was found -> "FAIL: with a named pipe at config.json, the daemon
-    //       says why it refused the file", the detail reading "did not respond within 2s,
-    //       starting without it" instead of naming the file type. The daemon still came up
-    //       and still exited: the two-second load deadline abandons the read. (b) that plus
-    //       `kLoadDeadline` raised to 3600 s in wallpaper_manager.cpp, so nothing abandons it
-    //       -> the FIFO case red on "answers GetStatus" ("org.freedesktop.DBus.Error.Timeout"
-    //       -- main() is parked in the constructor with the bus name already taken and no
-    //       object served) and on the refusal detail, and the run took 32.7 s instead of 2.7.
-    //       What stayed GREEN under (b) is worth as much as what went red: the daemon still
-    //       exited 0 without being killed, because main.cpp's five-second teardown deadline
-    //       fires and ends the process. So stoppability here now rests on three independent
-    //       mechanisms -- the type and size guards, the load deadline, and that watchdog --
-    //       and no single-mutation control can redden the exit checks in this phase.
+    //       says why it refused the file", the detail reading "not saving over it; ...: did
+    //       not respond within 2s, starting without it" instead of naming the file type. The
+    //       daemon still came up and still exited: the two-second load deadline abandons the
+    //       read. (b) that plus `kLoadDeadline` raised to 3600 s in wallpaper_manager.cpp, so
+    //       nothing abandons it -> "FAIL: with a named pipe at config.json, the daemon reaches
+    //       the bus" and "FAIL: ... the daemon exits 0" ("exit code 1"), and the run took
+    //       37.6 s instead of 4.6. The name is what moves under (b): main() parks in the
+    //       manager's constructor, which now runs BEFORE requestName, so that daemon never
+    //       reaches the bus at all -- the phase's GetStatus and detail checks are skipped
+    //       rather than red, and the FAILs land on the two that do not depend on the name.
+    //       What stayed GREEN under (b) is worth as much: the daemon still exited without
+    //       being killed, because main.cpp's five-second teardown deadline fires and ends the
+    //       process -- and it is that deadline, not a clean stop, that the exit code 1 above
+    //       comes from. So stoppability here rests on three independent mechanisms -- the type
+    //       and size guards, the load deadline, and that watchdog -- and no single-mutation
+    //       control can redden the "exits on SIGTERM without having to be killed" checks.
     // COVERAGE-ASSERT: every case is accounted for -- exercised, or reported as one this
     //       host could not stage -- against the table's size, so a case that quietly stops
     //       being planted fails instead of shrinking the phase in silence.
@@ -4274,15 +4451,17 @@ void checkStoppableOnAnyConfigFile(NameWatcher& names, const std::string& valida
           "every unreadable-config-file case was either exercised or reported unstageable");
 }
 
-// A config that is valid, large, and applies to nothing -- every entry names a monitor id
-// this build has no room for, so the daemon keeps them and renders none. Its only purpose
-// is to make the startup work between the bus name and the event loop take long enough to
-// be caught in the act.
-std::string manyUnapplicableEntries(int count) {
+// A config that parses and every entry of which the daemon rejects, grown to just under the
+// store's 1 MiB cap. Its only purpose is to lengthen the work the daemon does *after* it owns
+// the bus name: rejected entries make preserveUnreadableConfig() copy the whole file aside,
+// and that call sits between requestName() and the event loop. A monitor id the JSON gives as
+// a string is what the store refuses, so nothing is restored and no render is ever queued.
+std::string rejectedEntriesNearCap(std::size_t targetBytes) {
+    static constexpr char kEntry[] = "{\"monitor_id\":\"x\",\"type\":\"slideshow\",\"path\":\"/not/rendered/here.png\"}";
     std::string text = "{\"version\":1,\"monitors\":[";
-    for (int i = 0; i < count; ++i) {
-        if (i > 0) text += ',';
-        text += "{\"monitor_id\":40,\"type\":\"slideshow\",\"path\":\"/not/rendered/here.png\"}";
+    while (text.size() + sizeof(kEntry) + 2 < targetBytes) {
+        if (text.back() != '[') text += ',';
+        text += kEntry;
     }
     text += "]}";
     return text;
@@ -4296,8 +4475,8 @@ void checkShutdownDuringStartup(NameWatcher& names, const std::string& validatio
     constexpr const char* kGoal =
         "S8.20 (a shutdown signal that arrives before the event loop starts still stops the daemon)";
     constexpr int kPort = wallpaperx::HttpServer::kDefaultPort;
-    constexpr int kAttempts = 6;
-    constexpr int kEntries = 15000;
+    constexpr int kAttempts = 12;
+    constexpr std::size_t kConfigBytes = 1000000;
 
     ScratchDir configHome("earlyterm");
     if (!configHome.ok()) {
@@ -4306,7 +4485,7 @@ void checkShutdownDuringStartup(NameWatcher& names, const std::string& validatio
     }
     std::error_code ec;
     std::filesystem::create_directories(configHome.configFile().parent_path(), ec);
-    if (ec || !writeTextFile(configHome.configFile(), manyUnapplicableEntries(kEntries))) {
+    if (ec || !writeTextFile(configHome.configFile(), rejectedEntriesNearCap(kConfigBytes))) {
         notVerified(kGoal, "the large config that widens this phase's startup window could not be written");
         return;
     }
@@ -4329,19 +4508,34 @@ void checkShutdownDuringStartup(NameWatcher& names, const std::string& validatio
     //       enterEventLoop(). Only then is SIGTERM queued and SIGCONT sent. The obvious
     //       simpler version -- signal as soon as the name appears and hope -- cannot tell
     //       which side of the loop it landed on, so it would grade an ordinary shutdown and
-    //       report it as this one. The config is 15 000 entries for the same reason: it
-    //       widens the work between the name and the loop from microseconds to milliseconds.
+    //       report it as this one.
+    //       The fixture is what makes that freeze land often enough to be usable, and it has
+    //       to be a config whose cost falls AFTER the name: the config read and the restore
+    //       both run before requestName(), so a merely large valid config -- which is what
+    //       this phase used to plant -- lengthens the wrong side and buys nothing. A file
+    //       whose entries are all rejected is copied aside by preserveUnreadableConfig(),
+    //       which main() calls immediately after requestName(), so its size lands squarely in
+    //       the graded window. Measured on this host, eight runs each: with rejected entries,
+    //       caught on attempt 1 of 12 every time; with the same file made valid, attempts 1-3
+    //       (mean 1.8) -- and with the phase as it stood before this change, attempts 1-6
+    //       (mean 2.75), which is a 7% chance of no attempt landing at all and the goal
+    //       silently going unexercised.
     // CONTROL: two, both reverted. (a) the guard alone deleted, so main enters the loop
     //       whatever the watcher recorded -> still green, four runs out of four, each with
     //       the freeze confirmed: that is the latch, measured here rather than taken on
-    //       trust, and it is why this phase claims nothing about the guard. (b) the guard
-    //       deleted AND the latch removed with it -- the watcher calling leaveEventLoop()
-    //       only when a flag says the loop is running -> "FAIL: the daemon signalled before
-    //       its event loop began exits without having to be killed" ("exited normally 0,
-    //       timed out 1", i.e. SIGKILLed after the reap timeout), plus the exit-code and
-    //       destructor-chain checks here. That mutation also reddened the SIGINT and SIGHUP
-    //       phases, which signal as soon as the name appears and so land in this window by
-    //       accident; the SIGTERM phase, which does work first, stayed green.
+    //       trust, and it is why this phase claims nothing about the guard. Run before the
+    //       reordering that moved preserveUnreadableConfig() after requestName(), and left
+    //       standing because it says the guard is not load-bearing, which nothing since has
+    //       touched. (b) the guard deleted AND the latch removed with it -- the watcher
+    //       calling leaveEventLoop() only when a flag says the loop is running -- re-run
+    //       against the current binary -> "FAIL: a daemon signalled before its event loop
+    //       began exits 0" ("exit code 1") and "FAIL: ... still runs its destructor chain".
+    //       Note the signature has MOVED since that mutation was first run: the daemon is no
+    //       longer SIGKILLed after the reap timeout but ends itself at the five-second
+    //       teardown deadline with exit 1, so "exits without having to be killed" stays green
+    //       and the exit code carries the failure. The same mutation still reddens the SIGINT
+    //       and SIGHUP phases, which signal as soon as the name appears and so land in this
+    //       window by accident; the SIGTERM phase, which does work first, stayed green.
     // COVERAGE-ASSERT: an attempt counts only when the connect said refused while the
     //       daemon was stopped. If no attempt in six lands in the window -- another process
     //       holds 18462, or this host starts the daemon faster than the harness can freeze
@@ -4352,6 +4546,15 @@ void checkShutdownDuringStartup(NameWatcher& names, const std::string& validatio
     std::string lastPortAnswer = "not probed";
     for (int attempt = 0; attempt < kAttempts && inWindow == 0; ++attempt) {
         ++attemptsUsed;
+        // The copy each attempt makes would occupy the next attempt's target name, and the
+        // daemon's numbered search gives up after ten -- so without this the widening the
+        // fixture buys would quietly stop happening partway through the loop.
+        for (int n = 0; n < 12; ++n) {
+            std::error_code removeEc;
+            std::filesystem::remove(std::filesystem::path(configHome.configFile().string() + ".bad" +
+                                                          (n == 0 ? "" : "." + std::to_string(n))),
+                                    removeEc);
+        }
         SpawnedDaemon daemon({validationEnv, configHome.env()});
         if (!names.waitFor(true)) {
             if (reportedStartupFault(daemon, kGoal)) return;
@@ -4510,6 +4713,286 @@ void checkFileSizeLimit(NameWatcher& names, const std::string& validationEnv, co
         if (exitCode != 0) std::fprintf(stderr, "  exit code %d\n", exitCode);
     }
     awaitNameRelease(names, "the phase after the file-size-limit phase");
+}
+
+// ---------------------------------------------------------------------------- //
+// S8.29-S8.32: the daemon while the filesystem holding its config has stopped
+// answering. In process, config_store_test grades the same properties against
+// WallpaperManager; only here is the thing under test a bus that a real client is
+// waiting on.
+// ---------------------------------------------------------------------------- //
+void checkStalledConfigWrite(NameWatcher& names, const std::string& validationEnv, const std::string& bluePath,
+                             const Check& check) {
+    // This phase drives a daemon of its own, so its ids are only ever compared with its own.
+    constexpr int32_t kMonitorStalledFirst = 18;
+    constexpr int32_t kMonitorStalledSecond = 19;
+    constexpr const char* kGoals = "S8.29/S8.30/S8.31/S8.32 (the daemon while its config filesystem has stopped "
+                                   "answering)";
+    // The deadline a save is given, restated rather than shared: kLoadDeadline sits in an
+    // anonymous namespace in wallpaper_manager.cpp, and a copy here means a change to it
+    // fails this phase loudly instead of silently re-pointing it at the new value.
+    constexpr double kSaveDeadlineMs = 2000.0;
+
+    ScratchDir configHome("stalledwrite");
+    if (!configHome.ok()) {
+        notVerified(kGoals, "a scratch XDG_CONFIG_HOME could not be created under the temp directory");
+        return;
+    }
+
+    // The fixture, proved before the daemon exists: see blocking_config_write.h. It runs a
+    // save of this build's own ConfigStore -- the code the daemon executes -- through a fifo
+    // and requires it to park. Without it, "the daemon answered instantly" has two causes
+    // that look identical from out here, one of which is this harness's fault.
+    std::string fixtureWhy;
+    if (!wallpaperx::testing::blockingWriteFixtureWorks(configHome.path() / "wallpaperx" / "probe.json",
+                                                       fixtureWhy)) {
+        notVerified(kGoals, fixtureWhy);
+        return;
+    }
+
+    SpawnedDaemon daemon({validationEnv, configHome.env()});
+    if (!names.waitFor(true)) {
+        if (!reportedStartupFault(daemon, kGoals)) {
+            notVerified(kGoals, "the daemon for this phase never acquired the bus name");
+        }
+        return;
+    }
+
+    auto proxy =
+        sdbus::createProxy(sdbus::ServiceName{DbusService::kBusName}, sdbus::ObjectPath{DbusService::kObjectPath});
+
+    // A save that works, before anything is blocked, and it is a precondition rather than a
+    // check: it is what makes "the next write is parked in this phase's fifo" a fact instead
+    // of an assumption. This daemon is shown to write to THIS config file, and the fixture
+    // probe above has shown a write to that file parks -- so a later save cannot be finishing
+    // somewhere out of sight. It also gives S8.32 a last-good save to hide, which is the
+    // wrong answer that goal names.
+    //
+    // `video`, not `static`, throughout: requestWallpaper records and persists it and
+    // renderPending refuses it before touching the GPU, so nothing here creates a Vulkan
+    // device. What is being measured is a handler's latency, and a driver's first-use cost
+    // inside the same call would swamp it -- and would make this phase unanswerable on a host
+    // with no working ICD, for a question that has nothing to do with the GPU.
+    std::string baselineError;
+    try {
+        setWallpaper(*proxy, "video", bluePath, kMonitorStalledFirst);
+    } catch (const std::exception& e) {
+        baselineError = e.what();
+    }
+    std::string baselineWhy;
+    const std::map<int, PersistedEntry> baseline = configEntries(configHome.configFile(), baselineWhy);
+    if (!baselineError.empty() || baseline.count(kMonitorStalledFirst) != 1) {
+        // X.3: a daemon that cannot persist at all is graded by the phases written for that.
+        // Here it is a baseline that did not appear, so this phase establishes nothing.
+        notVerified(kGoals, "the daemon did not persist a wallpaper into this phase's config file before anything "
+                            "was blocked (" +
+                                (baselineError.empty() ? baselineWhy : baselineError) + ")");
+        return;
+    }
+
+    wallpaperx::testing::BlockingWrite blocked(configHome.configFile());
+    if (!blocked.arm()) {
+        notVerified(kGoals, "a fifo could not be created at " + blocked.temp() +
+                                ", so no write of this daemon's can be made to block");
+        return;
+    }
+
+    // GOAL: S8.29 at the process level -- SetWallpaper returns even though the write it
+    //       triggers has stopped coming back, and returns on the deadline rather than when
+    //       the filesystem answers. False if the reply waits for the mount: the caller is a
+    //       client on the bus, and the daemon has one thread serving all of them.
+    // WHY-THIS-SHAPE: the call carries a timeout of its own, unlike every other SetWallpaper
+    //       in this file. With the write back on the bus thread this call never returns at
+    //       all, and the bus's 25-second default would turn the control run into something
+    //       that looks like a hung suite rather than a failed check -- and would put a
+    //       25-second stall in front of every check below it.
+    // CONTROL: `m_store.save(entries);` added at the top of WallpaperManager::persist(), i.e.
+    //       the write put back on the bus thread -> "FAIL: the daemon answers a SetWallpaper
+    //       whose config write has stopped coming back", printing
+    //       "org.freedesktop.DBus.Error.Timeout: Connection timed out (after 15075 ms)", and
+    //       six more: the deadline check here, both GetStatus checks, the second-save check,
+    //       the stall-report check ("persistence reads (absent)") and both shutdown checks
+    //       ("exit code 1", the watchdog line present). That is the state this whole change
+    //       exists to prevent, reproduced end to end. Reverted.
+    const auto firstStart = Clock::now();
+    std::string stalledError;
+    try {
+        setWallpaper(*proxy, "video", bluePath, kMonitorStalledSecond, std::chrono::seconds(15));
+    } catch (const sdbus::Error& e) {
+        stalledError = e.getName() + ": " + e.getMessage();
+    } catch (const std::exception& e) {
+        stalledError = e.what();
+    }
+    const double firstMs = millis(Clock::now() - firstStart);
+    check(stalledError.empty(), "the daemon answers a SetWallpaper whose config write has stopped coming back");
+    if (!stalledError.empty()) {
+        // Not an early return, deliberately. A daemon wedged in this handler fails every
+        // check below too, and each of those is a true and separate statement about it -- the
+        // bus does not answer, the stall is not reported, the process has to be forced out.
+        // Returning here would leave the one property this phase exists for, that the bus
+        // still answers, with no mutation that can redden it.
+        std::fprintf(stderr, "  %s (after %.0f ms)\n", stalledError.c_str(), firstMs);
+        std::printf("daemon_system_test: the stalled-write daemon did not answer the call that stalls it; the "
+                    "failures below share that one cause.\n");
+    }
+    const bool boundedByTheDeadline = firstMs < 2 * kSaveDeadlineMs;
+    check(boundedByTheDeadline, "that reply waits for the deadline and not for the filesystem");
+    if (!boundedByTheDeadline) {
+        std::fprintf(stderr, "  SetWallpaper took %.0f ms against a %.0f ms deadline\n", firstMs, kSaveDeadlineMs);
+    }
+
+    // GOAL: S8.30 -- the daemon goes on answering while a config write is outstanding. This
+    //       is the whole reason the write left the bus thread: before it did, one
+    //       SetWallpaper onto a dead mount stopped the daemon answering ANY method until its
+    //       own teardown watchdog killed it, so every client -- the panel, a status poller,
+    //       the plugin -- hung with it.
+    // WHY-THIS-SHAPE: asked after the stalled SetWallpaper has returned, not concurrently
+    //       with it. The write is provably still outstanding at this point -- nothing in this
+    //       phase attaches a reader to the fifo, so it cannot have completed -- while a
+    //       racing GetStatus issued from a second thread might legally be answered before the
+    //       handler ever reached the write, which is a check graded on the interleaving.
+    //       The latency is bounded as well as the answer required: "it replied eventually" is
+    //       also true of a daemon that answers status only once the deadline it should not be
+    //       paying expires.
+    // CONTROL: the same `m_store.save(entries);` at the top of persist() -> "FAIL: the daemon
+    //       answers GetStatus while a config write of its own is stalled", printing "GetStatus
+    //       failed with org.freedesktop.DBus.Error.Timeout, which is not one of the daemon's
+    //       own error names -- so it is the bus, the connection, or the daemon failing outside
+    //       its own taxonomy: Connection timed out". Reverted.
+    const auto statusStart = Clock::now();
+    const StatusReply during = getStatus(*proxy, std::chrono::seconds(10));
+    const double statusMs = millis(Clock::now() - statusStart);
+    check(during.ok(), "the daemon answers GetStatus while a config write of its own is stalled");
+    if (!during.ok()) std::fprintf(stderr, "  %s\n", during.error().c_str());
+    const bool answeredPromptly = during.ok() && statusMs < kSaveDeadlineMs / 2;
+    check(answeredPromptly, "and answers it without waiting on that write");
+    if (during.ok() && !answeredPromptly) {
+        std::fprintf(stderr, "  GetStatus took %.0f ms while a write was outstanding\n", statusMs);
+    }
+
+    // GOAL: S8.31 -- once one wait has run out, no later SetWallpaper pays the deadline
+    //       again. False if an outage costs two seconds per wallpaper change rather than two
+    //       seconds once.
+    // COVERAGE-ASSERT: the first call's own elapsed time is asserted to be at least three
+    //       quarters of the deadline. Without it this comparison is green on a daemon that
+    //       waits for nothing at all: both calls return instantly and the phase reports that
+    //       the deadline is not paid twice, having never seen it paid once. CONTROL for it:
+    //       `kLoadDeadline` in the settled.wait_for() replaced with 0 seconds -> "FAIL: the
+    //       first call really did wait for the deadline, so the comparison above has a
+    //       baseline", printing "the first call took 0 ms", while the check it guards stayed
+    //       green at 0 ms. Reverted.
+    // CONTROL: `if (m_persist->stalled) return;` deleted from persist() -> "FAIL: a second
+    //       SetWallpaper during the stall does not wait for the deadline all over again",
+    //       printing "the second call took 2000 ms against a 2000 ms deadline", and nothing
+    //       else red. Reverted.
+    const auto secondStart = Clock::now();
+    std::string secondError;
+    try {
+        setWallpaper(*proxy, "video", bluePath, kMonitorStalledFirst, std::chrono::seconds(15));
+    } catch (const std::exception& e) {
+        secondError = e.what();
+    }
+    const double secondMs = millis(Clock::now() - secondStart);
+    const bool cheap = secondError.empty() && secondMs < kSaveDeadlineMs / 4;
+    check(cheap, "a second SetWallpaper during the stall does not wait for the deadline all over again");
+    if (!cheap) {
+        std::fprintf(stderr, "  the second call took %.0f ms against a %.0f ms deadline%s%s\n", secondMs,
+                     kSaveDeadlineMs, secondError.empty() ? "" : ", and failed: ", secondError.c_str());
+    }
+    const bool firstPaidIt = firstMs >= 0.75 * kSaveDeadlineMs;
+    check(firstPaidIt, "the first call really did wait for the deadline, so the comparison above has a baseline");
+    if (!firstPaidIt) {
+        std::fprintf(stderr, "  the first call took %.0f ms, which is not a deadline being paid\n", firstMs);
+    }
+
+    // GOAL: S8.32 -- what the daemon PUBLISHES while a write is outstanding is that write,
+    //       not the last save that succeeded. False if persistence still reads ok with the
+    //       baseline save's detail: nothing else is slow any more -- that is what moving the
+    //       write off the bus thread bought -- so a stale ok is the only thing an operator
+    //       would ever see while nothing has reached the disk since the mount died.
+    // WHY-THIS-SHAPE: read over the bus rather than from /health, so it does not depend on
+    //       this daemon owning port 18462 -- a developer's own daemon on that port would turn
+    //       this into a skip. Polled to a deadline with a failure branch, and the verdict is
+    //       the LAST observation: the stall becomes reportable at almost the same instant the
+    //       first caller is released, so a single reply taken here would land on either side
+    //       of that by luck. Both the status and the wording are asserted, because a `fail`
+    //       carrying the previous save's detail sends an operator to a disk error that does
+    //       not exist.
+    // CONTROL: the `if (writingSince && ... > kLoadDeadline)` block deleted from
+    //       applyPersistOutcomeLocked() -> "FAIL: GetStatus reports the write that has not
+    //       come back, rather than the last save that did", printing "persistence reads ok
+    //       (/tmp/.../config.json)" -- the baseline save above, which is exactly the wrong
+    //       answer this goal names. Reverted.
+    std::string sawStatus;
+    std::string sawDetail;
+    bool namesTheStall = false;
+    const auto pollDeadline = Clock::now() + std::chrono::seconds(8);
+    while (Clock::now() < pollDeadline) {
+        const StatusReply reply = getStatus(*proxy, std::chrono::seconds(10));
+        if (reply.ok() && reply.json().contains("persistence") && reply.json()["persistence"].is_object()) {
+            const nlohmann::json& persistence = reply.json()["persistence"];
+            sawStatus = persistence.value("status", std::string());
+            sawDetail = persistence.value("detail", std::string());
+            namesTheStall =
+                sawStatus == "fail" &&
+                sawDetail.find("has not answered a write, the filesystem may be stalled") != std::string::npos;
+            if (namesTheStall) break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    check(namesTheStall, "GetStatus reports the write that has not come back, rather than the last save that did");
+    if (!namesTheStall) {
+        std::fprintf(stderr, "  persistence reads %s (%s)\n", sawStatus.empty() ? "(absent)" : sawStatus.c_str(),
+                     sawDetail.c_str());
+    }
+
+    std::printf("daemon_system_test: with the config filesystem stalled, SetWallpaper cost %.0f ms then %.0f ms, "
+                "and GetStatus %.0f ms\n",
+                firstMs, secondMs, statusMs);
+
+    // GOAL: S8.29's other half -- a daemon whose config write can never finish still stops.
+    //       The write is on a thread nothing joins and that holds no reference to the manager,
+    //       so shutdown must not wait for it. False if the process has to be killed: a user
+    //       whose NFS server is down would be unable to stop or restart the daemon at all,
+    //       and systemd would end up sending SIGKILL on every stop.
+    // WHY-THIS-SHAPE: the fifo is deliberately never released. The write is therefore still
+    //       parked in the kernel at the moment the daemon is asked to exit, which is the state
+    //       being graded; releasing it first would grade an ordinary shutdown. The absence of
+    //       the watchdog's line is asserted beside the exit code, because the watchdog also
+    //       ends the process -- so an exit-code check alone would pass for a daemon that had
+    //       to be forced out five seconds late.
+    // CONTROL: `.detach()` in startPersistWorker() replaced by storing the thread in the
+    //       manager and joining it in ~WallpaperManager -> "FAIL: a daemon with a config write
+    //       it can never finish still exits 0 on SIGTERM" ("exit code 1") and "FAIL: it leaves
+    //       through main() rather than through the teardown watchdog". The worker loops
+    //       forever by design, so that mutation blocks EVERY teardown: nine other shutdown
+    //       checks in this file went red with it, which is the sense in which abandoning this
+    //       thread is load-bearing rather than incidental. Note what stayed green: "still
+    //       exits on SIGTERM" above, because the forced path is still a normal exit -- which
+    //       is why the exit CODE and the watchdog's line are asserted separately. Reverted.
+    //       That check has a control of its own: the same join plus `kTeardownDeadline` in
+    //       main.cpp raised to an hour, so nothing forces the process out at all -> "FAIL: a
+    //       daemon with a config write it can never finish still exits on SIGTERM", printing
+    //       "exited normally 0, timed out 1, signal 0" -- it had to be SIGKILLed. Reverted.
+    const int exitCode = daemon.shutdown(SIGTERM);
+    const std::string output = daemon.output();
+    const bool stopped = daemon.exitedNormally() && !daemon.timedOut();
+    check(stopped, "a daemon with a config write it can never finish still exits on SIGTERM");
+    if (!stopped) {
+        std::fprintf(stderr, "  exited normally %d, timed out %d, signal %d\n",
+                     static_cast<int>(daemon.exitedNormally()), static_cast<int>(daemon.timedOut()),
+                     daemon.termSignal());
+    }
+    if (output.find("Sanitizer: reported") != std::string::npos) {
+        check(false, "the stalled-write daemon's sanitizer reported no warnings (its exit code is the sanitizer's "
+                     "here, so the exit-code check cannot run)");
+    } else {
+        check(exitCode == 0, "a daemon with a config write it can never finish still exits 0 on SIGTERM");
+        if (exitCode != 0) std::fprintf(stderr, "  exit code %d\n", exitCode);
+    }
+    check(output.find("shutdown blocked") == std::string::npos,
+          "it leaves through main() rather than through the teardown watchdog");
+    awaitNameRelease(names, "the phase after the stalled-write phase");
 }
 
 }  // namespace
@@ -4751,6 +5234,33 @@ int main() {
                   "the daemon reports which signal it is shutting down for");
             check(daemonOutput.find("stopped cleanly") != std::string::npos,
                   "the daemon runs its destructor chain on the way out (worker join, GPU teardown, leak report)");
+
+            // GOAL: the busiest daemon this suite runs -- a device created, wallpapers set,
+            //       a hundred concurrent calls behind it -- still finishes teardown inside
+            //       main.cpp's five-second budget, so it leaves through main() rather than
+            //       through the watchdog's _Exit. False if the daemon starts taking the
+            //       forced path routinely: teardown would then be abandoned every stop, and
+            //       "stopped cleanly" above would go with it.
+            // WHY-THIS-SHAPE: the absence of the forced line, asserted separately from
+            //       "stopped cleanly" rather than folded into it. The two are not the same
+            //       claim -- the forced path writes with write(2) straight to fd 2 while the
+            //       clean line goes through stdio, so a build that printed both, or that
+            //       raced them, would satisfy one and not the other -- and only this one
+            //       names the deadline as the thing that fired.
+            //       What it deliberately does NOT establish: what the forced path DOES when
+            //       it is taken. That was measured out of suite (config_store.cpp's open made
+            //       blocking and the load deadline raised to an hour, so main parks in the
+            //       manager's constructor): the daemon wrote exactly this line to stderr and
+            //       exited 1. No committed check can reach it -- the fixture would have to be
+            //       teardown that genuinely wedges, which needs a filesystem this harness can
+            //       hang on demand.
+            // CONTROL: `kTeardownDeadline` in main.cpp set to 0 seconds, so every stop takes
+            //       the forced path -> "FAIL: the daemon leaves through main() rather than
+            //       through the teardown watchdog", "FAIL: the daemon exits 0 on SIGTERM"
+            //       ("exit code 1") and "FAIL: the daemon runs its destructor chain on the way
+            //       out". Reverted.
+            const bool leftThroughMain = daemonOutput.find("shutdown blocked") == std::string::npos;
+            check(leftThroughMain, "the daemon leaves through main() rather than through the teardown watchdog");
             check(names.waitFor(false), "the bus name is released once the daemon exits");
         }
 
@@ -4827,10 +5337,12 @@ int main() {
         checkConfigRestart(names, validationEnv, check);
         checkStartsOnAnyConfig(names, validationEnv, check);
         checkStoppableOnAnyConfigFile(names, validationEnv, check);
+        checkConfigPreservationOwnership(names, validationEnv, check);
         checkShutdownDuringStartup(names, validationEnv, check);
         checkUnreadableRestore(names, validationEnv, bluePath, check);
         checkConfigLocation(names, validationEnv, bluePath, check);
         checkFileSizeLimit(names, validationEnv, bluePath, check);
+        checkStalledConfigWrite(names, validationEnv, bluePath, check);
 
         // Every Frame's UnixFd closes at scope exit, and the daemon is gone, so this
         // process must be back where it started. A descriptor leaked per GetFrameFd is

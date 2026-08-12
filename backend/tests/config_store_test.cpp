@@ -24,27 +24,36 @@
 #include "daemon/config_store.h"
 #include "daemon/log_escape.h"
 #include "daemon/wallpaper_manager.h"
+#include "tests/client/blocking_config_write.h"
 #include "tests/client/scratch_dir.h"
 
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <map>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
+#include <utility>
 #include <vector>
 
 #include <dlfcn.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -54,6 +63,9 @@ using wallpaperx::LogFraming;
 using wallpaperx::PersistedWallpaper;
 using wallpaperx::SaveResult;
 using wallpaperx::sanitizeForLog;
+using wallpaperx::testing::BlockingWrite;
+using wallpaperx::testing::blockingWriteFixtureWorks;
+using wallpaperx::testing::isRegularFile;
 using wallpaperx::testing::ScratchDir;
 using wallpaperx::WallpaperManager;
 
@@ -75,6 +87,37 @@ extern "C" int fdatasync(int fd) {
     using Fn = int (*)(int);
     static Fn real = reinterpret_cast<Fn>(::dlsym(RTLD_NEXT, "fdatasync"));
     return real != nullptr ? real(fd) : 0;
+}
+
+// Counts the saves that actually landed, by counting successful rename(2) calls onto one
+// path -- the last step of ConfigStore::save(), and the only one a caller can see from
+// outside. Interposed for the same reason the two counters above are, and it is the same
+// mechanism: the test links the daemon statically, so a strong definition here is what the
+// daemon's own call resolves to.
+//
+// It exists because counting writes is the only way to tell a superseded snapshot from a
+// queued one -- both leave the newest state on disk. inotify was tried first and cannot do
+// it: the kernel merges an IN_MOVED_TO with the one before it when the mask and name match,
+// which is exactly the case here, so two renames onto config.json arrive as one event.
+// Measured, with the watch widened to IN_ALL_EVENTS: both renames are there, with distinct
+// cookies, and the narrow watch still reported one.
+std::mutex g_renameMutex;
+std::string g_renameTarget;
+unsigned g_renameCount = 0;
+
+extern "C" int rename(const char* oldPath, const char* newPath) {
+    using Fn = int (*)(const char*, const char*);
+    static Fn real = reinterpret_cast<Fn>(::dlsym(RTLD_NEXT, "rename"));
+    if (real == nullptr) {
+        errno = ENOSYS;
+        return -1;
+    }
+    const int result = real(oldPath, newPath);
+    if (result == 0 && newPath != nullptr) {
+        std::lock_guard<std::mutex> lock(g_renameMutex);
+        if (!g_renameTarget.empty() && g_renameTarget == newPath) ++g_renameCount;
+    }
+    return result;
 }
 
 namespace {
@@ -840,6 +883,13 @@ void runUnreadableConfigChecks() {
     WallpaperManager::Config config;
     config.configFile = file;
     WallpaperManager manager(config);
+    // main.cpp's order: construct, restore, and only then preserve -- the constructor is
+    // read-only, and preserveUnreadableConfig() is the one call that writes to the config
+    // directory, made after the bus name is held. Nothing in this file can establish that
+    // ordering, because there is no bus here; daemon_system_test's preservation-ownership
+    // phase is where it is graded.
+    manager.restoreSaved();
+    manager.preserveUnreadableConfig();
 
     // GOAL: S8.13 -- a config file this build could not parse survives the run that could
     //       not parse it. False if the next SetWallpaper overwrites it: the file is the only
@@ -853,10 +903,11 @@ void runUnreadableConfigChecks() {
     //       build that preserved the file and then clobbered the copy on the first write.
     //       The health status is asserted alongside because a preserved file nobody is told
     //       about reads to the user as a config that silently emptied itself.
-    // CONTROL: the `std::filesystem::rename(m_store.file(), kept, ec)` block deleted from
-    //       WallpaperManager's constructor -> "FAIL: a config that could not be read is kept
-    //       as config.json.bad" and "FAIL: the preserved copy is byte-identical to the file
-    //       the daemon could not read", printing "  no config.json.bad exists". Reverted.
+    // CONTROL: the `std::filesystem::rename(m_store.file(), kept, ec)` call deleted from
+    //       WallpaperManager::preserveConfigTo(), leaving the move branch a no-op -> "FAIL: a
+    //       config that could not be read is kept as config.json.bad" and "FAIL: the
+    //       preserved copy is byte-identical to the file the daemon could not read", printing
+    //       "  no config.json.bad exists". Reverted.
     const WallpaperManager::Snapshot afterLoad = manager.snapshot();
     check(afterLoad.health.persistence.status == wallpaperx::HealthStatus::Fail,
           "a config that could not be read leaves the persistence check reporting failure");
@@ -866,7 +917,6 @@ void runUnreadableConfigChecks() {
         std::fprintf(stderr, "  persistence detail: %s\n", afterLoad.health.persistence.detail.c_str());
     }
 
-    manager.restoreSaved();
     manager.requestWallpaper("static", wallpaper.string(), 1);
 
     const bool keptExists = std::filesystem::exists(kept);
@@ -970,9 +1020,10 @@ void runPreservedCopyChecks() {
     //       mode-000 file sits in a directory this process owns and may write to. The
     //       obvious cheaper fixture, a config inside a directory chmod'd to 000, fails to
     //       open for a reason that ALSO makes both of those fail, so a check on it would be
-    //       green against a build that tried to destroy the file and merely could not. Both
-    //       observations are made AFTER a save, because the constructor is not the only
-    //       writer and the save is the write that had the defect.
+    //       green against a build that tried to destroy the file and merely could not. Each
+    //       case drives preserveUnreadableConfig() -- the daemon's only writer of that
+    //       directory -- and both observations are made AFTER a save, because preservation is
+    //       not the only writer and the save is the write that had the defect.
     // CONTROL: three, all reverted. (a) `result.preservable = true;` hoisted in
     //       config_store.cpp's load() to just above the open-failure return -> the symlink
     //       and mode-000 cases each red on all three of their checks, led by "FAIL: a
@@ -1013,6 +1064,11 @@ void runPreservedCopyChecks() {
         WallpaperManager::Config config;
         config.configFile = file;
         WallpaperManager manager(config);
+        // Called, not skipped, and that is the whole phase: the constructor writes nothing,
+        // so a version of this loop that left it out would assert "no copy was made" about a
+        // manager that was never asked to make one -- green against any build at all.
+        manager.restoreSaved();
+        manager.preserveUnreadableConfig();
         const WallpaperManager::Snapshot snap = manager.snapshot();
 
         // The refusal itself is graded, so "no copy was made" cannot be satisfied by a
@@ -1026,7 +1082,6 @@ void runPreservedCopyChecks() {
                          snap.health.persistence.detail.c_str());
         }
 
-        manager.restoreSaved();
         manager.requestWallpaper("static", wallpaper.string(), 1);
 
         // Asked after the save, and asked of the health field the save writes: the
@@ -1074,7 +1129,7 @@ void runPreservedCopyChecks() {
     //       merely counted, because an overwrite and a correct second copy leave the same
     //       NUMBER of files behind and differ only in which bytes are in which name.
     // CONTROL: two, both reverted. (a) the `+ (n == 0 ? "" : "." + std::to_string(n))`
-    //       suffix dropped from the loop in WallpaperManager's constructor, so every copy
+    //       suffix dropped from WallpaperManager::preserveConfigTo()'s loop, so every copy
     //       competes for one name -> "FAIL: the second unreadable config is preserved under
     //       a name of its own" with "  copies beside it: config.json.bad", "FAIL: the daemon
     //       says where the second unreadable config was kept" ("not kept, no free name"),
@@ -1104,6 +1159,8 @@ void runPreservedCopyChecks() {
     WallpaperManager::Config config;
     config.configFile = file;
     WallpaperManager manager(config);
+    manager.restoreSaved();
+    manager.preserveUnreadableConfig();
     const WallpaperManager::Snapshot snap = manager.snapshot();
 
     const std::string keptNow = readFile(kept);
@@ -1125,7 +1182,6 @@ void runPreservedCopyChecks() {
     // Preserving it is what clears the path, so persistence has to work again afterwards --
     // a build that moved the file aside and then still refused to save would leave the user
     // with no config at all and no way to make one.
-    manager.restoreSaved();
     manager.requestWallpaper("static", wallpaper.string(), 1);
     std::string why;
     const std::map<int, std::string> onDisk = pathsInFile(file, why);
@@ -1185,6 +1241,7 @@ void runPreservationExhaustedChecks() {
     config.configFile = file;
     WallpaperManager manager(config);
     manager.restoreSaved();
+    manager.preserveUnreadableConfig();
     manager.requestWallpaper("static", wallpaper.string(), 1);
 
     const WallpaperManager::Snapshot snap = manager.snapshot();
@@ -1248,24 +1305,23 @@ void runMalformedEntryCopyChecks() {
     //       content" -- the two leave the same file. The restored entry is asserted in the
     //       same breath, so this cannot pass for a build that refused the file outright and
     //       had nothing to restore, which is a different code path with a different verdict.
-    // CONTROL: two, both reverted. (a) `std::filesystem::copy_file` in WallpaperManager's
-    //       constructor replaced with `std::filesystem::rename` -> "FAIL: a config with
-    //       malformed entries is still there after the copy is made", plus both second-start
-    //       checks, since a rename has no destination-exists refusal to stop it. Note what
-    //       stayed GREEN under it: "a wallpaper set after a config with malformed entries is
-    //       persisted", because the save simply recreates the file it took away -- which is
-    //       why the loss has to be caught by the file's absence rather than by the daemon
-    //       misbehaving afterwards. (b) `std::filesystem::copy_options::overwrite_existing`
-    //       added to the copy_file call -> "FAIL: a second start with a different malformed
-    //       config does not overwrite the first start's copy", printing the second file's
-    //       bytes where the first's had been, and "FAIL: the daemon says the second
-    //       malformed config was not copied".
+    // CONTROL: the `move` argument of preserveConfigTo() forced true on the malformed-entry
+    //       path, i.e. a rename where a copy is owed -> "FAIL: a config with malformed
+    //       entries is still there after the copy is made", and that alone. Note what stayed
+    //       GREEN under it: "a wallpaper set after a config with malformed entries is
+    //       persisted", because the save simply recreates the file the rename took away --
+    //       which is why the loss has to be caught by the file's absence rather than by the
+    //       daemon misbehaving afterwards. The two second-start checks stayed green too: the
+    //       numbered search still sends the second file to a name of its own whether it is
+    //       moved or copied, so what the second start grades is the naming, not the mode.
+    //       Reverted.
     {
         WallpaperManager::Config config;
         config.configFile = file;
         WallpaperManager manager(config);
         const std::vector<int> restored = manager.restoreSaved();
         check(restored == std::vector<int>{0}, "the entry the daemon did understand is restored from the same file");
+        manager.preserveUnreadableConfig();
 
         check(readFile(file) == firstBroken, "a config with malformed entries is still there after the copy is made");
         check(readFile(kept) == firstBroken, "the copy holds the bytes of the file the entries were rejected from");
@@ -1292,18 +1348,42 @@ void runMalformedEntryCopyChecks() {
     WallpaperManager::Config second;
     second.configFile = file;
     WallpaperManager secondManager(second);
+    secondManager.restoreSaved();
+    secondManager.preserveUnreadableConfig();
     const std::string keptNow = readFile(kept);
     check(keptNow == firstBroken, "a second start with a different malformed config does not overwrite the first "
                                   "start's copy");
     if (keptNow != firstBroken) {
         std::fprintf(stderr, "  the copy now holds: %s\n  it held: %s\n", keptNow.c_str(), firstBroken.c_str());
     }
-    const std::string reported = secondManager.snapshot().health.persistence.detail;
-    check(reported.find("not copied") != std::string::npos,
-          "the daemon says the second malformed config was not copied");
-    if (reported.find("not copied") == std::string::npos) {
-        std::fprintf(stderr, "  persistence detail: %s\n", reported.c_str());
+    // GOAL: S8.24 -- the second start's rejected entries get a copy under a name of their
+    //       own, and the daemon says which name. False if the second file is silently not
+    //       copied: its rejected entries exist nowhere else, so nothing on disk would hold
+    //       them and nothing would say so. Equally false if the name it reports is not the
+    //       file that is there.
+    // WHY-THIS-SHAPE: the reported name is compared against the .bad.1 that must exist on
+    //       disk holding secondBroken's bytes, not merely searched for the word "copied".
+    //       Asserting only that the detail contains a name would pass for a daemon that
+    //       announced a copy it did not make -- which is the worse failure, since the user
+    //       then goes looking for a file that is not there.
+    // CONTROL: the `+ (n == 0 ? "" : "." + std::to_string(n))` suffix dropped from
+    //       preserveConfigTo()'s loop, so both starts compete for config.json.bad -> "FAIL:
+    //       the second start's malformed config is copied under a name of its own" with
+    //       "  copies beside it: config.json.bad", and "FAIL: the daemon says where the
+    //       second malformed config was copied" printing "1 malformed entries ignored; not
+    //       copied: no free name". The first start's copy stayed intact under that mutation,
+    //       so the pair separates "the second file was lost" from "the first was destroyed".
+    //       Reverted.
+    const std::filesystem::path keptSecond = std::filesystem::path(file.string() + ".bad.1");
+    const bool secondCopied = readFile(keptSecond) == secondBroken;
+    check(secondCopied, "the second start's malformed config is copied under a name of its own");
+    if (!secondCopied) {
+        std::fprintf(stderr, "  copies beside it: %s\n", joined(preservedCopyNames(file)).c_str());
     }
+    const std::string reported = secondManager.snapshot().health.persistence.detail;
+    const bool said = reported.find(keptSecond.filename().string()) != std::string::npos;
+    check(said, "the daemon says where the second malformed config was copied");
+    if (!said) std::fprintf(stderr, "  persistence detail: %s\n", reported.c_str());
 }
 
 // ---------------------------------------------------------------------------- //
@@ -1349,12 +1429,18 @@ void runUnappliedEntryChecks() {
     //       "FAIL: the persistence detail says how many entries could not be applied".
     //       Reverted.
     const std::vector<int> unusableIds{40, 5, 6};
+    // Negative ids, the one kind of entry that is dropped rather than kept. A monitor id is
+    // an index into this build's array, so no larger kMaxMonitors could ever admit one --
+    // keeping them would carry them through every save for the life of the install.
+    const std::vector<int> droppedIds{-1, -7};
     const std::string config = "{\"version\":1,\"monitors\":["
                                "{\"monitor_id\":3,\"type\":\"static\",\"path\":" +
                                nlohmann::json(present.string()).dump() +
                                "},"
                                "{\"monitor_id\":40,\"type\":\"static\",\"path\":\"/a.png\"},"
+                               "{\"monitor_id\":-1,\"type\":\"static\",\"path\":\"/neg.png\"},"
                                "{\"monitor_id\":5,\"type\":\"slideshow\",\"path\":\"/b.png\"},"
+                               "{\"monitor_id\":-7,\"type\":\"static\",\"path\":\"/neg2.png\"},"
                                "{\"monitor_id\":6,\"type\":\"static\",\"path\":\"\"}]}";
     if (!writeFile(file, config)) {
         notVerified(kGoal, "the config file this phase reads could not be written");
@@ -1375,14 +1461,44 @@ void runUnappliedEntryChecks() {
     check(snap.health.persistence.status == wallpaperx::HealthStatus::Ok,
           "an entry this build cannot apply is reported without failing the persistence check");
 
+    // GOAL: an entry no build could ever apply is DROPPED, and the loss is counted and
+    //       named. False in either direction: a negative monitor id kept in the file is
+    //       carried through every save for the life of the install, and one dropped in
+    //       silence is a wallpaper the user set that never comes back with nothing anywhere
+    //       saying why. The two halves are reported differently on purpose -- "kept" and
+    //       "dropped" are different outcomes and a reader has to be able to tell them apart.
+    // WHY-THIS-SHAPE: TWO negative ids, and the expected count is derived from that list
+    //       rather than written as "2". With one, a detail that reported the number of
+    //       *kinds* of loss, or a hardcoded 1, would pass. The wording is matched in full,
+    //       including "no build can apply them", because the kept-entry clause of the same
+    //       detail also ends in a count and a semicolon -- matching only a number would let
+    //       either clause satisfy this.
+    // CONTROL: `++m_droppedEntries;` deleted from restoreSaved()'s negative-id branch ->
+    //       "FAIL: the persistence detail says how many entries no build can apply", printing
+    //       the detail with only the kept-entry clause in it. The id-set check below stayed
+    //       green under it, which is what separates "not counted" from "not dropped".
+    //       Reverted.
+    const std::string expectedDropped =
+        std::to_string(droppedIds.size()) + " entries dropped, no build can apply them";
+    const bool droppedReported = snap.health.persistence.detail.find(expectedDropped) != std::string::npos;
+    check(droppedReported, "the persistence detail says how many entries no build can apply");
+    if (!droppedReported) {
+        std::fprintf(stderr, "  persistence detail: %s\n  expected '%s'\n", snap.health.persistence.detail.c_str(),
+                     expectedDropped.c_str());
+    }
+
     manager.requestWallpaper("static", other.string(), 1);
     std::string why;
     const std::map<int, std::string> onDisk = pathsInFile(file, why);
     std::vector<int> ids;
     for (const auto& entry : onDisk) ids.push_back(entry.first);
+    // An exact set, so it is simultaneously the kept-entry assertion and the dropped-entry
+    // one: -1 and -7 are absent, and their absence cannot be satisfied by a build that lost
+    // the others too.
     const std::vector<int> expectedIds{1, 3, 5, 6, 40};
     const bool survived = ids == expectedIds;
-    check(survived, "the entries this build cannot apply are all still in the file after another monitor is set");
+    check(survived, "the entries this build cannot apply are all still in the file, and the ones no build can "
+                    "apply are gone, after another monitor is set");
     if (!survived) {
         std::fprintf(stderr, "  %s; ids on disk:", why.empty() ? "read back" : why.c_str());
         for (const int id : ids) std::fprintf(stderr, " %d", id);
@@ -1599,6 +1715,517 @@ void runSaveCostChecks() {
     if (!wrote) std::fprintf(stderr, "  %s\n", why.empty() ? "the file holds something else" : why.c_str());
 }
 
+// ---------------------------------------------------------------------------- //
+// Phases 9-11 -- S8.28-S8.33: a config write that blocks on the filesystem.
+// ---------------------------------------------------------------------------- //
+
+using StallClock = std::chrono::steady_clock;
+
+double millisSince(StallClock::time_point start) {
+    return std::chrono::duration<double, std::milli>(StallClock::now() - start).count();
+}
+
+// The deadline a save is given, restated rather than shared: kLoadDeadline sits in an
+// anonymous namespace in wallpaper_manager.cpp. A copy here means a change to it fails these
+// phases loudly instead of silently re-pointing them at whatever the new value is.
+constexpr double kSaveDeadlineMs = 2000.0;
+
+// BlockingWrite, blockingWriteFixtureWorks() and isRegularFile() live in
+// tests/client/blocking_config_write.h, shared with daemon_system_test: the fixture's
+// correctness rests on details a second copy would drift away from silently.
+
+// One requestWallpaper(), made on a thread this phase can walk away from.
+//
+// The obvious version -- call it inline -- turns a build whose wait is unbounded into a
+// HANG, and a hung test prints nothing at all: no FAIL line, no reason, just a ctest
+// timeout thirty seconds later. This one turns that build into a check that goes red.
+// The manager is held by shared_ptr and copied into the thread, so a call that never
+// returns keeps alive the object it is inside rather than being abandoned on top of a
+// destroyed one.
+struct AbandonedOrReturned {
+    bool returned = false;
+    double elapsedMs = 0;
+    std::string threw;
+};
+
+AbandonedOrReturned requestOnAbandonableThread(const std::shared_ptr<WallpaperManager>& manager,
+                                               const std::string& path, int monitorId,
+                                               std::chrono::seconds patience) {
+    struct Answer {
+        double elapsedMs = 0;
+        std::string threw;
+    };
+    auto answered = std::make_shared<std::promise<Answer>>();
+    std::future<Answer> future = answered->get_future();
+    std::thread([manager, answered, path, monitorId] {
+        const auto start = StallClock::now();
+        Answer answer;
+        try {
+            manager->requestWallpaper("static", path, monitorId);
+        } catch (const std::exception& e) {
+            answer.threw = e.what();
+        } catch (...) {
+            answer.threw = "an exception that is not a std::exception";
+        }
+        answer.elapsedMs = millisSince(start);
+        answered->set_value(answer);
+    }).detach();
+
+    AbandonedOrReturned out;
+    if (future.wait_for(patience) != std::future_status::ready) return out;
+    const Answer answer = future.get();
+    out.returned = true;
+    out.elapsedMs = answer.elapsedMs;
+    out.threw = answer.threw;
+    return out;
+}
+
+void runStalledSaveChecks() {
+    constexpr const char* kGoals = "S8.29/S8.31/S8.32 (a config write that never comes back)";
+
+    const ScratchDir scratch("stalledsave");
+    if (!scratch.ok()) {
+        notVerified(kGoals, "a scratch directory could not be created");
+        return;
+    }
+    const std::filesystem::path configFile = scratch.path() / "wallpaperx" / "config.json";
+    const std::filesystem::path healthyWallpaper = scratch.path() / "healthy.png";
+    const std::filesystem::path stalledWallpaper = scratch.path() / "stalled.png";
+    if (!writeWallpaperFile(healthyWallpaper) || !writeWallpaperFile(stalledWallpaper)) {
+        notVerified(kGoals, "the wallpaper files this phase needs could not be written");
+        return;
+    }
+
+    WallpaperManager::Config config;
+    config.configFile = configFile;
+    auto manager = std::make_shared<WallpaperManager>(config);
+
+    // A healthy save first, and it is a precondition rather than a check: what S8.32 forbids
+    // is health showing the last save that WORKED while a later one is stuck, and that is
+    // only a wrong answer when there is a right one for it to show. A phase that stalled the
+    // very first save would assert the same words against a manager that had never persisted
+    // anything.
+    manager->requestWallpaper("static", healthyWallpaper.string(), 0);
+    const WallpaperManager::Snapshot healthy = manager->snapshot();
+    std::string why;
+    const std::map<int, std::string> savedFirst = pathsInFile(configFile, why);
+    if (healthy.health.persistence.status != wallpaperx::HealthStatus::Ok || savedFirst.count(0) != 1) {
+        // X.3: the save path being broken is graded by the phases written for it. Here it is
+        // a baseline that did not appear, so this phase establishes nothing and says so.
+        notVerified(kGoals, "the healthy save this phase needs as a baseline did not happen (persistence reads " +
+                                std::string(wallpaperx::toString(healthy.health.persistence.status)) + ", " +
+                                (why.empty() ? "the file holds no entry for monitor 0" : why) + ")");
+        return;
+    }
+
+    std::string fixtureWhy;
+    if (!blockingWriteFixtureWorks(scratch.path() / "wallpaperx" / "probe.json", fixtureWhy)) {
+        notVerified(kGoals, fixtureWhy);
+        return;
+    }
+    BlockingWrite blocked(configFile);
+    if (!blocked.arm()) {
+        notVerified(kGoals, std::string("a fifo could not be created at ") + blocked.temp() +
+                                ", so no write can be made to block on this host");
+        return;
+    }
+
+    // GOAL: S8.29 -- a save whose write never returns releases the caller, and does so
+    //       inside the two-second deadline rather than when the filesystem answers. False if
+    //       the caller is still in requestWallpaper() when the dead mount is the only thing
+    //       that could release it: that thread is the daemon's bus thread, and a SetWallpaper
+    //       that never returns is a daemon that answers nothing until its watchdog kills it.
+    //       False in the other direction too if the request FAILS -- a wallpaper the daemon
+    //       applied must not be reported as rejected because the config write is slow.
+    // WHY-THIS-SHAPE: the call is made on a thread this phase abandons, and the wait on it is
+    //       bounded and has a failure branch. Calling requestWallpaper() inline here is the
+    //       shorter version and is unusable: with the deadline removed it never returns, so
+    //       the check does not fail, it hangs -- and a hung test prints no FAIL line, no
+    //       reason and nothing a reader can act on. The elapsed time is asserted against a
+    //       window (waited, but not forever) rather than a point, because how long past the
+    //       deadline the wakeup lands is the scheduler's business.
+    // CONTROL: two, both reverted. (a) `kLoadDeadline` in the settled.wait_for() call
+    //       replaced with `std::chrono::hours(1)` -> "FAIL: a save whose write cannot
+    //       complete still releases the caller", printing "requestWallpaper has not returned
+    //       20.0 s after a write that cannot finish", the rest of this phase skipped with
+    //       that reason, and the snapshot-wins phase reporting NOT VERIFIED rather than
+    //       failing. (b) `throw std::runtime_error("stalled")` added after
+    //       the wait_for -> "FAIL: a config write that cannot complete does not fail the
+    //       request that triggered it", printing "requestWallpaper threw: stalled". (c) for
+    //       the upper bound specifically, `kLoadDeadline` replaced with 10 seconds, so the
+    //       caller is released but far too late -> "FAIL: the caller of a stalled save waits
+    //       for the deadline and not for the filesystem", printing "requestWallpaper took
+    //       10000 ms against a 2000 ms deadline", and nothing else red.
+    const AbandonedOrReturned stalled =
+        requestOnAbandonableThread(manager, stalledWallpaper.string(), 1, std::chrono::seconds(20));
+    check(stalled.returned, "a save whose write cannot complete still releases the caller");
+    if (!stalled.returned) {
+        std::fprintf(stderr, "  requestWallpaper has not returned 20.0 s after a write that cannot finish; the "
+                             "checks after this one are skipped rather than measured against a thread that is "
+                             "still inside the manager\n");
+        return;
+    }
+    check(stalled.threw.empty(), "a config write that cannot complete does not fail the request that triggered it");
+    if (!stalled.threw.empty()) std::fprintf(stderr, "  requestWallpaper threw: %s\n", stalled.threw.c_str());
+    const bool bounded = stalled.elapsedMs < 2 * kSaveDeadlineMs;
+    check(bounded, "the caller of a stalled save waits for the deadline and not for the filesystem");
+    if (!bounded) {
+        std::fprintf(stderr, "  requestWallpaper took %.0f ms against a %.0f ms deadline\n", stalled.elapsedMs,
+                     kSaveDeadlineMs);
+    }
+
+    // GOAL: S8.32 -- while a write is outstanding past the deadline, health reports THAT,
+    //       and not the last save that succeeded. False if persistence still reads ok: the
+    //       bus thread has stopped waiting on that write, so a stale ok is the only thing
+    //       anyone would ever see, and an operator watching /health would be told the config
+    //       is being saved while nothing has reached the disk since the mount died.
+    // WHY-THIS-SHAPE: polled to a deadline with a failure branch, and the verdict is the
+    //       LAST observation, not "did any observation match". A single snapshot taken right
+    //       after the stalled call cannot be used: the stall is reported once the write is
+    //       older than the deadline, and the caller is released at almost exactly that
+    //       instant, so which side of the comparison that snapshot lands on is a race. The
+    //       status and the wording are both asserted -- a `fail` with the previous save's
+    //       detail would send an operator to look at a disk error that is not there.
+    // CONTROL: the `if (writingSince && ... > kLoadDeadline)` block deleted from
+    //       applyPersistOutcomeLocked() -> "FAIL: health reports a write that has not come
+    //       back rather than the last save that did", printing "persistence reads ok
+    //       (/tmp/.../config.json)" -- the healthy save above, which is the exact wrong
+    //       answer this goal names. Reverted.
+    wallpaperx::HealthStatus sawStatus = wallpaperx::HealthStatus::Pending;
+    std::string sawDetail;
+    bool namesTheStall = false;
+    const auto pollDeadline = StallClock::now() + std::chrono::seconds(8);
+    while (StallClock::now() < pollDeadline) {
+        const WallpaperManager::Snapshot snap = manager->snapshot();
+        sawStatus = snap.health.persistence.status;
+        sawDetail = snap.health.persistence.detail;
+        namesTheStall = sawStatus == wallpaperx::HealthStatus::Fail &&
+                        sawDetail.find("has not answered a write, the filesystem may be stalled") != std::string::npos;
+        if (namesTheStall) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    check(namesTheStall, "health reports a write that has not come back rather than the last save that did");
+    if (!namesTheStall) {
+        std::fprintf(stderr, "  persistence reads %s (%s)\n", wallpaperx::toString(sawStatus), sawDetail.c_str());
+    } else {
+        // Asked only once there IS a stalled-write report: ungated, this reads the last good
+        // save's detail instead, which also names the file, so it would pass while saying
+        // nothing about the report it is named for.
+        // CONTROL: the file name dropped from the stall detail in applyPersistOutcomeLocked()
+        //       -> "FAIL: the stalled-write report names the file that is not answering", and
+        //       nothing else red. Reverted.
+        check(sawDetail.find(configFile.string()) != std::string::npos,
+              "the stalled-write report names the file that is not answering");
+    }
+
+    // GOAL: S8.31 -- once a wait has run out, a later save does not pay the deadline again.
+    //       False if every SetWallpaper during an outage costs another two seconds: the
+    //       answer is already known, and a desktop that changes wallpaper on a timer would
+    //       spend the outage with its bus thread asleep.
+    // WHY-THIS-SHAPE: run on THIS thread, unlike the stalled call above, and that is safe
+    //       for the reason the check exists: the worst a build without the short-circuit can
+    //       do is wait one more deadline and return, which is a red check rather than a hang.
+    //       The bound is a quarter of the deadline, not "faster than the first call": the
+    //       second save does no I/O at all on this thread, so anything near the deadline is
+    //       the defect, and a relative bound would be satisfied by 1.9 s.
+    // CONTROL: `if (m_persist->stalled) return;` deleted from persist() -> "FAIL: a second
+    //       save during a stall does not wait for the deadline all over again", printing
+    //       "the second save took 2000 ms against a 2000 ms deadline". Reverted.
+    // COVERAGE-ASSERT: the first save's own elapsed time is asserted to be at least three
+    //       quarters of the deadline. Without it this comparison is green on a build that
+    //       waits for nothing at all -- both calls return instantly and the phase reports
+    //       that the deadline is not paid twice, having never seen it paid once. CONTROL for
+    //       it: `kLoadDeadline` in the settled.wait_for() replaced with 0 seconds -> "FAIL:
+    //       the first save really did wait for the deadline, so the comparison above has a
+    //       baseline", printing "the first save took 0 ms", while the check it guards stayed
+    //       green at 0 ms. Reverted.
+    const auto secondStart = StallClock::now();
+    manager->requestWallpaper("static", healthyWallpaper.string(), 2);
+    const double secondMs = millisSince(secondStart);
+    const bool cheap = secondMs < kSaveDeadlineMs / 4;
+    check(cheap, "a second save during a stall does not wait for the deadline all over again");
+    if (!cheap) {
+        std::fprintf(stderr, "  the second save took %.0f ms against a %.0f ms deadline\n", secondMs,
+                     kSaveDeadlineMs);
+    }
+    const bool firstPaidIt = stalled.elapsedMs >= 0.75 * kSaveDeadlineMs;
+    check(firstPaidIt, "the first save really did wait for the deadline, so the comparison above has a baseline");
+    if (!firstPaidIt) {
+        std::fprintf(stderr, "  the first save took %.0f ms, which is not a deadline being paid\n",
+                     stalled.elapsedMs);
+    }
+    std::printf("config_store_test: a stalled save cost %.0f ms, the next one %.0f ms\n", stalled.elapsedMs,
+                secondMs);
+}
+
+void runSaveVisibleOnReturnChecks() {
+    constexpr const char* kGoals = "S8.28 (a save is on disk when the call that made it returns)";
+
+    const ScratchDir scratch("savewait");
+    if (!scratch.ok()) {
+        notVerified(kGoals, "a scratch directory could not be created");
+        return;
+    }
+    const std::filesystem::path configFile = scratch.path() / "wallpaperx" / "config.json";
+    const std::filesystem::path wallpaper = scratch.path() / "slow.png";
+    if (!writeWallpaperFile(wallpaper)) {
+        notVerified(kGoals, "the wallpaper file this phase needs could not be written");
+        return;
+    }
+
+    std::string fixtureWhy;
+    if (!blockingWriteFixtureWorks(scratch.path() / "wallpaperx" / "probe.json", fixtureWhy)) {
+        notVerified(kGoals, fixtureWhy);
+        return;
+    }
+    BlockingWrite blocked(configFile);
+    if (!blocked.arm()) {
+        notVerified(kGoals, std::string("a fifo could not be created at ") + blocked.temp() +
+                                ", so no write can be made slow on this host");
+        return;
+    }
+
+    WallpaperManager::Config config;
+    config.configFile = configFile;
+    WallpaperManager manager(config);
+
+    // Held for well under the deadline, so this write COMPLETES rather than being abandoned:
+    // the property is about the wait ending because the write landed.
+    constexpr auto kHold = std::chrono::milliseconds(700);
+    BlockingWrite::Released released;
+    // jthread, so an exception out of the call below joins this rather than reaching
+    // std::terminate through a live std::thread and destroying the diagnostics with it. Every
+    // wait inside release() is bounded, so that join cannot hang.
+    std::jthread releaser([&] {
+        std::this_thread::sleep_for(kHold);
+        released = blocked.release(std::chrono::milliseconds(10000));
+    });
+
+    // GOAL: S8.28 -- the caller of a save waits for the write, so the reply to SetWallpaper
+    //       means the choice is on disk. False if the write is merely queued: a wallpaper set
+    //       just before a shutdown is then lost, and every check in this suite that sets a
+    //       wallpaper and reads the file back becomes a race it usually wins.
+    // WHY-THIS-SHAPE: the write is made to take a known 700 ms and the CAUSAL ORDER is
+    //       asserted -- requestWallpaper did not return before the write was let go. Two
+    //       cheaper versions were rejected. Setting a wallpaper on a healthy tmpfs and
+    //       reading the file back is what the rest of this suite already does, and it cannot
+    //       fail reliably: the write takes microseconds, so removing the wait leaves a race
+    //       the check wins nearly every time. Comparing against when the WRITER CLOSED is
+    //       the other one, and it is an assertion on the scheduler: that instant is observed
+    //       by this thread's peer, which may not be scheduled until after the main thread has
+    //       already returned, so a correct build would go red at random. When the reader
+    //       attached is observed before the write can possibly have finished, and is
+    //       therefore a lower bound no interleaving can move.
+    // CONTROL: `kLoadDeadline` in persist()'s settled.wait_for() replaced with 0 seconds,
+    //       i.e. the write left fully asynchronous -> "FAIL: requestWallpaper returns only
+    //       after the write it queued has landed", printing "it returned 700 ms before the
+    //       write was even let go". The same mutation also reddened one of the older checks
+    //       that sets a wallpaper and reads the file back ("a monitor whose file was
+    //       unreadable at restore is still in the file after another monitor is set"), which
+    //       is the accident this phase exists to turn into a deliberate check. Reverted.
+    const auto start = StallClock::now();
+    manager.requestWallpaper("static", wallpaper.string(), 0);
+    const auto returnedAt = StallClock::now();
+    const double elapsedMs = millisSince(start);
+    releaser.join();
+
+    if (!released.ok) {
+        notVerified(kGoals, "the write never reached the fifo at " + blocked.temp() + " (" + released.why +
+                                "), so this phase never had a slow write to time");
+        return;
+    }
+
+    // The bytes the parked write was carrying, so "the caller waited" is about THIS request's
+    // write and not about some other one that happened to be in flight.
+    // CONTROL: `m_persist->pending = entries;` in persist() replaced with an empty vector,
+    //       i.e. a save that queues the wrong state -> "FAIL: the write this phase released is
+    //       the one the request queued", printing "the fifo carried 37 bytes", alongside five
+    //       older persistence checks. Reverted.
+    const nlohmann::json wrote = nlohmann::json::parse(released.bytes, nullptr, false);
+    const bool carriedThisRequest =
+        !wrote.is_discarded() && wrote.is_object() && wrote.contains("monitors") && wrote["monitors"].is_array() &&
+        wrote["monitors"].size() == 1 && wrote["monitors"][0].value("path", std::string()) == wallpaper.string();
+    check(carriedThisRequest, "the write this phase released is the one the request queued");
+    if (!carriedThisRequest) {
+        std::fprintf(stderr, "  the fifo carried %zu bytes: %s\n", released.bytes.size(), released.bytes.c_str());
+    }
+
+    const bool waitedForIt = returnedAt >= released.at;
+    check(waitedForIt, "requestWallpaper returns only after the write it queued has landed");
+    if (!waitedForIt) {
+        std::fprintf(stderr, "  it returned %.0f ms before the write was even let go\n",
+                     std::chrono::duration<double, std::milli>(released.at - returnedAt).count());
+    }
+    std::printf("config_store_test: a save held for %lld ms took %.0f ms to return\n",
+                static_cast<long long>(kHold.count()), elapsedMs);
+}
+
+// Points the interposed rename() at one destination and zeroes its count.
+void countRenamesOnto(const std::filesystem::path& target) {
+    std::lock_guard<std::mutex> lock(g_renameMutex);
+    g_renameTarget = target.string();
+    g_renameCount = 0;
+}
+
+unsigned renamesCounted() {
+    std::lock_guard<std::mutex> lock(g_renameMutex);
+    return g_renameCount;
+}
+
+void runLatestSnapshotWinsChecks() {
+    constexpr const char* kGoals = "S8.33 (the snapshot queued behind a stalled write is replaced, not queued)";
+
+    const ScratchDir scratch("latestwins");
+    if (!scratch.ok()) {
+        notVerified(kGoals, "a scratch directory could not be created");
+        return;
+    }
+    const std::filesystem::path configFile = scratch.path() / "wallpaperx" / "config.json";
+    const std::filesystem::path stuck = scratch.path() / "stuck.png";
+    const std::filesystem::path superseded = scratch.path() / "superseded.png";
+    const std::filesystem::path newest = scratch.path() / "newest.png";
+    if (!writeWallpaperFile(stuck) || !writeWallpaperFile(superseded) || !writeWallpaperFile(newest)) {
+        notVerified(kGoals, "the wallpaper files this phase needs could not be written");
+        return;
+    }
+
+    std::string fixtureWhy;
+    if (!blockingWriteFixtureWorks(scratch.path() / "wallpaperx" / "probe.json", fixtureWhy)) {
+        notVerified(kGoals, fixtureWhy);
+        return;
+    }
+    BlockingWrite blocked(configFile);
+    if (!blocked.arm()) {
+        notVerified(kGoals, std::string("a fifo could not be created at ") + blocked.temp() +
+                                ", so no write can be made to block on this host");
+        return;
+    }
+    // COVERAGE-ASSERT for the write count below: a count of zero is what a dead instrument
+    // and a daemon that wrote nothing both produce, so the counter is shown to move for a
+    // rename this phase performs itself before it is trusted with the daemon's.
+    // CONTROL: the `++g_renameCount` line removed from the interposed rename() -> "FAIL: the
+    //       rename counter this phase reads is live" and, below it, "the snapshot a newer one
+    //       superseded is never written" printing "0 writes landed". Reverted.
+    const std::filesystem::path probeFrom = scratch.path() / "probe.from";
+    const std::filesystem::path probeTo = scratch.path() / "probe.to";
+    countRenamesOnto(probeTo);
+    const bool probed = writeFile(probeFrom, "probe") && ::rename(probeFrom.c_str(), probeTo.c_str()) == 0;
+    check(probed && renamesCounted() == 1, "the rename counter this phase reads is live");
+    if (!probed || renamesCounted() != 1) {
+        std::fprintf(stderr, "  a rename this phase performed itself counted %u, so the count below establishes "
+                             "nothing\n",
+                     renamesCounted());
+    }
+    // Pointed at the config file before the manager exists, so no save of this phase can land
+    // uncounted.
+    countRenamesOnto(configFile);
+
+    WallpaperManager::Config config;
+    config.configFile = configFile;
+    auto manager = std::make_shared<WallpaperManager>(config);
+
+    const AbandonedOrReturned first = requestOnAbandonableThread(manager, stuck.string(), 0, std::chrono::seconds(20));
+    if (!first.returned) {
+        // Graded by runStalledSaveChecks, which is where that property lives. Here it is a
+        // precondition: with a thread still inside the manager, nothing below can be set up.
+        notVerified(kGoals, "the first save never returned, so the two snapshots this phase queues behind it were "
+                            "never queued");
+        return;
+    }
+    // Both land while the first write is stuck in the fifo, so the second is a snapshot the
+    // third supersedes before either can reach the disk.
+    manager->requestWallpaper("static", superseded.string(), 1);
+    manager->requestWallpaper("static", newest.string(), 2);
+
+    const BlockingWrite::Released released = blocked.release(std::chrono::milliseconds(10000));
+    if (!released.ok) {
+        notVerified(kGoals, "the parked write could not be read back (" + released.why + ")");
+        return;
+    }
+
+    // GOAL: S8.33, first half -- the write that was stuck is the one that was queued when it
+    //       started, so the two later snapshots really were queued BEHIND it. False if the
+    //       stuck write already carried them: this phase would then be counting writes of a
+    //       state that was never superseded, and the count below would mean nothing.
+    // WHY-THIS-SHAPE: read out of the fifo rather than off the disk, because these are bytes
+    //       that never reach the disk -- the write lands in the pipe and its rename moves the
+    //       fifo, not a file. It is also the only way to see a superseded snapshot's content
+    //       at all.
+    // CONTROL: `m_persist->pending = entries;` in persist() replaced with an empty vector ->
+    //       "FAIL: the write that stalled is the snapshot that was current when it started",
+    //       printing "the fifo carried 37 bytes". Reverted. The first-wins and queue mutations
+    //       below both leave this one GREEN -- the fifo carries the first snapshot under
+    //       either -- which is why it is asserted as a precondition here rather than left to
+    //       the checks that need it.
+    const nlohmann::json parked = nlohmann::json::parse(released.bytes, nullptr, false);
+    const bool parkedIsTheFirst = !parked.is_discarded() && parked.is_object() && parked.contains("monitors") &&
+                                  parked["monitors"].is_array() && parked["monitors"].size() == 1 &&
+                                  parked["monitors"][0].value("path", std::string()) == stuck.string();
+    check(parkedIsTheFirst, "the write that stalled is the snapshot that was current when it started");
+    if (!parkedIsTheFirst) {
+        std::fprintf(stderr, "  the fifo carried %zu bytes: %s\n", released.bytes.size(), released.bytes.c_str());
+    }
+
+    // GOAL: S8.33 -- the snapshot that lands once the filesystem answers is the NEWEST one,
+    //       and the one it superseded is never written at all. False in the first direction
+    //       if a save queued during an outage is dropped, which loses the user's last choice;
+    //       false in the second if snapshots queue up, which spends one write per change on a
+    //       filesystem that has just proved it is slow.
+    // WHY-THIS-SHAPE: the file's contents AND the number of times anything was renamed onto
+    //       it. Contents alone cannot tell the two apart -- a queue that writes every
+    //       snapshot in order also ends with the newest one on disk, so a content-only check
+    //       is green under both. The count is read only after the newest content is on disk,
+    //       which is what makes it race-free rather than a grace period: under a queue the
+    //       superseded write necessarily precedes the newest one, so by the time this reads
+    //       the count, a third rename would already have been queued by the kernel.
+    //       The wait for the content has a failure branch and never falls through into the
+    //       count, and every read of the file is guarded by S_ISREG: the released write
+    //       renames the FIFO onto config.json, and an unguarded read of that path would block
+    //       this thread for good.
+    // CONTROL: two, both reverted. (a) `m_persist->pending = entries;` in persist() replaced
+    //       with `if (!m_persist->pending) m_persist->pending = entries;`, i.e. first-wins ->
+    //       "FAIL: the snapshot that lands after a stalled write is the newest one", printing
+    //       "  monitor 2 is missing from the file". (b) `pending` turned into a
+    //       std::deque<std::vector<PersistedWallpaper>> the worker pops the front of, i.e. a
+    //       real queue -> "FAIL: the snapshot a newer one superseded is never written",
+    //       printing "3 writes landed on config.json, expected 2", while the content check
+    //       stayed green -- which is the pair of results these two checks exist to tell apart.
+    std::map<int, std::string> landed;
+    std::string landedWhy;
+    const auto deadline = StallClock::now() + std::chrono::seconds(10);
+    bool newestLanded = false;
+    while (StallClock::now() < deadline) {
+        if (isRegularFile(configFile)) {
+            landedWhy.clear();
+            landed = pathsInFile(configFile, landedWhy);
+            newestLanded = landed.count(2) == 1;
+            if (newestLanded) break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    const bool newestWon = newestLanded && landed.size() == 3 && landed.at(0) == stuck.string() &&
+                           landed.at(1) == superseded.string() && landed.at(2) == newest.string();
+    check(newestWon, "the snapshot that lands after a stalled write is the newest one");
+    if (!newestWon) {
+        std::string wrong = "the file holds a different set of monitors";
+        if (!newestLanded) {
+            wrong = landedWhy.empty() ? "monitor 2 is missing from the file"
+                                      : "the config file never arrived: " + landedWhy;
+        }
+        std::fprintf(stderr, "  %s\n", wrong.c_str());
+        // The count below is only meaningful once the newest write has landed; without it a
+        // low count is "nothing has been written yet", not "nothing extra was written".
+        return;
+    }
+
+    const unsigned writes = renamesCounted();
+    check(writes == 2, "the snapshot a newer one superseded is never written");
+    if (writes != 2) {
+        std::fprintf(stderr, "  %u writes landed on %s, expected 2 (the stalled one and the newest one)\n", writes,
+                     configFile.filename().string().c_str());
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -1654,6 +2281,9 @@ int main() {
         {"entries this build cannot apply", runUnappliedEntryChecks},
         {"a save that cannot succeed", runFailedSaveChecks},
         {"the cost of the save", runSaveCostChecks},
+        {"a write that never comes back", runStalledSaveChecks},
+        {"the wait a save is given", runSaveVisibleOnReturnChecks},
+        {"the snapshot that wins a stall", runLatestSnapshotWinsChecks},
     };
     for (const Phase& phase : kPhases) {
         try {

@@ -192,8 +192,16 @@ inline Frame getFrameFd(sdbus::IProxy& proxy, int32_t monitorId) {
     return frame;
 }
 
-inline void setWallpaper(sdbus::IProxy& proxy, const std::string& type, const std::string& path, int32_t monitorId) {
-    proxy.callMethod("SetWallpaper").onInterface(DbusService::kInterface).withArguments(type, path, monitorId);
+// `timeout` is the method-call timeout. Zero, the default, means the bus's own (25 s) and is
+// what every caller wants but one: a phase asking the question OF a daemon that may be wedged
+// inside the handler passes a short one, so that daemon produces a failed check in seconds
+// rather than a run that merely looks hung.
+inline void setWallpaper(sdbus::IProxy& proxy, const std::string& type, const std::string& path, int32_t monitorId,
+                         std::chrono::microseconds timeout = {}) {
+    proxy.callMethod("SetWallpaper")
+        .onInterface(DbusService::kInterface)
+        .withTimeout(timeout)
+        .withArguments(type, path, monitorId);
 }
 
 // The answer to GetStatus, or the reason there is none.
@@ -262,10 +270,11 @@ inline bool daemonErrorName(const std::string& name) {
     return name.rfind(std::string(DbusService::kInterface) + ".Error.", 0) == 0;
 }
 
-inline StatusReply getStatus(sdbus::IProxy& proxy) {
+// `timeout` as on setWallpaper() above: zero means the bus's default.
+inline StatusReply getStatus(sdbus::IProxy& proxy, std::chrono::microseconds timeout = {}) {
     std::string status;
     try {
-        proxy.callMethod("GetStatus").onInterface(DbusService::kInterface).storeResultsTo(status);
+        proxy.callMethod("GetStatus").onInterface(DbusService::kInterface).withTimeout(timeout).storeResultsTo(status);
     } catch (const sdbus::Error& e) {
         // Only one direction is knowable from an error name. A name in the daemon's own
         // namespace came from the daemon; everything else is genuinely ambiguous, and the

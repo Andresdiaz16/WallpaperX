@@ -2249,6 +2249,7 @@ void runHealthStateChecks(const std::string& bluePath, const std::string& videoP
                 return daemon.manager().snapshot().gpu.initialized;
             }();
             int graded = 0;
+            int skipped = 0;
             if (!deviceExists) {
                 notVerified("S7.10h (a render failure the daemon owns fails the verdict; a wallpaper's does not)",
                             "no Vulkan device could be created on this host, so every render here fails for the "
@@ -2260,6 +2261,7 @@ void runHealthStateChecks(const std::string& bluePath, const std::string& videoP
                         std::error_code ec;
                         std::filesystem::remove(c.path, ec);
                         if (ec) {
+                            ++skipped;
                             notVerified("S7.10h, one case",
                                         std::string("the fixture for '") + c.what + "' could not be deleted");
                             continue;
@@ -2274,6 +2276,7 @@ void runHealthStateChecks(const std::string& bluePath, const std::string& videoP
                         // X.3: the state this case grades was never reached, and grading the
                         // verdict anyway would report the endpoint for a property of the
                         // host's renderer.
+                        ++skipped;
                         notVerified("S7.10h, one case",
                                     std::string("the '") + c.what + "' render did not fail the way this case needs " +
                                         "(monitor 0 recorded '" + lastError + "', expected it to name '" +
@@ -2282,6 +2285,11 @@ void runHealthStateChecks(const std::string& bluePath, const std::string& videoP
                     }
                     const HttpReply health = daemon.health();
                     if (!health.ok()) {
+                        // Graded, not skipped: an endpoint that stopped answering is the
+                        // defect this file exists to find, and it has just been reported as
+                        // one -- so this case is accounted for below rather than counted as
+                        // coverage this host could not reach.
+                        ++graded;
                         check(false, "the fault-ownership daemon answered /health with a parseable 200");
                         continue;
                     }
@@ -2318,10 +2326,32 @@ void runHealthStateChecks(const std::string& bluePath, const std::string& videoP
                                                  lastError.c_str());
                     }
                 }
-                check(graded == static_cast<int>(faults.size()),
-                      "every fault-ownership case reached the state it grades");
-                if (graded != static_cast<int>(faults.size())) {
-                    std::fprintf(stderr, "  %d of %zu cases were graded\n", graded, faults.size());
+                // COVERAGE-ASSERT: every case in the table is accounted for -- graded, or
+                //       reported through notVerified as one this host could not reach. What
+                //       this must NOT do is assert `graded == faults.size()`: the two skip
+                //       arms above are legitimate X.3 skips (a fixture this filesystem would
+                //       not delete, a render that failed for a different reason on this
+                //       driver), and counting them as a shortfall prints a named FAIL against
+                //       the daemon for a property of the host, contradicting the notVerified
+                //       the same iteration just issued. The counters are bumped on the exit
+                //       paths rather than at the top of the loop, so the hollowing edit this
+                //       guards against -- a `continue` inserted before any of them -- still
+                //       goes red.
+                // CONTROL: two, both reverted, and the pair is what establishes the shape.
+                //       (a) a `continue` added as the first statement of the loop body, which
+                //       is what hollowing this out looks like -> "FAIL: every fault-ownership
+                //       case is either graded or reported as one this run could not reach",
+                //       with "  0 graded, 0 skipped, of 3 cases", and nothing else red here.
+                //       (b) the deleted-fixture arm forced (the `remove()` result replaced
+                //       with a permission-denied error_code, a harness-input mutation) -> one
+                //       NOT VERIFIED naming that case, no FAIL, and ctest Skipped. Run again
+                //       with this line written as `graded == faults.size()`, the same
+                //       mutation printed the NOT VERIFIED *and* "FAIL: ..." -- the daemon
+                //       accused of a fault the harness had just reported as the host's.
+                check(graded + skipped == static_cast<int>(faults.size()),
+                      "every fault-ownership case is either graded or reported as one this run could not reach");
+                if (graded + skipped != static_cast<int>(faults.size())) {
+                    std::fprintf(stderr, "  %d graded, %d skipped, of %zu cases\n", graded, skipped, faults.size());
                 }
             }
         }
@@ -3258,9 +3288,15 @@ void runAgreementChecks(httplib::Client& cli, sdbus::IProxy& proxy, WallpaperMan
 // ---------------------------------------------------------------------------- //
 // Phase 6 -- /health once a device exists.
 // ---------------------------------------------------------------------------- //
-void runHealthAfterDeviceChecks(httplib::Client& cli, sdbus::IProxy& proxy, const Check& check) {
+void runHealthAfterDeviceChecks(httplib::Client& cli, sdbus::IProxy& proxy, WallpaperManager& manager,
+                                const Check& check) {
+    // Bracketing the two replies, and required to agree below. The verdict this phase grades
+    // is a function of how many renders are outstanding, and reading that once beside the
+    // reply would be asserting on whichever moment the render worker happened to be in.
+    const WallpaperManager::Snapshot before = manager.snapshot();
     const HttpReply health = get(cli, "/health");
     const StatusReply status = getStatusOrExplain(proxy);
+    const WallpaperManager::Snapshot after = manager.snapshot();
     if (!health.hasJsonObject() || !status.ok()) {
         check(false, "/health and GetStatus both answered after the first render");
         return;
@@ -3288,8 +3324,9 @@ void runHealthAfterDeviceChecks(httplib::Client& cli, sdbus::IProxy& proxy, cons
     //       record removed, gpu still read ok here (the commit had set it) and only the
     //       detail check below went red. Both removed together -> "FAIL: /health reports
     //       the GPU as ok once a device exists" with "GetStatus: initialized=true
-    //       /health: gpu=pending". The aggregate is `fail` on this manager whichever way
-    //       the mutation goes, so it moves only the gpu line. The shaders half is separate:
+    //       /health: gpu=pending". The mutation moves only the gpu line: this manager's
+    //       verdict is `pending` either way -- it has renders outstanding, and a gpu check
+    //       that falls back to `pending` aggregates to the same word. The shaders half is separate:
     //       `recordHealth(&DaemonHealth::shaders, HealthStatus::Ok, ...)` deleted ->
     //       "FAIL: /health reports the shader directory as ok once a render has resolved
     //       it". All reverted.
@@ -3326,16 +3363,16 @@ void runHealthAfterDeviceChecks(httplib::Client& cli, sdbus::IProxy& proxy, cons
     //       FrameReady has arrived, nothing is queued), so a disagreement cannot be two
     //       honest views of two moments.
     // CONTROL: three, because the verdict, the breakdown and the cause fail independently.
-    //       (a) `firstUnsupported` dropped from the wallpapers detail (`failed > 0 ?
-    //       firstFailure : std::string()`) -> only "FAIL: the wallpapers detail names the
-    //       monitor GetStatus reports as unrenderable", with "detail: 1 of 3 monitors show
-    //       nothing:" and nothing after the colon. (b) `wallpapers.status = HealthStatus::Ok`
-    //       changed back to `Fail` in the failed-or-unsupported arm -> "FAIL: a monitor this
-    //       build cannot draw does not fail the daemon's wallpapers check" and "FAIL: a
-    //       blank monitor does not fail the aggregate when every dependency is ok". (c) the
-    //       `perMonitor[key] = ...` line deleted from the unsupported arm -> "FAIL: the
-    //       breakdown names exactly the monitors GetStatus has a record of", printing the
-    //       two key lists. All reverted.
+    //       (a) `firstUnsupported` dropped from the failure note carried into the pending
+    //       detail (`failed > 0 ? firstFailure : std::string()`) -> only "FAIL: the wallpapers
+    //       detail names the monitor GetStatus reports as unrenderable", with the detail
+    //       ending "1 failed or cannot be rendered: " and nothing after it. (b) the
+    //       outstanding arm's `HealthStatus::Pending` changed to `Fail` -> "FAIL: the daemon
+    //       never reports a wallpaper problem or an unfinished render as a daemon failure"
+    //       and "FAIL: the verdict is exactly what the manager's own outstanding count says
+    //       it should be". (c) the `perMonitor[key] = ...` line deleted from the unsupported
+    //       arm -> "FAIL: the breakdown names exactly the monitors GetStatus has a record
+    //       of", printing the two key lists. All reverted.
     // COVERAGE-ASSERT: the mix is required before anything is graded. If this run left the
     //       manager with no unrenderable monitor, or with none showing a frame, the claim
     //       has nothing in it and the phase reports NOT VERIFIED rather than passing on a
@@ -3344,6 +3381,7 @@ void runHealthAfterDeviceChecks(httplib::Client& cli, sdbus::IProxy& proxy, cons
     int firstUnsupportedId = -1;
     std::string firstUnsupportedType;
     std::vector<std::string> statusMonitorKeys;
+    std::vector<int> inFlightIds;
     if (statusJson.contains("wallpapers") && statusJson["wallpapers"].is_object()) {
         for (const auto& [key, entry] : statusJson["wallpapers"].items()) {
             if (!entry.is_object()) continue;
@@ -3360,10 +3398,27 @@ void runHealthAfterDeviceChecks(httplib::Client& cli, sdbus::IProxy& proxy, cons
                 }
             } else if (entry.value("has_frame", false)) {
                 ++showingCount;
+            } else {
+                inFlightIds.push_back(id);
             }
         }
     }
     std::sort(statusMonitorKeys.begin(), statusMonitorKeys.end());
+
+    // How many of the monitors with no picture are ones the daemon still owes a render for,
+    // counted off the manager's own MonitorStatus. Both bracketing snapshots have to agree,
+    // or the number was moving while /health was being asked and grading it would be grading
+    // an interleaving (X.2).
+    const auto outstandingIn = [&inFlightIds](const WallpaperManager::Snapshot& snap) {
+        std::size_t n = 0;
+        for (const int id : inFlightIds) {
+            const auto it = snap.monitors.find(id);
+            if (it != snap.monitors.end() && it->second.renderOutstanding) ++n;
+        }
+        return n;
+    };
+    const std::size_t outstanding = outstandingIn(before);
+    const bool quiesced = outstanding == outstandingIn(after);
 
     if (failedCount != 0 || unsupportedCount == 0 || showingCount == 0) {
         notVerified("S8.16 (a blank monitor is named per monitor and does not fail the daemon)",
@@ -3371,13 +3426,48 @@ void runHealthAfterDeviceChecks(httplib::Client& cli, sdbus::IProxy& proxy, cons
                         std::to_string(monitorCount) + " monitors: " + std::to_string(showingCount) +
                         " showing, " + std::to_string(unsupportedCount) + " unrenderable, " +
                         std::to_string(failedCount) + " failed)");
+    } else if (!quiesced) {
+        // X.2 again, and reported rather than retried: the two counts disagreeing means a
+        // render landed mid-phase, and the verdict below is derived from a number that was
+        // true of neither reply.
+        notVerified("S8.16 (a blank monitor is named per monitor and does not fail the daemon)",
+                    "the number of outstanding renders moved while /health was being asked (" +
+                        std::to_string(outstanding) + " before, " + std::to_string(outstandingIn(after)) +
+                        " after), so no verdict can be attributed to a state");
     } else {
-        check(healthCheckStatus(health.json, "wallpapers") == "ok",
-              "a monitor this build cannot draw does not fail the daemon's wallpapers check");
-        check(health.json.value("status", std::string()) == "ok",
-              "a blank monitor does not fail the aggregate when every dependency is ok");
-        if (health.json.value("status", std::string()) != "ok") {
-            std::fprintf(stderr, "  aggregate: %s (body: %s)\n", health.json.value("status", std::string()).c_str(),
+        // GOAL: S8.16's second clause and S7.10b-i's "never fail", on the state this run has
+        //       actually built -- one monitor this build cannot draw, one showing a picture,
+        //       and whatever renders the manager still owes. Neither a wallpaper the daemon
+        //       cannot render nor a render it has not finished may make the verdict `fail`:
+        //       `fail` is what a watchdog restarts a daemon over, and neither of those is the
+        //       daemon being broken.
+        // WHY-THIS-SHAPE: the expected verdict is DERIVED from the manager's own outstanding
+        //       count rather than written as a literal. `== "ok"` cannot be used here: this
+        //       phase runs on the manager every phase above has been writing to, and two of
+        //       those monitors were recorded through the manager rather than set over the
+        //       bus, so no render was ever queued for them and they are legitimately
+        //       outstanding -- `pending` is then the contract's answer, not a defect. The
+        //       opposite simplification, `!= "fail"` alone, is satisfied by an endpoint that
+        //       answers `pending` to everything, which is the pre-S7.10 endpoint. Asserting
+        //       both -- never `fail`, and exactly the value the state calls for -- is what
+        //       distinguishes those.
+        //       Note what this phase can therefore NOT establish while a render is
+        //       outstanding: that the UNRENDERABLE monitor alone leaves the verdict ok. The
+        //       outstanding arm is ahead of the failed-or-unsupported arm in the daemon, so
+        //       that arm is not even reached here. Scenario (a2) of runHealthStateChecks
+        //       grades it, on a daemon with one monitor and nothing outstanding.
+        const std::string wallpapers = healthCheckStatus(health.json, "wallpapers");
+        const std::string aggregate = health.json.value("status", std::string());
+        const bool notADaemonFault = wallpapers != "fail" && aggregate != "fail";
+        check(notADaemonFault,
+              "the daemon never reports a wallpaper problem or an unfinished render as a daemon failure");
+        const std::string expected = outstanding > 0 ? "pending" : "ok";
+        const bool asStated = wallpapers == expected && aggregate == expected;
+        check(asStated, "the verdict is exactly what the manager's own outstanding count says it should be");
+        if (!notADaemonFault || !asStated) {
+            std::fprintf(stderr, "  %zu of %zu monitors outstanding -> expected %s, got wallpapers %s / aggregate "
+                                 "%s (body: %s)\n",
+                         outstanding, monitorCount, expected.c_str(), wallpapers.c_str(), aggregate.c_str(),
                          health.body.c_str());
         }
 
@@ -3403,17 +3493,46 @@ void runHealthAfterDeviceChecks(httplib::Client& cli, sdbus::IProxy& proxy, cons
             }
         }
 
+        // GOAL: whichever branch the verdict came from, the detail carries BOTH numbers the
+        //       state has: how many monitors are blank for the wallpaper's own reasons, and,
+        //       when a render is outstanding, how many of the monitor total that is. False if
+        //       an unfinished render silences the wallpaper failure the same daemon is also
+        //       reporting -- the operator is then told a render is pending and never told a
+        //       monitor cannot be drawn at all, which is the one of the two that will not fix
+        //       itself.
+        // WHY-THIS-SHAPE: both expected substrings are derived, and which pair is expected
+        //       follows the branch the state puts the daemon in. Writing the "N of M" form
+        //       alone -- what this check was before the daemon grew an outstanding-render
+        //       branch -- asserts a sentence that is only produced when nothing is
+        //       outstanding, so it goes red on a daemon that is behaving exactly to contract.
+        //       Dropping the count and matching only "failed or cannot be rendered" would go
+        //       the other way and pass for any count at all, including a wrong one.
+        // CONTROL: `failureNote` replaced with `std::string()` at its use in the outstanding
+        //       arm, i.e. the failure dropped from the pending detail -> "FAIL: the wallpapers
+        //       detail counts the blank monitors against the monitor total" and "FAIL: the
+        //       wallpapers detail names the monitor GetStatus reports as unrenderable",
+        //       printing "detail: 2 of 5 monitors have not finished rendering". Reverted.
         const std::string detail = healthCheckDetail(health.json, "wallpapers");
-        const std::string expectCount =
-            std::to_string(failedCount + unsupportedCount) + " of " + std::to_string(monitorCount);
-        check(detail.find(expectCount) != std::string::npos,
-              "the wallpapers detail counts the blank monitors against the monitor total");
+        const std::string blank = std::to_string(failedCount + unsupportedCount);
+        // The daemon writes the blank count as a clause of its own once a render is
+        // outstanding, and as "N of M monitors ..." when it is the whole verdict.
+        const std::string expectBlank = outstanding > 0
+                                            ? "; " + blank + " failed or cannot be rendered"
+                                            : blank + " of " + std::to_string(monitorCount) +
+                                                  " monitors failed or cannot be rendered";
+        const std::string expectCount = outstanding > 0
+                                            ? std::to_string(outstanding) + " of " + std::to_string(monitorCount) +
+                                                  " monitors have not finished rendering"
+                                            : expectBlank;
+        const bool counted =
+            detail.find(expectCount) != std::string::npos && detail.find(expectBlank) != std::string::npos;
+        check(counted, "the wallpapers detail counts the blank monitors against the monitor total");
         const bool named = detail.find("monitor " + std::to_string(firstUnsupportedId)) != std::string::npos &&
                            detail.find("'" + firstUnsupportedType + "'") != std::string::npos;
         check(named, "the wallpapers detail names the monitor GetStatus reports as unrenderable");
-        if (!named || detail.find(expectCount) == std::string::npos) {
-            std::fprintf(stderr, "  detail: %s\n  expected '%s', 'monitor %d' and '%s'\n", detail.c_str(),
-                         expectCount.c_str(), firstUnsupportedId, firstUnsupportedType.c_str());
+        if (!named || !counted) {
+            std::fprintf(stderr, "  detail: %s\n  expected '%s', '%s', 'monitor %d' and '%s'\n", detail.c_str(),
+                         expectCount.c_str(), expectBlank.c_str(), firstUnsupportedId, firstUnsupportedType.c_str());
         }
     }
 
@@ -4164,7 +4283,7 @@ int main() {
                                      : std::string()));
             } else {
                 runAgreementChecks(cli, *proxy, manager, signals, hostilePath, check);
-                runHealthAfterDeviceChecks(cli, *proxy, check);
+                runHealthAfterDeviceChecks(cli, *proxy, manager, check);
                 runReadOnlyChecks(cli, *proxy, check);
                 runGpuLockChecks(*proxy, signals, *server, largePath, check);
             }
