@@ -335,6 +335,8 @@ constexpr int kMonitorParam = 0;      // recorded, never rendered -- the not-cla
 constexpr int kMonitorTorn = 1;       // flipped by the writer thread in runTornReadChecks
 constexpr int kMonitorAgree = 2;      // the hostile path, rendered
 constexpr int kMonitorGpuLock = 3;    // the slow render in runGpuLockChecks
+constexpr int kMonitorLiteral = 4;    // the path_literal round trip -- set over the bus, twice
+constexpr int kMonitorNonUtf8 = 5;    // a path JSON cannot carry, recorded through the manager
 constexpr int kMonitorNeverSet = 31;  // also the upper in-range boundary for S7.5
 
 // Goals this run could not exercise, as opposed to goals it exercised and that held.
@@ -2785,8 +2787,8 @@ void runTornReadChecks(WallpaperManager& manager, httplib::Client& cli, const st
 // ---------------------------------------------------------------------------- //
 // Phase 5 -- the two channels, on a monitor whose path is hostile.
 // ---------------------------------------------------------------------------- //
-void runAgreementChecks(httplib::Client& cli, sdbus::IProxy& proxy, const std::string& hostilePath,
-                        const Check& check) {
+void runAgreementChecks(httplib::Client& cli, sdbus::IProxy& proxy, WallpaperManager& manager,
+                        FrameReadyLog& signals, const std::string& hostilePath, const Check& check) {
     // The fixture has to be hostile, or both checks below are trivially true of a daemon
     // that escapes nothing. Asserted rather than assumed: the filename is built from
     // constants, but a filesystem that refused one of these bytes would leave the phase
@@ -2845,6 +2847,126 @@ void runAgreementChecks(httplib::Client& cli, sdbus::IProxy& proxy, const std::s
           "/config reports no type for a monitor GetStatus has no entry for");
     check(wallpaperStatus(status, std::to_string(kMonitorNeverSet)) == nullptr,
           "GetStatus has no entry for the monitor /config reports as empty");
+
+    // GOAL: S8.19 -- `path_literal` on both channels is the path a client may ACT on -- the bytes as
+    //       stored, so handing it straight back to SetWallpaper names the same file --
+    //       while `path` stays the display-escaped form and is NOT usable that way. False
+    //       if the escaped form is accepted (the two forms then name the same file, so the
+    //       literal buys nothing), false if the literal is rejected (a client cannot act on
+    //       what it is told), and false if the two channels publish different bytes, which
+    //       is the defect aded2e5 fixed for `path` reappearing on a new key.
+    // WHY-THIS-SHAPE: the round trip is driven over the WIRE, not by comparing strings. The
+    //       cheaper version -- assert path_literal == hostilePath -- is a check on this
+    //       test's own fixture: it passes for a daemon whose literal is unusable for some
+    //       reason the comparison does not model (a path the daemon normalised, a relative
+    //       form), and it says nothing about the escaped form being unusable, which is the
+    //       half that makes publishing two keys worth the bytes. The rejection is asserted
+    //       first, so the monitor this drives ends the phase showing the frame the
+    //       acceptance put there rather than holding a failed request.
+    // CONTROL: two, one per channel, both reverted. (a) `path_literal` in http_server.cpp's
+    //       /config handler replaced with `sanitizeForLog(it->second.path, 4096,
+    //       LogFraming::Bare)` -> five FAILs: the two channels no longer publish the same
+    //       bytes, /config's literal is not the stored bytes, the display form and the
+    //       literal stop being different strings, and -- the one that matters -- "FAIL: the
+    //       path_literal a client reads back is accepted by SetWallpaper", the escaped name
+    //       not being a file. (b) the same substitution in dbus_service.cpp instead -> two
+    //       FAILs, the agreement one printing "http literal: ...wpx_hostile_<U+202E>" against
+    //       "dbus literal: ...wpx_hostile_\xe2\x80\xae\x7f\nname.png".
+    const bool literalsPresent = config.json.contains("path_literal") && config.json["path_literal"].is_string() &&
+                                 entry->contains("path_literal") && (*entry)["path_literal"].is_string();
+    check(literalsPresent, "both channels publish a path_literal for a monitor with a hostile path");
+    if (literalsPresent) {
+        const std::string httpLiteral = config.json.value("path_literal", std::string());
+        const std::string dbusLiteral = entry->value("path_literal", std::string());
+        check(httpLiteral == dbusLiteral, "/config and GetStatus publish the same path_literal bytes");
+        check(httpLiteral == hostilePath, "/config's path_literal is the stored bytes, not the display-escaped form");
+        if (httpLiteral != dbusLiteral || httpLiteral != hostilePath) {
+            std::fprintf(stderr, "  http literal: %s\n  dbus literal: %s\n", httpLiteral.c_str(),
+                         dbusLiteral.c_str());
+        }
+        // Without this the round trip below could be two spellings of the same file, and
+        // "the escaped one is rejected" would be unfalsifiable.
+        check(httpPath != httpLiteral, "the display form and the literal really are different strings");
+
+        std::string rejected;
+        try {
+            setWallpaper(proxy, "static", httpPath, kMonitorLiteral);
+        } catch (const std::exception& e) {
+            rejected = e.what();
+        }
+        check(!rejected.empty(), "the display-escaped path a client reads from `path` is refused by SetWallpaper");
+
+        std::string accepted;
+        try {
+            setWallpaper(proxy, "static", httpLiteral, kMonitorLiteral);
+        } catch (const std::exception& e) {
+            accepted = e.what();
+        }
+        check(accepted.empty(), "the path_literal a client reads back is accepted by SetWallpaper");
+        if (!accepted.empty()) std::fprintf(stderr, "  %s\n", accepted.c_str());
+
+        // Waited for, not fire-and-forget: a monitor left mid-render turns every later
+        // /health aggregate in this run into `pending`, which is a phase above grading this
+        // one's leftovers.
+        if (accepted.empty() && !signals.wait(kMonitorLiteral, 1)) {
+            notVerified("the round trip's render",
+                        "the frame for the wallpaper set through path_literal never arrived, so this run leaves a "
+                        "monitor mid-render");
+        }
+    }
+
+    // GOAL: S8.19's null clause -- a path that is not valid UTF-8 is published as JSON null
+    //       on both channels, and neither channel breaks. False if the raw bytes go in: dump()
+    //       throws on invalid UTF-8, so a single oddly-named file would take GetStatus and
+    //       /config down for EVERY monitor, not just its own. Also false if the key is
+    //       simply omitted -- a client cannot then tell an unusable path from an older
+    //       daemon that has no such key.
+    // WHY-THIS-SHAPE: recorded through the manager rather than over the bus, because DBus
+    //       strings must be valid UTF-8 and the broker refuses the message -- so
+    //       SetWallpaper cannot reach this state and only the in-process tier can build it.
+    //       (The daemon reaches it through a config file written by another tool, or a
+    //       filename created before a locale change.) The whole reply is asserted to arrive,
+    //       not just the key: the failure mode being guarded is a THROW, which leaves no
+    //       key to inspect.
+    // CONTROL: `literal ? nlohmann::json(*literal) : nlohmann::json(nullptr)` replaced with
+    //       the raw `path` in http_server.cpp and in dbus_service.cpp -> the five checks
+    //       below all red, led by "/config still answers for a monitor whose path is not
+    //       valid UTF-8" (500) and "GetStatus still answers ..." (sdbus error carrying
+    //       json.exception.type_error.316, invalid UTF-8 byte 0x80). The blast radius is the
+    //       point: four LATER phases went red too, because one monitor's filename had made
+    //       GetStatus unanswerable for every monitor. Reverted.
+    std::string nonUtf8Path;
+    try {
+        nonUtf8Path = writeSolidImage(std::string("wpx_nonutf8_\x80name.png"), 0, 0, 255);
+    } catch (const std::exception& e) {
+        nonUtf8Path.clear();
+    }
+    if (nonUtf8Path.empty() || wallpaperx::isValidUtf8(nonUtf8Path)) {
+        // A filesystem that refuses the byte, or a temp path that swallowed it. Not a
+        // defect in the daemon, and grading it as one would be X.3 in reverse.
+        notVerified("path_literal's null clause",
+                    "this host would not create a file whose name is not valid UTF-8, so no monitor can hold such "
+                    "a path");
+    } else {
+        manager.requestWallpaper("static", nonUtf8Path, kMonitorNonUtf8);
+        const HttpReply raw = get(cli, "/config?monitor=" + std::to_string(kMonitorNonUtf8));
+        const StatusReply rawStatus = getStatusOrExplain(proxy);
+        const nlohmann::json* rawEntry = wallpaperStatus(rawStatus, std::to_string(kMonitorNonUtf8));
+
+        check(raw.ok(), "/config still answers for a monitor whose path is not valid UTF-8");
+        check(rawStatus.ok() && rawEntry != nullptr,
+              "GetStatus still answers for a monitor whose path is not valid UTF-8");
+        if (!rawStatus.ok()) std::fprintf(stderr, "  %s\n", rawStatus.error().c_str());
+
+        check(raw.ok() && raw.json.contains("path_literal") && raw.json["path_literal"].is_null(),
+              "/config reports path_literal as null, not absent, for a path JSON cannot carry");
+        check(rawEntry != nullptr && rawEntry->contains("path_literal") && (*rawEntry)["path_literal"].is_null(),
+              "GetStatus reports path_literal as null, not absent, for a path JSON cannot carry");
+        // The other key still has to work: null on both is also what a daemon that
+        // published nothing at all would produce.
+        check(raw.ok() && !raw.json.value("path", std::string()).empty(),
+              "the display path is still published for a monitor whose path is not valid UTF-8");
+    }
 }
 
 // ---------------------------------------------------------------------------- //
@@ -3471,6 +3593,187 @@ void runKeepAliveShutdownChecks(WallpaperManager& manager, const Check& check) {
     std::fflush(stdout);
 }
 
+// A connected socket that has already had one request served on it, so the server
+// demonstrably accepted it and gave it a worker. Returns -1 with `why` set on any failure;
+// the caller must close it.
+int servedConnection(int port, std::string& why) {
+    const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) {
+        why = "could not create a socket";
+        return -1;
+    }
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(static_cast<uint16_t>(port));
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+        why = "could not connect to the server this phase started";
+        ::close(fd);
+        return -1;
+    }
+    const std::string request = "GET /health HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(port) +
+                                "\r\nConnection: keep-alive\r\n\r\n";
+    std::string response;
+    if (::send(fd, request.data(), request.size(), MSG_NOSIGNAL) != static_cast<ssize_t>(request.size()) ||
+        !readOneResponse(fd, 5000, response) || response.find(" 200 ") == std::string::npos) {
+        why = "the connection never had a request served on it, so nothing proves the server gave it a worker";
+        ::close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+// The first line of a request and nothing more: no CRLF, so the server is mid-parse and
+// blocks in the timed read rather than in the keep-alive poll.
+bool sendPartialRequest(int fd) {
+    static constexpr std::string_view kPartial = "GET /health HTTP/1.1";
+    return ::send(fd, kPartial.data(), kPartial.size(), MSG_NOSIGNAL) == static_cast<ssize_t>(kPartial.size());
+}
+
+// ---------------------------------------------------------------------------- //
+// Phase 12 -- a client that goes silent mid-request cannot hold the server open.
+// ---------------------------------------------------------------------------- //
+void runSilentClientShutdownChecks(WallpaperManager& manager, const Check& check) {
+    constexpr const char* kGoal = "S8.21 (the read timeout bounds how long a client that goes silent mid-request "
+                                  "can hold a serving thread, and so how long it can delay shutdown)";
+    // The healthy cost is one read timeout: 500 ms, http_server.cpp's kIoTimeoutMicroseconds.
+    // What this guards is that constant going back up -- it was 5 s until afe32a3, measured
+    // at 4932 ms of held shutdown. 1500 ms sits 3x above the healthy value and 3.3x below
+    // the regression, so neither a loaded host nor the scheduler can move a run across it.
+    constexpr double kBudgetMs = 1500.0;
+
+    std::string reason;
+    std::unique_ptr<HttpServer> server = startServer(manager, reason);
+    if (!server) {
+        notVerified(kGoal, reason);
+        return;
+    }
+    const int port = server->port();
+
+    // GOAL: S8.21 -- a client that sends part of a request and then nothing is dropped by the server
+    //       within the read timeout. False if it is held indefinitely, or for the 5 s this
+    //       was: the serving thread is parked for that long, and ~HttpServer joins it, so a
+    //       status client -- or anything that crashed mid-request -- decides when the daemon
+    //       may finish stopping.
+    // WHY-THIS-SHAPE: the timeout is measured from the CLIENT side, as the time until the
+    //       server drops the connection, and a deadline that expires is a FAIL rather than a
+    //       number. Timing the destructor alone is the obvious version and it is not
+    //       falsifiable on its own: whether the worker has entered the timed read or is
+    //       still in httplib's 10 ms keep-alive poll when stop() lands is a race, and the
+    //       fast side of that race passes. This measurement has no fast side -- the server
+    //       either drops the connection or the phase fails. The partial request is what
+    //       makes it the case at all: an idle connection that sent nothing is bounded by
+    //       keep_alive()'s stop check instead, which the phase above already covers.
+    //       Distinct from S7.17's decided non-goal, which is the client that keeps
+    //       DRIBBLING bytes: each byte restarts the timeout, that is unbounded by design,
+    //       and no such connection is left open here.
+    // CONTROL: kIoTimeoutSeconds/kIoTimeoutMicroseconds in http_server.cpp put back to
+    //       `5, 0`, the value before afe32a3 -> both checks red: "a client that stops
+    //       mid-request is dropped by the server rather than held indefinitely" (the 4 s
+    //       deadline expired first, which is the failure branch doing its job) and "...
+    //       within the read timeout", printing "the server held a silent client for 4019.00
+    //       ms (budget 1500 ms) and never dropped it". Unmutated: 501.90 ms. Reverted.
+    std::string why;
+    int fd = servedConnection(port, why);
+    if (fd < 0) {
+        notVerified(kGoal, why);
+        return;
+    }
+    struct FdGuard {
+        int fd;
+        ~FdGuard() {
+            if (fd >= 0) ::close(fd);
+        }
+    } guard{fd};
+
+    if (!sendPartialRequest(fd)) {
+        notVerified(kGoal, "the partial request that puts the server into a timed read could not be sent");
+        return;
+    }
+
+    const Clock::time_point sentAt = Clock::now();
+    bool dropped = false;
+    // 4 s, comfortably past the 5 s a regression would take? No -- deliberately below it:
+    // the deadline expiring is a FAIL, so it has to be reachable by the failure this exists
+    // to catch, and 4 s already distinguishes 500 ms from anything second-scale.
+    const Clock::time_point deadline = sentAt + std::chrono::milliseconds(4000);
+    while (!dropped) {
+        const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - Clock::now()).count();
+        if (left <= 0) break;
+        pollfd pfd{fd, POLLIN, 0};
+        const int ready = ::poll(&pfd, 1, static_cast<int>(left));
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (ready == 0) break;
+        char buf[512];
+        const ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
+        if (n < 0 && errno == EINTR) continue;
+        // 0 is the server closing after the timeout; anything else it says first (a 408) is
+        // read and ignored until the close arrives.
+        if (n <= 0) dropped = true;
+    }
+    const double heldMs = millis(Clock::now() - sentAt);
+
+    check(dropped, "a client that stops mid-request is dropped by the server rather than held indefinitely");
+    check(dropped && heldMs < kBudgetMs, "a client that stops mid-request is dropped within the read timeout");
+    if (!dropped || heldMs >= kBudgetMs) {
+        std::fprintf(stderr, "  the server held a silent client for %.2f ms (budget %.0f ms)%s\n", heldMs, kBudgetMs,
+                     dropped ? "" : " and never dropped it");
+    }
+    std::printf("http_server_test: a client silent mid-request was dropped after %.2f ms\n", heldMs);
+    std::fflush(stdout);
+
+    // GOAL: S8.21 on the thing that actually matters -- destroying the server
+    //       while a silent client is being held. False if the join waits longer than the
+    //       read timeout that bounds the worker.
+    // WHY-THIS-SHAPE: the pause before the destruction is what makes this measure anything:
+    //       without it the worker is still in the keep-alive poll, stop() ends its loop, and
+    //       the destruction returns in a millisecond having tested nothing -- which is
+    //       exactly how a first attempt at this measured 1 ms and looked like a pass. The
+    //       pause is not a wait for a result (X.1): the result is the elapsed time of the
+    //       destructor, measured afterwards.
+    // COVERAGE-ASSERT: a destruction that returned promptly is reported as a state this run
+    //       failed to build, NOT as a pass. That is the only way this check can go green
+    //       without the property holding, so it is the thing asserted.
+    // CONTROL: the same 5 s timeout -> "FAIL: destroying the server while a silent client is
+    //       held does not take longer than the read timeout", printing "  ~HttpServer took
+    //       4925.22 ms with one silent client held (budget 1500 ms)", against 401.90 ms
+    //       unmutated. Reverted.
+    std::string secondWhy;
+    const int second = servedConnection(port, secondWhy);
+    if (second < 0) {
+        notVerified(kGoal, "the second connection this phase needs: " + secondWhy);
+        return;
+    }
+    FdGuard secondGuard{second};
+    if (!sendPartialRequest(second)) {
+        notVerified(kGoal, "the partial request for the destruction measurement could not be sent");
+        return;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    const Clock::time_point before = Clock::now();
+    server.reset();  // ~HttpServer: stop() then join()
+    const double destroyMs = millis(Clock::now() - before);
+
+    if (destroyMs < 50.0) {
+        notVerified(kGoal, "destroying the server took " + std::to_string(destroyMs) +
+                               " ms, so its worker was not holding the silent client at that moment and the "
+                               "measurement grades nothing");
+    } else {
+        check(destroyMs < kBudgetMs,
+              "destroying the server while a silent client is held does not take longer than the read timeout");
+        if (destroyMs >= kBudgetMs) {
+            std::fprintf(stderr, "  ~HttpServer took %.2f ms with one silent client held (budget %.0f ms)\n",
+                         destroyMs, kBudgetMs);
+        }
+    }
+    std::printf("http_server_test: shutdown with one silent client held: %.2f ms\n", destroyMs);
+    std::fflush(stdout);
+}
+
 }  // namespace
 
 int main() {
@@ -3574,7 +3877,7 @@ int main() {
                                      ? " -- last_error: " + entry->value("last_error", std::string())
                                      : std::string()));
             } else {
-                runAgreementChecks(cli, *proxy, hostilePath, check);
+                runAgreementChecks(cli, *proxy, manager, signals, hostilePath, check);
                 runHealthAfterDeviceChecks(cli, *proxy, check);
                 runReadOnlyChecks(cli, *proxy, check);
                 runGpuLockChecks(*proxy, signals, *server, largePath, check);
@@ -3587,6 +3890,7 @@ int main() {
 
         runShutdownChecks(manager, check);
         runKeepAliveShutdownChecks(manager, check);
+        runSilentClientShutdownChecks(manager, check);
 
         // GOAL: S7.20's release half again, from the direction the phases feel it -- the
         //       registration guard may turn away no HttpServer built anywhere in this run.

@@ -89,17 +89,24 @@ WallpaperManager::WallpaperManager(Config config)
         std::string reported = loaded.error;
         if (loaded.preservable) {
             const std::filesystem::path kept = m_store.file().string() + ".bad";
+            const std::string keptName = sanitizeForLog(kept.string(), 4096, LogFraming::Bare);
             std::error_code ec;
+            const bool present = std::filesystem::exists(kept, ec);
             // Never over an existing copy: the first bad start moves the real config here,
             // and a second one would otherwise replace it with the throwaway written since.
-            if (std::filesystem::exists(kept, ec)) {
-                reported += "; not kept, " + sanitizeForLog(kept.string(), 4096, LogFraming::Bare) +
-                            " already exists";
+            // A copy that cannot be inspected counts as present for the same reason.
+            //
+            // Every branch reports. Saying the config could not be read while staying silent
+            // about whether the copy was made sends the user looking for a file that is not
+            // there.
+            if (ec) {
+                reported += "; not kept, " + keptName + " could not be checked: " + ec.message();
+            } else if (present) {
+                reported += "; not kept, " + keptName + " already exists";
             } else {
                 std::filesystem::rename(m_store.file(), kept, ec);
-                if (!ec) {
-                    reported += "; kept as " + sanitizeForLog(kept.string(), 4096, LogFraming::Bare);
-                }
+                reported += ec ? "; not kept, could not move it to " + keptName + ": " + ec.message()
+                               : "; kept as " + keptName;
             }
         }
         recordHealth(&DaemonHealth::persistence, HealthStatus::Fail, reported);

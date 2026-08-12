@@ -4095,10 +4095,19 @@ void checkStoppableOnAnyConfigFile(NameWatcher& names, const std::string& valida
     //       having to be killed. `timedOut()` is asserted explicitly because shutdown()
     //       SIGKILLs after its wait expires and returns an exit code either way -- a check on
     //       the code alone would grade a hang that had to be killed as a clean exit.
-    //       KNOWN GAP, stated rather than papered over: a config file on a genuinely hung
-    //       mount blocks the daemon inside the stat that precedes all of this, before any
-    //       guard runs. Nothing here covers that, and no test in this suite does; moving the
-    //       read after the signal thread starts is a pending decision.
+    //       KNOWN GAP, stated rather than papered over, and MEASURED rather than assumed:
+    //       a config file on a genuinely hung mount blocks the daemon inside the stat or the
+    //       read, and moving that work after the signal thread (afe32a3) does not make the
+    //       daemon stoppable there. Established out of suite by patching load() to sleep
+    //       indefinitely: the daemon printed "Terminated received, shutting down" -- the
+    //       watcher thread now runs, so the signal is consumed instead of left pending --
+    //       and the process was still alive three seconds later in state S, needing SIGKILL,
+    //       because main() is parked in the read and nothing else can end the process. So
+    //       the cases below are the whole of what is covered: the guards keep the daemon out
+    //       of open() for the file types that hang, which is a different property from
+    //       surviving a filesystem that stops answering. Nothing in this suite covers the
+    //       latter and no committed check can, since the fixture would have to be a
+    //       filesystem this harness can hang on demand (FUSE) and the daemon would fail it.
     // CONTROL: all three of load()'s pre-open guards disabled in config_store.cpp -- the
     //       is_regular_file refusal, the file_size error check and the size cap -- which is
     //       the code as it stood when the hang was found. Each one alone is enough to keep
@@ -4131,6 +4140,18 @@ void checkStoppableOnAnyConfigFile(NameWatcher& names, const std::string& valida
         {"a regular file over the size cap",
          [](const std::filesystem::path& file) { return writeTextFile(file, std::string(2u * 1024u * 1024u, 'x')); },
          "over the"},
+        // The other arm of the guard: a path stat() cannot answer for at all. ELOOP is the
+        // one an unprivileged test can produce; a hung mount is the case that matters and
+        // the KNOWN GAP above is about it. Distinct from the rows above because it takes the
+        // "could not be checked" branch, where the file is NOT eligible to be moved aside --
+        // config_store_test's preserved-copy phase grades that half.
+        {"a self-referential symlink",
+         [](const std::filesystem::path& file) {
+             std::error_code ec;
+             std::filesystem::create_symlink(file, file, ec);
+             return !ec;
+         },
+         "could not be checked"},
     };
 
     int exercised = 0;
@@ -4206,6 +4227,162 @@ void checkStoppableOnAnyConfigFile(NameWatcher& names, const std::string& valida
     }
     check(exercised + unstageable == static_cast<int>(cases.size()),
           "every unreadable-config-file case was either exercised or reported unstageable");
+}
+
+// A config that is valid, large, and applies to nothing -- every entry names a monitor id
+// this build has no room for, so the daemon keeps them and renders none. Its only purpose
+// is to make the startup work between the bus name and the event loop take long enough to
+// be caught in the act.
+std::string manyUnapplicableEntries(int count) {
+    std::string text = "{\"version\":1,\"monitors\":[";
+    for (int i = 0; i < count; ++i) {
+        if (i > 0) text += ',';
+        text += "{\"monitor_id\":40,\"type\":\"slideshow\",\"path\":\"/not/rendered/here.png\"}";
+    }
+    text += "]}";
+    return text;
+}
+
+void checkShutdownDuringStartup(NameWatcher& names, const std::string& validationEnv, const Check& check) {
+    using wallpaperx::testing::ConnectResult;
+    using wallpaperx::testing::describe;
+    using wallpaperx::testing::tryConnect;
+
+    constexpr const char* kGoal =
+        "S8.20 (a shutdown signal that arrives before the event loop starts still stops the daemon)";
+    constexpr int kPort = wallpaperx::HttpServer::kDefaultPort;
+    constexpr int kAttempts = 6;
+    constexpr int kEntries = 15000;
+
+    ScratchDir configHome("earlyterm");
+    if (!configHome.ok()) {
+        notVerified(kGoal, "a scratch XDG_CONFIG_HOME could not be created under the temp directory");
+        return;
+    }
+    std::error_code ec;
+    std::filesystem::create_directories(configHome.configFile().parent_path(), ec);
+    if (ec || !writeTextFile(configHome.configFile(), manyUnapplicableEntries(kEntries))) {
+        notVerified(kGoal, "the large config that widens this phase's startup window could not be written");
+        return;
+    }
+
+    // GOAL: S8.20 -- a SIGTERM delivered after the daemon owns the bus name but before it enters its
+    //       event loop still terminates it, cleanly and through main(). False if such a
+    //       daemon runs on holding io.wallpaperx.Daemon and port 18462 after being told to
+    //       stop -- the user's `systemctl stop` returns, the name stays taken, and the next
+    //       start fails with FileExists.
+    // WHY-THIS-SHAPE: it asserts the OUTCOME, not the mechanism, and deliberately makes no
+    //       claim about main.cpp's `shutdownRequested` guard. Measured: with that guard
+    //       removed the daemon still exits cleanly, because sdbus-c++ latches a
+    //       leaveEventLoop() issued before the loop starts. A check written as "the guard is
+    //       what saves it" would therefore be a false claim, and one written to go red when
+    //       the guard is deleted cannot exist.
+    //       The window is entered by force rather than by luck. SIGSTOP freezes the daemon
+    //       where it stands; a connect() to 18462 is then answered by the KERNEL, so it
+    //       still discriminates on a process that cannot run -- refused means the HttpServer
+    //       constructor has not completed, and that constructor runs before
+    //       enterEventLoop(). Only then is SIGTERM queued and SIGCONT sent. The obvious
+    //       simpler version -- signal as soon as the name appears and hope -- cannot tell
+    //       which side of the loop it landed on, so it would grade an ordinary shutdown and
+    //       report it as this one. The config is 15 000 entries for the same reason: it
+    //       widens the work between the name and the loop from microseconds to milliseconds.
+    // CONTROL: two, both reverted. (a) the guard alone deleted, so main enters the loop
+    //       whatever the watcher recorded -> still green, four runs out of four, each with
+    //       the freeze confirmed: that is the latch, measured here rather than taken on
+    //       trust, and it is why this phase claims nothing about the guard. (b) the guard
+    //       deleted AND the latch removed with it -- the watcher calling leaveEventLoop()
+    //       only when a flag says the loop is running -> "FAIL: the daemon signalled before
+    //       its event loop began exits without having to be killed" ("exited normally 0,
+    //       timed out 1", i.e. SIGKILLed after the reap timeout), plus the exit-code and
+    //       destructor-chain checks here. That mutation also reddened the SIGINT and SIGHUP
+    //       phases, which signal as soon as the name appears and so land in this window by
+    //       accident; the SIGTERM phase, which does work first, stayed green.
+    // COVERAGE-ASSERT: an attempt counts only when the connect said refused while the
+    //       daemon was stopped. If no attempt in six lands in the window -- another process
+    //       holds 18462, or this host starts the daemon faster than the harness can freeze
+    //       it -- the phase reports NOT VERIFIED and grades nothing, rather than passing on
+    //       shutdowns that all happened from inside the loop.
+    int inWindow = 0;
+    int attemptsUsed = 0;
+    std::string lastPortAnswer = "not probed";
+    for (int attempt = 0; attempt < kAttempts && inWindow == 0; ++attempt) {
+        ++attemptsUsed;
+        SpawnedDaemon daemon({validationEnv, configHome.env()});
+        if (!names.waitFor(true)) {
+            if (reportedStartupFault(daemon, kGoal)) return;
+            notVerified(kGoal, "the daemon for this phase never acquired the bus name");
+            return;
+        }
+
+        const pid_t pid = daemon.pid();
+        const bool frozen = pid > 0 && ::kill(pid, SIGSTOP) == 0;
+        const ConnectResult port = frozen ? tryConnect("127.0.0.1", kPort, 500) : ConnectResult::Failed;
+        lastPortAnswer = describe(port);
+        const bool beforeLoop = frozen && port == ConnectResult::Refused;
+
+        // Queued while the process is stopped, so it is provably delivered to a daemon that
+        // had not reached enterEventLoop(); SIGCONT is what lets it be acted on.
+        if (frozen) {
+            ::kill(pid, SIGTERM);
+            ::kill(pid, SIGCONT);
+        }
+
+        if (!beforeLoop) {
+            // This attempt says nothing about the goal: either the daemon was already
+            // serving, or the freeze failed. Shut it down and try again rather than
+            // grading it as though it had been caught in the window.
+            daemon.shutdown(SIGTERM);
+            awaitNameRelease(names, "the next attempt at the startup-shutdown window");
+            continue;
+        }
+        // waitForExit, not shutdown(): the SIGTERM has already been sent, and sending a
+        // second one would let a daemon that ignored the first pass on the second.
+        const int exitCode = daemon.waitForExit();
+        const std::string output = daemon.output();
+
+        // The refused connect is evidence only for a daemon that was going to bind that
+        // port. One that could not bind it at all -- another process holds 18462 -- answers
+        // refused from inside its event loop just as it does before reaching it, which would
+        // let this phase grade an ordinary shutdown and report it as a startup-window one.
+        if (output.find(bindFailureMarker(kPort)) != std::string::npos) {
+            lastPortAnswer = "refused, but that daemon never bound the port at all";
+            awaitNameRelease(names, "the next attempt at the startup-shutdown window");
+            continue;
+        }
+        ++inWindow;
+
+        const bool stopped = daemon.exitedNormally() && !daemon.timedOut();
+        check(stopped, "the daemon signalled before its event loop began exits without having to be killed");
+        if (!stopped) {
+            std::fprintf(stderr, "  exited normally %d, timed out %d, signal %d\n",
+                         static_cast<int>(daemon.exitedNormally()), static_cast<int>(daemon.timedOut()),
+                         daemon.termSignal());
+        }
+        if (output.find("Sanitizer: reported") != std::string::npos) {
+            check(false, "the startup-shutdown daemon's sanitizer reported no warnings (its exit code is the "
+                         "sanitizer's here, so the exit-code check cannot run)");
+        } else {
+            check(exitCode == 0, "a daemon signalled before its event loop began exits 0");
+            if (exitCode != 0) std::fprintf(stderr, "  exit code %d\n", exitCode);
+        }
+        check(output.find(kSignalShutdownLine) != std::string::npos,
+              "a daemon signalled before its event loop began still says which signal it is stopping for");
+        check(output.find("stopped cleanly") != std::string::npos,
+              "a daemon signalled before its event loop began still runs its destructor chain");
+        check(names.waitFor(false), "the bus name is released by a daemon signalled before its event loop began");
+    }
+
+    if (inWindow > 0) {
+        std::printf("daemon_system_test: the daemon was frozen inside its startup window, before port %d was "
+                    "bound, on attempt %d of %d\n",
+                    kPort, attemptsUsed, kAttempts);
+        std::fflush(stdout);
+    } else {
+        notVerified(kGoal, std::string("no attempt in ") + std::to_string(kAttempts) +
+                               " froze the daemon before it had bound port " + std::to_string(kPort) +
+                               " (the last connect answered '" + lastPortAnswer +
+                               "'), so nothing was signalled inside the startup window");
+    }
 }
 
 void checkFileSizeLimit(NameWatcher& names, const std::string& validationEnv, const std::string& bluePath,
@@ -4605,6 +4782,7 @@ int main() {
         checkConfigRestart(names, validationEnv, check);
         checkStartsOnAnyConfig(names, validationEnv, check);
         checkStoppableOnAnyConfigFile(names, validationEnv, check);
+        checkShutdownDuringStartup(names, validationEnv, check);
         checkUnreadableRestore(names, validationEnv, bluePath, check);
         checkConfigLocation(names, validationEnv, bluePath, check);
         checkFileSizeLimit(names, validationEnv, bluePath, check);

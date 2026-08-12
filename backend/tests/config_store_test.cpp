@@ -415,8 +415,11 @@ void runLoadCorpusChecks() {
         // nlohmann's lexer treats a NUL as end of input, so `{...}\0junk` parsed clean and
         // the tail was dropped -- the file the daemon believed it read was not the file on
         // disk. Refused outright as of 2026-08-11, the decision this row was written to
-        // force. CONTROL: observed red in the other direction first -- with the load still
-        // accepting NUL, this row reported 1 entry and no error where it now expects none.
+        // force.
+        // CONTROL: the `text.find('\0')` refusal in config_store.cpp's load() disabled ->
+        //       "FAIL: a NUL byte is refused rather than silently ending the document: 1
+        //       entries (expected 0), 0 malformed (expected 0), error ''", i.e. the row goes
+        //       red naming the truncation, and it is the only failure in the run. Reverted.
         {"a NUL byte is refused rather than silently ending the document", nulAfterValid, 0, 0, true},
         {"a well-formed file",
          "{\"version\":1,\"monitors\":[{\"monitor_id\":0,\"type\":\"static\",\"path\":\"/a.png\"},"
@@ -852,6 +855,140 @@ void runUnreadableConfigChecks() {
 }
 
 // ---------------------------------------------------------------------------- //
+// Phase 6bb -- S8.13's other two clauses: when the copy must NOT be made.
+// ---------------------------------------------------------------------------- //
+void runPreservedCopyChecks() {
+    constexpr const char* kGoal = "S8.18 (the preserved copy is made only for an ordinary file that was read and "
+                                  "rejected, and never over an existing copy)";
+
+    // A config.json the daemon could not inspect or could not read as a file at all --
+    // as opposed to one it read and rejected. `rename()` would succeed on every one of
+    // these, which is what makes the checks below able to fail.
+    struct UnreadCase {
+        const char* what;
+        bool (*plant)(const std::filesystem::path& file);
+        const char* detailFragment;
+    };
+    const UnreadCase cases[] = {
+        {"a self-referential symlink, which stat() answers with ELOOP",
+         [](const std::filesystem::path& file) {
+             std::error_code ec;
+             std::filesystem::create_symlink(file, file, ec);
+             return !ec;
+         },
+         "could not be checked"},
+        {"a named pipe", [](const std::filesystem::path& file) { return ::mkfifo(file.c_str(), 0644) == 0; },
+         "is not a regular file"},
+    };
+
+    // GOAL: S8.18, first clause -- config.json.bad is made only when an ORDINARY file was
+    //       read and rejected on its contents. A config the daemon could not inspect (a
+    //       stat that failed) or that is not a file it can read at all must be left exactly
+    //       where it is. False if a transient stat failure renames the user's only config
+    //       out from under them; that rename is unconditional data movement performed on
+    //       the strength of an error nobody has diagnosed.
+    // WHY-THIS-SHAPE: both fixtures are things `rename()` succeeds on -- a symlink is
+    //       renamed as a symlink, a FIFO as a FIFO. The obvious cheaper fixture, a config
+    //       inside a directory chmod'd to 000, makes stat() fail for a reason that ALSO
+    //       makes rename() fail, so the check would pass against a build that tried to move
+    //       the file and could not: it would be green on the defect. The absence of the copy
+    //       is asserted after a later save as well, since the ctor is not the only writer.
+    // CONTROL: `result.preservable = true;` hoisted in config_store.cpp's load() to just
+    //       above the `if (ec)` return, then to just above the is_regular_file return --
+    //       i.e. the file being treated as safe to move aside on an answer that never
+    //       inspected it. Each -> "FAIL: <case> at config.json is left alone rather than
+    //       moved to config.json.bad", printing "  config.json.bad exists after the load
+    //       that could not read the file". Both reverted.
+    for (const UnreadCase& c : cases) {
+        const ScratchDir scratch("nopreserve");
+        if (!scratch.ok()) {
+            notVerified(kGoal, std::string("a scratch directory for the '") + c.what + "' case could not be created");
+            continue;
+        }
+        const std::filesystem::path file = scratch.path() / "wallpaperx" / "config.json";
+        const std::filesystem::path kept = std::filesystem::path(file.string() + ".bad");
+        const std::filesystem::path wallpaper = scratch.path() / "wallpaper.png";
+        std::error_code ec;
+        std::filesystem::create_directories(file.parent_path(), ec);
+        if (ec || !writeWallpaperFile(wallpaper) || !c.plant(file)) {
+            notVerified(kGoal, std::string("this host would not let the '") + c.what + "' case be staged");
+            continue;
+        }
+
+        WallpaperManager::Config config;
+        config.configFile = file;
+        WallpaperManager manager(config);
+        const WallpaperManager::Snapshot snap = manager.snapshot();
+
+        // The refusal itself is graded, so "no copy was made" cannot be satisfied by a
+        // build that read the file happily and had nothing to preserve.
+        const bool refused = snap.health.persistence.status == wallpaperx::HealthStatus::Fail &&
+                             snap.health.persistence.detail.find(c.detailFragment) != std::string::npos;
+        check(refused, (std::string("a config.json that is ") + c.what + " is refused, and the detail says why").c_str());
+        if (!refused) {
+            std::fprintf(stderr, "  persistence: %s / %s\n",
+                         snap.health.persistence.status == wallpaperx::HealthStatus::Fail ? "fail" : "not fail",
+                         snap.health.persistence.detail.c_str());
+        }
+
+        manager.restoreSaved();
+        manager.requestWallpaper("static", wallpaper.string(), 1);
+
+        const bool moved = std::filesystem::exists(std::filesystem::symlink_status(kept));
+        check(!moved, (std::string("a config.json that is ") + c.what +
+                       " is left alone rather than moved to config.json.bad")
+                          .c_str());
+        if (moved) std::fprintf(stderr, "  config.json.bad exists after the load that could not read the file\n");
+    }
+
+    // GOAL: S8.18, second clause -- a second bad start never writes over the copy the first
+    //       one made. False if two unlucky starts in a row leave config.json.bad holding
+    //       the throwaway written between them instead of the user's own file, which is
+    //       total loss: the original is gone from both names.
+    // WHY-THIS-SHAPE: the fixture is the second start, not the first -- config.json.bad
+    //       already holds the user's real wallpapers and config.json holds a later,
+    //       worthless file that is also unreadable. Asserting on the FIRST start (that a
+    //       copy appears) is what Phase 6b already does, and it passes against a build that
+    //       overwrites: it is only the second pass through the same code that loses data.
+    //       The copy is compared byte for byte against the user's file rather than merely
+    //       existing, since an overwrite leaves a file of exactly the same name.
+    // CONTROL: the `if (std::filesystem::exists(kept, ec))` arm deleted from
+    //       WallpaperManager's constructor, leaving the rename unconditional -> "FAIL: a
+    //       second unreadable config does not overwrite the copy the first one preserved",
+    //       printing the throwaway's bytes where the user's config had been. Reverted.
+    const ScratchDir scratch("twicebad");
+    if (!scratch.ok()) {
+        notVerified(kGoal, "a scratch directory for the second-bad-start case could not be created");
+        return;
+    }
+    const std::filesystem::path file = scratch.path() / "wallpaperx" / "config.json";
+    const std::filesystem::path kept = std::filesystem::path(file.string() + ".bad");
+    const std::string usersOwn =
+        "{\"version\":1,\"monitors\":[{\"monitor_id\":0,\"type\":\"static\",\"path\":\"/photos/kept.png\"},]}";
+    const std::string throwaway = "{\"version\":1,\"monitors\":[{,";
+    if (!writeFile(kept, usersOwn) || !writeFile(file, throwaway)) {
+        notVerified(kGoal, "the two config files the second-bad-start case needs could not be written");
+        return;
+    }
+
+    WallpaperManager::Config config;
+    config.configFile = file;
+    WallpaperManager manager(config);
+    const WallpaperManager::Snapshot snap = manager.snapshot();
+
+    const std::string keptNow = readFile(kept);
+    check(keptNow == usersOwn, "a second unreadable config does not overwrite the copy the first one preserved");
+    if (keptNow != usersOwn) {
+        std::fprintf(stderr, "  config.json.bad now holds: %s\n  it held: %s\n", keptNow.c_str(), usersOwn.c_str());
+    }
+    // Silence here is its own defect: the user is owed the reason their second broken
+    // config was not kept, since the file they are looking at is not the one on disk.
+    const bool said = snap.health.persistence.detail.find("already exists") != std::string::npos;
+    check(said, "the daemon says the unreadable config was not kept because a copy already exists");
+    if (!said) std::fprintf(stderr, "  persistence detail: %s\n", snap.health.persistence.detail.c_str());
+}
+
+// ---------------------------------------------------------------------------- //
 // Phase 6c -- S8.14: entries this build cannot apply survive, and are reported.
 // ---------------------------------------------------------------------------- //
 void runUnappliedEntryChecks() {
@@ -1193,6 +1330,7 @@ int main() {
         {"a malformed entry", runMalformedEntryChecks},
         {"restore does not write", runRestoreChecks},
         {"a config that could not be read", runUnreadableConfigChecks},
+        {"when the preserved copy must not be made", runPreservedCopyChecks},
         {"entries this build cannot apply", runUnappliedEntryChecks},
         {"a save that cannot succeed", runFailedSaveChecks},
         {"the cost of the save", runSaveCostChecks},
