@@ -1664,34 +1664,45 @@ void runHealthStateChecks(const std::string& bluePath, const std::string& videoP
             } else {
                 // GOAL: S7.10f -- a monitor that has been requested but has not yet
                 //       rendered is not a monitor showing a picture, so `wallpapers` reads
-                //       `pending`; and S7.10b -- that pending stays where it was recorded
-                //       instead of moving the aggregate, which reads `ok`. Both halves are
-                //       independently false: an endpoint calling an unrendered monitor
-                //       `ok` tells a frontend a blank screen has a picture on it, and an
-                //       aggregate dragged to `pending` by it tells a watchdog a daemon
-                //       mid-render is unhealthy.
-                // WHY-THIS-SHAPE: the two are asserted as one conjunction, on a state that
-                //       has ok checks in it. Asserting `aggregate == "ok"` alone is
-                //       vacuous here -- this daemon reads ok in every other respect, so
-                //       the check would pass on an endpoint with no `pending` state left
-                //       to report at all; asserting only `wallpapers == "pending"` says
-                //       nothing about what the aggregate did with it. The mix (two checks
-                //       ok, one pending) is what separates an aggregate that ignores
-                //       pending from one that has nothing to ignore, and the ok-ness of
-                //       the other two is asserted rather than assumed or this is the
-                //       all-pending case of runHealthBeforeDeviceChecks under another name.
-                // CONTROL: two, in opposite directions. (a) the `else if (inFlight > 0)`
-                //       arm deleted from the wallpapers derivation in http_server.cpp, so
-                //       an in-flight monitor falls into the ok branch -> "FAIL: a monitor
-                //       that has been requested but not rendered leaves wallpapers
-                //       pending, not ok", "FAIL: a monitor still rendering leaves the
-                //       aggregate ok and reports its pending on its own check" (with
-                //       "wallpapers ok, shaders ok, gpu ok -> aggregate ok") and the
-                //       pending-detail check below, which has no branch left to read. (b)
-                //       the `else if (check->status == HealthStatus::Pending && overall !=
-                //       HealthStatus::Fail)` arm restored in the aggregation -> only the
-                //       conjunction red, "wallpapers pending, shaders ok, gpu ok ->
-                //       aggregate pending". Both reverted.
+                //       `pending`; and S7.10b-i -- that particular pending DOES reach the
+                //       aggregate, as `pending` and never as `fail`. It is the daemon
+                //       owing an answer it started, which is different from a dependency
+                //       nobody has needed yet. Three independent ways to be false: an
+                //       endpoint calling an unrendered monitor `ok` tells a frontend a
+                //       blank screen has a picture on it; an aggregate of `ok` tells a
+                //       watchdog a wedged render worker is a working daemon, which is the
+                //       state this exists to make visible; and an aggregate of `fail`
+                //       accuses the daemon of a failure when nothing has failed.
+                // WHY-THIS-SHAPE: the aggregate is asserted to be exactly `pending`, on a
+                //       state whose OTHER two checks are asserted to read `ok`. Asserting
+                //       only `wallpapers == "pending"` says nothing about the aggregate,
+                //       and asserting `aggregate != "ok"` would be satisfied by `fail`,
+                //       which is the misattribution S8.16 forbids. The two ok checks are
+                //       what make this state distinguishable from the all-pending daemon
+                //       of runHealthBeforeDeviceChecks, where a `pending` aggregate is
+                //       exactly what S7.10b says must NOT happen -- the same aggregate
+                //       value is right here and wrong there, so the mix has to be pinned.
+                // CONTROL: three, all reverted. (a) the `if (wallpapers.status ==
+                //       HealthStatus::Pending && overall == HealthStatus::Ok)` arm deleted
+                //       from the aggregation in http_server.cpp -> "FAIL: a render the
+                //       daemon started and has not finished makes the aggregate pending"
+                //       with "wallpapers pending, shaders ok, gpu ok -> aggregate ok".
+                //       (b) `HealthStatus::Pending` in that arm replaced with
+                //       `HealthStatus::Fail` -> the same check red with "-> aggregate
+                //       fail". (c) the `else if (inFlight > 0)` arm deleted from the
+                //       wallpapers derivation, so an in-flight monitor falls into the ok
+                //       branch -> "FAIL: a monitor that has been requested but not
+                //       rendered leaves wallpapers pending, not ok", the aggregate check,
+                //       and the pending-detail check below, which has no branch left to
+                //       read.
+                //       A fourth mutation, run to place the boundary rather than to redden
+                //       anything here: the blanket "any pending check propagates" rule
+                //       restored in the aggregation loop. This scenario stayed GREEN under
+                //       it -- the aggregate it asks for is what the blanket rule produces --
+                //       and the untried-dependency checks went red instead ("pending checks:
+                //       gpu, shaders; aggregate: pending", in runHealthBeforeDeviceChecks
+                //       and in scenario (a2)). That pair of scenarios, not this one, is
+                //       where S7.10b and S7.10b-i are told apart. Reverted.
                 check(healthCheckStatus(health.json, "shaders") == "ok" &&
                           healthCheckStatus(health.json, "gpu") == "ok",
                       "the mixed-state daemon really does have two checks reading ok");
@@ -1699,9 +1710,10 @@ void runHealthStateChecks(const std::string& bluePath, const std::string& videoP
                       "a monitor that has been requested but not rendered leaves wallpapers pending, not ok");
                 const std::string aggregate = health.json.value("status", std::string());
                 const bool inFlightIsNotAFault =
-                    healthCheckStatus(health.json, "wallpapers") == "pending" && aggregate == "ok";
+                    healthCheckStatus(health.json, "wallpapers") == "pending" && aggregate == "pending";
                 check(inFlightIsNotAFault,
-                      "a monitor still rendering leaves the aggregate ok and reports its pending on its own check");
+                      "a render the daemon started and has not finished makes the aggregate pending, not ok and "
+                      "not fail");
                 if (!inFlightIsNotAFault) {
                     std::fprintf(stderr, "  wallpapers %s, shaders %s, gpu %s -> aggregate %s\n",
                                  healthCheckStatus(health.json, "wallpapers").c_str(),
@@ -2130,6 +2142,186 @@ void runHealthStateChecks(const std::string& bluePath, const std::string& videoP
                         std::fprintf(stderr, "  monitor 0 after a good render: %s\n  body: %s\n",
                                      monitorState(recovered.json, 0).c_str(), recovered.body.c_str());
                     }
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------ //
+    // (d2) who owns a failed render: the daemon, or the wallpaper.
+    // ------------------------------------------------------------------ //
+    {
+        // A shader directory that EXISTS and is empty. resolveShaderDir only requires a
+        // directory, so `shaders` records ok and a device is created -- and then the render
+        // fails inside StaticRenderer with a plain std::runtime_error, which is the
+        // unclassified case. A missing directory (scenario (b)) will not do: it fails
+        // `shaders` as well, so the aggregate would read fail whatever the classification
+        // did, and the check would establish nothing.
+        WallpaperManager::Config config = base;
+        config.shaderDir = makeEmptyDir("wpx_health_no_spv_dir");
+
+        IsolatedDaemon daemon(config);
+        std::string vanishing;
+        try {
+            vanishing = writeSolidImage("http_health_vanishing.png", 0, 128, 0);
+        } catch (const std::exception& e) {
+            vanishing.clear();
+        }
+        if (!daemon.ready()) {
+            notVerified("S7.10h (a render failure the daemon owns fails the verdict; a wallpaper's does not)",
+                        daemon.reason());
+        } else if (vanishing.empty()) {
+            notVerified("S7.10h (a render failure the daemon owns fails the verdict; a wallpaper's does not)",
+                        "the image fixture this scenario deletes mid-flight could not be written");
+        } else {
+            // Three renders on ONE monitor of ONE daemon, in this order: an undecodable
+            // image, then a good image that cannot find a shader, then an image deleted
+            // between the request and the render.
+            //
+            // GOAL: S7.10h -- a render that failed for a reason the daemon owns makes
+            //       /health report a failing verdict, while an image the user can replace
+            //       leaves it ok. Both directions are independently false and both are
+            //       damaging: a daemon whose renders all die of a bug inside it reporting
+            //       `ok` is a blank desktop nothing will ever flag, and a deleted wallpaper
+            //       reporting `fail` is a watchdog restarting a daemon that is working.
+            // WHY-THIS-SHAPE: the three renders are made on the same monitor of the same
+            //       manager, one after another, and the verdict is read between them. Three
+            //       separate daemons would compare three configurations as much as three
+            //       classifications; here the shader directory, the device, the monitor and
+            //       every other check are identical across all three, so the ONLY thing that
+            //       differs is which exception the render threw. `shaders` and `gpu` are
+            //       asserted to stay `ok` through the failing one for the same reason: the
+            //       fault has to land on `wallpapers` without accusing a dependency that is
+            //       working, which is what S7.10a requires and what makes this different
+            //       from scenario (b).
+            //       The last render is what shows the flag is per-render rather than sticky.
+            //       Without it, a build that latched the first daemon fault forever would
+            //       pass every assertion above it.
+            // CONTROL: three, all reverted. (a) `daemonFault = true;` deleted from both
+            //       `catch (const std::exception&)` arms in wallpaper_manager.cpp's
+            //       renderPending -> exactly three red: "a render that failed inside the
+            //       daemon is recorded as the daemon's own fault", "after a render that
+            //       failed inside the daemon, /health reports the verdict as fail", and "the
+            //       failing wallpapers check says the failure was inside the daemon and
+            //       carries the monitor's own error text". (b) both `catch (const
+            //       WallpaperContentError&)` arms deleted, so a content rejection falls into
+            //       the unclassified branch -> the two ok-side cases red on both of their
+            //       checks ("an image that cannot be decoded is recorded as not the daemon's
+            //       fault", "after ... /health reports the verdict as ok", and the same pair
+            //       for the deleted file), plus scenario (c)'s two aggregate checks. (c)
+            //       `daemonFaults > 0` in http_server.cpp's wallpapers derivation changed to
+            //       `false` -> only the two fail-side checks red and the ok side untouched,
+            //       which separates "the manager classified it" from "the endpoint acted on
+            //       it": (a) and (c) redden overlapping but different sets.
+            // COVERAGE-ASSERT: each of the three renders is required to have actually failed,
+            //       and to have failed for its own reason (the shader case must name a
+            //       shader, the deleted case must name the open), before its verdict is
+            //       graded. A render that quietly succeeded -- a host that ships .spv files
+            //       into every directory, say -- would otherwise leave three vacuous ok
+            //       comparisons behind.
+            //       CONTROL: `if (c.removeBeforeRender) continue;` added at the top of the
+            //       loop -> "FAIL: every fault-ownership case reached the state it grades"
+            //       with "  2 of 3 cases were graded", and nothing else. Reverted.
+            struct FaultCase {
+                const char* what;
+                std::string path;
+                // Deleted after the request and before the render, so the render meets a
+                // file that was there when the daemon accepted it.
+                bool removeBeforeRender;
+                const char* errorFragment;
+                bool expectDaemonFault;
+                const char* expectAggregate;
+                const char* expectWallpapers;
+            };
+            const std::vector<FaultCase> faults{
+                {"an image that cannot be decoded", junkPath, false, "not a decodable image", false, "ok", "ok"},
+                {"a render that failed inside the daemon", bluePath, false, "shader", true, "fail", "fail"},
+                {"an image that was deleted before the render", vanishing, true, "cannot open image", false, "ok",
+                 "ok"},
+            };
+
+            // One render before the table, only to find out whether this host can make a
+            // device at all. Asked of the manager rather than of /health's own gpu check: a
+            // gate that reads the field under test turns a broken endpoint into a skip.
+            const bool deviceExists = [&] {
+                daemon.manager().requestWallpaper("static", junkPath, 0);
+                daemon.manager().renderPending(0);
+                return daemon.manager().snapshot().gpu.initialized;
+            }();
+            int graded = 0;
+            if (!deviceExists) {
+                notVerified("S7.10h (a render failure the daemon owns fails the verdict; a wallpaper's does not)",
+                            "no Vulkan device could be created on this host, so every render here fails for the "
+                            "same reason and the classification cannot be observed");
+            } else {
+                for (const FaultCase& c : faults) {
+                    daemon.manager().requestWallpaper("static", c.path, 0);
+                    if (c.removeBeforeRender) {
+                        std::error_code ec;
+                        std::filesystem::remove(c.path, ec);
+                        if (ec) {
+                            notVerified("S7.10h, one case",
+                                        std::string("the fixture for '") + c.what + "' could not be deleted");
+                            continue;
+                        }
+                    }
+                    daemon.manager().renderPending(0);
+
+                    const WallpaperManager::Snapshot snap = daemon.manager().snapshot();
+                    const auto it = snap.monitors.find(0);
+                    const std::string lastError = it != snap.monitors.end() ? it->second.lastError : std::string();
+                    if (lastError.find(c.errorFragment) == std::string::npos) {
+                        // X.3: the state this case grades was never reached, and grading the
+                        // verdict anyway would report the endpoint for a property of the
+                        // host's renderer.
+                        notVerified("S7.10h, one case",
+                                    std::string("the '") + c.what + "' render did not fail the way this case needs " +
+                                        "(monitor 0 recorded '" + lastError + "', expected it to name '" +
+                                        c.errorFragment + "')");
+                        continue;
+                    }
+                    const HttpReply health = daemon.health();
+                    if (!health.ok()) {
+                        check(false, "the fault-ownership daemon answered /health with a parseable 200");
+                        continue;
+                    }
+                    ++graded;
+
+                    check(it->second.lastErrorIsDaemonFault == c.expectDaemonFault,
+                          (std::string(c.what) + " is recorded as " +
+                           (c.expectDaemonFault ? "the daemon's own fault" : "not the daemon's fault"))
+                              .c_str());
+                    const std::string aggregate = health.json.value("status", std::string());
+                    const bool verdict = aggregate == c.expectAggregate &&
+                                         healthCheckStatus(health.json, "wallpapers") == c.expectWallpapers;
+                    check(verdict, (std::string("after ") + c.what + ", /health reports the verdict as " +
+                                    c.expectAggregate)
+                                       .c_str());
+                    // The daemon's own dependencies are working, and the endpoint must keep
+                    // saying so: pinning a render bug on the GPU or the shaders sends the
+                    // reader to a component that is fine, which is the misattribution
+                    // S7.10a exists to prevent.
+                    check(healthCheckStatus(health.json, "shaders") == "ok" &&
+                              healthCheckStatus(health.json, "gpu") == "ok",
+                          (std::string("after ") + c.what + ", neither the shaders nor the GPU is implicated")
+                              .c_str());
+                    if (!verdict || healthCheckStatus(health.json, "gpu") != "ok") {
+                        std::fprintf(stderr, "  %s -> %s\n", c.what, health.body.c_str());
+                    }
+                    if (c.expectDaemonFault) {
+                        const std::string detail = healthCheckDetail(health.json, "wallpapers");
+                        const bool named = detail.find("inside the daemon") != std::string::npos &&
+                                           detail.find(lastError) != std::string::npos;
+                        check(named, "the failing wallpapers check says the failure was inside the daemon and "
+                                     "carries the monitor's own error text");
+                        if (!named) std::fprintf(stderr, "  detail: %s\n  lastError: %s\n", detail.c_str(),
+                                                 lastError.c_str());
+                    }
+                }
+                check(graded == static_cast<int>(faults.size()),
+                      "every fault-ownership case reached the state it grades");
+                if (graded != static_cast<int>(faults.size())) {
+                    std::fprintf(stderr, "  %d of %zu cases were graded\n", graded, faults.size());
                 }
             }
         }

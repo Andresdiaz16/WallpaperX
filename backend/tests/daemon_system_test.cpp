@@ -4113,14 +4113,19 @@ void checkStoppableOnAnyConfigFile(NameWatcher& names, const std::string& valida
     constexpr const char* kGoals = "S8.12 (no config file content or type can stop the daemon being stopped)";
 
     // GOAL: S8.12 -- a config.json that is not an ordinary file, or is over the size cap, is
-    //       refused WITHOUT being opened: the daemon reaches the bus, answers, and exits on
-    //       SIGTERM. False if any of these makes it unreachable or SIGKILL-only. This is not
+    //       refused without the daemon ever waiting on it: it reaches the bus, answers, and
+    //       exits on SIGTERM. False if any of these makes it unreachable or SIGKILL-only.
+    //       (S8.12's wording says "refused without being opened", which was the mechanism
+    //       when it was written; the file is now opened O_NONBLOCK and inspected through the
+    //       descriptor, which is what makes opening a FIFO safe. The property the goal is
+    //       about -- the daemon never blocks on it -- is unchanged, and is what is graded
+    //       here.) This is not
     //       hypothetical and not about exotic input: measured before the guard existed, a
     //       named pipe at config.json left the daemon parked in wait_for_partner with one
-    //       thread, no bus name, no log line, and immune to SIGTERM and SIGINT -- because
-    //       main.cpp blocks those signals at line 26, reads the config at line 57, and only
-    //       starts the thread that consumes them at line 95. A symlink to /dev/zero did the
-    //       same while growing 43 MB/s; a 200 MB file did it for 14 seconds.
+    //       thread, no bus name, no log line, and immune to SIGTERM and SIGINT, because the
+    //       config was read while shutdown signals were blocked and before the thread that
+    //       consumes them existed. A symlink to /dev/zero did the same while growing
+    //       43 MB/s; a 200 MB file did it for 14 seconds.
     // WHY-THIS-SHAPE: the daemon is required to be STOPPED, not merely to have started. The
     //       obvious shape -- S8.2's, "it came up and exited 0" -- passes on exactly the
     //       daemon this goal exists to catch if it is written as "did not exit non-zero", and
@@ -4131,26 +4136,31 @@ void checkStoppableOnAnyConfigFile(NameWatcher& names, const std::string& valida
     //       SIGKILLs after its wait expires and returns an exit code either way -- a check on
     //       the code alone would grade a hang that had to be killed as a clean exit.
     //       KNOWN GAP, stated rather than papered over, and MEASURED rather than assumed:
-    //       a config file on a genuinely hung mount blocks the daemon inside the stat or the
-    //       read, and moving that work after the signal thread (afe32a3) does not make the
-    //       daemon stoppable there. Established out of suite by patching load() to sleep
-    //       indefinitely: the daemon printed "Terminated received, shutting down" -- the
-    //       watcher thread now runs, so the signal is consumed instead of left pending --
-    //       and the process was still alive three seconds later in state S, needing SIGKILL,
-    //       because main() is parked in the read and nothing else can end the process. So
-    //       the cases below are the whole of what is covered: the guards keep the daemon out
-    //       of open() for the file types that hang, which is a different property from
-    //       surviving a filesystem that stops answering. Nothing in this suite covers the
-    //       latter and no committed check can, since the fixture would have to be a
-    //       filesystem this harness can hang on demand (FUSE) and the daemon would fail it.
-    // CONTROL: all three of load()'s pre-open guards disabled in config_store.cpp -- the
-    //       is_regular_file refusal, the file_size error check and the size cap -- which is
-    //       the code as it stood when the hang was found. Each one alone is enough to keep
-    //       the daemon out of open(): with only the first removed, file_size() refuses a
-    //       FIFO; with the first two removed, its -1 trips the cap. With all three gone the
-    //       named-pipe and /dev/zero cases went red on "the daemon reaches the bus", "exits
-    //       on SIGTERM without having to be killed" (printing "timed out 1", i.e. SIGKILLed)
-    //       and "exits 0", and the run took 125 s instead of 2.7 s. All reverted.
+    //       a config file on a genuinely hung mount blocks the daemon inside the read, which
+    //       none of the cases below reproduce -- they are refused before any byte is asked
+    //       for. Measured out of suite by making that block happen (see CONTROL (b) below):
+    //       the daemon takes the bus name, never serves a request, and then exits 0 five
+    //       seconds after SIGTERM, because the watcher thread stops waiting for a teardown
+    //       that is not coming. So a hung mount now costs the daemon its usefulness rather
+    //       than its stoppability. Nothing in this suite covers it and no committed check
+    //       can: the fixture would have to be a filesystem this harness can hang on demand
+    //       (FUSE), and without one there is no way to reach that state from outside the
+    //       process.
+    // CONTROL: two, both reverted, and the pair is the finding. (a) `O_NONBLOCK` dropped from
+    //       load()'s open in config_store.cpp, so the FIFO blocks in open() exactly as it did
+    //       when the hang was found -> "FAIL: with a named pipe at config.json, the daemon
+    //       says why it refused the file", the detail reading "did not respond within 2s,
+    //       starting without it" instead of naming the file type. The daemon still came up
+    //       and still exited: the two-second load deadline abandons the read. (b) that plus
+    //       `kLoadDeadline` raised to 3600 s in wallpaper_manager.cpp, so nothing abandons it
+    //       -> the FIFO case red on "answers GetStatus" ("org.freedesktop.DBus.Error.Timeout"
+    //       -- main() is parked in the constructor with the bus name already taken and no
+    //       object served) and on the refusal detail, and the run took 32.7 s instead of 2.7.
+    //       What stayed GREEN under (b) is worth as much as what went red: the daemon still
+    //       exited 0 without being killed, because main.cpp's five-second teardown deadline
+    //       fires and ends the process. So stoppability here now rests on three independent
+    //       mechanisms -- the type and size guards, the load deadline, and that watchdog --
+    //       and no single-mutation control can redden the exit checks in this phase.
     // COVERAGE-ASSERT: every case is accounted for -- exercised, or reported as one this
     //       host could not stage -- against the table's size, so a case that quietly stops
     //       being planted fails instead of shrinking the phase in silence.
@@ -4175,10 +4185,10 @@ void checkStoppableOnAnyConfigFile(NameWatcher& names, const std::string& valida
         {"a regular file over the size cap",
          [](const std::filesystem::path& file) { return writeTextFile(file, std::string(2u * 1024u * 1024u, 'x')); },
          "over the"},
-        // The other arm of the guard: a path stat() cannot answer for at all. ELOOP is the
-        // one an unprivileged test can produce; a hung mount is the case that matters and
-        // the KNOWN GAP above is about it. Distinct from the rows above because it takes the
-        // "could not be checked" branch, where the file is NOT eligible to be moved aside --
+        // The other arm of the guard: a path the open itself refuses. ELOOP is the one an
+        // unprivileged test can produce; a hung mount is the case that matters and the KNOWN
+        // GAP above is about it. Distinct from the rows above because it never gets a
+        // descriptor at all, so the file is NOT eligible to be moved aside --
         // config_store_test's preserved-copy phase grades that half.
         {"a self-referential symlink",
          [](const std::filesystem::path& file) {
@@ -4186,7 +4196,7 @@ void checkStoppableOnAnyConfigFile(NameWatcher& names, const std::string& valida
              std::filesystem::create_symlink(file, file, ec);
              return !ec;
          },
-         "could not be checked"},
+         "could not be opened"},
     };
 
     int exercised = 0;

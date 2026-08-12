@@ -153,6 +153,14 @@ bool writeFile(const std::filesystem::path& file, std::string_view text) {
 // nothing here renders.
 bool writeWallpaperFile(const std::filesystem::path& file) { return writeFile(file, "not really a png"); }
 
+// The fixture for the config the daemon is not allowed to open, at namespace scope because
+// the case table's plant and intact functions are captureless. Two monitors and valid JSON:
+// what makes losing it data loss rather than a reset is that the daemon cannot read either
+// path, while a save rebuilds the file from live state that holds neither.
+constexpr const char* kUnopenableConfig =
+    "{\"version\":1,\"monitors\":[{\"monitor_id\":0,\"type\":\"static\",\"path\":\"/photos/left.png\"},"
+    "{\"monitor_id\":1,\"type\":\"static\",\"path\":\"/photos/right.png\"}]}";
+
 std::string hex(std::string_view bytes) {
     static constexpr char kHex[] = "0123456789abcdef";
     std::string out;
@@ -163,6 +171,32 @@ std::string hex(std::string_view bytes) {
         out += ' ';
     }
     return out;
+}
+
+// Every preserved-copy name sitting beside the config file, sorted. Named by prefix rather
+// than by asking whether `config.json.bad` exists: preservation now numbers its copies, so
+// a check written against the one name would be satisfied by a build that wrote `.bad.1`
+// instead -- which is still a copy the goal says must not have been made.
+std::vector<std::string> preservedCopyNames(const std::filesystem::path& file) {
+    std::vector<std::string> names;
+    const std::string prefix = file.filename().string() + ".bad";
+    std::error_code ec;
+    for (auto it = std::filesystem::directory_iterator(file.parent_path(), ec);
+         !ec && it != std::filesystem::directory_iterator(); it.increment(ec)) {
+        const std::string name = it->path().filename().string();
+        if (name.rfind(prefix, 0) == 0) names.push_back(name);
+    }
+    std::sort(names.begin(), names.end());
+    return names;
+}
+
+std::string joined(const std::vector<std::string>& names) {
+    std::string out;
+    for (const std::string& name : names) {
+        if (!out.empty()) out += ", ";
+        out += name;
+    }
+    return out.empty() ? "(none)" : out;
 }
 
 // The paths persisted for each monitor id, read back out of a config file by parsing it
@@ -855,65 +889,126 @@ void runUnreadableConfigChecks() {
 }
 
 // ---------------------------------------------------------------------------- //
-// Phase 6bb -- S8.13's other two clauses: when the copy must NOT be made.
+// Phase 6bb -- S8.18 and S8.22: when the copy must NOT be made, and what must survive.
 // ---------------------------------------------------------------------------- //
 void runPreservedCopyChecks() {
     constexpr const char* kGoal = "S8.18 (the preserved copy is made only for an ordinary file that was read and "
-                                  "rejected, and never over an existing copy)";
+                                  "rejected, and never over an existing copy) and S8.22 (a config that could not be "
+                                  "opened is neither moved aside nor overwritten)";
 
-    // A config.json the daemon could not inspect or could not read as a file at all --
-    // as opposed to one it read and rejected. `rename()` would succeed on every one of
-    // these, which is what makes the checks below able to fail.
+    // A config.json the daemon could not read at all -- as opposed to one it read and
+    // rejected. `rename()` would succeed on every one of these, which is what makes the
+    // checks below able to fail.
     struct UnreadCase {
         const char* what;
         bool (*plant)(const std::filesystem::path& file);
+        // What the file must still be after the daemon has run and saved. Two of these are
+        // not files whose bytes exist, so this is a predicate rather than a comparison.
+        bool (*intact)(const std::filesystem::path& file);
         const char* detailFragment;
+        // Why this host might refuse to stage it, so a skip names a cause instead of
+        // leaving a reader to guess which of the three ways it could fail happened.
+        const char* stageHint;
     };
     const UnreadCase cases[] = {
-        {"a self-referential symlink, which stat() answers with ELOOP",
+        // load() opens the path and inspects the descriptor, so a symlink loop is refused by
+        // open() with ELOOP rather than by a stat beforehand. It is here because it is the
+        // one "cannot be read at all" answer an unprivileged test can produce on demand.
+        {"a self-referential symlink, which open() answers with ELOOP",
          [](const std::filesystem::path& file) {
              std::error_code ec;
              std::filesystem::create_symlink(file, file, ec);
              return !ec;
          },
-         "could not be checked"},
+         [](const std::filesystem::path& file) {
+             std::error_code ec;
+             return std::filesystem::is_symlink(std::filesystem::symlink_status(file, ec)) &&
+                    std::filesystem::read_symlink(file, ec) == file;
+         },
+         "could not be opened", "this filesystem may not support symbolic links"},
         {"a named pipe", [](const std::filesystem::path& file) { return ::mkfifo(file.c_str(), 0644) == 0; },
-         "is not a regular file"},
+         [](const std::filesystem::path& file) {
+             std::error_code ec;
+             return std::filesystem::is_fifo(std::filesystem::symlink_status(file, ec));
+         },
+         "is not a regular file", "this filesystem may not support FIFOs"},
+        // S8.22. An ordinary file holding the user's real wallpapers that this process is
+        // not allowed to open -- the one case of the three where bytes with value in them
+        // are what stands to be lost.
+        {"an ordinary file that cannot be opened",
+         [](const std::filesystem::path& file) {
+             if (!writeFile(file, kUnopenableConfig)) return false;
+             if (::chmod(file.c_str(), 0) != 0) return false;
+             // Root ignores the mode bits, and so do some filesystems. Staging has not
+             // happened unless the file really is unopenable, or this case would grade a
+             // daemon that read the config perfectly well.
+             const int fd = ::open(file.c_str(), O_RDONLY);
+             if (fd >= 0) {
+                 ::close(fd);
+                 return false;
+             }
+             return true;
+         },
+         [](const std::filesystem::path& file) {
+             // Readable again first: this process cannot compare bytes it is not allowed to
+             // read either, and the mode is no longer load-bearing once the daemon is done.
+             if (::chmod(file.c_str(), 0600) != 0) return false;
+             return readFile(file) == kUnopenableConfig;
+         },
+         "could not be opened",
+         "this process can open a file it made mode 000 (running as root, or a filesystem that ignores mode bits)"},
     };
 
-    // GOAL: S8.18, first clause -- config.json.bad is made only when an ORDINARY file was
-    //       read and rejected on its contents. A config the daemon could not inspect (a
-    //       stat that failed) or that is not a file it can read at all must be left exactly
-    //       where it is. False if a transient stat failure renames the user's only config
-    //       out from under them; that rename is unconditional data movement performed on
-    //       the strength of an error nobody has diagnosed.
-    // WHY-THIS-SHAPE: both fixtures are things `rename()` succeeds on -- a symlink is
-    //       renamed as a symlink, a FIFO as a FIFO. The obvious cheaper fixture, a config
-    //       inside a directory chmod'd to 000, makes stat() fail for a reason that ALSO
-    //       makes rename() fail, so the check would pass against a build that tried to move
-    //       the file and could not: it would be green on the defect. The absence of the copy
-    //       is asserted after a later save as well, since the ctor is not the only writer.
-    // CONTROL: `result.preservable = true;` hoisted in config_store.cpp's load() to just
-    //       above the `if (ec)` return, then to just above the is_regular_file return --
-    //       i.e. the file being treated as safe to move aside on an answer that never
-    //       inspected it. Each -> "FAIL: <case> at config.json is left alone rather than
-    //       moved to config.json.bad", printing "  config.json.bad exists after the load
-    //       that could not read the file". Both reverted.
+    // GOAL: S8.18's first clause with S8.22 -- a config the daemon could not READ is left
+    //       exactly where it is: no copy under any .bad name, and the file itself neither
+    //       moved nor rewritten by the SetWallpaper that follows. False in two directions,
+    //       and both lose the user's wallpapers: a rename decided by an error nobody
+    //       diagnosed moves their only config out from under them, and a save that goes
+    //       ahead anyway replaces every monitor in it with the one just set.
+    // WHY-THIS-SHAPE: the fixtures are things `rename()` and `open(O_CREAT|O_TRUNC)` both
+    //       SUCCEED on -- a symlink is renamed as a symlink, a FIFO as a FIFO, and the
+    //       mode-000 file sits in a directory this process owns and may write to. The
+    //       obvious cheaper fixture, a config inside a directory chmod'd to 000, fails to
+    //       open for a reason that ALSO makes both of those fail, so a check on it would be
+    //       green against a build that tried to destroy the file and merely could not. Both
+    //       observations are made AFTER a save, because the constructor is not the only
+    //       writer and the save is the write that had the defect.
+    // CONTROL: three, all reverted. (a) `result.preservable = true;` hoisted in
+    //       config_store.cpp's load() to just above the open-failure return -> the symlink
+    //       and mode-000 cases each red on all three of their checks, led by "FAIL: a
+    //       config.json that is <case> is left where it is, under its own name" printing
+    //       "  preserved copies beside it: config.json.bad". (b) the same, hoisted above the
+    //       S_ISREG return -> the same three for the named-pipe case. (c) the `if
+    //       (m_configUnread)` early return deleted from WallpaperManager::persist() -> all
+    //       three cases red on "still holds the bytes it held before the daemon ran" and on
+    //       "the daemon says it refused to save over it", with the mode-000 file rewritten
+    //       to hold monitor 1 alone -- the two paths the goal names, measured separately.
+    // COVERAGE-ASSERT: every case is accounted for -- exercised, or reported as one this
+    //       host could not stage -- against the table's size, so a case that quietly stops
+    //       being planted shrinks the phase loudly rather than silently.
+    //       CONTROL: a `continue` for the named-pipe case added at the top of the loop, which
+    //       is what a "skip the awkward one" edit looks like -> "FAIL: every unreadable-config
+    //       case was either exercised or reported as one this host could not stage", and
+    //       nothing else. Reverted.
+    int exercised = 0;
+    int unstageable = 0;
     for (const UnreadCase& c : cases) {
         const ScratchDir scratch("nopreserve");
         if (!scratch.ok()) {
+            ++unstageable;
             notVerified(kGoal, std::string("a scratch directory for the '") + c.what + "' case could not be created");
             continue;
         }
         const std::filesystem::path file = scratch.path() / "wallpaperx" / "config.json";
-        const std::filesystem::path kept = std::filesystem::path(file.string() + ".bad");
         const std::filesystem::path wallpaper = scratch.path() / "wallpaper.png";
         std::error_code ec;
         std::filesystem::create_directories(file.parent_path(), ec);
         if (ec || !writeWallpaperFile(wallpaper) || !c.plant(file)) {
-            notVerified(kGoal, std::string("this host would not let the '") + c.what + "' case be staged");
+            ++unstageable;
+            notVerified(kGoal, std::string("the '") + c.what + "' case could not be staged: " + c.stageHint);
             continue;
         }
+        ++exercised;
 
         WallpaperManager::Config config;
         config.configFile = file;
@@ -934,28 +1029,61 @@ void runPreservedCopyChecks() {
         manager.restoreSaved();
         manager.requestWallpaper("static", wallpaper.string(), 1);
 
-        const bool moved = std::filesystem::exists(std::filesystem::symlink_status(kept));
-        check(!moved, (std::string("a config.json that is ") + c.what +
-                       " is left alone rather than moved to config.json.bad")
-                          .c_str());
-        if (moved) std::fprintf(stderr, "  config.json.bad exists after the load that could not read the file\n");
-    }
+        // Asked after the save, and asked of the health field the save writes: the
+        // constructor's own note survives into it, so a build that reported the refusal at
+        // startup and then quietly overwrote the file would still have to say so here.
+        const WallpaperManager::Snapshot afterSave = manager.snapshot();
+        const bool saidNotSaved =
+            afterSave.health.persistence.status == wallpaperx::HealthStatus::Fail &&
+            afterSave.health.persistence.detail.find("will not overwrite it") != std::string::npos;
+        check(saidNotSaved, (std::string("with ") + c.what +
+                             " at config.json, the daemon says it refused to save over it")
+                                .c_str());
+        if (!saidNotSaved) {
+            std::fprintf(stderr, "  persistence after the save: %s / %s\n",
+                         wallpaperx::toString(afterSave.health.persistence.status),
+                         afterSave.health.persistence.detail.c_str());
+        }
 
-    // GOAL: S8.18, second clause -- a second bad start never writes over the copy the first
-    //       one made. False if two unlucky starts in a row leave config.json.bad holding
-    //       the throwaway written between them instead of the user's own file, which is
-    //       total loss: the original is gone from both names.
-    // WHY-THIS-SHAPE: the fixture is the second start, not the first -- config.json.bad
-    //       already holds the user's real wallpapers and config.json holds a later,
-    //       worthless file that is also unreadable. Asserting on the FIRST start (that a
-    //       copy appears) is what Phase 6b already does, and it passes against a build that
-    //       overwrites: it is only the second pass through the same code that loses data.
-    //       The copy is compared byte for byte against the user's file rather than merely
-    //       existing, since an overwrite leaves a file of exactly the same name.
-    // CONTROL: the `if (std::filesystem::exists(kept, ec))` arm deleted from
-    //       WallpaperManager's constructor, leaving the rename unconditional -> "FAIL: a
-    //       second unreadable config does not overwrite the copy the first one preserved",
-    //       printing the throwaway's bytes where the user's config had been. Reverted.
+        const std::vector<std::string> copies = preservedCopyNames(file);
+        check(copies.empty(),
+              (std::string("a config.json that is ") + c.what + " is left where it is, under its own name").c_str());
+        if (!copies.empty()) {
+            std::fprintf(stderr, "  preserved copies beside it: %s\n", joined(copies).c_str());
+        }
+        const bool unchanged = c.intact(file);
+        check(unchanged, (std::string("a config.json that is ") + c.what +
+                          " still holds the bytes it held before the daemon ran")
+                             .c_str());
+        if (!unchanged) std::fprintf(stderr, "  the file the daemon could not read is not what was planted\n");
+    }
+    check(exercised + unstageable == static_cast<int>(std::size(cases)),
+          "every unreadable-config case was either exercised or reported as one this host could not stage");
+
+    // GOAL: S8.18's second clause -- a second bad start never writes over the copy the first
+    //       one made, and the second broken config is preserved too, under a name of its
+    //       own. False in two ways, both of which lose data: the first copy overwritten
+    //       leaves the user's real config gone from both names, and a second config with
+    //       nowhere to go is left in place with saving disabled for the run, so the daemon
+    //       stops persisting anything until somebody deletes a file by hand.
+    // WHY-THIS-SHAPE: the fixture is the SECOND start -- config.json.bad already holds the
+    //       user's real wallpapers and config.json holds a later, different broken file.
+    //       Asserting that a copy appears on a first start is what Phase 6b already does,
+    //       and it passes against a build that overwrites; only the second pass through the
+    //       same code can lose anything. Both files are compared byte for byte rather than
+    //       merely counted, because an overwrite and a correct second copy leave the same
+    //       NUMBER of files behind and differ only in which bytes are in which name.
+    // CONTROL: two, both reverted. (a) the `+ (n == 0 ? "" : "." + std::to_string(n))`
+    //       suffix dropped from the loop in WallpaperManager's constructor, so every copy
+    //       competes for one name -> "FAIL: the second unreadable config is preserved under
+    //       a name of its own" with "  copies beside it: config.json.bad", "FAIL: the daemon
+    //       says where the second unreadable config was kept" ("not kept, no free name"),
+    //       and "FAIL: a wallpaper set after the second unreadable config is persisted into
+    //       a fresh config.json" -- the run stops saving, which is the second half of the
+    //       damage. (b) the `if (std::filesystem::exists(kept, ec)) continue;` arm deleted,
+    //       leaving the rename unconditional -> "FAIL: a second unreadable config does not
+    //       overwrite the copy the first one preserved", printing the throwaway's bytes
+    //       where the user's config had been, beside the name-of-its-own check.
     const ScratchDir scratch("twicebad");
     if (!scratch.ok()) {
         notVerified(kGoal, "a scratch directory for the second-bad-start case could not be created");
@@ -963,10 +1091,12 @@ void runPreservedCopyChecks() {
     }
     const std::filesystem::path file = scratch.path() / "wallpaperx" / "config.json";
     const std::filesystem::path kept = std::filesystem::path(file.string() + ".bad");
+    const std::filesystem::path keptSecond = std::filesystem::path(file.string() + ".bad.1");
+    const std::filesystem::path wallpaper = scratch.path() / "wallpaper.png";
     const std::string usersOwn =
         "{\"version\":1,\"monitors\":[{\"monitor_id\":0,\"type\":\"static\",\"path\":\"/photos/kept.png\"},]}";
     const std::string throwaway = "{\"version\":1,\"monitors\":[{,";
-    if (!writeFile(kept, usersOwn) || !writeFile(file, throwaway)) {
+    if (!writeFile(kept, usersOwn) || !writeFile(file, throwaway) || !writeWallpaperFile(wallpaper)) {
         notVerified(kGoal, "the two config files the second-bad-start case needs could not be written");
         return;
     }
@@ -981,11 +1111,199 @@ void runPreservedCopyChecks() {
     if (keptNow != usersOwn) {
         std::fprintf(stderr, "  config.json.bad now holds: %s\n  it held: %s\n", keptNow.c_str(), usersOwn.c_str());
     }
-    // Silence here is its own defect: the user is owed the reason their second broken
-    // config was not kept, since the file they are looking at is not the one on disk.
-    const bool said = snap.health.persistence.detail.find("already exists") != std::string::npos;
-    check(said, "the daemon says the unreadable config was not kept because a copy already exists");
+    const bool secondKept = readFile(keptSecond) == throwaway;
+    check(secondKept, "the second unreadable config is preserved under a name of its own");
+    if (!secondKept) {
+        std::fprintf(stderr, "  copies beside it: %s\n", joined(preservedCopyNames(file)).c_str());
+    }
+    // Silence here is its own defect: the file the user is looking at is not the one on
+    // disk any more, so the name it went to is the only way back to it.
+    const bool said = snap.health.persistence.detail.find(keptSecond.filename().string()) != std::string::npos;
+    check(said, "the daemon says where the second unreadable config was kept");
     if (!said) std::fprintf(stderr, "  persistence detail: %s\n", snap.health.persistence.detail.c_str());
+
+    // Preserving it is what clears the path, so persistence has to work again afterwards --
+    // a build that moved the file aside and then still refused to save would leave the user
+    // with no config at all and no way to make one.
+    manager.restoreSaved();
+    manager.requestWallpaper("static", wallpaper.string(), 1);
+    std::string why;
+    const std::map<int, std::string> onDisk = pathsInFile(file, why);
+    const bool wroteNew = onDisk.size() == 1 && onDisk.count(1) == 1 && onDisk.at(1) == wallpaper.string();
+    check(wroteNew, "a wallpaper set after the second unreadable config is persisted into a fresh config.json");
+    if (!wroteNew) std::fprintf(stderr, "  %s\n", why.empty() ? "the file holds something else" : why.c_str());
+}
+
+// ---------------------------------------------------------------------------- //
+// Phase 6bc -- S8.22: with every copy name taken, the config is kept, not destroyed.
+// ---------------------------------------------------------------------------- //
+void runPreservationExhaustedChecks() {
+    constexpr const char* kGoal = "S8.22 (a config that cannot be preserved is left in place, and is not saved over)";
+    const ScratchDir scratch("nofreename");
+    if (!scratch.ok()) {
+        notVerified(kGoal, "a scratch directory could not be created");
+        return;
+    }
+    const std::filesystem::path file = scratch.path() / "wallpaperx" / "config.json";
+    const std::filesystem::path wallpaper = scratch.path() / "wallpaper.png";
+    // One more than the daemon's bound would leave a free name, one fewer would not test
+    // it: this is exactly the count at which the search runs out.
+    constexpr int kCopies = 10;
+    const std::string usersOwn =
+        "{\"version\":1,\"monitors\":[{\"monitor_id\":0,\"type\":\"static\",\"path\":\"/photos/kept.png\"},"
+        "{\"monitor_id\":1,\"type\":\"static\",\"path\":\"/photos/right.png\"},]}";
+    bool staged = writeWallpaperFile(wallpaper) && writeFile(file, usersOwn);
+    for (int n = 0; n < kCopies && staged; ++n) {
+        staged = writeFile(std::filesystem::path(file.string() + ".bad" + (n == 0 ? "" : "." + std::to_string(n))),
+                           "an earlier broken config");
+    }
+    if (!staged) {
+        notVerified(kGoal, "the ten occupied copy names this case needs could not be written");
+        return;
+    }
+
+    // GOAL: S8.22 -- when there is nowhere left to preserve it to, an unreadable config is
+    //       LEFT ALONE and the run stops saving, rather than being destroyed to make room.
+    //       False if the next SetWallpaper rewrites the file: the user has ten preserved
+    //       copies and the eleventh start silently discards the live one, which is the only
+    //       file the daemon will read on the next start.
+    // WHY-THIS-SHAPE: the number of occupied names is the daemon's own bound, and the check
+    //       is made after a SetWallpaper rather than after the constructor. A check that
+    //       only asserted "no config.json.bad.10 was created" would pass for a build that
+    //       gave up on preserving and then went on to overwrite the file, which is the
+    //       damaging half; and one made before the save would pass for any build at all,
+    //       since the constructor writes nothing on this path.
+    // CONTROL: two, both reverted. (a) `kMaxPreservedCopies` in wallpaper_manager.cpp raised
+    //       to 11, so a free name exists after all -> all three checks red, "  11 copies
+    //       beside it (expected 10)" naming config.json.bad.10. (b) `m_configUnread = true;`
+    //       deleted from the constructor's error branch -> "FAIL: with every copy name
+    //       taken, the config the daemon could not read is not saved over", printing the
+    //       file rewritten to hold monitor 1 alone, with the copy-count check still green:
+    //       that pair is what separates "gave up on preserving" from "went on to destroy
+    //       it", and only the second is data loss.
+    WallpaperManager::Config config;
+    config.configFile = file;
+    WallpaperManager manager(config);
+    manager.restoreSaved();
+    manager.requestWallpaper("static", wallpaper.string(), 1);
+
+    const WallpaperManager::Snapshot snap = manager.snapshot();
+    const bool reported = snap.health.persistence.status == wallpaperx::HealthStatus::Fail &&
+                          snap.health.persistence.detail.find("not kept") != std::string::npos;
+    check(reported, "with every copy name taken, the daemon says the config could not be kept");
+    if (!reported) {
+        std::fprintf(stderr, "  persistence: %s / %s\n", wallpaperx::toString(snap.health.persistence.status),
+                     snap.health.persistence.detail.c_str());
+    }
+
+    const std::vector<std::string> copies = preservedCopyNames(file);
+    check(static_cast<int>(copies.size()) == kCopies,
+          "with every copy name taken, the config the daemon could not read is still there");
+    if (static_cast<int>(copies.size()) != kCopies) {
+        std::fprintf(stderr, "  %zu copies beside it (expected %d): %s\n", copies.size(), kCopies,
+                     joined(copies).c_str());
+    }
+    const std::string onDisk = readFile(file);
+    check(onDisk == usersOwn, "with every copy name taken, the config the daemon could not read is not saved over");
+    if (onDisk != usersOwn) std::fprintf(stderr, "  config.json now holds: %s\n", onDisk.c_str());
+}
+
+// ---------------------------------------------------------------------------- //
+// Phase 6bd -- S8.23: the copy made for malformed entries is a copy, and is made once.
+// ---------------------------------------------------------------------------- //
+void runMalformedEntryCopyChecks() {
+    constexpr const char* kGoal = "S8.23 (the copy made when entries are malformed is a copy, and is not made twice)";
+    const ScratchDir scratch("malformedcopy");
+    if (!scratch.ok()) {
+        notVerified(kGoal, "a scratch directory could not be created");
+        return;
+    }
+    const std::filesystem::path file = scratch.path() / "wallpaperx" / "config.json";
+    const std::filesystem::path kept = std::filesystem::path(file.string() + ".bad");
+    const std::filesystem::path wallpaper = scratch.path() / "wallpaper.png";
+    // Parses, so nothing here is an unreadable config: one entry the daemon restores and
+    // one it cannot make sense of. A rejected entry never becomes an entry at all, so the
+    // keep-for-a-newer-build path cannot carry it and the first save drops it -- which is
+    // what makes the copy the user's only record of it.
+    const std::string firstBroken =
+        "{\"version\":1,\"monitors\":[{\"monitor_id\":0,\"type\":\"static\",\"path\":\"/photos/left.png\"},"
+        "{\"monitor_id\":\"two\",\"type\":\"static\",\"path\":\"/photos/right.png\"}]}";
+    const std::string secondBroken =
+        "{\"version\":1,\"monitors\":[{\"monitor_id\":0,\"type\":\"static\",\"path\":\"/photos/later.png\"},"
+        "{\"monitor_id\":1.5,\"type\":\"static\",\"path\":\"/photos/other.png\"}]}";
+    if (!writeWallpaperFile(wallpaper) || !writeFile(file, firstBroken)) {
+        notVerified(kGoal, "the config file this phase reads could not be written");
+        return;
+    }
+
+    // GOAL: S8.23 -- a file whose entries were rejected is COPIED aside, not moved: the
+    //       daemon goes on using it, because the entries it did understand are being
+    //       restored from it. False if config.json is gone after the load, which is the
+    //       whole config lost to one bad line; and false if a later start with a different
+    //       broken file overwrites the copy, which loses the first file's rejected entry
+    //       for good -- nothing else on disk holds it.
+    // WHY-THIS-SHAPE: two starts with DIFFERENT broken files, compared byte for byte. One
+    //       start can only establish that a copy exists, and a second start with the same
+    //       bytes cannot tell "not copied again" from "copied again over identical
+    //       content" -- the two leave the same file. The restored entry is asserted in the
+    //       same breath, so this cannot pass for a build that refused the file outright and
+    //       had nothing to restore, which is a different code path with a different verdict.
+    // CONTROL: two, both reverted. (a) `std::filesystem::copy_file` in WallpaperManager's
+    //       constructor replaced with `std::filesystem::rename` -> "FAIL: a config with
+    //       malformed entries is still there after the copy is made", plus both second-start
+    //       checks, since a rename has no destination-exists refusal to stop it. Note what
+    //       stayed GREEN under it: "a wallpaper set after a config with malformed entries is
+    //       persisted", because the save simply recreates the file it took away -- which is
+    //       why the loss has to be caught by the file's absence rather than by the daemon
+    //       misbehaving afterwards. (b) `std::filesystem::copy_options::overwrite_existing`
+    //       added to the copy_file call -> "FAIL: a second start with a different malformed
+    //       config does not overwrite the first start's copy", printing the second file's
+    //       bytes where the first's had been, and "FAIL: the daemon says the second
+    //       malformed config was not copied".
+    {
+        WallpaperManager::Config config;
+        config.configFile = file;
+        WallpaperManager manager(config);
+        const std::vector<int> restored = manager.restoreSaved();
+        check(restored == std::vector<int>{0}, "the entry the daemon did understand is restored from the same file");
+
+        check(readFile(file) == firstBroken, "a config with malformed entries is still there after the copy is made");
+        check(readFile(kept) == firstBroken, "the copy holds the bytes of the file the entries were rejected from");
+        const WallpaperManager::Snapshot snap = manager.snapshot();
+        const bool said = snap.health.persistence.detail.find("malformed") != std::string::npos &&
+                          snap.health.persistence.detail.find(kept.filename().string()) != std::string::npos;
+        check(said, "the daemon says how many entries were dropped and where the file was copied");
+        if (!said) std::fprintf(stderr, "  persistence detail: %s\n", snap.health.persistence.detail.c_str());
+
+        // The copy is not a substitute for the daemon working: a rejected entry must not
+        // stop the file being written from here on.
+        manager.requestWallpaper("static", wallpaper.string(), 1);
+        std::string why;
+        const std::map<int, std::string> onDisk = pathsInFile(file, why);
+        const bool wrote = onDisk.count(1) == 1 && onDisk.at(1) == wallpaper.string();
+        check(wrote, "a wallpaper set after a config with malformed entries is persisted");
+        if (!wrote) std::fprintf(stderr, "  %s\n", why.empty() ? "the file holds something else" : why.c_str());
+    }
+
+    if (!writeFile(file, secondBroken)) {
+        notVerified(kGoal, "the second malformed config this phase needs could not be written");
+        return;
+    }
+    WallpaperManager::Config second;
+    second.configFile = file;
+    WallpaperManager secondManager(second);
+    const std::string keptNow = readFile(kept);
+    check(keptNow == firstBroken, "a second start with a different malformed config does not overwrite the first "
+                                  "start's copy");
+    if (keptNow != firstBroken) {
+        std::fprintf(stderr, "  the copy now holds: %s\n  it held: %s\n", keptNow.c_str(), firstBroken.c_str());
+    }
+    const std::string reported = secondManager.snapshot().health.persistence.detail;
+    check(reported.find("not copied") != std::string::npos,
+          "the daemon says the second malformed config was not copied");
+    if (reported.find("not copied") == std::string::npos) {
+        std::fprintf(stderr, "  persistence detail: %s\n", reported.c_str());
+    }
 }
 
 // ---------------------------------------------------------------------------- //
@@ -1331,6 +1649,8 @@ int main() {
         {"restore does not write", runRestoreChecks},
         {"a config that could not be read", runUnreadableConfigChecks},
         {"when the preserved copy must not be made", runPreservedCopyChecks},
+        {"a config that cannot be preserved anywhere", runPreservationExhaustedChecks},
+        {"the copy made for malformed entries", runMalformedEntryCopyChecks},
         {"entries this build cannot apply", runUnappliedEntryChecks},
         {"a save that cannot succeed", runFailedSaveChecks},
         {"the cost of the save", runSaveCostChecks},

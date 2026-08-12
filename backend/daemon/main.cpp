@@ -66,9 +66,8 @@ int main() {
                                  "wallpapers will not survive a restart\n");
         }
 
-        // Also requests the bus name; throws if another instance owns it.
-        auto connection =
-            sdbus::createSessionBusConnection(sdbus::ServiceName{wallpaperx::DbusService::kBusName});
+        // Connected without claiming the name yet -- see the request below.
+        auto connection = sdbus::createSessionBusConnection();
 
         // sigwait on its own thread, not a handler: leaveEventLoop() takes locks and is
         // not async-signal-safe. A guard rather than a bare std::thread because
@@ -141,14 +140,28 @@ int main() {
         wallpaperx::WallpaperManager manager(config);
         wallpaperx::DbusService service(*connection, manager);
 
-        // Before the banner, which a supervisor may treat as readiness: this is what fills
-        // the monitor map. Skipped after a stop -- it starts the first render, and that is
-        // GPU work for a process already leaving.
+        // Before the name is claimed: this is what fills the monitor map. Skipped after a
+        // stop -- it starts the first render, and that is GPU work for a process leaving.
         if (!shutdownRequested.load(std::memory_order_acquire)) service.restoreSaved();
+
+        // Claimed last, so the name appearing on the bus means the daemon can actually
+        // answer: the object is registered and the saved wallpapers are back. Claiming it
+        // first published a daemon that was still reading its config and would answer
+        // UnknownObject. Throws if another instance owns it -- later than before, which
+        // costs a duplicate instance the startup work it was going to discard anyway.
+        connection->requestName(sdbus::ServiceName{wallpaperx::DbusService::kBusName});
 
         std::printf("wallpaperx-daemon: serving %s at %s\n", wallpaperx::DbusService::kBusName,
                     wallpaperx::DbusService::kObjectPath);
         std::fflush(stdout);
+
+        // The health endpoint is otherwise the only channel saying so, and a user whose
+        // wallpapers stopped being remembered has no reason to look there.
+        if (const auto snap = manager.snapshot();
+            snap.health.persistence.status == wallpaperx::HealthStatus::Fail) {
+            std::fprintf(stderr, "wallpaperx-daemon: wallpapers may not survive a restart: %s\n",
+                         snap.health.persistence.detail.c_str());
+        }
 
         // Declared after the service so it is destroyed first: its handlers call
         // manager.snapshot(), so HTTP has to stop before anything it reads is torn down.
