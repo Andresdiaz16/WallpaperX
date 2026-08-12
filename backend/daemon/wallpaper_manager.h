@@ -319,6 +319,11 @@ private:
     const OffscreenTarget& acquireTarget(int monitorId);
     void releaseTarget(int monitorId);
 
+    // Reads the config on a thread this can walk away from. Linux gives no way to bound a
+    // filesystem call -- a hard network mount is uninterruptible by design -- so the only
+    // way to stop a stalled read holding startup is to stop waiting for it.
+    LoadResult loadWithDeadline() const;
+
     // Snapshots the monitors worth persisting. Caller must hold m_stateMutex.
     std::vector<PersistedWallpaper> persistableLocked() const;
 

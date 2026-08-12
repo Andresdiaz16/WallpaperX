@@ -6,10 +6,14 @@
 #include "vulkan/offscreen.h"
 #include "vulkan/tier_selection.h"
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <future>
+#include <memory>
 #include <stdexcept>
+#include <thread>
 #include <utility>
 
 #include <unistd.h>
@@ -27,6 +31,10 @@ namespace {
 bool isKnownType(const std::string& type) {
     return type == "static" || type == "video" || type == "shader";
 }
+
+// Long enough that a slow disk is not cut off -- a healthy read measures in microseconds --
+// and short enough that a stalled mount does not visibly stall a login.
+constexpr std::chrono::seconds kLoadDeadline{2};
 
 // Applied identically by every entry point. Validating on SetWallpaper but not on
 // GetFrameFd would report a bad id as "no frame yet" -- a state a polling consumer is
@@ -74,7 +82,7 @@ WallpaperManager::WallpaperManager(Config config)
         return;
     }
 
-    const LoadResult loaded = m_store.load();
+    const LoadResult loaded = loadWithDeadline();
     m_restore = loaded.entries;
 
     std::string detail = sanitizeForLog(m_store.file().string(), 4096, LogFraming::Bare);
@@ -271,7 +279,9 @@ void WallpaperManager::requestWallpaper(const std::string& type, const std::stri
     // or a directory and then sat frameless forever.
     //
     // Known and accepted: these two syscalls run on the DBus event-loop thread, so a hung
-    // NFS mount blocks every other method. Moving them to the render worker was considered
+    // NFS mount blocks every other method -- and leaves the daemon unkillable with it, since
+    // the loop cannot act on leaveEventLoop() until this handler returns. SIGTERM is received
+    // and reported, and the process stays up. Moving them to the render worker was considered
     // and rejected -- it is a FIFO, so a bad path would wait behind every queued render and
     // break S6.9's burst bound. The fix, if ever needed, is a separate validation thread.
     std::error_code ec;
@@ -302,6 +312,29 @@ void WallpaperManager::requestWallpaper(const std::string& type, const std::stri
     // Outside the lock, and before the render: what the user asked for is worth keeping
     // whether or not it turns out to draw.
     persist(toPersist);
+}
+
+LoadResult WallpaperManager::loadWithDeadline() const {
+    // A detached thread and a shared promise, NOT std::async: the future std::async returns
+    // blocks in its own destructor until the task finishes, which would wait exactly as long
+    // as this exists to avoid. Nothing here ever joins.
+    //
+    // The store is copied in, so the thread outliving this call cannot reach a destroyed one.
+    auto answer = std::make_shared<std::promise<LoadResult>>();
+    std::future<LoadResult> pending = answer->get_future();
+    std::thread([answer, store = m_store] { answer->set_value(store.load()); }).detach();
+
+    if (pending.wait_for(kLoadDeadline) == std::future_status::ready) return pending.get();
+
+    // Abandoned, not cancelled: the thread stays blocked in the kernel until the process
+    // exits. Startup continues without a config rather than becoming unstoppable -- the
+    // stuck thread is harmless, a stuck main() is not.
+    LoadResult timedOut;
+    timedOut.fileExisted = true;
+    timedOut.error = sanitizeForLog(m_store.file().string(), 4096, LogFraming::Bare) +
+                     ": did not respond within " + std::to_string(kLoadDeadline.count()) +
+                     "s, starting without it";
+    return timedOut;
 }
 
 std::vector<PersistedWallpaper> WallpaperManager::persistableLocked() const {

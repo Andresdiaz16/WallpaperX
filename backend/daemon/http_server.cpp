@@ -249,6 +249,9 @@ void HttpServer::registerRoutes() {
 
         HealthCheck wallpapers;
         if (snap.monitors.empty()) {
+            // Ok: nothing was tried because nothing was asked for. Pending would claim the
+            // daemon has not finished something it started.
+            wallpapers.status = HealthStatus::Ok;
             wallpapers.detail = "no wallpaper set";
         } else if (failed > 0 || unsupported > 0) {
             // Ok, not Fail: a deleted file or a type this build cannot draw is that
@@ -275,17 +278,15 @@ void HttpServer::registerRoutes() {
             {"persistence", &snap.health.persistence},
         }};
 
-        // Worst check wins, Fail > Pending > Ok. Pending propagates rather than counting as
-        // ok: an untried dependency is unknown, and reporting a daemon healthy on the
-        // strength of checks nobody has run is the failure this endpoint was rebuilt to fix.
+        // Failures only. Pending means a dependency nothing has needed yet, and a component
+        // being idle is not a fault of the daemon -- the renderer is created on the first
+        // render by design, so propagating it made an untouched daemon report itself
+        // unhealthy. Nothing is hidden by this: the component's own entry still says pending,
+        // and a reader wanting "has everything been exercised" reads the entries.
         HealthStatus overall = HealthStatus::Ok;
         nlohmann::json checksJson = nlohmann::json::object();
         for (const auto& [name, check] : checks) {
-            if (check->status == HealthStatus::Fail) {
-                overall = HealthStatus::Fail;
-            } else if (check->status == HealthStatus::Pending && overall != HealthStatus::Fail) {
-                overall = HealthStatus::Pending;
-            }
+            if (check->status == HealthStatus::Fail) overall = HealthStatus::Fail;
             checksJson[name] = {{"status", toString(check->status)}, {"detail", check->detail}};
         }
         checksJson["wallpapers"]["monitors"] = std::move(perMonitor);

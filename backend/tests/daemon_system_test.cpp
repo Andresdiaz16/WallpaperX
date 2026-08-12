@@ -2590,6 +2590,30 @@ const nlohmann::json* healthChecks(const nlohmann::json& body) {
     return checks.is_object() ? &checks : nullptr;
 }
 
+// The names of the checks reading `pending`, sorted, and a printable form of that list. The
+// aggregate counts failures only, so "ok overall while a dependency is untried" has to name
+// the untried ones: `status == "ok"` alone is equally true of an endpoint with no `pending`
+// state left to report.
+std::vector<std::string> pendingCheckNames(const nlohmann::json& body) {
+    std::vector<std::string> names;
+    const nlohmann::json* checks = healthChecks(body);
+    if (checks == nullptr) return names;
+    for (const auto& [name, entry] : checks->items()) {
+        if (entry.is_object() && entry.value("status", std::string()) == "pending") names.push_back(name);
+    }
+    std::sort(names.begin(), names.end());
+    return names;
+}
+
+std::string joinNames(const std::vector<std::string>& names) {
+    std::string out;
+    for (const std::string& name : names) {
+        if (!out.empty()) out += ", ";
+        out += name;
+    }
+    return out.empty() ? "(none)" : out;
+}
+
 // ---------------------------------------------------------------------------- //
 // Phase 10 -- the HTTP config server, in the shipped binary, on the shipped port.
 // ---------------------------------------------------------------------------- //
@@ -2682,28 +2706,35 @@ void checkHttpLifecycle(NameWatcher& names, const std::string& bluePath, const s
 
     // GOAL: S7.10/S7.10b end to end -- /health on 127.0.0.1:18462, asked of the real
     //       binary by a process that is not it. A daemon that has just started has not
-    //       touched its shader directory or created a device, so every check is `pending`
-    //       and so is the aggregate. A watchdog polling this must not be told the daemon
-    //       is healthy on the strength of checks nobody has run.
+    //       touched its shader directory or created a device, so `shaders` and `gpu` read
+    //       `pending` in their own entries while the aggregate, which counts failures only,
+    //       reads `ok`. False in either direction: an aggregate of `pending` has a watchdog
+    //       restarting an idle daemon that is working, and a `pending` that never appears
+    //       has the shipped binary claiming health nobody established.
     // WHY-THIS-SHAPE: the in-process tier already pins the JSON in far more detail. What
     //       only this tier can establish is that the shipped binary reaches this state at
-    //       all -- an HttpServer that was never wired into main.cpp, or a daemon that
-    //       eagerly created a device at startup, would leave every in-process check green.
-    //       So this asserts the aggregate and the three names, not the details.
+    //       all -- an HttpServer never wired into main.cpp, or a daemon that eagerly
+    //       created a device at startup, would leave every in-process check green. So this
+    //       asserts the names and the pending set beside the aggregate, and no details.
+    //       The pending set is asserted rather than `status == "ok"` alone because alone it
+    //       is vacuous: a daemon that reported everything `ok` from birth satisfies it.
     // CONTROL: the `wallpaperx::HttpServer httpServer(manager);` line removed from
     //       main.cpp -> this phase reports NOT VERIFIED ("the daemon printed neither the
     //       bind-success nor the bind-failure line for port 18462; the daemon reports
     //       config_server pending") rather than spending a FAIL on the daemon; the run's
     //       failures for that mutation all come from phase 11, which grades it directly.
-    //       For the body itself: the
-    //       `else if (check->status == HealthStatus::Pending ...)` arm deleted from
-    //       http_server.cpp's aggregation -> "FAIL: the real daemon reports the aggregate
-    //       as pending before it has used anything" with "  fresh /health: ... status ok".
-    //       And for the three names: the `{"gpu", &snap.health.gpu}` entry removed from
-    //       that same array -> "FAIL: the real daemon's /health names shaders, gpu and
-    //       wallpapers as separate checks" and "FAIL: the real daemon reports the GPU as
-    //       untried before its first wallpaper", the body coming back with two checks in
-    //       it. All reverted.
+    //       For the body itself, two: the `else if (check->status ==
+    //       HealthStatus::Pending && overall != HealthStatus::Fail)` arm restored in
+    //       http_server.cpp's aggregation -> "FAIL: the real daemon reports ok overall
+    //       before it has used anything, with the dependencies it has not used pending"
+    //       ("pending checks: gpu, shaders; aggregate: pending"); and `HealthStatus status
+    //       = HealthStatus::Ok;` as HealthCheck's default in wallpaper_manager.h -> the
+    //       same line red the other way ("pending checks: (none); aggregate: ok") beside
+    //       the GPU one. And for the three names: the `{"gpu", &snap.health.gpu}` entry
+    //       removed from that same array -> "FAIL: the real daemon's /health names
+    //       shaders, gpu and wallpapers as separate checks" and "FAIL: the real daemon
+    //       reports the GPU as untried before its first wallpaper", the body coming back
+    //       with two checks in it. All reverted.
     httplib::Client cli = wallpaperx::testing::makeClient(kPort);
     const HttpReply fresh = wallpaperx::testing::get(cli, "/health");
     check(fresh.ok(), "the real daemon answers GET /health on 127.0.0.1:18462");
@@ -2712,13 +2743,17 @@ void checkHttpLifecycle(NameWatcher& names, const std::string& bluePath, const s
         const bool named = checks != nullptr && checks->contains("shaders") && checks->contains("gpu") &&
                            checks->contains("wallpapers");
         check(named, "the real daemon's /health names shaders, gpu and wallpapers as separate checks");
-        check(fresh.json.value("status", std::string()) == "pending",
-              "the real daemon reports the aggregate as pending before it has used anything");
+        const std::string aggregate = fresh.json.value("status", std::string());
+        const std::vector<std::string> untried = pendingCheckNames(fresh.json);
+        const bool idleIsHealthy = untried == std::vector<std::string>{"gpu", "shaders"} && aggregate == "ok";
+        check(idleIsHealthy, "the real daemon reports ok overall before it has used anything, with the "
+                             "dependencies it has not used pending");
         check(named && (*checks)["gpu"].is_object() &&
                   (*checks)["gpu"].value("status", std::string()) == "pending",
               "the real daemon reports the GPU as untried before its first wallpaper");
-        if (fresh.json.value("status", std::string()) != "pending" || !named) {
-            std::fprintf(stderr, "  fresh /health: %s\n", fresh.body.c_str());
+        if (!idleIsHealthy || !named) {
+            std::fprintf(stderr, "  pending checks: %s; aggregate: %s\n  fresh /health: %s\n",
+                         joinNames(untried).c_str(), aggregate.c_str(), fresh.body.c_str());
         }
         std::printf("daemon_system_test: /health on the shipped port before any wallpaper: %s\n",
                     fresh.body.c_str());

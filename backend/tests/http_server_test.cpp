@@ -768,6 +768,29 @@ std::vector<std::string> sortedKeys(const nlohmann::json& object) {
     return keys;
 }
 
+// The names of the checks reading `pending`, sorted. The aggregate counts failures only, so
+// every claim of the form "ok overall while a dependency is untried" has to name the untried
+// dependencies in the same breath: `status == "ok"` on its own is equally true of an endpoint
+// that has no `pending` state left to report.
+std::vector<std::string> pendingCheckNames(const nlohmann::json& health) {
+    std::vector<std::string> names;
+    if (!health.is_object() || !health.contains("checks") || !health["checks"].is_object()) return names;
+    for (const auto& [name, entry] : health["checks"].items()) {
+        if (entry.is_object() && entry.value("status", std::string()) == "pending") names.push_back(name);
+    }
+    std::sort(names.begin(), names.end());
+    return names;
+}
+
+std::string joined(const std::vector<std::string>& names) {
+    std::string out;
+    for (const std::string& name : names) {
+        if (!out.empty()) out += ", ";
+        out += name;
+    }
+    return out.empty() ? "(none)" : out;
+}
+
 // One monitor's reported state, and "" when this monitor is not in the breakdown at all --
 // which a caller must tell apart from a state it did not expect, so every use below asserts
 // the id is present first.
@@ -1334,40 +1357,60 @@ void runHealthBeforeDeviceChecks(httplib::Client& cli, const Check& check) {
                      healthCheckDetail(health.json, "persistence").c_str());
     }
 
-    // GOAL: S7.10b -- `pending` is a distinct state from `ok` and it reaches the
-    //       aggregate. Both the shader directory and the device are touched only on the
-    //       first render, so on a daemon that has not rendered, nothing has been tried and
-    //       nothing is known. False if this reports "ok", which is health on the strength
-    //       of checks nobody has run -- the defect S7.10 exists to remove, and the
-    //       aggregate is the field a watchdog reads.
-    // WHY-THIS-SHAPE: the per-check statuses and the top-level one are asserted together.
-    //       Asserting only the three sub-checks would pass for an aggregate hardcoded to
-    //       "ok", which is exactly the old endpoint; asserting only the aggregate would
-    //       pass for a daemon that reported everything pending forever, so scenarios (a)
-    //       and (c) of runHealthStateChecks assert that the same three fields and the
-    //       aggregate all read "ok" once a render has happened. Neither half establishes
-    //       anything alone.
-    // CONTROL: two, because the aggregate and the three checks it is computed from fail
-    //       independently. (a) the `else if (check->status == HealthStatus::Pending ...)`
-    //       arm deleted from the aggregation in http_server.cpp, so pending counts as ok
-    //       -> "FAIL: /health reports the aggregate as pending before anything has been
-    //       tried" with "aggregate before any render: ok", the three per-check assertions
-    //       staying green. (b) `HealthStatus status = HealthStatus::Ok;` as HealthCheck's
-    //       default in wallpaper_manager.h -- which is the pre-rebuild endpoint restored,
-    //       health asserted rather than established -> all four go red, with
-    //       "{"gpu":{"status":"ok"},"shaders":{"status":"ok"},...},"status":"ok"" on a
-    //       daemon that had done nothing at all. Both reverted.
+    // GOAL: S7.10b -- `pending` is a distinct state from `ok` in the entry that reports it,
+    //       and the aggregate counts failures only. The shader directory and the device are
+    //       touched only on the first render, so on a daemon that has not rendered, both
+    //       read `pending` and neither is a fault. Two independent ways to be false: a
+    //       dependency nobody has run reads `ok` (health asserted rather than established,
+    //       the defect S7.10 exists to remove), or the aggregate reads `pending` (an idle,
+    //       working daemon reporting itself unhealthy to whatever watchdog polls it).
+    // WHY-THIS-SHAPE: the aggregate is asserted in the same check as the exact set of
+    //       checks reading `pending`, not on its own. `aggregate == "ok"` alone is the
+    //       vacuous shape this contract invites -- it is equally satisfied by an endpoint
+    //       that has no `pending` state at all, which is the pre-rebuild endpoint -- and
+    //       the set is what makes the claim "ok *in spite of* two untried dependencies".
+    //       The set is compared by name rather than counted, so a daemon that started
+    //       reporting one of these eagerly cannot hold the count at two with some other
+    //       check going untried.
+    // CONTROL: three. (a) the `else if (check->status == HealthStatus::Pending && overall
+    //       != HealthStatus::Fail)` arm restored in http_server.cpp's aggregation -> "FAIL:
+    //       /health reports ok overall while the dependencies nothing has used report
+    //       pending" with "  pending checks: gpu, shaders; aggregate: pending". (b)
+    //       `HealthStatus status = HealthStatus::Ok;` as HealthCheck's default in
+    //       wallpaper_manager.h -> the same check red from the other direction ("pending
+    //       checks: (none); aggregate: ok") plus the two per-check assertions. (c)
+    //       `wallpapers.status = HealthStatus::Ok;` deleted from the empty-monitor arm ->
+    //       "FAIL: /health reports wallpapers as ok with detail 'no wallpaper set' when no
+    //       wallpaper has been set" and the pending-set half of the check above. All
+    //       reverted.
     check(healthCheckStatus(health.json, "shaders") == "pending",
           "/health reports the shader directory as pending before anything has looked at it");
     check(healthCheckStatus(health.json, "gpu") == "pending",
           "/health reports the GPU as pending before a device has been created");
-    check(healthCheckStatus(health.json, "wallpapers") == "pending",
-          "/health reports wallpapers as pending before any wallpaper is set");
+
+    // The detail, not just the status. `ok` alone cannot separate "nothing was asked for"
+    // from "every monitor is showing a frame", and those are opposite facts to an operator
+    // looking at a blank desktop -- the empty-monitor arm exists precisely to say which.
+    // CONTROL: the empty-monitor detail changed to "0 monitor(s) showing a frame" -> "FAIL:
+    //       /health reports wallpapers as ok with detail 'no wallpaper set' when no
+    //       wallpaper has been set", printing the detail it got. Reverted.
+    const bool idleWallpapers = healthCheckStatus(health.json, "wallpapers") == "ok" &&
+                                healthCheckDetail(health.json, "wallpapers") == "no wallpaper set";
+    check(idleWallpapers,
+          "/health reports wallpapers as ok with detail 'no wallpaper set' when no wallpaper has been set");
+    if (!idleWallpapers) {
+        std::fprintf(stderr, "  wallpapers: status '%s', detail '%s'\n",
+                     healthCheckStatus(health.json, "wallpapers").c_str(),
+                     healthCheckDetail(health.json, "wallpapers").c_str());
+    }
+
     const std::string aggregate = health.json.value("status", std::string());
-    check(aggregate == "pending", "/health reports the aggregate as pending before anything has been tried");
-    if (aggregate != "pending") {
-        std::fprintf(stderr, "  aggregate before any render: %s (body: %s)\n", aggregate.c_str(),
-                     health.body.c_str());
+    const std::vector<std::string> untried = pendingCheckNames(health.json);
+    const bool idleIsHealthy = untried == std::vector<std::string>{"gpu", "shaders"} && aggregate == "ok";
+    check(idleIsHealthy, "/health reports ok overall while the dependencies nothing has used report pending");
+    if (!idleIsHealthy) {
+        std::fprintf(stderr, "  pending checks: %s; aggregate: %s (body: %s)\n", joined(untried).c_str(),
+                     aggregate.c_str(), health.body.c_str());
     }
 }
 
@@ -1619,42 +1662,48 @@ void runHealthStateChecks(const std::string& bluePath, const std::string& videoP
             } else if (!health.ok()) {
                 check(false, "the mixed-state daemon answered /health with a parseable 200");
             } else {
-                // GOAL: S7.10b -- `pending` propagates to the aggregate rather than being
-                //       rounded off to `ok`; and S7.10f -- a monitor that has been
-                //       requested but has not yet rendered is not a monitor showing a
-                //       picture. False here if /health answers "ok" for a daemon with one
-                //       blank screen, which is a watchdog being told a half-black desktop
-                //       is healthy.
-                // WHY-THIS-SHAPE: runHealthBeforeDeviceChecks already pins an all-pending
-                //       daemon, and an aggregation with the pending arm deleted fails
-                //       there too -- but only because *nothing* was ok. An implementation
-                //       taking worst(ok, pending) = ok and worst(pending) = pending passes
-                //       there and fails here. So the state is deliberately mixed, and the
-                //       ok-ness of the ok checks is asserted rather than assumed, or the
-                //       aggregate assertion below is the all-pending case under another
-                //       name. The mix is built from an in-flight monitor rather than from
-                //       an unrenderable type, which is what it used to use: that state now
-                //       reads `fail`, and `{wallpapers ok, shaders pending, gpu pending}`
-                //       is unreachable by construction, since wallpapers=ok requires a
-                //       render and a render is what makes the other two ok.
-                // CONTROL: the `else if (inFlight > 0)` arm deleted from the wallpapers
-                //       derivation in http_server.cpp, so an in-flight monitor falls into
-                //       the ok branch -> "FAIL: a monitor that has been requested but not
-                //       rendered leaves wallpapers pending, not ok", "FAIL: an untried
-                //       dependency keeps the aggregate at pending even when another check
-                //       is ok" (with "mixed state {wallpapers ok, shaders ok, gpu ok}
-                //       aggregated to: ok") and the pending-detail check below, which has
-                //       no branch left to read. Reverted.
+                // GOAL: S7.10f -- a monitor that has been requested but has not yet
+                //       rendered is not a monitor showing a picture, so `wallpapers` reads
+                //       `pending`; and S7.10b -- that pending stays where it was recorded
+                //       instead of moving the aggregate, which reads `ok`. Both halves are
+                //       independently false: an endpoint calling an unrendered monitor
+                //       `ok` tells a frontend a blank screen has a picture on it, and an
+                //       aggregate dragged to `pending` by it tells a watchdog a daemon
+                //       mid-render is unhealthy.
+                // WHY-THIS-SHAPE: the two are asserted as one conjunction, on a state that
+                //       has ok checks in it. Asserting `aggregate == "ok"` alone is
+                //       vacuous here -- this daemon reads ok in every other respect, so
+                //       the check would pass on an endpoint with no `pending` state left
+                //       to report at all; asserting only `wallpapers == "pending"` says
+                //       nothing about what the aggregate did with it. The mix (two checks
+                //       ok, one pending) is what separates an aggregate that ignores
+                //       pending from one that has nothing to ignore, and the ok-ness of
+                //       the other two is asserted rather than assumed or this is the
+                //       all-pending case of runHealthBeforeDeviceChecks under another name.
+                // CONTROL: two, in opposite directions. (a) the `else if (inFlight > 0)`
+                //       arm deleted from the wallpapers derivation in http_server.cpp, so
+                //       an in-flight monitor falls into the ok branch -> "FAIL: a monitor
+                //       that has been requested but not rendered leaves wallpapers
+                //       pending, not ok", "FAIL: a monitor still rendering leaves the
+                //       aggregate ok and reports its pending on its own check" (with
+                //       "wallpapers ok, shaders ok, gpu ok -> aggregate ok") and the
+                //       pending-detail check below, which has no branch left to read. (b)
+                //       the `else if (check->status == HealthStatus::Pending && overall !=
+                //       HealthStatus::Fail)` arm restored in the aggregation -> only the
+                //       conjunction red, "wallpapers pending, shaders ok, gpu ok ->
+                //       aggregate pending". Both reverted.
                 check(healthCheckStatus(health.json, "shaders") == "ok" &&
                           healthCheckStatus(health.json, "gpu") == "ok",
                       "the mixed-state daemon really does have two checks reading ok");
                 check(healthCheckStatus(health.json, "wallpapers") == "pending",
                       "a monitor that has been requested but not rendered leaves wallpapers pending, not ok");
                 const std::string aggregate = health.json.value("status", std::string());
-                check(aggregate == "pending",
-                      "an untried dependency keeps the aggregate at pending even when another check is ok");
-                if (aggregate != "pending") {
-                    std::fprintf(stderr, "  mixed state {wallpapers %s, shaders %s, gpu %s} aggregated to: %s\n",
+                const bool inFlightIsNotAFault =
+                    healthCheckStatus(health.json, "wallpapers") == "pending" && aggregate == "ok";
+                check(inFlightIsNotAFault,
+                      "a monitor still rendering leaves the aggregate ok and reports its pending on its own check");
+                if (!inFlightIsNotAFault) {
+                    std::fprintf(stderr, "  wallpapers %s, shaders %s, gpu %s -> aggregate %s\n",
                                  healthCheckStatus(health.json, "wallpapers").c_str(),
                                  healthCheckStatus(health.json, "shaders").c_str(),
                                  healthCheckStatus(health.json, "gpu").c_str(), aggregate.c_str());
@@ -1710,8 +1759,25 @@ void runHealthStateChecks(const std::string& bluePath, const std::string& videoP
                 } else {
                     check(healthCheckStatus(full.json, "wallpapers") == "ok",
                           "wallpapers reads ok once every monitor has a frame");
-                    check(full.json.value("status", std::string()) == "ok",
-                          "the aggregate leaves pending once the in-flight monitor has rendered");
+
+                    // `pending` must be a state this daemon can leave, or every "ok overall
+                    // while a check is pending" assertion in this file is equally satisfied
+                    // by an endpoint stuck on pending forever. The aggregate cannot carry
+                    // that any more -- it read `ok` in the mixed state too -- so what is
+                    // asserted is that no check is left reading pending at all.
+                    // CONTROL: `wallpapers.status = HealthStatus::Ok;` deleted from the
+                    //       all-showing arm in http_server.cpp -> "FAIL: no check is left
+                    //       reading pending once every dependency has been used" with
+                    //       "still pending: wallpapers; aggregate: ok", beside the check
+                    //       above and its equivalent in the recovery scenario. Reverted.
+                    const std::vector<std::string> stillPending = pendingCheckNames(full.json);
+                    const bool nothingUntried =
+                        stillPending.empty() && full.json.value("status", std::string()) == "ok";
+                    check(nothingUntried, "no check is left reading pending once every dependency has been used");
+                    if (!nothingUntried) {
+                        std::fprintf(stderr, "  still pending: %s; aggregate: %s\n", joined(stillPending).c_str(),
+                                     full.json.value("status", std::string()).c_str());
+                    }
                     const std::string okDetail = healthCheckDetail(full.json, "wallpapers");
                     check(showing == 2 && okDetail.find(std::to_string(showing) + " monitor") != std::string::npos,
                           "the ok detail counts the monitors that have a frame");
@@ -1754,25 +1820,32 @@ void runHealthStateChecks(const std::string& bluePath, const std::string& videoP
                 //       daemon that is working exactly as designed. The daemon's own faults
                 //       still fail the aggregate -- scenario (b) above is where a missing
                 //       shader directory does precisely that.
-                // WHY-THIS-SHAPE: the shaders and gpu checks are asserted to be *pending*
-                //       alongside, and the aggregate is asserted to be `pending` rather than
-                //       merely "not fail". Asserting `!= "fail"` would also be satisfied by
-                //       an endpoint stuck on `ok`, which would hide an untried dependency --
-                //       the defect S7.10 exists to remove. Pending on both dependencies is
-                //       also what pins that the verdict below is about the TYPE and not
-                //       about a render that blew up.
-                // CONTROL: the `!isRenderableType(monitor.type)` arm deleted from the
-                //       classification loop in http_server.cpp, so an unrenderable monitor
-                //       falls through to the in-flight count -> "FAIL: a wallpaper type this
-                //       build cannot render is not a failure of the daemon" (the check reads
-                //       `pending`), "FAIL: a monitor whose type this build cannot render is
-                //       reported per monitor as unsupported" (state 'rendering'), "FAIL: the
-                //       unsupported monitor's own detail names it and the type it is set
-                //       to", and the same three in the after-device phase. A second control
-                //       replaced `firstUnsupported` in the detail with `std::string()` ->
-                //       only "FAIL: the unsupported detail names the monitor and the type it
-                //       is set to", printing "detail: 1 of 1 monitors failed or cannot be
-                //       rendered:  (expected 'monitor 0' and 'video')". Both reverted.
+                // WHY-THIS-SHAPE: the aggregate is asserted to be exactly `ok`, together
+                //       with the exact set of checks reading `pending`. `!= "fail"` would
+                //       be satisfied by an endpoint that answers `pending` to everything,
+                //       and `== "ok"` on its own would be satisfied by one with no
+                //       `pending` state left at all -- the pre-rebuild endpoint, which is
+                //       what S7.10 exists to remove. The pending pair is also what pins
+                //       that the verdict here is about the TYPE and not about a render
+                //       that blew up: neither dependency was ever asked for anything.
+                // CONTROL: three. (a) the `!isRenderableType(monitor.type)` arm deleted from
+                //       the classification loop in http_server.cpp, so an unrenderable
+                //       monitor falls through to the in-flight count -> "FAIL: a wallpaper
+                //       type this build cannot render is not a failure of the daemon" (the
+                //       check reads `pending`), "FAIL: an unrenderable type leaves the
+                //       aggregate ok with the untried dependencies still pending" (pending
+                //       checks: gpu, shaders, wallpapers), "FAIL: a monitor whose type this
+                //       build cannot render is reported per monitor as unsupported" (state
+                //       'rendering'), "FAIL: the unsupported monitor's own detail names it
+                //       and the type it is set to", and the same in the after-device phase.
+                //       (b) `firstUnsupported` in the detail replaced with `std::string()`
+                //       -> only "FAIL: the unsupported detail names the monitor and the type
+                //       it is set to", printing "detail: 1 of 1 monitors failed or cannot be
+                //       rendered:  (expected 'monitor 0' and 'video')". (c) the `else if
+                //       (check->status == HealthStatus::Pending && overall !=
+                //       HealthStatus::Fail)` arm restored in the aggregation -> only the
+                //       aggregate check red, "pending checks: gpu, shaders; aggregate:
+                //       pending". All reverted.
                 // COVERAGE-ASSERT: the monitor is asserted to carry no lastError, so this
                 //       scenario cannot silently become a second copy of scenario (c) -- a
                 //       future requestWallpaper that recorded an error for `video` would
@@ -1784,11 +1857,15 @@ void runHealthStateChecks(const std::string& bluePath, const std::string& videoP
                 check(healthCheckStatus(health.json, "shaders") == "pending" &&
                           healthCheckStatus(health.json, "gpu") == "pending",
                       "an unrenderable type does not implicate the shaders or the GPU");
-                check(health.json.value("status", std::string()) == "pending",
-                      "an unrenderable type leaves the aggregate on its untried dependencies, not on fail");
-                if (health.json.value("status", std::string()) != "pending") {
-                    std::fprintf(stderr, "  aggregate: %s (body: %s)\n",
-                                 health.json.value("status", std::string()).c_str(), health.body.c_str());
+                const std::string aggregate = health.json.value("status", std::string());
+                const std::vector<std::string> untried = pendingCheckNames(health.json);
+                const bool notTheDaemonsFault = untried == std::vector<std::string>{"gpu", "shaders"} &&
+                                                aggregate == "ok";
+                check(notTheDaemonsFault,
+                      "an unrenderable type leaves the aggregate ok with the untried dependencies still pending");
+                if (!notTheDaemonsFault) {
+                    std::fprintf(stderr, "  pending checks: %s; aggregate: %s (body: %s)\n", joined(untried).c_str(),
+                                 aggregate.c_str(), health.body.c_str());
                 }
 
                 // The per-monitor object, as an exact set on both levels: which monitors it
@@ -1884,8 +1961,25 @@ void runHealthStateChecks(const std::string& bluePath, const std::string& videoP
                       "a missing shader directory does not implicate the GPU");
                 check(healthCheckDetail(health.json, "shaders").find("wpx_no_such_shader_dir") != std::string::npos,
                       "the shader check's detail names the directory that could not be found");
-                check(health.json.value("status", std::string()) == "fail",
-                      "a failing check makes the aggregate fail");
+                // GOAL: S7.10b's unchanged half -- a genuine failure of one of the daemon's
+                //       own dependencies still reaches the aggregate. False if a daemon
+                //       whose shader directory does not exist reports itself healthy, which
+                //       is the whole endpoint gone: a failure counted the way `pending` now
+                //       is would leave `status` a constant.
+                // WHY-THIS-SHAPE: this is the only state in the suite where the aggregate is
+                //       anything but `ok`, so it is load-bearing for every check that
+                //       asserts `ok`: without it, "the aggregate is ok" is satisfied by a
+                //       hardcoded string. Asserting the shaders check alone would not
+                //       establish it -- the aggregation loop is a separate piece of code
+                //       from the recording.
+                // CONTROL: `if (check->status == HealthStatus::Fail) overall =
+                //       HealthStatus::Fail;` deleted from the aggregation in
+                //       http_server.cpp, leaving the aggregate a constant `ok` -> "FAIL: a
+                //       failing check makes the aggregate fail" with "  aggregate: ok".
+                //       Reverted.
+                const std::string aggregate = health.json.value("status", std::string());
+                check(aggregate == "fail", "a failing check makes the aggregate fail");
+                if (aggregate != "fail") std::fprintf(stderr, "  aggregate: %s\n", aggregate.c_str());
                 std::printf("http_server_test: missing shader directory -> %s\n", health.body.c_str());
                 std::fflush(stdout);
             }
