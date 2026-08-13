@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+
 // Step 8's persistence layer, below the bus and below the GPU: ConfigStore,
 // defaultConfigPath(), and the WallpaperManager half that drives them.
 //
@@ -26,6 +28,7 @@
 #include "daemon/wallpaper_manager.h"
 #include "tests/client/blocking_config_write.h"
 #include "tests/client/scratch_dir.h"
+#include "tests/test_report.h"
 
 #include <nlohmann/json.hpp>
 
@@ -122,30 +125,13 @@ extern "C" int rename(const char* oldPath, const char* newPath) {
 
 namespace {
 
-int g_failures = 0;
-
-void check(bool cond, const char* msg) {
-    if (!cond) {
-        std::fprintf(stderr, "FAIL: %s\n", msg);
-        ++g_failures;
-    }
-}
-
-// Goals this host could not exercise at all, as opposed to goals it exercised and that
-// held. Reported as exit 77, which ctest turns into a SKIP through SKIP_RETURN_CODE --
-// the same channel daemon_system_test uses, and for the same reason: a phase that returned
-// early after printing a reason would otherwise leave ctest reporting PASS for coverage
-// that never ran.
-int g_notVerified = 0;
-constexpr int kNotVerifiedExitCode = 77;
-
-void notVerified(const char* goals, const std::string& reason) {
-    std::printf("config_store_test: NOT VERIFIED -- %s could not be exercised: %s. This run establishes nothing "
-                "about them, and is reported to ctest as a skip rather than as a pass.\n",
-                goals, reason.c_str());
-    std::fflush(stdout);
-    ++g_notVerified;
-}
+// The pass / fail / skip contract lives in tests/test_report.h: exit 77 for a goal this host
+// could not exercise (ctest turns it into SKIP through SKIP_RETURN_CODE), exit 1 for a check
+// that ran and did not hold, and failures outranking skips so a run that is both broken and
+// incomplete cannot hide behind "Skipped".
+using wallpaperx::testing::check;
+using wallpaperx::testing::g_failures;
+using wallpaperx::testing::notVerified;
 
 // Sets an environment variable for as long as it is alive and puts back exactly what was
 // there before, including "it was not set at all". Every phase that reads
@@ -2229,6 +2215,8 @@ void runLatestSnapshotWinsChecks() {
 }  // namespace
 
 int main() {
+    wallpaperx::testing::g_testName = "config_store_test";
+
     // GOAL: this file manipulates $HOME and $XDG_CONFIG_HOME in process and builds
     //       ConfigStores from paths it computes, so it is one edit away from writing into
     //       the developer's own wallpaper config. False if a run creates or changes the file
@@ -2318,16 +2306,6 @@ int main() {
 
     // Asked before the not-verified count, so a run that is both broken and incomplete
     // reports as broken rather than hiding failures behind ctest's "Skipped".
-    if (g_failures > 0) {
-        std::fprintf(stderr, "config_store_test: %d check(s) failed\n", g_failures);
-        return 1;
-    }
-    if (g_notVerified > 0) {
-        std::printf("config_store_test: every check that ran passed, but %d goal(s) could not be exercised on this "
-                    "host (listed above) -- reported to ctest as a skip, not a pass.\n",
-                    g_notVerified);
-        return kNotVerifiedExitCode;
-    }
-    std::printf("config_store_test: all checks passed\n");
-    return 0;
+    if (wallpaperx::testing::reportCheckFailures()) return 1;
+    return wallpaperx::testing::reportNotVerifiedOrPassed();
 }

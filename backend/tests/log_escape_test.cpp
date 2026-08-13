@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+
 // S7.19: sanitizeForLog (backend/daemon/log_escape.h) returns valid UTF-8 for every input.
 //
 // Its own target rather than a phase of http_server_test, because sanitizeForLog is a pure
@@ -13,6 +15,7 @@
 // one.
 
 #include "daemon/log_escape.h"
+#include "tests/test_report.h"
 
 #include <nlohmann/json.hpp>
 
@@ -28,14 +31,8 @@ using wallpaperx::sanitizeForLog;
 
 namespace {
 
-int g_failures = 0;
-
-void check(bool cond, const char* msg) {
-    if (!cond) {
-        std::fprintf(stderr, "FAIL: %s\n", msg);
-        ++g_failures;
-    }
-}
+using wallpaperx::testing::check;
+using wallpaperx::testing::g_failures;
 
 std::string toHex(std::string_view bytes) {
     static constexpr char kHex[] = "0123456789abcdef";
@@ -334,8 +331,13 @@ void runTruncationBoundaryChecks() {
 }  // namespace
 
 int main() {
+    wallpaperx::testing::g_testName = "log_escape_test";
+
     // Nothing here depends on the host, so there is no skip path: every check can be
-    // answered on any machine that can run the binary at all.
+    // answered on any machine that can run the binary at all. That is why the log_escape
+    // entry in backend/CMakeLists.txt carries no SKIP_RETURN_CODE -- so a notVerified()
+    // added here later would exit 77 and read to ctest as a failure, not a skip. Red is the
+    // safe direction, but the entry needs the property before this file grows a skip path.
     Sweep sweep;
     try {
         runValidityChecks(sweep);
@@ -345,13 +347,15 @@ int main() {
         ++g_failures;
     }
 
-    if (g_failures > 0) {
-        std::fprintf(stderr, "log_escape_test: %d check(s) failed\n", g_failures);
-        return 1;
-    }
-    std::printf("log_escape_test: all checks passed (%lld sanitize/dump combinations, %lld truncated, %lld "
-                "escaping, %lld ill-formed inputs, %lld valid multi-byte inputs)\n",
-                sweep.combinations, sweep.truncatedOutputs, sweep.escapingOutputs, sweep.illFormedInputs,
-                sweep.multiByteInputs);
-    return 0;
+    if (wallpaperx::testing::reportCheckFailures()) return 1;
+
+    // The counts ride on the all-passed line so a sweep that quietly stopped covering
+    // anything is visible in a green run: "0 ill-formed inputs" is the shape of a generator
+    // that broke, and it would otherwise pass in silence.
+    const std::string coverage = " (" + std::to_string(sweep.combinations) + " sanitize/dump combinations, " +
+                                 std::to_string(sweep.truncatedOutputs) + " truncated, " +
+                                 std::to_string(sweep.escapingOutputs) + " escaping, " +
+                                 std::to_string(sweep.illFormedInputs) + " ill-formed inputs, " +
+                                 std::to_string(sweep.multiByteInputs) + " valid multi-byte inputs)";
+    return wallpaperx::testing::reportNotVerifiedOrPassed(wallpaperx::testing::kSkipReasonHost, coverage);
 }

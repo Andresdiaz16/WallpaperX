@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+
 // System-level test for Step 6 task 4: drives the **real daemon binary, in its own
 // process**, over a private session bus.
 //
@@ -51,6 +53,7 @@
 #include "tests/client/daemon_client.h"
 #include "tests/client/http_probe.h"
 #include "tests/client/scratch_dir.h"
+#include "tests/test_report.h"
 
 #include "support/exported_frame_map.h"
 // Fork-side scaffolding, shared with renderer/tests/device_affinity_probe.cpp. It lives in
@@ -195,30 +198,21 @@ constexpr const char* kSignalShutdownLine = "received, shutting down";
 std::string testAssetDir() { return std::string(WALLPAPERX_TEST_IMAGE_DIR); }
 
 // Goals this run could not exercise at all, because the host or the harness could not
-// build the precondition -- as opposed to goals it exercised and that held.
+// build the precondition -- as opposed to goals it exercised and that held. The channel
+// itself is tests/test_report.h; what matters here is why this file uses it.
 //
 // The two were previously indistinguishable from outside: the exit status was a pure
 // function of the failure count, so a phase that returned early after printing a reason
 // left ctest reporting PASS for coverage that never ran. That is the vacuous-green trap,
 // and it sat on the phase written for the worst crash the QA pass found. Reported the way
-// the renderer probes report it (modifier_roundtrip_probe's g_notVerified /
-// kNotVerifiedExitCode): exit 77, which ctest turns into a SKIP through the
+// the renderer probes report it: exit 77, which ctest turns into a SKIP through the
 // SKIP_RETURN_CODE property set in backend/CMakeLists.txt. A skip is not a pass, and no
 // reader can mistake it for one.
 //
 // Not a check() failure, deliberately: X.3 forbids reporting a fault of the host or the
 // harness as a fault of the daemon, and every caller here names a cause on this side of
 // the boundary.
-int g_notVerified = 0;
-constexpr int kNotVerifiedExitCode = 77;
-
-void notVerified(const char* goals, const std::string& reason) {
-    std::printf("daemon_system_test: NOT VERIFIED -- %s could not be exercised: %s. This run establishes "
-                "nothing about them, and is reported to ctest as a skip rather than as a pass.\n",
-                goals, reason.c_str());
-    std::fflush(stdout);
-    ++g_notVerified;
-}
+using wallpaperx::testing::notVerified;
 
 // This file failed to start a child process, so whatever the phase was going to grade was
 // never exercised. Its own channel, separate from both check() and notVerified(): a fork
@@ -4998,13 +4992,12 @@ void checkStalledConfigWrite(NameWatcher& names, const std::string& validationEn
 }  // namespace
 
 int main() {
-    int failures = 0;
-    const Check check = [&](bool cond, const char* msg) {
-        if (!cond) {
-            std::fprintf(stderr, "FAIL: %s\n", msg);
-            ++failures;
-        }
-    };
+    wallpaperx::testing::g_testName = "daemon_system_test";
+
+    // Wrapped in a Check rather than called directly because every phase below takes one:
+    // the std::function is what lets a phase be handed the grader without this file's
+    // reporting internals.
+    const Check check = wallpaperx::testing::check;
 
     const bool wantValidation = !validationWaived() && validationLayerAvailable();
     if (validationWaived()) {
@@ -5357,7 +5350,7 @@ int main() {
         // produces -- would abort the process, so ctest would report an opaque SIGABRT
         // instead of the named failures above.
         std::fprintf(stderr, "FAIL: unexpected exception: %s\n", e.what());
-        ++failures;
+        ++wallpaperx::testing::g_failures;
     }
 
     // GOAL: S6.31 -- the daemon reports its GPU name and descriptor tier once the device
@@ -5472,12 +5465,9 @@ int main() {
         }
     }
 
-    if (failures > 0) {
-        // Asked before the not-verified count, so a run that is both broken and incomplete
-        // reports as broken: a skip would hide the failures behind ctest's "Skipped".
-        std::fprintf(stderr, "daemon_system_test: %d check(s) failed\n", failures);
-        return 1;
-    }
+    // Asked before the not-verified count, so a run that is both broken and incomplete
+    // reports as broken: a skip would hide the failures behind ctest's "Skipped".
+    if (wallpaperx::testing::reportCheckFailures()) return 1;
     // Red, and not a skip. Same grading as device_affinity_probe's harness faults: a host
     // that cannot fork-and-exec a child cannot run dbus_service or the renderer probes
     // either, so reporting this one alone as "Skipped" would mark it optional while its
@@ -5489,12 +5479,5 @@ int main() {
                      g_harnessFaults);
         return 1;
     }
-    if (g_notVerified > 0) {
-        std::printf("daemon_system_test: every check that ran passed, but %d goal(s) could not be exercised on "
-                    "this host (listed above) -- reported to ctest as a skip, not a pass.\n",
-                    g_notVerified);
-        return kNotVerifiedExitCode;
-    }
-    std::printf("daemon_system_test: all checks passed\n");
-    return 0;
+    return wallpaperx::testing::reportNotVerifiedOrPassed();
 }

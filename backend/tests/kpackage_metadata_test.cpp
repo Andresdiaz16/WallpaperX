@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+
 // Step 9's Plasma wallpaper package: backend/kde/kpackage/, the directory Plasma reads to
 // learn that a wallpaper plugin called WallpaperX exists, what to call it in the wallpaper
 // chooser, and which QML file to load.
@@ -36,6 +38,8 @@
 // icon theme, and that activation changes a real desktop. Those were checked by hand on
 // Plasma 6.7.4 and are recorded in PLAN.md, not here.
 
+#include "tests/test_report.h"
+
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -55,20 +59,14 @@
 
 namespace {
 
-int g_failures = 0;
+// The pass / fail / skip contract lives in tests/test_report.h: check() and its counter,
+// notVerified() and its counter, and exit 77 -- which ctest reads as SKIP through
+// SKIP_RETURN_CODE in backend/CMakeLists.txt -- reserved for "this host could not set the
+// check up", never for "the check did not like what it saw".
+using wallpaperx::testing::check;
+using wallpaperx::testing::notVerified;
+
 int g_harnessFaults = 0;
-int g_notVerified = 0;
-
-// ctest reads this as SKIP (see SKIP_RETURN_CODE in backend/CMakeLists.txt). Reserved for
-// "this host could not set the check up", never for "the check did not like what it saw".
-constexpr int kNotVerifiedExitCode = 77;
-
-void check(bool cond, const char* msg) {
-    if (!cond) {
-        std::fprintf(stderr, "FAIL: %s\n", msg);
-        ++g_failures;
-    }
-}
 
 // A defect in this file rather than in the package it reads. Counted separately, not just
 // printed differently: the summary line otherwise reports a broken helper as "N check(s)
@@ -77,11 +75,6 @@ void check(bool cond, const char* msg) {
 void harnessFailure(const std::string& what) {
     std::fprintf(stderr, "FAIL (harness): %s\n", what.c_str());
     ++g_harnessFaults;
-}
-
-void notVerified(const char* goals, const std::string& reason) {
-    std::fprintf(stderr, "NOT VERIFIED: %s -- %s\n", goals, reason.c_str());
-    ++g_notVerified;
 }
 
 // The wallpaper plugin's identifier, pinned here as a literal on purpose.
@@ -589,10 +582,11 @@ void runMetadataParseChecks() {
     //       printing that their metadata arms were withheld rather than failing too.
     //       Reverted. The three arms above it were controlled the same way, each restored and
     //       hash-compared: the file moved aside gave `FAIL: the wallpaper package ships a
-    //       metadata.json`; chmod 000 gave `NOT VERIFIED: S9.1-S9.3 -- metadata.json is
-    //       present but could not be read` and exit 77, a ctest skip rather than an
-    //       accusation against the package (and not a spurious parse failure); wrapping the
-    //       object in [ ] gave `FAIL: the package's metadata.json is a JSON object`.
+    //       metadata.json`; chmod 000 gave `kpackage_metadata_test: NOT VERIFIED --
+    //       S9.1-S9.3 could not be exercised: metadata.json is present but could not be
+    //       read ...` and exit 77, a ctest skip rather than an accusation against the
+    //       package (and not a spurious parse failure); wrapping the object in [ ] gave
+    //       `FAIL: the package's metadata.json is a JSON object`.
     try {
         g_metadata = nlohmann::json::parse(*text);
     } catch (const nlohmann::json::exception& e) {
@@ -965,6 +959,8 @@ void runConfigQmlChecks() {
 }  // namespace
 
 int main() {
+    wallpaperx::testing::g_testName = "kpackage_metadata_test";
+
     g_backendDir = std::filesystem::path(WALLPAPERX_BACKEND_SOURCE_DIR);
     g_packageDir = g_backendDir / kPackageDirArgument;
 
@@ -979,7 +975,7 @@ int main() {
         notVerified("S9.1-S9.5", "the backend source directory baked in at build time is not there now: " +
                                      g_backendDir.string());
         std::printf("kpackage_metadata_test: nothing could be checked -- reported to ctest as a skip, not a pass.\n");
-        return kNotVerifiedExitCode;
+        return wallpaperx::testing::kNotVerifiedExitCode;
     }
 
     struct Phase {
@@ -1009,22 +1005,13 @@ int main() {
     // are counted apart from check failures so the summary cannot send a reader to the
     // package for a fault in this file -- but they are equally red, never a skip, because a
     // harness that cannot be trusted must not report a verdict.
-    if (g_failures > 0) {
-        std::fprintf(stderr, "kpackage_metadata_test: %d check(s) failed\n", g_failures);
-    }
+    const bool checksFailed = wallpaperx::testing::reportCheckFailures();
     if (g_harnessFaults > 0) {
         std::fprintf(stderr, "kpackage_metadata_test: %d fault(s) in this test file, not in the package\n",
                      g_harnessFaults);
     }
-    if (g_failures > 0 || g_harnessFaults > 0) {
+    if (checksFailed || g_harnessFaults > 0) {
         return 1;
     }
-    if (g_notVerified > 0) {
-        std::printf("kpackage_metadata_test: every check that ran passed, but %d goal(s) could not be exercised on "
-                    "this host (listed above) -- reported to ctest as a skip, not a pass.\n",
-                    g_notVerified);
-        return kNotVerifiedExitCode;
-    }
-    std::printf("kpackage_metadata_test: all checks passed\n");
-    return 0;
+    return wallpaperx::testing::reportNotVerifiedOrPassed();
 }

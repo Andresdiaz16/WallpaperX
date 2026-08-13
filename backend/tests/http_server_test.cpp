@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+
 // Step 7's HTTP config server (backend/daemon/http_server.cpp), in process, against a
 // real WallpaperManager and a real DbusService on a private session bus.
 //
@@ -43,6 +45,7 @@
 
 #include "tests/client/daemon_client.h"
 #include "tests/client/http_probe.h"
+#include "tests/test_report.h"
 
 #include <httplib.h>
 
@@ -342,17 +345,14 @@ constexpr int kMonitorNeverSet = 31;  // also the upper in-range boundary for S7
 // Goals this run could not exercise, as opposed to goals it exercised and that held.
 // Reported to ctest as exit 77 (SKIP_RETURN_CODE in backend/CMakeLists.txt) so an
 // unexercised goal can never read as a pass. Not a check() failure: X.3 forbids
-// reporting a fault of the host or the harness as a fault of the daemon.
-int g_notVerified = 0;
-constexpr int kNotVerifiedExitCode = 77;
+// reporting a fault of the host or the harness as a fault of the daemon. The channel
+// itself lives in tests/test_report.h.
+using wallpaperx::testing::notVerified;
 
-void notVerified(const char* goals, const std::string& reason) {
-    std::printf("http_server_test: NOT VERIFIED -- %s could not be exercised: %s. This run establishes "
-                "nothing about them, and is reported to ctest as a skip rather than as a pass.\n",
-                goals, reason.c_str());
-    std::fflush(stdout);
-    ++g_notVerified;
-}
+// Unlike the other test binaries, this one must not say "on this host" in its skip summary:
+// the reasons its phases print are a mix of host limits and preconditions this run could not
+// build, and naming one cause for all of them points a reader at the wrong component.
+constexpr const char* kSkipReasonMixed = "goal group(s) could not be exercised (each reason is printed above)";
 
 // Three faults startServer() can meet that no single phase can grade, recorded here and
 // answered once in main: a phase whose server is null can only say NOT VERIFIED, so without
@@ -4182,13 +4182,12 @@ void runSilentClientShutdownChecks(WallpaperManager& manager, const Check& check
 }  // namespace
 
 int main() {
-    int failures = 0;
-    const Check check = [&](bool cond, const char* msg) {
-        if (!cond) {
-            std::fprintf(stderr, "FAIL: %s\n", msg);
-            ++failures;
-        }
-    };
+    wallpaperx::testing::g_testName = "http_server_test";
+
+    // Wrapped in a Check rather than called directly because every phase below takes one:
+    // the std::function is what lets a phase be handed the grader without this file's
+    // reporting internals.
+    const Check check = wallpaperx::testing::check;
 
     // This thread drives every request, so it allocates on the client side of each one.
     // Marking it keeps the allocation probe from mistaking the client for the handler.
@@ -4356,24 +4355,11 @@ int main() {
         // produces -- would abort the process, so ctest would report an opaque SIGABRT
         // instead of the named failures above.
         std::fprintf(stderr, "FAIL: unexpected exception: %s\n", e.what());
-        ++failures;
+        ++wallpaperx::testing::g_failures;
     }
 
-    if (failures > 0) {
-        // Asked before the not-verified count, so a run that is both broken and
-        // incomplete reports as broken rather than hiding behind ctest's "Skipped".
-        std::fprintf(stderr, "http_server_test: %d check(s) failed\n", failures);
-        return 1;
-    }
-    if (g_notVerified > 0) {
-        // Not "on this host": the reasons above are a mix of host limits and preconditions
-        // this run could not build, and naming one cause for all of them points a reader at
-        // the wrong component.
-        std::printf("http_server_test: every check that ran passed, but %d goal group(s) could not be exercised "
-                    "(each reason is printed above) -- reported to ctest as a skip, not a pass.\n",
-                    g_notVerified);
-        return kNotVerifiedExitCode;
-    }
-    std::printf("http_server_test: all checks passed\n");
-    return 0;
+    // Asked before the not-verified count, so a run that is both broken and incomplete
+    // reports as broken rather than hiding behind ctest's "Skipped".
+    if (wallpaperx::testing::reportCheckFailures()) return 1;
+    return wallpaperx::testing::reportNotVerifiedOrPassed(kSkipReasonMixed);
 }
