@@ -2251,6 +2251,21 @@ int main() {
     // rather than one around all of them: a throw in phase 2 used to delete phases 3 to 8
     // from the run with nothing in the output saying they had not been reached, so a reader
     // saw one named failure and reasonably concluded everything else had been checked.
+    //
+    // GOAL: X.3 -- what escapes a phase body is a fault of the code under test, so the
+    //       handler below counts it as one. False if a host limit reaches here: $TMPDIR
+    //       naming a directory that does not exist used to throw out of every phase's first
+    //       line and print 16 FAIL lines against ConfigStore for a machine with nowhere to
+    //       put a temporary directory.
+    // WHY-THIS-SHAPE: fixed at the setup call (ScratchDir's temp_directory_path now uses the
+    //       error_code overload, so the phase reaches its own notVerified arm), NOT by
+    //       adding a `catch (const std::filesystem::filesystem_error&) -> notVerified` arm
+    //       here. That arm cannot tell the two apart: ConfigStore throwing a
+    //       filesystem_error of its own is the same C++ type, and demoting it to a skip
+    //       would convert real defects into green.
+    // CONTROL: ConfigStore's constructor (backend/daemon/config_store.cpp) made to throw a
+    //       std::filesystem::filesystem_error -> 16 `FAIL: the "..." phase threw: filesystem
+    //       error: CONTROL: ...` lines and exit 1, not a skip. Reverted.
     struct Phase {
         const char* name;
         void (*run)();

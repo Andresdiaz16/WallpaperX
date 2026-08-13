@@ -36,6 +36,7 @@
 #include "support/exported_frame_map.h"
 #include "support/validation_grade.h"
 #include "tests/client/daemon_client.h"
+#include "tests/test_report.h"
 
 #include <sdbus-c++/sdbus-c++.h>
 
@@ -83,6 +84,15 @@ using wallpaperx::testing::setWallpaper;
 using wallpaperx::testing::StatusReply;
 using wallpaperx::testing::validationWaived;
 using wallpaperx::testing::wallpaperStatus;
+
+// The pass / fail contract lives in tests/test_report.h, shared with the other five test
+// binaries so the wording and the exit codes cannot drift apart.
+//
+// This file uses only two of its three channels. It has no notVerified() call and its four
+// ctest entries in backend/CMakeLists.txt carry no SKIP_RETURN_CODE, so exit 77 would read
+// to ctest as a failure: the skip channel has to be enabled there before it can be used
+// here. reportNotVerifiedOrPassed() below therefore always takes its all-passed branch, and
+// is called for the failure guard it applies rather than for a skip this file can produce.
 
 // Deliberately not square. With equal dimensions a width/height swap anywhere between
 // the target and the wire would satisfy every assertion below.
@@ -409,8 +419,9 @@ void runHostChecks(sdbus::IProxy& proxy, const std::string& imagePath, const Che
     //       fails loudly in the exact configuration this goal forbids, which is the
     //       silence ("accepted, then frameless forever") the goal describes.
     // CONTROL: the path check in WallpaperManager::requestWallpaper put back inside
-    //       `if (type == "static")`, re-run 2026-08-05 with the per-case checks below in
-    //       place -> 8 FAIL lines and "dbus_service_test: 8 check(s) failed": one per
+    //       `if (type == "static")` (backend/daemon/wallpaper_manager.cpp), re-run after
+    //       this file moved onto tests/test_report.h -> 8 FAIL lines and
+    //       "dbus_service_test: 8 check(s) failed": one per
     //       (type, path) pair ("a video wallpaper with an empty path is rejected as
     //       InvalidArgs" and the other five), plus "a monitor whose every request was
     //       rejected is still reported as never set" (it answered
@@ -439,7 +450,7 @@ void runHostChecks(sdbus::IProxy& proxy, const std::string& imagePath, const Che
                 ++driven;
                 // Each case is its own counted check rather than a hand-printed "FAIL:"
                 // line feeding one aggregate assertion. "FAIL: " is the harness's marker
-                // for a counted failure, and writing it without incrementing `failures`
+                // for a counted failure, and writing it without incrementing the counter
                 // made the summary line disagree with the number of FAIL lines on stderr
                 // -- six regressions printed seven FAILs and reported one. Six named
                 // checks are also strictly stronger than their conjunction.
@@ -1486,13 +1497,12 @@ void runCoalescingChecks(sdbus::IProxy& proxy, FrameReadyLog& signals, const std
 }  // namespace
 
 int main() {
-    int failures = 0;
-    const Check check = [&](bool cond, const char* msg) {
-        if (!cond) {
-            std::fprintf(stderr, "FAIL: %s\n", msg);
-            ++failures;
-        }
-    };
+    wallpaperx::testing::g_testName = "dbus_service_test";
+
+    // Wrapped in a Check rather than called directly because every phase below takes one:
+    // the std::function is what lets a phase be handed the grader without this file's
+    // reporting internals.
+    const Check check = wallpaperx::testing::check;
 
     // Scoped so the manager, and with it the render thread, the Vulkan Device, the
     // offscreen targets and Memory's leaked-allocation check, are all destroyed before
@@ -1584,7 +1594,7 @@ int main() {
         // ctest would report an opaque SIGABRT instead of a named failure, and none of
         // the FAIL lines above would ever be printed.
         std::fprintf(stderr, "FAIL: unexpected exception: %s\n", e.what());
-        ++failures;
+        ++wallpaperx::testing::g_failures;
     }
 
     // Asking for validation is not the same as getting it: Device degrades silently when
@@ -1604,13 +1614,13 @@ int main() {
         std::fprintf(stderr,
                      "FAIL: no Vulkan device was ever created, so the validation oracle graded "
                      "nothing -- see the render failures above for the cause.\n");
-        ++failures;
+        ++wallpaperx::testing::g_failures;
     } else if (!validationLayerWasActive) {
         std::fprintf(stderr,
                      "FAIL: VK_LAYER_KHRONOS_validation was requested but is not loaded -- the "
                      "zero-warning check below would pass without validating anything. "
                      "Install the Vulkan validation layers.\n");
-        ++failures;
+        ++wallpaperx::testing::g_failures;
     } else {
         const int warnings = validationCounter->load();
         check(warnings == 0, "the render, export and teardown path produced zero Vulkan validation warnings");
@@ -1619,10 +1629,8 @@ int main() {
         }
     }
 
-    if (failures == 0) {
-        std::printf("dbus_service_test: all checks passed\n");
-        return 0;
-    }
-    std::fprintf(stderr, "dbus_service_test: %d check(s) failed\n", failures);
-    return 1;
+    // Asked before the pass/skip summary, so a run that is both broken and incomplete
+    // reports as broken rather than hiding behind ctest's "Skipped".
+    if (wallpaperx::testing::reportCheckFailures()) return 1;
+    return wallpaperx::testing::reportNotVerifiedOrPassed();
 }

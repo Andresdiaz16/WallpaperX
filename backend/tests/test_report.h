@@ -16,7 +16,7 @@
 //      point of the 77 channel, and it is the first thing a retyped copy drops.
 //
 // One definition rather than one per binary, for the reason tests/client/daemon_client.h
-// gives: a contract five files each state separately is five things that can disagree, and
+// gives: a contract six files each state separately is six things that can disagree, and
 // a copy that drops part 3 or writes its skip line to the wrong stream still compiles,
 // still passes, and still reads to a developer as coverage.
 //
@@ -102,7 +102,7 @@ constexpr const char* kSkipReasonHost = "goal(s) could not be exercised on this 
                                                    const std::string& passDetail = "") {
     // Part 2 of the contract, enforced here rather than trusted to each main(): reaching
     // this with failures pending would return 77 and let ctest print "Skipped" over a run
-    // that had red in it. Unreachable from all five callers today -- they all ask
+    // that had red in it. Unreachable from all six callers today -- they all ask
     // reportCheckFailures() first -- which is exactly why it is a guard and not a comment.
     // CONTROL: a scratch program that failed a check and then called this directly, skipping
     //       reportCheckFailures() -> the line below and exit 1, not 77.

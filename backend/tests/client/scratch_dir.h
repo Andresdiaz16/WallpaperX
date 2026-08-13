@@ -26,23 +26,31 @@ public:
     // `base` is a parameter because one phase needs a real disk: temp_directory_path() is
     // tmpfs on most hosts, and a measurement that compares a durable write against a plain
     // one cannot discriminate there.
-    ScratchDir(const std::filesystem::path& base, const char* tag) {
-        static int counter = 0;
-        m_path = base / ("wpx_test_" + std::to_string(::getpid()) + "_" + std::to_string(counter++) + "_" +
-                         std::string(tag));
-        std::error_code ec;
-        std::filesystem::remove_all(m_path, ec);
-        std::filesystem::create_directories(m_path, ec);
-        m_ok = !ec;
-    }
+    ScratchDir(const std::filesystem::path& base, const char* tag) { create(base, tag); }
 
-    explicit ScratchDir(const char* tag) : ScratchDir(std::filesystem::temp_directory_path(), tag) {}
+    // temp_directory_path() through its error_code overload rather than the throwing one.
+    // A host whose $TMPDIR names a directory that does not exist makes the throwing one
+    // throw out of the very first line of a phase -- past the !ok() arm that phase already
+    // wrote -- and into whatever catch-all its main() has, which then reports "this machine
+    // has nowhere to put a scratch directory" as a defect of the code under test. Failing
+    // into ok() == false instead routes it to the reason the caller already prints.
+    explicit ScratchDir(const char* tag) {
+        std::error_code ec;
+        const std::filesystem::path base = std::filesystem::temp_directory_path(ec);
+        // m_path stays empty and m_ok stays false: an empty base would make the name below
+        // relative, so a failure here would create the scratch directory in the working
+        // directory and then delete it from there.
+        if (ec) return;
+        create(base, tag);
+    }
 
     // Every call here has a non-throwing overload, `increment(ec)` included: this runs in a
     // destructor, so a directory error met while walking would otherwise leave through an
     // implicitly-noexcept function and take the process down with std::terminate, losing
     // exactly the diagnostics the test existed to print.
     ~ScratchDir() {
+        // Never constructed a name at all, so there is nothing of ours to chmod or remove.
+        if (m_path.empty()) return;
         std::error_code ec;
         std::filesystem::permissions(m_path, std::filesystem::perms::owner_all,
                                      std::filesystem::perm_options::add, ec);
@@ -73,6 +81,16 @@ public:
     std::string env() const { return "XDG_CONFIG_HOME=" + m_path.string(); }
 
 private:
+    void create(const std::filesystem::path& base, const char* tag) {
+        static int counter = 0;
+        m_path = base / ("wpx_test_" + std::to_string(::getpid()) + "_" + std::to_string(counter++) + "_" +
+                         std::string(tag));
+        std::error_code ec;
+        std::filesystem::remove_all(m_path, ec);
+        std::filesystem::create_directories(m_path, ec);
+        m_ok = !ec;
+    }
+
     std::filesystem::path m_path;
     bool m_ok = false;
 };
