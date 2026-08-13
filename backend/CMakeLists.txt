@@ -207,6 +207,27 @@ target_link_libraries(wallpaperx-log-escape-test PRIVATE wallpaperx-daemon-lib)
 add_executable(wallpaperx-config-store-test tests/config_store_test.cpp)
 target_link_libraries(wallpaperx-config-store-test PRIVATE wallpaperx-daemon-lib)
 
+# Step 9's Plasma wallpaper package (kde/kpackage), checked as text: that its metadata
+# parses, declares the structure Plasma looks for, and agrees with the install rule below
+# and with the plugin id the app's activation script will ask for.
+#
+# Deliberately outside the if(WALLPAPERX_BUILD_KDE_PLUGIN) guard, unlike everything else
+# that concerns the KDE plugin. Nothing here needs Qt, ECM, Plasma or kpackagetool6 -- it
+# reads files -- and the sanitizer tree is configured with that option OFF, so putting it
+# inside would leave the one tier most likely to be run after an edit blind to a package
+# that had stopped installing under the id metadata.json declares.
+#
+# It links nlohmann_json alone rather than wallpaperx-daemon-lib: the daemon library drags
+# in the renderer and the compiled shaders, none of which a text check needs, and the
+# lighter target keeps this runnable wherever the source tree is.
+add_executable(wallpaperx-kpackage-metadata-test tests/kpackage_metadata_test.cpp)
+target_link_libraries(wallpaperx-kpackage-metadata-test PRIVATE nlohmann_json::nlohmann_json)
+# The files under test are source, not build output, and ctest runs in the build tree. This
+# is the only way the test can find them; without it there is nothing to look at.
+target_compile_definitions(wallpaperx-kpackage-metadata-test PRIVATE
+    WALLPAPERX_BACKEND_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+)
+
 # The system-level tier: spawns the real wallpaperx-daemon executable and drives it over
 # the bus. It links the daemon library only for the DBus name/interface constants and
 # the client-side test scaffolding -- deliberately not to call into the daemon's code,
@@ -248,6 +269,7 @@ if(WALLPAPERX_BUILD_KDE_PLUGIN)
     set_target_properties(wallpaperx-daemon-lib wallpaperx-daemon wallpaperx-dbus-service-test
                           wallpaperx-daemon-system-test wallpaperx-http-server-test
                           wallpaperx-log-escape-test wallpaperx-config-store-test
+                          wallpaperx-kpackage-metadata-test
         PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
 endif()
 
@@ -266,6 +288,15 @@ set_tests_properties(log_escape PROPERTIES LABELS "novulkan")
 # driver.
 add_test(NAME config_store COMMAND $<TARGET_FILE:wallpaperx-config-store-test>)
 set_tests_properties(config_store PROPERTIES LABELS "novulkan"
+                     SKIP_RETURN_CODE 77)
+
+# Outside the guard as well, and for the strongest version of the reason: this one opens no
+# bus, no port and no driver, and reads only files. `novulkan` because the TSan block below
+# selects tests by label and an unlabelled test is disabled there. SKIP_RETURN_CODE because
+# a source tree that is not where the build recorded it is this test failing to set up, not
+# the package being wrong, and must not print as a package defect.
+add_test(NAME kpackage_metadata COMMAND $<TARGET_FILE:wallpaperx-kpackage-metadata-test>)
+set_tests_properties(kpackage_metadata PROPERTIES LABELS "novulkan"
                      SKIP_RETURN_CODE 77)
 
 # The DBus service test needs a session bus. dbus-run-session gives each run a
@@ -484,7 +515,7 @@ elseif(WALLPAPERX_SANITIZE STREQUAL "thread")
             # Two labels, not one, and the second is the correction: what disqualifies a
             # test here is *loading the proprietary ICD*, which the absence of a lavapipe
             # label is a bad proxy for. Keyed on that absence, this branch also disabled
-            # the six CPU-only tests, which never open a driver and cannot SEGV in one.
+            # the CPU-only tests, which never open a driver and cannot SEGV in one.
             if("lavapipe" IN_LIST _labels OR "novulkan" IN_LIST _labels)
                 # APPEND rather than read-modify-write: CMake already handles the
                 # empty-property case and the list quoting.
@@ -507,11 +538,12 @@ elseif(WALLPAPERX_SANITIZE STREQUAL "thread")
     # exits 0, which reads exactly like a clean gate. It happens whenever the lavapipe
     # ICD is missing, since every lavapipe entry is registered under find_file. Say so at
     # configure time -- by the time ctest is green it is too late to notice.
-    # Counted on the lavapipe entries specifically, not on the total. The six novulkan
-    # entries are single-threaded and always survive, so a total of 6 would satisfy an
-    # "anything left?" check while detecting no race whatever -- every threaded path in
-    # this project reaches TSan through a lavapipe entry. Without the ICD that is what
-    # the tier degrades to, and it still exits 0.
+    # Counted on the lavapipe entries specifically, not on the total. The novulkan entries
+    # are single-threaded and always survive, so a nonzero total would satisfy an "anything
+    # left?" check while detecting no race whatever -- every threaded path in this project
+    # reaches TSan through a lavapipe entry. Without the ICD that is what the tier degrades
+    # to, and it still exits 0. The live counts are in the configure-time message below,
+    # which cannot go stale because it is computed.
     if(_tsan_lavapipe EQUAL 0)
         message(WARNING
             "TSan tier: no lavapipe test survived, so this tree detects no races at all "

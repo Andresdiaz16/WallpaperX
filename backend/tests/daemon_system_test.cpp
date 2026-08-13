@@ -2066,7 +2066,7 @@ SignalMasks readSignalMasks(pid_t pid, const std::vector<pid_t>& tids) {
 //       matched via strsignal() rather than the literal "Hangup" because the daemon
 //       inherits this process's locale and a translated string would fail a correct
 //       daemon.
-// CONTROL: `sigaddset(&shutdownSignals, SIGHUP)` deleted from main.cpp -> "FAIL: the
+// CONTROL: `sigaddset(&shutdownSignals, SIGHUP)` deleted from backend/daemon/main.cpp -> "FAIL: the
 //       daemon exits through main() on SIGHUP rather than being killed by it (terminated
 //       by signal 1)", plus the exit-0, signal-name and stopped-cleanly checks. Reverted.
 void checkHangupShutdown(NameWatcher& names, const Check& check) {
@@ -2131,7 +2131,7 @@ void checkHangupShutdown(NameWatcher& names, const Check& check) {
 //       away, nothing generates EPIPE and all of the above passes on a daemon with the
 //       bug reintroduced -- so the write is asserted rather than assumed.
 // CONTROL: three, all re-run 2026-08-05 against this shape of the phase.
-//       (a) `std::signal(SIGPIPE, SIG_IGN)` deleted from main.cpp -> 5 FAILs: SetWallpaper
+//       (a) `std::signal(SIGPIPE, SIG_IGN)` deleted from backend/daemon/main.cpp -> 5 FAILs: SetWallpaper
 //       came back [org.freedesktop.DBus.Error.NoReply], GetStatus came back
 //       ServiceUnknown, "the daemon ignores SIGPIPE", and the exit checks with
 //       "terminated by signal 13".
@@ -2368,7 +2368,7 @@ void checkClosedStdout(NameWatcher& names, const std::string& bluePath, const st
 //       connection-loss checks (S6.35) could not be exercised: no dbus-daemon binary was
 //       found at configure time", exit 77, and ctest reported `daemon_system ...Skipped`
 //       instead of Passed. Both reverted.
-//       (iii) main.cpp's ShutdownWatch guard replaced by a bare `std::thread shutdownWatch`
+//       (iii) backend/daemon/main.cpp's ShutdownWatch guard replaced by a bare `std::thread shutdownWatch`
 //       with the pthread_kill/join moved to after enterEventLoop() -- i.e. the code as it
 //       was before f1aa32c. Re-run 2026-08-06: the daemon printed "terminate called
 //       without an active exception" and died on signal 6, and exactly 3 FAILs followed --
@@ -2503,7 +2503,7 @@ void checkBusLoss(const Check& check) {
     //       reworded message in main.cpp turns those red instead of leaving this one
     //       vacuously green.
     //
-    // CONTROL: main.cpp's `wakingForShutdown` early return deleted from the watcher -- i.e.
+    // CONTROL: backend/daemon/main.cpp's `wakingForShutdown` early return deleted from the watcher -- i.e.
     //       the code as it was before this fix. Re-run 2026-08-06: the orphan printed
     //       "wallpaperx-daemon: Terminated received, shutting down" ahead of its ENOTCONN
     //       fatal line, and this was the ONLY failure in the run -- "FAIL: the daemon does
@@ -2720,7 +2720,7 @@ void checkHttpLifecycle(NameWatcher& names, const std::string& bluePath, const s
     //       The pending set is asserted rather than `status == "ok"` alone because alone it
     //       is vacuous: a daemon that reported everything `ok` from birth satisfies it.
     // CONTROL: the `wallpaperx::HttpServer httpServer(manager);` line removed from
-    //       main.cpp -> this phase reports NOT VERIFIED ("the daemon printed neither the
+    //       backend/daemon/main.cpp -> this phase reports NOT VERIFIED ("the daemon printed neither the
     //       bind-success nor the bind-failure line for port 18462; the daemon reports
     //       config_server pending") rather than spending a FAIL on the daemon; the run's
     //       failures for that mutation all come from phase 11, which grades it directly.
@@ -2849,7 +2849,7 @@ void checkHttpLifecycle(NameWatcher& names, const std::string& bluePath, const s
     //       The alternative -- asserting that some specific request got a 200 during the
     //       window -- would be an assertion on the scheduler (X.2), since when the poller
     //       stops being served is exactly what shutdown decides.
-    // CONTROL: main.cpp's `HttpServer httpServer(manager);` replaced with
+    // CONTROL: backend/daemon/main.cpp's `HttpServer httpServer(manager);` replaced with
     //       `auto* leaked = new HttpServer(manager); (void)leaked;` -- the server then
     //       outlives the manager it reads, which is precisely the ordering the
     //       declare-it-last comment exists to guarantee. Observed: the daemon died on
@@ -3037,7 +3037,7 @@ void checkConfigServerOwnsPort(NameWatcher& names, const std::string& validation
     //       event loop -- so a reply having come back is proof the decision is made, and
     //       nothing answers GetStatus before then. The bus name, which is taken earlier,
     //       is not that proof.
-    // CONTROL: three. (a) main.cpp's HttpServer constructed on kDefaultPort + 1, its
+    // CONTROL: three. (a) backend/daemon/main.cpp's HttpServer constructed on kDefaultPort + 1, its
     //       constructor still recording the bind -> "FAIL: config_server reads ok exactly
     //       when this daemon is the process holding 18462" with "  config_server: ok /
     //       listening, but 127.0.0.1:18462 is held by nobody". (b) the `status
@@ -3616,7 +3616,7 @@ void checkConfigRestart(NameWatcher& names, const std::string& validationEnv, co
     //       before the restarted daemon is spawned, so no startup render can be emitted
     //       unobserved -- subscribing after the name appears would not do, since the daemon
     //       owns its name before it queues that render.
-    // CONTROL: `service.restoreSaved();` deleted from main.cpp -> seven FAILs, led by "the
+    // CONTROL: `service.restoreSaved();` deleted from backend/daemon/main.cpp -> seven FAILs, led by "the
     //       wallpaper set before the restart is on that monitor after it, with no client
     //       asking" and "the restored wallpaper renders in the new process without any
     //       client asking", and including this phase's two S8.11 lines and the
@@ -4192,7 +4192,7 @@ void checkConfigPreservationOwnership(NameWatcher& names, const std::string& val
     //       "config.json.bad exists" alone would pass for a daemon that wrote a summary into
     //       it, and leaving the original in place is the state in which the next save
     //       overwrites the user's only copy -- moving it is what clears the path.
-    // CONTROL: `manager.preserveUnreadableConfig();` deleted from main.cpp -> "FAIL: the
+    // CONTROL: `manager.preserveUnreadableConfig();` deleted from backend/daemon/main.cpp -> "FAIL: the
     //       daemon moves a config it could not read aside", "FAIL: the copy the daemon kept
     //       holds the bytes of the file it could not read" and "FAIL: the daemon says where
     //       it kept the config it could not read", printing "copies beside it: (none)".
@@ -4235,7 +4235,7 @@ void checkConfigPreservationOwnership(NameWatcher& names, const std::string& val
     //       duplicate is required to have exited before anything is read, so this cannot pass
     //       on a race in which it simply had not got there yet.
     // CONTROL: `manager.preserveUnreadableConfig()` moved back above the `requestName` call
-    //       in main.cpp, which is the ordering this goal exists to forbid -> "FAIL: a daemon
+    //       in backend/daemon/main.cpp, which is the ordering this goal exists to forbid -> "FAIL: a daemon
     //       that lost the name request leaves config.json exactly as it found it" and "FAIL:
     //       a daemon that lost the name request makes no copy of the config", printing
     //       "config.json now holds: (nothing)" and "copies beside it: config.json.bad,
@@ -4333,7 +4333,7 @@ void checkStoppableOnAnyConfigFile(NameWatcher& names, const std::string& valida
     //       reaches the bus at all -- the phase's GetStatus and detail checks are skipped
     //       rather than red, and the FAILs land on the two that do not depend on the name.
     //       What stayed GREEN under (b) is worth as much: the daemon still exited without
-    //       being killed, because main.cpp's five-second teardown deadline fires and ends the
+    //       being killed, because backend/daemon/main.cpp's five-second teardown deadline fires and ends the
     //       process -- and it is that deadline, not a clean stop, that the exit code 1 above
     //       comes from. So stoppability here rests on three independent mechanisms -- the type
     //       and size guards, the load deadline, and that watchdog -- and no single-mutation
@@ -4656,7 +4656,7 @@ void checkFileSizeLimit(NameWatcher& names, const std::string& validationEnv, co
     //       the config -- a failure this phase would report against the daemon. The limit is
     //       applied in the forked child rather than to this process, because a limit here
     //       would apply to the harness's own writes too.
-    // CONTROL: `std::signal(SIGXFSZ, SIG_IGN)` disabled in main.cpp -> four FAILs: the
+    // CONTROL: `std::signal(SIGXFSZ, SIG_IGN)` disabled in backend/daemon/main.cpp -> four FAILs: the
     //       SetWallpaper call itself (the daemon dies mid-reply), "a config write that
     //       exceeds the file-size limit does not kill the daemon", and both shutdown checks,
     //       printing "  exited normally 0, timed out 0, signal 25". Reverted.
@@ -4971,7 +4971,7 @@ void checkStalledConfigWrite(NameWatcher& names, const std::string& validationEn
     //       exits on SIGTERM" above, because the forced path is still a normal exit -- which
     //       is why the exit CODE and the watchdog's line are asserted separately. Reverted.
     //       That check has a control of its own: the same join plus `kTeardownDeadline` in
-    //       main.cpp raised to an hour, so nothing forces the process out at all -> "FAIL: a
+    //       backend/daemon/main.cpp raised to an hour, so nothing forces the process out at all -> "FAIL: a
     //       daemon with a config write it can never finish still exits on SIGTERM", printing
     //       "exited normally 0, timed out 1, signal 0" -- it had to be SIGKILLed. Reverted.
     const int exitCode = daemon.shutdown(SIGTERM);
@@ -5180,7 +5180,7 @@ int main() {
                 //       plausible future regression. The error name is what pins the
                 //       reason, and it is the name a caller of
                 //       createSessionBusConnection() would branch on.
-                // CONTROL: main.cpp patched to throw before requesting the name
+                // CONTROL: backend/daemon/main.cpp patched to throw before requesting the name
                 //       (`throw std::runtime_error("no")` above createSessionBusConnection)
                 //       -> "FAIL: the second instance is refused with
                 //       org.freedesktop.DBus.Error.FileExists", while the pre-existing
@@ -5254,7 +5254,7 @@ int main() {
             //       exited 1. No committed check can reach it -- the fixture would have to be
             //       teardown that genuinely wedges, which needs a filesystem this harness can
             //       hang on demand.
-            // CONTROL: `kTeardownDeadline` in main.cpp set to 0 seconds, so every stop takes
+            // CONTROL: `kTeardownDeadline` in backend/daemon/main.cpp set to 0 seconds, so every stop takes
             //       the forced path -> "FAIL: the daemon leaves through main() rather than
             //       through the teardown watchdog", "FAIL: the daemon exits 0 on SIGTERM"
             //       ("exit code 1") and "FAIL: the daemon runs its destructor chain on the way
