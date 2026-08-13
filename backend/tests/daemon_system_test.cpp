@@ -681,8 +681,42 @@ private:
 // The prefix every scratch directory this run creates shares, so the isolation guard can
 // tell a config file written by one of this run's daemons from one written by a process it
 // does not own. Must stay in step with ScratchDir's naming in tests/client/scratch_dir.h.
+//
+// Empty when this host has no temporary directory, through temp_directory_path()'s
+// error_code overload rather than the throwing one: this is called from the isolation guard,
+// which runs outside main()'s try on purpose, so a throw here dies by std::terminate and
+// takes every diagnostic the run was about to print with it. The one caller must treat empty
+// as "unavailable" and never as a needle -- find("") matches at position 0 of every string.
 std::string harnessTempPrefix() {
-    return (std::filesystem::temp_directory_path() / ("wpx_test_" + std::to_string(::getpid()) + "_")).string();
+    std::error_code ec;
+    const std::filesystem::path base = std::filesystem::temp_directory_path(ec);
+    if (ec) return {};
+    return (base / ("wpx_test_" + std::to_string(::getpid()) + "_")).string();
+}
+
+// Empty when this host can give the suite a scratch directory; otherwise why it cannot.
+//
+// Probed once, up front, because every daemon this file spawns needs a scratch directory for
+// its XDG_CONFIG_HOME: without one SpawnedDaemon's constructor throws, main()'s catch-all
+// prints "FAIL: unexpected exception", and a machine with no /tmp is recorded as a defect of
+// the daemon. Asked as a positive probe of the host rather than by classifying an exception,
+// so nothing the daemon does can reach this answer.
+std::string scratchDirectoryFault() {
+    std::error_code ec;
+    const std::filesystem::path base = std::filesystem::temp_directory_path(ec);
+    if (ec) {
+        // The value is quoted, and empty and unset are worded apart: an empty $TMPDIR is a
+        // real way to hit this and prints as nothing at all otherwise.
+        const char* tmpdir = std::getenv("TMPDIR");
+        std::string where = "$TMPDIR is unset, so /tmp was tried";
+        if (tmpdir != nullptr) {
+            where = *tmpdir == '\0' ? "$TMPDIR is set but empty" : "$TMPDIR is '" + std::string(tmpdir) + "'";
+        }
+        return "std::filesystem::temp_directory_path() failed (" + ec.message() + "); " + where;
+    }
+    const ScratchDir probe("hostprobe");
+    if (!probe.ok()) return "a directory could not be created under " + base.string();
+    return {};
 }
 
 // The developer's own config file, as this process's environment names it, and whatever was
@@ -5010,6 +5044,41 @@ int main() {
                     "process, wire and threading behaviour holds.\n");
     }
 
+    // GOAL: X.3 -- a host that cannot supply a temporary directory makes this run report,
+    //       not abort, and does not have the missing directory recorded against the daemon.
+    //       False if `TMPDIR=/nonexistent ./wallpaperx-daemon-system-test` dies on SIGABRT,
+    //       or exits with a FAIL line, or exits 0.
+    // WHY-THIS-SHAPE: a positive probe of the host, taken before anything is spawned, rather
+    //       than classifying what main()'s catch-all caught. Routing that catch-all to the
+    //       skip channel would be the smaller edit and is the trap: it also catches the
+    //       sdbus::Error a genuinely broken daemon raises, so every real defect that escapes
+    //       a phase would become ctest "Skipped" instead of red. Nothing the daemon does can
+    //       reach this branch -- it is decided before the first fork.
+    //       Skip, not the harnessFault channel this file grades a dead fork with: the sibling
+    //       tier (config_store_test) already answers this same host state with 77, and one of
+    //       the two reporting the machine's missing /tmp as red would have the two tiers
+    //       disagree about whose fault it is.
+    // CONTROL: run as `TMPDIR=/nonexistent/nowhere ./wallpaperx-daemon-system-test`. Before
+    //       this branch: "FAIL: unexpected exception: scratch XDG_CONFIG_HOME could not be
+    //       created", then "terminate called ... temp_directory_path" from harnessTempPrefix()
+    //       in the isolation guard below, and exit 134 with the rest of the report lost.
+    //       After: one NOT VERIFIED line naming temp_directory_path and $TMPDIR, and exit 77.
+    //       Second arm, $TMPDIR pointed at a mode-500 directory: NOT VERIFIED naming "a
+    //       directory could not be created under ...", exit 77.
+    //       Countercheck that this did not widen the skip channel: with a normal $TMPDIR and
+    //       the GPU/tier printf in backend/daemon/wallpaper_manager.cpp replaced by an
+    //       unrelated line, the run still prints FAIL and exits 1, not 77. Reverted.
+    if (const std::string scratchFault = scratchDirectoryFault(); !scratchFault.empty()) {
+        notVerified("every goal in this file",
+                    "this host cannot give the harness a scratch directory, and every daemon this file spawns "
+                    "needs one for its XDG_CONFIG_HOME: " +
+                        scratchFault);
+        // Returned before the isolation guard below rather than falling through to it: no
+        // daemon was spawned, so there is nothing for that guard to attribute, and it would
+        // otherwise run with the empty prefix this same host fault produces.
+        return wallpaperx::testing::reportNotVerifiedOrPassed();
+    }
+
     // GOAL: this suite must not touch the developer's own wallpaper config. Every daemon it
     //       spawns gets an XDG_CONFIG_HOME of the harness's own, and this is the check that
     //       the arrangement actually holds. False if a run creates or edits the config file
@@ -5438,7 +5507,21 @@ int main() {
     } else {
         const RealConfigWitness after = witnessRealConfig();
         const bool untouched = after.existed == realConfig.existed && after.contents == realConfig.contents;
-        const bool holdsOurPaths = after.contents.find(harnessTempPrefix()) != std::string::npos ||
+        // GOAL: a prefix this run could not compute never attributes the developer's config
+        //       to this suite. False if a host that lost its temporary directory mid-run
+        //       turns an unrelated edit into "a daemon this run spawned wrote it".
+        // WHY-THIS-SHAPE: the empty case is tested before find(), not left to find(): an empty
+        //       needle is found at position 0 of EVERY string, so passing it straight through
+        //       -- the shorter line -- reads as a match for whatever the file now contains and
+        //       takes the accusing branch on no evidence at all.
+        // CONTROL: harnessTempPrefix() forced to return {}, this process's XDG_CONFIG_HOME
+        //       pointed at a scratch config.json rewritten two seconds into the run with a
+        //       path this run does not own. Guarded (as written) -> HARNESS FAULT naming the
+        //       missing half of the attribution, no FAIL. With `!ourPrefix.empty() &&` removed
+        //       -> "FAIL: no daemon this run spawned touched the config file of the developer
+        //       running it", printing "wrote 40 bytes to ...". Both mutations reverted.
+        const std::string ourPrefix = harnessTempPrefix();
+        const bool holdsOurPaths = (!ourPrefix.empty() && after.contents.find(ourPrefix) != std::string::npos) ||
                                    after.contents.find(testAssetDir()) != std::string::npos;
         if (untouched) {
             // Nothing to say: the guard held. A message here would be one more line between a
@@ -5460,7 +5543,10 @@ int main() {
                          ("the developer's config file at " + after.file.string() +
                           " changed during this run but holds none of this run's paths, so another process on this "
                           "machine -- most likely the developer's own daemon -- wrote it and the guard could not "
-                          "conclude")
+                          "conclude" +
+                          (ourPrefix.empty() ? " (and this host stopped supplying a temporary directory mid-run, so "
+                                               "only the test-asset half of the attribution was available)"
+                                             : ""))
                              .c_str());
         }
     }
