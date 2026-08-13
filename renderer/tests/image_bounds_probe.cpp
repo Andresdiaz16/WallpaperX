@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+
 // S4.9 -- StaticRenderer's decode budget is applied from the image *header*, before any
 // pixel memory is allocated, and it is applied at the edge the contract states.
 //

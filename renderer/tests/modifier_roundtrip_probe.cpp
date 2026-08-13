@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+
 // Round-trips an exported frame through a real Vulkan importer.
 //
 // This is the check every other export test in this project is a proxy for. The rest

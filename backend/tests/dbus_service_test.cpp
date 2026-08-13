@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+
 // System-level test for Step 6: stands up the real DbusService on the session bus
 // and drives it through a real sdbus-c++ proxy client (same process, separate
 // connections -- messages still round-trip through the bus). A static wallpaper is

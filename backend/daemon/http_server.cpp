@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+
 #include "http_server.h"
 
 #include "log_escape.h"

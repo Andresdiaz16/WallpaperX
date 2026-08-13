@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+
 #pragma once
 
 // Client-side scaffolding for talking to io.wallpaperx.Daemon over DBus, shared by the

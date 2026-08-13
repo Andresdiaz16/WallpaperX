@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+
 #pragma once
 
 // Grades a Device's validation-warning count, at the right time, with the guard that

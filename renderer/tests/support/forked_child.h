@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+
 #pragma once
 
 // Fork-side scaffolding shared by the two test binaries in this repo that fork children:

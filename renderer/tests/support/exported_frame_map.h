@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+
 #pragma once
 
 // Test-only support for reading an exported frame's bytes back through nothing but

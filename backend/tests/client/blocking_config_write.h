@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+
 #pragma once
 
 // A config write that blocks until the test lets it through -- a dead mount, in one mknod.

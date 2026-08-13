@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+
 #pragma once
 
 // Test-only helpers for producing a reference frame, getting its pixels onto the host,

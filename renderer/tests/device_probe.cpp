@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+
 #include "vulkan/device.h"
 #include "support/validation_grade.h"
 

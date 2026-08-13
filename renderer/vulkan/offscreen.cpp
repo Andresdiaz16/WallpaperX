@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+
 #include "offscreen.h"
 
 #include "../renderers/renderer_base.h"

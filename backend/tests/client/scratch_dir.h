@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+
 #pragma once
 
 // A temporary directory a test owns: created on construction, removed on destruction.

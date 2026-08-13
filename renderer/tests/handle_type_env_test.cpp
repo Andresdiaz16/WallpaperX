@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+
 // Covers the two-argument externalMemoryHandleType() -- the overload the shipping code
 // actually calls, and the one memory_export_test deliberately never touches.
 //

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+
 #include "device.h"
 
 #include "descriptor_buffer.h"

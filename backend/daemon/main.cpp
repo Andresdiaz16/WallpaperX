@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+
 #include "dbus_service.h"
 #include "http_server.h"
 #include "wallpaper_manager.h"

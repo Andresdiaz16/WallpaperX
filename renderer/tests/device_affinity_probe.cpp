@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+
 // Device thread-affinity probe -- GOALS.md S2.11.
 //
 // `Device` aborts on any GPU call from a thread other than the one that created it.
