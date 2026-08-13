@@ -1,12 +1,17 @@
 name: CI
 
-# Runs the renderer's hardware-independent test subset on every push to main and
-# on pull requests. GitHub's hosted runners have no GPU, so we run only the
-# Lavapipe-labelled ctest entries (Mesa's software Vulkan) -- these need no
-# hardware and cover the Classic/Buffer descriptor tiers plus the DMA_BUF frame-
-# export path. Validation layers are installed so they act as the correctness
-# oracle, exactly as on a developer machine. The real-GPU (Heap tier) tests can
-# only run on a machine with a GPU and are intentionally not part of hosted CI.
+# Runs the hardware-independent tests on every push to main and on pull requests.
+# GitHub's hosted runners have no GPU, so selection is by ctest label: `lavapipe`
+# entries drive Mesa's software Vulkan, with validation layers installed so they act
+# as the correctness oracle exactly as on a developer machine; `novulkan` entries open
+# no driver at all. Un-labelled entries expect a real GPU with the Heap tier and are
+# intentionally not part of hosted CI.
+#
+# Each label is run as its own step with --no-tests=error. The two mean different
+# things and only one of them is conditional: every `lavapipe` entry is registered
+# only if CMake's find_file locates the Lavapipe ICD, while `novulkan` entries always
+# register. Selecting both in one command reports a union, so a runner that lost the
+# ICD would print a passing summary for the CPU-only tests alone.
 
 on:
   push:
@@ -40,12 +45,16 @@ jobs:
       - name: Build
         run: cmake --build renderer/build-ci
 
-      # Only the lavapipe-labelled subset: those entries set VK_ICD_FILENAMES to
-      # Lavapipe and WALLPAPERX_ALLOW_NO_HEAP_TIER=1 (Lavapipe has no Heap tier).
-      # Running the un-labelled entries here would fail, since they expect a real
-      # GPU with the Heap tier.
+      # `lavapipe` entries set VK_ICD_FILENAMES to Lavapipe and WALLPAPERX_ALLOW_NO_HEAP_TIER=1
+      # (Lavapipe has no Heap tier). Both labels are required: a `lavapipe`-only selection
+      # builds the CPU-only tests here and runs none of them.
       - name: Test (Lavapipe)
-        run: ctest --test-dir renderer/build-ci -L lavapipe --output-on-failure
+        run: ctest --test-dir renderer/build-ci -L lavapipe --no-tests=error --output-on-failure
+
+      # always(), so losing the Lavapipe driver does not also hide the CPU-only result.
+      - name: Test (no driver)
+        if: always()
+        run: ctest --test-dir renderer/build-ci -L novulkan --no-tests=error --output-on-failure
 
   # The daemon's DBus tests are the only place the DMA_BUF wire fields
   # (drm_format / drm_modifier / planes) are exercised end to end: the developer's
@@ -95,7 +104,12 @@ jobs:
         run: cmake --build backend/build-ci
 
       # The dbus_service_lavapipe entry carries the lavapipe label and sets
-      # VK_ICD_FILENAMES itself; the renderer's lavapipe entries come along because
-      # the backend adds the renderer as a subproject.
+      # VK_ICD_FILENAMES itself; the renderer's entries come along because the backend
+      # adds the renderer as a subproject. Split by label for the reason the renderer
+      # job states.
       - name: Test (Lavapipe)
-        run: ctest --test-dir backend/build-ci -L lavapipe --output-on-failure
+        run: ctest --test-dir backend/build-ci -L lavapipe --no-tests=error --output-on-failure
+
+      - name: Test (no driver)
+        if: always()
+        run: ctest --test-dir backend/build-ci -L novulkan --no-tests=error --output-on-failure
