@@ -24,10 +24,10 @@
 // that links nothing but nlohmann_json as well as by the ones that link the whole daemon,
 // so anything heavier here would cost the light one its independence.
 //
-// What stays out: anything specific to one file's harness. kpackage_metadata_test's
-// harnessFailure()/g_harnessFaults draws a package-versus-harness line only that file has,
-// and daemon_system_test's harnessFault() grades a dead fork as red rather than as a skip.
-// Both compose with the two report functions below instead of being folded into them.
+// What stays out: anything specific to one file's harness. daemon_system_test's
+// phaseSetupFault(what, detail) prints two stdout lines about a dead fork and returns before the
+// skip/pass summary; it composes with the two report functions below instead of being folded
+// into them.
 
 #include <cstdio>
 #include <string>
@@ -61,6 +61,28 @@ inline void check(bool cond, const char* msg) {
     }
 }
 
+// A fault in the test file itself, or in a tool it drives, rather than in the code it grades.
+// Counted apart from check() so the summary cannot send a reader to the component under test
+// for a fault that is in the harness. Still red, never a skip: a harness that cannot be
+// trusted must not go on issuing verdicts.
+//
+// Not the only such channel here. daemon_system_test keeps its own phaseSetupFault(what, detail)
+// and g_phaseSetupFaults; the names are kept distinct from these on purpose, because the count a
+// file prints is the one it reads and a site reaching for the wrong one would file a fault into a
+// counter nobody summarises. reportNotVerifiedOrPassed() below is the backstop for that mistake.
+//
+// CONTROL: the increment below deleted -- kpackage_metadata_test, with its QML comment
+//       stripper broken so its own self-test fails, went from `1 fault(s) in this test file,
+//       not in the package` and exit 1 to `all checks passed` and exit 0; qml_lint_test, driven
+//       by a stand-in linter whose `success` field disagrees with its diagnostics, likewise
+//       went from exit 1 to exit 0 with the fault line still printed. Restored.
+inline int g_harnessFaults = 0;
+
+inline void harnessFailure(const std::string& what) {
+    std::fprintf(stderr, "FAIL (harness): %s\n", what.c_str());
+    ++g_harnessFaults;
+}
+
 // stdout with an explicit flush, while check() writes to stderr: the two streams are
 // buffered differently, so a NOT VERIFIED line left in stdout's buffer can surface after
 // FAIL lines that were printed later. Flushing at each stdout write is what keeps the
@@ -88,6 +110,20 @@ inline void notVerified(const char* goals, const std::string& reason) {
     return false;
 }
 
+// Prints the harness-fault summary, if there is one. Returns true when the run must go red.
+//
+// `whereClause` completes "N fault(s) ...", as a whole clause rather than a noun, for the same
+// reason reportNotVerifiedOrPassed() takes one: the callers must keep saying different things
+// -- one of them drives an external tool and has to name it as a candidate culprit, the other
+// has no tool to blame.
+[[nodiscard]] inline bool reportHarnessFaults(const char* whereClause) {
+    if (g_harnessFaults > 0) {
+        std::fprintf(stderr, "%s: %d fault(s) %s\n", g_testName, g_harnessFaults, whereClause);
+        return true;
+    }
+    return false;
+}
+
 // What most callers pass: the goals that could not run are a property of the machine.
 constexpr const char* kSkipReasonHost = "goal(s) could not be exercised on this host (listed above)";
 
@@ -110,6 +146,20 @@ constexpr const char* kSkipReasonHost = "goal(s) could not be exercised on this 
         std::fprintf(stderr, "%s: reached the skip/pass summary with %d failed check(s) -- reporting the run as "
                              "failed, not skipped\n",
                      g_testName, g_failures);
+        return 1;
+    }
+    // The same guard for the harness channel, and it needs to be here more than the one above
+    // does: harnessFailure() is reachable from any file that includes this header, while only
+    // the files that also call reportHarnessFaults() read the count back. A fault recorded and
+    // never read would otherwise leave this returning 0 or 77 over a harness known to be
+    // broken.
+    // CONTROL: harnessFailure() called once at the top of daemon_system_test's main(), which
+    //       summarises only its own g_phaseSetupFaults -> the line below and exit 1. With this
+    //       branch disabled and the same call in place, the run reported `Passed`. Both reverted.
+    if (g_harnessFaults > 0) {
+        std::fprintf(stderr, "%s: reached the skip/pass summary with %d unreported harness fault(s) -- reporting "
+                             "the run as failed, not skipped\n",
+                     g_testName, g_harnessFaults);
         return 1;
     }
     if (g_notVerified > 0) {

@@ -148,10 +148,12 @@ constexpr int32_t kMonitorClosedStdout = 24;
 // The port-conflict phase's own id: it renders once, to show the daemon is still doing its
 // job while reporting that it lost its config port.
 constexpr int32_t kMonitorLostPort = 27;
-// 18, 19, 28 and 29 belong to the Step 8 phases and are declared where they are used. Each
-// of those phases drives a daemon of its own, so its ids are only ever compared with its
-// own -- which is also why 19 is spent twice down there, by the unreadable-restore phase and
-// by the file-size-limit phase. 30 and 31 are the barrier phase's, above. A new phase needs
+// 18, 19, 28 and 29 belong to the phases that each drive a daemon and an XDG_CONFIG_HOME of
+// their own -- the Step 8 config phases and the Step 10 connector-name phase -- and are
+// declared where they are used. That ownership is what makes reuse legal at all: such a
+// phase's ids are only ever compared with its own, so several of them share 18 and 19. No
+// tally of who currently holds which is kept here, because a tally is what goes stale; grep
+// the kMonitor* declarations. 30 and 31 are the barrier phase's, above. A new phase needs
 // an id retired by an old one, or a daemon of its own; ids are never derived by arithmetic
 // over a case list, since the block of ids consumed then grows silently past 31.
 
@@ -222,14 +224,18 @@ using wallpaperx::testing::notVerified;
 //
 // Both lines on stdout, for the reason device_affinity_probe's harnessFault() carries: split
 // across stdout and stderr they need an fflush between them to stay adjacent under ctest.
-int g_harnessFaults = 0;
+//
+// Named apart from tests/test_report.h's g_harnessFaults / harnessFailure() rather than
+// shadowing them: the two counters have different epilogues, and a site here that reached the
+// shared name would file a fault into a count this file never reads.
+int g_phaseSetupFaults = 0;
 
-void harnessFault(const char* what, const char* detail) {
+void phaseSetupFault(const char* what, const char* detail) {
     std::printf("daemon_system_test: HARNESS FAULT -- %s could not be set up: %s. This says nothing about the "
                 "daemon.\n",
                 what, detail);
     std::fflush(stdout);
-    ++g_harnessFaults;
+    ++g_phaseSetupFaults;
 }
 
 using Clock = std::chrono::steady_clock;
@@ -463,6 +469,64 @@ public:
     bool exitedNormally() const { return m_exitedNormally; }
     int termSignal() const { return m_termSignal; }
 
+    // True once the capture pipe has stopped delivering -- EOF, or a read error. A cheap
+    // gate for "the daemon may be gone", not an answer to it: readFailed() below separates
+    // the two causes, and departure() is the only thing that establishes what the process
+    // actually did.
+    bool exited() const { return m_readerDone.load(std::memory_order_acquire); }
+
+    // True when the reader stopped because read() failed rather than because the pipe
+    // reached EOF. Kept apart because only the second says anything about the child: a
+    // failed read is this harness losing its capture, and grading it as the daemon having
+    // died is a verdict on the wrong process.
+    bool readFailed() const { return m_readFailed.load(std::memory_order_acquire); }
+
+    // What the process did, for a caller that must tell a daemon which quit of its own
+    // accord (the daemon's defect) from one the machine killed (not the daemon's defect).
+    // exited() cannot: the capture pipe's end-of-file carries no exit status.
+    //
+    // waitid with WNOWAIT, as startupFault() above: WNOHANG *consumes* the status, so reap()
+    // would then hit ECHILD and invent a second fault on top of the real one. WNOWAIT leaves
+    // the child reapable, so shutdown()/waitForExit() are unaffected.
+    //
+    // Polled, briefly: the child's descriptors close a fraction before its status becomes
+    // publishable, so a single sample taken the instant the pipe hit EOF would decide the
+    // verdict on that gap. Callers gate on exited() first, so the poll only ever runs on a
+    // path that is already going to report something.
+    enum class Departure { StillRunning, QuitOnItsOwn, KilledFromOutside, Unknown };
+
+    Departure departure(int& signo) const {
+        signo = 0;
+        if (m_pid <= 0) return Departure::Unknown;
+        const auto deadline = Clock::now() + std::chrono::milliseconds(500);
+        while (true) {
+            siginfo_t info{};
+            info.si_pid = 0;  // waitid leaves it untouched when WNOHANG finds nothing
+            if (waitid(P_PID, static_cast<id_t>(m_pid), &info, WEXITED | WNOHANG | WNOWAIT) != 0) {
+                return Departure::Unknown;
+            }
+            if (info.si_pid != 0) {
+                if (info.si_code != CLD_KILLED && info.si_code != CLD_DUMPED) return Departure::QuitOnItsOwn;
+                signo = info.si_status;
+                // A fault signal is the daemon dying of its own defect and stays its own;
+                // these four are what an OOM killer, a stray script or a session teardown
+                // sends, and no phase sends any of them before asking.
+                switch (signo) {
+                    case SIGKILL:
+                    case SIGTERM:
+                    case SIGINT:
+                    case SIGHUP:
+                        return Departure::KilledFromOutside;
+                    default:
+                        return Departure::QuitOnItsOwn;
+                }
+            }
+            // waitid found the child but had nothing to report, so it has not terminated.
+            if (Clock::now() >= deadline) return Departure::StillRunning;
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+    }
+
     // GOAL: X.3 -- a child that died in its fork preamble (PR_SET_PDEATHSIG refused, dup2
     //       failed, execve failed) never became the daemon, so its absence must be reported
     //       as this harness failing to set the phase up, never as the daemon failing to
@@ -601,7 +665,11 @@ private:
             // line, the validation scan -- then reads a short buffer and fails, or passes,
             // for a reason that has nothing to do with the daemon.
             if (n < 0 && errno == EINTR) continue;
-            if (n <= 0) break;
+            if (n < 0) {
+                m_readFailed.store(true, std::memory_order_release);
+                break;
+            }
+            if (n == 0) break;
             {
                 std::lock_guard<std::mutex> lock(m_mutex);
                 m_output.append(buf, static_cast<size_t>(n));
@@ -674,6 +742,7 @@ private:
     int m_termSignal = 0;
     std::thread m_reader;
     std::atomic<bool> m_readerDone{false};
+    std::atomic<bool> m_readFailed{false};
     mutable std::mutex m_mutex;
     std::string m_output;
 };
@@ -750,7 +819,7 @@ RealConfigWitness witnessRealConfig() {
 bool reportedStartupFault(const SpawnedDaemon& daemon, const char* phase) {
     const char* fault = daemon.startupFault();
     if (fault == nullptr) return false;
-    harnessFault(phase, fault);
+    phaseSetupFault(phase, fault);
     return true;
 }
 
@@ -2413,7 +2482,7 @@ void checkBusLoss(const Check& check) {
         // A bus child that never execed is this file's fault specifically, not the host's,
         // and bus.reason() would name dbus-daemon for it -- see the block that sets this.
         if (const char* fault = bus.preambleFault()) {
-            harnessFault("the connection-loss checks (S6.35)", fault);
+            phaseSetupFault("the connection-loss checks (S6.35)", fault);
             return;
         }
         // X.3: a bus this test could not start is a fault in the harness or the host, and
@@ -2582,8 +2651,18 @@ std::string askConfigServerStatus(std::string& detail, std::string& why) {
             why = "GetStatus carried no config_server object";
             return {};
         }
-        detail = report->value("detail", std::string());
-        return report->value("status", std::string());
+        // is_string() first, both times: value() converts rather than defaults, so it
+        // throws type_error.302 on a present non-string. A throw here leaves the phase and
+        // every phase after it ungraded behind one opaque line (X.4), where a daemon that
+        // published the wrong type should read as "could not be asked" and skip.
+        if (report->contains("detail") && (*report)["detail"].is_string()) {
+            detail = (*report)["detail"].get<std::string>();
+        }
+        if (!report->contains("status") || !(*report)["status"].is_string()) {
+            why = "GetStatus's config_server object carries no string status";
+            return {};
+        }
+        return (*report)["status"].get<std::string>();
     } catch (const std::exception& e) {
         why = e.what();
         return {};
@@ -2600,6 +2679,145 @@ std::string askConfigServerStatus(std::string& detail, std::string& why) {
 // checkConfigServerLostPort.
 std::string bindFailureMarker(int port) {
     return std::string("could not bind ") + wallpaperx::HttpServer::kLoopbackHost + ":" + std::to_string(port);
+}
+
+// The daemon's bind-SUCCESS wording, duplicated for the same reason the failure wording is.
+// This one has no live DBus counterpart to cross-check against: the success path's health
+// detail is the fixed word "listening" (WallpaperManager::recordConfigServer), not the
+// printf's wording. What guards it is the FAIL arm in awaitConfigServerBind below.
+std::string bindSuccessMarker(int port) {
+    return std::string("config server on http://") + wallpaperx::HttpServer::kLoopbackHost + ":" +
+           std::to_string(port);
+}
+
+// GOAL: X.3 in both of its directions, for every phase whose checks need the spawned daemon
+//       to be the process listening on `port`. A daemon that reworded its bind-success line
+//       must arrive as a named failure, never as a skip that deletes the phase; a daemon
+//       that quit of its own accord must arrive as a named failure; a daemon the machine
+//       killed must arrive as a skip, never as a verdict on the daemon; and a port genuinely
+//       held by another process must arrive as a skip, asserted only where the daemon's own
+//       bind-failure line says so.
+// WHY-THIS-SHAPE: one function, not a copy per phase. The obvious alternative -- each phase
+//       inlining its own wait-and-classify -- is what this replaces, and the cost of it is
+//       measurable: a copy that drops the drain re-wait accuses production of rewording a
+//       log line the daemon did print, and a copy that drops the bind-failure cross-check
+//       files a daemon that died mid-phase as another process holding 18462. The arm order
+//       is the substance: each positive signal (the daemon printed the failure line; the
+//       process is gone; the daemon says ok) is consulted before anything is concluded from
+//       an absence, because "no bind line in the buffer" is equally true of all of them.
+//       The process-gone arm asks waitid for the real exit status rather than concluding
+//       from the capture pipe's end-of-file, which is the tempting shorter form and is
+//       wrong in both directions: it carries no status, so an OOM kill reads as the daemon
+//       quitting, and a broken capture pipe reads as a dead daemon that is in fact running.
+//       The second wait covers only the capture pipe's drain -- the daemon answers GetStatus
+//       from an event loop it enters after the HttpServer constructor has printed, so an
+//       "ok" verdict proves the printf already ran -- and it expires into the same FAIL, so
+//       it can never turn a real rewording into a pass (X.1).
+// CONTROL: six, all reverted, each reported by both calling phases. (a) the success printf
+//       in backend/daemon/http_server.cpp reworded to "config server listening on
+//       http://%s:%d" -> "FAIL: the bind-success wording the connector-name phase waits for
+//       is still the daemon's" and the same for the HTTP lifecycle phase. (b)
+//       `wallpaperx::HttpServer httpServer(manager);` commented out in
+//       backend/daemon/main.cpp -> "NOT VERIFIED -- ... the daemon printed neither the
+//       bind-success nor the bind-failure line for port 18462; the daemon reports
+//       config_server pending", and no FAIL from either phase. (c) that construction replaced
+//       in backend/daemon/main.cpp by a detached thread that `std::_Exit(7)`s two seconds in,
+//       which is a daemon that quit of its own accord mid-phase -> "FAIL: the daemon of the
+//       connector-name phase is still running when its config port is asked about" and the
+//       same for the HTTP lifecycle phase. (d) the same replacement but `kill(getpid(),
+//       SIGKILL)` instead of the exit, which is a daemon the machine took away (the signal is
+//       what this classifies on, not who sent it) -> "NOT VERIFIED -- ... the daemon of the
+//       connector-name phase was killed by signal 9 by something outside this test before its
+//       config port could be graded", from both phases, and no FAIL: the same run under the
+//       old capture-pipe verdict produced (c)'s two FAIL lines instead. (e) readLoop() made to
+//       set m_readerDone (and m_readFailed) and return at once, which is a live daemon behind
+//       a lost capture pipe -> "HARNESS FAULT -- the connector-name phase could not be set up:
+//       the daemon's output pipe failed while it was still running", from both phases; with
+//       the StillRunning arm removed the same build printed (c)'s two FAIL lines against a
+//       daemon that was running the whole time. (f) an unrelated process made to hold port
+//       18462 -> the port-conflict skip carrying the daemon's own detail, "port 18462 is held
+//       by another process on this machine (a real wallpaperx-daemon?) ...; the daemon reports
+//       config_server fail / could not bind 127.0.0.1:18462 (is another process using it?)",
+//       and with bindFailureMarker additionally made to match nothing the daemon prints, the
+//       neutral skip with the same detail appended -- where restoring the dropped
+//       `|| reportStatus == "fail"` disjunct claimed the phantom holding process instead.
+//       Timing, same port-conflict run: 17.7 s with the two-marker wait above, 37.4 s with the
+//       single-marker wait it replaced.
+bool awaitConfigServerBind(const SpawnedDaemon& daemon, int port, const char* goals, const char* phase,
+                           const Check& check) {
+    const std::string bindOk = bindSuccessMarker(port);
+    const std::string bindFail = bindFailureMarker(port);
+    // Watches both markers. They are the two branches of one `if` in HttpServer's
+    // constructor, so on a host where the port is taken the answer is in the buffer within
+    // milliseconds; waiting only for the success wording spends the whole ten seconds per
+    // calling phase before reading a failure line it already had. The loop decides only when
+    // to stop waiting -- every arm below concludes exactly as it would have.
+    const auto deadline = Clock::now() + std::chrono::seconds(10);
+    while (true) {
+        if (daemon.waitForOutput(bindOk, std::chrono::milliseconds(100))) return true;
+        if (daemon.output().find(bindFail) != std::string::npos) break;
+        if (daemon.exited() || Clock::now() >= deadline) break;
+    }
+
+    std::string reportDetail;
+    std::string askWhy;
+    const std::string reportStatus = askConfigServerStatus(reportDetail, askWhy);
+    if (reportStatus == "ok" && daemon.waitForOutput(bindOk, std::chrono::seconds(2))) return true;
+
+    const std::string daemonSays =
+        reportStatus.empty()
+            ? std::string("; the daemon could not be asked over DBus (") + askWhy + ")"
+            : std::string("; the daemon reports config_server ") + reportStatus +
+                  (reportDetail.empty() ? std::string() : std::string(" / ") + reportDetail);
+
+    // First, because it is the daemon's own words about the port and they do not stop being
+    // true when it later dies. Only this line is evidence about the host: config_server
+    // "fail" alone is equally true of a bind refused for any other reason (EACCES under a
+    // sandbox, EADDRNOTAVAIL with no loopback), and claiming a conflicting process for those
+    // sends the reader hunting a daemon that does not exist -- `daemonSays` carries the real
+    // reason into the neutral skip instead.
+    if (daemon.output().find(bindFail) != std::string::npos) {
+        notVerified(goals, std::string("port ") + std::to_string(port) +
+                               " is held by another process on this machine (a real wallpaperx-daemon?), "
+                               "so the spawned daemon could not bind it" +
+                               daemonSays + (daemon.exited() ? "; the daemon has since exited" : ""));
+        return false;
+    }
+    if (daemon.exited()) {
+        int signo = 0;
+        switch (daemon.departure(signo)) {
+            case SpawnedDaemon::Departure::KilledFromOutside:
+                notVerified(goals, std::string("the daemon of ") + phase + " was killed by signal " +
+                                       std::to_string(signo) +
+                                       " by something outside this test before its config port could be graded");
+                return false;
+            case SpawnedDaemon::Departure::StillRunning:
+                phaseSetupFault(phase, daemon.readFailed()
+                                           ? "the daemon's output pipe failed while it was still running"
+                                           : "the daemon's output pipe reached end of file while it was still "
+                                             "running");
+                return false;
+            case SpawnedDaemon::Departure::Unknown:
+                phaseSetupFault(phase, "the daemon is gone and its exit status could not be read");
+                return false;
+            case SpawnedDaemon::Departure::QuitOnItsOwn:
+                break;
+        }
+        check(false, (std::string("the daemon of ") + phase + " is still running when its config port is asked about")
+                         .c_str());
+        std::fprintf(stderr, "  the daemon exited on its own, before this phase signalled it; %s\n",
+                     askWhy.empty() ? "it still answered GetStatus" : askWhy.c_str());
+        return false;
+    }
+    if (reportStatus == "ok") {
+        check(false, (std::string("the bind-success wording ") + phase + " waits for is still the daemon's").c_str());
+        std::fprintf(stderr, "  waited for \"%s\", but the daemon never printed it and reports config_server ok / %s\n",
+                     bindOk.c_str(), reportDetail.empty() ? "(empty detail)" : reportDetail.c_str());
+        return false;
+    }
+    notVerified(goals, "the daemon printed neither the bind-success nor the bind-failure line for port " +
+                           std::to_string(port) + daemonSays);
+    return false;
 }
 
 // A /health body's `checks` object, or nullptr when the body does not carry one. Third site
@@ -2682,55 +2900,14 @@ void checkHttpLifecycle(NameWatcher& names, const std::string& bluePath, const s
         return;
     }
 
-    // Which of the two lines the daemon prints decides whether this phase can run at all.
-    // waitForOutput returns false on timeout AND on the daemon exiting, and neither is
-    // treated as data -- see the bind-failure branch.
-    const std::string bindOk = std::string("config server on http://127.0.0.1:") + std::to_string(kPort);
-    const std::string bindFailed = bindFailureMarker(kPort);
-    bool listening = daemon.waitForOutput(bindOk, std::chrono::seconds(10));
-    if (!listening) {
-        // GOAL: X.3, in the direction that hides coverage rather than accusing production --
-        //       a rewording of the daemon's bind-success line must arrive here as a named
-        //       failure, never as a skip. `bindOk` duplicates a literal no test can read out
-        //       of a process it only spawns, so a stale duplicate would silently delete this
-        //       whole phase.
-        // WHY-THIS-SHAPE: bindFailureMarker's trick -- cross-check the duplicate against the
-        //       daemon's own DBus detail -- does not transfer: the success path records an
-        //       EMPTY detail, so there is no string to compare. What DBus does carry is the
-        //       verdict. main.cpp answers GetStatus only from its event loop, which it
-        //       reaches after the HttpServer constructor and so after that printf has run;
-        //       a daemon reporting ok that never printed the line therefore means the literal
-        //       here has drifted, not that the daemon is slow. The second wait covers only
-        //       the capture pipe's drain, and it expires into the FAIL, never into a pass.
-        // CONTROL: the success printf in http_server.cpp reworded to "config server
-        //       listening on http://%s:%d" -> "FAIL: the bind-success wording this phase
-        //       waits for is still the daemon's".
-        std::string reportDetail;
-        std::string askWhy;
-        const std::string reportStatus = askConfigServerStatus(reportDetail, askWhy);
-        if (reportStatus == "ok") listening = daemon.waitForOutput(bindOk, std::chrono::seconds(2));
-        if (!listening) {
-            if (reportStatus == "ok") {
-                check(false, "the bind-success wording this phase waits for is still the daemon's");
-                std::fprintf(stderr,
-                             "  waited for \"%s\", but the daemon never printed it and reports config_server ok / %s\n",
-                             bindOk.c_str(), reportDetail.empty() ? "(empty detail)" : reportDetail.c_str());
-            } else {
-                const std::string daemonSays =
-                    reportStatus.empty() ? std::string("; the daemon could not be asked over DBus (") + askWhy + ")"
-                                         : std::string("; the daemon reports config_server ") + reportStatus;
-                const std::string why =
-                    daemon.output().find(bindFailed) != std::string::npos
-                        ? std::string("port ") + std::to_string(kPort) +
-                              " is held by another process on this machine (a real wallpaperx-daemon?), "
-                              "so the spawned daemon could not bind it" + daemonSays
-                        : "the daemon printed neither the bind-success nor the bind-failure line for port " +
-                              std::to_string(kPort) + daemonSays;
-                notVerified("S7.8/S7.11 (the HTTP server's process lifecycle)", why);
-            }
-            daemon.shutdown(SIGTERM);
-            return;
-        }
+    // Whether this daemon is the process on 18462 decides whether this phase can run at all,
+    // and the four outcomes are told apart in awaitConfigServerBind -- one classifier shared
+    // with the connector-name phase, so the two cannot drift into disagreeing about which
+    // outcome is the daemon's fault and which is the machine's.
+    if (!awaitConfigServerBind(daemon, kPort, "S7.8/S7.11 (the HTTP server's process lifecycle)",
+                               "the HTTP lifecycle phase", check)) {
+        daemon.shutdown(SIGTERM);
+        return;
     }
 
     // GOAL: S7.10/S7.10b end to end -- /health on 127.0.0.1:18462, asked of the real
@@ -3392,6 +3569,9 @@ bool writeTextFile(const std::filesystem::path& file, const std::string& text) {
 struct PersistedEntry {
     std::string type;
     std::string path;
+    // Empty when the row carries no connector name, which is the ordinary case: a screen is
+    // only named once the app has run for it.
+    std::string output;
 };
 
 // What the daemon wrote, read straight off the disk. Parsed here rather than through
@@ -3418,8 +3598,13 @@ std::map<int, PersistedEntry> configEntries(const std::filesystem::path& file, s
         if (!entry["monitor_id"].is_number_integer() || !entry["type"].is_string() || !entry["path"].is_string()) {
             continue;
         }
+        // `output` is optional and is not part of the required-field guard above: a row
+        // written before connector names existed carries none, and dropping such a row
+        // would make the wallpaper checks in the other phases silently stop comparing.
+        std::string output;
+        if (entry.contains("output") && entry["output"].is_string()) output = entry["output"].get<std::string>();
         entries[entry["monitor_id"].get<int>()] =
-            PersistedEntry{entry["type"].get<std::string>(), entry["path"].get<std::string>()};
+            PersistedEntry{entry["type"].get<std::string>(), entry["path"].get<std::string>(), std::move(output)};
     }
     return entries;
 }
@@ -3704,20 +3889,28 @@ void checkConfigRestart(NameWatcher& names, const std::string& validationEnv, co
         }
     }
 
-    // GOAL: S8.5 end to end -- a daemon that only restores does not write the config file.
-    //       In process this is asserted on a hand-written file (config_store_test); here it
-    //       is asserted of the shipped binary, where main.cpp's own call order is what could
-    //       break it.
+    // GOAL: S8.5 end to end -- a daemon that restores entries needing no repair does not write
+    //       the config file. In process this is asserted on a hand-written file
+    //       (config_store_test); here it is asserted of the shipped binary, where main.cpp's
+    //       own call order is what could break it. The other half of the rule is the opposite
+    //       property: a restore that DOES repair something writes the repair at that start,
+    //       which config_store_test's startup-repair phase grades. This fixture reaches neither
+    //       -- it is the file the first daemon wrote from one valid SetWallpaper, so there is
+    //       nothing in it to repair.
     // WHY-THIS-SHAPE: the MTIME is what is graded, not the bytes. Bytes cannot work at this
     //       tier and that is not obvious: the file under test was written by the first
     //       daemon's own save(), so a second save reproduces it byte for byte -- measured, a
     //       `persist(persistableLocked())` added to restoreSaved() left a byte comparison
     //       completely green. Both samples are taken while no daemon is running, so nothing
     //       but the restart can have moved either.
-    // CONTROL: `persist(persistableLocked())` added at the end of
-    //       WallpaperManager::restoreSaved(), outside the lock -> "FAIL: a daemon that only
-    //       restores leaves the config file exactly as it found it", with "  the file's
-    //       mtime moved across a start that only restored". Reverted.
+    // CONTROL: the `if (repaired)` guard on `m_repair = persistableLocked();` at the end of
+    //       WallpaperManager::restoreSaved() (backend/daemon/wallpaper_manager.cpp) deleted, so
+    //       every start hands writeRepairedConfig() a snapshot -> "FAIL: a daemon that restores
+    //       entries needing no repair leaves the config file exactly as it found it", with "  the
+    //       file's mtime moved across a start that only restored". Six more went red with it, all
+    //       in the unreadable-config phases: an empty snapshot written after the file was moved
+    //       aside recreates config.json and replaces the detail saying why it was refused.
+    //       Observed 2026-08-15. Reverted.
     second.shutdown(SIGTERM);
     awaitNameRelease(names, "the phase after the config restart");
     std::error_code afterEc;
@@ -3725,13 +3918,444 @@ void checkConfigRestart(NameWatcher& names, const std::string& validationEnv, co
     const bool untouched = !bytesBeforeRestart.empty() && !timeEc && !afterEc &&
                            mtimeAfterRestart == mtimeBeforeRestart &&
                            readTextFile(configHome.configFile()) == bytesBeforeRestart;
-    check(untouched, "a daemon that only restores leaves the config file exactly as it found it");
+    check(untouched,
+          "a daemon that restores entries needing no repair leaves the config file exactly as it found it");
     if (!untouched) {
         std::fprintf(stderr, "  %s\n",
                      mtimeAfterRestart != mtimeBeforeRestart
                          ? "the file's mtime moved across a start that only restored"
                          : "the file's contents changed, or it could not be read on both sides of the restart");
     }
+}
+
+// ---------------------------------------------------------------------------- //
+// Step 10 -- the connector name a plugin identifies itself by, across a restart.
+// ---------------------------------------------------------------------------- //
+//
+// Everything else about connector names is graded in process: the store keeps the field
+// (config_store_test), the manager rebinds what it reads (config_store_test), the bus
+// records it (dbus_service_test), and /config resolves it (http_server_test). None of
+// those crosses a process boundary, and S10.5 is about exactly that boundary -- a screen's
+// name has to come back in a daemon that was started fresh, from the file alone, with no
+// client to re-tell it. A plugin instance cannot re-tell it: only the app can, and the app
+// may not run for weeks.
+void checkOutputRestart(NameWatcher& names, const std::string& validationEnv, const Check& check) {
+    using wallpaperx::testing::boundMonitor;
+    using wallpaperx::testing::HttpReply;
+    using wallpaperx::testing::setMonitorOutput;
+
+    constexpr int kPort = wallpaperx::HttpServer::kDefaultPort;
+    // This phase drives a daemon and an XDG_CONFIG_HOME of its own, so these ids are only
+    // ever compared against its own -- the rule the id table at the top of this file sets
+    // out for a phase that does not share a daemon with any other.
+    constexpr int32_t kMonitorNamedA = 18;
+    constexpr int32_t kMonitorNamedB = 19;
+    constexpr const char* kGoals = "S10.5 (a connector name a plugin can still identify itself by after a restart)";
+
+    const std::string nameA = "DP-3";
+    const std::string nameB = "HDMI-A-1";
+    const std::string neverAssigned = "DVI-I-99-never-told";
+
+    ScratchDir configHome("outputrestart");
+    if (!configHome.ok()) {
+        notVerified(kGoals, "a scratch XDG_CONFIG_HOME could not be created under the temp directory");
+        return;
+    }
+
+    // COVERAGE-ASSERT: every "not the other screen's wallpaper" clause below is vacuous if
+    // the two screens share a file. Pinned at build time rather than by a check(): the two
+    // names are literals in this source, so no behaviour of the daemon, the host or the
+    // harness can make a runtime comparison of them false -- it would occupy a line in the
+    // pass/fail report that nothing could ever turn red. Giving both calls the same name now
+    // stops the file compiling instead.
+    constexpr std::string_view kImageA = "system_output_a.png";
+    constexpr std::string_view kImageB = "system_output_b.png";
+    static_assert(kImageA != kImageB, "the two screens this phase tells apart need two different wallpapers");
+
+    std::string pathA;
+    std::string pathB;
+    try {
+        pathA = writeSolidImage(kImageA.data(), 0, 0, 255);
+        pathB = writeSolidImage(kImageB.data(), 0, 255, 0);
+    } catch (const std::exception& e) {
+        notVerified(kGoals, std::string("the two wallpapers this phase tells apart could not be written: ") + e.what());
+        return;
+    }
+
+    // Both halves of each row, not the name alone: the checks after the restart compare the
+    // wallpaper path as well, so a row that reached disk carrying the name and no path would
+    // be graded as the restore having lost it. `configWhy` is rewritten on every call and so
+    // always describes the most recent read.
+    std::string configWhy;
+    const auto rowsOnDisk = [&] {
+        const std::map<int, PersistedEntry> saved = configEntries(configHome.configFile(), configWhy);
+        const auto rowPersisted = [&saved](int32_t monitorId, const std::string& name, const std::string& path) {
+            const auto it = saved.find(monitorId);
+            return it != saved.end() && it->second.output == name && it->second.path == path;
+        };
+        return rowPersisted(kMonitorNamedA, nameA, pathA) && rowPersisted(kMonitorNamedB, nameB, pathB);
+    };
+
+    // The first daemon's own verdict on whether it could write its config file, taken while
+    // it is still alive and used only if the rows turn out to be missing from that file.
+    // "fail" here is a host that would not take the write, not a defect in the restore.
+    std::string persistStatus;
+    std::string persistDetail;
+    {
+        SpawnedDaemon first({validationEnv, configHome.env()});
+        if (!names.waitFor(true)) {
+            if (!reportedStartupFault(first, kGoals)) {
+                notVerified(kGoals, "the first daemon of this phase never acquired the bus name");
+            }
+            // Left through the same door as every other exit: the next phase reads ownership
+            // from the bus, not from the process table, so a reap alone is not the barrier.
+            first.shutdown(SIGTERM);
+            awaitNameRelease(names, "the phase after the connector-name restart");
+            return;
+        }
+        try {
+            auto proxy = sdbus::createProxy(sdbus::ServiceName{DbusService::kBusName},
+                                            sdbus::ObjectPath{DbusService::kObjectPath});
+            setWallpaper(*proxy, "static", pathA, kMonitorNamedA);
+            setWallpaper(*proxy, "static", pathB, kMonitorNamedB);
+            setMonitorOutput(*proxy, kMonitorNamedA, nameA);
+            setMonitorOutput(*proxy, kMonitorNamedB, nameB);
+            // A bounded wait for the write to land, not a single health sample taken the
+            // instant the last call returned. WallpaperManager::persist() waits on the write
+            // worker only until its own deadline, and once a slow filesystem has marked that
+            // worker stalled every later call enqueues and returns without waiting at all --
+            // so "SetMonitorOutput returned" is not evidence of a write, and killing the
+            // daemon here would discard a snapshot still in flight. Reading the file while
+            // the daemon runs is safe: ConfigStore::save() renames a temporary over it, so a
+            // reader sees the old file or the new one, never a torn one.
+            constexpr auto kPersistBound = std::chrono::seconds(10);
+            const auto persistDeadline = Clock::now() + kPersistBound;
+            bool landed = false;
+            while (true) {
+                landed = rowsOnDisk();
+                if (landed || Clock::now() >= persistDeadline) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+            // Sampled where the wait gave up, so it reports the daemon's persistence health
+            // at the moment the rows were last found missing rather than before the writes.
+            if (!landed) {
+                const StatusReply wrote = getStatusOrExplain(*proxy);
+                if (wrote.ok() && wrote.json().contains("persistence") && wrote.json()["persistence"].is_object()) {
+                    const nlohmann::json& persistence = wrote.json()["persistence"];
+                    if (persistence.contains("status") && persistence["status"].is_string()) {
+                        persistStatus = persistence["status"].get<std::string>();
+                    }
+                    if (persistence.contains("detail") && persistence["detail"].is_string()) {
+                        persistDetail = persistence["detail"].get<std::string>();
+                    }
+                }
+            }
+        } catch (const sdbus::Error& e) {
+            // Above the std::exception handler, which this derives from, or it would be dead
+            // code. X.3 in the direction that is easy to get backwards: a name the daemon
+            // itself chose means the daemon refused an ordinary screen id and an ordinary
+            // connector name, which is its defect -- filing that as a skip would delete this
+            // phase's only end-to-end grading of the restore. Every other name (the
+            // transport's, and org.sdbuscpp.Error, which is what an exception escaping a
+            // handler becomes) is unattributable and keeps the skip.
+            //
+            // daemonErrorName() alone is not enough here, and measuring it is the only way to
+            // find that out: DbusService rejects a bad argument under the STANDARD name
+            // org.freedesktop.DBus.Error.InvalidArgs (kErrorInvalidArgs in
+            // backend/daemon/dbus_service.cpp), which is outside the daemon's own namespace,
+            // so a daemon that refused "DP-3" would still have skipped. That name is safe to
+            // attribute here because the bus does not generate it for a well-formed call to a
+            // service that exists -- only the callee marshalling arguments does.
+            //
+            // CONTROL: both arms, both reverted. DbusService::setMonitorOutput
+            //       (backend/daemon/dbus_service.cpp) made to throw sdbus::Error under
+            //       kErrorInvalidArgs for every call -> "FAIL: the first daemon records a
+            //       connector name for a valid screen id and name"; with daemonErrorName()
+            //       as the only test the same daemon produced a skip and no FAIL at all.
+            //       Made to throw std::runtime_error instead, which sdbus-c++ delivers as
+            //       org.sdbuscpp.Error -> the skip below, naming that error.
+            constexpr const char* kRefusedArgs = "org.freedesktop.DBus.Error.InvalidArgs";
+            const std::string name = e.getName();
+            const std::string message = e.getMessage();
+            if (wallpaperx::testing::daemonErrorName(name) || name == kRefusedArgs) {
+                check(false, "the first daemon records a connector name for a valid screen id and name");
+                std::fprintf(stderr, "  %s: %s -- so the restart below was not graded\n", name.c_str(),
+                             message.c_str());
+            } else {
+                notVerified(kGoals,
+                            std::string("the first daemon would not record the two screen names this phase restarts "
+                                        "with: ") +
+                                name + ": " + message);
+            }
+            first.shutdown(SIGTERM);
+            awaitNameRelease(names, "the phase after the connector-name restart");
+            return;
+        } catch (const std::exception& e) {
+            // X.3: the precondition could not be built, so nothing below is graded against
+            // the daemon's restore. A skip naming the cause, not a FAIL against the restart.
+            notVerified(kGoals,
+                        std::string("the first daemon would not record the two screen names this phase restarts "
+                                    "with: ") +
+                            e.what());
+            first.shutdown(SIGTERM);
+            awaitNameRelease(names, "the phase after the connector-name restart");
+            return;
+        }
+        // No FrameReady wait: this phase grades stored identity, not pixels. Naming a screen
+        // starts no render at all, and the wallpapers are here only so the restored name has
+        // something of its own to resolve to.
+        first.shutdown(SIGTERM);
+        awaitNameRelease(names, "the restarted daemon of the connector-name phase");
+    }
+
+    // GOAL: the precondition every check below rests on -- the first daemon put both rows,
+    //       connector name and wallpaper path, in $XDG_CONFIG_HOME/wallpaperx/config.json.
+    //       False if SetMonitorOutput returns and the file does not hold them.
+    // WHY-THIS-SHAPE: "SetMonitorOutput returned" is not evidence of a write, so the write is
+    //       given a bounded chance to land above and graded here, once the daemon has exited
+    //       and nothing can still be moving the file. Both fields, because the checks after
+    //       the restart consume both: a gate on the name alone lets a lost path arrive as
+    //       "the restarted daemon answers that screen's name with that screen's wallpaper"
+    //       going red for a write that never happened.
+    //       The FAIL-versus-skip split is X.3, and the health field is only ever read on the
+    //       failing side: a daemon reporting persistence ok after the wait expired is a
+    //       daemon lying about a write, which is its defect; a daemon reporting a persistence
+    //       failure is the host refusing the write, which is not. A host that is merely slow
+    //       completes inside the wait and reaches neither arm.
+    // CONTROL: three, all reverted, and they must land on different arms. (a)
+    //       `row[kKeyOutput] = entry.output;` disabled in ConfigStore::save()
+    //       (backend/daemon/config_store.cpp), so the name is accepted and never written ->
+    //       "FAIL: the daemon writes the connector name and the wallpaper it was given into
+    //       $XDG_CONFIG_HOME/wallpaperx/config.json", printing both rows of the file it did
+    //       write, and NONE of the restore checks ran. (b) the same save() made to write a
+    //       different path for any row carrying a name -- the half a name-only gate would let
+    //       through -> the SAME failure above, where under a gate comparing only the name the
+    //       identical daemon produced "FAIL: the restarted daemon answers that screen's name
+    //       with that screen's wallpaper (DP-3)" and again for HDMI-A-1, accusing the restore
+    //       of a write that never happened. (c) the same save() made to return an error
+    //       unconditionally, which is the host refusing the write -> no FAIL from this phase
+    //       at all, only "NOT VERIFIED -- ... the first daemon could not persist the two
+    //       screen rows (it reports persistence fail: ...)".
+    if (!rowsOnDisk()) {
+        if (persistStatus == "ok") {
+            check(false, "the daemon writes the connector name and the wallpaper it was given into "
+                         "$XDG_CONFIG_HOME/wallpaperx/config.json");
+            std::fprintf(stderr, "  %s\n  config file: %s\n",
+                         configWhy.empty() ? "the two rows are not in the file" : configWhy.c_str(),
+                         readTextFile(configHome.configFile()).c_str());
+        } else {
+            notVerified(kGoals, std::string("the first daemon could not persist the two screen rows (it reports "
+                                            "persistence ") +
+                                    (persistStatus.empty() ? std::string("(absent)") : persistStatus) + ": " +
+                                    (persistDetail.empty() ? std::string("no detail") : persistDetail) +
+                                    "), so the restart below would grade a restore against a file that was never "
+                                    "written");
+        }
+        return;
+    }
+
+    // The restart. No client call of any kind against this daemon before the assertions --
+    // no SetMonitorOutput, no SetWallpaper -- because the reads below are the whole point:
+    // a check that named the screens again would establish nothing about the file.
+    SpawnedDaemon second({validationEnv, configHome.env()});
+    if (!names.waitFor(true)) {
+        if (!reportedStartupFault(second, kGoals)) {
+            notVerified(kGoals, "the restarted daemon never acquired the bus name");
+        }
+        // As the first daemon's equivalent exit: the destructor kills and reaps, which is not
+        // the barrier the next phase reads. Without the release wait the next phase's daemon
+        // can lose its own name request to a name the bus has not dropped yet, and report as
+        // a second instance.
+        second.shutdown(SIGTERM);
+        awaitNameRelease(names, "the phase after the connector-name restart");
+        return;
+    }
+    auto proxy =
+        sdbus::createProxy(sdbus::ServiceName{DbusService::kBusName}, sdbus::ObjectPath{DbusService::kObjectPath});
+
+    // GOAL: S10.5 on the DBus surface -- a connector name bound before a restart resolves to
+    //       the SAME monitor in a daemon that was started fresh and told nothing. False if a
+    //       named screen comes back anonymous, or bound to another monitor.
+    // WHY-THIS-SHAPE: read straight after the bus name appears, with no poll and no retry.
+    //       That is sound because backend/daemon/main.cpp calls restoreSaved() BEFORE
+    //       requestName(), so the name appearing on the bus already means the file has been
+    //       read -- the wait for the name IS the barrier. A poll-until-bound loop would be
+    //       the dangerous alternative: its success path is reachable by waiting, so a daemon
+    //       that bound the names late for the wrong reason would still pass, and a daemon
+    //       that never bound them at all would spend the timeout and then be graded on
+    //       whatever the last sample happened to hold. TWO screens with two names, because
+    //       one cannot distinguish a restored map from a map with a single entry in it.
+    // CONTROL: the whole `if (nameValid && entry.monitorId < kMaxMonitors &&
+    //       bindOutputLocked(entry.monitorId, entry.output) == BindResult::Displaced)`
+    //       statement in WallpaperManager::restoreSaved()
+    //       (backend/daemon/wallpaper_manager.cpp) deleted -- the bind is a side effect of
+    //       the CONDITION, so removing only the `++displacedNames;` body disables nothing
+    //       and leaves every check here green. With the statement gone: "FAIL: both
+    //       connector names resolve to their own monitors in a daemon that was told
+    //       nothing", printing "'DP-3' -> -1 (expected 18), 'HDMI-A-1' -> -1 (expected 19)"
+    //       and the config file it read them out of, plus the four /config lines below. The
+    //       reply arrives either way under that mutation -- it simply carries no entry for
+    //       either name -- so the "answers GetStatus" line stays green and only the restore
+    //       line goes red. Reverted.
+    //       Whether the reply arrived is graded on its own line rather than left to
+    //       boundMonitor()'s sentinel: a StatusReply that failed carries an empty object, so
+    //       both names come back as -1 and an unanswered call would otherwise print as the
+    //       restore having lost them both. The unanswered case is still red -- a daemon
+    //       holding the bus name and not answering is the daemon's defect -- and the skip
+    //       beside it keeps the restore property visible as untested rather than absent.
+    //       CONTROL: DbusService::getStatus (backend/daemon/dbus_service.cpp) made to throw,
+    //       so the reply never arrives -> "FAIL: the restarted daemon answers GetStatus" plus
+    //       "NOT VERIFIED -- ... the restarted daemon did not answer GetStatus, so the
+    //       connector-name map could not be read over the bus", and the restore line was NOT
+    //       printed -- which is the accusation this guard removes. Reverted.
+    const StatusReply afterRestart = getStatusOrExplain(*proxy);
+    check(afterRestart.ok(), "the restarted daemon answers GetStatus");
+    if (!afterRestart.ok()) {
+        notVerified(kGoals, "the restarted daemon did not answer GetStatus, so the connector-name map could not be "
+                            "read over the bus; the GET /config half below still grades the restore");
+    } else {
+        const int boundA = boundMonitor(afterRestart, nameA);
+        const int boundB = boundMonitor(afterRestart, nameB);
+        const bool bothBound = boundA == kMonitorNamedA && boundB == kMonitorNamedB;
+        check(bothBound, "both connector names resolve to their own monitors in a daemon that was told nothing");
+        if (!bothBound) {
+            std::fprintf(stderr, "  '%s' -> %d (expected %d), '%s' -> %d (expected %d)\n  config file: %s\n",
+                         nameA.c_str(), boundA, kMonitorNamedA, nameB.c_str(), boundB, kMonitorNamedB,
+                         readTextFile(configHome.configFile()).c_str());
+        }
+    }
+
+    // Whether this daemon is the process on 18462 decides whether the HTTP half can run at
+    // all: a developer's own daemon holding the port is a skip, a restarted daemon killed by
+    // the machine is a skip, a restarted daemon that quit of its own accord is a FAIL, and a
+    // drifted log literal is a FAIL. They are told apart in awaitConfigServerBind, shared
+    // with the HTTP lifecycle phase so the two cannot drift.
+    if (awaitConfigServerBind(second, kPort, "S10.5's GET /config?output= half", "the connector-name phase", check)) {
+        // GOAL: S10.5 on the surface the plugin actually uses -- GET /config?output=<name>
+        //       answers "known": true with THAT screen's wallpaper, in a daemon that has
+        //       never been told the name. False if it answers known=false, which is the
+        //       state GOALS.md names, and equally false if it answers another screen's
+        //       wallpaper.
+        // WHY-THIS-SHAPE: asserted beside the GetStatus check above rather than instead of
+        //       it, because the two can disagree and only this one is what a plugin instance
+        //       reads. It is also over a real socket to a real process, so a manager that
+        //       restored the map but an HTTP route that consulted something else would be
+        //       caught here and nowhere else. The never-assigned name is asked in the same
+        //       breath: without it "known": true is satisfied by a daemon that says yes to
+        //       every name, and then the whole endpoint means nothing after a restart.
+        //       The query is built by pluginPoll() rather than as a bare `output=<name>`,
+        //       because the bare form is not the shape this GOAL claims: the plugin appends
+        //       a cache-buster to every poll, so a daemon that started refusing requests
+        //       carrying one would answer this phase and fail every real screen.
+        // CONTROL: the same restoreSaved() bind statement deleted (the one quoted in full
+        //       above) -> "FAIL: a screen named before the restart is known to the restarted
+        //       daemon over HTTP (DP-3)" and "FAIL: the restarted daemon answers that
+        //       screen's name with that screen's wallpaper (DP-3)", both again for
+        //       HDMI-A-1, each printing `{"known":false,"monitor_id":null,...}`, while the
+        //       never-assigned line stayed green -- which is what keeps this about the
+        //       restore rather than about the field. Four more, all in the /config handler
+        //       in backend/daemon/http_server.cpp and all reverted. `known = bound !=
+        //       snap.outputs.end()` forced to `known = true`, with the id assignment guarded
+        //       so an unknown name does not dereference end() -> "FAIL: a name the restarted
+        //       daemon was never given is still reported as not known" alone, which is the
+        //       line that stops known=true being a constant. `monitorId = bound->second`
+        //       replaced by `snap.outputs.begin()->second`, the shape of a lookup that
+        //       ignores which name was asked for -> "FAIL: the restarted daemon answers that
+        //       screen's name with that screen's wallpaper (HDMI-A-1)" and "FAIL: a restored
+        //       screen is never answered with the other screen's wallpaper (HDMI-A-1)",
+        //       HDMI-A-1 coming back with monitor 18 and DP-3's file. The output arm made to
+        //       throw, so it answers through its own 500 handler -> all seven lines of this
+        //       block red, both cross-serve lines among them; with that clause gated on
+        //       `reached` instead of `ok()` the same 500 left both of them green. And
+        //       `out["known"] = nullptr` on the output arm -> five red (both known lines, both
+        //       own-wallpaper lines, and the never-assigned one) and the run finished; with
+        //       `value("known", false)` in place of the is_boolean() read, the same daemon
+        //       killed the run with "FAIL: unexpected exception: [json.exception.type_error
+        //       .302] type must be boolean, but is null" as the only line, and the eight later
+        //       phases never ran. For pluginPoll()'s `t=` in particular: parseIdentity() in
+        //       backend/daemon/http_server.cpp made to answer 400 for any parameter other
+        //       than monitor and output -> all seven lines red, each printing `answered 400:
+        //       {"error":"..."}`, where the bare `output=<name>` this replaced stayed green
+        //       under the same daemon. Reverted.
+        // COVERAGE-ASSERT: two static_asserts, one on the wallpaper names above and one on
+        //       the table's size below, so neither the loop nor the not-the-other-screen's
+        //       clause can be hollowed out without the file failing to compile.
+        httplib::Client cli = wallpaperx::testing::makeClient(kPort);
+        // The plugin's own query, cache-buster and all: main.qml builds
+        // `output=<name>&t=<Date.now()>` on every poll. The names here are plain ASCII, so
+        // the percent-encoding main.qml also applies is the identity on them and is left out
+        // rather than reimplemented.
+        const auto pluginPoll = [](const std::string& name) {
+            const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 std::chrono::system_clock::now().time_since_epoch())
+                                 .count();
+            return "/config?output=" + name + "&t=" + std::to_string(now);
+        };
+        const struct {
+            const std::string& name;
+            int32_t monitorId;
+            const std::string& path;
+            const std::string& otherPath;
+        } kNamed[] = {
+            {nameA, kMonitorNamedA, pathA, pathB},
+            {nameB, kMonitorNamedB, pathB, pathA},
+        };
+        // A build-time assertion, not a check(): the table's size is fixed by this source, so
+        // an edit that halved it should stop the file compiling rather than quietly leave the
+        // loop asserting about one screen -- which is the case that cannot tell a lookup from
+        // a constant.
+        static_assert(std::size(kNamed) == 2, "this phase needs two named screens to tell a lookup from a constant");
+        for (const auto& screen : kNamed) {
+            const HttpReply res = wallpaperx::testing::get(cli, pluginPoll(screen.name));
+            // Every field read through a type predicate, never through value(): value()
+            // converts rather than defaults, so it throws type_error.302 on a present null.
+            // The handler's own not-known path emits `out["monitor_id"] = nullptr`
+            // (backend/daemon/http_server.cpp), so the ordinary unknown-name response is
+            // already enough to throw. `known` it emits as a boolean, `out["known"] =
+            // known`, and the predicate there guards against that type drifting -- forcing
+            // it to null is the mutation in the CONTROL above. A throw abandons this phase
+            // and the eight after it behind one opaque line, where what is wanted is the
+            // named FAIL (X.4).
+            const bool known = res.ok() && res.json.contains("known") && res.json["known"].is_boolean() &&
+                               res.json["known"].get<bool>();
+            check(known, ("a screen named before the restart is known to the restarted daemon over HTTP (" +
+                          screen.name + ")")
+                             .c_str());
+            const bool literalMatches = known && res.json.contains("path_literal") &&
+                                        res.json["path_literal"].is_string() &&
+                                        res.json["path_literal"].get<std::string>() == screen.path;
+            const bool servedItsOwn = literalMatches && res.json.contains("monitor_id") &&
+                                      res.json["monitor_id"].is_number_integer() &&
+                                      res.json["monitor_id"].get<int>() == screen.monitorId;
+            check(servedItsOwn, ("the restarted daemon answers that screen's name with that screen's wallpaper (" +
+                                 screen.name + ")")
+                                    .c_str());
+            // ok(), not reached(): `reached` is true of any completed exchange, so a 500
+            // from the handler's exception path -- body `{"error":"internal error"}`, which
+            // contains no wallpaper path at all -- would pass this as a screen correctly
+            // served. Named per screen because only one of the two iterations trips under
+            // the cross-wiring defect this exists to catch, and an unqualified line does not
+            // say which.
+            const bool notCrossServed = res.ok() && res.body.find(screen.otherPath) == std::string::npos;
+            check(notCrossServed, ("a restored screen is never answered with the other screen's wallpaper (" +
+                                   screen.name + ")")
+                                      .c_str());
+            if (!servedItsOwn || !notCrossServed) {
+                std::fprintf(stderr, "  %s answered %d: %s\n", screen.name.c_str(), res.status, res.body.c_str());
+            }
+        }
+        const HttpReply stranger = wallpaperx::testing::get(cli, pluginPoll(neverAssigned));
+        const bool refused = stranger.ok() && stranger.hasJsonObject() && stranger.json.contains("known") &&
+                             stranger.json["known"].is_boolean() && !stranger.json["known"].get<bool>();
+        check(refused, "a name the restarted daemon was never given is still reported as not known");
+        if (!refused) {
+            std::fprintf(stderr, "  %s answered %d: %s\n", neverAssigned.c_str(), stranger.status,
+                         stranger.body.c_str());
+        }
+    }
+
+    second.shutdown(SIGTERM);
+    awaitNameRelease(names, "the phase after the connector-name restart");
 }
 
 void checkStartsOnAnyConfig(NameWatcher& names, const std::string& validationEnv, const Check& check) {
@@ -4139,7 +4763,7 @@ void checkConfigLocation(NameWatcher& names, const std::string& validationEnv, c
             //       "HARNESS FAULT -- ... could not be read (No such file or directory)"
             //       lines and no FAIL, where the previous shape returned an empty vector and
             //       passed the absence check. Reverted.
-            harnessFault(kGoals, walkWhy.c_str());
+            phaseSetupFault(kGoals, walkWhy.c_str());
         } else {
             check(left.empty(),
                   (std::string("with ") + c.what + ", the daemon writes nothing into its working directory").c_str());
@@ -4298,6 +4922,92 @@ void checkConfigPreservationOwnership(NameWatcher& names, const std::string& val
 
     first.shutdown(SIGTERM);
     awaitNameRelease(names, "the phase after the config-preservation phase");
+}
+
+void checkRepairWrittenAfterPreservation(NameWatcher& names, const std::string& validationEnv, const Check& check) {
+    constexpr const char* kGoals = "S8.23 with S10.14 (a start that both copies its config aside and repairs it "
+                                   "preserves the bytes it was given, then writes the repair)";
+
+    ScratchDir configHome("repairafterbad");
+    if (!configHome.ok()) {
+        notVerified(kGoals, "a scratch XDG_CONFIG_HOME could not be created under the temp directory");
+        return;
+    }
+    const std::filesystem::path file = configHome.configFile();
+    const std::filesystem::path kept(file.string() + ".bad");
+    // Three rows the daemon treats three ways: one it restores, one it cannot parse -- the
+    // shape a NEWER build writes, which nothing but the copy will hold once this build
+    // rewrites the file -- and one it repairs away. The third is what makes this start owe
+    // the file a write at all.
+    const std::string usersOwn =
+        "{\"version\":1,\"monitors\":[{\"monitor_id\":0,\"type\":\"static\",\"path\":\"/photos/kept.png\"},"
+        "{\"monitor_id\":\"two\",\"type\":\"static\",\"path\":\"/photos/newer.png\"},"
+        "{\"monitor_id\":-4,\"type\":\"static\",\"path\":\"/photos/gone.png\"}]}";
+    if (!writeTextFile(file, usersOwn)) {
+        notVerified(kGoals, "the config this phase reads could not be written");
+        return;
+    }
+
+    SpawnedDaemon daemon({validationEnv, configHome.env()});
+    if (!names.waitFor(true)) {
+        if (!reportedStartupFault(daemon, kGoals)) {
+            notVerified(kGoals, "the daemon for this phase never acquired the bus name");
+        }
+        return;
+    }
+    // The barrier, and the reason nothing here polls the file. main.cpp claims the bus name
+    // FIRST and then copies aside and writes the repair, so the name appearing says nothing
+    // about either. But the name appearing does prove the post-name block was entered, and
+    // that block runs to its end whatever a signal does -- so a daemon that has exited has
+    // provably finished both. A poll-until-the-copy-appears loop would instead have a
+    // success path reachable by waiting, and would grade whichever sample it stopped on.
+    const int exitCode = daemon.shutdown(SIGTERM);
+    awaitNameRelease(names, "the phase after the repair-after-preservation phase");
+    if (!daemon.exitedNormally()) {
+        notVerified(kGoals, "the daemon for this phase did not exit through main(), so what it had written by then "
+                            "is not this build's answer");
+        return;
+    }
+    check(exitCode == 0, "the daemon that copied its config aside and repaired it exits 0");
+
+    // GOAL: S8.23 with S10.14, of the SHIPPED BINARY -- the copy taken aside holds the bytes
+    //       the user's file held, on a start that also owes that file a repair. False if the
+    //       repair is written first: the copy is then a copy of the daemon's own rewrite, the
+    //       "monitor_id":"two" row exists in neither file, and the daemon's health note still
+    //       tells the user the config was preserved.
+    // WHY-THIS-SHAPE: at this tier and not only in process, because the ordering under test
+    //       lives in backend/daemon/main.cpp -- which method it calls first. The in-process
+    //       phase (config_store_test's malformed-entry copy phase) drives those methods
+    //       itself, in an order it chooses, so it is green for any main.cpp at all. Both
+    //       halves are asserted: the copy's bytes AND the repair reaching config.json.
+    //       Without the second, a build that never wrote the repair would satisfy the first
+    //       by doing nothing.
+    // CONTROL: `manager.writeRepairedConfig();` moved above `manager.preserveUnreadableConfig();`
+    //       in backend/daemon/main.cpp -- the ordering this goal exists to forbid -> "FAIL: the
+    //       copy the daemon took aside holds the bytes of the file the user had", printing the
+    //       daemon's own pretty-printed rewrite with monitor 0 alone in it. The repair half
+    //       stayed green under it, which is what separates "written in the wrong order" from
+    //       "not written". And the other way round: `manager.writeRepairedConfig();` deleted
+    //       from backend/daemon/main.cpp -> "FAIL: the daemon writes the repaired config once
+    //       the copy has been taken" alone, printing config.json still holding all three of the
+    //       user's rows, with the copy half green. Both observed 2026-08-15. Both reverted.
+    const std::string copied = readTextFile(kept);
+    const bool preserved = copied == usersOwn;
+    check(preserved, "the copy the daemon took aside holds the bytes of the file the user had");
+    if (!preserved) {
+        std::fprintf(stderr, "  copies beside it: %s\n  the copy holds: %s\n  the user had:   %s\n",
+                     joined(preservedCopyNames(file)).c_str(), copied.empty() ? "(nothing)" : copied.c_str(),
+                     usersOwn.c_str());
+    }
+
+    std::string why;
+    const std::map<int, PersistedEntry> onDisk = configEntries(file, why);
+    const bool repairWritten = onDisk.size() == 1 && onDisk.count(0) == 1 && onDisk.at(0).path == "/photos/kept.png";
+    check(repairWritten, "the daemon writes the repaired config once the copy has been taken");
+    if (!repairWritten) {
+        std::fprintf(stderr, "  %s; config.json now holds: %s\n", why.empty() ? "read back" : why.c_str(),
+                     readTextFile(file).c_str());
+    }
 }
 
 // A config.json of a shape or a size the daemon must refuse without opening it.
@@ -5054,7 +5764,7 @@ int main() {
     //       sdbus::Error a genuinely broken daemon raises, so every real defect that escapes
     //       a phase would become ctest "Skipped" instead of red. Nothing the daemon does can
     //       reach this branch -- it is decided before the first fork.
-    //       Skip, not the harnessFault channel this file grades a dead fork with: the sibling
+    //       Skip, not the phaseSetupFault channel this file grades a dead fork with: the sibling
     //       tier (config_store_test) already answers this same host state with 77, and one of
     //       the two reporting the machine's missing /tmp as red would have the two tiers
     //       disagree about whose fault it is.
@@ -5397,9 +6107,19 @@ int main() {
         // the descriptor accounting below -- their proxies and httplib clients close their
         // sockets at scope exit, which that accounting would otherwise report as a leak.
         checkConfigRestart(names, validationEnv, check);
+        // Step 10, and beside the restart phase above because it is the same shape one goal
+        // further on: that one restarts a wallpaper, this one restarts the connector name a
+        // plugin instance identifies itself by. Its own phase rather than more lines inside
+        // checkConfigRestart, so that a host that cannot set it up reports S10.5 as
+        // unexercised instead of hiding inside a skip that names only the Step 8 goals.
+        checkOutputRestart(names, validationEnv, check);
         checkStartsOnAnyConfig(names, validationEnv, check);
         checkStoppableOnAnyConfigFile(names, validationEnv, check);
         checkConfigPreservationOwnership(names, validationEnv, check);
+        // Beside the phase above because it grades the other half of the same ordering rule:
+        // that one, that nothing writes before the bus name is held; this one, that the
+        // repair a start owes its config is written after the copy aside rather than over it.
+        checkRepairWrittenAfterPreservation(names, validationEnv, check);
         checkShutdownDuringStartup(names, validationEnv, check);
         checkUnreadableRestore(names, validationEnv, bluePath, check);
         checkConfigLocation(names, validationEnv, bluePath, check);
@@ -5539,15 +6259,14 @@ int main() {
             // every SetWallpaper -- so blaming the suite here would send the reader hunting
             // for a leak in SpawnedDaemon that is not there. Still red, through the harness
             // channel, because the guard could not conclude.
-            harnessFault("the config-isolation guard",
-                         ("the developer's config file at " + after.file.string() +
-                          " changed during this run but holds none of this run's paths, so another process on this "
-                          "machine -- most likely the developer's own daemon -- wrote it and the guard could not "
-                          "conclude" +
-                          (ourPrefix.empty() ? " (and this host stopped supplying a temporary directory mid-run, so "
-                                               "only the test-asset half of the attribution was available)"
-                                             : ""))
-                             .c_str());
+            const std::string why =
+                "the developer's config file at " + after.file.string() +
+                " changed during this run but holds none of this run's paths, so another process on this machine -- "
+                "most likely the developer's own daemon -- wrote it and the guard could not conclude" +
+                (ourPrefix.empty() ? " (and this host stopped supplying a temporary directory mid-run, so only the "
+                                     "test-asset half of the attribution was available)"
+                                   : "");
+            phaseSetupFault("the config-isolation guard", why.c_str());
         }
     }
 
@@ -5558,12 +6277,15 @@ int main() {
     // that cannot fork-and-exec a child cannot run dbus_service or the renderer probes
     // either, so reporting this one alone as "Skipped" would mark it optional while its
     // siblings went red for the same cause. The lines above name the real reason.
-    if (g_harnessFaults > 0) {
+    if (g_phaseSetupFaults > 0) {
         std::fprintf(stderr,
                      "daemon_system_test: %d phase(s) could not be set up by the harness -- see the HARNESS FAULT "
                      "lines above. No conclusion about the daemon either way.\n",
-                     g_harnessFaults);
+                     g_phaseSetupFaults);
         return 1;
     }
+    // This reads tests/test_report.h's own harness counter, which nothing here increments and
+    // this epilogue therefore never summarises. A future site reaching for the shared
+    // harnessFailure() by mistake is caught by the guard inside rather than dropped.
     return wallpaperx::testing::reportNotVerifiedOrPassed();
 }

@@ -16,20 +16,25 @@
 // not exist yet, so its id is pinned as a literal and the goal is covered two ways out of
 // three until then. GOALS.md's S9.3 records that as an obligation on Step 15.
 //
+// It grades one Step 10 fact for the same reason, added in the same shape: the address the
+// wallpaper QML asks the daemon at (S10.11). That number is written twice -- as a literal in
+// main.qml's URL and as HttpServer::kDefaultPort in the daemon -- and when the two disagree
+// the plugin reports "WallpaperX is not running" on a machine where it is running.
+//
 // Its own target rather than a phase of an existing test, and deliberately outside the
 // if(WALLPAPERX_BUILD_KDE_PLUGIN) guard: everything here is text in the source tree, so it
 // needs no Qt, no KDE libraries, no kpackagetool6, no running Plasma and no GPU. It links
-// nlohmann_json alone -- not the daemon library -- so it stays runnable in the sanitizer
-// tree, which is configured with the KDE plugin off, and on a hosted runner, which selects
-// it by its `novulkan` label.
+// nlohmann_json alone -- not the daemon library, though it now reads one of its headers for
+// that port -- so it stays runnable in the sanitizer tree, which is configured with the KDE
+// plugin off, and on a hosted runner, which selects it by its `novulkan` label.
 //
 // This test only ever opens files for reading, and only under the backend source directory
 // baked in below. It creates nothing, so it cannot reach a developer's own
 // ~/.config/wallpaperx.
 //
 // The skip is file-granular: one arm that could not be exercised makes the whole binary exit
-// 77, so ctest says "Skipped" even where four of the five goals ran and passed. Splitting it
-// would mean a phase-selecting argument and five registrations, which is more machinery than
+// 77, so ctest says "Skipped" even where five of the six goals ran and passed. Splitting it
+// would mean a phase-selecting argument and six registrations, which is more machinery than
 // a more precise word for a broken checkout is worth. A check that actually fails always
 // wins over a skip, so this cannot turn a failure into one.
 //
@@ -38,6 +43,12 @@
 // icon theme, and that activation changes a real desktop. Those were checked by hand on
 // Plasma 6.7.4 and are recorded in PLAN.md, not here.
 
+// The daemon's own header, for the loopback host and port the QML has to agree with. Reading
+// a production header is not linking the daemon: it declares those two as constexpr and pulls
+// in nothing heavier than <atomic>, <memory> and <thread>, so this target still links
+// nlohmann_json alone and still builds where the daemon library is not built at all.
+#include "daemon/http_server.h"
+#include "tests/file_presence.h"
 #include "tests/test_report.h"
 
 #include <nlohmann/json.hpp>
@@ -60,22 +71,17 @@
 namespace {
 
 // The pass / fail / skip contract lives in tests/test_report.h: check() and its counter,
-// notVerified() and its counter, and exit 77 -- which ctest reads as SKIP through
+// notVerified() and its counter, exit 77 -- which ctest reads as SKIP through
 // SKIP_RETURN_CODE in backend/CMakeLists.txt -- reserved for "this host could not set the
-// check up", never for "the check did not like what it saw".
+// check up", never for "the check did not like what it saw", and harnessFailure(), which
+// names a defect in this file rather than in the package it reads. The present / missing /
+// unknowable classification lives in tests/file_presence.h, shared with qml_lint_test, which
+// grades the same package.
 using wallpaperx::testing::check;
+using wallpaperx::testing::harnessFailure;
 using wallpaperx::testing::notVerified;
-
-int g_harnessFaults = 0;
-
-// A defect in this file rather than in the package it reads. Counted separately, not just
-// printed differently: the summary line otherwise reports a broken helper as "N check(s)
-// failed", which sends the reader to backend/kde/kpackage/ for a fault that is here. Still
-// exits nonzero -- a harness that cannot be trusted must stay red, never become a skip.
-void harnessFailure(const std::string& what) {
-    std::fprintf(stderr, "FAIL (harness): %s\n", what.c_str());
-    ++g_harnessFaults;
-}
+using wallpaperx::testing::Presence;
+using wallpaperx::testing::presenceOf;
 
 // The wallpaper plugin's identifier, pinned here as a literal on purpose.
 //
@@ -329,10 +335,18 @@ bool cmakeReaderWorks() {
 // contents/ui/main.qml: the root element
 // --------------------------------------------------------------------------- //
 
-// Blanks out //-comments, /*...*/ comments and the insides of string literals, replacing
-// each removed byte with a space so line numbers and offsets survive. Without it, the word
-// WallpaperItem inside a comment or a string would satisfy a search for the root element.
-std::string blankCommentsAndStrings(std::string_view src) {
+// Whether string literals are blanked along with comments. The root-element scan wants them
+// gone -- `text: "WallpaperItem"` must not answer a search for a declaration. The URL scan
+// below wants them kept, since the daemon's address lives inside one; it still needs the
+// comment blanking, and it still needs strings *recognised* either way, or the `//` in
+// `"http://..."` starts a comment that swallows the rest of the line.
+enum class StringBodies { Blank, Keep };
+
+// Blanks out //-comments, /*...*/ comments and, on request, the insides of string literals,
+// replacing each removed byte with a space so line numbers and offsets survive. Without it,
+// the word WallpaperItem inside a comment or a string would satisfy a search for the root
+// element.
+std::string blankComments(std::string_view src, StringBodies strings) {
     std::string out(src);
     std::size_t i = 0;
     const auto blankTo = [&](std::size_t from, std::size_t to) {
@@ -351,21 +365,28 @@ std::string blankCommentsAndStrings(std::string_view src) {
             end = (end == std::string::npos) ? out.size() : end + 2;
             blankTo(i, end);
             i = end;
-        } else if (out[i] == '"' || out[i] == '\'') {
+        } else if (out[i] == '"' || out[i] == '\'' || out[i] == '`') {
             const char quote = out[i];
             std::size_t k = i + 1;
-            while (k < out.size() && out[k] != quote && out[k] != '\n') {
+            // A template literal legally spans lines, so it alone has no newline stop. The stop
+            // stays for the other two: an unterminated ordinary quote is a syntax error, and
+            // resyncing at the newline limits the damage to one line instead of the file.
+            while (k < out.size() && out[k] != quote && (quote == '`' || out[k] != '\n')) {
                 if (out[k] == '\\' && k + 1 < out.size()) ++k;
                 ++k;
             }
             const std::size_t end = (k < out.size() && out[k] == quote) ? k + 1 : k;
-            blankTo(i, end);
+            if (strings == StringBodies::Blank) blankTo(i, end);
             i = end;
         } else {
             ++i;
         }
     }
     return out;
+}
+
+std::string blankCommentsAndStrings(std::string_view src) {
+    return blankComments(src, StringBodies::Blank);
 }
 
 struct QmlImport {
@@ -454,6 +475,7 @@ bool commentStripperWorks() {
         {"text: 'WallpaperItem'\n", "WallpaperItem", "a single-quoted string's body"},
         {"text: \"/*\"\nItem {}\n", "/*", "a comment delimiter inside a string"},
         {"/* a\n WallpaperItem \n*/\nItem {}\n", "WallpaperItem", "a block comment spanning lines"},
+        {"text: `WallpaperItem`\n", "WallpaperItem", "a template literal's body"},
     };
     for (const Blanking& c : kBlanking) {
         const std::string blanked = blankCommentsAndStrings(c.source);
@@ -508,36 +530,95 @@ bool commentStripperWorks() {
 }
 
 // --------------------------------------------------------------------------- //
+// contents/ui/main.qml: the address it asks the daemon at
+// --------------------------------------------------------------------------- //
+
+struct LoopbackUrl {
+    int port = -1;  // -1: the loopback host appears with no port after it
+    int line = 0;
+};
+
+// Every request URL in the QML that names the daemon's loopback host, with the port written
+// after it. Comments are blanked first and string bodies deliberately are not: the address
+// lives inside a string literal, and a mention inside a comment is documentation, not a
+// request.
+//
+// The needle is the whole `http://<host>:` prefix, and the digit run has to end at `/` or at
+// the closing quote, rather than matching the bare host anywhere it appears. A text scanner
+// cannot tell a URL the plugin *requests* from one it merely *displays*, and matching the bare
+// host graded a diagnostic string such as "check http://127.0.0.1:8080/health" as a port
+// disagreement -- red on a package that is correct, with deleting a legitimate string as the
+// only remedy. What that narrowing gives up is a wrong port written outside a full URL; the
+// self-test rows below are what keep the narrowing itself from going vacuous.
+std::vector<LoopbackUrl> findLoopbackUrls(std::string_view source) {
+    const std::string text = blankComments(source, StringBodies::Keep);
+    const std::string needle = std::string("http://") + std::string(wallpaperx::HttpServer::kLoopbackHost) + ":";
+    std::vector<LoopbackUrl> found;
+    for (std::size_t pos = text.find(needle); pos != std::string::npos; pos = text.find(needle, pos + 1)) {
+        std::size_t digits = pos + needle.size();
+        std::string number;
+        while (digits < text.size() && std::isdigit(static_cast<unsigned char>(text[digits])) != 0) {
+            number += text[digits++];
+        }
+        const bool urlEnds = digits < text.size() && (text[digits] == '/' || text[digits] == '"' ||
+                                                      text[digits] == '\'' || text[digits] == '`');
+        if (!urlEnds) continue;
+        LoopbackUrl url;
+        url.line = static_cast<int>(std::count(text.begin(), text.begin() + static_cast<std::ptrdiff_t>(pos), '\n')) + 1;
+        // Ten digits is past any port; parsing it as one would throw out of a helper whose
+        // caller reports "the package disagrees with the daemon", which is the wrong verdict
+        // for a string that is not a port at all.
+        if (!number.empty() && number.size() <= 5) url.port = std::stoi(number);
+        found.push_back(url);
+    }
+    return found;
+}
+
+// The scanner decides what S10.11 compares, so it is checked against the cases where a naive
+// search is wrong before its answer is believed. A scanner that had stopped seeing the URL
+// would make the check pass over any port at all, silently -- there would simply be nothing
+// left to compare.
+bool urlScannerWorks() {
+    const std::string host(wallpaperx::HttpServer::kLoopbackHost);
+    struct Case {
+        std::string source;
+        std::vector<int> expectedPorts;
+        const char* what;
+    };
+    const Case kCases[] = {
+        {"x: \"http://" + host + ":18462/config?output=a\"\n", {18462}, "a port inside a URL string"},
+        {"// http://" + host + ":1/\n", {}, "a line comment is not a request"},
+        {"/* http://" + host + ":2/ */\n", {}, "a block comment is not a request"},
+        {"a: \"http://" + host + ":3\"\nb: \"http://" + host + ":4\"\n", {3, 4}, "two mentions are both read"},
+        {"a: \"http://" + host + ":\"\n", {-1}, "a host with no port after it"},
+        {"a: \"http://" + host + ":123456789012\"\n", {-1}, "digits too long to be a port"},
+        {"x: `http://" + host + ":18462/c`\n", {18462}, "a port inside a template literal"},
+        {"text: \"see " + host + ":1 in the logs\"\n", {}, "a bare host:port mention is not a request"},
+    };
+    bool ok = true;
+    for (const Case& c : kCases) {
+        std::vector<int> ports;
+        for (const LoopbackUrl& u : findLoopbackUrls(c.source)) ports.push_back(u.port);
+        if (ports != c.expectedPorts) {
+            std::fprintf(stderr, "  the URL scanner is wrong about %s: it found %zu mention(s)\n", c.what,
+                         ports.size());
+            ok = false;
+        }
+    }
+    const std::vector<LoopbackUrl> located = findLoopbackUrls("\n\nx: \"http://" + host + ":5\"\n");
+    if (located.size() != 1 || located.front().line != 3) {
+        std::fprintf(stderr, "  the URL scanner reports the wrong line for a mention\n");
+        ok = false;
+    }
+    return ok;
+}
+
+// --------------------------------------------------------------------------- //
 // Phases
 // --------------------------------------------------------------------------- //
 
 std::filesystem::path g_backendDir;
 std::filesystem::path g_packageDir;
-
-// Three phases ask the same question about a file and must draw the same distinction: a
-// traversal error -- an unreadable parent directory, EIO -- is this host failing to look,
-// which is a skip, while a clean answer of "not a regular file" is the package failing to
-// ship it, which is a failure. Collapsing the two blames production for a broken checkout.
-enum class Presence { Present, Missing, Unknowable };
-
-Presence presenceOf(const std::filesystem::path& path, std::string& why) {
-    std::error_code ec;
-    const bool regular = std::filesystem::is_regular_file(path, ec);
-    if (ec) {
-        // libstdc++ reports "not there" through ec rather than returning a clean false, so
-        // the one condition Missing exists for is the one that arrives here. Treating every
-        // ec as "could not look" made a deleted package file a skip, which ctest grades as
-        // green -- the package vanishing would have been the quietest result of all.
-        // ENOTDIR belongs with ENOENT: a path component replaced by a file is the package
-        // being wrong, not the host.
-        if (ec == std::errc::no_such_file_or_directory || ec == std::errc::not_a_directory) {
-            return Presence::Missing;
-        }
-        why = path.string() + ": " + ec.message();
-        return Presence::Unknowable;
-    }
-    return regular ? Presence::Present : Presence::Missing;
-}
 
 // Parsed once and shared: S9.2 and S9.3 both read it, and reparsing would report one broken
 // file as two unrelated failures.
@@ -846,10 +927,14 @@ void runWallpaperQmlChecks() {
         return;
     }
 
-    // GOAL: S9.4 -- main.qml's root element is WallpaperItem from org.kde.plasma.plasmoid.
-    //       False if the root is a plain Item, or if the module is not imported. A
-    //       non-WallpaperItem root renders off-screen at zero size, which looks like nothing
-    //       happening rather than like an error.
+    // GOAL: S9.4, and S10.9's root-element half, which is the same property -- main.qml's root
+    //       element is WallpaperItem from org.kde.plasma.plasmoid. False if the root is a
+    //       plain Item, or if the module is not imported. A non-WallpaperItem root renders
+    //       off-screen at zero size, which looks like nothing happening rather than like an
+    //       error. Two goals rest on this check and only this one: qmllint does not catch it
+    //       (measured -- with the root changed to Item, `qmllint -W0` still exits 0, since the
+    //       now unused import is only an Info-level finding), so backend/tests/qml_lint_test.cpp
+    //       deliberately does not repeat it. Weakening or removing this leaves both uncovered.
     // WHY-THIS-SHAPE: reading text is all that is available -- instantiating the type needs
     //       Qt, a QML engine and the Plasma module, none of which this suite may depend on.
     //       So the check is a proxy, and its limits are real: it establishes that the module
@@ -956,6 +1041,98 @@ void runConfigQmlChecks() {
     check(size > 0, "contents/ui/config.qml is not empty");
 }
 
+// S10.11
+void runDaemonPortChecks() {
+    const std::filesystem::path mainQml = g_packageDir / "contents" / "ui" / "main.qml";
+    std::string why;
+    switch (presenceOf(mainQml, why)) {
+        case Presence::Unknowable:
+            notVerified("S10.11", "whether the package ships contents/ui/main.qml could not be determined -- " + why);
+            return;
+        case Presence::Missing:
+            // Already a FAIL from S9.4 in this same run, on this same file. A second one would
+            // be the same defect counted twice; what must not happen is this phase reporting
+            // nothing at all, which is why it is a printed skip rather than a silent return.
+            notVerified("S10.11", "contents/ui/main.qml is not there, so it names no address -- S9.4 above is the "
+                                  "check that fails on that");
+            return;
+        case Presence::Present:
+            break;
+    }
+    const std::optional<std::string> source = readFile(mainQml);
+    if (!source) {
+        notVerified("S10.11", "contents/ui/main.qml is present but could not be read from " + mainQml.string());
+        return;
+    }
+    if (!urlScannerWorks()) {
+        harnessFailure("this file's URL scanner failed its own cases, so S10.11's verdict is withheld -- the fault "
+                       "is in backend/tests/kpackage_metadata_test.cpp, not in the package");
+        return;
+    }
+
+    // GOAL: S10.11 -- the address the wallpaper QML asks the daemon at is the address the
+    //       daemon binds. False if main.qml's URL names a port other than
+    //       HttpServer::kDefaultPort. The two are written in different languages in different
+    //       files and nothing makes them agree; when they disagree the plugin's every request
+    //       fails to connect, which it renders as "WallpaperX is not running" on a machine
+    //       where the daemon is running fine.
+    // WHY-THIS-SHAPE: the number is compared against the daemon's own compiled constant, not
+    //       against a literal repeated here. A test that wrote 18462 out again would keep
+    //       passing after someone changed kDefaultPort -- it would then be a third copy of the
+    //       fact and no closer to checking agreement. The QML side has to be read as text
+    //       (nothing here can run a QML engine), so the scanner is the weak link and is
+    //       self-tested first: comments blanked, string bodies kept (including template
+    //       literals, whose `//` would otherwise start a comment that swallows the address),
+    //       every request URL collected rather than the first, and a host with no digits after
+    //       it reported instead of skipped.
+    // COVERAGE-ASSERT: the number of addresses compared is asserted to be non-zero and is
+    //       printed. Without that, a main.qml that built its URL from a variable -- or a
+    //       scanner that stopped matching -- would leave zero comparisons and the phase would
+    //       pass having compared nothing, which is exactly how this check would rot.
+    // CONTROL: four mutations. In a copy of backend/ under /tmp, main.qml's URL changed to
+    //       port 18463 -> `main.qml line 88 asks for port 18463; the daemon binds 18462` and
+    //       `FAIL: main.qml asks the daemon at the port the daemon binds`. In the same copy,
+    //       the URL rewritten to build its address from a property so no literal is left ->
+    //       `FAIL: main.qml names the daemon's loopback address somewhere this check can read
+    //       it`, not a silent pass over zero comparisons. In the repository itself,
+    //       backend/daemon/http_server.h's kDefaultPort changed to 18463 -> the first FAIL
+    //       again with the numbers the other way round, which is what proves the comparison
+    //       reads the daemon's constant rather than a copy of the number; reverted immediately
+    //       and the file checked clean against git. And the scanner itself blanking string
+    //       bodies, the one thing it must not do -> five named scanner errors and `FAIL
+    //       (harness): this file's URL scanner failed its own cases`, with S10.11's verdict
+    //       withheld rather than passed. And two on the scanner's own cases, added before the
+    //       code that satisfies them: a port inside a template literal, and a bare
+    //       `127.0.0.1:1` in a diagnostic string that must not be read as a request -> `the URL
+    //       scanner is wrong about a port inside a template literal: it found 0 mention(s)` and
+    //       `... a bare host:port mention is not a request: it found 1 mention(s)`, with
+    //       S10.11's verdict withheld; green once the backtick delimiter and the `http://`
+    //       needle were in place.
+    const std::vector<LoopbackUrl> urls = findLoopbackUrls(*source);
+    check(!urls.empty(), "main.qml names the daemon's loopback address somewhere this check can read it");
+    if (urls.empty()) {
+        std::fprintf(stderr, "  looked for \"%s:<port>\" outside comments in %s; the daemon binds that host and "
+                             "port %d\n",
+                     wallpaperx::HttpServer::kLoopbackHost, mainQml.string().c_str(),
+                     wallpaperx::HttpServer::kDefaultPort);
+        return;
+    }
+    bool agree = true;
+    for (const LoopbackUrl& url : urls) {
+        if (url.port == wallpaperx::HttpServer::kDefaultPort) continue;
+        agree = false;
+        std::fprintf(stderr, "  %s line %d asks for port %d; the daemon binds %d (HttpServer::kDefaultPort). Every "
+                             "loopback URL in main.qml is graded, so build any second one from the same literal "
+                             "rather than writing the address again\n",
+                     mainQml.string().c_str(), url.line, url.port, wallpaperx::HttpServer::kDefaultPort);
+    }
+    check(agree, "main.qml asks the daemon at the port the daemon binds");
+    std::printf("kpackage_metadata_test: compared %zu loopback address(es) in main.qml against "
+                "HttpServer::kDefaultPort (%d).\n",
+                urls.size(), wallpaperx::HttpServer::kDefaultPort);
+    std::fflush(stdout);
+}
+
 }  // namespace
 
 int main() {
@@ -988,6 +1165,7 @@ int main() {
         {"one plugin id, in the two places this process can read it (S9.3)", runIdentifierAgreementChecks},
         {"the wallpaper's QML entry point (S9.4)", runWallpaperQmlChecks},
         {"the settings page (S9.5)", runConfigQmlChecks},
+        {"the daemon's address, in the two places it is written (S10.11)", runDaemonPortChecks},
     };
     for (const Phase& phase : kPhases) {
         try {
@@ -1006,11 +1184,8 @@ int main() {
     // package for a fault in this file -- but they are equally red, never a skip, because a
     // harness that cannot be trusted must not report a verdict.
     const bool checksFailed = wallpaperx::testing::reportCheckFailures();
-    if (g_harnessFaults > 0) {
-        std::fprintf(stderr, "kpackage_metadata_test: %d fault(s) in this test file, not in the package\n",
-                     g_harnessFaults);
-    }
-    if (checksFailed || g_harnessFaults > 0) {
+    const bool harnessFaulted = wallpaperx::testing::reportHarnessFaults("in this test file, not in the package");
+    if (checksFailed || harnessFaulted) {
         return 1;
     }
     return wallpaperx::testing::reportNotVerifiedOrPassed();

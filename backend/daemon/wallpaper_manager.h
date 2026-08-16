@@ -262,9 +262,17 @@ public:
     // non-static types -- those still need their target released.
     void requestWallpaper(const std::string& type, const std::string& path, int monitorId);
 
+    // Records the connector name a monitor is known by -- "DP-3". Throws InvalidRequest for
+    // a bad id or a name outputNameError() rejects. No render and no GPU work.
+    //
+    // Idempotent, and a call changing nothing does not write: clients are invited to
+    // re-assert names, and the write parks the calling thread.
+    void setMonitorOutput(int monitorId, const std::string& outputName);
+
     // Applies the config file's wallpapers, returning the monitor ids to post to the
-    // worker. Call once. Neither rejects an unreadable path nor saves -- an entry dropped
-    // here is dropped from the file by the next save.
+    // worker. Call once. Writes nothing: a repair it performed is held for
+    // writeRepairedConfig(), and an entry it dropped without repairing is dropped from the
+    // file by the next save.
     std::vector<int> restoreSaved();
 
     // Moves an unreadable config aside, or copies one whose entries were partly rejected,
@@ -273,6 +281,11 @@ public:
     // otherwise move the running daemon's config before finding out it cannot run. Call
     // once, after the bus name is held. Until it runs, saving stays refused.
     void preserveUnreadableConfig();
+
+    // Writes the repair restoreSaved() computed, if it computed one. Call once, after
+    // preserveUnreadableConfig(): the repair rewrites config.json from live state, which
+    // would replace the very bytes that call copies aside to preserve.
+    void writeRepairedConfig();
 
     // Renders whatever request the monitor currently holds. Called on the render
     // worker's thread; never on the DBus thread.
@@ -298,6 +311,11 @@ public:
         GpuStatus gpu;
         DaemonHealth health;
         std::map<int, MonitorStatus> monitors;
+
+        // Connector name -> monitor id. Its own field, not a MonitorStatus member: a named
+        // monitor need not have a wallpaper, and inventing a MonitorStatus to hold the name
+        // would make /health report that screen as set to a wallpaper it cannot render.
+        std::map<std::string, int> outputs;
     };
     Snapshot snapshot() const;
 
@@ -384,6 +402,15 @@ private:
     // Snapshots the monitors worth persisting. Caller must hold m_stateMutex.
     std::vector<PersistedWallpaper> persistableLocked() const;
 
+    // Displaced covers both collisions a bind resolves: a name taken off another monitor,
+    // and a name this monitor already answered to. Reporting one and not the other loses a
+    // name in silence.
+    enum class BindResult { Unchanged, Bound, Displaced };
+
+    // Binds a name to a monitor, releasing any binding either side already had. Caller must
+    // hold m_stateMutex and must have validated the name.
+    BindResult bindOutputLocked(int monitorId, const std::string& outputName);
+
     // Writes `entries` and records the persistence health. Must NOT be called holding
     // m_stateMutex: it records health, which takes it, and the write is a syscall.
     void persist(const std::vector<PersistedWallpaper>& entries);
@@ -407,6 +434,10 @@ private:
     // Not recorded into m_health, because the writer cannot touch this object at all.
     void applyPersistOutcomeLocked(DaemonHealth& health) const;
 
+    // Whether the last completed write failed, so live state and the file disagree. Caller
+    // must hold m_stateMutex; takes the worker's lock, which is the established order.
+    bool persistFailedLocked() const;
+
     const Config m_config;
     const ConfigStore m_store;
 
@@ -417,12 +448,16 @@ private:
     // Guarded by m_stateMutex.
     std::vector<PersistedWallpaper> m_unapplied;
 
+    // The repair restoreSaved() computed, until writeRepairedConfig() takes it out.
+    // Guarded by m_stateMutex.
+    std::optional<std::vector<PersistedWallpaper>> m_repair;
+
     // The file still holds content this run could not read and could not move aside, so
     // persist() must not replace it. Written only by the constructor, read afterwards.
     bool m_configUnread = false;
 
-    // Raw, unsanitized; sanitized once when recorded. Written by the constructor, read
-    // under m_stateMutex afterwards.
+    // Raw, unsanitized; sanitized once when recorded. Written by the constructor and by
+    // restoreSaved(), both before the event loop starts; read under m_stateMutex after.
     std::string m_persistenceNote;
 
     // Started on the first save rather than at construction, so a daemon that never sets a
@@ -431,8 +466,10 @@ private:
 
     // Entries no build can apply, dropped rather than kept. Counted so the loss is
     // reported: unlike a kept entry, nothing else would ever mention it. Guarded by
-    // m_stateMutex.
+    // m_stateMutex. Name-only rows counted apart: the report these feed is the user's
+    // notice that a picture did not come back, and a name never was one.
     int m_droppedEntries = 0;
+    int m_droppedNames = 0;
 
     // What the load found, held for preserveUnreadableConfig() to act on later.
     bool m_loadPreservable = false;
@@ -453,6 +490,11 @@ private:
     // published once at initialisation, so status() can answer without touching the
     // Device and therefore without waiting for a render to finish.
     std::map<int, MonitorState> m_monitors;
+
+    // Connector name -> monitor id, and the only authority on which is which. Reverse
+    // lookup is a scan of at most kMaxMonitors entries; an index would be a second
+    // structure to keep agreeing about the thing this mapping exists to disambiguate.
+    std::map<std::string, int> m_outputs;
     // Member pointer picks the check, so a caller cannot record into a field it did not
     // mean and the sanitizing happens in one place.
     void recordHealth(HealthCheck DaemonHealth::*which, HealthStatus status, const std::string& detail);

@@ -172,6 +172,9 @@ int main() {
             // Only now: this moves the user's config aside, and until the name is held
             // this process does not know it is the daemon.
             manager.preserveUnreadableConfig();
+            // After the copy aside, not before: the repair rewrites config.json from live
+            // state, and the copy exists to preserve the bytes that rewrite would destroy.
+            manager.writeRepairedConfig();
         }
 
         std::printf("wallpaperx-daemon: serving %s at %s\n", wallpaperx::DbusService::kBusName,

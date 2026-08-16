@@ -340,6 +340,13 @@ constexpr int kMonitorAgree = 2;      // the hostile path, rendered
 constexpr int kMonitorGpuLock = 3;    // the slow render in runGpuLockChecks
 constexpr int kMonitorLiteral = 4;    // the path_literal round trip -- set over the bus, twice
 constexpr int kMonitorNonUtf8 = 5;    // a path JSON cannot carry, recorded through the manager
+// Step 10's connector-name ids. Two named monitors carry a wallpaper of their own, because
+// the property is that a name resolves to ITS OWN monitor: with one named monitor every wrong
+// answer is also the right one, so the phase could not tell a lookup from a constant.
+constexpr int kMonitorNamedSet = 6;      // named, and a wallpaper of its own
+constexpr int kMonitorNamedOther = 7;    // named, and a different wallpaper
+constexpr int kMonitorNamedUnset = 8;    // named, nothing ever set on it
+constexpr int kMonitorNamedHostile = 9;  // named with bytes a display surface must escape
 constexpr int kMonitorNeverSet = 31;  // also the upper in-range boundary for S7.5
 
 // Goals this run could not exercise, as opposed to goals it exercised and that held.
@@ -3001,6 +3008,551 @@ void runMonitorParamChecks(httplib::Client& cli, const std::string& recordedPath
 }
 
 // ---------------------------------------------------------------------------- //
+// Phase 3b -- Step 10: asking /config by connector name instead of by monitor id.
+// ---------------------------------------------------------------------------- //
+
+// A query-string spelling of arbitrary bytes. Needed because the names this phase asks
+// about deliberately contain a newline, a right-to-left override and DEL: written raw into
+// a request line they would not survive the HTTP parser, so a failure to escape them would
+// look like a daemon defect.
+std::string percentEncode(const std::string& raw) {
+    static constexpr char kHex[] = "0123456789ABCDEF";
+    std::string out;
+    for (const char c : raw) {
+        const auto b = static_cast<unsigned char>(c);
+        const bool unreserved = (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z') || (b >= '0' && b <= '9') ||
+                                b == '-' || b == '.' || b == '_' || b == '~';
+        if (unreserved) {
+            out += static_cast<char>(b);
+            continue;
+        }
+        out += '%';
+        out += kHex[b >> 4];
+        out += kHex[b & 0x0F];
+    }
+    return out;
+}
+
+std::string configByOutput(const std::string& name) { return "/config?output=" + percentEncode(name); }
+
+// nlohmann's value(key, default) defaults on an ABSENT key only -- on a present JSON null it
+// throws. /config answers `monitor_id` as null for a name it does not know and `path_literal`
+// as null for a stored path that is not UTF-8, so value() would turn the very regression these
+// checks exist to catch into an exception that main's catch-all reports as one opaque line,
+// abandoning every later phase with no NOT VERIFIED row (X.4).
+std::optional<int> intField(const HttpReply& reply, const char* key) {
+    if (!reply.hasJsonObject() || !reply.json.contains(key) || !reply.json[key].is_number_integer()) {
+        return std::nullopt;
+    }
+    return reply.json[key].get<int>();
+}
+
+std::optional<std::string> stringField(const HttpReply& reply, const char* key) {
+    if (!reply.hasJsonObject() || !reply.json.contains(key) || !reply.json[key].is_string()) {
+        return std::nullopt;
+    }
+    return reply.json[key].get<std::string>();
+}
+
+std::optional<bool> boolField(const HttpReply& reply, const char* key) {
+    if (!reply.hasJsonObject() || !reply.json.contains(key) || !reply.json[key].is_boolean()) {
+        return std::nullopt;
+    }
+    return reply.json[key].get<bool>();
+}
+
+// GOAL: a name /config could never have been given is refused with 400 rather than
+//       answered "I have never heard of it". False if an empty, oversized or
+//       non-UTF-8 name is answered 200 -- the daemon would then be telling a caller its
+//       screen is unknown when the real answer is that the request is malformed, and
+//       "run the app" is the wrong advice for it.
+// WHY-THIS-SHAPE: the cap is exercised on BOTH sides -- 256 bytes accepted, 257
+//       rejected -- because a check on the oversized case alone passes for a daemon
+//       whose bound is off by one in either direction, and a name one surface accepts
+//       that another cannot hold is precisely what one shared outputNameError() exists
+//       to prevent. This is also the only route on which the daemon's own UTF-8
+//       rejection is reachable from a client: over DBus the bus library refuses to
+//       build a message holding an invalid UTF-8 string, so that clause is enforced
+//       before the daemon sees it (measured -- see the DBus tier's own note).
+//       A free function rather than part of runOutputParamChecks: the daemon rejects all
+//       four of these names inside parseIdentity before any lookup, so they need no
+//       connector name recorded, and leaving them in the phase's setup-dependent region
+//       meant a setup that threw dropped them unrun and unreported.
+// CONTROL: two, reverted. (a) the `outputNameError` call deleted from parseIdentity() in
+//       backend/daemon/http_server.cpp -> three FAILs, "an empty output= is rejected with
+//       400", the oversized one and the non-UTF-8 one, each answering 200 with
+//       known=false -- the last echoing `"output":"DP-\\xff-1"`, which is also the
+//       measurement that the daemon's own UTF-8 rejection is genuinely reached on this
+//       route rather than pre-empted by the HTTP layer. (b) `name.size() >
+//       kMaxOutputNameBytes` in backend/daemon/config_store.h weakened to `>=` -> "FAIL:
+//       a connector name of exactly the maximum length is accepted" ("a 256-byte name
+//       answered 400"), while the 257-byte case stayed green. (c) the accept side is graded
+//       on a parsed 200 carrying `known`, not on the status: asking it with "/config?t=1" --
+//       a 200 that never went through the connector-name branch -- reddens that line, where
+//       written as `reached && status == 200` the same request stayed GREEN.
+void runOutputNameValidationChecks(httplib::Client& cli, const Check& check) {
+    const struct {
+        std::string value;
+        const char* what;
+    } kUnusable[] = {
+        {"", "an empty output= is rejected with 400"},
+        {std::string(wallpaperx::kMaxOutputNameBytes + 1, 'D'), "an oversized output= is rejected with 400"},
+        {std::string("DP-\xFF-1"), "an output= that is not valid UTF-8 is rejected with 400"},
+    };
+    for (const auto& bad : kUnusable) {
+        const HttpReply res = get(cli, configByOutput(bad.value));
+        check(res.reached && res.status == 400, bad.what);
+        if (!(res.reached && res.status == 400)) {
+            std::fprintf(stderr, "  a %zu-byte name answered %d: %s\n", bad.value.size(), res.status,
+                         res.body.c_str());
+        }
+    }
+    const HttpReply atCap = get(cli, configByOutput(std::string(wallpaperx::kMaxOutputNameBytes, 'D')));
+    // A parsed 200 carrying `known`, not a bare 200: httplib answers 200 by default for a
+    // handler that writes nothing, so "did not refuse" and "answered" are different states,
+    // and `known` is emitted only by the connector-name branch -- a name at the cap that fell
+    // through to the monitor branch would otherwise grade as accepted.
+    const bool atCapAccepted = atCap.ok() && atCap.json.contains("known");
+    check(atCapAccepted, "a connector name of exactly the maximum length is accepted");
+    if (!atCapAccepted) {
+        std::fprintf(stderr, "  a %zu-byte name answered %d: %s\n", wallpaperx::kMaxOutputNameBytes, atCap.status,
+                     atCap.body.c_str());
+    }
+}
+
+void runOutputParamChecks(WallpaperManager& manager, httplib::Client& cli, const std::string& monitor0Path,
+                          const std::string& namedPath, const std::string& otherPath, const Check& check) {
+    // Bytes every display surface has to escape, and valid UTF-8 so the name is one the
+    // daemon will accept at all: U+202E, a newline and DEL.
+    const std::string hostileName = std::string("DP-\xE2\x80\xAE\nHDMI\x7F-1");
+    const std::string unknownName = "DVI-I-99-never-told";
+
+    // COVERAGE-ASSERT for every path comparison and body search below: the three wallpapers
+    // must be three different files, must survive the daemon's display escaper unchanged, and
+    // must carry no byte nlohmann escapes. Graded before the setup because it is a statement
+    // about the fixtures alone. The first clause keeps the not-the-other-monitor's checks
+    // falsifiable; the second is what lets `path` be compared for equality (the handler runs
+    // it through sanitizeForLog); the third is what keeps the raw-body searches from going
+    // quietly vacuous under a build directory holding a quote or a backslash.
+    // CONTROL: `namedPath` set to bluePath at the call site in main() -> "FAIL: the three
+    //       wallpapers this phase distinguishes between are three different files", plus the
+    //       not-monitor-0's-wallpaper line it makes unsatisfiable. Restored.
+    //       And `displaySafe(namedPath)` called as `displaySafe(namedPath + "\"")` -> "FAIL:
+    //       the three wallpapers ... survive display escaping and JSON encoding unchanged",
+    //       nothing else red. Restored.
+    const auto displaySafe = [](const std::string& p) {
+        return wallpaperx::sanitizeForLog(p, 4096, wallpaperx::LogFraming::Bare) == p &&
+               p.find_first_of("\"\\") == std::string::npos;
+    };
+    check(namedPath != otherPath && namedPath != monitor0Path && otherPath != monitor0Path,
+          "the three wallpapers this phase distinguishes between are three different files");
+    check(displaySafe(namedPath) && displaySafe(otherPath) && displaySafe(monitor0Path),
+          "the three wallpapers this phase distinguishes between survive display escaping and JSON encoding "
+          "unchanged");
+
+    // Ahead of the setup, and outside its try: these need no connector name recorded, so a
+    // setup that throws must not take them with it.
+    runOutputNameValidationChecks(cli, check);
+
+    // Every goal the region below this setup grades, named in one place: a goal that vanishes
+    // from the ledger reads afterwards as a goal that was established. S10.8 is not among them
+    // -- its hostile name is bound in its own try, further down, so a name the daemon refuses
+    // does not take with it the goals whose fixtures are already recorded.
+    static constexpr const char* kSetupDependentGoals =
+        "S10.1, S10.2, S10.3, S10.6 (asking /config by connector name), that the plugin's own polled shape "
+        "(output= beside a cache-buster) resolves like the bare form, and that `known` and `output` appear on "
+        "no other /config reply";
+    try {
+        manager.requestWallpaper("static", namedPath, kMonitorNamedSet);
+        manager.requestWallpaper("static", otherPath, kMonitorNamedOther);
+        manager.setMonitorOutput(kMonitorNamedSet, "DP-1");
+        manager.setMonitorOutput(kMonitorNamedOther, "DP-2");
+        manager.setMonitorOutput(kMonitorNamedUnset, "HDMI-A-2");
+    } catch (const wallpaperx::InvalidRequest& e) {
+        // The code under test refusing input it is required to accept is a defect, not a host
+        // condition: reported through check() so the run exits 1 rather than 77. Without this
+        // arm a daemon that started rejecting "DP-1" would make its own feature untestable and
+        // ctest would print Skipped.
+        // CONTROL: a fixture name the daemon must accept made one it refuses ("HDMI\xff-A-2")
+        //       -> "FAIL: the daemon accepts the connector names and wallpapers this phase's
+        //       fixtures use", the refusal printed, the ledger row beside it, exit 1. With this
+        //       arm removed the same mutation printed the ledger row alone and exited 77 --
+        //       a daemon defect reported to ctest as an unexercisable host.
+        check(false, "the daemon accepts the connector names and wallpapers this phase's fixtures use");
+        std::fprintf(stderr, "  a fixture the daemon must accept was refused: %s\n", e.what());
+        notVerified(kSetupDependentGoals,
+                    std::string("the connector names this phase asks about were refused: ") + e.what());
+        return;
+    } catch (const std::exception& e) {
+        // X.3: the phase could not build its precondition, so nothing below is graded
+        // against the HTTP server. Reported as a skip rather than as a page of FAIL lines.
+        notVerified(kSetupDependentGoals,
+                    std::string("the connector names this phase asks about could not be recorded: ") + e.what());
+        return;
+    }
+
+    // GOAL: S10.1 -- a name the daemon has been told about answers with THAT monitor's
+    //       wallpaper. False if it answers with another monitor's, or refuses a name it
+    //       was given.
+    // WHY-THIS-SHAPE: two named monitors with two different wallpapers, and each answer is
+    //       asserted to carry its own path AND not the other's. One named monitor cannot
+    //       distinguish a lookup from a constant -- every wrong answer would also be the
+    //       right one -- and monitor 0's path is excluded as well, since 0 is what a
+    //       handler that ignored the parameter would fall back to. Both path fields are
+    //       pinned, not just `path_literal`: the shipped plugin renders `path` and reads
+    //       "no wallpaper chosen for this screen" off it being empty
+    //       (backend/kde/kpackage/contents/ui/main.qml), so an output= branch that filled
+    //       only the actionable field would blank every named screen with this phase green.
+    //       The two negative clauses compare the DECODED path_literal rather than searching
+    //       the response text: a substring search is satisfied both by a reply that carries
+    //       no answer at all (a 400, a 500, an empty body) and by one whose path is present
+    //       but spelled with JSON escapes, so it would report green for a daemon handing
+    //       every named screen monitor 0's picture.
+    // CONTROL: three, reverted. (a) `if (known) monitorId = bound->second;` in the /config
+    //       handler in backend/daemon/http_server.cpp made `monitorId = 0` -> 7 FAILs, led by
+    //       "a named monitor's own wallpaper is served for its name (DP-1)" and the same for
+    //       DP-2, both printing monitor 0's blue path with monitor_id 0, and both
+    //       never-served-monitor-0's lines red with them. Every unknown-name check stayed
+    //       green, which is what keeps this about resolution and not about the field.
+    //       (b) `if (kind == IdentityKind::Output) out["path"] = "";` inserted just before
+    //       the final sendJson in backend/daemon/http_server.cpp -> exactly the two "a named
+    //       monitor's own wallpaper is served for its name" lines red, with every
+    //       path_literal-based and ?monitor= check green -- which is what shows the display
+    //       field is pinned on the output= route specifically.
+    //       (c) the output= branch made to answer 400 -> the two "never served another named
+    //       monitor's wallpaper" lines and the two "never served monitor 0's wallpaper" lines
+    //       red. Written as a search of res.body those four stayed GREEN under the same
+    //       mutation, since an error body contains no path either: that is the measurement
+    //       the decoded comparison rests on.
+    // COVERAGE-ASSERT: the fixtures are asserted distinct and escape-free above the setup,
+    //       which is what keeps the not-the-other-monitor's clauses falsifiable.
+    const struct {
+        const char* name;
+        int monitorId;
+        const std::string& path;
+    } kNamed[] = {
+        {"DP-1", kMonitorNamedSet, namedPath},
+        {"DP-2", kMonitorNamedOther, otherPath},
+    };
+    for (const auto& bound : kNamed) {
+        const HttpReply res = get(cli, configByOutput(bound.name));
+        const std::optional<std::string> literal = stringField(res, "path_literal");
+        const bool served = res.ok() && boolField(res, "known") == true &&
+                            intField(res, "monitor_id") == bound.monitorId && literal == bound.path &&
+                            stringField(res, "path") == bound.path &&
+                            stringField(res, "type") == std::string("static");
+        bool clean = served;
+        check(served, (std::string("a named monitor's own wallpaper is served for its name (") + bound.name +
+                       ")").c_str());
+        for (const auto& foreign : kNamed) {
+            if (foreign.monitorId == bound.monitorId) continue;
+            const bool notForeign = literal.has_value() && *literal != foreign.path;
+            clean = clean && notForeign;
+            check(notForeign, (std::string("a named monitor is never served another named monitor's wallpaper (") +
+                               bound.name + " must not carry " + foreign.name + "'s)").c_str());
+        }
+        const bool notMonitorZero = literal.has_value() && *literal != monitor0Path;
+        clean = clean && notMonitorZero;
+        check(notMonitorZero,
+              (std::string("a named monitor is never served monitor 0's wallpaper (") + bound.name + ")").c_str());
+        // Gated on all three results, not on `served` alone: the two negative checks fail on
+        // a well-formed 200 that simply carries the wrong path, and that is the failure the
+        // body is needed to explain.
+        if (!clean) {
+            std::fprintf(stderr, "  %s answered %d: %s\n", bound.name, res.status, res.body.c_str());
+        }
+    }
+
+    // GOAL: the request shape the shipped plugin actually polls with -- output= alongside the
+    //       cache-buster main.qml appends to every poll -- resolves exactly as the bare form
+    //       does. False if a second query parameter changes or refuses the answer, which
+    //       would leave every Plasma screen showing a refusal while every check above stayed
+    //       green, since nothing else in the tree ever sends that shape.
+    // WHY-THIS-SHAPE: asserted against the bare reply's own id and path rather than against
+    //       the fixture constants, so it cannot pass while the bare form has silently stopped
+    //       resolving; and both sides are required to have a value, because two absent fields
+    //       compare equal and would make the comparison vacuous on a pair of error replies.
+    //       The cache-buster is not folded into configByOutput: that would move every check
+    //       in the phase onto the polled shape and lose the bare form entirely.
+    // CONTROL: `if (hasMonitor && hasOutput)` in parseIdentity (backend/daemon/http_server.cpp)
+    //       widened to `if (hasOutput && req.params.size() > 1)` -> exactly this check red,
+    //       "the plugin's own request shape (output= with a cache-buster) resolves like the
+    //       bare form", with the three monitor=-and-output=-are-400 checks still green.
+    //       Reverted.
+    const HttpReply bare = get(cli, configByOutput("DP-1"));
+    const HttpReply asPolled = get(cli, configByOutput("DP-1") + "&t=1234567890");
+    const bool pollShapeAgrees = asPolled.ok() && bare.ok() && intField(bare, "monitor_id").has_value() &&
+                                 intField(asPolled, "monitor_id") == intField(bare, "monitor_id") &&
+                                 stringField(bare, "path_literal").has_value() &&
+                                 stringField(asPolled, "path_literal") == stringField(bare, "path_literal");
+    check(pollShapeAgrees, "the plugin's own request shape (output= with a cache-buster) resolves like the bare form");
+    if (!pollShapeAgrees) {
+        std::fprintf(stderr, "  bare answered %d: %s\n  with &t= answered %d: %s\n", bare.status, bare.body.c_str(),
+                     asPolled.status, asPolled.body.c_str());
+    }
+
+    // GOAL: S10.2 -- a name the daemon has never been told about answers 200 with
+    //       known=false, an empty type and path, and no monitor id at all. False if a
+    //       freshly started daemon serves monitor 0's entry to an unrecognised screen.
+    // WHY-THIS-SHAPE: monitor_id is required to be JSON null rather than merely "not this
+    //       monitor". 0 would be a well-formed id the plugin could hand straight back to
+    //       ?monitor=, which puts monitor 0's picture on a screen that is not monitor 0 --
+    //       the substitution this endpoint exists to refuse. The status is asserted 200
+    //       separately from the body: this state is ordinary, and a 404 would make every
+    //       plugin instance on a screen the app has not yet named look like an error.
+    // CONTROL: two, reverted. (a) `out["monitor_id"] = nullptr;` and the early return deleted
+    //       from backend/daemon/http_server.cpp, so an unknown name falls through to the
+    //       monitor lookup with monitorId still 0 -> 3 FAILs: "an unknown connector name is
+    //       answered with no monitor id rather than with 0", "... is answered with an empty
+    //       type and path", and "... is not answered with monitor 0's wallpaper".
+    //       (b) the output= branch made to answer 400 -> "an unknown connector name is not
+    //       answered with monitor 0's wallpaper" red; written as `unknown.reached &&` it
+    //       stayed GREEN under the same mutation.
+    const HttpReply unknown = get(cli, configByOutput(unknownName));
+    const bool unknownAnswered = unknown.reached && unknown.status == 200;
+    const bool unknownNotKnown = unknown.hasJsonObject() && unknown.json.contains("known") &&
+                                 unknown.json["known"].is_boolean() && !unknown.json["known"].get<bool>();
+    const bool unknownHasNoId =
+        unknown.hasJsonObject() && unknown.json.contains("monitor_id") && unknown.json["monitor_id"].is_null();
+    const bool unknownIsEmpty = stringField(unknown, "type") == std::string() &&
+                                stringField(unknown, "path") == std::string();
+    // A parsed 200, not merely a reply that arrived: `reached` alone is satisfied by any error
+    // body, which naturally holds no path, so a daemon refusing every output= query would
+    // grade green here. Measured -- see this block's CONTROL (b).
+    const bool unknownCarriesNoZero = unknown.ok() && unknown.body.find(monitor0Path) == std::string::npos;
+    check(unknownAnswered, "a connector name the daemon has never been told about is answered with 200, not an error");
+    check(unknownNotKnown, "a connector name the daemon has never been told about is reported as not known");
+    check(unknownHasNoId, "an unknown connector name is answered with no monitor id rather than with 0");
+    check(unknownIsEmpty, "an unknown connector name is answered with an empty type and path");
+    check(unknownCarriesNoZero, "an unknown connector name is not answered with monitor 0's wallpaper");
+    // All five, not the status alone: the other four fail on a well-formed 200, and that is
+    // the reply the reader needs to see.
+    if (!(unknownAnswered && unknownNotKnown && unknownHasNoId && unknownIsEmpty && unknownCarriesNoZero)) {
+        std::fprintf(stderr, "  an unknown name answered %d: %s\n", unknown.status, unknown.body.c_str());
+    }
+
+    // GOAL: S10.3 -- "I have never heard of this screen" and "I know this screen and
+    //       nothing is set on it" are distinguishable from the response alone. False if a
+    //       plugin cannot tell them apart: one is fixed by running the app, the other by
+    //       picking a wallpaper, and they need different words on the desktop.
+    // WHY-THIS-SHAPE: both replies are first asserted to have an EMPTY type and path, and
+    //       only then are they required to differ. Without that half the check would be
+    //       satisfied by two responses that differ in some unrelated field -- and it is
+    //       exactly the empty type and path that makes the two states look alike to a
+    //       plugin, so a check that did not pin them establishes nothing about the
+    //       confusion it exists to prevent.
+    // CONTROL: `out["known"] = known;` deleted from backend/daemon/http_server.cpp -> 8 FAILs,
+    //       among them "a known screen with nothing set reports known=true" and
+    //       "known-with-nothing-set and never-heard-of differ in the response body". Under the
+    //       same mutation, `distinguishable` rewritten as the naive
+    //       `knownUnset.json.value("known", false) != unknown.json.value("known", true)`
+    //       stayed GREEN -- 7 FAILs, that line not among them -- which is the measurement the
+    //       both-must-carry-a-boolean shape rests on. Both reverted.
+    const HttpReply knownUnset = get(cli, configByOutput("HDMI-A-2"));
+    check(knownUnset.ok() && stringField(knownUnset, "type") == std::string() &&
+              stringField(knownUnset, "path") == std::string(),
+          "a named monitor with no wallpaper answers with an empty type and path, like an unknown name");
+    check(boolField(knownUnset, "known") == true, "a known screen with nothing set reports known=true");
+    // Read with an explicit type guard, not value("monitor_id", -1): the handler answers this
+    // field as JSON null for a name it does not resolve, which is exactly the regression this
+    // check exists to catch, and value() throws on a present null rather than defaulting.
+    check(intField(knownUnset, "monitor_id") == kMonitorNamedUnset,
+          "a known screen with nothing set still reports which monitor it is");
+    // Both replies must CARRY a boolean `known`, not merely disagree about one. Written as
+    // `value("known", false) != value("known", true)` the check passed with `out["known"] =
+    // known;` deleted from backend/daemon/http_server.cpp altogether -- the two defaults
+    // differ, so absence satisfied it. Measured under this block's CONTROL above.
+    const std::optional<bool> knownUnsetFlag = boolField(knownUnset, "known");
+    const std::optional<bool> unknownFlag = boolField(unknown, "known");
+    const bool distinguishable =
+        knownUnsetFlag.has_value() && unknownFlag.has_value() && *knownUnsetFlag != *unknownFlag;
+    check(distinguishable, "known-with-nothing-set and never-heard-of differ in the response body");
+    if (!distinguishable) {
+        std::fprintf(stderr, "  known-but-unset: %s\n  never heard of:  %s\n", knownUnset.body.c_str(),
+                     unknown.body.c_str());
+    }
+
+    // GOAL: S10.6 -- monitor= and output= together are rejected with 400. False if one
+    //       silently wins: two identities in one request cannot be reconciled, and choosing
+    //       either is a guess about which screen the caller meant.
+    // WHY-THIS-SHAPE: both parameter orders, and a case whose monitor id is VALID. Testing
+    //       only "monitor=99&output=DP-1" would be satisfied by a handler that rejected it
+    //       for the id alone and went on silently preferring one identity whenever both are
+    //       well-formed. The body is checked to carry neither wallpaper, so a 400 that also
+    //       answered cannot pass.
+    // CONTROL: the `hasMonitor && hasOutput` branch deleted from parseIdentity() in
+    //       backend/daemon/http_server.cpp, leaving output= to win -> three "monitor= and
+    //       output= in one request are rejected with 400" FAILs (200 each, the id-99 case
+    //       among them) and three "a request naming a screen two ways is answered with no
+    //       wallpaper at all", every body carrying the DP-1 monitor's path. Reverted.
+    //       The searched paths are asserted JSON-safe above the setup, so this one substring
+    //       search -- the phase's last, kept because a rejection has no parsed field to read
+    //       -- cannot go vacuous under a build directory holding a quote or a backslash.
+    //       The body clause is gated on the 400 rather than on the reply arriving: pointing the
+    //       loop at "/config?output=HDMI-A-2" -- a 200 with no wallpaper in it -- reddens both
+    //       lines, where on the transport gate the no-wallpaper line stayed GREEN.
+    for (const char* query : {"/config?monitor=0&output=DP-1", "/config?output=DP-1&monitor=0",
+                              "/config?monitor=99&output=DP-1"}) {
+        const HttpReply both = get(cli, query);
+        const bool rejected = both.reached && both.status == 400;
+        // Gated on the rejection, not on the reply merely arriving: any non-400 answer holds
+        // no wallpaper either when it is a 500 or an empty body, so on the transport gate this
+        // line graded green for replies that were not the refusal it claims to have seen.
+        const bool carriesNothing = rejected && both.body.find(namedPath) == std::string::npos &&
+                                    both.body.find(monitor0Path) == std::string::npos;
+        check(rejected,
+              (std::string("monitor= and output= in one request are rejected with 400 (") + query + ")").c_str());
+        check(carriesNothing, (std::string("a request naming a screen two ways is answered with no wallpaper at "
+                                           "all (") +
+                               query + ")").c_str());
+        // Both, not the status alone: a 400 whose body still leaked a wallpaper would
+        // otherwise print an unattributable line and no body.
+        if (!(rejected && carriesNothing)) {
+            std::fprintf(stderr, "  %s answered %d: %s\n", query, both.status, both.body.c_str());
+        }
+    }
+
+    // GOAL: S10.6's other shape -- ONE parameter given twice with two different values is
+    //       rejected too. False if the daemon answers for one of them: a query string is a
+    //       multimap, so "output=DP-1&output=DP-2" names two screens just as surely as
+    //       monitor= beside output= does, and picking either is the same guess the
+    //       both-parameters rule exists to refuse.
+    // WHY-THIS-SHAPE: the values differ AND both name a real, differently-set screen, and the
+    //       body is asserted to carry neither wallpaper. Repeating one value ("output=DP-1"
+    //       twice) would go green on a daemon that read only the first, since first-wins and
+    //       reject-both give the same answer for it. Reading only the status would let a 400
+    //       that still leaked a screen's path through.
+    // CONTROL: the `req.params.count(...) > 1` branch removed from parseIdentity() in
+    //       backend/daemon/http_server.cpp -> "FAIL: one identity parameter given twice is
+    //       rejected with 400 (/config?output=DP-1&output=DP-2)" answering 200 with DP-1's
+    //       path, the same for "/config?monitor=0&monitor=6" answering 200 with monitor 0's
+    //       path, and both "answered with no wallpaper at all" lines red beside them -- four in
+    //       all, with the three both-parameters checks above staying green, so this grades the
+    //       repeat and not the rule it sits beside. Observed 2026-08-15. The searched paths are asserted
+    //       distinct and JSON-safe above the setup, which is what keeps the two body clauses
+    //       falsifiable. Second control, on the body clause's gate: the loop pointed at
+    //       "/config?output=HDMI-A-2" -- a 200 with no wallpaper in it -- reddens both lines,
+    //       where gated on the reply merely arriving the no-wallpaper line stayed GREEN.
+    for (const char* query : {"/config?output=DP-1&output=DP-2", "/config?monitor=0&monitor=6"}) {
+        const HttpReply twice = get(cli, query);
+        const bool rejected = twice.reached && twice.status == 400;
+        // Gated on the rejection for the reason the loop above states: a reply that is not the
+        // 400 carries no wallpaper either, and would otherwise pass this line.
+        const bool carriesNothing = rejected && twice.body.find(namedPath) == std::string::npos &&
+                                    twice.body.find(otherPath) == std::string::npos &&
+                                    twice.body.find(monitor0Path) == std::string::npos;
+        check(rejected,
+              (std::string("one identity parameter given twice is rejected with 400 (") + query + ")").c_str());
+        check(carriesNothing, (std::string("a request naming two screens through one parameter is answered with no "
+                                           "wallpaper at all (") +
+                               query + ")").c_str());
+        if (!(rejected && carriesNothing)) {
+            std::fprintf(stderr, "  %s answered %d: %s\n", query, twice.status, twice.body.c_str());
+        }
+    }
+
+    // GOAL: the two fields output= introduces exist ONLY on output= replies. False if the
+    //       bare /config or ?monitor= shape grows a "known" or an "output" key, which is a
+    //       response shape the app and wpxctl already consume.
+    // WHY-THIS-SHAPE: absence is asserted with contains(), not with value("known", false).
+    //       The latter cannot fail -- it returns the default for an absent key and for a
+    //       present false one alike -- so it would go green on exactly the change it is
+    //       here to catch.
+    // CONTROL: `out["known"] = known;` and the `out["output"] = ...` line moved out of the
+    //       `kind == IdentityKind::Output` block in backend/daemon/http_server.cpp, so every
+    //       reply carries them -> three "a /config reply that was not asked by connector name
+    //       carries no known or output field" FAILs, one per query, each printing a body with
+    //       `"known":true,"output":""` in it, while every output= check above stayed green.
+    //       Reverted. And separately: the handler made to answer 400 for a request naming no
+    //       screen -> the "/config" and "/config?t=1" lines red; written as `hasJsonObject()`
+    //       rather than `ok()` both stayed GREEN, since a 400 error body carries neither
+    //       field either. Reverted.
+    for (const char* query : {"/config", "/config?t=1", "/config?monitor=0"}) {
+        const HttpReply plain = get(cli, query);
+        // status 200 as well as a parsed object: hasJsonObject() alone is satisfied by a 400,
+        // whose error body naturally carries neither field, so this loop would report green
+        // for a daemon that had started refusing the plugin's bare cache-busted poll.
+        const bool unchanged = plain.ok() && !plain.json.contains("known") && !plain.json.contains("output");
+        check(unchanged, "a /config reply that was not asked by connector name carries no known or output field");
+        if (!unchanged) std::fprintf(stderr, "  %s answered: %s\n", query, plain.body.c_str());
+    }
+    const HttpReply byOutput = get(cli, configByOutput("DP-1"));
+    check(byOutput.hasJsonObject() && byOutput.json.contains("known") && byOutput.json.contains("output"),
+          "a /config reply asked by connector name carries both the known and the output field");
+
+    // GOAL: S10.8's /config clause -- a connector name is escaped wherever it is displayed.
+    //       False if a name holding a newline, a right-to-left override or DEL is echoed
+    //       raw into the JSON the plugin renders.
+    // WHY-THIS-SHAPE: the raw bytes are asserted ABSENT from the whole body, and the echo is
+    //       compared against sanitizeForLog's output rather than merely against the raw name.
+    //       "echo != raw" alone would be satisfied by an endpoint that truncated the name or
+    //       dropped it, and a check that only looked at the echoed field would miss the same
+    //       bytes appearing elsewhere in the reply. That the name still RESOLVES is asserted
+    //       too: escaping the display copy must not change the key the lookup uses.
+    // CONTROL: `out["output"] = sanitizeForLog(...)` replaced with `out["output"] =
+    //       outputName;` in backend/daemon/http_server.cpp -> 3 FAILs: "a hostile connector
+    //       name is echoed by /config in its escaped form", "... carries no raw
+    //       bidirectional override ..." and "... no raw DEL byte ...", followed by the
+    //       escaped body -- the reply was a well-formed 200, so `ok()` gates none of them out.
+    //       Reverted. And the two absence lines are gated on ok(), not on `reached`: asking the
+    //       block with a name the daemon refuses (an empty output=, a 400) reddens all four
+    //       under ok(), where under `reached` the two absence lines stayed GREEN -- an error
+    //       body holds neither byte sequence either.
+    // COVERAGE-ASSERT: the name is asserted to be one sanitizeForLog actually alters, so a
+    //       future edit that tamed it fails here instead of leaving the three checks vacuous.
+    //       CONTROL: hostileName replaced with "DP-tame-1" -> "FAIL: the hostile connector
+    //       name is one sanitizeForLog alters, so the escaping checks can discriminate", and
+    //       nothing else red. Restored.
+    const std::string escapedName =
+        wallpaperx::sanitizeForLog(hostileName, wallpaperx::kMaxOutputNameBytes, wallpaperx::LogFraming::Bare);
+    check(escapedName != hostileName,
+          "the hostile connector name is one sanitizeForLog alters, so the escaping checks can discriminate");
+
+    // Bound here rather than in the phase's setup: this name is the one most likely to be
+    // refused by a future tightening of the name rules, and it is used by nothing above, so a
+    // refusal must cost S10.8 alone instead of every goal whose fixtures are already recorded.
+    // CONTROL: this binding made a name the daemon refuses ("\xff") -> one skip row, naming
+    //       S10.8 alone, with every other check in the phase still graded and green.
+    bool hostileBound = true;
+    try {
+        manager.setMonitorOutput(kMonitorNamedHostile, hostileName);
+    } catch (const std::exception& e) {
+        notVerified("S10.8's /config clause (a connector name is escaped wherever it is displayed)",
+                    std::string("the hostile connector name could not be recorded: ") + e.what());
+        hostileBound = false;
+    }
+    if (hostileBound) {
+        const HttpReply hostile = get(cli, configByOutput(hostileName));
+        const bool hostileResolves = hostile.ok() && boolField(hostile, "known") == true &&
+                                     intField(hostile, "monitor_id") == kMonitorNamedHostile;
+        const bool hostileEchoEscaped = stringField(hostile, "output") == escapedName;
+        // Searched for as the two byte sequences JSON serialisation passes through untouched,
+        // not for the whole name. nlohmann escapes control bytes below 0x20 by itself, so the
+        // newline is absent from the body of a daemon that does no escaping at all -- measured:
+        // with the sanitize call removed, a whole-name search stayed GREEN while these two
+        // sequences were sitting in the reply. U+202E and DEL are what actually reaches a
+        // terminal or a QML label when the escaping goes.
+        // Gated on ok(), not on `reached`: an error body contains neither sequence, so on the
+        // transport gate these two lines graded green for a daemon that never echoed the name.
+        const bool hostileNoOverride = hostile.ok() && hostile.body.find("\xE2\x80\xAE") == std::string::npos;
+        const bool hostileNoDel = hostile.ok() && hostile.body.find('\x7F') == std::string::npos;
+        check(hostileResolves, "a connector name holding a newline, U+202E and DEL still resolves to its own monitor");
+        check(hostileEchoEscaped, "a hostile connector name is echoed by /config in its escaped form");
+        check(hostileNoOverride, "/config's reply carries no raw bidirectional override from a connector name");
+        check(hostileNoDel, "/config's reply carries no raw DEL byte from a connector name");
+        // Gated on all four, not on ok(): the three escaping checks fail on a perfectly
+        // well-formed 200 that simply echoed the raw bytes, so gating on the transport left the
+        // one failure this block exists to catch with no body printed at all. Shown escaped --
+        // the bytes it just found are exactly the ones that must not reach a terminal.
+        if (!(hostileResolves && hostileEchoEscaped && hostileNoOverride && hostileNoDel)) {
+            std::fprintf(stderr, "  a hostile name answered %d (body shown escaped): %s\n", hostile.status,
+                         wallpaperx::sanitizeForLog(hostile.body, hostile.body.size(), wallpaperx::LogFraming::Bare)
+                             .c_str());
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------- //
 // Phase 4 -- /config cannot report a torn view of one monitor.
 // ---------------------------------------------------------------------------- //
 void runTornReadChecks(WallpaperManager& manager, httplib::Client& cli, const std::string& staticPath,
@@ -3443,10 +3995,11 @@ void runHealthAfterDeviceChecks(httplib::Client& cli, sdbus::IProxy& proxy, Wall
         //       daemon being broken.
         // WHY-THIS-SHAPE: the expected verdict is DERIVED from the manager's own outstanding
         //       count rather than written as a literal. `== "ok"` cannot be used here: this
-        //       phase runs on the manager every phase above has been writing to, and two of
-        //       those monitors were recorded through the manager rather than set over the
-        //       bus, so no render was ever queued for them and they are legitimately
-        //       outstanding -- `pending` is then the contract's answer, not a defect. The
+        //       phase runs on the manager every phase above has been writing to, and several of
+        //       those monitors were recorded straight through the manager rather than set over
+        //       the bus (the monitor= phase, the connector-name phase, the torn-read writer and
+        //       the non-UTF-8 path in runAgreementChecks), so no render was ever queued for
+        //       them and they are legitimately outstanding -- `pending` is then the contract's answer, not a defect. The
         //       opposite simplification, `!= "fail"` alone, is satisfied by an endpoint that
         //       answers `pending` to everything, which is the pre-S7.10 endpoint. Asserting
         //       both -- never `fail`, and exactly the value the state calls for -- is what
@@ -3576,11 +4129,27 @@ void runReadOnlyChecks(httplib::Client& cli, sdbus::IProxy& proxy, const Check& 
     //       GetStatus reply compared byte for byte, taken when the daemon is quiesced
     //       (the last render's FrameReady has arrived and nothing else is queued), so a
     //       difference cannot be an in-flight render.
-    // CONTROL: a mutating route added to registerRoutes --
-    //           m_server->Post("/config", [this](const auto& req, auto& res) {
-    //               m_manager.requestWallpaper("video", req.body, 0); res.status = 200; });
-    //       -> "FAIL: POST /config is not a route this server serves" and "FAIL: no
-    //       sequence of HTTP requests changed what GetStatus reports". Reverted.
+    //       The battery covers the connector-name route as well as the numeric one, and the
+    //       unknown-name entry is the load-bearing one: a handler that answered `known:false`
+    //       by inventing and storing a binding writes into the outputs map GetStatus dumps,
+    //       which is exactly what a snapshot comparison catches and what a monitor=-only list
+    //       cannot see at all.
+    // CONTROL: two, both reverted. (a) a mutating route added to registerRoutes in
+    //       backend/daemon/http_server.cpp --
+    //           m_server->Post("/config", [this](const auto&, auto& res) {
+    //               m_manager.setMonitorOutput(0, "POST-CONTROL"); res.status = 200; });
+    //       -> "FAIL: a non-GET method is not a route this server serves" ("POST /config
+    //       answered 200") and "FAIL: no sequence of HTTP requests changed what GetStatus
+    //       reports". A mutation that throws instead of writing (requestWallpaper on an
+    //       unreadable path) reddens only the first line -- the write has to succeed for the
+    //       state half to be the thing under test.
+    //       (b) aimed at the connector-name entries: the IdentityKind::Output branch in
+    //       backend/daemon/http_server.cpp made to record the name it was asked about
+    //       (`if (!known) m_manager.setMonitorOutput(0, outputName);`) -> exactly one red, "no
+    //       sequence of HTTP requests changed what GetStatus reports", the after-dump carrying
+    //       an eDP-9-asked-only-here entry in `outputs` the before-dump has not. Nothing in the
+    //       connector-name phase saw it: that handler answers from a snapshot taken before the
+    //       write, so its unknown-name checks stayed green -- this battery is the only detector.
     const StatusReply before = getStatusOrExplain(proxy);
 
     struct MethodCase {
@@ -3608,9 +4177,16 @@ void runReadOnlyChecks(httplib::Client& cli, sdbus::IProxy& proxy, const Check& 
     }
 
     // A battery of ordinary and awkward GETs on top, so the state comparison covers the
-    // routes that do exist as well as the methods that do not.
+    // routes that do exist as well as the methods that do not. The connector-name shapes are
+    // unconditional even though the phase that records DP-1 and HDMI-A-2 can skip: a name the
+    // daemon was never given is still a valid read-only probe, and it is the one that would
+    // catch a handler that binds what it is asked about. That probe name is asked nowhere else
+    // in the file on purpose -- a name an earlier phase already asked about would already have
+    // been bound by such a handler, leaving nothing for this comparison to see.
     for (const char* path : {"/config", "/config?t=1", "/config?monitor=0", "/config?monitor=99", "/health",
-                             "/", "/config/../health", "/config?monitor=0&monitor=1"}) {
+                             "/", "/config/../health", "/config?monitor=0&monitor=1", "/config?output=DP-1",
+                             "/config?output=HDMI-A-2", "/config?output=eDP-9-asked-only-here", "/config?output=DP-1&t=1",
+                             "/config?output=", "/config?monitor=0&output=DP-1"}) {
         (void)get(cli, path);
     }
 
@@ -3636,8 +4212,8 @@ void runReadOnlyChecks(httplib::Client& cli, sdbus::IProxy& proxy, const Check& 
 // ---------------------------------------------------------------------------- //
 // Phase 8 -- a poll never waits on a render.
 // ---------------------------------------------------------------------------- //
-void runGpuLockChecks(sdbus::IProxy& proxy, FrameReadyLog& signals, HttpServer& server, const std::string& largePath,
-                      const Check& check) {
+void runGpuLockChecks(sdbus::IProxy& proxy, WallpaperManager& manager, FrameReadyLog& signals, HttpServer& server,
+                      const std::string& largePath, const Check& check) {
     // GOAL: S7.12 -- polling at the plugin's cadence never waits on a render. The lock
     //       split exists for this: snapshot() takes m_stateMutex only, while a render
     //       holds m_gpuMutex for its whole duration (decode included, and the decode is
@@ -3653,13 +4229,18 @@ void runGpuLockChecks(sdbus::IProxy& proxy, FrameReadyLog& signals, HttpServer& 
     //       that request's own FrameReady), never by a sleep.
     //       If the render is too fast on this host to be conclusive, the phase says so
     //       and is not graded -- a fast render must not be graded as a passing poll.
+    //       The poller sends what the shipped plugin sends -- output=NAME beside the
+    //       cache-buster main.qml appends -- not ?monitor=N: the connector-name branch does
+    //       work the numeric one does not (an outputs-map lookup and a sanitize of the name),
+    //       and it is that extra work a future change could move behind the render lock. The
+    //       numeric shape gives up only parseMonitorParam, which takes no lock at all.
     // CONTROL: `(void)m_manager.validationCounter();` added at the top of the /config
-    //       handler -- one line, and it takes m_gpuMutex exactly as an accidental GPU
-    //       touch would -> "FAIL: polls kept completing while a render was in flight"
-    //       and "FAIL: polls kept completing in the second half of the render window",
-    //       with "0 of 1 polls completed inside the 63.8 ms render window" -- the
-    //       poller's single request spent the whole render blocked on m_gpuMutex.
-    //       Reverted.
+    //       handler in backend/daemon/http_server.cpp -- one line, and it takes m_gpuMutex
+    //       exactly as an accidental GPU touch would -> "FAIL: polls kept completing while a
+    //       render was in flight" and "FAIL: polls kept completing in the second half of the
+    //       render window", with "0 of 1 polls completed inside the 64.7 ms render window" --
+    //       the poller's single connector-name request spent the whole render blocked on
+    //       m_gpuMutex. Reverted.
     // COVERAGE-ASSERT: the completion counts are asserted, not just their existence, and
     //       the window length is printed, so a future edit that shortens the render or
     //       stops the poller cannot leave this quietly green.
@@ -3690,7 +4271,16 @@ void runGpuLockChecks(sdbus::IProxy& proxy, FrameReadyLog& signals, HttpServer& 
         generation = entry != nullptr ? entry->value("generation", uint64_t{0}) : 0;
     }
 
-    Poller poller(server.port(), "/config?monitor=" + std::to_string(kMonitorGpuLock));
+    // A name of its own, distinct from the connector-name phase's, so binding it cannot
+    // disturb that phase's "a name resolves to its own monitor" checks.
+    try {
+        manager.setMonitorOutput(kMonitorGpuLock, "DP-LOCK");
+    } catch (const std::exception& e) {
+        notVerified("S7.12 (a poll never waits on a render)",
+                    std::string("the connector name the poller asks by could not be recorded: ") + e.what());
+        return;
+    }
+    Poller poller(server.port(), std::string("/config?output=DP-LOCK&t=1"));
 
     const Clock::time_point start = Clock::now();
     setWallpaper(proxy, "static", largePath, kMonitorGpuLock);
@@ -4198,6 +4788,10 @@ int main() {
         const std::string videoPath = writeSolidImage("http_video.mp4", 255, 0, 0);
         const std::string hostilePath = writeHostileNamedImage();
         const std::string junkPath = writeUndecodableFile("http_not_an_image.png");
+        // Two more distinct files, so the connector-name phase can tell "this screen's
+        // wallpaper" from "some screen's wallpaper".
+        const std::string namedPath = writeSolidImage("http_named.png", 0, 255, 0);
+        const std::string namedOtherPath = writeSolidImage("http_named_other.png", 255, 255, 0);
         // 2400x1800. Large enough that stb's decode dominates the render on a fast GPU,
         // small enough that writing it costs about a second. If it is still too fast to
         // be conclusive, runGpuLockChecks says so rather than grading it.
@@ -4231,8 +4825,13 @@ int main() {
         std::unique_ptr<HttpServer> server = startServer(manager, reason);
         if (!server) {
             // A harness failure, not a daemon failure (X.3): every check below needs a
-            // listening server, so none of them runs and none of them is graded.
-            notVerified("every Step 7 goal", reason);
+            // listening server, so none of them runs and none of them is graded. Step 10's
+            // connector-name phase is graded in this branch too, so it is named here -- a goal
+            // that drops out of the ledger reads afterwards as a goal that was established.
+            notVerified("every Step 7 goal, plus S10.1, S10.2, S10.3, S10.6 and S10.8's /config clause "
+                        "(asking /config by connector name), including the refusal of names /config could "
+                        "never have been given",
+                        reason);
         } else {
             std::printf("http_server_test: serving on 127.0.0.1:%d (never the shipped 18462, so a running daemon "
                         "and a parallel ctest entry cannot collide with this run)\n",
@@ -4262,6 +4861,10 @@ int main() {
             manager.requestWallpaper("static", bluePath, kMonitorParam);
             runMonitorParamChecks(cli, bluePath, check);
 
+            // Same reasoning as the line above: recorded through the manager, so the phase
+            // adds monitors and connector names without queueing a render.
+            runOutputParamChecks(manager, cli, bluePath, namedPath, namedOtherPath, check);
+
             runTornReadChecks(manager, cli, bluePath, videoPath, check);
 
             // First render of the run. Everything after it needs a Device to exist.
@@ -4284,7 +4887,7 @@ int main() {
                 runAgreementChecks(cli, *proxy, manager, signals, hostilePath, check);
                 runHealthAfterDeviceChecks(cli, *proxy, manager, check);
                 runReadOnlyChecks(cli, *proxy, check);
-                runGpuLockChecks(*proxy, signals, *server, largePath, check);
+                runGpuLockChecks(*proxy, manager, signals, *server, largePath, check);
             }
 
             // Destroyed before the manager it reads, which is the ordering main.cpp gets

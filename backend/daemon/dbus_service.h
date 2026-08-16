@@ -52,6 +52,10 @@ private:
     // those cost nothing to detect and are the ones worth failing fast.
     void setWallpaper(const std::string& type, const std::string& path, int32_t monitorId);
 
+    // Complete on return, unlike SetWallpaper: no render sits behind it, so an accepted
+    // reply means the mapping is in place rather than merely queued.
+    void setMonitorOutput(int32_t monitorId, const std::string& outputName);
+
     void emitFrameReady(int monitorId, uint64_t generation);
 
     // Returns (fd, width, height, memory_size, handle_type, sync_fds, frame_generation,

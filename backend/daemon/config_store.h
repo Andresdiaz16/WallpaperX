@@ -2,19 +2,48 @@
 
 #pragma once
 
+#include "log_escape.h"
+
+#include <cstddef>
 #include <filesystem>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace wallpaperx {
 
 // One monitor's wallpaper as it survives a restart. Nothing about the current run
 // (generation, hasFrame, lastError) is persisted.
+//
+// `output` is the screen's connector name -- "DP-3". It may ride on a row whose type and
+// path are empty: a screen the app has named but chosen nothing for is the ordinary
+// first-run state, and it must still survive a restart or the plugin is anonymous again.
 struct PersistedWallpaper {
     int monitorId = 0;
     std::string type;
     std::string path;
+    std::string output;
 };
+
+// Not a fit -- real names run under a dozen bytes -- but a finite bound on a string a
+// client chooses, which is then stored, written to the config and echoed back.
+constexpr std::size_t kMaxOutputNameBytes = 256;
+
+// Why a connector name is unusable, or empty when it is fine. One definition because three
+// callers reject it: WallpaperManager::setMonitorOutput, GET /config?output=, and
+// WallpaperManager::restoreSaved on what it read out of this file. ConfigStore does not --
+// it validates structure, and these are the manager's rules.
+inline std::string outputNameError(std::string_view name) {
+    if (name.empty()) return "output name must not be empty";
+    if (name.size() > kMaxOutputNameBytes) {
+        return "output name must be at most " + std::to_string(kMaxOutputNameBytes) +
+               " bytes, got " + std::to_string(name.size());
+    }
+    // dump() throws on invalid UTF-8, so a name that reached the file and could not be
+    // written would cost the user every other entry in it.
+    if (!isValidUtf8(name)) return "output name is not valid UTF-8";
+    return {};
+}
 
 struct LoadResult {
     std::vector<PersistedWallpaper> entries;

@@ -45,6 +45,7 @@
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include <stb_image_write.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -126,6 +127,24 @@ constexpr int32_t kMonitorRejectedPaths = 11;
 constexpr int32_t kMonitorUnservicedStatic = 12;
 constexpr int32_t kMonitorUnservicedVideo = 13;
 constexpr int32_t kMonitorUnservicedNeverSet = 14;
+
+// Step 10's connector-name ids, on the shared manager the host checks drive. Naming a
+// monitor records nothing in the wallpaper map, so these ids never appear in GetStatus's
+// `wallpapers` object and cannot disturb the never-set assertions above.
+constexpr int32_t kMonitorOutputA = 15;
+constexpr int32_t kMonitorOutputB = 16;
+// Holds one accepted name ("DP-KEEP"), then receives every refused name. The accepted name
+// is load-bearing, not setup: it is what lets the refusal check grade destroys-nothing
+// rather than only adds-nothing.
+constexpr int32_t kMonitorOutputRejected = 17;
+constexpr int32_t kMonitorOutputAtCap = 18;
+constexpr int32_t kMonitorOutputHostile = 19;
+
+// The bytes that make the hostile connector name hostile, named once so the fixture and
+// the scan that looks for them in GetStatus's reply cannot drift apart. Spelled as the
+// HTTP tier spells them (http_server_test.cpp), which carries the same pair.
+constexpr const char* kBidiOverride = "\xE2\x80\xAE";  // U+202E RIGHT-TO-LEFT OVERRIDE
+constexpr char kDel = '\x7F';
 
 // The three error names GetFrameFd answers with when there is no frame. S6.39 is the
 // claim that these are three and not two, so they are named once, here, and compared by
@@ -269,6 +288,28 @@ std::string interfaceBody(const std::string& xml, const std::string& name) {
     std::smatch match;
     if (!std::regex_search(xml, match, interfaceRe)) return {};
     return match[1].str();
+}
+
+// Every member of one kind ("method" or "signal") the interface body declares, sorted.
+// This is the direction the per-member signature comparison cannot see: it iterates the
+// expected table, so a member on the bus that the table omits is never visited.
+std::vector<std::string> elementNames(const std::string& ifaceXml, const std::string& element) {
+    std::vector<std::string> names;
+    const std::regex re("<" + element + " name=\"([^\"]*)\"");
+    for (auto it = std::sregex_iterator(ifaceXml.begin(), ifaceXml.end(), re); it != std::sregex_iterator(); ++it) {
+        names.push_back((*it)[1].str());
+    }
+    std::sort(names.begin(), names.end());
+    return names;
+}
+
+std::string joinQuoted(const std::vector<std::string>& values) {
+    std::string out;
+    for (const std::string& value : values) {
+        if (!out.empty()) out += ", ";
+        out += "'" + value + "'";
+    }
+    return out.empty() ? "(none)" : out;
 }
 
 // --------------------------------------------------------------------------- //
@@ -478,10 +519,11 @@ void runHostChecks(sdbus::IProxy& proxy, const std::string& imagePath, const Che
               "a monitor whose every request was rejected is told to call SetWallpaper first");
     }
 
-    // Lock the whole wire contract: every argument of every method and signal, in
-    // order. The KDE plugin (Step 12) is generated against it, so a reordering, a type
-    // change or a dropped slot must fail here rather than at plugin-import time -- a
-    // partial check would let width/height be swapped and still report green.
+    // Lock the whole wire contract: which methods and signals exist, and every argument
+    // of each, in order. The KDE plugin (Step 12) is generated against it, so a
+    // reordering, a type change, a dropped slot or an added one must fail here rather
+    // than at plugin-import time -- a partial check would let width/height be swapped
+    // and still report green.
     //
     // Parsed rather than substring-matched: matching sd-bus's emitted XML verbatim
     // would couple this test to libsystemd's attribute order and spacing, so a
@@ -518,6 +560,15 @@ void runHostChecks(sdbus::IProxy& proxy, const std::string& imagePath, const Che
                  {"out", "u:drm_format"},
                  {"out", "t:drm_modifier"},
                  {"out", "a(tt):planes"}}},
+        // CONTROL: the second name in `.withInputParamNames("monitor_id", "output_name")` in
+        //       DbusService::registerVTable (backend/daemon/dbus_service.cpp) changed to
+        //       "output" -> "FAIL: wire signature of method SetMonitorOutput is unchanged",
+        //       printing expected `s:output_name(in)` against actual `s:output(in)`.
+        //       Reverted. Dropping the name entirely was tried first and is NOT a usable
+        //       control: sd-bus refuses a vtable whose parameter-name count disagrees with
+        //       the signature, so the daemon fails to register at all and the run reports an
+        //       exception instead of this line.
+        {"method", "SetMonitorOutput", ArgList{{"in", "i:monitor_id"}, {"in", "s:output_name"}}},
         {"method", "GetStatus", ArgList{{"out", "s:status"}}},
         // A signal's args carry no direction attribute, hence the empty first field.
         {"signal", "FrameReady", ArgList{{"", "i:monitor_id"}, {"", "t:frame_generation"}}},
@@ -534,6 +585,568 @@ void runHostChecks(sdbus::IProxy& proxy, const std::string& imagePath, const Che
             for (const auto& [dir, arg] : actualArgs) std::fprintf(stderr, " %s(%s)", arg.c_str(), dir.c_str());
             std::fprintf(stderr, "\n");
         }
+    }
+
+    // GOAL: io.wallpaperx.Daemon exports exactly the members named above -- no extra
+    //       method or signal reaches the public interface unreviewed. False if the
+    //       daemon's vtable declares a member this table does not.
+    // WHY-THIS-SHAPE: the loop above iterates the *table*, so it compares only members
+    //       the table already names. That makes it a one-directional containment
+    //       (table is a subset of the bus) which catches a removed or retyped member and
+    //       is structurally blind to an added one -- exactly the change that puts an
+    //       unreviewed slot on the interface the KDE plugin is generated against.
+    //       Comparing sorted name lists is the direction the per-member loop cannot take.
+    //       Scoped to `ifaceXml`, not the whole document, so the standard
+    //       org.freedesktop.DBus.* interfaces are not swept in. Methods and signals only:
+    //       registerVTable declares no properties, and a property added later would need
+    //       its own list rather than silently joining one of these.
+    // CONTROL: `sdbus::registerMethod("Debug").implementedAs([this]() { (void)this; })`
+    //       added to DbusService::registerVTable (backend/daemon/dbus_service.cpp) ->
+    //       "FAIL: io.wallpaperx.Daemon exports exactly the methods this table names",
+    //       printing expected "'GetFrameFd', 'GetStatus', 'SetMonitorOutput',
+    //       'SetWallpaper'" against actual with 'Debug' first, and it was the only red
+    //       line -- every per-member signature check stayed green, which is the
+    //       measurement showing this is not redundant with them. Reverted.
+    {
+        std::vector<std::string> expectedMethods, expectedSignals;
+        for (const auto& [element, name, expectedArgs] : expected) {
+            (void)expectedArgs;
+            (element == "method" ? expectedMethods : expectedSignals).push_back(name);
+        }
+        std::sort(expectedMethods.begin(), expectedMethods.end());
+        std::sort(expectedSignals.begin(), expectedSignals.end());
+
+        const std::pair<const std::vector<std::string>*, const char*> kinds[] = {
+            {&expectedMethods, "method"},
+            {&expectedSignals, "signal"},
+        };
+        for (const auto& [expectedNames, element] : kinds) {
+            const std::vector<std::string> actualNames = elementNames(ifaceXml, element);
+            const std::string message =
+                std::string("io.wallpaperx.Daemon exports exactly the ") + element + "s this table names";
+            check(actualNames == *expectedNames, message.c_str());
+            if (actualNames != *expectedNames) {
+                std::fprintf(stderr, "  %ss expected: %s\n  %ss actual:   %s\n", element,
+                             joinQuoted(*expectedNames).c_str(), element, joinQuoted(actualNames).c_str());
+            }
+        }
+    }
+}
+
+// --------------------------------------------------------------------------- //
+// Step 10 -- SetMonitorOutput: which screen answers to which connector name.
+// Needs no GPU: naming a screen says nothing about what it draws.
+// --------------------------------------------------------------------------- //
+
+// Every connector name GetStatus currently publishes for one monitor. A vector rather
+// than a lookup, because the property under test is a COUNT -- "a monitor answers to at
+// most one name" is false the moment this has two entries, and a find()-shaped helper
+// could not express that.
+std::vector<std::string> namesFor(const StatusReply& status, int32_t monitorId) {
+    std::vector<std::string> names;
+    const nlohmann::json* outputs = wallpaperx::testing::outputBindings(status);
+    if (outputs == nullptr) return names;
+    for (const auto& [name, id] : outputs->items()) {
+        if (id.is_number_integer() && id.get<int>() == monitorId) names.push_back(name);
+    }
+    return names;
+}
+
+// Escaped, always: these names came from a client over the bus, and a failing run is
+// exactly when one of them holds the newline or right-to-left override the escaping
+// checks below exist to forbid. Printing them raw would let a hostile name break the
+// line that reports it -- a name containing "\nFAIL: " would forge an uncounted failure.
+// A correct daemon already escaped them, so this is a second pass and not idempotent;
+// that is the point, since the fault being reported is the daemon having skipped the first.
+std::string joinNames(const std::vector<std::string>& names) {
+    std::vector<std::string> escaped;
+    escaped.reserve(names.size());
+    for (const std::string& name : names) {
+        escaped.push_back(
+            wallpaperx::sanitizeForLog(name, wallpaperx::kMaxOutputNameBytes, wallpaperx::LogFraming::Bare));
+    }
+    return joinQuoted(escaped);
+}
+
+void runOutputNameChecks(sdbus::IProxy& proxy, const Check& check) {
+    using wallpaperx::testing::boundMonitor;
+    using wallpaperx::testing::outputBindings;
+    using wallpaperx::testing::setMonitorOutput;
+
+    constexpr const char* kInvalidArgs = "org.freedesktop.DBus.Error.InvalidArgs";
+
+    check(outputBindings(getStatusOrExplain(proxy)) != nullptr,
+          "GetStatus carries an outputs object mapping connector names to monitors");
+
+    // Every SetMonitorOutput below is made through errorNameFrom -- or, for the UTF-8 case,
+    // its own try/catch -- the calls made only for their side effect included: bare, an
+    // unexpected error reply becomes an exception whose nearest
+    // handler is main's catch-all above every later phase, so one refusal here turns "a named
+    // check failed" into "the render and coalescing phases never ran".
+    // CONTROL: `if (outputName == "DP-MOVE") throw std::runtime_error(...)` added to
+    //       WallpaperManager::setMonitorOutput (backend/daemon/wallpaper_manager.cpp) -> four
+    //       named FAIL lines from "naming monitor A 'DP-MOVE' is accepted" onward, and the
+    //       render phase still ran ("SetWallpaper replied in 0 ms, FrameReady at 164 ms").
+    //       Reverting only that one call to a bare one, mutation still in place: a single
+    //       "FAIL: unexpected exception: [io.wallpaperx.Daemon.Error.RenderFailed]", no render
+    //       phase, and the Vulkan oracle reporting that no device was ever created. Both
+    //       reverted.
+
+    // GOAL: S10.7 -- SetMonitorOutput validates its arguments the way every other
+    //       externally-reachable call does. An out-of-range monitor id, an empty name and
+    //       an oversized name are each refused with a reason, none of them becomes a
+    //       binding, and none of them costs the target monitor the name it already answered
+    //       to. False if any is accepted, silently unbinds, or crashes the daemon.
+    // WHY-THIS-SHAPE: the error name alone is not the check -- a daemon that threw AFTER
+    //       recording would satisfy an errorNameFrom() assertion with the wrong screen
+    //       mapped -- so each refusal is graded on the state it left, by two different
+    //       routes because the two rejection families leave their trace in different
+    //       places. The name-validation refusals target monitor 17, so they are graded
+    //       through that monitor's name list. The two id refusals target -1 and the cap,
+    //       ids no monitor-keyed lookup in this phase can reach, so their adds-nothing half
+    //       is graded through the NAME they used: "DP-1" must not be published at all. That
+    //       one is asserted with contains() rather than boundMonitor(), whose
+    //       kNoOutputBinding sentinel is -1 and would collide with the very id under test.
+    //       Monitor 17 is given "DP-KEEP" first and asserted to hold it AFTER the refusals,
+    //       not merely asserted empty: a refusal has two obligations, adds-nothing and
+    //       destroys-nothing, and an empty monitor can only express the first -- a daemon
+    //       that released the monitor's existing name before validating would pass an
+    //       emptiness check. The id refusals are therefore made TWICE, once with a name
+    //       nothing holds and once with "DP-KEEP": a bad id carrying an unheld name has
+    //       nothing to destroy, so that pair alone leaves the destroys-nothing half of this
+    //       family ungraded -- which is precisely the shape a stale monitor id from the
+    //       plugin takes after a screen is unplugged, where the name is one a live screen
+    //       still answers to. The at-cap case is here for the same reason the HTTP tier has
+    //       one: an oversized-only check passes for a bound that is off by one in the
+    //       accepting direction, and the two surfaces share outputNameError() precisely so
+    //       a name one accepts is one the other can hold.
+    // CONTROL: five, all reverted, all in backend/daemon/. (a) `requireValidMonitorId(monitorId);`
+    //       deleted from WallpaperManager::setMonitorOutput (wallpaper_manager.cpp) -> six
+    //       red: all four InvalidArgs lines below, "FAIL: a refused connector name neither
+    //       binds ..." printing "monitor 17 answers to (none)", and the cross-monitor check
+    //       at the end of the phase. "the connector name refused for an out-of-range monitor
+    //       id is not published at all" stays GREEN under this mutation -- the last "DP-KEEP"
+    //       call binds to id 32 and its release loop drops the "DP-1" entry the earlier call
+    //       had wrongly made -- so the id family's adds-nothing half is carried by the two
+    //       InvalidArgs lines here, not by that one.
+    //       (b) the same call moved below the bindOutputLocked block, so the id is recorded
+    //       and only then refused -> all four InvalidArgs lines stay green (the call still
+    //       throws) and exactly two are red: "FAIL: a refused connector name neither binds
+    //       ..." printing "monitor 17 answers to (none)", and the cross-monitor check. This
+    //       is the mutation the "DP-KEEP" pair was added for -- recording a bad id costs
+    //       monitor 17 the name it held.
+    //       (c) the `outputNameError` check deleted from setMonitorOutput -> four red: "FAIL:
+    //       an empty connector name is rejected as InvalidArgs", "FAIL: an oversized connector
+    //       name is rejected as InvalidArgs", "FAIL: a refused connector name neither binds to
+    //       the monitor it targeted nor disturbs the name it already answered to" printing the
+    //       257-byte name it had wrongly taken -- one name, not two, because the release loop
+    //       drops both "DP-KEEP" and the empty name when the oversized one lands on the same
+    //       monitor -- and the cross-monitor check. That control is also what measured the
+    //       UTF-8 clause below staying green.
+    //       (d) destroys-nothing for the NAME family: a copy of bindOutputLocked's release
+    //       loop hoisted into setMonitorOutput above the `outputNameError` throw -> exactly
+    //       two red, that same check printing "monitor 17 answers to (none)" and the
+    //       cross-monitor check, with every InvalidArgs line still green.
+    //       (e) destroys-nothing for the ID family, which is what the "DP-KEEP" pair adds:
+    //       bindOutputLocked's `find`/`erase` displacement block hoisted into
+    //       setMonitorOutput ABOVE `requireValidMonitorId` -> exactly two red, "FAIL: a
+    //       refused connector name neither binds ..." printing "monitor 17 answers to
+    //       (none)" and the cross-monitor check at the end of the phase, with all four
+    //       InvalidArgs lines green. With the "DP-KEEP" pair deleted and that mutation still
+    //       in place the run reported "all checks passed" -- measured -- which is the gap
+    //       the pair closes. A sixth, `name.size() > kMaxOutputNameBytes` in config_store.h
+    //       weakened to `>=`, belongs to the at-cap pair below and is recorded there.
+    //
+    // Split rather than ANDed: a single conjunction reports one FAIL that cannot say which
+    // half broke, and every refusal check below is graded against this binding, so a setup
+    // fault would print as four failures of the validation code.
+    // CONTROL: the setup name here changed to "" -> "FAIL: the connector name the refusals
+    //       below rely on is accepted" printing "SetMonitorOutput refused 'DP-KEEP' with
+    //       org.freedesktop.DBus.Error.InvalidArgs", and separately "FAIL: the monitor the
+    //       refusals below target answers to a connector name before they are made" printing
+    //       "'DP-KEEP' resolves to monitor -1, not 17". Reverted.
+    const std::string keepError =
+        errorNameFrom([&] { setMonitorOutput(proxy, kMonitorOutputRejected, "DP-KEEP"); });
+    check(keepError.empty(), "the connector name the refusals below rely on is accepted");
+    if (!keepError.empty()) {
+        std::fprintf(stderr, "  SetMonitorOutput refused 'DP-KEEP' with %s\n", keepError.c_str());
+    }
+    const int keepBinding = boundMonitor(getStatusOrExplain(proxy), "DP-KEEP");
+    check(keepBinding == kMonitorOutputRejected,
+          "the monitor the refusals below target answers to a connector name before they are made");
+    if (keepBinding != kMonitorOutputRejected) {
+        std::fprintf(stderr, "  'DP-KEEP' resolves to monitor %d, not %d\n", keepBinding, kMonitorOutputRejected);
+    }
+
+    check(errorNameFrom([&] { setMonitorOutput(proxy, -1, "DP-1"); }) == kInvalidArgs,
+          "a negative monitor id is rejected by SetMonitorOutput as InvalidArgs");
+    check(errorNameFrom([&] {
+              setMonitorOutput(proxy, wallpaperx::WallpaperManager::kMaxMonitors, "DP-1");
+          }) == kInvalidArgs,
+          "a monitor id at or above the cap is rejected by SetMonitorOutput as InvalidArgs");
+    // The same two ids again, now carrying a name a live monitor holds -- the only form in
+    // which a bad id has something to destroy.
+    check(errorNameFrom([&] { setMonitorOutput(proxy, -1, "DP-KEEP"); }) == kInvalidArgs,
+          "a negative monitor id is rejected even when the connector name is one a monitor already holds");
+    check(errorNameFrom([&] {
+              setMonitorOutput(proxy, wallpaperx::WallpaperManager::kMaxMonitors, "DP-KEEP");
+          }) == kInvalidArgs,
+          "a monitor id at or above the cap is rejected even when the connector name is one a monitor already holds");
+    check(errorNameFrom([&] { setMonitorOutput(proxy, kMonitorOutputRejected, ""); }) == kInvalidArgs,
+          "an empty connector name is rejected as InvalidArgs");
+    check(errorNameFrom([&] {
+              setMonitorOutput(proxy, kMonitorOutputRejected,
+                               std::string(wallpaperx::kMaxOutputNameBytes + 1, 'D'));
+          }) == kInvalidArgs,
+          "an oversized connector name is rejected as InvalidArgs");
+
+    // GOAL: S10.7's UTF-8 clause. A name that is not valid UTF-8 never becomes a binding.
+    // WHY-THIS-SHAPE: deliberately NOT written as "the daemon rejects it", because the
+    //       daemon never sees it: sd-bus validates every 's' argument as it builds the
+    //       message, so the call fails client-side with "Failed to serialize a string value
+    //       (Invalid argument)" and no traffic is sent (measured on this stack, and the
+    //       error is reprinted below rather than attributed). What is left that this tier CAN
+    //       falsify is the outcome -- no binding appears -- and that is what is asserted.
+    //       The daemon's own outputNameError() UTF-8 arm is reachable from a hand-edited
+    //       config.json (config_store_test) and from GET /config?output= (http_server_test),
+    //       and both of those grade it directly.
+    //       The graded fact is the THROW, recorded here rather than taken from
+    //       errorMessageFrom(): that helper returns "" both for a call that succeeded and
+    //       for one that threw carrying no text, so grading `!message.empty()` would report
+    //       a differently-worded sdbus-c++ or libsystemd as the daemon having accepted an
+    //       invalid name -- a harness fault printed as a production defect.
+    //       The printed line no longer ASSERTS which component refused, because the same
+    //       catch fires for a daemon error reply and the two are indistinguishable by error
+    //       name: sd-bus reports its client-side serialization refusal as InvalidArgs, which
+    //       is also what the daemon's own UTF-8 arm answers with. Only a name in the
+    //       daemon's own error namespace is attributable, so that is the one branch that
+    //       names a component; otherwise the message text is printed and the reader is told
+    //       the name does not settle it.
+    //       A refusal under one of the transport-failure names is NOT graded as the property
+    //       holding: NoReply, ServiceUnknown and Disconnected mean the call never got an
+    //       answer at all, and counting them as "the name was refused" would turn a dead
+    //       daemon into a green check.
+    // CONTROL: not controllable by mutating the daemon *while the bus stack rejects the
+    //       argument client-side*, which is what the printed line now states per run. With
+    //       WallpaperManager::setMonitorOutput's validation deleted entirely (control (c)
+    //       above) this check stayed GREEN -- observed -- because the message still never
+    //       left the client. It is controllable from the harness side, both observed and
+    //       reverted: (i) `badUtf8Name` set to a valid "DP-3" -> "FAIL: a connector name
+    //       that is not valid UTF-8 does not complete as a successful call", printing
+    //       "unexpectedly completed as a successful call", plus the refusal-safety check
+    //       below red with "monitor 17 answers to 'DP-3'" and the cross-monitor check at the
+    //       end of the phase -- the name lands for real once it is serialisable. (ii) the call redirected to a proxy for a bus name nothing owns ->
+    //       the same FAIL line, printing "the call ... failed without an answer
+    //       (org.freedesktop.DBus.Error.ServiceUnknown: The name io.wallpaperx.NobodyOwnsThis
+    //       was not provided by any .service files), so this run establishes nothing about
+    //       the name" -- where grading the throw alone would have called that transport
+    //       failure a refusal and passed.
+    const std::string badUtf8Name = std::string("DP\xFF-3");
+    bool utf8NameRefused = false;
+    std::string busRefusal;
+    std::string refusalName;
+    try {
+        setMonitorOutput(proxy, kMonitorOutputRejected, badUtf8Name);
+    } catch (const sdbus::Error& e) {
+        utf8NameRefused = true;
+        refusalName = std::string(e.getName());
+        // Name as well as message: an error carrying no text still has to say which
+        // component answered, or the diagnostic reads as though nothing happened.
+        busRefusal = refusalName + (e.getMessage().empty() ? "" : ": " + std::string(e.getMessage()));
+    }
+    const bool noAnswer = refusalName == "org.freedesktop.DBus.Error.NoReply" ||
+                          refusalName == "org.freedesktop.DBus.Error.ServiceUnknown" ||
+                          refusalName == "org.freedesktop.DBus.Error.Disconnected";
+    if (!utf8NameRefused) {
+        std::printf("dbus_service_test: a connector name that is not valid UTF-8 unexpectedly completed as a "
+                    "successful call\n");
+    } else if (noAnswer) {
+        std::printf("dbus_service_test: the call carrying a connector name that is not valid UTF-8 failed without an "
+                    "answer (%s), so this run establishes nothing about the name\n",
+                    busRefusal.c_str());
+    } else if (wallpaperx::testing::daemonErrorName(refusalName)) {
+        std::printf("dbus_service_test: a connector name that is not valid UTF-8 reached the daemon, which refused "
+                    "it: '%s'\n",
+                    busRefusal.c_str());
+    } else {
+        // InvalidArgs is the one name both sides can produce -- sd-bus reports a client-side
+        // serialization refusal under it, and the daemon's own UTF-8 arm answers with it --
+        // so the message text is printed instead of an attribution the name cannot support.
+        std::printf("dbus_service_test: a connector name that is not valid UTF-8 was refused with '%s' -- the message "
+                    "says which component answered, the error name alone does not\n",
+                    busRefusal.c_str());
+    }
+    std::fflush(stdout);
+    check(utf8NameRefused && !noAnswer,
+          "a connector name that is not valid UTF-8 does not complete as a successful call");
+
+    // One snapshot, read two ways: the name-validation refusals graded through the monitor
+    // they targeted, the id refusals through the name they used.
+    const StatusReply afterRefusals = getStatusOrExplain(proxy);
+    const std::vector<std::string> refusedNames = namesFor(afterRefusals, kMonitorOutputRejected);
+    const std::vector<std::string> keptOnly{"DP-KEEP"};
+    check(refusedNames == keptOnly,
+          "a refused connector name neither binds to the monitor it targeted nor disturbs the name it already "
+          "answered to");
+    if (refusedNames != keptOnly) {
+        std::fprintf(stderr, "  monitor %d answers to %s\n", kMonitorOutputRejected, joinNames(refusedNames).c_str());
+    }
+
+    // The reply's arrival is part of the assertion, not a precondition assumed: a GetStatus
+    // that never answered publishes no "DP-1" either, and would otherwise be graded as the
+    // property holding.
+    const nlohmann::json* afterRefusalBindings = outputBindings(afterRefusals);
+    const bool badIdNamePublished = afterRefusalBindings != nullptr && afterRefusalBindings->contains("DP-1");
+    check(afterRefusalBindings != nullptr && !badIdNamePublished,
+          "the connector name refused for an out-of-range monitor id is not published at all");
+    if (badIdNamePublished) {
+        std::fprintf(stderr, "  'DP-1' resolves to monitor %s\n", (*afterRefusalBindings)["DP-1"].dump().c_str());
+    }
+
+    // Split for the same reason as the "DP-KEEP" precondition above: refused-outright and
+    // accepted-but-not-published are different faults, and one graded conjunction can name
+    // neither. The name itself is not printed -- it is 256 bytes of 'D' -- only its length.
+    // CONTROL: `status["outputs"]` dropped from DbusService::getStatus
+    //       (backend/daemon/dbus_service.cpp) -> the publication half alone red, "FAIL: a
+    //       connector name of exactly the maximum length is published for the monitor it was
+    //       given to" printing "the 256-byte name resolves to monitor -1, not 18", with the
+    //       acceptance half green. `name.size() > kMaxOutputNameBytes` weakened to `>=` in
+    //       config_store.h reddens both halves, the acceptance one printing "SetMonitorOutput
+    //       refused a 256-byte name with org.freedesktop.DBus.Error.InvalidArgs" -- which is
+    //       the fault the single conjunction could not name. Both reverted.
+    const std::string atCap(wallpaperx::kMaxOutputNameBytes, 'D');
+    const std::string atCapError = errorNameFrom([&] { setMonitorOutput(proxy, kMonitorOutputAtCap, atCap); });
+    check(atCapError.empty(), "a connector name of exactly the maximum length is accepted");
+    if (!atCapError.empty()) {
+        std::fprintf(stderr, "  SetMonitorOutput refused a %zu-byte name with %s\n", atCap.size(),
+                     atCapError.c_str());
+    }
+    const int atCapBinding = boundMonitor(getStatusOrExplain(proxy), atCap);
+    check(atCapBinding == kMonitorOutputAtCap,
+          "a connector name of exactly the maximum length is published for the monitor it was given to");
+    if (atCapBinding != kMonitorOutputAtCap) {
+        std::fprintf(stderr, "  the %zu-byte name resolves to monitor %d, not %d\n", atCap.size(), atCapBinding,
+                     kMonitorOutputAtCap);
+    }
+
+    // GOAL: S10.4 -- a connector name maps to exactly one monitor. Assigning a name another
+    //       monitor already holds MOVES it. False if, after reassigning, the old monitor
+    //       still answers for that name: two plugin instances would then claim one screen,
+    //       and whichever the daemon returned first would decide which desktop is wrong.
+    // WHY-THIS-SHAPE: asserted as "which monitor does this name resolve to now", not as
+    //       "how many entries does the map have". GetStatus publishes name -> id, so a name
+    //       held twice is unrepresentable in the reply and a size check could never see the
+    //       defect; the resolution, on the other hand, is exactly what a plugin asks for and
+    //       goes wrong in the observable direction. The first binding is asserted BEFORE the
+    //       reassignment, so a run where the first call silently did nothing cannot be read
+    //       as a successful move.
+    //       The releasing half is graded on the reply having arrived, not on the old monitor's
+    //       name list merely being empty: a GetStatus that never answered lists nothing for
+    //       monitor 15 either, so a bare emptiness check would read a lost reply as the
+    //       release having happened.
+    // CONTROL: the body of the `if (existing != m_outputs.end())` branch in
+    //       WallpaperManager::bindOutputLocked (backend/daemon/wallpaper_manager.cpp) --
+    //       `m_outputs.erase(existing); displaced = true;` -- replaced with
+    //       `return BindResult::Unchanged;`, i.e. first-wins -> "FAIL: reassigning a connector
+    //       name moves it to the new monitor", printing "'DP-MOVE' still resolves to monitor
+    //       15, not 16", and "FAIL: the monitor a connector name was taken from answers to it
+    //       no longer", printing "monitor 15 still answers to 'DP-MOVE'". The arrival half:
+    //       `status["outputs"] = std::move(outputs);` dropped from DbusService::getStatus
+    //       (backend/daemon/dbus_service.cpp) -> both halves red, the move check printing
+    //       "'DP-MOVE' still resolves to monitor -1, not 16" and the release check "GetStatus
+    //       published no outputs object to read the old monitor from", beside every other
+    //       outputs-reading check in this phase. Both reverted.
+    check(errorNameFrom([&] { setMonitorOutput(proxy, kMonitorOutputA, "DP-MOVE"); }).empty(),
+          "naming monitor A 'DP-MOVE' is accepted");
+    check(boundMonitor(getStatusOrExplain(proxy), "DP-MOVE") == kMonitorOutputA,
+          "a connector name resolves to the monitor it was just given to");
+    check(errorNameFrom([&] { setMonitorOutput(proxy, kMonitorOutputB, "DP-MOVE"); }).empty(),
+          "reassigning 'DP-MOVE' to monitor B is accepted");
+    // One snapshot, read two ways: arrival on the new monitor and release from the old are
+    // two halves of ONE state. Two reads would let a daemon that reported the move in the
+    // first reply and a stale map in the second be graded correct, and would print two
+    // states that never coexisted.
+    const StatusReply afterMoveStatus = getStatusOrExplain(proxy);
+    const int afterMove = boundMonitor(afterMoveStatus, "DP-MOVE");
+    check(afterMove == kMonitorOutputB, "reassigning a connector name moves it to the new monitor");
+    if (afterMove != kMonitorOutputB) {
+        std::fprintf(stderr, "  'DP-MOVE' still resolves to monitor %d, not %d\n", afterMove, kMonitorOutputB);
+    }
+    const nlohmann::json* afterMoveBindings = outputBindings(afterMoveStatus);
+    const std::vector<std::string> namesOnOldMonitor = namesFor(afterMoveStatus, kMonitorOutputA);
+    check(afterMoveBindings != nullptr && namesOnOldMonitor.empty(),
+          "the monitor a connector name was taken from answers to it no longer");
+    if (afterMoveBindings == nullptr) {
+        std::fprintf(stderr, "  GetStatus published no outputs object to read the old monitor from\n");
+    } else if (!namesOnOldMonitor.empty()) {
+        std::fprintf(stderr, "  monitor %d still answers to %s\n", kMonitorOutputA,
+                     joinNames(namesOnOldMonitor).c_str());
+    }
+
+    // GOAL: the converse GOALS.md records as a deliberate decision under S10.4 -- naming a
+    //       monitor releases whatever name it already answered to, so a monitor responds to
+    //       at most one connector. False if a screen the app renames after a replug goes on
+    //       resolving under its old name, which is a name pointing at hardware that is no
+    //       longer behind it.
+    // WHY-THIS-SHAPE: the name COUNT for the monitor is asserted, not just that the new name
+    //       resolves. "DP-SECOND resolves to 15" is true whether or not DP-FIRST was
+    //       released, so the obvious assertion is satisfied by exactly the implementation
+    //       this goal forbids. Counting is possible here only because GetStatus publishes
+    //       the whole map rather than answering one lookup at a time.
+    // CONTROL: the `for (auto it = m_outputs.begin(); ...)` release loop deleted from
+    //       WallpaperManager::bindOutputLocked (backend/daemon/wallpaper_manager.cpp) ->
+    //       "FAIL: naming a monitor releases the name it answered to before", printing
+    //       "monitor 15 answers to 'DP-FIRST', 'DP-SECOND'", and "FAIL: naming a monitor with
+    //       the name it already has leaves exactly one binding". Reverted.
+    check(errorNameFrom([&] { setMonitorOutput(proxy, kMonitorOutputA, "DP-FIRST"); }).empty(),
+          "naming monitor A 'DP-FIRST' is accepted");
+    check(errorNameFrom([&] { setMonitorOutput(proxy, kMonitorOutputA, "DP-SECOND"); }).empty(),
+          "renaming monitor A to 'DP-SECOND' is accepted");
+    const std::vector<std::string> namesAfterRename = namesFor(getStatusOrExplain(proxy), kMonitorOutputA);
+    const bool exactlyOne = namesAfterRename == std::vector<std::string>{"DP-SECOND"};
+    check(exactlyOne, "naming a monitor releases the name it answered to before");
+    if (!exactlyOne) {
+        std::fprintf(stderr, "  monitor %d answers to %s\n", kMonitorOutputA, joinNames(namesAfterRename).c_str());
+    }
+
+    // Idempotent, and complete on return: the same pair twice is not an error and leaves
+    // one binding. Unlike SetWallpaper there is no render behind the call, so an accepted
+    // reply means the mapping is in place -- which is what lets every check in this phase
+    // read GetStatus immediately instead of waiting for a signal.
+    check(errorNameFrom([&] { setMonitorOutput(proxy, kMonitorOutputA, "DP-SECOND"); }).empty(),
+          "naming a monitor with the name it already has is not an error");
+    check(namesFor(getStatusOrExplain(proxy), kMonitorOutputA) == std::vector<std::string>{"DP-SECOND"},
+          "naming a monitor with the name it already has leaves exactly one binding");
+
+    // GOAL: S10.8 -- a connector name is escaped wherever it is displayed, GetStatus
+    //       included. False if a name holding a newline, a right-to-left override or DEL
+    //       reaches a display field raw. The name arrives over the bus from a client and is
+    //       exactly as untrusted as the GPU name that produced this defect in 4d2d5d8.
+    // WHY-THIS-SHAPE: two claims, and neither is enough alone. The specific escaped key must
+    //       be present AND resolve to the right monitor -- escaping the display copy must
+    //       not change the key the lookup uses -- and separately NO key anywhere in the
+    //       reply may hold one of the three raw byte classes. The second is what stops a
+    //       future name from being published raw beside a correctly escaped one. Inspected
+    //       on the PARSED keys rather than on the serialised reply, because JSON's own
+    //       encoder escapes bytes below 0x20 by itself: a newline searched for in the wire
+    //       text is absent even from a daemon that does no escaping at all (measured on the
+    //       HTTP tier, where a whole-name search stayed green under exactly that mutation).
+    // CONTROL: `sanitizeForLog(name, kMaxOutputNameBytes, LogFraming::Bare)` in
+    //       DbusService::getStatus (backend/daemon/dbus_service.cpp) replaced with `name` ->
+    //       "FAIL: a hostile connector name is published by GetStatus in its escaped form,
+    //       bound to its own monitor" ("the escaped name resolves to -1, not 19") and "FAIL:
+    //       no connector name GetStatus publishes holds a raw newline, U+202E or DEL", which
+    //       printed the offending key as "DP-\xe2\x80\xae\nHDMI\x7f-1" -- one readable line.
+    //       With the diagnostic printing rawKey unescaped instead, the same run emitted the
+    //       override byte and a real newline, splitting the line in two. Dropping
+    //       `status["outputs"]` from the same function
+    //       makes the scan red too, printing "the scan saw no key at all for monitor 19, so it
+    //       graded nothing" rather than passing on an empty scan. Both reverted.
+    // COVERAGE-ASSERT: the fixture is asserted to carry all three byte classes the scan below
+    //       searches for, and to be one sanitizeForLog alters. Both halves are needed: a
+    //       fixture edit that dropped DEL would leave the scan looking for a byte no key can
+    //       hold -- green for a daemon that published it raw -- and the sanitizeForLog clause
+    //       alone cannot see that, since it stays true for any name with a newline in it. The
+    //       scan itself asserts it saw a key for monitor 19, so an outputs object that arrived
+    //       empty cannot be read as "nothing raw was published". Controlled by dropping kDel
+    //       from the fixture -> "FAIL: the hostile connector name holds every byte class the
+    //       scan looks for...", the only red line. Reverted.
+    const std::string hostileName = std::string("DP-") + kBidiOverride + "\nHDMI" + kDel + "-1";
+    const std::string escapedName = wallpaperx::sanitizeForLog(hostileName, wallpaperx::kMaxOutputNameBytes,
+                                                              wallpaperx::LogFraming::Bare);
+    check(hostileName.find(kBidiOverride) != std::string::npos && hostileName.find(kDel) != std::string::npos &&
+              hostileName.find('\n') != std::string::npos && escapedName != hostileName,
+          "the hostile connector name holds every byte class the scan looks for and is one sanitizeForLog alters");
+    check(errorNameFrom([&] { setMonitorOutput(proxy, kMonitorOutputHostile, hostileName); }).empty(),
+          "the hostile connector name is accepted by SetMonitorOutput");
+    const StatusReply hostileStatus = getStatusOrExplain(proxy);
+    // The raw name, not `escapedName`: boundMonitor escapes what it is given, and
+    // sanitizeForLog is not idempotent, so handing it the escaped form would look the
+    // doubly-escaped name up and miss.
+    const int hostileBinding = boundMonitor(hostileStatus, hostileName);
+    check(hostileBinding == kMonitorOutputHostile,
+          "a hostile connector name is published by GetStatus in its escaped form, bound to its own monitor");
+    if (hostileBinding != kMonitorOutputHostile) {
+        std::fprintf(stderr, "  the escaped name resolves to %d, not %d\n", hostileBinding, kMonitorOutputHostile);
+    }
+    // Arrival and the hostile monitor's own key are part of the assertion, not assumed: an
+    // empty or missing outputs object scans clean, which an emptiness check alone would
+    // grade as the escaping property holding.
+    const nlohmann::json* hostileBindings = outputBindings(hostileStatus);
+    std::string rawKey;
+    bool hostileKeyScanned = false;
+    if (hostileBindings != nullptr) {
+        for (const auto& [name, id] : hostileBindings->items()) {
+            if (id.is_number_integer() && id.get<int>() == kMonitorOutputHostile) hostileKeyScanned = true;
+            if (rawKey.empty() && (name.find(kBidiOverride) != std::string::npos ||
+                                   name.find(kDel) != std::string::npos || name.find('\n') != std::string::npos)) {
+                rawKey = name;
+            }
+        }
+    }
+    check(hostileKeyScanned && rawKey.empty(),
+          "no connector name GetStatus publishes holds a raw newline, U+202E or DEL");
+    if (!hostileKeyScanned) {
+        std::fprintf(stderr, "  the scan saw no key at all for monitor %d, so it graded nothing\n",
+                     kMonitorOutputHostile);
+    }
+    // Shown escaped: rawKey is non-empty only when a hostile name reached the reply raw,
+    // so printing it verbatim would feed the terminal the very override byte this line is
+    // reporting -- and would split the diagnostic across lines on the newline case.
+    if (!rawKey.empty()) {
+        std::fprintf(stderr, "  raw key published (shown escaped): '%s'\n",
+                     wallpaperx::sanitizeForLog(rawKey, wallpaperx::kMaxOutputNameBytes,
+                                                wallpaperx::LogFraming::Bare)
+                         .c_str());
+    }
+
+    // GOAL: naming one monitor leaves every OTHER monitor's connector name intact. False if
+    //       the daemon can hold only one name at a time for the whole machine -- on a
+    //       two-screen desktop that means naming the second screen erases the first, whose
+    //       plugin instance then cannot identify itself and never restores its wallpaper.
+    // WHY-THIS-SHAPE: every other check in this phase reads back only the monitor it just
+    //       named, so the phase's entire view of the binding map is one monitor wide, and a
+    //       release loop that over-erased -- dropping entries belonging to OTHER monitors --
+    //       would be invisible to all of them. The gap is in the read pattern, not in any
+    //       one check, so it is closed once at the end over every monitor this phase named
+    //       rather than by a cross-monitor read after each binding.
+    // CONTROL: the `if (it->second != monitorId) { ++it; continue; }` guard deleted from the
+    //       release loop in WallpaperManager::bindOutputLocked
+    //       (backend/daemon/wallpaper_manager.cpp), so it erases unconditionally -> "FAIL:
+    //       naming one monitor leaves every other monitor's connector name intact" printing
+    //       monitors 15..18 as "(none)", and it was the ONLY red line in the phase -- which
+    //       is the measurement showing it is not redundant with the checks above. Reverted.
+    // COVERAGE-ASSERT: the number of monitors actually compared is counted and asserted
+    //       against the table's size, so an edit that empties or short-circuits the loop
+    //       fails instead of asserting nothing. The reply's arrival is a separate clause of
+    //       `independent`, because a missing outputs object makes every lookup return
+    //       "(none)" -- a scan that agrees with nothing, which is not the same as a scan
+    //       that found no disagreement. Controlled by changing the loop's `continue` to
+    //       `break`, so it compares one monitor and stops -> "FAIL: every monitor this phase
+    //       named was compared by the cross-monitor check" as the only red line, with the
+    //       independence check above it green. Reverted.
+    {
+        const StatusReply finalNames = getStatusOrExplain(proxy);
+        const std::pair<int32_t, std::string> stillHeld[] = {
+            {kMonitorOutputA, "DP-SECOND"},
+            {kMonitorOutputB, "DP-MOVE"},
+            {kMonitorOutputRejected, "DP-KEEP"},
+            {kMonitorOutputAtCap, atCap},
+            {kMonitorOutputHostile, escapedName},
+        };
+        int compared = 0;
+        bool independent = outputBindings(finalNames) != nullptr;
+        for (const auto& [monitorId, expectedName] : stillHeld) {
+            ++compared;
+            const std::vector<std::string> held = namesFor(finalNames, monitorId);
+            if (held == std::vector<std::string>{expectedName}) continue;
+            independent = false;
+            std::fprintf(stderr, "  monitor %d answers to %s, not to the one name it was last given\n", monitorId,
+                         joinNames(held).c_str());
+        }
+        check(independent, "naming one monitor leaves every other monitor's connector name intact");
+        check(compared == static_cast<int>(sizeof(stillHeld) / sizeof(stillHeld[0])),
+              "every monitor this phase named was compared by the cross-monitor check");
     }
 }
 
@@ -1577,6 +2190,23 @@ int main() {
             .call([&signals](int32_t monitorId, uint64_t generation) { signals.record(monitorId, generation); });
 
         runHostChecks(*proxy, imagePath, check);
+        // Before the render phases, and on the same manager: naming a screen needs no GPU,
+        // and running it first keeps it reachable on a host whose Vulkan stack cannot come
+        // up -- the same reason runHostChecks is first.
+        //
+        // Guarded, unlike its neighbours: it runs ahead of every GPU phase, and one call in
+        // it is graded on a third-party library's throwing behaviour (sd-bus refusing to
+        // serialize a non-UTF-8 argument). An exception under any type its own catch does
+        // not name would otherwise reach main's catch-all and cancel the render, export and
+        // coalescing phases outright, so a dependency upgrade would delete the GPU coverage
+        // of this binary while printing only a connector-name failure. Counted as a failure
+        // so the run still cannot report green.
+        try {
+            runOutputNameChecks(*proxy, check);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "FAIL: the connector-name phase aborted, later phases still ran: %s\n", e.what());
+            ++wallpaperx::testing::g_failures;
+        }
         runRenderChecks(*proxy, signals, imagePath, corruptPath, videoPath, check);
         runCoalescingChecks(*proxy, signals, imagePath, corruptPath, burstPaths, check);
 

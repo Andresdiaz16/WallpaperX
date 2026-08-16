@@ -81,6 +81,40 @@ bool parseMonitorParam(const httplib::Request& req, int& outMonitorId, std::stri
     return true;
 }
 
+// Which identity the request asked by. Both given is a 400, not a precedence rule: picking
+// either silently is a guess about which screen the caller meant.
+enum class IdentityKind { Default, Monitor, Output };
+
+bool parseIdentity(const httplib::Request& req, IdentityKind& outKind, std::string& outOutput,
+                   std::string& outError) {
+    const bool hasMonitor = req.has_param("monitor");
+    const bool hasOutput = req.has_param("output");
+    if (hasMonitor && hasOutput) {
+        outError = "monitor and output cannot both be given: they name the screen two ways";
+        return false;
+    }
+
+    // Same rule for one parameter repeated: get_param_value() returns the first of them, so
+    // without this "output=DP-3&output=DP-4" would be answered for DP-3. Repeats of an equal
+    // value are refused too rather than compared -- the caller still asked twice.
+    if (req.params.count("monitor") > 1 || req.params.count("output") > 1) {
+        outError = "monitor and output may each be given once: repeating one names the screen "
+                   "more than one way";
+        return false;
+    }
+
+    outKind = hasOutput ? IdentityKind::Output : (hasMonitor ? IdentityKind::Monitor : IdentityKind::Default);
+    if (!hasOutput) return true;
+
+    outOutput = req.get_param_value("output");
+    // A name the daemon could never have been given is refused, not answered "never heard".
+    if (const std::string why = outputNameError(outOutput); !why.empty()) {
+        outError = why;
+        return false;
+    }
+    return true;
+}
+
 }  // namespace
 
 HttpServer::Registration::Registration(WallpaperManager& manager, int port)
@@ -188,19 +222,47 @@ HttpServer::~HttpServer() {
 void HttpServer::registerRoutes() {
     // `t` is ignored: it is QML's cache-buster and means nothing to the daemon.
     m_server->Get("/config", [this](const httplib::Request& req, httplib::Response& res) {
-        int monitorId = 0;
+        IdentityKind kind = IdentityKind::Default;
+        std::string outputName;
         std::string error;
-        if (!parseMonitorParam(req, monitorId, error)) {
+        if (!parseIdentity(req, kind, outputName, error)) {
+            sendJson(res, nlohmann::json{{"error", error}}, 400);
+            return;
+        }
+
+        int monitorId = 0;
+        if (kind != IdentityKind::Output && !parseMonitorParam(req, monitorId, error)) {
             sendJson(res, nlohmann::json{{"error", error}}, 400);
             return;
         }
 
         const WallpaperManager::Snapshot snap = m_manager.snapshot();
 
+        // Emitted only for output= queries: a range-checked id always resolves, so adding
+        // the field elsewhere would change a shape that has consumers for a constant.
+        bool known = true;
+        if (kind == IdentityKind::Output) {
+            const auto bound = snap.outputs.find(outputName);
+            known = bound != snap.outputs.end();
+            if (known) monitorId = bound->second;
+        }
+
         // An unset monitor answers with empty strings rather than 404: the plugin polls
         // every second from startup, and "no wallpaper yet" is ordinary, not an error.
         nlohmann::json out{
             {"monitor_id", monitorId}, {"type", ""}, {"path", ""}, {"path_literal", ""}};
+
+        if (kind == IdentityKind::Output) {
+            out["known"] = known;
+            out["output"] = sanitizeForLog(outputName, kMaxOutputNameBytes, LogFraming::Bare);
+            if (!known) {
+                // Null, never 0: an id the caller could hand back to ?monitor= would put
+                // monitor 0's wallpaper on a screen that is not monitor 0.
+                out["monitor_id"] = nullptr;
+                sendJson(res, out);
+                return;
+            }
+        }
 
         const auto it = snap.monitors.find(monitorId);
         if (it != snap.monitors.end()) {

@@ -8,12 +8,14 @@
 #include "vulkan/offscreen.h"
 #include "vulkan/tier_selection.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <future>
 #include <memory>
+#include <set>
 #include <stdexcept>
 #include <thread>
 #include <utility>
@@ -93,9 +95,9 @@ WallpaperManager::WallpaperManager(Config config)
     }
 
     // Read-only. Everything that writes to the config directory is deferred to
-    // preserveUnreadableConfig(), which main() calls once this process owns the bus name --
-    // a second instance must not move the running daemon's config before it finds out it
-    // has no right to run.
+    // preserveUnreadableConfig() and writeRepairedConfig(), which main() calls once this
+    // process owns the bus name -- a second instance must not move or rewrite the running
+    // daemon's config before it finds out it has no right to run.
     const LoadResult loaded = loadWithDeadline();
     m_restore = loaded.entries;
     m_loadPreservable = loaded.preservable;
@@ -181,6 +183,20 @@ void WallpaperManager::preserveUnreadableConfig() {
     recordHealth(&DaemonHealth::persistence, HealthStatus::Fail, persistenceDetail(m_loadError));
 }
 
+void WallpaperManager::writeRepairedConfig() {
+    std::optional<std::vector<PersistedWallpaper>> repair;
+    {
+        std::lock_guard<std::mutex> stateLock(m_stateMutex);
+        repair.swap(m_repair);
+    }
+    // Written once, here, because this run has resolved something the file still states -- a
+    // name two rows claimed, a row no build can apply. Leaving it for the next save means the
+    // note recurs on every boot, and the next save may never come: a client that only
+    // re-asserts names it already has writes nothing. persist() is what refuses a file this
+    // run could not read; taken outside the lock, which it requires.
+    if (repair) persist(*repair);
+}
+
 void WallpaperManager::addPersistenceNote(const std::string& note) {
     if (!m_persistenceNote.empty()) m_persistenceNote += "; ";
     m_persistenceNote += note;
@@ -191,13 +207,33 @@ std::string WallpaperManager::persistenceDetail(const std::string& base) const {
     // tail, so a long config path must not be what silences them.
     std::string detail;
     if (!m_persistenceNote.empty()) detail = m_persistenceNote + "; ";
-    if (!m_unapplied.empty()) {
-        detail += std::to_string(m_unapplied.size()) + " entries this build cannot apply, kept; ";
+
+    // Two independent facts about one row, not a partition: this text is the user's notice
+    // that a picture did not come back, and a row can have lost a name as well as one.
+    int keptWallpapers = 0;
+    int keptNames = 0;
+    for (const PersistedWallpaper& entry : m_unapplied) {
+        if (!entry.type.empty() || !entry.path.empty()) ++keptWallpapers;
+        // Only the names the next save will actually write. restoreSaved() settles the
+        // collisions the file arrived with, but a client can claim one of these names later,
+        // and persistableLocked() drops the kept copy when it does -- so counting it here
+        // would go on offering a name the file no longer holds.
+        if (!entry.output.empty() && m_outputs.count(entry.output) == 0) ++keptNames;
+    }
+    if (keptWallpapers > 0) {
+        detail += std::to_string(keptWallpapers) + " entries this build cannot apply, kept; ";
+    }
+    if (keptNames > 0) {
+        detail += std::to_string(keptNames) +
+                  " screen names this build's monitor limit excludes, kept; ";
     }
     // Reported for the same reason the kept ones are: a wallpaper that did not come back is
     // otherwise invisible, and these are the ones no restart will bring back.
     if (m_droppedEntries > 0) {
         detail += std::to_string(m_droppedEntries) + " entries dropped, no build can apply them; ";
+    }
+    if (m_droppedNames > 0) {
+        detail += std::to_string(m_droppedNames) + " screen names dropped, no build can apply them; ";
     }
     return detail + base;
 }
@@ -391,6 +427,58 @@ void WallpaperManager::requestWallpaper(const std::string& type, const std::stri
     persist(toPersist);
 }
 
+void WallpaperManager::setMonitorOutput(int monitorId, const std::string& outputName) {
+    requireValidMonitorId(monitorId);
+    if (const std::string why = outputNameError(outputName); !why.empty()) {
+        throw InvalidRequest(why + ": " + sanitizeForLog(outputName));
+    }
+
+    std::vector<PersistedWallpaper> toPersist;
+    {
+        std::lock_guard<std::mutex> stateLock(m_stateMutex);
+        // Idempotent is advertised, so a client may re-assert every name on each screen
+        // change; persist() parks this thread -- the bus event loop -- on the write. Not
+        // skipped when the last write failed: the map agrees with the request but the file
+        // does not, and re-asserting is then the only retry a client can reach.
+        if (bindOutputLocked(monitorId, outputName) == BindResult::Unchanged &&
+            !persistFailedLocked()) {
+            return;
+        }
+        toPersist = persistableLocked();
+    }
+
+    // Outside the lock. Persisted because only the app can name a screen again, and it may
+    // not run for weeks.
+    persist(toPersist);
+}
+
+WallpaperManager::BindResult WallpaperManager::bindOutputLocked(int monitorId,
+                                                                const std::string& outputName) {
+    bool displaced = false;
+    const auto existing = m_outputs.find(outputName);
+    if (existing != m_outputs.end()) {
+        if (existing->second == monitorId) return BindResult::Unchanged;
+        // Erased, not left: a name on two monitors is two plugin instances answering to one
+        // screen, and whichever came back first would decide who shows the wrong picture.
+        m_outputs.erase(existing);
+        displaced = true;
+    }
+
+    // A monitor answers to one name too: without this a screen the app renamed would go on
+    // answering to its old name.
+    for (auto it = m_outputs.begin(); it != m_outputs.end();) {
+        if (it->second != monitorId) {
+            ++it;
+            continue;
+        }
+        it = m_outputs.erase(it);
+        displaced = true;
+    }
+
+    m_outputs.emplace(outputName, monitorId);
+    return displaced ? BindResult::Displaced : BindResult::Bound;
+}
+
 LoadResult WallpaperManager::loadWithDeadline() const {
     // A detached thread and a shared promise, NOT std::async: the future std::async returns
     // blocks in its own destructor until the task finishes, which would wait exactly as long
@@ -425,18 +513,48 @@ LoadResult WallpaperManager::loadWithDeadline() const {
 }
 
 std::vector<PersistedWallpaper> WallpaperManager::persistableLocked() const {
-    std::vector<PersistedWallpaper> entries;
-    entries.reserve(m_monitors.size() + m_unapplied.size());
+    // Keyed by monitor id, not appended: a wallpaper and a name for one monitor belong on
+    // one row, and two rows would be two monitors claiming one screen on the next load.
+    std::map<int, PersistedWallpaper> rows;
     for (const auto& [monitorId, state] : m_monitors) {
         if (state.type.empty() || state.path.empty()) continue;
-        entries.push_back(PersistedWallpaper{monitorId, state.type, state.path});
+        rows.emplace(monitorId, PersistedWallpaper{monitorId, state.type, state.path, {}});
     }
 
     // Entries this build could not apply are still the user's. Without this the save
     // below, which rebuilds the file from live state alone, would delete a wallpaper set
     // by a newer build the moment anything else is set here. Live state wins per monitor.
     for (const PersistedWallpaper& entry : m_unapplied) {
-        if (m_monitors.count(entry.monitorId) == 0) entries.push_back(entry);
+        if (m_monitors.count(entry.monitorId) == 0) rows.emplace(entry.monitorId, entry);
+    }
+
+    // m_outputs is the only authority, so a name an unapplied entry carried is dropped --
+    // kept only for an id this build cannot bind, and only while nothing else claims it.
+    // Nothing here can report a file naming one screen twice, so it must not write one:
+    // a build whose limit admits both ids would bind both and one screen would lose.
+    std::set<std::string> written;
+    for (auto& [monitorId, row] : rows) {
+        if (row.output.empty()) continue;
+        if (monitorId < kMaxMonitors || m_outputs.count(row.output) != 0 ||
+            !written.insert(row.output).second) {
+            row.output.clear();
+        }
+    }
+    for (const auto& [name, monitorId] : m_outputs) {
+        PersistedWallpaper& row = rows[monitorId];
+        // Explicit: operator[] default-constructs monitorId 0 for a named, wallpaper-less
+        // screen.
+        row.monitorId = monitorId;
+        row.output = name;
+    }
+
+    std::vector<PersistedWallpaper> entries;
+    entries.reserve(rows.size());
+    for (auto& [monitorId, row] : rows) {
+        // A row the clearing loop emptied has nothing left to say. Written out, the next
+        // start reads it back and reports it as a wallpaper that did not come back.
+        if (row.type.empty() && row.path.empty() && row.output.empty()) continue;
+        entries.push_back(std::move(row));
     }
     return entries;
 }
@@ -455,25 +573,33 @@ void WallpaperManager::persist(const std::vector<PersistedWallpaper>& entries) {
         return;
     }
 
-    startPersistWorker();
+    // Published under m_stateMutex, which is where every reader takes it: an unlocked store
+    // beside locked loads is a data race, and the first save can run beside a /health request
+    // on the HTTP thread. Released before the worker's lock, keeping the documented order.
+    std::shared_ptr<PersistWorker> worker;
+    {
+        std::lock_guard<std::mutex> stateLock(m_stateMutex);
+        startPersistWorker();
+        worker = m_persist;
+    }
 
-    std::unique_lock<std::mutex> workerLock(m_persist->mutex);
+    std::unique_lock<std::mutex> workerLock(worker->mutex);
     // Replaced, not appended: an older snapshot waiting behind a stalled write describes a
     // state this one already supersedes, so writing it would only be a slower route to the
     // same file.
-    m_persist->pending = entries;
-    m_persist->wake.notify_one();
+    worker->pending = entries;
+    worker->wake.notify_one();
 
     // Waited on, briefly. A healthy write takes microseconds, and callers -- including the
     // reply to SetWallpaper -- are entitled to assume the choice is on disk when it returns.
     // The deadline is the whole point: past it the write keeps going on the worker and this
     // thread stops caring, so a stalled filesystem costs one wait rather than the daemon.
-    if (m_persist->stalled) return;
-    const auto quiesced = [this] { return !m_persist->pending && !m_persist->writingSince; };
-    if (!m_persist->settled.wait_for(workerLock, kLoadDeadline, quiesced)) {
+    if (worker->stalled) return;
+    const auto quiesced = [&worker] { return !worker->pending && !worker->writingSince; };
+    if (!worker->settled.wait_for(workerLock, kLoadDeadline, quiesced)) {
         // Not waited on again until something completes: a second stalled call would add
         // another deadline's delay to a bus thread that has already learned the answer.
-        m_persist->stalled = true;
+        worker->stalled = true;
     }
 }
 
@@ -510,6 +636,14 @@ void WallpaperManager::startPersistWorker() {
             worker->settled.notify_all();
         }
     }).detach();
+}
+
+bool WallpaperManager::persistFailedLocked() const {
+    // Null before the first save, which means nothing has been asked of the file yet: an
+    // unchanged binding then came out of the config, so the file already holds it.
+    if (!m_persist) return false;
+    std::lock_guard<std::mutex> workerLock(m_persist->mutex);
+    return m_persist->haveResult && !m_persist->result.error.empty();
 }
 
 void WallpaperManager::applyPersistOutcomeLocked(DaemonHealth& health) const {
@@ -550,7 +684,7 @@ void WallpaperManager::applyPersistOutcomeLocked(DaemonHealth& health) const {
     std::string base = m_store.file().string();
     if (saved.skippedNonUtf8 > 0) {
         base += " (" + std::to_string(saved.skippedNonUtf8) +
-                " entries skipped: path is not valid UTF-8)";
+                " entries skipped: a path, type or screen name is not valid UTF-8)";
     }
     // Fail, not Ok: the write succeeded but those monitors will not come back, and a
     // health field that reads ok is the only thing that would say otherwise.
@@ -562,14 +696,52 @@ std::vector<int> WallpaperManager::restoreSaved() {
     std::vector<PersistedWallpaper> pending;
     pending.swap(m_restore);
 
+    // A name lost at load is invisible otherwise: it is in no monitor's status, and the
+    // entry it came from may restore perfectly well without it.
+    int displacedNames = 0;
+    int rejectedNames = 0;
+    int duplicateIds = 0;
+
+    bool repaired = false;
     std::lock_guard<std::mutex> stateLock(m_stateMutex);
     for (const PersistedWallpaper& entry : pending) {
+        // Three outcomes for a name, each of them reported: bound here, carried for a build
+        // whose limit admits the id, or dropped. The carried case asks only for valid UTF-8,
+        // not the whole client rule -- a newer build may have a larger cap, and only invalid
+        // UTF-8 would cost the entire row on the next write.
+        const bool nameValid = !entry.output.empty() && outputNameError(entry.output).empty();
+        const bool nameTravels =
+            !entry.output.empty() && entry.monitorId >= kMaxMonitors && isValidUtf8(entry.output);
+        if (!entry.output.empty() && !nameValid && !nameTravels) ++rejectedNames;
+
         // Dropped, not kept: a kept entry is only ever superseded by a live monitor
         // claiming its id, and a negative id can never be one -- so keeping it means
         // carrying it through every save for the life of the install. An id above this
         // build's limit is different and stays below: a larger kMaxMonitors would take it.
         if (entry.monitorId < 0) {
-            ++m_droppedEntries;
+            // Both halves counted, because a row can lose both: reporting one of two losses
+            // sends the user looking for the wrong thing.
+            if (!entry.type.empty() || !entry.path.empty() || entry.output.empty()) {
+                ++m_droppedEntries;
+            }
+            if (nameValid) ++m_droppedNames;
+            continue;
+        }
+
+        // Independent halves of a row: this one is restored even when the other cannot be.
+        // Last-wins -- file order carries no meaning. What matters is that the loss is
+        // reported, not left as two monitors quietly answering to one screen.
+        if (nameValid && entry.monitorId < kMaxMonitors &&
+            bindOutputLocked(entry.monitorId, entry.output) == BindResult::Displaced) {
+            ++displacedNames;
+        }
+
+        // A row with no wallpaper stops here rather than falling into the arm below, whose
+        // health text is the user's only notice that a wallpaper did not come back. Only a
+        // name bound for a bigger build is still worth carrying; a row with nothing left on
+        // it would otherwise ride every save for the life of the install.
+        if (entry.type.empty() && entry.path.empty() && !nameTravels) {
+            if (entry.output.empty()) ++m_droppedEntries;
             continue;
         }
 
@@ -577,7 +749,31 @@ std::vector<int> WallpaperManager::restoreSaved() {
         // or an id a larger kMaxMonitors would admit, is not rendered here -- but it is
         // kept, so the next save does not delete a wallpaper a newer build understands.
         if (!isKnownType(entry.type) || entry.path.empty() || entry.monitorId >= kMaxMonitors) {
-            m_unapplied.push_back(entry);
+            // One row per id: persistableLocked() keys the file by monitor id, so a second
+            // kept entry would be dropped by the next save with nothing said. Merged half by
+            // half, as the in-range arms above treat them -- a later row carrying only a
+            // name must not delete the wallpaper this arm exists to preserve. Last-wins, and
+            // reported, only where both rows really filled the same half.
+            const auto held = std::find_if(
+                m_unapplied.begin(), m_unapplied.end(),
+                [&](const PersistedWallpaper& kept) { return kept.monitorId == entry.monitorId; });
+            if (held == m_unapplied.end()) {
+                PersistedWallpaper keep = entry;
+                if (!nameTravels) keep.output.clear();
+                m_unapplied.push_back(std::move(keep));
+                continue;
+            }
+            if (!entry.type.empty() || !entry.path.empty()) {
+                if (!held->type.empty() || !held->path.empty()) ++duplicateIds;
+                held->type = entry.type;
+                held->path = entry.path;
+            }
+            if (nameTravels) {
+                // The name counter, not the row counter: what was lost here is a screen's
+                // name, and duplicateIds prints a note about kept wallpapers.
+                if (!held->output.empty() && held->output != entry.output) ++displacedNames;
+                held->output = entry.output;
+            }
             continue;
         }
 
@@ -590,15 +786,47 @@ std::vector<int> WallpaperManager::restoreSaved() {
         monitorIds.push_back(entry.monitorId);
     }
 
+    // Settled here, not in the save. persistableLocked() is const and runs on every write, so
+    // a name it dropped could only vanish in silence -- and persistenceDetail() would already
+    // have promised it back. Reverse order to keep last-wins, as everything else here does.
+    std::set<std::string> claimed;
+    for (auto it = m_unapplied.rbegin(); it != m_unapplied.rend(); ++it) {
+        if (it->output.empty()) continue;
+        if (m_outputs.count(it->output) != 0 || !claimed.insert(it->output).second) {
+            it->output.clear();
+            ++displacedNames;
+        }
+    }
+
+    if (displacedNames > 0) {
+        addPersistenceNote(std::to_string(displacedNames) +
+                           " screen names displaced by a later entry claiming the same name or "
+                           "the same screen; the last entry won");
+    }
+    if (rejectedNames > 0) {
+        addPersistenceNote(std::to_string(rejectedNames) +
+                           " screen names dropped, unusable; those screens must be named again");
+    }
+    if (duplicateIds > 0) {
+        addPersistenceNote(std::to_string(duplicateIds) +
+                           " kept entries dropped, a later entry claimed the same monitor; the "
+                           "last entry won");
+    }
+
     // Kept entries are invisible otherwise: they are in no monitor's status and are not
     // malformed, so nothing would tell the user those wallpapers did not come back.
     // Recomposed from the raw path rather than appended to the recorded detail, which is
     // already sanitized and would be escaped a second time.
-    if ((!m_unapplied.empty() || m_droppedEntries > 0) &&
-        m_health.persistence.status == HealthStatus::Ok) {
+    repaired = displacedNames > 0 || rejectedNames > 0 || duplicateIds > 0 || m_droppedEntries > 0 ||
+               m_droppedNames > 0;
+    if ((!m_unapplied.empty() || repaired) && m_health.persistence.status == HealthStatus::Ok) {
         recordHealthLocked(&DaemonHealth::persistence, HealthStatus::Ok,
                            persistenceDetail(m_store.file().string()));
     }
+    // Held, not written: this runs before the bus name is claimed, and the write would land
+    // on a running daemon's config and on top of the bytes preserveUnreadableConfig() has
+    // yet to copy aside. main() writes it once both are settled.
+    if (repaired) m_repair = persistableLocked();
     return monitorIds;
 }
 
@@ -861,6 +1089,7 @@ WallpaperManager::Snapshot WallpaperManager::snapshot() const {
         }
         out.monitors.emplace(monitorId, std::move(entry));
     }
+    out.outputs = m_outputs;
     return out;
 }
 

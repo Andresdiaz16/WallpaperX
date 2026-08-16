@@ -222,10 +222,107 @@ target_link_libraries(wallpaperx-config-store-test PRIVATE wallpaperx-daemon-lib
 # lighter target keeps this runnable wherever the source tree is.
 add_executable(wallpaperx-kpackage-metadata-test tests/kpackage_metadata_test.cpp)
 target_link_libraries(wallpaperx-kpackage-metadata-test PRIVATE nlohmann_json::nlohmann_json)
+# Stated here rather than inherited. The targets that link wallpaperx-daemon-lib get this
+# directory from its PUBLIC include list; this one deliberately does not link it, and with
+# WALLPAPERX_BUILD_KDE_PLUGIN=ON it still compiled because KDECMakeSettings turns on
+# CMAKE_INCLUDE_CURRENT_DIR. With the option OFF -- the hosted runner and the sanitizer tree,
+# the two configurations this target exists to survive -- KDE's settings are never included
+# and `#include "tests/test_report.h"` does not resolve, which fails the whole backend build.
+target_include_directories(wallpaperx-kpackage-metadata-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 # The files under test are source, not build output, and ctest runs in the build tree. This
 # is the only way the test can find them; without it there is nothing to look at.
 target_compile_definitions(wallpaperx-kpackage-metadata-test PRIVATE
     WALLPAPERX_BACKEND_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+)
+
+# The QML the wallpaper package ships (kde/kpackage/contents/ui/) put through Qt's QML linter.
+# Nothing else in this tree ever compiles those files -- Plasma loads them -- so a property
+# named wrongly in a binding or read back under the wrong name is accepted at load time and
+# silently shows nothing. What qmllint does *not* catch is written out in the test's own
+# header: an assignment target inside a JavaScript function body is unchecked.
+#
+# Outside the if(WALLPAPERX_BUILD_KDE_PLUGIN) guard for the reason kpackage_metadata is: the
+# sanitizer tree and the hosted runner both configure with that option OFF.
+add_executable(wallpaperx-qml-lint-test tests/qml_lint_test.cpp)
+target_link_libraries(wallpaperx-qml-lint-test PRIVATE nlohmann_json::nlohmann_json)
+# Same reason as the kpackage_metadata target above: this links no daemon library, so nothing
+# else puts backend/ on the include path. The renderer's tests directory is on it for
+# support/forked_child.h, which arms the qmllint child against this test dying without
+# unwinding (X.8); that header is POSIX-only and pulls in no renderer code.
+target_include_directories(wallpaperx-qml-lint-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../renderer/tests)
+
+# Qt is asked where it keeps its tools before any directory is guessed; a hand-written list can
+# only ever describe layouts someone thought of. Not REQUIRED and not a link dependency, so a
+# host with no Qt configures exactly as before. The literal hints stay for the other direction
+# -- a host with qmllint but no Qt CMake package -- and because Arch keeps Qt 6's tools in
+# /usr/lib/qt6/bin, off PATH.
+if(NOT QT6_INSTALL_PREFIX)
+    find_package(Qt6 QUIET COMPONENTS Qml)
+endif()
+set(WALLPAPERX_QMLLINT_HINTS /usr/lib/qt6/bin /usr/lib64/qt6/bin /usr/lib/x86_64-linux-gnu/qt6/bin)
+if(QT6_INSTALL_PREFIX AND QT6_INSTALL_BINS)
+    list(PREPEND WALLPAPERX_QMLLINT_HINTS "${QT6_INSTALL_PREFIX}/${QT6_INSTALL_BINS}")
+endif()
+find_program(WALLPAPERX_QMLLINT_EXECUTABLE
+    NAMES qmllint qmllint-qt6
+    HINTS ${WALLPAPERX_QMLLINT_HINTS}
+    DOC "Qt's QML linter, used by the qml_lint test to grade the Plasma wallpaper QML")
+
+# find_program establishes a name; the test needs a capability. A qmllint predating Qt 6's
+# --json writes usage text to stderr and nothing to stdout, so accepting it unprobed skips the
+# test forever while the warning below -- the one signal that says this coverage is absent --
+# stays silent, suppressed by exactly the case that needs it.
+#
+# The verdict goes in a plain variable and the cache entry is never cleared: it may have been
+# set with -D, and clearing it replaces a developer's chosen linter with a fresh system search
+# on the next configure -- silently, and it is how the test's stand-in linters are supplied.
+set(WALLPAPERX_QMLLINT_FOR_TEST "${WALLPAPERX_QMLLINT_EXECUTABLE}")
+if(WALLPAPERX_QMLLINT_EXECUTABLE)
+    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/qmllint_probe.qml" "import QtQml\nQtObject {}\n")
+    execute_process(
+        COMMAND "${WALLPAPERX_QMLLINT_EXECUTABLE}" --json - "${CMAKE_CURRENT_BINARY_DIR}/qmllint_probe.qml"
+        OUTPUT_VARIABLE WALLPAPERX_QMLLINT_PROBE_OUT
+        # Captured only to keep an old qmllint's usage text out of the configure log.
+        ERROR_VARIABLE WALLPAPERX_QMLLINT_PROBE_ERR
+        RESULT_VARIABLE WALLPAPERX_QMLLINT_PROBE_RESULT
+        TIMEOUT 15)
+    file(REMOVE "${CMAKE_CURRENT_BINARY_DIR}/qmllint_probe.qml")
+    # The exit status is deliberately not consulted for the accept/reject decision: a working
+    # qmllint exits nonzero for a file with findings and still emits the report, so the output
+    # is the only usable answer -- the same reason the test itself grades the JSON body rather
+    # than the status. A substring, not parsed JSON: the weakest property the test's own reader
+    # needs, so this stays strictly more permissive than the test and a tool accepted here but
+    # rejected there still ends in that test's named skip rather than a false pass.
+    string(FIND "${WALLPAPERX_QMLLINT_PROBE_OUT}" "\"files\"" WALLPAPERX_QMLLINT_PROBE_FILES)
+    if(WALLPAPERX_QMLLINT_PROBE_FILES LESS 0)
+        # Only to name the cause: empty output arrives equally from a pre---json qmllint, one
+        # that could not start, and one killed at the TIMEOUT. CMake stores a number for a
+        # process that ran and a message for one that did not.
+        if(WALLPAPERX_QMLLINT_PROBE_RESULT MATCHES "^[0-9]+$")
+            set(WALLPAPERX_QMLLINT_WHY "it did not answer --json with a \"files\" report")
+        else()
+            set(WALLPAPERX_QMLLINT_WHY "it could not be run to completion (${WALLPAPERX_QMLLINT_PROBE_RESULT})")
+        endif()
+        message(STATUS "Rejecting ${WALLPAPERX_QMLLINT_EXECUTABLE}: ${WALLPAPERX_QMLLINT_WHY}")
+        set(WALLPAPERX_QMLLINT_FOR_TEST "")
+    endif()
+endif()
+
+if(NOT WALLPAPERX_QMLLINT_FOR_TEST)
+    message(WARNING
+        "no usable qmllint that understands --json -- the qml_lint test cannot lint the Plasma wallpaper QML "
+        "(the lint half of S10.9/S10.12) and will report itself to ctest as SKIPPED, not passed. If a STATUS line "
+        "above says one was rejected, it names the cause; -UWALLPAPERX_QMLLINT_EXECUTABLE searches again. Otherwise "
+        "install Qt 6's qmllint to get that coverage.")
+endif()
+
+# The files under test are source, not build output, and ctest runs in the build tree. The
+# linter path is resolved here so a host without it produces a named skip, not an exec failure
+# inside a fork.
+target_compile_definitions(wallpaperx-qml-lint-test PRIVATE
+    WALLPAPERX_BACKEND_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+    WALLPAPERX_QMLLINT_EXECUTABLE="${WALLPAPERX_QMLLINT_FOR_TEST}"
 )
 
 # The system-level tier: spawns the real wallpaperx-daemon executable and drives it over
@@ -269,7 +366,7 @@ if(WALLPAPERX_BUILD_KDE_PLUGIN)
     set_target_properties(wallpaperx-daemon-lib wallpaperx-daemon wallpaperx-dbus-service-test
                           wallpaperx-daemon-system-test wallpaperx-http-server-test
                           wallpaperx-log-escape-test wallpaperx-config-store-test
-                          wallpaperx-kpackage-metadata-test
+                          wallpaperx-kpackage-metadata-test wallpaperx-qml-lint-test
         PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
 endif()
 
@@ -297,6 +394,15 @@ set_tests_properties(config_store PROPERTIES LABELS "novulkan"
 # the package being wrong, and must not print as a package defect.
 add_test(NAME kpackage_metadata COMMAND $<TARGET_FILE:wallpaperx-kpackage-metadata-test>)
 set_tests_properties(kpackage_metadata PROPERTIES LABELS "novulkan"
+                     SKIP_RETURN_CODE 77)
+
+# Outside the guard for the same reason as kpackage_metadata, with the same two properties:
+# `novulkan` so the sanitizer block below selects it, and SKIP_RETURN_CODE because a host that
+# cannot look -- the hosted runner installs no Qt -- has not established the lint half of
+# S10.9/S10.12 and must not report that it has. Why it is a separate entry rather than a phase
+# of kpackage_metadata is in that test's own header.
+add_test(NAME qml_lint COMMAND $<TARGET_FILE:wallpaperx-qml-lint-test>)
+set_tests_properties(qml_lint PROPERTIES LABELS "novulkan"
                      SKIP_RETURN_CODE 77)
 
 # The DBus service test needs a session bus. dbus-run-session gives each run a

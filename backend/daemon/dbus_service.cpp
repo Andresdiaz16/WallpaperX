@@ -70,6 +70,11 @@ void DbusService::registerVTable() {
                 .withInputParamNames("monitor_id")
                 .withOutputParamNames("fd", "width", "height", "memory_size", "handle_type", "sync_fds",
                                       "frame_generation", "drm_format", "drm_modifier", "planes"),
+            sdbus::registerMethod("SetMonitorOutput")
+                .implementedAs([this](int32_t monitorId, const std::string& outputName) {
+                    setMonitorOutput(monitorId, outputName);
+                })
+                .withInputParamNames("monitor_id", "output_name"),
             sdbus::registerMethod("GetStatus").implementedAs([this]() { return getStatus(); }).withOutputParamNames("status"),
             // frame_generation rides along with the monitor id. A bare FrameReady(monitor)
             // was unambiguous only while rendering was synchronous; now that several
@@ -124,6 +129,29 @@ void DbusService::setWallpaper(const std::string& type, const std::string& path,
     // need their monitor's target released, and that is GPU work, so it belongs on the
     // worker rather than in this handler.
     m_worker.post(monitorId);
+}
+
+void DbusService::setMonitorOutput(int32_t monitorId, const std::string& outputName) {
+    std::printf("wallpaperx-daemon: SetMonitorOutput(monitor=%d, output=%s)\n", monitorId,
+                sanitizeForLog(outputName).c_str());
+    std::fflush(stdout);
+
+    try {
+        m_manager.setMonitorOutput(monitorId, outputName);
+    } catch (const InvalidRequest& e) {
+        std::fprintf(stderr, "wallpaperx-daemon: SetMonitorOutput rejected (monitor=%d): %s\n",
+                     monitorId, e.what());
+        throw sdbus::Error(sdbus::Error::Name{kErrorInvalidArgs}, e.what());
+    } catch (const std::exception& e) {
+        // As SetWallpaper does: the save behind this can throw on a machine out of threads
+        // or memory, and letting that escape the callback tells the client nothing.
+        std::fprintf(stderr, "wallpaperx-daemon: SetMonitorOutput failed (monitor=%d): %s\n",
+                     monitorId, e.what());
+        throw sdbus::Error(sdbus::Error::Name{kErrorRenderFailed}, e.what());
+    }
+
+    // No m_worker.post(): naming a screen changes nothing about what it draws, so there is
+    // no render to schedule and no target to release.
 }
 
 void DbusService::completeGetFrameFd(FrameFdCall call, int32_t monitorId) {
@@ -262,6 +290,16 @@ std::string DbusService::getStatus() {
         wallpapers[std::to_string(monitorId)] = std::move(entry);
     }
     status["wallpapers"] = wallpapers;
+
+    // Its own object, not a field on each wallpaper: a screen can be named before anything
+    // is chosen for it, leaving no wallpaper entry to carry the name. The cap is the bound
+    // the name was accepted under, so nothing truncates -- truncation is the only way
+    // escaping could map two names onto one key and drop a screen from here.
+    nlohmann::json outputs = nlohmann::json::object();
+    for (const auto& [name, monitorId] : snap.outputs) {
+        outputs[sanitizeForLog(name, kMaxOutputNameBytes, LogFraming::Bare)] = monitorId;
+    }
+    status["outputs"] = std::move(outputs);
 
     return status.dump();
 }

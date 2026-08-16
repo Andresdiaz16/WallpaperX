@@ -35,6 +35,7 @@ constexpr const char* kKeyMonitors = "monitors";
 constexpr const char* kKeyMonitorId = "monitor_id";
 constexpr const char* kKeyType = "type";
 constexpr const char* kKeyPath = "path";
+constexpr const char* kKeyOutput = "output";
 
 // load() returns from a dozen places; this is what keeps the descriptor from leaking out
 // of any of them.
@@ -222,6 +223,12 @@ LoadResult ConfigStore::load() const {
                 ++result.malformedEntries;
                 continue;
             }
+            // Optional, unlike the three above: a config written before connector names
+            // existed has no such key and is not malformed. Present but not a string is.
+            if (element.contains(kKeyOutput) && !readString(element, kKeyOutput, entry.output)) {
+                ++result.malformedEntries;
+                continue;
+            }
             result.entries.push_back(std::move(entry));
         }
     } catch (const std::exception& e) {
@@ -246,13 +253,17 @@ SaveResult ConfigStore::save(const std::vector<PersistedWallpaper>& entries) con
             // single unusual filename would otherwise cost every monitor its wallpaper.
             // Dropping just this entry keeps the rest, and the count tells the caller a
             // monitor will not come back.
-            if (!isValidUtf8(entry.path) || !isValidUtf8(entry.type)) {
+            if (!isValidUtf8(entry.path) || !isValidUtf8(entry.type) || !isValidUtf8(entry.output)) {
                 ++result.skippedNonUtf8;
                 continue;
             }
-            monitors.push_back(nlohmann::json{{kKeyMonitorId, entry.monitorId},
-                                              {kKeyType, entry.type},
-                                              {kKeyPath, entry.path}});
+            nlohmann::json row{{kKeyMonitorId, entry.monitorId},
+                               {kKeyType, entry.type},
+                               {kKeyPath, entry.path}};
+            // Only when there is one: a config for an install that never named a screen
+            // stays byte-identical to what a build without this field writes.
+            if (!entry.output.empty()) row[kKeyOutput] = entry.output;
+            monitors.push_back(std::move(row));
         }
         const nlohmann::json root{{kKeyVersion, kSchemaVersion}, {kKeyMonitors, std::move(monitors)}};
         const std::string text = root.dump(2) + "\n";

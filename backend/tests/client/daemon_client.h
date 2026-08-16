@@ -18,7 +18,9 @@
 // system test has no access to either, and a helper that quietly needed them could not
 // be shared.
 
+#include "daemon/config_store.h"
 #include "daemon/dbus_service.h"
+#include "daemon/log_escape.h"
 #include "support/validation_grade.h"
 
 #include <sdbus-c++/sdbus-c++.h>
@@ -272,6 +274,19 @@ inline bool daemonErrorName(const std::string& name) {
     return name.rfind(std::string(DbusService::kInterface) + ".Error.", 0) == 0;
 }
 
+// Records the connector name a monitor answers to. `timeout` as on setWallpaper() above.
+//
+// Shared rather than written out in each tier for the reason this header exists: the two
+// tiers have to agree on the wire. A copy in one file would keep compiling and keep
+// passing if the argument order ever changed under it.
+inline void setMonitorOutput(sdbus::IProxy& proxy, int32_t monitorId, const std::string& outputName,
+                             std::chrono::microseconds timeout = {}) {
+    proxy.callMethod("SetMonitorOutput")
+        .onInterface(DbusService::kInterface)
+        .withTimeout(timeout)
+        .withArguments(monitorId, outputName);
+}
+
 // `timeout` as on setWallpaper() above: zero means the bus's default.
 inline StatusReply getStatus(sdbus::IProxy& proxy, std::chrono::microseconds timeout = {}) {
     std::string status;
@@ -343,6 +358,51 @@ inline const nlohmann::json* wallpaperStatus(const StatusReply& status, const st
     if (!wallpapers.is_object() || !wallpapers.contains(monitorId)) return nullptr;
     const nlohmann::json& entry = wallpapers[monitorId];
     return entry.is_object() ? &entry : nullptr;
+}
+
+// GetStatus's connector-name map -- sanitized name -> monitor id -- or nullptr when the
+// reply carries none.
+//
+// Guarded the same way wallpaperStatus() is, and for the same reason: the parsed reply is
+// const, so under NDEBUG a const operator[] on a missing key dereferences end() and kills
+// the test instead of printing the FAIL line the caller wanted.
+inline const nlohmann::json* outputBindings(const StatusReply& status) {
+    const nlohmann::json& json = status.json();
+    if (!json.is_object() || !json.contains("outputs")) return nullptr;
+    const nlohmann::json& outputs = json["outputs"];
+    return outputs.is_object() ? &outputs : nullptr;
+}
+
+// The monitor GetStatus says `name` resolves to, or kNoOutputBinding when it resolves to
+// nothing -- an absent "outputs" object, an absent key, or a value that is not an integer.
+//
+// `name` is the connector name as GIVEN to SetMonitorOutput, not the form GetStatus
+// publishes. The two differ: GetStatus keys its map by sanitizeForLog(name), so a caller
+// handing this the raw string it set would be told a perfectly bound name resolves to
+// nothing -- a FAIL against a daemon that did everything right. Escaping once here is what
+// keeps the daemon's input and display domains meeting in a single place. A caller that
+// wants to assert on the published key instead reads outputBindings() directly, which is
+// what the escaping check in dbus_service_test does.
+//
+// A sentinel rather than std::optional so a caller can compare against an expected id in
+// one expression. -1 is safe as "no binding" because WallpaperManager rejects every
+// negative monitor id, so no real binding can ever carry it.
+//
+// CONTROL: the sanitizeForLog() call in DbusService::getStatus (backend/daemon/dbus_service.cpp)
+//       replaced by the bare name, so the daemon publishes raw keys while this still escapes
+//       -> "FAIL: a hostile connector name is published by GetStatus in its escaped form,
+//       bound to its own monitor" in dbus_service_test. Reverted.
+inline constexpr int kNoOutputBinding = -1;
+
+inline int boundMonitor(const StatusReply& status, const std::string& name) {
+    const nlohmann::json* outputs = outputBindings(status);
+    // Not idempotent: sanitizeForLog escapes a backslash as two, so this must be applied to
+    // the raw name exactly once and never to an already-escaped one.
+    const std::string key =
+        wallpaperx::sanitizeForLog(name, wallpaperx::kMaxOutputNameBytes, wallpaperx::LogFraming::Bare);
+    if (outputs == nullptr || !outputs->contains(key)) return kNoOutputBinding;
+    const nlohmann::json& id = (*outputs)[key];
+    return id.is_number_integer() ? id.get<int>() : kNoOutputBinding;
 }
 
 // GOAL: S6.18 -- GetStatus is one consistent snapshot: it can never report

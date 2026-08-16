@@ -34,6 +34,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
@@ -42,6 +43,7 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <future>
 #include <map>
 #include <memory>
@@ -131,6 +133,7 @@ namespace {
 // incomplete cannot hide behind "Skipped".
 using wallpaperx::testing::check;
 using wallpaperx::testing::g_failures;
+using wallpaperx::testing::harnessFailure;
 using wallpaperx::testing::notVerified;
 
 // Sets an environment variable for as long as it is alive and puts back exactly what was
@@ -161,6 +164,20 @@ private:
     std::optional<std::string> m_previous;
 };
 
+// Points the interposed rename() above at one destination and zeroes its count. Two phases
+// read it: the one that counts the saves a stalled write swallowed, and the one that counts
+// the saves a redundant SetMonitorOutput must not make.
+void countRenamesOnto(const std::filesystem::path& target) {
+    std::lock_guard<std::mutex> lock(g_renameMutex);
+    g_renameTarget = target.string();
+    g_renameCount = 0;
+}
+
+unsigned renamesCounted() {
+    std::lock_guard<std::mutex> lock(g_renameMutex);
+    return g_renameCount;
+}
+
 std::string readFile(const std::filesystem::path& file) {
     std::ifstream in(file, std::ios::binary);
     if (!in) return {};
@@ -181,6 +198,52 @@ bool writeFile(const std::filesystem::path& file, std::string_view text) {
 // so a manager-level phase needs one per monitor it drives. The contents are irrelevant:
 // nothing here renders.
 bool writeWallpaperFile(const std::filesystem::path& file) { return writeFile(file, "not really a png"); }
+
+// Where a fixture-driven phase writes, and the wallpaper files it drives.
+struct PhasePaths {
+    std::filesystem::path config;
+    std::vector<std::filesystem::path> wallpapers;
+};
+
+// The preconditions every fixture-driven phase shares, in one place rather than copied per
+// phase: a guard a phase needs must not be the one its author forgot, and a phase missing one
+// grades the daemon on a host state it was never put in.
+//
+// Takes the ScratchDir by reference and does not own it: ScratchDir deletes its copy
+// constructor and declares a destructor, so it has no move constructor and cannot be returned.
+//
+// CONTROL, for the guards being reached: the binary run under a TMPDIR whose name carries a
+// lone 0x80 byte -> all twelve phases routed through here report NOT VERIFIED naming their
+// goals, no FAIL line, exit 77, instead of grading the daemon on a path its config writer must
+// skip. With the UTF-8 arm below disabled and the same TMPDIR, twelve FAIL lines came back.
+// CONTROL, for the migration not having defanged those phases: on a healthy host with
+// backend/daemon/config_store.cpp's per-entry UTF-8 test forced true, so save() drops every
+// entry -> 40 FAIL lines including all seven these phases contribute. Reverted.
+std::optional<PhasePaths> preparePhase(const ScratchDir& scratch, const char* goals, int wallpaperCount) {
+    if (!scratch.ok()) {
+        notVerified(goals, "a scratch directory could not be created");
+        return std::nullopt;
+    }
+    PhasePaths paths;
+    paths.config = scratch.path() / "wallpaperx" / "config.json";
+    for (int i = 0; i < wallpaperCount; ++i) {
+        const std::filesystem::path wallpaper = scratch.path() / ("wallpaper" + std::to_string(i) + ".png");
+        if (!writeWallpaperFile(wallpaper)) {
+            notVerified(goals, "the wallpaper files this phase drives could not be written");
+            return std::nullopt;
+        }
+        paths.wallpapers.push_back(wallpaper);
+    }
+    // nlohmann's dump() throws on a string that is not valid UTF-8, and these phases name a
+    // scratch path this host chose inside a JSON fixture. A skip with the reason, rather than
+    // an exception the phase would report as a failure of the daemon.
+    if (wallpaperCount > 0 && !wallpaperx::isValidUtf8(scratch.path().string())) {
+        notVerified(goals, "this host's temporary directory has a path that is not valid UTF-8, so no JSON fixture "
+                           "can name it");
+        return std::nullopt;
+    }
+    return paths;
+}
 
 // The fixture for the config the daemon is not allowed to open, at namespace scope because
 // the case table's plant and intact functions are captureless. Two monitors and valid JSON:
@@ -250,6 +313,164 @@ std::map<int, std::string> pathsInFile(const std::filesystem::path& file, std::s
         paths[entry["monitor_id"].get<int>()] = entry["path"].get<std::string>();
     }
     return paths;
+}
+
+// One monitor's row as it sits in the file, for the connector-name phases. `hasOutputKey`
+// is separate from `output` because "the key is absent" and "the key is an empty string"
+// are different files: the first is what a build with no connector names writes, and
+// keeping them apart is the only way to check that promise.
+struct RowInFile {
+    std::string type;
+    std::string path;
+    bool hasOutputKey = false;
+    std::string output;
+};
+
+// Read by parsing here rather than through ConfigStore::load(), for the reason
+// pathsInFile() above gives: a reader sharing the writer's field-name constants agrees
+// with it by construction, including when both are wrong.
+//
+// `rawRows`, when given, receives how many rows the file really carries, which the map cannot
+// say: it keys by monitor id, so two rows for one id and one row for that id are the same map.
+// Filled from the SAME parse rather than by a second read, because the daemon's writer can
+// replace the file between two reads -- a count from one version against ids from another
+// reports a correct save as a monitor written on two rows.
+//
+// CONTROL, for the four duplicate-row checks really reading this number: `size() + 1` here ->
+// all four go red at once, printing "5 rows for 4 monitor ids", "6 rows for 5 monitor ids",
+// "6 rows for 5 monitor ids" and "13 rows for 12 monitor ids". Observed 2026-08-15. Reverted.
+std::map<int, RowInFile> rowsInFile(const std::filesystem::path& file, std::string& why,
+                                    std::size_t* rawRows = nullptr) {
+    std::map<int, RowInFile> rows;
+    if (rawRows != nullptr) *rawRows = 0;
+    const std::string text = readFile(file);
+    if (text.empty()) {
+        why = "the config file is empty or absent";
+        return rows;
+    }
+    const nlohmann::json root = nlohmann::json::parse(text, nullptr, false);
+    if (root.is_discarded() || !root.is_object() || !root.contains("monitors") || !root["monitors"].is_array()) {
+        why = "the config file is not an object with a monitors array";
+        return rows;
+    }
+    if (rawRows != nullptr) *rawRows = root["monitors"].size();
+    for (const nlohmann::json& entry : root["monitors"]) {
+        if (!entry.is_object() || !entry.contains("monitor_id") || !entry["monitor_id"].is_number_integer()) continue;
+        RowInFile row;
+        if (entry.contains("type") && entry["type"].is_string()) row.type = entry["type"].get<std::string>();
+        if (entry.contains("path") && entry["path"].is_string()) row.path = entry["path"].get<std::string>();
+        row.hasOutputKey = entry.contains("output");
+        if (row.hasOutputKey && entry["output"].is_string()) row.output = entry["output"].get<std::string>();
+        rows[entry["monitor_id"].get<int>()] = std::move(row);
+    }
+    return rows;
+}
+
+std::string idsOf(const std::map<int, RowInFile>& rows) {
+    std::string out;
+    for (const auto& [id, row] : rows) {
+        (void)row;
+        if (!out.empty()) out += " ";
+        out += std::to_string(id);
+    }
+    return out.empty() ? "(none)" : out;
+}
+
+// Waits for the state a phase is about to grade to reach the config file, up to a bound far
+// longer than WallpaperManager::persist()'s own deadline. Needed because persist() waits for
+// its detached writer only until that deadline and then returns with the write still queued:
+// a read taken at the instant a manager call returned can legitimately see the file as it was,
+// and grading it prints a FAIL against the daemon for a slow host.
+//
+// Sound only where nothing else is writing between the call and the read -- with a second
+// writer outstanding, the state the poll observes need not be the one the graded call made.
+// An expired wait is left to the caller's own check: ten seconds without the row is a verdict
+// on the daemon, not on the host, so no check is weakened by waiting.
+//
+// CONTROL: a three-second sleep added to this file's interposed rename(), so every write lands
+// after persist() has abandoned its wait -- a host slower than the daemon's deadline, with the
+// daemon itself correct. With this wait shortened to zero, that run produced 18 FAIL lines
+// against the daemon, among them "the repair a start performs is on disk before any client
+// call" and "a kept row left holding nothing is not written back". With the wait as it stands,
+// the same host left 3, all at reads of the health text and the fsync counter, which no wait on
+// the file's rows can settle. Observed 2026-08-15. Both reverted.
+bool waitForRows(const std::filesystem::path& file,
+                 const std::function<bool(const std::map<int, RowInFile>&)>& landed) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    for (;;) {
+        std::string ignored;
+        if (landed(rowsInFile(file, ignored))) return true;
+        if (std::chrono::steady_clock::now() >= deadline) return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+}
+
+// The number a persistence-report clause is prefixed with. `clause` is the text WITHOUT the
+// count, e.g. " screen names dropped, unusable".
+//
+// Compared as an integer rather than searched for as "3 screen names ...": std::string::find
+// has no left boundary, so the expected text is also a substring of "13 screen names ..." and
+// a build that over-counted by ten would pass. Returns 0 when the clause is absent, which is
+// what production writes for a count of zero, and an EMPTY optional when the digits cannot be
+// read. Empty rather than a negative number so the two cannot be compared in the same channel:
+// a sentinel graded as a count reports a reworded report as the daemon having lost every row
+// the clause counts.
+//
+// CONTROL: the kept-wallpaper count in WallpaperManager::persistenceDetail()
+// (backend/daemon/wallpaper_manager.cpp) written as `keptWallpapers + 10`, which is the
+// over-count a find() cannot see -> "FAIL: the persistence detail says how many entries could
+// not be applied", "FAIL: only the rows with a wallpaper are reported as entries this build
+// cannot apply" and "FAIL: every kept row carrying a wallpaper is reported as one". Observed
+// 2026-08-14. Reverted.
+std::optional<int> clauseCount(const std::string& detail, const std::string& clause) {
+    const std::size_t at = detail.find(clause);
+    if (at == std::string::npos) return 0;
+    std::size_t start = at;
+    while (start > 0 && std::isdigit(static_cast<unsigned char>(detail[start - 1]))) --start;
+    if (start == at || at - start > 9) return std::nullopt;
+    return std::stoi(detail.substr(start, at - start));
+}
+
+// The same, with an unreadable count reported as a skip of `goals` and the report printed.
+// A caller that gets an empty result must grade nothing it would have compared: the count it
+// wanted is not a number this run knows, and comparing it against a fixture size accuses the
+// daemon of a loss the report never claimed.
+//
+// CONTROL: the leading space dropped from one clause a phase searches for, so the digits no
+// longer sit against it -> "NOT VERIFIED -- S10.4/S10.5's reporting half ... a count could not
+// be read out of the persistence report's 'screen names dropped, unusable' clause", exit 77.
+// With that phase's comparison put back to grading the unreadable result as a number, the same
+// build reported "FAIL: every name no build could accept is reported as dropped and unusable"
+// -- the daemon blamed for the harness's parse. Observed 2026-08-15. Both reverted.
+std::optional<int> clauseCountOrSkip(const std::string& detail, const std::string& clause, const char* goals) {
+    const std::optional<int> count = clauseCount(detail, clause);
+    if (!count.has_value()) {
+        notVerified(goals, "a count could not be read out of the persistence report's '" + clause + "' clause");
+        std::fprintf(stderr, "  persistence detail: %s\n", detail.c_str());
+    }
+    return count;
+}
+
+// The texts WallpaperManager::persistenceDetail() emits for the counters that set `repaired` in
+// restoreSaved() (backend/daemon/wallpaper_manager.cpp). Returns the ones present, quoted, for
+// the failure print; empty means nothing was repaired. One list rather than one per phase: two
+// copies can only agree by an editor remembering both, and a copy that misses a clause
+// production later added leaves its check green over a daemon that repairs on every boot.
+//
+// CONTROL, for both readers really reading this list: "config.json" -- a text every persistence
+// report carries -- added to it -> "FAIL: this phase's fixture is one the restore has nothing to
+// repair in" and "FAIL: a second start with no client acting has nothing left to repair", the
+// two checks in different phases that scan for these clauses, from one edit. Observed
+// 2026-08-15. Reverted.
+std::string repairClausesIn(const std::string& detail) {
+    static constexpr const char* kRepairClauses[] = {"displaced by a later entry", "dropped, unusable",
+                                                     "kept entries dropped", "entries dropped, no build can apply",
+                                                     "screen names dropped, no build can apply"};
+    std::string found;
+    for (const char* clause : kRepairClauses) {
+        if (detail.find(clause) != std::string::npos) found += std::string(" '") + clause + "'";
+    }
+    return found;
 }
 
 // ---------------------------------------------------------------------------- //
@@ -667,6 +888,59 @@ void runNonUtf8Checks() {
     const SaveResult badType = store.save({{0, std::string("sta\xFFtic"), "/tmp/first.png"}});
     check(badType.error.empty() && badType.skippedNonUtf8 == 1,
           "a type that is not valid UTF-8 is skipped the same way rather than failing the write");
+
+    // GOAL: the daemon's notice that entries were skipped names every field that can cause a
+    //       skip. False if it says the path is at fault: the same counter is incremented for a
+    //       bad type and for a bad screen name -- asserted directly above, and in the
+    //       connector-name phase for the name -- and a name-only row has no path at all, so a
+    //       path-only wording sends the user hunting for a filename that does not exist.
+    // WHY-THIS-SHAPE: driven through a real manager save rather than read off SaveResult,
+    //       because the misleading text lives in the health detail
+    //       (WallpaperManager::applyPersistOutcomeLocked), not in the store. It is graded as
+    //       wording, deliberately: the only cause a client can actually reach is the path,
+    //       since every route a screen name can take into the file is validated first
+    //       (setMonitorOutput, GET /config?output=, restoreSaved) and requestWallpaper admits
+    //       only three literal types. So this cannot be driven by the name; what it asserts is
+    //       that the one reachable cause is not reported as the only possible one.
+    // CONTROL: the detail text in WallpaperManager::applyPersistOutcomeLocked
+    //       (backend/daemon/wallpaper_manager.cpp) put back to " entries skipped: path is not
+    //       valid UTF-8)" -> "FAIL: the skipped-entry notice names the type and the screen
+    //       name as possible causes, not the path alone", printing the detail. Observed
+    //       2026-08-14. Reverted.
+    // CONTROL, for searching only from the skip notice: the same text with just the type
+    //       dropped, " entries skipped: a path or screen name is not valid UTF-8)", run with
+    //       TMPDIR=/tmp/prototype-build -> the same FAIL. Searching the whole detail instead --
+    //       the simpler form this rejects -- reported zero failures on that run: "prototype" in
+    //       the config path satisfied the search for "type" on its own. Observed 2026-08-14.
+    //       Both reverted.
+    const std::filesystem::path oddlyNamed = scratch.path() / std::string("bad\x80name.png");
+    if (!writeWallpaperFile(oddlyNamed) || wallpaperx::isValidUtf8(oddlyNamed.string())) {
+        notVerified("the wording of the daemon's skipped-entry notice",
+                    "this host would not create a file whose name is not valid UTF-8, so no monitor can hold a path "
+                    "the config writer has to skip");
+        return;
+    }
+    WallpaperManager::Config managerConfig;
+    managerConfig.configFile = scratch.path() / "manager" / "config.json";
+    WallpaperManager manager(managerConfig);
+    manager.requestWallpaper("static", oddlyNamed.string(), 0);
+    const std::string detail = manager.snapshot().health.persistence.detail;
+    const std::optional<int> skipped =
+        clauseCountOrSkip(detail, " entries skipped", "the wording of the daemon's skipped-entry notice");
+    if (!skipped.has_value()) return;
+    const bool skipReported = *skipped == 1;
+    check(skipReported, "the daemon reports how many entries its config writer had to skip");
+    // Searched from the skip notice rather than across the whole detail. The detail begins
+    // with the config path, which is derived from this host's temporary directory, so a
+    // machine whose $TMPDIR contains "type" satisfies the first term with the path alone --
+    // and a notice that had regressed to naming the path only would still read green.
+    const std::size_t causesAt = detail.find("entries skipped");
+    const std::string causes = causesAt == std::string::npos ? std::string() : detail.substr(causesAt);
+    const bool everyCauseNamed =
+        causes.find("type") != std::string::npos && causes.find("screen name") != std::string::npos;
+    check(everyCauseNamed,
+          "the skipped-entry notice names the type and the screen name as possible causes, not the path alone");
+    if (!skipReported || !everyCauseNamed) std::fprintf(stderr, "  persistence detail: %s\n", detail.c_str());
 }
 
 // ---------------------------------------------------------------------------- //
@@ -727,12 +1001,13 @@ void runMalformedEntryChecks() {
 }
 
 // ---------------------------------------------------------------------------- //
-// Phase 6 -- S8.5 and S8.4: restore reads, and never writes.
+// Phase 6 -- S8.5 and S8.4: a restore with nothing to repair reads and does not write.
 // ---------------------------------------------------------------------------- //
 void runRestoreChecks() {
     const ScratchDir scratch("restore");
     if (!scratch.ok()) {
-        notVerified("S8.5 (restore does not write) and S8.4 (an unreadable entry is not forgotten)",
+        notVerified("S8.5 (a restore with nothing to repair does not write) and S8.4 (an unreadable entry is not "
+                    "forgotten)",
                     "a scratch directory could not be created");
         return;
     }
@@ -770,30 +1045,54 @@ void runRestoreChecks() {
     config.configFile = file;
     WallpaperManager manager(config);
 
-    // GOAL: S8.5 -- a start that only restores does not write the config file. False if
-    //       its contents or its mtime move. Not hypothetical: restore records the same
-    //       per-monitor state requestWallpaper() records, and requestWallpaper() is where
-    //       the save hook is attached, so one line in the wrong place saves on startup --
-    //       and S8.4 (the unreadable entry surviving) depends on this not happening.
+    // GOAL: S8.5 -- a start that restores entries needing no repair does not write the config
+    //       file. False if its contents or its mtime move. Not hypothetical: restore records
+    //       the same per-monitor state requestWallpaper() records, and requestWallpaper() is
+    //       where the save hook is attached, so one line in the wrong place saves on startup --
+    //       and S8.4 (the unreadable entry surviving) depends on this not happening. The other
+    //       half of the rule is the opposite property and is graded in the startup-repair
+    //       phase: a restore that DOES repair something writes the repair down at that start.
     // WHY-THIS-SHAPE: bytes AND mtime, against a file written in a formatting save() does
     //       not produce. Comparing only the mtime would miss a rewrite inside the
     //       filesystem's timestamp granularity; comparing only the parsed entries would
     //       miss a rewrite that preserved them, which is precisely what an accidental save
     //       on restore would do -- it would look identical in every way except that the
     //       file had been replaced.
-    // CONTROL: `m_store.save(persistableLocked());` added at the end of
-    //       WallpaperManager::restoreSaved() -> "FAIL: restoring does not rewrite the config
-    //       file", and nothing else red. The mtime half stayed green under it, because this
-    //       host's scratch filesystem stamps both writes with the same coarse time -- which
-    //       is the reason both comparisons are here rather than either alone. The mtime half
-    //       is what carries the equivalent check in daemon_system_test, where the file was
-    //       written by the daemon's own save() and a second save reproduces it byte for
-    //       byte. Reverted.
+    // CONTROL: the `if (repaired)` guard on `m_repair = persistableLocked();` at the end of
+    //       WallpaperManager::restoreSaved() (backend/daemon/wallpaper_manager.cpp) deleted, so
+    //       every start hands writeRepairedConfig() a snapshot -> "FAIL: restoring entries that
+    //       need no repair does not rewrite the config file", and that alone in the whole
+    //       binary. The mtime half stayed green under
+    //       it, because this host's scratch filesystem stamps both writes with the same coarse
+    //       time -- which is the reason both comparisons are here rather than either alone. The
+    //       mtime half is what carries the equivalent check in daemon_system_test, where the
+    //       file was written by the daemon's own save() and a second save reproduces it byte
+    //       for byte. Observed 2026-08-15. Reverted.
+    // COVERAGE-ASSERT: the byte comparison is only evidence of this rule while the fixture
+    //       really needs no repair, and a repair-free fixture is not self-evident from two
+    //       rows of JSON. The repair clauses are asserted absent below, so a later fixture edge
+    //       -- a negative id, a duplicate name, a name this build refuses -- fails naming the
+    //       fixture rather than accusing the daemon of overwriting the user's config. Observed
+    //       by adding a row with monitor id -3 to the fixture: "FAIL: this phase's fixture is
+    //       one the restore has nothing to repair in", printing "repaired: 'entries dropped, no
+    //       build can apply'". Reverted.
     check(readFile(file) == original, "constructing a manager reads the config file without rewriting it");
 
     const std::vector<int> restored = manager.restoreSaved();
     check(restored == std::vector<int>({0, 1}), "restoreSaved returns the monitors to post, in file order");
-    check(readFile(file) == original, "restoring does not rewrite the config file");
+    // The rest of the startup sequence backend/daemon/main.cpp performs, in its order.
+    // restoreSaved() alone cannot write at all since the repair moved to writeRepairedConfig(),
+    // so grading the file after it by itself would assert a rule nothing could break.
+    manager.preserveUnreadableConfig();
+    manager.writeRepairedConfig();
+
+    const std::string restoreDetail = manager.snapshot().health.persistence.detail;
+    const std::string repairsFound = repairClausesIn(restoreDetail);
+    const bool fixtureNeedsNoRepair = repairsFound.empty();
+    check(fixtureNeedsNoRepair, "this phase's fixture is one the restore has nothing to repair in");
+    if (!fixtureNeedsNoRepair) std::fprintf(stderr, "  repaired:%s; detail: %s\n", repairsFound.c_str(),
+                                            restoreDetail.c_str());
+    check(readFile(file) == original, "restoring entries that need no repair does not rewrite the config file");
 
     // An error code per sample, and a failed read is a skip rather than a verdict. Sharing
     // one code let the second call's success erase the first call's failure, so a stat this
@@ -805,7 +1104,8 @@ void runRestoreChecks() {
     if (beforeEc || afterEc) {
         notVerified("S8.5's mtime clause", "the config file's modification time could not be read on this host");
     } else {
-        check(mtimeAfter == mtimeBefore, "restoring does not touch the config file's mtime");
+        check(mtimeAfter == mtimeBefore,
+              "restoring entries that need no repair does not touch the config file's mtime");
     }
 
     // GOAL: S8.4 -- the monitor whose file is unreadable keeps its entry, across the
@@ -824,6 +1124,7 @@ void runRestoreChecks() {
     //       order" and "the restored monitor is in the manager's state with its path
     //       unchanged". Reverted.
     manager.requestWallpaper("static", other.string(), 2);
+    waitForRows(file, [](const std::map<int, RowInFile>& rows) { return rows.count(2) == 1; });
     std::string why;
     const std::map<int, std::string> onDisk = pathsInFile(file, why);
     const bool kept = onDisk.count(0) == 1 && onDisk.at(0) == missing && onDisk.count(1) == 1 &&
@@ -848,20 +1149,22 @@ void runRestoreChecks() {
 void runUnreadableConfigChecks() {
     constexpr const char* kGoal = "S8.13 (a config that could not be read is preserved byte-identical)";
     const ScratchDir scratch("keptbad");
-    if (!scratch.ok()) {
-        notVerified(kGoal, "a scratch directory could not be created");
-        return;
-    }
-    const std::filesystem::path file = scratch.path() / "wallpaperx" / "config.json";
+    // Through preparePhase because the last check here reads back a path the daemon persisted:
+    // on a host whose temporary directory is not valid UTF-8 the config writer is required to
+    // skip that entry (S8.7), so the row would be legitimately absent and the check would
+    // report the daemon as having lost a wallpaper.
+    const std::optional<PhasePaths> paths = preparePhase(scratch, kGoal, 1);
+    if (!paths.has_value()) return;
+    const std::filesystem::path file = paths->config;
     const std::filesystem::path kept = std::filesystem::path(file.string() + ".bad");
-    const std::filesystem::path wallpaper = scratch.path() / "wallpaper.png";
+    const std::filesystem::path wallpaper = paths->wallpapers.front();
     // A hand edit that broke the syntax: one trailing comma in an otherwise complete file
     // holding two wallpapers the user picked. What makes this the case worth pinning is that
     // the bytes are still valuable -- the paths are readable in it -- so losing them is data
     // loss and not merely a reset.
     const std::string handEdited =
         "{\"version\":1,\"monitors\":[{\"monitor_id\":0,\"type\":\"static\",\"path\":\"/a.png\"},]}";
-    if (!writeFile(file, handEdited) || !writeWallpaperFile(wallpaper)) {
+    if (!writeFile(file, handEdited)) {
         notVerified(kGoal, "the damaged config file this phase reads could not be written");
         return;
     }
@@ -869,11 +1172,13 @@ void runUnreadableConfigChecks() {
     WallpaperManager::Config config;
     config.configFile = file;
     WallpaperManager manager(config);
-    // main.cpp's order: construct, restore, and only then preserve -- the constructor is
-    // read-only, and preserveUnreadableConfig() is the one call that writes to the config
-    // directory, made after the bus name is held. Nothing in this file can establish that
-    // ordering, because there is no bus here; daemon_system_test's preservation-ownership
-    // phase is where it is graded.
+    // main.cpp's order: construct, restore, and only then preserve. The constructor is
+    // read-only and restoreSaved() only computes a repair, so preserveUnreadableConfig() is the
+    // one call here that can touch the config directory -- and this fixture's config could not
+    // be read at all, which is what makes writeRepairedConfig() (not called, main.cpp's next
+    // step) unable to write over it. Nothing in this file can establish that this ordering is
+    // what the daemon performs, because there is no bus here; daemon_system_test's
+    // preservation-ownership phase grades it for an unreadable config.
     manager.restoreSaved();
     manager.preserveUnreadableConfig();
 
@@ -904,6 +1209,7 @@ void runUnreadableConfigChecks() {
     }
 
     manager.requestWallpaper("static", wallpaper.string(), 1);
+    waitForRows(file, [](const std::map<int, RowInFile>& rows) { return rows.count(1) == 1; });
 
     const bool keptExists = std::filesystem::exists(kept);
     check(keptExists, "a config that could not be read is kept as config.json.bad");
@@ -1126,18 +1432,19 @@ void runPreservedCopyChecks() {
     //       overwrite the copy the first one preserved", printing the throwaway's bytes
     //       where the user's config had been, beside the name-of-its-own check.
     const ScratchDir scratch("twicebad");
-    if (!scratch.ok()) {
-        notVerified(kGoal, "a scratch directory for the second-bad-start case could not be created");
-        return;
-    }
-    const std::filesystem::path file = scratch.path() / "wallpaperx" / "config.json";
+    // preparePhase, not a bare scratch.ok(): the last check here reads back a path the daemon
+    // persisted, and a temporary directory whose name is not valid UTF-8 makes the writer skip
+    // that entry by design (S8.7).
+    const std::optional<PhasePaths> paths = preparePhase(scratch, kGoal, 1);
+    if (!paths.has_value()) return;
+    const std::filesystem::path file = paths->config;
     const std::filesystem::path kept = std::filesystem::path(file.string() + ".bad");
     const std::filesystem::path keptSecond = std::filesystem::path(file.string() + ".bad.1");
-    const std::filesystem::path wallpaper = scratch.path() / "wallpaper.png";
+    const std::filesystem::path wallpaper = paths->wallpapers.front();
     const std::string usersOwn =
         "{\"version\":1,\"monitors\":[{\"monitor_id\":0,\"type\":\"static\",\"path\":\"/photos/kept.png\"},]}";
     const std::string throwaway = "{\"version\":1,\"monitors\":[{,";
-    if (!writeFile(kept, usersOwn) || !writeFile(file, throwaway) || !writeWallpaperFile(wallpaper)) {
+    if (!writeFile(kept, usersOwn) || !writeFile(file, throwaway)) {
         notVerified(kGoal, "the two config files the second-bad-start case needs could not be written");
         return;
     }
@@ -1169,6 +1476,7 @@ void runPreservedCopyChecks() {
     // a build that moved the file aside and then still refused to save would leave the user
     // with no config at all and no way to make one.
     manager.requestWallpaper("static", wallpaper.string(), 1);
+    waitForRows(file, [](const std::map<int, RowInFile>& rows) { return rows.count(1) == 1; });
     std::string why;
     const std::map<int, std::string> onDisk = pathsInFile(file, why);
     const bool wroteNew = onDisk.size() == 1 && onDisk.count(1) == 1 && onDisk.at(1) == wallpaper.string();
@@ -1257,24 +1565,28 @@ void runPreservationExhaustedChecks() {
 void runMalformedEntryCopyChecks() {
     constexpr const char* kGoal = "S8.23 (the copy made when entries are malformed is a copy, and is not made twice)";
     const ScratchDir scratch("malformedcopy");
-    if (!scratch.ok()) {
-        notVerified(kGoal, "a scratch directory could not be created");
-        return;
-    }
-    const std::filesystem::path file = scratch.path() / "wallpaperx" / "config.json";
+    // preparePhase, not a bare scratch.ok(): one check here reads back a path the daemon
+    // persisted, and a temporary directory whose name is not valid UTF-8 makes the writer skip
+    // that entry by design (S8.7).
+    const std::optional<PhasePaths> paths = preparePhase(scratch, kGoal, 1);
+    if (!paths.has_value()) return;
+    const std::filesystem::path file = paths->config;
     const std::filesystem::path kept = std::filesystem::path(file.string() + ".bad");
-    const std::filesystem::path wallpaper = scratch.path() / "wallpaper.png";
-    // Parses, so nothing here is an unreadable config: one entry the daemon restores and
-    // one it cannot make sense of. A rejected entry never becomes an entry at all, so the
-    // keep-for-a-newer-build path cannot carry it and the first save drops it -- which is
-    // what makes the copy the user's only record of it.
+    const std::filesystem::path wallpaper = paths->wallpapers.front();
+    // Parses, so nothing here is an unreadable config: one entry the daemon restores, one it
+    // cannot make sense of, and one it repairs. A rejected entry never becomes an entry at
+    // all, so the keep-for-a-newer-build path cannot carry it and the first save drops it --
+    // which is what makes the copy the user's only record of it. The negative id is the
+    // repairable row: it makes this start a repairing start, so the copy is taken while a
+    // rewrite of the same file is owed.
     const std::string firstBroken =
         "{\"version\":1,\"monitors\":[{\"monitor_id\":0,\"type\":\"static\",\"path\":\"/photos/left.png\"},"
-        "{\"monitor_id\":\"two\",\"type\":\"static\",\"path\":\"/photos/right.png\"}]}";
+        "{\"monitor_id\":\"two\",\"type\":\"static\",\"path\":\"/photos/right.png\"},"
+        "{\"monitor_id\":-4,\"type\":\"static\",\"path\":\"/photos/gone.png\"}]}";
     const std::string secondBroken =
         "{\"version\":1,\"monitors\":[{\"monitor_id\":0,\"type\":\"static\",\"path\":\"/photos/later.png\"},"
         "{\"monitor_id\":1.5,\"type\":\"static\",\"path\":\"/photos/other.png\"}]}";
-    if (!writeWallpaperFile(wallpaper) || !writeFile(file, firstBroken)) {
+    if (!writeFile(file, firstBroken)) {
         notVerified(kGoal, "the config file this phase reads could not be written");
         return;
     }
@@ -1301,6 +1613,31 @@ void runMalformedEntryCopyChecks() {
     //       numbered search still sends the second file to a name of its own whether it is
     //       moved or copied, so what the second start grades is the naming, not the mode.
     //       Reverted.
+    //
+    // GOAL: S8.23 with S10.14 -- the copy holds what the USER's file held, on a start that
+    //       also owes the file a repair. False if the repair is written first: the aside copy
+    //       is then a copy of the daemon's own rewrite, and the row this build could not parse
+    //       -- the one a newer build wrote, which nothing else on disk holds -- is in neither
+    //       file, while the daemon still reports that the config was copied aside.
+    // WHY-THIS-SHAPE: the fixture carries a repairable row (monitor id -4) BESIDE the
+    //       unparseable one, and the phase deliberately stops after preserveUnreadableConfig()
+    //       instead of going on to writeRepairedConfig(). Both matter. Without the repairable
+    //       row the start writes nothing at all and the byte comparisons cannot see the
+    //       ordering. And calling writeRepairedConfig() here would rewrite config.json
+    //       legitimately, which destroys this phase's OTHER control: a build that MOVED the
+    //       file aside instead of copying it would have config.json recreated by that write,
+    //       so "still there after the copy is made" would go green on a rename. The instant
+    //       between the two calls is a real point in backend/daemon/main.cpp's startup, and it
+    //       is the only one at which both properties are visible.
+    // CONTROL: the repair written from inside restoreSaved() instead of being handed to
+    //       writeRepairedConfig() -- `if (repaired) persist(persistableLocked());` at the end of
+    //       WallpaperManager::restoreSaved() (backend/daemon/wallpaper_manager.cpp), in place of
+    //       `m_repair = persistableLocked();` -> "FAIL: a config with malformed entries is
+    //       still there after the copy is made", "FAIL: the copy holds the bytes of the file
+    //       the entries were rejected from", and "FAIL: a second start with a different
+    //       malformed config does not overwrite the first start's copy", the last printing a
+    //       copy holding the daemon's pretty-printed rewrite with monitor 0 alone in it -- the
+    //       "monitor_id":"two" row gone from both files. Observed 2026-08-15. Reverted.
     {
         WallpaperManager::Config config;
         config.configFile = file;
@@ -1320,6 +1657,7 @@ void runMalformedEntryCopyChecks() {
         // The copy is not a substitute for the daemon working: a rejected entry must not
         // stop the file being written from here on.
         manager.requestWallpaper("static", wallpaper.string(), 1);
+        waitForRows(file, [](const std::map<int, RowInFile>& rows) { return rows.count(1) == 1; });
         std::string why;
         const std::map<int, std::string> onDisk = pathsInFile(file, why);
         const bool wrote = onDisk.count(1) == 1 && onDisk.at(1) == wallpaper.string();
@@ -1404,16 +1742,21 @@ void runUnappliedEntryChecks() {
     //       anywhere says an entry did not come back.
     // WHY-THIS-SHAPE: three kinds of unusable entry at once -- an id past the daemon's
     //       32-monitor range, a type this build has never heard of, an empty path -- and the
-    //       on-disk ids are compared as an exact set after a save made for a DIFFERENT
-    //       monitor. Only that write can drop them, so a check made straight after the
-    //       restore would pass for a build that forgets them at the first SetWallpaper. The
-    //       count in the health detail is derived from the fixture, not spelled out, so a
-    //       build that reports a fixed number cannot pass.
-    // CONTROL: `m_unapplied.push_back(entry);` deleted from restoreSaved()'s skip branch
-    //       (its state before today) -> "FAIL: the entries this build cannot apply are all
-    //       still in the file after another monitor is set" with "  ids on disk: 1 3", and
-    //       "FAIL: the persistence detail says how many entries could not be applied".
-    //       Reverted.
+    //       on-disk ids are compared as an exact set TWICE: once straight after the restore
+    //       and once after a save made for a DIFFERENT monitor. Two reads, not one, because
+    //       two different writes can drop these rows and a single read cannot say which did.
+    //       This fixture's negative ids are a repair, so restoreSaved() persists at startup;
+    //       the SetWallpaper save is a second, independent chance to forget them, and it is
+    //       the one a user actually reaches. The count in the health detail is derived from
+    //       the fixture, not spelled out, so a build that reports a fixed number cannot pass.
+    // CONTROL: `m_unapplied.push_back(std::move(keep));` deleted from restoreSaved()'s kept
+    //       branch (backend/daemon/wallpaper_manager.cpp) -> "FAIL: the entries this build
+    //       cannot apply survive the write the restore itself makes" with "  ids on disk: 3",
+    //       "FAIL: the entries this build cannot apply are all still in the file, and the ones
+    //       no build can apply are gone, after another monitor is set" with "  ids on disk: 1
+    //       3", and "FAIL: the persistence detail says how many entries could not be applied".
+    //       Twenty more went red with them across the kept-row phases, keeping the row being
+    //       what they all rest on. Observed 2026-08-14. Reverted.
     const std::vector<int> unusableIds{40, 5, 6};
     // Negative ids, the one kind of entry that is dropped rather than kept. A monitor id is
     // an index into this build's array, so no larger kMaxMonitors could ever admit one --
@@ -1438,10 +1781,37 @@ void runUnappliedEntryChecks() {
     WallpaperManager manager(managerConfig);
     const std::vector<int> restored = manager.restoreSaved();
     check(restored == std::vector<int>{3}, "only the entry this build can apply is posted for rendering");
+    // The two calls backend/daemon/main.cpp makes once it owns the bus name, in that order.
+    // restoreSaved() computes the repair but writes nothing, so a phase that graded the file
+    // after it alone would be grading a startup the daemon does not perform.
+    manager.preserveUnreadableConfig();
+    manager.writeRepairedConfig();
+
+    // The first of the two reads: the negative ids make this a repair, so the start has
+    // already written the file. What it wrote must hold the rows no build here can apply and
+    // not the ones no build anywhere can. Waited for on the row the fixture cannot supply --
+    // the write drops -1 -- because persist() may return with the write still queued.
+    waitForRows(file, [](const std::map<int, RowInFile>& rows) {
+        return rows.count(-1) == 0 && rows.count(3) == 1;
+    });
+    std::string repairWhy;
+    const std::map<int, std::string> afterRestore = pathsInFile(file, repairWhy);
+    std::vector<int> idsAfterRestore;
+    for (const auto& entry : afterRestore) idsAfterRestore.push_back(entry.first);
+    const std::vector<int> expectedAfterRestore{3, 5, 6, 40};
+    const bool survivedRepair = idsAfterRestore == expectedAfterRestore;
+    check(survivedRepair, "the entries this build cannot apply survive the write the restore itself makes");
+    if (!survivedRepair) {
+        std::fprintf(stderr, "  %s; ids on disk:", repairWhy.empty() ? "read back" : repairWhy.c_str());
+        for (const int id : idsAfterRestore) std::fprintf(stderr, " %d", id);
+        std::fprintf(stderr, "\n");
+    }
 
     const WallpaperManager::Snapshot snap = manager.snapshot();
-    const std::string expectedCount = std::to_string(unusableIds.size()) + " entries this build cannot apply";
-    const bool reported = snap.health.persistence.detail.find(expectedCount) != std::string::npos;
+    const std::optional<int> unusableCount =
+        clauseCountOrSkip(snap.health.persistence.detail, " entries this build cannot apply", kGoal);
+    if (!unusableCount.has_value()) return;
+    const bool reported = *unusableCount == static_cast<int>(unusableIds.size());
     check(reported, "the persistence detail says how many entries could not be applied");
     if (!reported) std::fprintf(stderr, "  persistence detail: %s\n", snap.health.persistence.detail.c_str());
     check(snap.health.persistence.status == wallpaperx::HealthStatus::Ok,
@@ -1464,16 +1834,19 @@ void runUnappliedEntryChecks() {
     //       the detail with only the kept-entry clause in it. The id-set check below stayed
     //       green under it, which is what separates "not counted" from "not dropped".
     //       Reverted.
-    const std::string expectedDropped =
-        std::to_string(droppedIds.size()) + " entries dropped, no build can apply them";
-    const bool droppedReported = snap.health.persistence.detail.find(expectedDropped) != std::string::npos;
+    const std::string droppedClause = " entries dropped, no build can apply them";
+    const std::optional<int> droppedCount =
+        clauseCountOrSkip(snap.health.persistence.detail, droppedClause, kGoal);
+    if (!droppedCount.has_value()) return;
+    const bool droppedReported = *droppedCount == static_cast<int>(droppedIds.size());
     check(droppedReported, "the persistence detail says how many entries no build can apply");
     if (!droppedReported) {
-        std::fprintf(stderr, "  persistence detail: %s\n  expected '%s'\n", snap.health.persistence.detail.c_str(),
-                     expectedDropped.c_str());
+        std::fprintf(stderr, "  persistence detail: %s\n  expected %zu of '%s'\n",
+                     snap.health.persistence.detail.c_str(), droppedIds.size(), droppedClause.c_str());
     }
 
     manager.requestWallpaper("static", other.string(), 1);
+    waitForRows(file, [](const std::map<int, RowInFile>& rows) { return rows.count(1) == 1; });
     std::string why;
     const std::map<int, std::string> onDisk = pathsInFile(file, why);
     std::vector<int> ids;
@@ -1490,6 +1863,2084 @@ void runUnappliedEntryChecks() {
         for (const int id : ids) std::fprintf(stderr, " %d", id);
         std::fprintf(stderr, "\n");
     }
+}
+
+// ---------------------------------------------------------------------------- //
+// Phase 6e -- Step 10: the connector name as a field of the stored row.
+// ---------------------------------------------------------------------------- //
+void runOutputFieldChecks() {
+    constexpr const char* kGoals = "S10.5's storage half (a connector name is a persisted field of a monitor's row)";
+    const ScratchDir scratch("outputfield");
+    if (!scratch.ok()) {
+        notVerified(kGoals, "a scratch directory could not be created");
+        return;
+    }
+    const std::filesystem::path file = scratch.path() / "wallpaperx" / "config.json";
+    const ConfigStore store(file);
+
+    // GOAL: a connector name written into the store comes back byte for byte, including on
+    //       a row that carries no wallpaper at all. False if the name is lost, altered, or
+    //       reachable only when a wallpaper rides with it -- a screen the app has named but
+    //       for which nothing has been chosen is the ordinary first-run state, and it must
+    //       survive a restart or every plugin instance is anonymous again.
+    // WHY-THIS-SHAPE: one case is a name sanitizeForLog would ALTER, and that property is
+    //       asserted as part of the check. A round trip over "DP-1" alone passes just as
+    //       well against a store that persists the display-safe rendering of the name --
+    //       which is the defect that already had to be closed for `path` (PLAN.md Step 8
+    //       trap 4), and the store has no reason to have learned it twice.
+    // CONTROL: `row[kKeyOutput] = entry.output;` in ConfigStore::save()
+    //       (backend/daemon/config_store.cpp) replaced with
+    //       `sanitizeForLog(entry.output, kMaxOutputNameBytes, LogFraming::Bare)` -> "FAIL: a
+    //       connector name holding U+202E and DEL survives the round trip byte for byte",
+    //       printing the four raw bytes (e2 80 ae 7f) against the sixteen ASCII characters
+    //       that escaping turns them into. Reverted.
+    // COVERAGE-ASSERT: the altering case is asserted to be one sanitizeForLog alters, so an
+    //       edit that tamed it fails instead of leaving the phase unable to discriminate.
+    const std::string hostileName = std::string("DP-\xE2\x80\xAE\x7F-1");
+    check(sanitizeForLog(hostileName, wallpaperx::kMaxOutputNameBytes, LogFraming::Bare) != hostileName,
+          "the round-trip connector name is one sanitizeForLog alters, so a sanitizing store would fail here");
+    const std::vector<PersistedWallpaper> entries{
+        {0, "static", "/tmp/zero.png", "DP-1"},
+        {1, "static", "/tmp/one.png", hostileName},
+        // A screen that has been named and has nothing set on it.
+        {2, "", "", "HDMI-A-2"},
+        // A wallpaper with no name, which is every row a build without this field writes.
+        {3, "static", "/tmp/three.png", ""},
+    };
+    const SaveResult saved = store.save(entries);
+    check(saved.error.empty() && saved.skippedNonUtf8 == 0, "a row carrying a connector name is saved");
+    if (!saved.error.empty()) std::fprintf(stderr, "  save error: %s\n", saved.error.c_str());
+
+    const LoadResult loaded = store.load();
+    std::map<int, PersistedWallpaper> byId;
+    for (const PersistedWallpaper& entry : loaded.entries) byId[entry.monitorId] = entry;
+    check(loaded.entries.size() == entries.size() && loaded.malformedEntries == 0,
+          "every saved row comes back, and none of them reads as malformed");
+    check(byId.count(0) == 1 && byId[0].output == "DP-1", "an ordinary connector name survives the round trip");
+    const bool hostileKept = byId.count(1) == 1 && byId[1].output == hostileName;
+    check(hostileKept, "a connector name holding U+202E and DEL survives the round trip byte for byte");
+    if (!hostileKept) {
+        std::fprintf(stderr, "  in:  %s\n  out: %s\n", hex(hostileName).c_str(),
+                     byId.count(1) == 1 ? hex(byId[1].output).c_str() : "(no entry for this monitor)");
+    }
+    const bool nameOnlyKept =
+        byId.count(2) == 1 && byId[2].output == "HDMI-A-2" && byId[2].type.empty() && byId[2].path.empty();
+    check(nameOnlyKept, "a row carrying a connector name and no wallpaper survives with the name intact");
+
+    // GOAL: the `output` key is written only when there is one, so a config for an install
+    //       that has never named a screen is byte-identical to what a build without this
+    //       field writes. False if every row grows an `"output": ""` -- that is a config an
+    //       older build would then read, and a change to a file format is not free just
+    //       because this build tolerates it.
+    // WHY-THIS-SHAPE: the KEY's presence is asserted, not the value. `output == ""` is true
+    //       of a row with no key and of a row with an empty one alike, so the value-shaped
+    //       version of this check cannot fail for the thing it exists to forbid.
+    // CONTROL: the `if (!entry.output.empty())` guard removed from ConfigStore::save() in
+    //       backend/daemon/config_store.cpp, so the key is always written -> "FAIL: a row
+    //       with no connector name carries no output key at all", and, in the restore phase
+    //       below, "a rebinding is written to the file, not just held in memory" -- the
+    //       released monitor now carries an empty output key instead of none. Reverted.
+    std::string why;
+    const std::map<int, RowInFile> onDisk = rowsInFile(file, why);
+    check(onDisk.count(3) == 1 && !onDisk.at(3).hasOutputKey,
+          "a row with no connector name carries no output key at all");
+    check(onDisk.count(0) == 1 && onDisk.at(0).hasOutputKey && onDisk.at(0).output == "DP-1",
+          "a row with a connector name carries it under the output key");
+    if (onDisk.count(3) == 0) std::fprintf(stderr, "  %s; ids on disk: %s\n", why.c_str(), idsOf(onDisk).c_str());
+
+    // GOAL: a config written by a build that had never heard of connector names loads
+    //       cleanly. False if the absent key counts as a malformed entry, which would put a
+    //       "N malformed entries ignored" notice in front of every user who upgrades.
+    // WHY-THIS-SHAPE: the malformed COUNT is asserted, not just that the entries came back.
+    //       A loader that counted the missing key and kept the entry anyway would satisfy an
+    //       entries-only check while telling the user their config is damaged.
+    // CONTROL: the `element.contains(kKeyOutput) &&` guard removed from ConfigStore::load()
+    //       in backend/daemon/config_store.cpp, making the key mandatory -> "FAIL: a config
+    //       written before connector names existed loads with no malformed entries", 0
+    //       entries and 2 malformed. Reverted.
+    const std::string oldConfig =
+        "{\"version\":1,\"monitors\":[{\"monitor_id\":0,\"type\":\"static\",\"path\":\"/a.png\"},"
+        "{\"monitor_id\":1,\"type\":\"static\",\"path\":\"/b.png\"}]}";
+    if (!writeFile(file, oldConfig)) {
+        notVerified(kGoals, "the old-format config file could not be written");
+    } else {
+        const LoadResult old = store.load();
+        const bool clean = old.entries.size() == 2 && old.malformedEntries == 0 && old.error.empty();
+        check(clean, "a config written before connector names existed loads with no malformed entries");
+        if (!clean) {
+            std::fprintf(stderr, "  %zu entries, %d malformed, error '%s'\n", old.entries.size(),
+                         old.malformedEntries, old.error.c_str());
+        }
+        bool anyOutput = false;
+        for (const PersistedWallpaper& entry : old.entries) anyOutput = anyOutput || !entry.output.empty();
+        check(!anyOutput, "a config with no output keys yields rows with no connector name");
+    }
+
+    // GOAL: an `output` that is present and is not a string is a malformed entry, costing
+    //       that row and nothing else. False in either direction: accepting it would put a
+    //       number where a name belongs, and failing the whole load would cost a user every
+    //       working monitor because one line was hand-edited wrong.
+    // WHY-THIS-SHAPE: the SURVIVING ids are asserted as an exact set, not just the count.
+    //       "one malformed" is equally true of a loader that dropped entry 1 and of one that
+    //       dropped entry 2 and kept a duplicate -- and which id a wallpaper lands on is the
+    //       whole subject of this step.
+    // CONTROL: the `!readString(element, kKeyOutput, entry.output)` arm of that guard in
+    //       ConfigStore::load() (backend/daemon/config_store.cpp) replaced with `false`, so a
+    //       non-string output is accepted -> "FAIL: an output that is not a string costs its
+    //       own entry and no other", reporting 3 entries and 0 malformed. Reverted.
+    const std::string badTypeConfig =
+        "{\"version\":1,\"monitors\":[{\"monitor_id\":0,\"type\":\"static\",\"path\":\"/a.png\"},"
+        "{\"monitor_id\":1,\"type\":\"static\",\"path\":\"/b.png\",\"output\":42},"
+        "{\"monitor_id\":2,\"type\":\"static\",\"path\":\"/c.png\",\"output\":\"DP-2\"}]}";
+    if (!writeFile(file, badTypeConfig)) {
+        notVerified(kGoals, "the non-string-output config file could not be written");
+    } else {
+        const LoadResult mixed = store.load();
+        std::vector<int> ids;
+        for (const PersistedWallpaper& entry : mixed.entries) ids.push_back(entry.monitorId);
+        const bool asExpected = ids == std::vector<int>{0, 2} && mixed.malformedEntries == 1 && mixed.error.empty();
+        check(asExpected, "an output that is not a string costs its own entry and no other");
+        if (!asExpected) {
+            std::fprintf(stderr, "  %zu entries (%d malformed), ids:", mixed.entries.size(), mixed.malformedEntries);
+            for (const int id : ids) std::fprintf(stderr, " %d", id);
+            std::fprintf(stderr, "; error '%s'\n", mixed.error.c_str());
+        }
+    }
+
+    // GOAL: a connector name that is not valid UTF-8 costs that row and nothing else on the
+    //       way OUT, exactly as an unusable path already does. False if one such name throws
+    //       out of dump() and takes the whole write with it, losing every other monitor.
+    // WHY-THIS-SHAPE: asserted at the ConfigStore level with a hand-built entry, and NOT by
+    //       driving the daemon: nothing a client can do produces this state. The manager
+    //       validates every name it binds, and the read path cannot deliver one either --
+    //       nlohmann's parser rejects an ill-formed UTF-8 byte as a whole-file syntax error
+    //       (measured: "parse error at line 1 ... ill-formed UTF-8 byte"), so a hand-edited
+    //       config carrying one never reaches the per-entry code at all. What is left is
+    //       ConfigStore's own contract -- save() must not throw for any input -- and that is
+    //       what this grades. The bad row is in the MIDDLE, so a writer that stops at the
+    //       first bad name cannot pass.
+    // CONTROL: `|| !isValidUtf8(entry.output)` removed from ConfigStore::save()'s guard in
+    //       backend/daemon/config_store.cpp -> three FAILs: "a connector name that is not
+    //       valid UTF-8 does not fail the write", printing "save error: ... [json.exception.
+    //       type_error.316] invalid UTF-8 byte at index 2: 0xFF"; "the save reports exactly
+    //       one entry skipped for its connector name"; and "the rows with usable connector
+    //       names are all in the file, and only the bad one is missing", which reports the
+    //       ids of the file the previous case left behind because this write never landed.
+    //       Reverted.
+    const std::string badUtf8Name = std::string("DP\xFF-1");
+    check(!wallpaperx::isValidUtf8(badUtf8Name), "the case name really is invalid UTF-8, so this phase can discriminate");
+    const SaveResult badSave = store.save({{0, "static", "/tmp/zero.png", "DP-0"},
+                                           {1, "static", "/tmp/one.png", badUtf8Name},
+                                           {2, "static", "/tmp/two.png", "DP-2"}});
+    check(badSave.error.empty(), "a connector name that is not valid UTF-8 does not fail the write");
+    if (!badSave.error.empty()) std::fprintf(stderr, "  save error: %s\n", badSave.error.c_str());
+    check(badSave.skippedNonUtf8 == 1, "the save reports exactly one entry skipped for its connector name");
+    std::string badWhy;
+    const std::map<int, RowInFile> afterBad = rowsInFile(file, badWhy);
+    const bool onlyBadLost = afterBad.size() == 2 && afterBad.count(0) == 1 && afterBad.count(2) == 1;
+    check(onlyBadLost, "the rows with usable connector names are all in the file, and only the bad one is missing");
+    if (!onlyBadLost) {
+        std::fprintf(stderr, "  %s; ids on disk: %s\n", badWhy.empty() ? "read back" : badWhy.c_str(),
+                     idsOf(afterBad).c_str());
+    }
+}
+
+// ---------------------------------------------------------------------------- //
+// Phase 6f -- Step 10: what the manager does with the names it reads back.
+// ---------------------------------------------------------------------------- //
+void runOutputRestoreChecks() {
+    constexpr const char* kGoals = "S10.4 and S10.5 at the manager level (names are restored, merged into one row "
+                                   "per monitor, and never claimed by two monitors)";
+    const ScratchDir scratch("outputrestore");
+    const std::optional<PhasePaths> paths = preparePhase(scratch, kGoals, 2);
+    if (!paths) return;
+    const std::filesystem::path& file = paths->config;
+    const std::filesystem::path& present = paths->wallpapers[0];
+    const std::filesystem::path& other = paths->wallpapers[1];
+
+    // Monitor 1: a wallpaper and a name. Monitor 2: a name and nothing else. Monitors 3 and
+    // 4: both claiming "DP-DUP". Monitor 5: a name past the cap, with a wallpaper that must
+    // still restore.
+    const std::string oversized(wallpaperx::kMaxOutputNameBytes + 1, 'D');
+    const std::string config = "{\"version\":1,\"monitors\":["
+                               "{\"monitor_id\":1,\"type\":\"static\",\"path\":" +
+                               nlohmann::json(present.string()).dump() +
+                               ",\"output\":\"DP-1\"},"
+                               "{\"monitor_id\":2,\"type\":\"\",\"path\":\"\",\"output\":\"DP-2\"},"
+                               "{\"monitor_id\":3,\"type\":\"\",\"path\":\"\",\"output\":\"DP-DUP\"},"
+                               "{\"monitor_id\":4,\"type\":\"\",\"path\":\"\",\"output\":\"DP-DUP\"},"
+                               "{\"monitor_id\":5,\"type\":\"static\",\"path\":" +
+                               nlohmann::json(other.string()).dump() + ",\"output\":" +
+                               nlohmann::json(oversized).dump() + "}]}";
+    if (!writeFile(file, config)) {
+        notVerified(kGoals, "the config file this phase reads could not be written");
+        return;
+    }
+
+    WallpaperManager::Config managerConfig;
+    managerConfig.configFile = file;
+    WallpaperManager manager(managerConfig);
+    const std::vector<int> restored = manager.restoreSaved();
+    // The two calls backend/daemon/main.cpp makes once it owns the bus name, in that order.
+    // restoreSaved() computes the repair this fixture's contested name owes and writes nothing,
+    // so without writeRepairedConfig() the file read below would still be the test's own
+    // fixture and the two checks on the start's write would grade nothing the daemon did.
+    manager.preserveUnreadableConfig();
+    manager.writeRepairedConfig();
+
+    // GOAL: S10.5's manager half -- a connector name read out of the config is bound, and
+    //       bound independently of whether the wallpaper half of its row restores. A row
+    //       carrying only a name must NOT be posted for rendering. False if a named screen
+    //       comes back anonymous, or if naming a screen queues a render of nothing.
+    // WHY-THIS-SHAPE: the ids posted for rendering are asserted as an exact vector, not just
+    //       checked for containing 1. A manager that posted monitor 2 -- a row with an empty
+    //       type and path -- would satisfy a contains-style check and would then drive the
+    //       render worker for a screen with nothing on it.
+    // CONTROL, for the posted-ids check: a row with no wallpaper is stopped three times over,
+    //       and it takes all three -- in backend/daemon/wallpaper_manager.cpp, the
+    //       `if (entry.type.empty() && entry.path.empty() && !nameTravels)` early-continue in
+    //       restoreSaved() disabled, isKnownType() returning true for the empty type, and the
+    //       `entry.path.empty()` term dropped from the kept-row arm, which together are what
+    //       let a name-only row reach the render arm -> "FAIL: only the rows with a wallpaper
+    //       are posted for rendering", printing "posted: 1 2 3 4 5". The first two without the
+    //       third left it GREEN, the kept-row arm still catching the row on its empty path.
+    //       Observed 2026-08-14. All reverted.
+    // CONTROL, for the two binding checks below: the `if (nameValid && entry.monitorId <
+    //       kMaxMonitors && bindOutputLocked(...) == BindResult::Displaced)` statement deleted
+    //       from WallpaperManager::restoreSaved(), taking the bind with it (`nameValid` is the
+    //       local declared a few lines above it) -> "FAIL: a connector name in the config is
+    //       bound at startup" and six more in this phase, the snapshot's outputs map coming
+    //       back empty, while the posted-ids check above stays green. Observed 2026-08-14.
+    //       Reverted.
+    check(restored == std::vector<int>({1, 5}), "only the rows with a wallpaper are posted for rendering");
+    if (restored != std::vector<int>({1, 5})) {
+        std::string ids;
+        for (const int id : restored) ids += " " + std::to_string(id);
+        std::fprintf(stderr, "  posted:%s\n", ids.empty() ? " (none)" : ids.c_str());
+    }
+
+    WallpaperManager::Snapshot snap = manager.snapshot();
+    check(snap.outputs.count("DP-1") == 1 && snap.outputs.at("DP-1") == 1,
+          "a connector name in the config is bound at startup");
+    check(snap.outputs.count("DP-2") == 1 && snap.outputs.at("DP-2") == 2,
+          "a connector name on a row with no wallpaper is bound at startup too");
+
+    // GOAL: S10.4 across a restore -- two rows claiming one connector name leave exactly one
+    //       monitor answering to it, and the loss is reported. False if both ids resolve for
+    //       that name, which is two plugin instances claiming one screen.
+    // WHY-THIS-SHAPE: the binding COUNT is asserted, not merely that the name resolves.
+    //       "DP-DUP resolves to 4" is true of an implementation that also left 3 bound,
+    //       because the snapshot is keyed by name -- the only way to see the second binding
+    //       is to count how many names point at monitor 3. The health note is asserted
+    //       alongside, because a silent last-wins is a monitor the user set that comes back
+    //       nameless with nothing saying so.
+    // CONTROL: `++displacedNames;` deleted from restoreSaved()'s bindOutputLocked call in
+    //       backend/daemon/wallpaper_manager.cpp -> "FAIL: two config rows claiming one
+    //       connector name are reported as a loss", printing the persistence detail without
+    //       the clause, while the resolution checks stayed green -- which is what separates
+    //       "not reported" from "not resolved". Reverted.
+    check(snap.outputs.count("DP-DUP") == 1 && snap.outputs.at("DP-DUP") == 4,
+          "two config rows claiming one connector name leave the last one holding it");
+    int namesOnThree = 0;
+    for (const auto& [name, id] : snap.outputs) {
+        (void)name;
+        if (id == 3) ++namesOnThree;
+    }
+    check(namesOnThree == 0, "the monitor that lost a contested connector name answers to no name");
+    const std::optional<int> displacedCount =
+        clauseCountOrSkip(snap.health.persistence.detail, " screen names displaced by a later entry", kGoals);
+    if (!displacedCount.has_value()) return;
+    const bool displacedReported = *displacedCount == 1;
+    check(displacedReported, "two config rows claiming one connector name are reported as a loss");
+    if (!displacedReported) {
+        std::fprintf(stderr, "  persistence detail: %s\n", snap.health.persistence.detail.c_str());
+    }
+
+    // GOAL: a connector name the daemon could not accept is dropped, its row's wallpaper is
+    //       restored anyway, and the dropped name is reported. False if an unusable name
+    //       costs the wallpaper on the same row, and equally false if it is dropped in
+    //       silence -- the user's only clue that a screen must be named again.
+    // WHY-THIS-SHAPE: the case is an OVERSIZED name, not a non-UTF-8 one, and that is not
+    //       arbitrary. nlohmann's parser rejects an ill-formed UTF-8 byte as a whole-file
+    //       syntax error, so no config file can deliver a non-UTF-8 name to this code --
+    //       measured. An over-length name is the one shape of unusable name that actually
+    //       reaches restoreSaved()'s rejection arm from a file, so it is the only one that
+    //       can control it.
+    // CONTROL: the `outputNameError(entry.output).empty()` term of `const bool nameValid` in
+    //       WallpaperManager::restoreSaved() (backend/daemon/wallpaper_manager.cpp) replaced by
+    //       `true`, so nameValid degrades to `!entry.output.empty()` and the oversized name is
+    //       accepted and bound -> "FAIL: an unusable connector name is not bound" and "FAIL: an
+    //       unusable connector name in the config is reported as dropped", the persistence
+    //       detail carrying no dropped-name clause at all. The narrower mutation of only
+    //       suppressing `++rejectedNames` reddens the reporting check alone -- it never binds
+    //       the name -- so it does not control the first of the two. Observed 2026-08-14.
+    //       Reverted.
+    check(snap.outputs.count(oversized) == 0, "an unusable connector name is not bound");
+    check(snap.monitors.count(5) == 1 && snap.monitors.at(5).path == other.string(),
+          "the wallpaper on a row whose connector name was refused is restored anyway");
+    const std::optional<int> rejectedCount =
+        clauseCountOrSkip(snap.health.persistence.detail, " screen names dropped, unusable", kGoals);
+    if (!rejectedCount.has_value()) return;
+    const bool rejectedReported = *rejectedCount == 1;
+    check(rejectedReported, "an unusable connector name in the config is reported as dropped");
+    if (!rejectedReported) {
+        std::fprintf(stderr, "  persistence detail: %s\n", snap.health.persistence.detail.c_str());
+    }
+
+    // GOAL: a row carrying only a connector name is NOT counted among "entries this build
+    //       cannot apply". False if naming a screen before choosing a wallpaper for it puts
+    //       a loss notice in the daemon's persistence health -- which tells the user a
+    //       wallpaper did not come back when none was ever set.
+    // WHY-THIS-SHAPE: BOTH kept-row clauses are asserted absent, not just the wallpaper one.
+    //       Asserting only the wallpaper clause cannot fail: persistenceDetail() counts a row
+    //       carrying only a name under its own wording, so a restoreSaved() without that guard
+    //       carries these rows and reports them as "screen names ... kept", leaving a check
+    //       that looks only for "entries this build cannot apply" green. The property is that
+    //       the row is not carried AT ALL, so neither clause may name it.
+    // CONTROL: the `if (entry.type.empty() && entry.path.empty() && !nameTravels)` guard in
+    //       WallpaperManager::restoreSaved() (backend/daemon/wallpaper_manager.cpp) disabled ->
+    //       "FAIL: a screen named with no wallpaper is reported as neither a kept entry nor a
+    //       kept name", printing a persistence detail containing "3 screen names this build's
+    //       monitor limit excludes, kept". Observed 2026-08-14. Reverted. Measured 2026-08-13:
+    //       the single-clause form of this check stayed GREEN under that same mutation.
+    const bool noFalseLoss =
+        snap.health.persistence.detail.find("entries this build cannot apply") == std::string::npos &&
+        snap.health.persistence.detail.find("screen names this build's monitor limit excludes") ==
+            std::string::npos;
+    check(noFalseLoss, "a screen named with no wallpaper is reported as neither a kept entry nor a kept name");
+    if (!noFalseLoss) {
+        std::fprintf(stderr, "  persistence detail: %s\n", snap.health.persistence.detail.c_str());
+    }
+
+    // GOAL: a name and a wallpaper for one monitor are written back as ONE row. False if the
+    //       next save emits two rows with the same monitor_id, which the next load reads as
+    //       two monitors claiming one screen -- the ambiguity this whole step exists to
+    //       remove. And a screen that has only been named still gets a row of its own.
+    // WHY-THIS-SHAPE: read off the disk TWICE -- once straight after the restore, once after a
+    //       save triggered by a DIFFERENT monitor -- and the ids are compared as an exact set
+    //       each time. Two reads, not one: this fixture's contested name is a repair, so the
+    //       start writes the file itself, and the first SetWallpaper is a second, independent
+    //       chance to split the row. A single read after the save cannot say which write did
+    //       it, and a single read after the restore would pass for a build that splits at the
+    //       first SetWallpaper -- the state a user actually reaches.
+    //       rowsInFile() keys by monitor id, so a duplicated row is invisible to it; the row
+    //       COUNT in the raw file is therefore asserted separately, at both reads.
+    // CONTROL: the m_outputs loop in WallpaperManager::persistableLocked()
+    //       (backend/daemon/wallpaper_manager.cpp) changed from merging each name into the
+    //       row keyed by its monitor id to appending a name-only row of its own -> "FAIL: the
+    //       restore's own write puts a monitor's wallpaper and its connector name on one row"
+    //       with "5 rows for 4 monitor ids", "FAIL: a monitor's wallpaper and its connector
+    //       name are written as one row" with "6 rows for 5 monitor ids", and the two
+    //       merged-row checks, neither read finding the name on the row that holds the
+    //       wallpaper. Observed 2026-08-14. Reverted.
+    // CONTROL, for the first read being of the START's write and not of the fixture this phase
+    //       wrote: rowsInFile()'s raw-row count returned one too high -> "FAIL: the restore's
+    //       own write puts a monitor's wallpaper and its connector name on one row", printing
+    //       "5 rows for 4 monitor ids (read back); ids: 1 2 4 5" -- four ids, where the fixture
+    //       above has five. Observed 2026-08-15. Reverted.
+    const std::string presentPath = present.string();
+    waitForRows(file, [&presentPath](const std::map<int, RowInFile>& rows) {
+        return rows.count(1) == 1 && rows.at(1).output == "DP-1" && rows.at(1).path == presentPath;
+    });
+    std::string repairWhy;
+    std::size_t repairRowCount = 0;
+    const std::map<int, RowInFile> afterRestore = rowsInFile(file, repairWhy, &repairRowCount);
+    const bool oneRowEachAfterRestore = repairRowCount == afterRestore.size() && repairRowCount > 0;
+    check(oneRowEachAfterRestore, "the restore's own write puts a monitor's wallpaper and its connector name on one "
+                                  "row");
+    if (!oneRowEachAfterRestore) {
+        std::fprintf(stderr, "  %zu rows for %zu monitor ids (%s); ids: %s\n", repairRowCount, afterRestore.size(),
+                     repairWhy.empty() ? "read back" : repairWhy.c_str(), idsOf(afterRestore).c_str());
+    }
+    const bool mergedAfterRestore = afterRestore.count(1) == 1 && afterRestore.at(1).output == "DP-1" &&
+                                    afterRestore.at(1).path == present.string();
+    check(mergedAfterRestore, "the row the restore wrote carries both the wallpaper and the connector name");
+
+    manager.requestWallpaper("static", other.string(), 6);
+    waitForRows(file, [](const std::map<int, RowInFile>& rows) { return rows.count(6) == 1; });
+    std::string why;
+    std::size_t rowCount = 0;
+    const std::map<int, RowInFile> onDisk = rowsInFile(file, why, &rowCount);
+    const bool oneRowEach = rowCount == onDisk.size() && rowCount > 0;
+    check(oneRowEach, "a monitor's wallpaper and its connector name are written as one row");
+    if (!oneRowEach) {
+        std::fprintf(stderr, "  %zu rows for %zu monitor ids (%s); ids: %s\n", rowCount, onDisk.size(),
+                     why.empty() ? "read back" : why.c_str(), idsOf(onDisk).c_str());
+    }
+    const bool mergedRow = onDisk.count(1) == 1 && onDisk.at(1).output == "DP-1" &&
+                           onDisk.at(1).path == present.string();
+    check(mergedRow, "the merged row carries both the wallpaper and the connector name");
+    const bool nameOnlyRow = onDisk.count(2) == 1 && onDisk.at(2).output == "DP-2" && onDisk.at(2).path.empty();
+    check(nameOnlyRow, "a screen that has only been named keeps a row of its own across a save");
+    if (!mergedRow || !nameOnlyRow) {
+        std::fprintf(stderr, "  ids on disk: %s\n", idsOf(onDisk).c_str());
+    }
+
+    // GOAL: S10.4 through the manager's own entry point -- setMonitorOutput moves a name off
+    //       whatever monitor held it, and releases whatever name the target monitor had.
+    //       Asserted here as well as over the bus because this is where a save happens, and
+    //       the file must reflect the move rather than keeping the stale binding.
+    // WHY-THIS-SHAPE: graded on the FILE, not on the snapshot. The bus tier already grades
+    //       the in-memory map; what only this tier can see is that the write that follows a
+    //       rebinding carries the new mapping and not the old one -- a manager that rebound
+    //       in memory and persisted from a stale copy would pass every check in the other
+    //       tier and lose the mapping at the next restart.
+    // CONTROL: `row.output = name;` in WallpaperManager::persistableLocked()
+    //       (backend/daemon/wallpaper_manager.cpp) deleted -> three FAILs: "a rebinding is
+    //       written to the file, not just held in memory", "the merged row carries both the
+    //       wallpaper and the connector name", and "a screen that has only been named keeps
+    //       a row of its own across a save" -- no output key on any row. Reverted.
+    manager.setMonitorOutput(7, "DP-1");
+    waitForRows(file, [](const std::map<int, RowInFile>& rows) {
+        return rows.count(7) == 1 && rows.at(7).output == "DP-1";
+    });
+    std::string moveWhy;
+    const std::map<int, RowInFile> afterMove = rowsInFile(file, moveWhy);
+    const bool movedOnDisk = afterMove.count(7) == 1 && afterMove.at(7).output == "DP-1" &&
+                             afterMove.count(1) == 1 && !afterMove.at(1).hasOutputKey;
+    check(movedOnDisk, "a rebinding is written to the file, not just held in memory");
+    if (!movedOnDisk) {
+        std::fprintf(stderr, "  %s; monitor 1 output '%s', monitor 7 output '%s'\n",
+                     moveWhy.empty() ? "read back" : moveWhy.c_str(),
+                     afterMove.count(1) ? afterMove.at(1).output.c_str() : "(no row)",
+                     afterMove.count(7) ? afterMove.at(7).output.c_str() : "(no row)");
+    }
+}
+
+// One config row as JSON. `output` is omitted when empty, matching what a build that never
+// named a screen writes -- a fixture that always emitted the key would be testing a file
+// shape no build produces.
+nlohmann::json configRow(int monitorId, const std::string& type, const std::string& path,
+                         const std::string& output) {
+    nlohmann::json row;
+    row["monitor_id"] = monitorId;
+    row["type"] = type;
+    row["path"] = path;
+    if (!output.empty()) row["output"] = output;
+    return row;
+}
+
+// ---------------------------------------------------------------------------- //
+// Phase 6g -- Step 10: what the restore report says about the names it could not keep.
+// ---------------------------------------------------------------------------- //
+void runOutputLossReportChecks() {
+    constexpr const char* kGoals = "S10.4/S10.5's reporting half (every screen name a restore could not keep is "
+                                   "reported, and none of them is reported as a wallpaper)";
+    const ScratchDir scratch("outputloss");
+    const std::optional<PhasePaths> paths = preparePhase(scratch, kGoals, 1);
+    if (!paths) return;
+    const std::filesystem::path& file = paths->config;
+    const std::filesystem::path& present = paths->wallpapers[0];
+
+    // The kinds of unusable row, at DIFFERENT multiplicities -- 2, 1, 4, 3, 2, 2, 1. The
+    // counts are what the checks below match, so a build that reported the right numbers
+    // under swapped clauses could not pass.
+    const std::vector<int> keptWallpaperIds{40, 41};
+    const std::vector<int> keptNameIds{42};
+    const std::vector<int> droppedWallpaperIds{-1, -2, -4, -6};
+    const std::vector<int> droppedNameIds{-3, -5, -7};
+    // The three shapes a row whose id no build can use takes when it is not simply one
+    // wallpaper or one name: both halves at once, a name no build could ever accept, and a
+    // row with nothing on it at all. Each is counted differently from the two above.
+    const std::vector<int> droppedBothIds{-8, -10};
+    const std::vector<int> droppedUnusableNameIds{-9, -11};
+    const std::vector<int> droppedEmptyIds{-12};
+    // The rows with an id this build CAN use whose name it still refuses. Counted under the
+    // same clause as droppedUnusableNameIds: both are names no build accepts.
+    const std::vector<int> refusedInRangeIds{2};
+    const std::string oversized(wallpaperx::kMaxOutputNameBytes + 1, 'D');
+
+    nlohmann::json monitors = nlohmann::json::array();
+    // Monitor 1 twice, under two different names: the second row claims a screen the first
+    // already named, which is the monitor-side collision a bind resolves.
+    monitors.push_back(configRow(1, "", "", "DP-1"));
+    monitors.push_back(configRow(1, "", "", "HDMI-A-1"));
+    // Monitor 2: no wallpaper, and a name too long for this build to hold.
+    for (const int id : refusedInRangeIds) monitors.push_back(configRow(id, "", "", oversized));
+    for (const int id : keptWallpaperIds) monitors.push_back(configRow(id, "static", "/kept.png", ""));
+    for (const int id : keptNameIds) monitors.push_back(configRow(id, "", "", "DP-K" + std::to_string(id)));
+    for (const int id : droppedWallpaperIds) monitors.push_back(configRow(id, "static", "/gone.png", ""));
+    for (const int id : droppedNameIds) monitors.push_back(configRow(id, "", "", "DP-N" + std::to_string(-id)));
+    for (const int id : droppedBothIds) {
+        monitors.push_back(configRow(id, "static", "/gone.png", "DP-B" + std::to_string(-id)));
+    }
+    for (const int id : droppedUnusableNameIds) monitors.push_back(configRow(id, "", "", oversized));
+    for (const int id : droppedEmptyIds) monitors.push_back(configRow(id, "", "", ""));
+    nlohmann::json root;
+    root["version"] = 1;
+    root["monitors"] = monitors;
+    if (!writeFile(file, root.dump())) {
+        notVerified(kGoals, "the config file this phase reads could not be written");
+        return;
+    }
+
+    WallpaperManager::Config managerConfig;
+    managerConfig.configFile = file;
+    WallpaperManager manager(managerConfig);
+    const std::vector<int> restored = manager.restoreSaved();
+    check(restored.empty(), "a config whose only usable rows carry no wallpaper posts nothing for rendering");
+    const WallpaperManager::Snapshot snap = manager.snapshot();
+    const std::string& detail = snap.health.persistence.detail;
+    // The count is compared as a number, not searched for as text: "3 screen names dropped"
+    // is a substring of "13 screen names dropped", so a find() would pass for a build that
+    // over-counted by ten. A count the harness could not read is not compared at all -- it is
+    // no number, and grading it against a fixture size accuses the daemon of losing every row
+    // the clause counts. `countsReadable` gates each group of verdicts below.
+    bool countsReadable = true;
+    const auto reports = [&detail, &countsReadable, kGoals](const std::string& clause, std::size_t expected) {
+        const std::optional<int> count = clauseCountOrSkip(detail, clause, kGoals);
+        if (!count.has_value()) {
+            countsReadable = false;
+            return false;
+        }
+        return *count == static_cast<int>(expected);
+    };
+
+    // GOAL: S10.4's monitor-side clause across a restore -- two rows naming the SAME monitor
+    //       differently leave it answering to one name, and the name it lost is reported.
+    //       False if the loss is silent: the user's screen comes back under a name the app
+    //       never gave it, and the persistence health -- the only place a lost name is ever
+    //       mentioned -- says nothing happened.
+    // WHY-THIS-SHAPE: the fixture collides on the MONITOR, never on the name, which is the
+    //       only way to grade this half. The neighbouring phase's two-rows-one-name fixture
+    //       exercises the name-side release, and that path reported a loss even before this
+    //       one did -- so a check built on it stays green with the monitor-side release
+    //       reporting nothing. The binding count is asserted beside the report, because a
+    //       silent last-wins and a correct one are indistinguishable from the map alone.
+    // CONTROL: `displaced = true;` deleted from the monitor-side release loop in
+    //       WallpaperManager::bindOutputLocked (backend/daemon/wallpaper_manager.cpp), so it
+    //       returns Bound -> "FAIL: the name a second row took off a monitor is reported as a
+    //       loss", printing a detail with no displaced clause, while both binding checks
+    //       stayed green -- which is what separates "not reported" from "not released".
+    //       Reverted.
+    int namesOnMonitorOne = 0;
+    for (const auto& [name, id] : snap.outputs) {
+        (void)name;
+        if (id == 1) ++namesOnMonitorOne;
+    }
+    check(namesOnMonitorOne == 1, "a monitor named twice in the config answers to exactly one name");
+    check(snap.outputs.count("HDMI-A-1") == 1 && snap.outputs.at("HDMI-A-1") == 1,
+          "the name the later row gave that monitor is the one it answers to");
+    const bool displacedReported = reports(" screen names displaced by a later entry", 1);
+    if (!countsReadable) return;
+    check(displacedReported, "the name a second row took off a monitor is reported as a loss");
+    if (!displacedReported || namesOnMonitorOne != 1) {
+        std::fprintf(stderr, "  %d names on monitor 1; persistence detail: %s\n", namesOnMonitorOne, detail.c_str());
+    }
+
+    // GOAL: every name no build could ever accept is reported as dropped and unusable,
+    //       whether the id carrying it is one this build can bind or one no build can. False
+    //       if either kind is left out: the user is told to name that screen again only for
+    //       the names the report happens to notice, and the rest disappear in silence.
+    // WHY-THIS-SHAPE: one clause, one exact count, summed over TWO id lists that are counted
+    //       under different rules elsewhere -- an in-range row (whose name is refused because
+    //       this build would bind it and cannot) and negative-id rows (whose name is refused
+    //       because nothing can travel on an id no build will read back). Asserting the clause
+    //       is merely present passes for a build that reports one of the two kinds, which is
+    //       the state this fixture found.
+    // CONTROL: `if (!entry.output.empty() && !nameValid && !nameTravels) ++rejectedNames;` in
+    //       WallpaperManager::restoreSaved() (backend/daemon/wallpaper_manager.cpp) moved
+    //       below the negative-id branch, so a name on an id no build can use is never
+    //       examined -> "FAIL: every name no build could accept is reported as dropped and
+    //       unusable", printing a detail whose clause read "1 screen names dropped, unusable"
+    //       against 3 expected. Observed 2026-08-14. Reverted.
+    const std::size_t unusableNames = refusedInRangeIds.size() + droppedUnusableNameIds.size();
+    const bool unusableReported = reports(" screen names dropped, unusable", unusableNames);
+    if (!countsReadable) return;
+    check(unusableReported, "every name no build could accept is reported as dropped and unusable");
+    if (!unusableReported) {
+        std::fprintf(stderr, "  persistence detail: %s\n  expected %zu of ' screen names dropped, unusable'\n",
+                     detail.c_str(), unusableNames);
+    }
+
+    // GOAL: Step 10's split of the persistence report -- a row carrying only a screen's name
+    //       is counted as a name, never as a wallpaper, on both the kept and the dropped
+    //       side. False if naming a screen puts "entries this build cannot apply" or "entries
+    //       dropped" in front of a user whose wallpapers all came back: that text is what
+    //       someone reads when a picture is missing, and a name was never a picture.
+    // WHY-THIS-SHAPE: four clauses at four DIFFERENT multiplicities, each derived from the
+    //       fixture rather than written as a literal. The obvious version -- one kept name and
+    //       one dropped name -- passes for a build that merely renamed the clauses while still
+    //       counting name rows and wallpaper rows together, because every count would read 1
+    //       either way. With 2/1/4/3 a flat count reads 3 and 7 and no arrangement of the old
+    //       wording matches.
+    // CONTROL: the whole flat-counting regime put back in backend/daemon/wallpaper_manager.cpp
+    //       -- persistenceDetail() reporting `m_unapplied.size()` and `m_droppedEntries` with
+    //       neither name clause, AND restoreSaved()'s negative-id branch counting every drop
+    //       into m_droppedEntries -> all four FAILs, the detail reading "3 entries this build
+    //       cannot apply, kept; 12 entries dropped, no build can apply them". Both sites are
+    //       needed: mutating persistenceDetail() alone leaves the dropped-name rows counted in
+    //       m_droppedNames, so the dropped-wallpaper clause still reads 7 and its check stays
+    //       green. Re-run 2026-08-14. Reverted.
+    // CONTROL, for comparing each count as a number rather than searching for it as text:
+    //       `keptNames` printed as `keptNames + 10` in WallpaperManager::persistenceDetail()
+    //       (backend/daemon/wallpaper_manager.cpp) -> "FAIL: only the out-of-range row's name
+    //       is reported as a name this build's limit excludes". With that one clause put back
+    //       to a std::string::find of "1 screen names this build's monitor limit excludes,
+    //       kept", the same mutated build read GREEN: the expected text is a substring of
+    //       "11 screen names ...", so a search has no left boundary and an over-count of ten
+    //       satisfies it. Observed 2026-08-14. Both reverted.
+    // COVERAGE-ASSERT: the expected numbers are computed from the id lists, so deleting rows
+    //       from the fixture changes what is demanded rather than quietly weakening it.
+    //
+    // GOAL, on the dropped pair specifically: a row an id no build can use takes off the disk
+    //       is counted under EVERY heading it really lost. False under a partition of the two
+    //       counters: a row carrying a wallpaper and a name is then reported as a lost
+    //       wallpaper only, so the user is never told to name that screen again; a row
+    //       carrying neither is reported as a lost name, which it never had.
+    // WHY-THIS-SHAPE: the two expected numbers are sums over id lists chosen so that the
+    //       partition moves BOTH of them and in opposite directions -- two rows with both
+    //       halves push the wallpaper count up, one row with nothing on it pushes it up again
+    //       while the partition files it under names. Balanced lists were the trap here: with
+    //       only the both-halves rows and the unusable-name rows in play the partition scores
+    //       7 and 5 as well, because the two shifts cancel exactly.
+    // CONTROL: the two counted conditions in restoreSaved()'s negative-id branch
+    //       (backend/daemon/wallpaper_manager.cpp) replaced by the partition
+    //       `if (!entry.type.empty() || !entry.path.empty()) ++m_droppedEntries; else
+    //       ++m_droppedNames;` -> "FAIL: only the rows with a wallpaper are reported as
+    //       entries no build can apply" and "FAIL: the name-only rows no build can apply are
+    //       reported as names, not as entries", the detail reading "6 entries dropped" against
+    //       7 and "6 screen names dropped" against 5. Observed 2026-08-14. Reverted.
+    //       Separately, `if (nameValid)` in that branch widened to `if (!entry.output.empty())`
+    //       -- the shape that reported an unusable name as a name a build could have used ->
+    //       "FAIL: the name-only rows no build can apply are reported as names, not as
+    //       entries", the detail reading "7 screen names dropped, no build can apply them".
+    //       Observed 2026-08-14. Reverted.
+    const std::size_t keptWallpapers = keptWallpaperIds.size();
+    const std::size_t keptNames = keptNameIds.size();
+    const std::size_t droppedWallpapers = droppedWallpaperIds.size() + droppedBothIds.size() + droppedEmptyIds.size();
+    const std::size_t droppedNames = droppedNameIds.size() + droppedBothIds.size();
+    const bool keptWallpapersReported = reports(" entries this build cannot apply, kept", keptWallpapers);
+    const bool keptNamesReported = reports(" screen names this build's monitor limit excludes, kept", keptNames);
+    const bool droppedWallpapersReported = reports(" entries dropped, no build can apply them", droppedWallpapers);
+    const bool droppedNamesReported = reports(" screen names dropped, no build can apply them", droppedNames);
+    if (!countsReadable) return;
+    check(keptWallpapersReported, "only the rows with a wallpaper are reported as entries this build cannot apply");
+    check(keptNamesReported, "only the out-of-range row's name is reported as a name this build's limit excludes");
+    check(droppedWallpapersReported, "only the rows with a wallpaper are reported as entries no build can apply");
+    check(droppedNamesReported, "the name-only rows no build can apply are reported as names, not as entries");
+    if (!keptWallpapersReported || !keptNamesReported || !droppedWallpapersReported || !droppedNamesReported) {
+        std::fprintf(stderr, "  persistence detail: %s\n  expected %zu kept wallpapers, %zu kept names, %zu dropped "
+                             "wallpapers, %zu dropped names\n",
+                     detail.c_str(), keptWallpapers, keptNames, droppedWallpapers, droppedNames);
+    }
+
+    // The save that lets the on-disk half of the refused-name goal above be read. Made for a
+    // monitor none of the fixture rows mention, so nothing it writes can be confused for a
+    // row the restore kept.
+    manager.requestWallpaper("static", present.string(), 8);
+    waitForRows(file, [](const std::map<int, RowInFile>& rows) { return rows.count(8) == 1; });
+    std::string why;
+    std::size_t rowsWritten = 0;
+    const std::map<int, RowInFile> onDisk = rowsInFile(file, why, &rowsWritten);
+    // COVERAGE-ASSERT: the absence of the refused rows below is only evidence if the file was
+    // written and read at all -- an empty or unparseable file has no such row either.
+    const bool saveLanded = onDisk.count(8) == 1;
+    check(saveLanded, "the save this phase reads back really happened");
+    if (!saveLanded) {
+        std::fprintf(stderr, "  %s; ids on disk: %s\n", why.empty() ? "read back" : why.c_str(),
+                     idsOf(onDisk).c_str());
+    } else {
+        // GOAL: the two rows this fixture gives monitor 1 come back as one row. False if both
+        //       are written: the next start reads two monitors claiming one screen again, so
+        //       the collision this run reported as resolved is back, on every boot.
+        // WHY-THIS-SHAPE: the RAW row count, because every other check in this phase reads the
+        //       file through rowsInFile(), which keys by monitor id -- two rows for id 1 and
+        //       one row for id 1 are the same map, so nothing else here can see the duplicate.
+        //       Both numbers come from the ONE read above rather than from a second read of the
+        //       same path: the daemon's writer can replace the file between two reads, and a
+        //       count taken from a later version than the ids reports a correct save as a
+        //       duplicated row.
+        // CONTROL: every m_unapplied entry appended to the returned vector as well as being
+        //       merged into the id-keyed rows, in WallpaperManager::persistableLocked()
+        //       (backend/daemon/wallpaper_manager.cpp) -> "FAIL: no monitor is written on two
+        //       rows of the config", printing "8 rows for 5 monitor ids". Observed 2026-08-14.
+        //       Reverted.
+        const bool oneRowPerMonitor = rowsWritten == onDisk.size() && rowsWritten > 0;
+        check(oneRowPerMonitor, "no monitor is written on two rows of the config");
+        if (!oneRowPerMonitor) {
+            std::fprintf(stderr, "  %zu rows for %zu monitor ids; ids: %s\n", rowsWritten, onDisk.size(),
+                         idsOf(onDisk).c_str());
+        }
+
+        // GOAL: a row with no wallpaper and a name this build refused leaves nothing in the
+        //       config. False if an empty row is written: the next start reads it back and
+        //       reports it as a wallpaper that did not come back, on every boot forever.
+        // WHY-THIS-SHAPE: graded on the file, not on whether the row is held in memory. Being
+        //       held is no longer observable from outside -- such a row is stripped of its
+        //       name as it is kept, so it moves no counter -- and the file is where the harm
+        //       would be.
+        // CONTROL: two mutations together, because this property is defended twice and
+        //       neither defence alone reaches the file: the `if (entry.type.empty() &&
+        //       entry.path.empty())` guard in WallpaperManager::restoreSaved() disabled, so
+        //       the row is held, AND the empty-row skip in
+        //       WallpaperManager::persistableLocked() (both in
+        //       backend/daemon/wallpaper_manager.cpp) put back to an unconditional
+        //       `entries.push_back(std::move(row));` -> "FAIL: a wallpaper-less row whose name
+        //       was refused leaves no row in the config at all", printing "ids on disk: 1 2 8
+        //       40 41 42" with monitor 2 empty in every field. Each mutation alone leaves this
+        //       green; the save-side one alone is controlled on its own in the phase below,
+        //       where a held row really is emptied. Observed 2026-08-14. Both reverted.
+        std::vector<int> refusedRowsOnDisk;
+        for (const int id : refusedInRangeIds) {
+            if (onDisk.count(id) != 0) refusedRowsOnDisk.push_back(id);
+        }
+        const bool refusedRowGone = refusedRowsOnDisk.empty();
+        check(refusedRowGone, "a wallpaper-less row whose name was refused leaves no row in the config at all");
+        if (!refusedRowGone) {
+            std::fprintf(stderr, "  ids on disk: %s; monitor %d type '%s' path '%s' output '%s'\n",
+                         idsOf(onDisk).c_str(), refusedRowsOnDisk.front(),
+                         onDisk.at(refusedRowsOnDisk.front()).type.c_str(),
+                         onDisk.at(refusedRowsOnDisk.front()).path.c_str(),
+                         onDisk.at(refusedRowsOnDisk.front()).output.c_str());
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------- //
+// Phase 6h -- Step 10: the rows kept for a newer build, once names share the file.
+// ---------------------------------------------------------------------------- //
+void runPreservedRowChecks() {
+    constexpr const char* kGoals = "S8.14's Step-10 half (a row kept for a newer build keeps both halves of what it "
+                                   "carried, never keeps a connector name another row already carries, and carries a "
+                                   "name this build cannot bind rather than deleting it)";
+    const ScratchDir scratch("preservedrows");
+    const std::optional<PhasePaths> paths = preparePhase(scratch, kGoals, 2);
+    if (!paths) return;
+    const std::filesystem::path& file = paths->config;
+    const std::filesystem::path& present = paths->wallpapers[0];
+    const std::filesystem::path& other = paths->wallpapers[1];
+
+    // A row kept for a newer build has two independent halves -- a wallpaper (type and path)
+    // and a screen name -- and every combination below is a case the merge has to get right.
+    // Two names this build refuses, distinct so the file can be asked which one it holds: one
+    // on an id this build binds, one on an id only a bigger build could.
+    const std::string oversized(wallpaperx::kMaxOutputNameBytes + 1, 'D');
+    const std::string oversizedBindable(wallpaperx::kMaxOutputNameBytes + 9, 'E');
+    nlohmann::json monitors = nlohmann::json::array();
+    // A live screen and a row this build cannot apply, both claiming "DP-3".
+    monitors.push_back(configRow(1, "static", present.string(), "DP-3"));
+    // A live screen carrying a name this build could not use: the third outcome a name can
+    // have, beside bound (monitor 1) and carried (monitor 47).
+    monitors.push_back(configRow(3, "static", "/kept3.png", oversizedBindable));
+    monitors.push_back(configRow(40, "static", "/kept.png", "DP-3"));
+    // Two rows this build cannot apply for one monitor id: a real collision, both halves.
+    monitors.push_back(configRow(41, "static", "/first.png", ""));
+    monitors.push_back(configRow(41, "static", "/second.png", ""));
+    // Complementary halves for one id, in both file orders. Neither pair collides: each row
+    // fills a half the other left empty.
+    monitors.push_back(configRow(64, "video", "/clip.mp4", ""));
+    monitors.push_back(configRow(64, "", "", "DP-5"));
+    monitors.push_back(configRow(65, "", "", "DP-6"));
+    monitors.push_back(configRow(65, "video", "/other.mp4", ""));
+    // Two names for one id, which IS a collision -- of the name half.
+    monitors.push_back(configRow(66, "", "", "DP-7"));
+    monitors.push_back(configRow(66, "", "", "DP-8"));
+    // One name on two kept rows, with no live screen holding it.
+    monitors.push_back(configRow(42, "static", "/dup-a.png", "DP-9"));
+    monitors.push_back(configRow(43, "static", "/dup-b.png", "DP-9"));
+    // One row carrying both halves, with nothing else in play: its name is uncontested, no
+    // live screen holds it, and it merges with no other row. The both-headings check below
+    // rests on this row.
+    monitors.push_back(configRow(44, "static", "/kept44.png", "DP-10"));
+    // A kept row carrying a name this build could not use but a bigger build might.
+    monitors.push_back(configRow(47, "static", "/kept47.png", oversized));
+    nlohmann::json root;
+    root["version"] = 1;
+    root["monitors"] = monitors;
+    if (!writeFile(file, root.dump())) {
+        notVerified(kGoals, "the config file this phase reads could not be written");
+        return;
+    }
+
+    WallpaperManager::Config managerConfig;
+    managerConfig.configFile = file;
+    WallpaperManager manager(managerConfig);
+    const std::vector<int> restored = manager.restoreSaved();
+    check(restored == std::vector<int>{1, 3}, "only the in-range rows are posted for rendering");
+    const WallpaperManager::Snapshot snap = manager.snapshot();
+
+    // GOAL: a kept row for a monitor id this build cannot apply is replaced, not silently
+    //       discarded, when a second row claims the same id -- and the wallpaper that survives
+    //       is the later one. False if the first row wins with nothing said: the next save
+    //       then deletes a wallpaper a newer build set, which is the exact loss keeping the
+    //       row exists to prevent, and the report the user consults says only that some rows
+    //       were kept.
+    // WHY-THIS-SHAPE: graded on WHICH path is in the file, not on how many rows there are.
+    //       The file is keyed by monitor id on the way out, so both the losing build and the
+    //       correct one write exactly one row for this monitor -- a row-count check cannot
+    //       tell them apart. The report is asserted beside it because a build could pick the
+    //       right row and still say nothing about the one it dropped.
+    // CONTROL: the find-and-overwrite in WallpaperManager::restoreSaved()
+    //       (backend/daemon/wallpaper_manager.cpp) short-circuited so every kept row is a bare
+    //       `m_unapplied.push_back(...)` -> "FAIL: two kept rows for one monitor leave the
+    //       later row's wallpaper in the file", printing "monitor 41 holds '/first.png'", and
+    //       "FAIL: every kept row a later row really overwrote is reported as a loss, and no
+    //       other" with no such clause in the detail at all, nothing having been overwritten.
+    //       Six more went red with them, the merge being what every other check here rests on.
+    //       Re-observed 2026-08-14. Reverted.
+    // COVERAGE-ASSERT: the expected number of losses is the length of the collision list
+    //       below, so adding a colliding pair to the fixture without it being reported fails
+    //       rather than quietly leaving the count alone.
+    const std::string& detail = snap.health.persistence.detail;
+    // The count is compared as a number, not searched for as text: "1 kept entries dropped"
+    // is a substring of "11 kept entries dropped", so a find() would pass for a build that
+    // over-counted by ten.
+    // A count the harness could not read is not compared at all -- it is no number, and grading
+    // it against a fixture size accuses the daemon of losing every row the clause counts.
+    // `countsReadable` gates each group of verdicts below.
+    bool clauseCountsReadable = true;
+    const auto reports = [&detail, &clauseCountsReadable, kGoals](const std::string& clause, std::size_t expected) {
+        const std::optional<int> count = clauseCountOrSkip(detail, clause, kGoals);
+        if (!count.has_value()) {
+            clauseCountsReadable = false;
+            return false;
+        }
+        return *count == static_cast<int>(expected);
+    };
+    // Only monitor 41's two rows collide on the WALLPAPER half. Monitor 66's two collide on
+    // the name half, which is a lost name and counted below, not here; the other repeated ids
+    // (64, 65) fill complementary halves and are not losses at all.
+    const std::vector<int> collidingIds{41};
+    const std::string duplicateClause = " kept entries dropped, a later entry claimed the same monitor";
+    const bool duplicateReported = reports(duplicateClause, collidingIds.size());
+    if (!clauseCountsReadable) return;
+    check(duplicateReported, "every kept row a later row really overwrote is reported as a loss, and no other");
+    if (!duplicateReported) {
+        std::fprintf(stderr, "  persistence detail: %s\n  expected %zu of '%s'\n", detail.c_str(),
+                     collidingIds.size(), duplicateClause.c_str());
+    }
+
+    // GOAL: every screen name a kept row lost is reported as a lost NAME, and the count is
+    //       exactly the names really lost. Two ways to be false, and this fixture has both:
+    //       reporting a name a later row took as a dropped WALLPAPER tells a user whose
+    //       pictures all came back to go looking for a missing picture; and settling a name
+    //       collision in the save instead of at the load reports nothing at all, because the
+    //       save is const and cannot count.
+    // WHY-THIS-SHAPE: an exact count summed over a list of the three DIFFERENT ways a name is
+    //       lost here -- one monitor named twice among kept rows (66), one name on two kept
+    //       rows (42 loses it to 43), one name a live screen already answers to (40). Checking
+    //       that the clause is merely present cannot separate them: each of the three alone
+    //       prints the same clause. The duplicate-wallpaper count above is asserted in the
+    //       same breath, since the failure being ruled out is a loss counted under the other
+    //       heading, which leaves the total right and both clauses wrong.
+    // CONTROL: `++displacedNames` in the two-kept-rows-one-name arm of
+    //       WallpaperManager::restoreSaved() (backend/daemon/wallpaper_manager.cpp) put back
+    //       to `++duplicateIds` -> "FAIL: every screen name a kept row lost
+    //       is reported as a lost name, and no other" with the detail reading "2 screen names
+    //       displaced" against 3, and "FAIL: every kept row a later row really overwrote is
+    //       reported as a loss, and no other" reading "2 kept entries dropped" against 1.
+    //       Separately, the whole reverse-order reconciliation loop at the end of
+    //       restoreSaved() deleted -> the same first FAIL reading "1 screen names displaced"
+    //       against 3. Both observed 2026-08-14. Both reverted.
+    // COVERAGE-ASSERT: the expected number is the length of the list, so a fixture row that
+    //       stops losing its name fails here rather than quietly lowering the bar.
+    const std::vector<int> namesLostIds{40, 42, 66};
+    const std::string displacedClause = " screen names displaced by a later entry";
+    const bool displacedReported = reports(displacedClause, namesLostIds.size());
+    if (!clauseCountsReadable) return;
+    check(displacedReported, "every screen name a kept row lost is reported as a lost name, and no other");
+    if (!displacedReported) {
+        std::fprintf(stderr, "  persistence detail: %s\n  expected %zu of '%s'\n", detail.c_str(),
+                     namesLostIds.size(), displacedClause.c_str());
+    }
+
+    // GOAL: Fix 5's property -- a kept row that carries BOTH an unrenderable wallpaper and a
+    //       screen name is reported under both headings. False if the two counts partition the
+    //       rows: this build can bind that name no more than it can draw that wallpaper, so a
+    //       report that mentions only the wallpaper tells the user their screen will come back
+    //       named when it will not.
+    // WHY-THIS-SHAPE: exact counts derived from two ID LISTS that deliberately overlap -- six
+    //       rows keep a name, eight keep a wallpaper, and five rows are in both. The obvious
+    //       alternative, asserting that each clause is merely present, passes for the
+    //       partition too: this fixture has one name-only row (66) and rows with wallpapers,
+    //       so a partitioning build still prints both clauses, with the wrong numbers.
+    //       Monitor 44 is in the fixture for this check alone: it is the one row in both lists
+    //       with nothing else riding on it. Every other overlapping row is also something
+    //       else -- 43 took a contested name from 42, 64 and 65 are two config rows merged,
+    //       47 carries a name this build cannot bind -- so a later rule about any of those
+    //       could empty the overlap and leave this check green while covering nothing.
+    // CONTROL: the counting loop in WallpaperManager::persistenceDetail()
+    //       (backend/daemon/wallpaper_manager.cpp) replaced by the if/else partition
+    //       `if (type.empty() && path.empty()) ++keptNames; else ++keptWallpapers;` -> "FAIL:
+    //       every kept row carrying a screen name is reported as one", the detail reading
+    //       "1 screen names this build's monitor limit excludes, kept" -- only monitor 66,
+    //       whose row has no wallpaper to be partitioned under -- against six expected. The
+    //       kept-wallpaper check stayed green at eight, which is what separates "counted once"
+    //       from "not counted". Re-observed 2026-08-14. Reverted.
+    // Every kept row holding a name the next save will really leave behind, and every kept row
+    // holding a wallpaper. Monitors 40 and 42 are in the second list only: a live screen holds
+    // "DP-3" and a later kept row took "DP-9", so the load clears both copies and the report
+    // does not promise them back.
+    const std::vector<int> keptNameIds{43, 44, 47, 64, 65, 66};
+    const std::vector<int> keptWallpaperIds{40, 41, 42, 43, 44, 47, 64, 65};
+    const std::string keptNameClause = " screen names this build's monitor limit excludes, kept";
+    const std::string keptWallpaperClause = " entries this build cannot apply, kept";
+    const bool keptNamesReported = reports(keptNameClause, keptNameIds.size());
+    const bool keptWallpapersReported = reports(keptWallpaperClause, keptWallpaperIds.size());
+    if (!clauseCountsReadable) return;
+    check(keptNamesReported, "every kept row carrying a screen name is reported as one");
+    check(keptWallpapersReported, "every kept row carrying a wallpaper is reported as one");
+    if (!keptNamesReported || !keptWallpapersReported) {
+        std::fprintf(stderr, "  persistence detail: %s\n  expected %zu of '%s' and %zu of '%s'\n", detail.c_str(),
+                     keptNameIds.size(), keptNameClause.c_str(), keptWallpaperIds.size(), keptWallpaperClause.c_str());
+    }
+
+    // GOAL: the kept-name count promises back only names the next save will really leave in the
+    //       file. False if a kept row's name that a live screen also answers to is counted: that
+    //       copy is taken off the row, so the user is told a name returns on a larger build when
+    //       the very next save writes the file without it.
+    // WHY-THIS-SHAPE: a DIFFERENCE between two loads of the same rows -- once with the live row
+    //       that claims "DP-3", once without it -- rather than a second literal count. A
+    //       literal ("must not say seven") is reddened by any mutation that adds one kept name
+    //       for any reason at all, and would print this check's message about a rule it never
+    //       touched. The difference cancels every such shift, so only the live-screen rule
+    //       itself can move it. The exact count above cannot replace this either -- it goes red
+    //       for the regression but says only that some name total is wrong.
+    // CONTROL: this rule is defended in two independent places and NEITHER mutation alone
+    //       reddens this check, so it takes both -- `m_outputs.count(it->output) != 0 ||`
+    //       deleted from the reconciliation loop at the end of
+    //       WallpaperManager::restoreSaved(), which is what strips the name from the kept row
+    //       at load, AND `&& m_outputs.count(entry.output) == 0` deleted from the kept-name
+    //       loop in WallpaperManager::persistenceDetail(), which refuses to count such a name
+    //       even when the row still carries it (both in backend/daemon/wallpaper_manager.cpp)
+    //       -> "FAIL: a name a live screen already holds is left out of the count of names that
+    //       will come back", printing "7 kept names with the live row, 7 without it; expected 1
+    //       fewer with it". Deleting the load-side clause alone leaves this GREEN, the counting
+    //       guard still refusing the name; what it reddens instead is the displaced-names check
+    //       above, reading "2 screen names displaced" against 3. The counting guard has a
+    //       control of its own further down this phase, where a client claims a kept row's name
+    //       after startup -- the one state the load-side rule cannot reach. Observed 2026-08-14.
+    //       Both reverted.
+    // COVERAGE-ASSERT: both loads' claim on the name is asserted -- one live screen holding
+    //       "DP-3" and none in the other run. If the second load kept a live claimant too the
+    //       difference would be 0 for a correct build and the mutated one alike, and the check
+    //       would establish nothing.
+    const std::vector<int> liveHeldNameIds{40};
+    const auto keptNameCount = [&keptNameClause](const std::string& text) {
+        return clauseCount(text, keptNameClause);
+    };
+    // Read once, here, and its readability graded once: keptNameCount comes back empty for a
+    // report whose count it cannot parse, and an unread count compared against a row count
+    // reads as the daemon having lost every kept name -- an accusation with nothing behind it
+    // but a reworded report. Every consumer below is gated on this.
+    //
+    // CONTROL: the kept-name count wrapped in parentheses in
+    // WallpaperManager::persistenceDetail() (backend/daemon/wallpaper_manager.cpp), so the
+    // digits no longer sit against the clause -> "FAIL: the kept-name count can be read out of
+    // the persistence report" and the two sibling readability checks, plus a NOT VERIFIED line
+    // for this phase's goal; the file-comparison check below no longer reports the daemon as
+    // having lost kept names. Observed 2026-08-14. Reverted.
+    const std::optional<int> promisedKeptNames = keptNameCount(detail);
+    const bool keptNameCountReadable = promisedKeptNames.has_value();
+    check(keptNameCountReadable, "the kept-name count can be read out of the persistence report");
+    if (!keptNameCountReadable) std::fprintf(stderr, "  persistence detail: %s\n", detail.c_str());
+    // The same rows the run above loaded, minus the one that claims "DP-3" -- so the only
+    // difference between the two reports is whether a live screen answers to that name.
+    nlohmann::json noLiveRows = nlohmann::json::array();
+    for (const nlohmann::json& row : monitors) {
+        if (row.at("monitor_id").get<int>() != 1) noLiveRows.push_back(row);
+    }
+    nlohmann::json noLiveRoot;
+    noLiveRoot["version"] = 1;
+    noLiveRoot["monitors"] = noLiveRows;
+    const std::filesystem::path noLiveFile = scratch.path() / "wallpaperx" / "nolive.json";
+    if (!writeFile(noLiveFile, noLiveRoot.dump())) {
+        notVerified("S8.14's live-name half (a kept name a live screen already holds is not counted as one that "
+                    "comes back)",
+                    "the second config file this comparison loads could not be written");
+    } else {
+        WallpaperManager::Config noLiveConfig;
+        noLiveConfig.configFile = noLiveFile;
+        WallpaperManager noLiveManager(noLiveConfig);
+        const std::vector<int> noLiveRestored = noLiveManager.restoreSaved();
+        const WallpaperManager::Snapshot noLiveSnap = noLiveManager.snapshot();
+        const std::string& noLiveDetail = noLiveSnap.health.persistence.detail;
+        const bool claimantsAsExpected = snap.outputs.count("DP-3") == 1 && noLiveSnap.outputs.count("DP-3") == 0 &&
+                                         noLiveRestored == std::vector<int>{3};
+        check(claimantsAsExpected,
+              "one load has a live screen answering to the kept row's name and the other has none");
+        const std::optional<int> withoutLive = keptNameCount(noLiveDetail);
+        const bool bothCountsReadable = keptNameCountReadable && withoutLive.has_value();
+        check(withoutLive.has_value(), "the kept-name count can be read out of the second load's persistence report");
+        if (!claimantsAsExpected || !bothCountsReadable) {
+            std::fprintf(stderr, "  live claimants %zu/%zu, restored %zu rows; details: %s | %s\n",
+                         snap.outputs.count("DP-3"), noLiveSnap.outputs.count("DP-3"), noLiveRestored.size(),
+                         detail.c_str(), noLiveDetail.c_str());
+        } else {
+            const bool liveNameLeftOut =
+                *withoutLive - *promisedKeptNames == static_cast<int>(liveHeldNameIds.size());
+            check(liveNameLeftOut,
+                  "a name a live screen already holds is left out of the count of names that will come back");
+            if (!liveNameLeftOut) {
+                std::fprintf(stderr, "  %d kept names with the live row, %d without it; expected %zu fewer with it\n",
+                             *promisedKeptNames, *withoutLive, liveHeldNameIds.size());
+            }
+        }
+    }
+
+    // GOAL: a name this build refuses is dropped only when the monitor id carrying it is one
+    //       this build binds. On an id only a bigger build could use, the name travels with
+    //       the wallpaper on the same row instead. False if the id is ignored and every
+    //       refused name is dropped: this build's own length limit then deletes a name a
+    //       newer build with a larger limit would have accepted, which is the same
+    //       forward-compatible loss that keeping the row at all exists to prevent -- and the
+    //       report tells the user to name that screen again when nothing was wrong with it.
+    // WHY-THIS-SHAPE: two rows carrying names this build refuses for the same reason, one on
+    //       an id it binds (3) and one on an id it cannot (47), graded by an exact count of
+    //       one. Asserting only that some name was dropped passes for a build that drops both;
+    //       asserting only that none was dropped passes for a build that keeps an unusable name
+    //       on a screen it will actually bind.
+    // CONTROL: the carried case in WallpaperManager::restoreSaved()
+    //       (backend/daemon/wallpaper_manager.cpp) gated on the whole client rule rather than
+    //       on valid UTF-8, as `const bool nameTravels = nameValid && entry.monitorId >=
+    //       kMaxMonitors;` -> "FAIL: a name this build refuses is dropped only when the id
+    //       carrying it is one this build binds", the detail reading "2 screen names dropped,
+    //       unusable" against 1, together with "FAIL: every kept row carrying a screen name is
+    //       reported as one" at five instead of six. Observed 2026-08-14. Reverted.
+    // COVERAGE-ASSERT: both refused names are asserted present in the fixture rows the load
+    //       read, so a fixture edit that removes either one fails here rather than reducing
+    //       this to a count of nothing.
+    const std::vector<int> refusedNameDroppedIds{3};
+    const std::vector<int> carriedNameIds{47};
+    const std::string rejectedClause = " screen names dropped, unusable";
+    const bool rejectedReported = reports(rejectedClause, refusedNameDroppedIds.size());
+    if (!clauseCountsReadable) return;
+    check(rejectedReported, "a name this build refuses is dropped only when the id carrying it is one this build binds");
+    if (!rejectedReported) {
+        std::fprintf(stderr, "  persistence detail: %s\n  expected %zu of '%s'\n", detail.c_str(),
+                     refusedNameDroppedIds.size(), rejectedClause.c_str());
+    }
+    // Read off the fixture rows, not off the two id lists: asking whether `{3}` and `{47}` are
+    // non-empty restates literals written four lines above, so it holds for every fixture and
+    // cannot notice a fixture edit.
+    //
+    // CONTROL: monitor 47's fixture row given the ordinary name "DP-47" instead of the
+    // oversized one -> "FAIL: the fixture really carries a refused name on both an id this
+    // build binds and one it cannot", printing "fixture rows carrying a refused name: 3".
+    // Graded instead as `!refusedNameDroppedIds.empty() && !carriedNameIds.empty()` plus the
+    // two name strings, this stays GREEN under the same edit and only the two downstream
+    // checks fail, naming the daemon for a fixture that changed. Observed 2026-08-14. Reverted.
+    std::vector<int> fixtureIdsWithRefusedName;
+    for (const nlohmann::json& row : monitors) {
+        const std::string name = row.value("output", std::string());
+        if (!name.empty() && !wallpaperx::outputNameError(name).empty()) {
+            fixtureIdsWithRefusedName.push_back(row.at("monitor_id").get<int>());
+        }
+    }
+    std::vector<int> expectedRefusedIds = refusedNameDroppedIds;
+    expectedRefusedIds.insert(expectedRefusedIds.end(), carriedNameIds.begin(), carriedNameIds.end());
+    std::sort(fixtureIdsWithRefusedName.begin(), fixtureIdsWithRefusedName.end());
+    std::sort(expectedRefusedIds.begin(), expectedRefusedIds.end());
+    const bool refusedNamesInFixture = fixtureIdsWithRefusedName == expectedRefusedIds;
+    check(refusedNamesInFixture, "the fixture really carries a refused name on both an id this build binds and one it "
+                                 "cannot");
+    if (!refusedNamesInFixture) {
+        std::string ids;
+        for (const int id : fixtureIdsWithRefusedName) ids += " " + std::to_string(id);
+        std::fprintf(stderr, "  fixture rows carrying a refused name:%s\n", ids.empty() ? " (none)" : ids.c_str());
+    }
+
+    // The save that rewrites the file from live state plus the kept rows. Made for a monitor
+    // the fixture never mentions, so nothing it writes can be mistaken for a kept row.
+    manager.requestWallpaper("static", other.string(), 2);
+    waitForRows(file, [](const std::map<int, RowInFile>& rows) { return rows.count(2) == 1; });
+    std::string why;
+    std::size_t rowsWritten = 0;
+    const std::map<int, RowInFile> onDisk = rowsInFile(file, why, &rowsWritten);
+    const bool saveLanded = onDisk.count(2) == 1;
+    check(saveLanded, "the save this phase reads back really happened");
+    if (!saveLanded) {
+        std::fprintf(stderr, "  %s; ids on disk: %s\n", why.empty() ? "read back" : why.c_str(),
+                     idsOf(onDisk).c_str());
+        return;
+    }
+
+    // GOAL: no monitor id is written on two rows, kept rows included. False if one is: the
+    //       next start reads that as two monitors claiming one screen, resolves it last-wins
+    //       and deletes the half it did not keep -- a wallpaper lost to the mechanism whose
+    //       whole job is to preserve it.
+    // WHY-THIS-SHAPE: the RAW row count against the number of distinct ids. Every other check
+    //       below reads the file through rowsInFile(), which keys by monitor id, so a second
+    //       row for an id it already holds is invisible to all of them -- and this fixture's
+    //       repeated ids (41, 64, 65, 66) are exactly where such a row would come from. Both
+    //       numbers come from the ONE read above: the daemon's writer can replace the file
+    //       between two reads, and a count from a later version than the ids reports a correct
+    //       save as a duplicated row.
+    // CONTROL: every m_unapplied entry appended to the returned vector as well as being merged
+    //       into the id-keyed rows, in WallpaperManager::persistableLocked()
+    //       (backend/daemon/wallpaper_manager.cpp) -> "FAIL: no monitor is written on two rows
+    //       of the config, kept rows included", printing "21 rows for 12 monitor ids". Observed
+    //       2026-08-14. Reverted.
+    const bool oneRowPerMonitor = rowsWritten == onDisk.size() && rowsWritten > 0;
+    check(oneRowPerMonitor, "no monitor is written on two rows of the config, kept rows included");
+    if (!oneRowPerMonitor) {
+        std::fprintf(stderr, "  %zu rows for %zu monitor ids; ids: %s\n", rowsWritten, onDisk.size(),
+                     idsOf(onDisk).c_str());
+    }
+
+    const bool lastRowWon = onDisk.count(41) == 1 && onDisk.at(41).path == "/second.png";
+    check(lastRowWon, "two kept rows for one monitor leave the later row's wallpaper in the file");
+    if (!lastRowWon) {
+        std::fprintf(stderr, "  monitor 41 holds '%s'\n",
+                     onDisk.count(41) ? onDisk.at(41).path.c_str() : "(no row)");
+    }
+
+    // GOAL: Fix 1's property -- when two config rows share a monitor id this build cannot
+    //       apply and each fills a half the other left empty, BOTH halves are in the file
+    //       afterwards. False if the later row replaces the earlier one: a config holding a
+    //       video wallpaper for monitor 64 and, further down, a bare name for monitor 64 then
+    //       loses the video path at the next save, deleted for good by the mechanism whose
+    //       only job is to preserve it.
+    // WHY-THIS-SHAPE: both file orders are exercised, because a replace-the-held-row build
+    //       loses a different half in each -- name-last loses the wallpaper, wallpaper-last
+    //       loses the name -- so a single-order check is half-blind. The SURVIVING values are
+    //       asserted, not the absence of a loss report: the report is the second-order symptom
+    //       and the wallpaper path is the thing the user loses.
+    // CONTROL: the half-by-half merge in WallpaperManager::restoreSaved()
+    //       (backend/daemon/wallpaper_manager.cpp) replaced with `*held = entry;
+    //       ++duplicateIds;` -> "FAIL: a later name-only row does not delete the wallpaper on
+    //       the row it merges into", printing "monitor 64 holds path '' output 'DP-5'";
+    //       "FAIL: a later wallpaper row does not delete the screen name on the row it merges
+    //       into", printing "monitor 65 holds path '/other.mp4' output ''"; and "FAIL: every
+    //       kept row a later row really overwrote is reported as a loss, and no other", the
+    //       detail reading "4 kept entries dropped" where one row really lost a wallpaper. The
+    //       two kept counts go red with them, the halves those rows lost no longer being kept
+    //       at all. Re-observed 2026-08-14. Reverted.
+    const bool wallpaperSurvived =
+        onDisk.count(64) == 1 && onDisk.at(64).path == "/clip.mp4" && onDisk.at(64).output == "DP-5";
+    check(wallpaperSurvived, "a later name-only row does not delete the wallpaper on the row it merges into");
+    if (!wallpaperSurvived) {
+        std::fprintf(stderr, "  monitor 64 holds path '%s' output '%s'\n",
+                     onDisk.count(64) ? onDisk.at(64).path.c_str() : "(no row)",
+                     onDisk.count(64) ? onDisk.at(64).output.c_str() : "(no row)");
+    }
+    const bool nameSurvived =
+        onDisk.count(65) == 1 && onDisk.at(65).path == "/other.mp4" && onDisk.at(65).output == "DP-6";
+    check(nameSurvived, "a later wallpaper row does not delete the screen name on the row it merges into");
+    if (!nameSurvived) {
+        std::fprintf(stderr, "  monitor 65 holds path '%s' output '%s'\n",
+                     onDisk.count(65) ? onDisk.at(65).path.c_str() : "(no row)",
+                     onDisk.count(65) ? onDisk.at(65).output.c_str() : "(no row)");
+    }
+    // The half that really does collide still resolves last-wins, so the merge above is not
+    // just "never overwrite anything".
+    const bool nameCollisionResolved = onDisk.count(66) == 1 && onDisk.at(66).output == "DP-8";
+    check(nameCollisionResolved, "two kept rows naming one monitor differently leave the later name in the file");
+    if (!nameCollisionResolved) {
+        std::fprintf(stderr, "  monitor 66 holds output '%s'\n",
+                     onDisk.count(66) ? onDisk.at(66).output.c_str() : "(no row)");
+    }
+
+    // GOAL: a connector name is written on exactly one row, even when the row carrying it is
+    //       one this build cannot apply and so never bound. False if both rows keep it: the
+    //       file then names one screen twice, permanently -- the load side skips out-of-range
+    //       ids entirely, so no later run of this build can ever notice, report or repair it.
+    // WHY-THIS-SHAPE: every row in the file is scanned for the name and the ids are compared
+    //       as a list. Asking instead which monitor "DP-3" resolves to -- in the snapshot or
+    //       by looking up row 1 -- is true of the duplicating build as well, because the
+    //       second copy sits on a row nothing in this build ever reads back. The kept row's
+    //       own wallpaper is asserted still present, so clearing the name by deleting the row
+    //       does not pass either.
+    // CONTROL: two mutations together, and it takes both -- `m_outputs.count(it->output) != 0
+    //       ||` deleted from the reconciliation loop at the end of
+    //       WallpaperManager::restoreSaved() AND `|| m_outputs.count(row.output) != 0` deleted
+    //       from the name-clearing loop in WallpaperManager::persistableLocked() (both in
+    //       backend/daemon/wallpaper_manager.cpp) -> "FAIL: a connector name a live screen
+    //       holds is written on that screen's row and no other", printing "rows carrying
+    //       'DP-3': 1 40". Either alone leaves the file with one copy and this check green,
+    //       which is the point of the pair: the load-side rule decides it and the save-side
+    //       rule is the backstop for a name a client claims later. What separates them is the
+    //       REPORT -- deleting the load-side rule alone reddens the displaced-names check
+    //       above, which reads "2 screen names displaced" against 3, because only the load can
+    //       count what it took away. Observed 2026-08-14. Both reverted.
+    std::vector<int> rowsCarryingName;
+    for (const auto& [id, row] : onDisk) {
+        if (row.output == "DP-3") rowsCarryingName.push_back(id);
+    }
+    const bool nameOnLiveRowOnly = rowsCarryingName == std::vector<int>{1};
+    check(nameOnLiveRowOnly, "a connector name a live screen holds is written on that screen's row and no other");
+    if (!nameOnLiveRowOnly) {
+        std::string ids;
+        for (const int id : rowsCarryingName) ids += " " + std::to_string(id);
+        std::fprintf(stderr, "  rows carrying 'DP-3':%s\n", ids.empty() ? " (none)" : ids.c_str());
+    }
+    const bool keptRowIntact = onDisk.count(40) == 1 && onDisk.at(40).path == "/kept.png";
+    check(keptRowIntact, "the kept row keeps its wallpaper when the name it carried is taken from it");
+    if (!keptRowIntact) {
+        std::fprintf(stderr, "  monitor 40 holds '%s'\n",
+                     onDisk.count(40) ? onDisk.at(40).path.c_str() : "(no row)");
+    }
+
+    // GOAL: Fix 2's property -- a connector name appears on at most one row of the written
+    //       file even when NO live screen holds it, i.e. when both rows carrying it are ones
+    //       this build cannot apply. False if both are written: a later build whose monitor
+    //       limit admits both ids binds both, one displaces the other, and the screen that
+    //       loses stops being findable by the only name the plugin knows it by.
+    // WHY-THIS-SHAPE: the live-screen case above cannot establish this. It is cleared by a
+    //       different clause -- the name is in m_outputs -- so a build with no duplicate
+    //       suppression at all passes it. Two kept rows with no live claimant is the only
+    //       shape that reaches the clause under test. Both rows' wallpapers are asserted
+    //       present as well, so clearing the duplicate by dropping the whole row does not
+    //       pass.
+    //       The row it survives on is asserted too, and is the LATER of the two: last-wins is
+    //       the rule every other collision here follows, and the two places that can settle
+    //       this one disagree about it -- the load walks the kept rows backwards and keeps the
+    //       later, the save walks them in monitor-id order and would keep the earlier. Only
+    //       naming the row says which one ran.
+    // CONTROL: the reverse-order reconciliation loop at the end of
+    //       WallpaperManager::restoreSaved() (backend/daemon/wallpaper_manager.cpp) deleted ->
+    //       "FAIL: a connector name no live screen holds is written on the later kept row and
+    //       no other", printing "rows carrying 'DP-9': 42" -- the save's own duplicate
+    //       suppression still leaves one copy, but the earlier row's. Deleting
+    //       `|| !written.insert(row.output).second` from the name-clearing loop in
+    //       WallpaperManager::persistableLocked() as well -> the same FAIL printing "rows
+    //       carrying 'DP-9': 42 43", which is the shape with neither defence. Both observed
+    //       2026-08-14. Both reverted.
+    std::vector<int> rowsCarryingDuplicate;
+    for (const auto& [id, row] : onDisk) {
+        if (row.output == "DP-9") rowsCarryingDuplicate.push_back(id);
+    }
+    const bool duplicateNameWrittenOnce = rowsCarryingDuplicate == std::vector<int>{43};
+    check(duplicateNameWrittenOnce, "a connector name no live screen holds is written on the later kept row and no "
+                                    "other");
+    if (!duplicateNameWrittenOnce) {
+        std::string ids;
+        for (const int id : rowsCarryingDuplicate) ids += " " + std::to_string(id);
+        std::fprintf(stderr, "  rows carrying 'DP-9':%s\n", ids.empty() ? " (none)" : ids.c_str());
+    }
+    const bool bothDuplicateRowsIntact = onDisk.count(42) == 1 && onDisk.at(42).path == "/dup-a.png" &&
+                                         onDisk.count(43) == 1 && onDisk.at(43).path == "/dup-b.png";
+    check(bothDuplicateRowsIntact, "the kept row that lost a contested connector name keeps its wallpaper");
+    if (!bothDuplicateRowsIntact) std::fprintf(stderr, "  ids on disk: %s\n", idsOf(onDisk).c_str());
+
+    // GOAL: the storage half of the same rule -- a name this build refuses reaches the file
+    //       again on exactly the rows whose ids only a bigger build could bind, and byte for
+    //       byte. Two ways to be false: written on a row this build binds, and it rides every
+    //       save for the life of the install while the report says the screen must be named
+    //       again; or deleted from the row it was carried on, and this build's length limit
+    //       has destroyed a name a build with a larger limit would have used.
+    // WHY-THIS-SHAPE: every row in the file is scanned for a name this build would refuse and
+    //       the ids are compared as a list, rather than looking up monitor 47 and asking
+    //       whether it has an output. Which row such a name lands on is the whole property
+    //       here, and "row 47 has a name" is also true of a build that copied it onto every
+    //       row. The bytes are compared as well: a build that truncated the name to the limit
+    //       would satisfy the id list and still have destroyed what it carried.
+    // CONTROL: the carried case in WallpaperManager::restoreSaved()
+    //       (backend/daemon/wallpaper_manager.cpp) gated on the whole client rule rather than
+    //       on valid UTF-8, as `const bool nameTravels = nameValid && entry.monitorId >=
+    //       kMaxMonitors;` -> "FAIL: a name this build refuses is written back only on a row
+    //       whose id this build cannot bind", printing "rows carrying a name this build
+    //       refuses: (none)", and "FAIL: the carried name reaches the file byte for byte".
+    //       Observed 2026-08-14. Reverted.
+    std::vector<int> rowsWithRefusedName;
+    for (const auto& [id, row] : onDisk) {
+        if (!row.output.empty() && !wallpaperx::outputNameError(row.output).empty()) {
+            rowsWithRefusedName.push_back(id);
+        }
+    }
+    const bool refusedNameOnCarriedRowOnly = rowsWithRefusedName == carriedNameIds;
+    check(refusedNameOnCarriedRowOnly,
+          "a name this build refuses is written back only on a row whose id this build cannot bind");
+    if (!refusedNameOnCarriedRowOnly) {
+        std::string ids;
+        for (const int id : rowsWithRefusedName) {
+            ids += " " + std::to_string(id) + " (" + std::to_string(onDisk.at(id).output.size()) + " bytes)";
+        }
+        std::fprintf(stderr, "  rows carrying a name this build refuses:%s\n", ids.empty() ? " (none)" : ids.c_str());
+    }
+    const bool carriedNameIntact = onDisk.count(47) == 1 && onDisk.at(47).output == oversized;
+    check(carriedNameIntact, "the carried name reaches the file byte for byte");
+    if (!carriedNameIntact) {
+        std::fprintf(stderr, "  monitor 47 carries %zu bytes, expected %zu\n",
+                     onDisk.count(47) ? onDisk.at(47).output.size() : 0, oversized.size());
+    }
+    const bool refusedNameRowIntact = onDisk.count(47) == 1 && onDisk.at(47).path == "/kept47.png";
+    check(refusedNameRowIntact, "the kept row carrying a name this build cannot bind keeps its wallpaper");
+    if (!refusedNameRowIntact) {
+        std::fprintf(stderr, "  monitor 47 holds '%s'\n",
+                     onDisk.count(47) ? onDisk.at(47).path.c_str() : "(no row)");
+    }
+
+    // GOAL: the count of kept names the report promises back is the number of names the save
+    //       really left in the file. False whenever a name is taken off a kept row somewhere
+    //       the report cannot see: the save rebuilds the file on every write and is const, so
+    //       a name it drops there is dropped in silence, while the health text -- recomputed
+    //       from the rows still held -- goes on offering it to the user on every boot.
+    // WHY-THIS-SHAPE: the report is compared against the FILE, not against a literal. A
+    //       literal for each is what the two exact-count checks above already do, and both of
+    //       them stay green when the two sides disagree: they are computed from the same
+    //       fixture by hand and a build that clears a name at save time satisfies whichever
+    //       one it was written for. Only reading back what was written can catch the two
+    //       drifting apart.
+    // CONTROL: the reverse-order reconciliation loop at the end of
+    //       WallpaperManager::restoreSaved() (backend/daemon/wallpaper_manager.cpp) deleted,
+    //       which puts both decisions back inside the const save -> "FAIL: every kept name the
+    //       report promises back is really in the written file", printing "the report promises
+    //       7 kept names, the file holds 6, the fixture expects 6". The eighth kept row that
+    //       still carries a name after that deletion is monitor 40, and persistenceDetail()'s
+    //       own live-name guard leaves it out of the count -- so 7 is the number, not 8.
+    //       Re-observed 2026-08-14. Reverted.
+    // COVERAGE-ASSERT: the comparison is only evidence if the file really holds kept names, so
+    //       the count it read is asserted to be the expected one rather than merely equal.
+    int namesOnKeptRows = 0;
+    for (const auto& [id, row] : onDisk) {
+        if (id >= WallpaperManager::kMaxMonitors && !row.output.empty()) ++namesOnKeptRows;
+    }
+    if (!keptNameCountReadable) {
+        // The graded readability check is above; comparing a count the harness could not read
+        // against a row count here would print this goal's message for a report, not a daemon.
+        notVerified(kGoals, "the kept-name count could not be read out of the persistence report");
+    } else {
+        const bool reportMatchesFile = *promisedKeptNames == namesOnKeptRows &&
+                                       namesOnKeptRows == static_cast<int>(keptNameIds.size());
+        check(reportMatchesFile, "every kept name the report promises back is really in the written file");
+        if (!reportMatchesFile) {
+            std::fprintf(stderr, "  the report promises %d kept names, the file holds %d, the fixture expects %zu\n",
+                         *promisedKeptNames, namesOnKeptRows, keptNameIds.size());
+        }
+    }
+
+    // GOAL: once a client claims a screen name a kept row was carrying, the report stops
+    //       offering that name back. False if the count still includes it: the very next save
+    //       takes the name off the kept row -- it must, or the file would name one screen
+    //       twice -- while the health text goes on telling the user that name returns on a
+    //       build with a larger monitor limit. It says so for the life of the process, and the
+    //       number then drops at the next start with nothing said about why.
+    // WHY-THIS-SHAPE: the name is claimed through setMonitorOutput AFTER restoreSaved() has
+    //       run. That is the whole check: the load reconciles every collision the file ARRIVED
+    //       with, so a phase that only writes a fixture naming one screen twice and reads the
+    //       count cannot go red here no matter what the counting rule is -- a client binding
+    //       the name later is the only way to reach it. Graded as a DIFFERENCE across the one
+    //       claim rather than a literal, for the reason the live-screen check above gives: a
+    //       literal is reddened by any fixture change that shifts the total and would then
+    //       print this message about a rule it never touched. The FILE is read back beside the
+    //       text because the defect is the two disagreeing -- a check on the text alone is
+    //       equally satisfied by a build that stopped writing the name and stopped counting it.
+    // CONTROL: `&& m_outputs.count(entry.output) == 0` deleted from the kept-name loop in
+    //       WallpaperManager::persistenceDetail() (backend/daemon/wallpaper_manager.cpp) ->
+    //       "FAIL: a screen name a client claims after startup stops being counted among the
+    //       names that come back", printing "6 kept names promised before the claim, 6 after
+    //       it; expected 1 fewer", and "FAIL: after a client claims a kept row's name the report
+    //       counts exactly the kept names the file holds", printing "the report promises 6 kept
+    //       names, the file holds 5". Those two are the ONLY checks in the phase that mutation
+    //       reddens: everywhere else the load has already stripped the name, so the guard is
+    //       inert -- which is why the live-screen check above needs both mutations and this one
+    //       needs only this. Observed 2026-08-14. Reverted.
+    // COVERAGE-ASSERT: the name is asserted to be held by a kept row and by no live screen at
+    //       the moment it is claimed, and to be bound to the claiming monitor afterwards.
+    //       Without those the difference is 0 for a correct build and the mutated one alike,
+    //       and this establishes nothing.
+    const std::string claimedName = "DP-5";
+    constexpr int claimingMonitor = 5;
+    const WallpaperManager::Snapshot beforeClaim = manager.snapshot();
+    const std::optional<int> keptNamesBefore = keptNameCount(beforeClaim.health.persistence.detail);
+    // Graded before it is used, and skipped rather than folded into the check below: an empty
+    // result means the harness could not read the report, and folding it in prints a message
+    // about the fixture and the daemon for a failure that is neither.
+    const bool beforeCountReadable = keptNamesBefore.has_value();
+    check(beforeCountReadable, "the kept-name count can be read out of the report taken before the claim");
+    if (!beforeCountReadable) {
+        notVerified(kGoals, "the kept-name count could not be read out of the report taken before the claim");
+        std::fprintf(stderr, "  persistence detail: %s\n", beforeClaim.health.persistence.detail.c_str());
+        return;
+    }
+    const bool claimIsOfAKeptName = *keptNamesBefore > 0 && beforeClaim.outputs.count(claimedName) == 0 &&
+                                    onDisk.count(64) == 1 && onDisk.at(64).output == claimedName;
+    check(claimIsOfAKeptName, "the name claimed after startup is one a kept row holds and no live screen does");
+    if (!claimIsOfAKeptName) {
+        std::fprintf(stderr, "  %d kept names promised, live claimants %zu, monitor 64 output '%s'\n",
+                     *keptNamesBefore, beforeClaim.outputs.count(claimedName),
+                     onDisk.count(64) ? onDisk.at(64).output.c_str() : "(no row)");
+        return;
+    }
+
+    manager.setMonitorOutput(claimingMonitor, claimedName);
+    const WallpaperManager::Snapshot afterClaim = manager.snapshot();
+    const std::optional<int> keptNamesAfter = keptNameCount(afterClaim.health.persistence.detail);
+    const bool claimBound = afterClaim.outputs.count(claimedName) == 1 &&
+                            afterClaim.outputs.at(claimedName) == claimingMonitor;
+    check(claimBound, "the name claimed after startup really binds to the monitor that asked for it");
+    // Graded, not merely used to return: an ungraded return would leave the three checks below
+    // unrun with no pass, fail or skip recorded for any of them.
+    const bool afterCountReadable = keptNamesAfter.has_value();
+    check(afterCountReadable, "the kept-name count can be read out of the report taken after the claim");
+    if (!claimBound || !afterCountReadable) {
+        notVerified(kGoals, "the claim this phase makes did not bind, or its report could not be read, so what the "
+                            "count does after a claim was not established");
+        std::fprintf(stderr, "  persistence detail after the claim: %s\n",
+                     afterClaim.health.persistence.detail.c_str());
+        return;
+    }
+
+    const bool claimedNameGivenUp = *keptNamesBefore - *keptNamesAfter == 1;
+    check(claimedNameGivenUp, "a screen name a client claims after startup stops being counted among the names that "
+                              "come back");
+    if (!claimedNameGivenUp) {
+        std::fprintf(stderr, "  %d kept names promised before the claim, %d after it; expected 1 fewer\n",
+                     *keptNamesBefore, *keptNamesAfter);
+    }
+
+    waitForRows(file, [&claimedName, claimingMonitor](const std::map<int, RowInFile>& rows) {
+        return rows.count(claimingMonitor) == 1 && rows.at(claimingMonitor).output == claimedName;
+    });
+    std::string claimWhy;
+    const std::map<int, RowInFile> afterClaimOnDisk = rowsInFile(file, claimWhy);
+    std::vector<int> rowsCarryingClaimedName;
+    for (const auto& [id, row] : afterClaimOnDisk) {
+        if (row.output == claimedName) rowsCarryingClaimedName.push_back(id);
+    }
+    const bool claimedNameOnLiveRowOnly = rowsCarryingClaimedName == std::vector<int>{claimingMonitor};
+    check(claimedNameOnLiveRowOnly, "a name claimed after startup is written on the claiming screen's row and no "
+                                    "other");
+    if (!claimedNameOnLiveRowOnly) {
+        std::string ids;
+        for (const int id : rowsCarryingClaimedName) ids += " " + std::to_string(id);
+        std::fprintf(stderr, "  %s; rows carrying '%s':%s\n", claimWhy.empty() ? "read back" : claimWhy.c_str(),
+                     claimedName.c_str(), ids.empty() ? " (none)" : ids.c_str());
+    }
+    const bool keptRowKeptItsWallpaper =
+        afterClaimOnDisk.count(64) == 1 && afterClaimOnDisk.at(64).path == "/clip.mp4";
+    check(keptRowKeptItsWallpaper, "the kept row keeps its wallpaper when a client claims the name it carried");
+    if (!keptRowKeptItsWallpaper) {
+        std::fprintf(stderr, "  monitor 64 holds '%s'\n",
+                     afterClaimOnDisk.count(64) ? afterClaimOnDisk.at(64).path.c_str() : "(no row)");
+    }
+
+    int namesOnKeptRowsAfterClaim = 0;
+    for (const auto& [id, row] : afterClaimOnDisk) {
+        if (id >= WallpaperManager::kMaxMonitors && !row.output.empty()) ++namesOnKeptRowsAfterClaim;
+    }
+    const bool stillMatchesFile = *keptNamesAfter == namesOnKeptRowsAfterClaim &&
+                                  namesOnKeptRowsAfterClaim == static_cast<int>(keptNameIds.size()) - 1;
+    check(stillMatchesFile, "after a client claims a kept row's name the report counts exactly the kept names the "
+                            "file holds");
+    if (!stillMatchesFile) {
+        std::fprintf(stderr, "  the report promises %d kept names, the file holds %d\n", *keptNamesAfter,
+                     namesOnKeptRowsAfterClaim);
+    }
+}
+
+// ---------------------------------------------------------------------------- //
+// Phase 6i -- Step 10: the cost of a client re-asserting a name it already gave.
+// ---------------------------------------------------------------------------- //
+void runIdempotentRenameChecks() {
+    constexpr const char* kGoal = "S10.13 (naming a screen the name it already has does not rewrite the config)";
+    const ScratchDir scratch("renameidempotent");
+    if (!scratch.ok()) {
+        notVerified(kGoal, "a scratch directory could not be created");
+        return;
+    }
+    const std::filesystem::path file = scratch.path() / "wallpaperx" / "config.json";
+    std::error_code ec;
+    std::filesystem::create_directories(file.parent_path(), ec);
+    if (ec) {
+        notVerified(kGoal, "the config directory this phase writes into could not be created: " + ec.message());
+        return;
+    }
+
+    // Pointed at the config file before the manager exists, so no save of this phase can land
+    // uncounted.
+    countRenamesOnto(file);
+    WallpaperManager::Config managerConfig;
+    managerConfig.configFile = file;
+    WallpaperManager manager(managerConfig);
+
+    // GOAL: SetMonitorOutput is idempotent in cost as well as in outcome -- a call that
+    //       changes no binding performs no write. False if it rewrites the file: the method is
+    //       documented idempotent so a client is invited to re-assert every screen's name on
+    //       each display change, and each redundant call parks the daemon's DBus event-loop
+    //       thread until the write settles.
+    // WHY-THIS-SHAPE: successful rename(2) calls onto the config file are counted, which is
+    //       what ConfigStore::save() finishes with. Neither obvious alternative works here.
+    //       Comparing the file's bytes cannot see a redundant save at all, because it writes
+    //       exactly what was already there. Comparing modification times -- what the system
+    //       tier uses across a process restart -- is only as fine as the filesystem's
+    //       timestamp granularity, and the two calls here are microseconds apart in one
+    //       process, so on a filesystem with coarse timestamps it would read "unchanged" for
+    //       a daemon that wrote twice. A rename count is exact on every filesystem. What makes
+    //       an exact number legitimate here rather than an assertion on the scheduler is that
+    //       every count is taken from a QUIESCED daemon, and quiescence is established rather
+    //       than assumed: WallpaperManager::persist() waits for the worker only up to its own
+    //       two-second deadline and then returns with the save still queued, so each sample
+    //       below waits for the name to reach the file and then requires that it had already
+    //       landed when the call returned. A host that missed that deadline is reported as a
+    //       skip -- on such a host a late write and a redundant one are indistinguishable, and
+    //       grading either way would be grading the host. A call that must write NOTHING is
+    //       sampled at once, and what makes that sample safe is the call after it: waiting for
+    //       that write re-reads the count, so a write the redundant call made late shows up as
+    //       a count that moved and is skipped rather than passed over.
+    // CONTROL: the `== BindResult::Unchanged` early return deleted from
+    //       WallpaperManager::setMonitorOutput (backend/daemon/wallpaper_manager.cpp) ->
+    //       "FAIL: naming a screen the name it already has does not write the config at all",
+    //       printing "2 write(s) landed for 1 change". Observed 2026-08-14. Reverted.
+    // CONTROL, for the skip: persist()'s wait shortened to zero AND a 300 ms sleep added ahead
+    //       of store.save() in the persist worker (both in
+    //       backend/daemon/wallpaper_manager.cpp), which is a host whose write always lands
+    //       after the call returns -> this phase reports "NOT VERIFIED -- S10.13 ... this host
+    //       finished the daemon's first config write only after the call had returned". Reading
+    //       the file at the instant the call returned, with no wait, reports "FAIL: naming a
+    //       screen writes that name into the config file" on that same host -- a daemon that
+    //       had done nothing wrong. Observed 2026-08-14. Both reverted.
+    // COVERAGE-ASSERT: a count that never moves is what a dead interposition and a daemon that
+    //       never saves both produce, so the first call is asserted to write exactly once and
+    //       a later call that DOES change the binding is asserted to write again -- an early
+    //       return that swallowed every save fails those instead of passing this.
+
+    // Polls for a name to reach the file, up to a bound far longer than persist()'s own
+    // deadline. Returning false means the write never arrived, which is a verdict on the
+    // daemon; arriving only after the call returned is a verdict on the host, and the callers
+    // below tell the two apart by re-reading the count.
+    const auto waitForOutput = [](const std::filesystem::path& path, int monitorId, const std::string& name) {
+        return waitForRows(path, [monitorId, &name](const std::map<int, RowInFile>& rows) {
+            return rows.count(monitorId) == 1 && rows.at(monitorId).output == name;
+        });
+    };
+
+    manager.setMonitorOutput(3, "DP-A");
+    const unsigned afterFirst = renamesCounted();
+    if (!waitForOutput(file, 3, "DP-A")) {
+        check(false, "naming a screen writes that name into the config file");
+        std::string why;
+        const std::map<int, RowInFile> afterFirstRows = rowsInFile(file, why);
+        std::fprintf(stderr, "  %s; monitor 3 output '%s'\n", why.empty() ? "read back" : why.c_str(),
+                     afterFirstRows.count(3) ? afterFirstRows.at(3).output.c_str() : "(no row)");
+        return;
+    }
+    if (afterFirst != renamesCounted()) {
+        notVerified(kGoal, "this host finished the daemon's first config write only after the call had returned, so "
+                           "every count below would be of a daemon that is still writing");
+        return;
+    }
+    if (afterFirst == 0) {
+        // The counter is incremented after the real rename(2) returns, so a read taken in that
+        // gap sees the new file and the old count. Re-read briefly before declaring anything.
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+        while (renamesCounted() == 0 && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        if (renamesCounted() != 0) {
+            notVerified(kGoal, "this host counted the daemon's first config write only after the file already held "
+                               "the name, so every count below would be of a daemon that is still writing");
+            return;
+        }
+        // The name is on disk and no write was ever counted, so the daemon saved and the
+        // INSTRUMENT is what did not see it. Red as a harness fault rather than a skip: a skip
+        // retires this goal and everything below it -- including "naming a screen the name it
+        // already has does not write the config at all" -- while a build that rewrote the file
+        // on every redundant call would ship. It is not a FAIL against the daemon either; the
+        // fault is this file's interposed rename() no longer sitting on ConfigStore::save()'s
+        // write path.
+        //
+        // CONTROL: the increment in this file's interposed rename() disabled, which is a dead
+        // instrument over a working daemon -> "FAIL (harness): the interposed rename() counted
+        // no write ...", the summary line "1 fault(s) in this test file, not in ConfigStore",
+        // and exit 1. With this arm put back to notVerified() and the same dead counter, the
+        // run printed "NOT VERIFIED -- S10.13 ..." and recorded no fault, retiring every check
+        // below this line. Observed 2026-08-15. Both reverted.
+        harnessFailure("the interposed rename() counted no write although the daemon's save reached the config file, "
+                       "so this phase's instrument no longer observes ConfigStore::save()");
+        return;
+    }
+    check(afterFirst == 1, "naming a screen a name it did not have writes the config exactly once");
+
+    manager.setMonitorOutput(3, "DP-A");
+    const unsigned afterRepeat = renamesCounted();
+    check(afterRepeat == afterFirst, "naming a screen the name it already has does not write the config at all");
+    if (afterRepeat != afterFirst) {
+        std::fprintf(stderr, "  %u write(s) landed for %u change\n", afterRepeat, afterFirst);
+    }
+
+    manager.setMonitorOutput(3, "DP-B");
+    const unsigned afterChange = renamesCounted();
+    if (!waitForOutput(file, 3, "DP-B")) {
+        check(false, "naming a screen a different name writes that name into the config file");
+        return;
+    }
+    if (afterChange != renamesCounted()) {
+        notVerified(kGoal, "this host finished the daemon's second config write only after the call had returned, so "
+                           "a write the redundant call made cannot be told from a late one");
+        return;
+    }
+    check(afterChange == afterRepeat + 1, "naming a screen a different name still writes the config");
+    if (afterChange != afterRepeat + 1) {
+        std::fprintf(stderr, "  %u write(s) landed after a change, %u before it\n", afterChange, afterRepeat);
+    }
+
+    // The other half of the same rule, on a daemon whose last write did not land. The skip
+    // above is what makes a client's re-assertion free; here it is what would make the
+    // re-assertion useless, so it must not apply.
+    constexpr const char* kRetryGoal = "S10.13's retry clause (re-asserting a name after a failed write attempts the "
+                                       "write again)";
+    const std::filesystem::path readOnly = scratch.path() / "ro";
+    std::filesystem::create_directories(readOnly, ec);
+    if (ec) {
+        notVerified(kRetryGoal, "the directory this phase makes unwritable could not be created: " + ec.message());
+        return;
+    }
+    std::filesystem::permissions(readOnly, std::filesystem::perms::owner_read | std::filesystem::perms::owner_exec,
+                                 std::filesystem::perm_options::replace, ec);
+    if (ec) {
+        notVerified(kRetryGoal, "the directory this phase writes into could not be made read-only: " + ec.message());
+        return;
+    }
+    // X.3, as in the failed-save phase: root ignores the mode bits and so do some
+    // filesystems. A host that cannot make a write fail must say so rather than grading the
+    // daemon on a state it was never put in.
+    { std::ofstream probe(readOnly / "probe"); }
+    if (std::filesystem::exists(readOnly / "probe")) {
+        std::filesystem::remove(readOnly / "probe", ec);
+        notVerified(kRetryGoal, "this process can write into a directory it made read-only (running as root, or a "
+                                "filesystem that ignores mode bits), so no save can be made to fail");
+        return;
+    }
+
+    // GOAL: S10.13's retry clause -- when the last config write FAILED, re-asserting the name a
+    //       screen already has attempts the write again. False if the idempotence skip applies:
+    //       the in-memory map is updated before the write is tried, so it agrees with the
+    //       request even when the file does not, and the header invites clients to re-assert
+    //       names, which would then be the one retry a client can reach and would do nothing.
+    // WHY-THIS-SHAPE: the directory is opened again between the two calls and the check is
+    //       that the name REACHES THE FILE. Counting write attempts is what the healthy half
+    //       above does, but it cannot be reused here: the interposed counter only sees a
+    //       rename that succeeded, and no write into an unwritable directory ever gets that
+    //       far, so a failed retry and no retry at all count identically. The third call, on a
+    //       daemon that is healthy again, is asserted to write NOTHING -- without it a build
+    //       that simply deleted the skip would pass this -- and that count is taken after a
+    //       later name change has reached the file, so a write the redundant call made late
+    //       has been counted by the time it is read.
+    // CONTROL: `&& !persistFailedLocked()` deleted from the early return in
+    //       WallpaperManager::setMonitorOutput (backend/daemon/wallpaper_manager.cpp) ->
+    //       "FAIL: re-asserting a name after a failed write writes it to the file", printing
+    //       "0 write(s) landed for the retry, 0 before it; the config file is empty or absent;
+    //       monitor 3 output '(no row)'", and "FAIL: the persistence health recovers once a
+    //       retried write lands". Reverted.
+    // CONTROL, for the last check of this phase: the whole `== BindResult::Unchanged` early
+    //       return deleted from the same function, so every call writes -> "FAIL: once the
+    //       retry has landed, re-asserting the same name writes nothing again", printing "3
+    //       write(s) landed for the redundant call and the change after it, 1 for the retry".
+    //       Observed 2026-08-14. Reverted.
+    const std::filesystem::path blockedFile = readOnly / "wallpaperx" / "config.json";
+    countRenamesOnto(blockedFile);
+    WallpaperManager::Config blockedConfig;
+    blockedConfig.configFile = blockedFile;
+    WallpaperManager blocked(blockedConfig);
+    blocked.setMonitorOutput(3, "DP-A");
+    if (blocked.snapshot().health.persistence.status != wallpaperx::HealthStatus::Fail) {
+        notVerified(kRetryGoal, "the save into a directory this process cannot write did not report a failure, so "
+                                "there is no failed write for a re-assertion to retry");
+        return;
+    }
+    const unsigned beforeRetry = renamesCounted();
+
+    std::filesystem::permissions(readOnly, std::filesystem::perms::owner_all, std::filesystem::perm_options::add, ec);
+    if (ec) {
+        notVerified(kRetryGoal, "the directory could not be made writable again: " + ec.message());
+        return;
+    }
+    blocked.setMonitorOutput(3, "DP-A");
+    // Waited for, then counted: a retry whose write landed a moment after persist() stopped
+    // waiting is still a retry, and sampling at the instant the call returned would report it
+    // as a daemon that never tried. The count is only compared as "more than before", so
+    // taking it after the wait cannot weaken it -- a build that never retries never produces
+    // the row either, and the wait then expires and this check fails as it should.
+    const bool retryLanded = waitForOutput(blockedFile, 3, "DP-A");
+    const unsigned afterRetry = renamesCounted();
+    std::string retryWhy;
+    const std::map<int, RowInFile> retryRows = rowsInFile(blockedFile, retryWhy);
+    const bool retried =
+        retryLanded && afterRetry > beforeRetry && retryRows.count(3) == 1 && retryRows.at(3).output == "DP-A";
+    check(retried, "re-asserting a name after a failed write writes it to the file");
+    if (!retried) {
+        std::fprintf(stderr, "  %u write(s) landed for the retry, %u before it; %s; monitor 3 output '%s'\n",
+                     afterRetry, beforeRetry, retryWhy.empty() ? "read back" : retryWhy.c_str(),
+                     retryRows.count(3) ? retryRows.at(3).output.c_str() : "(no row)");
+    }
+    check(blocked.snapshot().health.persistence.status == wallpaperx::HealthStatus::Ok,
+          "the persistence health recovers once a retried write lands");
+
+    blocked.setMonitorOutput(3, "DP-A");
+    // A name CHANGE is made after the redundant call and waited for, and the total is graded
+    // only once that change is on disk. Reading the count at the instant the redundant call
+    // returned would grade an unsynchronised moment -- persist() abandons its wait after two
+    // seconds, so on a host that hit the deadline a write the redundant call made lands after
+    // the sample and reads as no write at all, leaving this check green for the build it exists
+    // to catch. The changing call is the barrier: DP-C can only be on disk at the moment its
+    // own call returned if the worker was never behind, so anything the redundant call queued
+    // was written and counted. A host where it was behind never gets there -- the count moves
+    // during the wait below and the phase skips.
+    blocked.setMonitorOutput(3, "DP-C");
+    const unsigned afterHealthyChange = renamesCounted();
+    if (!waitForOutput(blockedFile, 3, "DP-C")) {
+        check(false, "a name change made after a retried write reaches the file");
+        return;
+    }
+    if (afterHealthyChange != renamesCounted()) {
+        notVerified(kRetryGoal, "this host finished the daemon's config write only after the call had returned, so a "
+                                "write the redundant call made cannot be told from a late one");
+        return;
+    }
+    const bool repeatWroteNothing = afterHealthyChange == afterRetry + 1;
+    check(repeatWroteNothing, "once the retry has landed, re-asserting the same name writes nothing again");
+    if (!repeatWroteNothing) {
+        std::fprintf(stderr, "  %u write(s) landed for the redundant call and the change after it, %u for the retry\n",
+                     afterHealthyChange, afterRetry);
+    }
+}
+
+// ---------------------------------------------------------------------------- //
+// Phase 6j -- Step 10: the repair a start performs is written at that start, so the
+// next one has nothing left to repair.
+// ---------------------------------------------------------------------------- //
+void runStartupRepairChecks() {
+    constexpr const char* kGoals = "S10.14 (a start that repairs the config writes the repair, so a second start with "
+                                   "no client acting reports nothing and no empty row survives)";
+    const ScratchDir scratch("startuprepair");
+    const std::optional<PhasePaths> paths = preparePhase(scratch, kGoals, 1);
+    if (!paths) return;
+    const std::filesystem::path& file = paths->config;
+    const std::filesystem::path& present = paths->wallpapers[0];
+
+    // Three rows, chosen so the load has to repair something and NO client call could ever
+    // be the thing that writes the repair down: a screen renamed by a later row, and a row
+    // for an id this build cannot apply whose only content is the name the live screen has
+    // just taken. The second is left holding nothing at all.
+    nlohmann::json monitors = nlohmann::json::array();
+    monitors.push_back(configRow(1, "static", present.string(), "DP-3"));
+    monitors.push_back(configRow(1, "", "", "DP-4"));
+    monitors.push_back(configRow(40, "", "", "DP-4"));
+    nlohmann::json root;
+    root["version"] = 1;
+    root["monitors"] = monitors;
+    if (!writeFile(file, root.dump())) {
+        notVerified(kGoals, "the config file this phase reads could not be written");
+        return;
+    }
+
+    std::string firstWhy;
+    std::map<int, RowInFile> afterFirstStart;
+    std::string firstDetail;
+    {
+        WallpaperManager::Config firstConfig;
+        firstConfig.configFile = file;
+        WallpaperManager first(firstConfig);
+        const std::vector<int> restored = first.restoreSaved();
+        check(restored == std::vector<int>{1}, "the one row this build can apply is posted for rendering");
+        // The two calls backend/daemon/main.cpp makes once it owns the bus name, in that
+        // order. restoreSaved() computes the repair and holds it -- writing it there would
+        // land on a running daemon's config and over the bytes preserveUnreadableConfig()
+        // copies aside -- so a phase that read the file after it alone would grade a startup
+        // sequence the daemon does not perform.
+        first.preserveUnreadableConfig();
+        first.writeRepairedConfig();
+        firstDetail = first.snapshot().health.persistence.detail;
+        // Read with no client call of any kind in between. That is the whole point: a save
+        // driven by a SetWallpaper or a SetMonitorOutput would establish nothing about
+        // whether the START wrote anything. Waiting is sound for the same reason: nothing but
+        // the start can put anything in this file, so whatever the wait sees the start wrote.
+        const std::string presentPath = present.string();
+        waitForRows(file, [&presentPath](const std::map<int, RowInFile>& rows) {
+            return rows.count(1) == 1 && rows.at(1).path == presentPath && rows.at(1).output == "DP-4";
+        });
+        afterFirstStart = rowsInFile(file, firstWhy);
+    }
+
+    // COVERAGE-ASSERT: everything below is a statement about a repair, so the first start is
+    // asserted to have really performed and reported one. Without this, a build that found
+    // nothing to repair would satisfy every check in this phase by doing nothing at all.
+    const std::optional<int> displacedCount = clauseCountOrSkip(firstDetail, " screen names displaced", kGoals);
+    if (!displacedCount.has_value()) return;
+    const bool firstStartRepaired = *displacedCount == 2;
+    check(firstStartRepaired, "the first start reports the repair it performed");
+    if (!firstStartRepaired) std::fprintf(stderr, "  persistence detail: %s\n", firstDetail.c_str());
+
+    // The empty-row rule below is graded on a key being ABSENT from this read, and a read that
+    // failed has no keys at all -- so a start that wrote nothing, or a truncated file, would
+    // satisfy it. Established first, and separately, so the failure line says which of the two
+    // broke rather than merging a read fault into a verdict on the daemon.
+    //
+    // CONTROL: this phase's read pointed at a path that does not exist -> "FAIL: the config
+    // this phase reads back was really written", printing "the config file is empty or absent;
+    // ids on disk: (none)", and nothing below it graded. With this precondition disabled and
+    // the same broken read, "a kept row left holding nothing is not written back" reported
+    // PASS on the empty map and only the content check went red. Observed 2026-08-15. Both
+    // reverted.
+    const bool firstReadOk = firstWhy.empty() && afterFirstStart.count(1) == 1;
+    check(firstReadOk, "the config this phase reads back was really written");
+    if (!firstReadOk) {
+        std::fprintf(stderr, "  %s; ids on disk: %s\n", firstWhy.empty() ? "read back" : firstWhy.c_str(),
+                     idsOf(afterFirstStart).c_str());
+        return;
+    }
+
+    // GOAL: the repair a start performs is on disk when that start finishes, with no client
+    //       call. False if the write waits for the next save: a client that only re-asserts
+    //       names it already holds writes nothing, so the next save may never come -- and the
+    //       config keeps the state the daemon has already rejected, which the user meets again
+    //       as the same health note on every boot.
+    // WHY-THIS-SHAPE: the file is read inside the first manager's lifetime and before any
+    //       client call, after a bounded wait for the repaired content, and it is graded on the
+    //       row's CONTENT, not on the file changing. Reading at the instant writeRepairedConfig()
+    //       returned is what a simpler version would do, and persist() abandons its wait after
+    //       two seconds -- so on a loaded host that read prints this FAIL against a daemon whose
+    //       write was merely still in flight. A wait that expires leaves the check red.
+    //       Asking whether monitor 1 carries "DP-4" is true of the unrepaired file as well --
+    //       the fixture's second row says exactly that -- so only asking for the wallpaper and
+    //       the name on one row separates the file this run wrote from the file it read.
+    // CONTROL: `if (repaired) m_repair = persistableLocked();` disabled at the end of
+    //       WallpaperManager::restoreSaved() (backend/daemon/wallpaper_manager.cpp), so
+    //       writeRepairedConfig() has nothing to write -> "FAIL: the repair a start performs is
+    //       on disk before any client call", printing "monitor 1 holds type '' path '' output
+    //       'DP-4'; ids on disk: 1 40", and "FAIL: a second start with no client acting has
+    //       nothing left to repair", printing a second-start detail carrying "2 screen names
+    //       displaced by a later entry" again. Observed 2026-08-15. Reverted.
+    const bool repairOnDisk = afterFirstStart.count(1) == 1 && afterFirstStart.at(1).path == present.string() &&
+                              afterFirstStart.at(1).output == "DP-4";
+    check(repairOnDisk, "the repair a start performs is on disk before any client call");
+    if (!repairOnDisk) {
+        std::fprintf(stderr, "  %s; monitor 1 holds type '%s' path '%s' output '%s'; ids on disk: %s\n",
+                     firstWhy.empty() ? "read back" : firstWhy.c_str(),
+                     afterFirstStart.count(1) ? afterFirstStart.at(1).type.c_str() : "(no row)",
+                     afterFirstStart.count(1) ? afterFirstStart.at(1).path.c_str() : "(no row)",
+                     afterFirstStart.count(1) ? afterFirstStart.at(1).output.c_str() : "(no row)",
+                     idsOf(afterFirstStart).c_str());
+    }
+
+    // GOAL: a kept row that has been stripped of its last content is not written back. False
+    //       if it is: the row reaches the file with no type, no path and no name, and the NEXT
+    //       start reads that emptiness as a wallpaper no build can apply -- a loss the user
+    //       never suffered, reported again on every boot, and self-sustaining because the
+    //       empty row is written out once more each time.
+    // WHY-THIS-SHAPE: monitor 40's row is the one shape that reaches this rule -- its name is
+    //       the only thing on it and the live screen takes that name -- and the check asks
+    //       whether the file has a row for it at all, rather than whether that row is empty.
+    //       "The row is empty" is satisfied by the build that writes it.
+    // CONTROL: the empty-row skip in WallpaperManager::persistableLocked()
+    //       (backend/daemon/wallpaper_manager.cpp) put back to an unconditional
+    //       `entries.push_back(std::move(row));` -> "FAIL: a kept row left holding nothing is
+    //       not written back", printing "ids on disk: 1 40", and "FAIL: a second start with no
+    //       client acting has nothing left to repair", whose detail then carried "1 entries
+    //       dropped, no build can apply them" -- the phantom loss this rule exists to stop.
+    //       Observed 2026-08-14. Reverted.
+    const bool emptyRowNotWritten = afterFirstStart.count(40) == 0;
+    check(emptyRowNotWritten, "a kept row left holding nothing is not written back");
+    if (!emptyRowNotWritten) {
+        std::fprintf(stderr, "  ids on disk: %s; monitor 40 holds type '%s' path '%s' output '%s'\n",
+                     idsOf(afterFirstStart).c_str(), afterFirstStart.at(40).type.c_str(),
+                     afterFirstStart.at(40).path.c_str(), afterFirstStart.at(40).output.c_str());
+    }
+
+    // GOAL: after one start has repaired the config, a second start on the same file -- with
+    //       no client acting between them -- finds nothing to repair and says nothing about
+    //       one. False if any repair clause comes back: the note the user reads is then a
+    //       permanent fixture of every boot rather than a report of something that happened,
+    //       which is how a real loss stops being noticeable.
+    // WHY-THIS-SHAPE: a second WallpaperManager over the same path, asserted to have restored
+    //       the wallpaper, and graded on the ABSENCE of all three repair clauses rather than
+    //       on the detail being any particular string. The detail legitimately carries the
+    //       config path and may carry standing facts about kept rows, so an equality check
+    //       would be brittle in exactly the direction that hides a regression. The restore is
+    //       asserted first so that a second start which read nothing at all -- an empty or
+    //       unparseable file -- cannot pass by having no clauses to print.
+    // CONTROL: as for the two checks above; each of the two mutations that redden them
+    //       reddens this one too, with a different clause. Observed 2026-08-14. Reverted.
+    WallpaperManager::Config secondConfig;
+    secondConfig.configFile = file;
+    WallpaperManager second(secondConfig);
+    const std::vector<int> secondRestored = second.restoreSaved();
+    const WallpaperManager::Snapshot secondSnap = second.snapshot();
+    const std::string& secondDetail = secondSnap.health.persistence.detail;
+    const bool secondStartRead = secondRestored == std::vector<int>{1} && secondSnap.outputs.count("DP-4") == 1;
+    check(secondStartRead, "the second start reads the repaired config back");
+    const std::string clausesFound = repairClausesIn(secondDetail);
+    const bool secondStartQuiet = clausesFound.empty();
+    check(secondStartQuiet, "a second start with no client acting has nothing left to repair");
+    if (!secondStartRead || !secondStartQuiet) {
+        std::fprintf(stderr, "  second start restored %zu row(s), %zu name(s);%s; persistence detail: %s\n",
+                     secondRestored.size(), secondSnap.outputs.size(),
+                     clausesFound.empty() ? " no repair clause" : clausesFound.c_str(), secondDetail.c_str());
+    }
+}
+
+// ---------------------------------------------------------------------------- //
+// Phase 6k -- Step 10: a health snapshot taken while the first save is publishing
+// its worker. The workload the ThreadSanitizer tier needs; see the block below for
+// what this does and does not assert on an ordinary build.
+// ---------------------------------------------------------------------------- //
+void runConcurrentHealthReadChecks() {
+    constexpr const char* kGoal = "S10.15 (the first save publishes its worker where every reader of it is "
+                                  "synchronised, so a /health request beside it is not a data race)";
+    const ScratchDir scratch("concurrenthealth");
+    const std::optional<PhasePaths> paths = preparePhase(scratch, kGoal, 1);
+    if (!paths) return;
+    const std::filesystem::path& file = paths->config;
+    const std::filesystem::path& wallpaper = paths->wallpapers[0];
+
+    WallpaperManager::Config managerConfig;
+    managerConfig.configFile = file;
+    WallpaperManager manager(managerConfig);
+
+    // GOAL: the daemon's first save and a concurrent health request do not race on the worker
+    //       the save publishes. False if that pointer is published unsynchronised: the HTTP
+    //       thread reads it under the state lock while the bus thread writes it under nothing,
+    //       which is undefined behaviour and, on a real toolchain, a torn or stale read of a
+    //       shared_ptr -- either a missed persistence status or a double free of the control
+    //       block.
+    // WHY-THIS-SHAPE: THIS PHASE ASSERTS NOTHING ABOUT THE RACE, deliberately. It exists to
+    //       produce the overlap, and the instrument that grades it is ThreadSanitizer: build
+    //       with -DWALLPAPERX_SANITIZE=thread and run this binary. An assertion here would be
+    //       an assertion on the scheduler -- a race that does not fire on this run is
+    //       indistinguishable from no race, so a green check would mean nothing and a red one
+    //       would be flaky. What the phase establishes instead is that the overlap really
+    //       happened -- the reader was already running before the save began, and completed at
+    //       least one snapshot while it was in flight -- and a run where it did not is a SKIP,
+    //       not a pass and not a failure. The reader is started and confirmed running BEFORE
+    //       requestWallpaper, rather than both being launched together, because the pointer is
+    //       published exactly once, on the first save -- two threads racing to start would
+    //       usually miss that instant.
+    // CONTROL: the publication in WallpaperManager::persist()
+    //       (backend/daemon/wallpaper_manager.cpp) put back to its unsynchronised shape --
+    //       `startPersistWorker(); std::shared_ptr<PersistWorker> worker = m_persist;` with no
+    //       m_stateMutex around it -- and the tree rebuilt with -DWALLPAPERX_SANITIZE=thread ->
+    //       "WARNING: ThreadSanitizer: data race", "Read of size 8 ... in
+    //       WallpaperManager::applyPersistOutcomeLocked() ... Previous write of size 8 ... by
+    //       main thread", and ctest reported config_store as Failed rather than Passed, the
+    //       sanitizer replacing the exit code. Every check in this phase stayed GREEN in that
+    //       run, which is the point of the block above: the sanitizer is the oracle here, not
+    //       the assertions. With the lock restored the same build reports nothing and passes.
+    //       Observed 2026-08-14. Reverted.
+    // CONTROL, for the overlap being reported as a skip rather than a pass: a three-second
+    //       sleep added to this reader's loop, so no read can complete inside the save window
+    //       -> exit 77 with "2 snapshot(s) in total, 0 of them while the save was in flight"
+    //       and "NOT VERIFIED -- S10.15 ... nothing overlapped it for the sanitizer to grade",
+    //       and no check failing. The production-side version of the same state -- persist()
+    //       called while m_stateMutex is held, so no health read can complete beside it --
+    //       cannot be used as a control: persist() takes that same mutex and the daemon
+    //       self-deadlocks. Observed 2026-08-14. Reverted.
+    // COVERAGE-ASSERT: a snapshot is counted as an overlap only when the save was in flight
+    //       both before the read began and after it ended, and a run where that count is zero
+    //       is reported as a SKIP rather than a pass. So a
+    //       future edit that leaves the reader not actually reading, or serialised behind the
+    //       save, cannot leave the sanitizer tier with nothing to sanitize while this phase
+    //       reads green. It is not graded as a failure: whether another thread is handed CPU
+    //       inside a two-microsecond window is a property of the host, not of the daemon, and
+    //       a check() there fails a correct build on a loaded single-CPU runner.
+    std::atomic<unsigned> snapshotsTaken{0};
+    std::atomic<unsigned> snapshotsDuringSave{0};
+    std::atomic<bool> saveInFlight{false};
+    bool readerStarted = false;
+    bool saveRefused = false;
+    std::string refusal;
+    // Written by the reader only, read only after ~jthread has joined it -- the join is the
+    // happens-before edge, so no lock is needed.
+    std::string readerThrew;
+    {
+        // The stop_token, not a flag of our own: every check below can be reached by a path
+        // that leaves the loop running, and ~jthread requests the stop on all of them --
+        // including one that throws something no catch here names. A hand-rolled flag has to
+        // be set on each of those paths, and the destructor would then join a loop nobody
+        // stopped.
+        //
+        // CONTROL: a bare `return;` added on the path out of this block, i.e. one exit that
+        // sets no flag. With the token the binary finished normally (exit 0, every later phase
+        // still run); with the loop back on a hand-rolled `std::atomic<bool>` it hung until
+        // killed at 30 s, printing nothing at all -- no phase name, no diagnostic, the failure
+        // mode this shape exists to remove. Observed 2026-08-14. Both reverted.
+        //
+        // CONTROL, for the handler: `throw std::runtime_error("CONTROL")` added at the top of
+        // the loop body -> "FAIL: the health read beside the first save completed without
+        // throwing", printing "WallpaperManager::snapshot() threw: CONTROL", and the phases
+        // after this one still ran. With the catch arms rethrowing instead, the same throw
+        // ended the binary in std::terminate: exit 134, "terminate called after throwing an
+        // instance of 'int'", no FAIL line, and none of the later phases run. Observed
+        // 2026-08-15. Both reverted.
+        std::jthread reader([&](std::stop_token stopping) {
+            // An exception escaping a thread's callable is std::terminate, which destroys the
+            // diagnostics this phase exists to print. Reported, not swallowed: it goes red as a
+            // FAIL below and the overlap counts of that run are discarded.
+            try {
+                while (!stopping.stop_requested()) {
+                    // Sampled on BOTH sides of the snapshot. The flag rises once and falls once
+                    // for the whole phase, so true before it began and true after it ended is
+                    // what proves the save was in flight across the read's entire interval. The
+                    // single sample taken after the call also counts a snapshot that finished
+                    // all its work before the save started, which is the one thing this counter
+                    // exists to rule out.
+                    //
+                    // CONTROL: a two-second sleep between the snapshot and the second sample,
+                    // and three seconds of the save window held open after requestWallpaper --
+                    // a read whose whole workload ran before the save began and which is still
+                    // alive when the flag rises -> "2 snapshot(s) in total, 0 of them while the
+                    // save was in flight" and "NOT VERIFIED -- S10.15 ...", exit 77. With the
+                    // second sample alone deciding, the same run reported "2 health snapshots
+                    // taken beside the first save, 1 of them while it was in flight" and "all
+                    // checks passed" -- an overlap certified for a read that never had one.
+                    // Observed 2026-08-15. All reverted.
+                    const bool inFlightBefore = saveInFlight.load(std::memory_order_acquire);
+                    const WallpaperManager::Snapshot taken = manager.snapshot();
+                    (void)taken;
+                    ++snapshotsTaken;
+                    if (inFlightBefore && saveInFlight.load(std::memory_order_acquire)) ++snapshotsDuringSave;
+                }
+            } catch (const std::exception& e) {
+                readerThrew = e.what();
+            } catch (...) {
+                readerThrew = "an exception that is not a std::exception";
+            }
+        });
+
+        // A deadline with a real failure branch: without it a reader that never ran would
+        // leave the save unobserved and this phase would report a concurrency property it
+        // never exercised.
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (snapshotsTaken.load() == 0 && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        readerStarted = snapshotsTaken.load() > 0;
+        if (readerStarted) {
+            saveInFlight.store(true, std::memory_order_release);
+            try {
+                manager.requestWallpaper("static", wallpaper.string(), 1);
+            } catch (const std::exception& e) {
+                saveRefused = true;
+                refusal = e.what();
+            }
+            saveInFlight.store(false, std::memory_order_release);
+        }
+    }
+
+    if (!readerThrew.empty()) {
+        check(false, "the health read beside the first save completed without throwing");
+        std::fprintf(stderr, "  WallpaperManager::snapshot() threw: %s\n", readerThrew.c_str());
+        return;
+    }
+    if (!readerStarted) {
+        notVerified(kGoal, "no health snapshot was taken within five seconds, so nothing ran beside the save");
+        return;
+    }
+    if (saveRefused) {
+        notVerified(kGoal, "the save this phase races against was refused: " + refusal);
+        return;
+    }
+    if (snapshotsDuringSave.load() == 0) {
+        std::fprintf(stderr, "  %u snapshot(s) in total, %u of them while the save was in flight\n",
+                     snapshotsTaken.load(), snapshotsDuringSave.load());
+        notVerified(kGoal, "no health snapshot completed while the first save was in flight, so nothing overlapped it "
+                           "for the sanitizer to grade");
+        return;
+    }
+    waitForRows(file, [](const std::map<int, RowInFile>& rows) { return rows.count(1) == 1; });
+    std::string why;
+    const std::map<int, RowInFile> onDisk = rowsInFile(file, why);
+    const bool saveLanded = onDisk.count(1) == 1;
+    check(saveLanded, "the save this phase races against really happened");
+    if (!saveLanded) {
+        std::fprintf(stderr, "  %s; ids on disk: %s\n", why.empty() ? "read back" : why.c_str(),
+                     idsOf(onDisk).c_str());
+    }
+    std::printf("config_store_test: %u health snapshots taken beside the first save, %u of them while it was in "
+                "flight\n",
+                snapshotsTaken.load(), snapshotsDuringSave.load());
 }
 
 // ---------------------------------------------------------------------------- //
@@ -1613,17 +4064,19 @@ void runSaveCostChecks() {
     constexpr const char* kGoal = "S8.10 (the save on SetWallpaper does not make a DBus handler slow)";
 
     const ScratchDir onDisk("savecost");
-    if (!onDisk.ok()) {
-        notVerified(kGoal, "a scratch directory could not be created");
-        return;
-    }
-    const std::filesystem::path persistedFile = onDisk.path() / "wallpaperx" / "config.json";
+    // preparePhase, not a bare onDisk.ok(): the closing check reads back the path the daemon
+    // persisted -- which is what establishes the zero-fsync count above was measured over a real
+    // save -- and a temporary directory whose name is not valid UTF-8 makes the writer skip that
+    // entry by design (S8.7).
+    const std::optional<PhasePaths> paths = preparePhase(onDisk, kGoal, 1);
+    if (!paths.has_value()) return;
+    const std::filesystem::path persistedFile = paths->config;
     const std::filesystem::path probeFile = onDisk.path() / "wallpaperx" / "probe.json";
-    const std::filesystem::path wallpaper = onDisk.path() / "wallpaper.png";
+    const std::filesystem::path wallpaper = paths->wallpapers.front();
     std::error_code ec;
     std::filesystem::create_directories(persistedFile.parent_path(), ec);
-    if (ec || !writeWallpaperFile(wallpaper)) {
-        notVerified(kGoal, "the fixture files this phase needs could not be written");
+    if (ec) {
+        notVerified(kGoal, "the directory this phase's probe writer needs could not be created");
         return;
     }
 
@@ -1638,8 +4091,8 @@ void runSaveCostChecks() {
     //       823.8 us, PLAN.md Step 8). False if the handler flushes to the platter before
     //       replying: every caller then waits on the disk.
     // WHY-THIS-SHAPE: the durability syscalls are counted, not the elapsed time. Timing the
-    //       save against a write+rename this file performs is the obvious version and is
-    //       what shipped: its bound is the geometric mean of two disk costs, while the
+    //       save against a write+rename this file performs is the obvious version and does not
+    //       work: its bound is the geometric mean of two disk costs, while the
     //       quantity it grades also carries a fixed CPU cost -- the JSON build -- that no
     //       yardstick in the phase measures and that does not shrink when the disk gets
     //       faster. On a host with a fast fsync the bound falls below what correct code
@@ -1770,17 +4223,16 @@ void runStalledSaveChecks() {
     constexpr const char* kGoals = "S8.29/S8.31/S8.32 (a config write that never comes back)";
 
     const ScratchDir scratch("stalledsave");
-    if (!scratch.ok()) {
-        notVerified(kGoals, "a scratch directory could not be created");
-        return;
-    }
-    const std::filesystem::path configFile = scratch.path() / "wallpaperx" / "config.json";
-    const std::filesystem::path healthyWallpaper = scratch.path() / "healthy.png";
-    const std::filesystem::path stalledWallpaper = scratch.path() / "stalled.png";
-    if (!writeWallpaperFile(healthyWallpaper) || !writeWallpaperFile(stalledWallpaper)) {
-        notVerified(kGoals, "the wallpaper files this phase needs could not be written");
-        return;
-    }
+    // preparePhase ahead of the baseline guard below, not instead of it: on a host whose
+    // temporary directory is not valid UTF-8 the writer must skip these entries (S8.7), and the
+    // baseline guard would then report the miss as "the healthy save did not happen", sending a
+    // reader to the daemon's save path for a property of the machine. The guard stays for every
+    // other cause, which is the one it was written for.
+    const std::optional<PhasePaths> paths = preparePhase(scratch, kGoals, 2);
+    if (!paths.has_value()) return;
+    const std::filesystem::path configFile = paths->config;
+    const std::filesystem::path healthyWallpaper = paths->wallpapers[0];
+    const std::filesystem::path stalledWallpaper = paths->wallpapers[1];
 
     WallpaperManager::Config config;
     config.configFile = configFile;
@@ -1948,16 +4400,15 @@ void runSaveVisibleOnReturnChecks() {
     constexpr const char* kGoals = "S8.28 (a save is on disk when the call that made it returns)";
 
     const ScratchDir scratch("savewait");
-    if (!scratch.ok()) {
-        notVerified(kGoals, "a scratch directory could not be created");
-        return;
-    }
-    const std::filesystem::path configFile = scratch.path() / "wallpaperx" / "config.json";
-    const std::filesystem::path wallpaper = scratch.path() / "slow.png";
-    if (!writeWallpaperFile(wallpaper)) {
-        notVerified(kGoals, "the wallpaper file this phase needs could not be written");
-        return;
-    }
+    // preparePhase, not a bare scratch.ok(): the bytes pulled out of the fifo are matched against
+    // the wallpaper path this phase requested, and a temporary directory whose name is not valid
+    // UTF-8 makes the writer skip that entry by design (S8.7) -- so the parked write would
+    // legitimately carry an empty monitor list and the check would read as the daemon queueing
+    // the wrong state.
+    const std::optional<PhasePaths> paths = preparePhase(scratch, kGoals, 1);
+    if (!paths.has_value()) return;
+    const std::filesystem::path configFile = paths->config;
+    const std::filesystem::path wallpaper = paths->wallpapers.front();
 
     std::string fixtureWhy;
     if (!blockingWriteFixtureWorks(scratch.path() / "wallpaperx" / "probe.json", fixtureWhy)) {
@@ -2046,34 +4497,21 @@ void runSaveVisibleOnReturnChecks() {
                 static_cast<long long>(kHold.count()), elapsedMs);
 }
 
-// Points the interposed rename() at one destination and zeroes its count.
-void countRenamesOnto(const std::filesystem::path& target) {
-    std::lock_guard<std::mutex> lock(g_renameMutex);
-    g_renameTarget = target.string();
-    g_renameCount = 0;
-}
-
-unsigned renamesCounted() {
-    std::lock_guard<std::mutex> lock(g_renameMutex);
-    return g_renameCount;
-}
-
 void runLatestSnapshotWinsChecks() {
     constexpr const char* kGoals = "S8.33 (the snapshot queued behind a stalled write is replaced, not queued)";
 
     const ScratchDir scratch("latestwins");
-    if (!scratch.ok()) {
-        notVerified(kGoals, "a scratch directory could not be created");
-        return;
-    }
-    const std::filesystem::path configFile = scratch.path() / "wallpaperx" / "config.json";
-    const std::filesystem::path stuck = scratch.path() / "stuck.png";
-    const std::filesystem::path superseded = scratch.path() / "superseded.png";
-    const std::filesystem::path newest = scratch.path() / "newest.png";
-    if (!writeWallpaperFile(stuck) || !writeWallpaperFile(superseded) || !writeWallpaperFile(newest)) {
-        notVerified(kGoals, "the wallpaper files this phase needs could not be written");
-        return;
-    }
+    // preparePhase, not a bare scratch.ok(): every check below identifies a snapshot by the
+    // wallpaper path in it, and a temporary directory whose name is not valid UTF-8 makes the
+    // writer skip those entries by design (S8.7). Without this the phase spends its full ten
+    // second wait for a row that is legitimately never coming and then blames the daemon for
+    // dropping the newest save.
+    const std::optional<PhasePaths> paths = preparePhase(scratch, kGoals, 3);
+    if (!paths.has_value()) return;
+    const std::filesystem::path configFile = paths->config;
+    const std::filesystem::path stuck = paths->wallpapers[0];
+    const std::filesystem::path superseded = paths->wallpapers[1];
+    const std::filesystem::path newest = paths->wallpapers[2];
 
     std::string fixtureWhy;
     if (!blockingWriteFixtureWorks(scratch.path() / "wallpaperx" / "probe.json", fixtureWhy)) {
@@ -2248,13 +4686,13 @@ int main() {
     // X.4: this file drives a WallpaperManager, whose constructor can throw on a machine
     // whose shader directory is missing. Without a handler the process would abort and ctest
     // would report an opaque SIGABRT instead of the FAIL lines above. One handler per phase
-    // rather than one around all of them: a throw in phase 2 used to delete phases 3 to 8
-    // from the run with nothing in the output saying they had not been reached, so a reader
-    // saw one named failure and reasonably concluded everything else had been checked.
+    // rather than one around all of them: a throw in phase 2 would otherwise delete phases 3
+    // to 8 from the run with nothing in the output saying they had not been reached, and a
+    // reader would see one named failure and reasonably conclude everything else was checked.
     //
     // GOAL: X.3 -- what escapes a phase body is a fault of the code under test, so the
-    //       handler below counts it as one. False if a host limit reaches here: $TMPDIR
-    //       naming a directory that does not exist used to throw out of every phase's first
+    //       handler below counts it as one. False if a host limit reaches here: $TMPDIR naming
+    //       a directory that does not exist would otherwise throw out of every phase's first
     //       line and print 16 FAIL lines against ConfigStore for a machine with nowhere to
     //       put a temporary directory.
     // WHY-THIS-SHAPE: fixed at the setup call (ScratchDir's temp_directory_path now uses the
@@ -2282,6 +4720,13 @@ int main() {
         {"a config that cannot be preserved anywhere", runPreservationExhaustedChecks},
         {"the copy made for malformed entries", runMalformedEntryCopyChecks},
         {"entries this build cannot apply", runUnappliedEntryChecks},
+        {"the connector name as a stored field", runOutputFieldChecks},
+        {"the connector names read back at startup", runOutputRestoreChecks},
+        {"the connector names a restore could not keep", runOutputLossReportChecks},
+        {"the rows kept for a build with more screens", runPreservedRowChecks},
+        {"re-asserting a name a screen already has", runIdempotentRenameChecks},
+        {"the repair a start performs is written at that start", runStartupRepairChecks},
+        {"a health read beside the first save", runConcurrentHealthReadChecks},
         {"a save that cannot succeed", runFailedSaveChecks},
         {"the cost of the save", runSaveCostChecks},
         {"a write that never comes back", runStalledSaveChecks},
@@ -2320,7 +4765,11 @@ int main() {
     }
 
     // Asked before the not-verified count, so a run that is both broken and incomplete
-    // reports as broken rather than hiding failures behind ctest's "Skipped".
-    if (wallpaperx::testing::reportCheckFailures()) return 1;
+    // reports as broken rather than hiding failures behind ctest's "Skipped". Both red
+    // channels are summarised: a fault this file recorded against itself -- an instrument that
+    // stopped observing what it grades -- must not be reported as a skip either.
+    const bool checksFailed = wallpaperx::testing::reportCheckFailures();
+    const bool harnessBroken = wallpaperx::testing::reportHarnessFaults("in this test file, not in ConfigStore");
+    if (checksFailed || harnessBroken) return 1;
     return wallpaperx::testing::reportNotVerifiedOrPassed();
 }
