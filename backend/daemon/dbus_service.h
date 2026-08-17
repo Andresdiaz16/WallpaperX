@@ -52,8 +52,10 @@ private:
     // those cost nothing to detect and are the ones worth failing fast.
     void setWallpaper(const std::string& type, const std::string& path, int32_t monitorId);
 
-    // Complete on return, unlike SetWallpaper: no render sits behind it, so an accepted
-    // reply means the mapping is in place rather than merely queued.
+    // Complete on return, unlike SetWallpaper: no render sits behind it, so an accepted reply
+    // means the mapping is in place and on disk rather than merely queued. An error reply means
+    // the name did not reach the config file -- the binding still stands for this run, but it
+    // will not survive a restart, and the client is invited to re-assert it later.
     void setMonitorOutput(int32_t monitorId, const std::string& outputName);
 
     void emitFrameReady(int monitorId, uint64_t generation);

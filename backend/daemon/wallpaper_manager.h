@@ -230,7 +230,10 @@ public:
     // a bad id or a name outputNameError() rejects. No render and no GPU work.
     //
     // Idempotent, and a call changing nothing does not write: clients are invited to
-    // re-assert names, and the write parks the calling thread.
+    // re-assert names, and the write parks the calling thread. Throws std::runtime_error when
+    // the name did not reach the config file -- the binding stands for this run regardless,
+    // but only a write makes it survive a restart, and the caller is the only one who can say
+    // so at the moment it happens.
     void setMonitorOutput(int monitorId, const std::string& outputName);
 
     // Applies the config file's wallpapers, returning the monitor ids to post to the worker.
@@ -244,9 +247,10 @@ public:
     // Until it runs, saving stays refused.
     void preserveUnreadableConfig();
 
-    // Writes the repair restoreSaved() computed, if it computed one and a copy of what it
-    // replaces exists. Call once, after preserveUnreadableConfig(): that call is what takes the
-    // copy, and the rewrite would replace the very bytes it preserves.
+    // Writes the repair restoreSaved() computed, if it computed one, and waits out the write's
+    // deadline so the caller can report the outcome. Call once, after preserveUnreadableConfig():
+    // that call is what copies the bytes this rewrite replaces, and with no copy every write --
+    // this one and every later save -- is refused until one is taken.
     void writeRepairedConfig();
 
     // Renders whatever request the monitor currently holds. Called on the render worker's
@@ -370,10 +374,15 @@ private:
     void addPersistenceNote(const std::string& note);
     std::string persistenceDetail(const std::string& base) const;
 
-    // Copies the config to the first free <state dir>/<file>.bad[.N], and removes the original
-    // when `move`. Returns the name used, or empty with `why` set. Numbered because one name
-    // meant the second unreadable config had nowhere to go, and so was destroyed.
+    // Copies the config to the first free <file>.bad[.N] in the state directory, or beside the
+    // config when there is no usable state directory, and removes the original when `move`.
+    // Returns the name used, or empty with `why` naming every directory tried. Numbered because
+    // one name meant the second unreadable config had nowhere to go, and so was destroyed.
     std::string preserveConfigTo(bool move, std::string& why) const;
+
+    // Whether a repair was staged with no copy of the bytes it replaces. Takes m_stateMutex,
+    // so it is called with none held.
+    bool repairUncopied() const;
 
     // Spawns the config writer on first use, and leaves m_persist null when the thread could
     // not be created. Caller must hold m_stateMutex: m_persist is published here and read
@@ -410,14 +419,25 @@ private:
     // preserveUnreadableConfig(), read by writeRepairedConfig(); both run before the event loop.
     bool m_repairCopied = false;
 
-    // Raw, unsanitized; sanitized once when recorded. Written by the constructor and by
-    // restoreSaved(), both before the event loop starts; read under m_stateMutex after.
+    // A repair was staged with no copy of what it replaces, so no write may go out until one is
+    // taken. Set by writeRepairedConfig(), cleared by queuePersist() once the copy lands.
+    // Guarded by m_stateMutex.
+    bool m_repairUncopied = false;
+
+    // Raw, unsanitized; sanitized once when recorded. Written by the constructor, by
+    // preserveUnreadableConfig() and by restoreSaved(), all before the event loop starts; read
+    // under m_stateMutex after.
     std::string m_persistenceNote;
 
     // Started on the first save rather than at construction, so a daemon that never sets a
     // wallpaper never spawns it. Detached, never joined: see PersistWorker. Guarded by
     // m_stateMutex; non-null means a thread is servicing it.
     std::shared_ptr<PersistWorker> m_persist;
+
+    // A save was asked for and no writer could be started, which is the other reason m_persist
+    // is null -- the first being that nothing has been asked of the file yet. Guarded by
+    // m_stateMutex.
+    bool m_persistWorkerFailed = false;
 
     // Entries no build can apply, dropped rather than kept, counted so the loss is reported at
     // all. Guarded by m_stateMutex. Name-only rows counted apart: the report these feed is the

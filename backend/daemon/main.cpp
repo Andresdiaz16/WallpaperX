@@ -174,8 +174,8 @@ int main() {
             manager.preserveUnreadableConfig();
             // After the copy aside, not before: the repair rewrites config.json from live
             // state, and the copy exists to preserve the bytes that rewrite would destroy.
-            // Called the other way round it writes nothing at all -- it refuses to rewrite a
-            // file no copy of exists.
+            // Called the other way round it writes nothing at all -- with no copy taken, every
+            // write is refused until one is.
             manager.writeRepairedConfig();
         }
 
