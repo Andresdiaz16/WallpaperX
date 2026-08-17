@@ -564,6 +564,20 @@ void WallpaperManager::requestWallpaper(const std::string& type, const std::stri
         // it counts renders, and no render has happened yet.
         state.hasFrame = false;
 
+        // A row kept for a newer build loses its monitor to this request, and the save below
+        // drops it. Erased and reported once, here: the same collision is counted when the
+        // config is restored, and a client claiming the id later cost the user the same
+        // picture with nothing anywhere saying so.
+        const auto kept = std::find_if(
+            m_unapplied.begin(), m_unapplied.end(),
+            [monitorId](const PersistedWallpaper& row) { return row.monitorId == monitorId; });
+        if (kept != m_unapplied.end() && (!kept->type.empty() || !kept->path.empty())) {
+            kept->type.clear();
+            kept->path.clear();
+            addPersistenceNote(
+                "1 entry this build cannot apply, replaced by a new wallpaper for that screen");
+        }
+
         toPersist = persistableLocked();
     }
 

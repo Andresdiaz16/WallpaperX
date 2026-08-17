@@ -207,6 +207,15 @@ target_link_libraries(wallpaperx-log-escape-test PRIVATE wallpaperx-daemon-lib)
 add_executable(wallpaperx-config-store-test tests/config_store_test.cpp)
 target_link_libraries(wallpaperx-config-store-test PRIVATE wallpaperx-daemon-lib)
 
+# The same trade the http-server test makes above, for the same measured reason. S10.16's
+# allocation half has one lever -- std::thread's constructor allocates before it asks the kernel
+# for anything -- and reaching it means replacing ::operator new/delete in this binary. A
+# sanitized runtime owns those two, so under a sanitizer the instrument is compiled out, the
+# phase reports itself unexercised, and SKIP_RETURN_CODE turns that into a ctest Skip.
+if(WALLPAPERX_SANITIZE)
+    target_compile_definitions(wallpaperx-config-store-test PRIVATE WALLPAPERX_ALLOCATION_INSTRUMENT=0)
+endif()
+
 # Step 9's Plasma wallpaper package (kde/kpackage), checked as text: that its metadata
 # parses, declares the structure Plasma looks for, and agrees with the install rule below
 # and with the plugin id the app's activation script will ask for.

@@ -247,8 +247,9 @@ public:
     // Until it runs, saving stays refused.
     void preserveUnreadableConfig();
 
-    // Writes the repair restoreSaved() computed, if it computed one, and waits out the write's
-    // deadline so the caller can report the outcome. Call once, after preserveUnreadableConfig():
+    // Queues the repair restoreSaved() computed, if it computed one, and does not wait for the
+    // write: the caller has claimed the bus name and has no event loop yet. A failed write is
+    // reported on stderr by the writer itself. Call once, after preserveUnreadableConfig():
     // that call is what copies the bytes this rewrite replaces, and with no copy every write --
     // this one and every later save -- is refused until one is taken.
     void writeRepairedConfig();
@@ -425,8 +426,9 @@ private:
     bool m_repairUncopied = false;
 
     // Raw, unsanitized; sanitized once when recorded. Written by the constructor, by
-    // preserveUnreadableConfig() and by restoreSaved(), all before the event loop starts; read
-    // under m_stateMutex after.
+    // preserveUnreadableConfig() and by restoreSaved(), all before the event loop starts, and by
+    // requestWallpaper() under m_stateMutex once per kept row it displaces; read under
+    // m_stateMutex.
     std::string m_persistenceNote;
 
     // Started on the first save rather than at construction, so a daemon that never sets a
