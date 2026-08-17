@@ -322,8 +322,10 @@ public:
         // per spawn; a test that wants state to survive a restart passes its own.
         std::vector<std::string> extraEnv = extraEnvIn;
         bool configHomeSet = false;
+        bool stateHomeSet = false;
         for (const std::string& entry : extraEnv) {
             if (entry.rfind("XDG_CONFIG_HOME=", 0) == 0) configHomeSet = true;
+            if (entry.rfind("XDG_STATE_HOME=", 0) == 0) stateHomeSet = true;
         }
         if (!configHomeSet) {
             // A member that owns itself, rather than a path cleaned up in ~SpawnedDaemon: a
@@ -332,6 +334,16 @@ public:
             m_configHome.emplace("spawn");
             if (!m_configHome->ok()) throw std::runtime_error("scratch XDG_CONFIG_HOME could not be created");
             extraEnv.push_back(m_configHome->env());
+        }
+        // The same for the copy the daemon takes of a config it rejects: unset, it would land
+        // in the developer's own $XDG_STATE_HOME. Kept beside whichever config home is in use
+        // when this owns one, so the two are removed together.
+        if (!stateHomeSet) {
+            if (!m_configHome.has_value()) {
+                m_stateHome.emplace("spawnstate");
+                if (!m_stateHome->ok()) throw std::runtime_error("scratch XDG_STATE_HOME could not be created");
+            }
+            extraEnv.push_back(m_configHome.has_value() ? m_configHome->stateEnv() : m_stateHome->stateEnv());
         }
 
         int fds[2];
@@ -726,8 +738,11 @@ private:
     }
 
     // Only engaged when this spawn created the directory, so an explicit override is never
-    // deleted by us. Declared before every other member so it outlives them.
+    // deleted by us. Declared before every other member so it outlives them. m_stateHome is
+    // engaged only when the caller brought its own config home and no state home, which is the
+    // one case the config home cannot hold the copies.
     std::optional<wallpaperx::testing::ScratchDir> m_configHome;
+    std::optional<wallpaperx::testing::ScratchDir> m_stateHome;
 
     pid_t m_pid = -1;
     int m_readFd = -1;
@@ -4794,14 +4809,20 @@ std::string joined(const std::vector<std::string>& names) {
     return text;
 }
 
-// Every <config.json>.bad[.N] beside the real file, sorted, so a phase can say how many
-// copies exist and which ones rather than only whether one does.
-std::vector<std::string> preservedCopyNames(const std::filesystem::path& file) {
+// Every <config.json>.bad[.N] the daemon may have written, sorted, so a phase can say how many
+// copies exist and which ones rather than only whether one does. Both the state directory the
+// copies go to and the config directory they used to go to are scanned: "no copy was made" has
+// to be false for a copy taken anywhere.
+std::vector<std::string> preservedCopyNames(const std::filesystem::path& file,
+                                            const std::filesystem::path& stateDir) {
     std::vector<std::string> found;
-    std::error_code ec;
-    for (const auto& entry : std::filesystem::directory_iterator(file.parent_path(), ec)) {
-        const std::string name = entry.path().filename().string();
-        if (name.rfind(file.filename().string() + ".bad", 0) == 0) found.push_back(name);
+    for (const std::filesystem::path& dir : {stateDir, file.parent_path()}) {
+        std::error_code ec;
+        for (auto it = std::filesystem::directory_iterator(dir, ec);
+             !ec && it != std::filesystem::directory_iterator(); it.increment(ec)) {
+            const std::string name = it->path().filename().string();
+            if (name.rfind(file.filename().string() + ".bad", 0) == 0) found.push_back(it->path().string());
+        }
     }
     std::sort(found.begin(), found.end());
     return found;
@@ -4827,7 +4848,7 @@ void checkConfigPreservationOwnership(NameWatcher& names, const std::string& val
         return;
     }
 
-    SpawnedDaemon first({validationEnv, configHome.env()});
+    SpawnedDaemon first({validationEnv, configHome.env(), configHome.stateEnv()});
     if (!names.waitFor(true)) {
         if (!reportedStartupFault(first, kGoals)) {
             notVerified(kGoals, "the daemon for this phase never acquired the bus name");
@@ -4849,14 +4870,24 @@ void checkConfigPreservationOwnership(NameWatcher& names, const std::string& val
     //       holds the bytes of the file it could not read" and "FAIL: the daemon says where
     //       it kept the config it could not read", printing "copies beside it: (none)".
     //       Reverted.
+    // CONTROL, for the copy being kept in the state directory rather than beside config.json:
+    //       the copy directory in WallpaperManager::preserveConfigTo()
+    //       (backend/daemon/wallpaper_manager.cpp) put back to the config file's own parent ->
+    //       "FAIL: the daemon moves a config it could not read aside" and "FAIL: the copy the
+    //       daemon kept holds the bytes of the file it could not read" at this tier, with the
+    //       repair-after-preservation phase's copy check red too. Observed 2026-08-15.
+    //       Reverted.
     auto proxy =
         sdbus::createProxy(sdbus::ServiceName{DbusService::kBusName}, sdbus::ObjectPath{DbusService::kObjectPath});
     const StatusReply firstStatus = getStatusOrExplain(*proxy);
-    const std::filesystem::path kept(file.string() + ".bad");
+    // In the state directory, not beside config.json: the copy is deliberately kept out of the
+    // directory the user hand-edits.
+    const std::filesystem::path kept = configHome.preservedDir() / "config.json.bad";
     const bool moved = !std::filesystem::exists(file) && std::filesystem::exists(kept);
     check(moved, "the daemon moves a config it could not read aside");
     if (!moved) {
-        std::fprintf(stderr, "  copies beside it: %s\n", joined(preservedCopyNames(file)).c_str());
+        std::fprintf(stderr, "  copies: %s\n",
+                     joined(preservedCopyNames(file, configHome.preservedDir())).c_str());
     }
     check(readTextFile(kept) == usersOwn, "the copy the daemon kept holds the bytes of the file it could not read");
     if (!firstStatus.ok()) {
@@ -4895,8 +4926,8 @@ void checkConfigPreservationOwnership(NameWatcher& names, const std::string& val
     if (!writeTextFile(file, laterBroken)) {
         notVerified("S8.25", "the second damaged config this phase needs could not be written");
     } else {
-        const std::vector<std::string> before = preservedCopyNames(file);
-        SpawnedDaemon second({validationEnv, configHome.env()});
+        const std::vector<std::string> before = preservedCopyNames(file, configHome.preservedDir());
+        SpawnedDaemon second({validationEnv, configHome.env(), configHome.stateEnv()});
         const int secondExit = second.waitForExit();
         if (reportedStartupFault(second, "S8.25 (only the name owner touches the config directory)")) {
             // X.3: that child never ran the daemon, so what it did or did not write to the
@@ -4911,10 +4942,10 @@ void checkConfigPreservationOwnership(NameWatcher& names, const std::string& val
                 std::fprintf(stderr, "  config.json now holds: %s\n",
                              onDisk.empty() ? "(nothing)" : onDisk.c_str());
             }
-            const std::vector<std::string> copies = preservedCopyNames(file);
+            const std::vector<std::string> copies = preservedCopyNames(file, configHome.preservedDir());
             check(copies == before, "a daemon that lost the name request makes no copy of the config");
             if (copies != before) {
-                std::fprintf(stderr, "  copies beside it: %s (they were: %s)\n", joined(copies).c_str(),
+                std::fprintf(stderr, "  copies: %s (they were: %s)\n", joined(copies).c_str(),
                              joined(before).c_str());
             }
         }
@@ -4934,7 +4965,7 @@ void checkRepairWrittenAfterPreservation(NameWatcher& names, const std::string& 
         return;
     }
     const std::filesystem::path file = configHome.configFile();
-    const std::filesystem::path kept(file.string() + ".bad");
+    const std::filesystem::path kept = configHome.preservedDir() / "config.json.bad";
     // Three rows the daemon treats three ways: one it restores, one it cannot parse -- the
     // shape a NEWER build writes, which nothing but the copy will hold once this build
     // rewrites the file -- and one it repairs away. The third is what makes this start owe
@@ -4948,7 +4979,7 @@ void checkRepairWrittenAfterPreservation(NameWatcher& names, const std::string& 
         return;
     }
 
-    SpawnedDaemon daemon({validationEnv, configHome.env()});
+    SpawnedDaemon daemon({validationEnv, configHome.env(), configHome.stateEnv()});
     if (!names.waitFor(true)) {
         if (!reportedStartupFault(daemon, kGoals)) {
             notVerified(kGoals, "the daemon for this phase never acquired the bus name");
@@ -4984,20 +5015,20 @@ void checkRepairWrittenAfterPreservation(NameWatcher& names, const std::string& 
     //       by doing nothing.
     // CONTROL: `manager.writeRepairedConfig();` moved above `manager.preserveUnreadableConfig();`
     //       in backend/daemon/main.cpp -- the ordering this goal exists to forbid -> "FAIL: the
-    //       copy the daemon took aside holds the bytes of the file the user had", printing the
-    //       daemon's own pretty-printed rewrite with monitor 0 alone in it. The repair half
-    //       stayed green under it, which is what separates "written in the wrong order" from
-    //       "not written". And the other way round: `manager.writeRepairedConfig();` deleted
-    //       from backend/daemon/main.cpp -> "FAIL: the daemon writes the repaired config once
-    //       the copy has been taken" alone, printing config.json still holding all three of the
-    //       user's rows, with the copy half green. Both observed 2026-08-15. Both reverted.
+    //       daemon writes the repaired config once the copy has been taken", printing config.json
+    //       still holding all three of the user's rows. The copy half stays green now, because
+    //       the rewrite is refused outright when no copy of what it replaces exists: since
+    //       2026-08-15 the ordering is enforced in the manager rather than only relied on here,
+    //       so the wrong order costs the repair instead of the copy's contents. And with
+    //       `manager.writeRepairedConfig();` deleted from backend/daemon/main.cpp -> the same
+    //       single FAIL. Both re-observed 2026-08-16. Both reverted.
     const std::string copied = readTextFile(kept);
     const bool preserved = copied == usersOwn;
     check(preserved, "the copy the daemon took aside holds the bytes of the file the user had");
     if (!preserved) {
-        std::fprintf(stderr, "  copies beside it: %s\n  the copy holds: %s\n  the user had:   %s\n",
-                     joined(preservedCopyNames(file)).c_str(), copied.empty() ? "(nothing)" : copied.c_str(),
-                     usersOwn.c_str());
+        std::fprintf(stderr, "  copies: %s\n  the copy holds: %s\n  the user had:   %s\n",
+                     joined(preservedCopyNames(file, configHome.preservedDir())).c_str(),
+                     copied.empty() ? "(nothing)" : copied.c_str(), usersOwn.c_str());
     }
 
     std::string why;
@@ -5289,11 +5320,11 @@ void checkShutdownDuringStartup(NameWatcher& names, const std::string& validatio
         // fixture buys would quietly stop happening partway through the loop.
         for (int n = 0; n < 12; ++n) {
             std::error_code removeEc;
-            std::filesystem::remove(std::filesystem::path(configHome.configFile().string() + ".bad" +
-                                                          (n == 0 ? "" : "." + std::to_string(n))),
+            std::filesystem::remove(configHome.preservedDir() /
+                                        ("config.json.bad" + (n == 0 ? std::string() : "." + std::to_string(n))),
                                     removeEc);
         }
-        SpawnedDaemon daemon({validationEnv, configHome.env()});
+        SpawnedDaemon daemon({validationEnv, configHome.env(), configHome.stateEnv()});
         if (!names.waitFor(true)) {
             if (reportedStartupFault(daemon, kGoal)) return;
             notVerified(kGoal, "the daemon for this phase never acquired the bus name");
@@ -5699,7 +5730,7 @@ void checkStalledConfigWrite(NameWatcher& names, const std::string& validationEn
     //       the watchdog's line is asserted beside the exit code, because the watchdog also
     //       ends the process -- so an exit-code check alone would pass for a daemon that had
     //       to be forced out five seconds late.
-    // CONTROL: `.detach()` in startPersistWorker() replaced by storing the thread in the
+    // CONTROL: `.detach()` in startPersistWorkerLocked() replaced by storing the thread in the
     //       manager and joining it in ~WallpaperManager -> "FAIL: a daemon with a config write
     //       it can never finish still exits 0 on SIGTERM" ("exit code 1") and "FAIL: it leaves
     //       through main() rather than through the teardown watchdog". The worker loops

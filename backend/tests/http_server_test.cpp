@@ -3451,9 +3451,9 @@ void runOutputParamChecks(WallpaperManager& manager, httplib::Client& cli, const
         }
     }
 
-    // GOAL: the two fields output= introduces exist ONLY on output= replies. False if the
-    //       bare /config or ?monitor= shape grows a "known" or an "output" key, which is a
-    //       response shape the app and wpxctl already consume.
+    // GOAL: the three fields output= introduces -- known, output, output_literal -- exist
+    //       ONLY on output= replies. False if the bare /config or ?monitor= shape grows any
+    //       of them, which is a response shape the app and wpxctl already consume.
     // WHY-THIS-SHAPE: absence is asserted with contains(), not with value("known", false).
     //       The latter cannot fail -- it returns the default for an absent key and for a
     //       present false one alike -- so it would go green on exactly the change it is
@@ -3461,45 +3461,57 @@ void runOutputParamChecks(WallpaperManager& manager, httplib::Client& cli, const
     // CONTROL: `out["known"] = known;` and the `out["output"] = ...` line moved out of the
     //       `kind == IdentityKind::Output` block in backend/daemon/http_server.cpp, so every
     //       reply carries them -> three "a /config reply that was not asked by connector name
-    //       carries no known or output field" FAILs, one per query, each printing a body with
+    //       carries no connector-name field" FAILs, one per query, each printing a body with
     //       `"known":true,"output":""` in it, while every output= check above stayed green.
-    //       Reverted. And separately: the handler made to answer 400 for a request naming no
-    //       screen -> the "/config" and "/config?t=1" lines red; written as `hasJsonObject()`
-    //       rather than `ok()` both stayed GREEN, since a 400 error body carries neither
-    //       field either. Reverted.
+    //       Reverted. Separately, `out["output_literal"] = outputName;` alone moved out of the
+    //       same block -> the same three FAILs, each body carrying `"output_literal":""`, and
+    //       the presence line below still green. Reverted. And separately: the handler made to
+    //       answer 400 for a request naming no screen -> the "/config" and "/config?t=1" lines
+    //       red; written as `hasJsonObject()` rather than `ok()` both stayed GREEN, since a
+    //       400 error body carries none of the three either. Reverted.
     for (const char* query : {"/config", "/config?t=1", "/config?monitor=0"}) {
         const HttpReply plain = get(cli, query);
         // status 200 as well as a parsed object: hasJsonObject() alone is satisfied by a 400,
-        // whose error body naturally carries neither field, so this loop would report green
+        // whose error body naturally carries none of the three, so this loop would report green
         // for a daemon that had started refusing the plugin's bare cache-busted poll.
-        const bool unchanged = plain.ok() && !plain.json.contains("known") && !plain.json.contains("output");
-        check(unchanged, "a /config reply that was not asked by connector name carries no known or output field");
+        const bool unchanged = plain.ok() && !plain.json.contains("known") && !plain.json.contains("output") &&
+                               !plain.json.contains("output_literal");
+        check(unchanged, "a /config reply that was not asked by connector name carries no connector-name field");
         if (!unchanged) std::fprintf(stderr, "  %s answered: %s\n", query, plain.body.c_str());
     }
     const HttpReply byOutput = get(cli, configByOutput("DP-1"));
-    check(byOutput.hasJsonObject() && byOutput.json.contains("known") && byOutput.json.contains("output"),
-          "a /config reply asked by connector name carries both the known and the output field");
+    check(byOutput.hasJsonObject() && byOutput.json.contains("known") && byOutput.json.contains("output") &&
+              byOutput.json.contains("output_literal"),
+          "a /config reply asked by connector name carries the known, output and output_literal fields");
 
     // GOAL: S10.8's /config clause -- a connector name is escaped wherever it is displayed.
-    //       False if a name holding a newline, a right-to-left override or DEL is echoed
-    //       raw into the JSON the plugin renders.
-    // WHY-THIS-SHAPE: the raw bytes are asserted ABSENT from the whole body, and the echo is
+    //       False if a name holding a newline, a right-to-left override or DEL reaches the
+    //       field the plugin renders, or any other part of the reply, raw.
+    // WHY-THIS-SHAPE: the raw bytes are asserted absent from the whole body APART FROM the
+    //       one field whose contract is to be exact (output_literal, matched key and value
+    //       together so an `output` echoed raw cannot be mistaken for it), and the echo is
     //       compared against sanitizeForLog's output rather than merely against the raw name.
     //       "echo != raw" alone would be satisfied by an endpoint that truncated the name or
     //       dropped it, and a check that only looked at the echoed field would miss the same
-    //       bytes appearing elsewhere in the reply. That the name still RESOLVES is asserted
-    //       too: escaping the display copy must not change the key the lookup uses.
+    //       bytes appearing elsewhere in the reply. Searching the entire body with no
+    //       exception is not available once a literal field ships: it would forbid the exact
+    //       round trip checked below rather than the leak. That the name still RESOLVES is
+    //       asserted too: escaping the display copy must not change the key the lookup uses.
     // CONTROL: `out["output"] = sanitizeForLog(...)` replaced with `out["output"] =
     //       outputName;` in backend/daemon/http_server.cpp -> 3 FAILs: "a hostile connector
     //       name is echoed by /config in its escaped form", "... carries no raw
     //       bidirectional override ..." and "... no raw DEL byte ...", followed by the
-    //       escaped body -- the reply was a well-formed 200, so `ok()` gates none of them out.
-    //       Reverted. And the two absence lines are gated on ok(), not on `reached`: asking the
-    //       block with a name the daemon refuses (an empty output=, a 400) reddens all four
-    //       under ok(), where under `reached` the two absence lines stayed GREEN -- an error
-    //       body holds neither byte sequence either.
+    //       escaped body -- the reply was a well-formed 200, so `ok()` gates none of them out,
+    //       and the exactness line below stayed green, which is what keeps the two halves
+    //       apart. Reverted. And the two absence lines are gated on ok(), not on `reached`:
+    //       asking the block with a name the daemon refuses (an empty output=, a 400) reddens
+    //       all five under ok() -- measured, body `{"error":"output name must not be empty"}` --
+    //       where under `reached` the two absence lines stayed GREEN, an error body holding
+    //       neither byte sequence either.
     // COVERAGE-ASSERT: the name is asserted to be one sanitizeForLog actually alters, so a
-    //       future edit that tamed it fails here instead of leaving the three checks vacuous.
+    //       future edit that tamed it fails here instead of leaving the four checks below
+    //       vacuous -- for a tame name the escaped echo, the exact echo and the request are
+    //       all the same bytes, and none of the four can tell a raw echo from an escaped one.
     //       CONTROL: hostileName replaced with "DP-tame-1" -> "FAIL: the hostile connector
     //       name is one sanitizeForLog alters, so the escaping checks can discriminate", and
     //       nothing else red. Restored.
@@ -3526,25 +3538,56 @@ void runOutputParamChecks(WallpaperManager& manager, httplib::Client& cli, const
         const bool hostileResolves = hostile.ok() && boolField(hostile, "known") == true &&
                                      intField(hostile, "monitor_id") == kMonitorNamedHostile;
         const bool hostileEchoEscaped = stringField(hostile, "output") == escapedName;
+
+        // GOAL: the name a client asked by comes back byte-for-byte in output_literal, so the
+        //       caller can tell "this is the screen you asked about" from "this is some other
+        //       screen". False if the only echo is the escaped one, which differs from the
+        //       request for every name escaping alters -- and the daemon stores, looks up and
+        //       persists the raw bytes, so the escaped form names nothing it holds.
+        // WHY-THIS-SHAPE: compared against the request bytes, not against `output`. The two
+        //       forms are equal for every ordinary connector name (DP-3, eDP-1), so a tame
+        //       name cannot tell a raw echo from an escaped one; this uses the name asserted
+        //       above to be one sanitizeForLog rewrites, which is what makes the comparison
+        //       able to fail. stringField() rather than value(): a null or absent field must
+        //       report as this FAIL, not as an exception that abandons the phase.
+        // CONTROL: run against the shipped handler before output_literal existed -> "FAIL: the
+        //       connector name a client asked by comes back unaltered in /config's
+        //       output_literal", printing the escaped body. With the field added but filled
+        //       from sanitizeForLog(outputName, kMaxOutputNameBytes, LogFraming::Bare) -- the
+        //       defect in field form -- the same line was the only red.
+        const bool hostileLiteralExact = stringField(hostile, "output_literal") == hostileName;
+
         // Searched for as the two byte sequences JSON serialisation passes through untouched,
         // not for the whole name. nlohmann escapes control bytes below 0x20 by itself, so the
         // newline is absent from the body of a daemon that does no escaping at all -- measured:
         // with the sanitize call removed, a whole-name search stayed GREEN while these two
         // sequences were sitting in the reply. U+202E and DEL are what actually reaches a
         // terminal or a QML label when the escaping goes.
+        //
+        // output_literal is removed from the copy searched, key and value together: it is the
+        // one field contracted to hold the exact bytes. Erasing only that exact key/value pair
+        // -- rather than the encoded name wherever it appears -- is what keeps a raw `output`
+        // from being explained away as the literal field.
         // Gated on ok(), not on `reached`: an error body contains neither sequence, so on the
         // transport gate these two lines graded green for a daemon that never echoed the name.
-        const bool hostileNoOverride = hostile.ok() && hostile.body.find("\xE2\x80\xAE") == std::string::npos;
-        const bool hostileNoDel = hostile.ok() && hostile.body.find('\x7F') == std::string::npos;
+        const std::string literalField = "\"output_literal\":" + nlohmann::json(hostileName).dump();
+        std::string displayed = hostile.body;
+        if (const auto at = displayed.find(literalField); at != std::string::npos) {
+            displayed.erase(at, literalField.size());
+        }
+        const bool hostileNoOverride = hostile.ok() && displayed.find("\xE2\x80\xAE") == std::string::npos;
+        const bool hostileNoDel = hostile.ok() && displayed.find('\x7F') == std::string::npos;
         check(hostileResolves, "a connector name holding a newline, U+202E and DEL still resolves to its own monitor");
         check(hostileEchoEscaped, "a hostile connector name is echoed by /config in its escaped form");
-        check(hostileNoOverride, "/config's reply carries no raw bidirectional override from a connector name");
-        check(hostileNoDel, "/config's reply carries no raw DEL byte from a connector name");
-        // Gated on all four, not on ok(): the three escaping checks fail on a perfectly
-        // well-formed 200 that simply echoed the raw bytes, so gating on the transport left the
-        // one failure this block exists to catch with no body printed at all. Shown escaped --
-        // the bytes it just found are exactly the ones that must not reach a terminal.
-        if (!(hostileResolves && hostileEchoEscaped && hostileNoOverride && hostileNoDel)) {
+        check(hostileLiteralExact,
+              "the connector name a client asked by comes back unaltered in /config's output_literal");
+        check(hostileNoOverride, "/config's reply carries no raw bidirectional override outside output_literal");
+        check(hostileNoDel, "/config's reply carries no raw DEL byte outside output_literal");
+        // Gated on all five, not on ok(): the escaping checks fail on a perfectly well-formed
+        // 200 that simply echoed the raw bytes, so gating on the transport left the one failure
+        // this block exists to catch with no body printed at all. Shown escaped -- the bytes it
+        // just found are exactly the ones that must not reach a terminal.
+        if (!(hostileResolves && hostileEchoEscaped && hostileLiteralExact && hostileNoOverride && hostileNoDel)) {
             std::fprintf(stderr, "  a hostile name answered %d (body shown escaped): %s\n", hostile.status,
                          wallpaperx::sanitizeForLog(hostile.body, hostile.body.size(), wallpaperx::LogFraming::Bare)
                              .c_str());

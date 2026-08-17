@@ -80,6 +80,12 @@ public:
     std::filesystem::path configFile() const { return m_path / "wallpaperx" / "config.json"; }
     std::string env() const { return "XDG_CONFIG_HOME=" + m_path.string(); }
 
+    // The same for the state directory, which is where a copy of a rejected config goes. A
+    // spawn that is given neither gets one of its own: a daemon started with the real
+    // XDG_STATE_HOME would leave copies in the developer's own state directory.
+    std::filesystem::path preservedDir() const { return m_path / "state" / "wallpaperx"; }
+    std::string stateEnv() const { return "XDG_STATE_HOME=" + (m_path / "state").string(); }
+
 private:
     void create(const std::filesystem::path& base, const char* tag) {
         static int counter = 0;

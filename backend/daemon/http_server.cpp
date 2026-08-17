@@ -254,7 +254,12 @@ void HttpServer::registerRoutes() {
 
         if (kind == IdentityKind::Output) {
             out["known"] = known;
+            // Same split as `path`/`path_literal`: `output` is display-safe, `output_literal`
+            // is the bytes the caller asked by and the daemon stored, so a client can tell the
+            // answer is about the screen it named. Raw is safe for dump() here because
+            // parseIdentity rejected anything outputNameError refuses, invalid UTF-8 included.
             out["output"] = sanitizeForLog(outputName, kMaxOutputNameBytes, LogFraming::Bare);
+            out["output_literal"] = outputName;
             if (!known) {
                 // Null, never 0: an id the caller could hand back to ?monitor= would put
                 // monitor 0's wallpaper on a screen that is not monitor 0.

@@ -59,6 +59,7 @@
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -265,22 +266,59 @@ std::string hex(std::string_view bytes) {
     return out;
 }
 
-// Every preserved-copy name sitting beside the config file, sorted. Named by prefix rather
-// than by asking whether `config.json.bad` exists: preservation now numbers its copies, so
-// a check written against the one name would be satisfied by a build that wrote `.bad.1`
-// instead -- which is still a copy the goal says must not have been made.
-std::vector<std::string> preservedCopyNames(const std::filesystem::path& file) {
+// Where the daemon keeps a preserved copy of a config it rejected: $XDG_STATE_HOME/wallpaperx.
+// A phase that can produce one sets XDG_STATE_HOME to its own scratch directory, so no run of
+// this file writes into the developer's own state directory.
+std::filesystem::path stateHomeOf(const ScratchDir& scratch) { return scratch.path() / "state"; }
+std::filesystem::path preservedCopyDir(const ScratchDir& scratch) {
+    return stateHomeOf(scratch) / "wallpaperx";
+}
+
+// Every preserved-copy name in a state directory, sorted. Named by prefix rather than by
+// asking whether `config.json.bad` exists: preservation numbers its copies, so a check
+// written against the one name would be satisfied by a build that wrote `.bad.1` instead --
+// which is still a copy the goal says must not have been made. Both directories are scanned,
+// because "no copy was made" has to be false for a copy taken anywhere, the old place beside
+// the config file included.
+std::vector<std::string> preservedCopyNames(const std::filesystem::path& file,
+                                            const std::filesystem::path& stateDir) {
     std::vector<std::string> names;
     const std::string prefix = file.filename().string() + ".bad";
-    std::error_code ec;
-    for (auto it = std::filesystem::directory_iterator(file.parent_path(), ec);
-         !ec && it != std::filesystem::directory_iterator(); it.increment(ec)) {
-        const std::string name = it->path().filename().string();
-        if (name.rfind(prefix, 0) == 0) names.push_back(name);
+    for (const std::filesystem::path& dir : {stateDir, file.parent_path()}) {
+        std::error_code ec;
+        for (auto it = std::filesystem::directory_iterator(dir, ec);
+             !ec && it != std::filesystem::directory_iterator(); it.increment(ec)) {
+            const std::string name = it->path().filename().string();
+            if (name.rfind(prefix, 0) == 0) names.push_back(it->path().string());
+        }
     }
     std::sort(names.begin(), names.end());
     return names;
 }
+
+// One config row as JSON. `output` is omitted when empty, matching what a build that never
+// named a screen writes -- a fixture that always emitted the key would be testing a file
+// shape no build produces.
+nlohmann::json configRow(int monitorId, const std::string& type, const std::string& path,
+                         const std::string& output) {
+    nlohmann::json row;
+    row["monitor_id"] = monitorId;
+    row["type"] = type;
+    row["path"] = path;
+    if (!output.empty()) row["output"] = output;
+    return row;
+}
+
+using StallClock = std::chrono::steady_clock;
+
+double millisSince(StallClock::time_point start) {
+    return std::chrono::duration<double, std::milli>(StallClock::now() - start).count();
+}
+
+// The deadline a save is given, restated rather than shared: kLoadDeadline sits in an
+// anonymous namespace in wallpaper_manager.cpp. A copy here means a change to it fails the
+// phases that use it loudly instead of silently re-pointing them at whatever the new value is.
+constexpr double kSaveDeadlineMs = 2000.0;
 
 std::string joined(const std::vector<std::string>& names) {
     std::string out;
@@ -463,9 +501,9 @@ std::optional<int> clauseCountOrSkip(const std::string& detail, const std::strin
 // two checks in different phases that scan for these clauses, from one edit. Observed
 // 2026-08-15. Reverted.
 std::string repairClausesIn(const std::string& detail) {
-    static constexpr const char* kRepairClauses[] = {"displaced by a later entry", "dropped, unusable",
-                                                     "kept entries dropped", "entries dropped, no build can apply",
-                                                     "screen names dropped, no build can apply"};
+    static constexpr const char* kRepairClauses[] = {
+        "displaced by a later entry", "dropped, unusable", "entries dropped, a later entry",
+        "entries dropped, no build can apply", "screen names dropped, no build can apply"};
     std::string found;
     for (const char* clause : kRepairClauses) {
         if (detail.find(clause) != std::string::npos) found += std::string(" '") + clause + "'";
@@ -1011,6 +1049,10 @@ void runRestoreChecks() {
                     "a scratch directory could not be created");
         return;
     }
+    // Its own state directory, like every phase whose start takes a copy aside: the copy names
+    // are numbered and run out after ten, so phases sharing one directory would silently stop
+    // being able to write their repairs partway through a run.
+    const ScopedEnv stateHome("XDG_STATE_HOME", stateHomeOf(scratch).string());
     const std::filesystem::path file = scratch.path() / "wallpaperx" / "config.json";
     const std::filesystem::path present = scratch.path() / "present.png";
     const std::filesystem::path other = scratch.path() / "other.png";
@@ -1156,7 +1198,10 @@ void runUnreadableConfigChecks() {
     const std::optional<PhasePaths> paths = preparePhase(scratch, kGoal, 1);
     if (!paths.has_value()) return;
     const std::filesystem::path file = paths->config;
-    const std::filesystem::path kept = std::filesystem::path(file.string() + ".bad");
+    // The copy is kept in $XDG_STATE_HOME/wallpaperx, out of the directory the user hand-edits,
+    // so the env var is what decides where this phase looks for it.
+    const ScopedEnv stateHome("XDG_STATE_HOME", stateHomeOf(scratch).string());
+    const std::filesystem::path kept = preservedCopyDir(scratch) / "config.json.bad";
     const std::filesystem::path wallpaper = paths->wallpapers.front();
     // A hand edit that broke the syntax: one trailing comma in an otherwise complete file
     // holding two wallpapers the user picked. What makes this the case worth pinning is that
@@ -1194,11 +1239,16 @@ void runUnreadableConfigChecks() {
     //       build that preserved the file and then clobbered the copy on the first write.
     //       The health status is asserted alongside because a preserved file nobody is told
     //       about reads to the user as a config that silently emptied itself.
-    // CONTROL: the `std::filesystem::rename(m_store.file(), kept, ec)` call deleted from
-    //       WallpaperManager::preserveConfigTo(), leaving the move branch a no-op -> "FAIL: a
-    //       config that could not be read is kept as config.json.bad" and "FAIL: the
-    //       preserved copy is byte-identical to the file the daemon could not read", printing
-    //       "  no config.json.bad exists". Reverted.
+    // CONTROL: the `std::filesystem::copy_file(m_store.file(), kept, ec)` call deleted from
+    //       WallpaperManager::preserveConfigTo() (backend/daemon/wallpaper_manager.cpp),
+    //       leaving nothing preserved -> "FAIL: a config that could not be read is kept as
+    //       config.json.bad" and "FAIL: the preserved copy is byte-identical to the file the
+    //       daemon could not read", printing "  no config.json.bad exists". Observed
+    //       2026-08-15. Reverted.
+    // CONTROL, for the copy being kept OUT of the config directory: the copy directory in
+    //       preserveConfigTo() put back to the config file's own parent -> "FAIL: the config
+    //       the daemon could not read is kept out of the directory the user edits", printing
+    //       the copy's real path beside config.json. Observed 2026-08-15. Reverted.
     const WallpaperManager::Snapshot afterLoad = manager.snapshot();
     check(afterLoad.health.persistence.status == wallpaperx::HealthStatus::Fail,
           "a config that could not be read leaves the persistence check reporting failure");
@@ -1216,9 +1266,29 @@ void runUnreadableConfigChecks() {
     check(keptExists && readFile(kept) == handEdited,
           "the preserved copy is byte-identical to the file the daemon could not read");
     if (!keptExists) {
-        std::fprintf(stderr, "  no config.json.bad exists\n");
+        std::fprintf(stderr, "  no %s exists; copies anywhere: %s\n", kept.string().c_str(),
+                     joined(preservedCopyNames(file, preservedCopyDir(scratch))).c_str());
     } else if (readFile(kept) != handEdited) {
         std::fprintf(stderr, "  kept: %s\n  written: %s\n", readFile(kept).c_str(), handEdited.c_str());
+    }
+
+    // GOAL: the copy is kept OUT of the directory the config file lives in, so a user tidying
+    //       their config directory by hand cannot take the copy with the file it was made for.
+    //       False if it sits beside config.json, which is where it used to go. This is
+    //       separation from the directory the user edits, not protection from the user: they
+    //       own the state directory too.
+    // WHY-THIS-SHAPE: asserted as an absence beside config.json AND a presence in the state
+    //       directory (the check above). Either alone is satisfied by the wrong build -- an
+    //       absence alone by a daemon that preserves nothing at all, a presence alone by one
+    //       that writes both.
+    // CONTROL: the copy directory in WallpaperManager::preserveConfigTo()
+    //       (backend/daemon/wallpaper_manager.cpp) put back to m_store.file()'s parent ->
+    //       "FAIL: the config the daemon could not read is kept out of the directory the user
+    //       edits". Observed 2026-08-15. Reverted.
+    const std::vector<std::string> besideConfig = preservedCopyNames(file, {});
+    check(besideConfig.empty(), "the config the daemon could not read is kept out of the directory the user edits");
+    if (!besideConfig.empty()) {
+        std::fprintf(stderr, "  copies in the config directory: %s\n", joined(besideConfig).c_str());
     }
 
     // The daemon has to keep working afterwards: preserving the old file must not mean
@@ -1320,7 +1390,7 @@ void runPreservedCopyChecks() {
     //       config_store.cpp's load() to just above the open-failure return -> the symlink
     //       and mode-000 cases each red on all three of their checks, led by "FAIL: a
     //       config.json that is <case> is left where it is, under its own name" printing
-    //       "  preserved copies beside it: config.json.bad". (b) the same, hoisted above the
+    //       "  preserved copies: <state dir>/config.json.bad". (b) the same, hoisted above the
     //       S_ISREG return -> the same three for the named-pipe case. (c) the `if
     //       (m_configUnread)` early return deleted from WallpaperManager::persist() -> all
     //       three cases red on "still holds the bytes it held before the daemon ran" and on
@@ -1342,6 +1412,9 @@ void runPreservedCopyChecks() {
             notVerified(kGoal, std::string("a scratch directory for the '") + c.what + "' case could not be created");
             continue;
         }
+        // Preserved copies are kept under $XDG_STATE_HOME, so "no copy was made" is only an
+        // observation about this daemon if that variable names a directory this phase owns.
+        const ScopedEnv stateHome("XDG_STATE_HOME", stateHomeOf(scratch).string());
         const std::filesystem::path file = scratch.path() / "wallpaperx" / "config.json";
         const std::filesystem::path wallpaper = scratch.path() / "wallpaper.png";
         std::error_code ec;
@@ -1392,11 +1465,11 @@ void runPreservedCopyChecks() {
                          afterSave.health.persistence.detail.c_str());
         }
 
-        const std::vector<std::string> copies = preservedCopyNames(file);
+        const std::vector<std::string> copies = preservedCopyNames(file, preservedCopyDir(scratch));
         check(copies.empty(),
               (std::string("a config.json that is ") + c.what + " is left where it is, under its own name").c_str());
         if (!copies.empty()) {
-            std::fprintf(stderr, "  preserved copies beside it: %s\n", joined(copies).c_str());
+            std::fprintf(stderr, "  preserved copies: %s\n", joined(copies).c_str());
         }
         const bool unchanged = c.intact(file);
         check(unchanged, (std::string("a config.json that is ") + c.what +
@@ -1423,8 +1496,9 @@ void runPreservedCopyChecks() {
     // CONTROL: two, both reverted. (a) the `+ (n == 0 ? "" : "." + std::to_string(n))`
     //       suffix dropped from WallpaperManager::preserveConfigTo()'s loop, so every copy
     //       competes for one name -> "FAIL: the second unreadable config is preserved under
-    //       a name of its own" with "  copies beside it: config.json.bad", "FAIL: the daemon
-    //       says where the second unreadable config was kept" ("not kept, no free name"),
+    //       a name of its own" with one copy listed, "FAIL: the daemon says where the second
+    //       unreadable config was kept" ("not kept: no free name"), re-observed 2026-08-16
+    //       against the state-directory copy,
     //       and "FAIL: a wallpaper set after the second unreadable config is persisted into
     //       a fresh config.json" -- the run stops saving, which is the second half of the
     //       damage. (b) the `if (std::filesystem::exists(kept, ec)) continue;` arm deleted,
@@ -1437,9 +1511,10 @@ void runPreservedCopyChecks() {
     // that entry by design (S8.7).
     const std::optional<PhasePaths> paths = preparePhase(scratch, kGoal, 1);
     if (!paths.has_value()) return;
+    const ScopedEnv stateHome("XDG_STATE_HOME", stateHomeOf(scratch).string());
     const std::filesystem::path file = paths->config;
-    const std::filesystem::path kept = std::filesystem::path(file.string() + ".bad");
-    const std::filesystem::path keptSecond = std::filesystem::path(file.string() + ".bad.1");
+    const std::filesystem::path kept = preservedCopyDir(scratch) / "config.json.bad";
+    const std::filesystem::path keptSecond = preservedCopyDir(scratch) / "config.json.bad.1";
     const std::filesystem::path wallpaper = paths->wallpapers.front();
     const std::string usersOwn =
         "{\"version\":1,\"monitors\":[{\"monitor_id\":0,\"type\":\"static\",\"path\":\"/photos/kept.png\"},]}";
@@ -1464,7 +1539,7 @@ void runPreservedCopyChecks() {
     const bool secondKept = readFile(keptSecond) == throwaway;
     check(secondKept, "the second unreadable config is preserved under a name of its own");
     if (!secondKept) {
-        std::fprintf(stderr, "  copies beside it: %s\n", joined(preservedCopyNames(file)).c_str());
+        std::fprintf(stderr, "  copies: %s\n", joined(preservedCopyNames(file, preservedCopyDir(scratch))).c_str());
     }
     // Silence here is its own defect: the file the user is looking at is not the one on
     // disk any more, so the name it went to is the only way back to it.
@@ -1494,6 +1569,7 @@ void runPreservationExhaustedChecks() {
         notVerified(kGoal, "a scratch directory could not be created");
         return;
     }
+    const ScopedEnv stateHome("XDG_STATE_HOME", stateHomeOf(scratch).string());
     const std::filesystem::path file = scratch.path() / "wallpaperx" / "config.json";
     const std::filesystem::path wallpaper = scratch.path() / "wallpaper.png";
     // One more than the daemon's bound would leave a free name, one fewer would not test
@@ -1504,7 +1580,8 @@ void runPreservationExhaustedChecks() {
         "{\"monitor_id\":1,\"type\":\"static\",\"path\":\"/photos/right.png\"},]}";
     bool staged = writeWallpaperFile(wallpaper) && writeFile(file, usersOwn);
     for (int n = 0; n < kCopies && staged; ++n) {
-        staged = writeFile(std::filesystem::path(file.string() + ".bad" + (n == 0 ? "" : "." + std::to_string(n))),
+        staged = writeFile(preservedCopyDir(scratch) /
+                               ("config.json.bad" + (n == 0 ? std::string() : "." + std::to_string(n))),
                            "an earlier broken config");
     }
     if (!staged) {
@@ -1525,7 +1602,8 @@ void runPreservationExhaustedChecks() {
     //       since the constructor writes nothing on this path.
     // CONTROL: two, both reverted. (a) `kMaxPreservedCopies` in wallpaper_manager.cpp raised
     //       to 11, so a free name exists after all -> all three checks red, "  11 copies
-    //       beside it (expected 10)" naming config.json.bad.10. (b) `m_configUnread = true;`
+    //       (expected 10)" naming config.json.bad.10, re-observed 2026-08-16 with the copies in
+    //       the state directory. (b) `m_configUnread = true;`
     //       deleted from the constructor's error branch -> "FAIL: with every copy name
     //       taken, the config the daemon could not read is not saved over", printing the
     //       file rewritten to hold monitor 1 alone, with the copy-count check still green:
@@ -1547,12 +1625,11 @@ void runPreservationExhaustedChecks() {
                      snap.health.persistence.detail.c_str());
     }
 
-    const std::vector<std::string> copies = preservedCopyNames(file);
+    const std::vector<std::string> copies = preservedCopyNames(file, preservedCopyDir(scratch));
     check(static_cast<int>(copies.size()) == kCopies,
           "with every copy name taken, the config the daemon could not read is still there");
     if (static_cast<int>(copies.size()) != kCopies) {
-        std::fprintf(stderr, "  %zu copies beside it (expected %d): %s\n", copies.size(), kCopies,
-                     joined(copies).c_str());
+        std::fprintf(stderr, "  %zu copies (expected %d): %s\n", copies.size(), kCopies, joined(copies).c_str());
     }
     const std::string onDisk = readFile(file);
     check(onDisk == usersOwn, "with every copy name taken, the config the daemon could not read is not saved over");
@@ -1570,8 +1647,9 @@ void runMalformedEntryCopyChecks() {
     // that entry by design (S8.7).
     const std::optional<PhasePaths> paths = preparePhase(scratch, kGoal, 1);
     if (!paths.has_value()) return;
+    const ScopedEnv stateHome("XDG_STATE_HOME", stateHomeOf(scratch).string());
     const std::filesystem::path file = paths->config;
-    const std::filesystem::path kept = std::filesystem::path(file.string() + ".bad");
+    const std::filesystem::path kept = preservedCopyDir(scratch) / "config.json.bad";
     const std::filesystem::path wallpaper = paths->wallpapers.front();
     // Parses, so nothing here is an unreadable config: one entry the daemon restores, one it
     // cannot make sense of, and one it repairs. A rejected entry never becomes an entry at
@@ -1604,10 +1682,11 @@ void runMalformedEntryCopyChecks() {
     //       same breath, so this cannot pass for a build that refused the file outright and
     //       had nothing to restore, which is a different code path with a different verdict.
     // CONTROL: the `move` argument of preserveConfigTo() forced true on the malformed-entry
-    //       path, i.e. a rename where a copy is owed -> "FAIL: a config with malformed
-    //       entries is still there after the copy is made", and that alone. Note what stayed
-    //       GREEN under it: "a wallpaper set after a config with malformed entries is
-    //       persisted", because the save simply recreates the file the rename took away --
+    //       path, so the original is unlinked where a copy is owed -> "FAIL: a config with
+    //       malformed entries is still there after the copy is made", and that alone.
+    //       Re-observed 2026-08-16 after preserveConfigTo() became copy-then-unlink. Note what
+    //       stayed GREEN under it: "a wallpaper set after a config with malformed entries is
+    //       persisted", because the save simply recreates the file the unlink took away --
     //       which is why the loss has to be caught by the file's absence rather than by the
     //       daemon misbehaving afterwards. The two second-start checks stayed green too: the
     //       numbered search still sends the second file to a name of its own whether it is
@@ -1692,22 +1771,194 @@ void runMalformedEntryCopyChecks() {
     //       then goes looking for a file that is not there.
     // CONTROL: the `+ (n == 0 ? "" : "." + std::to_string(n))` suffix dropped from
     //       preserveConfigTo()'s loop, so both starts compete for config.json.bad -> "FAIL:
-    //       the second start's malformed config is copied under a name of its own" with
-    //       "  copies beside it: config.json.bad", and "FAIL: the daemon says where the
-    //       second malformed config was copied" printing "1 malformed entries ignored; not
-    //       copied: no free name". The first start's copy stayed intact under that mutation,
+    //       the second start's malformed config is copied under a name of its own" with one
+    //       copy listed, and "FAIL: the daemon says where the second malformed config was
+    //       copied" printing "1 malformed entries ignored; not copied: no free name".
+    //       Re-observed 2026-08-16. The first start's copy stayed intact under that mutation,
     //       so the pair separates "the second file was lost" from "the first was destroyed".
     //       Reverted.
-    const std::filesystem::path keptSecond = std::filesystem::path(file.string() + ".bad.1");
+    const std::filesystem::path keptSecond = preservedCopyDir(scratch) / "config.json.bad.1";
     const bool secondCopied = readFile(keptSecond) == secondBroken;
     check(secondCopied, "the second start's malformed config is copied under a name of its own");
     if (!secondCopied) {
-        std::fprintf(stderr, "  copies beside it: %s\n", joined(preservedCopyNames(file)).c_str());
+        std::fprintf(stderr, "  copies: %s\n", joined(preservedCopyNames(file, preservedCopyDir(scratch))).c_str());
     }
     const std::string reported = secondManager.snapshot().health.persistence.detail;
     const bool said = reported.find(keptSecond.filename().string()) != std::string::npos;
     check(said, "the daemon says where the second malformed config was copied");
     if (!said) std::fprintf(stderr, "  persistence detail: %s\n", reported.c_str());
+}
+
+// ---------------------------------------------------------------------------- //
+// Phase 6be -- S10.18: the startup rewrite is gated on a copy of what it replaces.
+// ---------------------------------------------------------------------------- //
+void runRepairCopyChecks() {
+    constexpr const char* kGoals = "S10.18 (a start that rewrites the config copies it aside first, and does not "
+                                   "rewrite it at all when no copy could be made)";
+
+    // Two rows claiming one screen name: every row parses, so the store finds nothing
+    // malformed, and the rejection is the manager's own. This is what a monitor replug
+    // produces, and it is the case in which the file used to be rewritten with no copy taken.
+    const auto fixture = [](const std::filesystem::path& first, const std::filesystem::path& second) {
+        nlohmann::json monitors = nlohmann::json::array();
+        monitors.push_back(configRow(1, "static", first.string(), "DP-3"));
+        monitors.push_back(configRow(2, "static", second.string(), "DP-3"));
+        nlohmann::json root;
+        root["version"] = 1;
+        root["monitors"] = monitors;
+        return root.dump();
+    };
+
+    {
+        const ScratchDir scratch("repaircopy");
+        const std::optional<PhasePaths> paths = preparePhase(scratch, kGoals, 2);
+        if (!paths.has_value()) return;
+        const ScopedEnv stateHome("XDG_STATE_HOME", stateHomeOf(scratch).string());
+        const std::filesystem::path& file = paths->config;
+        const std::filesystem::path kept = preservedCopyDir(scratch) / "config.json.bad";
+        const std::string usersOwn = fixture(paths->wallpapers[0], paths->wallpapers[1]);
+        if (!writeFile(file, usersOwn)) {
+            notVerified(kGoals, "the config file this phase reads could not be written");
+            return;
+        }
+
+        // GOAL: S10.18's first half -- a start that will rewrite config.json copies the file
+        //       aside first, even though nothing in it was malformed. False if no copy is made:
+        //       the rewrite rebuilds the file from what this run kept, so the row it rejected
+        //       exists nowhere afterwards, while the health note goes on saying the config was
+        //       preserved.
+        // WHY-THIS-SHAPE: the fixture repairs for a MANAGER-level reason (two rows claiming one
+        //       screen) and for no store-level one, which is the case the copy used to miss --
+        //       a fixture with a malformed row copies the file for the other reason entirely and
+        //       is green either way. The copy is compared byte for byte against what was
+        //       written, and the rewrite is asserted to have happened in the same breath: "a
+        //       copy exists" is trivially satisfiable by a build that never rewrites anything.
+        // CONTROL: two, in backend/daemon/wallpaper_manager.cpp. (a) the whole pre-fix shape --
+        //       the copy gated on `m_loadMalformed > 0` alone AND writeRepairedConfig() ungated
+        //       -> "FAIL: a start that rewrites the config copies it aside first" and "FAIL: the
+        //       copy holds the bytes the user's file held", printing "copies: (none)", with the
+        //       rewrite check GREEN: the rewrite landing over a file nothing had copied is the
+        //       loss itself. (b) only the `|| repairPending` disjunct removed, so the rewrite
+        //       stays gated -> the same two plus "FAIL: the repair this start computed reaches
+        //       the file once the copy is taken" and five more across the file, no repairing
+        //       start being able to write at all. Both observed 2026-08-16.
+        countRenamesOnto(file);
+        WallpaperManager::Config config;
+        config.configFile = file;
+        WallpaperManager manager(config);
+        manager.restoreSaved();
+        manager.preserveUnreadableConfig();
+        manager.writeRepairedConfig();
+
+        const bool copied = std::filesystem::exists(kept);
+        check(copied, "a start that rewrites the config copies it aside first");
+        if (!copied) {
+            std::fprintf(stderr, "  copies: %s\n",
+                         joined(preservedCopyNames(file, preservedCopyDir(scratch))).c_str());
+        }
+        check(copied && readFile(kept) == usersOwn, "the copy holds the bytes the user's file held");
+        if (copied && readFile(kept) != usersOwn) {
+            std::fprintf(stderr, "  the copy holds: %s\n  the user had:   %s\n", readFile(kept).c_str(),
+                         usersOwn.c_str());
+        }
+        const std::string presentPath = paths->wallpapers[1].string();
+        const bool rewritten =
+            waitForRows(file, [&presentPath](const std::map<int, RowInFile>& rows) {
+                return rows.count(2) == 1 && rows.at(2).output == "DP-3" && rows.count(1) == 1 &&
+                       rows.at(1).output.empty();
+            });
+        check(rewritten, "the repair this start computed reaches the file once the copy is taken");
+        if (!rewritten) {
+            std::string why;
+            const std::map<int, RowInFile> onDisk = rowsInFile(file, why);
+            std::fprintf(stderr, "  %s; ids on disk: %s\n", why.empty() ? "read back" : why.c_str(),
+                         idsOf(onDisk).c_str());
+        }
+        const std::string detail = manager.snapshot().health.persistence.detail;
+        const bool said = detail.find(kept.filename().string()) != std::string::npos;
+        check(said, "the daemon says where it copied the config it was about to rewrite");
+        if (!said) std::fprintf(stderr, "  persistence detail: %s\n", detail.c_str());
+    }
+
+    // The same start with nowhere to put the copy. XDG_STATE_HOME names a REGULAR FILE, so
+    // creating the directory under it fails for a reason no privilege changes -- unlike a
+    // read-only directory, which root ignores.
+    const ScratchDir scratch("repairnocopy");
+    const std::optional<PhasePaths> paths = preparePhase(scratch, kGoals, 2);
+    if (!paths.has_value()) return;
+    const std::filesystem::path blocked = scratch.path() / "not-a-directory";
+    if (!writeFile(blocked, "this is a file, not a state directory")) {
+        notVerified(kGoals, "the file that stands in for an unusable state directory could not be written");
+        return;
+    }
+    const ScopedEnv stateHome("XDG_STATE_HOME", blocked.string());
+    const std::filesystem::path& file = paths->config;
+    const std::string usersOwn = fixture(paths->wallpapers[0], paths->wallpapers[1]);
+    if (!writeFile(file, usersOwn)) {
+        notVerified(kGoals, "the config file the no-copy case reads could not be written");
+        return;
+    }
+
+    // GOAL: S10.18's second half -- when no copy could be taken, the rewrite does not happen at
+    //       all and the user's file is left as it is. False if the rewrite goes ahead: that is
+    //       the one path on which the daemon destroys rows nothing else on disk holds, and the
+    //       health note still claims a copy was made.
+    // WHY-THIS-SHAPE: graded on a rename(2) counter rather than on the file's bytes, and over a
+    //       window rather than at an instant. The rewrite is queued to a writer thread now, so a
+    //       read taken when writeRepairedConfig() returns sees the old bytes whether or not the
+    //       write is coming. The counter is the same instrument the stalled-save phases use, and
+    //       the window can only mis-grade in the safe direction: a write that lands after it is
+    //       still a write, and the check above -- which asserts the counter DOES reach one when
+    //       a copy exists -- is what establishes the instrument counts this daemon's saves at all.
+    // CONTROL: the `if (!m_repairCopied)` arm in WallpaperManager::writeRepairedConfig()
+    //       (backend/daemon/wallpaper_manager.cpp) forced false, which is the code before this
+    //       fix -> "FAIL: with no copy taken, the config the daemon was about to rewrite is left
+    //       alone", printing "1 save(s) landed on it", "FAIL: with no copy taken, the config
+    //       still holds the bytes the user wrote", and "FAIL: the daemon says it did not save
+    //       over the config it could not copy". Observed 2026-08-16.
+    countRenamesOnto(file);
+    WallpaperManager::Config config;
+    config.configFile = file;
+    WallpaperManager manager(config);
+    manager.restoreSaved();
+    manager.preserveUnreadableConfig();
+    manager.writeRepairedConfig();
+
+    const auto window = StallClock::now() + std::chrono::seconds(1);
+    while (StallClock::now() < window && renamesCounted() == 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    const unsigned wrote = renamesCounted();
+    check(wrote == 0, "with no copy taken, the config the daemon was about to rewrite is left alone");
+    if (wrote != 0) std::fprintf(stderr, "  %u save(s) landed on it\n", wrote);
+    check(readFile(file) == usersOwn, "with no copy taken, the config still holds the bytes the user wrote");
+
+    const std::string detail = manager.snapshot().health.persistence.detail;
+    const bool said = detail.find("not saving over it") != std::string::npos &&
+                      detail.find("not copied") != std::string::npos;
+    check(said, "the daemon says it did not save over the config it could not copy");
+    if (!said) std::fprintf(stderr, "  persistence detail: %s\n", detail.c_str());
+
+    // GOAL: dropping the repair does not stop the run persisting. False if the daemon refuses
+    //       every write for the session -- the user's later wallpaper changes would stop being
+    //       saved, which is a larger loss than the repair this path declined to write.
+    // WHY-THIS-SHAPE: a client save after the declined repair, graded on the row reaching the
+    //       file. This is the check that separates "the repair was dropped" from "saving was
+    //       switched off", and those two are indistinguishable from the checks above.
+    // CONTROL: `m_configUnread = true;` set in place of dropping the repair in
+    //       WallpaperManager::writeRepairedConfig() -- the repair the review warned against ->
+    //       "FAIL: a wallpaper set after a repair was dropped is still persisted", printing
+    //       "ids on disk: 1 2". Observed 2026-08-15. Reverted.
+    manager.requestWallpaper("static", paths->wallpapers[0].string(), 3);
+    waitForRows(file, [](const std::map<int, RowInFile>& rows) { return rows.count(3) == 1; });
+    std::string why;
+    const std::map<int, RowInFile> onDisk = rowsInFile(file, why);
+    const bool stillSaves = onDisk.count(3) == 1 && onDisk.at(3).path == paths->wallpapers[0].string();
+    check(stillSaves, "a wallpaper set after a repair was dropped is still persisted");
+    if (!stillSaves) {
+        std::fprintf(stderr, "  %s; ids on disk: %s\n", why.empty() ? "read back" : why.c_str(),
+                     idsOf(onDisk).c_str());
+    }
 }
 
 // ---------------------------------------------------------------------------- //
@@ -1720,6 +1971,7 @@ void runUnappliedEntryChecks() {
         notVerified(kGoal, "a scratch directory could not be created");
         return;
     }
+    const ScopedEnv stateHome("XDG_STATE_HOME", stateHomeOf(scratch).string());
     const std::filesystem::path file = scratch.path() / "wallpaperx" / "config.json";
     const std::filesystem::path present = scratch.path() / "present.png";
     const std::filesystem::path other = scratch.path() / "other.png";
@@ -2054,6 +2306,7 @@ void runOutputRestoreChecks() {
     const ScratchDir scratch("outputrestore");
     const std::optional<PhasePaths> paths = preparePhase(scratch, kGoals, 2);
     if (!paths) return;
+    const ScopedEnv stateHome("XDG_STATE_HOME", stateHomeOf(scratch).string());
     const std::filesystem::path& file = paths->config;
     const std::filesystem::path& present = paths->wallpapers[0];
     const std::filesystem::path& other = paths->wallpapers[1];
@@ -2173,8 +2426,9 @@ void runOutputRestoreChecks() {
     //       unusable connector name in the config is reported as dropped", the persistence
     //       detail carrying no dropped-name clause at all. The narrower mutation of only
     //       suppressing `++rejectedNames` reddens the reporting check alone -- it never binds
-    //       the name -- so it does not control the first of the two. Observed 2026-08-14.
-    //       Reverted.
+    //       the name -- so it does not control the first of the two. Re-observed 2026-08-16,
+    //       now with six further checks in other phases red beside them, since carrying a name
+    //       for a bigger build is gated on the same predicate. Reverted.
     check(snap.outputs.count(oversized) == 0, "an unusable connector name is not bound");
     check(snap.monitors.count(5) == 1 && snap.monitors.at(5).path == other.string(),
           "the wallpaper on a row whose connector name was refused is restored anyway");
@@ -2305,19 +2559,6 @@ void runOutputRestoreChecks() {
                      afterMove.count(1) ? afterMove.at(1).output.c_str() : "(no row)",
                      afterMove.count(7) ? afterMove.at(7).output.c_str() : "(no row)");
     }
-}
-
-// One config row as JSON. `output` is omitted when empty, matching what a build that never
-// named a screen writes -- a fixture that always emitted the key would be testing a file
-// shape no build produces.
-nlohmann::json configRow(int monitorId, const std::string& type, const std::string& path,
-                         const std::string& output) {
-    nlohmann::json row;
-    row["monitor_id"] = monitorId;
-    row["type"] = type;
-    row["path"] = path;
-    if (!output.empty()) row["output"] = output;
-    return row;
 }
 
 // ---------------------------------------------------------------------------- //
@@ -2598,6 +2839,243 @@ void runOutputLossReportChecks() {
 }
 
 // ---------------------------------------------------------------------------- //
+// Phase 6g1 -- S10.21: a kept wallpaper a live monitor has taken the id of.
+// ---------------------------------------------------------------------------- //
+void runKeptWallpaperSupersededChecks() {
+    constexpr const char* kGoals = "S10.21 (the report promises back only the kept wallpapers the next save really "
+                                   "writes, so a kept row a live monitor has superseded stops being counted)";
+    const ScratchDir scratch("keptsuperseded");
+    const std::optional<PhasePaths> paths = preparePhase(scratch, kGoals, 1);
+    if (!paths.has_value()) return;
+    const std::filesystem::path& file = paths->config;
+    const std::filesystem::path& wallpaper = paths->wallpapers[0];
+
+    // A type only a newer build understands, on a monitor id this build can use: kept at load,
+    // and dropped by the first save that has live state for that id.
+    nlohmann::json monitors = nlohmann::json::array();
+    monitors.push_back(configRow(0, "hologram", "/x.png", ""));
+    nlohmann::json root;
+    root["version"] = 1;
+    root["monitors"] = monitors;
+    if (!writeFile(file, root.dump())) {
+        notVerified(kGoals, "the config file this phase reads could not be written");
+        return;
+    }
+
+    WallpaperManager::Config config;
+    config.configFile = file;
+    WallpaperManager manager(config);
+    manager.restoreSaved();
+
+    // COVERAGE-ASSERT: the report has to promise the row back BEFORE the client acts, or the
+    // check below is green over a build that never counted it at all -- and over a fixture the
+    // daemon rejected outright.
+    const std::string kept = " entries this build cannot apply, kept";
+    const std::optional<int> before = clauseCountOrSkip(manager.snapshot().health.persistence.detail, kept, kGoals);
+    if (!before.has_value()) return;
+    check(*before == 1, "a wallpaper this build cannot apply is reported as kept before anything else is set");
+    if (*before != 1) {
+        std::fprintf(stderr, "  persistence detail: %s\n", manager.snapshot().health.persistence.detail.c_str());
+    }
+
+    // GOAL: S10.21 -- once a live monitor takes the id a kept row was holding, the report stops
+    //       saying that row is kept. False if it keeps counting: the save has already stopped
+    //       writing the row, so the user is told for the life of the install that a wallpaper a
+    //       newer build set is preserved, and finds it gone when they reinstall that build.
+    // WHY-THIS-SHAPE: the row's absence from the FILE is asserted beside the count, in the same
+    //       phase. Grading the count alone cannot tell "the report is honest" from "the report
+    //       and the save both keep it", which is a different build and not a defect; grading the
+    //       file alone is what the save-side phases already do and says nothing about the text
+    //       the user reads.
+    // CONTROL: the `&& m_monitors.count(entry.monitorId) == 0` guard removed from the
+    //       kept-wallpaper count in WallpaperManager::persistenceDetail()
+    //       (backend/daemon/wallpaper_manager.cpp), which is the code before this fix -> "FAIL:
+    //       a kept wallpaper a live monitor has replaced is no longer reported as kept",
+    //       printing "1 of ' entries this build cannot apply, kept' after the row was dropped",
+    //       with the file check green -- the save and the report disagreeing is the defect
+    //       itself. Observed 2026-08-15.
+    manager.requestWallpaper("static", wallpaper.string(), 0);
+    waitForRows(file, [&wallpaper](const std::map<int, RowInFile>& rows) {
+        return rows.count(0) == 1 && rows.at(0).path == wallpaper.string();
+    });
+    std::string why;
+    const std::map<int, RowInFile> onDisk = rowsInFile(file, why);
+    const bool droppedFromFile = onDisk.count(0) == 1 && onDisk.at(0).type == "static";
+    check(droppedFromFile, "the save really stopped writing the kept row this phase is about");
+    if (!droppedFromFile) {
+        std::fprintf(stderr, "  %s; monitor 0 holds type '%s' path '%s'\n", why.empty() ? "read back" : why.c_str(),
+                     onDisk.count(0) ? onDisk.at(0).type.c_str() : "(no row)",
+                     onDisk.count(0) ? onDisk.at(0).path.c_str() : "(no row)");
+        return;
+    }
+    const std::string detail = manager.snapshot().health.persistence.detail;
+    const std::optional<int> after = clauseCountOrSkip(detail, kept, kGoals);
+    if (!after.has_value()) return;
+    check(*after == 0, "a kept wallpaper a live monitor has replaced is no longer reported as kept");
+    if (*after != 0) {
+        std::fprintf(stderr, "  %d of '%s' after the row was dropped; persistence detail: %s\n", *after, kept.c_str(),
+                     detail.c_str());
+    }
+}
+
+// ---------------------------------------------------------------------------- //
+// Phase 6g2 -- S10.19: two rows claiming one monitor this build can apply.
+// ---------------------------------------------------------------------------- //
+void runDuplicateLiveRowChecks() {
+    constexpr const char* kGoals = "S10.19 (a second config row for a monitor this build CAN apply loses the first "
+                                   "row's wallpaper, and that loss is counted and named)";
+    const ScratchDir scratch("duplicatelive");
+    const std::optional<PhasePaths> paths = preparePhase(scratch, kGoals, 2);
+    if (!paths.has_value()) return;
+    const ScopedEnv stateHome("XDG_STATE_HOME", stateHomeOf(scratch).string());
+    const std::filesystem::path& file = paths->config;
+    const std::filesystem::path& first = paths->wallpapers[0];
+    const std::filesystem::path& second = paths->wallpapers[1];
+
+    nlohmann::json monitors = nlohmann::json::array();
+    monitors.push_back(configRow(0, "static", first.string(), ""));
+    monitors.push_back(configRow(0, "static", second.string(), ""));
+    nlohmann::json root;
+    root["version"] = 1;
+    root["monitors"] = monitors;
+    if (!writeFile(file, root.dump())) {
+        notVerified(kGoals, "the config file this phase reads could not be written");
+        return;
+    }
+
+    WallpaperManager::Config config;
+    config.configFile = file;
+    WallpaperManager manager(config);
+    const std::vector<int> restored = manager.restoreSaved();
+    const std::string detail = manager.snapshot().health.persistence.detail;
+
+    // GOAL: S10.19 -- a wallpaper the config lost to a second row for the same monitor is
+    //       reported, and the monitor is posted for rendering once. False on both counts before
+    //       this fix: the daemon reported a clean restore over a file that had just cost the
+    //       user a picture, and queued the same screen for two renders. The identical collision
+    //       between two rows this build CANNOT apply was reported all along, so the user was
+    //       told only when the loss happened to a wallpaper this build cannot draw.
+    // WHY-THIS-SHAPE: the count is read out of the report as a number and the render queue is
+    //       compared as a whole vector. Asserting only that monitor 0 holds the later wallpaper
+    //       passes for the build that lost the earlier one in silence -- last-wins is the
+    //       policy, and it is not what is missing. The queue is graded because a monitor listed
+    //       twice is a second full render of the same request.
+    // CONTROL: the `alreadyRestored` test deleted from the applicable-row arm of
+    //       WallpaperManager::restoreSaved() (backend/daemon/wallpaper_manager.cpp), which is
+    //       the code before this fix -> "FAIL: a wallpaper a later row for the same monitor
+    //       displaced is reported as a loss", printing a detail with no such clause, and "FAIL:
+    //       a monitor named by two rows is posted for rendering once", printing "0 0".
+    //       Observed 2026-08-15.
+    const std::string duplicateClause = " entries dropped, a later entry claimed the same monitor";
+    const std::optional<int> duplicates = clauseCountOrSkip(detail, duplicateClause, kGoals);
+    if (!duplicates.has_value()) return;
+    check(*duplicates == 1, "a wallpaper a later row for the same monitor displaced is reported as a loss");
+    if (*duplicates != 1) {
+        std::fprintf(stderr, "  persistence detail: %s\n  expected 1 of '%s'\n", detail.c_str(),
+                     duplicateClause.c_str());
+    }
+    const bool postedOnce = restored == std::vector<int>{0};
+    check(postedOnce, "a monitor named by two rows is posted for rendering once");
+    if (!postedOnce) {
+        std::string ids;
+        for (const int id : restored) ids += std::to_string(id) + " ";
+        std::fprintf(stderr, "  posted: %s\n", ids.empty() ? "(none)" : ids.c_str());
+    }
+    // Last-wins is the policy, and it is asserted so this phase cannot be satisfied by a build
+    // that reports the loss and then keeps the wrong row.
+    const WallpaperManager::Snapshot snap = manager.snapshot();
+    const bool laterWon = snap.monitors.count(0) == 1 && snap.monitors.at(0).path == second.string();
+    check(laterWon, "the later of two rows for one monitor is the one restored");
+    if (!laterWon) {
+        std::fprintf(stderr, "  monitor 0 holds '%s'\n",
+                     snap.monitors.count(0) ? snap.monitors.at(0).path.c_str() : "(no row)");
+    }
+}
+
+// ---------------------------------------------------------------------------- //
+// Phase 6g3 -- S10.20: which kept row keeps a name several of them claim.
+// ---------------------------------------------------------------------------- //
+void runKeptNameLastWinsChecks() {
+    constexpr const char* kGoals = "S10.20 (of the kept rows claiming one screen name, the one the FILE names last "
+                                   "keeps it, which is what the report says happened)";
+    const ScratchDir scratch("keptnamelastwins");
+    const std::optional<PhasePaths> paths = preparePhase(scratch, kGoals, 1);
+    if (!paths.has_value()) return;
+    const ScopedEnv stateHome("XDG_STATE_HOME", stateHomeOf(scratch).string());
+    const std::filesystem::path& file = paths->config;
+
+    // Three rows, all above this build's monitor limit, so all are kept for a bigger build. The
+    // third names the screen last and names monitor 5000, whose row was created by the FIRST
+    // row -- so the position of a kept row and the last claim on a name are different facts.
+    nlohmann::json monitors = nlohmann::json::array();
+    monitors.push_back(configRow(5000, "static", "/a.png", "DP-9"));
+    monitors.push_back(configRow(6000, "static", "/b.png", "DP-9"));
+    monitors.push_back(configRow(5000, "", "", "DP-9"));
+    nlohmann::json root;
+    root["version"] = 1;
+    root["monitors"] = monitors;
+    if (!writeFile(file, root.dump())) {
+        notVerified(kGoals, "the config file this phase reads could not be written");
+        return;
+    }
+
+    WallpaperManager::Config config;
+    config.configFile = file;
+    WallpaperManager manager(config);
+    manager.restoreSaved();
+    manager.preserveUnreadableConfig();
+    manager.writeRepairedConfig();
+
+    // GOAL: S10.20 -- the row the file names LAST for a screen keeps that name. False if the
+    //       resolution goes by the order the rows sit in memory: a later row for a monitor id
+    //       already seen is merged into the place that id first appeared, so the two orders
+    //       differ, and the wrong row wins while the health note says "the last entry won". The
+    //       binding is then written to disk, so a build with a larger monitor limit brings the
+    //       screen back attached to the monitor the config did not last ask for.
+    // WHY-THIS-SHAPE: the fixture needs three rows and a repeated id -- with one row per id, the
+    //       memory order and the file order agree and every build passes. It is graded on the
+    //       FILE rather than on the health text, because the text says "the last entry won"
+    //       whichever row won. The count is asserted too: exactly one name is lost here, and a
+    //       build that cleared both rows' names would otherwise satisfy "6000 does not hold it".
+    // CONTROL: the reverse-order sweep put back in place of the last-claim pass at the end of
+    //       WallpaperManager::restoreSaved() (backend/daemon/wallpaper_manager.cpp), which is
+    //       the code before this fix -> "FAIL: the kept row the file names last for a screen is
+    //       the one that keeps the name", printing "monitor 5000 output '', monitor 6000 output
+    //       'DP-9'", and nothing else in the file red. Re-observed 2026-08-15 with the
+    //       tightened wait below.
+    // Waited for the REPAIRED content, not merely for both ids: the fixture already has a row
+    // for each, so a wait on their presence is satisfied by the file as it was written here and
+    // grades whichever sample the read lands on -- which made this check fail about one run in
+    // four before it was tightened. An expired wait is left to the checks below: ten seconds
+    // without the repair is a verdict on the daemon, not on the host.
+    waitForRows(file, [](const std::map<int, RowInFile>& rows) {
+        return rows.count(5000) == 1 && rows.at(5000).output == "DP-9" && rows.count(6000) == 1 &&
+               rows.at(6000).output.empty();
+    });
+    std::string why;
+    const std::map<int, RowInFile> onDisk = rowsInFile(file, why);
+    if (onDisk.count(5000) != 1 || onDisk.count(6000) != 1) {
+        check(false, "the repair this phase reads back was really written");
+        std::fprintf(stderr, "  %s; ids on disk: %s\n", why.empty() ? "read back" : why.c_str(),
+                     idsOf(onDisk).c_str());
+        return;
+    }
+    const bool lastClaimWon = onDisk.at(5000).output == "DP-9" && onDisk.at(6000).output.empty();
+    check(lastClaimWon, "the kept row the file names last for a screen is the one that keeps the name");
+    if (!lastClaimWon) {
+        std::fprintf(stderr, "  monitor 5000 output '%s', monitor 6000 output '%s'\n",
+                     onDisk.at(5000).output.c_str(), onDisk.at(6000).output.c_str());
+    }
+
+    const std::string detail = manager.snapshot().health.persistence.detail;
+    const std::optional<int> displaced =
+        clauseCountOrSkip(detail, " screen names displaced by a later entry", kGoals);
+    if (!displaced.has_value()) return;
+    check(*displaced == 1, "exactly one name is reported lost when three rows claim one screen");
+    if (*displaced != 1) std::fprintf(stderr, "  persistence detail: %s\n", detail.c_str());
+}
+
+// ---------------------------------------------------------------------------- //
 // Phase 6h -- Step 10: the rows kept for a newer build, once names share the file.
 // ---------------------------------------------------------------------------- //
 void runPreservedRowChecks() {
@@ -2683,8 +3161,8 @@ void runPreservedRowChecks() {
     //       below, so adding a colliding pair to the fixture without it being reported fails
     //       rather than quietly leaving the count alone.
     const std::string& detail = snap.health.persistence.detail;
-    // The count is compared as a number, not searched for as text: "1 kept entries dropped"
-    // is a substring of "11 kept entries dropped", so a find() would pass for a build that
+    // The count is compared as a number, not searched for as text: "1 entries dropped"
+    // is a substring of "11 entries dropped", so a find() would pass for a build that
     // over-counted by ten.
     // A count the harness could not read is not compared at all -- it is no number, and grading
     // it against a fixture size accuses the daemon of losing every row the clause counts.
@@ -2702,7 +3180,7 @@ void runPreservedRowChecks() {
     // the name half, which is a lost name and counted below, not here; the other repeated ids
     // (64, 65) fill complementary halves and are not losses at all.
     const std::vector<int> collidingIds{41};
-    const std::string duplicateClause = " kept entries dropped, a later entry claimed the same monitor";
+    const std::string duplicateClause = " entries dropped, a later entry claimed the same monitor";
     const bool duplicateReported = reports(duplicateClause, collidingIds.size());
     if (!clauseCountsReadable) return;
     check(duplicateReported, "every kept row a later row really overwrote is reported as a loss, and no other");
@@ -2729,10 +3207,11 @@ void runPreservedRowChecks() {
     //       to `++duplicateIds` -> "FAIL: every screen name a kept row lost
     //       is reported as a lost name, and no other" with the detail reading "2 screen names
     //       displaced" against 3, and "FAIL: every kept row a later row really overwrote is
-    //       reported as a loss, and no other" reading "2 kept entries dropped" against 1.
-    //       Separately, the whole reverse-order reconciliation loop at the end of
-    //       restoreSaved() deleted -> the same first FAIL reading "1 screen names displaced"
-    //       against 3. Both observed 2026-08-14. Both reverted.
+    //       reported as a loss, and no other" reading "2 entries dropped" against 1.
+    //       Separately, the whole last-claim reconciliation loop at the end of restoreSaved()
+    //       deleted -> the same first FAIL reading "1 screen names displaced" against 3, with
+    //       eight other checks across three phases. Re-observed 2026-08-15 against the reworked
+    //       loop. Both reverted.
     // COVERAGE-ASSERT: the expected number is the length of the list, so a fixture row that
     //       stops losing its name fails here rather than quietly lowering the bar.
     const std::vector<int> namesLostIds{40, 42, 66};
@@ -2772,7 +3251,7 @@ void runPreservedRowChecks() {
     // holding a wallpaper. Monitors 40 and 42 are in the second list only: a live screen holds
     // "DP-3" and a later kept row took "DP-9", so the load clears both copies and the report
     // does not promise them back.
-    const std::vector<int> keptNameIds{43, 44, 47, 64, 65, 66};
+    const std::vector<int> keptNameIds{43, 44, 64, 65, 66};
     const std::vector<int> keptWallpaperIds{40, 41, 42, 43, 44, 47, 64, 65};
     const std::string keptNameClause = " screen names this build's monitor limit excludes, kept";
     const std::string keptWallpaperClause = " entries this build cannot apply, kept";
@@ -2879,34 +3358,32 @@ void runPreservedRowChecks() {
         }
     }
 
-    // GOAL: a name this build refuses is dropped only when the monitor id carrying it is one
-    //       this build binds. On an id only a bigger build could use, the name travels with
-    //       the wallpaper on the same row instead. False if the id is ignored and every
-    //       refused name is dropped: this build's own length limit then deletes a name a
-    //       newer build with a larger limit would have accepted, which is the same
-    //       forward-compatible loss that keeping the row at all exists to prevent -- and the
-    //       report tells the user to name that screen again when nothing was wrong with it.
-    // WHY-THIS-SHAPE: two rows carrying names this build refuses for the same reason, one on
-    //       an id it binds (3) and one on an id it cannot (47), graded by an exact count of
-    //       one. Asserting only that some name was dropped passes for a build that drops both;
-    //       asserting only that none was dropped passes for a build that keeps an unusable name
-    //       on a screen it will actually bind.
+    // GOAL: a name past the stored format's byte cap is dropped and reported whatever monitor
+    //       id carries it -- the id decides whether the ROW travels to a bigger build, not
+    //       whether the name is usable. False if such a name is carried on an out-of-range id:
+    //       the cap belongs to the wire format, so no future build accepts it either, and the
+    //       row then rides every save for the life of the install while the report files the
+    //       loss under "this build's monitor limit", which is not the obstacle.
+    // WHY-THIS-SHAPE: two rows carrying names this build refuses for the same reason, one on an
+    //       id it binds (3) and one on an id it cannot (47), graded by an exact count of two.
+    //       Asserting only that some name was dropped passes for a build that drops one of
+    //       them, which is precisely the state this fixture found.
     // CONTROL: the carried case in WallpaperManager::restoreSaved()
-    //       (backend/daemon/wallpaper_manager.cpp) gated on the whole client rule rather than
-    //       on valid UTF-8, as `const bool nameTravels = nameValid && entry.monitorId >=
-    //       kMaxMonitors;` -> "FAIL: a name this build refuses is dropped only when the id
-    //       carrying it is one this build binds", the detail reading "2 screen names dropped,
-    //       unusable" against 1, together with "FAIL: every kept row carrying a screen name is
-    //       reported as one" at five instead of six. Observed 2026-08-14. Reverted.
+    //       (backend/daemon/wallpaper_manager.cpp) gated on valid UTF-8 rather than on the whole
+    //       rule, as `const bool nameTravels = !entry.output.empty() && entry.monitorId >=
+    //       kMaxMonitors && isValidUtf8(entry.output);` -- the code before this fix -> "FAIL: a
+    //       name the stored format cannot hold is dropped whatever id carries it", the detail
+    //       reading "1 screen names dropped, unusable" against 2, with "FAIL: every kept row
+    //       carrying a screen name is reported as one" at six instead of five and "FAIL: a name
+    //       this build refuses is written back on no row at all". Observed 2026-08-15.
     // COVERAGE-ASSERT: both refused names are asserted present in the fixture rows the load
     //       read, so a fixture edit that removes either one fails here rather than reducing
     //       this to a count of nothing.
-    const std::vector<int> refusedNameDroppedIds{3};
-    const std::vector<int> carriedNameIds{47};
+    const std::vector<int> refusedNameDroppedIds{3, 47};
     const std::string rejectedClause = " screen names dropped, unusable";
     const bool rejectedReported = reports(rejectedClause, refusedNameDroppedIds.size());
     if (!clauseCountsReadable) return;
-    check(rejectedReported, "a name this build refuses is dropped only when the id carrying it is one this build binds");
+    check(rejectedReported, "a name the stored format cannot hold is dropped whatever id carries it");
     if (!rejectedReported) {
         std::fprintf(stderr, "  persistence detail: %s\n  expected %zu of '%s'\n", detail.c_str(),
                      refusedNameDroppedIds.size(), rejectedClause.c_str());
@@ -2929,7 +3406,6 @@ void runPreservedRowChecks() {
         }
     }
     std::vector<int> expectedRefusedIds = refusedNameDroppedIds;
-    expectedRefusedIds.insert(expectedRefusedIds.end(), carriedNameIds.begin(), carriedNameIds.end());
     std::sort(fixtureIdsWithRefusedName.begin(), fixtureIdsWithRefusedName.end());
     std::sort(expectedRefusedIds.begin(), expectedRefusedIds.end());
     const bool refusedNamesInFixture = fixtureIdsWithRefusedName == expectedRefusedIds;
@@ -3004,7 +3480,7 @@ void runPreservedRowChecks() {
     //       "FAIL: a later wallpaper row does not delete the screen name on the row it merges
     //       into", printing "monitor 65 holds path '/other.mp4' output ''"; and "FAIL: every
     //       kept row a later row really overwrote is reported as a loss, and no other", the
-    //       detail reading "4 kept entries dropped" where one row really lost a wallpaper. The
+    //       detail reading "4 entries dropped" where one row really lost a wallpaper. The
     //       two kept counts go red with them, the halves those rows lost no longer being kept
     //       at all. Re-observed 2026-08-14. Reverted.
     const bool wallpaperSurvived =
@@ -3088,15 +3564,15 @@ void runPreservedRowChecks() {
     //       this one disagree about it -- the load walks the kept rows backwards and keeps the
     //       later, the save walks them in monitor-id order and would keep the earlier. Only
     //       naming the row says which one ran.
-    // CONTROL: the reverse-order reconciliation loop at the end of
-    //       WallpaperManager::restoreSaved() (backend/daemon/wallpaper_manager.cpp) deleted ->
+    // CONTROL: the last-claim reconciliation loop at the end of
+    //       WallpaperManager::restoreSaved() (backend/daemon/wallpaper_manager.cpp) emptied ->
     //       "FAIL: a connector name no live screen holds is written on the later kept row and
     //       no other", printing "rows carrying 'DP-9': 42" -- the save's own duplicate
     //       suppression still leaves one copy, but the earlier row's. Deleting
     //       `|| !written.insert(row.output).second` from the name-clearing loop in
     //       WallpaperManager::persistableLocked() as well -> the same FAIL printing "rows
-    //       carrying 'DP-9': 42 43", which is the shape with neither defence. Both observed
-    //       2026-08-14. Both reverted.
+    //       carrying 'DP-9': 42 43", which is the shape with neither defence. Re-observed
+    //       2026-08-15 against the reworked loop. Both reverted.
     std::vector<int> rowsCarryingDuplicate;
     for (const auto& [id, row] : onDisk) {
         if (row.output == "DP-9") rowsCarryingDuplicate.push_back(id);
@@ -3114,46 +3590,35 @@ void runPreservedRowChecks() {
     check(bothDuplicateRowsIntact, "the kept row that lost a contested connector name keeps its wallpaper");
     if (!bothDuplicateRowsIntact) std::fprintf(stderr, "  ids on disk: %s\n", idsOf(onDisk).c_str());
 
-    // GOAL: the storage half of the same rule -- a name this build refuses reaches the file
-    //       again on exactly the rows whose ids only a bigger build could bind, and byte for
-    //       byte. Two ways to be false: written on a row this build binds, and it rides every
-    //       save for the life of the install while the report says the screen must be named
-    //       again; or deleted from the row it was carried on, and this build's length limit
-    //       has destroyed a name a build with a larger limit would have used.
-    // WHY-THIS-SHAPE: every row in the file is scanned for a name this build would refuse and
-    //       the ids are compared as a list, rather than looking up monitor 47 and asking
-    //       whether it has an output. Which row such a name lands on is the whole property
-    //       here, and "row 47 has a name" is also true of a build that copied it onto every
-    //       row. The bytes are compared as well: a build that truncated the name to the limit
-    //       would satisfy the id list and still have destroyed what it carried.
+    // GOAL: the storage half of the same rule -- a name the stored format cannot hold reaches
+    //       the file on no row at all, whatever id it arrived on, while the row that carried it
+    //       keeps its wallpaper. False if such a name is written back: it then rides every save
+    //       for the life of the install, and no build that reads this format will ever bind it.
+    // WHY-THIS-SHAPE: every row in the file is scanned for a name this build would refuse,
+    //       rather than looking up monitor 47 and asking whether its output is empty. The
+    //       property is about the whole file: a build that moved the name onto some other row
+    //       satisfies the narrow question and not this one. The wallpaper on that row is
+    //       asserted in the same breath, because dropping the row entirely would also empty the
+    //       list, and that is a wallpaper lost rather than a name refused.
     // CONTROL: the carried case in WallpaperManager::restoreSaved()
-    //       (backend/daemon/wallpaper_manager.cpp) gated on the whole client rule rather than
-    //       on valid UTF-8, as `const bool nameTravels = nameValid && entry.monitorId >=
-    //       kMaxMonitors;` -> "FAIL: a name this build refuses is written back only on a row
-    //       whose id this build cannot bind", printing "rows carrying a name this build
-    //       refuses: (none)", and "FAIL: the carried name reaches the file byte for byte".
-    //       Observed 2026-08-14. Reverted.
+    //       (backend/daemon/wallpaper_manager.cpp) gated on valid UTF-8 rather than on the whole
+    //       rule -- the code before this fix -> "FAIL: a name the stored format cannot hold is
+    //       written back on no row at all", printing "rows carrying a name this build refuses:
+    //       47 (257 bytes)". Observed 2026-08-15.
     std::vector<int> rowsWithRefusedName;
     for (const auto& [id, row] : onDisk) {
         if (!row.output.empty() && !wallpaperx::outputNameError(row.output).empty()) {
             rowsWithRefusedName.push_back(id);
         }
     }
-    const bool refusedNameOnCarriedRowOnly = rowsWithRefusedName == carriedNameIds;
-    check(refusedNameOnCarriedRowOnly,
-          "a name this build refuses is written back only on a row whose id this build cannot bind");
-    if (!refusedNameOnCarriedRowOnly) {
+    const bool noRefusedNameWritten = rowsWithRefusedName.empty();
+    check(noRefusedNameWritten, "a name the stored format cannot hold is written back on no row at all");
+    if (!noRefusedNameWritten) {
         std::string ids;
         for (const int id : rowsWithRefusedName) {
             ids += " " + std::to_string(id) + " (" + std::to_string(onDisk.at(id).output.size()) + " bytes)";
         }
         std::fprintf(stderr, "  rows carrying a name this build refuses:%s\n", ids.empty() ? " (none)" : ids.c_str());
-    }
-    const bool carriedNameIntact = onDisk.count(47) == 1 && onDisk.at(47).output == oversized;
-    check(carriedNameIntact, "the carried name reaches the file byte for byte");
-    if (!carriedNameIntact) {
-        std::fprintf(stderr, "  monitor 47 carries %zu bytes, expected %zu\n",
-                     onDisk.count(47) ? onDisk.at(47).output.size() : 0, oversized.size());
     }
     const bool refusedNameRowIntact = onDisk.count(47) == 1 && onDisk.at(47).path == "/kept47.png";
     check(refusedNameRowIntact, "the kept row carrying a name this build cannot bind keeps its wallpaper");
@@ -3173,14 +3638,14 @@ void runPreservedRowChecks() {
     //       fixture by hand and a build that clears a name at save time satisfies whichever
     //       one it was written for. Only reading back what was written can catch the two
     //       drifting apart.
-    // CONTROL: the reverse-order reconciliation loop at the end of
-    //       WallpaperManager::restoreSaved() (backend/daemon/wallpaper_manager.cpp) deleted,
+    // CONTROL: the last-claim reconciliation loop at the end of
+    //       WallpaperManager::restoreSaved() (backend/daemon/wallpaper_manager.cpp) emptied,
     //       which puts both decisions back inside the const save -> "FAIL: every kept name the
     //       report promises back is really in the written file", printing "the report promises
-    //       7 kept names, the file holds 6, the fixture expects 6". The eighth kept row that
-    //       still carries a name after that deletion is monitor 40, and persistenceDetail()'s
-    //       own live-name guard leaves it out of the count -- so 7 is the number, not 8.
-    //       Re-observed 2026-08-14. Reverted.
+    //       6 kept names, the file holds 5, the fixture expects 5". The kept row that still
+    //       carries a name after that deletion but is left out of the count is monitor 40,
+    //       which persistenceDetail()'s own live-name guard excludes. Re-observed 2026-08-15
+    //       against the reworked loop. Reverted.
     // COVERAGE-ASSERT: the comparison is only evidence if the file really holds kept names, so
     //       the count it read is asserted to be the expected one rather than merely equal.
     int namesOnKeptRows = 0;
@@ -3598,6 +4063,7 @@ void runStartupRepairChecks() {
     const ScratchDir scratch("startuprepair");
     const std::optional<PhasePaths> paths = preparePhase(scratch, kGoals, 1);
     if (!paths) return;
+    const ScopedEnv stateHome("XDG_STATE_HOME", stateHomeOf(scratch).string());
     const std::filesystem::path& file = paths->config;
     const std::filesystem::path& present = paths->wallpapers[0];
 
@@ -3763,6 +4229,107 @@ void runStartupRepairChecks() {
 }
 
 // ---------------------------------------------------------------------------- //
+// Phase 6j2 -- S10.17: the startup repair does not park the thread that is about to
+// start serving.
+// ---------------------------------------------------------------------------- //
+void runStartupRepairIsNotBlockingChecks() {
+    constexpr const char* kGoals = "S10.17 (the startup repair hands its write to the writer and returns, so a config "
+                                   "directory that has stopped answering cannot park the daemon between claiming the "
+                                   "bus name and serving requests)";
+    const ScratchDir scratch("repairnotblocking");
+    const std::optional<PhasePaths> paths = preparePhase(scratch, kGoals, 1);
+    if (!paths.has_value()) return;
+    const std::filesystem::path& file = paths->config;
+    const std::filesystem::path& present = paths->wallpapers[0];
+    const ScopedEnv stateHome("XDG_STATE_HOME", (scratch.path() / "state").string());
+
+    std::string fixtureWhy;
+    if (!blockingWriteFixtureWorks(scratch.path() / "wallpaperx" / "probe.json", fixtureWhy)) {
+        notVerified(kGoals, fixtureWhy);
+        return;
+    }
+
+    // A screen renamed by a later row: a repair no client call could ever be the thing that
+    // writes down, which is why the write happens at startup at all.
+    nlohmann::json monitors = nlohmann::json::array();
+    monitors.push_back(configRow(1, "static", present.string(), "DP-3"));
+    monitors.push_back(configRow(1, "", "", "DP-4"));
+    nlohmann::json root;
+    root["version"] = 1;
+    root["monitors"] = monitors;
+    if (!writeFile(file, root.dump())) {
+        notVerified(kGoals, "the config file this phase reads could not be written");
+        return;
+    }
+
+    BlockingWrite blocked(file);
+    if (!blocked.arm()) {
+        notVerified(kGoals, std::string("a fifo could not be created at ") + blocked.temp() +
+                                ", so no write can be made to block on this host");
+        return;
+    }
+
+    WallpaperManager::Config config;
+    config.configFile = file;
+    WallpaperManager manager(config);
+    manager.restoreSaved();
+    manager.preserveUnreadableConfig();
+
+    // GOAL: S10.17 -- writeRepairedConfig() returns without waiting for the write to land.
+    //       False if it waits: backend/daemon/main.cpp calls it after requestName() and before
+    //       the event loop and the HTTP server exist, so on a config directory that has stopped
+    //       answering the daemon owns the bus name for the whole deadline while dispatching to
+    //       nobody, and the plugin's polls are refused outright.
+    // WHY-THIS-SHAPE: the write is really parked, on a fifo, and the elapsed time is compared
+    //       against a quarter of the daemon's own deadline. Two cheaper versions were rejected.
+    //       Timing this call on a healthy tmpfs measures nothing -- the write takes microseconds,
+    //       so a build that waits for it returns just as fast. And asserting only that the repair
+    //       reaches the file cannot see the wait at all, since a blocking write also arrives.
+    //       The parked write's bytes are graded beside the timing, because "returned instantly"
+    //       is trivially true of a build that queues nothing: that check is what stops this
+    //       phase being satisfied by losing the repair altogether.
+    // CONTROL: writeRepairedConfig() (backend/daemon/wallpaper_manager.cpp) calling persist()
+    //       rather than queuePersist(), which is the shape before this fix -> "FAIL: the
+    //       startup repair does not park the daemon on the config write", printing "it took
+    //       2000 ms against a 2000 ms deadline", with the queued-bytes check still green.
+    //       Observed 2026-08-15.
+    const auto start = StallClock::now();
+    manager.writeRepairedConfig();
+    const double elapsedMs = millisSince(start);
+
+    // Released after the measurement, and read back: a write that never reached the fifo means
+    // the repair was not queued at all, which the fixture probe above has already ruled out as
+    // a fault of this host.
+    const BlockingWrite::Released released = blocked.release(std::chrono::milliseconds(10000));
+    const bool queued = released.ok;
+    check(queued, "the startup repair hands a write to the writer");
+    if (!queued) std::fprintf(stderr, "  %s\n", released.why.c_str());
+
+    const bool prompt = elapsedMs < kSaveDeadlineMs / 4;
+    check(prompt, "the startup repair does not park the daemon on the config write");
+    if (!prompt) {
+        std::fprintf(stderr, "  it took %.0f ms against a %.0f ms deadline\n", elapsedMs, kSaveDeadlineMs);
+    }
+
+    if (queued) {
+        // COVERAGE-ASSERT: the write that was parked is the repair, not some empty snapshot --
+        // "returned promptly" would otherwise be satisfied by a build that queued nothing worth
+        // writing.
+        const nlohmann::json wrote = nlohmann::json::parse(released.bytes, nullptr, false);
+        const bool carriedRepair = !wrote.is_discarded() && wrote.is_object() && wrote.contains("monitors") &&
+                                   wrote["monitors"].is_array() && wrote["monitors"].size() == 1 &&
+                                   wrote["monitors"][0].value("path", std::string()) == present.string() &&
+                                   wrote["monitors"][0].value("output", std::string()) == "DP-4";
+        check(carriedRepair, "the write the startup repair queued carries the repaired row");
+        if (!carriedRepair) {
+            std::fprintf(stderr, "  the fifo carried %zu bytes: %s\n", released.bytes.size(),
+                         released.bytes.c_str());
+        }
+    }
+    std::printf("config_store_test: a startup repair against a parked write returned in %.0f ms\n", elapsedMs);
+}
+
+// ---------------------------------------------------------------------------- //
 // Phase 6k -- Step 10: a health snapshot taken while the first save is publishing
 // its worker. The workload the ThreadSanitizer tier needs; see the block below for
 // what this does and does not assert on an ordinary build.
@@ -3798,17 +4365,17 @@ void runConcurrentHealthReadChecks() {
     //       requestWallpaper, rather than both being launched together, because the pointer is
     //       published exactly once, on the first save -- two threads racing to start would
     //       usually miss that instant.
-    // CONTROL: the publication in WallpaperManager::persist()
+    // CONTROL: the publication in WallpaperManager::queuePersist()
     //       (backend/daemon/wallpaper_manager.cpp) put back to its unsynchronised shape --
-    //       `startPersistWorker(); std::shared_ptr<PersistWorker> worker = m_persist;` with no
-    //       m_stateMutex around it -- and the tree rebuilt with -DWALLPAPERX_SANITIZE=thread ->
-    //       "WARNING: ThreadSanitizer: data race", "Read of size 8 ... in
-    //       WallpaperManager::applyPersistOutcomeLocked() ... Previous write of size 8 ... by
-    //       main thread", and ctest reported config_store as Failed rather than Passed, the
-    //       sanitizer replacing the exit code. Every check in this phase stayed GREEN in that
-    //       run, which is the point of the block above: the sanitizer is the oracle here, not
-    //       the assertions. With the lock restored the same build reports nothing and passes.
-    //       Observed 2026-08-14. Reverted.
+    //       `startPersistWorkerLocked(); worker = m_persist;` with no m_stateMutex around it --
+    //       and the tree rebuilt with -DWALLPAPERX_SANITIZE=thread -> "WARNING:
+    //       ThreadSanitizer: data race" naming WallpaperManager::applyPersistOutcomeLocked()
+    //       under snapshot() against startPersistWorkerLocked() under queuePersist(), and ctest
+    //       reported config_store as Failed rather than Passed, the sanitizer replacing the
+    //       exit code. Every check in this phase stayed GREEN in that run, which is the point
+    //       of the block above: the sanitizer is the oracle here, not the assertions. With the
+    //       lock restored the same build reports nothing and passes. Re-observed 2026-08-15
+    //       against the split publish/wait shape. Reverted.
     // CONTROL, for the overlap being reported as a skip rather than a pass: a three-second
     //       sleep added to this reader's loop, so no read can complete inside the save window
     //       -> exit 77 with "2 snapshot(s) in total, 0 of them while the save was in flight"
@@ -4158,17 +4725,9 @@ void runSaveCostChecks() {
 // Phases 9-11 -- S8.28-S8.33: a config write that blocks on the filesystem.
 // ---------------------------------------------------------------------------- //
 
-using StallClock = std::chrono::steady_clock;
-
-double millisSince(StallClock::time_point start) {
-    return std::chrono::duration<double, std::milli>(StallClock::now() - start).count();
-}
-
-// The deadline a save is given, restated rather than shared: kLoadDeadline sits in an
-// anonymous namespace in wallpaper_manager.cpp. A copy here means a change to it fails these
-// phases loudly instead of silently re-pointing them at whatever the new value is.
-constexpr double kSaveDeadlineMs = 2000.0;
-
+// StallClock, millisSince() and kSaveDeadlineMs are declared above the startup-repair phase,
+// which is the first one to time a parked write.
+//
 // BlockingWrite, blockingWriteFixtureWorks() and isRegularFile() live in
 // tests/client/blocking_config_write.h, shared with daemon_system_test: the fixture's
 // correctness rests on details a second copy would drift away from silently.
@@ -4366,9 +4925,11 @@ void runStalledSaveChecks() {
     //       The bound is a quarter of the deadline, not "faster than the first call": the
     //       second save does no I/O at all on this thread, so anything near the deadline is
     //       the defect, and a relative bound would be satisfied by 1.9 s.
-    // CONTROL: `if (m_persist->stalled) return;` deleted from persist() -> "FAIL: a second
-    //       save during a stall does not wait for the deadline all over again", printing
-    //       "the second save took 2000 ms against a 2000 ms deadline". Reverted.
+    // CONTROL: the `if (worker->stalled)` short-circuit in WallpaperManager::persist()
+    //       (backend/daemon/wallpaper_manager.cpp) forced false, so every save waits -> "FAIL: a
+    //       second save during a stall does not wait for the deadline all over again", printing
+    //       "the second save took 2000 ms against a 2000 ms deadline". Re-observed 2026-08-15
+    //       against the split publish/wait shape. Reverted.
     // COVERAGE-ASSERT: the first save's own elapsed time is asserted to be at least three
     //       quarters of the deadline. Without it this comparison is green on a build that
     //       waits for nothing at all -- both calls return instantly and the phase reports
@@ -4393,6 +4954,164 @@ void runStalledSaveChecks() {
                      stalled.elapsedMs);
     }
     std::printf("config_store_test: a stalled save cost %.0f ms, the next one %.0f ms\n", stalled.elapsedMs,
+                secondMs);
+}
+
+// ---------------------------------------------------------------------------- //
+// Phase 11b -- S10.16: the config writer that could not be started.
+// ---------------------------------------------------------------------------- //
+void runNoWriterThreadChecks() {
+    constexpr const char* kGoals = "S10.16 (a config writer whose thread could not be created is reported as failed "
+                                   "persistence and retried, never remembered as a writer that exists)";
+    const ScratchDir scratch("nowriterthread");
+    const std::optional<PhasePaths> paths = preparePhase(scratch, kGoals, 1);
+    if (!paths.has_value()) return;
+    const std::filesystem::path configFile = paths->config;
+    const std::filesystem::path wallpaper = paths->wallpapers.front();
+
+    WallpaperManager::Config config;
+    config.configFile = configFile;
+    // Constructed BEFORE the limit below drops. The constructor reads the config on a thread
+    // of its own, and a manager that could not read its config refuses every save afterwards
+    // for a reason that has nothing to do with this goal.
+    WallpaperManager manager(config);
+
+    rlimit original{};
+    if (::getrlimit(RLIMIT_NPROC, &original) != 0) {
+        notVerified(kGoals, "this host would not report RLIMIT_NPROC, so thread creation cannot be made to fail");
+        return;
+    }
+    rlimit exhausted = original;
+    exhausted.rlim_cur = 1;
+    if (::setrlimit(RLIMIT_NPROC, &exhausted) != 0) {
+        notVerified(kGoals, "RLIMIT_NPROC could not be lowered here, so thread creation cannot be made to fail");
+        return;
+    }
+    // A guard, not a call at the end: the limit is process-wide, so anything that left this
+    // phase early -- a throw out of the manager, a return added later -- would take every
+    // following phase's threads with it and report the wreckage as daemon failures.
+    struct RestoreLimit {
+        rlimit original;
+        bool restored = false;
+        ~RestoreLimit() { restore(); }
+        void restore() {
+            if (!restored) restored = ::setrlimit(RLIMIT_NPROC, &original) == 0;
+        }
+    } restoreLimit{original};
+
+    // X.3: a privileged process ignores RLIMIT_NPROC entirely. A phase that cannot make
+    // thread creation fail must say so -- everything below would otherwise grade an ordinary
+    // healthy save and report it as this goal being satisfied.
+    bool fixtureWorks = false;
+    try {
+        std::thread probe([] {});
+        probe.join();
+    } catch (const std::system_error&) {
+        fixtureWorks = true;
+    }
+    if (!fixtureWorks) {
+        notVerified(kGoals, "this process still creates threads with RLIMIT_NPROC lowered (running as root, or with "
+                            "CAP_SYS_RESOURCE), so no config write can be made to have no thread to run on");
+        return;
+    }
+
+    const auto call = [&manager, &wallpaper](int monitorId, double& elapsedMs) {
+        std::string threw;
+        const auto start = StallClock::now();
+        try {
+            manager.requestWallpaper("static", wallpaper.string(), monitorId);
+        } catch (const std::exception& e) {
+            threw = e.what();
+        } catch (...) {
+            threw = "an exception that is not a std::exception";
+        }
+        elapsedMs = millisSince(start);
+        return threw;
+    };
+
+    double firstMs = 0;
+    const std::string firstThrew = call(0, firstMs);
+    const WallpaperManager::Snapshot afterFirst = manager.snapshot();
+    double secondMs = 0;
+    const std::string secondThrew = call(1, secondMs);
+
+    restoreLimit.restore();
+    const bool limitRestored = restoreLimit.restored;
+
+    // GOAL: S10.16 -- with no thread available for the config writer, the wallpaper is still
+    //       accepted and the daemon says persistence failed. False in two directions, and the
+    //       second is the damaging one: a request that throws reaches the client as a render
+    //       error, and a request that succeeds silently leaves persistence reading ok while
+    //       nothing will ever be written again for the life of the process.
+    // WHY-THIS-SHAPE: RLIMIT_NPROC is lowered around two real saves rather than a thread
+    //       failure being simulated. The simpler alternative -- a test-only hook that makes
+    //       the manager pretend the thread failed -- is production surface a test would own,
+    //       which this project forbids, and it would grade the pretence rather than what
+    //       std::thread does here. The limit is restored before anything is printed, and the
+    //       phase skips rather than grades when the limit does not bite.
+    // CONTROL: the fix reverted, i.e. `m_persist = std::make_shared<PersistWorker>();`
+    //       published before the std::thread that services it in
+    //       WallpaperManager::startPersistWorkerLocked (backend/daemon/wallpaper_manager.cpp)
+    //       -> all four checks below red: "a save with no thread for the writer does not fail
+    //       the request" printing "requestWallpaper threw: Resource temporarily unavailable",
+    //       "the daemon reports persistence as failed when it has no thread to write on"
+    //       printing "persistence reads ok", "a later save does not wait on a writer that was
+    //       never started" printing "the second save took 2000 ms", and "once threads are
+    //       available again a save reaches the file" printing "ids on disk: (none)".
+    //       Observed 2026-08-15.
+    // CONTROL, for the two recovery checks: `m_configUnread = true;` added beside that same
+    //       catch -- the "refuse every write for the session" repair the review warned against
+    //       -> "FAIL: once threads are available again a save reaches the file" and "FAIL:
+    //       persistence reports itself working again once a save has landed", printing "not
+    //       saved, this run could not read it and will not overwrite it", with the two checks
+    //       above still green. Observed 2026-08-15. Reverted.
+    check(firstThrew.empty(), "a save with no thread for the writer does not fail the request");
+    if (!firstThrew.empty()) std::fprintf(stderr, "  requestWallpaper threw: %s\n", firstThrew.c_str());
+    const bool reported = afterFirst.health.persistence.status == wallpaperx::HealthStatus::Fail &&
+                          afterFirst.health.persistence.detail.find("no thread") != std::string::npos;
+    check(reported, "the daemon reports persistence as failed when it has no thread to write on");
+    if (!reported) {
+        std::fprintf(stderr, "  persistence reads %s (%s)\n",
+                     wallpaperx::toString(afterFirst.health.persistence.status),
+                     afterFirst.health.persistence.detail.c_str());
+    }
+
+    // A second save is what separates "reported once" from "the daemon still believes it has a
+    // writer": with the pointer published before the thread, every later save queues a
+    // snapshot for nobody and pays the full deadline waiting for it.
+    const bool cheap = secondMs < kSaveDeadlineMs / 4;
+    check(cheap, "a later save does not wait on a writer that was never started");
+    if (!cheap) {
+        std::fprintf(stderr, "  the second save took %.0f ms against a %.0f ms deadline%s%s\n", secondMs,
+                     kSaveDeadlineMs, secondThrew.empty() ? "" : ", and threw: ", secondThrew.c_str());
+    }
+
+    if (!limitRestored) {
+        notVerified(kGoals, "RLIMIT_NPROC could not be put back, so whether persistence recovers was not asked");
+        return;
+    }
+    // The whole point of not remembering a writer that does not exist: the failure is
+    // transient, so a save made once threads are available again has to land.
+    manager.requestWallpaper("static", wallpaper.string(), 2);
+    waitForRows(configFile, [](const std::map<int, RowInFile>& rows) { return rows.count(2) == 1; });
+    std::string why;
+    std::size_t rowsWritten = 0;
+    const std::map<int, RowInFile> onDisk = rowsInFile(configFile, why, &rowsWritten);
+    const bool recovered = onDisk.count(2) == 1 && onDisk.at(2).path == wallpaper.string();
+    check(recovered, "once threads are available again a save reaches the file");
+    if (!recovered) {
+        std::fprintf(stderr, "  %s; ids on disk: %s\n", why.empty() ? "read back" : why.c_str(),
+                     idsOf(onDisk).c_str());
+    }
+    const WallpaperManager::Snapshot afterRecovery = manager.snapshot();
+    const bool healthy = afterRecovery.health.persistence.status == wallpaperx::HealthStatus::Ok;
+    check(healthy, "persistence reports itself working again once a save has landed");
+    if (!healthy) {
+        std::fprintf(stderr, "  persistence reads %s (%s)\n",
+                     wallpaperx::toString(afterRecovery.health.persistence.status),
+                     afterRecovery.health.persistence.detail.c_str());
+    }
+    std::printf("config_store_test: with no thread for the writer, two saves cost %.0f ms and %.0f ms\n", firstMs,
                 secondMs);
 }
 
@@ -4474,10 +5193,11 @@ void runSaveVisibleOnReturnChecks() {
 
     // The bytes the parked write was carrying, so "the caller waited" is about THIS request's
     // write and not about some other one that happened to be in flight.
-    // CONTROL: `m_persist->pending = entries;` in persist() replaced with an empty vector,
+    // CONTROL: `worker->pending = entries;` in queuePersist() replaced with an empty vector,
     //       i.e. a save that queues the wrong state -> "FAIL: the write this phase released is
-    //       the one the request queued", printing "the fifo carried 37 bytes", alongside five
-    //       older persistence checks. Reverted.
+    //       the one the request queued", printing "the fifo carried 37 bytes", among 29 red
+    //       checks in all. Re-observed 2026-08-15 after the publish half moved into
+    //       queuePersist(). Reverted.
     const nlohmann::json wrote = nlohmann::json::parse(released.bytes, nullptr, false);
     const bool carriedThisRequest =
         !wrote.is_discarded() && wrote.is_object() && wrote.contains("monitors") && wrote["monitors"].is_array() &&
@@ -4575,7 +5295,7 @@ void runLatestSnapshotWinsChecks() {
     //       that never reach the disk -- the write lands in the pipe and its rename moves the
     //       fifo, not a file. It is also the only way to see a superseded snapshot's content
     //       at all.
-    // CONTROL: `m_persist->pending = entries;` in persist() replaced with an empty vector ->
+    // CONTROL: `worker->pending = entries;` in queuePersist() replaced with an empty vector ->
     //       "FAIL: the write that stalled is the snapshot that was current when it started",
     //       printing "the fifo carried 37 bytes". Reverted. The first-wins and queue mutations
     //       below both leave this one GREEN -- the fifo carries the first snapshot under
@@ -4606,7 +5326,7 @@ void runLatestSnapshotWinsChecks() {
     //       count, and every read of the file is guarded by S_ISREG: the released write
     //       renames the FIFO onto config.json, and an unguarded read of that path would block
     //       this thread for good.
-    // CONTROL: two, both reverted. (a) `m_persist->pending = entries;` in persist() replaced
+    // CONTROL: two, both reverted. (a) `worker->pending = entries;` in queuePersist() replaced
     //       with `if (!m_persist->pending) m_persist->pending = entries;`, i.e. first-wins ->
     //       "FAIL: the snapshot that lands after a stalled write is the newest one", printing
     //       "  monitor 2 is missing from the file". (b) `pending` turned into a
@@ -4683,6 +5403,33 @@ int main() {
         realConfigBefore = realConfigExisted ? readFile(realConfig) : std::string();
     }
 
+    // The daemon keeps a preserved copy of a rejected config under $XDG_STATE_HOME, and a
+    // phase that forgets to point that somewhere of its own would write into the developer's
+    // real state directory. One scratch directory for the whole run is the backstop; the
+    // phases that read a copy back set their own inside it.
+    //
+    // CONTROL: this pair deleted, with the phases' own ScopedEnvs deleted too -> "FAIL: this
+    // test wrote nothing into the developer's own state directory", naming
+    // $HOME/.local/state/wallpaperx/config.json.bad. Observed 2026-08-15. Reverted.
+    const ScratchDir stateGuard("stateguard");
+    if (!stateGuard.ok()) {
+        harnessFailure("no scratch directory for XDG_STATE_HOME could be created, so a preserved copy this run "
+                       "makes would land in the real state directory");
+        return 1;
+    }
+    const ScopedEnv stateHome("XDG_STATE_HOME", (stateGuard.path() / "state").string());
+    const std::filesystem::path realStateDir = [] {
+        if (const char* home = std::getenv("HOME"); home != nullptr && *home != '\0') {
+            return std::filesystem::path(home) / ".local" / "state" / "wallpaperx";
+        }
+        return std::filesystem::path();
+    }();
+    bool realStateDirExisted = false;
+    if (!realStateDir.empty()) {
+        std::error_code ec;
+        realStateDirExisted = std::filesystem::exists(realStateDir, ec) && !ec;
+    }
+
     // X.4: this file drives a WallpaperManager, whose constructor can throw on a machine
     // whose shader directory is missing. Without a handler the process would abort and ctest
     // would report an opaque SIGABRT instead of the FAIL lines above. One handler per phase
@@ -4719,17 +5466,24 @@ int main() {
         {"when the preserved copy must not be made", runPreservedCopyChecks},
         {"a config that cannot be preserved anywhere", runPreservationExhaustedChecks},
         {"the copy made for malformed entries", runMalformedEntryCopyChecks},
+        {"the copy made before a repair is written", runRepairCopyChecks},
         {"entries this build cannot apply", runUnappliedEntryChecks},
         {"the connector name as a stored field", runOutputFieldChecks},
         {"the connector names read back at startup", runOutputRestoreChecks},
         {"the connector names a restore could not keep", runOutputLossReportChecks},
+        {"a kept row a live monitor has taken over", runKeptWallpaperSupersededChecks},
+        {"two rows for one monitor this build can apply", runDuplicateLiveRowChecks},
+        {"which kept row keeps a name three rows claim", runKeptNameLastWinsChecks},
         {"the rows kept for a build with more screens", runPreservedRowChecks},
         {"re-asserting a name a screen already has", runIdempotentRenameChecks},
         {"the repair a start performs is written at that start", runStartupRepairChecks},
+        {"the startup repair against a config directory that has stopped answering",
+         runStartupRepairIsNotBlockingChecks},
         {"a health read beside the first save", runConcurrentHealthReadChecks},
         {"a save that cannot succeed", runFailedSaveChecks},
         {"the cost of the save", runSaveCostChecks},
         {"a write that never comes back", runStalledSaveChecks},
+        {"a writer thread that could not be created", runNoWriterThreadChecks},
         {"the wait a save is given", runSaveVisibleOnReturnChecks},
         {"the snapshot that wins a stall", runLatestSnapshotWinsChecks},
     };
@@ -4761,6 +5515,24 @@ int main() {
             std::fprintf(stderr, "  %s %s before this run and %s\n", realConfig.string().c_str(),
                          realConfigExisted ? "held something else" : "did not exist",
                          existsNow ? "does now" : "is gone");
+        }
+    }
+
+    // The same guard for the directory a preserved copy goes to. Graded on the copies, not on
+    // the directory's existence: another WallpaperX process may legitimately have made one
+    // before this run started, and a phase whose ScopedEnv is missing writes a NEW one.
+    if (realStateDir.empty()) {
+        std::printf("config_store_test: this process has no usable HOME, so there is no real state directory for "
+                    "this run to have touched.\n");
+    } else {
+        std::error_code ec;
+        const bool existsNow = std::filesystem::exists(realStateDir, ec) && !ec;
+        const bool untouched = realStateDirExisted || !existsNow;
+        check(untouched, "this test wrote nothing into the developer's own state directory");
+        if (!untouched) {
+            std::fprintf(stderr, "  %s did not exist before this run and does now, holding: %s\n",
+                         realStateDir.string().c_str(),
+                         joined(preservedCopyNames(std::filesystem::path("config.json"), realStateDir)).c_str());
         }
     }
 

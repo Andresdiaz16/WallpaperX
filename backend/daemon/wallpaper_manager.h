@@ -26,19 +26,15 @@ class Device;
 class OffscreenTargetManager;
 struct OffscreenTarget;
 
-// A request that was malformed rather than one that failed to render. Its own type
-// so the DBus layer can answer with InvalidArgs instead of a generic failure --
-// "you asked for something that cannot exist" and "I could not do what you asked"
-// are different bugs on the client's side of the wire.
+// A request that was malformed rather than one that failed to render. Its own type so the
+// DBus layer can answer with InvalidArgs instead of a generic failure.
 struct InvalidRequest : std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
-// What a monitor was last asked to display, and what came of it. `generation` is
-// monotonic per monitor and never resets -- a consumer uses it to tell a fresh frame
-// from a repeat, so reusing a number for different pixels would defeat it. `hasFrame`
-// is therefore separate: a request that failed, or one for a type this build cannot
-// render yet, leaves the counter alone and clears the flag rather than rewinding.
+// What a monitor was last asked to display, and what came of it. `generation` is monotonic
+// per monitor and never resets, so a consumer can tell a fresh frame from a repeat; `hasFrame`
+// is separate because a failed render clears the flag without rewinding the counter.
 struct MonitorStatus {
     std::string type;
     std::string path;
@@ -47,26 +43,23 @@ struct MonitorStatus {
     uint64_t generation = 0;
     bool hasFrame = false;
 
-    // Why the most recent request produced no frame, or empty if it produced one or is
-    // still rendering. Rendering is asynchronous, so this is the only channel a failure
-    // has: the DBus reply to SetWallpaper is sent before the render is attempted.
+    // Why the most recent request produced no frame, or empty if it produced one or is still
+    // rendering. The only channel a failure has: SetWallpaper replies before the render runs.
     std::string lastError;
 
     // Whether that failure is the daemon's to answer for, as opposed to the image being
-    // unreadable or undecodable. Only the daemon's own failures make /health report a
-    // broken daemon; a file the user can replace does not.
+    // unreadable. Only the daemon's own failures make /health report a broken daemon.
     bool lastErrorIsDaemonFault = false;
 
-    // A render has been accepted and no pass has run for it yet. This is what separates
-    // "the daemon owes an answer" from "this monitor has no picture" -- the second is also
-    // true of a monitor whose render was superseded, which nobody is waiting on.
+    // A render has been accepted and no pass has run for it yet -- "the daemon owes an answer",
+    // as against "this monitor has no picture", which is also true of a superseded render.
     bool renderOutstanding = false;
 };
 
 // The config writer's thread and everything it touches. Held by shared_ptr and deliberately
-// free of any reference back to the manager: a write on a stalled mount cannot be
-// interrupted, so the thread has to be abandonable, and abandoning one that could reach the
-// manager would be a use-after-free waiting for the mount to recover.
+// free of any reference back to the manager: a write on a stalled mount cannot be interrupted,
+// so the thread must be abandonable, and abandoning one that could reach the manager would be
+// a use-after-free waiting for the mount to recover.
 struct PersistWorker {
     std::mutex mutex;
 
@@ -92,9 +85,8 @@ struct PersistWorker {
 };
 
 // True once a config read has been abandoned mid-call. That thread is still blocked in the
-// kernel and may wake at any time, including during static destruction, where it would run
-// library code the runtime is tearing down. main() ends the process rather than unwind past
-// a thread it cannot account for.
+// kernel and may wake during static destruction, into library code being torn down, so main()
+// ends the process rather than unwind past it.
 bool configLoadAbandoned();
 
 // The GPU the daemon resolved, once it has resolved one.
@@ -104,9 +96,8 @@ struct GpuStatus {
     std::string descriptorTier;
 };
 
-// Pending is a real answer: nothing has been tried yet. For shaders and gpu that means no
-// render has happened -- which, since restoreSaved() renders at startup, now describes a
-// daemon with no saved config rather than every fresh daemon.
+// Pending is a real answer: nothing has been tried yet. Since restoreSaved() renders at
+// startup, for shaders and gpu that describes a daemon with no saved config.
 enum class HealthStatus { Pending, Ok, Fail };
 
 const char* toString(HealthStatus status);
@@ -124,15 +115,12 @@ struct DaemonHealth {
     HealthCheck gpu;
 
     // Deliberately absent from /health's checks: a bind failure means /health is answered by
-    // whatever took the port, so there it could only ever read ok. GetStatus carries it --
-    // the bus name cannot be taken from a running daemon, so DBus is the channel that can
-    // still say "the thing on that port is not mine".
+    // whatever took the port, so there it could only ever read ok. GetStatus carries it,
+    // because the bus name cannot be taken from a running daemon.
     HealthCheck configServer;
 
-    // Whether the wallpaper choice will survive a restart. Separate from configServer,
-    // which is the HTTP surface. A failed save leaves SetWallpaper succeeding -- the
-    // wallpaper is on screen and a full disk is not a broken wallpaper -- so this is the
-    // only channel that says the choice will be lost.
+    // Whether the wallpaper choice will survive a restart. A failed save leaves SetWallpaper
+    // succeeding, so this is the only channel that says the choice will be lost.
     HealthCheck persistence;
 };
 
@@ -143,26 +131,13 @@ struct FrameHandle {
     uint64_t generation = 0;
 };
 
-// Why an export produced nothing. Carried out of the manager rather than re-derived by
-// the caller, because the three cases are distinguishable only from state guarded by
-// m_stateMutex, and a caller that took a second look would be reading a second, later
-// truth -- the exact split this class exists to prevent.
-//
-// The distinction is not cosmetic. A consumer polls GetFrameFd, and "nothing yet, ask
-// again" and "this wallpaper will never render" require opposite responses: retry, or
-// stop and show the error. Collapsing them tells a client to retry a dead wallpaper
-// forever.
 // The single answer to "can this build draw this type", so the render dispatch, the
-// GetFrameFd reason and the GetStatus field cannot drift apart. They did: the dispatch
-// test and the reason test were two separate `type != "static"` literals, and Step 13
-// making video renderable would have had to find both or GetFrameFd would go on telling
-// clients a working wallpaper can never produce a frame.
+// GetFrameFd reason and the GetStatus field cannot drift apart.
 inline bool isRenderableType(const std::string& type) { return type == "static"; }
 
 // The path a client may act on: the bytes as stored, or nothing when they are not valid
-// UTF-8 and so cannot be carried by JSON at all. Published beside the escaped `path`,
-// which stays display-safe -- one definition because a value raw on one channel and
-// escaped on the other is the defect aded2e5 fixed.
+// UTF-8 and so cannot be carried by JSON at all. Published beside the escaped `path`, which
+// stays display-safe.
 inline std::optional<std::string> literalPath(const std::string& path) {
     if (!isValidUtf8(path)) return std::nullopt;
     return path;
@@ -195,56 +170,46 @@ struct RenderOutcome {
     uint64_t generation = 0;
 };
 
-// Owns the renderer for the daemon: one Vulkan Device, one OffscreenTargetManager
-// keyed by monitor, and the per-monitor bookkeeping behind SetWallpaper/GetFrameFd.
-//
-// Split into a request phase and a render phase, because rendering is slow and the DBus
-// event loop is single-threaded. requestWallpaper() only records what was asked for and
-// returns; renderPending() does the GPU work, and runs on the render worker's thread.
+// Owns the renderer for the daemon: one Vulkan Device, one OffscreenTargetManager keyed by
+// monitor, and the per-monitor bookkeeping behind SetWallpaper/GetFrameFd. Split into a
+// request phase and a render phase, because rendering is slow and the DBus event loop is
+// single-threaded.
 //
 // Thread-safe, under two locks with a strict order: m_gpuMutex may be taken before
 // m_stateMutex, never the reverse.
 //
 //   m_gpuMutex   guards the Device and the offscreen targets, and serialises all GPU
-//                submission. Held for the whole of a render, which is the slow part.
-//                It is also what makes the export path safe: OffscreenTarget's
-//                exportLayout/externalOwner are written through a const reference by
-//                *both* render and export, so both must hold this same lock.
-//   m_stateMutex guards the per-monitor bookkeeping only. Every operation under it is
-//                a map lookup or a string copy, so GetStatus and SetWallpaper never
-//                wait on a render -- which is the entire point of the split.
+//                submission. Held for the whole of a render. It is also what makes export
+//                safe: OffscreenTarget's exportLayout/externalOwner are written through a
+//                const reference by *both* render and export.
+//   m_stateMutex guards the per-monitor bookkeeping only, where every operation is a map
+//                lookup or a string copy, so GetStatus never waits on a render.
 class WallpaperManager {
 public:
-    // Upper bound on monitor ids. An id that renders successfully retains a full-size
-    // exportable image (~9 MB at 1080p) until the daemon exits; an unsupported type or a
-    // failed render releases it instead. So an unbounded id space lets any client on the
-    // session bus walk ids until the GPU allocator fails -- after which even the user's
-    // real monitor 0 can no longer be set. Comfortably above any real display count; the
-    // cap exists to make the worst case finite, not to be tight.
+    // Upper bound on monitor ids. A successful render retains a full-size exportable image
+    // (~9 MB at 1080p) until the daemon exits, so an unbounded id space lets any client on the
+    // session bus walk ids until the GPU allocator fails. The cap makes the worst case finite
+    // rather than being tight.
     static constexpr int kMaxMonitors = 32;
 
     struct Config {
-        // Placeholder geometry. The daemon has no source of real monitor dimensions
-        // until the app supplies them via KScreen (Step 15), so every target is
-        // created at this size. Tests override it to keep software-rasterised runs
-        // fast.
+        // Placeholder geometry: no source of real monitor dimensions exists until the app
+        // supplies them via KScreen (Step 15). Tests override it to keep software-rasterised
+        // runs fast.
         uint32_t width = 1920;
         uint32_t height = 1080;
 
-        // Off by default: the validation layers cost real time and are not
-        // guaranteed installed on a user's machine. Tests turn them on, since they
-        // are the correctness oracle for everything the export path cannot assert.
+        // Off by default: the validation layers cost real time and are not guaranteed
+        // installed on a user's machine. Tests turn them on as their correctness oracle.
         bool enableValidation = false;
 
         // Where the compiled SPIR-V lives. Empty means "resolve at first use" --
         // $WALLPAPERX_SHADER_DIR if set, else the build-time default.
         std::string shaderDir;
 
-        // Where wallpaper choices are persisted. Empty disables persistence entirely.
-        //
-        // Empty is the default, and production opts in via defaultConfigPath(): a test
-        // that says nothing about config must not read the developer's real wallpapers
-        // back in, nor overwrite them on its first SetWallpaper.
+        // Where wallpaper choices are persisted; empty disables persistence. Empty is the
+        // default and production opts in via defaultConfigPath(), so a test that says nothing
+        // about config cannot read or overwrite the developer's own.
         std::filesystem::path configFile;
     };
 
@@ -254,9 +219,8 @@ public:
     WallpaperManager(const WallpaperManager&) = delete;
     WallpaperManager& operator=(const WallpaperManager&) = delete;
 
-    // Records a request. Fast and GPU-free: it validates, stores the request and marks
-    // the monitor as having no current frame. Throws InvalidRequest for a malformed
-    // request; everything that can only fail on the GPU fails later, in renderPending().
+    // Records a request. Fast and GPU-free. Throws InvalidRequest for a malformed request;
+    // everything that can only fail on the GPU fails later, in renderPending().
     //
     // The caller must post the monitor to the render worker afterwards, including for
     // non-static types -- those still need their target released.
@@ -269,60 +233,52 @@ public:
     // re-assert names, and the write parks the calling thread.
     void setMonitorOutput(int monitorId, const std::string& outputName);
 
-    // Applies the config file's wallpapers, returning the monitor ids to post to the
-    // worker. Call once. Writes nothing: a repair it performed is held for
-    // writeRepairedConfig(), and an entry it dropped without repairing is dropped from the
-    // file by the next save.
+    // Applies the config file's wallpapers, returning the monitor ids to post to the worker.
+    // Call once. Writes nothing: a repair it computed is held for writeRepairedConfig().
     std::vector<int> restoreSaved();
 
-    // Moves an unreadable config aside, or copies one whose entries were partly rejected,
-    // and updates the persistence health with the outcome. Separate from the constructor
-    // because it writes to the user's config directory: a duplicate instance would
-    // otherwise move the running daemon's config before finding out it cannot run. Call
-    // once, after the bus name is held. Until it runs, saving stays refused.
+    // Moves an unreadable config aside, or copies one this run rejected rows from or is about
+    // to rewrite, and updates the persistence health with the outcome. Separate from the
+    // constructor because it writes: a duplicate instance would otherwise move the running
+    // daemon's config before finding out it cannot run. Call once, after the bus name is held.
+    // Until it runs, saving stays refused.
     void preserveUnreadableConfig();
 
-    // Writes the repair restoreSaved() computed, if it computed one. Call once, after
-    // preserveUnreadableConfig(): the repair rewrites config.json from live state, which
-    // would replace the very bytes that call copies aside to preserve.
+    // Writes the repair restoreSaved() computed, if it computed one and a copy of what it
+    // replaces exists. Call once, after preserveUnreadableConfig(): that call is what takes the
+    // copy, and the rewrite would replace the very bytes it preserves.
     void writeRepairedConfig();
 
-    // Renders whatever request the monitor currently holds. Called on the render
-    // worker's thread; never on the DBus thread.
+    // Renders whatever request the monitor currently holds. Called on the render worker's
+    // thread; never on the DBus thread.
     //
-    // Returns rendered=true only when a frame was actually produced *and* is still the
-    // one that was asked for. A request that arrives mid-render supersedes this one, and
-    // its result is discarded rather than committed -- otherwise the monitor would end
-    // up flagged as holding a frame whose pixels belong to the previous wallpaper.
-    // Failures are recorded in the monitor's lastError, not thrown: nobody is waiting.
+    // Returns rendered=true only when a frame was produced *and* is still the one that was
+    // asked for: a request arriving mid-render supersedes this one, and committing it anyway
+    // would flag the monitor as holding pixels from the previous wallpaper. Failures are
+    // recorded in the monitor's lastError, not thrown -- nobody is waiting.
     RenderOutcome renderPending(int monitorId);
 
-    // Exports the monitor's most recent frame as a fresh fd. An empty handle means
-    // there is nothing to export, with `reason` saying which of the three states that
-    // is; a thrown exception means the export itself went wrong.
+    // Exports the monitor's most recent frame as a fresh fd. An empty handle means there is
+    // nothing to export, with `reason` saying which state that is; a thrown exception means
+    // the export itself went wrong.
     FrameExport exportCurrentFrame(int monitorId);
 
-    // One consistent snapshot of everything GetStatus reports. Deliberately not two
-    // accessors: reading the GPU block and the monitor map under separate lock
-    // acquisitions lets a render commit in between, producing a reply that claims no GPU
-    // is initialised next to a monitor that already has a frame -- the exact
-    // contradiction the GPU block exists to settle.
+    // One consistent snapshot of everything GetStatus reports. Deliberately not two accessors:
+    // separate lock acquisitions let a render commit in between, producing a reply that claims
+    // no GPU beside a monitor that already has a frame.
     struct Snapshot {
         GpuStatus gpu;
         DaemonHealth health;
         std::map<int, MonitorStatus> monitors;
 
-        // Connector name -> monitor id. Its own field, not a MonitorStatus member: a named
-        // monitor need not have a wallpaper, and inventing a MonitorStatus to hold the name
-        // would make /health report that screen as set to a wallpaper it cannot render.
+        // Connector name -> monitor id. Its own field: a named monitor need not have a
+        // wallpaper.
         std::map<std::string, int> outputs;
     };
     Snapshot snapshot() const;
 
-    // The config-server health has exactly one writer, and the rule is stated on
-    // HttpServer's constructor. Private with a single friend rather than public and
-    // documented: a claim any caller can revoke would let a second server stamp its own
-    // bind failure over one that is serving, which is the state being prevented.
+    // Private with a single friend rather than public: a claim any caller could revoke would
+    // let a second server stamp its own bind failure over one that is serving.
 private:
     friend class HttpServer;
 
@@ -339,18 +295,12 @@ private:
     void detachConfigServer();
 
 public:
-    // The renderer's validation-warning counter, or null when no device has been created
-    // yet. Shared so it stays readable after this manager and its Device are destroyed:
-    // the layer's teardown complaints are the ones worth having, and they are emitted
-    // during destruction.
+    // The renderer's validation-warning counter, or null before a device exists. Shared so it
+    // stays readable after this manager and its Device are destroyed, which is when the layer's
+    // teardown complaints are emitted.
     //
-    // NOT currently surfaced by GetStatus: GpuStatus carries initialized/name/tier only.
-    // An earlier version of this comment claimed otherwise, which was both false and the
-    // stated justification for these being production surface -- so if the only callers
-    // stay in tests, either add the field to GpuStatus or move these behind whatever
-    // does consume them. Note the lock: both take m_gpuMutex, which a render holds for
-    // its whole duration, so wiring them into GetStatus as-is would make status wait on
-    // a full image decode -- the exact thing snapshot() takes only m_stateMutex to avoid.
+    // NOT surfaced by GetStatus, and both take m_gpuMutex -- a render holds it for its whole
+    // duration, so wiring them into status as-is would make status wait on an image decode.
     std::shared_ptr<const std::atomic<int>> validationCounter() const;
     bool validationLayerActive() const;
 
@@ -359,17 +309,14 @@ private:
         std::string type;
         std::string path;
 
-        // Counts accepted requests, where generation counts completed renders. The two
-        // are what let a render detect that it has been superseded: the worker snapshots
-        // requestSeq before rendering and refuses to commit if it has moved.
+        // Counts accepted requests, where generation counts completed renders: the worker
+        // snapshots requestSeq before rendering and refuses to commit if it has moved.
         uint64_t requestSeq = 0;
 
-        // The requestSeq a render pass has already been run for, successfully or not.
-        // renderPending() is idempotent per request because of this: the worker's queue
-        // can legitimately hold a monitor twice (a request arriving after the monitor
-        // was dequeued but before its seq was read re-queues it), and without this the
-        // second pass would render identical pixels again, burn a generation number and
-        // emit a second FrameReady for a frame the consumer already imported.
+        // The requestSeq a render pass has already been run for, successfully or not, which is
+        // what makes renderPending() idempotent per request. The worker's queue can
+        // legitimately hold a monitor twice, and a second pass would burn a generation number
+        // and emit a second FrameReady for a frame the consumer already imported.
         uint64_t servicedSeq = 0;
 
         uint64_t generation = 0;
@@ -377,17 +324,14 @@ private:
         std::string lastError;
         bool lastErrorIsDaemonFault = false;
 
-        // Copied from the target at commit time rather than read back from it, so
-        // status() can report the frame's size without touching the GPU state and
-        // therefore without waiting behind a render.
+        // Copied from the target at commit time, so status() can report the frame's size
+        // without touching GPU state and therefore without waiting behind a render.
         uint32_t width = 0;
         uint32_t height = 0;
     };
 
-    // Creates the Device and target manager on first use. Deferred rather than done
-    // in the constructor so the daemon still starts, serves GetStatus and reports a
-    // clean error on a machine with no working Vulkan, instead of failing at launch.
-    // Called with m_gpuMutex held.
+    // Creates the Device and target manager on first use, so a machine with no working Vulkan
+    // still starts and reports a clean error. Called with m_gpuMutex held.
     void ensureGpu();
 
     // Both called with m_gpuMutex held.
@@ -402,33 +346,39 @@ private:
     // Snapshots the monitors worth persisting. Caller must hold m_stateMutex.
     std::vector<PersistedWallpaper> persistableLocked() const;
 
-    // Displaced covers both collisions a bind resolves: a name taken off another monitor,
-    // and a name this monitor already answered to. Reporting one and not the other loses a
-    // name in silence.
+    // Displaced: the bind took the name off another monitor, or took another name off this one.
     enum class BindResult { Unchanged, Bound, Displaced };
 
     // Binds a name to a monitor, releasing any binding either side already had. Caller must
     // hold m_stateMutex and must have validated the name.
     BindResult bindOutputLocked(int monitorId, const std::string& outputName);
 
-    // Writes `entries` and records the persistence health. Must NOT be called holding
-    // m_stateMutex: it records health, which takes it, and the write is a syscall.
+    // Hands `entries` to the config writer and returns it, or null when nothing was queued
+    // (persistence disabled, an unread config, no writer thread). Must NOT be called holding
+    // m_stateMutex: it takes that lock itself.
+    std::shared_ptr<PersistWorker> queuePersist(const std::vector<PersistedWallpaper>& entries);
+
+    // queuePersist(), then a bounded wait for the write to land. The wait is what lets the
+    // reply to SetWallpaper mean the choice is on disk -- but only when it ends because the
+    // write landed: a wait that runs out leaves the write in flight and records persistence as
+    // unsettled instead. Same locking rule.
     void persist(const std::vector<PersistedWallpaper>& entries);
 
-    // Facts about the config that outlive the operation that discovered them -- a copy of
-    // an unreadable file, entries kept for a newer build. Every persistence detail is
-    // rebuilt through these, because the next save would otherwise report only itself and
-    // silently drop the pointer to the copy.
+    // Facts about the config that outlive the operation that discovered them -- a copy of an
+    // unreadable file, entries kept for a newer build. Every persistence detail is rebuilt
+    // through these, or the next save would report only itself and drop the pointer to the copy.
     void addPersistenceNote(const std::string& note);
     std::string persistenceDetail(const std::string& base) const;
 
-    // Moves or copies the config to the first free <file>.bad[.N]. Returns the name used,
-    // or empty with `why` set. Numbered because one name meant the second unreadable config
-    // had nowhere to go, and nowhere to go meant it was destroyed.
+    // Copies the config to the first free <state dir>/<file>.bad[.N], and removes the original
+    // when `move`. Returns the name used, or empty with `why` set. Numbered because one name
+    // meant the second unreadable config had nowhere to go, and so was destroyed.
     std::string preserveConfigTo(bool move, std::string& why) const;
 
-    // Spawns the config writer on first use.
-    void startPersistWorker();
+    // Spawns the config writer on first use, and leaves m_persist null when the thread could
+    // not be created. Caller must hold m_stateMutex: m_persist is published here and read
+    // under that lock.
+    void startPersistWorkerLocked();
 
     // Folds the writer's latest outcome into a health copy. Caller must hold m_stateMutex.
     // Not recorded into m_health, because the writer cannot touch this object at all.
@@ -456,18 +406,22 @@ private:
     // persist() must not replace it. Written only by the constructor, read afterwards.
     bool m_configUnread = false;
 
+    // A copy of the pre-repair file exists, so writeRepairedConfig() may replace it. Written by
+    // preserveUnreadableConfig(), read by writeRepairedConfig(); both run before the event loop.
+    bool m_repairCopied = false;
+
     // Raw, unsanitized; sanitized once when recorded. Written by the constructor and by
     // restoreSaved(), both before the event loop starts; read under m_stateMutex after.
     std::string m_persistenceNote;
 
     // Started on the first save rather than at construction, so a daemon that never sets a
-    // wallpaper never spawns it. Detached, never joined: see PersistWorker.
+    // wallpaper never spawns it. Detached, never joined: see PersistWorker. Guarded by
+    // m_stateMutex; non-null means a thread is servicing it.
     std::shared_ptr<PersistWorker> m_persist;
 
-    // Entries no build can apply, dropped rather than kept. Counted so the loss is
-    // reported: unlike a kept entry, nothing else would ever mention it. Guarded by
-    // m_stateMutex. Name-only rows counted apart: the report these feed is the user's
-    // notice that a picture did not come back, and a name never was one.
+    // Entries no build can apply, dropped rather than kept, counted so the loss is reported at
+    // all. Guarded by m_stateMutex. Name-only rows counted apart: the report these feed is the
+    // user's notice that a picture did not come back, and a name never was one.
     int m_droppedEntries = 0;
     int m_droppedNames = 0;
 
@@ -491,9 +445,8 @@ private:
     // Device and therefore without waiting for a render to finish.
     std::map<int, MonitorState> m_monitors;
 
-    // Connector name -> monitor id, and the only authority on which is which. Reverse
-    // lookup is a scan of at most kMaxMonitors entries; an index would be a second
-    // structure to keep agreeing about the thing this mapping exists to disambiguate.
+    // Connector name -> monitor id, and the only authority on which is which. Guarded by
+    // m_stateMutex.
     std::map<std::string, int> m_outputs;
     // Member pointer picks the check, so a caller cannot record into a field it did not
     // mean and the sanitizing happens in one place.
