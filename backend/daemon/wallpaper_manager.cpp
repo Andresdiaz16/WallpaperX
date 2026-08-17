@@ -898,7 +898,10 @@ void WallpaperManager::applyPersistOutcomeLocked(DaemonHealth& health) const {
     // Nothing has been asked of the file yet, so there is no write to describe and whatever the
     // constructor recorded still stands.
     if (!m_persist) {
-        if (m_preserveFailed) report(HealthStatus::Fail, health.persistence.detail);
+        // The status alone: this detail was sanitized when it was recorded, and sanitizeForLog
+        // is not idempotent -- a second pass turns one backslash in a path into two, so the
+        // alarm would name a path that does not exist.
+        if (m_preserveFailed) health.persistence.status = HealthStatus::Fail;
         return;
     }
 

@@ -5643,6 +5643,297 @@ void runNameAnswersForItsOwnWriteChecks() {
 }
 
 // ---------------------------------------------------------------------------- //
+// Phase 6p -- Step 10: the surviving alarm is escaped once, not once per read.
+// ---------------------------------------------------------------------------- //
+void runStickyAlarmEscapingChecks() {
+    constexpr const char* kGoals = "S6.40's persistence half (a path that reaches the health field is escaped once, "
+                                   "whatever else the daemon reports about it)";
+    const ScratchDir scratch("alarmescape");
+    if (!scratch.ok()) {
+        notVerified(kGoals, "a scratch directory could not be created");
+        return;
+    }
+    // A backslash in the config directory's name. It is a legal byte in a Linux filename and the
+    // one character whose escaping is visibly not idempotent: sanitizeForLog turns it into two,
+    // and two into four.
+    const std::filesystem::path oddDir = scratch.path() / "conf\\dir";
+    const std::filesystem::path file = oddDir / "wallpaperx" / "config.json";
+    std::error_code ec;
+    std::filesystem::create_directories(file.parent_path(), ec);
+    if (ec) {
+        notVerified(kGoals, "this host would not create a directory whose name contains a backslash, so double "
+                            "escaping cannot be made visible");
+        return;
+    }
+    // One malformed entry, so a copy is owed; and nowhere to put it, so the copy fails and the
+    // sticky alarm is what health reports.
+    const std::filesystem::path blocked = scratch.path() / "not-a-directory";
+    if (!writeFile(blocked, "this is a file, not a state directory") ||
+        !writeFile(file, "{\"version\":1,\"monitors\":[{\"monitor_id\":\"two\",\"type\":\"static\","
+                         "\"path\":\"/photos/right.png\"}]}")) {
+        notVerified(kGoals, "the fixture this phase needs could not be written");
+        return;
+    }
+    const ScopedEnv stateHome("XDG_STATE_HOME", blocked.string());
+    bool occupied = true;
+    for (int n = 0; n < 10 && occupied; ++n) {
+        occupied = writeFile(file.parent_path() /
+                                 ("config.json.bad" + (n == 0 ? std::string() : "." + std::to_string(n))),
+                             "an earlier broken config " + std::to_string(n));
+    }
+    if (!occupied) {
+        notVerified(kGoals, "the ten occupied copy names beside the config could not be written, so the copy cannot "
+                            "be made to fail");
+        return;
+    }
+
+    WallpaperManager::Config config;
+    config.configFile = file;
+    WallpaperManager manager(config);
+    manager.restoreSaved();
+    manager.preserveUnreadableConfig();
+
+    // GOAL: the path in the health detail is escaped exactly once. False if a report re-escapes
+    //       an already-escaped string: one backslash in the user's config path is shown as two,
+    //       and the path they are being sent to look at is not a path that exists. This is the
+    //       defect the codebase already names -- "escaping twice turns one backslash in a path
+    //       into two in what the user reads" -- reached by a different route.
+    // WHY-THIS-SHAPE: read from a manager that has been asked to preserve and NOT asked to save,
+    //       because the branch at issue is the one that reports the surviving alarm when no
+    //       writer exists yet; once a save has been made, the detail is composed from raw text
+    //       and escaped once. The expected rendering is computed with production's own
+    //       sanitizeForLog rather than written out by hand, so the check states "escaped once"
+    //       rather than pinning today's escape syntax.
+    // COVERAGE-ASSERT: the alarm really is the thing being reported -- status Fail and no writer
+    //       -- so this cannot pass by reading a detail that never went near the branch.
+    //
+    // CONTROL: report(HealthStatus::Fail, health.persistence.detail) restored in place of the
+    //       status-only assignment in applyPersistOutcomeLocked()'s "nothing has been asked of
+    //       the file yet" branch -- the shape bcac12f shipped, which this check caught. report()
+    //       sanitizes, over a string recordHealthLocked() had already sanitized, and
+    //       sanitizeForLog is not idempotent -> "FAIL: the config path in the surviving alarm is
+    //       escaped once, not twice", printing a directory named `conf\dir` as `conf\\\\dir`:
+    //       an alarm naming a path that does not exist. Fixed by carrying only the severity,
+    //       since the detail was already correct when it was recorded.
+    const WallpaperManager::Snapshot snap = manager.snapshot();
+    const bool alarmShowing = snap.health.persistence.status == wallpaperx::HealthStatus::Fail &&
+                              snap.health.persistence.detail.find("not copied") != std::string::npos;
+    check(alarmShowing, "the surviving alarm is what this phase reads");
+    if (!alarmShowing) {
+        std::fprintf(stderr, "  persistence: %s / %s\n", wallpaperx::toString(snap.health.persistence.status),
+                     snap.health.persistence.detail.c_str());
+        return;
+    }
+    const std::string escapedOnce = sanitizeForLog(file.string(), 1024, LogFraming::Bare);
+    const std::string escapedTwice = sanitizeForLog(escapedOnce, 1024, LogFraming::Bare);
+    const bool escapedOnlyOnce = snap.health.persistence.detail.find(escapedOnce) != std::string::npos &&
+                                 snap.health.persistence.detail.find(escapedTwice) == std::string::npos;
+    check(escapedOnlyOnce, "the config path in the surviving alarm is escaped once, not twice");
+    if (!escapedOnlyOnce) {
+        std::fprintf(stderr, "  detail holds: %s\n  escaped once would be: %s\n  escaped twice is: %s\n",
+                     snap.health.persistence.detail.c_str(), escapedOnce.c_str(), escapedTwice.c_str());
+    }
+}
+
+// ---------------------------------------------------------------------------- //
+// Phase 6o -- Step 10: the three channels that answer "is the file up to date"
+// answer the same way about one write.
+// ---------------------------------------------------------------------------- //
+
+// What each channel said about the same write, sampled around one re-assertion of a name the
+// manager already holds. Kept together because the property under test is that they AGREE:
+// sampled apart, three separate checks each pass while the daemon contradicts itself.
+struct FileAnswers {
+    bool healthOk = false;   // the persistence health field, read before the call
+    bool replyOk = false;    // the reply SetMonitorOutput would give a client
+    unsigned writes = 0;     // whether the idempotent shortcut let a write through
+    std::string threw;
+};
+
+FileAnswers askEveryChannel(WallpaperManager& manager, const std::filesystem::path& file, int monitorId,
+                            const std::string& outputName) {
+    FileAnswers out;
+    out.healthOk = manager.snapshot().health.persistence.status == wallpaperx::HealthStatus::Ok;
+    countRenamesOnto(file);
+    try {
+        manager.setMonitorOutput(monitorId, outputName);
+    } catch (const std::exception& e) {
+        out.threw = e.what();
+    } catch (...) {
+        out.threw = "an exception that is not a std::exception";
+    }
+    out.replyOk = out.threw.empty();
+    out.writes = renamesCounted();
+    return out;
+}
+
+void runOneAnswerAboutTheFileChecks() {
+    constexpr const char* kGoals = "S10.13/S10.16's shared premise (the health field, the reply to SetMonitorOutput "
+                                   "and the idempotent re-assert shortcut cannot disagree about one write)";
+
+    // GOAL: the three channels that answer "does the config file hold what live state holds"
+    //       give the same answer about the same write. False whenever they are derived
+    //       separately: three review rounds found that defect in three costumes -- a name
+    //       reported lost that was written, a name reported stored that was refused, and a name
+    //       reported durable while the write that would have made it so had never completed. The
+    //       damage is always the same shape: the client acts on one channel and the daemon
+    //       believes another.
+    // WHY-THIS-SHAPE: all three are sampled around ONE call, in several states, and compared to
+    //       each other rather than each to a constant. Three separate checks -- health is Fail
+    //       here, the reply throws there -- is what this file already had, and it passed
+    //       throughout the two rounds in which the channels disagreed. The re-assertion is of a
+    //       name the manager ALREADY holds, because that is the only call that reaches the
+    //       shortcut; a new name would bind and write whatever the outcome said. States with a
+    //       failed preservation or a dropped wallpaper are deliberately excluded: those make
+    //       health Fail for losses that are not "the file is out of date", so the equivalence
+    //       being asserted would not hold and the check would be grading the wrong thing.
+    //       Each state also carries the answer that is TRUE of it, and both channels are graded
+    //       against that as well as against each other. Agreement alone is not enough and was
+    //       measured not to be: with one shared derivation the channels agree by construction, so
+    //       a mutation of that derivation makes them consistently wrong and an agreement-only
+    //       check stays green. Agreement guards against the derivation being split again;
+    //       correctness guards against the one derivation being wrong.
+    // CONTROL, for the correctness half: `outstanding` in
+    //       WallpaperManager::persistOutcomeLocked() (backend/daemon/wallpaper_manager.cpp)
+    //       forced to false, which is the pre-bcac12f reading that consulted only completed
+    //       writes -> "FAIL: the file is reported out of date, when a write is outstanding and
+    //       the caller gave up on it", printing "health said up-to-date and the reply said
+    //       up-to-date, but the file does not hold what live state holds".
+    // CONTROL, for the agreement half: the shortcut in WallpaperManager::setMonitorOutput given
+    //       back an inference of its own -- `!(m_persist && m_persist->haveResult &&
+    //       !m_persist->result.error.empty())` in place of `persistOutcomeLocked().onDisk` --
+    //       which is the shape that let two callers disagree -> six red, this phase's four led by
+    //       "FAIL: every channel agrees about the write, when a write is outstanding and the
+    //       caller gave up on it", printing "health said not-up-to-date, the reply said
+    //       up-to-date, and 0 write(s) were made", and the same pair for the refused-write state.
+    //       The two phases below it go red on the same edit -- one mutation, all three of the
+    //       states this cluster is about.
+    // COVERAGE-ASSERT: the number of states really compared is asserted against the number the
+    //       phase sets up, so a state that stops being reachable -- a fixture this host cannot
+    //       stage, an early return added later -- shrinks the phase loudly instead of leaving it
+    //       green over one trivial comparison.
+    int compared = 0;
+    const auto compare = [&compared](const FileAnswers& answers, bool expectedOnDisk, const char* what) {
+        ++compared;
+        const bool agree = answers.healthOk == answers.replyOk;
+        check(agree, (std::string("every channel agrees about the write, when ") + what).c_str());
+        if (!agree) {
+            std::fprintf(stderr, "  health said %s, the reply said %s, and %u write(s) were made%s%s\n",
+                         answers.healthOk ? "up-to-date" : "not-up-to-date",
+                         answers.replyOk ? "up-to-date" : "not-up-to-date", answers.writes,
+                         answers.threw.empty() ? "" : "; it threw: ", answers.threw.c_str());
+        }
+        // What is actually true of this state, so a build in which every channel is wrong the
+        // same way cannot pass by agreeing with itself.
+        const bool correct = answers.healthOk == expectedOnDisk && answers.replyOk == expectedOnDisk;
+        check(correct, (std::string(expectedOnDisk ? "the file is reported up to date, when "
+                                                   : "the file is reported out of date, when ") +
+                        what)
+                           .c_str());
+        if (!correct) {
+            std::fprintf(stderr, "  health said %s and the reply said %s, but the file %s\n",
+                         answers.healthOk ? "up-to-date" : "not-up-to-date",
+                         answers.replyOk ? "up-to-date" : "not-up-to-date",
+                         expectedOnDisk ? "holds what live state holds" : "does not hold what live state holds");
+        }
+        // The other half of the same agreement: a daemon that believes the file is up to date
+        // must take the shortcut, and one that does not must try again. Without this, "they
+        // agree" is satisfied by a build whose shortcut ignores both of them.
+        const bool shortcutMatches = answers.healthOk ? answers.writes == 0 : answers.writes == 0 || !answers.replyOk;
+        check(shortcutMatches,
+              (std::string("the re-assert shortcut follows the same answer, when ") + what).c_str());
+        if (!shortcutMatches) {
+            std::fprintf(stderr, "  %u write(s) for a daemon reporting %s\n", answers.writes,
+                         answers.healthOk ? "up-to-date" : "not-up-to-date");
+        }
+    };
+
+    {
+        const ScratchDir scratch("oneanswer");
+        const std::optional<PhasePaths> paths = preparePhase(scratch, kGoals, 1);
+        if (!paths.has_value()) return;
+        const std::filesystem::path& file = paths->config;
+
+        std::string fixtureWhy;
+        if (!blockingWriteFixtureWorks(scratch.path() / "wallpaperx" / "probe.json", fixtureWhy)) {
+            notVerified(kGoals, fixtureWhy);
+            return;
+        }
+
+        WallpaperManager::Config config;
+        config.configFile = file;
+        WallpaperManager manager(config);
+        manager.setMonitorOutput(3, "DP-A");
+        if (!waitForRows(file, [](const std::map<int, RowInFile>& rows) {
+                return rows.count(3) == 1 && rows.at(3).output == "DP-A";
+            })) {
+            notVerified(kGoals, "the first name never reached the file, so there is no up-to-date state to compare "
+                                "the others against");
+            return;
+        }
+        // State one: quiescent and healthy. It is the state in which the shortcut is SUPPOSED to
+        // fire, so it is what stops this phase being satisfied by a daemon that never takes it.
+        compare(askEveryChannel(manager, file, 3, "DP-A"), /*expectedOnDisk=*/true, "the file is up to date");
+
+        // State two: a write parked on a fifo, waited out, and given up on. The state the old
+        // predicate got wrong -- it read completed writes only, so it called the file up to date
+        // while nothing had landed.
+        BlockingWrite blocked(file);
+        if (!blocked.arm()) {
+            notVerified(kGoals, std::string("a fifo could not be created at ") + blocked.temp() +
+                                    ", so no write can be left outstanding on this host");
+        } else {
+            const auto start = StallClock::now();
+            manager.requestWallpaper("static", paths->wallpapers[0].string(), 0);
+            const double elapsedMs = millisSince(start);
+            const FileAnswers outstanding = askEveryChannel(manager, file, 3, "DP-A");
+            const BlockingWrite::Released released = blocked.release(std::chrono::milliseconds(10000));
+            if (!released.ok || elapsedMs < kSaveDeadlineMs * 0.9) {
+                notVerified(kGoals, released.ok ? "the save returned in " +
+                                                      std::to_string(static_cast<int>(elapsedMs)) +
+                                                      " ms rather than waiting out its deadline, so no write was ever "
+                                                      "outstanding"
+                                                : "no config write reached the fifo: " + released.why);
+            } else {
+                compare(outstanding, /*expectedOnDisk=*/false, "a write is outstanding and the caller gave up on it");
+            }
+        }
+    }
+
+    // State three: a config the daemon could not read and could not move aside, so every write
+    // is refused before a writer thread exists. A separate manager because the refusal is decided
+    // in the constructor and cannot be entered from a healthy one.
+    const ScratchDir refusedScratch("oneanswerrefused");
+    if (!refusedScratch.ok()) {
+        notVerified(kGoals, "a scratch directory for the refused-write state could not be created");
+    } else {
+        const ScopedEnv stateHome("XDG_STATE_HOME", stateHomeOf(refusedScratch).string());
+        const std::filesystem::path refusedFile = refusedScratch.path() / "wallpaperx" / "config.json";
+        std::error_code ec;
+        std::filesystem::create_directories(refusedFile.parent_path(), ec);
+        if (ec || ::mkfifo(refusedFile.c_str(), 0644) != 0) {
+            notVerified(kGoals, "a named pipe could not be created at the config path, so no write can be refused "
+                                "before a writer exists");
+        } else {
+            WallpaperManager::Config refusedConfig;
+            refusedConfig.configFile = refusedFile;
+            WallpaperManager refused(refusedConfig);
+            refused.restoreSaved();
+            refused.preserveUnreadableConfig();
+            try {
+                refused.setMonitorOutput(4, "DP-B");
+            } catch (const std::exception&) {  // NOLINT(bugprone-empty-catch) -- graded below
+            }
+            compare(askEveryChannel(refused, refusedFile, 4, "DP-B"), /*expectedOnDisk=*/false,
+                    "every write is refused before a writer exists");
+        }
+    }
+
+    check(compared == 3, "all three states this phase sets up were really compared");
+    if (compared != 3) std::fprintf(stderr, "  %d of 3 states compared\n", compared);
+}
+
+// ---------------------------------------------------------------------------- //
 // Phase 6n -- Step 10: re-asserting a name the daemon refused to write.
 // ---------------------------------------------------------------------------- //
 void runRefusedNameRetryChecks() {
@@ -6466,11 +6757,20 @@ void runNoWriterThreadChecks() {
     //       binding out with the rest of the live state and would hide the defect. The failing
     //       call is asserted to report, so this cannot be satisfied by a build that never noticed
     //       the writer was missing.
-    // CONTROL: `if (!m_persist) return m_persistWorkerFailed;` put back to `if (!m_persist)
-    //       return false;` in WallpaperManager::persistFailedLocked()
-    //       (backend/daemon/wallpaper_manager.cpp), which is the code before this fix -> "FAIL:
-    //       re-asserting a name whose writer could never start writes it to the file", printing
+    // CONTROL: the `if (!m_notWritten.empty())` branch disabled in
+    //       WallpaperManager::persistOutcomeLocked() (backend/daemon/wallpaper_manager.cpp), so a
+    //       refusal decided before any writer exists is invisible again -> six red across three
+    //       phases, here "FAIL: naming a screen with no thread for the writer reports the name
+    //       did not reach the file" printing "the call returned normally", and "FAIL:
+    //       re-asserting a name whose writer could never start writes it to the file" printing
     //       "the config file is empty or absent; monitor 4 output '(no row)'".
+    // CONTROL, for the other direction -- a stale refusal must stop outranking the writer once a
+    //       snapshot has been handed over: `if (worker) m_notWritten.clear();` disabled in
+    //       WallpaperManager::queuePersist() -> "FAIL: re-asserting a name whose writer could
+    //       never start writes it to the file", printing "monitor 4 output 'DP-Z'; the
+    //       re-assertion threw: ... no thread available: Resource temporarily unavailable" -- the
+    //       name in the file and the daemon still reporting the refusal that preceded it -- and
+    //       "FAIL: persistence reports itself working again once a save has landed".
     const bool nameReported = nameThrew.find("no thread") != std::string::npos;
     check(nameReported, "naming a screen with no thread for the writer reports the name did not reach the file");
     if (!nameReported) {
@@ -6998,6 +7298,8 @@ int main() {
          runStartupRepairIsNotBlockingChecks},
         {"a health read beside the first save", runConcurrentHealthReadChecks},
         {"naming a screen beside an unrelated persistence failure", runNameAnswersForItsOwnWriteChecks},
+        {"one answer about the config file, asked three ways", runOneAnswerAboutTheFileChecks},
+        {"the escaping of an alarm that outlives its write", runStickyAlarmEscapingChecks},
         {"re-asserting a name the daemon refused to write", runRefusedNameRetryChecks},
         {"a save that cannot succeed", runFailedSaveChecks},
         {"a failed write nobody waited for", runFailedWriteIsAnnouncedChecks},
