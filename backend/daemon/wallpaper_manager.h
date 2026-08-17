@@ -183,10 +183,9 @@ struct RenderOutcome {
 //                GetStatus never waits on a render.
 class WallpaperManager {
 public:
-    // Upper bound on monitor ids. A successful render retains a full-size exportable image
-    // (~9 MB at 1080p) until the daemon exits, so an unbounded id space lets any client on the
-    // session bus walk ids until the GPU allocator fails. The cap makes the worst case finite
-    // rather than being tight.
+    // Bounds worst-case GPU memory: each successful render retains a ~9 MB exportable image
+    // until the daemon exits, so an unbounded id space is an unbounded allocation any client
+    // on the session bus can drive. Finite, not tight.
     static constexpr int kMaxMonitors = 32;
 
     struct Config {
@@ -288,11 +287,9 @@ private:
 
 public:
     // The renderer's validation-warning counter, or null before a device exists. Shared so it
-    // stays readable after this manager and its Device are destroyed, which is when the layer's
-    // teardown complaints are emitted.
-    //
-    // NOT surfaced by GetStatus, and both take m_gpuMutex -- a render holds it for its whole
-    // duration, so wiring them into status as-is would make status wait on an image decode.
+    // outlives this manager and its Device, which is when the layer emits its teardown
+    // complaints. Not surfaced by GetStatus: both take m_gpuMutex, which a render holds for its
+    // whole duration, so status would wait on an image decode.
     std::shared_ptr<const std::atomic<int>> validationCounter() const;
     bool validationLayerActive() const;
 
@@ -305,10 +302,9 @@ private:
         // snapshots requestSeq before rendering and refuses to commit if it has moved.
         uint64_t requestSeq = 0;
 
-        // The requestSeq a render pass has already been run for, successfully or not, which is
-        // what makes renderPending() idempotent per request. The worker's queue can
-        // legitimately hold a monitor twice, and a second pass would burn a generation number
-        // and emit a second FrameReady for a frame the consumer already imported.
+        // The requestSeq already rendered for, successfully or not: what makes renderPending()
+        // idempotent per request. The worker's queue can legitimately hold a monitor twice, and
+        // a second pass would burn a generation and re-announce a frame already imported.
         uint64_t servicedSeq = 0;
 
         uint64_t generation = 0;
@@ -350,17 +346,13 @@ private:
     // m_stateMutex: it takes that lock itself.
     std::shared_ptr<PersistWorker> queuePersist(const std::vector<PersistedWallpaper>& entries);
 
-    // queuePersist(), then a bounded wait for the write to land. The wait is what lets the
-    // reply to SetWallpaper mean the choice is on disk -- but only when it ends because the
-    // write landed: a wait that runs out leaves the write in flight and records persistence as
-    // unsettled instead. Same locking rule.
+    // queuePersist(), then a bounded wait: a wait that runs out leaves the write in flight and
+    // records persistence unsettled. Same locking rule.
     //
-    // Returns whether THESE entries are known to be on disk -- true when persistence is
-    // disabled, since durability was never promised then. A caller that must answer for its own
-    // write asks this rather than the persistence health, which is an aggregate and carries
-    // failures belonging to other rows. On false, `whyNot` receives that write's own reason:
-    // the health field does not hold it, because a completed write's error is composed into a
-    // caller's copy at snapshot time and recorded nowhere.
+    // Returns whether THESE entries are known to be on disk, true when persistence is disabled
+    // since durability was never promised. A caller answering for its own write asks this
+    // rather than the persistence health, which is an aggregate carrying other rows' failures.
+    // On false, `whyNot` receives that write's own reason.
     bool persist(const std::vector<PersistedWallpaper>& entries, std::string* whyNot = nullptr);
 
     // Facts about the config that outlive the operation that discovered them -- a copy of an
@@ -381,11 +373,9 @@ private:
     // under that lock.
     void startPersistWorkerLocked();
 
-    // THE answer to "does the file hold what live state holds, and if not, why". Derived, not
-    // stored: a completed write's result lives in the worker, which outlives this object and
-    // must never write into it. One derivation, read by every caller -- the health field, the
-    // reply to SetMonitorOutput, the re-assert shortcut -- so no two can disagree about one
-    // write.
+    // THE answer to "does the file hold what live state holds, and if not, why". Derived rather
+    // than stored, since a completed write's result lives in the worker, which outlives this
+    // object. One derivation for every caller, so no two can disagree about one write.
     struct PersistOutcome {
         bool settled = true;  // nothing outstanding, so onDisk describes the file as it stands
         bool onDisk = true;   // true before anything is asked of the file: it already agrees
