@@ -67,12 +67,10 @@ std::string describe(const std::filesystem::path& file, const std::string& what)
     return file.string() + ": " + what;
 }
 
-// Reads a string field only if it is present AND actually a string.
-//
-// contains() + is_string() rather than value() or operator[]: a const operator[] on a
-// missing key is a JSON_ASSERT, which aborts the process rather than throwing anything a
-// caller could catch, and value() throws type_error on a null. Both are reachable from a
-// hand-edited file, so neither may appear anywhere in this file.
+// Reads a string field only if present AND actually a string. contains() + is_string() rather
+// than value() or operator[]: a const operator[] on a missing key is a JSON_ASSERT, which
+// aborts rather than throwing, and value() throws type_error on a null. A hand-edited file
+// reaches both, so neither may appear anywhere in this file.
 bool readString(const nlohmann::json& object, const char* key, std::string& out) {
     if (!object.contains(key)) return false;
     const nlohmann::json& field = object.at(key);

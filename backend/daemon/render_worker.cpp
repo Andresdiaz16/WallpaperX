@@ -40,10 +40,9 @@ void RenderWorker::post(int monitorId) {
 void RenderWorker::postTask(Task task) {
     {
         std::lock_guard<std::mutex> lock(m_mutex);
-        // Dropped rather than run during shutdown. An export task holds a DBus reply it
-        // will never send, and the caller sees a NoReply timeout -- which is the right
-        // outcome for a daemon that is going away, and better than touching the GPU
-        // while the Device is being torn down.
+        // Dropped rather than run during shutdown: the caller sees a NoReply timeout, which is
+        // the right outcome for a daemon going away and better than touching the GPU while the
+        // Device is being torn down.
         if (m_stop) return;
         m_queue.push_back(Job{-1, std::move(task)});
     }
@@ -69,11 +68,10 @@ void RenderWorker::run() {
             }
         }
 
-        // Dequeued before running, so a request arriving mid-render re-queues the monitor
-        // and gets its own pass. That does mean a request landing in the gap between this
-        // erase and renderPending() reading the request is serviced by both passes --
-        // WallpaperManager makes the second a no-op via servicedSeq, which is where the
-        // idempotence has to live: only the manager knows which request a pass rendered.
+        // Dequeued before running, so a request arriving mid-render re-queues the monitor and
+        // gets its own pass. A request landing between that erase and renderPending() reading
+        // it is therefore serviced twice; servicedSeq makes the second a no-op, and that has to
+        // live in the manager, which is the only thing that knows what a pass rendered.
         try {
             if (job.monitorId >= 0) {
                 const RenderOutcome outcome = m_manager.renderPending(job.monitorId);
@@ -84,11 +82,9 @@ void RenderWorker::run() {
                 job.task();
             }
         } catch (const std::exception& e) {
-            // renderPending records render failures in the monitor's status rather than
-            // throwing, and an export task answers its own DBus reply, so reaching here
-            // means something unexpected -- but this runs on a bare thread, where an
-            // escaping exception is std::terminate and takes the whole daemon down with
-            // it. Log and keep serving.
+            // renderPending records failures in the monitor's status rather than throwing and
+            // an export task answers its own reply, so reaching here is unexpected -- but this
+            // is a bare thread, where an escaping exception is std::terminate. Log and serve on.
             std::fprintf(stderr, "wallpaperx-daemon: render worker error (monitor=%d): %s\n", job.monitorId,
                          e.what());
         } catch (...) {

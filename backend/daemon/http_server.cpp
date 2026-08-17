@@ -38,13 +38,10 @@ constexpr const char* kContentTypeJson = "application/json";
 constexpr size_t kMaxPayloadBytes = 8 * 1024;
 
 // Bounds a poller that stops reading mid-response. Per-read, not per-request: every byte
-// received restarts it, so it bounds a silent client and not a slow one.
-//
-// Also bounds how long shutdown takes. Server::stop() closes the listening socket and
-// nothing else, so an accepted connection that goes quiet holds the serving thread this
-// long and the destructor joins it -- letting a status client decide when the daemon may
-// finish closing. Sub-second because the traffic is loopback, GET-only and 8 kB-capped;
-// no legitimate client comes near it.
+// restarts it, so it bounds a silent client rather than a slow one. It also bounds shutdown,
+// since Server::stop() closes only the listening socket -- a connection that goes quiet holds
+// the serving thread this long and the destructor joins it. Sub-second because the traffic is
+// loopback, GET-only and 8 kB-capped.
 constexpr time_t kIoTimeoutSeconds = 0;
 constexpr time_t kIoTimeoutMicroseconds = 500000;
 
@@ -142,12 +139,11 @@ HttpServer::HttpServer(WallpaperManager& manager, int port)
     m_server->set_read_timeout(kIoTimeoutSeconds, kIoTimeoutMicroseconds);
     m_server->set_write_timeout(kIoTimeoutSeconds, kIoTimeoutMicroseconds);
 
-    // httplib's default sets SO_REUSEPORT, which lets another process of the same user
-    // bind alongside the daemon and take a share of the plugin's polls. SO_REUSEADDR is
-    // exclusive and still rebinds over TIME_WAIT.
-    // Reported rather than ignored: this callback replaces httplib's default, so a silent
-    // failure leaves the socket with neither option, and the symptom is a bind refused over
-    // TIME_WAIT after a restart -- which reads as a stale socket, not as this.
+    // httplib's default sets SO_REUSEPORT, which lets another process of the same user bind
+    // alongside the daemon and take a share of the plugin's polls. SO_REUSEADDR is exclusive
+    // and still rebinds over TIME_WAIT. Reported rather than ignored: this callback replaces
+    // httplib's default, so a silent failure leaves the socket with neither, surfacing later
+    // as a bind refused over TIME_WAIT -- which reads as a stale socket, not as this.
     m_server->set_socket_options([](socket_t sock) {
         int on = 1;
         if (::setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const void*>(&on),
@@ -314,11 +310,9 @@ void HttpServer::registerRoutes() {
                 ++showing;
                 perMonitor[key] = {{"state", "showing"}, {"detail", ""}};
             } else {
-                // Every monitor reaching here has an outstanding render: no frame is only
-                // ever set alongside a bumped request counter, and every path that marks a
-                // request serviced leaves an error, a frame, or an unsupported type. Kept as
-                // a count rather than a bool because a fourth render outcome -- one that
-                // finishes with neither frame nor error -- would make the two differ again.
+                // Every monitor here has an outstanding render, since "no frame" is only set
+                // alongside a bumped request counter. Counted rather than assumed: a fourth
+                // render outcome, finishing with neither frame nor error, would break that.
                 if (monitor.renderOutstanding) ++outstanding;
                 perMonitor[key] = {{"state", "rendering"}, {"detail", ""}};
             }
@@ -348,11 +342,10 @@ void HttpServer::registerRoutes() {
                                 std::to_string(snap.monitors.size()) +
                                 " monitors failed inside the daemon: " + firstDaemonFault;
         } else if (outstanding > 0) {
-            // Ahead of the failure branch, not after it: ordering this second meant one
-            // monitor with a bad image hid a render that never finished on every other
-            // monitor. Keyed on an accepted request no pass has run for, not on "has no
-            // frame" -- the second is also true of a monitor nobody is waiting on, and
-            // promoting that would make an idle daemon report itself unfinished.
+            // Ahead of the failure branch: ordered second, one monitor with a bad image hides
+            // a render that never finished on every other. Keyed on an accepted request no
+            // pass has run for, not on "has no frame" -- that is also true of a monitor nobody
+            // is waiting on, which would make an idle daemon report itself unfinished.
             wallpapers.status = HealthStatus::Pending;
             wallpapers.detail = std::to_string(outstanding) + " of " +
                                 std::to_string(snap.monitors.size()) +
@@ -378,11 +371,10 @@ void HttpServer::registerRoutes() {
             {"persistence", &snap.health.persistence},
         }};
 
-        // Failures only. Pending means a dependency nothing has needed yet, and a component
-        // being idle is not a fault of the daemon -- the renderer is created on the first
-        // render by design, so propagating it made an untouched daemon report itself
-        // unhealthy. Nothing is hidden by this: the component's own entry still says pending,
-        // and a reader wanting "has everything been exercised" reads the entries.
+        // Failures only. Pending means a dependency nothing has needed yet -- the renderer is
+        // created on the first render by design -- so propagating it makes an untouched daemon
+        // report itself unhealthy. Nothing is hidden: each component's own entry still says
+        // pending, which is where "has everything been exercised" is answered.
         HealthStatus overall = HealthStatus::Ok;
         nlohmann::json checksJson = nlohmann::json::object();
         for (const auto& [name, check] : checks) {

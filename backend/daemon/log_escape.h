@@ -23,11 +23,10 @@ namespace wallpaperx {
 // Other bytes >= 0x80 pass through: wallpaper paths are usually ordinary UTF-8 and
 // escaping all of it would make normal logs unreadable.
 //
-// Framing wraps the value in quotes so the daemon's own annotations are never in the same
-// alphabet as the payload -- callers add no quotes of their own. `Bare` drops them for a
-// value that fills a whole field (lastError, which JSON quotes itself). Truncation forces
-// quotes back on in both modes, because the marker is daemon-written text after the value
-// and a path can otherwise contain a convincing copy of it.
+// Framing quotes the value so the daemon's annotations are never in the same alphabet as the
+// payload; callers add no quotes of their own. `Bare` drops them where the value fills a whole
+// field (lastError, which JSON quotes itself). Truncation forces quotes back on in both modes:
+// the marker is daemon-written text after the value, and a path can contain a copy of it.
 enum class LogFraming { Quoted, Bare };
 
 namespace detail {
@@ -175,12 +174,10 @@ inline std::string sanitizeForLog(std::string_view text, std::size_t maxBytes = 
     }
     if (quoted) out += '"';
 
-    // The total length is diagnostic: without it a truncated 300 000-byte path and a
-    // genuine 4096-byte one read identically.
-    //
-    // `maxBytes` bounds the INPUT; output is up to 4x that, since an escaped byte becomes
-    // four characters. The default is PATH_MAX so no real path is ever truncated in the
-    // error a user reads to find their typo.
+    // The total length is diagnostic: without it a truncated 300 000-byte path and a genuine
+    // 4096-byte one read identically. `maxBytes` bounds the INPUT -- output is up to 4x, an
+    // escaped byte being four characters -- and defaults to PATH_MAX so no real path is
+    // truncated in the error a user reads to find their typo.
     if (truncated) {
         out += "... [truncated, ";
         out += std::to_string(text.size());
