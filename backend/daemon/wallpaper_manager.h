@@ -394,13 +394,37 @@ private:
     // under that lock.
     void startPersistWorkerLocked();
 
-    // Folds the writer's latest outcome into a health copy. Caller must hold m_stateMutex.
-    // Not recorded into m_health, because the writer cannot touch this object at all.
-    void applyPersistOutcomeLocked(DaemonHealth& health) const;
+    // THE answer to "does the file hold what live state holds, and if not, why" -- one
+    // derivation, read by everything that needs it: the health field, the reply to
+    // SetMonitorOutput, and the idempotent re-assert shortcut.
+    //
+    // It is derived rather than stored because it cannot be stored: a completed write's result
+    // lives in the worker, which outlives this object and must never write into it. What went
+    // wrong before was not the derivation but that there were four of them -- one per caller,
+    // each consulting a different subset of a null pointer, three bools and the worker's four
+    // progress fields, so callers disagreed about the same write. Every defect of that shape
+    // came back in a new costume until they were made one function.
+    struct PersistOutcome {
+        // No write is outstanding, so `onDisk` describes the file as it now stands rather than
+        // as it stood before work that has not finished.
+        bool settled = true;
+        // The file holds what live state holds. True before anything is asked of the file: an
+        // unchanged binding then came out of the config, so the file already agrees.
+        bool onDisk = true;
+        // Why not, when !onDisk. Raw; sanitized where it is recorded or thrown.
+        std::string why;
+    };
 
-    // Whether the last completed write failed, so live state and the file disagree. Caller
-    // must hold m_stateMutex; takes the worker's lock, which is the established order.
-    bool persistFailedLocked() const;
+    // Caller must hold m_stateMutex; takes the worker's lock, which is the established order.
+    PersistOutcome persistOutcomeLocked() const;
+
+    // Whether a write is in flight and older than the deadline -- a stalled filesystem, which
+    // earns its own wording. Same locking rule.
+    bool stalledWriteLocked() const;
+
+    // Folds that outcome, and the losses that outlive it, into a health copy. Caller must hold
+    // m_stateMutex. Not recorded into m_health, because the writer cannot touch this object.
+    void applyPersistOutcomeLocked(DaemonHealth& health) const;
 
     const Config m_config;
     const ConfigStore m_store;
@@ -441,10 +465,11 @@ private:
     // m_stateMutex; non-null means a thread is servicing it.
     std::shared_ptr<PersistWorker> m_persist;
 
-    // A save was asked for and no writer could be started, which is the other reason m_persist
-    // is null -- the first being that nothing has been asked of the file yet. Guarded by
-    // m_stateMutex.
-    bool m_persistWorkerFailed = false;
+    // Why the last save never reached the writer at all -- no thread, or a refusal decided
+    // before one exists. Empty when the last save was handed over. This is the half of the
+    // outcome the worker cannot know about; persistOutcomeLocked() joins it to the half only
+    // the worker knows. Guarded by m_stateMutex.
+    std::string m_notWritten;
 
     // Entries no build can apply, dropped rather than kept, counted so the loss is reported at
     // all. Guarded by m_stateMutex. Name-only rows counted apart: the report these feed is the
