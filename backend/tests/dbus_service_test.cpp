@@ -1100,6 +1100,32 @@ void runOutputNameChecks(sdbus::IProxy& proxy, const Check& check) {
                          .c_str());
     }
 
+    // GOAL: a client can find its own screen in GetStatus under the bytes it sent. False if
+    //       the only published key is the escaped display form -- for any name escaping
+    //       alters, that matches nothing the caller holds, so a client that just assigned a
+    //       name cannot locate the entry it created.
+    // WHY-THIS-SHAPE: the raw name is looked up directly in `outputs_literal`, not through
+    //       boundMonitor(), which escapes before looking up and so passes on a daemon that
+    //       publishes only the escaped map -- which is the defect. The escaped map keeps its
+    //       own checks above; this one must fail when the literal map alone is missing.
+    // CONTROL: `status["outputs_literal"] = std::move(outputsLiteral);` dropped from
+    //       DbusService::getStatus (backend/daemon/dbus_service.cpp) -> "FAIL: a connector
+    //       name resolves in GetStatus under the exact bytes the client sent", printing
+    //       "no outputs_literal object came back", while both escaped-key checks above and
+    //       the whole rest of the phase stayed green. Reverted.
+    const nlohmann::json& hostileJson = hostileStatus.json();
+    const bool literalIsObject = hostileJson.is_object() && hostileJson.contains("outputs_literal") &&
+                                 hostileJson["outputs_literal"].is_object();
+    const bool literalCarries = literalIsObject && hostileJson["outputs_literal"].contains(hostileName) &&
+                                hostileJson["outputs_literal"][hostileName].is_number_integer();
+    check(literalCarries && hostileJson["outputs_literal"][hostileName].get<int>() == kMonitorOutputHostile,
+          "a connector name resolves in GetStatus under the exact bytes the client sent");
+    if (!literalCarries) {
+        std::fprintf(stderr, "  %s\n",
+                     literalIsObject ? "outputs_literal came back without the name this phase assigned"
+                                     : "no outputs_literal object came back");
+    }
+
     // GOAL: naming one monitor leaves every OTHER monitor's connector name intact. False if
     //       the daemon can hold only one name at a time for the whole machine -- on a
     //       two-screen desktop that means naming the second screen erases the first, whose

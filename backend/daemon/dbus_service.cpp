@@ -296,10 +296,16 @@ std::string DbusService::getStatus() {
     // the name was accepted under, so nothing truncates -- truncation is the only way
     // escaping could map two names onto one key and drop a screen from here.
     nlohmann::json outputs = nlohmann::json::object();
+    nlohmann::json outputsLiteral = nlohmann::json::object();
     for (const auto& [name, monitorId] : snap.outputs) {
         outputs[sanitizeForLog(name, kMaxOutputNameBytes, LogFraming::Bare)] = monitorId;
+        // Keyed by the bytes the client sent, because the escaped key above is a display
+        // form and matches nothing the caller holds. Safe as a key: outputNameError()
+        // refused invalid UTF-8 before the name was ever stored, so dump() cannot throw.
+        outputsLiteral[name] = monitorId;
     }
     status["outputs"] = std::move(outputs);
+    status["outputs_literal"] = std::move(outputsLiteral);
 
     return status.dump();
 }
