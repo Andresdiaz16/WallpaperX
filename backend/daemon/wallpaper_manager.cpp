@@ -612,14 +612,10 @@ void WallpaperManager::setMonitorOutput(int monitorId, const std::string& output
     // failing on it told a client its name was lost when the name was written. The declared
     // contract is that an accepted reply means the mapping reached the file; the binding stands
     // for this run either way, and what the error denies is durability.
-    if (!persist(toPersist)) {
-        std::string detail;
-        {
-            std::lock_guard<std::mutex> stateLock(m_stateMutex);
-            detail = m_health.persistence.detail;
-        }
-        throw std::runtime_error(detail.empty() ? "the screen name did not reach the config file"
-                                                : detail);
+    std::string whyNot;
+    if (!persist(toPersist, &whyNot)) {
+        throw std::runtime_error(whyNot.empty() ? "the screen name did not reach the config file"
+                                                : whyNot);
     }
 }
 
@@ -767,11 +763,22 @@ std::shared_ptr<PersistWorker> WallpaperManager::queuePersist(
     return worker;
 }
 
-bool WallpaperManager::persist(const std::vector<PersistedWallpaper>& entries) {
+bool WallpaperManager::persist(const std::vector<PersistedWallpaper>& entries, std::string* whyNot) {
+    const auto explain = [whyNot](const std::string& why) {
+        if (whyNot != nullptr) *whyNot = why;
+    };
+
     const std::shared_ptr<PersistWorker> worker = queuePersist(entries);
     // Nothing was queued. Durability was never promised when the store is disabled; every other
-    // reason queuePersist() declines is a failure it has already recorded.
-    if (!worker) return !m_store.enabled();
+    // reason queuePersist() declines is a failure it has already recorded, so the health field
+    // is where that reason is.
+    if (!worker) {
+        if (m_store.enabled()) {
+            std::lock_guard<std::mutex> stateLock(m_stateMutex);
+            explain(m_health.persistence.detail);
+        }
+        return !m_store.enabled();
+    }
 
     // Waited on, briefly, so the reply to SetWallpaper can say the choice is on disk in the
     // healthy case -- which is the only case it can be said in. Past the deadline the write
@@ -797,6 +804,10 @@ bool WallpaperManager::persist(const std::vector<PersistedWallpaper>& entries) {
         if (landed && worker->haveResult && !worker->result.error.empty()) {
             landed = false;
             failed = true;
+            // The writer's own reason, not the health field: nothing records a completed write's
+            // error there -- it is composed into a caller's copy at snapshot time -- so a caller
+            // reading it was handed the config path with no cause at all.
+            explain(worker->result.error);
         }
     }
     if (landed) return true;
@@ -810,6 +821,7 @@ bool WallpaperManager::persist(const std::vector<PersistedWallpaper>& entries) {
     recordHealthLocked(&DaemonHealth::persistence, HealthStatus::Fail,
                        persistenceDetail(m_store.file().string() +
                                          ": a write has not come back, the choice may not be on disk yet"));
+    explain(m_health.persistence.detail);
     return false;
 }
 

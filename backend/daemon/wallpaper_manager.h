@@ -371,8 +371,10 @@ private:
     // Returns whether THESE entries are known to be on disk -- true when persistence is
     // disabled, since durability was never promised then. A caller that must answer for its own
     // write asks this rather than the persistence health, which is an aggregate and carries
-    // failures belonging to other rows.
-    bool persist(const std::vector<PersistedWallpaper>& entries);
+    // failures belonging to other rows. On false, `whyNot` receives that write's own reason:
+    // the health field does not hold it, because a completed write's error is composed into a
+    // caller's copy at snapshot time and recorded nowhere.
+    bool persist(const std::vector<PersistedWallpaper>& entries, std::string* whyNot = nullptr);
 
     // Facts about the config that outlive the operation that discovered them -- a copy of an
     // unreadable file, entries kept for a newer build. Every persistence detail is rebuilt
