@@ -17,16 +17,13 @@ namespace wallpaperx {
 
 class WallpaperManager;
 
-// Serves the io.wallpaperx.Daemon DBus interface on a caller-provided connection.
-// The connection owns the bus-name request and the event loop (blocking in the
-// daemon's main(), async in tests) -- this class only registers and implements the
-// methods and signals.
+// Serves the io.wallpaperx.Daemon DBus interface on a caller-provided connection. The
+// connection owns the bus-name request and the event loop (blocking in main(), async in
+// tests); this class only registers and implements the methods and signals.
 //
-// Stateless by design: every handler forwards to the WallpaperManager, which owns
-// both the wallpaper state and the lock guarding it. An earlier version kept its own
-// mutex and request map here; that made the recorded requests and the rendered frames
-// two separate truths under two separate locks, which is exactly the split that lets
-// GetStatus and GetFrameFd disagree.
+// Stateless by design: every handler forwards to the WallpaperManager, which owns both the
+// wallpaper state and the lock guarding it. State kept here would be a second truth under a
+// second lock, which is what lets GetStatus and GetFrameFd disagree.
 class DbusService {
 public:
     static constexpr const char* kBusName = "io.wallpaperx.Daemon";
@@ -43,51 +40,28 @@ public:
 private:
     void registerVTable();
 
-    // DBus method handlers (see the DBus Interface section in PLAN.md).
+    // DBus method handlers. PLAN.md's DBus Interface section is the wire contract.
     //
-    // Returns as soon as the request is recorded and queued; the render happens on the
-    // worker thread. A successful reply therefore means "accepted", not "the frame is
-    // ready" -- FrameReady announces that. Only client-side mistakes (unknown type,
-    // out-of-range monitor, a path that is not a file) still fail synchronously, since
-    // those cost nothing to detect and are the ones worth failing fast.
+    // Returns once the request is recorded and queued: a successful reply means "accepted",
+    // not "the frame is ready" -- FrameReady announces that. Only client-side mistakes fail
+    // synchronously, since they cost nothing to detect.
     void setWallpaper(const std::string& type, const std::string& path, int32_t monitorId);
 
-    // Complete on return, unlike SetWallpaper: no render sits behind it, so an accepted reply
-    // means the mapping is in place and on disk rather than merely queued. An error reply means
-    // the name did not reach the config file -- the binding still stands for this run, but it
-    // will not survive a restart, and the client is invited to re-assert it later.
+    // Complete on return, unlike SetWallpaper: an accepted reply means the mapping reached the
+    // config file. An error means it did not -- the binding still stands for this run but will
+    // not survive a restart, and the client may re-assert it later.
     void setMonitorOutput(int32_t monitorId, const std::string& outputName);
 
     void emitFrameReady(int monitorId, uint64_t generation);
 
     // Returns (fd, width, height, memory_size, handle_type, sync_fds, frame_generation,
-    //          drm_format, drm_modifier, planes).
+    //          drm_format, drm_modifier, planes). What each field means, and why sync_fds is a
+    //          reserved array rather than a bare 'h', is PLAN.md's DBus Interface section.
     //
-    // drm_format / drm_modifier / planes are what a DMA_BUF consumer needs to interpret
-    // the memory behind the fd: importing via EGL_LINUX_DMA_BUF_EXT or
-    // zwp_linux_dmabuf_v1 requires the fourcc, the 64-bit modifier and per-plane
-    // offset+pitch. They are unset (0, MOD_INVALID, empty) on the OPAQUE_FD path, which
-    // is importable only by another context on the same device. planes is a list rather
-    // than a scalar stride because multi-planar modifiers are normal on Intel.
-    //
-    // sync_fds is a reserved slot, always empty today. A consumer currently has no way
-    // to know the GPU finished writing the frame it just imported, which is fine only
-    // because static wallpapers render once. Video will need a real sync primitive here,
-    // and by then the KDE plugin ships against this signature -- so the slot is carved
-    // out now, while the method has no callers, rather than breaking daemon and plugin
-    // together later. It is an array (not a bare 'h') because DBus fd types index into
-    // the message's fd table and cannot encode "absent"; an empty array can.
-    //
-    // frameGeneration is a monotonic per-monitor render counter, letting a consumer tell
-    // a fresh frame from a stale or repeated one.
-    //
-    // Answered asynchronously, from the render worker's thread. Exporting a frame needs
-    // the GPU, and the GPU lock is held for a whole render -- so doing it in the handler
-    // would park the daemon's single event-loop thread behind whatever is rendering and
-    // stall GetStatus and SetWallpaper with it. That is the same stall this design moved
-    // SetWallpaper off; the rule that keeps it fixed is that no DBus handler touches the
-    // GPU. The caller still waits for its frame, which is unavoidable, but nothing else
-    // does.
+    // Answered from the render worker's thread, not in the handler. Exporting needs the GPU and
+    // the GPU lock is held for a whole render, so answering here would park the single
+    // event-loop thread behind whatever is rendering and take GetStatus with it. The rule that
+    // keeps it fixed -- no DBus handler touches the GPU -- is enforced by assertGpuThread().
     using FrameFdCall =
         sdbus::Result<sdbus::UnixFd, uint32_t, uint32_t, uint64_t, int32_t, std::vector<sdbus::UnixFd>, uint64_t,
                       uint32_t, uint64_t, std::vector<sdbus::Struct<uint64_t, uint64_t>>>;
@@ -95,9 +69,8 @@ private:
 
     std::string getStatus();
 
-    // Destroyed first among the members, but the destructor stops the worker before any
-    // of that runs -- see ~DbusService for why the ordering cannot be left to
-    // declaration order alone.
+    // ~DbusService stops the worker before any member is destroyed: the ordering cannot be
+    // left to declaration order alone, and that destructor says why.
     WallpaperManager& m_manager;
     std::unique_ptr<sdbus::IObject> m_object;
     RenderWorker m_worker;
