@@ -21,10 +21,9 @@
 #include <unistd.h>
 
 namespace {
-// Budgets the whole stop, from the signal arriving to the process being gone -- not just
-// the teardown, so work still running when the signal lands spends it too. Far above a
-// normal shutdown, measured in hundreds of milliseconds, so it only fires for a stop that
-// is genuinely stuck rather than merely slow.
+// Budgets the whole stop -- signal to process gone, not just teardown -- so work still
+// running when the signal lands spends it too. Far above a normal shutdown of a few hundred
+// milliseconds, so it fires only for a stop that is stuck rather than slow.
 constexpr std::chrono::seconds kTeardownDeadline{5};
 }  // namespace
 
@@ -74,17 +73,14 @@ int main() {
         // Connected without claiming the name yet -- see the request below.
         auto connection = sdbus::createSessionBusConnection();
 
-        // sigwait on its own thread, not a handler: leaveEventLoop() takes locks and is
-        // not async-signal-safe. A guard rather than a bare std::thread because
-        // enterEventLoop() THROWS when the connection drops, and a joinable thread
-        // destroyed mid-unwind is std::terminate.
-        //
-        // Started before anything that touches the filesystem: signals are blocked at the
-        // top of main, so work done before this thread exists cannot be stopped.
+        // sigwait on its own thread, not a handler: leaveEventLoop() takes locks and is not
+        // async-signal-safe. A guard rather than a bare std::thread because enterEventLoop()
+        // THROWS when the connection drops, and a joinable thread destroyed mid-unwind is
+        // std::terminate. Started before anything touching the filesystem, since signals are
+        // blocked at the top of main and work done before this thread cannot be stopped.
         //
         // wakingForShutdown separates the destructor's wake-up SIGTERM from a real one;
-        // shutdownRequested records a signal that arrived before the loop began. Declared
-        // before the guard so they outlive it.
+        // shutdownRequested records one that arrived before the loop began.
         std::atomic<bool> wakingForShutdown{false};
         std::atomic<bool> shutdownRequested{false};
 
@@ -128,10 +124,9 @@ int main() {
             shutdownRequested.store(true, std::memory_order_release);
             connection->leaveEventLoop();
 
-            // This thread is the only one that cannot be stuck -- it waits for signals and
-            // nothing else -- so it is where the deadline belongs. Any other thread blocked
-            // in an uninterruptible filesystem call would otherwise hold the process open
-            // against a stop it already acknowledged.
+            // The deadline belongs on this thread because it is the only one that cannot be
+            // stuck: it waits for signals and nothing else. Any other would risk being blocked
+            // in an uninterruptible filesystem call while holding the process open.
             std::unique_lock<std::mutex> lock(teardown.mutex);
             if (teardown.done.wait_for(lock, kTeardownDeadline,
                                        [&teardown] { return teardown.finished; })) {
@@ -159,23 +154,19 @@ int main() {
         // stop -- it starts the first render, and that is GPU work for a process leaving.
         if (!shutdownRequested.load(std::memory_order_acquire)) service.restoreSaved();
 
-        // Claimed last, so the name appearing on the bus means the daemon can actually
-        // answer: the object is registered and the saved wallpapers are back. Claiming it
-        // first published a daemon that was still reading its config and would answer
-        // UnknownObject. Throws if another instance owns it, which is why nothing above
-        // this line may write to the config directory.
-        //
-        // Skipped after a stop, or a daemon on its way out would take the well-known name
-        // for the moment it has left and drop it again.
+        // Claimed last, so the name appearing on the bus means the daemon can answer: the
+        // object is registered and the saved wallpapers are back. It throws if another
+        // instance owns it, which is why nothing above this line may write to the config
+        // directory. Skipped after a stop, or a daemon on its way out would take the
+        // well-known name for the moment it has left and drop it again.
         if (!shutdownRequested.load(std::memory_order_acquire)) {
             connection->requestName(sdbus::ServiceName{wallpaperx::DbusService::kBusName});
-            // Only now: this moves the user's config aside, and until the name is held
-            // this process does not know it is the daemon.
+            // Only now: this moves the user's config aside, and until the name is held this
+            // process does not know it is the daemon.
             manager.preserveUnreadableConfig();
-            // After the copy aside, not before: the repair rewrites config.json from live
-            // state, and the copy exists to preserve the bytes that rewrite would destroy.
-            // Nothing enforces the order -- called the other way round the rewrite still
-            // happens, and the copy is then taken of bytes the repair has already replaced.
+            // After the copy aside: the repair rewrites config.json from live state, and the
+            // copy preserves the bytes it destroys. Nothing enforces the order -- reversed, the
+            // copy is taken of bytes the repair has already replaced.
             manager.writeRepairedConfig();
         }
 
@@ -195,9 +186,9 @@ int main() {
         // manager.snapshot(), so HTTP has to stop before anything it reads is torn down.
         wallpaperx::HttpServer httpServer(manager);
 
-        // A signal delivered while the work above ran calls leaveEventLoop() on a loop that
-        // has not started. sdbus-c++ appears to latch that, but it is not documented, so
-        // this does not rely on it.
+        // A signal delivered while the work above ran calls leaveEventLoop() on a loop that has
+        // not started. sdbus-c++ appears to latch that, but it is undocumented, so do not rely
+        // on it.
         if (!shutdownRequested.load(std::memory_order_acquire)) {
             connection->enterEventLoop();  // returns once leaveEventLoop() is called
         }
@@ -218,9 +209,9 @@ int main() {
 
     std::printf("wallpaperx-daemon: stopped cleanly\n");
 
-    // An abandoned config read left a thread blocked in the kernel; if it wakes during
-    // static destruction it runs library code already being torn down. Everything with
-    // observable effects is destroyed by here.
+    // An abandoned config read left a thread blocked in the kernel, and waking during static
+    // destruction would run library code already torn down. Everything with observable effects
+    // is destroyed by here.
     if (wallpaperx::configLoadAbandoned()) {
         std::fflush(nullptr);
         std::_Exit(0);
