@@ -65,8 +65,8 @@ std::filesystem::path preservedCopyDir() {
     return {};
 }
 
-// Bounds the byte comparison that recognises an already-preserved config. The store's own
-// limit, not a second copy of the number: a file it refuses to read is not one to compare.
+// The store's own limit, not a second copy of it: a file it refuses to read is not one to
+// compare against a preserved copy.
 constexpr std::uintmax_t kMaxComparedBytes = ConfigStore::kMaxBytes;
 
 void appendReason(std::string& why, const std::string& reason) {
@@ -74,8 +74,7 @@ void appendReason(std::string& why, const std::string& reason) {
     why += reason;
 }
 
-// Whether an existing copy already holds exactly these bytes. Same size first: that settles it
-// for nearly every pair without a read.
+// Size first: it settles nearly every pair without a read.
 bool sameContents(const std::filesystem::path& a, const std::filesystem::path& b) {
     std::error_code ec;
     const std::uintmax_t sizeA = std::filesystem::file_size(a, ec);
@@ -91,10 +90,9 @@ bool sameContents(const std::filesystem::path& a, const std::filesystem::path& b
 }
 
 // Keeps `source` in `dir` under the first free <file>.bad[.N]. Returns the name used, or empty
-// with `reason` set to the last failure. A copy identical to one already there is treated as
-// already preserved: a repair this run cannot write is recomputed on every start, and taking a
-// fresh name each time would exhaust the budget in kMaxPreservedCopies restarts and leave a
-// genuinely unreadable config with nowhere to go.
+// with `reason` set to the last failure. A copy already holding these bytes counts as preserved:
+// a repair that cannot be written recurs every start, and a fresh name each time would exhaust
+// kMaxPreservedCopies in as many restarts.
 std::string keepCopyIn(const std::filesystem::path& source, const std::filesystem::path& dir,
                        bool move, std::string& reason) {
     const auto unlinkSource = [&source, &reason]() {
@@ -114,16 +112,15 @@ std::string keepCopyIn(const std::filesystem::path& source, const std::filesyste
             continue;
         }
         if (taken) {
-            // Never over an existing copy of *different* bytes: it holds an earlier broken
-            // config, and this one would replace it with whatever was written since.
+            // Never over different bytes: that copy holds an earlier broken config.
             if (!sameContents(source, kept)) continue;
             if (move && !unlinkSource()) return {};
             return kept.string();
         }
 
         if (move) {
-            // Atomic where it can be: the copy below exists only because the state directory
-            // can be on another filesystem, and a rename cannot leave a partial file behind.
+            // Atomic where it can be. The copy below exists only for the cross-filesystem case,
+            // and unlike a rename it can leave a partial file behind.
             std::filesystem::rename(source, kept, ec);
             if (!ec) return kept.string();
             if (ec != std::errc::cross_device_link) {
@@ -135,9 +132,9 @@ std::string keepCopyIn(const std::filesystem::path& source, const std::filesyste
 
         std::filesystem::copy_file(source, kept, ec);
         if (ec) {
-            // A failed copy can leave a truncated file holding a name every later attempt is
-            // then denied -- and offering the user a silently shortened config as a preserved
-            // one. Not removed when the copy failed because something else is already there.
+            // A truncated remnant would hold a name every later attempt is denied, and offer the
+            // user a silently shortened config as a preserved one. Left alone when the copy
+            // failed because something else is already there.
             if (ec != std::errc::file_exists) {
                 std::error_code cleanupEc;
                 std::filesystem::remove(kept, cleanupEc);
@@ -146,9 +143,8 @@ std::string keepCopyIn(const std::filesystem::path& source, const std::filesyste
             continue;
         }
         if (move && !unlinkSource()) {
-            // A copy is not preservation while the original is still there under the name the
-            // next save writes: take the copy back out so it does not hold a name the next
-            // attempt needs.
+            // Not preservation while the original still sits under the name the next save
+            // writes, so the copy goes back out rather than holding a name for nothing.
             std::error_code cleanupEc;
             std::filesystem::remove(kept, cleanupEc);
             return {};
@@ -240,10 +236,9 @@ WallpaperManager::WallpaperManager(Config config)
 }
 
 std::string WallpaperManager::preserveConfigTo(bool move, std::string& why) const {
-    // The state directory is preferred, but it is not the only place that will do: the config's
-    // own directory must already be writable for any save to work, so "nowhere preferred" must
-    // not become "nowhere". A daemon with a valid config path and no HOME could otherwise never
-    // preserve anything, and so refused to save for the whole run.
+    // The state directory is preferred but not required: the config's own directory must
+    // already be writable for any save to work, so "nowhere preferred" must not become
+    // "nowhere" -- which is what a daemon with a config path and no HOME would otherwise hit.
     std::vector<std::filesystem::path> dirs;
     if (std::filesystem::path preferred = preservedCopyDir(); !preferred.empty()) {
         dirs.push_back(std::move(preferred));
@@ -280,25 +275,21 @@ void WallpaperManager::preserveUnreadableConfig() {
 
     std::string why;
     if (m_loadError.empty()) {
-        // A pending repair means this run is about to rewrite the file from live state, so the
-        // copy covers that too: a row the manager rejected parses cleanly, is in no other
-        // place, and the rewrite is what removes it.
+        // A pending repair means a rewrite from live state is coming, and a row the manager
+        // rejected parses cleanly, lives nowhere else, and is what that rewrite removes.
         bool repairPending = false;
         {
             std::lock_guard<std::mutex> stateLock(m_stateMutex);
             repairPending = m_repair.has_value();
         }
-        // Copied, not moved: the entries this build did understand are being restored from
-        // this same file. Rejected ones never become entries at all, so the keep-for-a-newer-
-        // build path cannot see them and the first save would drop them for good.
+        // Copied, not moved: the entries this build understood are restored from this same file.
         if ((m_loadMalformed > 0 || repairPending) && m_loadPreservable) {
             const std::string copied = preserveConfigTo(/*move=*/false, why);
             m_repairCopied = !copied.empty();
             addPersistenceNote(copied.empty() ? "not copied: " + why : "copied to " + copied);
-            // Sticky, and Fail: the rows this run rejected exist in this file alone, and the
-            // rewrite that removes them is coming. Saving is NOT refused over it -- the user's
-            // later wallpaper changes are the larger loss -- so a later successful write must
-            // not be allowed to clear the record of what that first one took.
+            // Sticky: the rejected rows exist in this file alone and the rewrite removing them
+            // is coming. Saving is not refused over it -- later wallpaper changes are the larger
+            // loss -- so a write that succeeds later must not clear the record of that loss.
             if (!m_repairCopied) m_preserveFailed = true;
             recordHealth(&DaemonHealth::persistence,
                          m_repairCopied ? HealthStatus::Ok : HealthStatus::Fail,
@@ -330,17 +321,13 @@ void WallpaperManager::writeRepairedConfig() {
     }
     if (!repair) return;
 
-    // Written whether or not a copy was taken, and the failure to take one is reported instead.
-    // Refusing this write protected nothing -- the next ordinary save rebuilds the file from the
-    // same live state -- and refusing every write instead would trade a bounded, already-reported
-    // loss for every wallpaper choice the user makes for the rest of the run.
+    // Written whether or not a copy was taken: refusing this one write protects nothing, since
+    // the next ordinary save rebuilds the file from the same live state, and refusing every
+    // write costs the user every later wallpaper choice. m_preserveFailed reports it instead.
     //
-    // Queued, not waited on: this runs after the bus name is claimed and before the event loop
-    // exists, so a wait here is a daemon that answers nothing for the whole deadline. Nobody is
-    // owed the durability promise at startup. The outcome is not lost by not waiting for it --
-    // the writer reports a failed write on stderr itself, which is the only report that cannot
-    // race the write it describes. queuePersist() takes the state lock, so it is called with
-    // none held.
+    // Queued, not waited on: the bus name is claimed and no event loop exists yet, so a wait
+    // here answers nothing for the whole deadline. The writer reports a failed write on stderr
+    // itself. queuePersist() takes the state lock, so it is called with none held.
     queuePersist(*repair);
 }
 
@@ -604,14 +591,10 @@ void WallpaperManager::setMonitorOutput(int monitorId, const std::string& output
         toPersist = persistableLocked();
     }
 
-    // Outside the lock. Persisted because only the app can name a screen again, and it may
-    // not run for weeks.
-    //
-    // Reported on this call's own write, not on the daemon's persistence health: that aggregate
-    // also carries another monitor's un-encodable filename and any failure recorded earlier, so
-    // failing on it told a client its name was lost when the name was written. The declared
-    // contract is that an accepted reply means the mapping reached the file; the binding stands
-    // for this run either way, and what the error denies is durability.
+    // Outside the lock. Persisted because only the app can name a screen again, and it may not
+    // run for weeks. Reported on this call's own write rather than on persistence health, which
+    // is an aggregate carrying other monitors' failures: the contract is that an accepted reply
+    // means this mapping reached the file.
     std::string whyNot;
     if (!persist(toPersist, &whyNot)) {
         throw std::runtime_error(whyNot.empty() ? "the screen name did not reach the config file"
@@ -824,13 +807,11 @@ void WallpaperManager::startPersistWorkerLocked() {
 
                 const SaveResult saved = store.save(entries);
 
-                // Said on the console by the thread that learns it, because every other report
-                // of this races the write: the startup repair is queued and main() takes its
-                // snapshot on the next line, so a failed repair could read as a clean start
-                // with the notice only in GetStatus, which a user has no reason to open.
+                // Said by the thread that learns it: the startup repair is queued, so any other
+                // report of it races the write and can read as a clean start.
                 //
-                // write(2), not stdio: this thread outlives main() when a write is stuck, and
-                // a FILE* torn down by exit is not something it can hold.
+                // write(2), not stdio: this thread outlives main() when a write is stuck, and a
+                // FILE* torn down by exit is not something it can hold.
                 if (!saved.error.empty()) {
                     const std::string line =
                         "wallpaperx-daemon: config not saved: " + sanitizeForLog(saved.error) + "\n";
@@ -850,15 +831,13 @@ void WallpaperManager::startPersistWorkerLocked() {
             }
         }).detach();
     } catch (const std::exception& e) {
-        // Every failure, not only the kernel refusing a thread: std::thread also allocates the
-        // callable's state, so a machine out of memory threw std::bad_alloc straight past this
-        // and killed the daemon at startup.
+        // std::exception, not std::system_error: std::thread also allocates the callable's
+        // state, so std::bad_alloc reaches here and would otherwise kill the daemon at startup.
         //
-        // Not published, and not thrown on: a worker pointer with no thread behind it makes
-        // every later save wait out the deadline for an answer that cannot come, while health
-        // goes on reporting persistence fine. Reported instead, and retried by the next save
-        // that is queued.
-        // A second failure inside the handler would escape the frame it exists to contain.
+        // Not published and not rethrown: a worker pointer with no thread behind it makes every
+        // later save wait out the deadline for an answer that cannot come. Recorded instead,
+        // and retried by the next save that is queued. A second failure inside the handler
+        // would escape the frame it exists to contain.
         try {
             m_notWritten = m_store.file().string() + ": not saved, no thread available: " + e.what();
             recordHealthLocked(&DaemonHealth::persistence, HealthStatus::Fail,
@@ -1119,13 +1098,13 @@ std::vector<int> WallpaperManager::restoreSaved() {
                            " screen names dropped, unusable; those screens must be named again");
     }
     if (duplicateIds > 0) {
-        // Not "the last entry won": three different collisions feed this counter, and one of
-        // them is resolved by an EARLIER row -- the one this build can actually show. Saying
-        // last-wins sent the user looking in config.json for the row that was dropped.
+        // Not "the last entry won": three collisions feed this counter and one is resolved by
+        // the EARLIER row, the one this build can show. The copy is named by its own note
+        // rather than located here, since where it lands depends on the state directory.
         addPersistenceNote(std::to_string(duplicateIds) +
                            " entries dropped, another entry claimed the same monitor; the one "
-                           "this build can show was kept, and the rest are only in the copy "
-                           "beside the config file");
+                           "this build can show was kept, and the rest survive only in the "
+                           "preserved copy named above");
     }
 
     // Kept entries are invisible otherwise: they are in no monitor's status and are not

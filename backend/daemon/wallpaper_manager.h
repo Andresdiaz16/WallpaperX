@@ -171,19 +171,16 @@ struct RenderOutcome {
 };
 
 // Owns the renderer for the daemon: one Vulkan Device, one OffscreenTargetManager keyed by
-// monitor, and the per-monitor bookkeeping behind SetWallpaper/GetFrameFd. Split into a
-// request phase and a render phase, because rendering is slow and the DBus event loop is
-// single-threaded.
+// monitor, and the per-monitor bookkeeping behind SetWallpaper/GetFrameFd. Request and render
+// are separate phases because rendering is slow and the DBus event loop is single-threaded.
 //
-// Thread-safe, under two locks with a strict order: m_gpuMutex may be taken before
-// m_stateMutex, never the reverse.
+// Two locks, strictly ordered: m_gpuMutex before m_stateMutex, never the reverse.
 //
-//   m_gpuMutex   guards the Device and the offscreen targets, and serialises all GPU
-//                submission. Held for the whole of a render. It is also what makes export
-//                safe: OffscreenTarget's exportLayout/externalOwner are written through a
-//                const reference by *both* render and export.
-//   m_stateMutex guards the per-monitor bookkeeping only, where every operation is a map
-//                lookup or a string copy, so GetStatus never waits on a render.
+//   m_gpuMutex   the Device, the offscreen targets, and all GPU submission; held for a whole
+//                render. Also what makes export safe: OffscreenTarget's exportLayout and
+//                externalOwner are written through a const reference by render AND export.
+//   m_stateMutex the per-monitor bookkeeping only -- a map lookup or a string copy -- so
+//                GetStatus never waits on a render.
 class WallpaperManager {
 public:
     // Upper bound on monitor ids. A successful render retains a full-size exportable image
@@ -219,48 +216,38 @@ public:
     WallpaperManager(const WallpaperManager&) = delete;
     WallpaperManager& operator=(const WallpaperManager&) = delete;
 
-    // Records a request. Fast and GPU-free. Throws InvalidRequest for a malformed request;
-    // everything that can only fail on the GPU fails later, in renderPending().
-    //
-    // The caller must post the monitor to the render worker afterwards, including for
-    // non-static types -- those still need their target released.
+    // Records a request; GPU-free. Throws InvalidRequest for a malformed one, and everything
+    // that can only fail on the GPU fails later in renderPending(). The caller must then post
+    // the monitor to the render worker, non-static types included -- those still need their
+    // target released.
     void requestWallpaper(const std::string& type, const std::string& path, int monitorId);
 
-    // Records the connector name a monitor is known by -- "DP-3". Throws InvalidRequest for
-    // a bad id or a name outputNameError() rejects. No render and no GPU work.
-    //
-    // Idempotent, and a call changing nothing does not write: clients are invited to
-    // re-assert names, and the write parks the calling thread. Throws std::runtime_error when
-    // the name did not reach the config file -- the binding stands for this run regardless,
-    // but only a write makes it survive a restart, and the caller is the only one who can say
-    // so at the moment it happens.
+    // Records the connector name a monitor is known by -- "DP-3". Throws InvalidRequest for a
+    // bad id or a name outputNameError() rejects, and std::runtime_error when the name did not
+    // reach the config file: the binding stands for this run either way, and only the write
+    // makes it outlive a restart. Idempotent; a call that changes nothing already on disk does
+    // not write, since the write parks the calling thread.
     void setMonitorOutput(int monitorId, const std::string& outputName);
 
     // Applies the config file's wallpapers, returning the monitor ids to post to the worker.
     // Call once. Writes nothing: a repair it computed is held for writeRepairedConfig().
     std::vector<int> restoreSaved();
 
-    // Moves an unreadable config aside, or copies one this run rejected rows from or is about
-    // to rewrite, and updates the persistence health with the outcome. Separate from the
-    // constructor because it writes: a duplicate instance would otherwise move the running
-    // daemon's config before finding out it cannot run. Call once, after the bus name is held.
-    // Until it runs, saving stays refused.
+    // Moves an unreadable config aside, or copies one whose rows this run rejected or is about
+    // to rewrite, and records the outcome in the persistence health. Separate from the
+    // constructor because it writes, and a duplicate instance must not touch the running
+    // daemon's config: call once, after the bus name is held.
     void preserveUnreadableConfig();
 
-    // Queues the repair restoreSaved() computed, if it computed one, and does not wait for the
-    // write: the caller has claimed the bus name and has no event loop yet. A failed write is
-    // reported on stderr by the writer itself. Call once, after preserveUnreadableConfig():
-    // that call is what copies the bytes this rewrite replaces, and with no copy every write --
-    // this one and every later save -- is refused until one is taken.
+    // Queues the repair restoreSaved() computed. Does not wait: the caller holds the bus name
+    // and has no event loop yet, and the writer reports a failed write on stderr itself. Call
+    // once, after preserveUnreadableConfig(), which copies the bytes this rewrite replaces.
     void writeRepairedConfig();
 
-    // Renders whatever request the monitor currently holds. Called on the render worker's
-    // thread; never on the DBus thread.
-    //
-    // Returns rendered=true only when a frame was produced *and* is still the one that was
-    // asked for: a request arriving mid-render supersedes this one, and committing it anyway
-    // would flag the monitor as holding pixels from the previous wallpaper. Failures are
-    // recorded in the monitor's lastError, not thrown -- nobody is waiting.
+    // Renders the monitor's current request, on the render worker's thread and never the DBus
+    // one. rendered=true only when the frame is still the one that was asked for: a request
+    // arriving mid-render supersedes this one, and committing anyway would flag the monitor as
+    // holding pixels of the previous wallpaper. Failures land in lastError; nobody is waiting.
     RenderOutcome renderPending(int monitorId);
 
     // Exports the monitor's most recent frame as a fresh fd. An empty handle means there is
@@ -394,86 +381,71 @@ private:
     // under that lock.
     void startPersistWorkerLocked();
 
-    // THE answer to "does the file hold what live state holds, and if not, why" -- one
-    // derivation, read by everything that needs it: the health field, the reply to
-    // SetMonitorOutput, and the idempotent re-assert shortcut.
-    //
-    // It is derived rather than stored because it cannot be stored: a completed write's result
-    // lives in the worker, which outlives this object and must never write into it. What went
-    // wrong before was not the derivation but that there were four of them -- one per caller,
-    // each consulting a different subset of a null pointer, three bools and the worker's four
-    // progress fields, so callers disagreed about the same write. Every defect of that shape
-    // came back in a new costume until they were made one function.
+    // THE answer to "does the file hold what live state holds, and if not, why". Derived, not
+    // stored: a completed write's result lives in the worker, which outlives this object and
+    // must never write into it. One derivation, read by every caller -- the health field, the
+    // reply to SetMonitorOutput, the re-assert shortcut -- so no two can disagree about one
+    // write.
     struct PersistOutcome {
-        // No write is outstanding, so `onDisk` describes the file as it now stands rather than
-        // as it stood before work that has not finished.
-        bool settled = true;
-        // The file holds what live state holds. True before anything is asked of the file: an
-        // unchanged binding then came out of the config, so the file already agrees.
-        bool onDisk = true;
-        // Why not, when !onDisk. Raw; sanitized where it is recorded or thrown.
-        std::string why;
+        bool settled = true;  // nothing outstanding, so onDisk describes the file as it stands
+        bool onDisk = true;   // true before anything is asked of the file: it already agrees
+        std::string why;      // when !onDisk. Raw; sanitized where recorded or thrown
     };
 
     // Caller must hold m_stateMutex; takes the worker's lock, which is the established order.
     PersistOutcome persistOutcomeLocked() const;
 
-    // Whether a write is in flight and older than the deadline -- a stalled filesystem, which
-    // earns its own wording. Same locking rule.
+    // A write in flight past the deadline -- a stalled filesystem, which earns its own wording.
     bool stalledWriteLocked() const;
 
-    // Folds that outcome, and the losses that outlive it, into a health copy. Caller must hold
-    // m_stateMutex. Not recorded into m_health, because the writer cannot touch this object.
+    // Folds that outcome, and the losses outliving it, into a health copy rather than m_health:
+    // the writer cannot touch this object. Caller must hold m_stateMutex.
     void applyPersistOutcomeLocked(DaemonHealth& health) const;
 
     const Config m_config;
     const ConfigStore m_store;
 
+    // Everything from here to the mutexes is guarded by m_stateMutex, except the load results
+    // below, which are written before the event loop starts and only read after.
+
     // What load() returned, until restoreSaved() consumes it.
     std::vector<PersistedWallpaper> m_restore;
 
     // Entries restoreSaved() could not apply, carried so a save does not delete them.
-    // Guarded by m_stateMutex.
     std::vector<PersistedWallpaper> m_unapplied;
 
     // The repair restoreSaved() computed, until writeRepairedConfig() takes it out.
-    // Guarded by m_stateMutex.
     std::optional<std::vector<PersistedWallpaper>> m_repair;
 
-    // The file still holds content this run could not read and could not move aside, so
-    // persist() must not replace it. Written only by the constructor, read afterwards.
+    // The file holds content this run could not read and could not move aside, so persist()
+    // must not replace it. Written only by the constructor.
     bool m_configUnread = false;
 
-    // A copy of the pre-repair file exists, so writeRepairedConfig() may replace it. Written by
-    // preserveUnreadableConfig(), read by writeRepairedConfig(); both run before the event loop.
+    // A copy of the pre-repair file exists. Written by preserveUnreadableConfig(), read by
+    // writeRepairedConfig(); both run before the event loop.
     bool m_repairCopied = false;
 
-    // A copy this run needed could not be taken, so the rewrite that follows removed rows held
-    // nowhere else. Sticky for the life of the process: a later write succeeding says nothing
-    // about what the first one destroyed, and health flipping back to ok is what hid it. Set by
-    // preserveUnreadableConfig() before the event loop; read under m_stateMutex.
+    // A copy this run needed could not be taken, so the rewrite after it removed rows held
+    // nowhere else. Sticky: a later write succeeding says nothing about what the first
+    // destroyed, and health returning to ok is what hides it.
     bool m_preserveFailed = false;
 
-    // Raw, unsanitized; sanitized once when recorded. Written by the constructor, by
-    // preserveUnreadableConfig() and by restoreSaved(), all before the event loop starts, and by
-    // requestWallpaper() under m_stateMutex once per kept row it displaces; read under
-    // m_stateMutex.
+    // Raw; sanitized once when recorded. Written by the constructor, preserveUnreadableConfig()
+    // and restoreSaved() before the event loop, and by requestWallpaper() under m_stateMutex
+    // once per kept row it displaces.
     std::string m_persistenceNote;
 
-    // Started on the first save rather than at construction, so a daemon that never sets a
-    // wallpaper never spawns it. Detached, never joined: see PersistWorker. Guarded by
-    // m_stateMutex; non-null means a thread is servicing it.
+    // Started on the first save, so a daemon that never sets a wallpaper never spawns it.
+    // Detached, never joined: see PersistWorker. Non-null means a thread is servicing it.
     std::shared_ptr<PersistWorker> m_persist;
 
-    // Why the last save never reached the writer at all -- no thread, or a refusal decided
-    // before one exists. Empty when the last save was handed over. This is the half of the
-    // outcome the worker cannot know about; persistOutcomeLocked() joins it to the half only
-    // the worker knows. Guarded by m_stateMutex.
+    // Why the last save never reached the writer -- no thread, or a refusal decided before one
+    // exists. Empty once a save is handed over. The half of the outcome the worker cannot know.
     std::string m_notWritten;
 
     // Entries no build can apply, dropped rather than kept, counted so the loss is reported at
-    // all. Guarded by m_stateMutex. Name-only rows counted apart: the report these feed is the
-    // user's notice that a picture did not come back, and a name never was one.
+    // all. Name-only rows counted apart: this report is the user's notice that a picture did
+    // not come back, and a name never was one.
     int m_droppedEntries = 0;
     int m_droppedNames = 0;
 
