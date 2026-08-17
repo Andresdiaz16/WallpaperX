@@ -13,12 +13,10 @@
 
 namespace wallpaperx {
 
-// One monitor's wallpaper as it survives a restart. Nothing about the current run
-// (generation, hasFrame, lastError) is persisted.
-//
-// `output` is the screen's connector name -- "DP-3". It may ride on a row whose type and
-// path are empty: a screen the app has named but chosen nothing for is the ordinary
-// first-run state, and it must still survive a restart or the plugin is anonymous again.
+// One monitor's wallpaper as it survives a restart; nothing about the current run is kept.
+// `output` is the connector name -- "DP-3" -- and may ride on a row with no type or path: a
+// screen named but not yet chosen for is the ordinary first-run state, and losing it leaves
+// the plugin anonymous again.
 struct PersistedWallpaper {
     int monitorId = 0;
     std::string type;
@@ -67,8 +65,9 @@ struct LoadResult {
 struct SaveResult {
     std::string error;
 
-    // Entries whose path is not valid UTF-8, which dump() throws on. Skipping one beats
-    // failing the whole write; the count is what lets the daemon say a monitor is lost.
+    // Wallpapers dropped because their path or type is not valid UTF-8, which dump() throws
+    // on. The row survives if its screen name is writable, so this counts lost pictures, not
+    // lost rows; the count is what lets the daemon say a monitor will not come back.
     int skippedNonUtf8 = 0;
 };
 
@@ -84,9 +83,8 @@ class ConfigStore {
 public:
     static constexpr int kSchemaVersion = 1;
 
-    // The largest config this daemon will read. Public because anything reasoning about a
-    // config file's bytes -- including code that compares one against a preserved copy --
-    // must use the same bound, and a second copy of the number would drift from this one.
+    // The largest config this daemon will read. Public so anything reasoning about a config
+    // file's bytes shares the bound rather than keeping a second copy that can drift.
     static constexpr std::uintmax_t kMaxBytes = 1u << 20;
 
     // An empty path disables persistence, silently. Callers opt in explicitly so a test

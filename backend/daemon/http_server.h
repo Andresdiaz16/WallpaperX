@@ -25,24 +25,20 @@ public:
     static constexpr int kDefaultPort = 18462;
     static constexpr const char* kLoopbackHost = "127.0.0.1";
 
-    // Binds synchronously, then serves on a background thread, so a port conflict is a
-    // value the constructor reports rather than a failure inside a thread nobody awaits.
+    // Binds synchronously, then serves on a background thread, so a port conflict is a value
+    // the constructor reports rather than a failure inside a thread nobody awaits. A bind
+    // failure does NOT throw: it is published as the manager's config-server health, and DBus,
+    // wpxctl and rendering all work without this, so refusing to start would take every monitor
+    // down for a convenience channel.
     //
-    // Does NOT throw on a bind failure -- the result is published as the manager's
-    // config-server health, which GetStatus carries. DBus, wpxctl and rendering work
-    // without this, so refusing to start would take every monitor down for a convenience
-    // channel.
-    //
-    // At most one instance per manager, enforced: constructing one publishes its bind
-    // result as that manager's config-server health, and a second would overwrite the
-    // first's with its own -- including a failed bind stamping fail over a server that is
-    // serving. A second instance throws std::logic_error. That is a programming error and
-    // not an environment one, which is why it throws where a bind failure does not.
+    // A second instance for one manager DOES throw std::logic_error -- it would stamp its own
+    // bind result over the first's, including a failure over a server that is serving. That is
+    // a programming error rather than an environment one, hence the difference.
     HttpServer(WallpaperManager& manager, int port = kDefaultPort);
 
-    // Stops and joins on every path; a joinable thread destroyed mid-unwind is
-    // std::terminate. Records the config server as down on the way out, so a manager that
-    // outlives its server cannot go on reporting a port that is closed as ok.
+    // Stops and joins on every path; a joinable thread destroyed mid-unwind is std::terminate.
+    // Records the server as down on the way out, so a manager outliving it cannot go on
+    // reporting a closed port as ok.
     ~HttpServer();
 
     HttpServer(const HttpServer&) = delete;
@@ -52,10 +48,9 @@ public:
 
 private:
     // Declared first so it is released last, after the destructor has joined the serving
-    // thread. It also unwinds a constructor that throws before the thread starts, which
-    // retracts the success record written just above the thread; past that point the
-    // constructor cannot throw and unwind at all, since destroying a joinable std::thread
-    // is std::terminate.
+    // thread. It also retracts the success record if the constructor throws before the thread
+    // starts; past that point the constructor cannot throw at all, since destroying a joinable
+    // std::thread is std::terminate.
     class Registration {
     public:
         Registration(WallpaperManager& manager, int port);
