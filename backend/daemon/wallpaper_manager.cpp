@@ -65,9 +65,9 @@ std::filesystem::path preservedCopyDir() {
     return {};
 }
 
-// Bounds the byte comparison that recognises an already-preserved config. The store refuses
-// to read anything larger, so a file past it is not one this daemon wrote.
-constexpr std::uintmax_t kMaxComparedBytes = 1u << 20;
+// Bounds the byte comparison that recognises an already-preserved config. The store's own
+// limit, not a second copy of the number: a file it refuses to read is not one to compare.
+constexpr std::uintmax_t kMaxComparedBytes = ConfigStore::kMaxBytes;
 
 void appendReason(std::string& why, const std::string& reason) {
     if (!why.empty()) why += "; ";
@@ -295,9 +295,11 @@ void WallpaperManager::preserveUnreadableConfig() {
             const std::string copied = preserveConfigTo(/*move=*/false, why);
             m_repairCopied = !copied.empty();
             addPersistenceNote(copied.empty() ? "not copied: " + why : "copied to " + copied);
-            // Fail when nothing was kept: the rows this run rejected then exist in this file
-            // alone, saving stays refused until a copy lands, and Ok here is what silenced
-            // main()'s startup warning about it.
+            // Sticky, and Fail: the rows this run rejected exist in this file alone, and the
+            // rewrite that removes them is coming. Saving is NOT refused over it -- the user's
+            // later wallpaper changes are the larger loss -- so a later successful write must
+            // not be allowed to clear the record of what that first one took.
+            if (!m_repairCopied) m_preserveFailed = true;
             recordHealth(&DaemonHealth::persistence,
                          m_repairCopied ? HealthStatus::Ok : HealthStatus::Fail,
                          persistenceDetail(m_store.file().string()));
@@ -328,15 +330,11 @@ void WallpaperManager::writeRepairedConfig() {
     }
     if (!repair) return;
 
-    // Latched rather than refused here: this rewrite and the next ordinary save rebuild the
-    // file from the same live state, so guarding only this one announced a protection it did
-    // not give -- the daemon said "not saving over it" and then saved over it moments later.
-    // queuePersist() enforces it for every write and retries the copy.
-    if (!m_repairCopied) {
-        std::lock_guard<std::mutex> stateLock(m_stateMutex);
-        m_repairUncopied = true;
-    }
-
+    // Written whether or not a copy was taken, and the failure to take one is reported instead.
+    // Refusing this write protected nothing -- the next ordinary save rebuilds the file from the
+    // same live state -- and refusing every write instead would trade a bounded, already-reported
+    // loss for every wallpaper choice the user makes for the rest of the run.
+    //
     // Queued, not waited on: this runs after the bus name is claimed and before the event loop
     // exists, so a wait here is a daemon that answers nothing for the whole deadline. Nobody is
     // owed the durability promise at startup. The outcome is not lost by not waiting for it --
@@ -608,20 +606,20 @@ void WallpaperManager::setMonitorOutput(int monitorId, const std::string& output
 
     // Outside the lock. Persisted because only the app can name a screen again, and it may
     // not run for weeks.
-    persist(toPersist);
-
-    // Reported, because the declared contract is that an accepted reply means the mapping is in
-    // place rather than merely queued -- and a name held only in memory is gone at the next
-    // restart, where the plugin then tells every screen to run the app again. The binding
-    // stands for this run either way; what the error denies is durability.
-    DaemonHealth health;
-    {
-        std::lock_guard<std::mutex> stateLock(m_stateMutex);
-        health = m_health;
-        applyPersistOutcomeLocked(health);
-    }
-    if (health.persistence.status == HealthStatus::Fail) {
-        throw std::runtime_error(health.persistence.detail);
+    //
+    // Reported on this call's own write, not on the daemon's persistence health: that aggregate
+    // also carries another monitor's un-encodable filename and any failure recorded earlier, so
+    // failing on it told a client its name was lost when the name was written. The declared
+    // contract is that an accepted reply means the mapping reached the file; the binding stands
+    // for this run either way, and what the error denies is durability.
+    if (!persist(toPersist)) {
+        std::string detail;
+        {
+            std::lock_guard<std::mutex> stateLock(m_stateMutex);
+            detail = m_health.persistence.detail;
+        }
+        throw std::runtime_error(detail.empty() ? "the screen name did not reach the config file"
+                                                : detail);
     }
 }
 
@@ -735,24 +733,6 @@ std::shared_ptr<PersistWorker> WallpaperManager::queuePersist(
     const std::vector<PersistedWallpaper>& entries) {
     if (!m_store.enabled()) return nullptr;
 
-    // Every write, not just the startup repair: a row this run rejected parses cleanly, lives
-    // in no other place, and every save rebuilds the file from the same repaired live state.
-    // Retried here rather than only at startup, so a state directory that becomes writable
-    // later lets saving resume.
-    if (repairUncopied()) {
-        std::string why;
-        const bool copied = !preserveConfigTo(/*move=*/false, why).empty();
-        std::lock_guard<std::mutex> stateLock(m_stateMutex);
-        if (!copied) {
-            recordHealthLocked(
-                &DaemonHealth::persistence, HealthStatus::Fail,
-                persistenceDetail(m_store.file().string() +
-                                  ": not saved, no copy of the pre-repair config exists: " + why));
-            return nullptr;
-        }
-        m_repairUncopied = false;
-    }
-
     // The save rebuilds the file from live state, so writing now would replace monitors
     // this run never managed to read with the one the user just set.
     if (m_configUnread) {
@@ -787,15 +767,18 @@ std::shared_ptr<PersistWorker> WallpaperManager::queuePersist(
     return worker;
 }
 
-void WallpaperManager::persist(const std::vector<PersistedWallpaper>& entries) {
+bool WallpaperManager::persist(const std::vector<PersistedWallpaper>& entries) {
     const std::shared_ptr<PersistWorker> worker = queuePersist(entries);
-    if (!worker) return;
+    // Nothing was queued. Durability was never promised when the store is disabled; every other
+    // reason queuePersist() declines is a failure it has already recorded.
+    if (!worker) return !m_store.enabled();
 
     // Waited on, briefly, so the reply to SetWallpaper can say the choice is on disk in the
     // healthy case -- which is the only case it can be said in. Past the deadline the write
     // keeps going on the worker and this thread stops caring, so a stalled filesystem costs
     // one wait rather than the daemon, and the choice is then NOT known to be saved.
     bool landed = false;
+    bool failed = false;
     {
         std::unique_lock<std::mutex> workerLock(worker->mutex);
         const auto quiesced = [&worker] { return !worker->pending && !worker->writingSince; };
@@ -808,8 +791,16 @@ void WallpaperManager::persist(const std::vector<PersistedWallpaper>& entries) {
         } else {
             worker->stalled = true;
         }
+        // Read where the wait ended, under the lock that governs it: a write that came back
+        // with an error is no longer outstanding, which is not the same as the choice being on
+        // disk. The error itself is already the writer's to report.
+        if (landed && worker->haveResult && !worker->result.error.empty()) {
+            landed = false;
+            failed = true;
+        }
     }
-    if (landed) return;
+    if (landed) return true;
+    if (failed) return false;
 
     // Recorded outside the worker's lock, keeping the documented order. Without it the health
     // field can still read ok for a write this thread has knowingly given up on -- the outcome
@@ -819,11 +810,7 @@ void WallpaperManager::persist(const std::vector<PersistedWallpaper>& entries) {
     recordHealthLocked(&DaemonHealth::persistence, HealthStatus::Fail,
                        persistenceDetail(m_store.file().string() +
                                          ": a write has not come back, the choice may not be on disk yet"));
-}
-
-bool WallpaperManager::repairUncopied() const {
-    std::lock_guard<std::mutex> stateLock(m_stateMutex);
-    return m_repairUncopied;
+    return false;
 }
 
 void WallpaperManager::startPersistWorkerLocked() {
@@ -902,10 +889,13 @@ void WallpaperManager::startPersistWorkerLocked() {
 }
 
 bool WallpaperManager::persistFailedLocked() const {
-    // Null has two meanings. Nothing has been asked of the file yet, so an unchanged binding
-    // came out of the config and the file already holds it -- or a save was asked for and no
-    // writer could be started, which is live state and the file disagreeing, and is exactly
-    // the state a client re-asserting a name is trying to retry out of.
+    // Every state in which live state and the file disagree, not only a write that came back
+    // with an error: a refusal decided before any writer exists is invisible to the worker, and
+    // reading only the worker let a client's retry of a name the daemon had just rejected
+    // return success -- the same name reported failed, then durable, with nothing changed.
+    if (m_configUnread) return true;
+    // Null otherwise means nothing has been asked of the file yet, so an unchanged binding came
+    // out of the config and the file already holds it.
     if (!m_persist) return m_persistWorkerFailed;
     std::lock_guard<std::mutex> workerLock(m_persist->mutex);
     return m_persist->haveResult && !m_persist->result.error.empty();
@@ -916,12 +906,14 @@ void WallpaperManager::applyPersistOutcomeLocked(DaemonHealth& health) const {
 
     SaveResult saved;
     bool haveResult = false;
+    bool queued = false;
     std::optional<std::chrono::steady_clock::time_point> writingSince;
     {
         std::lock_guard<std::mutex> workerLock(m_persist->mutex);
         haveResult = m_persist->haveResult;
         saved = m_persist->result;
         writingSince = m_persist->writingSince;
+        queued = m_persist->pending.has_value();
     }
 
     // Written into the caller's copy rather than recorded: the write finishes on a thread
@@ -946,14 +938,23 @@ void WallpaperManager::applyPersistOutcomeLocked(DaemonHealth& health) const {
         return;
     }
 
+    // Only a quiescent writer's result describes the file. While one write is queued behind
+    // another, the last completed one is about bytes the caller did not ask for -- and stamping
+    // its success here erased a failure recorded microseconds earlier, so a caller that had
+    // just given up on its own write was told the write landed.
+    if (queued || writingSince) return;
+
     std::string base = m_store.file().string();
     if (saved.skippedNonUtf8 > 0) {
         base += " (" + std::to_string(saved.skippedNonUtf8) +
-                " entries skipped: a path, type or screen name is not valid UTF-8)";
+                " wallpapers dropped: a path or type is not valid UTF-8; any screen name on "
+                "those rows was kept)";
     }
     // Fail, not Ok: the write succeeded but those monitors will not come back, and a
-    // health field that reads ok is the only thing that would say otherwise.
-    report(saved.skippedNonUtf8 > 0 ? HealthStatus::Fail : HealthStatus::Ok, persistenceDetail(base));
+    // health field that reads ok is the only thing that would say otherwise. A copy this run
+    // could not take is the same kind of loss, and outlives the write that took it.
+    report(saved.skippedNonUtf8 > 0 || m_preserveFailed ? HealthStatus::Fail : HealthStatus::Ok,
+           persistenceDetail(base));
 }
 
 std::vector<int> WallpaperManager::restoreSaved() {
@@ -980,9 +981,11 @@ std::vector<int> WallpaperManager::restoreSaved() {
     std::lock_guard<std::mutex> stateLock(m_stateMutex);
     for (const PersistedWallpaper& entry : pending) {
         // Three outcomes for a name, each of them reported: bound here, carried for a build
-        // whose limit admits the id, or dropped. Carrying asks for the whole rule, the byte cap
-        // included -- that cap is a property of the stored format, so a name past it is one no
-        // build reading this file will bind.
+        // whose limit admits the id, or dropped. Only the id limit earns carrying. The byte cap
+        // is the manager's rule and not the file's (see outputNameError), so by the rule that
+        // carries an unknown wallpaper type a name past the cap would travel too -- deliberately
+        // not done: it would write a name back into every save that no build has ever accepted.
+        // Revisit with the forward-compatibility decision, not as a defect fix.
         const bool nameValid = !entry.output.empty() && outputNameError(entry.output).empty();
         const bool nameTravels = nameValid && entry.monitorId >= kMaxMonitors;
         if (!entry.output.empty() && !nameValid && !nameTravels) ++rejectedNames;
@@ -1111,18 +1114,24 @@ std::vector<int> WallpaperManager::restoreSaved() {
     }
 
     if (displacedNames > 0) {
+        // Same correction as the entry counter below: a name this build could bind displaces a
+        // later row carrying the same name for an id it cannot, so the earlier row wins there.
         addPersistenceNote(std::to_string(displacedNames) +
-                           " screen names displaced by a later entry claiming the same name or "
-                           "the same screen; the last entry won");
+                           " screen names displaced by another entry claiming the same name or "
+                           "the same screen; the binding this build could make was kept");
     }
     if (rejectedNames > 0) {
         addPersistenceNote(std::to_string(rejectedNames) +
                            " screen names dropped, unusable; those screens must be named again");
     }
     if (duplicateIds > 0) {
+        // Not "the last entry won": three different collisions feed this counter, and one of
+        // them is resolved by an EARLIER row -- the one this build can actually show. Saying
+        // last-wins sent the user looking in config.json for the row that was dropped.
         addPersistenceNote(std::to_string(duplicateIds) +
-                           " entries dropped, a later entry claimed the same monitor; the "
-                           "last entry won");
+                           " entries dropped, another entry claimed the same monitor; the one "
+                           "this build can show was kept, and the rest are only in the copy "
+                           "beside the config file");
     }
 
     // Kept entries are invisible otherwise: they are in no monitor's status and are not

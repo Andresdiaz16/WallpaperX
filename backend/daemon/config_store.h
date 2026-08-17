@@ -5,6 +5,7 @@
 #include "log_escape.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <string>
 #include <string_view>
@@ -82,6 +83,11 @@ std::filesystem::path defaultConfigPath();
 class ConfigStore {
 public:
     static constexpr int kSchemaVersion = 1;
+
+    // The largest config this daemon will read. Public because anything reasoning about a
+    // config file's bytes -- including code that compares one against a preserved copy --
+    // must use the same bound, and a second copy of the number would drift from this one.
+    static constexpr std::uintmax_t kMaxBytes = 1u << 20;
 
     // An empty path disables persistence, silently. Callers opt in explicitly so a test
     // that says nothing about config cannot touch the developer's own.

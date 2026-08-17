@@ -26,7 +26,7 @@ constexpr const char* kFileName = "config.json";
 
 // A 32-monitor config is about 4 kB. The cap is not about legitimate files: it bounds how
 // long startup can spend, and how much it can allocate, on a file someone else wrote.
-constexpr std::uintmax_t kMaxBytes = 1u << 20;
+constexpr std::uintmax_t kMaxBytes = ConfigStore::kMaxBytes;
 
 // Every field name in one place: a typo in the reader that matches a typo in the writer is
 // invisible until someone else's build reads the file.
@@ -253,16 +253,26 @@ SaveResult ConfigStore::save(const std::vector<PersistedWallpaper>& entries) con
             // single unusual filename would otherwise cost every monitor its wallpaper.
             // Dropping just this entry keeps the rest, and the count tells the caller a
             // monitor will not come back.
-            if (!isValidUtf8(entry.path) || !isValidUtf8(entry.type) || !isValidUtf8(entry.output)) {
+            //
+            // Half by half: the two are independently valid, and one gate over both cost a
+            // screen its name because the picture on it had an unusual filename -- leaving
+            // that screen anonymous after a restart, which no renaming of the image undoes.
+            const bool wallpaperOk = isValidUtf8(entry.path) && isValidUtf8(entry.type);
+            const bool nameOk = isValidUtf8(entry.output);
+            if (!wallpaperOk && (!entry.type.empty() || !entry.path.empty())) {
                 ++result.skippedNonUtf8;
-                continue;
             }
+            // Nothing left worth a row.
+            if (!wallpaperOk && (!nameOk || entry.output.empty())) continue;
+
+            // Both keys stay present whatever survives: load() reads a row missing either one
+            // as malformed, which would turn a degraded write into a lost row at the next start.
             nlohmann::json row{{kKeyMonitorId, entry.monitorId},
-                               {kKeyType, entry.type},
-                               {kKeyPath, entry.path}};
+                               {kKeyType, wallpaperOk ? entry.type : ""},
+                               {kKeyPath, wallpaperOk ? entry.path : ""}};
             // Only when there is one: a config for an install that never named a screen
             // stays byte-identical to what a build without this field writes.
-            if (!entry.output.empty()) row[kKeyOutput] = entry.output;
+            if (nameOk && !entry.output.empty()) row[kKeyOutput] = entry.output;
             monitors.push_back(std::move(row));
         }
         const nlohmann::json root{{kKeyVersion, kSchemaVersion}, {kKeyMonitors, std::move(monitors)}};

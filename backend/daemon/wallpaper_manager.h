@@ -367,7 +367,12 @@ private:
     // reply to SetWallpaper mean the choice is on disk -- but only when it ends because the
     // write landed: a wait that runs out leaves the write in flight and records persistence as
     // unsettled instead. Same locking rule.
-    void persist(const std::vector<PersistedWallpaper>& entries);
+    //
+    // Returns whether THESE entries are known to be on disk -- true when persistence is
+    // disabled, since durability was never promised then. A caller that must answer for its own
+    // write asks this rather than the persistence health, which is an aggregate and carries
+    // failures belonging to other rows.
+    bool persist(const std::vector<PersistedWallpaper>& entries);
 
     // Facts about the config that outlive the operation that discovered them -- a copy of an
     // unreadable file, entries kept for a newer build. Every persistence detail is rebuilt
@@ -381,9 +386,6 @@ private:
     // one name meant the second unreadable config had nowhere to go, and so was destroyed.
     std::string preserveConfigTo(bool move, std::string& why) const;
 
-    // Whether a repair was staged with no copy of the bytes it replaces. Takes m_stateMutex,
-    // so it is called with none held.
-    bool repairUncopied() const;
 
     // Spawns the config writer on first use, and leaves m_persist null when the thread could
     // not be created. Caller must hold m_stateMutex: m_persist is published here and read
@@ -420,10 +422,11 @@ private:
     // preserveUnreadableConfig(), read by writeRepairedConfig(); both run before the event loop.
     bool m_repairCopied = false;
 
-    // A repair was staged with no copy of what it replaces, so no write may go out until one is
-    // taken. Set by writeRepairedConfig(), cleared by queuePersist() once the copy lands.
-    // Guarded by m_stateMutex.
-    bool m_repairUncopied = false;
+    // A copy this run needed could not be taken, so the rewrite that follows removed rows held
+    // nowhere else. Sticky for the life of the process: a later write succeeding says nothing
+    // about what the first one destroyed, and health flipping back to ok is what hid it. Set by
+    // preserveUnreadableConfig() before the event loop; read under m_stateMutex.
+    bool m_preserveFailed = false;
 
     // Raw, unsanitized; sanitized once when recorded. Written by the constructor, by
     // preserveUnreadableConfig() and by restoreSaved(), all before the event loop starts, and by
