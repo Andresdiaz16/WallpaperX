@@ -22,11 +22,9 @@ namespace {
 constexpr const char* kErrorNoFrame = "io.wallpaperx.Daemon.Error.NoFrame";
 constexpr const char* kErrorExportFailed = "io.wallpaperx.Daemon.Error.ExportFailed";
 constexpr const char* kErrorRenderFailed = "io.wallpaperx.Daemon.Error.RenderFailed";
-// The third answer to "why is there no frame", distinct from the two above because it
-// calls for a third response: NoFrame means retry, RenderFailed means stop and show the
-// reason, Unsupported means stop and stop asking -- nothing about this build will change
-// while it runs. It was previously collapsed into NoFrame, so a client polling a video
-// wallpaper was told to retry forever.
+// The third answer to "why is there no frame", separate because it calls for a third
+// response: NoFrame means retry, RenderFailed means stop and show the reason, Unsupported
+// means stop asking -- nothing about this build changes while it runs.
 constexpr const char* kErrorUnsupported = "io.wallpaperx.Daemon.Error.Unsupported";
 constexpr const char* kErrorInvalidArgs = "org.freedesktop.DBus.Error.InvalidArgs";
 
@@ -43,10 +41,9 @@ DbusService::DbusService(sdbus::IConnection& connection, WallpaperManager& manag
 
 DbusService::~DbusService() {
     // Explicit, because neither destruction order alone is correct: handlers may still be
-    // dispatching, setWallpaper() posts to m_worker, and getFrameFd's task touches
-    // m_object, so destroying either first leaves the other dangling. stop() breaks the
-    // cycle -- it joins the render thread, then leaves post() a harmless no-op for any
-    // handler still in flight.
+    // dispatching, setWallpaper() posts to m_worker and getFrameFd's task touches m_object, so
+    // destroying either first leaves the other dangling. stop() joins the render thread, then
+    // leaves post() a no-op for any handler still in flight.
     m_worker.stop();
 }
 
@@ -170,13 +167,9 @@ void DbusService::completeGetFrameFd(FrameFdCall call, int32_t monitorId) {
     }
 
     if (!exported.handle) {
-        // RenderFailed and NoFrame are answered separately because a polling consumer
-        // must respond to them differently: NoFrame means ask again, RenderFailed means
-        // stop asking and show the reason. Both used to come back as NoFrame carrying
-        // the text "call SetWallpaper first" -- advice that is not merely unhelpful for
-        // a wallpaper that already failed, but tells the client to retry a request that
-        // cannot succeed until a *different* one replaces it. The reply also carries the
-        // render's own error text, which was otherwise reachable only through GetStatus.
+        // Answered separately because a polling consumer must respond differently: NoFrame
+        // means ask again, RenderFailed means stop asking and show the reason. The reply
+        // carries the render's own error text, otherwise reachable only through GetStatus.
         if (exported.reason == NoFrameReason::RenderFailed) {
             call.returnError(sdbus::Error(sdbus::Error::Name{kErrorRenderFailed},
                                           "the last render for monitor " + std::to_string(monitorId) +
@@ -184,11 +177,9 @@ void DbusService::completeGetFrameFd(FrameFdCall call, int32_t monitorId) {
             return;
         }
         if (exported.reason == NoFrameReason::Unsupported) {
-            // No lastError appended: this is not a failure, nothing wrote one, and the
-            // name plus this sentence already state the whole fact. The type is not
-            // echoed either -- it is in the client's own request and in GetStatus, and
-            // repeating client-supplied text into a reply is the habit that produced the
-            // log-injection this commit closed.
+            // No lastError: this is not a failure and nothing wrote one. The type is not
+            // echoed either -- it is in the client's own request, and repeating client text
+            // into a reply is the habit that produces log injection.
             call.returnError(sdbus::Error(sdbus::Error::Name{kErrorUnsupported},
                                           "monitor " + std::to_string(monitorId) +
                                               " holds a wallpaper type this build cannot render, so no "
@@ -206,11 +197,9 @@ void DbusService::completeGetFrameFd(FrameFdCall call, int32_t monitorId) {
 
     const ExportedFrame& frame = exported.handle->frame;
 
-    // adopt_fd, not the duplicating constructor: exportFrame() handed us ownership of a
-    // freshly created fd and nothing else will close it. Taken on the first line after
-    // the export so that any throw below runs ~UnixFd instead of leaking a descriptor --
-    // GetFrameFd is called repeatedly by a polling consumer, so a leak here is an
-    // eventual EMFILE, not a one-off.
+    // adopt_fd, not the duplicating constructor: exportFrame() handed over ownership of a fresh
+    // fd and nothing else closes it. Taken on the first line after the export so a throw below
+    // runs ~UnixFd -- a polling consumer calls this repeatedly, so a leak becomes EMFILE.
     sdbus::UnixFd fd(frame.fd, sdbus::adopt_fd);
 
     std::vector<sdbus::Struct<uint64_t, uint64_t>> planes;
@@ -256,15 +245,14 @@ std::string DbusService::getStatus() {
 
     nlohmann::json wallpapers = nlohmann::json::object();
     for (const auto& [monitorId, monitor] : snap.monitors) {
-        // Sanitized on the way out, not in storage -- the recorded path must stay
-        // byte-exact because it is what gets opened. JSON escaping is not a substitute:
-        // nlohmann escapes below 0x20 but not U+202E, the isolates or DEL, so `busctl`
-        // could show an admin a different path than the one on disk. Display-safe, not
-        // round-trip-safe. `type` needs none: requestWallpaper rejects anything outside
-        // three literals before storing.
-        // path_literal is the one to act on: the bytes as stored, so a client can hand it
-        // straight back to SetWallpaper. Null when the name is not valid UTF-8, which JSON
-        // cannot carry -- an absent key would be indistinguishable from an older daemon.
+        // Sanitized on the way out, not in storage: the recorded path is what gets opened and
+        // must stay byte-exact. JSON escaping is no substitute -- nlohmann escapes below 0x20
+        // but not U+202E, the isolates or DEL, so `busctl` could show an admin a path other
+        // than the one on disk. `type` needs none; requestWallpaper allows three literals.
+        //
+        // path_literal is the field to act on: the bytes as stored, handed straight back to
+        // SetWallpaper. Null rather than absent when they are not valid UTF-8, since an absent
+        // key is indistinguishable from an older daemon.
         const std::optional<std::string> literal = literalPath(monitor.path);
         nlohmann::json entry{{"type", monitor.type},
                              {"path", sanitizeForLog(monitor.path, 4096, LogFraming::Bare)},
