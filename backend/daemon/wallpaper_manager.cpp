@@ -361,13 +361,12 @@ void WallpaperManager::writeRepairedConfig() {
     }
     if (!repair) return;
 
-    // Written whether or not a copy was taken: refusing this one write protects nothing, since
-    // the next ordinary save rebuilds the file from the same live state, and refusing every
-    // write costs the user every later wallpaper choice. m_preserveFailed reports it instead.
+    // Written whether or not a copy was taken: the next ordinary save rebuilds the file from
+    // the same live state, so refusing this one write protects nothing while refusing every
+    // write costs every later wallpaper choice. m_preserveFailed reports it instead.
     //
-    // Queued, not waited on: the bus name is claimed and no event loop exists yet, so a wait
-    // here answers nothing for the whole deadline. The writer reports a failed write on stderr
-    // itself. queuePersist() takes the state lock, so it is called with none held.
+    // Queued, not waited on: the bus name is held and no event loop exists yet, so a wait here
+    // answers nothing. queuePersist() takes the state lock, so it is called with none held.
     queuePersist(*repair);
 }
 
@@ -525,11 +524,8 @@ void WallpaperManager::ensureGpu() {
     recordHealth(&DaemonHealth::gpu, HealthStatus::Ok,
                  m_gpuStatus.name + " (" + m_gpuStatus.descriptorTier + ")");
 
-    // Definition of Done #1 wants the daemon to report its GPU and descriptor tier. Here
-    // rather than at startup, because the device is created lazily and printing a tier
-    // before one exists would be a guess -- the same reason GetStatus omits the fields
-    // until now. Deliberately the identical format wallpaperx-device-probe prints, so an
-    // operator can compare the daemon's answer against the probe's line for line.
+    // Here rather than at startup: the device is created lazily, so a tier printed earlier
+    // would be a guess. Format matches wallpaperx-device-probe, to be comparable line for line.
     std::printf("wallpaperx-daemon: GPU: %s | Vendor: %s | Descriptor tier: %s\n",
                 m_device->info().gpuName.c_str(), toString(m_device->info().vendor),
                 toString(m_device->descriptorTier()));
@@ -537,11 +533,9 @@ void WallpaperManager::ensureGpu() {
 }
 
 const OffscreenTarget& WallpaperManager::acquireTarget(int monitorId) {
-    // Reuse the existing target unless its geometry no longer matches -- create()
-    // replaces (and waits for idle), which is wasted work when nothing changed. The
-    // size can only differ once real monitor geometry arrives in Step 15, but keying
-    // the reuse on the dimensions rather than on mere existence means that change does
-    // not silently keep rendering at the old resolution.
+    // Keyed on the dimensions, not on mere existence: create() replaces and waits for idle, so
+    // reuse is worth it, and when real monitor geometry arrives this will not go on quietly
+    // rendering at the old resolution.
     const bool reusable = m_targets->has(monitorId) && m_targets->get(monitorId).width == m_config.width &&
                           m_targets->get(monitorId).height == m_config.height;
     return reusable ? m_targets->get(monitorId) : m_targets->create(monitorId, m_config.width, m_config.height);

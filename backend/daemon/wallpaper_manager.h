@@ -124,7 +124,6 @@ struct DaemonHealth {
     HealthCheck persistence;
 };
 
-// An exported frame plus the generation counter of the render that produced it.
 // The caller owns frame.fd and must close it (or hand it to something that will).
 struct FrameHandle {
     ExportedFrame frame;
