@@ -261,6 +261,23 @@ target_link_libraries(wallpaperx-qml-lint-test PRIVATE nlohmann_json::nlohmann_j
 target_include_directories(wallpaperx-qml-lint-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/../renderer/tests)
 
+# The Plasma wallpaper QML's own behaviour, as against whether it parses: Qt Quick Test loads
+# main.qml headless and drives the states it can show (S10.10). Outside the KDE plugin guard for
+# the reason the lint test is, and QUIET rather than REQUIRED so a host without Qt's test module
+# -- the hosted runner installs no Qt at all -- configures exactly as before and simply does not
+# register the entry.
+find_package(Qt6 QUIET COMPONENTS QuickTest Qml)
+if(Qt6QuickTest_FOUND)
+    add_executable(wallpaperx-qml-states-test tests/qml_states_test.cpp)
+    target_link_libraries(wallpaperx-qml-states-test PRIVATE Qt6::QuickTest Qt6::Qml)
+    # Where the tst_*.qml files live, compiled in rather than passed at run time so the entry
+    # cannot be registered against a directory that moved.
+    target_compile_definitions(wallpaperx-qml-states-test PRIVATE
+        QUICK_TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/qml")
+else()
+    message(STATUS "  QML state tests: disabled (no Qt6 QuickTest module) -- S10.10 stays uncovered here")
+endif()
+
 # Qt is asked where it keeps its tools before any directory is guessed; a hand-written list can
 # only ever describe layouts someone thought of. Not REQUIRED and not a link dependency, so a
 # host with no Qt configures exactly as before. The literal hints stay for the other direction
@@ -413,6 +430,15 @@ set_tests_properties(kpackage_metadata PROPERTIES LABELS "novulkan"
 add_test(NAME qml_lint COMMAND $<TARGET_FILE:wallpaperx-qml-lint-test>)
 set_tests_properties(qml_lint PROPERTIES LABELS "novulkan"
                      SKIP_RETURN_CODE 77)
+
+# Registered only where Qt's test module exists. The offscreen platform is set here rather than
+# left to the environment: with a real display the plugin would open a window on the developer's
+# desktop, and on a host with none the run would fail for a reason unrelated to the checks.
+if(Qt6QuickTest_FOUND)
+    add_test(NAME qml_states COMMAND $<TARGET_FILE:wallpaperx-qml-states-test>)
+    set_tests_properties(qml_states PROPERTIES LABELS "novulkan"
+                         ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+endif()
 
 # The DBus service test needs a session bus. dbus-run-session gives each run a
 # private one (isolated from the developer's real session, and works headless in

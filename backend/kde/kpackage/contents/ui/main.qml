@@ -24,6 +24,12 @@ WallpaperItem {
     // The request still awaiting a reply, so a later tick supersedes it instead of racing it.
     property var pending: null
 
+    // The screen this instance sits on, by connector name -- the one fact the daemon also
+    // derives from the hardware. Assignable rather than a readonly binding so a test can reach
+    // the states that depend on it: no headless Qt platform reports a screen name, and an empty
+    // one pins every state below to "unnamed". Nothing in production assigns it.
+    property string connector: root.Screen.name
+
     readonly property string screenName:
         (root.reply && typeof root.reply.output === "string") ? root.reply.output : ""
 
@@ -35,7 +41,7 @@ WallpaperItem {
     // Each state needs a different action from whoever reads it, so they are told apart
     // rather than merged. Order matters: a refusal only means anything once something answered.
     readonly property string screenState:
-        root.Screen.name === "" ? "unnamed"
+        root.connector === "" ? "unnamed"
         : !root.answered ? "unreachable"
         : root.refusalReason !== "" ? "refused"
         : !root.reply ? "unreadable"
@@ -71,7 +77,7 @@ WallpaperItem {
     function refresh() {
         // An empty output= is a request the daemon rightly refuses, so asking anyway would
         // report a refusal this plugin caused as though the daemon had rejected the screen.
-        if (root.Screen.name === "") {
+        if (root.connector === "") {
             return;
         }
 
@@ -86,7 +92,7 @@ WallpaperItem {
         // The timestamp defeats any cache between here and the daemon: a wallpaper the user
         // just chose must not wait on a stale 200.
         const url = "http://127.0.0.1:18462/config?output=" +
-                    encodeURIComponent(root.Screen.name) + "&t=" + Date.now();
+                    encodeURIComponent(root.connector) + "&t=" + Date.now();
         request.onreadystatechange = function () {
             if (request.readyState !== XMLHttpRequest.DONE) {
                 return;
