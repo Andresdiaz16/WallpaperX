@@ -929,6 +929,13 @@ WallpaperManager::PersistOutcome WallpaperManager::persistOutcomeLocked() const 
     // Outstanding covers all three ways a write can be unfinished: still queued, in flight, or
     // abandoned by a caller that stopped waiting. Reading only `haveResult` reported a name as
     // durable while the write that would have made it so had never completed.
+    //
+    // Answers for ANY write, not the caller's own -- the same question only while one thread
+    // writes. It holds today because persist() is reached from bus handlers alone and sdbus-c++
+    // dispatches those on one event-loop thread; the startup repair uses queuePersist() before
+    // that loop exists. A second writer would make a landed write report as not on disk because
+    // another had since started. The fix then is to give each write an identity, not to widen
+    // this test.
     const bool outstanding = m_persist->pending.has_value() ||
                              m_persist->writingSince.has_value() || m_persist->stalled;
     if (m_persist->haveResult && !m_persist->result.error.empty()) {
