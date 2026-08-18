@@ -334,6 +334,16 @@ private:
     // Snapshots the monitors worth persisting. Caller must hold m_stateMutex.
     std::vector<PersistedWallpaper> persistableLocked() const;
 
+    // Clears the wallpaper half of a kept row, answering whether there was one to clear -- the
+    // caller reports the loss, and only when there was one. Takes the row, not an id: one caller
+    // holds a copy that is not in m_unapplied yet. Says nothing about `output`: a lost name is a
+    // different loss, counted separately.
+    static bool dropKeptWallpaper(PersistedWallpaper& row);
+
+    // Whether a live monitor holds a wallpaper for this id, which is what decides that a kept
+    // row for the same id will not survive the next save. Caller must hold m_stateMutex.
+    bool liveHoldsLocked(int monitorId) const;
+
     // Displaced: the bind took the name off another monitor, or took another name off this one.
     enum class BindResult { Unchanged, Bound, Displaced };
 

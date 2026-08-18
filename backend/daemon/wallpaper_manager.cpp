@@ -357,7 +357,7 @@ std::string WallpaperManager::persistenceDetail(const std::string& base) const {
         // over a kept row's id or claim its name later, and persistableLocked() then drops the
         // kept copy -- so counting it here would go on offering back a wallpaper, or a name,
         // the file no longer holds.
-        if ((!entry.type.empty() || !entry.path.empty()) && m_monitors.count(entry.monitorId) == 0) {
+        if ((!entry.type.empty() || !entry.path.empty()) && !liveHoldsLocked(entry.monitorId)) {
             ++keptWallpapers;
         }
         if (!entry.output.empty() && m_outputs.count(entry.output) == 0) ++keptNames;
@@ -559,9 +559,7 @@ void WallpaperManager::requestWallpaper(const std::string& type, const std::stri
         const auto kept = std::find_if(
             m_unapplied.begin(), m_unapplied.end(),
             [monitorId](const PersistedWallpaper& row) { return row.monitorId == monitorId; });
-        if (kept != m_unapplied.end() && (!kept->type.empty() || !kept->path.empty())) {
-            kept->type.clear();
-            kept->path.clear();
+        if (kept != m_unapplied.end() && dropKeptWallpaper(*kept)) {
             addPersistenceNote(
                 "1 entry this build cannot apply, replaced by a new wallpaper for that screen");
         }
@@ -681,6 +679,21 @@ LoadResult WallpaperManager::loadWithDeadline() const {
     return timedOut;
 }
 
+bool WallpaperManager::dropKeptWallpaper(PersistedWallpaper& row) {
+    if (row.type.empty() && row.path.empty()) return false;
+    row.type.clear();
+    row.path.clear();
+    return true;
+}
+
+bool WallpaperManager::liveHoldsLocked(int monitorId) const {
+    // Strict rather than "the id is present": nothing populates a live monitor without a
+    // wallpaper today, and if something ever does, this keeps that monitor's kept row in the
+    // file rather than dropping it.
+    const auto live = m_monitors.find(monitorId);
+    return live != m_monitors.end() && (!live->second.type.empty() || !live->second.path.empty());
+}
+
 std::vector<PersistedWallpaper> WallpaperManager::persistableLocked() const {
     // Keyed by monitor id, not appended: a wallpaper and a name for one monitor belong on
     // one row, and two rows would be two monitors claiming one screen on the next load.
@@ -694,7 +707,7 @@ std::vector<PersistedWallpaper> WallpaperManager::persistableLocked() const {
     // below, which rebuilds the file from live state alone, would delete a wallpaper set
     // by a newer build the moment anything else is set here. Live state wins per monitor.
     for (const PersistedWallpaper& entry : m_unapplied) {
-        if (m_monitors.count(entry.monitorId) == 0) rows.emplace(entry.monitorId, entry);
+        if (!liveHoldsLocked(entry.monitorId)) rows.emplace(entry.monitorId, entry);
     }
 
     // m_outputs is the authority: a carried name is written only for an id this build cannot
@@ -1036,18 +1049,12 @@ std::vector<int> WallpaperManager::restoreSaved() {
             // already holds keeps that wallpaper at the next save, so a kept row for it is
             // dropped. Counted here, while the note the user reads is still being built --
             // otherwise the entry left config.json with nothing anywhere reporting it.
-            const auto live = m_monitors.find(entry.monitorId);
-            const bool liveHolds =
-                live != m_monitors.end() && (!live->second.type.empty() || !live->second.path.empty());
+            const bool liveHolds = liveHoldsLocked(entry.monitorId);
 
             const auto slot = keptIndex.find(entry.monitorId);
             if (slot == keptIndex.end()) {
                 PersistedWallpaper keep = entry;
-                if (liveHolds && (!keep.type.empty() || !keep.path.empty())) {
-                    ++duplicateIds;
-                    keep.type.clear();
-                    keep.path.clear();
-                }
+                if (liveHolds && dropKeptWallpaper(keep)) ++duplicateIds;
                 if (!nameTravels) keep.output.clear();
                 // Nothing left to carry. Kept, it would ride every save for the life of the
                 // install and come back as a wallpaper that did not return.
@@ -1087,11 +1094,7 @@ std::vector<int> WallpaperManager::restoreSaved() {
         // stops offering it back, and counted so the loss is in the note rather than in silence.
         if (const auto slot = keptIndex.find(entry.monitorId); slot != keptIndex.end()) {
             PersistedWallpaper& held = m_unapplied[slot->second];
-            if (!held.type.empty() || !held.path.empty()) {
-                ++duplicateIds;
-                held.type.clear();
-                held.path.clear();
-            }
+            if (dropKeptWallpaper(held)) ++duplicateIds;
         }
         state.type = entry.type;
         state.path = entry.path;
