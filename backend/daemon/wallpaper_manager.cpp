@@ -89,17 +89,24 @@ bool sameContents(const std::filesystem::path& a, const std::filesystem::path& b
                       std::istreambuf_iterator<char>(streamB));
 }
 
-// Keeps `source` in `dir` under the first free <file>.bad[.N]. Returns the name used, or empty
-// with `reason` set to the last failure. A copy already holding these bytes counts as preserved:
-// a repair that cannot be written recurs every start, and a fresh name each time would exhaust
-// kMaxPreservedCopies in as many restarts.
-std::string keepCopyIn(const std::filesystem::path& source, const std::filesystem::path& dir,
-                       bool move, std::string& reason) {
-    const auto unlinkSource = [&source, &reason]() {
+// Where the bytes are and what went wrong, kept apart: a failed unlink after a good copy is a
+// complaint about the original, not about the preservation, and one value for both let the
+// second erase the first.
+struct KeptCopy {
+    std::string kept;     // empty: nothing was preserved
+    std::string trouble;  // why, or what still needs saying about a copy that succeeded
+};
+
+// Keeps `source` in `dir` under the first free <file>.bad[.N]. A copy already holding these
+// bytes counts as preserved: a repair that cannot be written recurs every start, and a fresh
+// name each time would exhaust kMaxPreservedCopies in as many restarts.
+KeptCopy keepCopyIn(const std::filesystem::path& source, const std::filesystem::path& dir,
+                    bool move) {
+    std::string reason;
+    const auto unlinkSource = [&source]() {
         std::error_code removeEc;
         std::filesystem::remove(source, removeEc);
-        if (removeEc) reason = removeEc.message();
-        return !removeEc;
+        return removeEc ? removeEc.message() : std::string{};
     };
 
     for (int n = 0; n < kMaxPreservedCopies; ++n) {
@@ -114,15 +121,14 @@ std::string keepCopyIn(const std::filesystem::path& source, const std::filesyste
         if (taken) {
             // Never over different bytes: that copy holds an earlier broken config.
             if (!sameContents(source, kept)) continue;
-            if (move && !unlinkSource()) return {};
-            return kept.string();
+            return {kept.string(), move ? unlinkSource() : std::string{}};
         }
 
         if (move) {
             // Atomic where it can be. The copy below exists only for the cross-filesystem case,
             // and unlike a rename it can leave a partial file behind.
             std::filesystem::rename(source, kept, ec);
-            if (!ec) return kept.string();
+            if (!ec) return {kept.string(), {}};
             if (ec != std::errc::cross_device_link) {
                 reason = ec.message();
                 continue;
@@ -142,17 +148,11 @@ std::string keepCopyIn(const std::filesystem::path& source, const std::filesyste
             reason = ec.message();
             continue;
         }
-        if (move && !unlinkSource()) {
-            // Not preservation while the original still sits under the name the next save
-            // writes, so the copy goes back out rather than holding a name for nothing.
-            std::error_code cleanupEc;
-            std::filesystem::remove(kept, cleanupEc);
-            return {};
-        }
-        return kept.string();
+        // The copy stays even when the original cannot go: the bytes are the point, and a start
+        // that finds this same content reuses this name rather than spending another.
+        return {kept.string(), move ? unlinkSource() : std::string{}};
     }
-    if (reason.empty()) reason = "no free name";
-    return {};
+    return {{}, reason.empty() ? "no free name" : reason};
 }
 
 std::atomic<bool> g_loadAbandoned{false};
@@ -253,19 +253,23 @@ std::string WallpaperManager::preserveConfigTo(bool move, std::string& why) cons
     }
 
     for (const std::filesystem::path& dir : dirs) {
-        std::string reason;
         std::error_code dirEc;
         std::filesystem::create_directories(dir, dirEc);
         if (dirEc) {
             appendReason(why, dir.string() + ": " + dirEc.message());
             continue;
         }
-        if (std::string kept = keepCopyIn(m_store.file(), dir, move, reason); !kept.empty()) {
-            return kept;
+        const KeptCopy copy = keepCopyIn(m_store.file(), dir, move);
+        if (!copy.kept.empty()) {
+            // Directories that failed before this one stop mattering once a copy exists; that
+            // the original is still where the next save writes does not.
+            why = copy.trouble.empty() ? std::string{}
+                                       : "original still in place: " + copy.trouble;
+            return copy.kept;
         }
         // Every candidate named: a message blaming only the last one sends the user to the
         // wrong directory.
-        appendReason(why, dir.string() + ": " + reason);
+        appendReason(why, dir.string() + ": " + copy.trouble);
     }
     return {};
 }
@@ -303,8 +307,10 @@ void WallpaperManager::preserveUnreadableConfig() {
         if (kept.empty()) {
             addPersistenceNote("not kept: " + why);
         } else {
+            // Safe to save over it now: the bytes are at `kept` whether or not the original
+            // went, and `why` says so when it did not.
             m_configUnread = false;
-            addPersistenceNote("kept as " + kept);
+            addPersistenceNote(why.empty() ? "kept as " + kept : "kept as " + kept + "; " + why);
         }
     }
     // Every path reports. Saying the config could not be read while staying silent about
