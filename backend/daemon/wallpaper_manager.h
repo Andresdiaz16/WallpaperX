@@ -449,6 +449,12 @@ private:
     int m_droppedEntries = 0;
     int m_droppedNames = 0;
 
+    // Counted, not written into m_persistenceNote: these two are the only losses a client can
+    // cause repeatedly, and the note is appended to for the life of the process while the
+    // detail is truncated at its tail -- so a run of them would crowd out everything after.
+    int m_replacedKept = 0;
+    int m_takenOverNames = 0;
+
     // What the load found, held for preserveUnreadableConfig() to act on later.
     bool m_loadPreservable = false;
     int m_loadMalformed = 0;

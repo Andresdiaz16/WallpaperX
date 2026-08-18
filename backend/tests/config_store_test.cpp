@@ -3623,12 +3623,17 @@ void runKeptWallpaperDisplacedAtRuntimeChecks() {
     // Polled with a bound, and an expired bound is returned as a verdict to the caller rather
     // than being read as "the note is not there" -- the callers below grade the count they get,
     // and a wait that ran out prints its own reason.
-    const std::string kNote = "1 entry this build cannot apply, replaced by a new wallpaper for that screen";
+    // The count is read out of one aggregated clause, not counted as repeated sentences: the
+    // daemon renders this loss the way it renders every other repeatable one, as "N ..." emitted
+    // once. clauseCount() answers 0 for a clause that is absent, which is what the
+    // nothing-was-displaced check below needs, and a build that reported the same loss twice
+    // reads back as 2 -- so all three controls named below still redden it.
+    const std::string kNote = " entries this build cannot apply, replaced by new wallpapers";
     const auto noteCountWhenSettled = [&manager, &kNote](int wanted) {
         const auto deadline = StallClock::now() + std::chrono::seconds(10);
         int count = 0;
         for (;;) {
-            count = occurrencesOf(manager.snapshot().health.persistence.detail, kNote);
+            count = clauseCount(manager.snapshot().health.persistence.detail, kNote).value_or(-1);
             if (count >= wanted || StallClock::now() >= deadline) return count;
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
         }
@@ -3663,6 +3668,12 @@ void runKeptWallpaperDisplacedAtRuntimeChecks() {
     //       the whole reason occurrences are counted. (c) the `(!kept->type.empty() ||
     //       !kept->path.empty())` guard dropped, which reports a displacement whenever any kept
     //       row exists for the id -> the same one red, same count.
+    //       NOT RE-OBSERVED since 2026-08-18, when the daemon stopped appending one sentence per
+    //       displacement and started counting into one clause: the guard named in (c) now lives
+    //       inside WallpaperManager::dropKeptWallpaper(), and the counts above are read out of
+    //       the clause rather than counted as occurrences. Each control should still redden the
+    //       same check -- that is the reason the count is read rather than the sentence matched --
+    //       but it is reasoning, not an observation, until the three are run again.
     // COVERAGE-ASSERT: the kept row is asserted to have been promised back BEFORE any client
     //       acts. Without it every count below is equally true of a fixture the daemon rejected
     //       outright, and the phase would be green over a manager that never kept anything.
@@ -3680,7 +3691,8 @@ void runKeptWallpaperDisplacedAtRuntimeChecks() {
     // A monitor no kept row holds. Nothing is lost here, so nothing may be reported.
     manager.requestWallpaper("static", paths->wallpapers[1].string(), 1);
     waitForRows(file, [](const std::map<int, RowInFile>& rows) { return rows.count(1) == 1; });
-    const int noteAfterUnrelated = occurrencesOf(manager.snapshot().health.persistence.detail, kNote);
+    const int noteAfterUnrelated =
+        clauseCount(manager.snapshot().health.persistence.detail, kNote).value_or(-1);
     check(noteAfterUnrelated == 0, "a save that displaces no kept row reports no displacement");
     if (noteAfterUnrelated != 0) {
         std::fprintf(stderr, "  the note appears %d times after a save on a monitor no kept row holds\n",
@@ -3709,7 +3721,8 @@ void runKeptWallpaperDisplacedAtRuntimeChecks() {
     waitForRows(file, [&paths](const std::map<int, RowInFile>& rows) {
         return rows.count(0) == 1 && rows.at(0).path == paths->wallpapers[1].string();
     });
-    const int noteAfterSecond = occurrencesOf(manager.snapshot().health.persistence.detail, kNote);
+    const int noteAfterSecond =
+        clauseCount(manager.snapshot().health.persistence.detail, kNote).value_or(-1);
     check(noteAfterSecond == 1, "setting the same monitor again does not report the same loss a second time");
     if (noteAfterSecond != 1) {
         std::fprintf(stderr, "  the note appears %d times after a second save; persistence detail: %s\n",

@@ -377,6 +377,14 @@ std::string WallpaperManager::persistenceDetail(const std::string& base) const {
     if (m_droppedNames > 0) {
         detail += std::to_string(m_droppedNames) + " screen names dropped, no build can apply them; ";
     }
+    if (m_replacedKept > 0) {
+        detail += std::to_string(m_replacedKept) +
+                  " entries this build cannot apply, replaced by new wallpapers for those screens; ";
+    }
+    if (m_takenOverNames > 0) {
+        detail += std::to_string(m_takenOverNames) +
+                  " screen names this build cannot bind, taken over by new names; ";
+    }
     return detail + base;
 }
 
@@ -559,10 +567,7 @@ void WallpaperManager::requestWallpaper(const std::string& type, const std::stri
         const auto kept = std::find_if(
             m_unapplied.begin(), m_unapplied.end(),
             [monitorId](const PersistedWallpaper& row) { return row.monitorId == monitorId; });
-        if (kept != m_unapplied.end() && dropKeptWallpaper(*kept)) {
-            addPersistenceNote(
-                "1 entry this build cannot apply, replaced by a new wallpaper for that screen");
-        }
+        if (kept != m_unapplied.end() && dropKeptWallpaper(*kept)) ++m_replacedKept;
 
         toPersist = persistableLocked();
     }
@@ -598,10 +603,9 @@ void WallpaperManager::setMonitorOutput(int monitorId, const std::string& output
             const auto kept = std::find_if(
                 m_unapplied.begin(), m_unapplied.end(),
                 [&outputName](const PersistedWallpaper& row) { return row.output == outputName; });
-            if (kept != m_unapplied.end()) {
+            if (kept != m_unapplied.end() && !kept->output.empty()) {
                 kept->output.clear();
-                addPersistenceNote("1 screen name this build cannot bind, taken over by a new "
-                                   "name for another monitor");
+                ++m_takenOverNames;
             }
         }
 
