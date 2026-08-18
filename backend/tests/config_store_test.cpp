@@ -1454,16 +1454,20 @@ void runUnreadableConfigChecks() {
     //       build that preserved the file and then clobbered the copy on the first write.
     //       The health status is asserted alongside because a preserved file nobody is told
     //       about reads to the user as a config that silently emptied itself.
-    // CONTROL: the `std::filesystem::copy_file(m_store.file(), kept, ec)` call deleted from
-    //       WallpaperManager::preserveConfigTo() (backend/daemon/wallpaper_manager.cpp),
-    //       leaving nothing preserved -> "FAIL: a config that could not be read is kept as
+    // CONTROL: the `std::filesystem::rename(source, kept, ec)` call deleted from putBytes()
+    //       (backend/daemon/wallpaper_manager.cpp), so the placement reports success without
+    //       writing anything -> "FAIL: a config that could not be read is kept as
     //       config.json.bad" and "FAIL: the preserved copy is byte-identical to the file the
-    //       daemon could not read", printing "  no config.json.bad exists". Observed
-    //       2026-08-15. Reverted.
-    // CONTROL, for the copy being kept OUT of the config directory: the copy directory in
-    //       preserveConfigTo() put back to the config file's own parent -> "FAIL: the config
-    //       the daemon could not read is kept out of the directory the user edits", printing
-    //       the copy's real path beside config.json. Observed 2026-08-15. Reverted.
+    //       daemon could not read", printing "no .../config.json.bad exists; copies anywhere:
+    //       (none)". The rename and not the copy_file below it: this path moves the file, and
+    //       here the two directories are on one filesystem, so the rename succeeds and deleting
+    //       copy_file instead leaves both checks GREEN -- measured. Observed 2026-08-18. Reverted.
+    // CONTROL, for the copy being kept OUT of the config directory: the preferred copy directory
+    //       in WallpaperManager::preserveConfigTo() (backend/daemon/wallpaper_manager.cpp) put
+    //       back to m_store.file()'s parent -> "FAIL: the config the daemon could not read is
+    //       kept out of the directory the user edits", printing that copy's path in the config
+    //       directory, and this phase's other two copy checks red with it -- they look for the
+    //       copy in the state directory, where nothing now lands. Observed 2026-08-18. Reverted.
     const WallpaperManager::Snapshot afterLoad = manager.snapshot();
     check(afterLoad.health.persistence.status == wallpaperx::HealthStatus::Fail,
           "a config that could not be read leaves the persistence check reporting failure");
@@ -1496,10 +1500,11 @@ void runUnreadableConfigChecks() {
     //       directory (the check above). Either alone is satisfied by the wrong build -- an
     //       absence alone by a daemon that preserves nothing at all, a presence alone by one
     //       that writes both.
-    // CONTROL: the copy directory in WallpaperManager::preserveConfigTo()
+    // CONTROL: the preferred copy directory in WallpaperManager::preserveConfigTo()
     //       (backend/daemon/wallpaper_manager.cpp) put back to m_store.file()'s parent ->
     //       "FAIL: the config the daemon could not read is kept out of the directory the user
-    //       edits". Observed 2026-08-15. Reverted.
+    //       edits", printing "copies in the config directory: .../wallpaperx/config.json.bad".
+    //       Observed 2026-08-18. Reverted.
     const std::vector<std::string> besideConfig = preservedCopyNames(file, {});
     check(besideConfig.empty(), "the config the daemon could not read is kept out of the directory the user edits");
     if (!besideConfig.empty()) {
@@ -1708,18 +1713,21 @@ void runPreservedCopyChecks() {
     //       same code can lose anything. Both files are compared byte for byte rather than
     //       merely counted, because an overwrite and a correct second copy leave the same
     //       NUMBER of files behind and differ only in which bytes are in which name.
-    // CONTROL: two, both reverted. (a) the `+ (n == 0 ? "" : "." + std::to_string(n))`
-    //       suffix dropped from WallpaperManager::preserveConfigTo()'s loop, so every copy
-    //       competes for one name -> "FAIL: the second unreadable config is preserved under
-    //       a name of its own" with one copy listed, "FAIL: the daemon says where the second
-    //       unreadable config was kept" ("not kept: no free name"), re-observed 2026-08-16
-    //       against the state-directory copy,
-    //       and "FAIL: a wallpaper set after the second unreadable config is persisted into
-    //       a fresh config.json" -- the run stops saving, which is the second half of the
-    //       damage. (b) the `if (std::filesystem::exists(kept, ec)) continue;` arm deleted,
-    //       leaving the rename unconditional -> "FAIL: a second unreadable config does not
-    //       overwrite the copy the first one preserved", printing the throwaway's bytes
-    //       where the user's config had been, beside the name-of-its-own check.
+    // CONTROL: two, both reverted, both observed 2026-08-18. (a) the
+    //       `(slot == 0 ? "" : "." + std::to_string(slot))` suffix dropped from preservedName()
+    //       (backend/daemon/wallpaper_manager.cpp), so every copy competes for one name ->
+    //       "FAIL: the second unreadable config is preserved under a name of its own", listing
+    //       config.json.bad in the state directory AND one in the config directory, and "FAIL:
+    //       the daemon says where the second unreadable config was kept", reading "kept as
+    //       .../wallpaperx/config.json.bad". Saving survives it: the second file falls back to
+    //       the config directory rather than having nowhere to go, so the overwrite check and
+    //       the save-afterwards check both stay green -- which is why the name a copy is
+    //       reported under has to be graded, and not just whether the run went on saving and
+    //       not just whether the first copy survived. (b) inspectName() made to answer
+    //       NameState::Free for a name that is already taken, so the placement is unconditional
+    //       -> "FAIL: a second unreadable config does not overwrite the copy the first one
+    //       preserved", printing the throwaway's bytes where the user's config had been, beside
+    //       the name-of-its-own check.
     const ScratchDir scratch("twicebad");
     // preparePhase, not a bare scratch.ok(): the last check here reads back a path the daemon
     // persisted, and a temporary directory whose name is not valid UTF-8 makes the writer skip
@@ -1919,8 +1927,10 @@ void runMalformedEntryCopyChecks() {
     //       had nothing to restore, which is a different code path with a different verdict.
     // CONTROL: the `move` argument of preserveConfigTo() forced true on the malformed-entry
     //       path, so the original is unlinked where a copy is owed -> "FAIL: a config with
-    //       malformed entries is still there after the copy is made", and that alone.
-    //       Re-observed 2026-08-16 after preserveConfigTo() became copy-then-unlink. Note what
+    //       malformed entries is still there after the copy is made" -- the only check red in
+    //       this phase, though two later phases that drive the same copy path go red as well.
+    //       Re-observed 2026-08-18, with move now taking the rename fast path inside putBytes()
+    //       rather than copy-then-unlink; the file goes either way. Note what
     //       stayed GREEN under it: "a wallpaper set after a config with malformed entries is
     //       persisted", because the save simply recreates the file the unlink took away --
     //       which is why the loss has to be caught by the file's absence rather than by the
@@ -2005,14 +2015,16 @@ void runMalformedEntryCopyChecks() {
     //       Asserting only that the detail contains a name would pass for a daemon that
     //       announced a copy it did not make -- which is the worse failure, since the user
     //       then goes looking for a file that is not there.
-    // CONTROL: the `+ (n == 0 ? "" : "." + std::to_string(n))` suffix dropped from
-    //       preserveConfigTo()'s loop, so both starts compete for config.json.bad -> "FAIL:
-    //       the second start's malformed config is copied under a name of its own" with one
-    //       copy listed, and "FAIL: the daemon says where the second malformed config was
-    //       copied" printing "1 malformed entries ignored; not copied: no free name".
-    //       Re-observed 2026-08-16. The first start's copy stayed intact under that mutation,
-    //       so the pair separates "the second file was lost" from "the first was destroyed".
-    //       Reverted.
+    // CONTROL: the `(slot == 0 ? "" : "." + std::to_string(slot))` suffix dropped from
+    //       preservedName() (backend/daemon/wallpaper_manager.cpp), so both starts compete for
+    //       config.json.bad -> "FAIL: the second start's malformed config is copied under a name
+    //       of its own", listing config.json.bad in the state directory and one in the config
+    //       directory, and "FAIL: the daemon says where the second malformed config was copied",
+    //       reading "1 malformed entries ignored; copied to .../wallpaperx/config.json.bad" --
+    //       a copy that was made, under the wrong name, which is why the reported name is
+    //       compared against the file rather than searched for the word "copied". The first
+    //       start's copy stayed intact, so the pair separates "the second file was lost" from
+    //       "the first was destroyed". Observed 2026-08-18. Reverted.
     const std::filesystem::path keptSecond = preservedCopyDir(scratch) / "config.json.bad.1";
     const bool secondCopied = readFile(keptSecond) == secondBroken;
     check(secondCopied, "the second start's malformed config is copied under a name of its own");
@@ -2433,11 +2445,11 @@ void runCopyMechanicsChecks() {
             return;
         }
 
-        // CONTROL: the `if (move)` rename arm in putBytes() (backend/daemon/wallpaper_manager.cpp,
-        //       split out of keepCopyIn() on 2026-08-18; observed there, not re-run since)
+        // CONTROL: the `if (move)` rename arm in putBytes() (backend/daemon/wallpaper_manager.cpp)
         //       disabled so the copy-then-unlink path runs, which is the code before this fix ->
         //       "FAIL: a config moved aside on one filesystem keeps its identity, so no partial
-        //       copy is possible", printing "config.json was inode 9905, the copy is inode 9908".
+        //       copy is possible", printing "config.json was inode 32031, the copy is inode
+        //       32034", and nothing else in the file red. Observed 2026-08-18. Reverted.
         WallpaperManager::Config config;
         config.configFile = file;
         WallpaperManager manager(config);
@@ -2547,10 +2559,11 @@ void runCopyMechanicsChecks() {
     //       was left behind" is true of every build. The limit is restored before any check runs,
     //       so a red line is never itself truncated.
     // CONTROL: the `std::filesystem::remove(kept, cleanupEc)` cleanup disabled in putBytes()'s
-    //       copy-failure arm (backend/daemon/wallpaper_manager.cpp, split out of keepCopyIn() on
-    //       2026-08-18; observed there, not re-run since), which is the code before this fix -> "FAIL: a copy that failed part-way leaves no file behind holding its
+    //       copy-failure arm (backend/daemon/wallpaper_manager.cpp), which is the code before
+    //       this fix -> "FAIL: a copy that failed part-way leaves no file behind holding its
     //       name", printing all TWENTY names -- ten in each candidate directory -- occupied by
     //       16-byte remnants, spent by this single start. Preservation is dead from here on.
+    //       Observed 2026-08-18. Reverted.
     manager.preserveUnreadableConfig();
     restoreSizeLimit.restore();
     if (!restoreSizeLimit.restored) {
@@ -2826,17 +2839,17 @@ void runPreservationReuseChecks() {
     //       the same unchanged file, which is what a restart is at this tier. The copy's bytes
     //       are compared as well as counted: one name held by a file that is not the user's
     //       config is the same loss by another route.
-    // CONTROL: the reuse arm in inspectName() (backend/daemon/wallpaper_manager.cpp), which now
-    //       answers SameBytes where keepCopyIn() used to test `!sameContents(source, kept)`
-    //       inline -- made to answer OtherBytes always, so every start takes a fresh name, which
-    //       is the code before this fix (split out on 2026-08-18; observed in the old shape, not
-    //       re-run since) -> all three red: "FAIL: twelve starts that could not write
+    // CONTROL: the reuse arm in inspectName() (backend/daemon/wallpaper_manager.cpp) made to
+    //       answer OtherBytes always, so every start takes a fresh name, which is the code
+    //       before this fix -> all three red: "FAIL: twelve starts that could not write
     //       their repair leave one preserved copy, not one per start", printing "10 copies" and
     //       naming config.json.bad through .bad.9; "FAIL: the one preserved copy holds the bytes
     //       the user's config held"; and "FAIL: the last of twelve identical starts still reports
-    //       where it kept the config", whose detail reads "not copied: ... no free name ... not
-    //       saved, no copy of the pre-repair config exists" -- preservation and saving both dead
-    //       from the eleventh start on.
+    //       where it kept the config", whose detail reads "not copied: .../state/wallpaperx: no
+    //       free name; .../wallpaperx: Permission denied" -- preservation dead from the eleventh
+    //       start on, and the run left with nowhere to keep the next unreadable config. The same
+    //       mutation also reddens the removal-clause phase's already-preserved arm, which is
+    //       built on the same answer. Observed 2026-08-18. Reverted.
     constexpr int kStarts = 12;
     std::printf("config_store_test: the 'config not saved' lines naming %s are this phase's -- up to %d of them, one "
                 "for each simulated restart against a read-only config directory\n",
@@ -3869,13 +3882,19 @@ void runKeptWallpaperSupersededChecks() {
     //       and the save both keep it", which is a different build and not a defect; grading the
     //       file alone is what the save-side phases already do and says nothing about the text
     //       the user reads.
-    // CONTROL: the `&& m_monitors.count(entry.monitorId) == 0` guard removed from the
-    //       kept-wallpaper count in WallpaperManager::persistenceDetail()
-    //       (backend/daemon/wallpaper_manager.cpp), which is the code before this fix -> "FAIL:
-    //       a kept wallpaper a live monitor has replaced is no longer reported as kept",
-    //       printing "1 of ' entries this build cannot apply, kept' after the row was dropped",
-    //       with the file check green -- the save and the report disagreeing is the defect
-    //       itself. Observed 2026-08-15.
+    // CONTROL: TWO mutations together, because this property is now defended twice and neither
+    //       defence alone changes the count (both in backend/daemon/wallpaper_manager.cpp, both
+    //       reverted): the `&& !liveHoldsLocked(entry.monitorId)` guard removed from the
+    //       kept-wallpaper count in WallpaperManager::persistenceDetail(), AND the
+    //       `dropKeptWallpaper(*kept)` call in WallpaperManager::requestWallpaper() disabled, so
+    //       the kept row keeps its type and path -> "FAIL: a kept wallpaper a live monitor has
+    //       replaced is no longer reported as kept", printing "1 of ' entries this build cannot
+    //       apply, kept' after the row was dropped", with the file check green -- the save and
+    //       the report disagreeing is the defect itself. Each mutation alone leaves this GREEN
+    //       (measured): the row is emptied on the request, so the count is zero whatever the
+    //       guard says, and the guard is false whatever the row holds. The request-side one is
+    //       controlled on its own in the displaced-wallpaper phase below, where the note it
+    //       writes is what is graded. Observed 2026-08-18.
     manager.requestWallpaper("static", wallpaper.string(), 0);
     waitForRows(file, [&wallpaper](const std::map<int, RowInFile>& rows) {
         return rows.count(0) == 1 && rows.at(0).path == wallpaper.string();
