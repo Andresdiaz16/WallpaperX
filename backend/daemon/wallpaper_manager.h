@@ -370,12 +370,6 @@ private:
     void addPersistenceNote(const std::string& note);
     std::string persistenceDetail(const std::string& base) const;
 
-    // Copies the config to the first free <file>.bad[.N] in the state directory, or beside the
-    // config when there is no usable state directory, and removes the original when `move`.
-    // Returns the name used, or empty with `why` naming every directory tried. Numbered because
-    // one name meant the second unreadable config had nowhere to go, and so was destroyed.
-    std::string preserveConfigTo(bool move, std::string& why) const;
-
 
     // Spawns the config writer on first use, and leaves m_persist null when the thread could
     // not be created. Caller must hold m_stateMutex: m_persist is published here and read

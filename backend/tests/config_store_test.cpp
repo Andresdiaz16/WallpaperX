@@ -1463,8 +1463,8 @@ void runUnreadableConfigChecks() {
     //       here the two directories are on one filesystem, so the rename succeeds and deleting
     //       copy_file instead leaves both checks GREEN -- measured. Observed 2026-08-18. Reverted.
     // CONTROL, for the copy being kept OUT of the config directory: the preferred copy directory
-    //       in WallpaperManager::preserveConfigTo() (backend/daemon/wallpaper_manager.cpp) put
-    //       back to m_store.file()'s parent -> "FAIL: the config the daemon could not read is
+    //       in preserveConfig() (backend/daemon/config_preserve.cpp) put back to the config
+    //       file's own parent -> "FAIL: the config the daemon could not read is
     //       kept out of the directory the user edits", printing that copy's path in the config
     //       directory, and this phase's other two copy checks red with it -- they look for the
     //       copy in the state directory, where nothing now lands. Observed 2026-08-18. Reverted.
@@ -1500,8 +1500,8 @@ void runUnreadableConfigChecks() {
     //       directory (the check above). Either alone is satisfied by the wrong build -- an
     //       absence alone by a daemon that preserves nothing at all, a presence alone by one
     //       that writes both.
-    // CONTROL: the preferred copy directory in WallpaperManager::preserveConfigTo()
-    //       (backend/daemon/wallpaper_manager.cpp) put back to m_store.file()'s parent ->
+    // CONTROL: the preferred copy directory in preserveConfig()
+    //       (backend/daemon/config_preserve.cpp) put back to the config file's own parent ->
     //       "FAIL: the config the daemon could not read is kept out of the directory the user
     //       edits", printing "copies in the config directory: .../wallpaperx/config.json.bad".
     //       Observed 2026-08-18. Reverted.
@@ -1850,7 +1850,7 @@ void runPreservationExhaustedChecks() {
     //       up on preserving" from "went on to destroy it", and only the second is data loss.
     //       (Six more go red in the phase above, which grades the same refusal on a config that
     //       could not be opened at all.) (c) the config directory dropped from
-    //       preserveConfigTo()'s candidate list, which is the shape this fixture used to be
+    //       preserveConfig()'s candidate list, which is the shape this fixture used to be
     //       written against -> nothing red here, which is the point: it is the fallback that
     //       makes the twenty names necessary.
     WallpaperManager::Config config;
@@ -1925,7 +1925,7 @@ void runMalformedEntryCopyChecks() {
     //       content" -- the two leave the same file. The restored entry is asserted in the
     //       same breath, so this cannot pass for a build that refused the file outright and
     //       had nothing to restore, which is a different code path with a different verdict.
-    // CONTROL: the `move` argument of preserveConfigTo() forced true on the malformed-entry
+    // CONTROL: the `move` argument of preserveConfig() forced true on the malformed-entry
     //       path, so the original is unlinked where a copy is owed -> "FAIL: a config with
     //       malformed entries is still there after the copy is made" -- the only check red in
     //       this phase, though two later phases that drive the same copy path go red as well.
@@ -2016,7 +2016,7 @@ void runMalformedEntryCopyChecks() {
     //       announced a copy it did not make -- which is the worse failure, since the user
     //       then goes looking for a file that is not there.
     // CONTROL: the `(slot == 0 ? "" : "." + std::to_string(slot))` suffix dropped from
-    //       preservedName() (backend/daemon/wallpaper_manager.cpp), so both starts compete for
+    //       preservedName() (backend/daemon/config_preserve.cpp), so both starts compete for
     //       config.json.bad -> "FAIL: the second start's malformed config is copied under a name
     //       of its own", listing config.json.bad in the state directory and one in the config
     //       directory, and "FAIL: the daemon says where the second malformed config was copied",
@@ -2359,7 +2359,7 @@ void runPreservationWithoutHomeChecks() {
     //       afterwards is what makes this about the user rather than about a file name: a build
     //       that kept a copy and still refused to save would satisfy a check on the copy alone,
     //       and that is the whole cost of the defect.
-    // CONTROL: the config file's own directory removed from preserveConfigTo()'s candidate list
+    // CONTROL: the config file's own directory removed from preserveConfig()'s candidate list
     //       in backend/daemon/wallpaper_manager.cpp, which is the code before this fix -> "FAIL:
     //       with no state directory the config is kept beside the config file", printing "copies:
     //       (none)", "FAIL: the config that could not be read is not left where the daemon reads
@@ -2445,7 +2445,7 @@ void runCopyMechanicsChecks() {
             return;
         }
 
-        // CONTROL: the `if (move)` rename arm in putBytes() (backend/daemon/wallpaper_manager.cpp)
+        // CONTROL: the `if (move)` rename arm in putBytes() (backend/daemon/config_preserve.cpp)
         //       disabled so the copy-then-unlink path runs, which is the code before this fix ->
         //       "FAIL: a config moved aside on one filesystem keeps its identity, so no partial
         //       copy is possible", printing "config.json was inode 32031, the copy is inode
@@ -2559,7 +2559,7 @@ void runCopyMechanicsChecks() {
     //       was left behind" is true of every build. The limit is restored before any check runs,
     //       so a red line is never itself truncated.
     // CONTROL: the `std::filesystem::remove(kept, cleanupEc)` cleanup disabled in putBytes()'s
-    //       copy-failure arm (backend/daemon/wallpaper_manager.cpp), which is the code before
+    //       copy-failure arm (backend/daemon/config_preserve.cpp), which is the code before
     //       this fix -> "FAIL: a copy that failed part-way leaves no file behind holding its
     //       name", printing all TWENTY names -- ten in each candidate directory -- occupied by
     //       16-byte remnants, spent by this single start. Preservation is dead from here on.
@@ -2692,7 +2692,7 @@ void runPreservedCopySurvivesFailedRemovalChecks() {
         //       back to writable BEFORE that save, so what it measures is the daemon's refusal and
         //       not the mode bits. The failure is a real EACCES from a real unlink rather than an
         //       interposed one; what is simulated is only the arm's precondition (see below).
-        // CONTROL: two, one per arm, both in keepCopyIn() (backend/daemon/wallpaper_manager.cpp),
+        // CONTROL: two, one per arm, both in keepCopyIn() (backend/daemon/config_preserve.cpp),
         //       both reverted -- see the arm table above for which fixture reaches which.
         //       (a) the SameBytes arm made to return `{{}, trouble}` when the removal failed,
         //       which is the code before this fix -> the reuse arm alone red, on "the copy holding
@@ -2839,7 +2839,7 @@ void runPreservationReuseChecks() {
     //       the same unchanged file, which is what a restart is at this tier. The copy's bytes
     //       are compared as well as counted: one name held by a file that is not the user's
     //       config is the same loss by another route.
-    // CONTROL: the reuse arm in inspectName() (backend/daemon/wallpaper_manager.cpp) made to
+    // CONTROL: the reuse arm in inspectName() (backend/daemon/config_preserve.cpp) made to
     //       answer OtherBytes always, so every start takes a fresh name, which is the code
     //       before this fix -> all three red: "FAIL: twelve starts that could not write
     //       their repair leave one preserved copy, not one per start", printing "10 copies" and

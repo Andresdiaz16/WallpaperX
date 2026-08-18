@@ -98,6 +98,7 @@ endif()
 # Daemon logic lives in a static lib so both the executable and the tests link it
 # (mirrors the renderer lib + probes layout).
 add_library(wallpaperx-daemon-lib STATIC
+    daemon/config_preserve.cpp
     daemon/config_store.cpp
     daemon/dbus_service.cpp
     daemon/http_server.cpp
