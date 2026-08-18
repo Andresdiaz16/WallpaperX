@@ -76,11 +76,8 @@ int main() {
         // sigwait on its own thread, not a handler: leaveEventLoop() takes locks and is not
         // async-signal-safe. A guard rather than a bare std::thread because enterEventLoop()
         // THROWS when the connection drops, and a joinable thread destroyed mid-unwind is
-        // std::terminate. Started before anything touching the filesystem, since signals are
-        // blocked at the top of main and work done before this thread cannot be stopped.
-        //
-        // wakingForShutdown separates the destructor's wake-up SIGTERM from a real one;
-        // shutdownRequested records one that arrived before the loop began.
+        // std::terminate. Started before anything touching the filesystem: signals are blocked
+        // at the top of main, and work done before this thread cannot be stopped.
         std::atomic<bool> wakingForShutdown{false};
         std::atomic<bool> shutdownRequested{false};
 
@@ -154,11 +151,10 @@ int main() {
         // stop -- it starts the first render, and that is GPU work for a process leaving.
         if (!shutdownRequested.load(std::memory_order_acquire)) service.restoreSaved();
 
-        // Claimed last, so the name appearing on the bus means the daemon can answer: the
-        // object is registered and the saved wallpapers are back. It throws if another
-        // instance owns it, which is why nothing above this line may write to the config
-        // directory. Skipped after a stop, or a daemon on its way out would take the
-        // well-known name for the moment it has left and drop it again.
+        // Claimed last, so the name on the bus means the daemon can answer: object registered,
+        // saved wallpapers back. Throws if another instance owns it, which is why nothing above
+        // may write to the config directory. Skipped after a stop, or a daemon on its way out
+        // would take the well-known name for a moment and drop it again.
         if (!shutdownRequested.load(std::memory_order_acquire)) {
             connection->requestName(sdbus::ServiceName{wallpaperx::DbusService::kBusName});
             // Only now: this moves the user's config aside, and until the name is held this

@@ -15,14 +15,11 @@ namespace wallpaperx {
 class WallpaperManager;
 
 // The daemon's one GPU thread, so the DBus event loop never touches the GPU: that loop is
-// single and blocking, so work inside a handler stalls every other method for its duration,
-// and a render on a cold GPU stack can approach sd-bus's 25 s reply timeout.
+// single and blocking, and a render on a cold GPU stack can approach sd-bus's 25 s timeout.
 //
-// Renders and tasks share one FIFO, so ordering between a render and an export is the order
-// the requests arrived in. Coalescing falls out for free because the queue holds monitor ids
-// rather than requests -- the request lives in the WallpaperManager -- so a client dragging
-// through a wallpaper list queues one render per monitor, not one per image. The manager makes
-// each pass idempotent per request, covering the gap between a dequeue and the request read.
+// One FIFO for renders and tasks, holding monitor ids rather than requests: ordering is
+// arrival order, and a client dragging through a wallpaper list coalesces to one render per
+// monitor. The manager makes each pass idempotent, covering dequeue-to-read.
 class RenderWorker {
 public:
     // Called on the worker thread after a render that produced a frame, so it must be safe off
@@ -44,12 +41,12 @@ public:
     // Queues a render for `monitorId`, or nothing if one is already queued. Non-blocking.
     void post(int monitorId);
 
-    // Queues arbitrary GPU work -- an export, whose DBus reply is then sent from the worker
-    // thread. Never coalesced, since each task carries its own reply. Non-blocking.
+    // Queues arbitrary GPU work -- an export, replying from the worker thread. Never coalesced,
+    // since each task carries its own reply. Non-blocking.
     void postTask(Task task);
 
-    // Stops accepting work and joins the thread. Idempotent, and safe while handlers are still
-    // dispatching: post()/postTask() become no-ops rather than touching a half-destroyed object.
+    // Stops accepting work and joins. Idempotent, and safe mid-dispatch: post() and postTask()
+    // become no-ops rather than touching a half-destroyed object.
     void stop();
 
 private:
@@ -65,12 +62,11 @@ private:
 
     std::mutex m_mutex;
     std::condition_variable m_wake;
-    std::deque<Job> m_queue;      // FIFO across monitors, so one busy monitor cannot starve another
+    std::deque<Job> m_queue;
     std::set<int> m_queuedRenders;  // membership test for the coalescing above
     bool m_stop = false;
 
-    // Last member: the thread body touches every field above, so all must be constructed
-    // before it starts and destroyed only after the destructor has joined it.
+    // Last member: the thread body touches every field above, so all must outlive it.
     std::thread m_thread;
 };
 
