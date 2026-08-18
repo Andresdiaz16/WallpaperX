@@ -113,12 +113,25 @@ std::mutex g_renameMutex;
 std::string g_renameTarget;
 unsigned g_renameCount = 0;
 
+// One source path whose renames answer EXDEV, which is how a kernel refuses to move a file to
+// another filesystem. The preservation phase that needs it cannot stage the real thing: it would
+// have to be handed two directories on two mounts, and a test that skipped unless the host
+// offered them would not run anywhere.
+std::string g_crossDeviceSource;
+
 extern "C" int rename(const char* oldPath, const char* newPath) {
     using Fn = int (*)(const char*, const char*);
     static Fn real = reinterpret_cast<Fn>(::dlsym(RTLD_NEXT, "rename"));
     if (real == nullptr) {
         errno = ENOSYS;
         return -1;
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_renameMutex);
+        if (!g_crossDeviceSource.empty() && oldPath != nullptr && g_crossDeviceSource == oldPath) {
+            errno = EXDEV;
+            return -1;
+        }
     }
     const int result = real(oldPath, newPath);
     if (result == 0 && newPath != nullptr) {
@@ -256,6 +269,23 @@ unsigned renamesCounted() {
     std::lock_guard<std::mutex> lock(g_renameMutex);
     return g_renameCount;
 }
+
+// Makes every rename OUT OF `source` answer EXDEV, and puts it back when it goes out of scope --
+// a leak would follow the config writer, whose own rename is how a save lands.
+class CrossDeviceRenames {
+public:
+    explicit CrossDeviceRenames(const std::filesystem::path& source) { set(source.string()); }
+    ~CrossDeviceRenames() { set({}); }
+
+    CrossDeviceRenames(const CrossDeviceRenames&) = delete;
+    CrossDeviceRenames& operator=(const CrossDeviceRenames&) = delete;
+
+private:
+    static void set(const std::string& source) {
+        std::lock_guard<std::mutex> lock(g_renameMutex);
+        g_crossDeviceSource = source;
+    }
+};
 
 std::string readFile(const std::filesystem::path& file) {
     std::ifstream in(file, std::ios::binary);
@@ -545,6 +575,18 @@ std::optional<int> clauseCount(const std::string& detail, const std::string& cla
     while (start > 0 && std::isdigit(static_cast<unsigned char>(detail[start - 1]))) --start;
     if (start == at || at - start > 9) return std::nullopt;
     return std::stoi(detail.substr(start, at - start));
+}
+
+// How many times `clause` occurs in `detail`. The counted-losses phase needs it because the
+// property there is "ONE clause carrying N", and clauseCount() reads the first occurrence only:
+// a report that emitted the same clause twice would answer the same number.
+int clauseOccurrences(const std::string& detail, const std::string& clause) {
+    int seen = 0;
+    for (std::size_t at = detail.find(clause); at != std::string::npos;
+         at = detail.find(clause, at + clause.size())) {
+        ++seen;
+    }
+    return seen;
 }
 
 // The same, with an unreadable count reported as a skip of `goals` and the report printed.
@@ -1111,6 +1153,47 @@ void runNonUtf8Checks() {
     check(everyCauseNamed,
           "the dropped-wallpaper notice names the type as a cause and says the screen name survived");
     if (!skipReported || !everyCauseNamed) std::fprintf(stderr, "  persistence detail: %s\n", detail.c_str());
+
+    // GOAL: the promise the notice makes -- "any screen name on those rows was kept" -- is only
+    //       made when the file really kept it. False if the name went out with the wallpaper: the
+    //       user reads that their screen is still named, restarts, and finds it anonymous, which
+    //       is worse than being told nothing because it stops them re-naming it.
+    // WHY-THIS-SHAPE: the promise is graded against the FILE, not against the wording. Asserting
+    //       the sentence is present -- the check directly above, and the simpler shape this one
+    //       rejects -- is satisfied by any build that prints it, including one that dropped the
+    //       row; only reading the row back can tell the two apart. The name is bound after the
+    //       unwritable wallpaper is set, so the row's two halves fail and succeed in one save.
+    // CONTROL: the row-dropping test in ConfigStore::save() (backend/daemon/config_store.cpp)
+    //       collapsed to the one gate over both halves, `if (!wallpaperOk || !nameOk) continue;`,
+    //       which is the code before this fix -> "FAIL: the screen name the notice promises was
+    //       kept is in the file", printing "monitor 0 is not in the file at all" beside a detail
+    //       still reading "(1 wallpapers dropped: ...; any screen name on those rows was kept)".
+    //       Observed 2026-08-18, reverted. Two checks above it go red from the same edit.
+    manager.setMonitorOutput(0, "DP-PROMISED");
+    const std::string namedDetail = manager.snapshot().health.persistence.detail;
+    std::string promisedWhy;
+    const std::map<int, RowInFile> promisedRows = rowsInFile(managerConfig.configFile, promisedWhy);
+    const bool promiseKept = promisedRows.count(0) == 1 && promisedRows.at(0).hasOutputKey &&
+                             promisedRows.at(0).output == "DP-PROMISED" &&
+                             namedDetail.find("any screen name on those rows was kept") != std::string::npos;
+    check(promiseKept, "the screen name the notice promises was kept is in the file");
+    if (!promiseKept) {
+        const std::string what = promisedRows.count(0) == 0
+                                     ? std::string("monitor 0 is not in the file at all")
+                                     : "monitor 0 holds output '" + promisedRows.at(0).output + "'" +
+                                           (promisedRows.at(0).hasOutputKey ? "" : " (no output key)");
+        std::fprintf(stderr, "  %s; %s; persistence detail: %s\n",
+                     promisedWhy.empty() ? "read back" : promisedWhy.c_str(), what.c_str(), namedDetail.c_str());
+    }
+    // COVERAGE-ASSERT: the save this promise is about really did drop a wallpaper. Without it the
+    // check is equally true of a run where nothing was skipped and the promise was never made --
+    // the clause would be absent, the name present, and the check would pass having graded
+    // nothing.
+    const std::optional<int> stillSkipped =
+        clauseCountOrSkip(namedDetail, " wallpapers dropped", "the wording of the daemon's dropped-wallpaper notice");
+    if (!stillSkipped.has_value()) return;
+    check(*stillSkipped == 1, "the save that carried the kept name is still one that dropped a wallpaper");
+    if (*stillSkipped != 1) std::fprintf(stderr, "  persistence detail: %s\n", namedDetail.c_str());
 }
 
 // ---------------------------------------------------------------------------- //
@@ -2497,6 +2580,193 @@ void runCopyMechanicsChecks() {
 }
 
 // ---------------------------------------------------------------------------- //
+// Phase 6bh -- S10.18's removal clause: the bytes are safe, the original would not go.
+// ---------------------------------------------------------------------------- //
+void runPreservedCopySurvivesFailedRemovalChecks() {
+    constexpr const char* kGoals = "S10.18's removal clause (a copy that holds the bytes counts as preserved even "
+                                   "when the original cannot be removed, the report says the original is still in "
+                                   "place, and saving is not refused for the rest of the run)";
+
+    // The two ways a copy can already hold the bytes when the removal fails. They are separate
+    // arms of keepCopyIn() and were separately wrong, so one fixture cannot stand for both.
+    struct Arm {
+        const char* what;
+        bool stageExistingCopy;  // an earlier start already preserved exactly these bytes
+        bool crossDevice;        // the state directory is on another filesystem, so a copy is made
+    };
+    const Arm arms[] = {
+        {"a copy an earlier start already made, holding these same bytes", true, false},
+        {"a copy this start wrote, because the two directories are on different filesystems", false, true},
+    };
+
+    int exercised = 0;
+    int unstageable = 0;
+    for (const Arm& arm : arms) {
+        const ScratchDir scratch("keptnoremove");
+        // preparePhase: the save at the end of each arm persists a real wallpaper path, which a
+        // temporary directory whose name is not valid UTF-8 would make the writer drop by design.
+        const std::optional<PhasePaths> paths = preparePhase(scratch, kGoals, 1);
+        if (!paths.has_value()) {
+            ++unstageable;
+            continue;
+        }
+        const ScopedEnv stateHome("XDG_STATE_HOME", stateHomeOf(scratch).string());
+        const std::filesystem::path& file = paths->config;
+        const std::filesystem::path kept = preservedCopyDir(scratch) / "config.json.bad";
+        // Read and rejected, not unopenable: preservation only moves bytes the daemon actually
+        // holds, and the trailing comma is what makes this file valid enough to read and invalid
+        // as JSON. Two monitors, so losing it is losing wallpapers rather than losing nothing.
+        const std::string usersOwn =
+            "{\"version\":1,\"monitors\":[{\"monitor_id\":0,\"type\":\"static\",\"path\":\"/photos/left.png\"},"
+            "{\"monitor_id\":1,\"type\":\"static\",\"path\":\"/photos/right.png\"},]}";
+        if (!writeFile(file, usersOwn) || (arm.stageExistingCopy && !writeFile(kept, usersOwn))) {
+            ++unstageable;
+            notVerified(kGoals, std::string("the '") + arm.what + "' case could not be staged: the config file, or "
+                                                                  "the copy standing for an earlier start, could not "
+                                                                  "be written");
+            continue;
+        }
+
+        // The config directory read-only is what makes the REMOVAL fail while the bytes are
+        // reachable: the file is still readable and still copyable out, and only unlinking it
+        // from this directory is refused.
+        std::error_code ec;
+        std::filesystem::permissions(file.parent_path(),
+                                     std::filesystem::perms::owner_read | std::filesystem::perms::owner_exec,
+                                     std::filesystem::perm_options::replace, ec);
+        if (ec) {
+            ++unstageable;
+            notVerified(kGoals, std::string("the config directory could not be made read-only for the '") + arm.what +
+                                    "' case: " + ec.message());
+            continue;
+        }
+        // Restored explicitly before the checks -- the last of them needs a save to land in this
+        // directory -- with the destructor as the backstop for any return added later.
+        struct RestorePermissions {
+            std::filesystem::path dir;
+            bool restored = false;
+            ~RestorePermissions() { restore(); }
+            void restore() {
+                if (restored) return;
+                std::error_code restoreEc;
+                std::filesystem::permissions(dir, std::filesystem::perms::owner_all,
+                                             std::filesystem::perm_options::add, restoreEc);
+                restored = !restoreEc;
+            }
+        } restorePermissions{file.parent_path()};
+        { std::ofstream probe(file.parent_path() / "probe"); }
+        if (std::filesystem::exists(file.parent_path() / "probe")) {
+            std::filesystem::remove(file.parent_path() / "probe", ec);
+            ++unstageable;
+            notVerified(kGoals, "this process can write into a directory it made read-only (running as root, or a "
+                                "filesystem that ignores mode bits), so the removal of the original cannot be made "
+                                "to fail");
+            continue;
+        }
+        ++exercised;
+
+        // GOAL: bytes safely at <kept> are PRESERVED even though the original would not go away,
+        //       the note says so, and the run goes on saving. False before this fix in both arms:
+        //       keepCopyIn() reported nothing preserved when only the removal failed -- and the
+        //       fresh-copy arm deleted the good copy it had just written on the way out. Reporting
+        //       nothing preserved leaves m_configUnread set, which refuses EVERY save for the rest
+        //       of the process, so a user with a read-only config directory loses every wallpaper
+        //       change until they restart, silently.
+        // WHY-THIS-SHAPE: the last check is a real save landing in the file, not a reading of the
+        //       health status. The status is Fail either way here -- the config was unreadable, and
+        //       that is what it reports -- so grading the status would be green against the build
+        //       that refuses every save. Only a row on disk separates them. The directory is put
+        //       back to writable BEFORE that save, so what it measures is the daemon's refusal and
+        //       not the mode bits. The failure is a real EACCES from a real unlink rather than an
+        //       interposed one; what is simulated is only the arm's precondition (see below).
+        // CONTROL: two, one per arm, both in keepCopyIn() (backend/daemon/wallpaper_manager.cpp),
+        //       both reverted -- see the arm table above for which fixture reaches which.
+        //       (a) the SameBytes arm made to return `{{}, trouble}` when the removal failed,
+        //       which is the code before this fix -> the reuse arm alone red, on "the copy holding
+        //       the config's bytes is reported as preserved" with a detail reading "not kept:
+        //       <state dir>: Permission denied; <config dir>: Permission denied; not saving over
+        //       it; ...", and on "a wallpaper set after the copy was made reaches the config file"
+        //       with the file still holding the user's own bytes and the daemon saying "not saved,
+        //       this run could not read it and will not overwrite it".
+        //       (b) the fresh-copy arm made to remove <kept> and return `{{}, trouble}` the same
+        //       way -> the cross-filesystem arm alone red, on those same two plus "the preserved
+        //       copy holds exactly the bytes the config held", printing "no copy exists at all" --
+        //       the good copy deleted on the way out. Each arm stays green under the other's
+        //       mutation, which is why they are separate fixtures.
+        // COVERAGE-ASSERT: `exercised + unstageable` is asserted against the table's size below,
+        //       so an arm that stops being reached is neither counted nor reported and the sum
+        //       falls short. CONTROL: a `continue` for the cross-filesystem arm at the top of the
+        //       loop -> "FAIL: every failed-removal case was either exercised or reported as one
+        //       this host could not stage", printing "1 exercised and 0 unstageable, of 2".
+        //       Reverted.
+        const std::string armName = arm.what;
+        {
+            // Scoped so the injection is gone before the save below: the config writer's own
+            // rename is how a save lands, and a leaked EXDEV would fail it for the wrong reason.
+            std::optional<CrossDeviceRenames> crossDevice;
+            if (arm.crossDevice) crossDevice.emplace(file);
+
+            WallpaperManager::Config config;
+            config.configFile = file;
+            WallpaperManager manager(config);
+            manager.restoreSaved();
+            manager.preserveUnreadableConfig();
+            const std::string detail = manager.snapshot().health.persistence.detail;
+            crossDevice.reset();
+
+            const std::vector<std::string> copies = preservedCopyNames(file, preservedCopyDir(scratch));
+            const bool copyHoldsIt = copies.size() == 1 && readFile(copies.front()) == usersOwn;
+            check(copyHoldsIt, (armName + ": the preserved copy holds exactly the bytes the config held").c_str());
+            if (!copyHoldsIt) {
+                std::fprintf(stderr, "  %s\n",
+                             copies.empty() ? "no copy exists at all"
+                                            : ("copies: " + joined(copies)).c_str());
+            }
+            // The original really did stay: without this the arm could be staged by a removal that
+            // quietly succeeded, and every check below would grade the ordinary path.
+            const bool originalStayed = readFile(file) == usersOwn;
+            check(originalStayed, (armName + ": the original this run could not remove is still where it was").c_str());
+            if (!originalStayed) {
+                std::error_code existsEc;
+                std::fprintf(stderr, "  %s\n",
+                             std::filesystem::exists(file, existsEc)
+                                 ? ("config.json now holds: " + readFile(file)).c_str()
+                                 : "config.json is gone, so the removal this arm needs to fail succeeded");
+            }
+
+            const bool reportedKept = detail.find("kept as " + kept.string()) != std::string::npos &&
+                                      detail.find("original still in place") != std::string::npos &&
+                                      detail.find("not kept") == std::string::npos &&
+                                      detail.find("not saving over it") == std::string::npos;
+            check(reportedKept, (armName + ": the copy holding the config's bytes is reported as preserved").c_str());
+            if (!reportedKept) std::fprintf(stderr, "  persistence detail: %s\n", detail.c_str());
+
+            restorePermissions.restore();
+            if (!restorePermissions.restored) {
+                harnessFailure("the config directory could not be made writable again, so whether the daemon still "
+                               "saves cannot be asked");
+                continue;
+            }
+            manager.requestWallpaper("static", paths->wallpapers[0].string(), 1);
+            const bool landed = waitForRows(file, [&paths](const std::map<int, RowInFile>& rows) {
+                return rows.count(1) == 1 && rows.at(1).path == paths->wallpapers[0].string();
+            });
+            check(landed, (armName + ": a wallpaper set after the copy was made reaches the config file").c_str());
+            if (!landed) {
+                std::fprintf(stderr, "  config.json holds: %s\n  persistence detail: %s\n", readFile(file).c_str(),
+                             manager.snapshot().health.persistence.detail.c_str());
+            }
+        }
+    }
+
+    const bool allAccounted = exercised + unstageable == static_cast<int>(std::size(arms));
+    check(allAccounted, "every failed-removal case was either exercised or reported as one this host could not stage");
+    if (!allAccounted) {
+        std::fprintf(stderr, "  %d exercised and %d unstageable, of %zu\n", exercised, unstageable, std::size(arms));
+    }
+}
+
+// ---------------------------------------------------------------------------- //
 // Phase 6bg -- S10.18's exhaustion clause: a repair that recurs every start.
 // ---------------------------------------------------------------------------- //
 void runPreservationReuseChecks() {
@@ -2951,6 +3221,61 @@ void runOutputFieldChecks() {
     check(othersKept, "a connector name that is not valid UTF-8 costs no other row its name");
     if (!othersKept) {
         std::fprintf(stderr, "  ids on disk: %s\n", idsOf(afterBad).c_str());
+    }
+
+    // GOAL: the lost name is COUNTED. A screen this file cannot carry the name of is a screen
+    //       that comes back anonymous, and only the caller can say so -- so a save that dropped
+    //       it and reported success is a loss with nothing anywhere pointing at it. False if the
+    //       name half of the gate skips the field and increments nothing, which is what it did:
+    //       the two checks above were satisfied by exactly that build.
+    // WHY-THIS-SHAPE: the count is graded on its own, beside the assertion above that the same
+    //       save reports NO dropped wallpaper. One counter for both losses is the simpler shape
+    //       and is wrong in the direction that matters: the health text turns skippedNonUtf8 into
+    //       "N wallpapers dropped", so a name counted there tells the user a picture will not come
+    //       back and sends them looking for a monitor that is not missing.
+    // CONTROL: `++result.skippedNames;` deleted from ConfigStore::save()
+    //       (backend/daemon/config_store.cpp), which is the code before this fix -> "FAIL: a
+    //       screen name the config file cannot carry is counted as one lost name", printing "0
+    //       screen names reported dropped, 0 wallpapers". Observed 2026-08-18, reverted.
+    //       Graded here and not through a manager because nothing a client can do makes this
+    //       counter move -- every path that reaches save() with a name has already run it past
+    //       outputNameError(), which rejects invalid UTF-8, and nlohmann refuses such a byte as a
+    //       whole-file syntax error on the way in. The persistence health going to Fail on this
+    //       counter is therefore defence in depth, and no check in this file can reach it.
+    const bool nameLossCounted = badSave.skippedNames == 1;
+    check(nameLossCounted, "a screen name the config file cannot carry is counted as one lost name");
+    if (!nameLossCounted) {
+        std::fprintf(stderr, "  %d screen names reported dropped, %d wallpapers\n", badSave.skippedNames,
+                     badSave.skippedNonUtf8);
+    }
+
+    // GOAL: the name is counted wherever it is lost, including on a row that keeps nothing at all.
+    //       False if the counter sits after the "nothing left worth a row" continue: the row with
+    //       BOTH halves unwritable is the one where the screen loses its name most completely,
+    //       and it would be the one case reported as a wallpaper loss alone -- the user re-picks a
+    //       picture and the screen is still anonymous.
+    // WHY-THIS-SHAPE: its own store and file, written last, because it replaces the file the
+    //       checks above read back. Both counters are asserted from one save: the row is gone
+    //       entirely, so "one wallpaper and one name were lost" is the only report that describes
+    //       what happened, and asserting the name count alone would pass for a build that had
+    //       stopped counting the wallpaper.
+    // CONTROL: the `if (!nameOk && !entry.output.empty()) ++result.skippedNames;` line in
+    //       ConfigStore::save() moved below the `if (!wallpaperOk && (!nameOk ||
+    //       entry.output.empty())) continue;` that discards the row -> "FAIL: a row that loses
+    //       both halves is reported as one lost wallpaper and one lost name", printing "1
+    //       wallpapers and 0 names reported dropped, 0 rows on disk".
+    const std::filesystem::path bothBadFile = scratch.path() / "bothbad.json";
+    const ConfigStore bothBadStore(bothBadFile);
+    const std::string badUtf8Path = std::string("/tmp/bad\x80name.png");
+    const SaveResult bothBad = bothBadStore.save({{4, "static", badUtf8Path, badUtf8Name}});
+    std::string bothWhy;
+    const std::map<int, RowInFile> afterBoth = rowsInFile(bothBadFile, bothWhy);
+    const bool bothCounted =
+        bothBad.error.empty() && bothBad.skippedNonUtf8 == 1 && bothBad.skippedNames == 1 && afterBoth.empty();
+    check(bothCounted, "a row that loses both halves is reported as one lost wallpaper and one lost name");
+    if (!bothCounted) {
+        std::fprintf(stderr, "  %d wallpapers and %d names reported dropped, %zu rows on disk; save error '%s'\n",
+                     bothBad.skippedNonUtf8, bothBad.skippedNames, afterBoth.size(), bothBad.error.c_str());
     }
 }
 
@@ -3664,19 +3989,20 @@ void runKeptWallpaperDisplacedAtRuntimeChecks() {
     //       block disabled, which is the code before this fix -> "FAIL: a kept wallpaper a client
     //       displaced is reported at the moment it is displaced", printing "the note appears 0
     //       times", and "FAIL: setting the same monitor again does not report the same loss a
-    //       second time", printing "the note appears 0 times after a second save". (b) the two
-    //       clear() calls removed, leaving the note -- the plausible half-fix -> "FAIL: setting
-    //       the same monitor again does not report the same loss a second time", printing "the
-    //       note appears 2 times after a second save", with the first two checks GREEN: that is
-    //       the whole reason occurrences are counted. (c) the `(!kept->type.empty() ||
-    //       !kept->path.empty())` guard dropped, which reports a displacement whenever any kept
-    //       row exists for the id -> the same one red, same count.
-    //       NOT RE-OBSERVED since 2026-08-18, when the daemon stopped appending one sentence per
-    //       displacement and started counting into one clause: the guard named in (c) now lives
-    //       inside WallpaperManager::dropKeptWallpaper(), and the counts above are read out of
-    //       the clause rather than counted as occurrences. Each control should still redden the
-    //       same check -- that is the reason the count is read rather than the sentence matched --
-    //       but it is reasoning, not an observation, until the three are run again.
+    //       second time", printing "the note appears 0 times after a second save". (b) the row
+    //       counted without being cleared -- `dropKeptWallpaper(*kept)` at that call site replaced
+    //       by a bare emptiness test, which is the plausible half-fix -> "FAIL: setting the same
+    //       monitor again does not report the same loss a second time", printing "the note appears
+    //       2 times after a second save; persistence detail: 2 entries this build cannot apply,
+    //       replaced by new wallpapers for those screens; ...", with the first two checks GREEN.
+    //       (c) the `row.type.empty() && row.path.empty()` guard deleted from
+    //       WallpaperManager::dropKeptWallpaper(), so a row already emptied is counted again ->
+    //       the same single check red with the same count of 2, and nothing else in this file red:
+    //       this phase is the only defender of that guard.
+    //       All three re-observed 2026-08-18 against the aggregated clause, after the daemon
+    //       stopped appending one sentence per displacement, and all three reverted. Reading the
+    //       count out of the clause is what keeps (b) and (c) red: a search for the sentence would
+    //       find one occurrence either way.
     // COVERAGE-ASSERT: the kept row is asserted to have been promised back BEFORE any client
     //       acts. Without it every count below is equally true of a fixture the daemon rejected
     //       outright, and the phase would be green over a manager that never kept anything.
@@ -3980,6 +4306,362 @@ void runCrossContainerDuplicateChecks() {
           "both file orders of the cross-container collision were graded");
     if (graded != static_cast<int>(std::size(orderings))) {
         std::fprintf(stderr, "  %d of %zu orderings graded\n", graded, std::size(orderings));
+    }
+}
+
+// ---------------------------------------------------------------------------- //
+// Phase 6g3b -- S10.19: what "a live monitor owns this id" is allowed to mean.
+// ---------------------------------------------------------------------------- //
+void runStrictOwnershipChecks() {
+    constexpr const char* kGoals = "S10.19's ownership test in its strict form (a kept row is surrendered only to a "
+                                   "live monitor that actually HOLDS a wallpaper, so a monitor this daemon records "
+                                   "without one cannot silently drop a user's kept row)";
+    const ScratchDir scratch("strictownership");
+    const std::optional<PhasePaths> paths = preparePhase(scratch, kGoals, 1);
+    if (!paths.has_value()) return;
+    const ScopedEnv stateHome("XDG_STATE_HOME", stateHomeOf(scratch).string());
+    const std::filesystem::path& file = paths->config;
+
+    // A row for monitor 0 -- an id this build CAN bind -- kept only because "hologram" is a type
+    // no build here knows. That is the row a loosened ownership test would give away.
+    nlohmann::json monitors = nlohmann::json::array();
+    monitors.push_back(configRow(0, "hologram", "/newer-build.holo", ""));
+    nlohmann::json root;
+    root["version"] = 1;
+    root["monitors"] = monitors;
+    if (!writeFile(file, root.dump())) {
+        notVerified(kGoals, "the config file this phase reads could not be written");
+        return;
+    }
+
+    WallpaperManager::Config config;
+    config.configFile = file;
+    WallpaperManager manager(config);
+    manager.restoreSaved();
+
+    // COVERAGE-ASSERT: the row this phase protects is really being kept before anything is
+    // driven. Without it every observation below holds trivially for a manager that kept nothing.
+    const std::optional<int> keptBefore =
+        clauseCountOrSkip(manager.snapshot().health.persistence.detail, " entries this build cannot apply, kept",
+                          kGoals);
+    if (!keptBefore.has_value()) return;
+    check(*keptBefore == 1, "the kept row this phase protects is there before anything is driven");
+    if (*keptBefore != 1) return;
+
+    // GOAL: no call a client can make records monitor 0 as live-but-wallpaper-less, and the kept
+    //       row for it survives every one of them. The strict ownership test -- liveHoldsLocked()
+    //       asks whether a live monitor HOLDS a wallpaper, not whether its id is present -- is
+    //       what makes the second half true if the first ever stops being.
+    // WHY-THIS-SHAPE: the strict form and the loose one are equivalent today, so the difference
+    //       between them cannot be observed through any interface: nothing records a monitor
+    //       without a wallpaper. Asserting the difference directly is therefore impossible, and a
+    //       check that pretended to would be vacuous. What this asserts instead is the
+    //       PRECONDITION under which they agree, driven across every public call that could
+    //       plausibly break it, together with the row whose survival depends on it. When a future
+    //       change does record a placeholder monitor -- a screen named before anything is chosen
+    //       for it is the obvious one -- this goes red at that change rather than at the config
+    //       file, which is where the loss would otherwise first be visible, one restart later.
+    // CONTROL: two mutations, applied together and separately, both in
+    //       backend/daemon/wallpaper_manager.cpp, both reverted. (a) `m_monitors[monitorId];`
+    //       added to WallpaperManager::setMonitorOutput(), which is the placeholder monitor this
+    //       check exists to catch -> "FAIL: no call this phase drives records a monitor without a
+    //       wallpaper", printing that line for all three calls, with the kept row still safe --
+    //       the strict test doing its job. (b) the same with liveHoldsLocked() ALSO loosened to
+    //       `m_monitors.count(monitorId) != 0` -> both red, the second printing "the kept row for
+    //       monitor 0 is of type ''", the row surviving as an empty shell with the user's
+    //       wallpaper gone from it. That is the loss (a) exists to fail before.
+    // COVERAGE-ASSERT: three calls are asserted to have been driven, against a literal three.
+    //       CONTROL: the render entry deleted from the table, which is what dropping an awkward
+    //       call looks like -> "FAIL: all three calls this phase means to drive were driven",
+    //       printing "2 calls driven, expected 3", and nothing else. Reverted.
+    struct Touch {
+        const char* what;
+        void (*drive)(WallpaperManager&);
+    };
+    static constexpr Touch kTouches[] = {
+        {"naming the screen", [](WallpaperManager& m) { m.setMonitorOutput(0, "DP-KEPT"); }},
+        {"asking it to render what has not been set", [](WallpaperManager& m) { m.renderPending(0); }},
+        {"asking it for a frame", [](WallpaperManager& m) { m.exportCurrentFrame(0); }},
+    };
+    int driven = 0;
+    bool placeholderSeen = false;
+    for (const Touch& touch : kTouches) {
+        touch.drive(manager);
+        ++driven;
+        for (const auto& [monitorId, status] : manager.snapshot().monitors) {
+            if (!status.type.empty() || !status.path.empty()) continue;
+            placeholderSeen = true;
+            std::fprintf(stderr, "  monitor %d is recorded with no wallpaper after: %s\n", monitorId, touch.what);
+        }
+    }
+    check(!placeholderSeen, "no call this phase drives records a monitor without a wallpaper");
+    // Against a literal, not against std::size(kTouches): the table's own size is true by
+    // construction and stays green after an entry is deleted, which is the edit this guards.
+    check(driven == 3, "all three calls this phase means to drive were driven");
+    if (driven != 3) std::fprintf(stderr, "  %d calls driven, expected 3\n", driven);
+
+    // The row itself, read from the file the last save left: the ownership test decides what
+    // persistableLocked() writes, so this is where a loosened one is paid for.
+    const bool survived = waitForRows(file, [](const std::map<int, RowInFile>& rows) {
+        return rows.count(0) == 1 && rows.at(0).type == "hologram";
+    });
+    check(survived, "the kept row for a monitor nothing has been set on survives the save");
+    if (!survived) {
+        std::string why;
+        const std::map<int, RowInFile> rows = rowsInFile(file, why);
+        std::fprintf(stderr, "  %s; the kept row for monitor 0 is %s; ids on disk: %s\n",
+                     why.empty() ? "read back" : why.c_str(),
+                     rows.count(0) == 0 ? "gone from the file" : ("of type '" + rows.at(0).type + "'").c_str(),
+                     idsOf(rows).c_str());
+    }
+}
+
+// ---------------------------------------------------------------------------- //
+// Phase 6g4 -- S10.19 for names: a carried screen name a client takes over.
+// ---------------------------------------------------------------------------- //
+void runKeptNameTakenOverAtRuntimeChecks() {
+    constexpr const char* kGoals = "S10.19 for names at runtime (a screen name carried for a build with more monitors, "
+                                   "taken over by a client naming a monitor this build CAN bind, is reported rather "
+                                   "than dropped in silence)";
+    const ScratchDir scratch("nametakenover");
+    const std::optional<PhasePaths> paths = preparePhase(scratch, kGoals, 1);
+    if (!paths.has_value()) return;
+    const ScopedEnv stateHome("XDG_STATE_HOME", stateHomeOf(scratch).string());
+    const std::filesystem::path& file = paths->config;
+
+    // Monitor 100 is above this build's limit of 32, which is the ONLY reason its name is
+    // carried rather than dropped: a larger kMaxMonitors would bind it. "hologram" keeps the
+    // row itself unapplied too, so the row survives the save that follows.
+    nlohmann::json monitors = nlohmann::json::array();
+    monitors.push_back(configRow(100, "hologram", "/newer-build.holo", "DP-CARRIED"));
+    nlohmann::json root;
+    root["version"] = 1;
+    root["monitors"] = monitors;
+    if (!writeFile(file, root.dump())) {
+        notVerified(kGoals, "the config file this phase reads could not be written");
+        return;
+    }
+
+    WallpaperManager::Config config;
+    config.configFile = file;
+    WallpaperManager manager(config);
+    manager.restoreSaved();
+
+    const std::string carriedClause = " screen names this build's monitor limit excludes, kept";
+    const std::string takenClause = " screen names this build cannot bind, taken over by new names";
+
+    // COVERAGE-ASSERT: the name really is being carried before any client acts. Without it every
+    // check below is equally true of a fixture whose name the restore had already dropped, and
+    // the phase would grade a daemon that never carried anything.
+    const std::optional<int> carriedBefore =
+        clauseCountOrSkip(manager.snapshot().health.persistence.detail, carriedClause, kGoals);
+    if (!carriedBefore.has_value()) return;
+    check(*carriedBefore == 1, "the screen name this phase takes over was promised back before any client acted");
+    if (*carriedBefore != 1) {
+        std::fprintf(stderr, "  %d carried; persistence detail: %s\n", *carriedBefore,
+                     manager.snapshot().health.persistence.detail.c_str());
+        return;
+    }
+
+    // GOAL: a client naming a monitor this build CAN bind takes a name away from a row carried
+    //       for a build with more monitors, and the daemon says so. False before this fix: the
+    //       name was dropped inside persistableLocked(), which is const, runs on every save and
+    //       cannot report -- so the screen the user had named on their other machine came back
+    //       anonymous with nothing anywhere saying why. Each mutator is expected to erase and
+    //       report first, and setMonitorOutput() had no such patch while requestWallpaper() did.
+    // WHY-THIS-SHAPE: three observations, not one. That the taken-over clause appears is not
+    //       enough on its own -- the simpler check, and it would pass for a build that reported
+    //       the loss and went on promising the name back as well, which is the more confusing
+    //       report of the two. So the carried clause is asserted to have gone, and the FILE is
+    //       read to confirm the name really did move rather than being reported as lost while
+    //       still on the carried row. The startup twin below is what pins the asymmetry the fix
+    //       was about: the same collision arriving from the file was reported all along.
+    // CONTROL: the erase-and-count block in WallpaperManager::setMonitorOutput()
+    //       (backend/daemon/wallpaper_manager.cpp) disabled, which is the code before this fix ->
+    //       "FAIL: a carried screen name a client takes over is reported at the moment it is
+    //       taken", printing "the report counts 0" beside a detail that still promises the row's
+    //       wallpaper back. Reverted. The other two checks here are each defended TWICE in
+    //       production, so that one mutation cannot redden them, and each needed the second
+    //       defence removed as well -- both observed, both reverted:
+    //       the promise check with `m_outputs.count(entry.output) == 0` dropped from
+    //       persistenceDetail()'s keptNames test -> "FAIL: the report stops promising back a
+    //       screen name a client has taken", printing "1 still promised";
+    //       the file check with `m_outputs.count(row.output) != 0` dropped from
+    //       persistableLocked()'s clearing loop -> "FAIL: the name the report says was taken over
+    //       really did leave the carried row", printing "ids on disk: 0 100" with both rows
+    //       carrying the name -- two monitors answering to one screen at the next start.
+    manager.setMonitorOutput(0, "DP-CARRIED");
+    const std::string detail = manager.snapshot().health.persistence.detail;
+
+    const std::optional<int> takenOver = clauseCountOrSkip(detail, takenClause, kGoals);
+    const std::optional<int> carriedAfter = clauseCountOrSkip(detail, carriedClause, kGoals);
+    if (!takenOver.has_value() || !carriedAfter.has_value()) return;
+    check(*takenOver == 1, "a carried screen name a client takes over is reported at the moment it is taken");
+    if (*takenOver != 1) std::fprintf(stderr, "  the report counts %d; detail: %s\n", *takenOver, detail.c_str());
+    check(*carriedAfter == 0, "the report stops promising back a screen name a client has taken");
+    if (*carriedAfter != 0) std::fprintf(stderr, "  %d still promised; detail: %s\n", *carriedAfter, detail.c_str());
+
+    std::string why;
+    const std::map<int, RowInFile> rows = rowsInFile(file, why);
+    const bool moved = rows.count(0) == 1 && rows.at(0).output == "DP-CARRIED" &&
+                       (rows.count(100) == 0 || !rows.at(100).hasOutputKey);
+    check(moved, "the name the report says was taken over really did leave the carried row");
+    if (!moved) {
+        std::string carrying;
+        for (const auto& [id, row] : rows) {
+            if (row.output == "DP-CARRIED") carrying += " " + std::to_string(id);
+        }
+        std::fprintf(stderr, "  %s; ids on disk: %s; rows carrying 'DP-CARRIED':%s\n",
+                     why.empty() ? "read back" : why.c_str(), idsOf(rows).c_str(),
+                     carrying.empty() ? " (none)" : carrying.c_str());
+    }
+
+    // The startup twin of the same collision, in its own manager over its own file: a row this
+    // build CAN bind claims the name a carried row also claims. This was reported before the fix
+    // and must still be, which is what makes the check above a statement about the runtime path
+    // rather than about reporting in general.
+    const ScratchDir twinScratch("nametakenovertwin");
+    const std::optional<PhasePaths> twinPaths = preparePhase(twinScratch, kGoals, 1);
+    if (!twinPaths.has_value()) return;
+    const ScopedEnv twinStateHome("XDG_STATE_HOME", stateHomeOf(twinScratch).string());
+    nlohmann::json twinMonitors = nlohmann::json::array();
+    twinMonitors.push_back(configRow(0, "static", twinPaths->wallpapers[0].string(), "DP-CARRIED"));
+    twinMonitors.push_back(configRow(100, "hologram", "/newer-build.holo", "DP-CARRIED"));
+    nlohmann::json twinRoot;
+    twinRoot["version"] = 1;
+    twinRoot["monitors"] = twinMonitors;
+    if (!writeFile(twinPaths->config, twinRoot.dump())) {
+        notVerified(kGoals, "the config file the startup twin reads could not be written");
+        return;
+    }
+    WallpaperManager::Config twinConfig;
+    twinConfig.configFile = twinPaths->config;
+    WallpaperManager twin(twinConfig);
+    twin.restoreSaved();
+    const std::optional<int> displaced = clauseCountOrSkip(twin.snapshot().health.persistence.detail,
+                                                          " screen names displaced by another entry", kGoals);
+    if (!displaced.has_value()) return;
+    check(*displaced == 1, "the same collision arriving from the config file is reported too");
+    if (*displaced != 1) {
+        std::fprintf(stderr, "  %d displaced; persistence detail: %s\n", *displaced,
+                     twin.snapshot().health.persistence.detail.c_str());
+    }
+}
+
+// ---------------------------------------------------------------------------- //
+// Phase 6g5 -- S10.19: the two losses a client can cause over and over.
+// ---------------------------------------------------------------------------- //
+void runRepeatedRuntimeLossesAreBoundedChecks() {
+    constexpr const char* kGoals = "S10.19's reporting bound (the two losses a client can cause repeatedly are "
+                                   "rendered as one clause carrying a count, so N of them cannot crowd the counts "
+                                   "and the config path out of a report truncated at 1024 bytes)";
+    const ScratchDir scratch("repeatedlosses");
+    const std::optional<PhasePaths> paths = preparePhase(scratch, kGoals, 1);
+    if (!paths.has_value()) return;
+    const ScopedEnv stateHome("XDG_STATE_HOME", stateHomeOf(scratch).string());
+    const std::filesystem::path& file = paths->config;
+
+    // Twelve of each loss. The number is chosen against the daemon's own 1024-byte cap on the
+    // health detail: one sentence per occurrence runs past it at this count, and the cap drops
+    // the TAIL, which is where the config path and every count live. Fewer would leave the
+    // pre-fix build inside its budget and the phase would pass against it.
+    constexpr int kEach = 12;
+    nlohmann::json monitors = nlohmann::json::array();
+    for (int i = 0; i < kEach; ++i) {
+        // Ids this build can bind, kept only because the type is one no build here knows: a
+        // client setting that monitor is what displaces them.
+        monitors.push_back(configRow(i, "hologram", "/newer-build-" + std::to_string(i) + ".holo", ""));
+        // Ids above this build's limit, carrying names a client can take over.
+        monitors.push_back(configRow(100 + i, "hologram", "/future-" + std::to_string(i) + ".holo",
+                                     "DP-CARRIED-" + std::to_string(i)));
+    }
+    nlohmann::json root;
+    root["version"] = 1;
+    root["monitors"] = monitors;
+    if (!writeFile(file, root.dump())) {
+        notVerified(kGoals, "the config file this phase reads could not be written");
+        return;
+    }
+
+    WallpaperManager::Config config;
+    config.configFile = file;
+    WallpaperManager manager(config);
+    manager.restoreSaved();
+
+    const std::string replacedClause = " entries this build cannot apply, replaced by new wallpapers for those screens";
+    const std::string takenClause = " screen names this build cannot bind, taken over by new names";
+
+    // COVERAGE-ASSERT: all twenty-four losses this phase counts were really available to be
+    // caused. Without it a fixture the restore had thrown away would leave every count below
+    // trivially satisfied by a daemon that reported nothing at all.
+    const std::string before = manager.snapshot().health.persistence.detail;
+    const std::optional<int> keptBefore = clauseCountOrSkip(before, " entries this build cannot apply, kept", kGoals);
+    const std::optional<int> namesBefore =
+        clauseCountOrSkip(before, " screen names this build's monitor limit excludes, kept", kGoals);
+    if (!keptBefore.has_value() || !namesBefore.has_value()) return;
+    const bool fixtureStands = *keptBefore == 2 * kEach && *namesBefore == kEach;
+    check(fixtureStands, "the fixture offers twelve displaceable wallpapers and twelve takeable names");
+    if (!fixtureStands) {
+        std::fprintf(stderr, "  %d kept entries and %d carried names; persistence detail: %s\n", *keptBefore,
+                     *namesBefore, before.c_str());
+        return;
+    }
+
+    // GOAL: twelve occurrences of a loss produce ONE clause carrying twelve, not twelve
+    //       sentences. False before this fix: each occurrence appended a fixed sentence to a
+    //       note string that lives for the whole process and is never trimmed, while the health
+    //       detail is capped at 1024 bytes and the cap drops the tail -- so a dozen of them
+    //       pushed the counts and the config path, the things the message exists to carry, out
+    //       of the report entirely. A client can cause both of these as often as it likes.
+    // WHY-THIS-SHAPE: three assertions per loss, because each alone is passable by the build the
+    //       goal is about. The count alone is satisfied by a report that also repeats itself; the
+    //       occurrence count alone is satisfied by one clause carrying the wrong number; and
+    //       neither is what the user actually loses -- the config path is, so it is asserted
+    //       present in the same detail. clauseCount() reads the FIRST occurrence, which is why
+    //       clauseOccurrences() exists beside it.
+    // CONTROL: the two counter increments replaced by the per-occurrence sentence they replaced
+    //       -- `++m_replacedKept` in WallpaperManager::requestWallpaper() and `++m_takenOverNames`
+    //       in WallpaperManager::setMonitorOutput() (backend/daemon/wallpaper_manager.cpp) each
+    //       made an addPersistenceNote() of a fixed sentence -> all three checks here red: both
+    //       count checks printing "the clause appears 0 times and reads 0", and "FAIL: the report
+    //       still names the config file after twelve losses of each kind" printing "1059 bytes of
+    //       detail, not naming <path>", the detail being twelve identical sentences and a
+    //       thirteenth cut mid-word. Three more went red in the two phases above, which grade the
+    //       same two counters one occurrence at a time. Observed 2026-08-18, reverted.
+    for (int i = 0; i < kEach; ++i) {
+        manager.requestWallpaper("static", paths->wallpapers[0].string(), i);
+    }
+    for (int i = 0; i < kEach; ++i) {
+        manager.setMonitorOutput(kEach + i, "DP-CARRIED-" + std::to_string(i));
+    }
+
+    // Read once, after both bursts: every assertion below is about the same report, which is
+    // what the user is shown.
+    const std::string detail = manager.snapshot().health.persistence.detail;
+    const std::optional<int> replaced = clauseCountOrSkip(detail, replacedClause, kGoals);
+    const std::optional<int> taken = clauseCountOrSkip(detail, takenClause, kGoals);
+    if (!replaced.has_value() || !taken.has_value()) return;
+
+    const int replacedTimes = clauseOccurrences(detail, replacedClause);
+    const bool replacedBounded = *replaced == kEach && replacedTimes == 1;
+    check(replacedBounded, "twelve displaced wallpapers are reported as one clause counting twelve");
+    if (!replacedBounded) {
+        std::fprintf(stderr, "  the clause appears %d times and reads %d\n", replacedTimes, *replaced);
+    }
+    const int takenTimes = clauseOccurrences(detail, takenClause);
+    const bool takenBounded = *taken == kEach && takenTimes == 1;
+    check(takenBounded, "twelve taken-over screen names are reported as one clause counting twelve");
+    if (!takenBounded) {
+        std::fprintf(stderr, "  the clause appears %d times and reads %d\n", takenTimes, *taken);
+    }
+    // What the truncation actually costs, asserted directly rather than by measuring the length:
+    // a length bound would need a number nobody can justify, while the config path is the thing
+    // the message exists to name and it sits at the very end, so it is the first casualty.
+    const bool pathSurvives = detail.find(file.string()) != std::string::npos;
+    check(pathSurvives, "the report still names the config file after twelve losses of each kind");
+    if (!pathSurvives) {
+        std::fprintf(stderr, "  %zu bytes of detail, not naming %s: %s\n", detail.size(), file.string().c_str(),
+                     detail.c_str());
     }
 }
 
@@ -7297,6 +7979,7 @@ int main() {
         {"the copy made before a repair is written", runRepairCopyChecks},
         {"preservation on a daemon with no state directory", runPreservationWithoutHomeChecks},
         {"what a move is, and what a failed copy leaves", runCopyMechanicsChecks},
+        {"a copy kept when the original would not go", runPreservedCopySurvivesFailedRemovalChecks},
         {"a repair recomputed on every start", runPreservationReuseChecks},
         {"entries this build cannot apply", runUnappliedEntryChecks},
         {"the connector name as a stored field", runOutputFieldChecks},
@@ -7306,6 +7989,9 @@ int main() {
         {"a kept row a client takes the monitor of", runKeptWallpaperDisplacedAtRuntimeChecks},
         {"two rows for one monitor this build can apply", runDuplicateLiveRowChecks},
         {"one monitor claimed by a row this build can apply and one it cannot", runCrossContainerDuplicateChecks},
+        {"what owning a monitor id is allowed to mean", runStrictOwnershipChecks},
+        {"a carried screen name a client takes over", runKeptNameTakenOverAtRuntimeChecks},
+        {"the same loss caused twelve times", runRepeatedRuntimeLossesAreBoundedChecks},
         {"which kept row keeps a name three rows claim", runKeptNameLastWinsChecks},
         {"the rows kept for a build with more screens", runPreservedRowChecks},
         {"re-asserting a name a screen already has", runIdempotentRenameChecks},
