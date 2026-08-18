@@ -587,10 +587,26 @@ void WallpaperManager::setMonitorOutput(int monitorId, const std::string& output
         // change; persist() parks this thread -- the bus event loop -- on the write. Skipped
         // only when the file is known to hold what the map holds: any other answer, including a
         // write still outstanding, means re-asserting is the only retry a client can reach.
-        if (bindOutputLocked(monitorId, outputName) == BindResult::Unchanged &&
-            persistOutcomeLocked().onDisk) {
+        const BindResult bound = bindOutputLocked(monitorId, outputName);
+        if (bound == BindResult::Unchanged && persistOutcomeLocked().onDisk) {
             return;
         }
+
+        // A name carried for a build with more monitors is taken over by this one, and the save
+        // below drops it. Erased and reported here for the reason its wallpaper sibling above
+        // is: persistableLocked() is const, runs on every save, and cannot say what it dropped.
+        // Unchanged means the name was already this monitor's, so nothing new is superseded.
+        if (bound != BindResult::Unchanged) {
+            const auto kept = std::find_if(
+                m_unapplied.begin(), m_unapplied.end(),
+                [&outputName](const PersistedWallpaper& row) { return row.output == outputName; });
+            if (kept != m_unapplied.end()) {
+                kept->output.clear();
+                addPersistenceNote("1 screen name this build cannot bind, taken over by a new "
+                                   "name for another monitor");
+            }
+        }
+
         toPersist = persistableLocked();
     }
 
