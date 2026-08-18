@@ -1,0 +1,223 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#include "config_writer.h"
+
+#include "log_escape.h"
+
+#include <chrono>
+#include <thread>
+#include <utility>
+
+#include <unistd.h>
+
+namespace wallpaperx {
+namespace {
+
+// The same bound the config read uses: long enough that a slow disk is not cut off, short
+// enough that a stalled mount does not visibly stall a login.
+constexpr std::chrono::seconds kWriteDeadline{2};
+
+}
+
+ConfigWriter::ConfigWriter(ConfigStore store) : m_store(std::move(store)) {}
+
+void ConfigWriter::refuse(std::string why) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_refusing = true;
+    m_refusal = std::move(why);
+}
+
+void ConfigWriter::allow() {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_refusing = false;
+    m_refusal.clear();
+}
+
+bool ConfigWriter::refusing() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_refusing;
+}
+
+void ConfigWriter::startLocked() {
+    if (m_worker) return;
+
+    // The store is copied in and nothing else is captured: this thread outlives its owner
+    // whenever a write is stuck, and a write on a dead mount cannot be interrupted.
+    std::shared_ptr<PersistWorker> worker;
+    try {
+        worker = std::make_shared<PersistWorker>();
+        std::thread([worker, store = m_store] {
+            for (;;) {
+                std::vector<PersistedWallpaper> entries;
+                {
+                    std::unique_lock<std::mutex> lock(worker->mutex);
+                    // No stop condition: there is nothing safe to wait for at exit, since a
+                    // write on a dead mount cannot be interrupted. The thread ends with the
+                    // process, and holds nothing the process needs to release.
+                    worker->wake.wait(lock, [&worker] { return worker->pending.has_value(); });
+                    entries = std::move(*worker->pending);
+                    worker->pending.reset();
+                    worker->writingSince = std::chrono::steady_clock::now();
+                }
+
+                const SaveResult saved = store.save(entries);
+
+                // Said by the thread that learns it: the startup repair is queued, so any other
+                // report of it races the write and can read as a clean start.
+                //
+                // write(2), not stdio: this thread outlives main() when a write is stuck, and a
+                // FILE* torn down by exit is not something it can hold.
+                if (!saved.error.empty()) {
+                    const std::string line =
+                        "wallpaperx-daemon: config not saved: " + sanitizeForLog(saved.error) + "\n";
+                    const ssize_t ignored = ::write(STDERR_FILENO, line.data(), line.size());
+                    (void)ignored;
+                }
+
+                {
+                    std::lock_guard<std::mutex> lock(worker->mutex);
+                    worker->result = saved;
+                    worker->haveResult = true;
+                    worker->writingSince.reset();
+                    // The filesystem answered, so the next caller is allowed to wait again.
+                    worker->stalled = false;
+                }
+                worker->settled.notify_all();
+            }
+        }).detach();
+    } catch (const std::exception& e) {
+        // std::exception, not std::system_error: std::thread also allocates the callable's
+        // state, so std::bad_alloc reaches here and would otherwise kill the daemon at startup.
+        //
+        // Not published and not rethrown: a worker pointer with no thread behind it makes every
+        // later save wait out the deadline for an answer that cannot come. Recorded instead,
+        // and retried by the next save that is queued.
+        try {
+            m_notWritten = m_store.file().string() + ": not saved, no thread available: " + e.what();
+        } catch (...) {  // NOLINT(bugprone-empty-catch) -- nothing left to report it with
+        }
+        return;
+    }
+
+    // Published only now: a non-null worker means a thread is servicing it.
+    m_worker = std::move(worker);
+}
+
+bool ConfigWriter::queue(const std::vector<PersistedWallpaper>& rows) {
+    if (!m_store.enabled()) return false;
+
+    std::shared_ptr<PersistWorker> worker;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        // The save rebuilds the file from live state, so writing now would replace monitors
+        // this run never managed to read with the one the user just set.
+        if (m_refusing) {
+            m_notWritten = m_refusal;
+            return false;
+        }
+        startLocked();
+        worker = m_worker;
+        // Cleared only once the snapshot is on its way to a writer: from here the worker's own
+        // result is the authority, and a stale refusal would outrank it.
+        if (worker) m_notWritten.clear();
+    }
+    // No writer, and startLocked() recorded why: the next save retries.
+    if (!worker) return false;
+
+    {
+        std::lock_guard<std::mutex> workerLock(worker->mutex);
+        // Replaced, not appended: an older snapshot waiting behind a stalled write describes a
+        // state this one already supersedes, so writing it would only be a slower route to the
+        // same file.
+        worker->pending = rows;
+    }
+    worker->wake.notify_one();
+    return true;
+}
+
+bool ConfigWriter::write(const std::vector<PersistedWallpaper>& rows, std::string* whyNot) {
+    queue(rows);
+
+    std::shared_ptr<PersistWorker> worker;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        worker = m_worker;
+    }
+
+    // Waited on, briefly, so the reply to a save can say the choice is on disk in the healthy
+    // case -- which is the only case it can be said in. Past the deadline the write keeps going
+    // on the worker and this thread stops caring, so a stalled filesystem costs one wait rather
+    // than the daemon, and the choice is then NOT known to be saved.
+    if (worker) {
+        std::unique_lock<std::mutex> workerLock(worker->mutex);
+        const auto quiesced = [&worker] { return !worker->pending && !worker->writingSince; };
+        // Not waited on again until something completes: a second stalled call would add
+        // another deadline's delay to a thread that has already learned the answer.
+        if (!worker->stalled && !worker->settled.wait_for(workerLock, kWriteDeadline, quiesced)) {
+            worker->stalled = true;
+        }
+    }
+
+    const Outcome result = outcome();
+    if (!result.onDisk && whyNot != nullptr) *whyNot = result.why;
+    return result.onDisk;
+}
+
+ConfigWriter::Outcome ConfigWriter::outcome() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return outcomeLocked();
+}
+
+ConfigWriter::Outcome ConfigWriter::outcomeLocked() const {
+    // Durability was never promised, so the file cannot disagree with anything.
+    if (!m_store.enabled()) return {};
+
+    // The half the worker cannot know: a save refused, or a writer that never started. Recorded
+    // rather than inferred from a null worker, which also means "nothing asked yet".
+    if (!m_notWritten.empty()) return {/*settled=*/true, /*onDisk=*/false, m_notWritten};
+    if (!m_worker) return {};
+
+    std::lock_guard<std::mutex> workerLock(m_worker->mutex);
+    // Outstanding covers all three ways a write can be unfinished: still queued, in flight, or
+    // abandoned by a caller that stopped waiting. Reading only `haveResult` reported a name as
+    // durable while the write that would have made it so had never completed.
+    //
+    // Answers for ANY write, not the caller's own -- the same question only while one thread
+    // writes. It holds today because saves are reached from bus handlers alone and sdbus-c++
+    // dispatches those on one event-loop thread; the startup repair queues without waiting
+    // before that loop exists. A second writer would make a landed write report as not on disk
+    // because another had since started. The fix then is to give each write an identity, not to
+    // widen this test.
+    const bool outstanding = m_worker->pending.has_value() ||
+                             m_worker->writingSince.has_value() || m_worker->stalled;
+    if (m_worker->haveResult && !m_worker->result.error.empty()) {
+        return {!outstanding, false, m_worker->result.error};
+    }
+    if (outstanding) {
+        return {false, false,
+                m_store.file().string() + ": a write has not come back, the choice may not be on disk yet"};
+    }
+    return {true, true, {}};
+}
+
+bool ConfigWriter::everQueued() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_worker != nullptr;
+}
+
+bool ConfigWriter::stalledPastDeadline() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!m_worker) return false;
+    std::lock_guard<std::mutex> workerLock(m_worker->mutex);
+    return m_worker->writingSince.has_value() &&
+           std::chrono::steady_clock::now() - *m_worker->writingSince > kWriteDeadline;
+}
+
+SaveResult ConfigWriter::lastResult() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!m_worker) return {};
+    std::lock_guard<std::mutex> workerLock(m_worker->mutex);
+    return m_worker->result;
+}
+
+}

@@ -86,7 +86,7 @@ std::string resolveShaderDir(const std::string& configured) {
 bool configLoadAbandoned() { return g_loadAbandoned.load(std::memory_order_acquire); }
 
 WallpaperManager::WallpaperManager(Config config)
-    : m_config(std::move(config)), m_store(m_config.configFile) {
+    : m_config(std::move(config)), m_store(m_config.configFile), m_writer(m_store) {
     if (!m_store.enabled()) {
         // Ok, not Fail: this feeds a worst-wins aggregate, so Fail would make every daemon
         // that never opted in report itself broken.
@@ -114,7 +114,8 @@ WallpaperManager::WallpaperManager(Config config)
         // Set before any preservation is attempted, and cleared only if the file is
         // actually moved aside: until then, overwriting it would destroy the user's only
         // copy of every other monitor.
-        m_configUnread = true;
+        m_writer.refuse(m_store.file().string() +
+                        ": not saved, this run could not read it and will not overwrite it");
         recordHealth(&DaemonHealth::persistence, HealthStatus::Fail,
                      persistenceDetail(loaded.error));
         return;
@@ -160,14 +161,14 @@ void WallpaperManager::preserveUnreadableConfig() {
         } else {
             // Safe to save over it now: the bytes are at `kept` whether or not the original
             // went, and `why` says so when it did not.
-            m_configUnread = false;
+            m_writer.allow();
             addPersistenceNote(copy.why.empty() ? "kept as " + copy.kept
                                                 : "kept as " + copy.kept + "; " + copy.why);
         }
     }
     // Every path reports. Saying the config could not be read while staying silent about
     // whether a copy survived sends the user looking for a file that is not there.
-    if (m_configUnread) addPersistenceNote("not saving over it");
+    if (m_writer.refusing()) addPersistenceNote("not saving over it");
     recordHealth(&DaemonHealth::persistence, HealthStatus::Fail, persistenceDetail(m_loadError));
 }
 
@@ -184,7 +185,7 @@ void WallpaperManager::writeRepairedConfig() {
     // write costs every later wallpaper choice. m_preserveFailed reports it instead.
     //
     // Queued, not waited on: the bus name is held and no event loop exists yet, so a wait here
-    // answers nothing. queuePersist() takes the state lock, so it is called with none held.
+    // answers nothing.
     queuePersist(*repair);
 }
 
@@ -437,7 +438,7 @@ void WallpaperManager::setMonitorOutput(int monitorId, const std::string& output
         // only when the file is known to hold what the map holds: any other answer, including a
         // write still outstanding, means re-asserting is the only retry a client can reach.
         const BindResult bound = bindOutputLocked(monitorId, outputName);
-        if (bound == BindResult::Unchanged && persistOutcomeLocked().onDisk) {
+        if (bound == BindResult::Unchanged && m_writer.outcome().onDisk) {
             return;
         }
 
@@ -590,184 +591,32 @@ std::vector<PersistedWallpaper> WallpaperManager::persistableLocked() const {
     return entries;
 }
 
-std::shared_ptr<PersistWorker> WallpaperManager::queuePersist(
-    const std::vector<PersistedWallpaper>& entries) {
-    if (!m_store.enabled()) return nullptr;
-
-    // The save rebuilds the file from live state, so writing now would replace monitors
-    // this run never managed to read with the one the user just set.
-    if (m_configUnread) {
-        std::lock_guard<std::mutex> stateLock(m_stateMutex);
-        m_notWritten = m_store.file().string() +
-                       ": not saved, this run could not read it and will not overwrite it";
-        recordHealthLocked(&DaemonHealth::persistence, HealthStatus::Fail,
-                           persistenceDetail(m_notWritten));
-        return nullptr;
-    }
-
-    // Published under m_stateMutex, which is where every reader takes it: an unlocked store
-    // beside locked loads is a data race, and the first save can run beside a /health request
-    // on the HTTP thread. Released before the worker's lock, keeping the documented order.
-    std::shared_ptr<PersistWorker> worker;
-    {
-        std::lock_guard<std::mutex> stateLock(m_stateMutex);
-        startPersistWorkerLocked();
-        worker = m_persist;
-        // Cleared only once the snapshot is on its way to a writer: from here the worker's own
-        // result is the authority, and a stale refusal would outrank it.
-        if (worker) m_notWritten.clear();
-    }
-    // No writer, and startPersistWorkerLocked() recorded why: the next save retries.
-    if (!worker) return nullptr;
-
-    {
-        std::lock_guard<std::mutex> workerLock(worker->mutex);
-        // Replaced, not appended: an older snapshot waiting behind a stalled write describes a
-        // state this one already supersedes, so writing it would only be a slower route to the
-        // same file.
-        worker->pending = entries;
-    }
-    worker->wake.notify_one();
-    return worker;
+void WallpaperManager::queuePersist(const std::vector<PersistedWallpaper>& entries) {
+    if (m_writer.queue(entries)) return;
+    // Nothing reached the writer, and it recorded which of disabled, refused or no-thread it
+    // was. Reported here because health is the manager's to publish.
+    if (!m_writer.enabled()) return;
+    std::lock_guard<std::mutex> stateLock(m_stateMutex);
+    recordHealthLocked(&DaemonHealth::persistence, HealthStatus::Fail,
+                       persistenceDetail(m_writer.outcome().why));
 }
 
 bool WallpaperManager::persist(const std::vector<PersistedWallpaper>& entries, std::string* whyNot) {
-    const std::shared_ptr<PersistWorker> worker = queuePersist(entries);
+    std::string why;
+    if (m_writer.write(entries, &why)) return true;
 
-    // Waited on, briefly, so the reply to SetWallpaper can say the choice is on disk in the
-    // healthy case -- which is the only case it can be said in. Past the deadline the write
-    // keeps going on the worker and this thread stops caring, so a stalled filesystem costs
-    // one wait rather than the daemon, and the choice is then NOT known to be saved.
-    if (worker) {
-        std::unique_lock<std::mutex> workerLock(worker->mutex);
-        const auto quiesced = [&worker] { return !worker->pending && !worker->writingSince; };
-        // Not waited on again until something completes: a second stalled call would add
-        // another deadline's delay to a bus thread that has already learned the answer.
-        if (!worker->stalled && !worker->settled.wait_for(workerLock, kLoadDeadline, quiesced)) {
-            worker->stalled = true;
-        }
-    }
-
-    // Asked, not re-derived: whether the file now holds these entries is the same question the
-    // health field and the re-assert shortcut ask, and answering it separately here is what let
-    // three callers disagree about one write.
     std::lock_guard<std::mutex> stateLock(m_stateMutex);
-    const PersistOutcome outcome = persistOutcomeLocked();
-    if (!outcome.onDisk) {
-        // Sanitized here, once, because this one leaves the process: the store composes its
-        // errors around a path, and a path is arbitrary bytes the daemon did not choose.
-        if (whyNot != nullptr) *whyNot = sanitizeForLog(outcome.why, 1024, LogFraming::Bare);
-        // Recorded so a status read taken later still shows what this thread learned: the fold-in
-        // reports an outstanding write, but only this call knows a caller stopped waiting on one.
-        recordHealthLocked(&DaemonHealth::persistence, HealthStatus::Fail,
-                           persistenceDetail(outcome.why));
-    }
-    return outcome.onDisk;
-}
-
-void WallpaperManager::startPersistWorkerLocked() {
-    if (m_persist) return;
-
-    // The store is copied in and nothing else is captured: this thread outlives the manager
-    // whenever a write is stuck, and a write on a dead mount cannot be interrupted.
-    std::shared_ptr<PersistWorker> worker;
-    try {
-        worker = std::make_shared<PersistWorker>();
-        std::thread([worker, store = m_store] {
-            for (;;) {
-                std::vector<PersistedWallpaper> entries;
-                {
-                    std::unique_lock<std::mutex> lock(worker->mutex);
-                    // No stop condition: there is nothing safe to wait for at exit, since a
-                    // write on a dead mount cannot be interrupted. The thread ends with the
-                    // process, and holds nothing the process needs to release.
-                    worker->wake.wait(lock, [&worker] { return worker->pending.has_value(); });
-                    entries = std::move(*worker->pending);
-                    worker->pending.reset();
-                    worker->writingSince = std::chrono::steady_clock::now();
-                }
-
-                const SaveResult saved = store.save(entries);
-
-                // Said by the thread that learns it: the startup repair is queued, so any other
-                // report of it races the write and can read as a clean start.
-                //
-                // write(2), not stdio: this thread outlives main() when a write is stuck, and a
-                // FILE* torn down by exit is not something it can hold.
-                if (!saved.error.empty()) {
-                    const std::string line =
-                        "wallpaperx-daemon: config not saved: " + sanitizeForLog(saved.error) + "\n";
-                    const ssize_t ignored = ::write(STDERR_FILENO, line.data(), line.size());
-                    (void)ignored;
-                }
-
-                {
-                    std::lock_guard<std::mutex> lock(worker->mutex);
-                    worker->result = saved;
-                    worker->haveResult = true;
-                    worker->writingSince.reset();
-                    // The filesystem answered, so the next caller is allowed to wait again.
-                    worker->stalled = false;
-                }
-                worker->settled.notify_all();
-            }
-        }).detach();
-    } catch (const std::exception& e) {
-        // std::exception, not std::system_error: std::thread also allocates the callable's
-        // state, so std::bad_alloc reaches here and would otherwise kill the daemon at startup.
-        //
-        // Not published and not rethrown: a worker pointer with no thread behind it makes every
-        // later save wait out the deadline for an answer that cannot come. Recorded instead,
-        // and retried by the next save that is queued. A second failure inside the handler
-        // would escape the frame it exists to contain.
-        try {
-            m_notWritten = m_store.file().string() + ": not saved, no thread available: " + e.what();
-            recordHealthLocked(&DaemonHealth::persistence, HealthStatus::Fail,
-                               persistenceDetail(m_notWritten));
-        } catch (...) {  // NOLINT(bugprone-empty-catch) -- nothing left to report it with
-        }
-        return;
-    }
-
-    // Published only now: m_persist means "a thread is servicing this", and every reader
-    // takes it under the lock this call is made with.
-    m_persist = std::move(worker);
-}
-
-WallpaperManager::PersistOutcome WallpaperManager::persistOutcomeLocked() const {
-    // Durability was never promised, so the file cannot disagree with anything.
-    if (!m_store.enabled()) return {};
-
-    // The half the worker cannot know: a save refused, or a writer that never started. Recorded
-    // rather than inferred from m_persist being null, which also means "nothing asked yet".
-    if (!m_notWritten.empty()) return {/*settled=*/true, /*onDisk=*/false, m_notWritten};
-    if (!m_persist) return {};
-
-    std::lock_guard<std::mutex> workerLock(m_persist->mutex);
-    // Outstanding covers all three ways a write can be unfinished: still queued, in flight, or
-    // abandoned by a caller that stopped waiting. Reading only `haveResult` reported a name as
-    // durable while the write that would have made it so had never completed.
-    //
-    // Answers for ANY write, not the caller's own -- the same question only while one thread
-    // writes. It holds today because persist() is reached from bus handlers alone and sdbus-c++
-    // dispatches those on one event-loop thread; the startup repair uses queuePersist() before
-    // that loop exists. A second writer would make a landed write report as not on disk because
-    // another had since started. The fix then is to give each write an identity, not to widen
-    // this test.
-    const bool outstanding = m_persist->pending.has_value() ||
-                             m_persist->writingSince.has_value() || m_persist->stalled;
-    if (m_persist->haveResult && !m_persist->result.error.empty()) {
-        return {!outstanding, false, m_persist->result.error};
-    }
-    if (outstanding) {
-        return {false, false, m_store.file().string() +
-                                  ": a write has not come back, the choice may not be on disk yet"};
-    }
-    return {true, true, {}};
+    // Sanitized here, once, because this one leaves the process: the store composes its errors
+    // around a path, and a path is arbitrary bytes the daemon did not choose.
+    if (whyNot != nullptr) *whyNot = sanitizeForLog(why, 1024, LogFraming::Bare);
+    // Recorded so a status read taken later still shows what this thread learned: the fold-in
+    // reports an outstanding write, but only this call knows a caller stopped waiting on one.
+    recordHealthLocked(&DaemonHealth::persistence, HealthStatus::Fail, persistenceDetail(why));
+    return false;
 }
 
 void WallpaperManager::applyPersistOutcomeLocked(DaemonHealth& health) const {
-    const PersistOutcome outcome = persistOutcomeLocked();
+    const ConfigWriter::Outcome outcome = m_writer.outcome();
 
     // Written into the caller's copy rather than recorded: the write finishes on a thread
     // that must never reach this object, so the outcome is folded in when someone asks.
@@ -779,9 +628,9 @@ void WallpaperManager::applyPersistOutcomeLocked(DaemonHealth& health) const {
     if (!outcome.onDisk) {
         // A write nobody is waiting for any more is the only symptom a stalled config
         // filesystem leaves, so it is named rather than left to look like an ordinary failure.
-        const bool stalled = !outcome.settled && stalledWriteLocked();
+        const bool stalled = !outcome.settled && m_writer.stalledPastDeadline();
         report(HealthStatus::Fail,
-               persistenceDetail(stalled ? m_store.file().string() +
+               persistenceDetail(stalled ? m_writer.file().string() +
                                                ": has not answered a write, the filesystem may "
                                                "be stalled"
                                          : outcome.why));
@@ -789,7 +638,7 @@ void WallpaperManager::applyPersistOutcomeLocked(DaemonHealth& health) const {
     }
     // Nothing has been asked of the file yet, so there is no write to describe and whatever the
     // constructor recorded still stands.
-    if (!m_persist) {
+    if (!m_writer.everQueued()) {
         // The status alone: this detail was sanitized when it was recorded, and sanitizeForLog
         // is not idempotent -- a second pass turns one backslash in a path into two, so the
         // alarm would name a path that does not exist.
@@ -797,40 +646,27 @@ void WallpaperManager::applyPersistOutcomeLocked(DaemonHealth& health) const {
         return;
     }
 
-    int skipped = 0;
-    int skippedNames = 0;
-    {
-        std::lock_guard<std::mutex> workerLock(m_persist->mutex);
-        skipped = m_persist->result.skippedNonUtf8;
-        skippedNames = m_persist->result.skippedNames;
-    }
-    std::string base = m_store.file().string();
-    if (skipped > 0) {
+    const SaveResult saved = m_writer.lastResult();
+    std::string base = m_writer.file().string();
+    if (saved.skippedNonUtf8 > 0) {
         // The promise about names is made only when it is true: the two halves of a row fail
         // independently, so a dropped wallpaper says nothing about the name beside it.
-        base += " (" + std::to_string(skipped) +
+        base += " (" + std::to_string(saved.skippedNonUtf8) +
                 " wallpapers dropped: a path or type is not valid UTF-8" +
-                (skippedNames == 0 ? "; any screen name on those rows was kept)" : ")");
+                (saved.skippedNames == 0 ? "; any screen name on those rows was kept)" : ")");
     }
-    if (skippedNames > 0) {
-        base += " (" + std::to_string(skippedNames) +
+    if (saved.skippedNames > 0) {
+        base += " (" + std::to_string(saved.skippedNames) +
                 " screen names dropped: not valid UTF-8; those screens must be named again)";
     }
     // Fail, not Ok: the write succeeded but those monitors will not come back, and a
     // health field that reads ok is the only thing that would say otherwise. A copy this run
     // could not take is the same kind of loss, and outlives the write that took it.
-    report(skipped > 0 || skippedNames > 0 || m_preserveFailed ? HealthStatus::Fail
-                                                               : HealthStatus::Ok,
+    report(saved.skippedNonUtf8 > 0 || saved.skippedNames > 0 || m_preserveFailed
+               ? HealthStatus::Fail
+               : HealthStatus::Ok,
            persistenceDetail(base));
 }
-
-bool WallpaperManager::stalledWriteLocked() const {
-    if (!m_persist) return false;
-    std::lock_guard<std::mutex> workerLock(m_persist->mutex);
-    return m_persist->writingSince.has_value() &&
-           std::chrono::steady_clock::now() - *m_persist->writingSince > kLoadDeadline;
-}
-
 std::vector<int> WallpaperManager::restoreSaved() {
     std::vector<int> monitorIds;
     std::vector<PersistedWallpaper> pending;

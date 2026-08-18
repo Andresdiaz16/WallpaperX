@@ -3,6 +3,7 @@
 #pragma once
 
 #include "config_store.h"
+#include "config_writer.h"
 #include "log_escape.h"
 #include "vulkan/frame_export.h"
 
@@ -54,34 +55,6 @@ struct MonitorStatus {
     // A render has been accepted and no pass has run for it yet -- "the daemon owes an answer",
     // as against "this monitor has no picture", which is also true of a superseded render.
     bool renderOutstanding = false;
-};
-
-// The config writer's thread and everything it touches. Held by shared_ptr and deliberately
-// free of any reference back to the manager: a write on a stalled mount cannot be interrupted,
-// so the thread must be abandonable, and abandoning one that could reach the manager would be
-// a use-after-free waiting for the mount to recover.
-struct PersistWorker {
-    std::mutex mutex;
-
-    // wake: the worker waiting for something to write. settled: whoever queued it waiting
-    // for the write to land, which is what keeps a healthy save synchronous.
-    std::condition_variable wake;
-    std::condition_variable settled;
-
-    // Set when a wait ran out, cleared when the filesystem answers again. Stops every later
-    // save paying the same deadline for an answer this one already has.
-    bool stalled = false;
-
-    // One slot, not a queue: bus handlers run one at a time, so the newest snapshot already
-    // describes everything the older ones would have written.
-    std::optional<std::vector<PersistedWallpaper>> pending;
-
-    // Set when a snapshot is handed over, cleared when the write returns. A value that stays
-    // put is what tells the health report the filesystem has stopped answering.
-    std::optional<std::chrono::steady_clock::time_point> writingSince;
-
-    bool haveResult = false;
-    SaveResult result;
 };
 
 // True once a config read has been abandoned mid-call. That thread is still blocked in the
@@ -330,6 +303,18 @@ private:
     // way to stop a stalled read holding startup is to stop waiting for it.
     LoadResult loadWithDeadline() const;
 
+    // Hands `entries` to the writer without waiting, and reports a refusal or a missing
+    // thread as persistence health. Safe to call with no lock held.
+    void queuePersist(const std::vector<PersistedWallpaper>& entries);
+
+    // The same, then the writer's bounded wait. Returns whether THESE entries are known to
+    // be on disk; on false, `whyNot` receives that write's own reason, sanitized.
+    bool persist(const std::vector<PersistedWallpaper>& entries, std::string* whyNot = nullptr);
+
+    // Folds the writer's answer, and the losses outliving it, into a health copy rather
+    // than m_health: the writer's thread cannot touch this object.
+    void applyPersistOutcomeLocked(DaemonHealth& health) const;
+
     // Snapshots the monitors worth persisting. Caller must hold m_stateMutex.
     std::vector<PersistedWallpaper> persistableLocked() const;
 
@@ -350,53 +335,18 @@ private:
     // hold m_stateMutex and must have validated the name.
     BindResult bindOutputLocked(int monitorId, const std::string& outputName);
 
-    // Hands `entries` to the config writer and returns it, or null when nothing was queued
-    // (persistence disabled, an unread config, no writer thread). Must NOT be called holding
-    // m_stateMutex: it takes that lock itself.
-    std::shared_ptr<PersistWorker> queuePersist(const std::vector<PersistedWallpaper>& entries);
-
-    // queuePersist(), then a bounded wait: a wait that runs out leaves the write in flight and
-    // records persistence unsettled. Same locking rule.
-    //
-    // Returns whether THESE entries are known to be on disk, true when persistence is disabled
-    // since durability was never promised. A caller answering for its own write asks this
-    // rather than the persistence health, which is an aggregate carrying other rows' failures.
-    // On false, `whyNot` receives that write's own reason.
-    bool persist(const std::vector<PersistedWallpaper>& entries, std::string* whyNot = nullptr);
-
     // Facts about the config that outlive the operation that discovered them -- a copy of an
     // unreadable file, entries kept for a newer build. Every persistence detail is rebuilt
     // through these, or the next save would report only itself and drop the pointer to the copy.
     void addPersistenceNote(const std::string& note);
     std::string persistenceDetail(const std::string& base) const;
 
-
-    // Spawns the config writer on first use, and leaves m_persist null when the thread could
-    // not be created. Caller must hold m_stateMutex: m_persist is published here and read
-    // under that lock.
-    void startPersistWorkerLocked();
-
-    // THE answer to "does the file hold what live state holds, and if not, why". Derived rather
-    // than stored, since a completed write's result lives in the worker, which outlives this
-    // object. One derivation for every caller, so no two can disagree about one write.
-    struct PersistOutcome {
-        bool settled = true;  // nothing outstanding, so onDisk describes the file as it stands
-        bool onDisk = true;   // true before anything is asked of the file: it already agrees
-        std::string why;      // when !onDisk. Raw; sanitized where recorded or thrown
-    };
-
-    // Caller must hold m_stateMutex; takes the worker's lock, which is the established order.
-    PersistOutcome persistOutcomeLocked() const;
-
-    // A write in flight past the deadline -- a stalled filesystem, which earns its own wording.
-    bool stalledWriteLocked() const;
-
-    // Folds that outcome, and the losses outliving it, into a health copy rather than m_health:
-    // the writer cannot touch this object. Caller must hold m_stateMutex.
-    void applyPersistOutcomeLocked(DaemonHealth& health) const;
-
     const Config m_config;
     const ConfigStore m_store;
+
+    // Owns getting choices onto disk and answers whether they got there. Declared before
+    // the state it reports on, so it outlives every path that asks.
+    ConfigWriter m_writer;
 
     // Everything from here to the mutexes is guarded by m_stateMutex, except the load results
     // below, which are written before the event loop starts and only read after.
@@ -409,10 +359,6 @@ private:
 
     // The repair restoreSaved() computed, until writeRepairedConfig() takes it out.
     std::optional<std::vector<PersistedWallpaper>> m_repair;
-
-    // The file holds content this run could not read and could not move aside, so persist()
-    // must not replace it. Written only by the constructor.
-    bool m_configUnread = false;
 
     // A copy of the pre-repair file exists. Written by preserveUnreadableConfig(), read by
     // writeRepairedConfig(); both run before the event loop.
@@ -427,14 +373,6 @@ private:
     // and restoreSaved() before the event loop, and by requestWallpaper() under m_stateMutex
     // once per kept row it displaces.
     std::string m_persistenceNote;
-
-    // Started on the first save, so a daemon that never sets a wallpaper never spawns it.
-    // Detached, never joined: see PersistWorker. Non-null means a thread is servicing it.
-    std::shared_ptr<PersistWorker> m_persist;
-
-    // Why the last save never reached the writer -- no thread, or a refusal decided before one
-    // exists. Empty once a save is handed over. The half of the outcome the worker cannot know.
-    std::string m_notWritten;
 
     // Entries no build can apply, dropped rather than kept, counted so the loss is reported at
     // all. Name-only rows counted apart: this report is the user's notice that a picture did

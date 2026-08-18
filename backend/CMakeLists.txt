@@ -100,6 +100,7 @@ endif()
 add_library(wallpaperx-daemon-lib STATIC
     daemon/config_preserve.cpp
     daemon/config_store.cpp
+    daemon/config_writer.cpp
     daemon/dbus_service.cpp
     daemon/http_server.cpp
     daemon/render_worker.cpp
