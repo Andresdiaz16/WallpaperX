@@ -1037,11 +1037,11 @@ std::vector<int> WallpaperManager::restoreSaved() {
     std::lock_guard<std::mutex> stateLock(m_stateMutex);
     for (const PersistedWallpaper& entry : pending) {
         // Three outcomes for a name, each of them reported: bound here, carried for a build
-        // whose limit admits the id, or dropped. Only the id limit earns carrying. The byte cap
-        // is the manager's rule and not the file's (see outputNameError), so by the rule that
-        // carries an unknown wallpaper type a name past the cap would travel too -- deliberately
-        // not done: it would write a name back into every save that no build has ever accepted.
-        // Revisit with the forward-compatibility decision, not as a defect fix.
+        // whose limit admits the id, or dropped. Only the id limit earns carrying -- and the
+        // byte cap is this build's own constant too, so symmetry alone would carry an over-long
+        // name as well. Settled against (S10.22): monitor counts grow, so an id above the limit
+        // is a value a later build may accept, while a legitimate 256-byte connector name is not
+        // a thing that exists, and carrying one writes bytes no build accepts into every save.
         const bool nameValid = !entry.output.empty() && outputNameError(entry.output).empty();
         const bool nameTravels = nameValid && entry.monitorId >= kMaxMonitors;
         if (!entry.output.empty() && !nameValid && !nameTravels) ++rejectedNames;
