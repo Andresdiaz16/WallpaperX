@@ -912,20 +912,29 @@ void WallpaperManager::applyPersistOutcomeLocked(DaemonHealth& health) const {
     }
 
     int skipped = 0;
+    int skippedNames = 0;
     {
         std::lock_guard<std::mutex> workerLock(m_persist->mutex);
         skipped = m_persist->result.skippedNonUtf8;
+        skippedNames = m_persist->result.skippedNames;
     }
     std::string base = m_store.file().string();
     if (skipped > 0) {
+        // The promise about names is made only when it is true: the two halves of a row fail
+        // independently, so a dropped wallpaper says nothing about the name beside it.
         base += " (" + std::to_string(skipped) +
-                " wallpapers dropped: a path or type is not valid UTF-8; any screen name on "
-                "those rows was kept)";
+                " wallpapers dropped: a path or type is not valid UTF-8" +
+                (skippedNames == 0 ? "; any screen name on those rows was kept)" : ")");
+    }
+    if (skippedNames > 0) {
+        base += " (" + std::to_string(skippedNames) +
+                " screen names dropped: not valid UTF-8; those screens must be named again)";
     }
     // Fail, not Ok: the write succeeded but those monitors will not come back, and a
     // health field that reads ok is the only thing that would say otherwise. A copy this run
     // could not take is the same kind of loss, and outlives the write that took it.
-    report(skipped > 0 || m_preserveFailed ? HealthStatus::Fail : HealthStatus::Ok,
+    report(skipped > 0 || skippedNames > 0 || m_preserveFailed ? HealthStatus::Fail
+                                                               : HealthStatus::Ok,
            persistenceDetail(base));
 }
 

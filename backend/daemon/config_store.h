@@ -69,6 +69,11 @@ struct SaveResult {
     // on. The row survives if its screen name is writable, so this counts lost pictures, not
     // lost rows; the count is what lets the daemon say a monitor will not come back.
     int skippedNonUtf8 = 0;
+
+    // Screen names dropped for the same reason, counted apart because the two halves of a row
+    // fail independently: reporting a name loss as a wallpaper loss sends the user looking for
+    // a picture that is still there.
+    int skippedNames = 0;
 };
 
 // $XDG_CONFIG_HOME/wallpaperx/config.json, else $HOME/.config/... Empty when neither is

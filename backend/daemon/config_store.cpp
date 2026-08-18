@@ -260,6 +260,9 @@ SaveResult ConfigStore::save(const std::vector<PersistedWallpaper>& entries) con
             if (!wallpaperOk && (!entry.type.empty() || !entry.path.empty())) {
                 ++result.skippedNonUtf8;
             }
+            // Counted wherever the name is lost, not only on rows that survive: a name this
+            // file cannot carry leaves the screen anonymous either way.
+            if (!nameOk && !entry.output.empty()) ++result.skippedNames;
             // Nothing left worth a row.
             if (!wallpaperOk && (!nameOk || entry.output.empty())) continue;
 
