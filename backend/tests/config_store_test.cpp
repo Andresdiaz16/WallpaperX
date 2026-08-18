@@ -2350,7 +2350,8 @@ void runCopyMechanicsChecks() {
             return;
         }
 
-        // CONTROL: the `if (move)` rename arm in keepCopyIn() (backend/daemon/wallpaper_manager.cpp)
+        // CONTROL: the `if (move)` rename arm in putBytes() (backend/daemon/wallpaper_manager.cpp,
+        //       split out of keepCopyIn() on 2026-08-18; observed there, not re-run since)
         //       disabled so the copy-then-unlink path runs, which is the code before this fix ->
         //       "FAIL: a config moved aside on one filesystem keeps its identity, so no partial
         //       copy is possible", printing "config.json was inode 9905, the copy is inode 9908".
@@ -2462,9 +2463,9 @@ void runCopyMechanicsChecks() {
     //       fixture and grades nothing: the copy fails before it creates anything, so "no file
     //       was left behind" is true of every build. The limit is restored before any check runs,
     //       so a red line is never itself truncated.
-    // CONTROL: the `std::filesystem::remove(kept, cleanupEc)` cleanup disabled in keepCopyIn()'s
-    //       copy-failure arm (backend/daemon/wallpaper_manager.cpp), which is the code before
-    //       this fix -> "FAIL: a copy that failed part-way leaves no file behind holding its
+    // CONTROL: the `std::filesystem::remove(kept, cleanupEc)` cleanup disabled in putBytes()'s
+    //       copy-failure arm (backend/daemon/wallpaper_manager.cpp, split out of keepCopyIn() on
+    //       2026-08-18; observed there, not re-run since), which is the code before this fix -> "FAIL: a copy that failed part-way leaves no file behind holding its
     //       name", printing all TWENTY names -- ten in each candidate directory -- occupied by
     //       16-byte remnants, spent by this single start. Preservation is dead from here on.
     manager.preserveUnreadableConfig();
@@ -2555,9 +2556,11 @@ void runPreservationReuseChecks() {
     //       the same unchanged file, which is what a restart is at this tier. The copy's bytes
     //       are compared as well as counted: one name held by a file that is not the user's
     //       config is the same loss by another route.
-    // CONTROL: the `if (!sameContents(source, kept)) continue;` reuse arm in keepCopyIn()
-    //       (backend/daemon/wallpaper_manager.cpp) replaced with a bare `continue`, which is the
-    //       code before this fix -> all three red: "FAIL: twelve starts that could not write
+    // CONTROL: the reuse arm in inspectName() (backend/daemon/wallpaper_manager.cpp), which now
+    //       answers SameBytes where keepCopyIn() used to test `!sameContents(source, kept)`
+    //       inline -- made to answer OtherBytes always, so every start takes a fresh name, which
+    //       is the code before this fix (split out on 2026-08-18; observed in the old shape, not
+    //       re-run since) -> all three red: "FAIL: twelve starts that could not write
     //       their repair leave one preserved copy, not one per start", printing "10 copies" and
     //       naming config.json.bad through .bad.9; "FAIL: the one preserved copy holds the bytes
     //       the user's config held"; and "FAIL: the last of twelve identical starts still reports

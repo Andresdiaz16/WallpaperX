@@ -97,60 +97,94 @@ struct KeptCopy {
     std::string trouble;  // why, or what still needs saying about a copy that succeeded
 };
 
-// Keeps `source` in `dir` under the first free <file>.bad[.N]. A copy already holding these
+// The name slot `n` would use: <file>.bad, then .bad.1, .bad.2 ...
+std::filesystem::path preservedName(const std::filesystem::path& source,
+                                    const std::filesystem::path& dir, int slot) {
+    return dir / (source.filename().string() + ".bad" + (slot == 0 ? "" : "." + std::to_string(slot)));
+}
+
+enum class NameState {
+    Free,        // nothing there
+    SameBytes,   // an earlier run already preserved exactly this content here
+    OtherBytes,  // an earlier broken config; never write over it
+    Unknown,     // the filesystem would not say
+};
+
+NameState inspectName(const std::filesystem::path& source, const std::filesystem::path& kept,
+                      std::string& why) {
+    std::error_code ec;
+    const bool taken = std::filesystem::exists(kept, ec);
+    if (ec) {
+        why = ec.message();
+        return NameState::Unknown;
+    }
+    if (!taken) return NameState::Free;
+    return sameContents(source, kept) ? NameState::SameBytes : NameState::OtherBytes;
+}
+
+// Whether the source survived matters to the caller: a rename has already taken it away, and
+// asking again would report a file that is missing because this succeeded.
+struct Placement {
+    std::string error;
+    bool sourceRemains = true;
+};
+
+Placement putBytes(const std::filesystem::path& source, const std::filesystem::path& kept,
+                   bool move) {
+    std::error_code ec;
+    if (move) {
+        // Atomic where it can be. The copy below exists only for the cross-filesystem case, and
+        // unlike a rename it can leave a partial file behind.
+        std::filesystem::rename(source, kept, ec);
+        if (!ec) return {{}, false};
+        if (ec != std::errc::cross_device_link) return {ec.message(), true};
+        ec.clear();
+    }
+
+    std::filesystem::copy_file(source, kept, ec);
+    if (!ec) return {{}, true};
+    // A truncated remnant would hold a name every later attempt is denied, and offer the user a
+    // silently shortened config as a preserved one. Left alone when something else is there.
+    if (ec != std::errc::file_exists) {
+        std::error_code cleanupEc;
+        std::filesystem::remove(kept, cleanupEc);
+    }
+    return {ec.message(), true};
+}
+
+std::string removeSource(const std::filesystem::path& source) {
+    std::error_code ec;
+    std::filesystem::remove(source, ec);
+    return ec ? ec.message() : std::string{};
+}
+
+// Keeps `source` in `dir` under the first usable <file>.bad[.N]. A copy already holding these
 // bytes counts as preserved: a repair that cannot be written recurs every start, and a fresh
 // name each time would exhaust kMaxPreservedCopies in as many restarts.
 KeptCopy keepCopyIn(const std::filesystem::path& source, const std::filesystem::path& dir,
                     bool move) {
     std::string reason;
-    const auto unlinkSource = [&source]() {
-        std::error_code removeEc;
-        std::filesystem::remove(source, removeEc);
-        return removeEc ? removeEc.message() : std::string{};
-    };
-
-    for (int n = 0; n < kMaxPreservedCopies; ++n) {
-        const std::filesystem::path kept =
-            dir / (source.filename().string() + ".bad" + (n == 0 ? "" : "." + std::to_string(n)));
-        std::error_code ec;
-        const bool taken = std::filesystem::exists(kept, ec);
-        if (ec) {
-            reason = ec.message();
-            continue;
-        }
-        if (taken) {
-            // Never over different bytes: that copy holds an earlier broken config.
-            if (!sameContents(source, kept)) continue;
-            return {kept.string(), move ? unlinkSource() : std::string{}};
-        }
-
-        if (move) {
-            // Atomic where it can be. The copy below exists only for the cross-filesystem case,
-            // and unlike a rename it can leave a partial file behind.
-            std::filesystem::rename(source, kept, ec);
-            if (!ec) return {kept.string(), {}};
-            if (ec != std::errc::cross_device_link) {
-                reason = ec.message();
+    for (int slot = 0; slot < kMaxPreservedCopies; ++slot) {
+        const std::filesystem::path kept = preservedName(source, dir, slot);
+        switch (inspectName(source, kept, reason)) {
+            case NameState::OtherBytes:
+            case NameState::Unknown:
                 continue;
-            }
-            ec.clear();
+            case NameState::SameBytes:
+                return {kept.string(), move ? removeSource(source) : std::string{}};
+            case NameState::Free:
+                break;
         }
 
-        std::filesystem::copy_file(source, kept, ec);
-        if (ec) {
-            // A truncated remnant would hold a name every later attempt is denied, and offer the
-            // user a silently shortened config as a preserved one. Left alone when the copy
-            // failed because something else is already there.
-            if (ec != std::errc::file_exists) {
-                std::error_code cleanupEc;
-                std::filesystem::remove(kept, cleanupEc);
-            }
-            reason = ec.message();
+        const Placement placed = putBytes(source, kept, move);
+        if (!placed.error.empty()) {
+            reason = placed.error;
             continue;
         }
         // The copy stays even when the original cannot go: the bytes are the point, and a start
         // that finds this same content reuses this name rather than spending another.
-        return {kept.string(), move ? unlinkSource() : std::string{}};
+        return {kept.string(),
+                move && placed.sourceRemains ? removeSource(source) : std::string{}};
     }
     return {{}, reason.empty() ? "no free name" : reason};
 }
