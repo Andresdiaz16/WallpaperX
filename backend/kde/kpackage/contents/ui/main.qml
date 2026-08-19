@@ -30,8 +30,13 @@ WallpaperItem {
     // one pins every state below to "unnamed". Nothing in production assigns it.
     property string connector: root.Screen.name
 
+    // Clamped for the same reason refusalReason is: this comes from whatever holds the port,
+    // and it lands on the desktop. The daemon's own limit is 256 bytes, so a longer answer is
+    // not one of ours whatever else it is.
     readonly property string screenName:
-        (root.reply && typeof root.reply.output === "string") ? root.reply.output : ""
+        (root.reply && typeof root.reply.output === "string")
+            ? root.reply.output.substring(0, 256)
+            : ""
 
     // Never path_literal: that is the raw bytes to act on, and putting them on the desktop
     // would render control characters and bidirectional overrides out of a filename.
