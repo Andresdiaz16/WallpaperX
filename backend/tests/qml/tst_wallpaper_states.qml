@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 // S10.10: whatever has gone wrong, the plugin says something visible and says which cause it
-// is. The seven cases main.qml derives are driven here through its real file -- not a copy of
-// its logic, which would drift -- and both halves are asserted for each: the state the binding
-// produces and the message describe() hands to the Text that lands on the desktop.
+// is, in characters rather than in markup. The seven cases main.qml derives are driven here
+// through its real file -- not a copy of its logic, which would drift -- and both halves are
+// asserted for each: the state the binding produces and the message describe() hands to the
+// Text that lands on the desktop.
 //
 // The plugin is driven, never polled: apply(status, body) is the same entry point its own
 // XMLHttpRequest handler calls, so no stub HTTP server is needed and no check waits on anything.
@@ -38,6 +39,14 @@ TestCase {
             height: 600
             source: "../../kde/kpackage/contents/ui/main.qml"
         }
+    }
+
+    // A yardstick Text the markup check lays the same string out in, once as literal characters
+    // and once as markup. Every property that moves a glyph is copied off the plugin's own Text
+    // at use, so this stays a comparison of formats and not of two different fonts.
+    Component {
+        id: yardstick
+        Text {}
     }
 
     // The seven cases, each with the drive that reaches it, the state main.qml must derive, and
@@ -393,6 +402,126 @@ TestCase {
             rendered += 1;
         }
         compare(rendered, cases.length, "every case was checked as rendered");
+    }
+
+    // Markup a hostile answer on port 18462 could put in either of the two reply fields the
+    // desktop message interpolates. The anchor is what `linkAt` can find; the image is the one
+    // that matters most, because Qt's styled text fetches an <img src>. Its source is a
+    // relative name, never a URL: a styled yardstick below lays this out for real, and a check
+    // must not make the request it exists to prove the plugin does not make. That yardstick is
+    // what logs "Cannot open: .../nope.png" in a passing run -- from the test's own directory,
+    // which is how a reader tells it apart from the plugin having parsed the tag.
+    readonly property string markup:
+        '<a href="http://example.invalid/x">CLICKME</a>'
+        + '<img src="nope.png" width="60" height="240">'
+
+    function markupCases() {
+        return [
+            {
+                // reply.output, which the "unknown" message interpolates ahead of its newline.
+                tag: "a screen name from the reply",
+                drive: [200, JSON.stringify({ output: suite.markup, known: false })]
+            },
+            {
+                // refusalReason, the field the goal was written from. Measured fact, and the
+                // reason the control cannot red this row: Qt's auto-detection gives up at the
+                // first newline, and the refusal wording puts one ahead of its %1, so today
+                // this row would hold even with no textFormat set. It is asserted anyway --
+                // the protection is an accident of wording, and moving %1 ahead of the newline
+                // would end it. Row 1 is what makes the check able to fail.
+                tag: "a refusal reason from the reply",
+                drive: [400, JSON.stringify({ error: suite.markup })]
+            }
+        ];
+    }
+
+    // GOAL: markup arriving in a reply from whatever holds port 18462 is drawn as the
+    //       characters it is, never interpreted. False if the desktop message renders a live
+    //       link, or lays out as anything other than the literal string -- Qt's styled text
+    //       consumes tags and fetches <img src>, which turns a wallpaper into a client that
+    //       makes requests on behalf of whoever answered on loopback.
+    // WHY-THIS-SHAPE: graded on the layout the Text actually produced, not on `textFormat`,
+    //       which asserts the spelling of the fix rather than the property. The yardstick pair
+    //       is what makes the layout comparison mean something: matching the plain twin alone
+    //       would also hold if Qt stopped distinguishing the formats, so the styled twin is
+    //       asserted to differ first (seen red by laying both twins out plain: '116 vs 116').
+    //       `linkAt` alone is not enough either -- an <img> is not a link, and the image is the
+    //       case that reaches the network.
+    // CONTROL: `textFormat: Text.PlainText` removed from main.qml's Text, i.e. the file as it
+    //       stood before 66be011 -- row 1 red with 'no part of the message is a live link: 154
+    //       of 10880 probes hit [http://example.invalid/x]', and with the link half stubbed out
+    //       to reach the next one, 'the message is laid out as the characters it contains.
+    //       Actual (): 636.98. Expected (): 573.70'. That run also logged main.qml itself
+    //       trying to open the image. Reverted. Row 2 does not red there, and cannot: see it.
+    // COVERAGE-ASSERT: the probe grid is asserted against the item's own size, so a Text that
+    //       collapsed to nothing scans 0 points and fails rather than finding no links because
+    //       it looked nowhere. Seen red by halving the scan: 'Actual (): 2400. Expected ():
+    //       4640'. The case count is asserted too.
+    function test_markup_in_a_reply_is_drawn_as_text() {
+        const cases = markupCases();
+        let checked = 0;
+        for (let i = 0; i < cases.length; ++i) {
+            const item = drivenPlugin({ connector: suite.namedScreen, drive: cases[i].drive });
+            const shown = onlyDescendantWith(item, "wrapMode");
+
+            // Without this the rest grades a Text that never received the markup at all.
+            verify(shown.text.indexOf(suite.markup) !== -1,
+                   "the reply's markup reached the desktop message for " + cases[i].tag
+                   + ": [" + shown.text + "]");
+
+            let probes = 0;
+            let hits = 0;
+            let firstLink = "";
+            for (let y = 0; y < shown.height; y += 4) {
+                for (let x = 0; x < shown.width; x += 4) {
+                    probes += 1;
+                    const link = shown.linkAt(x, y);
+                    if (link !== "") {
+                        hits += 1;
+                        if (firstLink === "") {
+                            firstLink = link;
+                        }
+                    }
+                }
+            }
+            compare(probes, Math.ceil(shown.width / 4) * Math.ceil(shown.height / 4),
+                    "the whole message area was probed for links, " + cases[i].tag);
+            compare(hits, 0, "no part of the message is a live link: " + hits + " of " + probes
+                    + " probes hit [" + firstLink + "], " + cases[i].tag);
+
+            // Same string, same font, same wrapping: once as characters, once as markup.
+            const literal = suite.layOut(shown, Text.PlainText);
+            const consumed = suite.layOut(shown, Text.StyledText);
+            // Height, not width: a wrapped message's painted width is its longest line, which
+            // for the refusal wording is the fixed prefix and stays put whichever way the
+            // markup goes. The image's reserved height is what parts the two layouts.
+            verify(Math.abs(literal.paintedHeight - consumed.paintedHeight) > 100,
+                   "the two layouts are distinguishable at all -- otherwise the comparison "
+                   + "below proves nothing (" + literal.paintedHeight + " vs "
+                   + consumed.paintedHeight + "), " + cases[i].tag);
+            fuzzyCompare(shown.paintedWidth, literal.paintedWidth, 0.5,
+                         "the message is laid out as the characters it contains, "
+                         + cases[i].tag);
+            fuzzyCompare(shown.paintedHeight, literal.paintedHeight, 0.5,
+                         "the message is laid out as the characters it contains, "
+                         + cases[i].tag);
+            checked += 1;
+        }
+        compare(checked, cases.length, "every markup route was checked");
+    }
+
+    // The plugin's own Text laid out again in a chosen format. Copied rather than declared, so
+    // a font change in main.qml cannot make the yardstick disagree for a reason that has
+    // nothing to do with markup.
+    function layOut(source, format) {
+        return createTemporaryObject(yardstick, suite, {
+            width: source.width,
+            font: source.font,
+            wrapMode: source.wrapMode,
+            horizontalAlignment: source.horizontalAlignment,
+            textFormat: format,
+            text: source.text
+        });
     }
 
     // The one visual descendant carrying `property`, found by walking the tree rather than by
