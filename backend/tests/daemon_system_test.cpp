@@ -5497,8 +5497,8 @@ void checkStalledConfigWrite(NameWatcher& names, const std::string& validationEn
     constexpr int32_t kMonitorStalledSecond = 19;
     constexpr const char* kGoals = "S8.29/S8.30/S8.31/S8.32 (the daemon while its config filesystem has stopped "
                                    "answering)";
-    // The deadline a save is given, restated rather than shared: kLoadDeadline sits in an
-    // anonymous namespace in wallpaper_manager.cpp, and a copy here means a change to it
+    // The deadline a save is given, restated rather than shared: kWriteDeadline sits in an
+    // anonymous namespace in config_writer.cpp, and a copy here means a change to it
     // fails this phase loudly instead of silently re-pointing it at the new value.
     constexpr double kSaveDeadlineMs = 2000.0;
 
@@ -5646,14 +5646,15 @@ void checkStalledConfigWrite(NameWatcher& names, const std::string& validationEn
     //       quarters of the deadline. Without it this comparison is green on a daemon that
     //       waits for nothing at all: both calls return instantly and the phase reports that
     //       the deadline is not paid twice, having never seen it paid once. CONTROL for it:
-    //       `kLoadDeadline` in the settled.wait_for() replaced with 0 seconds -> "FAIL: the
-    //       first call really did wait for the deadline, so the comparison above has a
-    //       baseline", printing "the first call took 0 ms", while the check it guards stayed
-    //       green at 0 ms. Reverted.
-    // CONTROL: `if (m_persist->stalled) return;` deleted from persist() -> "FAIL: a second
-    //       SetWallpaper during the stall does not wait for the deadline all over again",
-    //       printing "the second call took 2000 ms against a 2000 ms deadline", and nothing
-    //       else red. Reverted.
+    //       `kWriteDeadline` (backend/daemon/config_writer.cpp) replaced with 0 seconds -> "FAIL:
+    //       the first call really did wait for the deadline, so the comparison above has a
+    //       baseline", printing "the first call took 0 ms" and the phase's own summary line
+    //       "SetWallpaper cost 0 ms then 0 ms", while the check it guards stayed green at 0 ms.
+    //       Re-observed 2026-08-18. Reverted.
+    // CONTROL: the `!worker->stalled &&` short-circuit dropped from ConfigWriter::write()'s wait
+    //       (backend/daemon/config_writer.cpp) -> "FAIL: a second SetWallpaper during the stall
+    //       does not wait for the deadline all over again", printing "the second call took 2000 ms
+    //       against a 2000 ms deadline", and nothing else red. Re-observed 2026-08-18. Reverted.
     const auto secondStart = Clock::now();
     std::string secondError;
     try {
@@ -5687,11 +5688,15 @@ void checkStalledConfigWrite(NameWatcher& names, const std::string& validationEn
     //       of that by luck. Both the status and the wording are asserted, because a `fail`
     //       carrying the previous save's detail sends an operator to a disk error that does
     //       not exist.
-    // CONTROL: the `if (writingSince && ... > kLoadDeadline)` block deleted from
-    //       applyPersistOutcomeLocked() -> "FAIL: GetStatus reports the write that has not
-    //       come back, rather than the last save that did", printing "persistence reads ok
-    //       (/tmp/.../config.json)" -- the baseline save above, which is exactly the wrong
-    //       answer this goal names. Reverted.
+    // CONTROL: ConfigWriter::stalledPastDeadline() (backend/daemon/config_writer.cpp) forced to
+    //       false, which is where the old `if (writingSince && ... > kLoadDeadline)` test now
+    //       lives -> "FAIL: GetStatus reports the write that has not come back, rather than the
+    //       last save that did", printing "persistence reads fail (... a write has not come back,
+    //       the choice may not be on disk yet)", and nothing else red. Re-observed 2026-08-18.
+    // WAS: this said the mutation printed "persistence reads ok" -- the baseline save above. True
+    //       when written 2026-08-12; bcac12f then made an outstanding write a failure in its own
+    //       right, so what this block uniquely supplies is now the WORDING, not the status. Both
+    //       are asserted, which is why the check still reddens.
     std::string sawStatus;
     std::string sawDetail;
     bool namesTheStall = false;
@@ -5730,15 +5735,16 @@ void checkStalledConfigWrite(NameWatcher& names, const std::string& validationEn
     //       the watchdog's line is asserted beside the exit code, because the watchdog also
     //       ends the process -- so an exit-code check alone would pass for a daemon that had
     //       to be forced out five seconds late.
-    // CONTROL: `.detach()` in startPersistWorkerLocked() replaced by storing the thread in the
-    //       manager and joining it in ~WallpaperManager -> "FAIL: a daemon with a config write
-    //       it can never finish still exits 0 on SIGTERM" ("exit code 1") and "FAIL: it leaves
-    //       through main() rather than through the teardown watchdog". The worker loops
-    //       forever by design, so that mutation blocks EVERY teardown: nine other shutdown
-    //       checks in this file went red with it, which is the sense in which abandoning this
-    //       thread is load-bearing rather than incidental. Note what stayed green: "still
-    //       exits on SIGTERM" above, because the forced path is still a normal exit -- which
-    //       is why the exit CODE and the watchdog's line are asserted separately. Reverted.
+    // CONTROL: `.detach()` in ConfigWriter::startLocked() (backend/daemon/config_writer.cpp)
+    //       replaced by storing the thread in the writer and joining it in ~ConfigWriter ->
+    //       "FAIL: a daemon with a config write it can never finish still exits 0 on SIGTERM"
+    //       ("exit code 1") and "FAIL: it leaves through main() rather than through the teardown
+    //       watchdog". The worker loops forever by design, so that mutation blocks EVERY
+    //       teardown: ten other shutdown checks in this file went red with it, which is the sense
+    //       in which abandoning this thread is load-bearing rather than incidental. Note what
+    //       stayed green: "still exits on SIGTERM" above, because the forced path is still a
+    //       normal exit -- which is why the exit CODE and the watchdog's line are asserted
+    //       separately. Re-observed 2026-08-18. Reverted.
     //       That check has a control of its own: the same join plus `kTeardownDeadline` in
     //       backend/daemon/main.cpp raised to an hour, so nothing forces the process out at all -> "FAIL: a
     //       daemon with a config write it can never finish still exits on SIGTERM", printing

@@ -423,8 +423,8 @@ double millisSince(StallClock::time_point start) {
     return std::chrono::duration<double, std::milli>(StallClock::now() - start).count();
 }
 
-// The deadline a save is given, restated rather than shared: kLoadDeadline sits in an
-// anonymous namespace in wallpaper_manager.cpp. A copy here means a change to it fails the
+// The deadline a save is given, restated rather than shared: kWriteDeadline sits in an
+// anonymous namespace in config_writer.cpp. A copy here means a change to it fails the
 // phases that use it loudly instead of silently re-pointing them at whatever the new value is.
 constexpr double kSaveDeadlineMs = 2000.0;
 
@@ -1611,11 +1611,13 @@ void runPreservedCopyChecks() {
     //       and mode-000 cases each red on all three of their checks, led by "FAIL: a
     //       config.json that is <case> is left where it is, under its own name" printing
     //       "  preserved copies: <state dir>/config.json.bad". (b) the same, hoisted above the
-    //       S_ISREG return -> the same three for the named-pipe case. (c) the `if
-    //       (m_configUnread)` early return deleted from WallpaperManager::persist() -> all
-    //       three cases red on "still holds the bytes it held before the daemon ran" and on
-    //       "the daemon says it refused to save over it", with the mode-000 file rewritten
-    //       to hold monitor 1 alone -- the two paths the goal names, measured separately.
+    //       S_ISREG return -> the same three for the named-pipe case. (c) the `if (m_refusing)`
+    //       early return deleted from ConfigWriter::queue() (backend/daemon/config_writer.cpp),
+    //       re-observed 2026-08-18 -> all three cases red on "still holds the bytes it held
+    //       before the daemon ran" and on "the daemon says it refused to save over it", the
+    //       latter reading "ok / not saving over it", with the mode-000 file rewritten to hold
+    //       monitor 1 alone -- the two paths the goal names, measured separately. Twelve red in
+    //       all; the other six grade the same refusal from the copy and retry phases.
     // COVERAGE-ASSERT: every case is accounted for -- exercised, or reported as one this
     //       host could not stage -- against the table's size, so a case that quietly stops
     //       being planted shrinks the phase loudly rather than silently.
@@ -1841,13 +1843,14 @@ void runPreservationExhaustedChecks() {
     // CONTROL: three, all reverted. (a) `kMaxPreservedCopies` in
     //       backend/daemon/wallpaper_manager.cpp raised to 11, so a free name exists after all ->
     //       all three checks red, "  21 copies (expected 20)" naming config.json.bad.10.
-    //       (b) `m_configUnread = true;` in the constructor's error branch set false instead,
-    //       re-observed 2026-08-17 against the twenty-name fixture -> "FAIL: with every copy name
-    //       taken, the daemon says the config could not be kept", reading "ok / not kept: ... no
-    //       free name" in BOTH directories, and "FAIL: with every copy name taken, the config the
-    //       daemon could not read is not saved over", printing the file rewritten to hold monitor
-    //       1 alone -- with the copy-count check still green: that pair is what separates "gave
-    //       up on preserving" from "went on to destroy it", and only the second is data loss.
+    //       (b) the `m_writer.refuse(...)` call in the constructor's error branch deleted -- the
+    //       successor to the old `m_configUnread = true;` -- re-observed 2026-08-18 against the
+    //       twenty-name fixture -> "FAIL: with every copy name taken, the daemon says the config
+    //       could not be kept", reading "ok / not kept: ... no free name" in BOTH directories, and
+    //       "FAIL: with every copy name taken, the config the daemon could not read is not saved
+    //       over", printing the file rewritten to hold monitor 1 alone -- with the copy-count
+    //       check still green: that pair is what separates "gave up on preserving" from "went on
+    //       to destroy it", and only the second is data loss.
     //       (Six more go red in the phase above, which grades the same refusal on a config that
     //       could not be opened at all.) (c) the config directory dropped from
     //       preserveConfig()'s candidate list, which is the shape this fixture used to be
@@ -2081,18 +2084,17 @@ void runRepairCopyChecks() {
         //       is green either way. The copy is compared byte for byte against what was
         //       written, and the rewrite is asserted to have happened in the same breath: "a
         //       copy exists" is trivially satisfiable by a build that never rewrites anything.
-        // CONTROL: two, in backend/daemon/wallpaper_manager.cpp, both re-observed 2026-08-17
-        //       against the guard as it now stands. (a) the whole pre-fix shape -- the copy in
-        //       preserveUnreadableConfig() gated on `m_loadMalformed > 0` alone AND the
-        //       `if (repairUncopied())` retry in queuePersist() disabled, so nothing anywhere
-        //       takes the copy -> fourteen red across four phases, led by "FAIL: a start that
-        //       rewrites the config copies it aside first" and "FAIL: the copy holds the bytes
-        //       the user's file held", with the rewrite check GREEN: the rewrite landing over a
-        //       file nothing had copied is the loss itself. (b) only the `|| repairPending`
-        //       disjunct removed, leaving the retry in place -> these two stay GREEN and five go
-        //       red elsewhere, because queuePersist() takes the copy the startup path declined
-        //       to. That is the fix's own doing and worth keeping written down: after it, no
-        //       single call site is solely responsible for the copy.
+        // CONTROL: the `|| repairPending` disjunct removed from preserveUnreadableConfig()'s copy
+        //       gate (backend/daemon/wallpaper_manager.cpp), so only a malformed row takes the
+        //       copy -> twelve red across five phases, led by "FAIL: a start that rewrites the
+        //       config copies it aside first" printing "copies: (none)" and "FAIL: the copy holds
+        //       the bytes the user's file held", with the rewrite check GREEN: the rewrite landing
+        //       over a file nothing had copied is the loss itself. Re-observed 2026-08-18.
+        // WAS: this named a second mutation beside it -- the `if (repairUncopied())` retry in
+        //       queuePersist() -- and recorded that removing the disjunct alone left these two
+        //       checks GREEN, because that retry took the copy the startup path declined. True
+        //       when written; 6fa5be3 deleted the retry the next day, so this gate is now the
+        //       only thing that takes the copy and one mutation reddens the pair directly.
         countRenamesOnto(file);
         WallpaperManager::Config config;
         config.configFile = file;
@@ -2249,10 +2251,13 @@ void runRepairCopyChecks() {
     // WHY-THIS-SHAPE: a real client save on the SAME manager that failed to preserve, graded on
     //       the row reaching the file. A fresh manager would prove nothing: it never attempted a
     //       copy, so it is not in the state this check is about.
-    // CONTROL: `queuePersist()` (backend/daemon/wallpaper_manager.cpp) given back the deleted
-    //       `if (repairUncopied()) { ... return nullptr; }` block, which is the code one commit
-    //       ago -> "FAIL: an ordinary save still reaches the file after a copy that could not be
-    //       taken", printing "ids on disk: 1 2".
+    // CONTROL: an early `if (m_preserveFailed) return false;` added to WallpaperManager::persist()
+    //       (backend/daemon/wallpaper_manager.cpp) -- refusing every save over a copy that could
+    //       not be taken, which is what this daemon did for one commit -> "FAIL: an ordinary save
+    //       still reaches the file after a copy that could not be taken", printing "ids on disk:
+    //       1 2", and nothing else red. Re-observed 2026-08-18. (The pre-fix code put that refusal
+    //       in queuePersist() and read it back through repairUncopied(); both are long gone, and
+    //       the writer now knows nothing of preservation, so the manager is where it can go.)
     manager.requestWallpaper("static", paths->wallpapers[0].string(), 3);
     waitForRows(file, [](const std::map<int, RowInFile>& rows) { return rows.count(3) == 1; });
     std::string why;
@@ -2682,9 +2687,10 @@ void runPreservedCopySurvivesFailedRemovalChecks() {
         //       the note says so, and the run goes on saving. False before this fix in both arms:
         //       keepCopyIn() reported nothing preserved when only the removal failed -- and the
         //       fresh-copy arm deleted the good copy it had just written on the way out. Reporting
-        //       nothing preserved leaves m_configUnread set, which refuses EVERY save for the rest
-        //       of the process, so a user with a read-only config directory loses every wallpaper
-        //       change until they restart, silently.
+        //       nothing preserved leaves the writer's refusal standing (ConfigWriter::refuse(),
+        //       lifted only by the allow() preserveUnreadableConfig() makes when a copy lands),
+        //       which refuses EVERY save for the rest of the process, so a user with a read-only
+        //       config directory loses every wallpaper change until they restart, silently.
         // WHY-THIS-SHAPE: the last check is a real save landing in the file, not a reading of the
         //       health status. The status is Fail either way here -- the config was unreadable, and
         //       that is what it reports -- so grading the status would be green against the build
@@ -5542,14 +5548,16 @@ void runIdempotentRenameChecks() {
     //       WallpaperManager::setMonitorOutput (backend/daemon/wallpaper_manager.cpp) ->
     //       "FAIL: naming a screen the name it already has does not write the config at all",
     //       printing "2 write(s) landed for 1 change". Observed 2026-08-14. Reverted.
-    // CONTROL, for the skip: persist()'s wait shortened to zero AND a 300 ms sleep added ahead
-    //       of store.save() in the persist worker (both in
-    //       backend/daemon/wallpaper_manager.cpp), which is a host whose write always lands
-    //       after the call returns -> this phase reports "NOT VERIFIED -- S10.13 ... this host
-    //       finished the daemon's first config write only after the call had returned". Reading
-    //       the file at the instant the call returned, with no wait, reports "FAIL: naming a
-    //       screen writes that name into the config file" on that same host -- a daemon that
-    //       had done nothing wrong. Observed 2026-08-14. Both reverted.
+    // NO CONTROL for the skip, and that is a finding rather than an omission. The stated one --
+    //       `kWriteDeadline` shortened to zero AND a 300 ms sleep ahead of store.save(), both now
+    //       in backend/daemon/config_writer.cpp, i.e. a host whose write always lands after the
+    //       call returns -- produced that skip when it was written on 2026-08-14. Re-run
+    //       2026-08-18 it no longer does: since 6fa5be3 setMonitorOutput THROWS when its own
+    //       write did not land, so the phase abandons through main()'s per-phase handler ("the
+    //       're-asserting a name a screen already has' phase threw: ... a write has not come back")
+    //       before it can reach the skip. Whether any mutation still reaches that branch is not
+    //       established; if none does, the branch is dead and should be removed, not left looking
+    //       like coverage.
     // COVERAGE-ASSERT: a count that never moves is what a dead interposition and a daemon that
     //       never saves both produce, so the first call is asserted to write exactly once and
     //       a later call that DOES change the binding is asserted to write again -- an early
@@ -5677,12 +5685,14 @@ void runIdempotentRenameChecks() {
     //       that simply deleted the skip would pass this -- and that count is taken after a
     //       later name change has reached the file, so a write the redundant call made late
     //       has been counted by the time it is read.
-    // CONTROL: `&& !persistFailedLocked()` deleted from the early return in
-    //       WallpaperManager::setMonitorOutput (backend/daemon/wallpaper_manager.cpp) ->
-    //       "FAIL: re-asserting a name after a failed write writes it to the file", printing
-    //       "0 write(s) landed for the retry, 0 before it; the config file is empty or absent;
-    //       monitor 3 output '(no row)'", and "FAIL: the persistence health recovers once a
-    //       retried write lands". Reverted.
+    // CONTROL: `&& m_writer.outcome().onDisk` deleted from the early return in
+    //       WallpaperManager::setMonitorOutput (backend/daemon/wallpaper_manager.cpp), which is
+    //       where the old persistFailedLocked() test now lives -> "FAIL: re-asserting a name after
+    //       a failed write writes it to the file", printing "0 write(s) landed for the retry, 0
+    //       before it; the config file is empty or absent; monitor 3 output '(no row)'", and
+    //       "FAIL: the persistence health recovers once a retried write lands". Eight red in all;
+    //       the other six are the agreement cluster below, which grades the same shortcut.
+    //       Re-observed 2026-08-18. Reverted.
     // CONTROL, for the last check of this phase: the whole `== BindResult::Unchanged` early
     //       return deleted from the same function, so every call writes -> "FAIL: once the
     //       retry has landed, re-asserting the same name writes nothing again", printing "3
@@ -6129,25 +6139,33 @@ void runConcurrentHealthReadChecks() {
     //       requestWallpaper, rather than both being launched together, because the pointer is
     //       published exactly once, on the first save -- two threads racing to start would
     //       usually miss that instant.
-    // CONTROL: the publication in WallpaperManager::queuePersist()
-    //       (backend/daemon/wallpaper_manager.cpp) put back to its unsynchronised shape --
-    //       `startPersistWorkerLocked(); worker = m_persist;` with no m_stateMutex around it --
-    //       and the tree rebuilt with -DWALLPAPERX_SANITIZE=thread -> "WARNING:
-    //       ThreadSanitizer: data race" naming WallpaperManager::applyPersistOutcomeLocked()
-    //       under snapshot() against startPersistWorkerLocked() under queuePersist(), and ctest
-    //       reported config_store as Failed rather than Passed, the sanitizer replacing the
-    //       exit code. Every check in this phase stayed GREEN in that run, which is the point
-    //       of the block above: the sanitizer is the oracle here, not the assertions. With the
-    //       lock restored the same build reports nothing and passes. Re-observed 2026-08-15
-    //       against the split publish/wait shape. Reverted.
+    // CONTROL: the publication in ConfigWriter::queue() (backend/daemon/config_writer.cpp) put
+    //       back to its unsynchronised shape -- `startLocked(); worker = m_worker;` moved out of
+    //       the m_mutex scope -- and the tree rebuilt with -DWALLPAPERX_SANITIZE=thread ->
+    //       "WARNING: ThreadSanitizer: data race" twice, naming ConfigWriter::startLocked()
+    //       writing m_worker from this thread against ConfigWriter::everQueued() and
+    //       outcomeLocked() reading it under WallpaperManager::applyPersistOutcomeLocked() under
+    //       snapshot(); ctest reported config_store as Failed rather than Skipped, the sanitizer
+    //       replacing the exit code. Every check in this phase stayed GREEN in that run (589
+    //       snapshots, 220 of them in flight), which is the point of the block above: the
+    //       sanitizer is the oracle here, not the assertions. With the lock restored the same
+    //       build is clean again. Re-observed 2026-08-18 after the writer moved out of the
+    //       manager. Reverted.
+    // NOTE, on which lock: the pointer is now published under ConfigWriter's own m_mutex, not
+    //       under m_stateMutex. The property is unchanged -- one lock covers every reader of
+    //       that pointer -- but the writer no longer takes any lock belonging to the manager,
+    //       which is why setMonitorOutput can and does call m_writer.outcome() with m_stateMutex
+    //       held.
     // CONTROL, for the overlap being reported as a skip rather than a pass: a three-second
     //       sleep added to this reader's loop, so no read can complete inside the save window
     //       -> exit 77 with "2 snapshot(s) in total, 0 of them while the save was in flight"
     //       and "NOT VERIFIED -- S10.15 ... nothing overlapped it for the sanitizer to grade",
-    //       and no check failing. The production-side version of the same state -- persist()
-    //       called while m_stateMutex is held, so no health read can complete beside it --
-    //       cannot be used as a control: persist() takes that same mutex and the daemon
-    //       self-deadlocks. Observed 2026-08-14. Reverted.
+    //       and no check failing. The production-side version of the same state -- the save made
+    //       while m_stateMutex is held, so no health read can complete beside it -- still cannot
+    //       be used as a control, but only through the wrapper: WallpaperManager::persist() takes
+    //       m_stateMutex on its failure path and would self-deadlock. m_writer.write() itself no
+    //       longer takes any manager lock, so it holds nobody out of snapshot(). Observed
+    //       2026-08-14, re-reasoned 2026-08-18. Reverted.
     // COVERAGE-ASSERT: a snapshot is counted as an overlap only when the save was in flight
     //       both before the read began and after it ended, and a run where that count is zero
     //       is reported as a SKIP rather than a pass. So a
@@ -6510,21 +6528,21 @@ void runOneAnswerAboutTheFileChecks() {
     //       a mutation of that derivation makes them consistently wrong and an agreement-only
     //       check stays green. Agreement guards against the derivation being split again;
     //       correctness guards against the one derivation being wrong.
-    // CONTROL, for the correctness half: `outstanding` in
-    //       WallpaperManager::persistOutcomeLocked() (backend/daemon/wallpaper_manager.cpp)
-    //       forced to false, which is the pre-bcac12f reading that consulted only completed
-    //       writes -> "FAIL: the file is reported out of date, when a write is outstanding and
-    //       the caller gave up on it", printing "health said up-to-date and the reply said
-    //       up-to-date, but the file does not hold what live state holds".
+    // CONTROL, for the correctness half: `outstanding` in ConfigWriter::outcomeLocked()
+    //       (backend/daemon/config_writer.cpp) forced to false, which is the pre-bcac12f reading
+    //       that consulted only completed writes -> "FAIL: the file is reported out of date, when
+    //       a write is outstanding and the caller gave up on it", printing "health said up-to-date
+    //       and the reply said up-to-date, but the file does not hold what live state holds", plus
+    //       the stalled-write health check two phases down. Re-observed 2026-08-18.
     // CONTROL, for the agreement half: the shortcut in WallpaperManager::setMonitorOutput given
-    //       back an inference of its own -- `!(m_persist && m_persist->haveResult &&
-    //       !m_persist->result.error.empty())` in place of `persistOutcomeLocked().onDisk` --
+    //       back an inference of its own -- `m_writer.lastResult().error.empty()`, i.e. only a
+    //       COMPLETED write with an error counts, in place of `m_writer.outcome().onDisk` --
     //       which is the shape that let two callers disagree -> six red, this phase's four led by
     //       "FAIL: every channel agrees about the write, when a write is outstanding and the
     //       caller gave up on it", printing "health said not-up-to-date, the reply said
     //       up-to-date, and 0 write(s) were made", and the same pair for the refused-write state.
     //       The two phases below it go red on the same edit -- one mutation, all three of the
-    //       states this cluster is about.
+    //       states this cluster is about. Re-observed 2026-08-18, unchanged.
     // COVERAGE-ASSERT: the number of states really compared is asserted against the number the
     //       phase sets up, so a state that stops being reachable -- a fixture this host cannot
     //       stage, an early return added later -- shrinks the phase loudly instead of leaving it
@@ -6698,15 +6716,19 @@ void runRefusedNameRetryChecks() {
     //       answer is the one it acts on. The config here can never be written for the life of
     //       the run, so a success is never true.
     // WHY-THIS-SHAPE: the refusal is a config the daemon could not read AND could not move
-    //       aside, which is the one refusal decided in queuePersist() before a writer thread
-    //       exists -- the worker-side failure the phase for a read-only directory already covers
+    //       aside, which is the one refusal decided in ConfigWriter::queue() before a writer
+    //       thread exists -- the worker-side failure the read-only-directory phase already covers
     //       cannot reach this arm, because there a writer does exist and its result carries the
     //       error. The IDENTICAL name is re-asserted, because that is the call the idempotence
     //       skip applies to; a different name would take the binding path and prove nothing.
-    // CONTROL: `if (m_configUnread) return true;` deleted from
-    //       WallpaperManager::persistFailedLocked (backend/daemon/wallpaper_manager.cpp), which
-    //       is the code before this fix -> "FAIL: re-asserting a name the daemon refused to write
-    //       is refused again, not reported as stored", printing "the retry returned normally".
+    // CONTROL: `m_notWritten = m_refusal;` deleted from ConfigWriter::queue()'s refusal branch
+    //       (backend/daemon/config_writer.cpp), so a refusal decided before any writer exists is
+    //       invisible to outcome() -- the successor to the deleted persistFailedLocked()'s
+    //       `if (m_configUnread) return true;` -> both checks below red, "FAIL: re-asserting a
+    //       name the daemon refused to write is refused again, not reported as stored" printing
+    //       "the retry returned normally", and the first call red the same way. The coverage
+    //       assert stays GREEN, correctly: the refusal still stops the write, only the report is
+    //       lost. Seven red in all. Re-observed 2026-08-18.
     const std::string firstThrew = name(3, "DP-A");
     const bool firstRefused = !firstThrew.empty();
     check(firstRefused, "a name the daemon will not write is reported as an error");
@@ -6769,16 +6791,20 @@ void runFailedSaveChecks() {
     //       throw-to-DBus-error translation -- so a bus round trip would test sdbus's
     //       error mapping, which S6.10's checks already cover, while costing this file a
     //       session bus it otherwise does not need.
-    // CONTROL: two, both reverted. (a) `recordHealth(&DaemonHealth::persistence,
-    //       HealthStatus::Fail, saved.error); return;` replaced by a bare `return;` in
-    //       WallpaperManager::persist(), i.e. the error swallowed -> "FAIL: a save that
-    //       failed leaves the persistence health check reporting failure" while the
-    //       no-throw check stayed green, which is the pair of results the two clauses
-    //       exist to distinguish. (b) that same line replaced with a `throw
-    //       std::runtime_error(saved.error)` -> "FAIL: a config write that cannot happen
-    //       does not fail the request that triggered it", printing "requestWallpaper threw:
-    //       .../ro/wallpaperx: could not be created: Permission denied", with the health
-    //       check red beside it since the throw skipped the recording.
+    // CONTROL: two, both reverted, both re-observed 2026-08-18. (a) the Fail in
+    //       applyPersistOutcomeLocked()'s `!outcome.onDisk` branch changed to Ok, i.e. the
+    //       error swallowed where health is now composed -> "FAIL: a save that failed leaves the
+    //       persistence health check reporting failure" while the no-throw check stayed green,
+    //       which is the pair of results the two clauses exist to distinguish. (b) a `throw
+    //       std::runtime_error(why)` added on persist()'s failure path -> "FAIL: a config write
+    //       that cannot happen does not fail the request that triggered it", printing
+    //       "requestWallpaper threw: .../ro/wallpaperx: could not be created: Permission denied",
+    //       and nine phases abandoned through main()'s handler.
+    // WAS: (a) named deleting the recordHealth call in WallpaperManager::persist(). Re-run
+    //       2026-08-18 that reddens NOTHING -- since bcac12f the health is derived from the
+    //       writer's own result at snapshot time, so removing the recording changes no answer
+    //       this phase can see. The check is not vacuous; the mutation named for it had gone
+    //       inert, which is why it is restated at the composition site above.
     std::string thrown;
     try {
         manager.requestWallpaper("static", wallpaper.string(), 0);
@@ -6895,11 +6921,11 @@ void runFailedWriteIsAnnouncedChecks() {
     //       capture is polled with a bound and a failure branch -- a wait that expires fails the
     //       check, it never falls through into treating the stall as an answer.
     // CONTROL: the `::write(STDERR_FILENO, line.data(), line.size())` block deleted from the
-    //       persist worker's loop in WallpaperManager::startPersistWorkerLocked()
-    //       (backend/daemon/wallpaper_manager.cpp), which is the code before this fix -> "FAIL: a
+    //       writer thread's loop in ConfigWriter::startLocked()
+    //       (backend/daemon/config_writer.cpp), which is the code before this fix -> "FAIL: a
     //       config write that failed is announced on standard error", printing "nothing naming
     //       this phase's own directory was written to standard error in 5000 ms; the capture
-    //       holds: (nothing)".
+    //       holds: (nothing)", and nothing else red. Re-observed 2026-08-18.
     const std::filesystem::path configFile = readOnly / "wallpaperx" / "config.json";
     const std::filesystem::path capturedTo = scratch.path() / "stderr.txt";
     std::string captured;
@@ -7187,18 +7213,21 @@ void runStalledSaveChecks() {
     //       reason and nothing a reader can act on. The elapsed time is asserted against a
     //       window (waited, but not forever) rather than a point, because how long past the
     //       deadline the wakeup lands is the scheduler's business.
-    // CONTROL: two, both reverted. (a) `kLoadDeadline` in the settled.wait_for() call
-    //       replaced with `std::chrono::hours(1)` -> "FAIL: a save whose write cannot
-    //       complete still releases the caller", printing "requestWallpaper has not returned
-    //       20.0 s after a write that cannot finish", the rest of this phase skipped with
-    //       that reason, and the snapshot-wins phase reporting NOT VERIFIED rather than
-    //       failing. (b) `throw std::runtime_error("stalled")` added after
-    //       the wait_for -> "FAIL: a config write that cannot complete does not fail the
-    //       request that triggered it", printing "requestWallpaper threw: stalled". (c) for
-    //       the upper bound specifically, `kLoadDeadline` replaced with 10 seconds, so the
-    //       caller is released but far too late -> "FAIL: the caller of a stalled save waits
-    //       for the deadline and not for the filesystem", printing "requestWallpaper took
-    //       10000 ms against a 2000 ms deadline", and nothing else red.
+    // CONTROL: three, all reverted, all against `kWriteDeadline` in ConfigWriter::write()'s
+    //       settled.wait_for() (backend/daemon/config_writer.cpp). (a) raised to 30 s -> "FAIL: a
+    //       save whose write cannot complete still releases the caller", printing
+    //       "requestWallpaper has not returned 20.0 s after a write that cannot finish", the rest
+    //       of this phase skipped with that reason, and the snapshot-wins phase reporting NOT
+    //       VERIFIED rather than failing -- one red, exactly as before. 30 s and not the hour this
+    //       used to say: at an hour the binary HANGS before reaching here, inside the
+    //       "one answer about the config file" phase, which parks on a refused write and is
+    //       bounded by nothing but this constant. (b) `throw std::runtime_error("stalled")` added
+    //       after the wait_for -> "FAIL: a config write that cannot complete does not fail the
+    //       request that triggered it", printing "requestWallpaper threw: stalled". (c) for the
+    //       upper bound specifically, replaced with 10 seconds, so the caller is released but far
+    //       too late -> "FAIL: the caller of a stalled save waits for the deadline and not for the
+    //       filesystem", printing "requestWallpaper took 10000 ms against a 2000 ms deadline", and
+    //       nothing else red. (a) and (c) re-observed 2026-08-18.
     const AbandonedOrReturned stalled =
         requestOnAbandonableThread(manager, stalledWallpaper.string(), 1, std::chrono::seconds(20));
     check(stalled.returned, "a save whose write cannot complete still releases the caller");
@@ -7229,11 +7258,15 @@ void runStalledSaveChecks() {
     //       instant, so which side of the comparison that snapshot lands on is a race. The
     //       status and the wording are both asserted -- a `fail` with the previous save's
     //       detail would send an operator to look at a disk error that is not there.
-    // CONTROL: the `if (writingSince && ... > kLoadDeadline)` block deleted from
-    //       applyPersistOutcomeLocked() -> "FAIL: health reports a write that has not come
-    //       back rather than the last save that did", printing "persistence reads ok
-    //       (/tmp/.../config.json)" -- the healthy save above, which is the exact wrong
-    //       answer this goal names. Reverted.
+    // CONTROL: ConfigWriter::stalledPastDeadline() (backend/daemon/config_writer.cpp) forced to
+    //       false, which is where the old `if (writingSince && ... > kLoadDeadline)` test now
+    //       lives -> "FAIL: health reports a write that has not come back rather than the last
+    //       save that did", printing "persistence reads fail (... a write has not come back, the
+    //       choice may not be on disk yet)", and nothing else red. Re-observed 2026-08-18.
+    // WAS: this said the mutation printed "persistence reads ok" -- the healthy save above. True
+    //       when written 2026-08-12; bcac12f then made an outstanding write a failure in its own
+    //       right, so what this block uniquely supplies is now the WORDING, not the status. The
+    //       check asserts both, which is why it still reddens.
     wallpaperx::HealthStatus sawStatus = wallpaperx::HealthStatus::Pending;
     std::string sawDetail;
     bool namesTheStall = false;
@@ -7271,19 +7304,19 @@ void runStalledSaveChecks() {
     //       The bound is a quarter of the deadline, not "faster than the first call": the
     //       second save does no I/O at all on this thread, so anything near the deadline is
     //       the defect, and a relative bound would be satisfied by 1.9 s.
-    // CONTROL: the `if (worker->stalled)` short-circuit in WallpaperManager::persist()
-    //       (backend/daemon/wallpaper_manager.cpp) forced false, so every save waits -> "FAIL: a
-    //       second save during a stall does not wait for the deadline all over again", printing
-    //       "the second save took 2000 ms against a 2000 ms deadline". Re-observed 2026-08-15
-    //       against the split publish/wait shape. Reverted.
+    // CONTROL: the `!worker->stalled &&` short-circuit dropped from ConfigWriter::write()'s wait
+    //       (backend/daemon/config_writer.cpp), so every save waits -> "FAIL: a second save during
+    //       a stall does not wait for the deadline all over again", printing "the second save took
+    //       2000 ms against a 2000 ms deadline", and nothing else red. Re-observed 2026-08-18
+    //       after the wait moved out of the manager. Reverted.
     // COVERAGE-ASSERT: the first save's own elapsed time is asserted to be at least three
     //       quarters of the deadline. Without it this comparison is green on a build that
     //       waits for nothing at all -- both calls return instantly and the phase reports
     //       that the deadline is not paid twice, having never seen it paid once. CONTROL for
-    //       it: `kLoadDeadline` in the settled.wait_for() replaced with 0 seconds -> "FAIL:
-    //       the first save really did wait for the deadline, so the comparison above has a
+    //       it: `kWriteDeadline` (backend/daemon/config_writer.cpp) replaced with 0 seconds ->
+    //       "FAIL: the first save really did wait for the deadline, so the comparison above has a
     //       baseline", printing "the first save took 0 ms", while the check it guards stayed
-    //       green at 0 ms. Reverted.
+    //       green at 0 ms. Re-observed 2026-08-18. Reverted.
     const auto secondStart = StallClock::now();
     manager->requestWallpaper("static", healthyWallpaper.string(), 2);
     const double secondMs = millisSince(secondStart);
@@ -7419,22 +7452,26 @@ void runNoWriterThreadChecks() {
     //       which this project forbids, and it would grade the pretence rather than what
     //       std::thread does here. The limit is restored before anything is printed, and the
     //       phase skips rather than grades when the limit does not bite.
-    // CONTROL: the fix reverted, i.e. `m_persist = std::make_shared<PersistWorker>();`
-    //       published before the std::thread that services it in
-    //       WallpaperManager::startPersistWorkerLocked (backend/daemon/wallpaper_manager.cpp)
-    //       -> all four checks below red: "a save with no thread for the writer does not fail
-    //       the request" printing "requestWallpaper threw: Resource temporarily unavailable",
-    //       "the daemon reports persistence as failed when it has no thread to write on"
-    //       printing "persistence reads ok", "a later save does not wait on a writer that was
-    //       never started" printing "the second save took 2000 ms", and "once threads are
-    //       available again a save reaches the file" printing "ids on disk: (none)".
-    //       Observed 2026-08-15.
-    // CONTROL, for the two recovery checks: `m_configUnread = true;` added beside that same
-    //       catch -- the "refuse every write for the session" repair the review warned against
-    //       -> "FAIL: once threads are available again a save reaches the file" and "FAIL:
-    //       persistence reports itself working again once a save has landed", printing "not
-    //       saved, this run could not read it and will not overwrite it", with the two checks
-    //       above still green. Observed 2026-08-15. Reverted.
+    // CONTROL: the fix reverted whole in ConfigWriter::startLocked()
+    //       (backend/daemon/config_writer.cpp) -- `m_worker` published before the std::thread that
+    //       services it AND the catch replaced by a rethrow, which together are the pre-fix shape
+    //       -> the four checks below red: "a save with no thread for the writer does not fail the
+    //       request" printing "requestWallpaper threw: Resource temporarily unavailable", "the
+    //       daemon reports persistence as failed when it has no thread to write on" printing
+    //       "persistence reads ok", "a later save does not wait on a writer that was never
+    //       started" printing "the second save took 2000 ms", and "once threads are available
+    //       again a save reaches the file" printing "ids on disk: (none)"; eight red in all.
+    //       Both halves are needed: with the catch left in place the early publish alone reddens
+    //       five OTHER checks and leaves these two green, because nothing escapes and the first
+    //       save's timed-out wait sets the stall flag that makes the second cheap. Re-observed
+    //       2026-08-18. Reverted.
+    // CONTROL, for the two recovery checks: `m_refusing = true;` with the unreadable-config
+    //       wording added beside that same catch -- the "refuse every write for the session"
+    //       repair the review warned against -> "FAIL: once threads are available again a save
+    //       reaches the file" and "FAIL: persistence reports itself working again once a save has
+    //       landed", printing "not saved, this run could not read it and will not overwrite it".
+    //       The two checks above stay green; the two name checks below now go red as well, since
+    //       they require the reason to still name the missing thread. Re-observed 2026-08-18.
     check(firstThrew.empty(), "a save with no thread for the writer does not fail the request");
     if (!firstThrew.empty()) std::fprintf(stderr, "  requestWallpaper threw: %s\n", firstThrew.c_str());
     const bool reported = afterFirst.health.persistence.status == wallpaperx::HealthStatus::Fail &&
@@ -7475,19 +7512,20 @@ void runNoWriterThreadChecks() {
     //       call is asserted to report, so this cannot be satisfied by a build that never noticed
     //       the writer was missing.
     // CONTROL: the `if (!m_notWritten.empty())` branch disabled in
-    //       WallpaperManager::persistOutcomeLocked() (backend/daemon/wallpaper_manager.cpp), so a
-    //       refusal decided before any writer exists is invisible again -> six red across three
-    //       phases, here "FAIL: naming a screen with no thread for the writer reports the name
-    //       did not reach the file" printing "the call returned normally", and "FAIL:
-    //       re-asserting a name whose writer could never start writes it to the file" printing
-    //       "the config file is empty or absent; monitor 4 output '(no row)'".
+    //       ConfigWriter::outcomeLocked() (backend/daemon/config_writer.cpp), so a refusal decided
+    //       before any writer exists is invisible again -> eleven red across five phases, here
+    //       "FAIL: naming a screen with no thread for the writer reports the name did not reach
+    //       the file" printing "the call returned normally", and "FAIL: re-asserting a name whose
+    //       writer could never start writes it to the file" printing "the config file is empty or
+    //       absent; monitor 4 output '(no row)'". Re-observed 2026-08-18.
     // CONTROL, for the other direction -- a stale refusal must stop outranking the writer once a
     //       snapshot has been handed over: `if (worker) m_notWritten.clear();` disabled in
-    //       WallpaperManager::queuePersist() -> "FAIL: re-asserting a name whose writer could
-    //       never start writes it to the file", printing "monitor 4 output 'DP-Z'; the
+    //       ConfigWriter::queue() -> exactly two red, "FAIL: re-asserting a name whose writer
+    //       could never start writes it to the file", printing "monitor 4 output 'DP-Z'; the
     //       re-assertion threw: ... no thread available: Resource temporarily unavailable" -- the
     //       name in the file and the daemon still reporting the refusal that preceded it -- and
-    //       "FAIL: persistence reports itself working again once a save has landed".
+    //       "FAIL: persistence reports itself working again once a save has landed". Re-observed
+    //       2026-08-18.
     const bool nameReported = nameThrew.find("no thread") != std::string::npos;
     check(nameReported, "naming a screen with no thread for the writer reports the name did not reach the file");
     if (!nameReported) {
@@ -7561,8 +7599,8 @@ void runWriterAllocationFailureChecks() {
     //       so both builds behave identically under it. Each sweep step gets a fresh manager,
     //       because a manager whose writer started never starts one again.
     // CONTROL: `catch (const std::exception& e)` put back to `catch (const std::system_error& e)`
-    //       in WallpaperManager::startPersistWorkerLocked() (backend/daemon/wallpaper_manager.cpp),
-    //       which is the code before this fix -> "FAIL: an allocation failure where the config
+    //       in ConfigWriter::startLocked() (backend/daemon/config_writer.cpp), which is the code
+    //       before this fix, re-observed 2026-08-18 -> "FAIL: an allocation failure where the config
     //       writer is started is reported, not thrown at the client", printing "no allocation in
     //       the first 400 reported a writer that could not be built; 16 were injected, and one
     //       escaped requestWallpaper at allocation 0: std::bad_alloc" -- the escape being the
@@ -7701,13 +7739,14 @@ void runSaveVisibleOnReturnChecks() {
     //       already returned, so a correct build would go red at random. When the reader
     //       attached is observed before the write can possibly have finished, and is
     //       therefore a lower bound no interleaving can move.
-    // CONTROL: `kLoadDeadline` in persist()'s settled.wait_for() replaced with 0 seconds,
-    //       i.e. the write left fully asynchronous -> "FAIL: requestWallpaper returns only
-    //       after the write it queued has landed", printing "it returned 700 ms before the
-    //       write was even let go". The same mutation also reddened one of the older checks
-    //       that sets a wallpaper and reads the file back ("a monitor whose file was
-    //       unreadable at restore is still in the file after another monitor is set"), which
-    //       is the accident this phase exists to turn into a deliberate check. Reverted.
+    // CONTROL: `kWriteDeadline` in ConfigWriter::write()'s settled.wait_for()
+    //       (backend/daemon/config_writer.cpp) replaced with 0 seconds, i.e. the write left fully
+    //       asynchronous -> "FAIL: requestWallpaper returns only after the write it queued has
+    //       landed", printing "it returned 700 ms before the write was even let go". The same
+    //       mutation takes seven other checks with it, including three phases abandoned by a
+    //       SetMonitorOutput that now throws on a write it cannot confirm -- collateral of the
+    //       kind this phase exists to turn into a deliberate check. Re-observed 2026-08-18.
+    //       Reverted.
     const auto start = StallClock::now();
     manager.requestWallpaper("static", wallpaper.string(), 0);
     const auto returnedAt = StallClock::now();
@@ -7722,11 +7761,11 @@ void runSaveVisibleOnReturnChecks() {
 
     // The bytes the parked write was carrying, so "the caller waited" is about THIS request's
     // write and not about some other one that happened to be in flight.
-    // CONTROL: `worker->pending = entries;` in queuePersist() replaced with an empty vector,
-    //       i.e. a save that queues the wrong state -> "FAIL: the write this phase released is
-    //       the one the request queued", printing "the fifo carried 37 bytes", among 29 red
-    //       checks in all. Re-observed 2026-08-15 after the publish half moved into
-    //       queuePersist(). Reverted.
+    // CONTROL: `worker->pending = rows;` in ConfigWriter::queue()
+    //       (backend/daemon/config_writer.cpp) replaced with an empty vector, i.e. a save that
+    //       queues the wrong state -> "FAIL: the write this phase released is the one the request
+    //       queued", printing "the fifo carried 37 bytes", among 40 red checks in all.
+    //       Re-observed 2026-08-18 after the writer moved out of the manager. Reverted.
     const nlohmann::json wrote = nlohmann::json::parse(released.bytes, nullptr, false);
     const bool carriedThisRequest =
         !wrote.is_discarded() && wrote.is_object() && wrote.contains("monitors") && wrote["monitors"].is_array() &&
@@ -7824,9 +7863,10 @@ void runLatestSnapshotWinsChecks() {
     //       that never reach the disk -- the write lands in the pipe and its rename moves the
     //       fifo, not a file. It is also the only way to see a superseded snapshot's content
     //       at all.
-    // CONTROL: `worker->pending = entries;` in queuePersist() replaced with an empty vector ->
-    //       "FAIL: the write that stalled is the snapshot that was current when it started",
-    //       printing "the fifo carried 37 bytes". Reverted. The first-wins and queue mutations
+    // CONTROL: `worker->pending = rows;` in ConfigWriter::queue()
+    //       (backend/daemon/config_writer.cpp) replaced with an empty vector -> "FAIL: the write
+    //       that stalled is the snapshot that was current when it started", printing "the fifo
+    //       carried 37 bytes". Re-observed 2026-08-18. The first-wins and queue mutations
     //       below both leave this one GREEN -- the fifo carries the first snapshot under
     //       either -- which is why it is asserted as a precondition here rather than left to
     //       the checks that need it.
@@ -7855,10 +7895,11 @@ void runLatestSnapshotWinsChecks() {
     //       count, and every read of the file is guarded by S_ISREG: the released write
     //       renames the FIFO onto config.json, and an unguarded read of that path would block
     //       this thread for good.
-    // CONTROL: two, both reverted. (a) `worker->pending = entries;` in queuePersist() replaced
-    //       with `if (!m_persist->pending) m_persist->pending = entries;`, i.e. first-wins ->
-    //       "FAIL: the snapshot that lands after a stalled write is the newest one", printing
-    //       "  monitor 2 is missing from the file". (b) `pending` turned into a
+    // CONTROL: two, both reverted. (a) `worker->pending = rows;` in ConfigWriter::queue()
+    //       (backend/daemon/config_writer.cpp) replaced with `if (!worker->pending)
+    //       worker->pending = rows;`, i.e. first-wins -> "FAIL: the snapshot that lands after a
+    //       stalled write is the newest one", printing "  monitor 2 is missing from the file",
+    //       and nothing else red. Re-observed 2026-08-18. (b) `pending` turned into a
     //       std::deque<std::vector<PersistedWallpaper>> the worker pops the front of, i.e. a
     //       real queue -> "FAIL: the snapshot a newer one superseded is never written",
     //       printing "3 writes landed on config.json, expected 2", while the content check
