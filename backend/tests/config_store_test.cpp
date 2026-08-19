@@ -1717,7 +1717,7 @@ void runPreservedCopyChecks() {
     //       NUMBER of files behind and differ only in which bytes are in which name.
     // CONTROL: two, both reverted, both observed 2026-08-18. (a) the
     //       `(slot == 0 ? "" : "." + std::to_string(slot))` suffix dropped from preservedName()
-    //       (backend/daemon/wallpaper_manager.cpp), so every copy competes for one name ->
+    //       (backend/daemon/config_preserve.cpp), so every copy competes for one name ->
     //       "FAIL: the second unreadable config is preserved under a name of its own", listing
     //       config.json.bad in the state directory AND one in the config directory, and "FAIL:
     //       the daemon says where the second unreadable config was kept", reading "kept as
@@ -1841,7 +1841,7 @@ void runPreservationExhaustedChecks() {
     //       overwrite the file, which is the damaging half; and one made before the save would
     //       pass for any build at all, since the constructor writes nothing on this path.
     // CONTROL: three, all reverted. (a) `kMaxPreservedCopies` in
-    //       backend/daemon/wallpaper_manager.cpp raised to 11, so a free name exists after all ->
+    //       backend/daemon/config_preserve.cpp raised to 11, so a free name exists after all ->
     //       all three checks red, "  21 copies (expected 20)" naming config.json.bad.10.
     //       (b) the `m_writer.refuse(...)` call in the constructor's error branch deleted -- the
     //       successor to the old `m_configUnread = true;` -- re-observed 2026-08-18 against the
