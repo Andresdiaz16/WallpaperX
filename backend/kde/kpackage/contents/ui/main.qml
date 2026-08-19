@@ -160,6 +160,12 @@ WallpaperItem {
             wrapMode: Text.Wrap
             color: "#f0f0f0"
             font.pointSize: 16
+
+            // Plain, not the default AutoText: the refusal message carries a string copied
+            // verbatim from whatever holds port 18462, and auto-detection would render markup
+            // in it -- including images Qt would fetch. Same reason the path above is shown
+            // escaped rather than raw.
+            textFormat: Text.PlainText
             text: root.describe()
         }
     }
