@@ -4,6 +4,7 @@
 
 #include "config_store.h"
 #include "config_writer.h"
+#include "kept_rows.h"
 #include "log_escape.h"
 #include "vulkan/frame_export.h"
 
@@ -303,6 +304,16 @@ private:
     // way to stop a stalled read holding startup is to stop waiting for it.
     LoadResult loadWithDeadline() const;
 
+    // Whether a live monitor holds a wallpaper for this id. Caller must hold m_stateMutex.
+    bool liveHolds(int monitorId) const;
+
+    // The live state the persistence side needs, and all it needs. Read under
+    // m_stateMutex wherever a render or a bus call could be running beside it.
+    LiveWallpapers liveWallpapers() const;
+
+    // The persistence report, over that live state. Same locking rule.
+    std::string keptDetail(const std::string& base) const;
+
     // Hands `entries` to the writer without waiting, and reports a refusal or a missing
     // thread as persistence health. Safe to call with no lock held.
     void queuePersist(const std::vector<PersistedWallpaper>& entries);
@@ -315,19 +326,6 @@ private:
     // than m_health: the writer's thread cannot touch this object.
     void applyPersistOutcomeLocked(DaemonHealth& health) const;
 
-    // Snapshots the monitors worth persisting. Caller must hold m_stateMutex.
-    std::vector<PersistedWallpaper> persistableLocked() const;
-
-    // Clears the wallpaper half of a kept row, answering whether there was one to clear -- the
-    // caller reports the loss, and only when there was one. Takes the row, not an id: one caller
-    // holds a copy that is not in m_unapplied yet. Says nothing about `output`: a lost name is a
-    // different loss, counted separately.
-    static bool dropKeptWallpaper(PersistedWallpaper& row);
-
-    // Whether a live monitor holds a wallpaper for this id, which is what decides that a kept
-    // row for the same id will not survive the next save. Caller must hold m_stateMutex.
-    bool liveHoldsLocked(int monitorId) const;
-
     // Displaced: the bind took the name off another monitor, or took another name off this one.
     enum class BindResult { Unchanged, Bound, Displaced };
 
@@ -335,11 +333,6 @@ private:
     // hold m_stateMutex and must have validated the name.
     BindResult bindOutputLocked(int monitorId, const std::string& outputName);
 
-    // Facts about the config that outlive the operation that discovered them -- a copy of an
-    // unreadable file, entries kept for a newer build. Every persistence detail is rebuilt
-    // through these, or the next save would report only itself and drop the pointer to the copy.
-    void addPersistenceNote(const std::string& note);
-    std::string persistenceDetail(const std::string& base) const;
 
     const Config m_config;
     const ConfigStore m_store;
@@ -348,14 +341,14 @@ private:
     // the state it reports on, so it outlives every path that asks.
     ConfigWriter m_writer;
 
+    // The rows this run could not apply, and the tally of what the config lost.
+    KeptRows m_kept{kMaxMonitors};
+
     // Everything from here to the mutexes is guarded by m_stateMutex, except the load results
     // below, which are written before the event loop starts and only read after.
 
     // What load() returned, until restoreSaved() consumes it.
     std::vector<PersistedWallpaper> m_restore;
-
-    // Entries restoreSaved() could not apply, carried so a save does not delete them.
-    std::vector<PersistedWallpaper> m_unapplied;
 
     // The repair restoreSaved() computed, until writeRepairedConfig() takes it out.
     std::optional<std::vector<PersistedWallpaper>> m_repair;
@@ -368,23 +361,6 @@ private:
     // nowhere else. Sticky: a later write succeeding says nothing about what the first
     // destroyed, and health returning to ok is what hides it.
     bool m_preserveFailed = false;
-
-    // Raw; sanitized once when recorded. Written by the constructor, preserveUnreadableConfig()
-    // and restoreSaved() before the event loop, and by requestWallpaper() under m_stateMutex
-    // once per kept row it displaces.
-    std::string m_persistenceNote;
-
-    // Entries no build can apply, dropped rather than kept, counted so the loss is reported at
-    // all. Name-only rows counted apart: this report is the user's notice that a picture did
-    // not come back, and a name never was one.
-    int m_droppedEntries = 0;
-    int m_droppedNames = 0;
-
-    // Counted, not written into m_persistenceNote: these two are the only losses a client can
-    // cause repeatedly, and the note is appended to for the life of the process while the
-    // detail is truncated at its tail -- so a run of them would crowd out everything after.
-    int m_replacedKept = 0;
-    int m_takenOverNames = 0;
 
     // What the load found, held for preserveUnreadableConfig() to act on later.
     bool m_loadPreservable = false;
