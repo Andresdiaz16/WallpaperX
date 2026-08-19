@@ -428,6 +428,65 @@ double millisSince(StallClock::time_point start) {
 // phases that use it loudly instead of silently re-pointing them at whatever the new value is.
 constexpr double kSaveDeadlineMs = 2000.0;
 
+// How long a phase that parks a config write waits for the call to come back before walking
+// away from it. Ten times the deadline above, so no healthy build is ever abandoned, and
+// finite, so a build whose wait is unbounded reddens a check instead of hanging the binary.
+constexpr std::chrono::seconds kParkedCallPatience{20};
+
+double parkedCallPatienceMs() {
+    return std::chrono::duration<double, std::milli>(kParkedCallPatience).count();
+}
+
+// One requestWallpaper(), made on a thread the caller can walk away from.
+//
+// The obvious version -- call it inline -- turns a build whose wait is unbounded into a
+// HANG, and a hung test prints nothing at all: no FAIL line, no reason, just a ctest
+// timeout thirty seconds later. This one turns that build into a check that goes red.
+// The manager is held by shared_ptr and copied into the thread, so a call that never
+// returns keeps alive the object it is inside rather than being abandoned on top of a
+// destroyed one.
+//
+// Declared here rather than beside its first caller because two phases park a write and both
+// need the bound: the "one answer about the config file" phase below and the stalled-save
+// phase further down.
+struct AbandonedOrReturned {
+    bool returned = false;
+    double elapsedMs = 0;
+    std::string threw;
+};
+
+AbandonedOrReturned requestOnAbandonableThread(const std::shared_ptr<WallpaperManager>& manager,
+                                               const std::string& path, int monitorId,
+                                               std::chrono::seconds patience) {
+    struct Answer {
+        double elapsedMs = 0;
+        std::string threw;
+    };
+    auto answered = std::make_shared<std::promise<Answer>>();
+    std::future<Answer> future = answered->get_future();
+    std::thread([manager, answered, path, monitorId] {
+        const auto start = StallClock::now();
+        Answer answer;
+        try {
+            manager->requestWallpaper("static", path, monitorId);
+        } catch (const std::exception& e) {
+            answer.threw = e.what();
+        } catch (...) {
+            answer.threw = "an exception that is not a std::exception";
+        }
+        answer.elapsedMs = millisSince(start);
+        answered->set_value(answer);
+    }).detach();
+
+    AbandonedOrReturned out;
+    if (future.wait_for(patience) != std::future_status::ready) return out;
+    const Answer answer = future.get();
+    out.returned = true;
+    out.elapsedMs = answer.elapsedMs;
+    out.threw = answer.threw;
+    return out;
+}
+
 std::string joined(const std::vector<std::string>& names) {
     std::string out;
     for (const std::string& name : names) {
@@ -5535,29 +5594,15 @@ void runIdempotentRenameChecks() {
     //       a daemon that wrote twice. A rename count is exact on every filesystem. What makes
     //       an exact number legitimate here rather than an assertion on the scheduler is that
     //       every count is taken from a QUIESCED daemon, and quiescence is established rather
-    //       than assumed: WallpaperManager::persist() waits for the worker only up to its own
-    //       two-second deadline and then returns with the save still queued, so each sample
-    //       below waits for the name to reach the file and then requires that it had already
-    //       landed when the call returned. A host that missed that deadline is reported as a
-    //       skip -- on such a host a late write and a redundant one are indistinguishable, and
-    //       grading either way would be grading the host. A call that must write NOTHING is
-    //       sampled at once, and what makes that sample safe is the call after it: waiting for
-    //       that write re-reads the count, so a write the redundant call made late shows up as
-    //       a count that moved and is skipped rather than passed over.
+    //       than assumed: after each call this phase waits for the name to reach the file and
+    //       then requires that it had already landed when the call returned. A call that must
+    //       write NOTHING is sampled at once, and what makes that sample safe is the call after
+    //       it: waiting for that write re-reads the count, so a write the redundant call made
+    //       late shows up as a count that moved.
     // CONTROL: the `== BindResult::Unchanged` early return deleted from
     //       WallpaperManager::setMonitorOutput (backend/daemon/wallpaper_manager.cpp) ->
     //       "FAIL: naming a screen the name it already has does not write the config at all",
     //       printing "2 write(s) landed for 1 change". Observed 2026-08-14. Reverted.
-    // NO CONTROL for the skip, and that is a finding rather than an omission. The stated one --
-    //       `kWriteDeadline` shortened to zero AND a 300 ms sleep ahead of store.save(), both now
-    //       in backend/daemon/config_writer.cpp, i.e. a host whose write always lands after the
-    //       call returns -- produced that skip when it was written on 2026-08-14. Re-run
-    //       2026-08-18 it no longer does: since 6fa5be3 setMonitorOutput THROWS when its own
-    //       write did not land, so the phase abandons through main()'s per-phase handler ("the
-    //       're-asserting a name a screen already has' phase threw: ... a write has not come back")
-    //       before it can reach the skip. Whether any mutation still reaches that branch is not
-    //       established; if none does, the branch is dead and should be removed, not left looking
-    //       like coverage.
     // COVERAGE-ASSERT: a count that never moves is what a dead interposition and a daemon that
     //       never saves both produce, so the first call is asserted to write exactly once and
     //       a later call that DOES change the binding is asserted to write again -- an early
@@ -5583,9 +5628,33 @@ void runIdempotentRenameChecks() {
                      afterFirstRows.count(3) ? afterFirstRows.at(3).output.c_str() : "(no row)");
         return;
     }
-    if (afterFirst != renamesCounted()) {
-        notVerified(kGoal, "this host finished the daemon's first config write only after the call had returned, so "
-                           "every count below would be of a daemon that is still writing");
+    // GOAL: a SetMonitorOutput that returned normally has already finished its write, so every
+    //       count taken below is of a quiesced daemon. False if the daemon reports success on a
+    //       write still in flight: "no write at all" and "a write that has not landed yet" then
+    //       read identically and nothing this phase counts means anything.
+    // WHY-THIS-SHAPE: a check, where this used to be a skip reading "this host finished the write
+    //       only after the call had returned". That host condition stopped existing at 6fa5be3
+    //       (2026-08-17), which made setMonitorOutput throw unless its own write landed, so
+    //       returning normally and having landed became one fact -- a moved count is now a daemon
+    //       defect, not a slow disk, and skipping would retire the phase over it. Kept rather than
+    //       simply deleted because every count below rests on this and a build that gave the
+    //       guarantee up would otherwise make them quietly meaningless.
+    // CONTROL: kWriteDeadline set to 0 and a 300 ms sleep added ahead of store.save()
+    //       (backend/daemon/config_writer.cpp) -- a host whose write always lands after the call
+    //       returns, which is exactly what the old skip claimed to cover. The shipped daemon does
+    //       not reach here at all under it: "FAIL: the 're-asserting a name a screen already has'
+    //       phase threw: ... a write has not come back, the choice may not be on disk yet". With
+    //       the throw ALSO taken out of setMonitorOutput -- the pre-6fa5be3 shape -- the same
+    //       mutation reddens this check: "FAIL: a SetMonitorOutput that returned had already
+    //       finished its write", printing "0 write(s) counted when the call returned, 1 once the
+    //       file held the name". All three reverted. Observed 2026-08-19.
+    const unsigned settledAfterFirst = renamesCounted();
+    const bool firstQuiesced = afterFirst == settledAfterFirst;
+    check(firstQuiesced, "a SetMonitorOutput that returned had already finished its write");
+    if (!firstQuiesced) {
+        std::fprintf(stderr, "  %u write(s) counted when the call returned, %u once the file held the name; every "
+                             "count below would be of a daemon that is still writing\n",
+                     afterFirst, settledAfterFirst);
         return;
     }
     if (afterFirst == 0) {
@@ -5633,9 +5702,23 @@ void runIdempotentRenameChecks() {
         check(false, "naming a screen a different name writes that name into the config file");
         return;
     }
-    if (afterChange != renamesCounted()) {
-        notVerified(kGoal, "this host finished the daemon's second config write only after the call had returned, so "
-                           "a write the redundant call made cannot be told from a late one");
+    // The same guarantee for the second write, and it carries more here: this sample is also what
+    // makes the redundant call above safe to have sampled at once. A skip in its place, like the
+    // one this replaced, would retire "naming a screen the name it already has does not write the
+    // config at all" over a state the daemon no longer allows.
+    // CONTROL: the throw taken out of WallpaperManager::setMonitorOutput and the config writer's
+    //       worker made to sleep 3 s -- past its deadline -- before store.save() for the DP-B
+    //       entry only, so THIS write lands late and the first does not -> "FAIL: a
+    //       SetMonitorOutput that changed a name had also already finished its write", printing
+    //       "1 write(s) counted when the call returned, 2 once the file held the name". Both
+    //       reverted. Observed 2026-08-19.
+    const unsigned settledAfterChange = renamesCounted();
+    const bool changeQuiesced = afterChange == settledAfterChange;
+    check(changeQuiesced, "a SetMonitorOutput that changed a name had also already finished its write");
+    if (!changeQuiesced) {
+        std::fprintf(stderr, "  %u write(s) counted when the call returned, %u once the file held the name; a write "
+                             "the redundant call made cannot be told from a late one\n",
+                     afterChange, settledAfterChange);
         return;
     }
     check(afterChange == afterRepeat + 1, "naming a screen a different name still writes the config");
@@ -6533,7 +6616,9 @@ void runOneAnswerAboutTheFileChecks() {
     //       that consulted only completed writes -> "FAIL: the file is reported out of date, when
     //       a write is outstanding and the caller gave up on it", printing "health said up-to-date
     //       and the reply said up-to-date, but the file does not hold what live state holds", plus
-    //       the stalled-write health check two phases down. Re-observed 2026-08-18.
+    //       the stalled-write health check two phases down -- two red in the run, no skips.
+    //       Re-observed 2026-08-19, after this phase moved its parked call onto an abandonable
+    //       thread; unchanged.
     // CONTROL, for the agreement half: the shortcut in WallpaperManager::setMonitorOutput given
     //       back an inference of its own -- `m_writer.lastResult().error.empty()`, i.e. only a
     //       COMPLETED write with an error counts, in place of `m_writer.outcome().onDisk` --
@@ -6542,12 +6627,16 @@ void runOneAnswerAboutTheFileChecks() {
     //       caller gave up on it", printing "health said not-up-to-date, the reply said
     //       up-to-date, and 0 write(s) were made", and the same pair for the refused-write state.
     //       The two phases below it go red on the same edit -- one mutation, all three of the
-    //       states this cluster is about. Re-observed 2026-08-18, unchanged.
-    // COVERAGE-ASSERT: the number of states really compared is asserted against the number the
-    //       phase sets up, so a state that stops being reachable -- a fixture this host cannot
-    //       stage, an early return added later -- shrinks the phase loudly instead of leaving it
-    //       green over one trivial comparison.
+    //       states this cluster is about. Re-observed 2026-08-19, after this phase moved its
+    //       parked call onto an abandonable thread; still six, still no skips.
+    // COVERAGE-ASSERT: every one of the three states is accounted for at the end -- compared, or
+    //       skipped with a printed reason. A state that stops being reachable with no reason given
+    //       (an early return added later, a fixture that silently does nothing) breaks the sum and
+    //       reddens, so the phase cannot shrink to one trivial comparison and stay green; a state
+    //       this host genuinely cannot stage says so and the run is a skip, not a pass, because
+    //       every arm that stops staging one also calls notVerified().
     int compared = 0;
+    int statesSkipped = 0;
     const auto compare = [&compared](const FileAnswers& answers, bool expectedOnDisk, const char* what) {
         ++compared;
         const bool agree = answers.healthOk == answers.replyOk;
@@ -6597,8 +6686,11 @@ void runOneAnswerAboutTheFileChecks() {
 
         WallpaperManager::Config config;
         config.configFile = file;
-        WallpaperManager manager(config);
-        manager.setMonitorOutput(3, "DP-A");
+        // shared_ptr because state two parks a request on a thread this phase may abandon, and
+        // that thread must be able to keep the manager alive rather than be left holding a
+        // destroyed one.
+        auto manager = std::make_shared<WallpaperManager>(config);
+        manager->setMonitorOutput(3, "DP-A");
         if (!waitForRows(file, [](const std::map<int, RowInFile>& rows) {
                 return rows.count(3) == 1 && rows.at(3).output == "DP-A";
             })) {
@@ -6608,29 +6700,83 @@ void runOneAnswerAboutTheFileChecks() {
         }
         // State one: quiescent and healthy. It is the state in which the shortcut is SUPPOSED to
         // fire, so it is what stops this phase being satisfied by a daemon that never takes it.
-        compare(askEveryChannel(manager, file, 3, "DP-A"), /*expectedOnDisk=*/true, "the file is up to date");
+        compare(askEveryChannel(*manager, file, 3, "DP-A"), /*expectedOnDisk=*/true, "the file is up to date");
 
         // State two: a write parked on a fifo, waited out, and given up on. The state the old
         // predicate got wrong -- it read completed writes only, so it called the file up to date
         // while nothing had landed.
         BlockingWrite blocked(file);
+
+        // GOAL (a property of this harness, X.3): staging the outstanding-write state is bounded
+        //       by something this phase owns, so a build whose save never comes back reddens or
+        //       skips with a reason instead of hanging. False whenever the only thing that can
+        //       release this phase is the daemon's own kWriteDeadline.
+        // WHY-THIS-SHAPE: two guards, because the bound can be lost two ways. The request is made
+        //       on a thread the phase abandons at kParkedCallPatience -- calling requestWallpaper()
+        //       inline is the shorter version and is what this phase used to do: with kWriteDeadline
+        //       raised it never returns, so the binary hangs, printing no phase name, no FAIL line
+        //       and no reason. That is not hypothetical here, it is paid history -- a control run on
+        //       the stalled-save phase below had to be re-observed at 30 s instead of the hour it
+        //       wanted, because THIS phase hung first. The second guard is cheaper and fires before
+        //       anything is staged: the comparison below grades elapsed time against kSaveDeadlineMs,
+        //       so a deadline that is not comfortably inside the patience makes "waited out its
+        //       deadline" and "was abandoned" the same observation, and the state is then skipped
+        //       with a reason rather than measured.
+        // CONTROL: (a) kWriteDeadline (backend/daemon/config_writer.cpp) raised to 300 s -> this
+        //       phase printed "NOT VERIFIED -- ... requestWallpaper had not returned 20 s after a
+        //       write that cannot finish, so the outstanding-write state was never staged", and the
+        //       whole binary finished in 63 s at exit 1, red on the stalled-save phase below which
+        //       is what that mutation is FOR. With the same mutation and this call put back inline
+        //       -- the shorter shape -- the binary printed nothing on stdout at all and was killed
+        //       at 90 s, exit 124. Both reverted. (b) kSaveDeadlineMs above raised to 30000 ->
+        //       "NOT VERIFIED -- ... the save deadline this phase grades against (30000 ms) is not
+        //       comfortably inside the 20000 ms this phase is willing to wait for a parked call",
+        //       in 7 s and with no fifo write staged at all. Reverted. Observed 2026-08-19.
         if (!blocked.arm()) {
+            ++statesSkipped;
             notVerified(kGoals, std::string("a fifo could not be created at ") + blocked.temp() +
                                     ", so no write can be left outstanding on this host");
+        } else if (kSaveDeadlineMs >= 0.5 * parkedCallPatienceMs()) {
+            ++statesSkipped;
+            notVerified(kGoals, "the save deadline this phase grades against (" +
+                                    std::to_string(static_cast<int>(kSaveDeadlineMs)) +
+                                    " ms) is not comfortably inside the " +
+                                    std::to_string(static_cast<int>(parkedCallPatienceMs())) +
+                                    " ms this phase is willing to wait for a parked call, so a write left "
+                                    "outstanding could not be told from one this phase merely gave up on");
         } else {
-            const auto start = StallClock::now();
-            manager.requestWallpaper("static", paths->wallpapers[0].string(), 0);
-            const double elapsedMs = millisSince(start);
-            const FileAnswers outstanding = askEveryChannel(manager, file, 3, "DP-A");
-            const BlockingWrite::Released released = blocked.release(std::chrono::milliseconds(10000));
-            if (!released.ok || elapsedMs < kSaveDeadlineMs * 0.9) {
-                notVerified(kGoals, released.ok ? "the save returned in " +
-                                                      std::to_string(static_cast<int>(elapsedMs)) +
-                                                      " ms rather than waiting out its deadline, so no write was ever "
-                                                      "outstanding"
-                                                : "no config write reached the fifo: " + released.why);
+            const AbandonedOrReturned parked =
+                requestOnAbandonableThread(manager, paths->wallpapers[0].string(), 0, kParkedCallPatience);
+            if (!parked.returned) {
+                // Released before the reason is printed: the abandoned thread is still inside the
+                // manager, and letting its write through is what gets it out before this process
+                // ends. Its result is not read -- the state was never staged, so there is nothing
+                // here to grade.
+                blocked.release(std::chrono::milliseconds(10000));
+                ++statesSkipped;
+                notVerified(kGoals, "requestWallpaper had not returned " +
+                                        std::to_string(static_cast<int>(parkedCallPatienceMs() / 1000)) +
+                                        " s after a write that cannot finish, so the outstanding-write state was "
+                                        "never staged and nothing below it was measured");
             } else {
-                compare(outstanding, /*expectedOnDisk=*/false, "a write is outstanding and the caller gave up on it");
+                const FileAnswers outstanding = askEveryChannel(*manager, file, 3, "DP-A");
+                const BlockingWrite::Released released = blocked.release(std::chrono::milliseconds(10000));
+                if (!released.ok || parked.elapsedMs < kSaveDeadlineMs * 0.9 || !parked.threw.empty()) {
+                    ++statesSkipped;
+                    notVerified(kGoals,
+                                !released.ok ? "no config write reached the fifo: " + released.why
+                                : !parked.threw.empty()
+                                    ? "the parked request threw (" + parked.threw +
+                                          "), so the daemon this would compare is not in the state the comparison "
+                                          "is about; whether a stalled write may fail its request is graded by the "
+                                          "stalled-save phase"
+                                    : "the save returned in " + std::to_string(static_cast<int>(parked.elapsedMs)) +
+                                          " ms rather than waiting out its deadline, so no write was ever "
+                                          "outstanding");
+                } else {
+                    compare(outstanding, /*expectedOnDisk=*/false,
+                            "a write is outstanding and the caller gave up on it");
+                }
             }
         }
     }
@@ -6640,6 +6786,7 @@ void runOneAnswerAboutTheFileChecks() {
     // in the constructor and cannot be entered from a healthy one.
     const ScratchDir refusedScratch("oneanswerrefused");
     if (!refusedScratch.ok()) {
+        ++statesSkipped;
         notVerified(kGoals, "a scratch directory for the refused-write state could not be created");
     } else {
         const ScopedEnv stateHome("XDG_STATE_HOME", stateHomeOf(refusedScratch).string());
@@ -6647,6 +6794,7 @@ void runOneAnswerAboutTheFileChecks() {
         std::error_code ec;
         std::filesystem::create_directories(refusedFile.parent_path(), ec);
         if (ec || ::mkfifo(refusedFile.c_str(), 0644) != 0) {
+            ++statesSkipped;
             notVerified(kGoals, "a named pipe could not be created at the config path, so no write can be refused "
                                 "before a writer exists");
         } else {
@@ -6664,8 +6812,12 @@ void runOneAnswerAboutTheFileChecks() {
         }
     }
 
-    check(compared == 3, "all three states this phase sets up were really compared");
-    if (compared != 3) std::fprintf(stderr, "  %d of 3 states compared\n", compared);
+    check(compared + statesSkipped == 3, "all three states this phase sets up were compared or skipped with a reason");
+    if (compared + statesSkipped != 3) {
+        std::fprintf(stderr, "  %d of 3 states compared, %d skipped with a stated reason, and the rest vanished "
+                             "without one\n",
+                     compared, statesSkipped);
+    }
 }
 
 // ---------------------------------------------------------------------------- //
@@ -7104,51 +7256,9 @@ void runSaveCostChecks() {
 // tests/client/blocking_config_write.h, shared with daemon_system_test: the fixture's
 // correctness rests on details a second copy would drift away from silently.
 
-// One requestWallpaper(), made on a thread this phase can walk away from.
-//
-// The obvious version -- call it inline -- turns a build whose wait is unbounded into a
-// HANG, and a hung test prints nothing at all: no FAIL line, no reason, just a ctest
-// timeout thirty seconds later. This one turns that build into a check that goes red.
-// The manager is held by shared_ptr and copied into the thread, so a call that never
-// returns keeps alive the object it is inside rather than being abandoned on top of a
-// destroyed one.
-struct AbandonedOrReturned {
-    bool returned = false;
-    double elapsedMs = 0;
-    std::string threw;
-};
-
-AbandonedOrReturned requestOnAbandonableThread(const std::shared_ptr<WallpaperManager>& manager,
-                                               const std::string& path, int monitorId,
-                                               std::chrono::seconds patience) {
-    struct Answer {
-        double elapsedMs = 0;
-        std::string threw;
-    };
-    auto answered = std::make_shared<std::promise<Answer>>();
-    std::future<Answer> future = answered->get_future();
-    std::thread([manager, answered, path, monitorId] {
-        const auto start = StallClock::now();
-        Answer answer;
-        try {
-            manager->requestWallpaper("static", path, monitorId);
-        } catch (const std::exception& e) {
-            answer.threw = e.what();
-        } catch (...) {
-            answer.threw = "an exception that is not a std::exception";
-        }
-        answer.elapsedMs = millisSince(start);
-        answered->set_value(answer);
-    }).detach();
-
-    AbandonedOrReturned out;
-    if (future.wait_for(patience) != std::future_status::ready) return out;
-    const Answer answer = future.get();
-    out.returned = true;
-    out.elapsedMs = answer.elapsedMs;
-    out.threw = answer.threw;
-    return out;
-}
+// requestOnAbandonableThread(), AbandonedOrReturned and kParkedCallPatience are declared
+// beside kSaveDeadlineMs above: the "one answer about the config file" phase parks a write
+// too and needs the same bound.
 
 void runStalledSaveChecks() {
     constexpr const char* kGoals = "S8.29/S8.31/S8.32 (a config write that never comes back)";
@@ -7214,27 +7324,32 @@ void runStalledSaveChecks() {
     //       window (waited, but not forever) rather than a point, because how long past the
     //       deadline the wakeup lands is the scheduler's business.
     // CONTROL: three, all reverted, all against `kWriteDeadline` in ConfigWriter::write()'s
-    //       settled.wait_for() (backend/daemon/config_writer.cpp). (a) raised to 30 s -> "FAIL: a
+    //       settled.wait_for() (backend/daemon/config_writer.cpp). (a) raised to 300 s -> "FAIL: a
     //       save whose write cannot complete still releases the caller", printing
     //       "requestWallpaper has not returned 20.0 s after a write that cannot finish", the rest
     //       of this phase skipped with that reason, and the snapshot-wins phase reporting NOT
-    //       VERIFIED rather than failing -- one red, exactly as before. 30 s and not the hour this
-    //       used to say: at an hour the binary HANGS before reaching here, inside the
-    //       "one answer about the config file" phase, which parks on a refused write and is
-    //       bounded by nothing but this constant. (b) `throw std::runtime_error("stalled")` added
+    //       VERIFIED rather than failing -- one red, exactly as before. Whole binary: 63 s.
+    //       WAS: this said 30 s, "not the hour this used to say", because at an hour the binary
+    //       hung before reaching here inside the "one answer about the config file" phase, which
+    //       was bounded by nothing but this constant. True when written 2026-08-18; that phase now
+    //       has a bound of its own, so this mutation can be as large as it likes.
+    //       (b) `throw std::runtime_error("stalled")` added
     //       after the wait_for -> "FAIL: a config write that cannot complete does not fail the
     //       request that triggered it", printing "requestWallpaper threw: stalled". (c) for the
     //       upper bound specifically, replaced with 10 seconds, so the caller is released but far
     //       too late -> "FAIL: the caller of a stalled save waits for the deadline and not for the
     //       filesystem", printing "requestWallpaper took 10000 ms against a 2000 ms deadline", and
-    //       nothing else red. (a) and (c) re-observed 2026-08-18.
+    //       nothing else red. (c) re-observed 2026-08-18, (a) at 300 s on 2026-08-19.
     const AbandonedOrReturned stalled =
-        requestOnAbandonableThread(manager, stalledWallpaper.string(), 1, std::chrono::seconds(20));
+        requestOnAbandonableThread(manager, stalledWallpaper.string(), 1, kParkedCallPatience);
     check(stalled.returned, "a save whose write cannot complete still releases the caller");
     if (!stalled.returned) {
-        std::fprintf(stderr, "  requestWallpaper has not returned 20.0 s after a write that cannot finish; the "
+        // Printed from the constant, not from a literal 20, so raising the patience cannot leave
+        // this line naming a wait nobody made.
+        std::fprintf(stderr, "  requestWallpaper has not returned %.1f s after a write that cannot finish; the "
                              "checks after this one are skipped rather than measured against a thread that is "
-                             "still inside the manager\n");
+                             "still inside the manager\n",
+                     parkedCallPatienceMs() / 1000.0);
         return;
     }
     check(stalled.threw.empty(), "a config write that cannot complete does not fail the request that triggered it");
