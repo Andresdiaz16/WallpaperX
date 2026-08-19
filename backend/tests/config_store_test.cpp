@@ -621,12 +621,12 @@ bool waitForRows(const std::filesystem::path& file,
 // a sentinel graded as a count reports a reworded report as the daemon having lost every row
 // the clause counts.
 //
-// CONTROL: the kept-wallpaper count in WallpaperManager::persistenceDetail()
-// (backend/daemon/wallpaper_manager.cpp) written as `keptWallpapers + 10`, which is the
-// over-count a find() cannot see -> "FAIL: the persistence detail says how many entries could
-// not be applied", "FAIL: only the rows with a wallpaper are reported as entries this build
-// cannot apply" and "FAIL: every kept row carrying a wallpaper is reported as one". Observed
-// 2026-08-14. Reverted.
+// CONTROL: the kept-wallpaper count in KeptRows::detail() (backend/daemon/kept_rows.cpp)
+// written as `keptWallpapers + 10`, which is the over-count a find() cannot see -> "FAIL: the
+// persistence detail says how many entries could not be applied", "FAIL: only the rows with a
+// wallpaper are reported as entries this build cannot apply" and "FAIL: every kept row carrying
+// a wallpaper is reported as one", plus four coverage-assert checks in the kept-row phases that
+// read the same clause. Re-observed 2026-08-19 in the counter's new home. Reverted.
 std::optional<int> clauseCount(const std::string& detail, const std::string& clause) {
     const std::size_t at = detail.find(clause);
     if (at == std::string::npos) return 0;
@@ -668,8 +668,8 @@ std::optional<int> clauseCountOrSkip(const std::string& detail, const std::strin
     return count;
 }
 
-// The texts WallpaperManager::persistenceDetail() emits for the counters that set `repaired` in
-// restoreSaved() (backend/daemon/wallpaper_manager.cpp). Returns the ones present, quoted, for
+// The texts KeptRows::detail() (backend/daemon/kept_rows.cpp) emits for the counters that set
+// `repaired` in WallpaperManager::restoreSaved(). Returns the ones present, quoted, for
 // the failure print; empty means nothing was repaired. One list rather than one per phase: two
 // copies can only agree by an editor remembering both, and a copy that misses a clause
 // production later added leaves its check green over a daemon that repairs on every boot.
@@ -1374,16 +1374,20 @@ void runRestoreChecks() {
     //       miss a rewrite that preserved them, which is precisely what an accidental save
     //       on restore would do -- it would look identical in every way except that the
     //       file had been replaced.
-    // CONTROL: the `if (repaired)` guard on `m_repair = persistableLocked();` at the end of
-    //       WallpaperManager::restoreSaved() (backend/daemon/wallpaper_manager.cpp) deleted, so
-    //       every start hands writeRepairedConfig() a snapshot -> "FAIL: restoring entries that
-    //       need no repair does not rewrite the config file", and that alone in the whole
-    //       binary. The mtime half stayed green under
-    //       it, because this host's scratch filesystem stamps both writes with the same coarse
-    //       time -- which is the reason both comparisons are here rather than either alone. The
-    //       mtime half is what carries the equivalent check in daemon_system_test, where the
-    //       file was written by the daemon's own save() and a second save reproduces it byte
-    //       for byte. Observed 2026-08-15. Reverted.
+    // CONTROL: the `if (repaired)` guard on `m_repair = m_kept.rowsToWrite(liveWallpapers());`
+    //       at the end of WallpaperManager::restoreSaved() deleted, AND writeRepairedConfig()'s
+    //       `queuePersist(*repair)` changed to `persist(*repair)` (both in
+    //       backend/daemon/wallpaper_manager.cpp) -> "FAIL: restoring entries that need no
+    //       repair does not rewrite the config file" AND "FAIL: ... does not touch the config
+    //       file's mtime". The second mutation is needed and was not always: until 2026-08-17
+    //       (4d10655) the repair write WAS synchronous, and the guard deletion alone reddened
+    //       this check, which is what the previous annotation recorded. It now goes green --
+    //       measured, five runs -- because the queued write has not reached the file when the
+    //       read below happens. The synchronous half alone reddens only "the startup repair
+    //       does not park the daemon on the config write", never these two. Observed
+    //       2026-08-19. Both reverted. This check therefore cannot see an asynchronous repair
+    //       write; the daemon_system twin, which samples across a process restart, can, and is
+    //       what really carries the rule.
     // COVERAGE-ASSERT: the byte comparison is only evidence of this rule while the fixture
     //       really needs no repair, and a repair-free fixture is not self-evident from two
     //       rows of JSON. The repair clauses are asserted absent below, so a later fixture edge
@@ -2017,14 +2021,17 @@ void runMalformedEntryCopyChecks() {
     //       between the two calls is a real point in backend/daemon/main.cpp's startup, and it
     //       is the only one at which both properties are visible.
     // CONTROL: the repair written from inside restoreSaved() instead of being handed to
-    //       writeRepairedConfig() -- `if (repaired) persist(persistableLocked());` at the end of
-    //       WallpaperManager::restoreSaved() (backend/daemon/wallpaper_manager.cpp), in place of
-    //       `m_repair = persistableLocked();` -> "FAIL: a config with malformed entries is
-    //       still there after the copy is made", "FAIL: the copy holds the bytes of the file
-    //       the entries were rejected from", and "FAIL: a second start with a different
-    //       malformed config does not overwrite the first start's copy", the last printing a
-    //       copy holding the daemon's pretty-printed rewrite with monitor 0 alone in it -- the
-    //       "monitor_id":"two" row gone from both files. Observed 2026-08-15. Reverted.
+    //       writeRepairedConfig() -- `if (repaired) persist(m_kept.rowsToWrite(liveWallpapers()));`
+    //       at the end of WallpaperManager::restoreSaved() (backend/daemon/wallpaper_manager.cpp),
+    //       in place of `m_repair = m_kept.rowsToWrite(liveWallpapers());` -> "FAIL: a config
+    //       with malformed entries is still there after the copy is made", "FAIL: the copy holds
+    //       the bytes of the file the entries were rejected from", and "FAIL: a second start with
+    //       a different malformed config does not overwrite the first start's copy", the last
+    //       printing a copy holding the daemon's pretty-printed rewrite with monitor 0 alone in
+    //       it -- the "monitor_id":"two" row gone from both files. Run this control under a
+    //       timeout: persist() takes m_stateMutex on a failed write and restoreSaved() already
+    //       holds it, so a later phase whose config directory is read-only deadlocks. The three
+    //       FAILs above are printed long before that. Re-observed 2026-08-19. Reverted.
     {
         WallpaperManager::Config config;
         config.configFile = file;
@@ -2983,14 +2990,17 @@ void runUnappliedEntryChecks() {
     //       the SetWallpaper save is a second, independent chance to forget them, and it is
     //       the one a user actually reaches. The count in the health detail is derived from
     //       the fixture, not spelled out, so a build that reports a fixed number cannot pass.
-    // CONTROL: `m_unapplied.push_back(std::move(keep));` deleted from restoreSaved()'s kept
-    //       branch (backend/daemon/wallpaper_manager.cpp) -> "FAIL: the entries this build
-    //       cannot apply survive the write the restore itself makes" with "  ids on disk: 3",
-    //       "FAIL: the entries this build cannot apply are all still in the file, and the ones
-    //       no build can apply are gone, after another monitor is set" with "  ids on disk: 1
-    //       3", and "FAIL: the persistence detail says how many entries could not be applied".
-    //       Twenty more went red with them across the kept-row phases, keeping the row being
-    //       what they all rest on. Observed 2026-08-14. Reverted.
+    // CONTROL: `keptIndex.emplace(...)` and `m_kept.carried().push_back(std::move(keep));` both
+    //       deleted from restoreSaved()'s kept branch (backend/daemon/wallpaper_manager.cpp), so
+    //       no row is carried -> "FAIL: the entries this build cannot apply survive the write
+    //       the restore itself makes" with "  ids on disk: 3", "FAIL: the entries this build
+    //       cannot apply are all still in the file, and the ones no build can apply are gone,
+    //       after another monitor is set" with "  ids on disk: 1 3", and "FAIL: the persistence
+    //       detail says how many entries could not be applied". Both statements go, not the
+    //       push_back alone: an index entry pointing past the end of the vector it indexes is
+    //       undefined behaviour, not a weaker build. 31 checks red in total across the kept-row
+    //       phases, keeping the row being what they all rest on. Re-observed 2026-08-19 against
+    //       KeptRows::carried(). Reverted.
     const std::vector<int> unusableIds{40, 5, 6};
     // Negative ids, the one kind of entry that is dropped rather than kept. A monitor id is
     // an index into this build's array, so no larger kMaxMonitors could ever admit one --
@@ -3063,11 +3073,15 @@ void runUnappliedEntryChecks() {
     //       including "no build can apply them", because the kept-entry clause of the same
     //       detail also ends in a count and a semicolon -- matching only a number would let
     //       either clause satisfy this.
-    // CONTROL: `++m_droppedEntries;` deleted from restoreSaved()'s negative-id branch ->
-    //       "FAIL: the persistence detail says how many entries no build can apply", printing
-    //       the detail with only the kept-entry clause in it. The id-set check below stayed
-    //       green under it, which is what separates "not counted" from "not dropped".
-    //       Reverted.
+    // CONTROL: `m_kept.countDroppedEntry();` deleted from restoreSaved()'s negative-id branch
+    //       (backend/daemon/wallpaper_manager.cpp) -> "FAIL: the persistence detail says how
+    //       many entries no build can apply", printing the detail with only the kept-entry
+    //       clause in it. The id-set check below stayed green under it, which is what separates
+    //       "not counted" from "not dropped". Two others go red with it, because the count also
+    //       feeds `repaired` and so decides whether the start writes its repair at all: "the
+    //       entries this build cannot apply survive the write the restore itself makes" here,
+    //       and the flat/partition check in the connector-name-loss phase. Re-observed
+    //       2026-08-19 against KeptRows' counter. Reverted.
     const std::string droppedClause = " entries dropped, no build can apply them";
     const std::optional<int> droppedCount =
         clauseCountOrSkip(snap.health.persistence.detail, droppedClause, kGoal);
@@ -3506,7 +3520,7 @@ void runOutputRestoreChecks() {
     //       a loss notice in the daemon's persistence health -- which tells the user a
     //       wallpaper did not come back when none was ever set.
     // WHY-THIS-SHAPE: BOTH kept-row clauses are asserted absent, not just the wallpaper one.
-    //       Asserting only the wallpaper clause cannot fail: persistenceDetail() counts a row
+    //       Asserting only the wallpaper clause cannot fail: KeptRows::detail() counts a row
     //       carrying only a name under its own wording, so a restoreSaved() without that guard
     //       carries these rows and reports them as "screen names ... kept", leaving a check
     //       that looks only for "entries this build cannot apply" green. The property is that
@@ -3539,14 +3553,13 @@ void runOutputRestoreChecks() {
     //       first SetWallpaper -- the state a user actually reaches.
     //       rowsInFile() keys by monitor id, so a duplicated row is invisible to it; the row
     //       COUNT in the raw file is therefore asserted separately, at both reads.
-    // CONTROL: the m_outputs loop in WallpaperManager::persistableLocked()
-    //       (backend/daemon/wallpaper_manager.cpp) changed from merging each name into the
-    //       row keyed by its monitor id to appending a name-only row of its own -> "FAIL: the
-    //       restore's own write puts a monitor's wallpaper and its connector name on one row"
-    //       with "5 rows for 4 monitor ids", "FAIL: a monitor's wallpaper and its connector
-    //       name are written as one row" with "6 rows for 5 monitor ids", and the two
-    //       merged-row checks, neither read finding the name on the row that holds the
-    //       wallpaper. Observed 2026-08-14. Reverted.
+    // CONTROL: the live.outputs loop in KeptRows::rowsToWrite() (backend/daemon/kept_rows.cpp)
+    //       changed from merging each name into the row keyed by its monitor id to appending a
+    //       name-only row of its own -> "FAIL: the restore's own write puts a monitor's
+    //       wallpaper and its connector name on one row" with "5 rows for 4 monitor ids",
+    //       "FAIL: a monitor's wallpaper and its connector name are written as one row" with
+    //       "6 rows for 5 monitor ids", and the two merged-row checks, neither read finding the
+    //       name on the row that holds the wallpaper. Re-observed 2026-08-19. Reverted.
     // CONTROL, for the first read being of the START's write and not of the fixture this phase
     //       wrote: rowsInFile()'s raw-row count returned one too high -> "FAIL: the restore's
     //       own write puts a monitor's wallpaper and its connector name on one row", printing
@@ -3599,11 +3612,12 @@ void runOutputRestoreChecks() {
     //       rebinding carries the new mapping and not the old one -- a manager that rebound
     //       in memory and persisted from a stale copy would pass every check in the other
     //       tier and lose the mapping at the next restart.
-    // CONTROL: `row.output = name;` in WallpaperManager::persistableLocked()
-    //       (backend/daemon/wallpaper_manager.cpp) deleted -> three FAILs: "a rebinding is
-    //       written to the file, not just held in memory", "the merged row carries both the
-    //       wallpaper and the connector name", and "a screen that has only been named keeps
-    //       a row of its own across a save" -- no output key on any row. Reverted.
+    // CONTROL: `row.output = name;` in KeptRows::rowsToWrite() (backend/daemon/kept_rows.cpp)
+    //       deleted -> three FAILs: "a rebinding is written to the file, not just held in
+    //       memory", "the merged row carries both the wallpaper and the connector name", and
+    //       "a screen that has only been named keeps a row of its own across a save" -- no
+    //       output key on any row. Thirteen more go red with them, every check in the binary
+    //       that reads a name back off the disk. Re-observed 2026-08-19. Reverted.
     manager.setMonitorOutput(7, "DP-1");
     waitForRows(file, [](const std::map<int, RowInFile>& rows) {
         return rows.count(7) == 1 && rows.at(7).output == "DP-1";
@@ -3765,22 +3779,25 @@ void runOutputLossReportChecks() {
     //       counting name rows and wallpaper rows together, because every count would read 1
     //       either way. With 2/1/4/3 a flat count reads 3 and 7 and no arrangement of the old
     //       wording matches.
-    // CONTROL: the whole flat-counting regime put back in backend/daemon/wallpaper_manager.cpp
-    //       -- persistenceDetail() reporting `m_unapplied.size()` and `m_droppedEntries` with
-    //       neither name clause, AND restoreSaved()'s negative-id branch counting every drop
-    //       into m_droppedEntries -> all four FAILs, the detail reading "3 entries this build
+    // CONTROL: the whole flat-counting regime put back -- KeptRows::detail()
+    //       (backend/daemon/kept_rows.cpp) reporting `m_carried.size()` and `m_droppedEntries`
+    //       with neither name clause, AND restoreSaved()'s negative-id branch
+    //       (backend/daemon/wallpaper_manager.cpp) counting every drop through
+    //       countDroppedEntry() -> all four FAILs, the detail reading "3 entries this build
     //       cannot apply, kept; 12 entries dropped, no build can apply them". Both sites are
-    //       needed: mutating persistenceDetail() alone leaves the dropped-name rows counted in
+    //       needed: mutating detail() alone leaves the dropped-name rows counted in
     //       m_droppedNames, so the dropped-wallpaper clause still reads 7 and its check stays
-    //       green. Re-run 2026-08-14. Reverted.
+    //       green. Re-observed 2026-08-19 in the counters' new home. Reverted.
     // CONTROL, for comparing each count as a number rather than searching for it as text:
-    //       `keptNames` printed as `keptNames + 10` in WallpaperManager::persistenceDetail()
-    //       (backend/daemon/wallpaper_manager.cpp) -> "FAIL: only the out-of-range row's name
+    //       `keptNames` printed as `keptNames + 10` in KeptRows::detail()
+    //       (backend/daemon/kept_rows.cpp) -> "FAIL: only the out-of-range row's name
     //       is reported as a name this build's limit excludes". With that one clause put back
     //       to a std::string::find of "1 screen names this build's monitor limit excludes,
     //       kept", the same mutated build read GREEN: the expected text is a substring of
     //       "11 screen names ...", so a search has no left boundary and an over-count of ten
-    //       satisfies it. Observed 2026-08-14. Both reverted.
+    //       satisfies it. The find() half observed 2026-08-14; the over-count re-observed
+    //       2026-08-19 in detail()'s new home, where five more checks go red with it. Both
+    //       reverted.
     // COVERAGE-ASSERT: the expected numbers are computed from the id lists, so deleting rows
     //       from the fixture changes what is demanded rather than quietly weakening it.
     //
@@ -3797,16 +3814,16 @@ void runOutputLossReportChecks() {
     //       7 and 5 as well, because the two shifts cancel exactly.
     // CONTROL: the two counted conditions in restoreSaved()'s negative-id branch
     //       (backend/daemon/wallpaper_manager.cpp) replaced by the partition
-    //       `if (!entry.type.empty() || !entry.path.empty()) ++m_droppedEntries; else
-    //       ++m_droppedNames;` -> "FAIL: only the rows with a wallpaper are reported as
+    //       `if (!entry.type.empty() || !entry.path.empty()) m_kept.countDroppedEntry(); else
+    //       m_kept.countDroppedName();` -> "FAIL: only the rows with a wallpaper are reported as
     //       entries no build can apply" and "FAIL: the name-only rows no build can apply are
     //       reported as names, not as entries", the detail reading "6 entries dropped" against
-    //       7 and "6 screen names dropped" against 5. Observed 2026-08-14. Reverted.
+    //       7 and "6 screen names dropped" against 5. Re-observed 2026-08-19. Reverted.
     //       Separately, `if (nameValid)` in that branch widened to `if (!entry.output.empty())`
     //       -- the shape that reported an unusable name as a name a build could have used ->
     //       "FAIL: the name-only rows no build can apply are reported as names, not as
-    //       entries", the detail reading "7 screen names dropped, no build can apply them".
-    //       Observed 2026-08-14. Reverted.
+    //       entries", the detail reading "7 screen names dropped, no build can apply them",
+    //       and that alone. Re-observed 2026-08-19. Reverted.
     const std::size_t keptWallpapers = keptWallpaperIds.size();
     const std::size_t keptNames = keptNameIds.size();
     const std::size_t droppedWallpapers = droppedWallpaperIds.size() + droppedBothIds.size() + droppedEmptyIds.size();
@@ -3852,10 +3869,10 @@ void runOutputLossReportChecks() {
         //       same path: the daemon's writer can replace the file between two reads, and a
         //       count taken from a later version than the ids reports a correct save as a
         //       duplicated row.
-        // CONTROL: every m_unapplied entry appended to the returned vector as well as being
-        //       merged into the id-keyed rows, in WallpaperManager::persistableLocked()
-        //       (backend/daemon/wallpaper_manager.cpp) -> "FAIL: no monitor is written on two
-        //       rows of the config", printing "8 rows for 5 monitor ids". Observed 2026-08-14.
+        // CONTROL: every m_carried entry appended to the returned vector as well as being
+        //       merged into the id-keyed rows, in KeptRows::rowsToWrite()
+        //       (backend/daemon/kept_rows.cpp) -> "FAIL: no monitor is written on two rows of
+        //       the config", printing "8 rows for 5 monitor ids". Re-observed 2026-08-19.
         //       Reverted.
         const bool oneRowPerMonitor = rowsWritten == onDisk.size() && rowsWritten > 0;
         check(oneRowPerMonitor, "no monitor is written on two rows of the config");
@@ -3871,17 +3888,20 @@ void runOutputLossReportChecks() {
         //       held is no longer observable from outside -- such a row is stripped of its
         //       name as it is kept, so it moves no counter -- and the file is where the harm
         //       would be.
-        // CONTROL: two mutations together, because this property is defended twice and
-        //       neither defence alone reaches the file: the `if (entry.type.empty() &&
-        //       entry.path.empty())` guard in WallpaperManager::restoreSaved() disabled, so
-        //       the row is held, AND the empty-row skip in
-        //       WallpaperManager::persistableLocked() (both in
-        //       backend/daemon/wallpaper_manager.cpp) put back to an unconditional
+        // CONTROL: THREE mutations together, because this property is defended three times and
+        //       no two of them reach the file: the `if (entry.type.empty() && entry.path.empty()
+        //       && !nameTravels)` guard in WallpaperManager::restoreSaved() disabled, so the row
+        //       is held; the `if (keep.type.empty() && keep.path.empty() && keep.output.empty())
+        //       continue;` guard in the same function disabled, so the emptied row is really
+        //       carried; AND the empty-row skip in KeptRows::rowsToWrite()
+        //       (backend/daemon/kept_rows.cpp) put back to an unconditional
         //       `entries.push_back(std::move(row));` -> "FAIL: a wallpaper-less row whose name
         //       was refused leaves no row in the config at all", printing "ids on disk: 1 2 8
-        //       40 41 42" with monitor 2 empty in every field. Each mutation alone leaves this
-        //       green; the save-side one alone is controlled on its own in the phase below,
-        //       where a held row really is emptied. Observed 2026-08-14. Both reverted.
+        //       40 41 42" with monitor 2 empty in every field. The middle mutation is new to
+        //       this block and is why the old two-mutation form now reads green: that guard
+        //       arrived 2026-08-17 (6d22e5d), after the pair was last observed. The save-side
+        //       one alone is controlled on its own in the phase below, where a held row really
+        //       is emptied. Observed 2026-08-19. All three reverted.
         std::vector<int> refusedRowsOnDisk;
         for (const int id : refusedInRangeIds) {
             if (onDisk.count(id) != 0) refusedRowsOnDisk.push_back(id);
@@ -3947,19 +3967,21 @@ void runKeptWallpaperSupersededChecks() {
     //       and the save both keep it", which is a different build and not a defect; grading the
     //       file alone is what the save-side phases already do and says nothing about the text
     //       the user reads.
-    // CONTROL: TWO mutations together, because this property is now defended twice and neither
-    //       defence alone changes the count (both in backend/daemon/wallpaper_manager.cpp, both
-    //       reverted): the `&& !liveHoldsLocked(entry.monitorId)` guard removed from the
-    //       kept-wallpaper count in WallpaperManager::persistenceDetail(), AND the
-    //       `dropKeptWallpaper(*kept)` call in WallpaperManager::requestWallpaper() disabled, so
-    //       the kept row keeps its type and path -> "FAIL: a kept wallpaper a live monitor has
+    // CONTROL: TWO mutations together, because this property is defended twice and neither
+    //       defence alone changes the count (both reverted): the `&& !live.holds(entry.monitorId)`
+    //       guard removed from the kept-wallpaper count in KeptRows::detail()
+    //       (backend/daemon/kept_rows.cpp), AND the `KeptRows::dropWallpaper(*kept)` call in
+    //       WallpaperManager::requestWallpaper() (backend/daemon/wallpaper_manager.cpp) disabled,
+    //       so the kept row keeps its type and path -> "FAIL: a kept wallpaper a live monitor has
     //       replaced is no longer reported as kept", printing "1 of ' entries this build cannot
     //       apply, kept' after the row was dropped", with the file check green -- the save and
-    //       the report disagreeing is the defect itself. Each mutation alone leaves this GREEN
-    //       (measured): the row is emptied on the request, so the count is zero whatever the
-    //       guard says, and the guard is false whatever the row holds. The request-side one is
-    //       controlled on its own in the displaced-wallpaper phase below, where the note it
-    //       writes is what is graded. Observed 2026-08-18.
+    //       the report disagreeing is the defect itself. Each mutation alone leaves this GREEN,
+    //       re-measured 2026-08-19: the row is emptied on the request, so the count is zero
+    //       whatever the guard says, and the guard is false whatever the row holds. Removing the
+    //       guard alone leaves the ENTIRE suite green, so this pair is the only thing anywhere
+    //       that answers for it. The request-side one is controlled on its own in the
+    //       displaced-wallpaper phase below, where the note it writes is what is graded.
+    //       Re-observed 2026-08-19 in KeptRows.
     manager.requestWallpaper("static", wallpaper.string(), 0);
     waitForRows(file, [&wallpaper](const std::map<int, RowInFile>& rows) {
         return rows.count(0) == 1 && rows.at(0).path == wallpaper.string();
@@ -4052,8 +4074,8 @@ void runKeptWallpaperDisplacedAtRuntimeChecks() {
     };
 
     // GOAL: a wallpaper this build cannot apply, displaced by a client setting that monitor, is
-    //       reported ONCE at the moment it is displaced. False before this fix: persistableLocked()
-    //       dropped the kept row in favour of live state and persistenceDetail() stopped counting
+    //       reported ONCE at the moment it is displaced. False before this fix: the save's row
+    //       merge dropped the kept row in favour of live state and the report stopped counting
     //       it, so a picture a newer build had set left config.json with nothing anywhere saying
     //       so -- the identical collision at RESTORE time was reported all along, so the user was
     //       told only when the file, and not a client, was what took the id.
@@ -4074,17 +4096,17 @@ void runKeptWallpaperDisplacedAtRuntimeChecks() {
     //       displaced is reported at the moment it is displaced", printing "the note appears 0
     //       times", and "FAIL: setting the same monitor again does not report the same loss a
     //       second time", printing "the note appears 0 times after a second save". (b) the row
-    //       counted without being cleared -- `dropKeptWallpaper(*kept)` at that call site replaced
-    //       by a bare emptiness test, which is the plausible half-fix -> "FAIL: setting the same
+    //       counted without being cleared -- `KeptRows::dropWallpaper(*kept)` at that call site
+    //       replaced by a bare emptiness test, the plausible half-fix -> "FAIL: setting the same
     //       monitor again does not report the same loss a second time", printing "the note appears
     //       2 times after a second save; persistence detail: 2 entries this build cannot apply,
     //       replaced by new wallpapers for those screens; ...", with the first two checks GREEN.
     //       (c) the `row.type.empty() && row.path.empty()` guard deleted from
-    //       WallpaperManager::dropKeptWallpaper(), so a row already emptied is counted again ->
-    //       the same single check red with the same count of 2, and nothing else in this file red:
-    //       this phase is the only defender of that guard.
-    //       All three re-observed 2026-08-18 against the aggregated clause, after the daemon
-    //       stopped appending one sentence per displacement, and all three reverted. Reading the
+    //       KeptRows::dropWallpaper() (backend/daemon/kept_rows.cpp), so a row already emptied is
+    //       counted again -> the same single check red with the same count of 2, and nothing else
+    //       in this file red: this phase is the only defender of that guard.
+    //       All three re-observed 2026-08-19 in KeptRows' new home, against the aggregated
+    //       clause, and all three reverted. Reading the
     //       count out of the clause is what keeps (b) and (c) red: a search for the sentence would
     //       find one occurrence either way.
     // COVERAGE-ASSERT: the kept row is asserted to have been promised back BEFORE any client
@@ -4121,7 +4143,7 @@ void runKeptWallpaperDisplacedAtRuntimeChecks() {
     }
 
     // NOT checked here, deliberately: that the report stops promising the row back. It is true
-    // either way, so no mutation of this fix can redden it -- persistenceDetail() already filters
+    // either way, so no mutation of this fix can redden it -- KeptRows::detail() already filters
     // kept rows by whether a live monitor holds the id, which the phase above owns and controls.
     // What the erase is observable through is the second save below: an uncleared row makes the
     // note fire again.
@@ -4433,9 +4455,9 @@ void runStrictOwnershipChecks() {
     if (*keptBefore != 1) return;
 
     // GOAL: no call a client can make records monitor 0 as live-but-wallpaper-less, and the kept
-    //       row for it survives every one of them. The strict ownership test -- liveHoldsLocked()
-    //       asks whether a live monitor HOLDS a wallpaper, not whether its id is present -- is
-    //       what makes the second half true if the first ever stops being.
+    //       row for it survives every one of them. The strict ownership test --
+    //       LiveWallpapers::holds() asks whether a live monitor HOLDS a wallpaper, not whether
+    //       its id is present -- is what makes the second half true if the first ever stops being.
     // WHY-THIS-SHAPE: the strict form and the loose one are equivalent today, so the difference
     //       between them cannot be observed through any interface: nothing records a monitor
     //       without a wallpaper. Asserting the difference directly is therefore impossible, and a
@@ -4445,15 +4467,19 @@ void runStrictOwnershipChecks() {
     //       change does record a placeholder monitor -- a screen named before anything is chosen
     //       for it is the obvious one -- this goes red at that change rather than at the config
     //       file, which is where the loss would otherwise first be visible, one restart later.
-    // CONTROL: two mutations, applied together and separately, both in
-    //       backend/daemon/wallpaper_manager.cpp, both reverted. (a) `m_monitors[monitorId];`
-    //       added to WallpaperManager::setMonitorOutput(), which is the placeholder monitor this
-    //       check exists to catch -> "FAIL: no call this phase drives records a monitor without a
+    // CONTROL: two mutations, applied together and separately, both reverted. (a)
+    //       `m_monitors[monitorId];` added to WallpaperManager::setMonitorOutput()
+    //       (backend/daemon/wallpaper_manager.cpp), which is the placeholder monitor this check
+    //       exists to catch -> "FAIL: no call this phase drives records a monitor without a
     //       wallpaper", printing that line for all three calls, with the kept row still safe --
-    //       the strict test doing its job. (b) the same with liveHoldsLocked() ALSO loosened to
-    //       `m_monitors.count(monitorId) != 0` -> both red, the second printing "the kept row for
-    //       monitor 0 is of type ''", the row surviving as an empty shell with the user's
-    //       wallpaper gone from it. That is the loss (a) exists to fail before.
+    //       the strict test doing its job. (b) the same with LiveWallpapers::holds()
+    //       (backend/daemon/kept_rows.cpp) ALSO loosened to return true on an id match -> both
+    //       red, the second printing "the kept row for monitor 0 is of type ''", the row
+    //       surviving as an empty shell with the user's wallpaper gone from it. That is the loss
+    //       (a) exists to fail before. It must be THAT copy: the manager kept a second,
+    //       map-lookup form, WallpaperManager::liveHolds(), and loosening it instead leaves (b)
+    //       green -- it is reached only from restoreSaved(), which runs before any placeholder
+    //       can exist. Established by running both, 2026-08-19.
     // COVERAGE-ASSERT: three calls are asserted to have been driven, against a literal three.
     //       CONTROL: the render entry deleted from the table, which is what dropping an awkward
     //       call looks like -> "FAIL: all three calls this phase means to drive were driven",
@@ -4485,7 +4511,7 @@ void runStrictOwnershipChecks() {
     if (driven != 3) std::fprintf(stderr, "  %d calls driven, expected 3\n", driven);
 
     // The row itself, read from the file the last save left: the ownership test decides what
-    // persistableLocked() writes, so this is where a loosened one is paid for.
+    // KeptRows::rowsToWrite() writes, so this is where a loosened one is paid for.
     const bool survived = waitForRows(file, [](const std::map<int, RowInFile>& rows) {
         return rows.count(0) == 1 && rows.at(0).type == "hologram";
     });
@@ -4549,7 +4575,7 @@ void runKeptNameTakenOverAtRuntimeChecks() {
 
     // GOAL: a client naming a monitor this build CAN bind takes a name away from a row carried
     //       for a build with more monitors, and the daemon says so. False before this fix: the
-    //       name was dropped inside persistableLocked(), which is const, runs on every save and
+    //       name was dropped inside the save's row merge, which is const, runs on every save and
     //       cannot report -- so the screen the user had named on their other machine came back
     //       anonymous with nothing anywhere saying why. Each mutator is expected to erase and
     //       report first, and setMonitorOutput() had no such patch while requestWallpaper() did.
@@ -4566,14 +4592,15 @@ void runKeptNameTakenOverAtRuntimeChecks() {
     //       taken", printing "the report counts 0" beside a detail that still promises the row's
     //       wallpaper back. Reverted. The other two checks here are each defended TWICE in
     //       production, so that one mutation cannot redden them, and each needed the second
-    //       defence removed as well -- both observed, both reverted:
-    //       the promise check with `m_outputs.count(entry.output) == 0` dropped from
-    //       persistenceDetail()'s keptNames test -> "FAIL: the report stops promising back a
+    //       defence removed as well -- both re-observed 2026-08-19, both reverted:
+    //       the promise check with `live.outputs.count(entry.output) == 0` dropped from
+    //       KeptRows::detail()'s keptNames test -> "FAIL: the report stops promising back a
     //       screen name a client has taken", printing "1 still promised";
-    //       the file check with `m_outputs.count(row.output) != 0` dropped from
-    //       persistableLocked()'s clearing loop -> "FAIL: the name the report says was taken over
-    //       really did leave the carried row", printing "ids on disk: 0 100" with both rows
-    //       carrying the name -- two monitors answering to one screen at the next start.
+    //       the file check with `live.outputs.count(row.output) != 0` dropped from
+    //       KeptRows::rowsToWrite()'s clearing loop (both in backend/daemon/kept_rows.cpp) ->
+    //       "FAIL: the name the report says was taken over really did leave the carried row",
+    //       printing "ids on disk: 0 100" with both rows carrying the name -- two monitors
+    //       answering to one screen at the next start.
     manager.setMonitorOutput(0, "DP-CARRIED");
     const std::string detail = manager.snapshot().health.persistence.detail;
 
@@ -4704,14 +4731,15 @@ void runRepeatedRuntimeLossesAreBoundedChecks() {
     //       present in the same detail. clauseCount() reads the FIRST occurrence, which is why
     //       clauseOccurrences() exists beside it.
     // CONTROL: the two counter increments replaced by the per-occurrence sentence they replaced
-    //       -- `++m_replacedKept` in WallpaperManager::requestWallpaper() and `++m_takenOverNames`
-    //       in WallpaperManager::setMonitorOutput() (backend/daemon/wallpaper_manager.cpp) each
-    //       made an addPersistenceNote() of a fixed sentence -> all three checks here red: both
+    //       -- `m_kept.countReplacedKept()` in WallpaperManager::requestWallpaper() and
+    //       `m_kept.countTakenOverName()` in WallpaperManager::setMonitorOutput() (both in
+    //       backend/daemon/wallpaper_manager.cpp) each made an `m_kept.note(...)` of the fixed
+    //       sentence d46f80a removed -> all three checks here red: both
     //       count checks printing "the clause appears 0 times and reads 0", and "FAIL: the report
     //       still names the config file after twelve losses of each kind" printing "1059 bytes of
     //       detail, not naming <path>", the detail being twelve identical sentences and a
     //       thirteenth cut mid-word. Three more went red in the two phases above, which grade the
-    //       same two counters one occurrence at a time. Observed 2026-08-18, reverted.
+    //       same two counters one occurrence at a time. Re-observed 2026-08-19, reverted.
     for (int i = 0; i < kEach; ++i) {
         manager.requestWallpaper("static", paths->wallpapers[0].string(), i);
     }
@@ -4800,13 +4828,15 @@ void runKeptNameLastWinsChecks() {
     //       the one that keeps the name", printing "monitor 5000 output '', monitor 6000 output
     //       'DP-9'", and nothing else in the file red. Re-observed 2026-08-15 with the
     //       tightened wait below.
-    // CONTROL, for the monitor-id -> kept-row index that replaced the per-entry scan of
-    //       m_unapplied in restoreSaved(): `keptIndex.emplace(entry.monitorId, 0)` -- an index
+    // CONTROL, for the monitor-id -> kept-row index that replaced the per-entry scan of the
+    //       carried rows in restoreSaved(): `keptIndex.emplace(entry.monitorId, 0)` -- an index
     //       whose entries exist but point at the wrong row -> twelve red across this phase and
     //       "the rows kept for a build with more screens", among them "the kept row keeps its
     //       wallpaper when the name it carried is taken from it" and "two kept rows for one
     //       monitor leave the later row's wallpaper in the file". Dropping the emplace entirely,
-    //       so no id is ever found again, reddens eleven of the same. Nothing distinguishes the
+    //       so no id is ever found again, reddens thirteen -- ten of the same twelve, plus three
+    //       in the cross-container duplicate phase. Both re-observed 2026-08-19 against
+    //       KeptRows::carried(), both reverted. Nothing distinguishes the
     //       index from the scan it replaced, and nothing should: the change is an algorithmic one
     //       for a file capped at ~28,000 rows, and its whole claim is that the result is
     //       identical. What is established is that the merge these checks grade is the code the
@@ -4919,12 +4949,12 @@ void runPreservedRowChecks() {
     //       right row and still say nothing about the one it dropped.
     // CONTROL: the find-and-overwrite in WallpaperManager::restoreSaved()
     //       (backend/daemon/wallpaper_manager.cpp) short-circuited so every kept row is a bare
-    //       `m_unapplied.push_back(...)` -> "FAIL: two kept rows for one monitor leave the
+    //       `m_kept.carried().push_back(...)` -> "FAIL: two kept rows for one monitor leave the
     //       later row's wallpaper in the file", printing "monitor 41 holds '/first.png'", and
     //       "FAIL: every kept row a later row really overwrote is reported as a loss, and no
     //       other" with no such clause in the detail at all, nothing having been overwritten.
-    //       Six more went red with them, the merge being what every other check here rests on.
-    //       Re-observed 2026-08-14. Reverted.
+    //       Nine more went red with them, the merge being what every other check here rests on.
+    //       Re-observed 2026-08-19. Reverted.
     // COVERAGE-ASSERT: the expected number of losses is the length of the collision list
     //       below, so adding a colliding pair to the fixture without it being reported fails
     //       rather than quietly leaving the count alone.
@@ -4997,8 +5027,8 @@ void runPreservedRowChecks() {
     //       rows: this build can bind that name no more than it can draw that wallpaper, so a
     //       report that mentions only the wallpaper tells the user their screen will come back
     //       named when it will not.
-    // WHY-THIS-SHAPE: exact counts derived from two ID LISTS that deliberately overlap -- six
-    //       rows keep a name, eight keep a wallpaper, and five rows are in both. The obvious
+    // WHY-THIS-SHAPE: exact counts derived from two ID LISTS that deliberately overlap -- five
+    //       rows keep a name, eight keep a wallpaper, and four rows are in both. The obvious
     //       alternative, asserting that each clause is merely present, passes for the
     //       partition too: this fixture has one name-only row (66) and rows with wallpapers,
     //       so a partitioning build still prints both clauses, with the wrong numbers.
@@ -5007,14 +5037,14 @@ void runPreservedRowChecks() {
     //       else -- 43 took a contested name from 42, 64 and 65 are two config rows merged,
     //       47 carries a name this build cannot bind -- so a later rule about any of those
     //       could empty the overlap and leave this check green while covering nothing.
-    // CONTROL: the counting loop in WallpaperManager::persistenceDetail()
-    //       (backend/daemon/wallpaper_manager.cpp) replaced by the if/else partition
-    //       `if (type.empty() && path.empty()) ++keptNames; else ++keptWallpapers;` -> "FAIL:
-    //       every kept row carrying a screen name is reported as one", the detail reading
-    //       "1 screen names this build's monitor limit excludes, kept" -- only monitor 66,
-    //       whose row has no wallpaper to be partitioned under -- against six expected. The
-    //       kept-wallpaper check stayed green at eight, which is what separates "counted once"
-    //       from "not counted". Re-observed 2026-08-14. Reverted.
+    // CONTROL: the counting loop in KeptRows::detail() (backend/daemon/kept_rows.cpp) replaced
+    //       by the if/else partition `if (type.empty() && path.empty()) ++keptNames; else
+    //       ++keptWallpapers;` -> "FAIL: every kept row carrying a screen name is reported as
+    //       one", the detail reading "1 screen names this build's monitor limit excludes, kept"
+    //       -- only monitor 66, whose row has no wallpaper to be partitioned under -- against
+    //       five expected. The kept-wallpaper check stayed green at eight, which is what
+    //       separates "counted once" from "not counted". Re-observed 2026-08-19 in the counting
+    //       loop's new home. Reverted.
     // Every kept row holding a name the next save will really leave behind, and every kept row
     // holding a wallpaper. Monitors 40 and 42 are in the second list only: a live screen holds
     // "DP-3" and a later kept row took "DP-9", so the load clears both copies and the report
@@ -5047,18 +5077,20 @@ void runPreservedRowChecks() {
     // CONTROL: this rule is defended in two independent places and NEITHER mutation alone
     //       reddens this check, so it takes both -- `m_outputs.count(it->output) != 0 ||`
     //       deleted from the reconciliation loop at the end of
-    //       WallpaperManager::restoreSaved(), which is what strips the name from the kept row
-    //       at load, AND `&& m_outputs.count(entry.output) == 0` deleted from the kept-name
-    //       loop in WallpaperManager::persistenceDetail(), which refuses to count such a name
-    //       even when the row still carries it (both in backend/daemon/wallpaper_manager.cpp)
+    //       WallpaperManager::restoreSaved() (backend/daemon/wallpaper_manager.cpp), which is
+    //       what strips the name from the kept row at load, AND
+    //       `&& live.outputs.count(entry.output) == 0` deleted from the kept-name loop in
+    //       KeptRows::detail() (backend/daemon/kept_rows.cpp), which refuses to count such a
+    //       name even when the row still carries it
     //       -> "FAIL: a name a live screen already holds is left out of the count of names that
-    //       will come back", printing "7 kept names with the live row, 7 without it; expected 1
+    //       will come back", printing "6 kept names with the live row, 6 without it; expected 1
     //       fewer with it". Deleting the load-side clause alone leaves this GREEN, the counting
     //       guard still refusing the name; what it reddens instead is the displaced-names check
     //       above, reading "2 screen names displaced" against 3. The counting guard has a
     //       control of its own further down this phase, where a client claims a kept row's name
-    //       after startup -- the one state the load-side rule cannot reach. Observed 2026-08-14.
-    //       Both reverted.
+    //       after startup -- the one state the load-side rule cannot reach. Re-observed
+    //       2026-08-19; the printed pair reads 6/6 rather than the 7/7 recorded before
+    //       2026-08-17, when the fixture lost a kept name. Both reverted.
     // COVERAGE-ASSERT: both loads' claim on the name is asserted -- one live screen holding
     //       "DP-3" and none in the other run. If the second load kept a live claimant too the
     //       difference would be 0 for a correct build and the mutated one alike, and the check
@@ -5072,12 +5104,14 @@ void runPreservedRowChecks() {
     // reads as the daemon having lost every kept name -- an accusation with nothing behind it
     // but a reworded report. Every consumer below is gated on this.
     //
-    // CONTROL: the kept-name count wrapped in parentheses in
-    // WallpaperManager::persistenceDetail() (backend/daemon/wallpaper_manager.cpp), so the
-    // digits no longer sit against the clause -> "FAIL: the kept-name count can be read out of
-    // the persistence report" and the two sibling readability checks, plus a NOT VERIFIED line
-    // for this phase's goal; the file-comparison check below no longer reports the daemon as
-    // having lost kept names. Observed 2026-08-14. Reverted.
+    // CONTROL: the kept-name count wrapped in parentheses in KeptRows::detail()
+    // (backend/daemon/kept_rows.cpp), so the digits no longer sit against the clause -> four
+    // NOT VERIFIED lines and exit 77, no FAIL anywhere: the `reports()` calls above see the
+    // unreadable clause first and `if (!clauseCountsReadable) return;` abandons the phase before
+    // this check is reached. The check below therefore never reports the daemon as having lost
+    // kept names, which is the property this block exists to establish -- but it is the early
+    // skip, not this check, that delivers it, and this check is unreachable under the only
+    // mutation that makes a count unreadable. Re-observed 2026-08-19. Reverted.
     const std::optional<int> promisedKeptNames = keptNameCount(detail);
     const bool keptNameCountReadable = promisedKeptNames.has_value();
     check(keptNameCountReadable, "the kept-name count can be read out of the persistence report");
@@ -5211,11 +5245,10 @@ void runPreservedRowChecks() {
     //       numbers come from the ONE read above: the daemon's writer can replace the file
     //       between two reads, and a count from a later version than the ids reports a correct
     //       save as a duplicated row.
-    // CONTROL: every m_unapplied entry appended to the returned vector as well as being merged
-    //       into the id-keyed rows, in WallpaperManager::persistableLocked()
-    //       (backend/daemon/wallpaper_manager.cpp) -> "FAIL: no monitor is written on two rows
-    //       of the config, kept rows included", printing "21 rows for 12 monitor ids". Observed
-    //       2026-08-14. Reverted.
+    // CONTROL: every m_carried entry appended to the returned vector as well as being merged
+    //       into the id-keyed rows, in KeptRows::rowsToWrite() (backend/daemon/kept_rows.cpp)
+    //       -> "FAIL: no monitor is written on two rows of the config, kept rows included",
+    //       printing "21 rows for 12 monitor ids". Re-observed 2026-08-19. Reverted.
     const bool oneRowPerMonitor = rowsWritten == onDisk.size() && rowsWritten > 0;
     check(oneRowPerMonitor, "no monitor is written on two rows of the config, kept rows included");
     if (!oneRowPerMonitor) {
@@ -5286,18 +5319,18 @@ void runPreservedRowChecks() {
     //       second copy sits on a row nothing in this build ever reads back. The kept row's
     //       own wallpaper is asserted still present, so clearing the name by deleting the row
     //       does not pass either.
-    // CONTROL: two mutations together, and it takes both -- `m_outputs.count(it->output) != 0
+    // CONTROL: two mutations together, and it takes both -- `m_outputs.count(kept.output) != 0
     //       ||` deleted from the reconciliation loop at the end of
-    //       WallpaperManager::restoreSaved() AND `|| m_outputs.count(row.output) != 0` deleted
-    //       from the name-clearing loop in WallpaperManager::persistableLocked() (both in
-    //       backend/daemon/wallpaper_manager.cpp) -> "FAIL: a connector name a live screen
-    //       holds is written on that screen's row and no other", printing "rows carrying
-    //       'DP-3': 1 40". Either alone leaves the file with one copy and this check green,
-    //       which is the point of the pair: the load-side rule decides it and the save-side
-    //       rule is the backstop for a name a client claims later. What separates them is the
-    //       REPORT -- deleting the load-side rule alone reddens the displaced-names check
-    //       above, which reads "2 screen names displaced" against 3, because only the load can
-    //       count what it took away. Observed 2026-08-14. Both reverted.
+    //       WallpaperManager::restoreSaved() (backend/daemon/wallpaper_manager.cpp) AND
+    //       `|| live.outputs.count(row.output) != 0` deleted from the name-clearing loop in
+    //       KeptRows::rowsToWrite() (backend/daemon/kept_rows.cpp) -> "FAIL: a connector name a
+    //       live screen holds is written on that screen's row and no other", printing "rows
+    //       carrying 'DP-3': 1 40". Either alone leaves the file with one copy and this check
+    //       green, which is the point of the pair: the load-side rule decides it and the
+    //       save-side rule is the backstop for a name a client claims later. What separates
+    //       them is the REPORT -- deleting the load-side rule alone reddens the displaced-names
+    //       check above, which reads "2 screen names displaced" against 3, because only the
+    //       load can count what it took away. Re-observed 2026-08-19. Both reverted.
     std::vector<int> rowsCarryingName;
     for (const auto& [id, row] : onDisk) {
         if (row.output == "DP-3") rowsCarryingName.push_back(id);
@@ -5338,9 +5371,9 @@ void runPreservedRowChecks() {
     //       no other", printing "rows carrying 'DP-9': 42" -- the save's own duplicate
     //       suppression still leaves one copy, but the earlier row's. Deleting
     //       `|| !written.insert(row.output).second` from the name-clearing loop in
-    //       WallpaperManager::persistableLocked() as well -> the same FAIL printing "rows
-    //       carrying 'DP-9': 42 43", which is the shape with neither defence. Re-observed
-    //       2026-08-15 against the reworked loop. Both reverted.
+    //       KeptRows::rowsToWrite() (backend/daemon/kept_rows.cpp) as well -> the same FAIL
+    //       printing "rows carrying 'DP-9': 42 43", which is the shape with neither defence.
+    //       Re-observed 2026-08-19 against the loop's new home. Both reverted.
     std::vector<int> rowsCarryingDuplicate;
     for (const auto& [id, row] : onDisk) {
         if (row.output == "DP-9") rowsCarryingDuplicate.push_back(id);
@@ -5412,8 +5445,8 @@ void runPreservedRowChecks() {
     //       report promises back is really in the written file", printing "the report promises
     //       6 kept names, the file holds 5, the fixture expects 5". The kept row that still
     //       carries a name after that deletion but is left out of the count is monitor 40,
-    //       which persistenceDetail()'s own live-name guard excludes. Re-observed 2026-08-15
-    //       against the reworked loop. Reverted.
+    //       which KeptRows::detail()'s own live-name guard excludes. Re-observed 2026-08-19.
+    //       Reverted.
     // COVERAGE-ASSERT: the comparison is only evidence if the file really holds kept names, so
     //       the count it read is asserted to be the expected one rather than merely equal.
     int namesOnKeptRows = 0;
@@ -5450,16 +5483,19 @@ void runPreservedRowChecks() {
     //       print this message about a rule it never touched. The FILE is read back beside the
     //       text because the defect is the two disagreeing -- a check on the text alone is
     //       equally satisfied by a build that stopped writing the name and stopped counting it.
-    // CONTROL: `&& m_outputs.count(entry.output) == 0` deleted from the kept-name loop in
-    //       WallpaperManager::persistenceDetail() (backend/daemon/wallpaper_manager.cpp) ->
-    //       "FAIL: a screen name a client claims after startup stops being counted among the
-    //       names that come back", printing "6 kept names promised before the claim, 6 after
+    // CONTROL: TWO mutations, and it now takes both (both reverted):
+    //       `&& live.outputs.count(entry.output) == 0` deleted from the kept-name loop in
+    //       KeptRows::detail() (backend/daemon/kept_rows.cpp), AND the erase-and-count block in
+    //       WallpaperManager::setMonitorOutput() (backend/daemon/wallpaper_manager.cpp) disabled
+    //       -> "FAIL: a screen name a client claims after startup stops being counted among the
+    //       names that come back", printing "5 kept names promised before the claim, 5 after
     //       it; expected 1 fewer", and "FAIL: after a client claims a kept row's name the report
-    //       counts exactly the kept names the file holds", printing "the report promises 6 kept
-    //       names, the file holds 5". Those two are the ONLY checks in the phase that mutation
-    //       reddens: everywhere else the load has already stripped the name, so the guard is
-    //       inert -- which is why the live-screen check above needs both mutations and this one
-    //       needs only this. Observed 2026-08-14. Reverted.
+    //       counts exactly the kept names the file holds", printing "the report promises 5 kept
+    //       names, the file holds 4". The counting guard alone left the WHOLE binary green,
+    //       measured 2026-08-19: since 6e1a059 (2026-08-18) setMonitorOutput() clears the name
+    //       off the carried row itself, so by the time detail() runs there is no name for the
+    //       guard to refuse. Before that commit this check did answer for the guard alone, which
+    //       is what the previous annotation recorded. Observed 2026-08-19.
     // COVERAGE-ASSERT: the name is asserted to be held by a kept row and by no live screen at
     //       the moment it is claimed, and to be bound to the claiming monitor afterwards.
     //       Without those the difference is 0 for a correct build and the mutated one alike,
@@ -6010,13 +6046,14 @@ void runStartupRepairChecks() {
     //       Asking whether monitor 1 carries "DP-4" is true of the unrepaired file as well --
     //       the fixture's second row says exactly that -- so only asking for the wallpaper and
     //       the name on one row separates the file this run wrote from the file it read.
-    // CONTROL: `if (repaired) m_repair = persistableLocked();` disabled at the end of
-    //       WallpaperManager::restoreSaved() (backend/daemon/wallpaper_manager.cpp), so
+    // CONTROL: `if (repaired) m_repair = m_kept.rowsToWrite(liveWallpapers());` disabled at the
+    //       end of WallpaperManager::restoreSaved() (backend/daemon/wallpaper_manager.cpp), so
     //       writeRepairedConfig() has nothing to write -> "FAIL: the repair a start performs is
     //       on disk before any client call", printing "monitor 1 holds type '' path '' output
     //       'DP-4'; ids on disk: 1 40", and "FAIL: a second start with no client acting has
     //       nothing left to repair", printing a second-start detail carrying "2 screen names
-    //       displaced by a later entry" again. Observed 2026-08-15. Reverted.
+    //       displaced by another entry" again. Twenty more go red with them, every check in the
+    //       binary that reads a startup repair back. Re-observed 2026-08-19. Reverted.
     const bool repairOnDisk = afterFirstStart.count(1) == 1 && afterFirstStart.at(1).path == present.string() &&
                               afterFirstStart.at(1).output == "DP-4";
     check(repairOnDisk, "the repair a start performs is on disk before any client call");
@@ -6038,13 +6075,13 @@ void runStartupRepairChecks() {
     //       the only thing on it and the live screen takes that name -- and the check asks
     //       whether the file has a row for it at all, rather than whether that row is empty.
     //       "The row is empty" is satisfied by the build that writes it.
-    // CONTROL: the empty-row skip in WallpaperManager::persistableLocked()
-    //       (backend/daemon/wallpaper_manager.cpp) put back to an unconditional
-    //       `entries.push_back(std::move(row));` -> "FAIL: a kept row left holding nothing is
-    //       not written back", printing "ids on disk: 1 40", and "FAIL: a second start with no
-    //       client acting has nothing left to repair", whose detail then carried "1 entries
-    //       dropped, no build can apply them" -- the phantom loss this rule exists to stop.
-    //       Observed 2026-08-14. Reverted.
+    // CONTROL: the empty-row skip in KeptRows::rowsToWrite() (backend/daemon/kept_rows.cpp) put
+    //       back to an unconditional `entries.push_back(std::move(row));` -> "FAIL: a kept row
+    //       left holding nothing is not written back", printing "ids on disk: 1 40", and "FAIL:
+    //       a second start with no client acting has nothing left to repair", whose detail then
+    //       carried "1 entries dropped, no build can apply them" -- the phantom loss this rule
+    //       exists to stop, and nothing else in the binary red. Re-observed 2026-08-19.
+    //       Reverted.
     const bool emptyRowNotWritten = afterFirstStart.count(40) == 0;
     check(emptyRowNotWritten, "a kept row left holding nothing is not written back");
     if (!emptyRowNotWritten) {

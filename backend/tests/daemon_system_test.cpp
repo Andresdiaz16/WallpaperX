@@ -3915,17 +3915,20 @@ void checkConfigRestart(NameWatcher& names, const std::string& validationEnv, co
     // WHY-THIS-SHAPE: the MTIME is what is graded, not the bytes. Bytes cannot work at this
     //       tier and that is not obvious: the file under test was written by the first
     //       daemon's own save(), so a second save reproduces it byte for byte -- measured, a
-    //       `persist(persistableLocked())` added to restoreSaved() left a byte comparison
+    //       a `persist(...)` of the save rows added to restoreSaved() left a byte comparison
     //       completely green. Both samples are taken while no daemon is running, so nothing
     //       but the restart can have moved either.
-    // CONTROL: the `if (repaired)` guard on `m_repair = persistableLocked();` at the end of
-    //       WallpaperManager::restoreSaved() (backend/daemon/wallpaper_manager.cpp) deleted, so
-    //       every start hands writeRepairedConfig() a snapshot -> "FAIL: a daemon that restores
-    //       entries needing no repair leaves the config file exactly as it found it", with "  the
-    //       file's mtime moved across a start that only restored". Six more went red with it, all
-    //       in the unreadable-config phases: an empty snapshot written after the file was moved
-    //       aside recreates config.json and replaces the detail saying why it was refused.
-    //       Observed 2026-08-15. Reverted.
+    // CONTROL: the `if (repaired)` guard on `m_repair = m_kept.rowsToWrite(liveWallpapers());`
+    //       at the end of WallpaperManager::restoreSaved() (backend/daemon/wallpaper_manager.cpp)
+    //       deleted, so every start hands writeRepairedConfig() a snapshot -> "FAIL: a daemon
+    //       that restores entries needing no repair leaves the config file exactly as it found
+    //       it", with "  the file's mtime moved across a start that only restored". Six more went
+    //       red with it, all in the unreadable-config phases: an empty snapshot written after the
+    //       file was moved aside recreates config.json and replaces the detail saying why it was
+    //       refused. Re-observed 2026-08-19 in the row builder's new home. Reverted. This tier is
+    //       now the only one that answers for the rule: config_store_test's twin reads the file
+    //       inside the manager's lifetime, and since the repair write became asynchronous that
+    //       read beats it.
     second.shutdown(SIGTERM);
     awaitNameRelease(names, "the phase after the config restart");
     std::error_code afterEc;
@@ -4594,10 +4597,14 @@ void checkUnreadableRestore(NameWatcher& names, const std::string& validationEnv
         //       detail, and only the daemon runs both -- an in-process check calls
         //       restoreSaved() itself. Asserted together with the monitor's absence, so it
         //       cannot pass for a daemon that counted a drop it did not make.
-        // CONTROL: `++m_droppedEntries;` deleted from restoreSaved()'s negative-id branch ->
-        //       "FAIL: the daemon says over DBus how many entries no build can apply",
-        //       printing "persistence detail: .../config.json". The absence check stayed
-        //       green, which is what separates "not counted" from "not dropped". Reverted.
+        // CONTROL: `m_kept.countDroppedEntry();` deleted from restoreSaved()'s negative-id
+        //       branch (backend/daemon/wallpaper_manager.cpp) -> "FAIL: the daemon says over
+        //       DBus how many entries no build can apply", printing "persistence detail:
+        //       .../config.json". The absence check stayed green, which is what separates "not
+        //       counted" from "not dropped". One more goes red with it -- "the daemon writes the
+        //       repaired config once the copy has been taken" -- because the count also decides
+        //       whether the start has a repair to write at all. Re-observed 2026-08-19 against
+        //       KeptRows' counter. Reverted.
         check(wallpaperStatus(status, std::to_string(kMonitorNegative)) == nullptr,
               "an entry with a negative monitor id never becomes a monitor");
         const nlohmann::json& statusJson = status.json();
