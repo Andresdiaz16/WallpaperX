@@ -5804,7 +5804,7 @@ void runIdempotentRenameChecks() {
     //       that simply deleted the skip would pass this -- and that count is taken after a
     //       later name change has reached the file, so a write the redundant call made late
     //       has been counted by the time it is read.
-    // CONTROL: `&& m_writer.outcome().onDisk` deleted from the early return in
+    // CONTROL: `&& m_writer.outcome().onDisk()` deleted from the early return in
     //       WallpaperManager::setMonitorOutput (backend/daemon/wallpaper_manager.cpp), which is
     //       where the old persistFailedLocked() test now lives -> "FAIL: re-asserting a name after
     //       a failed write writes it to the file", printing "0 write(s) landed for the retry, 0
@@ -6263,14 +6263,17 @@ void runConcurrentHealthReadChecks() {
     //       back to its unsynchronised shape -- `startLocked(); worker = m_worker;` moved out of
     //       the m_mutex scope -- and the tree rebuilt with -DWALLPAPERX_SANITIZE=thread ->
     //       "WARNING: ThreadSanitizer: data race" twice, naming ConfigWriter::startLocked()
-    //       writing m_worker from this thread against ConfigWriter::everQueued() and
-    //       outcomeLocked() reading it under WallpaperManager::applyPersistOutcomeLocked() under
+    //       writing m_worker from this thread against outcomeLocked() reading it under
+    //       WallpaperManager::applyPersistOutcomeLocked() under
     //       snapshot(); ctest reported config_store as Failed rather than Skipped, the sanitizer
     //       replacing the exit code. Every check in this phase stayed GREEN in that run (589
     //       snapshots, 220 of them in flight), which is the point of the block above: the
     //       sanitizer is the oracle here, not the assertions. With the lock restored the same
     //       build is clean again. Re-observed 2026-08-18 after the writer moved out of the
     //       manager. Reverted.
+    // NEEDS-REOBSERVATION: queue() now sets `pending` under m_mutex too, so the unsynchronised
+    //       shape this mutation restores is a smaller window than the one observed above, and
+    //       everQueued() -- one of the two readers named -- no longer exists.
     // NOTE, on which lock: the pointer is now published under ConfigWriter's own m_mutex, not
     //       under m_stateMutex. The property is unchanged -- one lock covers every reader of
     //       that pointer -- but the writer no longer takes any lock belonging to the manager,
@@ -6657,8 +6660,8 @@ void runOneAnswerAboutTheFileChecks() {
     //       Re-observed 2026-08-19, after this phase moved its parked call onto an abandonable
     //       thread; unchanged.
     // CONTROL, for the agreement half: the shortcut in WallpaperManager::setMonitorOutput given
-    //       back an inference of its own -- `m_writer.lastResult().error.empty()`, i.e. only a
-    //       COMPLETED write with an error counts, in place of `m_writer.outcome().onDisk` --
+    //       back an inference of its own -- `m_writer.outcome().saved.error.empty()`, i.e. only a
+    //       COMPLETED write with an error counts, in place of `m_writer.outcome().onDisk()` --
     //       which is the shape that let two callers disagree -> six red, this phase's four led by
     //       "FAIL: every channel agrees about the write, when a write is outstanding and the
     //       caller gave up on it", printing "health said not-up-to-date, the reply said
@@ -6666,6 +6669,9 @@ void runOneAnswerAboutTheFileChecks() {
     //       The two phases below it go red on the same edit -- one mutation, all three of the
     //       states this cluster is about. Re-observed 2026-08-19, after this phase moved its
     //       parked call onto an abandonable thread; still six, still no skips.
+    // NEEDS-REOBSERVATION: both mutations are restated against Outcome's current shape --
+    //       lastResult() folded into outcome().saved, and onDisk into onDisk(). Neither has been
+    //       run since.
     // COVERAGE-ASSERT: every one of the three states is accounted for at the end -- compared, or
     //       skipped with a printed reason. A state that stops being reachable with no reason given
     //       (an early return added later, a fixture that silently does nothing) breaks the sum and
@@ -7410,15 +7416,18 @@ void runStalledSaveChecks() {
     //       instant, so which side of the comparison that snapshot lands on is a race. The
     //       status and the wording are both asserted -- a `fail` with the previous save's
     //       detail would send an operator to look at a disk error that is not there.
-    // CONTROL: ConfigWriter::stalledPastDeadline() (backend/daemon/config_writer.cpp) forced to
-    //       false, which is where the old `if (writingSince && ... > kLoadDeadline)` test now
-    //       lives -> "FAIL: health reports a write that has not come back rather than the last
-    //       save that did", printing "persistence reads fail (... a write has not come back, the
-    //       choice may not be on disk yet)", and nothing else red. Re-observed 2026-08-18.
-    // WAS: this said the mutation printed "persistence reads ok" -- the healthy save above. True
-    //       when written 2026-08-12; bcac12f then made an outstanding write a failure in its own
-    //       right, so what this block uniquely supplies is now the WORDING, not the status. The
-    //       check asserts both, which is why it still reddens.
+    // CONTROL: `pastDeadline` in ConfigWriter::outcomeLocked() (backend/daemon/config_writer.cpp)
+    //       forced to false, which is where the old stalledPastDeadline() test now lives, so a
+    //       write that has stopped coming back reads as merely outstanding -> "FAIL: health
+    //       reports a write that has not come back rather than the last save that did".
+    // WAS: (a) this said the mutation printed "persistence reads ok" -- the healthy save above.
+    //       True when written 2026-08-12; bcac12f then made an outstanding write a failure in its
+    //       own right, so what this block uniquely supplies is the WORDING, not the status.
+    //       (b) it named ConfigWriter::stalledPastDeadline(), which no longer exists: the answer
+    //       is derived once, inside outcomeLocked(), rather than by a second call that would time
+    //       a write the first never saw.
+    // NEEDS-REOBSERVATION: an outstanding write is now Pending rather than Fail, so the mutation's
+    //       printed line has changed as well as its site. Not run since either change.
     wallpaperx::HealthStatus sawStatus = wallpaperx::HealthStatus::Pending;
     std::string sawDetail;
     bool namesTheStall = false;

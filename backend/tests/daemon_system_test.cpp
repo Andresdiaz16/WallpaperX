@@ -5695,15 +5695,17 @@ void checkStalledConfigWrite(NameWatcher& names, const std::string& validationEn
     //       of that by luck. Both the status and the wording are asserted, because a `fail`
     //       carrying the previous save's detail sends an operator to a disk error that does
     //       not exist.
-    // CONTROL: ConfigWriter::stalledPastDeadline() (backend/daemon/config_writer.cpp) forced to
-    //       false, which is where the old `if (writingSince && ... > kLoadDeadline)` test now
-    //       lives -> "FAIL: GetStatus reports the write that has not come back, rather than the
-    //       last save that did", printing "persistence reads fail (... a write has not come back,
-    //       the choice may not be on disk yet)", and nothing else red. Re-observed 2026-08-18.
-    // WAS: this said the mutation printed "persistence reads ok" -- the baseline save above. True
-    //       when written 2026-08-12; bcac12f then made an outstanding write a failure in its own
-    //       right, so what this block uniquely supplies is now the WORDING, not the status. Both
-    //       are asserted, which is why the check still reddens.
+    // CONTROL: `pastDeadline` in ConfigWriter::outcomeLocked() (backend/daemon/config_writer.cpp)
+    //       forced to false, which is where the old stalledPastDeadline() test now lives, so a
+    //       write that has stopped coming back reads as merely outstanding -> "FAIL: GetStatus
+    //       reports the write that has not come back, rather than the last save that did".
+    // WAS: (a) this said the mutation printed "persistence reads ok" -- the baseline save above.
+    //       True when written 2026-08-12; bcac12f then made an outstanding write a failure in its
+    //       own right, so what this block uniquely supplies is the WORDING, not the status.
+    //       (b) it named ConfigWriter::stalledPastDeadline(), which no longer exists: the answer
+    //       is derived once, inside outcomeLocked().
+    // NEEDS-REOBSERVATION: an outstanding write is now Pending rather than Fail, so the mutation's
+    //       printed line has changed as well as its site. Not run since either change.
     std::string sawStatus;
     std::string sawDetail;
     bool namesTheStall = false;
