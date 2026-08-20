@@ -51,11 +51,25 @@ struct PersistWorker {
 class ConfigWriter {
 public:
     // Derived rather than stored, since a completed write's result lives in the worker, which
-    // outlives this object. One derivation for every caller, so no two can disagree.
+    // outlives this object. Carries everything a report needs, taken under one acquisition of
+    // this object's lock: an answer stitched from several calls describes no single instant.
     struct Outcome {
-        bool settled = true;  // nothing outstanding, so onDisk describes the file as it stands
-        bool onDisk = true;   // true before anything is asked of the file: it already agrees
-        std::string why;      // when !onDisk. Raw; sanitized where recorded or thrown
+        enum class State {
+            NeverAsked,
+            OnDisk,
+            Outstanding,  // queued or in flight: not on disk YET, which is not a failure
+            Stalled,      // outstanding past the deadline: the filesystem stopped answering
+            Failed,
+        };
+
+        State state = State::NeverAsked;
+        // Set for every state but NeverAsked and OnDisk. Raw; sanitized where recorded or thrown.
+        std::string why;
+        // The last COMPLETED write's result. Default while none has completed, so "nothing
+        // counted yet" cannot read as "nothing lost".
+        SaveResult saved;
+
+        bool onDisk() const { return state == State::NeverAsked || state == State::OnDisk; }
     };
 
     explicit ConfigWriter(ConfigStore store);
@@ -82,18 +96,9 @@ public:
     // this write's own reason, raw.
     bool write(const std::vector<PersistedWallpaper>& rows, std::string* whyNot = nullptr);
 
+    // The single answer to whether the file holds what was handed over. Everything a report
+    // needs is in it, so nothing else here answers part of the same question.
     Outcome outcome() const;
-
-    // Whether anything has ever been handed over. False means the file has not been asked to
-    // hold anything, so whatever was recorded at startup still stands and must not be restated
-    // -- restating it would escape an already-escaped path a second time.
-    bool everQueued() const;
-
-    // A write in flight past the deadline -- a stalled filesystem, which earns its own wording.
-    bool stalledPastDeadline() const;
-
-    // What the last completed write reported, for the losses it counted.
-    SaveResult lastResult() const;
 
 private:
     // Spawns the thread on first use and leaves the worker null when it could not be created,

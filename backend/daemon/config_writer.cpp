@@ -120,11 +120,11 @@ bool ConfigWriter::queue(const std::vector<PersistedWallpaper>& rows) {
         // Cleared only once the snapshot is on its way to a writer: from here the worker's own
         // result is the authority, and a stale refusal would outrank it.
         if (worker) m_notWritten.clear();
-    }
-    // No writer, and startLocked() recorded why: the next save retries.
-    if (!worker) return false;
+        // No writer, and startLocked() recorded why: the next save retries.
+        if (!worker) return false;
 
-    {
+        // Still under m_mutex, so no reader sees a worker that exists with nothing pending and
+        // calls that a clean file. This lock then the worker's is the documented order.
         std::lock_guard<std::mutex> workerLock(worker->mutex);
         // Replaced, not appended: an older snapshot waiting behind a stalled write describes a
         // state this one already supersedes, so writing it would only be a slower route to the
@@ -159,8 +159,8 @@ bool ConfigWriter::write(const std::vector<PersistedWallpaper>& rows, std::strin
     }
 
     const Outcome result = outcome();
-    if (!result.onDisk && whyNot != nullptr) *whyNot = result.why;
-    return result.onDisk;
+    if (!result.onDisk() && whyNot != nullptr) *whyNot = result.why;
+    return result.onDisk();
 }
 
 ConfigWriter::Outcome ConfigWriter::outcome() const {
@@ -169,15 +169,19 @@ ConfigWriter::Outcome ConfigWriter::outcome() const {
 }
 
 ConfigWriter::Outcome ConfigWriter::outcomeLocked() const {
+    using State = Outcome::State;
+
     // Durability was never promised, so the file cannot disagree with anything.
     if (!m_store.enabled()) return {};
 
     // The half the worker cannot know: a save refused, or a writer that never started. Recorded
     // rather than inferred from a null worker, which also means "nothing asked yet".
-    if (!m_notWritten.empty()) return {/*settled=*/true, /*onDisk=*/false, m_notWritten};
+    if (!m_notWritten.empty()) return {State::Failed, m_notWritten, {}};
     if (!m_worker) return {};
 
     std::lock_guard<std::mutex> workerLock(m_worker->mutex);
+    const SaveResult saved = m_worker->haveResult ? m_worker->result : SaveResult{};
+
     // Outstanding covers all three ways a write can be unfinished: still queued, in flight, or
     // abandoned by a caller that stopped waiting. Reading only `haveResult` reported a name as
     // durable while the write that would have made it so had never completed.
@@ -190,34 +194,30 @@ ConfigWriter::Outcome ConfigWriter::outcomeLocked() const {
     // widen this test.
     const bool outstanding = m_worker->pending.has_value() ||
                              m_worker->writingSince.has_value() || m_worker->stalled;
+    // A write nobody is waiting for any more is the only symptom a stalled config filesystem
+    // leaves, so it is told apart from one that is merely still going.
+    const bool pastDeadline =
+        m_worker->writingSince.has_value() &&
+        std::chrono::steady_clock::now() - *m_worker->writingSince > kWriteDeadline;
+    const auto stalled = [this, &saved] {
+        return Outcome{State::Stalled,
+                       m_store.file().string() +
+                           ": has not answered a write, the filesystem may be stalled",
+                       saved};
+    };
+
     if (m_worker->haveResult && !m_worker->result.error.empty()) {
-        return {!outstanding, false, m_worker->result.error};
+        if (outstanding && pastDeadline) return stalled();
+        return {State::Failed, m_worker->result.error, saved};
     }
     if (outstanding) {
-        return {false, false,
-                m_store.file().string() + ": a write has not come back, the choice may not be on disk yet"};
+        if (pastDeadline) return stalled();
+        return {State::Outstanding,
+                m_store.file().string() +
+                    ": a write has not come back, the choice may not be on disk yet",
+                saved};
     }
-    return {true, true, {}};
-}
-
-bool ConfigWriter::everQueued() const {
-    std::lock_guard<std::mutex> lock(m_mutex);
-    return m_worker != nullptr;
-}
-
-bool ConfigWriter::stalledPastDeadline() const {
-    std::lock_guard<std::mutex> lock(m_mutex);
-    if (!m_worker) return false;
-    std::lock_guard<std::mutex> workerLock(m_worker->mutex);
-    return m_worker->writingSince.has_value() &&
-           std::chrono::steady_clock::now() - *m_worker->writingSince > kWriteDeadline;
-}
-
-SaveResult ConfigWriter::lastResult() const {
-    std::lock_guard<std::mutex> lock(m_mutex);
-    if (!m_worker) return {};
-    std::lock_guard<std::mutex> workerLock(m_worker->mutex);
-    return m_worker->result;
+    return {State::OnDisk, {}, saved};
 }
 
 }

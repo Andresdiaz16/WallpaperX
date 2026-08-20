@@ -116,19 +116,16 @@ int main() {
             if (sigwait(&shutdownSignals, &received) != 0) return;
             // Skips leaveEventLoop() too: on the throw path the connection is what failed.
             if (wakingForShutdown.load(std::memory_order_acquire)) return;
-            // Everything below is inside a guard because this is a bare thread, where an
-            // escaping exception is std::terminate: a core dump in place of the clean stop
-            // this thread exists to give, and main's own catch cannot intercept it. Several
-            // statements here can throw -- leaveEventLoop() is documented to, and the lock and
-            // the timed wait report failure that way.
+            // Guarded because this is a bare thread, where an escaping exception is
+            // std::terminate -- a core dump in place of the clean stop this thread exists to
+            // give, and main's own catch cannot intercept it.
             try {
                 std::printf("wallpaperx-daemon: %s received, shutting down\n",
                             strsignal(received));
                 std::fflush(stdout);
                 shutdownRequested.store(true, std::memory_order_release);
-                // Caught on its own rather than left to the guard below: a loop that cannot be
-                // told to leave still leaves the deadline running, and a bounded stop with a
-                // reason printed is better than an immediate abandoned one.
+                // Caught on its own: a loop that will not leave still has the deadline below
+                // bounding it, which is better than abandoning the stop immediately.
                 try {
                     connection->leaveEventLoop();
                 } catch (const std::exception& error) {
@@ -156,8 +153,7 @@ int main() {
                 ssize_t ignored = ::write(STDERR_FILENO, kBlocked, sizeof(kBlocked) - 1);
                 (void)ignored;
             } catch (...) {
-                // The deadline above is gone with the stack it was on, so nothing is bounding
-                // this stop any more and there is no waiting left to do.
+                // The deadline went with the stack it was on, so nothing bounds this stop now.
                 static constexpr char kLost[] =
                     "wallpaperx-daemon: shutdown watch failed, exiting now\n";
                 ssize_t ignored = ::write(STDERR_FILENO, kLost, sizeof(kLost) - 1);

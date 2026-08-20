@@ -129,7 +129,9 @@ WallpaperManager::WallpaperManager(Config config)
 void WallpaperManager::preserveUnreadableConfig() {
     if (!m_store.enabled()) return;
 
-    std::string why;
+    // The render worker is already running when main() calls this, so every touch of this
+    // object's state below is under m_stateMutex. The copy itself is filesystem work and stays
+    // outside it: a stalled mount must not hold up a render.
     if (m_loadError.empty()) {
         // A pending repair means a rewrite from live state is coming, and a row the manager
         // rejected parses cleanly, lives nowhere else, and is what that rewrite removes.
@@ -138,25 +140,29 @@ void WallpaperManager::preserveUnreadableConfig() {
             std::lock_guard<std::mutex> stateLock(m_stateMutex);
             repairPending = m_repair.has_value();
         }
+        if (!m_loadPreservable || (m_loadMalformed == 0 && !repairPending)) return;
+
         // Copied, not moved: the entries this build understood are restored from this same file.
-        if ((m_loadMalformed > 0 || repairPending) && m_loadPreservable) {
-            const PreservedCopy copy = preserveConfig(m_store.file(), /*move=*/false);
-            m_repairCopied = !copy.kept.empty();
-            m_kept.note(copy.kept.empty() ? "not copied: " + copy.why
-                                                 : "copied to " + copy.kept);
-            // Sticky: the rejected rows exist in this file alone and the rewrite removing them
-            // is coming. Saving is not refused over it -- later wallpaper changes are the larger
-            // loss -- so a write that succeeds later must not clear the record of that loss.
-            if (!m_repairCopied) m_preserveFailed = true;
-            recordHealth(&DaemonHealth::persistence,
-                         m_repairCopied ? HealthStatus::Ok : HealthStatus::Fail,
-                         keptDetail(m_store.file().string()));
-        }
+        const PreservedCopy copy = preserveConfig(m_store.file(), /*move=*/false);
+
+        std::lock_guard<std::mutex> stateLock(m_stateMutex);
+        m_repairCopied = !copy.kept.empty();
+        m_kept.note(copy.kept.empty() ? "not copied: " + copy.why : "copied to " + copy.kept);
+        // Sticky: the rejected rows exist in this file alone and the rewrite removing them
+        // is coming. Saving is not refused over it -- later wallpaper changes are the larger
+        // loss -- so a write that succeeds later must not clear the record of that loss.
+        if (!m_repairCopied) m_preserveFailed = true;
+        recordHealthLocked(&DaemonHealth::persistence,
+                           m_repairCopied ? HealthStatus::Ok : HealthStatus::Fail,
+                           keptDetail(m_store.file().string()));
         return;
     }
 
+    PreservedCopy copy;
+    if (m_loadPreservable) copy = preserveConfig(m_store.file(), /*move=*/true);
+
+    std::lock_guard<std::mutex> stateLock(m_stateMutex);
     if (m_loadPreservable) {
-        const PreservedCopy copy = preserveConfig(m_store.file(), /*move=*/true);
         if (copy.kept.empty()) {
             m_kept.note("not kept: " + copy.why);
         } else {
@@ -170,7 +176,7 @@ void WallpaperManager::preserveUnreadableConfig() {
     // Every path reports. Saying the config could not be read while staying silent about
     // whether a copy survived sends the user looking for a file that is not there.
     if (m_writer.refusing()) m_kept.note("not saving over it");
-    recordHealth(&DaemonHealth::persistence, HealthStatus::Fail, keptDetail(m_loadError));
+    recordHealthLocked(&DaemonHealth::persistence, HealthStatus::Fail, keptDetail(m_loadError));
 }
 
 void WallpaperManager::writeRepairedConfig() {
@@ -411,7 +417,7 @@ void WallpaperManager::setMonitorOutput(int monitorId, const std::string& output
         // only when the file is known to hold what the map holds: any other answer, including a
         // write still outstanding, means re-asserting is the only retry a client can reach.
         const BindResult bound = bindOutputLocked(monitorId, outputName);
-        if (bound == BindResult::Unchanged && m_writer.outcome().onDisk) {
+        if (bound == BindResult::Unchanged && m_writer.outcome().onDisk()) {
             return;
         }
 
@@ -529,6 +535,8 @@ bool WallpaperManager::persist(const std::vector<PersistedWallpaper>& entries, s
 }
 
 void WallpaperManager::applyPersistOutcomeLocked(DaemonHealth& health) const {
+    using State = ConfigWriter::Outcome::State;
+    // One call, so every part of the report describes the same instant.
     const ConfigWriter::Outcome outcome = m_writer.outcome();
 
     // Written into the caller's copy rather than recorded: the write finishes on a thread
@@ -538,28 +546,27 @@ void WallpaperManager::applyPersistOutcomeLocked(DaemonHealth& health) const {
         health.persistence.detail = sanitizeForLog(detail, 1024, LogFraming::Bare);
     };
 
-    if (!outcome.onDisk) {
-        // A write nobody is waiting for any more is the only symptom a stalled config
-        // filesystem leaves, so it is named rather than left to look like an ordinary failure.
-        const bool stalled = !outcome.settled && m_writer.stalledPastDeadline();
-        report(HealthStatus::Fail,
-               keptDetail(stalled ? m_writer.file().string() +
-                                               ": has not answered a write, the filesystem may "
-                                               "be stalled"
-                                         : outcome.why));
-        return;
-    }
-    // Nothing has been asked of the file yet, so there is no write to describe and whatever the
-    // constructor recorded still stands.
-    if (!m_writer.everQueued()) {
-        // The status alone: this detail was sanitized when it was recorded, and sanitizeForLog
-        // is not idempotent -- a second pass turns one backslash in a path into two, so the
-        // alarm would name a path that does not exist.
-        if (m_preserveFailed) health.persistence.status = HealthStatus::Fail;
-        return;
+    switch (outcome.state) {
+        case State::Stalled:
+        case State::Failed:
+            report(HealthStatus::Fail, keptDetail(outcome.why));
+            return;
+        case State::Outstanding:
+            // Pending, not Fail: the startup repair is queued and never waited on, so Fail here
+            // warned that wallpapers may not survive a restart on every repaired start.
+            report(HealthStatus::Pending, keptDetail(outcome.why));
+            return;
+        case State::NeverAsked:
+            // Whatever the constructor recorded still stands, and the status alone: that detail
+            // was sanitized when recorded, and sanitizeForLog is not idempotent -- a second pass
+            // turns one backslash in a path into two.
+            if (m_preserveFailed) health.persistence.status = HealthStatus::Fail;
+            return;
+        case State::OnDisk:
+            break;
     }
 
-    const SaveResult saved = m_writer.lastResult();
+    const SaveResult& saved = outcome.saved;
     std::string base = m_writer.file().string();
     if (saved.skippedNonUtf8 > 0) {
         // The promise about names is made only when it is true: the two halves of a row fail
