@@ -117,6 +117,31 @@ target_include_directories(wallpaperx-daemon-lib PUBLIC
 # links either way here, but relying on that makes the build silently platform-specific.
 find_package(Threads REQUIRED)
 
+# --------------------------------------------------------------------------- #
+# Frame import (Step 12)
+# --------------------------------------------------------------------------- #
+#
+# The half of frame sharing that runs in the compositor: an fd the daemon exported becomes a GL
+# texture. Its own library, with no Qt in it, so a probe can drive it against a real daemon with
+# no scene graph, no window and no Plasma -- the import is where the driver-specific failures
+# live, and mixing it into the QQuickItem would make those reachable only through plasmashell.
+pkg_check_modules(EGL QUIET egl)
+find_package(OpenGL QUIET COMPONENTS OpenGL)
+if(EGL_FOUND AND OpenGL_OpenGL_FOUND)
+    add_library(wallpaperx-frame-import STATIC kde/frame_import.cpp)
+    target_include_directories(wallpaperx-frame-import PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/kde
+                               PRIVATE ${EGL_INCLUDE_DIRS})
+    target_link_libraries(wallpaperx-frame-import PUBLIC ${EGL_LIBRARIES} OpenGL::GL)
+    set(WALLPAPERX_HAVE_FRAME_IMPORT ON)
+else()
+    # Named rather than silently skipped: without this the plugin cannot display anything, so a
+    # build missing it is not a smaller build, it is one that cannot do the step's whole job.
+    message(WARNING
+        "EGL or OpenGL not found -- the frame importer is not built, and with it the only path "
+        "from a rendered frame to the desktop. Install the EGL and OpenGL development packages.")
+    set(WALLPAPERX_HAVE_FRAME_IMPORT OFF)
+endif()
+
 target_link_libraries(wallpaperx-daemon-lib PUBLIC
     wallpaperx-renderer
     SDBusCpp::sdbus-c++
