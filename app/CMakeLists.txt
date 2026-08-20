@@ -40,5 +40,11 @@ qt_add_qml_module(wallpaperx
         qml/main.qml
 )
 
+# The plugin's settings pane offers one action -- launching this app -- and it runs it by name,
+# so the binary has to be somewhere a PATH lookup finds it. Until now nothing installed it at
+# all: it was only ever run out of the build directory.
+include(GNUInstallDirs)
+install(TARGETS wallpaperx RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+
 message(STATUS "wallpaperx configured")
 message(STATUS "  Qt6: ${Qt6_VERSION}")

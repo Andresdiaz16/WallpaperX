@@ -568,6 +568,9 @@ constexpr ProbeType kMainProbeTypes[] = {
 constexpr ProbeType kConfigProbeTypes[] = {
     {"Item", "QtQuick"},
     {"Control", "QtQuick.Controls"},
+    {"ColumnLayout", "QtQuick.Layouts"},
+    {"Heading", "org.kde.kirigami"},
+    {"DataSource", "org.kde.plasma.plasma5support"},
 };
 
 struct PackageQmlFile {
@@ -581,8 +584,10 @@ struct PackageQmlFile {
 constexpr PackageQmlFile kPackageQml[] = {
     {"contents/ui/main.qml", "import QtQuick\nimport org.kde.plasma.plasmoid\n", kMainProbeTypes,
      std::size(kMainProbeTypes), "main"},
-    {"contents/ui/config.qml", "import QtQuick\nimport QtQuick.Controls\n", kConfigProbeTypes,
-     std::size(kConfigProbeTypes), "config"},
+    {"contents/ui/config.qml",
+     "import QtQuick\nimport QtQuick.Controls\nimport QtQuick.Layouts\n"
+     "import org.kde.kirigami\nimport org.kde.plasma.plasma5support\n",
+     kConfigProbeTypes, std::size(kConfigProbeTypes), "config"},
 };
 
 // "WallpaperItem (org.kde.plasma.plasmoid), Rectangle (QtQuick)" -- for the line a passing run
