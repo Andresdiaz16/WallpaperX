@@ -1041,6 +1041,68 @@ void runConfigQmlChecks() {
     check(size > 0, "contents/ui/config.qml is not empty");
 }
 
+// S11.3 and S11.5: two halves of one decision -- this package does not carry wallpaper settings
+// of its own. Graded here rather than in the QML harness because both are claims about what the
+// package ships, not about a loaded instance, and this entry needs no Qt.
+void runNoWallpaperSettingsChecks() {
+    constexpr const char* kGoals = "S11.3, S11.5 (the settings pane writes no wallpaper state, and the "
+                                   "package declares no config schema for it to write into)";
+    const std::filesystem::path configQml = g_packageDir / "contents" / "ui" / "config.qml";
+
+    // GOAL: S11.3 -- the pane offers no control that writes wallpaper state. The daemon is the
+    //       single source of truth and main.qml polls it; a picker here would be a second writer
+    //       with nothing arbitrating between them, so a screen could show one thing while Plasma
+    //       believed another.
+    // WHY-THIS-SHAPE: `cfg_` is not a naming convention this project invented -- it is how a
+    //       Plasma config page writes into the wallpaper's config group, and every shipped
+    //       wallpaper's config.qml uses it (org.kde.image declares cfg_Image, cfg_FillMode and a
+    //       dozen more). So the absence of the prefix is exactly the absence of a writer, rather
+    //       than a proxy for it. Searched as text because the claim is about the file that
+    //       ships: a build that loaded it and inspected properties would answer for one instance
+    //       under one Plasma version.
+    // CONTROL: `property string cfg_WallpaperPath` added to config.qml's root -> "FAIL: the
+    //       settings pane declares no cfg_ property, so it writes no wallpaper state",
+    //       printing "contents/ui/config.qml carries a config-writing property at byte 1122:
+    //       cfg_WallpaperPath". One red in the run, no skips. Observed 2026-08-20. Reverted.
+    const std::optional<std::string> text = readFile(configQml);
+    if (!text.has_value()) {
+        notVerified(kGoals, "contents/ui/config.qml could not be read");
+        return;
+    }
+    const bool noWriters = text->find("cfg_") == std::string::npos;
+    check(noWriters, "the settings pane declares no cfg_ property, so it writes no wallpaper state");
+    if (!noWriters) {
+        const std::size_t at = text->find("cfg_");
+        std::fprintf(stderr, "  contents/ui/config.qml carries a config-writing property at byte %zu: %s\n",
+                     at, text->substr(at, 40).c_str());
+    }
+
+    // GOAL: S11.5 -- the package declares no KConfigXT schema, deliberately.
+    //       WallpaperItem.configuration is a KConfigPropertyMap built from contents/config/
+    //       main.xml, and Step 9's audit found the app writing WallpaperPath/WallpaperType keys
+    //       that would land on disk and be invisible to the plugin. Under this design that is
+    //       correct -- the plugin asks the daemon, not the config -- so the absence is asserted
+    //       rather than left to be closed by someone who reads it as an oversight.
+    // WHY-THIS-SHAPE: the whole contents/config directory is checked, not just main.xml. A
+    //       schema added under any other name is the same second writer, and a check naming one
+    //       file would miss it while reading as though it covered the question.
+    // CONTROL: an empty contents/config/main.xml created in the package -> "FAIL: the package
+    //       declares no config schema, so nothing here can write wallpaper state", printing
+    //       the unexpected directory's path. One red in the run, no skips. Observed
+    //       2026-08-20. Directory removed.
+    const std::filesystem::path configDir = g_packageDir / "contents" / "config";
+    std::error_code ec;
+    const bool schemaAbsent = !std::filesystem::exists(configDir, ec) || ec;
+    if (ec) {
+        notVerified(kGoals, "whether the package carries contents/config could not be determined -- " + ec.message());
+        return;
+    }
+    check(schemaAbsent, "the package declares no config schema, so nothing here can write wallpaper state");
+    if (!schemaAbsent) {
+        std::fprintf(stderr, "  unexpected schema directory at %s\n", configDir.string().c_str());
+    }
+}
+
 // S10.11
 void runDaemonPortChecks() {
     const std::filesystem::path mainQml = g_packageDir / "contents" / "ui" / "main.qml";
@@ -1165,6 +1227,7 @@ int main() {
         {"one plugin id, in the two places this process can read it (S9.3)", runIdentifierAgreementChecks},
         {"the wallpaper's QML entry point (S9.4)", runWallpaperQmlChecks},
         {"the settings page (S9.5)", runConfigQmlChecks},
+        {"the settings the pane deliberately does not carry (S11.3, S11.5)", runNoWallpaperSettingsChecks},
         {"the daemon's address, in the two places it is written (S10.11)", runDaemonPortChecks},
     };
     for (const Phase& phase : kPhases) {
