@@ -50,3 +50,22 @@ called_from_lib:libvulkan_intel.so
 # sd-bus runs the connection's event loop; its internal reference counting is
 # uninstrumented and shows up on every signal emission from the render thread.
 called_from_lib:libsystemd.so
+
+# Qt, for the plugin's headless state tests. Uninstrumented: the QML engine runs a
+# QQmlThread and the reply path starts a QNetworkAccessManager thread, and both are torn
+# down by Qt at exit in ways TSan cannot pair with the main thread. Measured on Qt 6.11.2 --
+# every frame of all five reports is libQt6Core, libc or libtsan itself, and not one names
+# this project.
+#
+# Narrow on purpose. `race:` matches the report's own location rather than any stack that
+# passes through Qt, so a race between our own instrumented threads is still reported even
+# while it is running inside the QML engine. That is the distinction the whole file rests
+# on, and it is why this is not `called_from_lib:libQt6Core.so`.
+race:libQt6Core.so
+# glib, which is Qt's event-loop backend here: the eventfd its main context uses to wake
+# the network thread is written on that thread and read on ours, with the pairing inside
+# uninstrumented glib. Same shape, same evidence -- no frame in this project.
+race:libglib-2.0.so
+# This project starts no QThread -- the daemon uses std::thread throughout -- so this can
+# only ever match a thread Qt started for itself.
+thread:QThread::start
