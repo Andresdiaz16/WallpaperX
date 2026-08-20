@@ -23,6 +23,21 @@ ColumnLayout {
     // exists to rule out.
     property string launchError: ""
 
+    // What a given exit code means, as a function rather than inline in the handler: the
+    // handler can only be reached by running a real process, and this is the part worth
+    // grading. 127 is the shell's own "not found", and the command is kstart -- so that code
+    // says the launcher is missing, not the app. Anything else non-zero is kstart reporting it
+    // could not start the entry, which is the case that means the app.
+    function launchFailureMessage(code: int): string {
+        if (code === 0) {
+            return "";
+        }
+        if (code === 127) {
+            return qsTr("The desktop launcher (kstart) is missing, so the app could not be opened.");
+        }
+        return qsTr("The WallpaperX app could not be started. It may not be installed.");
+    }
+
     spacing: Kirigami.Units.largeSpacing
 
     // kstart, not the binary directly: run as a plain command the app becomes a child of
@@ -38,15 +53,7 @@ ColumnLayout {
 
         onNewData: function (source, data) {
             disconnectSource(source);
-            const code = data["exit code"];
-            // 127 is the shell's own "not found", and the command here is kstart -- so that
-            // code says the launcher is missing, not the app. Anything else non-zero is kstart
-            // reporting it could not start the entry, which is the case that means the app.
-            if (code !== 0) {
-                root.launchError = (code === 127)
-                    ? qsTr("The desktop launcher (kstart) is missing, so the app could not be opened.")
-                    : qsTr("The WallpaperX app could not be started. It may not be installed.");
-            }
+            root.launchError = root.launchFailureMessage(data["exit code"]);
         }
 
         // The id, without the .desktop suffix, is what kstart resolves through the desktop
@@ -72,6 +79,9 @@ ColumnLayout {
     // Colour comes from the theme rather than being written here. The pane shipped with
     // color: "#ffffff", which is white text on the light Breeze dialog.
     Kirigami.Heading {
+        // Named so a check can find it by identity rather than by position among its siblings,
+        // which would make adding a row above it a test failure.
+        objectName: "wallpaperxConfigHeading"
         Layout.fillWidth: true
         level: 3
         wrapMode: Text.Wrap
