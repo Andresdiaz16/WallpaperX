@@ -116,26 +116,53 @@ int main() {
             if (sigwait(&shutdownSignals, &received) != 0) return;
             // Skips leaveEventLoop() too: on the throw path the connection is what failed.
             if (wakingForShutdown.load(std::memory_order_acquire)) return;
-            std::printf("wallpaperx-daemon: %s received, shutting down\n", strsignal(received));
-            std::fflush(stdout);
-            shutdownRequested.store(true, std::memory_order_release);
-            connection->leaveEventLoop();
+            // Everything below is inside a guard because this is a bare thread, where an
+            // escaping exception is std::terminate: a core dump in place of the clean stop
+            // this thread exists to give, and main's own catch cannot intercept it. Several
+            // statements here can throw -- leaveEventLoop() is documented to, and the lock and
+            // the timed wait report failure that way.
+            try {
+                std::printf("wallpaperx-daemon: %s received, shutting down\n",
+                            strsignal(received));
+                std::fflush(stdout);
+                shutdownRequested.store(true, std::memory_order_release);
+                // Caught on its own rather than left to the guard below: a loop that cannot be
+                // told to leave still leaves the deadline running, and a bounded stop with a
+                // reason printed is better than an immediate abandoned one.
+                try {
+                    connection->leaveEventLoop();
+                } catch (const std::exception& error) {
+                    std::fprintf(stderr, "wallpaperx-daemon: could not stop the bus loop: %s\n",
+                                 error.what());
+                    std::fflush(stderr);
+                } catch (...) {
+                    std::fprintf(stderr, "wallpaperx-daemon: could not stop the bus loop\n");
+                    std::fflush(stderr);
+                }
 
-            // The deadline belongs on this thread because it is the only one that cannot be
-            // stuck: it waits for signals and nothing else. Any other would risk being blocked
-            // in an uninterruptible filesystem call while holding the process open.
-            std::unique_lock<std::mutex> lock(teardown.mutex);
-            if (teardown.done.wait_for(lock, kTeardownDeadline,
-                                       [&teardown] { return teardown.finished; })) {
-                return;
+                // The deadline belongs on this thread because it is the only one that cannot be
+                // stuck: it waits for signals and nothing else. Any other would risk being
+                // blocked in an uninterruptible filesystem call while holding the process open.
+                std::unique_lock<std::mutex> lock(teardown.mutex);
+                if (teardown.done.wait_for(lock, kTeardownDeadline,
+                                           [&teardown] { return teardown.finished; })) {
+                    return;
+                }
+                // write(2) on the descriptor, not printf + fflush(nullptr): flushing every
+                // stream takes every stream's lock, and the thread this is escaping from may
+                // hold one. A last resort that can block on what it is escaping is not one.
+                static constexpr char kBlocked[] =
+                    "wallpaperx-daemon: shutdown blocked, exiting now\n";
+                ssize_t ignored = ::write(STDERR_FILENO, kBlocked, sizeof(kBlocked) - 1);
+                (void)ignored;
+            } catch (...) {
+                // The deadline above is gone with the stack it was on, so nothing is bounding
+                // this stop any more and there is no waiting left to do.
+                static constexpr char kLost[] =
+                    "wallpaperx-daemon: shutdown watch failed, exiting now\n";
+                ssize_t ignored = ::write(STDERR_FILENO, kLost, sizeof(kLost) - 1);
+                (void)ignored;
             }
-            // write(2) on the descriptor, not printf + fflush(nullptr): flushing every
-            // stream takes every stream's lock, and the thread this is escaping from may
-            // hold one. A last resort that can block on what it is escaping is not one.
-            static constexpr char kBlocked[] =
-                "wallpaperx-daemon: shutdown blocked, exiting now\n";
-            ssize_t ignored = ::write(STDERR_FILENO, kBlocked, sizeof(kBlocked) - 1);
-            (void)ignored;
             // Nonzero: teardown was abandoned, and a supervisor reading only the status
             // should not be told this was a clean stop. Wallpaper choices are written when
             // they are set, so nothing durable is lost.
