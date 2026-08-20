@@ -97,26 +97,51 @@ TestCase {
     //       to do nothing leaves the user believing the app is missing, which is the one thing
     //       this pane exists to rule out.
     // WHY-THIS-SHAPE: the mapping is driven as a function rather than by running a process,
-    //       because the process is the part this harness cannot stage. The two failing codes are
-    //       asserted to differ from each other, not just to be non-empty: 127 is the shell's
+    //       because the process is the part this harness cannot stage. The failing codes are
+    //       asserted to differ from EACH OTHER, not just to be non-empty: 127 is the shell's
     //       "not found" for kstart itself, so reporting it as "the app is not installed" sends
     //       the user to reinstall the wrong thing.
+    // WHY-124-IS-HERE: measured against the real command, not assumed. `kstart --application`
+    //       on an id it cannot resolve waits for a window that never appears -- still running
+    //       at 60 s -- so the launch is wrapped in timeout(1), and 124 is that wrapper reporting
+    //       it ended a command that had not finished. Unbounded, the likeliest failure of all
+    //       would produce no exit code at all and the pane would stay silent forever.
     // CONTROL: `if (code === 127)` changed to `if (false)` in config.qml's
-    //       launchFailureMessage() -> "FAIL: 'the two failures are told apart: [The WallpaperX
-    //       app could not be started. It may not be installed.] vs [the same again]' returned
-    //       FALSE", i.e. a missing launcher reported as a missing app. One red, no skips.
-    //       Observed 2026-08-20. Reverted.
+    //       launchFailureMessage() -> a missing launcher reported as a missing app; one red, no
+    //       skips. Observed 2026-08-20 against the then-two-arm form. Reverted.
+    // CONTROL: `if (code === 124)` changed to `if (false)` -> "FAIL: 'an app that never appeared
+    //       and a failed start are told apart: [The WallpaperX app could not be started.] vs
+    //       [the same again]' returned FALSE", one red in the run, no skips. Observed
+    //       2026-08-20. Reverted.
     function test_a_failed_launch_is_reported() {
         const item = loadPane();
 
         compare(item.launchFailureMessage(0), "", "a launch that worked says nothing");
 
         const missingLauncher = item.launchFailureMessage(127);
+        const neverAppeared = item.launchFailureMessage(124);
         const failedStart = item.launchFailureMessage(1);
         verify(missingLauncher.length > 0, "a missing launcher is reported");
+        verify(neverAppeared.length > 0, "a launch that never produced a window is reported");
         verify(failedStart.length > 0, "a failed start is reported");
+
+        // Pairwise, so a build that collapsed any two of them is red rather than only a build
+        // that collapsed all three.
+        verify(missingLauncher !== neverAppeared,
+               "a missing launcher and an app that never appeared are told apart: ["
+               + missingLauncher + "] vs [" + neverAppeared + "]");
         verify(missingLauncher !== failedStart,
-               "the two failures are told apart: [" + missingLauncher + "] vs [" + failedStart + "]");
+               "a missing launcher and a failed start are told apart: ["
+               + missingLauncher + "] vs [" + failedStart + "]");
+        verify(neverAppeared !== failedStart,
+               "an app that never appeared and a failed start are told apart: ["
+               + neverAppeared + "] vs [" + failedStart + "]");
+
+        // COVERAGE-ASSERT: the timeout the launch is wrapped in is real and non-zero. A build
+        // that dropped the bound would leave 124 unreachable, and the check above would grade a
+        // message nothing can produce.
+        verify(item.launchTimeoutSeconds > 0,
+               "the launch is bounded, so 124 is a code this pane can actually see");
     }
 
     // GOAL: the pane starts with nothing to apologise for -- the error is shown only once a

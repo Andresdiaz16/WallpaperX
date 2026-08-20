@@ -23,19 +23,32 @@ ColumnLayout {
     // exists to rule out.
     property string launchError: ""
 
+    // How long a launch may take before it is called failed. kstart waits for the application's
+    // window to appear, and on an id it cannot resolve it waits forever -- measured, not
+    // assumed: `kstart --application` on an unknown entry was still running at 60 s. Unbounded,
+    // the most likely failure of all (the app is not installed) would leave the button doing
+    // nothing with no exit code ever arriving, which is the one outcome this pane exists to
+    // prevent. Generous, because a cold start on a slow disk is not a failure.
+    readonly property int launchTimeoutSeconds: 20
+
     // What a given exit code means, as a function rather than inline in the handler: the
     // handler can only be reached by running a real process, and this is the part worth
-    // grading. 127 is the shell's own "not found", and the command is kstart -- so that code
-    // says the launcher is missing, not the app. Anything else non-zero is kstart reporting it
-    // could not start the entry, which is the case that means the app.
+    // grading.
     function launchFailureMessage(code: int): string {
         if (code === 0) {
             return "";
         }
+        // 127 is the shell's own "not found", and the command is the timeout/kstart pair, so
+        // that code says the launcher is missing rather than the app.
         if (code === 127) {
             return qsTr("The desktop launcher (kstart) is missing, so the app could not be opened.");
         }
-        return qsTr("The WallpaperX app could not be started. It may not be installed.");
+        // 124 is timeout(1) reporting it ended a command that had not finished -- here, kstart
+        // still waiting for a window that never appeared.
+        if (code === 124) {
+            return qsTr("The WallpaperX app did not start. It may not be installed.");
+        }
+        return qsTr("The WallpaperX app could not be started.");
     }
 
     spacing: Kirigami.Units.largeSpacing
@@ -63,7 +76,10 @@ ColumnLayout {
 
         function launch() {
             root.launchError = "";
-            connectSource("kstart --application " + launcher.desktopId);
+            // Bounded by timeout(1): see launchTimeoutSeconds. Without it a kstart that never
+            // returns leaves this source connected and the pane silent forever.
+            connectSource("timeout " + root.launchTimeoutSeconds
+                          + " kstart --application " + launcher.desktopId);
         }
     }
 
