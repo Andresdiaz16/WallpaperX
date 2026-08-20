@@ -498,8 +498,24 @@ std::string g_qmllint;
 //       passed green over the bogus property; with it restored the run reported `FAIL:
 //       backend/kde/kpackage/contents/ui/main.qml passes qmllint -W0`. The repository itself
 //       was not touched.
+// Where the generated com.wallpaperx module sits in the build tree, or empty when this build did
+// not produce one. WallpaperSurface.qml imports that module, and qmllint resolves a module's
+// types only from generated type information -- without this it reports WallpaperXRenderer as
+// "not found" and the file cannot be linted at all.
+#ifdef WALLPAPERX_QML_MODULE_PATH
+const std::string g_qmlModulePath = WALLPAPERX_QML_MODULE_PATH;
+#else
+const std::string g_qmlModulePath;
+#endif
+
 LintReport lintFile(const std::filesystem::path& file, std::string& hostProblem) {
-    const ProcessResult run = runCapturingStdout({g_qmllint, "--ignore-settings", "--json", "-", file.string()});
+    std::vector<std::string> argv{g_qmllint, "--ignore-settings", "--json", "-"};
+    if (!g_qmlModulePath.empty()) {
+        argv.emplace_back("-I");
+        argv.push_back(g_qmlModulePath);
+    }
+    argv.push_back(file.string());
+    const ProcessResult run = runCapturingStdout(argv);
     LintReport report;
     if (run.timedOut) {
         // Deliberately a harness fault and not a skip. Every other failure path here becomes
@@ -565,6 +581,10 @@ constexpr ProbeType kMainProbeTypes[] = {
     {"WallpaperItem", "org.kde.plasma.plasmoid"},
     {"Rectangle", "QtQuick"},
 };
+constexpr ProbeType kSurfaceProbeTypes[] = {
+    {"Item", "QtQuick"},
+    {"WallpaperXRenderer", "com.wallpaperx"},
+};
 constexpr ProbeType kConfigProbeTypes[] = {
     {"Item", "QtQuick"},
     {"Control", "QtQuick.Controls"},
@@ -584,6 +604,10 @@ struct PackageQmlFile {
 constexpr PackageQmlFile kPackageQml[] = {
     {"contents/ui/main.qml", "import QtQuick\nimport org.kde.plasma.plasmoid\n", kMainProbeTypes,
      std::size(kMainProbeTypes), "main"},
+    // The one file that imports the project's own QML module, which is why the linter is given
+    // the module's build-tree path above.
+    {"contents/ui/WallpaperSurface.qml", "import QtQuick\nimport com.wallpaperx\n", kSurfaceProbeTypes,
+     std::size(kSurfaceProbeTypes), "surface"},
     {"contents/ui/config.qml",
      "import QtQuick\nimport QtQuick.Controls\nimport QtQuick.Layouts\n"
      "import org.kde.kirigami\nimport org.kde.plasma.plasma5support\n",

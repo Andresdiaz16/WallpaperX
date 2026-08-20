@@ -161,15 +161,6 @@ if(EGL_FOUND AND OpenGL_OpenGL_FOUND)
     # The QQuickItem that puts an imported frame on the desktop. Needs Qt, so it is guarded --
     # the importer below it is not, which is what lets the probe run on a headless CI machine
     # with no Qt at all.
-    if(WALLPAPERX_BUILD_KDE_PLUGIN)
-        add_library(wallpaperx-kde-item STATIC kde/wallpaperx_item.cpp)
-        # POSITION_INDEPENDENT_CODE because this static library is linked INTO the QML plugin's
-        # shared object; without it the link fails on the relocations moc generates.
-        set_target_properties(wallpaperx-kde-item PROPERTIES AUTOMOC ON POSITION_INDEPENDENT_CODE ON)
-        target_link_libraries(wallpaperx-kde-item PUBLIC
-            wallpaperx-frame-import Qt6::Core Qt6::DBus Qt6::Quick Qt6::Qml)
-    endif()
-
     add_test(NAME frame_import_probe COMMAND wallpaperx-frame-import-probe)
     set_tests_properties(frame_import_probe PROPERTIES
         LABELS "novulkan"
@@ -330,6 +321,15 @@ target_link_libraries(wallpaperx-qml-lint-test PRIVATE nlohmann_json::nlohmann_j
 # unwinding (X.8); that header is POSIX-only and pulls in no renderer code.
 target_include_directories(wallpaperx-qml-lint-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/../renderer/tests)
+# WallpaperSurface.qml imports the project's own QML module, and qmllint can only resolve a
+# module's types from the type information the build generates. Passed as the module's parent
+# directory because that is what an import path means: com.wallpaperx resolves to com/wallpaperx
+# beneath it. Left undefined when this build produces no module, and the entry then reports the
+# file as unlintable rather than failing it.
+if(WALLPAPERX_BUILD_KDE_PLUGIN AND WALLPAPERX_HAVE_FRAME_IMPORT)
+    target_compile_definitions(wallpaperx-qml-lint-test PRIVATE
+        WALLPAPERX_QML_MODULE_PATH="${CMAKE_CURRENT_BINARY_DIR}/qml")
+endif()
 
 # The Plasma wallpaper QML's own behaviour, as against whether it parses: Qt Quick Test loads
 # main.qml headless and drives the states it can show (S10.10). Outside the KDE plugin guard for
@@ -796,24 +796,9 @@ endif()
 # --------------------------------------------------------------------------- #
 
 if(WALLPAPERX_BUILD_KDE_PLUGIN)
-    add_library(WallpaperX SHARED
-        kde/plugin.cpp
-    )
-
-    target_include_directories(WallpaperX PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}
-    )
-
-    target_link_libraries(WallpaperX PRIVATE
-        Qt6::Core
-        Qt6::Quick
-        Qt6::Qml
-        Qt6::DBus
-    )
-
-    set_target_properties(WallpaperX PROPERTIES
-        LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/kde
-    )
+    # The libWallpaperX.so placeholder that stood here built kde/plugin.cpp and shipped nowhere.
+    # Step 12 replaced it with the real thing: `wallpaperxplugin`, a generated QML module that
+    # installs into the wallpaper package. Removed rather than left building an empty library.
 
     add_executable(wpxctl
         wpxctl/main.cpp
@@ -827,19 +812,32 @@ if(WALLPAPERX_BUILD_KDE_PLUGIN)
 
     plasma_install_package(kde/kpackage com.wallpaperx.wallpaper wallpapers wallpaper)
 
-    # The QML module the package's own main.qml imports. It goes INSIDE the installed package
-    # rather than into Qt's global QML path, because a wallpaper package is what Plasma copies
-    # around and a plugin left outside it is one the desktop cannot find. The directory layout
-    # is the module uri: com.wallpaperx -> com/wallpaperx.
+    # The QML module the package's own WallpaperSurface.qml imports. It goes INSIDE the installed
+    # package rather than into Qt's global QML path, because a wallpaper package is what Plasma
+    # copies around and a plugin left outside it is one the desktop cannot find.
+    #
+    # qt_add_qml_module rather than a hand-written qmldir beside a QQmlExtensionPlugin: it
+    # generates the qmldir and, the part that matters, the type information. qmllint resolves a
+    # module's types only from that -- with a hand-written qmldir it reported WallpaperXRenderer
+    # as "not found" even with the module on its import path, which left the file that draws the
+    # wallpaper unlintable and the lint suite's own completeness check red.
     if(WALLPAPERX_HAVE_FRAME_IMPORT)
-        add_library(wallpaperxplugin SHARED kde/plugin.cpp)
-        set_target_properties(wallpaperxplugin PROPERTIES AUTOMOC ON)
-        target_link_libraries(wallpaperxplugin PRIVATE wallpaperx-kde-item Qt6::Qml Qt6::Quick)
+        qt_add_qml_module(wallpaperxplugin
+            URI com.wallpaperx
+            VERSION 1.0
+            PLUGIN_TARGET wallpaperxplugin
+            SOURCES kde/wallpaperx_item.cpp kde/wallpaperx_item.h
+            OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/qml/com/wallpaperx)
+        target_link_libraries(wallpaperxplugin PRIVATE
+            wallpaperx-frame-import Qt6::Core Qt6::DBus Qt6::Quick Qt6::Qml)
 
         set(WALLPAPERX_QML_MODULE_DIR
             ${KDE_INSTALL_DATADIR}/plasma/wallpapers/com.wallpaperx.wallpaper/contents/lib/qt6/qml/com/wallpaperx)
         install(TARGETS wallpaperxplugin DESTINATION ${WALLPAPERX_QML_MODULE_DIR})
-        install(FILES kde/qmldir DESTINATION ${WALLPAPERX_QML_MODULE_DIR})
+        install(FILES
+            ${CMAKE_CURRENT_BINARY_DIR}/qml/com/wallpaperx/qmldir
+            ${CMAKE_CURRENT_BINARY_DIR}/qml/com/wallpaperx/wallpaperxplugin.qmltypes
+            DESTINATION ${WALLPAPERX_QML_MODULE_DIR})
     else()
         message(WARNING
             "The frame importer is not built, so the QML module that draws wallpapers is not "

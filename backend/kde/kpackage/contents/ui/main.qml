@@ -66,6 +66,13 @@ WallpaperItem {
             ? root.reply.path.substring(0, 4096)
             : ""
 
+    // The id the renderer asks the daemon for frames by. Null in the reply until the daemon
+    // knows the screen, and null is deliberate on its side rather than 0 -- an id handed back
+    // as 0 would put monitor 0's wallpaper on a screen that is not monitor 0. -1 here means the
+    // same thing and is what the renderer refuses to draw for.
+    readonly property int monitorId:
+        (root.reply && typeof root.reply.monitor_id === "number") ? root.reply.monitor_id : -1
+
     // Each state needs a different action from whoever reads it, so they are told apart
     // rather than merged. Order matters: a refusal only means anything once something answered.
     readonly property string screenState:
@@ -195,10 +202,38 @@ WallpaperItem {
 
     // Opaque, because a message drawn over an unknown desktop may be unreadable, and a
     // transparent plugin that failed is indistinguishable from no plugin at all.
+    // The wallpaper itself, loaded rather than imported: see WallpaperSurface.qml for why
+    // main.qml must not import com.wallpaperx directly. A module that fails to load leaves this
+    // Loader in Error and the message below still describes the screen, instead of taking the
+    // whole plugin down with it.
+    Loader {
+        id: surface
+
+        anchors.fill: parent
+        // Only once there is something to draw AND a screen to ask about. Without the id test
+        // the renderer would poll for frames belonging to no monitor.
+        active: root.screenState === "set" && root.monitorId >= 0
+        source: "WallpaperSurface.qml"
+        onLoaded: item.monitorId = root.monitorId
+
+        // A later reply can move the screen to a different id -- a re-plug, or the daemon
+        // learning the name after the fact -- and the loaded item would otherwise keep drawing
+        // the frames of the id it was created with.
+        Connections {
+            target: root
+            function onMonitorIdChanged() {
+                if (surface.item !== null) surface.item.monitorId = root.monitorId;
+            }
+        }
+    }
+
     Rectangle {
         id: backdrop
 
         anchors.fill: parent
+        // Hidden rather than drawn under the wallpaper: it is opaque, and a frame that has been
+        // imported is what the user should see. Shown again the moment anything goes wrong.
+        visible: !(surface.status === Loader.Ready && root.screenState === "set")
         color: "#1b1b1b"
 
         Text {

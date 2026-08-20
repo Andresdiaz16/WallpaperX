@@ -7,6 +7,7 @@
 #include <QQuickItem>
 #include <QString>
 #include <QtGlobal>
+#include <QtQml/qqmlregistration.h>
 
 #include <mutex>
 #include <optional>
@@ -30,6 +31,12 @@ namespace wallpaperx {
 // shared: every GL object lives and dies on the render thread.
 class WallpaperXItem : public QQuickItem {
     Q_OBJECT
+    // Declared here rather than registered by hand in a plugin's registerTypes(), so the build
+    // generates the module's qmldir AND its type information. Without generated types qmllint
+    // cannot see WallpaperXRenderer at all -- measured: it reports "was not found" even with the
+    // module on its import path -- which would leave the one QML file that draws the wallpaper
+    // permanently unlintable.
+    QML_NAMED_ELEMENT(WallpaperXRenderer)
     Q_PROPERTY(int monitorId READ monitorId WRITE setMonitorId NOTIFY monitorIdChanged)
     Q_PROPERTY(bool daemonConnected READ daemonConnected NOTIFY daemonConnectedChanged)
     // Why nothing is being drawn, when nothing is. Empty while the wallpaper is showing, so QML
