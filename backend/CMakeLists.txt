@@ -826,10 +826,23 @@ if(WALLPAPERX_BUILD_KDE_PLUGIN)
             URI com.wallpaperx
             VERSION 1.0
             PLUGIN_TARGET wallpaperxplugin
+            # Without this the generated qmldir says `optional plugin`, and Qt then declines to
+            # load it: the type information alone looks sufficient, so `import com.wallpaperx`
+            # resolves but WallpaperXRenderer never gets registered and nothing instantiates.
+            # Measured -- with `optional` the import produced "Did not load any objects".
+            NO_PLUGIN_OPTIONAL
             SOURCES kde/wallpaperx_item.cpp kde/wallpaperx_item.h
             OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/qml/com/wallpaperx)
         target_link_libraries(wallpaperxplugin PRIVATE
             wallpaperx-frame-import Qt6::Core Qt6::DBus Qt6::Quick Qt6::Qml)
+
+        # The QML engine looks for lib<plugin>.so, and this target builds as
+        # wallpaperxplugin.so without it -- so the module resolved, the type information was
+        # read, and the plugin was never loaded. Measured, and it cost an hour: the earlier
+        # hand-written plugin happened to carry the prefix, so a stale copy of it in the staging
+        # directory made the generated module look like it worked. Wiping the staging directory
+        # is what exposed it.
+        set_target_properties(wallpaperxplugin PROPERTIES PREFIX "lib")
 
         set(WALLPAPERX_QML_MODULE_DIR
             ${KDE_INSTALL_DATADIR}/plasma/wallpapers/com.wallpaperx.wallpaper/contents/lib/qt6/qml/com/wallpaperx)

@@ -7,6 +7,7 @@
 #include <QDBusReply>
 #include <QDBusUnixFileDescriptor>
 #include <QQuickWindow>
+#include <QRunnable>
 #include <QSGRendererInterface>
 #include <QSGSimpleTextureNode>
 #include <QSGTexture>
@@ -97,6 +98,17 @@ void WallpaperXItem::onFrameReady(int monitorId, qulonglong generation) {
 void WallpaperXItem::fetchFrame(quint64 generation) {
     if (m_daemon == nullptr || m_monitorId < 0) return;
 
+    // Already have this frame, or a newer one. FrameReady carries the generation precisely so a
+    // client can answer this without asking, and asking is not free: GetFrameFd blocks this
+    // thread on the bus, makes the daemon export a fresh fd, and costs a dup() here. A signal
+    // for a frame already fetched is ordinary -- the daemon emits per render, and a burst of
+    // renders for one monitor produces a burst of signals.
+    //
+    // Zero means "fetch whatever is there": it is what the two callers that are not signals
+    // pass, when this item has just learned its monitor id or just connected, and neither knows
+    // what generation the daemon is on.
+    if (generation != 0 && generation <= m_fetchedGeneration) return;
+
     // Blocking, and deliberately on this thread: the render thread must never wait on the bus,
     // and the daemon answers this from its own GPU worker rather than its event loop, so a slow
     // render here does not stall the daemon's other callers either.
@@ -134,7 +146,10 @@ void WallpaperXItem::fetchFrame(quint64 generation) {
         setUnavailableReason(tr("WallpaperX sent a frame this plugin could not take hold of."));
         return;
     }
-    Q_UNUSED(generation);
+
+    // Recorded from the REPLY, not from the signal that prompted the fetch: the daemon may have
+    // rendered again between the two, and the reply describes the frame actually in hand.
+    m_fetchedGeneration = frame.generation;
 
     {
         std::lock_guard<std::mutex> lock(m_pendingMutex);
@@ -215,10 +230,37 @@ QSGNode* WallpaperXItem::updatePaintNode(QSGNode* old, UpdatePaintNodeData*) {
 }
 
 void WallpaperXItem::releaseResources() {
-    // The scene graph is taking the window away. The GL objects belong to that context, so they
-    // go with it; holding the names would leave this item pointing at freed driver state.
+    // Called when this item leaves its window, which is NOT necessarily when the context dies:
+    // an item moved between windows leaves a live context behind, and simply forgetting the
+    // names there leaks a texture and a memory object every time.
+    //
+    // They cannot be deleted here either -- this runs on the GUI thread and the context belongs
+    // to the render thread. scheduleRenderJob is the way across: the job runs on the render
+    // thread with the context current, which is the same pair of conditions updatePaintNode
+    // satisfies. It takes a copy, so nothing outlives this object.
+    if (m_imported.texture == 0 && m_imported.memoryObject == 0) return;
+
+    QQuickWindow* host = window();
+    const FrameImport::Result doomed = m_imported;
     m_imported = FrameImport::Result{};
     m_shownGeneration = 0;
+
+    if (host == nullptr) {
+        // No window to schedule against, so the context this belonged to is already gone and
+        // the driver freed its objects with it. Nothing to do but drop the names, which the
+        // assignment above has done.
+        return;
+    }
+
+    class ReleaseJob : public QRunnable {
+    public:
+        explicit ReleaseJob(FrameImport::Result imported) : m_imported(imported) {}
+        void run() override { FrameImport::release(m_imported); }
+
+    private:
+        FrameImport::Result m_imported;
+    };
+    host->scheduleRenderJob(new ReleaseJob(doomed), QQuickWindow::NoStage);
 }
 
 }  // namespace wallpaperx

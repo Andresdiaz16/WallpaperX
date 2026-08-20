@@ -88,6 +88,9 @@ private:
     void setUnavailableReason(const QString& reason);
 
     int m_monitorId = -1;
+    // The newest generation this item has fetched, so a signal for a frame already in hand
+    // costs nothing. GUI thread only, like everything else the fetch path touches.
+    quint64 m_fetchedGeneration = 0;
     bool m_daemonConnected = false;
     QString m_unavailableReason;
 
