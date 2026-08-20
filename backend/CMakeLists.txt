@@ -133,6 +133,34 @@ if(EGL_FOUND AND OpenGL_OpenGL_FOUND)
                                PRIVATE ${EGL_INCLUDE_DIRS})
     target_link_libraries(wallpaperx-frame-import PUBLIC ${EGL_LIBRARIES} OpenGL::GL)
     set(WALLPAPERX_HAVE_FRAME_IMPORT ON)
+
+    # The probe lives here rather than beside the renderer's, because it is the importer that is
+    # under test and the importer is this repo's. It borrows the renderer's shader and asset
+    # directories through the cache variables that module exports.
+    add_executable(wallpaperx-frame-import-probe tests/frame_import_probe.cpp)
+    target_link_libraries(wallpaperx-frame-import-probe PRIVATE
+        wallpaperx-frame-import wallpaperx-renderer)
+    add_dependencies(wallpaperx-frame-import-probe wallpaperx-shaders)
+    target_include_directories(wallpaperx-frame-import-probe PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/../renderer/tests)
+    # Its own asset directory, not the renderer's: that one is a plain variable in the renderer's
+    # scope and arrives here empty, which showed up as a write to "/frame_import_gradient.png".
+    # A separate directory is also what keeps this probe off the path its lavapipe twin writes.
+    set(WALLPAPERX_IMPORT_ASSET_DIR ${CMAKE_CURRENT_BINARY_DIR}/import_test_assets)
+    file(MAKE_DIRECTORY ${WALLPAPERX_IMPORT_ASSET_DIR})
+    target_compile_definitions(wallpaperx-frame-import-probe PRIVATE
+        WALLPAPERX_SHADER_DIR="${WALLPAPERX_SHADER_OUTPUT_DIR}"
+        WALLPAPERX_TEST_IMAGE_DIR="${WALLPAPERX_IMPORT_ASSET_DIR}")
+
+    # Registered even though it currently skips on this host: an unregistered probe is one
+    # nobody runs, and the pairing it needs (a GL context on the same driver the Vulkan device
+    # used) is a property of the machine that can change without this file changing. It reports
+    # 77 with the reason when it cannot import, which ctest reads as a skip.
+    add_test(NAME frame_import_probe COMMAND wallpaperx-frame-import-probe)
+    set_tests_properties(frame_import_probe PROPERTIES
+        LABELS "novulkan"
+        ENVIRONMENT "WALLPAPERX_FORCE_HANDLE_TYPE=opaque"
+        SKIP_RETURN_CODE 77)
 else()
     # Named rather than silently skipped: without this the plugin cannot display anything, so a
     # build missing it is not a smaller build, it is one that cannot do the step's whole job.
