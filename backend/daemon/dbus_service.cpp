@@ -27,6 +27,7 @@ constexpr const char* kErrorRenderFailed = "io.wallpaperx.Daemon.Error.RenderFai
 // means stop asking -- nothing about this build changes while it runs.
 constexpr const char* kErrorUnsupported = "io.wallpaperx.Daemon.Error.Unsupported";
 constexpr const char* kErrorShuttingDown = "io.wallpaperx.Daemon.Error.ShuttingDown";
+constexpr const char* kErrorBusy = "io.wallpaperx.Daemon.Error.Busy";
 constexpr const char* kErrorInvalidArgs = "org.freedesktop.DBus.Error.InvalidArgs";
 
 }  // namespace
@@ -61,14 +62,25 @@ void DbusService::registerVTable() {
                 // the event loop keeps serving while the frame is produced.
                 .implementedAs([this](FrameFdCall&& call, int32_t monitorId) {
                     m_worker.postTask(
-                        [this, call = std::move(call), monitorId](bool cancelled) mutable {
+                        [this, call = std::move(call),
+                         monitorId](wallpaperx::RenderWorker::TaskState state) mutable {
                             // Answered rather than dropped: destroying the Result sends
                             // nothing, leaving a GUI client blocked for the full reply
-                            // timeout on a daemon that is already gone.
-                            if (cancelled) {
-                                call.returnError(sdbus::Error(sdbus::Error::Name{kErrorShuttingDown},
-                                                              "the daemon is shutting down"));
-                                return;
+                            // timeout on a request that will never run.
+                            switch (state) {
+                                case RenderWorker::TaskState::ShuttingDown:
+                                    call.returnError(
+                                        sdbus::Error(sdbus::Error::Name{kErrorShuttingDown},
+                                                     "the daemon is shutting down"));
+                                    return;
+                                case RenderWorker::TaskState::Busy:
+                                    call.returnError(
+                                        sdbus::Error(sdbus::Error::Name{kErrorBusy},
+                                                     "too many frame exports are already "
+                                                     "waiting; retry"));
+                                    return;
+                                case RenderWorker::TaskState::Run:
+                                    break;
                             }
                             completeGetFrameFd(std::move(call), monitorId);
                         });

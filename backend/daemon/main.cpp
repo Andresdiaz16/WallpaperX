@@ -26,6 +26,20 @@ namespace {
 // milliseconds, so it fires only for a stop that is stuck rather than slow.
 constexpr std::chrono::seconds kTeardownDeadline{5};
 
+std::atomic<bool>* g_wakingForShutdown = nullptr;
+
+// Lets a second SIGINT/SIGTERM end a stop that is stuck. Returns for the watcher's own wake,
+// which sets the flag first. Everything it touches is async-signal-safe.
+void forceExitOnSecondSignal(int) {
+    if (g_wakingForShutdown != nullptr && g_wakingForShutdown->load(std::memory_order_acquire)) {
+        return;
+    }
+    static constexpr char kForced[] = "wallpaperx-daemon: asked again, exiting now\n";
+    ssize_t ignored = ::write(STDERR_FILENO, kForced, sizeof(kForced) - 1);
+    (void)ignored;
+    std::_Exit(1);
+}
+
 // First caller wins: re-arming per stage would hand each a fresh deadline, and the budget is
 // for the whole stop. SIGALRM's default action ends the process, and main() does not block it.
 void armTeardown(bool& armed) {
@@ -124,16 +138,16 @@ int main() {
             bool& teardownArmed;
             ~ShutdownWatch() {
                 if (!thread.joinable()) return;
-                // Releasing the watchdog leaves the rest of teardown -- the bus connection,
-                // then static destruction -- with nothing bounding it. A stop that got this
-                // far has already armed it; this is the case where nothing else did.
+                // Covers the tail -- the bus connection, then static destruction. A stop that
+                // got this far already armed it; this is the case where nothing else did.
                 armTeardown(teardownArmed);
                 {
                     std::lock_guard<std::mutex> lock(teardown.mutex);
                     teardown.finished = true;
                 }
                 teardown.done.notify_all();
-                // Set BEFORE the signal, or the watcher wakes, reads false, and prints.
+                // Set BEFORE the signal, or the watcher wakes, reads false, and prints -- or,
+                // once it has unblocked these, exits the process from its handler.
                 wakingForShutdown.store(true, std::memory_order_release);
                 pthread_kill(thread.native_handle(), SIGTERM);
                 thread.join();
@@ -170,6 +184,16 @@ int main() {
                     std::fprintf(stderr, "wallpaperx-daemon: could not stop the bus loop\n");
                     std::fflush(stderr);
                 }
+
+                // Unblocked here, not earlier: until now these have to reach the sigwait above.
+                g_wakingForShutdown = &wakingForShutdown;
+                struct sigaction forced {};
+                forced.sa_handler = forceExitOnSecondSignal;
+                sigemptyset(&forced.sa_mask);
+                sigaction(SIGINT, &forced, nullptr);
+                sigaction(SIGTERM, &forced, nullptr);
+                sigaction(SIGHUP, &forced, nullptr);
+                pthread_sigmask(SIG_UNBLOCK, &shutdownSignals, nullptr);
 
                 // The deadline belongs on this thread because it is the only one that cannot be
                 // stuck: it waits for signals and nothing else. Any other would risk being
@@ -227,8 +251,15 @@ int main() {
             manager.writeRepairedConfig();
         }
 
-        std::printf("wallpaperx-daemon: serving %s at %s\n", wallpaperx::DbusService::kBusName,
-                    wallpaperx::DbusService::kObjectPath);
+        // Unconditional, this claimed the name was held on a start a signal cut short before
+        // requesting it -- the opposite of what someone reading the journal needs.
+        if (shutdownRequested.load(std::memory_order_acquire)) {
+            std::printf("wallpaperx-daemon: stopped before claiming %s\n",
+                        wallpaperx::DbusService::kBusName);
+        } else {
+            std::printf("wallpaperx-daemon: serving %s at %s\n", wallpaperx::DbusService::kBusName,
+                        wallpaperx::DbusService::kObjectPath);
+        }
         std::fflush(stdout);
 
         // The health endpoint is otherwise the only channel saying so, and a user whose

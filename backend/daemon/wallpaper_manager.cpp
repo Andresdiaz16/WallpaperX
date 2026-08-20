@@ -482,13 +482,15 @@ LoadResult WallpaperManager::loadWithDeadline() const {
     // as this exists to avoid. Nothing here ever joins.
     //
     // The store is copied in, so the thread outliving this call cannot reach a destroyed one.
-    auto answer = std::make_shared<std::promise<LoadResult>>();
-    std::future<LoadResult> pending = answer->get_future();
+    std::future<LoadResult> pending;
     try {
+        auto answer = std::make_shared<std::promise<LoadResult>>();
+        pending = answer->get_future();
         std::thread([answer, store = m_store] { answer->set_value(store.load()); }).detach();
-    } catch (const std::system_error& e) {
-        // The store's contract is that config trouble is reported and never stops the
-        // daemon booting; this is the one statement here that can throw.
+    } catch (const std::exception& e) {
+        // std::exception, not std::system_error: the promise, the future and the thread's copy
+        // of the callable all allocate, so std::bad_alloc reaches here -- and config trouble is
+        // reported, never a reason the daemon does not boot.
         LoadResult noThread;
         noThread.error =
             m_store.file().string() + ": could not be read, no thread available: " + e.what();
@@ -510,27 +512,20 @@ LoadResult WallpaperManager::loadWithDeadline() const {
 }
 
 
+// Neither records health: every reader goes through snapshot(), which asks the writer and
+// overwrites persistence with its answer. An abandoned wait marks the worker stalled, so that
+// is in the answer too.
 void WallpaperManager::queuePersist(const std::vector<PersistedWallpaper>& entries) {
-    if (m_writer.queue(entries)) return;
-    // Nothing reached the writer, and it recorded which of disabled, refused or no-thread it
-    // was. Reported here because health is the manager's to publish.
-    if (!m_writer.enabled()) return;
-    std::lock_guard<std::mutex> stateLock(m_stateMutex);
-    recordHealthLocked(&DaemonHealth::persistence, HealthStatus::Fail,
-                       keptDetail(m_writer.outcome().why));
+    m_writer.queue(entries);
 }
 
 bool WallpaperManager::persist(const std::vector<PersistedWallpaper>& entries, std::string* whyNot) {
     std::string why;
     if (m_writer.write(entries, &why)) return true;
 
-    std::lock_guard<std::mutex> stateLock(m_stateMutex);
     // Sanitized here, once, because this one leaves the process: the store composes its errors
     // around a path, and a path is arbitrary bytes the daemon did not choose.
     if (whyNot != nullptr) *whyNot = sanitizeForLog(why, 1024, LogFraming::Bare);
-    // Recorded so a status read taken later still shows what this thread learned: the fold-in
-    // reports an outstanding write, but only this call knows a caller stopped waiting on one.
-    recordHealthLocked(&DaemonHealth::persistence, HealthStatus::Fail, keptDetail(why));
     return false;
 }
 
@@ -651,9 +646,10 @@ std::vector<int> WallpaperManager::restoreSaved() {
             continue;
         }
 
-        // The manager's own rules, not the store's: a type this build has never heard of,
-        // or an id a larger kMaxMonitors would admit, is not rendered here -- but it is
-        // kept, so the next save does not delete a wallpaper a newer build understands.
+        // The manager's own rules, not the store's: a type this build has never heard of, an
+        // id a larger kMaxMonitors would admit, or a known type with no path -- which is not a
+        // row this build wrote, so it is another writer's or a newer build's. None is rendered
+        // here, all are kept, so the next save does not delete what a newer build understands.
         if (!isKnownType(entry.type) || entry.path.empty() || entry.monitorId >= kMaxMonitors) {
             // One row per id, merged half by half: last wins, and a loss is counted only
             // where both rows really filled the same half -- a later row carrying just a name

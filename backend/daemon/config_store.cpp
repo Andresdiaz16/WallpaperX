@@ -279,11 +279,11 @@ SaveResult ConfigStore::save(const std::vector<PersistedWallpaper>& entries) con
         const nlohmann::json root{{kKeyVersion, kSchemaVersion}, {kKeyMonitors, std::move(monitors)}};
         const std::string text = root.dump(2) + "\n";
 
-        constexpr int kFlags = O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC;
+        constexpr int kFlags = O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW;
         int fd = ::open(temp.c_str(), kFlags, 0644);
-        if (fd < 0) {
-            // Only on the first save and after someone removes the directory. Doing it
-            // unconditionally would put a mkdir on the DBus thread for every SetWallpaper.
+        // Only on the first save and after someone removes the directory, and only for the
+        // errno that says so: any other failure is about the file, not the directory.
+        if (fd < 0 && errno == ENOENT) {
             std::error_code ec;
             std::filesystem::create_directories(m_file.parent_path(), ec);
             if (ec) {

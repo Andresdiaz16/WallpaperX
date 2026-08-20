@@ -116,7 +116,8 @@ private:
     std::shared_ptr<PersistWorker> m_worker;
 
     // Why the last save never reached the writer -- no thread, or a refusal decided before one
-    // exists. Empty once a save is handed over. The half of the outcome the worker cannot know.
+    // exists. Empty once a save is handed over, or once allow() ends the refusal it holds. The
+    // half of the outcome the worker cannot know.
     std::string m_notWritten;
 
     bool m_refusing = false;

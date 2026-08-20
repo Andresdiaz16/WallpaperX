@@ -33,15 +33,25 @@ WallpaperItem {
     // nothing else bounds what the shell takes in.
     readonly property int maxBodyBytes: 65536
 
+    // Checked on the way back as well as set on the way out: a redirect would otherwise make
+    // every screen's plugin fetch from wherever it names, once a second, from inside the shell.
+    readonly property string daemonOrigin: "http://127.0.0.1:18462"
+
+    // No headless Qt platform reports a screen name, and an empty one pins every state below to
+    // "unnamed", so a test needs a way in. It gets this rather than a writable `connector`: an
+    // assignment there would destroy the binding, leaving the plugin asking about a screen that
+    // a re-plug has since renamed. Empty in production.
+    property string connectorOverride: ""
+
     // The screen this instance sits on, by connector name -- the one fact the daemon also
-    // derives from the hardware. Assignable rather than a readonly binding so a test can reach
-    // the states that depend on it: no headless Qt platform reports a screen name, and an empty
-    // one pins every state below to "unnamed". Nothing in production assigns it.
-    property string connector: root.Screen.name
+    // derives from the hardware.
+    readonly property string connector:
+        root.connectorOverride !== "" ? root.connectorOverride : root.Screen.name
 
     // Clamped for the same reason refusalReason is: this comes from whatever holds the port,
-    // and it lands on the desktop. The daemon's own limit is 256 bytes, so a longer answer is
-    // not one of ours whatever else it is.
+    // and it lands on the desktop. The count is UTF-16 units and the daemon's limit is 256
+    // bytes, which is the safe direction -- no string is fewer bytes than units, so nothing the
+    // daemon can send is truncated here.
     readonly property string screenName:
         (root.reply && typeof root.reply.output === "string")
             ? root.reply.output.substring(0, 256)
@@ -49,8 +59,8 @@ WallpaperItem {
 
     // Never path_literal: that is the raw bytes to act on, and putting them on the desktop
     // would render control characters and bidirectional overrides out of a filename.
-    // Clamped like the two strings above, at the 4096 the daemon caps this field to: it lands
-    // in a text layout on plasmashell's GUI thread.
+    // Clamped like the two strings above, against the 4096 bytes the daemon caps this field to:
+    // it lands in a text layout on plasmashell's GUI thread.
     readonly property string wallpaperPath:
         (root.reply && typeof root.reply.path === "string")
             ? root.reply.path.substring(0, 4096)
@@ -118,7 +128,7 @@ WallpaperItem {
         root.pendingPolls = 0;
         // The timestamp defeats any cache between here and the daemon: a wallpaper the user
         // just chose must not wait on a stale 200.
-        const url = "http://127.0.0.1:18462/config?output=" +
+        const url = root.daemonOrigin + "/config?output=" +
                     encodeURIComponent(root.connector) + "&t=" + Date.now();
         request.onreadystatechange = function () {
             // Superseded or aborted: its answer describes a question already replaced.
@@ -142,10 +152,14 @@ WallpaperItem {
             }
             root.pending = null;
             root.pendingPolls = 0;
-            // An oversized body reads as unreadable rather than being parsed: a reply that
-            // ignores the bound is not one of ours whatever it holds.
+            // Redirected away from the daemon, or oversized: neither is ours whatever it holds,
+            // so both read as unreadable. An empty responseURL means Qt did not report one.
+            const from = request.responseURL;
+            const elsewhere = typeof from === "string" && from !== "" &&
+                              from.indexOf(root.daemonOrigin + "/") !== 0;
             const body = request.responseText;
-            root.apply(request.status, body.length > root.maxBodyBytes ? "" : body);
+            const usable = !elsewhere && body.length <= root.maxBodyBytes;
+            root.apply(request.status, usable ? body : "");
         };
         request.open("GET", url);
         request.send();

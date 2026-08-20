@@ -1781,7 +1781,7 @@ void runWorkerCoalescingChecks(const wallpaperx::WallpaperManager::Config& confi
     const std::shared_future<void> gateOpen = gate.promise.get_future().share();
 
     wallpaperx::RenderWorker worker(manager, [&](int, uint64_t) { ++frameReadySignals; });
-    worker.postTask([gateOpen](bool) { gateOpen.wait(); });
+    worker.postTask([gateOpen](wallpaperx::RenderWorker::TaskState) { gateOpen.wait(); });
 
     for (const std::string& path : burstPaths) {
         manager.requestWallpaper("static", path, kMonitorWorkerCoalesce);
@@ -1826,7 +1826,7 @@ void runWorkerCoalescingChecks(const wallpaperx::WallpaperManager::Config& confi
         std::future<void> future = done.get_future();
         // Moved into the task: a promise left on this stack would be destroyed while
         // the worker still held a reference to it if the wait below timed out.
-        worker.postTask([done = std::move(done)](bool) mutable { done.set_value(); });
+        worker.postTask([done = std::move(done)](wallpaperx::RenderWorker::TaskState) mutable { done.set_value(); });
         if (future.wait_for(wallpaperx::testing::kSignalTimeout) == std::future_status::ready) return;
         c(false, what);
         std::fprintf(stderr,

@@ -23,7 +23,7 @@ TestCase {
     visible: true
 
     // A named screen for every case but the first: no headless Qt platform reports a screen
-    // name, which is why main.qml takes its connector through an assignable property.
+    // name, which is why main.qml takes an override the connector binding prefers when set.
     readonly property string namedScreen: "DP-3"
 
     readonly property string goodReply:
@@ -161,7 +161,7 @@ TestCase {
         const item = host.item;
         verify(item !== null, "main.qml produced an item");
         quiesceThePoll(item);
-        item.connector = connector;
+        item.connectorOverride = connector;
         return item;
     }
 

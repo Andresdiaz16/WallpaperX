@@ -30,6 +30,9 @@ void ConfigWriter::refuse(std::string why) {
 void ConfigWriter::allow() {
     std::lock_guard<std::mutex> lock(m_mutex);
     m_refusing = false;
+    // Including the copy a refused save left behind, which outcome() reads first and which
+    // would otherwise report a daemon refusing to write after it stopped refusing.
+    if (m_notWritten == m_refusal) m_notWritten.clear();
     m_refusal.clear();
 }
 

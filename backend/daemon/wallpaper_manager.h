@@ -319,12 +319,9 @@ private:
     void queuePersist(const std::vector<PersistedWallpaper>& entries);
 
     // The same, then the writer's bounded wait. Returns whether THESE entries are known to
-    // be on disk; on false, `whyNot` receives that write's own reason, sanitized.
-    //
-    // MUST NOT be called holding m_stateMutex: the failure path takes it to record health, and
-    // it is not recursive. The writer itself has no such rule, so restoreSaved() -- which holds
-    // that lock for its whole body -- hands its repair to queuePersist() instead. Simplifying
-    // that back to a direct write here deadlocks the daemon at startup.
+    // be on disk; on false, `whyNot` receives that write's own reason, sanitized. Takes no lock
+    // of its own, but it parks the calling thread on the write for up to the writer's deadline,
+    // which is why restoreSaved() hands its repair to queuePersist() instead.
     bool persist(const std::vector<PersistedWallpaper>& entries, std::string* whyNot = nullptr);
 
     // Folds the writer's answer, and the losses outliving it, into a health copy rather

@@ -18,29 +18,30 @@ RenderWorker::~RenderWorker() { stop(); }
 void RenderWorker::stop() {
     {
         std::lock_guard<std::mutex> lock(m_mutex);
-        if (m_stop) return;  // idempotent: the thread has already been joined
         m_stop = true;
     }
     m_wake.notify_all();
-    m_thread.join();
+    // Every caller waits for the join, not just the first: returning early because another
+    // thread set m_stop would let this caller destroy state the worker is still reading.
+    std::call_once(m_joined, [this] { m_thread.join(); });
 
-    // After the join, so nothing here runs beside a render. Cancelling touches no GPU state --
-    // it sends an error reply -- and a task simply destroyed sends nothing at all.
+    // After the join, so no task is answered beside a running render.
     std::deque<Job> dropped;
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         dropped.swap(m_queue);
         m_queuedRenders.clear();
+        m_queuedTasks = 0;
     }
     for (Job& job : dropped) {
-        if (job.task) job.task(/*cancelled=*/true);
+        if (job.task) job.task(TaskState::ShuttingDown);
     }
 }
 
 void RenderWorker::post(int monitorId) {
     {
         std::lock_guard<std::mutex> lock(m_mutex);
-        if (m_stop) return;
+        if (m_stop || monitorId < 0) return;
         if (!m_queuedRenders.insert(monitorId).second) {
             return;  // already queued; the pending pass will pick up the newer request
         }
@@ -50,17 +51,22 @@ void RenderWorker::post(int monitorId) {
 }
 
 void RenderWorker::postTask(Task task) {
-    bool stopping = false;
+    TaskState refused = TaskState::Run;
     {
         std::lock_guard<std::mutex> lock(m_mutex);
-        stopping = m_stop;
-        if (!stopping) m_queue.push_back(Job{-1, std::move(task)});
+        // Stopping: the work would touch the GPU while the Device is being torn down.
+        // Full: the queue would otherwise grow with a live bus message pinned in each entry.
+        if (m_stop) {
+            refused = TaskState::ShuttingDown;
+        } else if (m_queuedTasks >= kMaxQueuedTasks) {
+            refused = TaskState::Busy;
+        } else {
+            m_queue.push_back(Job{-1, std::move(task)});
+            ++m_queuedTasks;
+        }
     }
-    if (stopping) {
-        // Cancelled rather than run: the work would touch the GPU while the Device is being
-        // torn down. Answered on this thread and outside the lock, since the worker will never
-        // pick it up.
-        if (task) task(/*cancelled=*/true);
+    if (refused != TaskState::Run) {
+        if (task) task(refused);
         return;
     }
     m_wake.notify_one();
@@ -82,6 +88,8 @@ void RenderWorker::run() {
             m_queue.pop_front();
             if (job.monitorId >= 0) {
                 m_queuedRenders.erase(job.monitorId);
+            } else if (m_queuedTasks > 0) {
+                --m_queuedTasks;
             }
         }
 
@@ -96,7 +104,7 @@ void RenderWorker::run() {
                     m_onFrameReady(job.monitorId, outcome.generation);
                 }
             } else if (job.task) {
-                job.task(/*cancelled=*/false);
+                job.task(TaskState::Run);
             }
         } catch (const std::exception& e) {
             // renderPending records failures in the monitor's status rather than throwing and
