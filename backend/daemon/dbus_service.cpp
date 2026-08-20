@@ -26,6 +26,7 @@ constexpr const char* kErrorRenderFailed = "io.wallpaperx.Daemon.Error.RenderFai
 // response: NoFrame means retry, RenderFailed means stop and show the reason, Unsupported
 // means stop asking -- nothing about this build changes while it runs.
 constexpr const char* kErrorUnsupported = "io.wallpaperx.Daemon.Error.Unsupported";
+constexpr const char* kErrorShuttingDown = "io.wallpaperx.Daemon.Error.ShuttingDown";
 constexpr const char* kErrorInvalidArgs = "org.freedesktop.DBus.Error.InvalidArgs";
 
 }  // namespace
@@ -60,7 +61,15 @@ void DbusService::registerVTable() {
                 // the event loop keeps serving while the frame is produced.
                 .implementedAs([this](FrameFdCall&& call, int32_t monitorId) {
                     m_worker.postTask(
-                        [this, call = std::move(call), monitorId]() mutable {
+                        [this, call = std::move(call), monitorId](bool cancelled) mutable {
+                            // Answered rather than dropped: destroying the Result sends
+                            // nothing, leaving a GUI client blocked for the full reply
+                            // timeout on a daemon that is already gone.
+                            if (cancelled) {
+                                call.returnError(sdbus::Error(sdbus::Error::Name{kErrorShuttingDown},
+                                                              "the daemon is shutting down"));
+                                return;
+                            }
                             completeGetFrameFd(std::move(call), monitorId);
                         });
                 })

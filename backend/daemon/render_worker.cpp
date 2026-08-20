@@ -23,6 +23,18 @@ void RenderWorker::stop() {
     }
     m_wake.notify_all();
     m_thread.join();
+
+    // After the join, so nothing here runs beside a render. Cancelling touches no GPU state --
+    // it sends an error reply -- and a task simply destroyed sends nothing at all.
+    std::deque<Job> dropped;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        dropped.swap(m_queue);
+        m_queuedRenders.clear();
+    }
+    for (Job& job : dropped) {
+        if (job.task) job.task(/*cancelled=*/true);
+    }
 }
 
 void RenderWorker::post(int monitorId) {
@@ -38,13 +50,18 @@ void RenderWorker::post(int monitorId) {
 }
 
 void RenderWorker::postTask(Task task) {
+    bool stopping = false;
     {
         std::lock_guard<std::mutex> lock(m_mutex);
-        // Dropped rather than run during shutdown: the caller sees a NoReply timeout, which is
-        // the right outcome for a daemon going away and better than touching the GPU while the
-        // Device is being torn down.
-        if (m_stop) return;
-        m_queue.push_back(Job{-1, std::move(task)});
+        stopping = m_stop;
+        if (!stopping) m_queue.push_back(Job{-1, std::move(task)});
+    }
+    if (stopping) {
+        // Cancelled rather than run: the work would touch the GPU while the Device is being
+        // torn down. Answered on this thread and outside the lock, since the worker will never
+        // pick it up.
+        if (task) task(/*cancelled=*/true);
+        return;
     }
     m_wake.notify_one();
 }
@@ -58,7 +75,7 @@ void RenderWorker::run() {
 
             // Stop wins over draining. Anything still queued is a wallpaper nobody will
             // see -- the daemon is going away -- and rendering it would only delay
-            // shutdown by a full GPU submit per entry.
+            // shutdown by a full GPU submit per entry. stop() answers the tasks left behind.
             if (m_stop) return;
 
             job = std::move(m_queue.front());
@@ -79,7 +96,7 @@ void RenderWorker::run() {
                     m_onFrameReady(job.monitorId, outcome.generation);
                 }
             } else if (job.task) {
-                job.task();
+                job.task(/*cancelled=*/false);
             }
         } catch (const std::exception& e) {
             // renderPending records failures in the monitor's status rather than throwing and

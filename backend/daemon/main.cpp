@@ -25,6 +25,14 @@ namespace {
 // running when the signal lands spends it too. Far above a normal shutdown of a few hundred
 // milliseconds, so it fires only for a stop that is stuck rather than slow.
 constexpr std::chrono::seconds kTeardownDeadline{5};
+
+// First caller wins: re-arming per stage would hand each a fresh deadline, and the budget is
+// for the whole stop. SIGALRM's default action ends the process, and main() does not block it.
+void armTeardown(bool& armed) {
+    if (armed) return;
+    armed = true;
+    ::alarm(static_cast<unsigned>(kTeardownDeadline.count()));
+}
 }  // namespace
 
 int main() {
@@ -89,17 +97,37 @@ int main() {
             bool finished = false;
         } teardown;
 
+        // Declared beside the objects whose destructors can block, so the watchdog is armed at
+        // the top of the unwind rather than after them -- the alarm used to be armed in
+        // ~ShutdownWatch, which runs last.
+        bool teardownArmed = false;
+        struct ArmTeardown {
+            bool& armed;
+            ~ArmTeardown() { armTeardown(armed); }
+        };
+
+        // Entering and leaving the event loop is the one pair sdbus-c++ supports being used
+        // from two threads; every other IConnection method is thread-aware but not thread-safe.
+        // This keeps the signal thread out of the connection while main is still registering
+        // the object and claiming the name, and loses no signal arriving in that window:
+        // whichever side arrives first, the loop is not entered.
+        struct LoopGate {
+            std::mutex mutex;
+            bool entered = false;
+            bool stopping = false;
+        } loopGate;
+
         struct ShutdownWatch {
             std::thread thread;
             std::atomic<bool>& wakingForShutdown;
             Teardown& teardown;
+            bool& teardownArmed;
             ~ShutdownWatch() {
                 if (!thread.joinable()) return;
                 // Releasing the watchdog leaves the rest of teardown -- the bus connection,
-                // then static destruction -- with nothing bounding it. SIGALRM's default
-                // action ends the process, and it is not among the signals main() blocks,
-                // so this covers the tail. A process that exits first never sees it.
-                ::alarm(static_cast<unsigned>(kTeardownDeadline.count()));
+                // then static destruction -- with nothing bounding it. A stop that got this
+                // far has already armed it; this is the case where nothing else did.
+                armTeardown(teardownArmed);
                 {
                     std::lock_guard<std::mutex> lock(teardown.mutex);
                     teardown.finished = true;
@@ -111,7 +139,7 @@ int main() {
                 thread.join();
             }
         } shutdownWatch{std::thread([&connection, &shutdownSignals, &wakingForShutdown,
-                                     &shutdownRequested, &teardown] {
+                                     &shutdownRequested, &teardown, &loopGate] {
             int received = 0;
             if (sigwait(&shutdownSignals, &received) != 0) return;
             // Skips leaveEventLoop() too: on the throw path the connection is what failed.
@@ -124,10 +152,16 @@ int main() {
                             strsignal(received));
                 std::fflush(stdout);
                 shutdownRequested.store(true, std::memory_order_release);
+                bool inLoop = false;
+                {
+                    std::lock_guard<std::mutex> lock(loopGate.mutex);
+                    loopGate.stopping = true;
+                    inLoop = loopGate.entered;
+                }
                 // Caught on its own: a loop that will not leave still has the deadline below
                 // bounding it, which is better than abandoning the stop immediately.
                 try {
-                    connection->leaveEventLoop();
+                    if (inLoop) connection->leaveEventLoop();
                 } catch (const std::exception& error) {
                     std::fprintf(stderr, "wallpaperx-daemon: could not stop the bus loop: %s\n",
                                  error.what());
@@ -163,12 +197,16 @@ int main() {
             // should not be told this was a clean stop. Wallpaper choices are written when
             // they are set, so nothing durable is lost.
             std::_Exit(1);
-        }), wakingForShutdown, teardown};
+        }), wakingForShutdown, teardown, teardownArmed};
 
         // Constructed after the watcher: this reads the config file, and a signal arriving
         // during that read must be able to stop the daemon.
         wallpaperx::WallpaperManager manager(config);
         wallpaperx::DbusService service(*connection, manager);
+        // Destroyed before ~DbusService joins the render worker and ~WallpaperManager tears the
+        // device down, which is what the deadline is for. This is the one that covers a throw
+        // out of requestName() below, where the server further down does not exist yet.
+        ArmTeardown armBeforeService{teardownArmed};
 
         // Before the name is claimed: this is what fills the monitor map. Skipped after a
         // stop -- it starts the first render, and that is GPU work for a process leaving.
@@ -204,11 +242,21 @@ int main() {
         // Declared after the service so it is destroyed first: its handlers call
         // manager.snapshot(), so HTTP has to stop before anything it reads is torn down.
         wallpaperx::HttpServer httpServer(manager);
+        // Destroyed first of everything here, so the ordinary stop is bounded from its own top.
+        ArmTeardown armBeforeHttp{teardownArmed};
 
-        // A signal delivered while the work above ran calls leaveEventLoop() on a loop that has
-        // not started. sdbus-c++ appears to latch that, but it is undocumented, so do not rely
-        // on it.
-        if (!shutdownRequested.load(std::memory_order_acquire)) {
+        // Published under the gate, so a signal arriving before this point stops the loop being
+        // entered at all rather than calling into the connection while the object is still
+        // being registered. From here on the signal thread does call leaveEventLoop(), which
+        // sdbus-c++ supports across threads -- including in the instants before the call below
+        // starts, where it appears to latch the leave, undocumented.
+        bool enter = false;
+        {
+            std::lock_guard<std::mutex> lock(loopGate.mutex);
+            enter = !loopGate.stopping;
+            loopGate.entered = enter;
+        }
+        if (enter) {
             connection->enterEventLoop();  // returns once leaveEventLoop() is called
         }
 

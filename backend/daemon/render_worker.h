@@ -28,7 +28,11 @@ public:
 
     // move_only_function, not std::function: an export task owns the method's
     // sdbus::Result, which is move-only, so a copyable callable cannot hold it.
-    using Task = std::move_only_function<void()>;
+    //
+    // Always invoked exactly once, with `cancelled` true when the worker is stopping and the
+    // work will not run. Destroying an sdbus::Result sends nothing, so a task that is only
+    // dropped leaves its caller blocked for the full 25 s reply timeout.
+    using Task = std::move_only_function<void(bool cancelled)>;
 
     // `manager` must outlive this worker, as must anything the callbacks touch. Call stop()
     // before tearing either down; the destructor does too, but stop() lets the owner pick when.
@@ -42,11 +46,12 @@ public:
     void post(int monitorId);
 
     // Queues arbitrary GPU work -- an export, replying from the worker thread. Never coalesced,
-    // since each task carries its own reply. Non-blocking.
+    // since each task carries its own reply. Non-blocking; a task posted after stop() is
+    // cancelled inline on the calling thread.
     void postTask(Task task);
 
-    // Stops accepting work and joins. Idempotent, and safe mid-dispatch: post() and postTask()
-    // become no-ops rather than touching a half-destroyed object.
+    // Stops accepting work, joins, then cancels every task still queued. Idempotent, and safe
+    // mid-dispatch: post() becomes a no-op rather than touching a half-destroyed object.
     void stop();
 
 private:

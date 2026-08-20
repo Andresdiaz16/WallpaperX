@@ -21,8 +21,17 @@ WallpaperItem {
     property bool answered: false
     property string refusalReason: ""
 
-    // The request still awaiting a reply, so a later tick supersedes it instead of racing it.
+    // The request still awaiting a reply, so a later tick supersedes it instead of racing it,
+    // and how many polls it has been waiting. A reply is not late until several have passed:
+    // the poll interval was doubling as the deadline, so a daemon answering slower than one
+    // tick was aborted every time and never once heard from.
     property var pending: null
+    property int pendingPolls: 0
+    readonly property int lateAfterPolls: 5
+
+    // What this will buffer and parse. The reply comes from whatever holds the port, and
+    // nothing else bounds what the shell takes in.
+    readonly property int maxBodyBytes: 65536
 
     // The screen this instance sits on, by connector name -- the one fact the daemon also
     // derives from the hardware. Assignable rather than a readonly binding so a test can reach
@@ -90,28 +99,53 @@ WallpaperItem {
             return;
         }
 
-        const previous = root.pending;
-        root.pending = null;
-        if (previous !== null) {
-            previous.abort();
+        if (root.pending !== null) {
+            root.pendingPolls += 1;
+            if (root.pendingPolls < root.lateAfterPolls) {
+                return;
+            }
+            const late = root.pending;
+            root.pending = null;
+            root.pendingPolls = 0;
+            late.abort();
+            // Nothing answered within the deadline, which is what "not running" describes.
+            root.apply(0, "");
+            return;
         }
 
         const request = new XMLHttpRequest();
         root.pending = request;
+        root.pendingPolls = 0;
         // The timestamp defeats any cache between here and the daemon: a wallpaper the user
         // just chose must not wait on a stale 200.
         const url = "http://127.0.0.1:18462/config?output=" +
                     encodeURIComponent(root.connector) + "&t=" + Date.now();
         request.onreadystatechange = function () {
-            if (request.readyState !== XMLHttpRequest.DONE) {
-                return;
-            }
             // Superseded or aborted: its answer describes a question already replaced.
             if (root.pending !== request) {
                 return;
             }
+            // Dropped before the body is buffered where the reply says how big it is.
+            if (request.readyState === XMLHttpRequest.HEADERS_RECEIVED) {
+                const declared = parseInt(request.getResponseHeader("Content-Length"), 10);
+                if (!isNaN(declared) && declared > root.maxBodyBytes) {
+                    const status = request.status;
+                    root.pending = null;
+                    root.pendingPolls = 0;
+                    request.abort();
+                    root.apply(status, "");
+                }
+                return;
+            }
+            if (request.readyState !== XMLHttpRequest.DONE) {
+                return;
+            }
             root.pending = null;
-            root.apply(request.status, request.responseText);
+            root.pendingPolls = 0;
+            // An oversized body reads as unreadable rather than being parsed: a reply that
+            // ignores the bound is not one of ours whatever it holds.
+            const body = request.responseText;
+            root.apply(request.status, body.length > root.maxBodyBytes ? "" : body);
         };
         request.open("GET", url);
         request.send();
