@@ -1,0 +1,6 @@
+# The QML module the wallpaper package ships beside its QML, loaded from
+# contents/lib/qt6/qml/com/wallpaperx/. `module` must match the uri plugin.cpp registers under
+# and the import line in main.qml; kpackage_metadata_test compares the three.
+module com.wallpaperx
+plugin wallpaperxplugin
+classname WallpaperXQmlPlugin

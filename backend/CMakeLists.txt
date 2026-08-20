@@ -129,6 +129,8 @@ pkg_check_modules(EGL QUIET egl)
 find_package(OpenGL QUIET COMPONENTS OpenGL)
 if(EGL_FOUND AND OpenGL_OpenGL_FOUND)
     add_library(wallpaperx-frame-import STATIC kde/frame_import.cpp)
+    # Same reason as wallpaperx-kde-item: this ends up inside the QML plugin's shared object.
+    set_target_properties(wallpaperx-frame-import PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_include_directories(wallpaperx-frame-import PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/kde
                                PRIVATE ${EGL_INCLUDE_DIRS})
     target_link_libraries(wallpaperx-frame-import PUBLIC ${EGL_LIBRARIES} OpenGL::GL)
@@ -161,7 +163,9 @@ if(EGL_FOUND AND OpenGL_OpenGL_FOUND)
     # with no Qt at all.
     if(WALLPAPERX_BUILD_KDE_PLUGIN)
         add_library(wallpaperx-kde-item STATIC kde/wallpaperx_item.cpp)
-        set_target_properties(wallpaperx-kde-item PROPERTIES AUTOMOC ON)
+        # POSITION_INDEPENDENT_CODE because this static library is linked INTO the QML plugin's
+        # shared object; without it the link fails on the relocations moc generates.
+        set_target_properties(wallpaperx-kde-item PROPERTIES AUTOMOC ON POSITION_INDEPENDENT_CODE ON)
         target_link_libraries(wallpaperx-kde-item PUBLIC
             wallpaperx-frame-import Qt6::Core Qt6::DBus Qt6::Quick Qt6::Qml)
     endif()
@@ -822,6 +826,25 @@ if(WALLPAPERX_BUILD_KDE_PLUGIN)
     )
 
     plasma_install_package(kde/kpackage com.wallpaperx.wallpaper wallpapers wallpaper)
+
+    # The QML module the package's own main.qml imports. It goes INSIDE the installed package
+    # rather than into Qt's global QML path, because a wallpaper package is what Plasma copies
+    # around and a plugin left outside it is one the desktop cannot find. The directory layout
+    # is the module uri: com.wallpaperx -> com/wallpaperx.
+    if(WALLPAPERX_HAVE_FRAME_IMPORT)
+        add_library(wallpaperxplugin SHARED kde/plugin.cpp)
+        set_target_properties(wallpaperxplugin PROPERTIES AUTOMOC ON)
+        target_link_libraries(wallpaperxplugin PRIVATE wallpaperx-kde-item Qt6::Qml Qt6::Quick)
+
+        set(WALLPAPERX_QML_MODULE_DIR
+            ${KDE_INSTALL_DATADIR}/plasma/wallpapers/com.wallpaperx.wallpaper/contents/lib/qt6/qml/com/wallpaperx)
+        install(TARGETS wallpaperxplugin DESTINATION ${WALLPAPERX_QML_MODULE_DIR})
+        install(FILES kde/qmldir DESTINATION ${WALLPAPERX_QML_MODULE_DIR})
+    else()
+        message(WARNING
+            "The frame importer is not built, so the QML module that draws wallpapers is not "
+            "installed either -- the package will load and report itself, but show nothing.")
+    endif()
 endif()
 
 message(STATUS "wallpaperx-backend configured")
