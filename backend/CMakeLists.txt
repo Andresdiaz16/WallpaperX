@@ -272,7 +272,14 @@ target_include_directories(wallpaperx-qml-lint-test PRIVATE ${CMAKE_CURRENT_SOUR
 find_package(Qt6 QUIET COMPONENTS QuickTest Qml)
 if(Qt6QuickTest_FOUND)
     add_executable(wallpaperx-qml-states-test tests/qml_states_test.cpp)
-    target_link_libraries(wallpaperx-qml-states-test PRIVATE Qt6::QuickTest Qt6::Qml)
+    target_link_libraries(wallpaperx-qml-states-test PRIVATE Qt6::QuickTest Qt6::Qml Threads::Threads)
+    # The stub daemon in that file answers on the port main.qml's daemonOrigin names, which is
+    # the only way to reach the two decisions refresh() makes before apply() is called.
+    target_include_directories(wallpaperx-qml-states-test PRIVATE ${HTTPLIB_INCLUDE_DIR})
+    # Explicit, not inherited: qt_standard_project_setup() -- which turns AUTOMOC on globally --
+    # is inside the KDE-plugin guard, so a -DWALLPAPERX_BUILD_KDE_PLUGIN=OFF tree (the sanitizer
+    # tier's) would otherwise fail to link the Q_OBJECT stub this target now contains.
+    set_target_properties(wallpaperx-qml-states-test PROPERTIES AUTOMOC ON)
     # Where the tst_*.qml files live, compiled in rather than passed at run time so the entry
     # cannot be registered against a directory that moved.
     target_compile_definitions(wallpaperx-qml-states-test PRIVATE
@@ -439,8 +446,22 @@ set_tests_properties(qml_lint PROPERTIES LABELS "novulkan"
 # desktop, and on a host with none the run would fail for a reason unrelated to the checks.
 if(Qt6QuickTest_FOUND)
     add_test(NAME qml_states COMMAND $<TARGET_FILE:wallpaperx-qml-states-test>)
+    # RESOURCE_LOCK, and it is the same lock http_config and daemon_system carry rather than one
+    # of its own: this entry now binds 127.0.0.1:18462, the port main.qml's daemonOrigin names
+    # and the port those two put a real daemon on. Under ctest -jN without it, whichever started
+    # second would fail to bind -- here that is reported as a skip, and there as a daemon that
+    # could not serve its config port.
+    #
+    # SKIP_REGULAR_EXPRESSION rather than SKIP_RETURN_CODE: Qt Quick Test exits 0 when cases
+    # skip, so a host where something else already holds 18462 would otherwise show green for a
+    # run in which the origin and body-size cases never happened. The trade-off is deliberate
+    # and worth stating: on such a host the whole entry reads Skipped, including the twenty-odd
+    # cases that did run and pass. Inconclusive is not green, and the sentinel is printed only
+    # when the stub could not be brought up at all.
     set_tests_properties(qml_states PROPERTIES LABELS "novulkan"
-                         ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+                         ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
+                         RESOURCE_LOCK wallpaperx_bus_tests
+                         SKIP_REGULAR_EXPRESSION "wallpaperx-qml-states: NO STUB DAEMON --")
 endif()
 
 # The DBus service test needs a session bus. dbus-run-session gives each run a

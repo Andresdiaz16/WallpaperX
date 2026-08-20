@@ -1075,6 +1075,22 @@ public:
         return has;
     }
 
+    // How many NameOwnerChanged events for this name have arrived. The only evidence OUTSIDE
+    // the daemon's own log that the name was ever claimed, which is what a phase grading that
+    // log needs -- it cannot use the log as its own witness. A counter rather than a cached
+    // ownership bool, for the reason waitFor's comment below gives.
+    uint64_t events() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_events;
+    }
+
+    // Waits, to a deadline, for that counter to move off `from`. False means it did not, which
+    // for a daemon that has already exited means the name was never taken and never released.
+    bool waitForEventsPast(uint64_t from, std::chrono::milliseconds patience) {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        return m_changed.wait_for(lock, patience, [&] { return m_events != from; });
+    }
+
     // Waits until the name is (or is not) owned. Returns false on timeout.
     //
     // Deliberately not "cache a bool in the signal handler and wait on it". Two attempts
@@ -1131,7 +1147,7 @@ private:
     //       silence above as evidence the ordering is optional -- an unreproducible race
     //       is still a race, and a control that cannot make this go red means this
     //       comment is a claim about C++ semantics, not an observation.
-    std::mutex m_mutex;
+    mutable std::mutex m_mutex;
     std::condition_variable m_changed;
     uint64_t m_events = 0;
     std::unique_ptr<sdbus::IProxy> m_proxy;
@@ -2632,6 +2648,327 @@ void checkBusLoss(const Check& check) {
         check(output.find(kSignalShutdownLine) == std::string::npos,
               "the daemon does not report a signal it was never sent when its bus connection drops");
     }
+}
+
+// ---------------------------------------------------------------------------- //
+// A daemon whose teardown STICKS, and the two things that end one.
+//
+// Both phases below need a stop that does not finish, and nothing in this suite produced
+// one: every fixture here is refused early or bounded by a deadline of its own. What is
+// used instead is the render worker. ~DbusService joins it, so a render that never returns
+// is a join that never returns -- and a wallpaper file whose open blocks forever is a FIFO.
+//
+// requestWallpaper() refuses a FIFO outright (is_regular_file), and correctly: the check
+// runs on the bus thread, and the render runs later on the worker. So the fixture points
+// the request at a SYMLINK to a real image and re-points that symlink at a FIFO in between.
+// That is a race, and it is treated as one: each attempt is verified, a lost attempt is
+// retried, and a host where none lands reports the phase unexercised rather than passing.
+// ---------------------------------------------------------------------------- //
+
+// Whether the daemon's render worker is provably stuck: a wallpaper set on `witnessMonitor`
+// after the wedge never produces a frame. The worker is one FIFO thread, so a monitor
+// queued behind a wedged render cannot be serviced -- which is a much stronger signal than
+// the wedged monitor's own silence, since that is also what a render that merely failed
+// looks like.
+bool workerIsWedged(sdbus::IProxy& proxy, const std::string& goodImage, int witnessMonitor,
+                    std::chrono::milliseconds patience) {
+    try {
+        setWallpaper(proxy, "static", goodImage, witnessMonitor, std::chrono::seconds(10));
+    } catch (const std::exception&) {
+        return false;
+    }
+    const std::string id = std::to_string(witnessMonitor);
+    const auto deadline = Clock::now() + patience;
+    while (Clock::now() < deadline) {
+        const StatusReply status = getStatus(proxy, std::chrono::seconds(10));
+        const nlohmann::json* entry = wallpaperStatus(status, id);
+        // A frame means the worker got through, so nothing is wedged.
+        if (entry != nullptr && entry->value("has_frame", false)) return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    // No frame for the whole patience, and the sanity render before the wedge proved this
+    // daemon renders, so the worker is not coming back.
+    return true;
+}
+
+// Wedges the worker, or returns false having said why in `why`. `link` is re-pointed
+// between the request and the render; `fifo` is what it ends up naming.
+bool wedgeRenderWorker(sdbus::IProxy& proxy, const std::string& goodImage, const std::filesystem::path& link,
+                       const std::filesystem::path& fifo, std::string& why) {
+    // The sanity render first: without it, "no frame appeared" below is equally consistent
+    // with a host whose daemon cannot render at all, and the phases would grade an unwind
+    // that was never wedged.
+    constexpr int kSanityMonitor = 20;
+    try {
+        setWallpaper(proxy, "static", goodImage, kSanityMonitor, std::chrono::seconds(10));
+    } catch (const std::exception& e) {
+        why = std::string("the daemon refused the wallpaper this phase needs as a baseline: ") + e.what();
+        return false;
+    }
+    bool rendered = false;
+    const auto sanityDeadline = Clock::now() + std::chrono::seconds(15);
+    while (!rendered && Clock::now() < sanityDeadline) {
+        const StatusReply status = getStatus(proxy, std::chrono::seconds(10));
+        const nlohmann::json* entry = wallpaperStatus(status, std::to_string(kSanityMonitor));
+        rendered = entry != nullptr && entry->value("has_frame", false);
+        if (!rendered) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    if (!rendered) {
+        why = "this daemon never produced a frame for an ordinary wallpaper, so a render cannot be wedged on this "
+              "host and nothing below would be measuring a stuck teardown";
+        return false;
+    }
+
+    // Each attempt gets monitor ids of its own: a re-used id coalesces with the request
+    // still outstanding on it, so a second attempt would queue nothing at all.
+    constexpr int kAttempts = 12;
+    for (int attempt = 0; attempt < kAttempts; ++attempt) {
+        const int wedgeMonitor = 1 + attempt * 2;
+        const int witnessMonitor = 2 + attempt * 2;
+        std::error_code ec;
+        std::filesystem::remove(link, ec);
+        std::filesystem::create_symlink(goodImage, link, ec);
+        if (ec) {
+            why = "a symlink could not be created at " + link.string() + ": " + ec.message();
+            return false;
+        }
+        try {
+            setWallpaper(proxy, "static", link.string(), wedgeMonitor, std::chrono::seconds(10));
+        } catch (const std::exception&) {
+            // The daemon saw the FIFO at validation -- the previous attempt's link, or this
+            // one re-pointed too early. Not a defect, just a lost race.
+            continue;
+        }
+        // The whole fixture, in two calls: the request is accepted against a real file and
+        // the render opens whatever this now names.
+        std::filesystem::remove(link, ec);
+        std::filesystem::create_symlink(fifo, link, ec);
+        if (ec) continue;
+
+        if (workerIsWedged(proxy, goodImage, witnessMonitor, std::chrono::milliseconds(2500))) return true;
+    }
+    why = "the render never landed on the fifo in " + std::to_string(kAttempts) +
+          " attempts -- this host services a render faster than the harness can re-point a symlink, so no stuck "
+          "teardown could be staged";
+    return false;
+}
+
+// GOAL: a teardown that STICKS is ended by the alarm the unwind arms at its top, rather than
+//       running forever. False if the alarm is armed only in ~ShutdownWatch, which is
+//       destroyed last: a destructor that blocks before it is then reached by nothing, and
+//       the daemon has to be SIGKILLed -- which for a systemd unit means every `systemctl
+//       stop` on that machine ends in SIGKILL after the unit's own timeout.
+// WHY-THIS-SHAPE: driven on the CONNECTION-LOSS path, not on a signal, and that is the whole
+//       reason the phase exists separately. On a signal the sigwait watcher is already
+//       running a deadline of its own and ends the process at five seconds whatever the
+//       guards do, so a signal-driven version of this check is green with them deleted --
+//       measured, and it is why the obvious shape was rejected. With the bus destroyed
+//       instead, no signal is ever received, the watcher is still parked in sigwait, and the
+//       guards are the only thing left.
+//       `timedOut()` is asserted rather than the exit code alone: shutdown()/waitForExit()
+//       SIGKILL after their own wait and report a code either way, so a code-only check
+//       grades a process that never exited as one that exited for the right reason.
+// CONTROL: both `ArmTeardown` guards (armBeforeService and armBeforeHttp) deleted from
+//       backend/daemon/main.cpp, i.e. the arming left to ~ShutdownWatch as it was before the
+//       fix -> "FAIL: a daemon whose teardown blocks still ends, rather than having to be
+//       killed", printing "it was still running 32.8 s after its bus was destroyed, with its
+//       render worker wedged; nothing armed the watchdog" -- the process had to be SIGKILLed
+//       at the harness timeout, and the whole binary went from 21 s to 46 s. One red in the
+//       run, no skips. The escalation phase below stayed GREEN under it, which is the
+//       separation the two phases exist for: the second signal does not need the alarm.
+//       Observed 2026-08-19. Reverted.
+// COVERAGE-ASSERT: the wedge is verified before the bus is killed -- a wallpaper set after it
+//       must produce no frame, on a daemon that has already been seen to render one -- and a
+//       run that could not wedge the worker reports NOT VERIFIED. Without that, a daemon
+//       whose teardown was never stuck exits promptly and this phase reads green having
+//       graded an ordinary shutdown.
+void checkStuckTeardownIsBounded(const std::string& validationEnv, const std::string& bluePath, const Check& check) {
+    constexpr const char* kGoal = "S8.20's watchdog clause (a teardown that blocks is ended by the alarm the unwind "
+                                  "arms at its top, not left to a destructor that is never reached)";
+    ScratchDir work("stuckteardown");
+    if (!work.ok()) {
+        notVerified(kGoal, "a scratch directory could not be created");
+        return;
+    }
+    const std::filesystem::path link = work.path() / "wallpaper-link.png";
+    const std::filesystem::path fifo = work.path() / "wallpaper.fifo";
+    if (::mkfifo(fifo.c_str(), 0644) != 0) {
+        notVerified(kGoal, "a fifo could not be created, so no render can be made to block on this host");
+        return;
+    }
+
+    NestedBus bus;
+    if (!bus.ok()) {
+        if (const char* fault = bus.preambleFault()) {
+            phaseSetupFault(kGoal, fault);
+            return;
+        }
+        notVerified(kGoal, bus.reason());
+        return;
+    }
+
+    SpawnedDaemon daemon({validationEnv, std::string("DBUS_SESSION_BUS_ADDRESS=") + bus.address()});
+    if (!daemon.waitForOutput(std::string("serving ") + DbusService::kBusName, std::chrono::seconds(30))) {
+        if (reportedStartupFault(daemon, kGoal)) return;
+        notVerified(kGoal, "the daemon for this phase never reached the bus");
+        return;
+    }
+
+    {
+        // Scoped, and closed before the bus is killed: this phase's own client must be gone
+        // by then, or destroying the broker would be graded against a connection the harness
+        // still held open.
+        auto connection = sdbus::createSessionBusConnectionWithAddress(bus.address());
+        connection->enterEventLoopAsync();
+        auto proxy = sdbus::createProxy(*connection, sdbus::ServiceName{DbusService::kBusName},
+                                        sdbus::ObjectPath{DbusService::kObjectPath});
+        std::string why;
+        if (!wedgeRenderWorker(*proxy, bluePath, link, fifo, why)) {
+            notVerified(kGoal, why);
+            return;
+        }
+    }
+
+    // Timed from HERE, not from the top of the phase: the wedge above takes seconds of its
+    // own, and folding those into the figure would put the printed line -- and the failure
+    // branch's "still running N s after its bus was destroyed" -- several seconds out.
+    const auto killedAt = Clock::now();
+    bus.kill();
+    const int exitCode = daemon.waitForExit();
+    const double elapsedMs = millis(Clock::now() - killedAt);
+    const std::string output = daemon.output();
+
+    check(!daemon.timedOut(), "a daemon whose teardown blocks still ends, rather than having to be killed");
+    if (daemon.timedOut()) {
+        std::fprintf(stderr, "  it was still running %.1f s after its bus was destroyed, with its render worker "
+                             "wedged; nothing armed the watchdog\n",
+                     elapsedMs / 1000.0);
+        return;
+    }
+    // SIGALRM specifically. The process could also leave by the sigwait watcher's own
+    // deadline, and that path prints a line of its own -- so the two are told apart rather
+    // than both accepted as "it exited somehow".
+    const bool endedByTheAlarm = !daemon.exitedNormally() && daemon.termSignal() == SIGALRM;
+    check(endedByTheAlarm, "the stuck teardown is ended by the alarm the unwind armed");
+    if (!endedByTheAlarm) {
+        std::fprintf(stderr, "  it %s (exit code %d, signal %d) after %.1f s\n",
+                     daemon.exitedNormally() ? "exited normally" : "was terminated by a signal", exitCode,
+                     daemon.termSignal(), elapsedMs / 1000.0);
+    }
+    std::printf("daemon_system_test: a daemon with a wedged render worker was ended %.1f s after its bus was "
+                "destroyed\n",
+                elapsedMs / 1000.0);
+}
+
+// GOAL: a second SIGINT/SIGTERM ends a stop that is stuck, promptly, and says it is doing so.
+//       False if the second signal does nothing: the user who pressed Ctrl-C twice waits out
+//       the full teardown deadline, and a supervisor's escalation lands on a process that
+//       cannot answer it.
+// WHY-THIS-SHAPE: the same wedged worker as the phase above, because a second signal only
+//       has anything to end if the first stop is stuck -- on an ordinary stop the process is
+//       gone before a second signal can be sent, and a check written that way would be
+//       grading a race. BOTH the message and the elapsed time are asserted: without the
+//       handler the process still exits, at the five-second deadline, so an exit-code check
+//       alone is green under the control. The absence of the deadline's own line is asserted
+//       for the same reason -- it is what the daemon prints when nothing shortened the stop.
+// CONTROL: the sigaction/pthread_sigmask block that installs forceExitOnSecondSignal deleted
+//       from the watcher in backend/daemon/main.cpp -> two red. "FAIL: the daemon says that a
+//       second signal is what ended it", printing "it left with exit code -1, signal 14, and
+//       said none of it"; and "FAIL: the second signal ends the daemon promptly rather than at
+//       the deadline", printing "the daemon took 3884 ms to go after the second signal,
+//       against a 5000 ms teardown deadline". The second signal simply stayed pending -- it is
+//       blocked in every thread and the watcher has left its sigwait -- so the process died on
+//       the unwind's own SIGALRM instead.
+//       Note which check did NOT fire: "the stop ends on the second signal rather than on the
+//       teardown deadline" stayed green, because the alarm beat the watcher's deadline and
+//       "shutdown blocked" was never printed. That is exactly why the message and the elapsed
+//       time are asserted as well; the absence check alone would have been green here.
+//       Observed 2026-08-19. Reverted.
+// COVERAGE-ASSERT: the wedge is verified before the first signal, exactly as above, and a run
+//       that could not stage it reports NOT VERIFIED rather than grading a stop that was
+//       never stuck.
+void checkSecondSignalEndsAStuckStop(const std::string& validationEnv, const std::string& bluePath,
+                                     const Check& check) {
+    constexpr const char* kGoal = "S8.20's escalation clause (a second shutdown signal ends a stop that is stuck, "
+                                  "rather than leaving the user to wait out the teardown deadline)";
+    ScratchDir work("secondsignal");
+    if (!work.ok()) {
+        notVerified(kGoal, "a scratch directory could not be created");
+        return;
+    }
+    const std::filesystem::path link = work.path() / "wallpaper-link.png";
+    const std::filesystem::path fifo = work.path() / "wallpaper.fifo";
+    if (::mkfifo(fifo.c_str(), 0644) != 0) {
+        notVerified(kGoal, "a fifo could not be created, so no render can be made to block on this host");
+        return;
+    }
+
+    NestedBus bus;
+    if (!bus.ok()) {
+        if (const char* fault = bus.preambleFault()) {
+            phaseSetupFault(kGoal, fault);
+            return;
+        }
+        notVerified(kGoal, bus.reason());
+        return;
+    }
+
+    SpawnedDaemon daemon({validationEnv, std::string("DBUS_SESSION_BUS_ADDRESS=") + bus.address()});
+    if (!daemon.waitForOutput(std::string("serving ") + DbusService::kBusName, std::chrono::seconds(30))) {
+        if (reportedStartupFault(daemon, kGoal)) return;
+        notVerified(kGoal, "the daemon for this phase never reached the bus");
+        return;
+    }
+
+    {
+        auto connection = sdbus::createSessionBusConnectionWithAddress(bus.address());
+        connection->enterEventLoopAsync();
+        auto proxy = sdbus::createProxy(*connection, sdbus::ServiceName{DbusService::kBusName},
+                                        sdbus::ObjectPath{DbusService::kObjectPath});
+        std::string why;
+        if (!wedgeRenderWorker(*proxy, bluePath, link, fifo, why)) {
+            notVerified(kGoal, why);
+            return;
+        }
+    }
+
+    ::kill(daemon.pid(), SIGTERM);
+    // Long enough for the watcher to have printed, installed the handler and unblocked these
+    // signals, and far short of the five-second deadline the control has to fall back on.
+    // A shorter wait would make the second signal race the handler's installation, which is
+    // the daemon's setup rather than the behaviour being graded.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+    const auto secondSignal = Clock::now();
+    ::kill(daemon.pid(), SIGTERM);
+    const int exitCode = daemon.waitForExit();
+    const double afterSecondMs = millis(Clock::now() - secondSignal);
+    const std::string output = daemon.output();
+
+    check(!daemon.timedOut(), "a daemon asked twice to stop does not have to be killed");
+    if (daemon.timedOut()) {
+        std::fprintf(stderr, "  it was still running %.1f s after the second signal\n", afterSecondMs / 1000.0);
+        return;
+    }
+    const bool saidSo = output.find("asked again, exiting now") != std::string::npos;
+    check(saidSo, "the daemon says that a second signal is what ended it");
+    if (!saidSo) {
+        std::fprintf(stderr, "  it left with exit code %d, signal %d, and said none of it\n", exitCode,
+                     daemon.termSignal());
+    }
+    // The other route out of a stuck stop, and the one the control falls back on: the
+    // watcher's own deadline. Its presence here means the second signal changed nothing.
+    const bool notTheDeadline = output.find("shutdown blocked") == std::string::npos;
+    check(notTheDeadline, "the stop ends on the second signal rather than on the teardown deadline");
+    // A quarter of the deadline: the handler runs in the signal itself, so anything near
+    // five seconds is the deadline having fired, and a relative bound would accept it.
+    const bool prompt = afterSecondMs < 1250;
+    check(prompt, "the second signal ends the daemon promptly rather than at the deadline");
+    if (!prompt) {
+        std::fprintf(stderr, "  the daemon took %.0f ms to go after the second signal, against a 5000 ms teardown "
+                             "deadline\n",
+                     afterSecondMs);
+    }
+    std::printf("daemon_system_test: a wedged stop ended %.0f ms after the second SIGTERM\n", afterSecondMs);
 }
 
 // Used by both phases below: phase 10 asks the daemon what it thinks of its config port
@@ -5243,6 +5580,131 @@ std::string rejectedEntriesNearCap(std::size_t targetBytes) {
     return text;
 }
 
+// A config that parses and every entry of which the daemon CAN apply, grown to just under the
+// store's 1 MiB cap. The mirror of rejectedEntriesNearCap above, and it exists for the mirror
+// reason: the read, the parse and restoreSaved() all run BEFORE requestName(), so this is what
+// lengthens the window in which a signal can arrive with no name yet claimed.
+std::string validEntriesNearCap(std::size_t targetBytes) {
+    std::string text = "{\"version\":1,\"monitors\":[";
+    int id = 0;
+    for (;;) {
+        std::string entry = "{\"monitor_id\":" + std::to_string(id) +
+                            ",\"type\":\"static\",\"path\":\"/not/rendered/here.png\"}";
+        if (text.size() + entry.size() + 3 >= targetBytes) break;
+        if (text.back() != '[') text += ',';
+        text += entry;
+        ++id;
+    }
+    text += "]}";
+    return text;
+}
+
+// GOAL: a start that a signal cut short before the bus name was requested says so, instead of
+//       announcing a name it never held. False if it prints "serving io.wallpaperx.Daemon"
+//       having skipped requestName(): the journal then records a daemon that took the name and
+//       exited, and an operator debugging a name that is NOT held goes looking for the process
+//       still holding it. Unconditional is exactly what that line used to be.
+// WHY-THIS-SHAPE: the daemon's own log cannot be its own evidence here -- the log is what is
+//       being graded -- so whether the name was ever claimed is decided by NameOwnerChanged on
+//       this process's connection, which the daemon does not write. Each attempt is then
+//       classified by that external fact and the matching invariant is asserted, so an attempt
+//       that lands on either side of the window is graded rather than discarded. Sending the
+//       signal and asserting one fixed message is the obvious simpler version and is a
+//       scheduler assertion: which side of requestName() the signal lands on is a race.
+//       The delays sweep rather than sit at one value because the ONE outcome that establishes
+//       nothing -- the signal arriving before main() has blocked it, which kills the process
+//       outright -- is the one a fixed short delay would produce every time on a fast host.
+// CONTROL: the `if (shutdownRequested...)` arm around the startup message in
+//       backend/daemon/main.cpp collapsed back to the unconditional
+//       `printf("... serving %s at %s")` -> "FAIL: a start stopped before the bus name was
+//       requested does not announce that name", twice, printing "the name was never taken, but
+//       the daemon announced it was serving it" -- once per attempt that landed in the window,
+//       and nothing else red. The run's own tally line was unchanged: "of 6 pre-claim attempts,
+//       2 stopped before the name, 1 after it, and 3 before the signal could be blocked".
+//       Observed 2026-08-19. Reverted.
+// COVERAGE-ASSERT: the number of attempts that actually landed BEFORE the name was claimed is
+//       asserted to be non-zero. Without it a host that starts the daemon faster than this
+//       harness can signal it would grade only ordinary starts and report the goal as met on
+//       evidence that never touched it; with it, such a host reports NOT VERIFIED.
+void checkStopBeforeClaiming(NameWatcher& names, const std::string& validationEnv, const Check& check) {
+    constexpr const char* kGoal = "S8.20's log clause (a start stopped before the bus name was requested says so, "
+                                  "rather than announcing a name it never held)";
+    constexpr std::size_t kConfigBytes = 1000000;
+    // Milliseconds between the spawn and the signal. Short enough to be inside the config read
+    // on this host, and spread so a slower or faster one still lands somewhere useful.
+    constexpr int kDelays[] = {4, 10, 20, 40, 80, 150};
+
+    ScratchDir configHome("preclaim");
+    if (!configHome.ok()) {
+        notVerified(kGoal, "a scratch XDG_CONFIG_HOME could not be created under the temp directory");
+        return;
+    }
+    std::error_code ec;
+    std::filesystem::create_directories(configHome.configFile().parent_path(), ec);
+    if (ec || !writeTextFile(configHome.configFile(), validEntriesNearCap(kConfigBytes))) {
+        notVerified(kGoal, "the large config that widens this phase's startup window could not be written");
+        return;
+    }
+
+    int beforeClaim = 0;
+    int afterClaim = 0;
+    int tooEarly = 0;
+    for (const int delayMs : kDelays) {
+        const uint64_t eventsBefore = names.events();
+        SpawnedDaemon daemon({validationEnv, configHome.env(), configHome.stateEnv()});
+        std::this_thread::sleep_for(std::chrono::milliseconds(delayMs));
+        daemon.shutdown(SIGTERM);
+
+        if (!daemon.exitedNormally() && daemon.termSignal() == SIGTERM) {
+            // The signal beat main()'s pthread_sigmask, so the kernel's default action ended
+            // the process before any of this daemon's code ran. Nothing to grade, and it is
+            // not a defect: no program can block a signal before it starts.
+            ++tooEarly;
+            continue;
+        }
+
+        // A daemon that claimed the name emitted two NameOwnerChanged before it exited, and it
+        // exited before this wait began -- so the wait expiring means the name was never taken.
+        const bool claimed = names.waitForEventsPast(eventsBefore, std::chrono::milliseconds(1500));
+        const std::string output = daemon.output();
+        const bool saysServing = output.find("serving " + std::string(DbusService::kBusName)) != std::string::npos;
+        const bool saysStopped = output.find("stopped before claiming") != std::string::npos;
+
+        if (claimed) {
+            ++afterClaim;
+            check(saysServing && !saysStopped,
+                  "a start that did claim the bus name says it is serving it");
+            if (!saysServing || saysStopped) {
+                std::fprintf(stderr, "  the name was taken, but the daemon said%s%s\n",
+                             saysStopped ? " it stopped before claiming" : "",
+                             saysServing ? " both" : (saysStopped ? "" : " neither"));
+            }
+        } else {
+            ++beforeClaim;
+            check(saysStopped && !saysServing,
+                  "a start stopped before the bus name was requested does not announce that name");
+            if (!saysStopped || saysServing) {
+                std::fprintf(stderr, "  the name was never taken, but the daemon %s\n",
+                             saysServing ? "announced it was serving it" : "said nothing about it");
+            }
+        }
+        awaitNameRelease(names, "the next pre-claim attempt");
+    }
+
+    check(beforeClaim > 0 || afterClaim > 0, "at least one attempt reached the daemon at all");
+    if (beforeClaim == 0) {
+        std::fprintf(stderr, "  %d attempt(s) landed after the name was claimed, %d before main() had blocked the "
+                             "signal, 0 in the window this phase grades\n",
+                     afterClaim, tooEarly);
+        notVerified(kGoal, "no attempt reached the daemon between its signal mask and its name request, so the "
+                           "message a start stopped in that window prints was never produced");
+        return;
+    }
+    std::printf("daemon_system_test: of %zu pre-claim attempts, %d stopped before the name, %d after it, and %d "
+                "before the signal could be blocked\n",
+                std::size(kDelays), beforeClaim, afterClaim, tooEarly);
+}
+
 void checkShutdownDuringStartup(NameWatcher& names, const std::string& validationEnv, const Check& check) {
     using wallpaperx::testing::ConnectResult;
     using wallpaperx::testing::describe;
@@ -5698,14 +6160,16 @@ void checkStalledConfigWrite(NameWatcher& names, const std::string& validationEn
     // CONTROL: `pastDeadline` in ConfigWriter::outcomeLocked() (backend/daemon/config_writer.cpp)
     //       forced to false, which is where the old stalledPastDeadline() test now lives, so a
     //       write that has stopped coming back reads as merely outstanding -> "FAIL: GetStatus
-    //       reports the write that has not come back, rather than the last save that did".
+    //       reports the write that has not come back, rather than the last save that did",
+    //       printing "persistence reads pending (<file>: a write has not come back, the choice
+    //       may not be on disk yet)" -- one red in the run, no skips. Re-observed 2026-08-19
+    //       against Outcome's current shape. Reverted.
     // WAS: (a) this said the mutation printed "persistence reads ok" -- the baseline save above.
     //       True when written 2026-08-12; bcac12f then made an outstanding write a failure in its
-    //       own right, so what this block uniquely supplies is the WORDING, not the status.
-    //       (b) it named ConfigWriter::stalledPastDeadline(), which no longer exists: the answer
-    //       is derived once, inside outcomeLocked().
-    // NEEDS-REOBSERVATION: an outstanding write is now Pending rather than Fail, so the mutation's
-    //       printed line has changed as well as its site. Not run since either change.
+    //       own right. It is now neither: an outstanding write reports Pending, so what this
+    //       block uniquely supplies is the STATUS being fail and the wording, against a mutation
+    //       that leaves it pending. (b) it named ConfigWriter::stalledPastDeadline(), which no
+    //       longer exists: the answer is derived once, inside outcomeLocked().
     std::string sawStatus;
     std::string sawDetail;
     bool namesTheStall = false;
@@ -6167,10 +6631,18 @@ int main() {
         // repair a start owes its config is written after the copy aside rather than over it.
         checkRepairWrittenAfterPreservation(names, validationEnv, check);
         checkShutdownDuringStartup(names, validationEnv, check);
+        // The other side of the same window: that one grades a signal landing after the name
+        // was taken, this one a signal landing before it was asked for.
+        checkStopBeforeClaiming(names, validationEnv, check);
         checkUnreadableRestore(names, validationEnv, bluePath, check);
         checkConfigLocation(names, validationEnv, bluePath, check);
         checkFileSizeLimit(names, validationEnv, bluePath, check);
         checkStalledConfigWrite(names, validationEnv, bluePath, check);
+        // Last of the daemon-spawning phases, and on buses of their own: each wedges a render
+        // worker on purpose, so the daemon it leaves behind cannot be stopped cleanly and must
+        // not be holding the name any phase above still needs.
+        checkStuckTeardownIsBounded(validationEnv, bluePath, check);
+        checkSecondSignalEndsAStuckStop(validationEnv, bluePath, check);
 
         // Every Frame's UnixFd closes at scope exit, and the daemon is gone, so this
         // process must be back where it started. A descriptor leaked per GetFrameFd is

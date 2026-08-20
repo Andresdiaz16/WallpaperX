@@ -61,6 +61,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -1710,6 +1711,285 @@ void runUnservicedRequestChecks(const wallpaperx::WallpaperManager::Config& conf
 // The daemon's Device belongs to the daemon's worker thread, so a second worker driving
 // the same manager trips that guard by design. A second manager brings its own Device,
 // created on and confined to the worker started below.
+//
+// The helper it calls last is declared first, below.
+// --------------------------------------------------------------------------- //
+
+// --------------------------------------------------------------------------- //
+// Every task the worker is handed is answered exactly once, whatever happens to it.
+//
+// An export task owns the sdbus::Result its caller is blocked on. A task that is dropped
+// -- because the queue is full, or because the worker is stopping -- answers nothing, and
+// destroying an sdbus::Result sends no reply at all: the client then waits out sd-bus's
+// full ~25 s timeout for a request the daemon decided in microseconds not to serve.
+//
+// Driven at the worker directly, for the same reason the coalescing phase above is: neither
+// "the queue is at its limit" nor "a task is still queued when the worker stops" is a state
+// any sequence of bus calls can stage. It takes the coalescing phase's manager rather than
+// building another, because it posts no renders at all -- nothing here reaches the Device,
+// so the thread-affinity guard that forbids a second rendering worker does not apply.
+//
+// Runs LAST in that phase, after its FrameReady counts are graded: this block stops a
+// worker, and a stopped worker beside a live one is not a state those counts describe.
+// --------------------------------------------------------------------------- //
+void runWorkerTaskAnswerChecks(wallpaperx::WallpaperManager& manager, const Check& check) {
+    using TaskState = wallpaperx::RenderWorker::TaskState;
+    constexpr int kMax = static_cast<int>(wallpaperx::RenderWorker::kMaxQueuedTasks);
+
+    // Every task posted below reports through this, so "answered exactly once" is a count
+    // and not an impression. Declared ahead of the worker, and read only after the worker
+    // has been joined and stop() has returned on both threads.
+    struct Answers {
+        std::atomic<int> invocations{0};
+        std::atomic<int> ran{0};
+        std::atomic<int> shuttingDown{0};
+        std::atomic<int> busy{0};
+        void record(TaskState state) {
+            ++invocations;
+            if (state == TaskState::Run) ++ran;
+            else if (state == TaskState::ShuttingDown) ++shuttingDown;
+            else ++busy;
+        }
+    } answers;
+    int posted = 0;
+
+    // Released on every path out of this function, including a throw: a worker left blocked
+    // on a gate never observes stop(), so the join would hang instead of failing.
+    struct Gate {
+        std::promise<void> promise;
+        std::atomic<bool> open{false};
+        void release() {
+            if (!open.exchange(true)) promise.set_value();
+        }
+        ~Gate() { release(); }
+    };
+    Gate holdOne;
+    Gate holdTwo;
+    const std::shared_future<void> gateOne = holdOne.promise.get_future().share();
+    const std::shared_future<void> gateTwo = holdTwo.promise.get_future().share();
+
+    std::promise<void> enteredOne;
+    std::promise<void> enteredTwo;
+    std::future<void> insideOne = enteredOne.get_future();
+    std::future<void> insideTwo = enteredTwo.get_future();
+    std::atomic<bool> secondTaskFinished{false};
+
+    wallpaperx::RenderWorker worker(manager, [](int, uint64_t) {});
+
+    // Held here so everything below is posted while the worker is provably inside a task and
+    // therefore dequeuing nothing. Without this barrier every count below is a race.
+    worker.postTask([&answers, &enteredOne, gateOne](TaskState state) mutable {
+        answers.record(state);
+        enteredOne.set_value();
+        gateOne.wait();
+    });
+    ++posted;
+    if (insideOne.wait_for(wallpaperx::testing::kSignalTimeout) != std::future_status::ready) {
+        check(false, "the render worker picked up the task that holds it");
+        std::fprintf(stderr, "dbus_service_test: the worker never entered the holding task, so the queue "
+                             "states below cannot be staged; skipping them rather than measuring a worker "
+                             "that is not running\n");
+        return;
+    }
+
+    // GOAL: RenderWorker::post() ignores a negative monitor id, so it never puts a job on the
+    //       FIFO that is neither a render nor a task. False if it queues one: run() treats
+    //       every job with a negative id as a task and decrements the task count for it, so
+    //       each such post silently spends one of the 64 slots that exist to stop a live bus
+    //       message being pinned per queued export. Reachable from a hand-edited config, whose
+    //       ids reach post() through DbusService::restoreSaved().
+    // WHY-THIS-SHAPE: measured as the queue's REMAINING capacity after the phantom jobs have
+    //       been dequeued, which is the only point at which the miscount exists. The obvious
+    //       simpler check -- post(-1) and assert nothing rendered -- is vacuous: a job with a
+    //       negative id and no task renders nothing in either build. Asserting the capacity
+    //       before the gate opens is vacuous too, for the mirror reason: the count is only
+    //       wrong once run() has processed those jobs.
+    //       Expressed against kMaxQueuedTasks rather than 64, so raising the limit does not
+    //       silently turn this into a check on a number nobody maintains.
+    // CONTROL: `|| monitorId < 0` dropped from RenderWorker::post()
+    //       (backend/daemon/render_worker.cpp) -> "FAIL: a negative monitor id costs the task
+    //       queue none of its capacity", printing "4 task(s) fit where 1 should, after 3 post(s)
+    //       with a negative id" -- one per phantom job, exactly as predicted. The shutdown check
+    //       below goes red with it as a knock-on ("67 task(s) answered ShuttingDown, expected
+    //       64"), since those three extra tasks are drained too. Observed 2026-08-19. Reverted.
+    constexpr int kNegativePosts = 3;
+    for (int i = 0; i < kNegativePosts; ++i) worker.post(-1 - i);
+
+    // A second holding task, so there is a moment AFTER the phantom jobs have been dequeued at
+    // which the worker is stopped again with tasks still queued behind it.
+    worker.postTask([&answers, &enteredTwo, gateTwo, &secondTaskFinished](TaskState state) mutable {
+        answers.record(state);
+        enteredTwo.set_value();
+        gateTwo.wait();
+        // Deliberate, and only for the second stop() check far below: it makes the window in
+        // which a caller that skipped the join has returned too early a real interval rather
+        // than a few instructions. Costs this phase 200 ms once.
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        secondTaskFinished.store(true);
+    });
+    ++posted;
+
+    const auto fill = [&worker, &answers, &posted] {
+        worker.postTask([&answers](TaskState state) { answers.record(state); });
+        ++posted;
+    };
+    for (int i = 1; i < kMax; ++i) fill();  // the holding task above is the first of kMax
+
+    // GOAL: a task posted when the queue is already at its limit is answered Busy, on the
+    //       posting thread, rather than dropped. False if it is dropped: the export handler's
+    //       sdbus::Result is destroyed unanswered and its client blocks for the reply timeout.
+    // WHY-THIS-SHAPE: the answer is read immediately after postTask returns, because the claim
+    //       is that it is answered INLINE -- a check that merely waited for the count to reach
+    //       one would also pass for a build that answered it from the worker thread much later,
+    //       which is the behaviour a blocked client cannot distinguish from a drop.
+    // CONTROL: the `else if (m_queuedTasks >= kMaxQueuedTasks)` arm deleted from
+    //       RenderWorker::postTask() (backend/daemon/render_worker.cpp) -> "FAIL: a task posted
+    //       past the queue limit is answered Busy before postTask returns", printing "the task
+    //       past the limit was answered 0 rather than Busy ... after 66 posts against a limit of
+    //       64", with the capacity check and the shutdown count red beside it (the queue is
+    //       unbounded, so nothing is refused anywhere). Observed 2026-08-19. Reverted.
+    std::atomic<TaskState> overflowAnswer{TaskState::Run};
+    worker.postTask([&answers, &overflowAnswer](TaskState state) {
+        answers.record(state);
+        overflowAnswer.store(state);
+    });
+    ++posted;
+    const bool refusedInline = overflowAnswer.load() == TaskState::Busy;
+    check(refusedInline, "a task posted past the queue limit is answered Busy before postTask returns");
+    if (!refusedInline) {
+        std::fprintf(stderr, "  the task past the limit was answered %d rather than Busy (Run=0, ShuttingDown=1, "
+                             "Busy=2), after %d posts against a limit of %d\n",
+                     static_cast<int>(overflowAnswer.load()), posted, kMax);
+    }
+
+    // Lets the worker drain the phantom jobs and reach the second holding task.
+    holdOne.release();
+    if (insideTwo.wait_for(wallpaperx::testing::kSignalTimeout) != std::future_status::ready) {
+        check(false, "the render worker reached the second holding task");
+        std::fprintf(stderr, "dbus_service_test: the worker did not reach the second holding task; the "
+                             "remaining checks are skipped rather than measured against a stalled queue\n");
+        holdTwo.release();
+        return;
+    }
+
+    // One slot came free when the second holding task was dequeued, so exactly one more task
+    // fits -- unless jobs that were never tasks have been counted as such.
+    int accepted = 0;
+    for (int i = 0; i < kNegativePosts + 2; ++i) {
+        // shared_ptr, not a stack local: a task that is ACCEPTED here is answered later, from
+        // stop()'s drain, long after this loop iteration's frame has gone. A reference to a
+        // local was the first shape and segfaulted the binary on exactly that path.
+        const auto answer = std::make_shared<std::atomic<TaskState>>(TaskState::Run);
+        worker.postTask([&answers, answer](TaskState state) {
+            answers.record(state);
+            answer->store(state);
+        });
+        ++posted;
+        if (answer->load() == TaskState::Busy) break;
+        ++accepted;
+    }
+    check(accepted == 1, "a negative monitor id costs the task queue none of its capacity");
+    if (accepted != 1) {
+        std::fprintf(stderr, "  %d task(s) fit where 1 should, after %d post(s) with a negative id\n", accepted,
+                     kNegativePosts);
+    }
+
+    // GOAL: stop() answers every task still on the queue with ShuttingDown, and every caller of
+    //       stop() waits for the worker to be joined. False on the first count if the queue is
+    //       simply discarded: up to 64 clients then block for the reply timeout on a daemon
+    //       that is already gone. False on the second if a caller returns early because another
+    //       thread had already set the stop flag: that caller then proceeds to tear down state
+    //       the worker thread is still reading.
+    // WHY-THIS-SHAPE: two threads, and the SECOND stop() is released by a probe rather than by
+    //       a sleep. postTask cannot be queued here -- the queue is full, so every probe is
+    //       answered inline -- and an inline ShuttingDown is the only observation that proves
+    //       the flag is already set. Releasing the gate on a timer instead is the obvious
+    //       simpler version and is a race: the worker would resume before the flag was set,
+    //       run the queued tasks normally, and this phase would fail a correct build.
+    //       Every wait has a failure branch, and the second-caller check is asserted ONLY when
+    //       the probe actually observed the flag -- a run where it did not has staged nothing,
+    //       and grading it would be grading the harness.
+    // CONTROL: two, in RenderWorker (backend/daemon/render_worker.cpp), both observed 2026-08-19
+    //       and both reverted. (a) the drain loop at the end of stop() replaced by
+    //       `dropped.clear();` -> "FAIL: every task still queued when the worker stops is
+    //       answered, not dropped" printing "0 task(s) answered ShuttingDown, expected 64", and
+    //       "FAIL: every task this phase posted was invoked exactly once" printing "5
+    //       invocation(s) for 69 posted task(s): 2 ran, 1 shutting down, 2 busy". (b) `if
+    //       (m_stop) return;` restored at the top of stop() -> "FAIL: a second caller of stop()
+    //       waits for the worker rather than returning on another thread's flag", printing
+    //       "stop() returned on the second thread while the task the worker was running had not
+    //       finished", and nothing else red -- three runs, red every time.
+    // COVERAGE-ASSERT: `answers.invocations` is compared against the number of posts this
+    //       function made, so a later edit that posts fewer tasks -- or one where a task is
+    //       answered twice -- fails rather than quietly checking less.
+    std::atomic<bool> sawStopping{false};
+    std::atomic<bool> secondStopSawItFinished{false};
+    {
+        std::jthread releaser([&] {
+            for (int i = 0; i < 2000 && !sawStopping.load(); ++i) {
+                // shared_ptr, not a stack local: were the queue ever not full, this probe
+                // would be queued and answered after the loop iteration had gone.
+                const auto seen = std::make_shared<std::atomic<TaskState>>(TaskState::Run);
+                worker.postTask([seen](TaskState state) { seen->store(state); });
+                if (seen->load() == TaskState::ShuttingDown) {
+                    sawStopping.store(true);
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            // Released whether or not the flag was seen: the gate must not be what wedges the
+            // join. Whether it was seen decides which checks below are asked, not this.
+            holdTwo.release();
+            worker.stop();
+            secondStopSawItFinished.store(secondTaskFinished.load());
+        });
+        worker.stop();
+    }
+
+    const int expectedShuttingDown = kMax;
+    const bool answeredOnShutdown = answers.shuttingDown.load() == expectedShuttingDown;
+    check(answeredOnShutdown, "every task still queued when the worker stops is answered, not dropped");
+    if (!answeredOnShutdown) {
+        std::fprintf(stderr, "  %d task(s) answered ShuttingDown, expected %d\n", answers.shuttingDown.load(),
+                     expectedShuttingDown);
+    }
+
+    if (sawStopping.load()) {
+        check(secondStopSawItFinished.load(),
+              "a second caller of stop() waits for the worker rather than returning on another thread's flag");
+        if (!secondStopSawItFinished.load()) {
+            std::fprintf(stderr, "  stop() returned on the second thread while the task the worker was running "
+                                 "had not finished\n");
+        }
+    } else {
+        std::fprintf(stderr, "dbus_service_test: the stop flag was never observed from the second thread, so "
+                             "whether that thread waits for the join was not established on this run\n");
+    }
+
+    // A task handed to a worker that has already stopped is the third way one can be dropped,
+    // and the only one reachable without staging a queue at all.
+    std::atomic<TaskState> afterStop{TaskState::Run};
+    worker.postTask([&answers, &afterStop](TaskState state) {
+        answers.record(state);
+        afterStop.store(state);
+    });
+    ++posted;
+    const bool answeredAfterStop = afterStop.load() == TaskState::ShuttingDown;
+    check(answeredAfterStop, "a task posted to a worker that has stopped is answered ShuttingDown, not dropped");
+    if (!answeredAfterStop) {
+        std::fprintf(stderr, "  it was answered %d (Run=0, ShuttingDown=1, Busy=2)\n",
+                     static_cast<int>(afterStop.load()));
+    }
+
+    const bool eachAnsweredOnce = answers.invocations.load() == posted;
+    check(eachAnsweredOnce, "every task this phase posted was invoked exactly once");
+    if (!eachAnsweredOnce) {
+        std::fprintf(stderr, "  %d invocation(s) for %d posted task(s): %d ran, %d shutting down, %d busy\n",
+                     answers.invocations.load(), posted, answers.ran.load(), answers.shuttingDown.load(),
+                     answers.busy.load());
+    }
+}
+
 void runWorkerCoalescingChecks(const wallpaperx::WallpaperManager::Config& config,
                                const std::vector<std::string>& burstPaths, const Check& check) {
     // This phase builds a manager, and therefore a Device, of its own. The counter is
@@ -1894,6 +2174,8 @@ void runWorkerCoalescingChecks(const wallpaperx::WallpaperManager::Config& confi
         std::fprintf(stderr, "  generation went from 1 to %llu on a re-post with no new request\n",
                      static_cast<unsigned long long>(repeated->second.generation));
     }
+
+    runWorkerTaskAnswerChecks(manager, check);
 }
 
 // --------------------------------------------------------------------------- //

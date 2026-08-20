@@ -318,6 +318,216 @@ TestCase {
                "the status stands in when the body carries no reason: [" + bare.describe() + "]");
     }
 
+    // Put at the END of an overlong reply field, so a clamp that did not happen shows up as
+    // these characters arriving on the desktop rather than as a length nobody can picture.
+    readonly property string clampTail: "TAIL-PAST-THE-LIMIT"
+
+    function overlongValue(length) {
+        let filler = "";
+        while (filler.length < length) {
+            filler += "0123456789";
+        }
+        return filler.substring(0, length - suite.clampTail.length) + suite.clampTail;
+    }
+
+    // The two reply fields that reach a text layout. `refusalReason` is the third and is
+    // covered by its own case above; these two were the ones with no bound.
+    function clampCases() {
+        return [
+            { tag: "the wallpaper path", key: "path", limit: 4096,
+              field: "wallpaperPath", state: "set" },
+            { tag: "the screen name", key: "output", limit: 256,
+              field: "screenName", state: "unknown" }
+        ];
+    }
+
+    function test_an_overlong_reply_field_is_clamped_data() {
+        return clampCases();
+    }
+
+    // GOAL: a reply field the desktop message interpolates is bounded before it reaches the
+    //       text layout. False if the plugin lays out whatever arrived: the reply comes from
+    //       whatever holds port 18462, the layout runs on plasmashell's GUI thread, and a
+    //       megabyte-long "path" is then a way to stall every screen's shell from loopback.
+    // WHY-THIS-SHAPE: the clamped VALUE and the rendered message are both asserted, and the
+    //       overlong fixture ends in a marker so the second one can be stated as "this tail
+    //       never reached the desktop". Asserting only `length <= limit` on the property is the
+    //       obvious simpler version and is weaker twice over: it passes for a plugin that
+    //       clamped the property but interpolated `reply.path` directly into describe(), and it
+    //       passes for one that dropped the field entirely. Equality against the first `limit`
+    //       characters is what rules the second out.
+    //       The state is asserted first, because each field is only interpolated by one arm of
+    //       describe() -- a drive that landed elsewhere would grade a message that never
+    //       contained the field at all.
+    // CONTROL: one per row, both in main.qml, both observed 2026-08-19 and both reverted.
+    //       `.substring(0, 4096)` dropped from the `wallpaperPath` binding -> "FAIL: the plugin
+    //       clamps the wallpaper path. Actual (): 8192. Expected (): 4096", that row only, the
+    //       screen-name row and the other 20 tests green. `.substring(0, 256)` dropped from the
+    //       `screenName` binding -> "FAIL: the plugin clamps the screen name. Actual (): 512.
+    //       Expected (): 256", that row only. QTest stops a data row at its first failure, so
+    //       the tail-on-the-desktop check below is not reached under either mutation; it is
+    //       there for a describe() that stopped using the clamped property, which the length
+    //       check cannot see.
+    // COVERAGE-ASSERT: the fixture is asserted to be twice the limit and to carry the marker in
+    //       its last characters, so an edit that shortened it below the limit would leave the
+    //       clamp untested rather than leave this green.
+    function test_an_overlong_reply_field_is_clamped(testCase) {
+        const value = suite.overlongValue(testCase.limit * 2);
+        compare(value.length, testCase.limit * 2, "the fixture is longer than the limit");
+        compare(value.indexOf(suite.clampTail), value.length - suite.clampTail.length,
+                "the fixture carries its marker past the limit");
+
+        const reply = { output: suite.namedScreen, known: testCase.state === "set" };
+        if (testCase.state === "set") {
+            reply.path = "/photos/short.png";
+        }
+        reply[testCase.key] = value;
+        const item = drivenPlugin({ connector: suite.namedScreen,
+                                    drive: [200, JSON.stringify(reply)] });
+
+        compare(item.screenState, testCase.state,
+                "the drive reaches the arm that interpolates " + testCase.tag);
+        compare(item[testCase.field].length, testCase.limit,
+                "the plugin clamps " + testCase.tag);
+        compare(item[testCase.field], value.substring(0, testCase.limit),
+                "the clamp keeps the front of " + testCase.tag + " rather than dropping it");
+
+        const shown = onlyDescendantWith(item, "wrapMode");
+        compare(shown.text.indexOf(suite.clampTail), -1,
+                "nothing past the limit reaches the desktop for " + testCase.tag);
+    }
+
+    // ---------------------------------------------------------------------------------- //
+    // The two decisions main.qml makes inside refresh()'s onreadystatechange handler, ahead
+    // of the apply() call every case above drives. Reaching them needs a real HTTP reply, so
+    // these run against the stub daemon tests/qml_states_test.cpp puts on 127.0.0.1:18462 --
+    // see that file for why it is that port and not one of the harness's choosing.
+    // ---------------------------------------------------------------------------------- //
+
+    // Loads a plugin, waits out any request its own start fired, and points the stub at the
+    // shape this case wants. The wait is not decoration: main.qml's refresh() counts a poll
+    // and returns when one is already pending, so a case that called it while a startup fetch
+    // was in flight would send nothing and then grade the startup fetch's answer.
+    function pluginReadyToFetch() {
+        const item = loadPlugin(suite.namedScreen);
+        tryVerify(function () { return item.pending === null; }, 5000,
+                  "the request the plugin's own start may have fired has settled");
+        stubDaemon.reset();
+        return item;
+    }
+
+    // GOAL (a property of this harness): the stub really does serve a reply the plugin
+    //       accepts over real HTTP. False if the transport is broken -- in which case the two
+    //       cases below would come out "unreadable" or "unreachable" whatever main.qml did,
+    //       and would establish nothing about the origin check or the size bound.
+    // WHY-THIS-SHAPE: the same body the oversized case pads and the same body the foreign
+    //       origin serves, so those two differ from this one in exactly one respect each.
+    //       The request count is asserted, not just the state: a plugin that never sent
+    //       anything and a stub that never answered both leave "unreachable", and only the
+    //       counter tells them apart.
+    // CONTROL: `res.status = 500` added to the stub's Good arm in tests/qml_states_test.cpp
+    //       -> "FAIL: a reply served over HTTP reaches the set state. Actual (): refused.
+    //       Expected (): set", 23 other cases green. Observed 2026-08-19. Reverted.
+    function test_the_stub_serves_a_reply_the_plugin_accepts() {
+        if (!stubDaemon.available()) {
+            skip(stubDaemon.unavailableReason());
+        }
+        const item = pluginReadyToFetch();
+        stubDaemon.serveGood();
+        item.refresh();
+
+        tryCompare(item, "screenState", "set", 5000,
+                   "a reply served over HTTP reaches the set state");
+        compare(stubDaemon.requests(), 1, "the plugin made exactly one request to the daemon's origin");
+        compare(item.wallpaperPath, "/home/u/Pictures/beach.png", "the served path reached the binding");
+    }
+
+    // GOAL: a reply that did not come from root.daemonOrigin is treated as unreadable, whatever
+    //       it holds. False if the plugin parses it: a redirect is enough to make every screen's
+    //       wallpaper plugin fetch from wherever a process on loopback names, once a second,
+    //       from inside plasmashell -- and then act on what it gets back.
+    // WHY-THIS-SHAPE: the foreign origin serves the SAME body the accepted case above serves,
+    //       and a 200 at that. So the two runs differ in the origin and in nothing else, and
+    //       "unreadable" here cannot be caused by the content. The redirect target is a second
+    //       real listener on an ephemeral port rather than the same socket under another host
+    //       name, which would rest on how Qt resolves "localhost". The alt server's own request
+    //       count is asserted, because a redirect Qt declined to follow would leave the plugin
+    //       reading the 302's empty body -- also "unreadable", for a reason this goal is not
+    //       about, and it would pass a state-only check.
+    // CONTROL: `elsewhere` dropped from the `usable` expression in main.qml's
+    //       onreadystatechange -> "FAIL: a reply redirected away from the daemon's origin is
+    //       unreadable. Actual (): set. Expected (): unreadable" -- the plugin having acted on
+    //       a wallpaper served by a foreign origin. That single mutation is also what shows the
+    //       check is not vacuous on this Qt: if responseURL were empty, `elsewhere` would be
+    //       false either way and both builds would read "set". 23 other cases green. Observed
+    //       2026-08-19 on Qt 6.11.2. Reverted.
+    function test_a_reply_from_another_origin_is_unreadable() {
+        if (!stubDaemon.available()) {
+            skip(stubDaemon.unavailableReason());
+        }
+        const item = pluginReadyToFetch();
+        stubDaemon.serveFromAnotherOrigin();
+        item.refresh();
+
+        tryCompare(item, "screenState", "unreadable", 5000,
+                   "a reply redirected away from the daemon's origin is unreadable");
+        compare(stubDaemon.requests(), 1, "the plugin asked the daemon's origin first");
+        compare(stubDaemon.altRequests(), 1,
+                "Qt followed the redirect, so what the plugin refused is a served reply and not an empty 302 body");
+        verify(item.describe().indexOf("cannot read") !== -1,
+               "the desktop message names the unreadable cause: [" + item.describe() + "]");
+    }
+
+    // GOAL: a body larger than maxBodyBytes is treated as unreadable rather than parsed. False
+    //       if the plugin buffers and parses whatever arrives: the reply comes from whatever
+    //       holds the port, nothing else bounds what the shell takes in, and the parse runs on
+    //       plasmashell's GUI thread.
+    // WHY-THIS-SHAPE: the oversized body is VALID JSON describing the same wallpaper the
+    //       accepted case above serves, so its SIZE is the only thing that can make it
+    //       unreadable. A check driven with garbage would be satisfied by the JSON parser and
+    //       would say nothing about the bound.
+    //       Served CHUNKED, deliberately, and that is not a detail: main.qml has two
+    //       independent bounds, and chunked is the only shape that reaches the one graded here.
+    //       With a Content-Length present the plugin refuses at HEADERS_RECEIVED instead, and
+    //       that path CANNOT BE DRIVEN -- it calls request.abort(), which segfaults Qt's
+    //       XMLHttpRequest. See the block below; the coverage that costs is stated there rather
+    //       than papered over with a row that crashes the binary.
+    // CONTROL: `body.length <= root.maxBodyBytes` in main.qml's onreadystatechange replaced by
+    //       `true` -> "FAIL: an oversized reply with no declared length is unreadable. Actual
+    //       (): set. Expected (): unreadable" -- 70 KB parsed and acted on. 23 other cases
+    //       green. Observed 2026-08-19. Reverted.
+    // COVERAGE-ASSERT: the served body is asserted to be larger than the plugin's own
+    //       maxBodyBytes, read off the plugin rather than written as a literal. A fixture that
+    //       stopped being oversized -- or a ceiling raised past 70000 -- fails here instead of
+    //       going green against a body the bound never applied to.
+    //
+    // WAS NOT COVERABLE, and the defect it named is now fixed: driving a reply with an
+    // oversized `Content-Length` reached `request.abort()` inside the HEADERS_RECEIVED handler,
+    // and the process died with SIGSEGV in QIODevice::readAll() under QQmlXMLHttpRequest on the
+    // next network event -- so the defence let anything holding 127.0.0.1:18462 kill
+    // plasmashell. main.qml no longer refuses at HEADERS_RECEIVED; a declared length is left to
+    // the same bound below, which catches it a moment later. A row serving 200 with a valid
+    // body and `Content-Length: 70050` should now pass here, and adding one would cover the
+    // second arm -- it is not shipped because nobody has run it.
+    function test_an_oversized_reply_is_unreadable() {
+        if (!stubDaemon.available()) {
+            skip(stubDaemon.unavailableReason());
+        }
+        const item = pluginReadyToFetch();
+        verify(stubDaemon.oversizedBytes() > item.maxBodyBytes,
+               "the stub's oversized body (" + stubDaemon.oversizedBytes() + " bytes) is past the plugin's "
+               + "ceiling of " + item.maxBodyBytes);
+
+        stubDaemon.serveOversizedChunked();
+        item.refresh();
+
+        tryCompare(item, "screenState", "unreadable", 5000,
+                   "an oversized reply with no declared length is unreadable");
+        compare(stubDaemon.requests(), 1, "the plugin made exactly one request");
+        verify(item.describe().indexOf("cannot read") !== -1,
+               "the desktop message names the unreadable cause: [" + item.describe() + "]");
+    }
+
     // GOAL: a refusal is never reported as "the daemon is not running". This is the defect the
     //       goal was written from, stated on its own so a regression prints as itself.
     // WHY-THIS-SHAPE: asserted as the absence of the other cause's remedy rather than only as

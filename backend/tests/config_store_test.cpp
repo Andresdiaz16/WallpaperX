@@ -1848,6 +1848,88 @@ void runPreservedCopyChecks() {
 }
 
 // ---------------------------------------------------------------------------- //
+// Phase 6bb2 -- a save turned away BEFORE the copy was made, and the run after it.
+// ---------------------------------------------------------------------------- //
+void runRefusalLiftedAfterRefusedSaveChecks() {
+    constexpr const char* kGoal = "S8.22's lifting clause (a refusal that has already turned a save away is lifted "
+                                  "completely once the unreadable config is safely copied aside)";
+    const ScratchDir scratch("refusallifted");
+    // preparePhase, not a bare scratch.ok(): the closing check reads back the path the daemon
+    // persisted, which the writer drops by design when the temporary directory's name is not
+    // valid UTF-8 (S8.7).
+    const std::optional<PhasePaths> paths = preparePhase(scratch, kGoal, 1);
+    if (!paths.has_value()) return;
+    const ScopedEnv stateHome("XDG_STATE_HOME", stateHomeOf(scratch).string());
+    const std::filesystem::path file = paths->config;
+    const std::filesystem::path wallpaper = paths->wallpapers.front();
+    // Readable bytes the daemon rejects, so the file is preservable: a file it could not open
+    // at all would never reach the copy that lifts the refusal.
+    const std::string usersOwn =
+        "{\"version\":1,\"monitors\":[{\"monitor_id\":0,\"type\":\"static\",\"path\":\"/photos/kept.png\"},]}";
+    if (!writeFile(file, usersOwn)) {
+        notVerified(kGoal, "the unreadable config this phase needs could not be written");
+        return;
+    }
+
+    WallpaperManager::Config config;
+    config.configFile = file;
+    WallpaperManager manager(config);
+    manager.restoreSaved();
+
+    // The save that is turned away, made BEFORE preserveUnreadableConfig(). That ordering is
+    // the whole fixture: it is the only one that leaves a refusal RECORDED against a writer
+    // which is then allowed again, and it is the state a client call racing startup reaches.
+    manager.requestWallpaper("static", wallpaper.string(), 1);
+    const std::string refusedDetail = manager.snapshot().health.persistence.detail;
+    if (refusedDetail.find("will not overwrite it") == std::string::npos) {
+        // X.3: no refusal was recorded, so there is nothing for allow() to clear and this
+        // phase would grade an ordinary start. Attributed to the setup, not to the daemon.
+        notVerified(kGoal, "the save made before the copy was not turned away (persistence detail: " + refusedDetail +
+                               "), so no recorded refusal exists for the copy to lift");
+        return;
+    }
+
+    manager.preserveUnreadableConfig();
+
+    // GOAL: once the unreadable config has been copied aside, the daemon stops reporting that
+    //       it is refusing to save. False if the refusal RECORDED by the save above outlives
+    //       the allow() that ended it: ConfigWriter::outcome() consults that recorded copy
+    //       first, ahead of the worker, so the daemon goes on saying "not saved, this run
+    //       could not read it and will not overwrite it" while refusing nothing -- and
+    //       backend/daemon/main.cpp reads exactly this report, one line after preserving, to
+    //       decide whether to warn the user their wallpapers are being lost.
+    // WHY-THIS-SHAPE: read HERE, before any further save. That ordering is the entire check,
+    //       and the obvious simpler version -- save first, then read, or grade only that the
+    //       row reaches the file -- is provably vacuous: it was written that way first and the
+    //       control below stayed GREEN, because ConfigWriter::queue() clears the same recorded
+    //       copy as soon as it hands a snapshot over. Only the window between allow() and the
+    //       next save can tell the two builds apart, and on a start with no repair to write
+    //       that window is the whole rest of the daemon's life.
+    //       Graded as an absence -- the refusal text is gone -- rather than as "reads ok",
+    //       because this start legitimately reports Fail for the config it could not read, with
+    //       a different detail; a status check would be red in both builds.
+    // CONTROL: the `if (m_notWritten == m_refusal) m_notWritten.clear();` line deleted from
+    //       ConfigWriter::allow() (backend/daemon/config_writer.cpp), which is the shape before
+    //       the fix -> "FAIL: a refusal that has been lifted is no longer reported", printing
+    //       "persistence detail: kept as <state>/config.json.bad; <file>: not saved, this run
+    //       could not read it and will not overwrite it" -- one red in the run, no skips, with
+    //       the on-disk check below still green. Observed 2026-08-19. Reverted.
+    const std::string afterCopy = manager.snapshot().health.persistence.detail;
+    const bool cleared = afterCopy.find("will not overwrite it") == std::string::npos;
+    check(cleared, "a refusal that has been lifted is no longer reported");
+    if (!cleared) std::fprintf(stderr, "  persistence detail: %s\n", afterCopy.c_str());
+
+    // The other half, and it is what stops the check above being satisfied by a build that
+    // simply lost the refusal text: saving really does work again.
+    manager.requestWallpaper("static", wallpaper.string(), 1);
+    const bool landed = waitForRows(file, [&wallpaper](const std::map<int, RowInFile>& rows) {
+        return rows.count(1) == 1 && rows.at(1).path == wallpaper.string();
+    });
+    check(landed, "a wallpaper set after the copy was made reaches the config file");
+    if (!landed) std::fprintf(stderr, "  config.json holds: %s\n", readFile(file).c_str());
+}
+
+// ---------------------------------------------------------------------------- //
 // Phase 6bc -- S8.22: with every copy name taken, the config is kept, not destroyed.
 // ---------------------------------------------------------------------------- //
 void runPreservationExhaustedChecks() {
@@ -6191,6 +6273,35 @@ void runStartupRepairIsNotBlockingChecks() {
     manager.writeRepairedConfig();
     const double elapsedMs = millisSince(start);
 
+    // GOAL: a write that is merely OUTSTANDING -- handed over, not yet answered, not yet past
+    //       the deadline -- reports Pending, not Fail. False if it reports Fail: main() prints
+    //       "wallpapers may not survive a restart" on exactly that condition, immediately after
+    //       writeRepairedConfig(), so a Fail here put that line in the journal of essentially
+    //       every repaired start while nothing whatever had gone wrong.
+    // WHY-THIS-SHAPE: read here, with the fifo still armed, and BEFORE blocked.release() below.
+    //       The obvious simpler version -- snapshot after the release, or on a healthy tmpfs
+    //       with no fixture at all -- cannot fail either way: the write lands in microseconds
+    //       and the outcome is OnDisk, so the Outstanding arm is never entered and the check is
+    //       vacuous. The status alone is asserted, not the wording: the detail here also carries
+    //       the repair's own kept-entry clauses, which other phases grade.
+    //       Fail is named explicitly beside Pending so that a build reporting Ok -- an
+    //       outstanding write called durable, which is a different defect -- is red too.
+    // CONTROL: the Outstanding arm of WallpaperManager::applyPersistOutcomeLocked()
+    //       (backend/daemon/wallpaper_manager.cpp) put back to report(HealthStatus::Fail, ...)
+    //       -> "FAIL: a write that has only just been handed over reports pending, not the
+    //       failure that warns the user their wallpapers are being lost", printing "persistence
+    //       reads fail (1 screen names displaced ...; copied to ...config.json.bad;
+    //       <file>: a write has not come back, the choice may not be on disk yet)" -- one red in
+    //       the run, no skips. Observed 2026-08-19. Reverted.
+    const wallpaperx::HealthStatus parkedStatus = manager.snapshot().health.persistence.status;
+    const bool pending = parkedStatus == wallpaperx::HealthStatus::Pending;
+    check(pending, "a write that has only just been handed over reports pending, not the failure that warns "
+                   "the user their wallpapers are being lost");
+    if (!pending) {
+        std::fprintf(stderr, "  persistence reads %s (%s)\n", wallpaperx::toString(parkedStatus),
+                     manager.snapshot().health.persistence.detail.c_str());
+    }
+
     // Released after the measurement, and read back: a write that never reached the fifo means
     // the repair was not queued at all, which the fixture probe above has already ruled out as
     // a fault of this host.
@@ -6260,20 +6371,24 @@ void runConcurrentHealthReadChecks() {
     //       published exactly once, on the first save -- two threads racing to start would
     //       usually miss that instant.
     // CONTROL: the publication in ConfigWriter::queue() (backend/daemon/config_writer.cpp) put
-    //       back to its unsynchronised shape -- `startLocked(); worker = m_worker;` moved out of
-    //       the m_mutex scope -- and the tree rebuilt with -DWALLPAPERX_SANITIZE=thread ->
-    //       "WARNING: ThreadSanitizer: data race" twice, naming ConfigWriter::startLocked()
-    //       writing m_worker from this thread against outcomeLocked() reading it under
-    //       WallpaperManager::applyPersistOutcomeLocked() under
-    //       snapshot(); ctest reported config_store as Failed rather than Skipped, the sanitizer
-    //       replacing the exit code. Every check in this phase stayed GREEN in that run (589
-    //       snapshots, 220 of them in flight), which is the point of the block above: the
+    //       back to its unsynchronised shape -- `startLocked(); worker = m_worker;` and the
+    //       m_notWritten clear moved out of the m_mutex scope, the `pending` handover left under
+    //       the worker's own lock -- and the tree rebuilt with -DWALLPAPERX_SANITIZE=thread ->
+    //       "WARNING: ThreadSanitizer: data race", once, naming ConfigWriter::startLocked()
+    //       (config_writer.cpp:106) writing m_worker from the main thread against
+    //       outcomeLocked() (config_writer.cpp:188) reading it under
+    //       WallpaperManager::applyPersistOutcomeLocked() under snapshot() on this phase's
+    //       reader thread; ctest reported config_store as Failed rather than Skipped, the
+    //       sanitizer replacing the 77. Every check in this phase stayed GREEN in that run (402
+    //       snapshots, 58 of them in flight), which is the point of the block above: the
     //       sanitizer is the oracle here, not the assertions. With the lock restored the same
-    //       build is clean again. Re-observed 2026-08-18 after the writer moved out of the
-    //       manager. Reverted.
-    // NEEDS-REOBSERVATION: queue() now sets `pending` under m_mutex too, so the unsynchronised
-    //       shape this mutation restores is a smaller window than the one observed above, and
-    //       everQueued() -- one of the two readers named -- no longer exists.
+    //       build is clean again (Skipped, 380/53). Re-observed 2026-08-19 after queue() moved
+    //       the handover under m_mutex as well. Reverted.
+    // ON THE CONTROL'S RELIABILITY: it reddened 3 runs out of 4; the fourth found no race and
+    //       exited 77, so the tier read Skipped with the defect present. That is inherent -- the
+    //       unsynchronised window is now the few instructions between startLocked() returning and
+    //       the worker's lock being taken, and TSan only reports what two threads actually
+    //       touched. Re-run before concluding a change is clean under this control.
     // NOTE, on which lock: the pointer is now published under ConfigWriter's own m_mutex, not
     //       under m_stateMutex. The property is unchanged -- one lock covers every reader of
     //       that pointer -- but the writer no longer takes any lock belonging to the manager,
@@ -6413,6 +6528,135 @@ void runConcurrentHealthReadChecks() {
     std::printf("config_store_test: %u health snapshots taken beside the first save, %u of them while it was in "
                 "flight\n",
                 snapshotsTaken.load(), snapshotsDuringSave.load());
+}
+
+// ---------------------------------------------------------------------------- //
+// Phase 6k2 -- Step 10: the startup preservation runs beside a live reader of the
+// same state. The second workload the ThreadSanitizer tier needs.
+// ---------------------------------------------------------------------------- //
+void runConcurrentPreserveChecks() {
+    constexpr const char* kGoal = "S10.19 (preserveUnreadableConfig() touches m_kept, m_preserveFailed and the health "
+                                  "record under m_stateMutex, so the render worker already running beside it is not a "
+                                  "data race)";
+    const ScratchDir scratch("concurrentpreserve");
+    const std::optional<PhasePaths> paths = preparePhase(scratch, kGoal, 1);
+    if (!paths.has_value()) return;
+    const ScopedEnv stateHome("XDG_STATE_HOME", stateHomeOf(scratch).string());
+    const std::filesystem::path& file = paths->config;
+
+    // Large on purpose, and it is the fixture's only unusual property: preservation is one
+    // file copy, and on a few hundred bytes it is over before any other thread is scheduled.
+    // Under the 1 MiB load limit so the file is READ and rejected -- a file refused on its
+    // size is never inspected and is not preservable, so nothing would be copied at all.
+    std::string big = "{\"version\":1,\"monitors\":[";
+    while (big.size() < 900000) {
+        big += "{\"monitor_id\":0,\"type\":\"static\",\"path\":\"/photos/aaaaaaaaaaaaaaaaaaaa.png\"},";
+    }
+    big += ",]";  // trailing garbage: readable bytes this build rejects
+    if (!writeFile(file, big)) {
+        notVerified(kGoal, "the large unreadable config this phase copies could not be written");
+        return;
+    }
+
+    WallpaperManager::Config config;
+    config.configFile = file;
+    WallpaperManager manager(config);
+
+    // GOAL: the startup preservation and a concurrent reader of the manager's state do not
+    //       race. False if preserveUnreadableConfig() touches m_kept, m_preserveFailed or the
+    //       health record outside m_stateMutex: main() calls it with the render worker already
+    //       started, and that worker reaches the same fields through renderPending() and
+    //       through every /health read -- so the notes describing what the user lost can be
+    //       appended to while another thread is reading them out of the same vector.
+    // WHY-THIS-SHAPE: THIS PHASE ASSERTS NOTHING ABOUT THE RACE, deliberately, for the same
+    //       reason the first-save phase above does not: an assertion here would be an assertion
+    //       on the scheduler. The instrument that grades it is ThreadSanitizer -- build with
+    //       -DWALLPAPERX_SANITIZE=thread and run this binary. What the phase establishes on an
+    //       ordinary build is that the overlap really happened, and a run where it did not is a
+    //       SKIP rather than a pass. The reader is started and confirmed running BEFORE the
+    //       preservation, because preservation happens exactly once per manager.
+    // CONTROL: the `std::lock_guard<std::mutex> stateLock(m_stateMutex);` line deleted from the
+    //       unreadable-config branch of WallpaperManager::preserveUnreadableConfig()
+    //       (backend/daemon/wallpaper_manager.cpp), which is the shape before the fix, and the
+    //       tree rebuilt with -DWALLPAPERX_SANITIZE=thread -> six "WARNING: ThreadSanitizer:
+    //       data race", naming preserveUnreadableConfig()'s recordHealthLocked() writing the
+    //       health record from the main thread against DaemonHealth::operator= reading it under
+    //       snapshot() on this phase's reader thread; ctest reported config_store as Failed
+    //       rather than Skipped, the sanitizer replacing the 77. Every check in this phase
+    //       stayed GREEN in that run (371 snapshots, 58 in flight) -- the sanitizer is the
+    //       oracle here, not the assertions. With the lock restored the same build is clean
+    //       again (0 warnings, Skipped, 423/57). Observed 2026-08-19. Reverted.
+    // COVERAGE-ASSERT: a snapshot counts as an overlap only when the preservation was in flight
+    //       both before the read began and after it ended, and a run whose overlap count is
+    //       zero is a skip. A future edit that leaves the reader not reading, or serialised
+    //       behind the copy, cannot leave the sanitizer tier with nothing to sanitize while
+    //       this phase reads green.
+    std::atomic<unsigned> snapshotsTaken{0};
+    std::atomic<unsigned> snapshotsDuringPreserve{0};
+    std::atomic<bool> preserveInFlight{false};
+    bool readerStarted = false;
+    std::string readerThrew;
+    {
+        // The stop_token rather than a flag of this phase's own, for the reason the first-save
+        // phase gives: several paths out of this block leave the loop running, and ~jthread
+        // requests the stop on all of them, including one that throws.
+        std::jthread reader([&](std::stop_token stopping) {
+            try {
+                while (!stopping.stop_requested()) {
+                    const bool before = preserveInFlight.load(std::memory_order_acquire);
+                    const WallpaperManager::Snapshot taken = manager.snapshot();
+                    (void)taken;
+                    ++snapshotsTaken;
+                    if (before && preserveInFlight.load(std::memory_order_acquire)) ++snapshotsDuringPreserve;
+                }
+            } catch (const std::exception& e) {
+                readerThrew = e.what();
+            } catch (...) {
+                readerThrew = "an exception that is not a std::exception";
+            }
+        });
+
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (snapshotsTaken.load() == 0 && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        readerStarted = snapshotsTaken.load() > 0;
+        if (readerStarted) {
+            preserveInFlight.store(true, std::memory_order_release);
+            manager.preserveUnreadableConfig();
+            preserveInFlight.store(false, std::memory_order_release);
+        }
+    }
+
+    if (!readerThrew.empty()) {
+        check(false, "the health read beside the startup preservation completed without throwing");
+        std::fprintf(stderr, "  WallpaperManager::snapshot() threw: %s\n", readerThrew.c_str());
+        return;
+    }
+    if (!readerStarted) {
+        notVerified(kGoal, "no health snapshot was taken within five seconds, so nothing ran beside the "
+                           "preservation");
+        return;
+    }
+    if (snapshotsDuringPreserve.load() == 0) {
+        std::fprintf(stderr, "  %u snapshot(s) in total, %u of them while the preservation was in flight\n",
+                     snapshotsTaken.load(), snapshotsDuringPreserve.load());
+        notVerified(kGoal, "no health snapshot completed while the preservation was in flight, so nothing "
+                           "overlapped it for the sanitizer to grade");
+        return;
+    }
+
+    // The preservation really happened: without this the overlap above could be an overlap with
+    // a call that returned immediately, and the sanitizer would have had nothing to watch.
+    const std::vector<std::string> copies = preservedCopyNames(file, preservedCopyDir(scratch));
+    const bool copied = copies.size() == 1 && readFile(copies.front()) == big;
+    check(copied, "the preservation this phase races against really copied the config");
+    if (!copied) {
+        std::fprintf(stderr, "  %s\n", copies.empty() ? "no copy exists at all" : ("copies: " + joined(copies)).c_str());
+    }
+    std::printf("config_store_test: %u health snapshots taken beside the startup preservation, %u of them while it "
+                "was in flight\n",
+                snapshotsTaken.load(), snapshotsDuringPreserve.load());
 }
 
 // ---------------------------------------------------------------------------- //
@@ -6656,9 +6900,9 @@ void runOneAnswerAboutTheFileChecks() {
     //       that consulted only completed writes -> "FAIL: the file is reported out of date, when
     //       a write is outstanding and the caller gave up on it", printing "health said up-to-date
     //       and the reply said up-to-date, but the file does not hold what live state holds", plus
-    //       the stalled-write health check two phases down -- two red in the run, no skips.
-    //       Re-observed 2026-08-19, after this phase moved its parked call onto an abandonable
-    //       thread; unchanged.
+    //       the stalled-write health check two phases down (which printed "persistence reads ok")
+    //       -- two red in the run, no skips. Re-observed 2026-08-19 against Outcome's current
+    //       shape, with `saved` read from outcome().saved; unchanged. Reverted.
     // CONTROL, for the agreement half: the shortcut in WallpaperManager::setMonitorOutput given
     //       back an inference of its own -- `m_writer.outcome().saved.error.empty()`, i.e. only a
     //       COMPLETED write with an error counts, in place of `m_writer.outcome().onDisk()` --
@@ -6666,12 +6910,11 @@ void runOneAnswerAboutTheFileChecks() {
     //       "FAIL: every channel agrees about the write, when a write is outstanding and the
     //       caller gave up on it", printing "health said not-up-to-date, the reply said
     //       up-to-date, and 0 write(s) were made", and the same pair for the refused-write state.
-    //       The two phases below it go red on the same edit -- one mutation, all three of the
-    //       states this cluster is about. Re-observed 2026-08-19, after this phase moved its
-    //       parked call onto an abandonable thread; still six, still no skips.
-    // NEEDS-REOBSERVATION: both mutations are restated against Outcome's current shape --
-    //       lastResult() folded into outcome().saved, and onDisk into onDisk(). Neither has been
-    //       run since.
+    //       The two phases below it go red on the same edit -- "re-asserting a name the daemon
+    //       refused to write is refused again, not reported as stored" and "re-asserting a name
+    //       whose writer could never start writes it to the file" -- one mutation, all three of
+    //       the states this cluster is about. Re-observed 2026-08-19 against Outcome's current
+    //       shape; still six, still no skips. Reverted.
     // COVERAGE-ASSERT: every one of the three states is accounted for at the end -- compared, or
     //       skipped with a printed reason. A state that stops being reachable with no reason given
     //       (an early return added later, a fixture that silently does nothing) breaks the sum and
@@ -6938,6 +7181,73 @@ void runRefusedNameRetryChecks() {
     // answers above true rather than merely consistent. A build that had quietly replaced the
     // fifo with a config of its own would make "refused" a lie in the other direction.
     check(!isRegularFile(file), "the config the daemon refused to write over is still the file the user left there");
+}
+
+// ---------------------------------------------------------------------------- //
+// Phase 6z -- a symlink planted where the save writes its temporary file.
+// ---------------------------------------------------------------------------- //
+void runTempFileSymlinkChecks() {
+    constexpr const char* kGoal = "the save's temporary file is opened without following a symlink, so a link "
+                                  "planted at config.json.tmp cannot make the daemon truncate whatever it points at";
+    const ScratchDir scratch("tmpsymlink");
+    if (!scratch.ok()) {
+        notVerified(kGoal, "a scratch directory could not be created");
+        return;
+    }
+    const std::filesystem::path file = scratch.path() / "wallpaperx" / "config.json";
+    const std::filesystem::path victim = scratch.path() / "victim";
+    const std::string victimBytes = "bytes the daemon must not truncate\n";
+
+    std::error_code ec;
+    std::filesystem::create_directories(file.parent_path(), ec);
+    if (ec || !writeFile(victim, victimBytes)) {
+        notVerified(kGoal, "the config directory or the file the link points at could not be created");
+        return;
+    }
+    std::filesystem::create_symlink(victim, std::filesystem::path(file.string() + ".tmp"), ec);
+    if (ec) {
+        notVerified(kGoal, "a symlink could not be created at config.json.tmp on this host: " + ec.message());
+        return;
+    }
+
+    const ConfigStore store(file);
+    const SaveResult saved = store.save({PersistedWallpaper{0, "static", "/photos/a.png", "DP-1"}});
+
+    // GOAL: a save whose temporary path has been replaced by a symlink refuses, and the file
+    //       the link points at keeps its bytes. False if the open follows the link: the config
+    //       directory is world-traversable on a shared machine, and O_TRUNC through the link
+    //       hands anyone who can create that name a way to have the daemon empty a file of
+    //       their choosing -- with the daemon's privileges, not theirs.
+    // WHY-THIS-SHAPE: the victim's BYTES are the check, not the reported error. Grading only
+    //       that save() returned an error is the obvious simpler version and is weaker than it
+    //       looks: an implementation that followed the link, truncated the target, and then
+    //       failed at rename would report an error too, having already done the damage. The
+    //       error is asserted as well, separately, because a save that silently reported
+    //       success would leave the daemon believing the choice was durable.
+    //       The link is left in place rather than removed and re-created per save: refusing
+    //       once and succeeding on a retry would be the same defect one call later.
+    // CONTROL: O_NOFOLLOW dropped from kFlags in ConfigStore::save()
+    //       (backend/daemon/config_store.cpp) -> all three red. "FAIL: a symlink at
+    //       config.json.tmp does not cost the file it points at its contents", printing "the
+    //       file the link pointed at holds 153 bytes, and held 35" -- the config written
+    //       straight through the link; "FAIL: a save that cannot open its own temporary file
+    //       says so", the save having reported success; and "FAIL: the refused save leaves no
+    //       config.json behind", the rename having moved the LINK into place, so config.json is
+    //       now a symlink to the victim and every later save writes there too. Nothing else red
+    //       in the run, no skips. Observed 2026-08-19. Reverted.
+    const std::string victimNow = readFile(victim);
+    const bool intact = victimNow == victimBytes;
+    check(intact, "a symlink at config.json.tmp does not cost the file it points at its contents");
+    if (!intact) {
+        std::fprintf(stderr, "  the file the link pointed at holds %zu bytes, and held %zu\n", victimNow.size(),
+                     victimBytes.size());
+    }
+    const bool refused = !saved.error.empty();
+    check(refused, "a save that cannot open its own temporary file says so");
+    if (!refused) std::fprintf(stderr, "  save() reported no error at all\n");
+    // Nothing was renamed into place either: a config.json here would mean the save had gone
+    // through by some route this phase did not anticipate.
+    check(!std::filesystem::exists(file, ec), "the refused save leaves no config.json behind");
 }
 
 // ---------------------------------------------------------------------------- //
@@ -7419,15 +7729,17 @@ void runStalledSaveChecks() {
     // CONTROL: `pastDeadline` in ConfigWriter::outcomeLocked() (backend/daemon/config_writer.cpp)
     //       forced to false, which is where the old stalledPastDeadline() test now lives, so a
     //       write that has stopped coming back reads as merely outstanding -> "FAIL: health
-    //       reports a write that has not come back rather than the last save that did".
+    //       reports a write that has not come back rather than the last save that did", printing
+    //       "persistence reads pending (<file>: a write has not come back, the choice may not be
+    //       on disk yet)" -- one red in the run, no skips. Re-observed 2026-08-19 against
+    //       Outcome's current shape. Reverted.
     // WAS: (a) this said the mutation printed "persistence reads ok" -- the healthy save above.
     //       True when written 2026-08-12; bcac12f then made an outstanding write a failure in its
-    //       own right, so what this block uniquely supplies is the WORDING, not the status.
-    //       (b) it named ConfigWriter::stalledPastDeadline(), which no longer exists: the answer
-    //       is derived once, inside outcomeLocked(), rather than by a second call that would time
-    //       a write the first never saw.
-    // NEEDS-REOBSERVATION: an outstanding write is now Pending rather than Fail, so the mutation's
-    //       printed line has changed as well as its site. Not run since either change.
+    //       own right. It is now neither: an outstanding write reports Pending, so what this
+    //       block uniquely supplies is the STATUS being fail and the wording, against a mutation
+    //       that leaves it pending. (b) it named ConfigWriter::stalledPastDeadline(), which no
+    //       longer exists: the answer is derived once, inside outcomeLocked(), rather than by a
+    //       second call that would time a write the first never saw.
     wallpaperx::HealthStatus sawStatus = wallpaperx::HealthStatus::Pending;
     std::string sawDetail;
     bool namesTheStall = false;
@@ -7840,6 +8152,83 @@ void runWriterAllocationFailureChecks() {
     std::printf("config_store_test: the config writer's own allocation was faulted at attempt %lld of %lld, and the "
                 "daemon reported: %s\n",
                 foundAt, kSweep, reportedDetail.empty() ? "(nothing)" : reportedDetail.c_str());
+
+    // GOAL: the same allocation failure where the config is READ is reported as a config
+    //       problem, not thrown. False if it escapes: loadWithDeadline() runs in
+    //       WallpaperManager's constructor, which main() calls before anything else, so an
+    //       exception out of it is a daemon that does not start at all -- on a machine short of
+    //       memory, over a config file it merely failed to read. std::thread and std::promise
+    //       both allocate before the kernel is asked for anything, so the throw is
+    //       std::bad_alloc and a handler naming only std::system_error does not see it.
+    // WHY-THIS-SHAPE: the same sweep as above rather than a named allocation, for the same
+    //       reason: which allocation on this thread belongs to std::promise or to
+    //       std::thread's state object is libstdc++'s business. The operation swept is the
+    //       CONSTRUCTOR, because that is the only caller of loadWithDeadline() -- driving a
+    //       later call would grade a manager whose config had already been read. The reported
+    //       detail is matched on both halves, "no thread available" and "bad_alloc", so an
+    //       injection that happened to make the ordinary read fail cannot satisfy it.
+    // CONTROL: `catch (const std::exception& e)` put back to `catch (const std::system_error& e)`
+    //       in WallpaperManager::loadWithDeadline() (backend/daemon/wallpaper_manager.cpp),
+    //       which is the code before this fix -> "FAIL: an allocation failure where the config
+    //       is read is reported, not thrown out of startup", printing "no allocation in the
+    //       first 400 reported a config that could not be read; 19 were injected, and one
+    //       escaped the constructor at allocation 0: std::bad_alloc" -- the escape being the
+    //       daemon that never starts. On the shipped build the sweep finds it at attempt 9.
+    //       Observed 2026-08-19. Reverted.
+    // COVERAGE-ASSERT: the number of allocations this sweep actually faulted is asserted to be
+    //       non-zero, so an instrument that stopped firing fails rather than sweeping in
+    //       silence -- the same guard the sweep above carries, and separately counted, because
+    //       the two sweeps arm different call trees.
+    bool loadReported = false;
+    long long loadInjections = 0;
+    long long loadFoundAt = -1;
+    std::string loadEscapedAt;
+    std::string loadDetail;
+    for (long long n = 0; n < kSweep && !loadReported; ++n) {
+        WallpaperManager::Config config;
+        config.configFile = paths->config;
+        std::string threw;
+        t_injected = false;
+        std::optional<WallpaperManager> manager;
+        try {
+            ArmedFor armed(n);
+            manager.emplace(config);
+        } catch (const std::exception& e) {
+            threw = e.what();
+        } catch (...) {
+            threw = "an exception that is not a std::exception";
+        }
+        if (!t_injected) continue;
+        ++loadInjections;
+        if (!threw.empty()) {
+            if (loadEscapedAt.empty()) {
+                loadEscapedAt = "one escaped the constructor at allocation " + std::to_string(n) + ": " + threw;
+            }
+            continue;
+        }
+        const std::string detail = manager->snapshot().health.persistence.detail;
+        if (detail.find("could not be read, no thread available") != std::string::npos &&
+            detail.find("bad_alloc") != std::string::npos) {
+            loadReported = true;
+            loadFoundAt = n;
+            loadDetail = detail;
+        }
+    }
+
+    check(loadReported, "an allocation failure where the config is read is reported, not thrown out of startup");
+    if (!loadReported) {
+        std::fprintf(stderr, "  no allocation in the first %lld reported a config that could not be read; %lld were "
+                             "injected%s%s\n",
+                     kSweep, loadInjections, loadEscapedAt.empty() ? "" : ", and ", loadEscapedAt.c_str());
+    }
+    check(loadInjections > 0, "the allocation instrument the config-read sweep depends on actually faulted an "
+                              "allocation");
+    if (loadInjections == 0) {
+        std::fprintf(stderr, "  the config-read sweep armed %lld times and nothing ever threw\n", kSweep);
+    }
+    std::printf("config_store_test: the config read's own allocation was faulted at attempt %lld of %lld, and the "
+                "daemon reported: %s\n",
+                loadFoundAt, kSweep, loadDetail.empty() ? "(nothing)" : loadDetail.c_str());
 #endif
 }
 
@@ -8195,6 +8584,7 @@ int main() {
         {"restore does not write", runRestoreChecks},
         {"a config that could not be read", runUnreadableConfigChecks},
         {"when the preserved copy must not be made", runPreservedCopyChecks},
+        {"a save refused before the copy was made", runRefusalLiftedAfterRefusedSaveChecks},
         {"a config that cannot be preserved anywhere", runPreservationExhaustedChecks},
         {"the copy made for malformed entries", runMalformedEntryCopyChecks},
         {"the copy made before a repair is written", runRepairCopyChecks},
@@ -8220,10 +8610,12 @@ int main() {
         {"the startup repair against a config directory that has stopped answering",
          runStartupRepairIsNotBlockingChecks},
         {"a health read beside the first save", runConcurrentHealthReadChecks},
+        {"a health read beside the startup preservation", runConcurrentPreserveChecks},
         {"naming a screen beside an unrelated persistence failure", runNameAnswersForItsOwnWriteChecks},
         {"one answer about the config file, asked three ways", runOneAnswerAboutTheFileChecks},
         {"the escaping of an alarm that outlives its write", runStickyAlarmEscapingChecks},
         {"re-asserting a name the daemon refused to write", runRefusedNameRetryChecks},
+        {"a symlink planted at the save's temporary file", runTempFileSymlinkChecks},
         {"a save that cannot succeed", runFailedSaveChecks},
         {"a failed write nobody waited for", runFailedWriteIsAnnouncedChecks},
         {"the cost of the save", runSaveCostChecks},
