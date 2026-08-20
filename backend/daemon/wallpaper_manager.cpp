@@ -548,8 +548,11 @@ void WallpaperManager::applyPersistOutcomeLocked(DaemonHealth& health) const {
             return;
         case State::Outstanding:
             // Pending, not Fail: the startup repair is queued and never waited on, so Fail here
-            // warned that wallpapers may not survive a restart on every repaired start.
-            report(HealthStatus::Pending, keptDetail(outcome.why));
+            // warned that wallpapers may not survive a restart on every repaired start. A copy
+            // this run could not take is the exception -- that loss is already real, and it
+            // must not be downgraded by a write happening to be in flight when someone asks.
+            report(m_preserveFailed ? HealthStatus::Fail : HealthStatus::Pending,
+                   keptDetail(outcome.why));
             return;
         case State::NeverAsked:
             // Whatever the constructor recorded still stands, and the status alone: that detail

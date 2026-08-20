@@ -29,8 +29,8 @@ WallpaperItem {
     property int pendingPolls: 0
     readonly property int lateAfterPolls: 5
 
-    // What this will buffer and parse. The reply comes from whatever holds the port, and
-    // nothing else bounds what the shell takes in.
+    // What this will parse. The reply comes from whatever holds the port, and nothing else
+    // bounds what the shell acts on. Not what it buffers: see the handler below.
     readonly property int maxBodyBytes: 65536
 
     // Checked on the way back as well as set on the way out: a redirect would otherwise make
@@ -135,18 +135,11 @@ WallpaperItem {
             if (root.pending !== request) {
                 return;
             }
-            // Dropped before the body is buffered where the reply says how big it is.
-            if (request.readyState === XMLHttpRequest.HEADERS_RECEIVED) {
-                const declared = parseInt(request.getResponseHeader("Content-Length"), 10);
-                if (!isNaN(declared) && declared > root.maxBodyBytes) {
-                    const status = request.status;
-                    root.pending = null;
-                    root.pendingPolls = 0;
-                    request.abort();
-                    root.apply(status, "");
-                }
-                return;
-            }
+            // A declared Content-Length is deliberately NOT acted on here. Refusing at
+            // HEADERS_RECEIVED means abort()ing from inside this handler, and on Qt 6.11.2 that
+            // segfaults QQmlXMLHttpRequest on the next network event -- so the defence against
+            // an oversized reply became a way for whatever holds the port to kill plasmashell.
+            // The bound below catches the same reply a moment later, having buffered it.
             if (request.readyState !== XMLHttpRequest.DONE) {
                 return;
             }
