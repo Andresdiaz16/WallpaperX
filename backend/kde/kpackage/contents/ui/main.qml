@@ -40,8 +40,14 @@ WallpaperItem {
 
     // Never path_literal: that is the raw bytes to act on, and putting them on the desktop
     // would render control characters and bidirectional overrides out of a filename.
+    //
+    // Clamped for the same reason the two strings above are: this comes from whatever holds the
+    // port, and it lands in a text layout on plasmashell's GUI thread. The daemon caps this
+    // field at 4096, so a longer answer is not one of ours whatever else it is.
     readonly property string wallpaperPath:
-        (root.reply && typeof root.reply.path === "string") ? root.reply.path : ""
+        (root.reply && typeof root.reply.path === "string")
+            ? root.reply.path.substring(0, 4096)
+            : ""
 
     // Each state needs a different action from whoever reads it, so they are told apart
     // rather than merged. Order matters: a refusal only means anything once something answered.
