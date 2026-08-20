@@ -6335,6 +6335,140 @@ void runStartupRepairIsNotBlockingChecks() {
 }
 
 // ---------------------------------------------------------------------------- //
+// Phase 6j2 -- Step 10: the same parked write, but on a start that could not keep
+// a copy of the config it is about to rewrite. The loss is already real, and a
+// write being in flight must not soften how it reads.
+// ---------------------------------------------------------------------------- //
+void runPreserveFailureOutlivesAParkedWriteChecks() {
+    constexpr const char* kGoals = "S10.18 (a config this run could not keep a copy of is reported as a failure "
+                                   "for the whole run, whatever a later write is doing)";
+    const ScratchDir scratch("preservefailparked");
+    const std::optional<PhasePaths> paths = preparePhase(scratch, kGoals, 1);
+    if (!paths.has_value()) return;
+    const std::filesystem::path& file = paths->config;
+    const std::filesystem::path& present = paths->wallpapers[0];
+
+    std::string fixtureWhy;
+    if (!blockingWriteFixtureWorks(scratch.path() / "wallpaperx" / "probe.json", fixtureWhy)) {
+        notVerified(kGoals, fixtureWhy);
+        return;
+    }
+
+    // The same repair-producing shape phase 6j uses: a screen renamed by a later row.
+    nlohmann::json monitors = nlohmann::json::array();
+    monitors.push_back(configRow(1, "static", present.string(), "DP-3"));
+    monitors.push_back(configRow(1, "", "", "DP-4"));
+    nlohmann::json root;
+    root["version"] = 1;
+    root["monitors"] = monitors;
+    if (!writeFile(file, root.dump())) {
+        notVerified(kGoals, "the config file this phase reads could not be written");
+        return;
+    }
+
+    // Armed BEFORE the directory is closed: opening a fifo that already exists needs no write
+    // permission on the directory holding it, so the write can still park after the chmod that
+    // is what makes the copy fail.
+    BlockingWrite blocked(file);
+    if (!blocked.arm()) {
+        notVerified(kGoals, std::string("a fifo could not be created at ") + blocked.temp() +
+                                ", so no write can be made to block on this host");
+        return;
+    }
+
+    // Both places a copy could go, closed for different reasons -- preserveConfig() tries the
+    // state directory first and the config's own directory second, and this phase needs BOTH to
+    // fail or no copy failure is recorded at all.
+    const std::filesystem::path stateBlocker = scratch.path() / "not-a-directory";
+    if (!writeFile(stateBlocker, "")) {
+        notVerified(kGoals, "the regular file standing in for the state directory could not be created");
+        return;
+    }
+    const ScopedEnv stateHome("XDG_STATE_HOME", (stateBlocker / "state").string());
+
+    std::error_code ec;
+    std::filesystem::permissions(file.parent_path(),
+                                 std::filesystem::perms::owner_read | std::filesystem::perms::owner_exec,
+                                 std::filesystem::perm_options::replace, ec);
+    if (ec) {
+        notVerified(kGoals, "the config directory could not be made read-only: " + ec.message());
+        return;
+    }
+    struct RestorePermissions {
+        std::filesystem::path dir;
+        ~RestorePermissions() {
+            std::error_code restoreEc;
+            std::filesystem::permissions(dir, std::filesystem::perms::owner_all,
+                                         std::filesystem::perm_options::add, restoreEc);
+        }
+    } restorePermissions{file.parent_path()};
+
+    // A run with the privilege to ignore the mode bits proves nothing here, and says so rather
+    // than passing: the copy would succeed and the state under test never be reached.
+    { std::ofstream probe(file.parent_path() / "probe"); }
+    if (std::filesystem::exists(file.parent_path() / "probe")) {
+        std::filesystem::remove(file.parent_path() / "probe", ec);
+        notVerified(kGoals, "the config directory is still writable after being made read-only "
+                            "(running as root?), so no copy can be made to fail");
+        return;
+    }
+
+    WallpaperManager::Config config;
+    config.configFile = file;
+    WallpaperManager manager(config);
+    manager.restoreSaved();
+    manager.preserveUnreadableConfig();
+
+    // COVERAGE-ASSERT: the copy really did fail. Without this the phase below is satisfied by a
+    // host where both targets happened to work -- the state under test never entered, and the
+    // check reduced to asserting that a healthy start reports healthy.
+    const std::string afterPreserve = manager.snapshot().health.persistence.detail;
+    const bool copyFailed = manager.snapshot().health.persistence.status == wallpaperx::HealthStatus::Fail &&
+                            afterPreserve.find("not copied") != std::string::npos;
+    if (!copyFailed) {
+        notVerified(kGoals, "no copy failure was staged; the detail read: " + afterPreserve);
+        return;
+    }
+
+    // GOAL: a start that could not keep a copy of the config it is about to rewrite reports
+    //       Fail for the rest of the run -- including while its repair write is outstanding.
+    //       False if the write softens it: main() reads exactly this status immediately after
+    //       writeRepairedConfig() to decide whether to warn, so a Pending here means the one
+    //       start that genuinely lost the user's only copy is the start that prints nothing.
+    // WHY-THIS-SHAPE: read with the fifo still armed, so the outcome is Outstanding rather than
+    //       OnDisk -- on a healthy directory the write lands in microseconds and the arm under
+    //       test is never entered, which makes the obvious version of this check vacuous. The
+    //       copy failure is asserted separately above for the same reason. Fail is compared
+    //       against the status alone, not the wording: the detail carries the repair's own
+    //       kept-entry clauses, which other phases grade.
+    // CONTROL: `m_preserveFailed ? HealthStatus::Fail :` deleted from the Outstanding arm of
+    //       WallpaperManager::applyPersistOutcomeLocked()
+    //       (backend/daemon/wallpaper_manager.cpp), leaving report(HealthStatus::Pending, ...)
+    //       -- which is the shape this fix replaced -> "FAIL: a copy this run could not take
+    //       still reads as a failure while the repair write is outstanding", printing
+    //       "persistence reads pending (... not copied: <state>: Not a directory; <dir>:
+    //       Permission denied; <file>: a write has not come back ...)" -- the loss spelled out
+    //       in the detail while the status a caller gates on says otherwise. One red in the
+    //       run, no skips. Observed 2026-08-20. Reverted.
+    manager.writeRepairedConfig();
+    const wallpaperx::HealthStatus parkedStatus = manager.snapshot().health.persistence.status;
+    const bool stillFails = parkedStatus == wallpaperx::HealthStatus::Fail;
+    check(stillFails, "a copy this run could not take still reads as a failure while the repair write is "
+                      "outstanding");
+    if (!stillFails) {
+        std::fprintf(stderr, "  persistence reads %s (%s)\n", wallpaperx::toString(parkedStatus),
+                     manager.snapshot().health.persistence.detail.c_str());
+    }
+
+    const BlockingWrite::Released released = blocked.release(std::chrono::milliseconds(10000));
+    // COVERAGE-ASSERT: the write really was parked. A build that queued nothing would leave the
+    // outcome at NeverAsked, whose arm forces Fail for its own reason -- so the check above
+    // would pass without the state it exists to grade ever being reached.
+    check(released.ok, "the startup repair hands a write to the writer");
+    if (!released.ok) std::fprintf(stderr, "  %s\n", released.why.c_str());
+}
+
+// ---------------------------------------------------------------------------- //
 // Phase 6k -- Step 10: a health snapshot taken while the first save is publishing
 // its worker. The workload the ThreadSanitizer tier needs; see the block below for
 // what this does and does not assert on an ordinary build.
@@ -8609,6 +8743,8 @@ int main() {
         {"the repair a start performs is written at that start", runStartupRepairChecks},
         {"the startup repair against a config directory that has stopped answering",
          runStartupRepairIsNotBlockingChecks},
+        {"a copy that could not be kept, while the repair write is still outstanding",
+         runPreserveFailureOutlivesAParkedWriteChecks},
         {"a health read beside the first save", runConcurrentHealthReadChecks},
         {"a health read beside the startup preservation", runConcurrentPreserveChecks},
         {"naming a screen beside an unrelated persistence failure", runNameAnswersForItsOwnWriteChecks},

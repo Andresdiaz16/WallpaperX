@@ -528,6 +528,41 @@ TestCase {
                "the desktop message names the unreadable cause: [" + item.describe() + "]");
     }
 
+    // GOAL: the same bound holds for a reply that DECLARES its size, and reaching that verdict
+    //       does not kill the process. Both halves matter: the plugin used to refuse this shape
+    //       at HEADERS_RECEIVED by calling abort() from inside the handler, which segfaults
+    //       Qt's XMLHttpRequest -- so the defence against a hostile reply was itself a way for
+    //       whatever holds the port to take plasmashell down.
+    // WHY-THIS-SHAPE: a separate function from the chunked row above, not a data row beside it.
+    //       Under the defect this does not fail, it ABORTS -- and a crash in a shared function
+    //       destroys the other row's diagnostics too. Kept apart so a regression prints as one
+    //       named case dying rather than as the file going silent.
+    // CONTROL: (a) `body.length <= root.maxBodyBytes` in main.qml's DONE handler replaced by
+    //       `true` -> "FAIL: an oversized reply that declares its length is unreadable. Actual
+    //       (): set. Expected (): unreadable", the chunked row red beside it. (b) the
+    //       HEADERS_RECEIVED arm put back -- `if (!isNaN(declared) && declared >
+    //       root.maxBodyBytes) { ... request.abort(); root.apply(status, ""); }` -> ctest
+    //       reports `qml_states (SEGFAULT)` with a stack trace in place of results, and no
+    //       case in this file reports at all. Both observed 2026-08-20, both reverted.
+    function test_an_oversized_reply_that_declares_its_length_is_unreadable() {
+        if (!stubDaemon.available()) {
+            skip(stubDaemon.unavailableReason());
+        }
+        const item = pluginReadyToFetch();
+        verify(stubDaemon.oversizedBytes() > item.maxBodyBytes,
+               "the stub's oversized body (" + stubDaemon.oversizedBytes() + " bytes) is past the plugin's "
+               + "ceiling of " + item.maxBodyBytes);
+
+        stubDaemon.serveOversizedWithLength();
+        item.refresh();
+
+        tryCompare(item, "screenState", "unreadable", 5000,
+                   "an oversized reply that declares its length is unreadable");
+        compare(stubDaemon.requests(), 1, "the plugin made exactly one request");
+        verify(item.describe().indexOf("cannot read") !== -1,
+               "the desktop message names the unreadable cause: [" + item.describe() + "]");
+    }
+
     // GOAL: a refusal is never reported as "the daemon is not running". This is the defect the
     //       goal was written from, stated on its own so a regression prints as itself.
     // WHY-THIS-SHAPE: asserted as the absence of the other cause's remedy rather than only as
