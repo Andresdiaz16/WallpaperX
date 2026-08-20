@@ -156,6 +156,16 @@ if(EGL_FOUND AND OpenGL_OpenGL_FOUND)
     # nobody runs, and the pairing it needs (a GL context on the same driver the Vulkan device
     # used) is a property of the machine that can change without this file changing. It reports
     # 77 with the reason when it cannot import, which ctest reads as a skip.
+    # The QQuickItem that puts an imported frame on the desktop. Needs Qt, so it is guarded --
+    # the importer below it is not, which is what lets the probe run on a headless CI machine
+    # with no Qt at all.
+    if(WALLPAPERX_BUILD_KDE_PLUGIN)
+        add_library(wallpaperx-kde-item STATIC kde/wallpaperx_item.cpp)
+        set_target_properties(wallpaperx-kde-item PROPERTIES AUTOMOC ON)
+        target_link_libraries(wallpaperx-kde-item PUBLIC
+            wallpaperx-frame-import Qt6::Core Qt6::DBus Qt6::Quick Qt6::Qml)
+    endif()
+
     add_test(NAME frame_import_probe COMMAND wallpaperx-frame-import-probe)
     set_tests_properties(frame_import_probe PROPERTIES
         LABELS "novulkan"
