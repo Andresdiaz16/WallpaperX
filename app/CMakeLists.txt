@@ -40,11 +40,14 @@ qt_add_qml_module(wallpaperx
         qml/main.qml
 )
 
-# The plugin's settings pane offers one action -- launching this app -- and it runs it by name,
-# so the binary has to be somewhere a PATH lookup finds it. Until now nothing installed it at
-# all: it was only ever run out of the build directory.
+# Nothing installed this app until now -- it was only ever run out of the build directory. The
+# plugin's settings pane launches it by desktop id, so both halves have to land: the binary
+# where a PATH lookup finds it, and the entry where the desktop environment does. The id in the
+# file name is what the pane passes to kstart, and what puts the app in the menu and KRunner.
 include(GNUInstallDirs)
 install(TARGETS wallpaperx RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(FILES com.wallpaperx.app.desktop
+        DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/applications)
 
 message(STATUS "wallpaperx configured")
 message(STATUS "  Qt6: ${Qt6_VERSION}")

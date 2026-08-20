@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=WallpaperX
+GenericName=Wallpaper Manager
+Comment=Interactive wallpapers for Linux
+Exec=wallpaperx
+Icon=preferences-desktop-wallpaper
+Terminal=false
+Categories=Qt;KDE;Settings;DesktopSettings;
+Keywords=wallpaper;background;desktop;shader;video;
+StartupNotify=true
+StartupWMClass=wallpaperx
+X-KDE-StartupNotify=true

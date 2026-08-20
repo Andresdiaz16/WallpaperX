@@ -25,9 +25,11 @@ ColumnLayout {
 
     spacing: Kirigami.Units.largeSpacing
 
-    // The executable runner, rather than a desktop-file launch: the app has no desktop entry
-    // yet -- that arrives with packaging -- and this reports an exit code, which is what tells
-    // the button whether to say anything.
+    // kstart, not the binary directly: run as a plain command the app becomes a child of
+    // plasmashell, and Plasma restarts its shell routinely -- the app would go with it. kstart
+    // launches the desktop entry into its own systemd scope, detached, with startup
+    // notification. The runner is still used rather than an openUrlExternally because it
+    // reports an exit code, which is the only reason this pane can say a launch failed.
     Plasma5Support.DataSource {
         id: launcher
 
@@ -37,18 +39,24 @@ ColumnLayout {
         onNewData: function (source, data) {
             disconnectSource(source);
             const code = data["exit code"];
-            // A launcher that reports success for a command that was never found is worse than
-            // one that reports nothing: 127 is the shell's own "not found".
+            // 127 is the shell's own "not found", and the command here is kstart -- so that
+            // code says the launcher is missing, not the app. Anything else non-zero is kstart
+            // reporting it could not start the entry, which is the case that means the app.
             if (code !== 0) {
                 root.launchError = (code === 127)
-                    ? qsTr("The WallpaperX app is not installed.")
-                    : qsTr("The WallpaperX app could not be started (exit %1).").arg(code);
+                    ? qsTr("The desktop launcher (kstart) is missing, so the app could not be opened.")
+                    : qsTr("The WallpaperX app could not be started. It may not be installed.");
             }
         }
 
+        // The id, without the .desktop suffix, is what kstart resolves through the desktop
+        // environment's own lookup -- so this finds the app wherever it was installed rather
+        // than assuming a prefix.
+        readonly property string desktopId: "com.wallpaperx.app"
+
         function launch() {
             root.launchError = "";
-            connectSource("wallpaperx");
+            connectSource("kstart --application " + launcher.desktopId);
         }
     }
 
