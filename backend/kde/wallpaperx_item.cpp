@@ -237,8 +237,13 @@ QSGNode* WallpaperXItem::updatePaintNode(QSGNode* old, UpdatePaintNodeData*) {
         m_pending.reset();
     }
 
+    quint64 shown = 0;
+    {
+        std::lock_guard<std::mutex> lock(m_importedMutex);
+        shown = m_shownGeneration;
+    }
     // Dropped if it is older than what is on screen; its fd is closed by ~PendingFrame.
-    if (incoming.has_value() && !supersedesShown(incoming->generation, m_shownGeneration)) {
+    if (incoming.has_value() && !supersedesShown(incoming->generation, shown)) {
         incoming.reset();
     }
 
@@ -253,9 +258,13 @@ QSGNode* WallpaperXItem::updatePaintNode(QSGNode* old, UpdatePaintNodeData*) {
             // Freed only now, with the new texture in hand: releasing the old one before the
             // node has been repointed leaves the scene graph holding a deleted texture for the
             // rest of this pass.
-            const FrameImport::Result previous = m_imported;
-            m_imported = imported;
-            m_shownGeneration = incoming->generation;
+            FrameImport::Result previous;
+            {
+                std::lock_guard<std::mutex> lock(m_importedMutex);
+                previous = m_imported;
+                m_imported = imported;
+                m_shownGeneration = incoming->generation;
+            }
 
             if (node == nullptr) {
                 node = new QSGSimpleTextureNode();
@@ -290,12 +299,16 @@ void WallpaperXItem::releaseResources() {
     // to the render thread. scheduleRenderJob is the way across: the job runs on the render
     // thread with the context current, which is the same pair of conditions updatePaintNode
     // satisfies. It takes a copy, so nothing outlives this object.
-    if (m_imported.texture == 0 && m_imported.memoryObject == 0) return;
+    FrameImport::Result doomed;
+    {
+        std::lock_guard<std::mutex> lock(m_importedMutex);
+        if (m_imported.texture == 0 && m_imported.memoryObject == 0 && m_imported.eglImage == nullptr) return;
+        doomed = m_imported;
+        m_imported = FrameImport::Result{};
+        m_shownGeneration = 0;
+    }
 
     QQuickWindow* host = window();
-    const FrameImport::Result doomed = m_imported;
-    m_imported = FrameImport::Result{};
-    m_shownGeneration = 0;
 
     if (host == nullptr) {
         // No window to schedule against, so the context this belonged to is already gone and

@@ -28,7 +28,8 @@ namespace wallpaperx {
 //     call needs never runs -- measured, it never returned and the item drew nothing;
 //   * the render thread imports that fd into GL inside updatePaintNode(), because that is the
 //     only place a GL context is current, and frees the previous texture there for the same
-//     reason.
+//     reason. releaseResources() is the exception -- it runs on the GUI thread and hands the
+//     freeing to a render job -- which is why the imported handles are behind a lock.
 //
 // m_pendingMutex guards the handover between the first two and the third. Nothing else here is
 // shared: every GL object lives and dies on the render thread.
@@ -120,8 +121,13 @@ private:
     std::optional<PendingFrame> m_pending;  // guarded by m_pendingMutex
 
     // Render thread only, past construction.
-    FrameImport::Result m_imported;
-    quint64 m_shownGeneration = 0;
+    // Written by the render thread in updatePaintNode and read by the GUI thread in
+    // releaseResources, which is why it is guarded. The header used to call it render-thread
+    // only; that was true of the paint path alone, and releaseResources contradicted it.
+    // The lock is never held across GL work -- it covers the swap, nothing else.
+    std::mutex m_importedMutex;
+    FrameImport::Result m_imported;      // guarded by m_importedMutex
+    quint64 m_shownGeneration = 0;       // guarded by m_importedMutex
 };
 
 }  // namespace wallpaperx
