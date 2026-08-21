@@ -221,6 +221,7 @@ FrameImport::Result FrameImport::importDmaBuf(const Request& request) {
 
     // EGL holds its own duplicate now, so this one is ours to close -- and must be, or the
     // plugin leaks one descriptor per frame for the life of the session.
+    // EGL holds its own duplicate now, so this one is ours to close.
     ::close(request.fd);
 
     out.texture = texture;

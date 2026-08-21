@@ -36,6 +36,8 @@
 #include <GL/gl.h>
 #include <GL/glext.h>
 
+#include <dirent.h>
+#include <fcntl.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -180,6 +182,18 @@ private:
     EGLContext m_context = EGL_NO_CONTEXT;
 };
 
+// How many descriptors this process holds. /proc/self/fd is the only view that counts what the
+// driver opened as well as what this code did, which is the point: the fd accounting under test
+// crosses into GL and EGL.
+int openFdCount() {
+    DIR* dir = ::opendir("/proc/self/fd");
+    if (dir == nullptr) return -1;
+    int count = 0;
+    while (::readdir(dir) != nullptr) ++count;
+    ::closedir(dir);
+    return count;
+}
+
 // Reads an imported texture back through a framebuffer object. glGetTexImage would be shorter
 // but is not available on GLES-shaped contexts, and the plugin's own context may be one.
 std::vector<unsigned char> readTexture(GLuint texture, uint32_t width, uint32_t height, std::string& why) {
@@ -297,6 +311,7 @@ bool runImportChecks() {
         //       NVIDIA GeForce RTX 3080 Ti/PCIe/SSE2: glTexStorageMem2DEXT could not back a
         //       texture with the imported memory". Observed 2026-08-20 -- and observed BEFORE
         //       the fix producing a skip instead, which is what the fix was for. Reverted.
+        const int beforeImport = openFdCount();
         const wallpaperx::FrameImport::Result imported = wallpaperx::FrameImport::import(request);
         const bool importedOk = imported.texture != 0;
         check(importedOk, "an exported frame imports into a GL context on the same device");
@@ -350,6 +365,74 @@ bool runImportChecks() {
         }
 
         wallpaperx::FrameImport::release(imported);
+
+        // GOAL: S12.3 -- a successful import consumes the fd exactly once, and a failed one
+        //       leaves it with the caller. Both halves matter and they fail in opposite
+        //       directions: consuming twice closes a descriptor this process may have reused,
+        //       and consuming neither leaks one per frame on a process that runs for a login
+        //       session.
+        // WHY-THIS-SHAPE: counted from /proc/self/fd rather than by inspecting the importer,
+        //       because the two paths dispose of the fd differently -- GL takes ownership,
+        //       EGL dups and the importer closes its own -- and the property that must hold is
+        //       about the process, not about which call was made.
+        // CONTROL: the `::close(request.fd)` deleted from FrameImport::importDmaBuf -> "FAIL:
+        //       importing and releasing repeatedly does not accumulate descriptors", printing
+        //       "45 open fds before, 47 after one cycle, 54 after eight" -- one per frame, which
+        //       is what the loop exists to show. Observed 2026-08-21 on the lavapipe entry.
+        //       Reverted.
+        const int afterImport = openFdCount();
+
+        // A failure that never reaches the driver: the fd must come back untouched.
+        wallpaperx::FrameImport::Request rejected;
+        rejected.fd = ::dup(STDIN_FILENO);
+        rejected.width = 0;  // refused before anything is imported
+        rejected.height = kHeight;
+        rejected.memorySize = 4096;
+        rejected.handleType = request.handleType;
+        const int beforeRejected = openFdCount();
+        const wallpaperx::FrameImport::Result none = wallpaperx::FrameImport::import(rejected);
+        const int afterRejected = openFdCount();
+        check(none.texture == 0, "an import that cannot proceed produces no texture");
+        check(afterRejected == beforeRejected,
+              "a failed import leaves its file descriptor with the caller, neither closed nor leaked");
+        if (afterRejected != beforeRejected) {
+            std::fprintf(stderr, "  %d open fds before the failed import, %d after\n", beforeRejected, afterRejected);
+        }
+        ::close(rejected.fd);
+
+        // The property that matters is that the count does not grow PER FRAME. A driver may hold
+        // one descriptor of its own for an imported allocation and release it only with the
+        // context -- measured here, NVIDIA does exactly that -- and a single import cannot tell
+        // that apart from a leak. A wallpaper that changes every few seconds can.
+        int afterFirstCycle = 0;
+        for (int cycle = 0; cycle < 8; ++cycle) {
+            const auto& spare = targets.create(0, kWidth, kHeight);
+            targets.render(renderer, spare);
+            wallpaperx::ExportedFrame extra = wallpaperx::exportFrame(device, spare);
+
+            wallpaperx::FrameImport::Request again = request;
+            again.fd = extra.fd;
+            again.planes.clear();
+            for (const auto& plane : extra.planes) again.planes.emplace_back(plane.offset, plane.rowPitch);
+
+            const wallpaperx::FrameImport::Result round = wallpaperx::FrameImport::import(again);
+            if (round.texture == 0) {
+                if (extra.fd >= 0) ::close(extra.fd);
+                notVerified(kGoals, "a repeat import failed, so descriptor growth could not be measured: " +
+                                        round.error);
+                return true;
+            }
+            wallpaperx::FrameImport::release(round);
+            if (cycle == 0) afterFirstCycle = openFdCount();
+        }
+
+        const int atEnd = openFdCount();
+        const bool steady = atEnd <= afterFirstCycle;
+        check(steady, "importing and releasing repeatedly does not accumulate descriptors");
+        if (!steady) {
+            std::fprintf(stderr, "  %d open fds before, %d after one cycle, %d after eight\n", beforeImport,
+                         afterFirstCycle, atEnd);
+        }
         return true;
     });
 }
