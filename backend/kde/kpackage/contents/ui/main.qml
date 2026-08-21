@@ -209,6 +209,8 @@ WallpaperItem {
     Loader {
         id: surface
 
+        // Named so a check can find it without depending on declaration order.
+        objectName: "wallpaperxSurface"
         anchors.fill: parent
         // Only once there is something to draw AND a screen to ask about. Without the id test
         // the renderer would poll for frames belonging to no monitor.
@@ -230,6 +232,7 @@ WallpaperItem {
     Rectangle {
         id: backdrop
 
+        objectName: "wallpaperxBackdrop"
         anchors.fill: parent
         // Hidden rather than drawn under the wallpaper: it is opaque, and a frame that has been
         // imported is what the user should see. Shown again the moment anything goes wrong.

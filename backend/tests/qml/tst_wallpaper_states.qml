@@ -789,4 +789,81 @@ TestCase {
         compare(found.length, 1, "exactly one descendant carries [" + property + "]");
         return found[0];
     }
+
+    // Finds a named child of the plugin, so a check does not depend on declaration order.
+    function childNamed(item, name) {
+        for (let i = 0; i < item.children.length; ++i) {
+            if (item.children[i].objectName === name) return item.children[i];
+        }
+        return null;
+    }
+
+    // GOAL: S12.6 -- whatever the renderer is doing, a screen that cannot show a wallpaper still
+    //       shows its message. The renderer is opaque and fills the item, so a build that
+    //       activates it in a non-"set" state covers the only thing the user had to read.
+    // WHY-THIS-SHAPE: driven across ALL the causes rather than one, because each reaches the
+    //       Loader's condition by a different route -- no name, no answer, a refusal, an
+    //       unreadable reply -- and a condition testing only `reply !== null` would pass four of
+    //       them and fail the fifth.
+    // CONTROL: `active:` on the Loader in main.qml changed to `true` -> "FAIL: [1-unnamed]
+    //       the renderer is not active while the screen has a message", and the no-id check
+    //       below with it. Observed 2026-08-21. Reverted.
+    function test_the_message_is_never_covered_by_the_renderer() {
+        const cases = causeCases();
+        for (let i = 0; i < cases.length; ++i) {
+            if (cases[i].state === "set") continue;
+            const item = drivenPlugin(cases[i]);
+            const surface = childNamed(item, "wallpaperxSurface");
+            const backdrop = childNamed(item, "wallpaperxBackdrop");
+            verify(surface !== null && backdrop !== null, "the plugin has a surface and a backdrop");
+            verify(!surface.active,
+                   "[" + cases[i].tag + "] the renderer is not active while the screen has a message");
+            verify(backdrop.visible, "[" + cases[i].tag + "] the message is visible");
+        }
+    }
+
+    // GOAL: S12.6 -- a screen the daemon has not given a monitor id is not rendered for. False if
+    //       the id is ignored: the renderer would ask for frames belonging to no monitor, and the
+    //       desktop would show neither a wallpaper nor a reason.
+    // WHY-THIS-SHAPE: the reply is otherwise a complete "set" answer -- known, with a path -- so
+    //       only the missing id distinguishes it. The daemon sends null rather than 0 for exactly
+    //       this case, and 0 is a real monitor.
+    // CONTROL: `&& root.monitorId >= 0` deleted from the Loader's `active` in main.qml ->
+    //       "FAIL: the renderer stays inactive without a monitor id", and that check alone,
+    //       which is what separates it from the broader one above. Observed 2026-08-21.
+    //       Reverted.
+    function test_a_screen_with_no_monitor_id_is_not_rendered_for() {
+        const item = loadPlugin(suite.namedScreen);
+        item.apply(200, '{"output":"DP-3","known":true,"path":"/w.png","monitor_id":null}');
+        compare(item.screenState, "set", "the reply is otherwise a set state");
+        compare(item.monitorId, -1, "a null monitor id reads as -1, not 0");
+
+        const surface = childNamed(item, "wallpaperxSurface");
+        verify(surface !== null, "the plugin has a surface");
+        verify(!surface.active, "the renderer stays inactive without a monitor id");
+    }
+
+    // GOAL: main.qml survives a QML module it cannot load. That is the whole reason the renderer
+    //       sits behind a Loader rather than an import: a failed import at the top of this file
+    //       takes the plugin down, and a wallpaper plugin that fails to load is a black desktop
+    //       with nothing logged.
+    // WHY-THIS-SHAPE: this harness has no com.wallpaperx on its import path, so the Loader
+    //       genuinely fails here and the check reads a real failure rather than a simulated one.
+    //       Asserted as "the message still works" rather than "the file loaded", because loading
+    //       and then showing nothing is the failure this guards against.
+    // COVERAGE: no control is run for this one. Making the module loadable here would need the
+    //       built plugin on the harness's import path, at which point the check stops testing
+    //       what it is for. It is graded by the state it observes -- Loader not Ready -- which is
+    //       asserted rather than assumed.
+    function test_a_missing_renderer_module_leaves_the_message_working() {
+        const item = drivenPlugin({ connector: suite.namedScreen, drive: [200, suite.goodReply] });
+        const surface = childNamed(item, "wallpaperxSurface");
+        verify(surface !== null, "the plugin has a surface");
+        verify(surface.status !== Loader.Ready,
+               "this harness has no renderer module, which is what makes this check meaningful");
+        verify(item.describe().length > 0, "the plugin still describes the screen");
+        const backdrop = childNamed(item, "wallpaperxBackdrop");
+        verify(backdrop !== null && backdrop.visible,
+               "the message is still shown when the renderer module cannot be loaded");
+    }
 }
