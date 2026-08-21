@@ -60,11 +60,22 @@ public:
 
     // Whether a FrameReady announcing `generation` is worth fetching, given the newest already
     // fetched. Fetching is not free -- a bus round trip, an export by the daemon, a dup here.
-    static bool worthFetching(quint64 generation, quint64 newestFetched);
+    // Distinct types rather than two quint64s, because the two arguments mean opposite things
+    // and swapping them compiled -- a real gap: every check in frame_generation_test passes
+    // against a build with the arguments the wrong way round, since the predicates themselves
+    // are still correct. The type is what grades the call site; a test cannot.
+    struct Arriving {
+        quint64 value = 0;
+    };
+    struct Held {
+        quint64 value = 0;
+    };
+
+    static bool worthFetching(Arriving generation, Held newestFetched);
 
     // Whether a frame that has arrived should replace what is on screen. Frames for one monitor
     // can complete out of order, so the newest wins by number rather than by arrival.
-    static bool supersedesShown(quint64 generation, quint64 shown);
+    static bool supersedesShown(Arriving generation, Held shown);
 
     int monitorId() const { return m_monitorId; }
     void setMonitorId(int monitorId);

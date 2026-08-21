@@ -51,14 +51,14 @@ WallpaperXItem::PendingFrame& WallpaperXItem::PendingFrame::operator=(PendingFra
     return *this;
 }
 
-bool WallpaperXItem::worthFetching(quint64 generation, quint64 newestFetched) {
-    if (generation == 0) return true;
-    return generation > newestFetched;
+bool WallpaperXItem::worthFetching(Arriving generation, Held newestFetched) {
+    if (generation.value == 0) return true;
+    return generation.value > newestFetched.value;
 }
 
-bool WallpaperXItem::supersedesShown(quint64 generation, quint64 shown) {
-    if (generation == 0) return true;
-    return generation >= shown;
+bool WallpaperXItem::supersedesShown(Arriving generation, Held shown) {
+    if (generation.value == 0) return true;
+    return generation.value >= shown.value;
 }
 
 WallpaperXItem::WallpaperXItem(QQuickItem* parent) : QQuickItem(parent) {
@@ -120,7 +120,7 @@ void WallpaperXItem::fetchFrame(quint64 generation) {
     // Zero means "fetch whatever is there": it is what the two callers that are not signals
     // pass, when this item has just learned its monitor id or just connected, and neither knows
     // what generation the daemon is on.
-    if (!worthFetching(generation, m_fetchedGeneration)) return;
+    if (!worthFetching(Arriving{generation}, Held{m_fetchedGeneration})) return;
 
     // ASYNCHRONOUS, and this is not a preference. A blocking call here parks the thread that
     // runs the compositor's UI until the daemon answers -- and worse, the first fetch happens
@@ -243,7 +243,7 @@ QSGNode* WallpaperXItem::updatePaintNode(QSGNode* old, UpdatePaintNodeData*) {
         shown = m_shownGeneration;
     }
     // Dropped if it is older than what is on screen; its fd is closed by ~PendingFrame.
-    if (incoming.has_value() && !supersedesShown(incoming->generation, shown)) {
+    if (incoming.has_value() && !supersedesShown(Arriving{incoming->generation}, Held{shown})) {
         incoming.reset();
     }
 

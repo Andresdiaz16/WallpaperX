@@ -3,6 +3,11 @@
 // S12.5: a stale frame is never shown, and a frame already in hand is never fetched twice.
 //
 // Both decisions are pure functions on WallpaperXItem precisely so they can be graded here.
+//
+// Their ORDER is graded by the type system rather than by anything below: the two arguments mean
+// opposite things, and with both as quint64 a call site could pass them the wrong way round and
+// every check here would still pass. Arriving and Held make that a compile error -- verified,
+// `cannot convert Held to Arriving`. A test cannot reach the call sites; the types can.
 // Left inline in their call sites they were reachable only by staging two fetches that complete
 // out of order against a live daemon, a window and a GPU -- which nothing in this suite can
 // force, so the ordering rule would have shipped on reasoning alone.
@@ -27,14 +32,14 @@ using wallpaperx::testing::check;
 //       "FAIL: the generation already held is not worth fetching again" and the
 //       coverage assert below. Observed 2026-08-21. Reverted.
 void checkWorthFetching() {
-    check(WallpaperXItem::worthFetching(5, 3), "a newer generation is worth fetching");
-    check(!WallpaperXItem::worthFetching(3, 5), "an older generation is not worth fetching");
-    check(!WallpaperXItem::worthFetching(5, 5), "the generation already held is not worth fetching again");
+    check(WallpaperXItem::worthFetching({5}, {3}), "a newer generation is worth fetching");
+    check(!WallpaperXItem::worthFetching({3}, {5}), "an older generation is not worth fetching");
+    check(!WallpaperXItem::worthFetching({5}, {5}), "the generation already held is not worth fetching again");
 
     // Zero is "not known", which the callers that are not signals pass. It must fetch, or a
     // screen that has just learned its monitor id never asks for anything and stays blank.
-    check(WallpaperXItem::worthFetching(0, 0), "an unknown generation is fetched when nothing is held");
-    check(WallpaperXItem::worthFetching(0, 9), "an unknown generation is fetched even with a frame in hand");
+    check(WallpaperXItem::worthFetching({0}, {0}), "an unknown generation is fetched when nothing is held");
+    check(WallpaperXItem::worthFetching({0}, {9}), "an unknown generation is fetched even with a frame in hand");
 }
 
 // GOAL: S12.5 -- the newest frame wins regardless of the order imports complete in. False if
@@ -48,17 +53,17 @@ void checkWorthFetching() {
 //       "FAIL: the same frame arriving again is still drawn" and the coverage assert
 //       below. Observed 2026-08-21. Reverted.
 void checkSupersedesShown() {
-    check(WallpaperXItem::supersedesShown(7, 4), "a newer frame replaces what is shown");
-    check(!WallpaperXItem::supersedesShown(4, 7), "a frame older than what is shown is dropped");
-    check(WallpaperXItem::supersedesShown(7, 7), "the same frame arriving again is still drawn");
-    check(WallpaperXItem::supersedesShown(0, 9), "a frame of unknown generation is drawn rather than discarded");
+    check(WallpaperXItem::supersedesShown({7}, {4}), "a newer frame replaces what is shown");
+    check(!WallpaperXItem::supersedesShown({4}, {7}), "a frame older than what is shown is dropped");
+    check(WallpaperXItem::supersedesShown({7}, {7}), "the same frame arriving again is still drawn");
+    check(WallpaperXItem::supersedesShown({0}, {9}), "a frame of unknown generation is drawn rather than discarded");
 }
 
 // COVERAGE-ASSERT: the two rules must not be the same function. They differ deliberately at
 // equality, and a refactor that unified them would satisfy every check above except this one.
 void checkTheTwoRulesDiffer() {
     const bool differAtEquality =
-        !WallpaperXItem::worthFetching(5, 5) && WallpaperXItem::supersedesShown(5, 5);
+        !WallpaperXItem::worthFetching({5}, {5}) && WallpaperXItem::supersedesShown({5}, {5});
     check(differAtEquality, "fetching and drawing disagree about a repeated generation, deliberately");
 }
 
