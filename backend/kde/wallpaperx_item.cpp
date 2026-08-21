@@ -4,6 +4,7 @@
 
 #include <QDBusArgument>
 #include <QDBusConnection>
+#include <QDBusServiceWatcher>
 #include <QDBusPendingCall>
 #include <QDBusPendingCallWatcher>
 #include <QDBusReply>
@@ -72,6 +73,18 @@ WallpaperXItem::~WallpaperXItem() = default;
 void WallpaperXItem::setMonitorId(int monitorId) {
     if (m_monitorId == monitorId) return;
     m_monitorId = monitorId;
+
+    // Generations are per monitor, so the old screen's marks would reject the new screen's frames.
+    m_fetchedGeneration = 0;
+    {
+        std::lock_guard<std::mutex> lock(m_pendingMutex);
+        m_pending.reset();
+    }
+    {
+        std::lock_guard<std::mutex> lock(m_importedMutex);
+        m_shownGeneration = 0;
+    }
+
     emit monitorIdChanged();
     // A screen that has just been identified may already have a frame waiting; without this the
     // desktop stays blank until the next time the wallpaper happens to change.
@@ -97,8 +110,21 @@ void WallpaperXItem::connectToDaemon() {
     QDBusConnection::sessionBus().connect(QString::fromUtf8(kService), QString::fromUtf8(kPath),
                                           QString::fromUtf8(kInterface), QStringLiteral("FrameReady"), this,
                                           SLOT(onFrameReady(int, qulonglong)));
-    // Not asserted here: whether the daemon is up is settled by the first reply, since asking
-    // in advance is the blocking call this avoids.
+    // The item is created with the desktop, so the daemon may not own its name yet.
+    auto* watcher = new QDBusServiceWatcher(QString::fromUtf8(kService), QDBusConnection::sessionBus(),
+                                            QDBusServiceWatcher::WatchForOwnerChange, this);
+    connect(watcher, &QDBusServiceWatcher::serviceOwnerChanged, this,
+            [this](const QString&, const QString&, const QString& newOwner) {
+                setDaemonConnected(!newOwner.isEmpty());
+                if (newOwner.isEmpty()) {
+                    setUnavailableReason(tr("WallpaperX is not running."));
+                    return;
+                }
+                // A restarted daemon numbers from scratch.
+                m_fetchedGeneration = 0;
+                fetchFrame(0);
+            });
+
     if (m_monitorId >= 0) fetchFrame(0);
 }
 
@@ -130,10 +156,14 @@ void WallpaperXItem::fetchFrame(quint64 generation) {
     request.setArguments({m_monitorId});
     QDBusPendingCall pending = QDBusConnection::sessionBus().asyncCall(request);
     auto* watcher = new QDBusPendingCallWatcher(pending, this);
-    connect(watcher, &QDBusPendingCallWatcher::finished, this, [this](QDBusPendingCallWatcher* done) {
-        done->deleteLater();
-        takeFrameReply(done->reply());
-    });
+    // The reply carries no monitor id of its own.
+    const int requestedMonitor = m_monitorId;
+    connect(watcher, &QDBusPendingCallWatcher::finished, this,
+            [this, requestedMonitor](QDBusPendingCallWatcher* done) {
+                done->deleteLater();
+                if (requestedMonitor != m_monitorId) return;
+                takeFrameReply(done->reply());
+            });
 }
 
 void WallpaperXItem::takeFrameReply(const QDBusMessage& call) {
@@ -292,6 +322,14 @@ QSGNode* WallpaperXItem::updatePaintNode(QSGNode* old, UpdatePaintNodeData*) {
     return node;
 }
 
+// A still wallpaper sends no further FrameReady, so a released item must ask on its own.
+void WallpaperXItem::itemChange(ItemChange change, const ItemChangeData& value) {
+    QQuickItem::itemChange(change, value);
+    if (change != ItemSceneChange || value.window == nullptr) return;
+    if (m_monitorId < 0) return;
+    fetchFrame(0);
+}
+
 void WallpaperXItem::releaseResources() {
     // Called when this item leaves its window, which is NOT necessarily when the context dies:
     // an item moved between windows leaves a live context behind, and simply forgetting the
@@ -301,6 +339,10 @@ void WallpaperXItem::releaseResources() {
     // to the render thread. scheduleRenderJob is the way across: the job runs on the render
     // thread with the context current, which is the same pair of conditions updatePaintNode
     // satisfies. It takes a copy, so nothing outlives this object.
+
+    // Above the early return, so an item holding nothing drops the mark too.
+    m_fetchedGeneration = 0;
+
     FrameImport::Result doomed;
     {
         std::lock_guard<std::mutex> lock(m_importedMutex);

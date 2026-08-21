@@ -99,6 +99,7 @@ signals:
 protected:
     QSGNode* updatePaintNode(QSGNode* old, UpdatePaintNodeData* data) override;
     void releaseResources() override;
+    void itemChange(ItemChange change, const ItemChangeData& value) override;
 
 private slots:
     // FrameReady(monitor_id, frame_generation) from the daemon, on the GUI thread.
