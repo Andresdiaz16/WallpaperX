@@ -24,7 +24,10 @@ public:
     enum class HandleType { OpaqueFd = 0, DmaBuf = 1 };
 
     struct Request {
-        int fd = -1;  // consumed by a successful import; still the caller's to close on failure
+        // Set to -1 once import() has consumed it; the caller closes it only if still >= 0.
+        // Not keyed on success -- GL takes it before the texture exists, so a failed import
+        // can still have consumed it.
+        int fd = -1;
         uint32_t width = 0;
         uint32_t height = 0;
         uint64_t memorySize = 0;
@@ -49,14 +52,13 @@ public:
     // support, so a resolve-based check reports yes and then fails at the call.
     static bool supports(HandleType type, std::string* whyNot = nullptr);
 
-    // Imports `request` into a new texture. On success the fd has been consumed and must not be
-    // closed by the caller; on failure it is untouched and remains the caller's to close.
-    static Result import(const Request& request);
+    // Imports `request` into a new texture. By reference so it can report the fd's fate.
+    static Result import(Request& request);
 
 private:
     // The dma_buf half of import(), through EGLImage. Separate because the two paths share
     // nothing but their result: one hands the fd to GL, the other describes it to EGL.
-    static Result importDmaBuf(const Request& request);
+    static Result importDmaBuf(Request& request);
 
 public:
     // Frees what import() returned. Must run on the thread whose context created them, with

@@ -448,8 +448,9 @@ bool runImportChecks() {
         const bool importedOk = imported.texture != 0;
         check(importedOk, "an exported frame imports into a GL context on the same device");
         if (!importedOk) {
-            // The fd is still ours on a failed import, by the contract in frame_import.h.
-            if (frame.fd >= 0) ::close(frame.fd);
+            // request, not frame: import() clears the one it consumed, and a failed import may
+            // still have consumed it.
+            if (request.fd >= 0) ::close(request.fd);
             std::fprintf(stderr, "  on %s: %s\n", gl.renderer().c_str(), imported.error.c_str());
             return true;
         }
@@ -597,10 +598,54 @@ bool runImportChecks() {
         }
         check(afterRejected == beforeRejected,
               "a failed import leaves its file descriptor with the caller, neither closed nor leaked");
-        if (afterRejected != beforeRejected) {
-            std::fprintf(stderr, "  %d open fds before the failed import, %d after\n", beforeRejected, afterRejected);
+
+        // GOAL: a failure AFTER the driver has taken the descriptor still tells the caller the
+        //       descriptor is gone. The case above is refused before any driver call, so it
+        //       grades the early half only: on the opaque path GL takes the fd at
+        //       glImportMemoryFdEXT and two later steps can still fail. A caller told the fd is
+        //       still its own closes a number the process has since reused -- inside a
+        //       compositor, its own socket.
+        // WHY-THIS-SHAPE: asserted by asking whether the descriptor is STILL OPEN, not by
+        //       counting. Counting cannot see this: the caller's second close simply fails with
+        //       EBADF and the total is unchanged, which is exactly what a count-based version of
+        //       this check did -- it passed with the defect present, measured.
+        // CONTROL: `request.fd = -1` deleted from FrameImport::import after the importFd check ->
+        //       "FAIL: a failed import that consumed the descriptor says so...", printing
+        //       "import failed and returned fd 51, which is already closed". Observed
+        //       2026-08-21. Reverted.
+        {
+            const auto& lateTarget = targets.create(0, kWidth, kHeight);
+            targets.render(renderer, lateTarget);
+            wallpaperx::ExportedFrame lateFrame = wallpaperx::exportFrame(device, lateTarget);
+
+            wallpaperx::FrameImport::Request late = request;
+            late.fd = lateFrame.fd;
+            late.planes.clear();
+            for (const auto& plane : lateFrame.planes) late.planes.emplace_back(plane.offset, plane.rowPitch);
+            // Transposed, which is what this file's own control uses to make the texture
+            // allocation fail while the memory import succeeds.
+            late.width = kHeight;
+            late.height = kWidth;
+            const int lateFd = late.fd;
+
+            const wallpaperx::FrameImport::Result lateResult = wallpaperx::FrameImport::import(late);
+            if (lateResult.texture != 0) {
+                wallpaperx::FrameImport::release(lateResult);
+                if (late.fd >= 0) ::close(late.fd);
+                notVerified(kGoals, "the transposed import unexpectedly succeeded, so a failure past the memory "
+                                    "import could not be staged on this driver");
+            } else {
+                // Either it says it consumed the fd, or the fd it handed back is genuinely open.
+                const bool stillOpen = ::fcntl(lateFd, F_GETFD) != -1;
+                const bool honest = late.fd < 0 || stillOpen;
+                check(honest, "a failed import that consumed the descriptor says so, rather than handing back a "
+                              "number the caller would close twice");
+                if (!honest) {
+                    std::fprintf(stderr, "  import failed and returned fd %d, which is already closed\n", lateFd);
+                }
+                if (late.fd >= 0 && stillOpen) ::close(late.fd);
+            }
         }
-        ::close(rejected.fd);
 
         // The property that matters is that the count does not grow PER FRAME. A driver may hold
         // one descriptor of its own for an imported allocation and release it only with the
@@ -619,7 +664,7 @@ bool runImportChecks() {
 
             const wallpaperx::FrameImport::Result round = wallpaperx::FrameImport::import(again);
             if (round.texture == 0) {
-                if (extra.fd >= 0) ::close(extra.fd);
+                if (again.fd >= 0) ::close(again.fd);
                 notVerified(kGoals, "a repeat import failed, so descriptor growth could not be measured: " +
                                         round.error);
                 return true;

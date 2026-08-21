@@ -163,7 +163,7 @@ bool FrameImport::supports(HandleType type, std::string* whyNot) {
 // Unlike the memory-object path, EGL does NOT take the fd: eglCreateImage dups what it needs.
 // So on success this closes the fd itself, which is what makes both paths honour the same
 // contract -- a successful import consumes it. On failure it is left for the caller, as there.
-FrameImport::Result FrameImport::importDmaBuf(const Request& request) {
+FrameImport::Result FrameImport::importDmaBuf(Request& request) {
     Result out;
 
     if (request.planes.empty()) {
@@ -221,15 +221,15 @@ FrameImport::Result FrameImport::importDmaBuf(const Request& request) {
 
     // EGL holds its own duplicate now, so this one is ours to close -- and must be, or the
     // plugin leaks one descriptor per frame for the life of the session.
-    // EGL holds its own duplicate now, so this one is ours to close.
     ::close(request.fd);
+    request.fd = -1;
 
     out.texture = texture;
     out.eglImage = image;
     return out;
 }
 
-FrameImport::Result FrameImport::import(const Request& request) {
+FrameImport::Result FrameImport::import(Request& request) {
     Result out;
 
     if (request.fd < 0) {
@@ -293,6 +293,8 @@ FrameImport::Result FrameImport::import(const Request& request) {
         out.error = "glImportMemoryFdEXT rejected the exported memory";
         return out;
     }
+    // Gone from here on, whatever happens below.
+    request.fd = -1;
 
     GLuint texture = 0;
     glGenTextures(1, &texture);

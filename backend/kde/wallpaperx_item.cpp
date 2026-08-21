@@ -254,9 +254,6 @@ QSGNode* WallpaperXItem::updatePaintNode(QSGNode* old, UpdatePaintNodeData*) {
         if (imported.texture == 0) {
             setUnavailableReason(tr("WallpaperX produced a frame this desktop could not import."));
         } else {
-            // The fd was consumed by the import, so the pending frame must not close it.
-            incoming->request.fd = -1;
-
             // Freed only now, with the new texture in hand: releasing the old one before the
             // node has been repointed leaves the scene graph holding a deleted texture for the
             // rest of this pass.
