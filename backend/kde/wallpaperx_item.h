@@ -127,6 +127,9 @@ private:
     // The newest generation this item has fetched, so a signal for a frame already in hand
     // costs nothing. GUI thread only, like everything else the fetch path touches.
     quint64 m_fetchedGeneration = 0;
+    // A GetFrameFd is out; a further one is wanted once it lands. GUI thread only.
+    bool m_fetchInFlight = false;
+    bool m_refetchWhenDone = false;
     bool m_daemonConnected = false;
     QString m_unavailableReason;
 

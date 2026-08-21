@@ -599,19 +599,22 @@ struct PackageQmlFile {
     const ProbeType* probeTypes;   // one per module in probeImports
     std::size_t probeTypeCount;
     const char* probeTag;          // distinguishes this entry's probe files in the scratch dir
+    // Needs a build artefact of THIS project, not only Qt and Plasma, so it runs as its own
+    // ctest entry rather than withholding every other file's verdict with its own.
+    bool needsProjectModule;
 };
 
 constexpr PackageQmlFile kPackageQml[] = {
     {"contents/ui/main.qml", "import QtQuick\nimport org.kde.plasma.plasmoid\n", kMainProbeTypes,
-     std::size(kMainProbeTypes), "main"},
+     std::size(kMainProbeTypes), "main", false},
     // The one file that imports the project's own QML module, which is why the linter is given
     // the module's build-tree path above.
     {"contents/ui/WallpaperSurface.qml", "import QtQuick\nimport com.wallpaperx\n", kSurfaceProbeTypes,
-     std::size(kSurfaceProbeTypes), "surface"},
+     std::size(kSurfaceProbeTypes), "surface", true},
     {"contents/ui/config.qml",
      "import QtQuick\nimport QtQuick.Controls\nimport QtQuick.Layouts\n"
      "import org.kde.kirigami\nimport org.kde.plasma.plasma5support\n",
-     kConfigProbeTypes, std::size(kConfigProbeTypes), "config"},
+     kConfigProbeTypes, std::size(kConfigProbeTypes), "config", false},
 };
 
 // "WallpaperItem (org.kde.plasma.plasmoid), Rectangle (QtQuick)" -- for the line a passing run
@@ -1012,8 +1015,17 @@ void checkTableCoversTheDirectory() {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
     wallpaperx::testing::g_testName = "qml_lint_test";
+
+    // Which half of the table to walk.
+    const std::string selector = argc > 1 ? argv[1] : "";
+    if (!selector.empty() && selector != "surface") {
+        harnessFailure("unrecognised argument '" + selector + "' -- expected no argument, or 'surface'");
+        (void)wallpaperx::testing::reportHarnessFaults("in this test's invocation, not in the package");
+        return 1;
+    }
+    const bool surfaceRun = selector == "surface";
 
     const std::filesystem::path backendDir(WALLPAPERX_BACKEND_SOURCE_DIR);
     g_packageDir = backendDir / "kde" / "kpackage";
@@ -1037,9 +1049,11 @@ int main() {
     // Files whose oracle proved the linter could answer about them, so a verdict was owed.
     int reachedTheLinter = 0;
     try {
-        checkTableCoversTheDirectory();
+        // Default run only, so the completeness guard fires once rather than twice.
+        if (!surfaceRun) checkTableCoversTheDirectory();
 
         for (const PackageQmlFile& entry : kPackageQml) {
+            if (entry.needsProjectModule != surfaceRun) continue;
             const std::filesystem::path file = g_packageDir / entry.relative;
 
             // Established before qmllint is consulted, and this ordering is the check. qmllint

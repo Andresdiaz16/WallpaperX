@@ -52,6 +52,10 @@ struct ExportedFrame {
     uint64_t memorySize = 0;
     HandleType type = HandleType::OpaqueFd;
 
+    // The channel order, reported on BOTH paths: an opaque fd carries no layout but its bytes
+    // still have an order, and an importer that guesses draws red and blue transposed.
+    uint32_t drmFormat = 0;
+
     // DMA-BUF layout metadata (AMD/Intel), describing how to interpret the bytes
     // behind `fd`. Populated on the DmaBuf path only; the OpaqueFd (NVIDIA) path
     // leaves them at their unset sentinels because an opaque fd is importable only
@@ -59,7 +63,6 @@ struct ExportedFrame {
     // layout. Note that modifier's sentinel is kDrmModifierInvalid rather than 0 --
     // 0 is the valid DRM_FORMAT_MOD_LINEAR, so a zero default would be
     // indistinguishable from a genuine linear layout.
-    uint32_t drmFormat = 0;
     uint64_t modifier = kDrmModifierInvalid;
     std::vector<ExportedFramePlane> planes;
 };

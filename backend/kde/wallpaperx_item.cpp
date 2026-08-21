@@ -108,9 +108,14 @@ void WallpaperXItem::connectToDaemon() {
     // Messages are built by hand rather than through QDBusInterface, whose constructor blocks on
     // an Introspect round trip -- on the thread that runs the compositor's UI, from a QML item's
     // constructor. Nothing here waits on the bus.
-    QDBusConnection::sessionBus().connect(QString::fromUtf8(kService), QString::fromUtf8(kPath),
-                                          QString::fromUtf8(kInterface), QStringLiteral("FrameReady"), this,
-                                          SLOT(onFrameReady(int, qulonglong)));
+    const bool subscribed = QDBusConnection::sessionBus().connect(
+        QString::fromUtf8(kService), QString::fromUtf8(kPath), QString::fromUtf8(kInterface),
+        QStringLiteral("FrameReady"), this, SLOT(onFrameReady(int, qulonglong)));
+    if (!subscribed) {
+        // Otherwise the wallpaper silently stops changing.
+        setUnavailableReason(tr("WallpaperX is running, but this plugin could not subscribe to frame updates."));
+        return;
+    }
     // The item is created with the desktop, so the daemon may not own its name yet.
     auto* watcher = new QDBusServiceWatcher(QString::fromUtf8(kService), QDBusConnection::sessionBus(),
                                             QDBusServiceWatcher::WatchForOwnerChange, this);
@@ -145,6 +150,14 @@ void WallpaperXItem::fetchFrame(quint64 generation) {
     // what generation the daemon is on.
     if (!worthFetching(Arriving{generation}, Held{m_fetchedGeneration})) return;
 
+    // The mark above only moves when a reply lands, so it cannot suppress a burst that arrives
+    // while one is out. One trailing fetch subsumes them: GetFrameFd serves the current frame.
+    if (m_fetchInFlight) {
+        m_refetchWhenDone = true;
+        return;
+    }
+    m_fetchInFlight = true;
+
     // ASYNCHRONOUS, and this is not a preference. A blocking call here parks the thread that
     // runs the compositor's UI until the daemon answers -- and worse, the first fetch happens
     // while QML is still building this item, where the nested event loop a blocking call needs
@@ -162,8 +175,11 @@ void WallpaperXItem::fetchFrame(quint64 generation) {
     connect(watcher, &QDBusPendingCallWatcher::finished, this,
             [this, requestedMonitor](QDBusPendingCallWatcher* done) {
                 done->deleteLater();
-                if (requestedMonitor != m_monitorId) return;
-                takeFrameReply(done->reply());
+                // Cleared before any early return, or one dropped reply stops fetching for good.
+                m_fetchInFlight = false;
+                const bool queued = std::exchange(m_refetchWhenDone, false);
+                if (requestedMonitor == m_monitorId) takeFrameReply(done->reply());
+                if (queued) fetchFrame(0);
             });
 }
 

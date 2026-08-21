@@ -4,8 +4,9 @@
 // screen should show, identifying itself by connector name -- the one fact both sides derive
 // from the hardware, so nothing has to stay in sync.
 //
-// No renderer yet: WallpaperXRenderer arrives in Step 12, and naming a QML type that does not
-// exist makes the whole file fail to load, which is a black desktop with nothing logged.
+// This file must never import com.wallpaperx: naming a QML type that fails to resolve takes the
+// whole entry file down, which is a black desktop with nothing logged. The renderer is reached
+// through the Loader below -- see WallpaperSurface.qml.
 import QtQuick
 import org.kde.plasma.plasmoid
 
@@ -208,10 +209,7 @@ WallpaperItem {
         root.reply = object;
     }
 
-    // Opaque, because a message drawn over an unknown desktop may be unreadable, and a
-    // transparent plugin that failed is indistinguishable from no plugin at all.
-    // The wallpaper itself, loaded rather than imported: see WallpaperSurface.qml for why
-    // main.qml must not import com.wallpaperx directly. A module that fails to load leaves this
+    // The wallpaper itself, loaded rather than imported. A module that fails to load leaves this
     // Loader in Error and the message below still describes the screen, instead of taking the
     // whole plugin down with it.
     Loader {
@@ -255,10 +253,10 @@ WallpaperItem {
 
         objectName: "wallpaperxBackdrop"
         anchors.fill: parent
-        // Hidden rather than drawn under the wallpaper: it is opaque, and a frame that has been
-        // imported is what the user should see. Shown again the moment anything goes wrong.
-        // Keyed on the renderer drawing, not merely on its module having loaded: a renderer that
-        // loads and cannot draw would otherwise leave a black screen explaining nothing.
+        // Opaque, because a message drawn over an unknown desktop may be unreadable, and a
+        // transparent plugin that failed is indistinguishable from no plugin at all. So it is
+        // hidden rather than drawn under the wallpaper, and shown again the moment anything goes
+        // wrong -- keyed on the renderer drawing, not merely on its module having loaded.
         visible: !(surface.status === Loader.Ready && root.screenState === "set" && root.rendererReason === "")
         color: "#1b1b1b"
 

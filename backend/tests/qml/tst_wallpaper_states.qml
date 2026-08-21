@@ -996,20 +996,25 @@ TestCase {
     //       sits behind a Loader rather than an import: a failed import at the top of this file
     //       takes the plugin down, and a wallpaper plugin that fails to load is a black desktop
     //       with nothing logged.
-    // WHY-THIS-SHAPE: this harness has no com.wallpaperx on its import path, so the Loader
-    //       genuinely fails here and the check reads a real failure rather than a simulated one.
-    //       Asserted as "the message still works" rather than "the file loaded", because loading
-    //       and then showing nothing is the failure this guards against.
+    // WHY-THIS-SHAPE: the drive carries a monitor_id, which is what makes the Loader ACTIVE -- and
+    //       activation is the whole point. suite.goodReply has no id, so a drive using it leaves
+    //       `active` false, the module load never attempted, and every assertion below satisfied
+    //       by a Loader that is simply switched off. This harness has no com.wallpaperx on its
+    //       import path, so an active Loader genuinely reaches Loader.Error here.
     // COVERAGE: no control is run for this one. Making the module loadable here would need the
     //       built plugin on the harness's import path, at which point the check stops testing
-    //       what it is for. It is graded by the state it observes -- Loader not Ready -- which is
-    //       asserted rather than assumed.
+    //       what it is for. The two states an inactive Loader cannot fake -- active, and Error --
+    //       are asserted instead.
     function test_a_missing_renderer_module_leaves_the_message_working() {
-        const item = drivenPlugin({ connector: suite.namedScreen, drive: [200, suite.goodReply] });
+        const item = drivenPlugin({
+            connector: suite.namedScreen,
+            drive: [200, '{"output":"DP-3","known":true,"path":"/w.png","monitor_id":0}']
+        });
         const surface = childNamed(item, "wallpaperxSurface");
         verify(surface !== null, "the plugin has a surface");
-        verify(surface.status !== Loader.Ready,
-               "this harness has no renderer module, which is what makes this check meaningful");
+        verify(surface.active, "the Loader actually tried to load the renderer module");
+        compare(surface.status, Loader.Error,
+                "the module cannot be loaded on this harness, which is the state being graded");
         verify(item.describe().length > 0, "the plugin still describes the screen");
         const backdrop = childNamed(item, "wallpaperxBackdrop");
         verify(backdrop !== null && backdrop.visible,

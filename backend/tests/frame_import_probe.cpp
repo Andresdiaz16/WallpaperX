@@ -44,6 +44,7 @@
 #include <array>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <string>
 #include <vector>
 
@@ -657,8 +658,12 @@ bool runImportChecks() {
             targets.render(renderer, spare);
             wallpaperx::ExportedFrame extra = wallpaperx::exportFrame(device, spare);
 
+            // Metadata from THIS export: exportFrame recomputes it per image.
             wallpaperx::FrameImport::Request again = request;
             again.fd = extra.fd;
+            again.memorySize = extra.memorySize;
+            again.drmFormat = extra.drmFormat;
+            again.drmModifier = extra.modifier;
             again.planes.clear();
             for (const auto& plane : extra.planes) again.planes.emplace_back(plane.offset, plane.rowPitch);
 
@@ -693,9 +698,18 @@ bool runImportChecks() {
 
 int main() {
     wallpaperx::testing::g_testName = "frame_import_probe";
-    const bool ok = runImportChecks();
-    if (!ok) return 1;
-    if (wallpaperx::testing::reportCheckFailures()) return 1;
-    if (wallpaperx::testing::reportHarnessFaults("while importing an exported frame")) return 1;
+    // Everything this drives reports failure by throwing, and without a boundary a host with no
+    // Vulkan ends in std::terminate -- a failure carrying no reason.
+    bool ok = false;
+    try {
+        ok = runImportChecks();
+    } catch (const std::exception& e) {
+        wallpaperx::testing::harnessFailure(std::string("the probe could not build its preconditions: ") +
+                                            e.what());
+    }
+    // Both reports run before the verdict, or a fault's reason line is never printed.
+    const bool failed = wallpaperx::testing::reportCheckFailures();
+    const bool faulted = wallpaperx::testing::reportHarnessFaults("while importing an exported frame");
+    if (!ok || failed || faulted) return 1;
     return wallpaperx::testing::reportNotVerifiedOrPassed();
 }

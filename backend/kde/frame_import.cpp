@@ -261,6 +261,35 @@ FrameImport::Result FrameImport::import(Request& request) {
 
     if (request.handleType == HandleType::DmaBuf) return importDmaBuf(request);
 
+    // GL_RGBA8 carries neither the channel order nor the alpha semantics, so both are decoded
+    // here and applied as swizzles below. Before anything is allocated, so a format this cannot
+    // lay out fails while the fd is still the caller's to close.
+    constexpr uint32_t kXrgb8888 = 'X' | ('R' << 8) | ('2' << 16) | ('4' << 24);
+    constexpr uint32_t kArgb8888 = 'A' | ('R' << 8) | ('2' << 16) | ('4' << 24);
+    constexpr uint32_t kXbgr8888 = 'X' | ('B' << 8) | ('2' << 16) | ('4' << 24);
+    constexpr uint32_t kAbgr8888 = 'A' | ('B' << 8) | ('2' << 16) | ('4' << 24);
+
+    bool swapRedAndBlue = false;
+    bool alphaIsUndefined = false;
+    switch (request.drmFormat) {
+        case kXrgb8888:
+            swapRedAndBlue = true;
+            alphaIsUndefined = true;
+            break;
+        case kArgb8888:
+            swapRedAndBlue = true;
+            break;
+        case kXbgr8888:
+            alphaIsUndefined = true;
+            break;
+        case kAbgr8888:
+            break;
+        default:
+            // Laid out as 8-bit RGBA it would import cleanly and draw garbage.
+            out.error = "the daemon exported a pixel format this importer cannot lay out";
+            return out;
+    }
+
     const MemoryObjectApi& api = memoryObjectApi();
 
     GLuint memory = 0;
@@ -310,25 +339,13 @@ FrameImport::Result FrameImport::import(Request& request) {
         out.error = "glTexStorageMem2DEXT could not back a texture with the imported memory";
         return out;
     }
-    // The memory has a channel order and GL_RGBA8 storage does not carry it. The daemon renders
-    // B8G8R8A8, so sampling the imported memory as RGBA returns red and blue transposed -- the
-    // first cross-process frame came out with a green corner where it should have been red.
-    // Swizzled rather than storing as BGRA because glTexStorageMem2DEXT takes a sized internal
+    // Swizzled rather than stored as BGRA because glTexStorageMem2DEXT takes a sized internal
     // format and there is no BGRA one; the swizzle is free at sample time.
-    //
-    // Keyed on the format the daemon reports rather than on the daemon being what it is today:
-    // an X/ARGB fourcc is byte order B,G,R,A in memory, and an X/ABGR one is already RGBA.
-    constexpr uint32_t kXrgb8888 = 'X' | ('R' << 8) | ('2' << 16) | ('4' << 24);
-    constexpr uint32_t kArgb8888 = 'A' | ('R' << 8) | ('2' << 16) | ('4' << 24);
-    constexpr uint32_t kXbgr8888 = 'X' | ('B' << 8) | ('2' << 16) | ('4' << 24);
-    if (request.drmFormat == kXrgb8888 || request.drmFormat == kArgb8888) {
+    if (swapRedAndBlue) {
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R, GL_BLUE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_B, GL_RED);
     }
-    // The X in an X fourcc means the alpha bytes are undefined. GL_RGBA8 storage cannot say so,
-    // so alpha is forced here; otherwise unwritten bytes are sampled as real coverage and the
-    // wallpaper blends against black. The dma_buf path gets this from EGL for free.
-    if (request.drmFormat == kXrgb8888 || request.drmFormat == kXbgr8888) {
+    if (alphaIsUndefined) {
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_A, GL_ONE);
     }
     glBindTexture(GL_TEXTURE_2D, 0);

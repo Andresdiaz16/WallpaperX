@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace wallpaperx {
@@ -32,9 +33,11 @@ public:
         uint32_t height = 0;
         uint64_t memorySize = 0;
         HandleType handleType = HandleType::OpaqueFd;
-        // DMA_BUF only. The modifier's sentinel is DRM_FORMAT_MOD_INVALID, not 0 -- 0 is LINEAR,
-        // a perfectly valid layout.
+        // Required for BOTH handle types: it is the channel order, and the opaque path has no
+        // other source for it. Left at 0, an opaque import is refused rather than drawn wrong.
         uint32_t drmFormat = 0;
+        // DMA_BUF only, both of them. The modifier's sentinel is DRM_FORMAT_MOD_INVALID, not
+        // 0 -- 0 is LINEAR, a perfectly valid layout.
         uint64_t drmModifier = 0;
         std::vector<std::pair<uint64_t, uint64_t>> planes;  // offset, rowPitch
     };
