@@ -2,6 +2,7 @@
 
 #include "wallpaperx_item.h"
 
+#include <QDBusArgument>
 #include <QDBusConnection>
 #include <QDBusInterface>
 #include <QDBusPendingCall>
@@ -153,6 +154,21 @@ void WallpaperXItem::takeFrameReply(const QDBusMessage& call) {
     frame.generation = args.at(6).toULongLong();
     frame.request.drmFormat = args.at(7).toUInt();
     frame.request.drmModifier = args.at(8).toULongLong();
+
+    // Field 9, the per-plane offsets and pitches. Only the dma_buf path needs them, but they are
+    // read for both: an opaque frame simply carries none, and reading conditionally would make
+    // the parse depend on a field the parse has just read.
+    const QDBusArgument planes = args.at(9).value<QDBusArgument>();
+    planes.beginArray();
+    while (!planes.atEnd()) {
+        quint64 offset = 0;
+        quint64 pitch = 0;
+        planes.beginStructure();
+        planes >> offset >> pitch;
+        planes.endStructure();
+        frame.request.planes.emplace_back(offset, pitch);
+    }
+    planes.endArray();
 
     if (frame.request.fd < 0) {
         setUnavailableReason(tr("WallpaperX sent a frame this plugin could not take hold of."));

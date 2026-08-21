@@ -3,8 +3,11 @@
 #include "frame_import.h"
 
 #include <EGL/egl.h>
+#include <EGL/eglext.h>
 #include <GL/gl.h>
 #include <GL/glext.h>
+
+#include <unistd.h>
 
 #include <cstring>
 #include <utility>
@@ -70,17 +73,73 @@ void setWhyNot(std::string* whyNot, const char* reason) {
     if (whyNot != nullptr) *whyNot = reason;
 }
 
+// The EGLImage side, for dma_buf. A dma_buf cannot go through GL memory objects: that needs
+// GL_EXT_memory_object_dma_buf, which neither the NVIDIA driver nor Mesa advertises here.
+struct EglImageApi {
+    using CreateFn = EGLImageKHR (*)(EGLDisplay, EGLContext, EGLenum, EGLClientBuffer, const EGLAttrib*);
+    using DestroyFn = EGLBoolean (*)(EGLDisplay, EGLImageKHR);
+    using TargetTextureFn = void (*)(GLenum, GLeglImageOES);
+
+    CreateFn create = nullptr;
+    DestroyFn destroy = nullptr;
+    TargetTextureFn targetTexture = nullptr;
+
+    bool complete() const { return create != nullptr && destroy != nullptr && targetTexture != nullptr; }
+};
+
+const EglImageApi& eglImageApi() {
+    static const EglImageApi api = [] {
+        EglImageApi resolved;
+        // The EXT spelling, not KHR: it takes EGLAttrib (64-bit), which the modifier halves and
+        // plane offsets need. The KHR form's EGLint attributes cannot carry them.
+        resolved.create = reinterpret_cast<EglImageApi::CreateFn>(eglGetProcAddress("eglCreateImage"));
+        resolved.destroy = reinterpret_cast<EglImageApi::DestroyFn>(eglGetProcAddress("eglDestroyImage"));
+        resolved.targetTexture =
+            reinterpret_cast<EglImageApi::TargetTextureFn>(eglGetProcAddress("glEGLImageTargetTexture2DOES"));
+        return resolved;
+    }();
+    return api;
+}
+
+bool hasEglExtension(const char* wanted) {
+    EGLDisplay display = eglGetCurrentDisplay();
+    if (display == EGL_NO_DISPLAY) return false;
+    const char* extensions = eglQueryString(display, EGL_EXTENSIONS);
+    if (extensions == nullptr) return false;
+    // Matched as a whole token: a substring search reports EGL_EXT_image_dma_buf_import present
+    // when only EGL_EXT_image_dma_buf_import_modifiers is.
+    const size_t length = std::strlen(wanted);
+    for (const char* at = std::strstr(extensions, wanted); at != nullptr; at = std::strstr(at + 1, wanted)) {
+        const bool startOk = at == extensions || at[-1] == ' ';
+        const bool endOk = at[length] == '\0' || at[length] == ' ';
+        if (startOk && endOk) return true;
+    }
+    return false;
+}
+
 }  // namespace
 
 bool FrameImport::supports(HandleType type, std::string* whyNot) {
     if (type == HandleType::DmaBuf) {
-        // Not implemented rather than not supported, and the two must not be confused: the
-        // driver here does advertise EGL_EXT_image_dma_buf_import, so this is a gap in this
-        // file. GL_EXT_memory_object_dma_buf -- what the plan originally called for -- is
-        // advertised by neither the NVIDIA driver nor llvmpipe on this machine.
-        setWhyNot(whyNot, "importing a dma_buf is not implemented yet; it needs the EGLImage path "
-                          "(eglCreateImageKHR with EGL_LINUX_DMA_BUF_EXT), not GL memory objects");
-        return false;
+        if (!hasEglExtension("EGL_EXT_image_dma_buf_import")) {
+            setWhyNot(whyNot, "this EGL does not advertise EGL_EXT_image_dma_buf_import");
+            return false;
+        }
+        // The modifier is not optional here: the daemon refuses to export a dma_buf without an
+        // explicit one, so an EGL that cannot be told the modifier cannot describe the image.
+        if (!hasEglExtension("EGL_EXT_image_dma_buf_import_modifiers")) {
+            setWhyNot(whyNot, "this EGL does not advertise EGL_EXT_image_dma_buf_import_modifiers");
+            return false;
+        }
+        if (!hasGlExtension("GL_OES_EGL_image")) {
+            setWhyNot(whyNot, "this GL context cannot bind an EGLImage to a texture (no GL_OES_EGL_image)");
+            return false;
+        }
+        if (!eglImageApi().complete()) {
+            setWhyNot(whyNot, "the EGLImage entry points could not be resolved");
+            return false;
+        }
+        return true;
     }
 
     if (!hasGlExtension("GL_EXT_memory_object")) {
@@ -96,6 +155,77 @@ bool FrameImport::supports(HandleType type, std::string* whyNot) {
         return false;
     }
     return true;
+}
+
+// The dma_buf path. The fd, the modifier and the per-plane offsets and pitches describe the
+// image to EGL, which hands back an EGLImage that a texture is then pointed at.
+//
+// Unlike the memory-object path, EGL does NOT take the fd: eglCreateImage dups what it needs.
+// So on success this closes the fd itself, which is what makes both paths honour the same
+// contract -- a successful import consumes it. On failure it is left for the caller, as there.
+FrameImport::Result FrameImport::importDmaBuf(const Request& request) {
+    Result out;
+
+    if (request.planes.empty()) {
+        out.error = "a dma_buf frame carries no plane layout, so EGL cannot be told where the pixels are";
+        return out;
+    }
+    // One plane is what this handles. A compressed modifier on Intel or AMD can carry a second
+    // metadata plane, and silently importing only the first would draw the image without its
+    // compression metadata -- garbage, not a degraded picture.
+    if (request.planes.size() > 1) {
+        out.error = "this frame has more than one memory plane, which the importer does not describe yet";
+        return out;
+    }
+
+    const EglImageApi& api = eglImageApi();
+    EGLDisplay display = eglGetCurrentDisplay();
+    if (display == EGL_NO_DISPLAY) {
+        out.error = "no current EGL display to import against";
+        return out;
+    }
+
+    const EGLAttrib attributes[] = {
+        EGL_WIDTH, static_cast<EGLAttrib>(request.width),
+        EGL_HEIGHT, static_cast<EGLAttrib>(request.height),
+        EGL_LINUX_DRM_FOURCC_EXT, static_cast<EGLAttrib>(request.drmFormat),
+        EGL_DMA_BUF_PLANE0_FD_EXT, static_cast<EGLAttrib>(request.fd),
+        EGL_DMA_BUF_PLANE0_OFFSET_EXT, static_cast<EGLAttrib>(request.planes[0].first),
+        EGL_DMA_BUF_PLANE0_PITCH_EXT, static_cast<EGLAttrib>(request.planes[0].second),
+        // Split across two attributes because the modifier is 64-bit. Passed always, not only
+        // when it is non-zero: zero is DRM_FORMAT_MOD_LINEAR, a real layout, and omitting it
+        // would let the driver infer a different one.
+        EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT, static_cast<EGLAttrib>(request.drmModifier & 0xffffffffu),
+        EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT, static_cast<EGLAttrib>(request.drmModifier >> 32),
+        EGL_NONE};
+
+    EGLImageKHR image = api.create(display, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, nullptr, attributes);
+    if (image == EGL_NO_IMAGE_KHR) {
+        out.error = "eglCreateImage rejected the exported dma_buf";
+        return out;
+    }
+
+    GLuint texture = 0;
+    glGenTextures(1, &texture);
+    glBindTexture(GL_TEXTURE_2D, texture);
+    api.targetTexture(GL_TEXTURE_2D, static_cast<GLeglImageOES>(image));
+    const bool bound = glGetError() == GL_NO_ERROR;
+    glBindTexture(GL_TEXTURE_2D, 0);
+
+    if (!bound) {
+        glDeleteTextures(1, &texture);
+        api.destroy(display, image);
+        out.error = "the EGLImage could not be bound to a texture";
+        return out;
+    }
+
+    // EGL holds its own duplicate now, so this one is ours to close -- and must be, or the
+    // plugin leaks one descriptor per frame for the life of the session.
+    ::close(request.fd);
+
+    out.texture = texture;
+    out.eglImage = image;
+    return out;
 }
 
 FrameImport::Result FrameImport::import(const Request& request) {
@@ -119,12 +249,14 @@ FrameImport::Result FrameImport::import(const Request& request) {
         return out;
     }
 
-    const MemoryObjectApi& api = memoryObjectApi();
-
     // Cleared first: a stale error from earlier in this context would otherwise be attributed
     // to whichever call below happens to be checked next.
     while (glGetError() != GL_NO_ERROR) {
     }
+
+    if (request.handleType == HandleType::DmaBuf) return importDmaBuf(request);
+
+    const MemoryObjectApi& api = memoryObjectApi();
 
     GLuint memory = 0;
     api.create(1, &memory);
@@ -198,6 +330,13 @@ void FrameImport::release(const Result& imported) {
     if (imported.texture != 0) {
         const GLuint texture = imported.texture;
         glDeleteTextures(1, &texture);
+    }
+    if (imported.eglImage != nullptr) {
+        const EglImageApi& api = eglImageApi();
+        EGLDisplay display = eglGetCurrentDisplay();
+        if (api.destroy != nullptr && display != EGL_NO_DISPLAY) {
+            api.destroy(display, static_cast<EGLImageKHR>(imported.eglImage));
+        }
     }
     if (imported.memoryObject != 0) {
         const MemoryObjectApi& api = memoryObjectApi();

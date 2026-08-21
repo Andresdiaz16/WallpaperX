@@ -38,6 +38,7 @@
 
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdio>
 #include <cstring>
@@ -235,11 +236,6 @@ bool runImportChecks() {
             notVerified(kGoals, "no GL context on the same device as the Vulkan one -- " + why);
             return true;
         }
-        if (!wallpaperx::FrameImport::supports(wallpaperx::FrameImport::HandleType::OpaqueFd, &why)) {
-            notVerified(kGoals,
-                        std::string("the GL context on that device (") + gl.renderer() + ") cannot import an opaque fd -- " + why);
-            return true;
-        }
         wallpaperx::OffscreenTargetManager targets(device);
         wallpaperx::StaticRenderer renderer(device, targets.renderPass(), imagePath, WALLPAPERX_SHADER_DIR);
 
@@ -261,19 +257,32 @@ bool runImportChecks() {
         targets.render(renderer, target);
         wallpaperx::ExportedFrame frame = wallpaperx::exportFrame(device, target);
 
-        if (frame.type != wallpaperx::ExportedFrame::HandleType::OpaqueFd) {
-            if (frame.fd >= 0) ::close(frame.fd);
-            notVerified(kGoals, "this device exported a dma_buf, which the importer does not handle yet -- run this "
-                                "probe with WALLPAPERX_FORCE_HANDLE_TYPE=opaque to reach the path under test");
-            return true;
-        }
+        const bool isDmaBuf = frame.type == wallpaperx::ExportedFrame::HandleType::DmaBuf;
 
         wallpaperx::FrameImport::Request request;
         request.fd = frame.fd;
         request.width = kWidth;
         request.height = kHeight;
         request.memorySize = frame.memorySize;
-        request.handleType = wallpaperx::FrameImport::HandleType::OpaqueFd;
+        request.handleType = isDmaBuf ? wallpaperx::FrameImport::HandleType::DmaBuf
+                                      : wallpaperx::FrameImport::HandleType::OpaqueFd;
+        request.drmFormat = frame.drmFormat;
+        request.drmModifier = frame.modifier;
+        for (const auto& plane : frame.planes) {
+            request.planes.emplace_back(plane.offset, plane.rowPitch);
+        }
+
+        // Which path runs is the device's choice, not this probe's: NVIDIA exports opaque by
+        // policy and Mesa exports dma_buf. Both are under test, and the run says which it took
+        // so a green log cannot be mistaken for covering both.
+        std::printf("frame_import_probe: %s path, on %s\n", isDmaBuf ? "dma_buf" : "opaque fd",
+                    gl.renderer().c_str());
+        if (!wallpaperx::FrameImport::supports(request.handleType, &why)) {
+            if (frame.fd >= 0) ::close(frame.fd);
+            notVerified(kGoals, std::string("this context cannot import the handle type this device exports (") +
+                                    (isDmaBuf ? "dma_buf" : "opaque fd") + ") -- " + why);
+            return true;
+        }
 
         // GOAL: S12.2 -- the import succeeds once the pairing is known good. Graded as a
         //       FAILURE, not a skip: every reason an import could legitimately be impossible
@@ -308,7 +317,28 @@ bool runImportChecks() {
 
         // GOAL: S12.1 -- the imported texture holds the pixels that were rendered.
         // CONTROL: `request.width` and `request.height` swapped at the import site
-        const bool same = got.size() == expected.size() && got == expected;
+        // CONTROL, dma_buf path: the plane pitch replaced by an assumed `width * 4` in
+        //       FrameImport::importDmaBuf -> "FAIL: the imported texture holds the frame that
+        //       was rendered, byte for byte", 7101 of 9792 bytes differing on llvmpipe.
+        //       Observed 2026-08-21 on the lavapipe entry. Reverted.
+        // NOT COVERED, measured rather than assumed: forcing the DRM modifier to 0 changes
+        //       nothing here, because lavapipe renders LINEAR and 0 IS linear. The modifier
+        //       plumbing is therefore exercised but not graded, and would need a device that
+        //       picks a tiled or compressed modifier -- which this machine has none of, since
+        //       its only other Vulkan device is NVIDIA and that exports an opaque fd.
+        // Compared both ways round, because the two import paths report channels differently and
+        // the difference is not a defect. The memory-object path lays GL_RGBA8 over the raw
+        // bytes, so a framebuffer read returns them in memory order -- the same order the Vulkan
+        // readback is in. The EGLImage path is told the fourcc, so EGL interprets the channels
+        // and a read comes back as RGBA against a B8G8R8A8 render. Requiring the raw order would
+        // fail the dma_buf path for being correct.
+        const auto swappedRedBlue = [](const std::vector<unsigned char>& in) {
+            std::vector<unsigned char> out = in;
+            for (size_t i = 0; i + 3 < out.size(); i += 4) std::swap(out[i], out[i + 2]);
+            return out;
+        };
+        const bool same = got.size() == expected.size() &&
+                          (got == expected || got == swappedRedBlue(expected));
         check(same, "the imported texture holds the frame that was rendered, byte for byte");
         if (!same) {
             size_t differing = 0;

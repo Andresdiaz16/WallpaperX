@@ -39,6 +39,7 @@ public:
     struct Result {
         unsigned int texture = 0;       // GL texture name, 0 when the import failed
         unsigned int memoryObject = 0;  // GL memory object backing it, 0 on the EGLImage path
+        void* eglImage = nullptr;       // EGLImageKHR backing it, null on the memory-object path
         std::string error;              // why, when texture is 0
     };
 
@@ -52,6 +53,12 @@ public:
     // closed by the caller; on failure it is untouched and remains the caller's to close.
     static Result import(const Request& request);
 
+private:
+    // The dma_buf half of import(), through EGLImage. Separate because the two paths share
+    // nothing but their result: one hands the fd to GL, the other describes it to EGL.
+    static Result importDmaBuf(const Request& request);
+
+public:
     // Frees what import() returned. Must run on the thread whose context created them, with
     // that context current -- the scene graph's render thread, for the QQuickItem.
     static void release(const Result& imported);

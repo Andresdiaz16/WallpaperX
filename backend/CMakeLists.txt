@@ -161,11 +161,22 @@ if(EGL_FOUND AND OpenGL_OpenGL_FOUND)
     # The QQuickItem that puts an imported frame on the desktop. Needs Qt, so it is guarded --
     # the importer below it is not, which is what lets the probe run on a headless CI machine
     # with no Qt at all.
+    # Two entries because there are two import paths and the DEVICE chooses which: this one runs
+    # on whatever Vulkan resolves to by default -- NVIDIA here, which exports an opaque fd --
+    # and the lavapipe twin below gets a dma_buf. Neither forces a handle type: forcing one
+    # would test the importer against a handle the daemon would not really have sent.
     add_test(NAME frame_import_probe COMMAND wallpaperx-frame-import-probe)
     set_tests_properties(frame_import_probe PROPERTIES
         LABELS "novulkan"
-        ENVIRONMENT "WALLPAPERX_FORCE_HANDLE_TYPE=opaque"
         SKIP_RETURN_CODE 77)
+
+    if(WALLPAPERX_LAVAPIPE_ICD)
+        add_test(NAME frame_import_probe_lavapipe COMMAND wallpaperx-frame-import-probe)
+        set_tests_properties(frame_import_probe_lavapipe PROPERTIES
+            ENVIRONMENT "VK_ICD_FILENAMES=${WALLPAPERX_LAVAPIPE_ICD}"
+            LABELS "lavapipe"
+            SKIP_RETURN_CODE 77)
+    endif()
 else()
     # Named rather than silently skipped: without this the plugin cannot display anything, so a
     # build missing it is not a smaller build, it is one that cannot do the step's whole job.
