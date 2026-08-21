@@ -905,6 +905,93 @@ TestCase {
         verify(item.describe().length > 0, "and it still has something to say");
     }
 
+    // The one configuration where main.qml hides the backdrop: a stand-in renderer loaded on a
+    // "set" screen. Every precondition is asserted, because a stand-in that failed to load leaves
+    // the backdrop legitimately visible and the checks that move it would grade nothing.
+    function drawnScreenWithStandIn() {
+        const item = loadPlugin(suite.namedScreen);
+        const surface = childNamed(item, "wallpaperxSurface");
+        const backdrop = childNamed(item, "wallpaperxBackdrop");
+        verify(surface !== null && backdrop !== null, "the plugin has a surface and a backdrop");
+        surface.sourceComponent = standInRenderer;
+
+        item.apply(200, '{"output":"DP-3","known":true,"path":"/w.png","monitor_id":0}');
+        compare(item.screenState, "set", "the drive reaches the state that draws a wallpaper");
+        compare(surface.status, Loader.Ready, "the stand-in renderer loaded");
+        verify(surface.item !== null, "the renderer occupies the surface");
+        compare(item.rendererReason, "", "a renderer that has said nothing reports no reason");
+        verify(!backdrop.visible, "the backdrop starts hidden, which is what these checks move");
+        return { item: item, surface: surface, backdrop: backdrop };
+    }
+
+    // GOAL: a renderer that LOADED and still cannot draw brings the message back, and stops
+    //       covering the screen once it recovers. False either way round: a Loader.Ready that
+    //       hides the backdrop on its own leaves a black desktop for an import the driver
+    //       refused, and a reason that never clears leaves the desktop covered after the next
+    //       import succeeds.
+    // WHY-THIS-SHAPE: driven through the loaded item's own `unavailableReason`, not by writing
+    //       root.rendererReason -- setting the plugin's property directly would grade nothing but
+    //       the backdrop binding, and the defect was that nothing carried the renderer's property
+    //       across at all. Both directions are driven on ONE instance, because a fresh plugin per
+    //       direction cannot show a stale reason outliving itself.
+    // CONTROL: `&& root.rendererReason === ""` deleted from the backdrop's `visible` in main.qml
+    //       -> "FAIL!: 'a renderer that loaded and cannot draw is covered by the message again'
+    //       returned FALSE". The clearing half seen red separately, with main.qml's
+    //       onUnavailableReasonChanged made conditional on a non-empty reason -> "FAIL!: 'a
+    //       renderer that recovers does not leave the desktop covered' returned FALSE". Observed
+    //       2026-08-21. Both reverted.
+    function test_a_loaded_renderer_that_cannot_draw_brings_the_message_back() {
+        const drawn = drawnScreenWithStandIn();
+        const reason = "the scene graph is not on OpenGL";
+
+        // The backdrop is asserted before the property that feeds it in both halves: it is the
+        // goal, and a compare() failure aborts the function, so the reverse order would leave the
+        // check that matters unreached whenever the reason itself stopped arriving.
+        drawn.surface.item.unavailableReason = reason;
+        verify(drawn.backdrop.visible,
+               "a renderer that loaded and cannot draw is covered by the message again");
+        compare(drawn.item.rendererReason, reason, "the renderer's reason reaches the plugin");
+        compare(drawn.surface.status, Loader.Ready,
+                "the renderer is still loaded, so this is not the module-missing case");
+
+        drawn.surface.item.unavailableReason = "";
+        verify(!drawn.backdrop.visible,
+               "a renderer that recovers does not leave the desktop covered");
+        compare(drawn.item.rendererReason, "", "the cleared reason reaches the plugin");
+    }
+
+    // GOAL: the reason the renderer gave is what the desktop shows. False if the message is
+    //       generic -- the user is then told the screen cannot be drawn on with no way to learn
+    //       whether it was the scene graph, the driver, or the daemon, and the renderer had
+    //       already said.
+    // WHY-THIS-SHAPE: an unmistakable reason string, so `indexOf` cannot pass on a coincidence
+    //       with the plugin's own wording, and the rendered Text is read rather than describe()
+    //       alone -- a message that is right on demand but never reaches the item on the desktop
+    //       is the blank-desktop failure by another route, and the "set" state is where the two
+    //       are easiest to confuse, since the wallpaper text and describe() agree there.
+    // CONTROL: the rendererReason arm of describe() in main.qml reduced to the same text with no
+    //       `.arg(...)` -> "FAIL!: 'the renderer's own reason reaches the desktop -- looked for
+    //       [dmabuf import refused: ...] in [WallpaperX cannot draw on this screen:]' returned
+    //       FALSE". The rendered half seen red separately, with the Text's binding made to return
+    //       the wallpaper message directly whenever the state is "set" -> "FAIL!: the desktop
+    //       shows the reason, not a message it was handed once", that check alone and no other in
+    //       the file. Observed 2026-08-21. Both reverted.
+    function test_the_message_carries_the_renderers_own_reason() {
+        const drawn = drawnScreenWithStandIn();
+        const reason = "dmabuf import refused: modifier 0x4000000 unsupported by this driver";
+
+        drawn.surface.item.unavailableReason = reason;
+        const shown = drawn.item.describe();
+        verify(shown.indexOf(reason) !== -1,
+               "the renderer's own reason reaches the desktop -- looked for [" + reason
+               + "] in [" + shown + "]");
+
+        const text = onlyDescendantWith(drawn.item, "wrapMode");
+        compare(text.text, shown, "the desktop shows the reason, not a message it was handed once");
+        verify(text.visible && text.paintedHeight > 0,
+               "the reason takes up space on the desktop [" + text.text + "]");
+    }
+
     // GOAL: main.qml survives a QML module it cannot load. That is the whole reason the renderer
     //       sits behind a Loader rather than an import: a failed import at the top of this file
     //       takes the plugin down, and a wallpaper plugin that fails to load is a black desktop
