@@ -49,6 +49,14 @@ TestCase {
         Text {}
     }
 
+    // A stand-in for the renderer module, which this harness has no import path for. It carries
+    // the one property main.qml assigns to the loaded item and nothing else -- every binding
+    // that decides WHETHER to load it stays main.qml's own.
+    Component {
+        id: standInRenderer
+        Item { property int monitorId: -1 }
+    }
+
     // The seven cases, each with the drive that reaches it, the state main.qml must derive, and
     // a fragment of the message that names *that* cause and no other. Fragments, not whole
     // strings, so a wording fix does not fail the suite -- but see the uniqueness check below,
@@ -808,6 +816,11 @@ TestCase {
     // CONTROL: `active:` on the Loader in main.qml changed to `true` -> "FAIL: [1-unnamed]
     //       the renderer is not active while the screen has a message", and the no-id check
     //       below with it. Observed 2026-08-21. Reverted.
+    // WHAT THIS ONE DOES NOT GRADE: the backdrop line here is weak on its own -- with no
+    //       renderer module on this harness's import path `surface.status` is never Ready, so
+    //       `visible` is pinned true whatever main.qml binds it to. The check that a wallpaper
+    //       actually uncovers it stands a renderer in; see
+    //       test_the_message_stops_covering_a_wallpaper_that_is_drawn below.
     function test_the_message_is_never_covered_by_the_renderer() {
         const cases = causeCases();
         for (let i = 0; i < cases.length; ++i) {
@@ -841,6 +854,52 @@ TestCase {
         const surface = childNamed(item, "wallpaperxSurface");
         verify(surface !== null, "the plugin has a surface");
         verify(!surface.active, "the renderer stays inactive without a monitor id");
+    }
+
+    // GOAL: S12.1/S12.6 -- once a wallpaper is actually being drawn, the message stops covering
+    //       it, and it comes back the moment it stops. False if the backdrop stays up: it is an
+    //       opaque rectangle over the whole screen, declared AFTER the renderer, so a build that
+    //       leaves it visible hides every imported frame behind a dark grey panel -- the exact
+    //       inverse of the check above, and just as fatal.
+    // WHY-THIS-SHAPE: the Loader is given a stand-in component. Nothing else in this file can
+    //       reach the state being graded: the real renderer module is not on this harness's
+    //       import path, so `surface.status` is never Ready and the backdrop is pinned visible
+    //       whatever main.qml says. Measured, not argued -- with `visible: true` written into
+    //       main.qml the entire suite stayed green, including both S12.6 checks. Only the module
+    //       is stood in for; `active` and `visible` are still main.qml's own bindings.
+    // CONTROL: `visible:` on the backdrop replaced by `true` in main.qml -> "FAIL: the message
+    //       stops covering the wallpaper once one is being drawn", that check alone. Observed
+    //       2026-08-21. Reverted.
+    // COVERAGE-ASSERT: the stand-in is asserted to have actually loaded. Without that, a Loader
+    //       that refused the component would leave the backdrop legitimately visible and the
+    //       check would grade nothing -- which is precisely how it reads today without the
+    //       stand-in.
+    function test_the_message_stops_covering_a_wallpaper_that_is_drawn() {
+        const item = loadPlugin(suite.namedScreen);
+        const surface = childNamed(item, "wallpaperxSurface");
+        const backdrop = childNamed(item, "wallpaperxBackdrop");
+        verify(surface !== null && backdrop !== null, "the plugin has a surface and a backdrop");
+        surface.sourceComponent = standInRenderer;
+
+        item.apply(200, '{"output":"DP-3","known":true,"path":"/w.png","monitor_id":0}');
+        compare(item.screenState, "set", "the drive reaches the state that draws a wallpaper");
+        verify(surface.active, "the renderer is asked for once there is a frame to draw");
+        compare(surface.status, Loader.Ready,
+                "the stand-in renderer loaded, which is what lets this check fail");
+        verify(surface.item !== null, "the renderer occupies the surface");
+        compare(surface.item.monitorId, 0, "the renderer is told which screen to ask about");
+        compare(surface.width, item.width, "the renderer covers the screen");
+        compare(surface.height, item.height, "the renderer covers the screen");
+        verify(!backdrop.visible,
+               "the message stops covering the wallpaper once one is being drawn");
+
+        // And back again: a screen that loses its wallpaper must get its message returned, or the
+        // desktop is left showing a frame that no longer describes anything.
+        item.apply(0, "");
+        compare(item.screenState, "unreachable", "the daemon going away is noticed");
+        verify(!surface.active, "the renderer is dropped when there is nothing to draw");
+        verify(backdrop.visible, "the message comes back when the wallpaper stops");
+        verify(item.describe().length > 0, "and it still has something to say");
     }
 
     // GOAL: main.qml survives a QML module it cannot load. That is the whole reason the renderer

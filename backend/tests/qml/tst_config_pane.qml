@@ -73,6 +73,42 @@ TestCase {
         verify(title.visible, "the heading is visible");
     }
 
+    // GOAL: S11.1's other half -- the heading is in TRANSLATED text, not a hardcoded string.
+    //       False if the string is written into the file bare: the pane then renders English on
+    //       every desktop, and the check above cannot tell, because it reads identical
+    //       characters either way.
+    // WHY-THIS-SHAPE: nothing about the rendered text distinguishes the two -- qsTr() with no
+    //       translation loaded returns its own source string. The obvious alternative, grepping
+    //       config.qml for "qsTr", asserts the spelling of the fix and passes for a qsTr sitting
+    //       on some other string entirely. So a translator is installed for the length of three
+    //       statements and the binding is asked to re-evaluate: only a qsTr binding moves.
+    //       No assertion runs between installing and removing it, deliberately -- a failure
+    //       there would leave every later case in this process reading rewritten strings.
+    // CONTROL: `qsTr(...)` on the Kirigami.Heading in config.qml replaced by the bare string ->
+    //       "FAIL: the heading is translated text, not a string written into the file: it did
+    //       not change when a translation was loaded", that check alone. Observed 2026-08-21.
+    //       Reverted.
+    function test_the_heading_is_translated_text() {
+        const item = loadPane();
+        const title = heading(item);
+        verify(title !== null, "the pane has a heading to read");
+
+        const before = title.text;
+        verify(translationProbe.translateEverything(),
+               "the harness could install a translation at all");
+        const translated = title.text;
+        translationProbe.stopTranslating();
+        const restored = title.text;
+
+        verify(translated !== before,
+               "the heading is translated text, not a string written into the file: it did not "
+               + "change when a translation was loaded [" + before + "]");
+        verify(translated.indexOf(translationProbe.translationMarker()) === 0,
+               "the heading went through the loaded translation: [" + translated + "]");
+        compare(restored, before,
+                "the harness put the untranslated text back for the cases that follow");
+    }
+
     // GOAL: S11.2 -- that text is legible against the settings background, because its colour
     //       comes from the theme rather than being written into the file. False if a colour is
     //       hardcoded: the pane shipped with color: "#ffffff", which is white on the light
@@ -137,11 +173,58 @@ TestCase {
                "an app that never appeared and a failed start are told apart: ["
                + neverAppeared + "] vs [" + failedStart + "]");
 
-        // COVERAGE-ASSERT: the timeout the launch is wrapped in is real and non-zero. A build
-        // that dropped the bound would leave 124 unreachable, and the check above would grade a
-        // message nothing can produce.
+        // COVERAGE-ASSERT: the timeout the launch is wrapped in is real and non-zero. It says
+        // nothing about the command using it -- that is the check below, which reads the command
+        // the pane actually composes.
         verify(item.launchTimeoutSeconds > 0,
                "the launch is bounded, so 124 is a code this pane can actually see");
+    }
+
+    // The pane's launcher, found by the pair of members only it has. Non-visual, so it lives in
+    // data[] rather than children[], and it is found by identity rather than by index because
+    // the index depends on declaration order in a production file.
+    function launcherOf(item) {
+        for (let i = 0; i < item.data.length; ++i) {
+            const child = item.data[i];
+            if (child.connectedSources !== undefined && typeof child.launch === "function") {
+                return child;
+            }
+        }
+        return null;
+    }
+
+    // GOAL: S11.4 -- the command the pane runs is actually bounded, so the failure it reports as
+    //       124 is one it can reach. False if the bound is dropped from the command: kstart on an
+    //       id it cannot resolve waits forever -- measured, still running at 60 s -- so the most
+    //       likely failure of all produces no exit code, the pane stays silent, and the button
+    //       appears to do nothing. Which is the whole defect S11.4 names.
+    // WHY-THIS-SHAPE: the composed command is read, not the property it is built from. The
+    //       simpler form next door -- assert launchTimeoutSeconds > 0 -- passes for a build that
+    //       keeps the property and stops using it, which is exactly the unbounded launch. The
+    //       DataSource is pointed at an engine that does not exist first, so the command is
+    //       composed and recorded WITHOUT being run: launching for real would either start the
+    //       app on the developer's desktop or block this case for the full timeout.
+    // CONTROL: the "timeout N " prefix removed from connectSource() in config.qml -> "FAIL: the
+    //       command the pane runs is bounded by a timeout: [kstart --application
+    //       com.wallpaperx.app]", that check alone. Observed 2026-08-21. Reverted.
+    // COVERAGE-ASSERT: exactly one command is asserted to have been requested, so a launcher
+    //       that was neutered into connecting nothing fails here rather than reading an empty
+    //       list and finding nothing wrong with it.
+    function test_the_launch_command_is_bounded() {
+        const item = loadPane();
+        const launcher = launcherOf(item);
+        verify(launcher !== null, "the pane has a launcher whose command can be read");
+
+        launcher.engine = "wallpaperx-no-such-engine";
+        launcher.launch();
+
+        compare(launcher.connectedSources.length, 1,
+                "the pane asked to run exactly one command");
+        const command = launcher.connectedSources[0];
+        verify(command.indexOf("timeout " + item.launchTimeoutSeconds + " ") === 0,
+               "the command the pane runs is bounded by a timeout: [" + command + "]");
+        verify(command.indexOf("kstart") !== -1,
+               "the command launches through the desktop launcher: [" + command + "]");
     }
 
     // GOAL: the pane starts with nothing to apologise for -- the error is shown only once a

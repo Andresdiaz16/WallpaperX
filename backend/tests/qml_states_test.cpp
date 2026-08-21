@@ -25,10 +25,12 @@
 
 #include <QtQuickTest/quicktest.h>
 
+#include <QCoreApplication>
 #include <QObject>
 #include <QQmlContext>
 #include <QQmlEngine>
 #include <QString>
+#include <QTranslator>
 
 #include <httplib.h>
 
@@ -214,6 +216,59 @@ private:
     QString m_why = QStringLiteral("the stub daemon was never started");
 };
 
+// Lets a check tell a translated string from a hardcoded one.
+//
+// It cannot be read off the text: qsTr() with no translation loaded returns its own source
+// string, so a pane that ships `text: "..."` and one that ships `text: qsTr("...")` render
+// character-identical output and no runtime comparison distinguishes them. What does
+// distinguish them is what happens when a translation arrives -- the qsTr binding
+// re-evaluates and the literal does not. So this installs a translator that rewrites every
+// source string, asks the engine to retranslate, and lets the check look again.
+class TranslationProbe : public QObject {
+    Q_OBJECT
+public:
+    // Prefixed rather than replaced, so a failure message still shows which string was being
+    // translated instead of just a marker.
+    static QString marker() { return QStringLiteral("[xlat]"); }
+
+    void setEngine(QQmlEngine* engine) { m_engine = engine; }
+
+    Q_INVOKABLE bool translateEverything() {
+        if (m_engine == nullptr) return false;
+        if (!m_installed) {
+            QCoreApplication::installTranslator(&m_translator);
+            m_installed = true;
+        }
+        m_engine->retranslate();
+        return true;
+    }
+
+    // Must be called by every case that translates, before it asserts anything: a translator
+    // left installed would rewrite every other case's strings in this same process.
+    Q_INVOKABLE void stopTranslating() {
+        if (!m_installed) return;
+        QCoreApplication::removeTranslator(&m_translator);
+        m_installed = false;
+        if (m_engine != nullptr) m_engine->retranslate();
+    }
+
+    Q_INVOKABLE QString translationMarker() const { return marker(); }
+
+private:
+    class RewritingTranslator : public QTranslator {
+    public:
+        // Non-empty, or QCoreApplication treats an installed translator as carrying nothing.
+        bool isEmpty() const override { return false; }
+        QString translate(const char*, const char* sourceText, const char*, int) const override {
+            return marker() + QString::fromUtf8(sourceText);
+        }
+    };
+
+    RewritingTranslator m_translator;
+    QQmlEngine* m_engine = nullptr;
+    bool m_installed = false;
+};
+
 class Setup : public QObject {
     Q_OBJECT
 
@@ -230,12 +285,20 @@ public slots:
 
     void qmlEngineAvailable(QQmlEngine* engine) {
         engine->rootContext()->setContextProperty(QStringLiteral("stubDaemon"), &m_stub);
+        m_translation.setEngine(engine);
+        engine->rootContext()->setContextProperty(QStringLiteral("translationProbe"), &m_translation);
     }
 
-    void cleanupTestCase() { m_stub.stop(); }
+    // Belt and braces: a case that failed between installing and removing would otherwise leave
+    // every later string in this process rewritten.
+    void cleanupTestCase() {
+        m_translation.stopTranslating();
+        m_stub.stop();
+    }
 
 private:
     StubDaemon m_stub;
+    TranslationProbe m_translation;
 };
 
 }  // namespace
