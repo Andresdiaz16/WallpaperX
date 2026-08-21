@@ -84,6 +84,10 @@ WallpaperItem {
         : root.wallpaperPath === "" ? "unset"
         : "set"
 
+    // Why the renderer is not drawing, when it has loaded and still is not. Kept on root rather
+    // than read through surface.item, which qmllint can only see as a QtObject.
+    property string rendererReason: ""
+
     function describe(): string {
         if (root.screenState === "unnamed") {
             return qsTr("This screen has not reported a connector name.\nWallpaperX identifies screens by that name.");
@@ -105,6 +109,10 @@ WallpaperItem {
         if (root.screenState === "unset") {
             return qsTr("No wallpaper chosen for this screen (%1).\nPick one in the WallpaperX app.")
                 .arg(root.screenName);
+        }
+        // Clamped like the strings above: it can carry a D-Bus error message from off-process.
+        if (root.rendererReason !== "") {
+            return qsTr("WallpaperX cannot draw on this screen:\n%1").arg(root.rendererReason.substring(0, 256));
         }
         return qsTr("WallpaperX will draw:\n%1").arg(root.wallpaperPath);
     }
@@ -216,7 +224,12 @@ WallpaperItem {
         // the renderer would poll for frames belonging to no monitor.
         active: root.screenState === "set" && root.monitorId >= 0
         source: "WallpaperSurface.qml"
-        onLoaded: item.monitorId = root.monitorId
+        onLoaded: {
+            item.monitorId = root.monitorId;
+            root.rendererReason = item.unavailableReason;
+        }
+        // A reason from an item that is going away would otherwise outlive it.
+        onStatusChanged: if (surface.status !== Loader.Ready) root.rendererReason = ""
 
         // A later reply can move the screen to a different id -- a re-plug, or the daemon
         // learning the name after the fact -- and the loaded item would otherwise keep drawing
@@ -225,6 +238,14 @@ WallpaperItem {
             target: root
             function onMonitorIdChanged() {
                 if (surface.item !== null) surface.item.monitorId = root.monitorId;
+            }
+        }
+
+        Connections {
+            target: surface.item
+            ignoreUnknownSignals: true
+            function onUnavailableReasonChanged() {
+                root.rendererReason = surface.item.unavailableReason;
             }
         }
     }
@@ -236,7 +257,9 @@ WallpaperItem {
         anchors.fill: parent
         // Hidden rather than drawn under the wallpaper: it is opaque, and a frame that has been
         // imported is what the user should see. Shown again the moment anything goes wrong.
-        visible: !(surface.status === Loader.Ready && root.screenState === "set")
+        // Keyed on the renderer drawing, not merely on its module having loaded: a renderer that
+        // loads and cannot draw would otherwise leave a black screen explaining nothing.
+        visible: !(surface.status === Loader.Ready && root.screenState === "set" && root.rendererReason === "")
         color: "#1b1b1b"
 
         Text {

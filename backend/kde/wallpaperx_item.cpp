@@ -10,10 +10,10 @@
 #include <QDBusReply>
 #include <QDBusUnixFileDescriptor>
 #include <QQuickWindow>
-#include <QRunnable>
 #include <QSGRendererInterface>
 #include <QSGSimpleTextureNode>
 #include <QSGTexture>
+#include <QThread>
 
 #include <unistd.h>
 
@@ -91,13 +91,14 @@ void WallpaperXItem::setMonitorId(int monitorId) {
     if (m_monitorId >= 0) fetchFrame(0);
 }
 
-void WallpaperXItem::setDaemonConnected(bool connected) {
-    if (m_daemonConnected == connected) return;
-    m_daemonConnected = connected;
-    emit daemonConnectedChanged();
-}
-
 void WallpaperXItem::setUnavailableReason(const QString& reason) {
+    // Reached from the render thread too, and QML binds to this, so the string is only ever
+    // touched on the thread that owns it.
+    if (QThread::currentThread() != thread()) {
+        QMetaObject::invokeMethod(
+            this, [this, reason] { setUnavailableReason(reason); }, Qt::QueuedConnection);
+        return;
+    }
     if (m_unavailableReason == reason) return;
     m_unavailableReason = reason;
     emit unavailableReasonChanged();
@@ -115,7 +116,7 @@ void WallpaperXItem::connectToDaemon() {
                                             QDBusServiceWatcher::WatchForOwnerChange, this);
     connect(watcher, &QDBusServiceWatcher::serviceOwnerChanged, this,
             [this](const QString&, const QString&, const QString& newOwner) {
-                setDaemonConnected(!newOwner.isEmpty());
+                m_daemonConnected = !newOwner.isEmpty();
                 if (newOwner.isEmpty()) {
                     setUnavailableReason(tr("WallpaperX is not running."));
                     return;
@@ -170,7 +171,7 @@ void WallpaperXItem::takeFrameReply(const QDBusMessage& call) {
     // The reply is what settles it: only an unknown service means the daemon is not there.
     const bool absent = call.type() == QDBusMessage::ErrorMessage &&
                         call.errorName() == QLatin1String("org.freedesktop.DBus.Error.ServiceUnknown");
-    setDaemonConnected(!absent);
+    m_daemonConnected = !absent;
 
     if (call.type() != QDBusMessage::ReplyMessage) {
         // Not a failure of this item: no frame yet is the ordinary state before the user has
@@ -255,13 +256,20 @@ void WallpaperXItem::takeFrameReply(const QDBusMessage& call) {
 QSGNode* WallpaperXItem::updatePaintNode(QSGNode* old, UpdatePaintNodeData*) {
     auto* node = static_cast<QSGSimpleTextureNode*>(old);
 
+    // No window or no interface is transient -- a reparent in progress -- so nothing is reported
+    // and nothing is torn down; the next sync pass has one.
+    QQuickWindow* host = window();
+    if (host == nullptr || host->rendererInterface() == nullptr) return old;
+
     // The scene graph can be running on Vulkan, Metal, D3D or software, and this import path is
     // OpenGL only. Checked every pass rather than once, because the window can change.
-    QQuickWindow* host = window();
-    if (host == nullptr || host->rendererInterface() == nullptr ||
-        host->rendererInterface()->graphicsApi() != QSGRendererInterface::OpenGL) {
+    if (host->rendererInterface()->graphicsApi() != QSGRendererInterface::OpenGL) {
         setUnavailableReason(tr("This desktop is not running on OpenGL, which WallpaperX needs to show a frame."));
         delete node;
+        {
+            std::lock_guard<std::mutex> lock(m_importedMutex);
+            m_shownGeneration = 0;
+        }
         return nullptr;
     }
 
@@ -287,33 +295,38 @@ QSGNode* WallpaperXItem::updatePaintNode(QSGNode* old, UpdatePaintNodeData*) {
         if (imported.texture == 0) {
             setUnavailableReason(tr("WallpaperX produced a frame this desktop could not import."));
         } else {
-            // Freed only now, with the new texture in hand: releasing the old one before the
-            // node has been repointed leaves the scene graph holding a deleted texture for the
-            // rest of this pass.
-            FrameImport::Result previous;
-            {
-                std::lock_guard<std::mutex> lock(m_importedMutex);
-                previous = m_imported;
-                m_imported = imported;
-                m_shownGeneration = incoming->generation;
-            }
-
             if (node == nullptr) {
                 node = new QSGSimpleTextureNode();
+                // Load-bearing for the release below: the node destroying its texture is what
+                // frees the import.
                 node->setOwnsTexture(true);
                 node->setFiltering(QSGTexture::Linear);
             }
+            // No alpha flag: every fourcc the daemon can export is an X variant, so the alpha
+            // bytes are undefined and the scene graph must not blend against them.
             QSGTexture* texture = QNativeInterface::QSGOpenGLTexture::fromNative(
-                imported.texture, host, QSize(static_cast<int>(incoming->request.width),
-                                              static_cast<int>(incoming->request.height)),
-                QQuickWindow::TextureHasAlphaChannel);
-            node->setTexture(texture);
-            node->markDirty(QSGNode::DirtyMaterial);
-            setUnavailableReason(QString());
-
-            // After the swap, and on this thread with the context current -- the two conditions
-            // S12.4 is about.
-            FrameImport::release(previous);
+                imported.texture, host,
+                QSize(static_cast<int>(incoming->request.width), static_cast<int>(incoming->request.height)), {});
+            if (texture == nullptr) {
+                // Nothing took ownership, so this is the one place that frees by hand.
+                FrameImport::release(imported);
+                setUnavailableReason(tr("WallpaperX produced a frame this desktop could not import."));
+            } else {
+                // Tied to the texture rather than scheduled as a render job: a NoStage job posted
+                // against an unexposed window is dropped without running, and by then this is the
+                // only reference left. Node teardown and setTexture both run on the render thread
+                // with the context current, which release needs.
+                QObject::connect(
+                    texture, &QObject::destroyed, texture, [imported] { FrameImport::release(imported); },
+                    Qt::DirectConnection);
+                node->setTexture(texture);
+                node->markDirty(QSGNode::DirtyMaterial);
+                {
+                    std::lock_guard<std::mutex> lock(m_importedMutex);
+                    m_shownGeneration = incoming->generation;
+                }
+                setUnavailableReason(QString());
+            }
         }
     }
 
@@ -330,46 +343,12 @@ void WallpaperXItem::itemChange(ItemChange change, const ItemChangeData& value) 
     fetchFrame(0);
 }
 
+// The imported handles are the scene graph's to free -- Qt's own exemption for resources its
+// nodes already manage -- so all this drops is the marks, which no longer describe anything.
 void WallpaperXItem::releaseResources() {
-    // Called when this item leaves its window, which is NOT necessarily when the context dies:
-    // an item moved between windows leaves a live context behind, and simply forgetting the
-    // names there leaks a texture and a memory object every time.
-    //
-    // They cannot be deleted here either -- this runs on the GUI thread and the context belongs
-    // to the render thread. scheduleRenderJob is the way across: the job runs on the render
-    // thread with the context current, which is the same pair of conditions updatePaintNode
-    // satisfies. It takes a copy, so nothing outlives this object.
-
-    // Above the early return, so an item holding nothing drops the mark too.
     m_fetchedGeneration = 0;
-
-    FrameImport::Result doomed;
-    {
-        std::lock_guard<std::mutex> lock(m_importedMutex);
-        if (m_imported.texture == 0 && m_imported.memoryObject == 0 && m_imported.eglImage == nullptr) return;
-        doomed = m_imported;
-        m_imported = FrameImport::Result{};
-        m_shownGeneration = 0;
-    }
-
-    QQuickWindow* host = window();
-
-    if (host == nullptr) {
-        // No window to schedule against, so the context this belonged to is already gone and
-        // the driver freed its objects with it. Nothing to do but drop the names, which the
-        // assignment above has done.
-        return;
-    }
-
-    class ReleaseJob : public QRunnable {
-    public:
-        explicit ReleaseJob(FrameImport::Result imported) : m_imported(imported) {}
-        void run() override { FrameImport::release(m_imported); }
-
-    private:
-        FrameImport::Result m_imported;
-    };
-    host->scheduleRenderJob(new ReleaseJob(doomed), QQuickWindow::NoStage);
+    std::lock_guard<std::mutex> lock(m_importedMutex);
+    m_shownGeneration = 0;
 }
 
 }  // namespace wallpaperx

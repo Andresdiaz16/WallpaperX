@@ -43,6 +43,7 @@ public:
         unsigned int texture = 0;       // GL texture name, 0 when the import failed
         unsigned int memoryObject = 0;  // GL memory object backing it, 0 on the EGLImage path
         void* eglImage = nullptr;       // EGLImageKHR backing it, null on the memory-object path
+        void* eglDisplay = nullptr;     // the display eglImage belongs to, so release need not guess
         std::string error;              // why, when texture is 0
     };
 
@@ -61,8 +62,9 @@ private:
     static Result importDmaBuf(Request& request);
 
 public:
-    // Frees what import() returned. Must run on the thread whose context created them, with
-    // that context current -- the scene graph's render thread, for the QQuickItem.
+    // Frees what import() returned. The GL half must run on the thread whose context created
+    // them, with that context current -- the scene graph's render thread, for the QQuickItem.
+    // The EGL half destroys against the stored display and needs no current context.
     static void release(const Result& imported);
 };
 

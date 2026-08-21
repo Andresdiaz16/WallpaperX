@@ -26,12 +26,11 @@ namespace wallpaperx {
 //     fetch happens while QML is still building this item, where the nested event loop such a
 //     call needs never runs -- measured, it never returned and the item drew nothing;
 //   * the render thread imports that fd into GL inside updatePaintNode(), because that is the
-//     only place a GL context is current, and frees the previous texture there for the same
-//     reason. releaseResources() is the exception -- it runs on the GUI thread and hands the
-//     freeing to a render job -- which is why the imported handles are behind a lock.
+//     only place a GL context is current. Freeing is the scene graph's: the node owns its
+//     texture, and destroying it releases the import on that same thread.
 //
-// m_pendingMutex guards the handover between the first two and the third. Nothing else here is
-// shared: every GL object lives and dies on the render thread.
+// m_pendingMutex guards the handover between the first two and the third. Every GL object lives
+// and dies on the render thread.
 class WallpaperXItem : public QQuickItem {
     Q_OBJECT
     // Declared here rather than registered by hand in a plugin's registerTypes(), so the build
@@ -41,7 +40,6 @@ class WallpaperXItem : public QQuickItem {
     // permanently unlintable.
     QML_NAMED_ELEMENT(WallpaperXRenderer)
     Q_PROPERTY(int monitorId READ monitorId WRITE setMonitorId NOTIFY monitorIdChanged)
-    Q_PROPERTY(bool daemonConnected READ daemonConnected NOTIFY daemonConnectedChanged)
     // Why nothing is being drawn, when nothing is. Empty while the wallpaper is showing, so QML
     // can fall back to the message states main.qml already derives rather than inventing its own.
     Q_PROPERTY(QString unavailableReason READ unavailableReason NOTIFY unavailableReasonChanged)
@@ -88,12 +86,10 @@ public:
     int monitorId() const { return m_monitorId; }
     void setMonitorId(int monitorId);
 
-    bool daemonConnected() const { return m_daemonConnected; }
     QString unavailableReason() const { return m_unavailableReason; }
 
 signals:
     void monitorIdChanged();
-    void daemonConnectedChanged();
     void unavailableReasonChanged();
 
 protected:
@@ -125,7 +121,6 @@ private:
     void fetchFrame(quint64 generation);
     // The reply half of fetchFrame, on the GUI thread once the bus answers.
     void takeFrameReply(const QDBusMessage& call);
-    void setDaemonConnected(bool connected);
     void setUnavailableReason(const QString& reason);
 
     int m_monitorId = -1;
@@ -138,14 +133,10 @@ private:
     std::mutex m_pendingMutex;
     std::optional<PendingFrame> m_pending;  // guarded by m_pendingMutex
 
-    // Render thread only, past construction.
-    // Written by the render thread in updatePaintNode and read by the GUI thread in
-    // releaseResources, which is why it is guarded. The header used to call it render-thread
-    // only; that was true of the paint path alone, and releaseResources contradicted it.
-    // The lock is never held across GL work -- it covers the swap, nothing else.
+    // Written by the render thread in updatePaintNode and by the GUI thread in releaseResources
+    // and setMonitorId, which is why it is guarded.
     std::mutex m_importedMutex;
-    FrameImport::Result m_imported;      // guarded by m_importedMutex
-    quint64 m_shownGeneration = 0;       // guarded by m_importedMutex
+    quint64 m_shownGeneration = 0;  // guarded by m_importedMutex
 };
 
 }  // namespace wallpaperx

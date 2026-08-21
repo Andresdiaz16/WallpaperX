@@ -50,11 +50,14 @@ TestCase {
     }
 
     // A stand-in for the renderer module, which this harness has no import path for. It carries
-    // the one property main.qml assigns to the loaded item and nothing else -- every binding
-    // that decides WHETHER to load it stays main.qml's own.
+    // the two properties main.qml exchanges with the loaded item and nothing else -- every
+    // binding that decides WHETHER to load it stays main.qml's own.
     Component {
         id: standInRenderer
-        Item { property int monitorId: -1 }
+        Item {
+            property int monitorId: -1
+            property string unavailableReason: ""
+        }
     }
 
     // The seven cases, each with the drive that reaches it, the state main.qml must derive, and

@@ -372,8 +372,16 @@ bool testHappyPathExport() {
         // An opaque fd is imported by another context on the same device, which needs
         // no layout metadata -- publishing a real-looking modifier here would send the
         // KDE plugin down its dmabuf-import branch for a handle that cannot support it.
-        // drmFormat is excluded as of Step 12: it is channel order, not layout, and an opaque
-        // fd has one too. The plugin picks its import path from handle_type, never the format.
+        // The fourcc is graded for both handle types: it is channel order, not layout, and an
+        // opaque fd carries one too. The plugin picks its import path from handle_type.
+        const uint32_t expectedFourcc =
+            wallpaperx::drmFourccForVkFormat(wallpaperx::OffscreenTargetManager::kFormat);
+        if (frame1.drmFormat != expectedFourcc) {
+            std::cerr << "frame_export_probe: frame reports drmFormat 0x" << std::hex << frame1.drmFormat
+                      << ", expected 0x" << expectedFourcc << std::dec << " for the target's Vulkan format"
+                      << std::endl;
+            ok = false;
+        }
         if (frame1.type == wallpaperx::ExportedFrame::HandleType::OpaqueFd) {
             if (frame1.modifier != wallpaperx::kDrmModifierInvalid || !frame1.planes.empty()) {
                 std::cerr << "frame_export_probe: an OpaqueFd frame must not carry DMA-BUF layout metadata"

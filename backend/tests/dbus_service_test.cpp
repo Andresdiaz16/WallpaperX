@@ -25,6 +25,7 @@
 
 #include "vulkan/device.h"
 #include "vulkan/frame_export.h"
+#include "vulkan/offscreen.h"
 
 // The renderer's shared test scaffolding, on the include path as `support/...`. The
 // backend's own lives in tests/client/, deliberately NOT tests/support/: a quoted
@@ -1238,21 +1239,23 @@ void runRenderChecks(sdbus::IProxy& proxy, FrameReadyLog& signals, const std::st
         check(frame.memorySize >= static_cast<uint64_t>(kTargetWidth) * kTargetHeight * 4,
               "memory_size covers at least the frame's pixels");
 
-        // The three layout fields are populated together or not at all. A half-populated
-        // set is the failure that matters: an importer given a fourcc but no modifier,
-        // or planes with no fourcc, builds a wrong image rather than failing.
+        // The fourcc is channel order, not layout, so it is published on both paths: an
+        // importer that has to guess it draws red and blue transposed.
+        check(frame.drmFormat == wallpaperx::drmFourccForVkFormat(wallpaperx::OffscreenTargetManager::kFormat),
+              "every exported frame reports the target format's fourcc, whichever handle type it uses");
+
+        // The layout fields are populated together or not at all. A half-populated
+        // set is the failure that matters: an importer given a modifier but no planes,
+        // or planes with no modifier, builds a wrong image rather than failing.
         const bool populated = frame.drmModifier != wallpaperx::kDrmModifierInvalid;
         if (populated) {
             check(frame.handleType == 1, "layout metadata is only published on the DMA_BUF path");
-            check(frame.drmFormat != 0, "a populated frame carries a DRM fourcc");
             check(!frame.planes.empty(), "a populated frame carries at least one plane");
             for (const auto& plane : frame.planes) {
                 check(plane.get<1>() >= static_cast<uint64_t>(kTargetWidth) * 4,
                       "each plane's rowPitch covers a row of pixels");
             }
         } else {
-            // The fourcc is channel order, not layout, and an opaque fd has one too -- see
-            // Step 12. Only the layout must be absent.
             check(frame.planes.empty(), "an unpopulated frame reports no planes");
         }
         std::printf("dbus_service_test: handle_type=%d drm_format=0x%08x modifier=0x%llx planes=%zu\n",

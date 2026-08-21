@@ -94,14 +94,6 @@ void populateDmaBufLayout(Device& device, const OffscreenTarget& target, Exporte
         frame.planes.push_back(ExportedFramePlane{layout.offset, layout.rowPitch});
     }
 
-    // Derived from the format the target was actually created with, never hard-coded:
-    // a wrong fourcc makes a compositor render swapped channels, and an assertion
-    // against a literal constant could not tell the difference.
-    frame.drmFormat = drmFourccForVkFormat(OffscreenTargetManager::kFormat);
-    if (frame.drmFormat == 0) {
-        throw std::runtime_error("exportFrame: no DRM fourcc mapping for the offscreen target's format -- "
-                                 "add one to drmFourccForVkFormat before changing kFormat");
-    }
     frame.modifier = modifierProps.drmFormatModifier;
 }
 
@@ -202,6 +194,11 @@ ExportedFrame exportFrame(Device& device, const OffscreenTarget& target) {
     getFdInfo.memory = device.memory().imageDeviceMemory(target.image);
     getFdInfo.handleType = handleType;
     const VkDeviceSize memorySize = device.memory().imageAllocationSize(target.image);
+    const uint32_t drmFormat = drmFourccForVkFormat(OffscreenTargetManager::kFormat);
+    if (drmFormat == 0) {
+        throw std::runtime_error("exportFrame: no DRM fourcc mapping for the offscreen target's format -- "
+                                 "add one to drmFourccForVkFormat before changing kFormat");
+    }
 
     ExportedFrame frame;
     // Validate the fd itself, not just the return code: some drivers (observed on
@@ -218,8 +215,8 @@ ExportedFrame exportFrame(Device& device, const OffscreenTarget& target) {
     // Reported for BOTH handle types, not just dma_buf. An opaque fd carries no layout
     // metadata, but it still has a CHANNEL ORDER, and an importer that guesses gets red and
     // blue the wrong way round -- which is exactly what the first cross-process frame looked
-    // like. The dma_buf path overwrites this with the same value from its own query.
-    frame.drmFormat = drmFourccForVkFormat(OffscreenTargetManager::kFormat);
+    // like.
+    frame.drmFormat = drmFormat;
     frame.type = (handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT) ? ExportedFrame::HandleType::OpaqueFd
                                                                                : ExportedFrame::HandleType::DmaBuf;
 

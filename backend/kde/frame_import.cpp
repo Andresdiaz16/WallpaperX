@@ -32,7 +32,10 @@ struct MemoryObjectApi {
     TexStorageFn texStorage = nullptr;
 
     bool complete() const {
-        return create != nullptr && destroy != nullptr && importFd != nullptr && texStorage != nullptr;
+        // parameteriv included: without it the dedicated flag cannot be set, and an import that
+        // skips the flag succeeds and samples blank.
+        return create != nullptr && destroy != nullptr && importFd != nullptr && parameteriv != nullptr &&
+               texStorage != nullptr;
     }
 };
 
@@ -226,6 +229,7 @@ FrameImport::Result FrameImport::importDmaBuf(Request& request) {
 
     out.texture = texture;
     out.eglImage = image;
+    out.eglDisplay = display;
     return out;
 }
 
@@ -274,14 +278,12 @@ FrameImport::Result FrameImport::import(Request& request) {
     //
     // Missed at first because the in-process probe passed regardless, which is exactly the
     // shape of bug a same-process test cannot see.
-    if (api.parameteriv != nullptr) {
-        const GLint dedicated = GL_TRUE;
-        api.parameteriv(memory, GL_DEDICATED_MEMORY_OBJECT_EXT, &dedicated);
-        if (glGetError() != GL_NO_ERROR) {
-            api.destroy(1, &memory);
-            out.error = "the memory object would not accept GL_DEDICATED_MEMORY_OBJECT_EXT";
-            return out;
-        }
+    const GLint dedicated = GL_TRUE;
+    api.parameteriv(memory, GL_DEDICATED_MEMORY_OBJECT_EXT, &dedicated);
+    if (glGetError() != GL_NO_ERROR) {
+        api.destroy(1, &memory);
+        out.error = "the memory object would not accept GL_DEDICATED_MEMORY_OBJECT_EXT";
+        return out;
     }
 
     // Takes ownership of the fd on success -- the EXT_memory_object_fd spec is explicit that
@@ -318,9 +320,16 @@ FrameImport::Result FrameImport::import(Request& request) {
     // an X/ARGB fourcc is byte order B,G,R,A in memory, and an X/ABGR one is already RGBA.
     constexpr uint32_t kXrgb8888 = 'X' | ('R' << 8) | ('2' << 16) | ('4' << 24);
     constexpr uint32_t kArgb8888 = 'A' | ('R' << 8) | ('2' << 16) | ('4' << 24);
+    constexpr uint32_t kXbgr8888 = 'X' | ('B' << 8) | ('2' << 16) | ('4' << 24);
     if (request.drmFormat == kXrgb8888 || request.drmFormat == kArgb8888) {
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R, GL_BLUE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_B, GL_RED);
+    }
+    // The X in an X fourcc means the alpha bytes are undefined. GL_RGBA8 storage cannot say so,
+    // so alpha is forced here; otherwise unwritten bytes are sampled as real coverage and the
+    // wallpaper blends against black. The dma_buf path gets this from EGL for free.
+    if (request.drmFormat == kXrgb8888 || request.drmFormat == kXbgr8888) {
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_A, GL_ONE);
     }
     glBindTexture(GL_TEXTURE_2D, 0);
 
@@ -334,19 +343,16 @@ void FrameImport::release(const Result& imported) {
         const GLuint texture = imported.texture;
         glDeleteTextures(1, &texture);
     }
-    if (imported.eglImage != nullptr) {
-        const EglImageApi& api = eglImageApi();
-        EGLDisplay display = eglGetCurrentDisplay();
-        if (api.destroy != nullptr && display != EGL_NO_DISPLAY) {
-            api.destroy(display, static_cast<EGLImageKHR>(imported.eglImage));
-        }
+    // Destroyed against the display that created it, not against whatever is current here: an
+    // EGLImage outlives its context, and asking the thread would silently skip the destroy and
+    // pin the daemon's buffer for the session.
+    if (imported.eglImage != nullptr && imported.eglDisplay != nullptr) {
+        eglImageApi().destroy(static_cast<EGLDisplay>(imported.eglDisplay),
+                              static_cast<EGLImageKHR>(imported.eglImage));
     }
     if (imported.memoryObject != 0) {
-        const MemoryObjectApi& api = memoryObjectApi();
-        if (api.destroy != nullptr) {
-            const GLuint memory = imported.memoryObject;
-            api.destroy(1, &memory);
-        }
+        const GLuint memory = imported.memoryObject;
+        memoryObjectApi().destroy(1, &memory);
     }
 }
 
