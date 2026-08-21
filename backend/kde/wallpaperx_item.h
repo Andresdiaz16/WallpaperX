@@ -12,7 +12,6 @@
 #include <mutex>
 #include <optional>
 
-class QDBusInterface;
 class QDBusMessage;
 
 namespace wallpaperx {
@@ -134,8 +133,6 @@ private:
     quint64 m_fetchedGeneration = 0;
     bool m_daemonConnected = false;
     QString m_unavailableReason;
-
-    QDBusInterface* m_daemon = nullptr;
 
     std::mutex m_pendingMutex;
     std::optional<PendingFrame> m_pending;  // guarded by m_pendingMutex

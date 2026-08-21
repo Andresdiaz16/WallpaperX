@@ -4,7 +4,6 @@
 
 #include <QDBusArgument>
 #include <QDBusConnection>
-#include <QDBusInterface>
 #include <QDBusPendingCall>
 #include <QDBusPendingCallWatcher>
 #include <QDBusReply>
@@ -76,7 +75,7 @@ void WallpaperXItem::setMonitorId(int monitorId) {
     emit monitorIdChanged();
     // A screen that has just been identified may already have a frame waiting; without this the
     // desktop stays blank until the next time the wallpaper happens to change.
-    if (m_daemonConnected && m_monitorId >= 0) fetchFrame(0);
+    if (m_monitorId >= 0) fetchFrame(0);
 }
 
 void WallpaperXItem::setDaemonConnected(bool connected) {
@@ -92,16 +91,14 @@ void WallpaperXItem::setUnavailableReason(const QString& reason) {
 }
 
 void WallpaperXItem::connectToDaemon() {
-    m_daemon = new QDBusInterface(QString::fromUtf8(kService), QString::fromUtf8(kPath),
-                                 QString::fromUtf8(kInterface), QDBusConnection::sessionBus(), this);
-    if (!m_daemon->isValid()) {
-        setUnavailableReason(tr("WallpaperX is not running."));
-        return;
-    }
+    // Messages are built by hand rather than through QDBusInterface, whose constructor blocks on
+    // an Introspect round trip -- on the thread that runs the compositor's UI, from a QML item's
+    // constructor. Nothing here waits on the bus.
     QDBusConnection::sessionBus().connect(QString::fromUtf8(kService), QString::fromUtf8(kPath),
                                           QString::fromUtf8(kInterface), QStringLiteral("FrameReady"), this,
                                           SLOT(onFrameReady(int, qulonglong)));
-    setDaemonConnected(true);
+    // Not asserted here: whether the daemon is up is settled by the first reply, since asking
+    // in advance is the blocking call this avoids.
     if (m_monitorId >= 0) fetchFrame(0);
 }
 
@@ -111,13 +108,10 @@ void WallpaperXItem::onFrameReady(int monitorId, qulonglong generation) {
 }
 
 void WallpaperXItem::fetchFrame(quint64 generation) {
-    if (m_daemon == nullptr || m_monitorId < 0) return;
+    if (m_monitorId < 0) return;
 
-    // Already have this frame, or a newer one. FrameReady carries the generation precisely so a
-    // client can answer this without asking, and asking is not free: GetFrameFd blocks this
-    // thread on the bus, makes the daemon export a fresh fd, and costs a dup() here. A signal
-    // for a frame already fetched is ordinary -- the daemon emits per render, and a burst of
-    // renders for one monitor produces a burst of signals.
+    // Already have this frame, or a newer one. Asking is not free: a bus round trip, an export
+    // by the daemon, a dup() here. A signal for a frame already fetched is ordinary.
     //
     // Zero means "fetch whatever is there": it is what the two callers that are not signals
     // pass, when this item has just learned its monitor id or just connected, and neither knows
@@ -130,7 +124,11 @@ void WallpaperXItem::fetchFrame(quint64 generation) {
     // never gets to run. Measured: the call never returned, the item drew nothing, and the
     // desktop had no way to say why. The daemon answering the same request over qdbus in
     // milliseconds is what located it.
-    QDBusPendingCall pending = m_daemon->asyncCall(QStringLiteral("GetFrameFd"), m_monitorId);
+    QDBusMessage request = QDBusMessage::createMethodCall(
+        QString::fromUtf8(kService), QString::fromUtf8(kPath), QString::fromUtf8(kInterface),
+        QStringLiteral("GetFrameFd"));
+    request.setArguments({m_monitorId});
+    QDBusPendingCall pending = QDBusConnection::sessionBus().asyncCall(request);
     auto* watcher = new QDBusPendingCallWatcher(pending, this);
     connect(watcher, &QDBusPendingCallWatcher::finished, this, [this](QDBusPendingCallWatcher* done) {
         done->deleteLater();
@@ -139,6 +137,11 @@ void WallpaperXItem::fetchFrame(quint64 generation) {
 }
 
 void WallpaperXItem::takeFrameReply(const QDBusMessage& call) {
+    // The reply is what settles it: only an unknown service means the daemon is not there.
+    const bool absent = call.type() == QDBusMessage::ErrorMessage &&
+                        call.errorName() == QLatin1String("org.freedesktop.DBus.Error.ServiceUnknown");
+    setDaemonConnected(!absent);
+
     if (call.type() != QDBusMessage::ReplyMessage) {
         // Not a failure of this item: no frame yet is the ordinary state before the user has
         // chosen a wallpaper, and the daemon says which case it is.
