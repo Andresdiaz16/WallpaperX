@@ -231,7 +231,11 @@ void DbusService::completeGetFrameFd(FrameFdCall call, int32_t monitorId) {
 
     call.returnResults(fd, frame.width, frame.height, frame.memorySize,
                        frame.type == ExportedFrame::HandleType::DmaBuf ? 1 : 0,
-                       std::vector<sdbus::UnixFd>{},  // sync_fds: reserved, always empty today
+                       // sync_fds: empty because the export waits on a fence before returning,
+                       // so the frame is complete by the time this reply is built. Reserved for
+                       // an async export; a client that cannot wait must refuse a non-empty one
+                       // rather than sample a half-drawn frame.
+                       std::vector<sdbus::UnixFd>{},
                        exported.handle->generation, frame.drmFormat, frame.modifier, planes);
 }
 

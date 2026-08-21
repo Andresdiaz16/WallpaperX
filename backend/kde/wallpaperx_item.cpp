@@ -144,6 +144,24 @@ void WallpaperXItem::takeFrameReply(const QDBusMessage& call) {
         return;
     }
 
+    // Field 5, sync_fds. The daemon sends none, and that is correct rather than unfinished: it
+    // waits on a fence before answering, so the frame is complete by the time the reply leaves.
+    // Refused rather than ignored if that ever changes -- a fence this plugin does not wait on
+    // means sampling a half-drawn frame, which shows as tearing that nothing here explains.
+    const QDBusArgument syncFds = args.at(5).value<QDBusArgument>();
+    int syncFdCount = 0;
+    syncFds.beginArray();
+    while (!syncFds.atEnd()) {
+        QDBusUnixFileDescriptor ignored;
+        syncFds >> ignored;
+        ++syncFdCount;
+    }
+    syncFds.endArray();
+    if (syncFdCount > 0) {
+        setUnavailableReason(tr("WallpaperX sent a frame that must be waited on, which this plugin cannot do yet."));
+        return;
+    }
+
     PendingFrame frame;
     frame.request.fd = ::dup(args.at(0).value<QDBusUnixFileDescriptor>().fileDescriptor());
     frame.request.width = args.at(1).toUInt();
