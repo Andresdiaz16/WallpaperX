@@ -50,6 +50,21 @@ public:
     explicit WallpaperXItem(QQuickItem* parent = nullptr);
     ~WallpaperXItem() override;
 
+    // The two generation decisions, as pure functions so they can be graded without a daemon,
+    // a window or a GPU. Inline in their call sites they were reachable only by staging two
+    // fetches that complete out of order, which nothing here can force.
+    //
+    // Zero means "not known": the callers that are not FrameReady signals pass it, having no
+    // idea what the daemon is on, and it must never be treated as older than everything.
+
+    // Whether a FrameReady announcing `generation` is worth fetching, given the newest already
+    // fetched. Fetching is not free -- a bus round trip, an export by the daemon, a dup here.
+    static bool worthFetching(quint64 generation, quint64 newestFetched);
+
+    // Whether a frame that has arrived should replace what is on screen. Frames for one monitor
+    // can complete out of order, so the newest wins by number rather than by arrival.
+    static bool supersedesShown(quint64 generation, quint64 shown);
+
     int monitorId() const { return m_monitorId; }
     void setMonitorId(int monitorId);
 

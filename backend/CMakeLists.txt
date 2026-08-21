@@ -170,6 +170,17 @@ if(EGL_FOUND AND OpenGL_OpenGL_FOUND)
         LABELS "novulkan"
         SKIP_RETURN_CODE 77)
 
+    # The generation rules are pure functions, so this needs no GPU and no daemon -- but it does
+    # need the item, hence the KDE plugin guard.
+    if(WALLPAPERX_BUILD_KDE_PLUGIN)
+        add_executable(wallpaperx-frame-generation-test tests/frame_generation_test.cpp)
+        target_link_libraries(wallpaperx-frame-generation-test PRIVATE
+            wallpaperxplugin Qt6::Core Qt6::Quick Qt6::Qml)
+        target_include_directories(wallpaperx-frame-generation-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        add_test(NAME frame_generation COMMAND wallpaperx-frame-generation-test)
+        set_tests_properties(frame_generation PROPERTIES LABELS "novulkan" SKIP_RETURN_CODE 77)
+    endif()
+
     if(WALLPAPERX_LAVAPIPE_ICD)
         add_test(NAME frame_import_probe_lavapipe COMMAND wallpaperx-frame-import-probe)
         set_tests_properties(frame_import_probe_lavapipe PROPERTIES
