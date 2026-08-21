@@ -13,6 +13,7 @@
 #include <optional>
 
 class QDBusInterface;
+class QDBusMessage;
 
 namespace wallpaperx {
 
@@ -21,8 +22,10 @@ namespace wallpaperx {
 // Three threads meet here and the split is the whole design:
 //
 //   * the GUI thread constructs this, owns the DBus proxy, and receives FrameReady;
-//   * the DBus reply carries a file descriptor, which is fetched on the GUI thread because
-//     GetFrameFd is a blocking call and blocking the render thread stalls the compositor;
+//   * GetFrameFd is asked ASYNCHRONOUSLY and its reply arrives back on the GUI thread. Not a
+//     preference: a blocking call parks the thread running the compositor's UI, and the first
+//     fetch happens while QML is still building this item, where the nested event loop such a
+//     call needs never runs -- measured, it never returned and the item drew nothing;
 //   * the render thread imports that fd into GL inside updatePaintNode(), because that is the
 //     only place a GL context is current, and frees the previous texture there for the same
 //     reason.
@@ -84,6 +87,8 @@ private:
 
     void connectToDaemon();
     void fetchFrame(quint64 generation);
+    // The reply half of fetchFrame, on the GUI thread once the bus answers.
+    void takeFrameReply(const QDBusMessage& call);
     void setDaemonConnected(bool connected);
     void setUnavailableReason(const QString& reason);
 

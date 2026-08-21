@@ -1251,7 +1251,8 @@ void runRenderChecks(sdbus::IProxy& proxy, FrameReadyLog& signals, const std::st
                       "each plane's rowPitch covers a row of pixels");
             }
         } else {
-            check(frame.drmFormat == 0, "an unpopulated frame reports no fourcc");
+            // The fourcc is channel order, not layout, and an opaque fd has one too -- see
+            // Step 12. Only the layout must be absent.
             check(frame.planes.empty(), "an unpopulated frame reports no planes");
         }
         std::printf("dbus_service_test: handle_type=%d drm_format=0x%08x modifier=0x%llx planes=%zu\n",

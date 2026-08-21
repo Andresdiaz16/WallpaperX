@@ -4,6 +4,8 @@
 
 #include <QDBusConnection>
 #include <QDBusInterface>
+#include <QDBusPendingCall>
+#include <QDBusPendingCallWatcher>
 #include <QDBusReply>
 #include <QDBusUnixFileDescriptor>
 #include <QQuickWindow>
@@ -109,11 +111,21 @@ void WallpaperXItem::fetchFrame(quint64 generation) {
     // what generation the daemon is on.
     if (generation != 0 && generation <= m_fetchedGeneration) return;
 
-    // Blocking, and deliberately on this thread: the render thread must never wait on the bus,
-    // and the daemon answers this from its own GPU worker rather than its event loop, so a slow
-    // render here does not stall the daemon's other callers either.
-    QDBusReply<QDBusUnixFileDescriptor> reply;
-    QDBusMessage call = m_daemon->call(QStringLiteral("GetFrameFd"), m_monitorId);
+    // ASYNCHRONOUS, and this is not a preference. A blocking call here parks the thread that
+    // runs the compositor's UI until the daemon answers -- and worse, the first fetch happens
+    // while QML is still building this item, where the nested event loop a blocking call needs
+    // never gets to run. Measured: the call never returned, the item drew nothing, and the
+    // desktop had no way to say why. The daemon answering the same request over qdbus in
+    // milliseconds is what located it.
+    QDBusPendingCall pending = m_daemon->asyncCall(QStringLiteral("GetFrameFd"), m_monitorId);
+    auto* watcher = new QDBusPendingCallWatcher(pending, this);
+    connect(watcher, &QDBusPendingCallWatcher::finished, this, [this](QDBusPendingCallWatcher* done) {
+        done->deleteLater();
+        takeFrameReply(done->reply());
+    });
+}
+
+void WallpaperXItem::takeFrameReply(const QDBusMessage& call) {
     if (call.type() != QDBusMessage::ReplyMessage) {
         // Not a failure of this item: no frame yet is the ordinary state before the user has
         // chosen a wallpaper, and the daemon says which case it is.

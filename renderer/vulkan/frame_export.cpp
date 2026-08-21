@@ -215,6 +215,11 @@ ExportedFrame exportFrame(Device& device, const OffscreenTarget& target) {
     frame.width = target.width;
     frame.height = target.height;
     frame.memorySize = memorySize;
+    // Reported for BOTH handle types, not just dma_buf. An opaque fd carries no layout
+    // metadata, but it still has a CHANNEL ORDER, and an importer that guesses gets red and
+    // blue the wrong way round -- which is exactly what the first cross-process frame looked
+    // like. The dma_buf path overwrites this with the same value from its own query.
+    frame.drmFormat = drmFourccForVkFormat(OffscreenTargetManager::kFormat);
     frame.type = (handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT) ? ExportedFrame::HandleType::OpaqueFd
                                                                                : ExportedFrame::HandleType::DmaBuf;
 

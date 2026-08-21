@@ -19,11 +19,13 @@ struct MemoryObjectApi {
     using CreateFn = void (*)(GLsizei, GLuint*);
     using DeleteFn = void (*)(GLsizei, const GLuint*);
     using ImportFdFn = void (*)(GLuint, GLuint64, GLenum, GLint);
+    using ParameterivFn = void (*)(GLuint, GLenum, const GLint*);
     using TexStorageFn = void (*)(GLenum, GLsizei, GLenum, GLsizei, GLsizei, GLuint, GLuint64);
 
     CreateFn create = nullptr;
     DeleteFn destroy = nullptr;
     ImportFdFn importFd = nullptr;
+    ParameterivFn parameteriv = nullptr;
     TexStorageFn texStorage = nullptr;
 
     bool complete() const {
@@ -37,6 +39,8 @@ const MemoryObjectApi& memoryObjectApi() {
         resolved.create = reinterpret_cast<MemoryObjectApi::CreateFn>(eglGetProcAddress("glCreateMemoryObjectsEXT"));
         resolved.destroy = reinterpret_cast<MemoryObjectApi::DeleteFn>(eglGetProcAddress("glDeleteMemoryObjectsEXT"));
         resolved.importFd = reinterpret_cast<MemoryObjectApi::ImportFdFn>(eglGetProcAddress("glImportMemoryFdEXT"));
+        resolved.parameteriv =
+            reinterpret_cast<MemoryObjectApi::ParameterivFn>(eglGetProcAddress("glMemoryObjectParameterivEXT"));
         resolved.texStorage =
             reinterpret_cast<MemoryObjectApi::TexStorageFn>(eglGetProcAddress("glTexStorageMem2DEXT"));
         return resolved;
@@ -129,6 +133,24 @@ FrameImport::Result FrameImport::import(const Request& request) {
         return out;
     }
 
+    // The daemon allocates every exportable image with a DEDICATED allocation -- the memory
+    // belongs to that one image rather than being suballocated from a pool -- and the importer
+    // has to say so before importing. Without it the import and the texture allocation both
+    // succeed and the texture samples as blank: the driver treats the memory as an ordinary
+    // pool, so nothing points at the pixels the daemon rendered.
+    //
+    // Missed at first because the in-process probe passed regardless, which is exactly the
+    // shape of bug a same-process test cannot see.
+    if (api.parameteriv != nullptr) {
+        const GLint dedicated = GL_TRUE;
+        api.parameteriv(memory, GL_DEDICATED_MEMORY_OBJECT_EXT, &dedicated);
+        if (glGetError() != GL_NO_ERROR) {
+            api.destroy(1, &memory);
+            out.error = "the memory object would not accept GL_DEDICATED_MEMORY_OBJECT_EXT";
+            return out;
+        }
+    }
+
     // Takes ownership of the fd on success -- the EXT_memory_object_fd spec is explicit that
     // the implementation closes it -- which is why the caller must not.
     api.importFd(memory, static_cast<GLuint64>(request.memorySize), GL_HANDLE_TYPE_OPAQUE_FD_EXT,
@@ -150,6 +172,20 @@ FrameImport::Result FrameImport::import(const Request& request) {
         api.destroy(1, &memory);
         out.error = "glTexStorageMem2DEXT could not back a texture with the imported memory";
         return out;
+    }
+    // The memory has a channel order and GL_RGBA8 storage does not carry it. The daemon renders
+    // B8G8R8A8, so sampling the imported memory as RGBA returns red and blue transposed -- the
+    // first cross-process frame came out with a green corner where it should have been red.
+    // Swizzled rather than storing as BGRA because glTexStorageMem2DEXT takes a sized internal
+    // format and there is no BGRA one; the swizzle is free at sample time.
+    //
+    // Keyed on the format the daemon reports rather than on the daemon being what it is today:
+    // an X/ARGB fourcc is byte order B,G,R,A in memory, and an X/ABGR one is already RGBA.
+    constexpr uint32_t kXrgb8888 = 'X' | ('R' << 8) | ('2' << 16) | ('4' << 24);
+    constexpr uint32_t kArgb8888 = 'A' | ('R' << 8) | ('2' << 16) | ('4' << 24);
+    if (request.drmFormat == kXrgb8888 || request.drmFormat == kArgb8888) {
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R, GL_BLUE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_B, GL_RED);
     }
     glBindTexture(GL_TEXTURE_2D, 0);
 
