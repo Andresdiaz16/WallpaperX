@@ -51,6 +51,8 @@ WallpaperXItem::PendingFrame& WallpaperXItem::PendingFrame::operator=(PendingFra
     return *this;
 }
 
+bool WallpaperXItem::replyIsReadable(int fieldCount) { return fieldCount >= kFrameReplyFields; }
+
 bool WallpaperXItem::worthFetching(Arriving generation, Held newestFetched) {
     if (generation.value == 0) return true;
     return generation.value > newestFetched.value;
@@ -149,7 +151,7 @@ void WallpaperXItem::takeFrameReply(const QDBusMessage& call) {
     // Ten fields, in the order GetFrameFd declares them. Checked rather than assumed: a daemon
     // from a newer build could answer with more, and reading past the end of a short reply is
     // the kind of crash that takes plasmashell with it.
-    if (args.size() < 10) {
+    if (!replyIsReadable(static_cast<int>(args.size()))) {
         setUnavailableReason(tr("WallpaperX answered with something this plugin cannot read."));
         return;
     }

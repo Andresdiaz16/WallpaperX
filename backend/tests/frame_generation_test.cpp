@@ -67,6 +67,29 @@ void checkTheTwoRulesDiffer() {
     check(differAtEquality, "fetching and drawing disagree about a repeated generation, deliberately");
 }
 
+
+// GOAL: a reply with too few fields is refused rather than read past the end. False if it reads
+//       anyway: the parse indexes fields 0 to 9, and indexing a shorter list is a crash inside
+//       plasmashell -- the compositor, not this plugin.
+// WHY-THIS-SHAPE: the boundary is tested from both sides and MORE fields must be accepted, not
+//       just the exact count. A newer daemon adding a field is a reply this plugin can still
+//       read, and an equality test would reject every one of them -- turning a compatible
+//       upgrade into a blank desktop.
+// COVERAGE: this grades the decision, not the parse it guards. Reaching the parse itself needs a
+//       bus peer answering malformed replies, which this suite has no way to stand up.
+// CONTROL: `fieldCount >= kFrameReplyFields` changed to `>` in WallpaperXItem::replyIsReadable
+//       -> "FAIL: a reply with exactly the declared fields is read". Observed 2026-08-21.
+//       Reverted.
+void checkReplyBounds() {
+    check(WallpaperXItem::replyIsReadable(WallpaperXItem::kFrameReplyFields),
+          "a reply with exactly the declared fields is read");
+    check(WallpaperXItem::replyIsReadable(WallpaperXItem::kFrameReplyFields + 3),
+          "a reply from a newer daemon carrying extra fields is still read");
+    check(!WallpaperXItem::replyIsReadable(WallpaperXItem::kFrameReplyFields - 1),
+          "a reply one field short is refused rather than read past the end");
+    check(!WallpaperXItem::replyIsReadable(0), "an empty reply is refused");
+}
+
 }  // namespace
 
 int main() {
@@ -74,6 +97,7 @@ int main() {
     checkWorthFetching();
     checkSupersedesShown();
     checkTheTwoRulesDiffer();
+    checkReplyBounds();
     if (wallpaperx::testing::reportCheckFailures()) return 1;
     return wallpaperx::testing::reportNotVerifiedOrPassed();
 }

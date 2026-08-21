@@ -1056,10 +1056,15 @@ void runNoWallpaperSettingsChecks() {
     // WHY-THIS-SHAPE: `cfg_` is not a naming convention this project invented -- it is how a
     //       Plasma config page writes into the wallpaper's config group, and every shipped
     //       wallpaper's config.qml uses it (org.kde.image declares cfg_Image, cfg_FillMode and a
-    //       dozen more). So the absence of the prefix is exactly the absence of a writer, rather
-    //       than a proxy for it. Searched as text because the claim is about the file that
-    //       ships: a build that loaded it and inspected properties would answer for one instance
-    //       under one Plasma version.
+    //       dozen more). Searched as text because the claim is about the file that ships: a
+    //       build that loaded it and inspected properties would answer for one instance under
+    //       one Plasma version.
+    // WHAT THIS DOES NOT COVER: the CONVENTIONAL writer, not every writer. A pane that POSTed to
+    //       the daemon's HTTP endpoint, called it over DBus, or assigned into
+    //       WallpaperItem.configuration directly would write wallpaper state and carry no `cfg_`
+    //       anywhere. This check would pass. S11.3 is therefore established against the route a
+    //       Plasma config page actually takes, and asserted by reading rather than by test
+    //       against the rest.
     // CONTROL: `property string cfg_WallpaperPath` added to config.qml's root -> "FAIL: the
     //       settings pane declares no cfg_ property, so it writes no wallpaper state",
     //       printing "contents/ui/config.qml carries a config-writing property at byte 1122:
