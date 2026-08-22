@@ -286,7 +286,8 @@ int main(int argc, char** argv) {
         // WHY-THIS-SHAPE: bounded, with an explicit failure branch, and everything below is gated
         //       on it. Falling through on the timeout would let a never-fetching item be graded on
         //       whatever state it was left in.
-        // CONTROL: `if (m_monitorId < 0) return;` widened to `< 1000` in WallpaperXItem::fetchFrame
+        // CONTROL: `if (m_monitorId < 0) return;` widened to `< 1000` in
+        //       WallpaperXItem::fetchFrame in backend/kde/wallpaperx_item.cpp
         //       -> "FAIL: the item asked the stub daemon for a frame", after 5s, and the checks
         //       below did not run. Observed 2026-08-21. Reverted.
         const bool asked = pumpUntil([&stub] { return stub.requests() > 0; }, 5000);
@@ -312,7 +313,8 @@ int main(int argc, char** argv) {
             //       be true without being informative, and the equality check below is what still
             //       refuses a reason from any other cause.
             // CONTROL: the `setUnavailableReason(QString())` at the end of
-            //       WallpaperXItem::takeFrameReply replaced with a non-empty string -> "FAIL: no
+            //       WallpaperXItem::takeFrameReply in backend/kde/wallpaperx_item.cpp
+            //       replaced with a non-empty string -> "FAIL: no
             //       reason is published by the fetch path itself, before any import runs", alone,
             //       with the import checks below still green. Observed 2026-08-21. Reverted.
             pumpFor(200);
@@ -326,7 +328,8 @@ int main(int argc, char** argv) {
             //       change on any pass where the item defers its update, and its failure branch
             //       would be indistinguishable from a real empty reason. The loop cannot pass by
             //       timing out: expiry leaves `reasonAppeared` false, which fails the check.
-            // CONTROL: on the texture == 0 branch of WallpaperXItem::updatePaintNode, the import
+            // CONTROL: on the texture == 0 branch of WallpaperXItem::updatePaintNode in
+            //       backend/kde/wallpaperx_item.cpp, the import
             //       message replaced with `setUnavailableReason(QString())` -> "FAIL: a failed
             //       import publishes a non-empty unavailableReason, readable from QML" plus the
             //       next check, after the full 5s. Observed 2026-08-21. Reverted.
@@ -346,7 +349,9 @@ int main(int argc, char** argv) {
             // WHY-THIS-SHAPE: equality against the shipped string, not `contains("import")`: the
             //       looser form also matches the sync-fd and short-reply messages, and this test
             //       exists to distinguish exactly those.
-            // CONTROL: the same branch made to publish the sync-fd message instead -> "FAIL: the
+            // CONTROL: the texture == 0 branch of WallpaperXItem::updatePaintNode in
+            //       backend/kde/wallpaperx_item.cpp made to publish the sync-fd message
+            //       instead -> "FAIL: the
             //       published reason is the one for an import that failed", alone, and the
             //       diagnostic below named the wrong string. Observed 2026-08-21. Reverted.
             const QString published = root->property("publishedReason").toString();
@@ -362,7 +367,8 @@ int main(int argc, char** argv) {
             // WHY-THIS-SHAPE: the binding above is compared against a direct meta-object read of
             //       the same property. Reading the property alone cannot see a missing NOTIFY.
             // CONTROL: `emit unavailableReasonChanged();` deleted from
-            //       WallpaperXItem::setUnavailableReason -> "FAIL: the QML binding holds the same
+            //       WallpaperXItem::setUnavailableReason in backend/kde/wallpaperx_item.cpp
+            //       -> "FAIL: the QML binding holds the same
             //       string the property returns", with the two checks above red as well because
             //       the binding never updated. Observed 2026-08-21. Reverted.
             auto* renderer = qobject_cast<QQuickItem*>(root->property("rendererItem").value<QObject*>());

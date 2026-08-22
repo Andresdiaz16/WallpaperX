@@ -115,6 +115,11 @@ WallpaperItem {
         if (root.rendererReason !== "") {
             return qsTr("WallpaperX cannot draw on this screen:\n%1").arg(root.rendererReason.substring(0, 256));
         }
+        // A module that never loaded leaves no item and so no reason of its own, and claiming the
+        // wallpaper is about to be drawn sends the user to look at their image file.
+        if (surface.status === Loader.Error) {
+            return qsTr("WallpaperX cannot draw on this screen:\nthe renderer module could not be loaded.");
+        }
         return qsTr("WallpaperX will draw:\n%1").arg(root.wallpaperPath);
     }
 

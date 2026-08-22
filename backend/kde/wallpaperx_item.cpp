@@ -74,8 +74,20 @@ void WallpaperXItem::setMonitorId(int monitorId) {
     if (m_monitorId == monitorId) return;
     m_monitorId = monitorId;
 
-    // Generations are per monitor, so the old screen's marks would reject the new screen's frames.
+    forgetGenerations();
+
+    emit monitorIdChanged();
+    // A screen that has just been identified may already have a frame waiting; without this the
+    // desktop stays blank until the next time the wallpaper happens to change.
+    if (m_monitorId >= 0) fetchFrame(0);
+}
+
+// Every generation mark at once. Generations belong to one monitor and one daemon instance, so a
+// change of either invalidates all of them -- resetting some and not the rest is what made a
+// restarted daemon's frames read as older than the screen.
+void WallpaperXItem::forgetGenerations() {
     m_fetchedGeneration = 0;
+    m_retriedGeneration = 0;
     {
         std::lock_guard<std::mutex> lock(m_pendingMutex);
         m_pending.reset();
@@ -84,11 +96,6 @@ void WallpaperXItem::setMonitorId(int monitorId) {
         std::lock_guard<std::mutex> lock(m_importedMutex);
         m_shownGeneration = 0;
     }
-
-    emit monitorIdChanged();
-    // A screen that has just been identified may already have a frame waiting; without this the
-    // desktop stays blank until the next time the wallpaper happens to change.
-    if (m_monitorId >= 0) fetchFrame(0);
 }
 
 void WallpaperXItem::setUnavailableReason(const QString& reason) {
@@ -99,35 +106,46 @@ void WallpaperXItem::setUnavailableReason(const QString& reason) {
             this, [this, reason] { setUnavailableReason(reason); }, Qt::QueuedConnection);
         return;
     }
-    if (m_unavailableReason == reason) return;
-    m_unavailableReason = reason;
+    // A missing subscription outlives any single frame, so a good frame must not clear it: the
+    // wallpaper would be shown and then never change again, with nothing said.
+    const QString settled = (reason.isEmpty() && !m_subscribed)
+                                ? tr("This plugin could not subscribe to WallpaperX frame updates, so "
+                                     "the wallpaper will not change.")
+                                : reason;
+    if (m_unavailableReason == settled) return;
+    m_unavailableReason = settled;
     emit unavailableReasonChanged();
+}
+
+bool WallpaperXItem::subscribeToFrameReady() {
+    return QDBusConnection::sessionBus().connect(QString::fromUtf8(kService), QString::fromUtf8(kPath),
+                                                 QString::fromUtf8(kInterface), QStringLiteral("FrameReady"), this,
+                                                 SLOT(onFrameReady(int, qulonglong)));
 }
 
 void WallpaperXItem::connectToDaemon() {
     // Messages are built by hand rather than through QDBusInterface, whose constructor blocks on
     // an Introspect round trip -- on the thread that runs the compositor's UI, from a QML item's
     // constructor. Nothing here waits on the bus.
-    const bool subscribed = QDBusConnection::sessionBus().connect(
-        QString::fromUtf8(kService), QString::fromUtf8(kPath), QString::fromUtf8(kInterface),
-        QStringLiteral("FrameReady"), this, SLOT(onFrameReady(int, qulonglong)));
-    if (!subscribed) {
-        // Otherwise the wallpaper silently stops changing.
-        setUnavailableReason(tr("WallpaperX is running, but this plugin could not subscribe to frame updates."));
-        return;
-    }
+    m_subscribed = subscribeToFrameReady();
+    // No early return on failure: an item that cannot hear FrameReady must still notice the
+    // daemon arriving or leaving, and the watcher below is the only thing that can retry.
+    if (!m_subscribed) setUnavailableReason(QString());
+
     // The item is created with the desktop, so the daemon may not own its name yet.
     auto* watcher = new QDBusServiceWatcher(QString::fromUtf8(kService), QDBusConnection::sessionBus(),
                                             QDBusServiceWatcher::WatchForOwnerChange, this);
     connect(watcher, &QDBusServiceWatcher::serviceOwnerChanged, this,
             [this](const QString&, const QString&, const QString& newOwner) {
-                m_daemonConnected = !newOwner.isEmpty();
                 if (newOwner.isEmpty()) {
                     setUnavailableReason(tr("WallpaperX is not running."));
                     return;
                 }
-                // A restarted daemon numbers from scratch.
-                m_fetchedGeneration = 0;
+                // Gated: an unconditional retry would add a duplicate match rule per restart,
+                // which is one of the things that makes the subscription fail in the first place.
+                if (!m_subscribed) m_subscribed = subscribeToFrameReady();
+                // A restarted daemon numbers from scratch, so every mark is meaningless now.
+                forgetGenerations();
                 fetchFrame(0);
             });
 
@@ -156,7 +174,6 @@ void WallpaperXItem::fetchFrame(quint64 generation) {
         m_refetchWhenDone = true;
         return;
     }
-    m_fetchInFlight = true;
 
     // ASYNCHRONOUS, and this is not a preference. A blocking call here parks the thread that
     // runs the compositor's UI until the daemon answers -- and worse, the first fetch happens
@@ -169,6 +186,13 @@ void WallpaperXItem::fetchFrame(quint64 generation) {
         QStringLiteral("GetFrameFd"));
     request.setArguments({m_monitorId});
     QDBusPendingCall pending = QDBusConnection::sessionBus().asyncCall(request);
+    // A call with no bus behind it comes back already finished, and its watcher would never emit
+    // anything -- so latching here would stop this item fetching for the rest of the session.
+    if (pending.isFinished()) {
+        takeFrameReply(pending.reply());
+        return;
+    }
+    m_fetchInFlight = true;
     auto* watcher = new QDBusPendingCallWatcher(pending, this);
     // The reply carries no monitor id of its own.
     const int requestedMonitor = m_monitorId;
@@ -184,12 +208,17 @@ void WallpaperXItem::fetchFrame(quint64 generation) {
 }
 
 void WallpaperXItem::takeFrameReply(const QDBusMessage& call) {
-    // The reply is what settles it: only an unknown service means the daemon is not there.
-    const bool absent = call.type() == QDBusMessage::ErrorMessage &&
-                        call.errorName() == QLatin1String("org.freedesktop.DBus.Error.ServiceUnknown");
-    m_daemonConnected = !absent;
-
     if (call.type() != QDBusMessage::ReplyMessage) {
+        // A bus error is jargon about transport ("The name io.wallpaperx.Daemon was not provided
+        // by any .service files"), so it is answered in this plugin's own words. Only the
+        // daemon's own errors carry text worth putting on a desktop.
+        const QString name = call.errorName();
+        if (name.startsWith(QLatin1String("org.freedesktop.DBus.Error."))) {
+            setUnavailableReason(name == QLatin1String("org.freedesktop.DBus.Error.ServiceUnknown")
+                                     ? tr("WallpaperX is not running.")
+                                     : tr("WallpaperX could not be reached."));
+            return;
+        }
         // Not a failure of this item: no frame yet is the ordinary state before the user has
         // chosen a wallpaper, and the daemon says which case it is.
         setUnavailableReason(call.errorMessage().isEmpty() ? tr("WallpaperX has no frame for this screen yet.")
@@ -308,9 +337,43 @@ QSGNode* WallpaperXItem::updatePaintNode(QSGNode* old, UpdatePaintNodeData*) {
 
     if (incoming.has_value()) {
         const FrameImport::Result imported = FrameImport::import(incoming->request);
-        if (imported.texture == 0) {
+        // Null means nothing took ownership of the import, so it is freed by hand here.
+        QSGTexture* texture =
+            imported.texture == 0
+                ? nullptr
+                // No alpha flag: every fourcc the daemon can export is an X variant, so the alpha
+                // bytes are undefined and the scene graph must not blend against them.
+                : QNativeInterface::QSGOpenGLTexture::fromNative(
+                      imported.texture, host,
+                      QSize(static_cast<int>(incoming->request.width), static_cast<int>(incoming->request.height)),
+                      {});
+        if (texture == nullptr) {
+            if (imported.texture != 0) FrameImport::release(imported);
             setUnavailableReason(tr("WallpaperX produced a frame this desktop could not import."));
+            // The node goes too: keeping one would leave the desktop showing a frame while the
+            // item reports it is drawing nothing.
+            delete node;
+            node = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(m_importedMutex);
+                m_shownGeneration = 0;
+            }
+            // Asked for once more. A still wallpaper sends no further FrameReady, so without this
+            // a transient failure is permanent. The whole decision runs on the item's own thread,
+            // marks included -- this branch is the render thread's.
+            const quint64 failed = incoming->generation;
+            QMetaObject::invokeMethod(
+                this,
+                [this, failed] {
+                    if (m_retriedGeneration == failed) return;
+                    m_retriedGeneration = failed;
+                    m_fetchedGeneration = 0;
+                    fetchFrame(0);
+                },
+                Qt::QueuedConnection);
         } else {
+            // Built only now: a node handed back without a texture is a null dereference inside
+            // the scene graph.
             if (node == nullptr) {
                 node = new QSGSimpleTextureNode();
                 // Load-bearing for the release below: the node destroying its texture is what
@@ -318,31 +381,20 @@ QSGNode* WallpaperXItem::updatePaintNode(QSGNode* old, UpdatePaintNodeData*) {
                 node->setOwnsTexture(true);
                 node->setFiltering(QSGTexture::Linear);
             }
-            // No alpha flag: every fourcc the daemon can export is an X variant, so the alpha
-            // bytes are undefined and the scene graph must not blend against them.
-            QSGTexture* texture = QNativeInterface::QSGOpenGLTexture::fromNative(
-                imported.texture, host,
-                QSize(static_cast<int>(incoming->request.width), static_cast<int>(incoming->request.height)), {});
-            if (texture == nullptr) {
-                // Nothing took ownership, so this is the one place that frees by hand.
-                FrameImport::release(imported);
-                setUnavailableReason(tr("WallpaperX produced a frame this desktop could not import."));
-            } else {
-                // Tied to the texture rather than scheduled as a render job: a NoStage job posted
-                // against an unexposed window is dropped without running, and by then this is the
-                // only reference left. Node teardown and setTexture both run on the render thread
-                // with the context current, which release needs.
-                QObject::connect(
-                    texture, &QObject::destroyed, texture, [imported] { FrameImport::release(imported); },
-                    Qt::DirectConnection);
-                node->setTexture(texture);
-                node->markDirty(QSGNode::DirtyMaterial);
-                {
-                    std::lock_guard<std::mutex> lock(m_importedMutex);
-                    m_shownGeneration = incoming->generation;
-                }
-                setUnavailableReason(QString());
+            // Tied to the texture rather than scheduled as a render job: a NoStage job posted
+            // against an unexposed window is dropped without running, and by then this is the
+            // only reference left. Node teardown and setTexture both run on the render thread
+            // with the context current, which release needs.
+            QObject::connect(
+                texture, &QObject::destroyed, texture, [imported] { FrameImport::release(imported); },
+                Qt::DirectConnection);
+            node->setTexture(texture);
+            node->markDirty(QSGNode::DirtyMaterial);
+            {
+                std::lock_guard<std::mutex> lock(m_importedMutex);
+                m_shownGeneration = incoming->generation;
             }
+            setUnavailableReason(QString());
         }
     }
 

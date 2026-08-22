@@ -2,6 +2,9 @@
 
 #include "frame_import.h"
 
+// The fourccs the daemon exports, shared with it rather than copied: the two lists had drifted.
+#include "vulkan/drm_formats.h"
+
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <GL/gl.h>
@@ -264,25 +267,20 @@ FrameImport::Result FrameImport::import(Request& request) {
     // GL_RGBA8 carries neither the channel order nor the alpha semantics, so both are decoded
     // here and applied as swizzles below. Before anything is allocated, so a format this cannot
     // lay out fails while the fd is still the caller's to close.
-    constexpr uint32_t kXrgb8888 = 'X' | ('R' << 8) | ('2' << 16) | ('4' << 24);
-    constexpr uint32_t kArgb8888 = 'A' | ('R' << 8) | ('2' << 16) | ('4' << 24);
-    constexpr uint32_t kXbgr8888 = 'X' | ('B' << 8) | ('2' << 16) | ('4' << 24);
-    constexpr uint32_t kAbgr8888 = 'A' | ('B' << 8) | ('2' << 16) | ('4' << 24);
-
     bool swapRedAndBlue = false;
     bool alphaIsUndefined = false;
     switch (request.drmFormat) {
-        case kXrgb8888:
+        case kDrmFormatXrgb8888:
             swapRedAndBlue = true;
             alphaIsUndefined = true;
             break;
-        case kArgb8888:
+        case kDrmFormatArgb8888:
             swapRedAndBlue = true;
             break;
-        case kXbgr8888:
+        case kDrmFormatXbgr8888:
             alphaIsUndefined = true;
             break;
-        case kAbgr8888:
+        case kDrmFormatAbgr8888:
             break;
         default:
             // Laid out as 8-bit RGBA it would import cleanly and draw garbage.
@@ -315,17 +313,18 @@ FrameImport::Result FrameImport::import(Request& request) {
         return out;
     }
 
-    // Takes ownership of the fd on success -- the EXT_memory_object_fd spec is explicit that
-    // the implementation closes it -- which is why the caller must not.
+    // Surrendered at the moment it is handed over, not once the call succeeds: ownership on
+    // failure is unspecified, and Mesa closes it before reporting the error. Closing a
+    // descriptor the process has since reused costs plasmashell its own socket.
+    const int surrendered = request.fd;
+    request.fd = -1;
     api.importFd(memory, static_cast<GLuint64>(request.memorySize), GL_HANDLE_TYPE_OPAQUE_FD_EXT,
-                 static_cast<GLint>(request.fd));
+                 static_cast<GLint>(surrendered));
     if (glGetError() != GL_NO_ERROR) {
         api.destroy(1, &memory);
         out.error = "glImportMemoryFdEXT rejected the exported memory";
         return out;
     }
-    // Gone from here on, whatever happens below.
-    request.fd = -1;
 
     GLuint texture = 0;
     glGenTextures(1, &texture);

@@ -118,6 +118,10 @@ private:
     };
 
     void connectToDaemon();
+    // Installs the FrameReady match rule. False when the bus refused it.
+    bool subscribeToFrameReady();
+    // Drops every generation mark together. See the definition for why they go as a set.
+    void forgetGenerations();
     void fetchFrame(quint64 generation);
     // The reply half of fetchFrame, on the GUI thread once the bus answers.
     void takeFrameReply(const QDBusMessage& call);
@@ -127,10 +131,15 @@ private:
     // The newest generation this item has fetched, so a signal for a frame already in hand
     // costs nothing. GUI thread only, like everything else the fetch path touches.
     quint64 m_fetchedGeneration = 0;
+    // The generation a failed import already asked for again, so an unimportable frame is
+    // retried once rather than forever.
+    quint64 m_retriedGeneration = 0;
     // A GetFrameFd is out; a further one is wanted once it lands. GUI thread only.
     bool m_fetchInFlight = false;
     bool m_refetchWhenDone = false;
-    bool m_daemonConnected = false;
+    // Whether FrameReady is subscribed. Without it no wallpaper change is ever heard, which no
+    // single frame's success can retire.
+    bool m_subscribed = false;
     QString m_unavailableReason;
 
     std::mutex m_pendingMutex;

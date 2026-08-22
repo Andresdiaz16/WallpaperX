@@ -517,13 +517,15 @@ bool runImportChecks() {
         //       gets there by swizzle and the other by telling EGL the fourcc, and both are ways
         //       of saying the same thing. So one expectation grades both, and neither path can
         //       reach it by accident.
-        // CONTROL: the swizzle in FrameImport::import disabled (`if (false)`) -> "FAIL: sampling
+        // CONTROL: the swizzle in FrameImport::import in backend/kde/frame_import.cpp disabled
+        //       (`if (false)`) -> "FAIL: sampling
         //       the imported texture gives the colours that were rendered", 4788 of 9792 bytes
         //       differing, "first at pixel (0,0): sampled 0,16,16,255; rendered 16,16,0,255", on
         //       the NVIDIA opaque entry and correctly green on the dma_buf one, which does not
         //       use the swizzle. Observed 2026-08-21. Reverted.
         // CONTROL: B8G8R8A8_UNORM mapped to XBGR8888 instead of XRGB8888 in
-        //       drmFourccForVkFormat -- an exporter that lies about its channel order -> the same
+        //       drmFourccForVkFormat in renderer/vulkan/frame_export.cpp -- an exporter that lies
+        //       about its channel order -> the same
         //       FAIL on BOTH entries. Before this check, that mutation left all 40 tests green.
         //       Observed 2026-08-21. Reverted.
         std::string sampledWhy;
@@ -567,7 +569,8 @@ bool runImportChecks() {
         //       because the two paths dispose of the fd differently -- GL takes ownership,
         //       EGL dups and the importer closes its own -- and the property that must hold is
         //       about the process, not about which call was made.
-        // CONTROL: the `::close(request.fd)` deleted from FrameImport::importDmaBuf -> "FAIL:
+        // CONTROL: the `::close(request.fd)` deleted from FrameImport::importDmaBuf in
+        //       backend/kde/frame_import.cpp -> "FAIL:
         //       importing and releasing repeatedly does not accumulate descriptors", printing
         //       "45 open fds before, 47 after one cycle, 54 after eight" -- one per frame, which
         //       is what the loop exists to show. Observed 2026-08-21 on the lavapipe entry.
@@ -610,7 +613,8 @@ bool runImportChecks() {
         //       counting. Counting cannot see this: the caller's second close simply fails with
         //       EBADF and the total is unchanged, which is exactly what a count-based version of
         //       this check did -- it passed with the defect present, measured.
-        // CONTROL: `request.fd = -1` deleted from FrameImport::import after the importFd check ->
+        // CONTROL: `request.fd = -1` deleted from FrameImport::import in
+        //       backend/kde/frame_import.cpp, ahead of the importFd call ->
         //       "FAIL: a failed import that consumed the descriptor says so...", printing
         //       "import failed and returned fd 51, which is already closed". Observed
         //       2026-08-21. Reverted.

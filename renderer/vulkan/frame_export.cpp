@@ -197,7 +197,8 @@ ExportedFrame exportFrame(Device& device, const OffscreenTarget& target) {
     const uint32_t drmFormat = drmFourccForVkFormat(OffscreenTargetManager::kFormat);
     if (drmFormat == 0) {
         throw std::runtime_error("exportFrame: no DRM fourcc mapping for the offscreen target's format -- "
-                                 "add one to drmFourccForVkFormat before changing kFormat");
+                                 "before changing kFormat, add a case to drmFourccForVkFormat AND to "
+                                 "FrameImport::import's format switch, which refuses what it cannot lay out");
     }
 
     ExportedFrame frame;

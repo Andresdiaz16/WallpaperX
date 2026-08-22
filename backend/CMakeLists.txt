@@ -131,7 +131,10 @@ if(EGL_FOUND AND OpenGL_OpenGL_FOUND)
     add_library(wallpaperx-frame-import STATIC kde/frame_import.cpp)
     # Same reason as wallpaperxplugin: this ends up inside the QML plugin's shared object.
     set_target_properties(wallpaperx-frame-import PROPERTIES POSITION_INDEPENDENT_CODE ON)
-    target_include_directories(wallpaperx-frame-import PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/kde)
+    # The renderer's directory is on the path for vulkan/drm_formats.h alone -- fourcc constants
+    # with no Vulkan in them, shared so the exporter and this importer cannot drift apart.
+    target_include_directories(wallpaperx-frame-import PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/kde
+                               ${CMAKE_CURRENT_SOURCE_DIR}/../renderer)
     # The imported target carries EGL's include dirs, library dir and -lEGL together; PUBLIC
     # hands all three to the probe and the plugin, which include <EGL/egl.h> themselves.
     target_link_libraries(wallpaperx-frame-import PUBLIC PkgConfig::EGL OpenGL::GL)
@@ -713,6 +716,7 @@ if(DBUS_RUN_SESSION)
         set_tests_properties(item_import_failure PROPERTIES
             ENVIRONMENT "QT_QPA_PLATFORM=wayland\;xcb\;offscreen;QT_NO_XDG_DESKTOP_PORTAL=1"
             LABELS "novulkan"
+            RESOURCE_LOCK wallpaperx_bus_tests
             SKIP_RETURN_CODE 77)
     endif()
 else()
