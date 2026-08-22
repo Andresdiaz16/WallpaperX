@@ -163,12 +163,19 @@ if(EGL_FOUND AND OpenGL_OpenGL_FOUND)
     # used) is a property of the machine that can change without this file changing. It reports
     # 77 with the reason when it cannot import, which ctest reads as a skip; the probe itself
     # needs no Qt.
-    # Two entries because there are two import paths, and each PINS the one it covers. Left to
-    # the device, a Mesa-only host sends both entries down the dma_buf path and the GL
-    # memory-object path is covered by nothing, so a regression in it ships green.
+    # One entry per import path, each PINNING the one it covers rather than letting the device
+    # decide -- a host that resolves to one vendor would otherwise leave the other path covered by
+    # nothing. Both are registered unconditionally so the gap is a named skip rather than an
+    # absent entry; the lavapipe twin below only adds a second device for the dma_buf path.
     add_test(NAME frame_import_probe COMMAND wallpaperx-frame-import-probe)
     set_tests_properties(frame_import_probe PROPERTIES
         ENVIRONMENT "WALLPAPERX_FORCE_HANDLE_TYPE=opaque"
+        LABELS "novulkan"
+        SKIP_RETURN_CODE 77)
+
+    add_test(NAME frame_import_probe_dmabuf COMMAND wallpaperx-frame-import-probe)
+    set_tests_properties(frame_import_probe_dmabuf PROPERTIES
+        ENVIRONMENT "WALLPAPERX_FORCE_HANDLE_TYPE=dmabuf"
         LABELS "novulkan"
         SKIP_RETURN_CODE 77)
 
@@ -535,13 +542,13 @@ set_tests_properties(qml_lint PROPERTIES LABELS "novulkan"
                      SKIP_RETURN_CODE 77)
 
 # The one file importing this project's own QML module, as its own entry: folded into the one
-# above, a build with no module withholds main.qml's and config.qml's verdicts too. Skipped here
-# means "this build has no QML module", not "this host has no qmllint".
-if(WALLPAPERX_BUILD_KDE_PLUGIN AND WALLPAPERX_HAVE_FRAME_IMPORT)
-    add_test(NAME qml_lint_surface COMMAND $<TARGET_FILE:wallpaperx-qml-lint-test> surface)
-    set_tests_properties(qml_lint_surface PROPERTIES LABELS "novulkan"
-                         SKIP_RETURN_CODE 77)
-endif()
+# above, a build with no module withholds main.qml's and config.qml's verdicts too. Registered
+# unconditionally, because this row also carries checks that need no module at all -- that the
+# package still ships the file, and that it has no lint directives -- and guarding the entry on
+# the module took those away too. Without a module the binary reports a named skip.
+add_test(NAME qml_lint_surface COMMAND $<TARGET_FILE:wallpaperx-qml-lint-test> surface)
+set_tests_properties(qml_lint_surface PROPERTIES LABELS "novulkan"
+                     SKIP_RETURN_CODE 77)
 
 # Registered only where Qt's test module exists. The offscreen platform is set here rather than
 # left to the environment: with a real display the plugin would open a window on the developer's

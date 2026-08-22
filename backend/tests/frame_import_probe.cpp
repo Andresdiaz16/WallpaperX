@@ -38,6 +38,7 @@
 
 #include <dirent.h>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -413,9 +414,9 @@ bool runImportChecks() {
             request.planes.emplace_back(plane.offset, plane.rowPitch);
         }
 
-        // Which path runs is the device's choice, not this probe's: NVIDIA exports opaque by
-        // policy and Mesa exports dma_buf. Both are under test, and the run says which it took
-        // so a green log cannot be mistaken for covering both.
+        // Which path runs is PINNED per ctest entry through WALLPAPERX_FORCE_HANDLE_TYPE, not
+        // left to the device. One run therefore covers one path, and this line says which -- a
+        // green log for one entry is not evidence about the other.
         std::printf("frame_import_probe: %s path, on %s\n", isDmaBuf ? "dma_buf" : "opaque fd",
                     gl.renderer().c_str());
         if (!wallpaperx::FrameImport::supports(request.handleType, &why)) {
@@ -491,15 +492,27 @@ bool runImportChecks() {
             return out;
         };
         const std::vector<unsigned char> asColours = swappedRedBlue(expected);
-        const bool same = got.size() == expected.size() && (got == expected || got == asColours);
+        // Alpha is normalised out of the LAYOUT comparison on both sides. The fourcc declares it
+        // undefined, and the two paths disagree about what a framebuffer read of it returns --
+        // GL_RGBA8 storage hands back the raw bytes, an XRGB EGLImage hands back 1, and a
+        // texture swizzle is a sampling rule that a framebuffer read does not apply. This check
+        // is about where bytes land; the sampled check below is what grades alpha.
+        const auto opaque = [](std::vector<unsigned char> in) {
+            for (size_t i = 3; i < in.size(); i += 4) in[i] = 255;
+            return in;
+        };
+        const std::vector<unsigned char> read = opaque(got);
+        const std::vector<unsigned char> asLaidOut = opaque(expected);
+        const std::vector<unsigned char> asLaidOutSwapped = opaque(asColours);
+        const bool same = got.size() == expected.size() && (read == asLaidOut || read == asLaidOutSwapped);
         check(same, "the imported texture is laid out as the frame that was rendered");
         if (!same) {
             size_t differing = 0;
-            for (size_t i = 0; i < got.size() && i < expected.size(); ++i) {
-                if (got[i] != expected[i]) ++differing;
+            for (size_t i = 0; i < read.size() && i < asLaidOut.size(); ++i) {
+                if (read[i] != asLaidOut[i]) ++differing;
             }
             std::fprintf(stderr, "  %zu of %zu bytes differ (read %zu, expected %zu) on %s\n", differing,
-                         expected.size(), got.size(), expected.size(), gl.renderer().c_str());
+                         asLaidOut.size(), got.size(), asLaidOut.size(), gl.renderer().c_str());
         }
 
         // GOAL: S12.1 -- what a compositor SAMPLES from the imported texture is the colour that
@@ -528,6 +541,13 @@ bool runImportChecks() {
         //       about its channel order -> the same
         //       FAIL on BOTH entries. Before this check, that mutation left all 40 tests green.
         //       Observed 2026-08-21. Reverted.
+        // CONTROL, the alpha half: the `GL_TEXTURE_SWIZZLE_A` block in FrameImport::import in
+        //       backend/kde/frame_import.cpp disabled (`if (false && ...)`) -> "FAIL: sampling the
+        //       imported texture gives the colours that were rendered, with the undefined alpha
+        //       forced opaque", 2448 of 9792 bytes differing -- exactly the alpha channel --
+        //       "sampled 16,16,0,32; rendered 16,16,0,255" on the NVIDIA opaque entry. This is
+        //       gradable only because the source frame's alpha varies and is never 255.
+        //       Observed 2026-08-22. Reverted.
         std::string sampledWhy;
         const std::vector<unsigned char> sampled = readSampled(imported.texture, kWidth, kHeight, sampledWhy);
         if (sampled.empty()) {
@@ -535,13 +555,20 @@ bool runImportChecks() {
             // harness cannot print as a failure of the code under test.
             notVerified(kGoals, "the imported texture could not be sampled -- " + sampledWhy);
         } else {
-            const bool coloursMatch = sampled == asColours;
-            check(coloursMatch, "sampling the imported texture gives the colours that were rendered");
+            // Alpha is expected OPAQUE whatever was rendered: the daemon exports an X fourcc, so
+            // those bytes are undefined and the importer must force them to 1. The source frame
+            // carries a varying alpha precisely so this is a claim that can fail.
+            std::vector<unsigned char> expectedSample = asColours;
+            for (size_t i = 3; i < expectedSample.size(); i += 4) expectedSample[i] = 255;
+
+            const bool coloursMatch = sampled == expectedSample;
+            check(coloursMatch, "sampling the imported texture gives the colours that were rendered, with the "
+                                "undefined alpha forced opaque");
             if (!coloursMatch) {
                 size_t differing = 0;
                 size_t firstAt = sampled.size();
-                for (size_t i = 0; i < sampled.size() && i < asColours.size(); ++i) {
-                    if (sampled[i] == asColours[i]) continue;
+                for (size_t i = 0; i < sampled.size() && i < expectedSample.size(); ++i) {
+                    if (sampled[i] == expectedSample[i]) continue;
                     ++differing;
                     if (firstAt == sampled.size()) firstAt = i;
                 }
@@ -550,10 +577,10 @@ bool runImportChecks() {
                     std::fprintf(stderr,
                                  "  %zu of %zu bytes differ, first at pixel (%zu,%zu): sampled %u,%u,%u,%u; rendered "
                                  "%u,%u,%u,%u -- on %s\n",
-                                 differing, asColours.size(), (pixel / 4) % kWidth, (pixel / 4) / kWidth,
+                                 differing, expectedSample.size(), (pixel / 4) % kWidth, (pixel / 4) / kWidth,
                                  sampled[pixel], sampled[pixel + 1], sampled[pixel + 2], sampled[pixel + 3],
-                                 asColours[pixel], asColours[pixel + 1], asColours[pixel + 2], asColours[pixel + 3],
-                                 gl.renderer().c_str());
+                                 expectedSample[pixel], expectedSample[pixel + 1], expectedSample[pixel + 2],
+                                 expectedSample[pixel + 3], gl.renderer().c_str());
                 }
             }
         }
@@ -602,6 +629,13 @@ bool runImportChecks() {
         }
         check(afterRejected == beforeRejected,
               "a failed import leaves its file descriptor with the caller, neither closed nor leaked");
+        if (afterRejected != beforeRejected) {
+            std::fprintf(stderr, "  %d open fds before the failed import, %d after\n", beforeRejected,
+                         afterRejected);
+        }
+        // Closed here, or the eight-cycle counts below start one descriptor high and a real
+        // per-frame leak is chased as a phantom.
+        if (rejected.fd >= 0) ::close(rejected.fd);
 
         // GOAL: a failure AFTER the driver has taken the descriptor still tells the caller the
         //       descriptor is gone. The case above is refused before any driver call, so it
@@ -623,33 +657,62 @@ bool runImportChecks() {
             targets.render(renderer, lateTarget);
             wallpaperx::ExportedFrame lateFrame = wallpaperx::exportFrame(device, lateTarget);
 
+            // Every value describes THIS export. Copying the first frame's size, fourcc or
+            // modifier makes the import fail on the mismatch instead of where it is staged to,
+            // which grades the pre-driver refusal already covered above and reports it as this.
             wallpaperx::FrameImport::Request late = request;
             late.fd = lateFrame.fd;
+            late.memorySize = lateFrame.memorySize;
+            late.drmFormat = lateFrame.drmFormat;
+            late.drmModifier = lateFrame.modifier;
             late.planes.clear();
             for (const auto& plane : lateFrame.planes) late.planes.emplace_back(plane.offset, plane.rowPitch);
-            // Transposed, which is what this file's own control uses to make the texture
-            // allocation fail while the memory import succeeds.
-            late.width = kHeight;
-            late.height = kWidth;
+            // Transposed, which makes the texture allocation fail after the memory import has
+            // already taken the fd. Only on the memory-object path: eglCreateImage does not
+            // validate the declared size, so on dma_buf this would simply succeed.
+            const bool stageable = late.handleType == wallpaperx::FrameImport::HandleType::OpaqueFd;
+            if (stageable) {
+                late.width = kHeight;
+                late.height = kWidth;
+            }
             const int lateFd = late.fd;
+            // Identity, not openness: a number the driver freed can be reopened by the driver
+            // before this is read, and fcntl would call that "still ours". The dup keeps the
+            // original file alive so a replacement is distinguishable by inode.
+            const int guard = ::dup(lateFd);
+            struct ::stat before {};
+            const bool guarded = guard >= 0 && ::fstat(guard, &before) == 0;
 
             const wallpaperx::FrameImport::Result lateResult = wallpaperx::FrameImport::import(late);
-            if (lateResult.texture != 0) {
+            struct ::stat after {};
+            const bool sameFile = guarded && late.fd >= 0 && ::fstat(late.fd, &after) == 0 &&
+                                  after.st_dev == before.st_dev && after.st_ino == before.st_ino;
+
+            if (!guarded) {
+                wallpaperx::testing::harnessFailure("the descriptor could not be duplicated, so what the import did "
+                                                   "with it could not be established");
+            } else if (lateResult.texture != 0) {
+                // Not a skip for the whole binary: the case is opaque-only by construction, and
+                // downgrading a fully passing dma_buf run to 77 hides everything else it graded.
                 wallpaperx::FrameImport::release(lateResult);
-                if (late.fd >= 0) ::close(late.fd);
-                notVerified(kGoals, "the transposed import unexpectedly succeeded, so a failure past the memory "
-                                    "import could not be staged on this driver");
-            } else {
-                // Either it says it consumed the fd, or the fd it handed back is genuinely open.
-                const bool stillOpen = ::fcntl(lateFd, F_GETFD) != -1;
-                const bool honest = late.fd < 0 || stillOpen;
+                std::printf("frame_import_probe: post-consumption failure not staged on the dma_buf path -- "
+                            "eglCreateImage takes no fd to lose. Graded on the opaque entry.\n");
+            } else if (stageable) {
+                // The fd was handed to GL, so the request must say it is gone.
+                const bool honest = late.fd < 0;
                 check(honest, "a failed import that consumed the descriptor says so, rather than handing back a "
                               "number the caller would close twice");
                 if (!honest) {
-                    std::fprintf(stderr, "  import failed and returned fd %d, which is already closed\n", lateFd);
+                    std::fprintf(stderr, "  import failed and returned fd %d, which %s\n", lateFd,
+                                 sameFile ? "still names the exported frame" : "now names a different file");
                 }
-                if (late.fd >= 0 && stillOpen) ::close(late.fd);
+            } else {
+                // The opposite claim, and a real one: EGL duplicates what it needs, so a dma_buf
+                // failure must leave the caller's descriptor untouched rather than consumed.
+                check(sameFile, "a failed dma_buf import leaves the caller's descriptor open and unchanged");
             }
+            if (late.fd >= 0 && sameFile) ::close(late.fd);
+            if (guard >= 0) ::close(guard);
         }
 
         // The property that matters is that the count does not grow PER FRAME. A driver may hold

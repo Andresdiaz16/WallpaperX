@@ -59,6 +59,10 @@ inline std::string writeSolidPng(const std::string& path, int width, int height,
 // succeeds for any rowPitch, any plane offset and either orientation. Only content that
 // varies in both axes can fail it. R varies along x only and G along y only, so a
 // transposed reading is distinguishable from a correct one.
+//
+// Alpha varies and is never 255, deliberately. The daemon exports an X fourcc, meaning the alpha
+// bytes are undefined and an importer must force them to 1; against a fully opaque frame that
+// forcing is byte-identical to passing the bytes through, so the whole decision was ungradable.
 inline std::string writeGradientPng(const std::string& path, int width, int height) {
     std::vector<unsigned char> pixels(static_cast<size_t>(width) * height * 4);
     for (int y = 0; y < height; ++y) {
@@ -67,7 +71,7 @@ inline std::string writeGradientPng(const std::string& path, int width, int heig
             px[0] = static_cast<unsigned char>(16 + x * 15);
             px[1] = static_cast<unsigned char>(16 + y * 15);
             px[2] = static_cast<unsigned char>((x * 16 + y * 3) & 0xff);
-            px[3] = 255;
+            px[3] = static_cast<unsigned char>(32 + ((x * 7 + y * 5) & 0x3f));
         }
     }
     detail::writePngOrThrow(path, width, height, pixels);

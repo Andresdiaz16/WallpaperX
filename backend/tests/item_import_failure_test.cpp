@@ -380,9 +380,16 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Before the render control tears its context down: the node owns the import, and freeing it
-    // needs that context.
+    // The node owns the import and freeing it needs the context, but destroying the item only
+    // QUEUES the node -- and QQuickRenderControl makes the context current only between
+    // beginFrame() and endFrame(). So one more frame runs the queued deletion, and invalidate()
+    // releases the scene graph's own resources. Today's import always fails and no texture
+    // exists; this is what keeps that true when a success case is added.
     root.reset();
+    control.beginFrame();
+    control.sync();
+    control.endFrame();
+    control.invalidate();
 
     const bool checksRed = wallpaperx::testing::reportCheckFailures();
     const bool harnessRed = wallpaperx::testing::reportHarnessFaults("in this test file, not in the plugin");
