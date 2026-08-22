@@ -633,8 +633,11 @@ bool runImportChecks() {
             std::fprintf(stderr, "  %d open fds before the failed import, %d after\n", beforeRejected,
                          afterRejected);
         }
-        // Closed here, or the eight-cycle counts below start one descriptor high and a real
-        // per-frame leak is chased as a phantom.
+        // Closed here, or this descriptor stays open for the run and the counts printed by the
+        // growth check below are one high -- sending whoever reads them after a leak the harness
+        // caused. NOT graded, and deliberately so: that check compares growth BETWEEN cycles, so
+        // a constant one-off offset cancels. Measured -- deleting this close leaves all three
+        // probe entries green.
         if (rejected.fd >= 0) ::close(rejected.fd);
 
         // GOAL: a failure AFTER the driver has taken the descriptor still tells the caller the
@@ -652,6 +655,15 @@ bool runImportChecks() {
         //       "FAIL: a failed import that consumed the descriptor says so...", printing
         //       "import failed and returned fd 51, which is already closed". Observed
         //       2026-08-21. Reverted.
+        // CONTROL, the dma_buf half: `::close(request.fd); request.fd = -1;` added to the
+        //       eglCreateImage failure return in FrameImport::importDmaBuf in
+        //       backend/kde/frame_import.cpp -> "FAIL: a failed dma_buf import leaves the
+        //       caller's descriptor open and unchanged" on BOTH dma_buf entries and correctly
+        //       green on the opaque one. Observed 2026-08-22. Reverted.
+        // COVERAGE-ASSERT: a staged failure that does not fail is a harness fault, not a skip.
+        //       Reporting it as notVerified() would downgrade the whole binary to 77, and an
+        //       earlier version of this block simply printed and fell through -- which left the
+        //       dma_buf claim below unreachable while appearing to grade it.
         {
             const auto& lateTarget = targets.create(0, kWidth, kHeight);
             targets.render(renderer, lateTarget);
@@ -667,13 +679,18 @@ bool runImportChecks() {
             late.drmModifier = lateFrame.modifier;
             late.planes.clear();
             for (const auto& plane : lateFrame.planes) late.planes.emplace_back(plane.offset, plane.rowPitch);
-            // Transposed, which makes the texture allocation fail after the memory import has
-            // already taken the fd. Only on the memory-object path: eglCreateImage does not
-            // validate the declared size, so on dma_buf this would simply succeed.
-            const bool stageable = late.handleType == wallpaperx::FrameImport::HandleType::OpaqueFd;
-            if (stageable) {
+            // Each path is failed at the point its driver has actually been handed the fd, which
+            // is the only place the two can disagree about who owns it.
+            const bool opaquePath = late.handleType == wallpaperx::FrameImport::HandleType::OpaqueFd;
+            if (opaquePath) {
+                // Transposed: the memory import takes the fd, then the texture allocation fails.
+                // eglCreateImage does not validate the declared size, so this would not fail there.
                 late.width = kHeight;
                 late.height = kWidth;
+            } else {
+                // A modifier no driver implements, so eglCreateImage refuses the buffer it has
+                // just been given the fd for.
+                late.drmModifier = 0x0123456789abcdefULL;
             }
             const int lateFd = late.fd;
             // Identity, not openness: a number the driver freed can be reopened by the driver
@@ -692,12 +709,16 @@ bool runImportChecks() {
                 wallpaperx::testing::harnessFailure("the descriptor could not be duplicated, so what the import did "
                                                    "with it could not be established");
             } else if (lateResult.texture != 0) {
-                // Not a skip for the whole binary: the case is opaque-only by construction, and
-                // downgrading a fully passing dma_buf run to 77 hides everything else it graded.
+                // Reported, not skipped: notVerified() here would downgrade the whole binary to
+                // 77 and hide everything else the run graded.
                 wallpaperx::FrameImport::release(lateResult);
-                std::printf("frame_import_probe: post-consumption failure not staged on the dma_buf path -- "
-                            "eglCreateImage takes no fd to lose. Graded on the opaque entry.\n");
-            } else if (stageable) {
+                if (late.fd >= 0 && sameFile) ::close(late.fd);
+                if (guard >= 0) ::close(guard);
+                wallpaperx::testing::harnessFailure(
+                    "the staged failure did not fail on this driver, so who owns the descriptor "
+                    "afterwards was not established");
+                return true;
+            } else if (opaquePath) {
                 // The fd was handed to GL, so the request must say it is gone.
                 const bool honest = late.fd < 0;
                 check(honest, "a failed import that consumed the descriptor says so, rather than handing back a "
