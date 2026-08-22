@@ -623,11 +623,10 @@ if(DBUS_RUN_SESSION)
     # One lock across every bus-driven test, not one per tier. Two reasons, and the
     # second is the reason it is shared rather than merely present: they render from
     # generated PNGs under the same WALLPAPERX_TEST_IMAGE_DIR, so ctest -jN must not run
-    # one while another is mid-write -- and daemon_system's responsiveness phase compares
-    # intervals measured in tens of microseconds against a render queue's drain time. A
-    # dbus_service run saturating a software rasteriser on the same host inflates the
-    # first without inflating the second, which fails the check by accusing SetWallpaper
-    # of rendering inline. Serialising them costs well under a second in total.
+    # one while another is mid-write -- and daemon_system's responsiveness phase takes a
+    # ratio of contended to uncontended call times, whose per-call floors a neighbour
+    # saturating the same rasteriser moves. Every entry here also holds bounded waits that
+    # a busy host can expire. Serialising them costs well under a second in total.
     set_tests_properties(dbus_service PROPERTIES RESOURCE_LOCK wallpaperx_bus_tests)
     set_tests_properties(dbus_service_classic PROPERTIES RESOURCE_LOCK wallpaperx_bus_tests)
     if(WALLPAPERX_LAVAPIPE_ICD)

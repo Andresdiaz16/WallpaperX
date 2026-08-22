@@ -125,7 +125,11 @@ private:
     void fetchFrame(quint64 generation);
     // The reply half of fetchFrame, on the GUI thread once the bus answers.
     void takeFrameReply(const QDBusMessage& call);
-    void setUnavailableReason(const QString& reason);
+    // The reason has two independent producers -- see the definitions for why neither writes the
+    // published string directly.
+    void setFetchReason(const QString& reason);   // GUI thread
+    void setRenderReason(const QString& reason);  // render thread
+    void publishReason();                         // GUI thread
 
     int m_monitorId = -1;
     // The newest generation this item has fetched, so a signal for a frame already in hand
@@ -134,13 +138,14 @@ private:
     // The generation a failed import already asked for again, so an unimportable frame is
     // retried once rather than forever.
     quint64 m_retriedGeneration = 0;
-    // A GetFrameFd is out; a further one is wanted once it lands. GUI thread only.
+    // A GetFrameFd is out, and the highest generation announced while it was. GUI thread only.
     bool m_fetchInFlight = false;
-    bool m_refetchWhenDone = false;
+    std::optional<quint64> m_queuedFetch;
     // Whether FrameReady is subscribed. Without it no wallpaper change is ever heard, which no
     // single frame's success can retire.
     bool m_subscribed = false;
-    QString m_unavailableReason;
+    QString m_fetchReason;         // GUI thread only
+    QString m_unavailableReason;   // GUI thread only, what QML reads
 
     std::mutex m_pendingMutex;
     std::optional<PendingFrame> m_pending;  // guarded by m_pendingMutex
@@ -149,6 +154,10 @@ private:
     // and setMonitorId, which is why it is guarded.
     std::mutex m_importedMutex;
     quint64 m_shownGeneration = 0;  // guarded by m_importedMutex
+    // Bumped every time the marks are invalidated, so the render thread can tell whether the
+    // shown generation it read is still the one it is about to write back to.
+    quint64 m_generationEpoch = 0;  // guarded by m_importedMutex
+    QString m_renderReason;         // guarded by m_importedMutex
 };
 
 }  // namespace wallpaperx

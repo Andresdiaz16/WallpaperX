@@ -1015,7 +1015,13 @@ TestCase {
         verify(surface.active, "the Loader actually tried to load the renderer module");
         compare(surface.status, Loader.Error,
                 "the module cannot be loaded on this harness, which is the state being graded");
-        verify(item.describe().length > 0, "the plugin still describes the screen");
+        // Content, not length: every possible string has a length, so the old check could not
+        // fail -- and the state it was meant to catch is the plugin claiming it will draw.
+        const shown = item.describe();
+        verify(shown.indexOf("will draw") === -1,
+               "the plugin does not claim it will draw when the module could not be loaded [" + shown + "]");
+        verify(shown.indexOf("could not be loaded") !== -1,
+               "the message names the module as the cause [" + shown + "]");
         const backdrop = childNamed(item, "wallpaperxBackdrop");
         verify(backdrop !== null && backdrop.visible,
                "the message is still shown when the renderer module cannot be loaded");

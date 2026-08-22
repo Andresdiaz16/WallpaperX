@@ -33,8 +33,9 @@ public:
         uint32_t height = 0;
         uint64_t memorySize = 0;
         HandleType handleType = HandleType::OpaqueFd;
-        // Required for BOTH handle types: it is the channel order, and the opaque path has no
-        // other source for it. Left at 0, an opaque import is refused rather than drawn wrong.
+        // Required for BOTH handle types: it is the channel order, which the opaque path has no
+        // other source for and the dma_buf path hands straight to EGL. Left at 0, the import is
+        // refused rather than drawn wrong.
         uint32_t drmFormat = 0;
         // DMA_BUF only, both of them. The modifier's sentinel is DRM_FORMAT_MOD_INVALID, not
         // 0 -- 0 is LINEAR, a perfectly valid layout.

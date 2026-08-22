@@ -253,6 +253,12 @@ FrameImport::Result FrameImport::import(Request& request) {
         out.error = "the frame reports no memory size, which the import needs exactly";
         return out;
     }
+    if (request.drmFormat == 0) {
+        // Checked ahead of the dma_buf dispatch, not in the swizzle switch below: EGL is handed
+        // this fourcc verbatim, and one that tolerates 0 draws garbage.
+        out.error = "the frame reports no pixel format, so its channel order is unknown";
+        return out;
+    }
     if (!supports(request.handleType, &out.error)) {
         return out;
     }

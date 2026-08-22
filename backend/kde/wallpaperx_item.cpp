@@ -95,23 +95,41 @@ void WallpaperXItem::forgetGenerations() {
     {
         std::lock_guard<std::mutex> lock(m_importedMutex);
         m_shownGeneration = 0;
+        ++m_generationEpoch;
     }
 }
 
-void WallpaperXItem::setUnavailableReason(const QString& reason) {
-    // Reached from the render thread too, and QML binds to this, so the string is only ever
-    // touched on the thread that owns it.
-    if (QThread::currentThread() != thread()) {
-        QMetaObject::invokeMethod(
-            this, [this, reason] { setUnavailableReason(reason); }, Qt::QueuedConnection);
-        return;
+// The two producers write their own fact and never the published string, because a queued clear
+// posted by one can otherwise land after the other has published a newer error and wipe it.
+// Recomputing from both facts gives the same answer whatever order the hops arrive in.
+void WallpaperXItem::setFetchReason(const QString& reason) {
+    m_fetchReason = reason;
+    publishReason();
+}
+
+void WallpaperXItem::setRenderReason(const QString& reason) {
+    {
+        std::lock_guard<std::mutex> lock(m_importedMutex);
+        m_renderReason = reason;
     }
+    QMetaObject::invokeMethod(this, [this] { publishReason(); }, Qt::QueuedConnection);
+}
+
+void WallpaperXItem::publishReason() {
+    QString render;
+    {
+        std::lock_guard<std::mutex> lock(m_importedMutex);
+        render = m_renderReason;
+    }
+    // The fetch side wins: it describes the newer observation, and a frame that cannot be
+    // imported matters less than not having reached the daemon at all.
+    QString settled = m_fetchReason.isEmpty() ? render : m_fetchReason;
     // A missing subscription outlives any single frame, so a good frame must not clear it: the
     // wallpaper would be shown and then never change again, with nothing said.
-    const QString settled = (reason.isEmpty() && !m_subscribed)
-                                ? tr("This plugin could not subscribe to WallpaperX frame updates, so "
-                                     "the wallpaper will not change.")
-                                : reason;
+    if (settled.isEmpty() && !m_subscribed) {
+        settled = tr("This plugin could not subscribe to WallpaperX frame updates, so the wallpaper "
+                     "will not change.");
+    }
     if (m_unavailableReason == settled) return;
     m_unavailableReason = settled;
     emit unavailableReasonChanged();
@@ -130,7 +148,7 @@ void WallpaperXItem::connectToDaemon() {
     m_subscribed = subscribeToFrameReady();
     // No early return on failure: an item that cannot hear FrameReady must still notice the
     // daemon arriving or leaving, and the watcher below is the only thing that can retry.
-    if (!m_subscribed) setUnavailableReason(QString());
+    if (!m_subscribed) publishReason();
 
     // The item is created with the desktop, so the daemon may not own its name yet.
     auto* watcher = new QDBusServiceWatcher(QString::fromUtf8(kService), QDBusConnection::sessionBus(),
@@ -138,7 +156,7 @@ void WallpaperXItem::connectToDaemon() {
     connect(watcher, &QDBusServiceWatcher::serviceOwnerChanged, this,
             [this](const QString&, const QString&, const QString& newOwner) {
                 if (newOwner.isEmpty()) {
-                    setUnavailableReason(tr("WallpaperX is not running."));
+                    setFetchReason(tr("WallpaperX is not running."));
                     return;
                 }
                 // Gated: an unconditional retry would add a duplicate match rule per restart,
@@ -169,9 +187,17 @@ void WallpaperXItem::fetchFrame(quint64 generation) {
     if (!worthFetching(Arriving{generation}, Held{m_fetchedGeneration})) return;
 
     // The mark above only moves when a reply lands, so it cannot suppress a burst that arrives
-    // while one is out. One trailing fetch subsumes them: GetFrameFd serves the current frame.
+    // while one is out. One trailing fetch subsumes them, and it carries the highest generation
+    // announced rather than 0 -- 0 forces, so a reply that already brought the newest frame
+    // would otherwise be followed by a redundant export and a second import of the same image.
     if (m_fetchInFlight) {
-        m_refetchWhenDone = true;
+        if (!m_queuedFetch) {
+            m_queuedFetch = generation;
+        } else if (*m_queuedFetch == 0 || generation == 0) {
+            m_queuedFetch = 0;  // a forced fetch stays forced
+        } else {
+            m_queuedFetch = std::max(*m_queuedFetch, generation);
+        }
         return;
     }
 
@@ -185,13 +211,16 @@ void WallpaperXItem::fetchFrame(quint64 generation) {
         QString::fromUtf8(kService), QString::fromUtf8(kPath), QString::fromUtf8(kInterface),
         QStringLiteral("GetFrameFd"));
     request.setArguments({m_monitorId});
-    QDBusPendingCall pending = QDBusConnection::sessionBus().asyncCall(request);
-    // A call with no bus behind it comes back already finished, and its watcher would never emit
-    // anything -- so latching here would stop this item fetching for the rest of the session.
-    if (pending.isFinished()) {
-        takeFrameReply(pending.reply());
+    // Checked before asking, not after: with no bus, asyncCall hands back a null pending call
+    // whose watcher never emits anything, so the in-flight latch below would never clear and
+    // this item would stop fetching for the rest of the session. Reported rather than inlined --
+    // answering the reply here would make the fetch synchronous for every caller.
+    QDBusConnection bus = QDBusConnection::sessionBus();
+    if (!bus.isConnected()) {
+        setFetchReason(tr("WallpaperX could not be reached."));
         return;
     }
+    QDBusPendingCall pending = bus.asyncCall(request);
     m_fetchInFlight = true;
     auto* watcher = new QDBusPendingCallWatcher(pending, this);
     // The reply carries no monitor id of its own.
@@ -201,9 +230,9 @@ void WallpaperXItem::fetchFrame(quint64 generation) {
                 done->deleteLater();
                 // Cleared before any early return, or one dropped reply stops fetching for good.
                 m_fetchInFlight = false;
-                const bool queued = std::exchange(m_refetchWhenDone, false);
+                const std::optional<quint64> queued = std::exchange(m_queuedFetch, std::nullopt);
                 if (requestedMonitor == m_monitorId) takeFrameReply(done->reply());
-                if (queued) fetchFrame(0);
+                if (queued) fetchFrame(*queued);
             });
 }
 
@@ -214,14 +243,14 @@ void WallpaperXItem::takeFrameReply(const QDBusMessage& call) {
         // daemon's own errors carry text worth putting on a desktop.
         const QString name = call.errorName();
         if (name.startsWith(QLatin1String("org.freedesktop.DBus.Error."))) {
-            setUnavailableReason(name == QLatin1String("org.freedesktop.DBus.Error.ServiceUnknown")
+            setFetchReason(name == QLatin1String("org.freedesktop.DBus.Error.ServiceUnknown")
                                      ? tr("WallpaperX is not running.")
                                      : tr("WallpaperX could not be reached."));
             return;
         }
         // Not a failure of this item: no frame yet is the ordinary state before the user has
         // chosen a wallpaper, and the daemon says which case it is.
-        setUnavailableReason(call.errorMessage().isEmpty() ? tr("WallpaperX has no frame for this screen yet.")
+        setFetchReason(call.errorMessage().isEmpty() ? tr("WallpaperX has no frame for this screen yet.")
                                                            : call.errorMessage());
         return;
     }
@@ -231,7 +260,7 @@ void WallpaperXItem::takeFrameReply(const QDBusMessage& call) {
     // from a newer build could answer with more, and reading past the end of a short reply is
     // the kind of crash that takes plasmashell with it.
     if (!replyIsReadable(static_cast<int>(args.size()))) {
-        setUnavailableReason(tr("WallpaperX answered with something this plugin cannot read."));
+        setFetchReason(tr("WallpaperX answered with something this plugin cannot read."));
         return;
     }
 
@@ -249,7 +278,7 @@ void WallpaperXItem::takeFrameReply(const QDBusMessage& call) {
     }
     syncFds.endArray();
     if (syncFdCount > 0) {
-        setUnavailableReason(tr("WallpaperX sent a frame that must be waited on, which this plugin cannot do yet."));
+        setFetchReason(tr("WallpaperX sent a frame that must be waited on, which this plugin cannot do yet."));
         return;
     }
 
@@ -280,7 +309,7 @@ void WallpaperXItem::takeFrameReply(const QDBusMessage& call) {
     planes.endArray();
 
     if (frame.request.fd < 0) {
-        setUnavailableReason(tr("WallpaperX sent a frame this plugin could not take hold of."));
+        setFetchReason(tr("WallpaperX sent a frame this plugin could not take hold of."));
         return;
     }
 
@@ -294,7 +323,7 @@ void WallpaperXItem::takeFrameReply(const QDBusMessage& call) {
         // one already supersedes, and its destructor closes its fd.
         m_pending = std::move(frame);
     }
-    setUnavailableReason(QString());
+    setFetchReason(QString());
     update();
 }
 
@@ -309,7 +338,7 @@ QSGNode* WallpaperXItem::updatePaintNode(QSGNode* old, UpdatePaintNodeData*) {
     // The scene graph can be running on Vulkan, Metal, D3D or software, and this import path is
     // OpenGL only. Checked every pass rather than once, because the window can change.
     if (host->rendererInterface()->graphicsApi() != QSGRendererInterface::OpenGL) {
-        setUnavailableReason(tr("This desktop is not running on OpenGL, which WallpaperX needs to show a frame."));
+        setRenderReason(tr("This desktop is not running on OpenGL, which WallpaperX needs to show a frame."));
         delete node;
         {
             std::lock_guard<std::mutex> lock(m_importedMutex);
@@ -326,9 +355,11 @@ QSGNode* WallpaperXItem::updatePaintNode(QSGNode* old, UpdatePaintNodeData*) {
     }
 
     quint64 shown = 0;
+    quint64 epoch = 0;
     {
         std::lock_guard<std::mutex> lock(m_importedMutex);
         shown = m_shownGeneration;
+        epoch = m_generationEpoch;
     }
     // Dropped if it is older than what is on screen; its fd is closed by ~PendingFrame.
     if (incoming.has_value() && !supersedesShown(Arriving{incoming->generation}, Held{shown})) {
@@ -349,7 +380,7 @@ QSGNode* WallpaperXItem::updatePaintNode(QSGNode* old, UpdatePaintNodeData*) {
                       {});
         if (texture == nullptr) {
             if (imported.texture != 0) FrameImport::release(imported);
-            setUnavailableReason(tr("WallpaperX produced a frame this desktop could not import."));
+            setRenderReason(tr("WallpaperX produced a frame this desktop could not import."));
             // The node goes too: keeping one would leave the desktop showing a frame while the
             // item reports it is drawing nothing.
             delete node;
@@ -392,9 +423,13 @@ QSGNode* WallpaperXItem::updatePaintNode(QSGNode* old, UpdatePaintNodeData*) {
             node->markDirty(QSGNode::DirtyMaterial);
             {
                 std::lock_guard<std::mutex> lock(m_importedMutex);
-                m_shownGeneration = incoming->generation;
+                // Only if nothing invalidated the marks while the import ran. The lock cannot be
+                // held across GL work, so a monitor change, a daemon restart or a detach can land
+                // in that gap -- and writing this number back afterwards would judge the next
+                // screen's, or the next daemon's, frames against a number that outlived them.
+                if (m_generationEpoch == epoch) m_shownGeneration = incoming->generation;
             }
-            setUnavailableReason(QString());
+            setRenderReason(QString());
         }
     }
 
@@ -417,6 +452,7 @@ void WallpaperXItem::releaseResources() {
     m_fetchedGeneration = 0;
     std::lock_guard<std::mutex> lock(m_importedMutex);
     m_shownGeneration = 0;
+    ++m_generationEpoch;
 }
 
 }  // namespace wallpaperx
