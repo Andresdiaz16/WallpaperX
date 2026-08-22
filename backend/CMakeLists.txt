@@ -687,12 +687,40 @@ if(DBUS_RUN_SESSION)
             RESOURCE_LOCK wallpaperx_bus_tests
             SKIP_RETURN_CODE 77)
     endif()
+
+    # The QQuickItem driven by a stub daemon answering GetFrameFd with a frame the importer must
+    # refuse. Here for the private bus: on the developer's real bus it would reach their daemon.
+    if(WALLPAPERX_BUILD_KDE_PLUGIN AND WALLPAPERX_HAVE_FRAME_IMPORT)
+        add_executable(wallpaperx-item-import-failure-test tests/item_import_failure_test.cpp)
+        # The plugin is not linked: the item is reached the way Plasma reaches it, off the QML
+        # path, so this also grades that the built module loads.
+        target_link_libraries(wallpaperx-item-import-failure-test PRIVATE
+            Qt6::Core Qt6::DBus Qt6::Gui Qt6::Qml Qt6::Quick)
+        target_include_directories(wallpaperx-item-import-failure-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        target_compile_definitions(wallpaperx-item-import-failure-test PRIVATE
+            WALLPAPERX_QML_MODULE_PATH="${CMAKE_CURRENT_BINARY_DIR}/qml")
+        add_dependencies(wallpaperx-item-import-failure-test wallpaperxplugin)
+        add_test(NAME item_import_failure
+                 COMMAND ${DBUS_RUN_SESSION} -- $<TARGET_FILE:wallpaperx-item-import-failure-test>)
+        # A fallback chain, not offscreen alone: offscreen forces the software scene graph, which
+        # refuses the RHI, and the item imports only under OpenGL -- so a headless host lands on
+        # offscreen and reports the named skip. Semicolons escaped; ctest splits on bare ones.
+        # Nothing is displayed either way: a render-control window has no native window behind it.
+        #
+        # QT_NO_XDG_DESKTOP_PORTAL because Qt's theme asks the portal for a colour scheme, which on
+        # a private bus ACTIVATES one that inherits this test's stdout -- ctest then never sees the
+        # pipe close and the entry hangs after the test has exited.
+        set_tests_properties(item_import_failure PROPERTIES
+            ENVIRONMENT "QT_QPA_PLATFORM=wayland\;xcb\;offscreen;QT_NO_XDG_DESKTOP_PORTAL=1"
+            LABELS "novulkan"
+            SKIP_RETURN_CODE 77)
+    endif()
 else()
     message(WARNING
         "dbus-run-session not found -- ALL bus-driven tests are unregistered: dbus_service, "
         "dbus_service_classic, dbus_service_lavapipe, dbus_service_classic_lavapipe, http_config, "
         "http_config_lavapipe, daemon_system, "
-        "daemon_system_lavapipe. That "
+        "daemon_system_lavapipe, item_import_failure. That "
         "removes the only coverage of the DBus wire contract, the DMA_BUF metadata, the HTTP config "
         "server, the Classic "
         "descriptor tier through the daemon, and the daemon's "
