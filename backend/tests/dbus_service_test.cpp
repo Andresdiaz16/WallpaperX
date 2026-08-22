@@ -1241,6 +1241,15 @@ void runRenderChecks(sdbus::IProxy& proxy, FrameReadyLog& signals, const std::st
 
         // The fourcc is channel order, not layout, so it is published on both paths: an
         // importer that has to guess it draws red and blue transposed.
+        //
+        // What this establishes is that the field REACHES the wire on both handle types -- the
+        // opaque path published 0 before. It cannot catch a wrong mapping: both sides of the
+        // comparison come from drmFourccForVkFormat, so changing that moves them together.
+        // Measured -- mapping B8G8R8A8_UNORM to ARGB instead of XRGB leaves this green, while
+        // frame_import_probe's sampled check reds. That check is where a wrong mapping is graded.
+        // CONTROL: `frame.drmFormat = drmFormat;` in exportFrame replaced with 0 -> "FAIL: every
+        //       exported frame reports the target format's fourcc, whichever handle type it
+        //       uses", here and in frame_export_probe. Observed 2026-08-22. Reverted.
         check(frame.drmFormat == wallpaperx::drmFourccForVkFormat(wallpaperx::OffscreenTargetManager::kFormat),
               "every exported frame reports the target format's fourcc, whichever handle type it uses");
 
