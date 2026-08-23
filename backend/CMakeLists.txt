@@ -905,8 +905,12 @@ if(WALLPAPERX_BUILD_KDE_PLUGIN)
         # and the plugin is never loaded.
         set_target_properties(wallpaperxplugin PROPERTIES PREFIX "lib")
 
-        set(WALLPAPERX_QML_MODULE_DIR
-            ${KDE_INSTALL_DATADIR}/plasma/wallpapers/com.wallpaperx.wallpaper/contents/lib/qt6/qml/com/wallpaperx)
+        # Qt's own import root, NOT inside the KPackage. Plasma does not add a package's internal
+        # directories to the QML import path, so a module shipped there is invisible: plasmashell
+        # reports `module "com.wallpaperx" is not installed` and the wallpaper never loads.
+        # Measured in a real session -- the in-tree harnesses missed it because they pass the
+        # package path with -I by hand.
+        set(WALLPAPERX_QML_MODULE_DIR ${KDE_INSTALL_QMLDIR}/com/wallpaperx)
         install(TARGETS wallpaperxplugin DESTINATION ${WALLPAPERX_QML_MODULE_DIR})
         install(FILES
             ${CMAKE_CURRENT_BINARY_DIR}/qml/com/wallpaperx/qmldir

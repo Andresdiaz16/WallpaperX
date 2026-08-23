@@ -18,6 +18,12 @@ ColumnLayout {
     // read by the dialog, not here, and every shipped wallpaper declares it.
     property var parentLayout
 
+    // Set on the root as INITIAL PROPERTIES when the pane is created, so they must exist even
+    // though nothing here reads them: undeclared, System Settings logs "ColumnLayout does not
+    // have a property called configDialog" and the pane never receives its configuration.
+    property var configDialog
+    property var wallpaperConfiguration
+
     // Set when a launch has been attempted and failed. A button that silently does nothing
     // leaves the user believing the app is not installed, which is the one thing the pane
     // exists to rule out.
