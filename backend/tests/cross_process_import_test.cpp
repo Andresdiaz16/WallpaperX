@@ -35,6 +35,8 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
+#include <linux/kcmp.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -454,6 +456,18 @@ enum class Outcome { Imported, RefusedAndHandedBack, RefusedAndConsumed, NeverAt
 // WallpaperXItem::onFrameReply does with the one QDBusUnixFileDescriptor hands it: the reply
 // object owns its own copy and closes it, and the importer's contract is about the copy it is
 // given.
+// Whether this kernel answers kcmp at all. FrameImport uses it as its only means of deciding who
+// owns a refused frame's descriptor, and where it is missing (no CONFIG_KCMP) or blocked (a
+// seccomp policy) the importer leaks one per refusal deliberately -- so the leak check below has
+// to know, or it grades that decision as a defect.
+bool kcmpUsable() {
+    static const bool usable = [] {
+        const long self = ::syscall(SYS_kcmp, ::getpid(), ::getpid(), KCMP_FILE, 0, 0);
+        return self >= 0;
+    }();
+    return usable;
+}
+
 wallpaperx::FrameImport::Request requestFromFrame(const wallpaperx::testing::Frame& frame) {
     wallpaperx::FrameImport::Request request;
     request.fd = ::dup(frame.fd.get());
@@ -791,15 +805,19 @@ bool runChecks() {
     //       2026-08-22. Reverted.
     constexpr int kCycles = 6;
     int importedCycles = 0;
+    bool dupFailed = false;
     size_t afterFirstCycle = 0;
     std::string cycleError;
     for (int cycle = 0; cycle < kCycles; ++cycle) {
         {
             const wallpaperx::testing::Frame again = wallpaperx::testing::getFrameFd(*proxy, kMonitor);
             wallpaperx::FrameImport::Request request2 = requestFromFrame(again);
-            // requestFromFrame has already reported it. Importing a -1 would fail and be counted
-            // against the importer for a descriptor this file never produced.
-            if (request2.fd < 0) return true;
+            // Breaks the loop, never returns: a return here would also delete the refusal phase
+            // below and the daemon's ordered shutdown.
+            if (request2.fd < 0) {
+                dupFailed = true;
+                break;
+            }
             const wallpaperx::FrameImport::Result round = wallpaperx::FrameImport::import(request2);
             if (round.texture == 0) {
                 if (request2.fd >= 0) close(request2.fd);
@@ -815,14 +833,18 @@ bool runChecks() {
         if (cycle == 0) afterFirstCycle = openFdCount();
     }
     const size_t afterAllCycles = openFdCount();
-    check(importedCycles == kCycles,
-          "every repeated fetch-and-import cycle succeeded, so the descriptor count below was measured over a "
-          "known number of real imports");
-    if (importedCycles != kCycles) {
-        std::fprintf(stderr, "  %d of %d cycles imported; the first failure was: %s\n", importedCycles, kCycles,
-                     cycleError.empty() ? "(none recorded)" : cycleError.c_str());
+    // Withheld when this file's own dup() failed: the cycles did not fall short because the
+    // importer refused them, and requestFromFrame has already reported the real cause.
+    if (!dupFailed) {
+        check(importedCycles == kCycles,
+              "every repeated fetch-and-import cycle succeeded, so the descriptor count below was measured over a "
+              "known number of real imports");
+        if (importedCycles != kCycles) {
+            std::fprintf(stderr, "  %d of %d cycles imported; the first failure was: %s\n", importedCycles, kCycles,
+                         cycleError.empty() ? "(none recorded)" : cycleError.c_str());
+        }
     }
-    if (importedCycles != kCycles) {
+    if (dupFailed || importedCycles != kCycles) {
         // Taken first, because a run that broke out of the loop early never reached the first
         // count and leaves it 0 -- the same value openFdCount() returns for a directory it
         // cannot read. Attributing that to procfs names the wrong cause; the check above is
@@ -835,11 +857,18 @@ bool runChecks() {
         notVerified(kGoals, "/proc/self/fd could not be read while importing frame after frame, so no descriptor "
                             "was counted");
     } else {
-        const bool steady = afterAllCycles <= afterFirstCycle;
+        // Bounded by a constant, not by zero. The property is that growth does not scale with the
+        // number of frames; a driver is free to open a fixed number of descriptors of its own
+        // lazily, and not necessarily all on the first import. A per-frame leak clears this bound
+        // as soon as the cycle count exceeds it, which is what the count check above guarantees.
+        constexpr size_t kLazyDriverAllowance = 2;
+        const size_t grew = afterAllCycles > afterFirstCycle ? afterAllCycles - afterFirstCycle : 0;
+        const bool steady = grew <= kLazyDriverAllowance;
         check(steady, "fetching and importing frame after frame does not accumulate file descriptors");
         if (!steady) {
-            std::fprintf(stderr, "  %zu open fds after the first cycle, %zu after %d\n", afterFirstCycle,
-                         afterAllCycles, kCycles);
+            std::fprintf(stderr, "  %zu open fds after the first cycle, %zu after %d -- grew by %zu over %d further "
+                                 "imports, which is more than a fixed lazy allocation can explain\n",
+                         afterFirstCycle, afterAllCycles, kCycles, grew, kCycles - 1);
         }
     }
 
@@ -892,6 +921,14 @@ bool runChecks() {
                 wallpaperx::FrameImport::release(result);
                 if (rejected.fd >= 0) close(rejected.fd);
                 return Outcome::Imported;
+            }
+            // A refusal that did not come from the hand-over never reached the branch this phase
+            // grades. Counting it would let the leak check pass over a sweep in which the leaking
+            // code ran zero times -- and a descriptor-pressure host, which is what a leak
+            // produces, refuses at the duplication instead.
+            if (error != wallpaperx::FrameImport::kImportRejectedError) {
+                if (rejected.fd >= 0) close(rejected.fd);
+                return Outcome::NeverAttempted;
             }
             // The importer's contract: a refused frame leaves the descriptor with the caller.
             if (rejected.fd >= 0) {
@@ -956,7 +993,14 @@ bool runChecks() {
                 std::fprintf(stderr, "  %d of %d refusals handed the descriptor back; %d reported it consumed\n",
                              handedBack, kRefusals, refusedAtHandover - handedBack);
             }
-            if (beforeRefusals == 0 || afterRefusals == 0) {
+            if (!kcmpUsable()) {
+                // The importer can only reclaim the duplicate where it can decide descriptor
+                // identity, and kcmp is its only means of doing so. Without it, production leaks
+                // one per refusal by documented decision -- grading that as a defect here would
+                // report a deliberate trade as a bug, with nothing naming kcmp.
+                notVerified(kGoals, "kcmp is unavailable on this host, so the importer cannot decide who owns a "
+                                    "refused frame's descriptor and leaks it by design");
+            } else if (beforeRefusals == 0 || afterRefusals == 0) {
                 notVerified(kGoals, "/proc/self/fd could not be read around the refusal sweep, so no descriptor was "
                                     "counted");
             } else if (refusedAtHandover == kRefusals) {
