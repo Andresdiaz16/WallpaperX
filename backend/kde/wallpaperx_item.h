@@ -161,12 +161,10 @@ private:
     // and setMonitorId, which is why it is guarded.
     std::mutex m_importedMutex;
     quint64 m_shownGeneration = 0;  // guarded by m_importedMutex
-    // Separate from m_shownGeneration, which answers a different question. That one is a
-    // staleness mark and is cleared whenever generations stop meaning anything -- a daemon
-    // restart, a monitor change -- while the node keeps drawing the frame it already has. This
-    // one says only whether a node with a live texture is on screen, so it is cleared where the
-    // node actually dies. Deriving the message panel from the staleness mark put the panel over
-    // a wallpaper that was still correctly displayed.
+    // Whether a node with a live texture is on screen -- NOT the same question as
+    // m_shownGeneration, which is a staleness mark cleared whenever generations stop meaning
+    // anything (a daemon restart, a monitor change) while the node keeps drawing what it has.
+    // Cleared where the node dies, not where generations are invalidated.
     bool m_nodeHasFrame = false;  // guarded by m_importedMutex
     // Bumped every time the marks are invalidated, so the render thread can tell whether the
     // shown generation it read is still the one it is about to write back to.

@@ -95,10 +95,14 @@ bool hasGlExtension(const char* wanted) {
 //
 // There is NO fstat fallback, and that is the point. Every opaque export from this driver shares
 // one anonymous inode, so fstat reports "same file" for descriptors naming different frames --
-// measured, see PLAN.md. Using it on a kernel built without CONFIG_KCMP would answer "still
-// yours" about a descriptor belonging to another frame, and closing that inside plasmashell frees
-// a number another thread is using. Answering "not ours" instead leaks one descriptor per failed
-// import on such a kernel, which is a bounded cost on an error path and cannot corrupt anything.
+// measured, see PLAN.md. Using it where kcmp is unavailable would answer "still yours" about a
+// descriptor belonging to another frame, and closing that inside plasmashell frees a number
+// another thread is using.
+//
+// The cost of answering "not ours" instead is one leaked descriptor per FAILED import, and that
+// is not self-limiting: where kcmp is missing (no CONFIG_KCMP) or blocked (a seccomp policy
+// returning EPERM), a driver that keeps refusing frames leaks one per attempt until the process
+// hits its limit. Preferred anyway -- a leak degrades, a wrong close corrupts another thread.
 bool sameOpenFile(int candidate, int reference) {
     const long compared = ::syscall(SYS_kcmp, ::getpid(), ::getpid(), KCMP_FILE, candidate, reference);
     if (compared >= 0) return compared == 0;
@@ -373,14 +377,14 @@ FrameImport::Result FrameImport::import(Request& request) {
     api.importFd(memory, static_cast<GLuint64>(request.memorySize), GL_HANDLE_TYPE_OPAQUE_FD_EXT,
                  static_cast<GLint>(gift));
     if (glGetError() != GL_NO_ERROR) {
-        // Compared while the original is still open -- it is the operand. A driver that took the
-        // duplicate leaves it closed or reused, and either way it is not ours to close.
-        const bool giftStillOurs = sameOpenFile(gift, request.fd);
-        // Destroyed BEFORE the close: a driver that took the descriptor on the failing call and
-        // releases it when the object dies would otherwise close a number this already freed --
-        // and inside plasmashell that number can belong to another thread by then.
+        // Destroyed first: a driver that took the descriptor on the failing call may release it
+        // with the object, and closing before that frees a number the driver then closes again.
         api.destroy(1, &memory);
-        if (giftStillOurs) ::close(gift);
+        // Compared AFTER the destroy and immediately before the close, never cached across it.
+        // The answer describes one instant, and the destroy is exactly what can change it: a
+        // driver that has just released the duplicate leaves this false, and the retained
+        // original still pins the open file, so the comparison is valid where it is used.
+        if (sameOpenFile(gift, request.fd)) ::close(gift);
         out.error = kImportRejectedError;
         // request.fd is untouched: a failed import never consumes the caller's descriptor now.
         return out;

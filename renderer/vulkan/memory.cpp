@@ -271,8 +271,10 @@ AllocatedImage Memory::createExportableImage(const VkImageCreateInfo& imageInfoI
             throw std::runtime_error(std::string("Memory: ") + (debugName ? debugName : "(unnamed exportable image)") +
                                      " is larger than this device can export as an opaque fd (" +
                                      std::to_string(imageInfo.extent.width) + "x" +
-                                     std::to_string(imageInfo.extent.height) + " exceeds " +
-                                     std::to_string(maxExtent.width) + "x" + std::to_string(maxExtent.height) + ")");
+                                     std::to_string(imageInfo.extent.height) + "x" +
+                                     std::to_string(imageInfo.extent.depth) + " exceeds " +
+                                     std::to_string(maxExtent.width) + "x" + std::to_string(maxExtent.height) + "x" +
+                                     std::to_string(maxExtent.depth) + ")");
         }
     }
 
