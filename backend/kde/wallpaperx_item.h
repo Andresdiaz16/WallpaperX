@@ -43,6 +43,10 @@ class WallpaperXItem : public QQuickItem {
     // Why nothing is being drawn, when nothing is. Empty while the wallpaper is showing, so QML
     // can fall back to the message states main.qml already derives rather than inventing its own.
     Q_PROPERTY(QString unavailableReason READ unavailableReason NOTIFY unavailableReasonChanged)
+    // Whether a frame has actually been imported and handed to the scene graph. An empty
+    // unavailableReason does not mean this: it is also empty before the first frame arrives,
+    // which is a window where the desktop shows neither a wallpaper nor a message.
+    Q_PROPERTY(bool frameShown READ frameShown NOTIFY frameShownChanged)
 
 public:
     explicit WallpaperXItem(QQuickItem* parent = nullptr);
@@ -87,10 +91,12 @@ public:
     void setMonitorId(int monitorId);
 
     QString unavailableReason() const { return m_unavailableReason; }
+    bool frameShown() const { return m_frameShown; }
 
 signals:
     void monitorIdChanged();
     void unavailableReasonChanged();
+    void frameShownChanged();
 
 protected:
     QSGNode* updatePaintNode(QSGNode* old, UpdatePaintNodeData* data) override;
@@ -146,6 +152,7 @@ private:
     bool m_subscribed = false;
     QString m_fetchReason;         // GUI thread only
     QString m_unavailableReason;   // GUI thread only, what QML reads
+    bool m_frameShown = false;     // GUI thread only, set from the render thread via a hop
 
     std::mutex m_pendingMutex;
     std::optional<PendingFrame> m_pending;  // guarded by m_pendingMutex

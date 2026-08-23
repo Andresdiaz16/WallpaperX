@@ -90,6 +90,10 @@ void WallpaperXItem::setMonitorId(int monitorId) {
 void WallpaperXItem::forgetGenerations() {
     m_fetchedGeneration = 0;
     m_retriedGeneration = 0;
+    if (m_frameShown) {
+        m_frameShown = false;
+        emit frameShownChanged();
+    }
     {
         std::lock_guard<std::mutex> lock(m_pendingMutex);
         m_pending.reset();
@@ -439,7 +443,15 @@ QSGNode* WallpaperXItem::updatePaintNode(QSGNode* old, UpdatePaintNodeData*) {
             // generation can be re-fetched later (a window change re-asks) and must be allowed
             // its retry again if that import fails too.
             QMetaObject::invokeMethod(
-                this, [this] { m_retriedGeneration = 0; }, Qt::QueuedConnection);
+                this,
+                [this] {
+                    m_retriedGeneration = 0;
+                    if (!m_frameShown) {
+                        m_frameShown = true;
+                        emit frameShownChanged();
+                    }
+                },
+                Qt::QueuedConnection);
             setRenderReason(QString());
         }
     }

@@ -229,6 +229,38 @@ AllocatedImage Memory::createExportableImage(const VkImageCreateInfo& imageInfoI
         imageInfo.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
         imageInfo.pNext = &modifierListInfo;
         drmModifierTiled = true;
+    } else {
+        // The same question the modifier loop above asks, for the path that has no modifiers to
+        // loop over. VUID-VkImageCreateInfo-pNext-00990 requires every handle type in
+        // handleTypes to be reported supported for THIS format/type/tiling/usage combination;
+        // nothing checked it here, so an unsupported combination created the image happily and
+        // failed later inside vkGetMemoryFdKHR, blaming the export for a decision made here.
+        VkPhysicalDeviceExternalImageFormatInfo externalInfo{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO};
+        externalInfo.handleType = exportHandleType;
+
+        VkPhysicalDeviceImageFormatInfo2 formatInfo{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2};
+        formatInfo.format = imageInfo.format;
+        formatInfo.type = imageInfo.imageType;
+        formatInfo.tiling = imageInfo.tiling;
+        formatInfo.usage = imageInfo.usage;
+        formatInfo.flags = imageInfo.flags;
+        formatInfo.pNext = &externalInfo;
+
+        VkExternalImageFormatProperties externalProps{VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES};
+        VkImageFormatProperties2 formatProps{VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2};
+        formatProps.pNext = &externalProps;
+
+        // EXPORTABLE only, not IMPORTABLE: an opaque fd is imported by a GL context on the same
+        // device through GL_EXT_memory_object_fd, which Vulkan's importability bit says nothing
+        // about. Requiring it here would refuse combinations that work.
+        if (vkGetPhysicalDeviceImageFormatProperties2(m_physicalDevice, &formatInfo, &formatProps) != VK_SUCCESS ||
+            (externalProps.externalMemoryProperties.externalMemoryFeatures &
+             VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT) == 0) {
+            throw std::runtime_error(std::string("Memory: this device cannot export ") +
+                                     (debugName ? debugName : "(unnamed exportable image)") +
+                                     " as an opaque fd with the requested format, tiling and usage");
+        }
     }
 
     VkExportMemoryAllocateInfo exportInfo{VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO};

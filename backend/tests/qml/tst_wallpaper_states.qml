@@ -57,6 +57,9 @@ TestCase {
         Item {
             property int monitorId: -1
             property string unavailableReason: ""
+            // The real item reports this only once a frame is on screen. The stand-in draws
+            // nothing, so a check that wants the backdrop hidden must set it.
+            property bool frameShown: false
         }
     }
 
@@ -893,6 +896,9 @@ TestCase {
         compare(surface.item.monitorId, 0, "the renderer is told which screen to ask about");
         compare(surface.width, item.width, "the renderer covers the screen");
         compare(surface.height, item.height, "the renderer covers the screen");
+        // "Being drawn" is the claim, so the stand-in has to make it: a loaded renderer that has
+        // not put a frame up leaves the message in place, deliberately.
+        surface.item.frameShown = true;
         verify(!backdrop.visible,
                "the message stops covering the wallpaper once one is being drawn");
 
@@ -920,6 +926,11 @@ TestCase {
         compare(surface.status, Loader.Ready, "the stand-in renderer loaded");
         verify(surface.item !== null, "the renderer occupies the surface");
         compare(item.rendererReason, "", "a renderer that has said nothing reports no reason");
+        // A loaded renderer that has drawn nothing does NOT hide the backdrop: the desktop would
+        // show neither a wallpaper nor a message. The stand-in has to claim a frame to reach the
+        // hidden state these checks then move.
+        verify(backdrop.visible, "a renderer that has not drawn yet leaves the message up");
+        surface.item.frameShown = true;
         verify(!backdrop.visible, "the backdrop starts hidden, which is what these checks move");
         return { item: item, surface: surface, backdrop: backdrop };
     }

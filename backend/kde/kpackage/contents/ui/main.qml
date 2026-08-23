@@ -89,6 +89,11 @@ WallpaperItem {
     // than read through surface.item, which qmllint can only see as a QtObject.
     property string rendererReason: ""
 
+    // Whether the renderer has actually put a frame on screen. An empty rendererReason is not the
+    // same claim: it is also empty between the module loading and the first frame arriving, and
+    // hiding the backdrop then leaves the desktop showing neither a wallpaper nor a message.
+    property bool rendererDrawing: false
+
     function describe(): string {
         if (root.screenState === "unnamed") {
             return qsTr("This screen has not reported a connector name.\nWallpaperX identifies screens by that name.");
@@ -235,9 +240,15 @@ WallpaperItem {
         onLoaded: {
             item.monitorId = root.monitorId;
             root.rendererReason = item.unavailableReason;
+            root.rendererDrawing = item.frameShown;
         }
-        // A reason from an item that is going away would otherwise outlive it.
-        onStatusChanged: if (surface.status !== Loader.Ready) root.rendererReason = ""
+        // State from an item that is going away would otherwise outlive it.
+        onStatusChanged: {
+            if (surface.status !== Loader.Ready) {
+                root.rendererReason = "";
+                root.rendererDrawing = false;
+            }
+        }
 
         // A later reply can move the screen to a different id -- a re-plug, or the daemon
         // learning the name after the fact -- and the loaded item would otherwise keep drawing
@@ -255,6 +266,9 @@ WallpaperItem {
             function onUnavailableReasonChanged() {
                 root.rendererReason = surface.item.unavailableReason;
             }
+            function onFrameShownChanged() {
+                root.rendererDrawing = surface.item.frameShown;
+            }
         }
     }
 
@@ -267,7 +281,8 @@ WallpaperItem {
         // transparent plugin that failed is indistinguishable from no plugin at all. So it is
         // hidden rather than drawn under the wallpaper, and shown again the moment anything goes
         // wrong -- keyed on the renderer drawing, not merely on its module having loaded.
-        visible: !(surface.status === Loader.Ready && root.screenState === "set" && root.rendererReason === "")
+        visible: !(surface.status === Loader.Ready && root.screenState === "set" && root.rendererReason === "" &&
+                   root.rendererDrawing)
         color: "#1b1b1b"
 
         Text {
