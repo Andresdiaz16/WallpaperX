@@ -293,10 +293,16 @@ bool runFrameShownChecks() {
             uuidQueryable = glDeviceUuid(glUuid);
             sameDevice = uuidQueryable && glUuid == vulkanDeviceUuid(device.physicalDevice());
         });
-        // Only the opaque path needs the match. A dma_buf is importable across devices, so
+        // Only the opaque path needs the match: a dma_buf is importable across devices, so
         // refusing to run for a UUID mismatch would skip every AMD and Intel host with a reason
-        // that is not true of them.
-        const bool needsSameDevice = stub.handleType() != 1;
+        // untrue of them. Asked of a real export rather than of the stub, which does not know its
+        // handle type until it has served a frame -- and that is after this gate.
+        bool needsSameDevice = true;
+        {
+            wallpaperx::ExportedFrame probe = wallpaperx::exportFrame(device, target);
+            needsSameDevice = probe.type != wallpaperx::ExportedFrame::HandleType::DmaBuf;
+            if (probe.fd >= 0) ::close(probe.fd);
+        }
 
         // Two causes, named apart: a context on another GPU, and a context that cannot answer
         // which GPU it is on. Both mean this run establishes nothing, but reporting the second as
@@ -456,8 +462,18 @@ bool runFrameShownChecks() {
             std::fprintf(stderr, "  the monitor-id change produced no new request, so the path that invalidates the "
                                  "generation marks may not have been entered at all\n");
         }
+        // Gated on the item having PROCESSED the refusal, not merely on the stub having received
+        // the request: reading in between passes without the refusal ever reaching the item, which
+        // is the state this check exists to grade.
+        const bool refusalHandled =
+            pumpUntil([&] { return !root->property("publishedReason").toString().isEmpty(); }, 5000);
         renderPass(nullptr);
-        check(claimsFrameShown(item), "the claim survives the refused fetch and the render pass after it");
+        if (!refusalHandled) {
+            wallpaperx::testing::harnessFailure(
+                "the item never reported the refused fetch, so whether the claim survives it was not established");
+        } else {
+            check(claimsFrameShown(item), "the claim survives the refused fetch and the render pass after it");
+        }
         check(itemTexture(item) == texture, "and the frame is still the one on screen");
 
         // GOAL: when the scene graph takes the item's resources away, the claim is withdrawn.

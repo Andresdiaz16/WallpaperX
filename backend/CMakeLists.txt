@@ -790,8 +790,8 @@ if(DBUS_RUN_SESSION)
                      "item_import_release: NOT VERIFIED -- Qt6 QuickPrivate headers were not found at configure "
                      "time, so this check was not built. It is the only check that the GL objects imported from a "
                      "daemon frame are freed by the scene graph's own teardown, on its thread with its context "
-                     "current; without it a build that leaks a screen's worth of GPU memory per frame is green. "
-                     "Install the Qt6 Quick private headers and re-configure.")
+                     "current; without it a build that leaks a screen's worth of GPU memory per unplugged monitor "
+                     "is green. Install the Qt6 Quick private headers and re-configure.")
             set_tests_properties(item_import_release PROPERTIES SKIP_REGULAR_EXPRESSION "NOT VERIFIED")
             add_test(NAME item_frame_shown
                      COMMAND ${CMAKE_COMMAND} -E echo
@@ -802,9 +802,10 @@ if(DBUS_RUN_SESSION)
                      "and re-configure.")
             set_tests_properties(item_frame_shown PROPERTIES SKIP_REGULAR_EXPRESSION "NOT VERIFIED")
             message(WARNING
-                "Qt6 QuickPrivate headers not found -- item_import_release is registered as a permanent SKIP "
-                "rather than built. That is the only check that the GL objects imported from a daemon frame "
-                "are freed by the scene graph's own teardown.")
+                "Qt6 QuickPrivate headers not found -- item_import_release and item_frame_shown are registered "
+                "as permanent SKIPs rather than built. Those are the only checks that the GL objects imported "
+                "from a daemon frame are freed by the scene graph's own teardown, and that the desktop says so "
+                "when nothing is drawn rather than going black in silence.")
         endif()
     endif()
 

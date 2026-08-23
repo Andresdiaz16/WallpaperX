@@ -908,7 +908,10 @@ TestCase {
         compare(item.screenState, "unreachable", "the daemon going away is noticed");
         verify(!surface.active, "the renderer is dropped when there is nothing to draw");
         verify(backdrop.visible, "the message comes back when the wallpaper stops");
-        verify(item.describe().length > 0, "and it still has something to say");
+        // The message names THIS cause. Any branch of describe() returns a non-empty string, so
+        // asserting only that it has one passes while the desktop shows the wrong explanation.
+        verify(item.describe().indexOf("WallpaperX is not running") === 0,
+               "and the message names the daemon being gone, not the previous cause");
     }
 
     // The one configuration where main.qml hides the backdrop: a stand-in renderer loaded on a
