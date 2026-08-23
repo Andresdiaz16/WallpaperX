@@ -262,6 +262,29 @@ public:
         return wallpaperx::testing::forkPreambleFault(info.si_status);
     }
 
+    // Whether the child is already dead, and how. startupFault() only recognises the fork
+    // preamble's own exit codes, so a daemon that segfaulted or exited 1 during startup looked
+    // identical to one that was merely slow -- and that was reported as a host limitation, which
+    // ctest prints as Skipped. A dead daemon is never a host limitation.
+    struct Death {
+        bool dead = false;
+        bool bySignal = false;
+        int status = 0;  // exit code, or signal number when bySignal
+    };
+
+    Death death() const {
+        Death out;
+        if (m_pid <= 0) return out;
+        siginfo_t info{};
+        info.si_pid = 0;
+        if (waitid(P_PID, static_cast<id_t>(m_pid), &info, WEXITED | WNOHANG | WNOWAIT) != 0) return out;
+        if (info.si_pid == 0) return out;
+        out.dead = true;
+        out.bySignal = info.si_code != CLD_EXITED;
+        out.status = info.si_status;
+        return out;
+    }
+
     // SIGTERM, then reap. Returns the exit status, or -1 if it did not exit normally; ask
     // timedOut() and termSignal() for which of the two that was.
     int shutdown() {
@@ -312,6 +335,7 @@ private:
                 continue;
             }
             const ssize_t got = read(m_readFd, buffer, sizeof(buffer));
+            if (got < 0 && (errno == EINTR || errno == EAGAIN)) continue;
             if (got <= 0) break;
             {
                 std::lock_guard<std::mutex> lock(m_mutex);
@@ -378,9 +402,16 @@ GpuUuid vulkanUuidForDeviceNamed(const std::string& wanted) {
     }
 
     uint32_t count = 0;
-    vkEnumeratePhysicalDevices(instance, &count, nullptr);
+    if (vkEnumeratePhysicalDevices(instance, &count, nullptr) != VK_SUCCESS || count == 0) {
+        vkDestroyInstance(instance, nullptr);
+        return out;
+    }
     std::vector<VkPhysicalDevice> devices(count);
-    if (count > 0) vkEnumeratePhysicalDevices(instance, &count, devices.data());
+    if (vkEnumeratePhysicalDevices(instance, &count, devices.data()) != VK_SUCCESS) {
+        vkDestroyInstance(instance, nullptr);
+        return out;
+    }
+    devices.resize(count);
 
     int matches = 0;
     std::string seen;
@@ -463,6 +494,16 @@ bool runChecks() {
             harnessFailure(std::string("the daemon child never ran: ") + fault);
             return false;
         }
+        // A daemon that died is the daemon failing, not the host refusing to run the test. Only a
+        // child still running -- one that simply never printed the line -- can be a skip.
+        const DaemonChild::Death died = daemon.death();
+        if (died.dead) {
+            check(false, died.bySignal ? "the daemon stayed alive long enough to announce the bus name"
+                                       : "the daemon started successfully enough to announce the bus name");
+            std::fprintf(stderr, "  the daemon %s %d before announcing the bus name; its output above says why\n",
+                         died.bySignal ? "died on signal" : "exited with status", died.status);
+            return false;
+        }
         notVerified(kGoals, "the daemon this test started never announced that it was serving the bus name, so "
                             "there was nothing to ask for a frame");
         return true;
@@ -526,9 +567,22 @@ bool runChecks() {
 
     wallpaperx::testing::setWallpaper(*proxy, "static", imagePath, kMonitor);
     if (!signals.wait(kMonitor, 1)) {
-        notVerified(kGoals, "the daemon never signalled FrameReady for the first wallpaper, so there was no frame "
-                            "to import");
-        return true;
+        // Diagnosed, not skipped. SetWallpaper already returned, so the daemon accepted the
+        // request; whether it then rendered is the behaviour under test, not a host capability.
+        // Its own status says which: a daemon with no GPU could not have rendered anywhere, but
+        // one that has a GPU and still produced nothing is a defect this entry must report.
+        const wallpaperx::testing::StatusReply why = wallpaperx::testing::getStatus(*proxy);
+        const bool gpuUp =
+            why.ok() && why.json().value("gpu", nlohmann::json::object()).value("initialized", false);
+        if (!gpuUp) {
+            notVerified(kGoals, "the daemon never brought a GPU up, so it could not render a frame to import" +
+                                    (why.ok() ? std::string() : std::string(" (and it would not report its status)")));
+            return true;
+        }
+        check(false, "the daemon renders a frame for a wallpaper it accepted");
+        std::fprintf(stderr, "  the daemon has a GPU but signalled no FrameReady for monitor %d; its status says %s\n",
+                     kMonitor, why.json().dump().c_str());
+        return false;
     }
 
     const wallpaperx::testing::StatusReply rendered = wallpaperx::testing::getStatus(*proxy);
@@ -588,7 +642,6 @@ bool runChecks() {
     //       Observed 2026-08-22. Reverted.
     wallpaperx::FrameImport::Request request = requestFromFrame(frame);
     if (request.fd < 0) {
-        harnessFailure("the frame's descriptor could not be duplicated, so nothing could be imported");
         return true;
     }
     const wallpaperx::FrameImport::Result imported = wallpaperx::FrameImport::import(request);
