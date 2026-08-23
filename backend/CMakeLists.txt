@@ -665,7 +665,8 @@ if(DBUS_RUN_SESSION)
         set_tests_properties(http_config_lavapipe PROPERTIES
             ENVIRONMENT "VK_ICD_FILENAMES=${WALLPAPERX_LAVAPIPE_ICD};WALLPAPERX_FORCE_TIER="
             LABELS "lavapipe"
-            RESOURCE_LOCK wallpaperx_bus_tests)
+            RESOURCE_LOCK wallpaperx_bus_tests
+            SKIP_RETURN_CODE 77)
     endif()
 
     # Same private-bus wrapper, one tier up: this one spawns the real daemon binary.
@@ -692,7 +693,8 @@ if(DBUS_RUN_SESSION)
         set_tests_properties(daemon_system_lavapipe PROPERTIES
             ENVIRONMENT "VK_ICD_FILENAMES=${WALLPAPERX_LAVAPIPE_ICD}"
             LABELS "lavapipe"
-            RESOURCE_LOCK wallpaperx_bus_tests)
+            RESOURCE_LOCK wallpaperx_bus_tests
+            SKIP_RETURN_CODE 77)
     endif()
 
     # The QQuickItem driven by a stub daemon answering GetFrameFd with a frame the importer must

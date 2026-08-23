@@ -427,6 +427,7 @@ int main(int argc, char** argv) {
     if (!ok || checksRed || harnessRed) return 1;
     // NOT a skip: the checks above ran and passed. Marking this Skipped would erase the only
     // grade of the black-desktop defect. Only the GPU-side cleanliness went unjudged.
+    if (wallpaperx::testing::g_notVerified > 0) return wallpaperx::testing::reportNotVerifiedOrPassed();
     if (g_ungradedValidation > 0) {
         std::fprintf(stderr,
                      "item_frame_shown_test: the validation grade could not be made -- "

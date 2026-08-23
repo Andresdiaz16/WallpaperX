@@ -713,6 +713,8 @@ bool runChecks() {
             // produces, refuses at the duplication instead.
             if (error != wallpaperx::FrameImport::kImportRejectedError) {
                 if (rejected.fd >= 0) close(rejected.fd);
+                harnessFailure("the staged frame was refused before its descriptor reached the driver (\"" + error +
+                               "\"), which is not the path this phase grades");
                 return Outcome::NeverAttempted;
             }
             // The importer's contract: a refused frame leaves the descriptor with the caller.
@@ -759,7 +761,8 @@ bool runChecks() {
             }
             const size_t afterRefusals = openFdCount();
 
-            if (neverAttempted) return true;
+            // Not a return: the daemon's ordered shutdown below must still run.
+            if (!neverAttempted) {
 
             check(refusedAtHandover == kRefusals,
                   "every staged frame in the refusal sweep really was refused, so the descriptor count below was "
@@ -796,6 +799,7 @@ bool runChecks() {
                                  beforeRefusals, kRefusals, afterRefusals, afterRefusals - beforeRefusals);
                 }
             }
+            }
         }
     }
 
@@ -805,8 +809,8 @@ bool runChecks() {
     const int exitCode = daemon.shutdown(SIGTERM);
     const char* kNotGraded = " (not graded here -- daemon_system_test owns the shutdown contract)\n";
     if (daemon.timedOut()) {
-        std::printf("cross_process_import_test: the daemon did not exit within 20s of SIGTERM and had to be "
-                    "SIGKILLed%s",
+        std::printf("cross_process_import_test: the daemon did not exit within the harness deadline of SIGTERM and "
+                    "had to be SIGKILLed%s",
                     kNotGraded);
     } else if (daemon.termSignal() != 0) {
         std::printf("cross_process_import_test: the daemon died on signal %d after SIGTERM%s", daemon.termSignal(),
