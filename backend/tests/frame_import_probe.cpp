@@ -404,19 +404,21 @@ bool runImportChecks() {
 
         // GOAL: a failure AFTER the driver has taken the descriptor still tells the caller the
         //       descriptor is gone. The case above is refused before any driver call, so it
-        //       grades the early half only: on the opaque path GL takes the fd at
-        //       glImportMemoryFdEXT and two later steps can still fail. A caller told the fd is
+        //       grades the early half only: on the opaque path the importer closes the caller's
+        //       descriptor once glImportMemoryFdEXT accepts the duplicate it was handed, and two
+        //       later steps can still fail after that. A caller told the fd is
         //       still its own closes a number the process has since reused -- inside a
         //       compositor, its own socket.
         // WHY-THIS-SHAPE: asserted by asking whether the descriptor is STILL OPEN, not by
         //       counting. Counting cannot see this: the caller's second close simply fails with
         //       EBADF and the total is unchanged, which is exactly what a count-based version of
         //       this check did -- it passed with the defect present, measured.
-        // CONTROL: `request.fd = -1` deleted from FrameImport::import in
-        //       backend/kde/frame_import.cpp, ahead of the importFd call ->
+        // CONTROL: `::close(request.fd); request.fd = -1;` -- the pair that runs once
+        //       glImportMemoryFdEXT has succeeded, in FrameImport::import in
+        //       backend/kde/frame_import.cpp -- commented out ->
         //       "FAIL: a failed import that consumed the descriptor says so...", printing
-        //       "import failed and returned fd 51, which is already closed". Observed
-        //       2026-08-21. Reverted.
+        //       "import failed and returned fd 52, which still names the exported frame".
+        //       Observed 2026-08-22. Reverted.
         // CONTROL, the dma_buf half: `::close(request.fd); request.fd = -1;` added to the
         //       eglCreateImage failure return in FrameImport::importDmaBuf in
         //       backend/kde/frame_import.cpp -> "FAIL: a failed dma_buf import leaves the
