@@ -345,7 +345,18 @@ QSGNode* WallpaperXItem::updatePaintNode(QSGNode* old, UpdatePaintNodeData*) {
     // OpenGL only. Checked every pass rather than once, because the window can change.
     if (host->rendererInterface()->graphicsApi() != QSGRendererInterface::OpenGL) {
         setRenderReason(tr("This desktop is not running on OpenGL, which WallpaperX needs to show a frame."));
-        delete node;
+        if (node != nullptr) {
+            // The release tied to the texture must NOT run here. It calls glDeleteTextures and
+            // glDeleteMemoryObjectsEXT, and this branch is reached precisely because the scene
+            // graph is not on OpenGL -- so there is no current context and those calls are silent
+            // no-ops that look like a free. Disconnected instead, and the handles are abandoned
+            // deliberately: the GL context that owned them is gone, and a context's objects die
+            // with it.
+            if (QSGTexture* texture = node->texture()) {
+                QObject::disconnect(texture, &QObject::destroyed, nullptr, nullptr);
+            }
+            delete node;
+        }
         {
             std::lock_guard<std::mutex> lock(m_importedMutex);
             m_shownGeneration = 0;
