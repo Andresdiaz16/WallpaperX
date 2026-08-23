@@ -586,7 +586,12 @@ if(DBUS_RUN_SESSION)
     # otherwise turn this entry -- and the lavapipe twin below -- into further copies of
     # dbus_service_classic. All three would pass, the tier assertion included, while
     # Heap and Buffer went entirely unexercised through the daemon.
-    set_tests_properties(dbus_service PROPERTIES ENVIRONMENT "WALLPAPERX_FORCE_TIER=")
+    # SKIP_RETURN_CODE so the test can say "not verified" at all. Without it, exit 77 reads to
+    # ctest as a failure, so a host with no vulkan-validation-layers package -- which grades
+    # nothing but breaks nothing -- turned the whole entry red as though the daemon were at fault.
+    set_tests_properties(dbus_service PROPERTIES
+        ENVIRONMENT "WALLPAPERX_FORCE_TIER="
+        SKIP_RETURN_CODE 77)
 
     # The test now renders and exports a real frame, so it exercises the export path
     # end to end -- and on the owner's NVIDIA GPU that path is OPAQUE_FD only. The
@@ -598,7 +603,8 @@ if(DBUS_RUN_SESSION)
                  COMMAND ${DBUS_RUN_SESSION} -- $<TARGET_FILE:wallpaperx-dbus-service-test>)
         set_tests_properties(dbus_service_lavapipe PROPERTIES
             ENVIRONMENT "VK_ICD_FILENAMES=${WALLPAPERX_LAVAPIPE_ICD};WALLPAPERX_FORCE_TIER="
-            LABELS "lavapipe")
+            LABELS "lavapipe"
+            SKIP_RETURN_CODE 77)
     endif()
 
     # DoD 12 wants the Classic descriptor tier verified end to end *through the
@@ -610,7 +616,8 @@ if(DBUS_RUN_SESSION)
     add_test(NAME dbus_service_classic
              COMMAND ${DBUS_RUN_SESSION} -- $<TARGET_FILE:wallpaperx-dbus-service-test>)
     set_tests_properties(dbus_service_classic PROPERTIES
-        ENVIRONMENT "WALLPAPERX_FORCE_TIER=classic")
+        ENVIRONMENT "WALLPAPERX_FORCE_TIER=classic"
+        SKIP_RETURN_CODE 77)
 
     # The Classic tier needs a lavapipe twin of its own, and not for coverage symmetry.
     # The TSan tier can only run lavapipe entries (the proprietary driver SEGVs under
@@ -624,7 +631,8 @@ if(DBUS_RUN_SESSION)
         set_tests_properties(dbus_service_classic_lavapipe PROPERTIES
             ENVIRONMENT "VK_ICD_FILENAMES=${WALLPAPERX_LAVAPIPE_ICD};WALLPAPERX_FORCE_TIER=classic"
             LABELS "lavapipe"
-            RESOURCE_LOCK wallpaperx_bus_tests)
+            RESOURCE_LOCK wallpaperx_bus_tests
+            SKIP_RETURN_CODE 77)
     endif()
 
     # One lock across every bus-driven test, not one per tier. Two reasons, and the
@@ -759,6 +767,29 @@ if(DBUS_RUN_SESSION)
                 ENVIRONMENT "QT_QPA_PLATFORM=wayland\;xcb\;offscreen;QT_NO_XDG_DESKTOP_PORTAL=1"
                 RESOURCE_LOCK wallpaperx_bus_tests
                 SKIP_RETURN_CODE 77)
+
+            # The same scene again, for what the item TELLS the desktop rather than for what it
+            # frees: the claim that a frame is on screen must be withdrawn when the scene graph
+            # takes the node away, and must survive a monitor-id change that only invalidates the
+            # staleness marks. Its own binary rather than another phase of the one above, because
+            # grading the first direction means detaching the item from its window -- which
+            # destroys the node and texture that file's whole check is about.
+            add_executable(wallpaperx-item-frame-shown-test tests/item_frame_shown_test.cpp)
+            target_link_libraries(wallpaperx-item-frame-shown-test PRIVATE
+                wallpaperx-renderer wallpaperx-frame-import
+                Qt6::Core Qt6::DBus Qt6::Gui Qt6::Qml Qt6::Quick Qt6::QuickPrivate
+                PkgConfig::EGL OpenGL::GL)
+            target_include_directories(wallpaperx-item-frame-shown-test PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../renderer/tests)
+            target_compile_definitions(wallpaperx-item-frame-shown-test PRIVATE
+                WALLPAPERX_QML_MODULE_PATH="${CMAKE_CURRENT_BINARY_DIR}/qml")
+            add_dependencies(wallpaperx-item-frame-shown-test wallpaperxplugin)
+            add_test(NAME item_frame_shown
+                     COMMAND ${DBUS_RUN_SESSION} -- $<TARGET_FILE:wallpaperx-item-frame-shown-test>)
+            set_tests_properties(item_frame_shown PROPERTIES
+                ENVIRONMENT "QT_QPA_PLATFORM=wayland\;xcb\;offscreen;QT_NO_XDG_DESKTOP_PORTAL=1"
+                RESOURCE_LOCK wallpaperx_bus_tests
+                SKIP_RETURN_CODE 77)
         else()
             # Registered anyway, as an entry that always skips. An unregistered test is one
             # nobody runs and nobody misses: ctest prints a full green run with no line for it,
@@ -772,6 +803,14 @@ if(DBUS_RUN_SESSION)
                      "current; without it a build that leaks a screen's worth of GPU memory per frame is green. "
                      "Install the Qt6 Quick private headers and re-configure.")
             set_tests_properties(item_import_release PROPERTIES SKIP_REGULAR_EXPRESSION "NOT VERIFIED")
+            add_test(NAME item_frame_shown
+                     COMMAND ${CMAKE_COMMAND} -E echo
+                     "item_frame_shown: NOT VERIFIED -- Qt6 QuickPrivate headers were not found at configure time, "
+                     "so this check was not built. It is the only check that the plugin stops telling the desktop a "
+                     "wallpaper is on screen once the scene graph has taken the node away; without it a build that "
+                     "leaves a black desktop with no message on it is green. Install the Qt6 Quick private headers "
+                     "and re-configure.")
+            set_tests_properties(item_frame_shown PROPERTIES SKIP_REGULAR_EXPRESSION "NOT VERIFIED")
             message(WARNING
                 "Qt6 QuickPrivate headers not found -- item_import_release is registered as a permanent SKIP "
                 "rather than built. That is the only check that the GL objects imported from a daemon frame "
@@ -832,11 +871,13 @@ else()
         "dbus-run-session not found -- ALL bus-driven tests are unregistered: dbus_service, "
         "dbus_service_classic, dbus_service_lavapipe, dbus_service_classic_lavapipe, http_config, "
         "http_config_lavapipe, daemon_system, "
-        "daemon_system_lavapipe, item_import_failure, item_import_release, cross_process_import. That "
+        "daemon_system_lavapipe, item_import_failure, item_import_release, item_frame_shown, "
+        "cross_process_import. That "
         "removes the only coverage of the DBus wire contract, the DMA_BUF metadata, the HTTP config "
         "server, the Classic "
         "descriptor tier through the daemon, the release of GL objects imported from a daemon "
-        "frame by the scene graph's own teardown, the only check that an opaque fd exported by "
+        "frame by the scene graph's own teardown, the only check that the plugin stops claiming a "
+        "wallpaper is on screen once the scene graph has taken its node away, the only check that an opaque fd exported by "
         "one process imports as correct pixels in another, and the daemon's "
         "process-level behaviour (name acquisition, second-instance refusal, SIGTERM/SIGINT "
         "shutdown). A green ctest run without them means much less "

@@ -105,8 +105,14 @@ std::vector<unsigned char> readTexture(GLuint texture, uint32_t width, uint32_t 
 
 using wallpaperx::testing::vulkanDeviceUuid;
 
+// Nonzero when the validation layer was absent. Its own counter, because charging that to
+// failures turns every deliberate skip in this file into exit 1 -- a host without the layer
+// package reports NOT VERIFIED in its output and FAILS to ctest, blaming the importer.
+int g_ungradedValidation = 0;
+
 bool runImportChecks() {
     return wallpaperx::testing::gradedRun("frame_import_probe", [&](wallpaperx::testing::ValidationGrade& grade) {
+        grade.reportUngradedTo(g_ungradedValidation);
         const std::string imagePath = wallpaperx::testing::writeGradientPng(
             std::string(WALLPAPERX_TEST_IMAGE_DIR) + "/frame_import_gradient.png", 16, 16);
 
@@ -543,6 +549,9 @@ int main() {
     } catch (const std::exception& e) {
         wallpaperx::testing::harnessFailure(std::string("the probe could not build its preconditions: ") +
                                             e.what());
+    }
+    if (g_ungradedValidation > 0) {
+        notVerified(kGoals, "VK_LAYER_KHRONOS_validation is not loaded, so this run's Vulkan work went ungraded");
     }
     // Both reports run before the verdict, or a fault's reason line is never printed.
     const bool failed = wallpaperx::testing::reportCheckFailures();

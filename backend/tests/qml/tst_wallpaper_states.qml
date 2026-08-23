@@ -971,6 +971,39 @@ TestCase {
         compare(drawn.item.rendererReason, "", "the cleared reason reaches the plugin");
     }
 
+    // GOAL: S12.7's QML half -- a renderer that is still loaded and has STOPPED drawing gets the
+    //       message back. That is what a Plasma session sees when the scene graph takes the
+    //       renderer's resources away: the item stays, its `frameShown` goes false, and nothing
+    //       else about the screen changes. False if the panel stays hidden, which is a black
+    //       desktop with neither a wallpaper nor an explanation on it -- the defect that shipped.
+    // WHY-THIS-SHAPE: the surface is left LOADED and the reason left EMPTY, so the drawing claim
+    //       is the only thing that moved. The file's existing "the message comes back when the
+    //       wallpaper stops" reaches a visible backdrop by deactivating the whole Loader, which
+    //       main.qml answers through onStatusChanged -- a different line, and one that stays
+    //       correct while this one is broken. Measured: with main.qml's onFrameShownChanged
+    //       reduced to `if (surface.item.frameShown) root.rendererDrawing = true;` that check
+    //       still passed.
+    // CONTROL: that same one-way onFrameShownChanged written into main.qml -> "FAIL!: 'a renderer
+    //       that stopped drawing is covered by the message again' returned FALSE", one row red out
+    //       of this file's 40. Observed 2026-08-23. Reverted.
+    function test_a_renderer_that_stops_drawing_brings_the_message_back() {
+        const drawn = drawnScreenWithStandIn();
+
+        drawn.surface.item.frameShown = false;
+        verify(drawn.backdrop.visible,
+               "a renderer that stopped drawing is covered by the message again");
+        compare(drawn.item.rendererDrawing, false, "the renderer's withdrawn claim reaches the plugin");
+        compare(drawn.surface.status, Loader.Ready,
+                "the renderer is still loaded, so this is not the Loader-deactivated case");
+        compare(drawn.item.rendererReason, "", "and it said no reason, so only the drawing claim moved");
+        verify(drawn.item.describe().length > 0, "and the panel has something to say");
+
+        // And away again on the next frame, or a screen that recovers stays covered for good.
+        drawn.surface.item.frameShown = true;
+        verify(!drawn.backdrop.visible, "the message goes away again once drawing resumes");
+        compare(drawn.item.rendererDrawing, true, "the renewed claim reaches the plugin");
+    }
+
     // GOAL: the reason the renderer gave is what the desktop shows. False if the message is
     //       generic -- the user is then told the screen cannot be drawn on with no way to learn
     //       whether it was the scene graph, the driver, or the daemon, and the renderer had
