@@ -99,19 +99,7 @@ std::vector<unsigned char> readTexture(GLuint texture, uint32_t width, uint32_t 
     return pixels;
 }
 
-// The UUID of the GPU a Vulkan device is running on, which is what the GL context must match.
-std::array<uint8_t, 16> vulkanDeviceUuid(VkPhysicalDevice physical) {
-    VkPhysicalDeviceIDProperties ids{};
-    ids.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES;
-    VkPhysicalDeviceProperties2 properties{};
-    properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
-    properties.pNext = &ids;
-    vkGetPhysicalDeviceProperties2(physical, &properties);
-
-    std::array<uint8_t, 16> uuid{};
-    std::memcpy(uuid.data(), ids.deviceUUID, uuid.size());
-    return uuid;
-}
+using wallpaperx::testing::vulkanDeviceUuid;
 
 bool runImportChecks() {
     return wallpaperx::testing::gradedRun("frame_import_probe", [&](wallpaperx::testing::ValidationGrade& grade) {
@@ -408,6 +396,10 @@ bool runImportChecks() {
         //       "FAIL: a failed import that consumed the descriptor says so...", printing
         //       "import failed and returned fd 52, which still names the exported frame".
         //       Observed 2026-08-22. Reverted.
+        // NOT COVERED HERE: the refusal at the hand-over itself -- glImportMemoryFdEXT declining
+        //       the descriptor. This check grades the step AFTER it. That branch is graded by
+        //       cross_process_import_test's refusal sweep, which stages the refusal inside
+        //       glImportMemoryFdEXT and asserts no descriptor leaks across 32 of them.
         // CONTROL, the dma_buf half: `::close(request.fd); request.fd = -1;` added to the
         //       eglCreateImage failure return in FrameImport::importDmaBuf in
         //       backend/kde/frame_import.cpp -> "FAIL: a failed dma_buf import leaves the

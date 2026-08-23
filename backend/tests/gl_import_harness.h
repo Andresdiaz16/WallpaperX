@@ -293,4 +293,20 @@ inline std::vector<unsigned char> readSampled(GLuint texture, uint32_t width, ui
     return pixels;
 }
 
+// The UUID of the GPU a Vulkan device is running on, which is what the GL context must match.
+// Here rather than in each caller: the two tests that pair a GL context with a Vulkan export
+// both need it, and a second copy is one that can be fixed in one place and not the other.
+inline std::array<uint8_t, 16> vulkanDeviceUuid(VkPhysicalDevice physical) {
+    VkPhysicalDeviceIDProperties ids{};
+    ids.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES;
+    VkPhysicalDeviceProperties2 properties{};
+    properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+    properties.pNext = &ids;
+    vkGetPhysicalDeviceProperties2(physical, &properties);
+
+    std::array<uint8_t, 16> uuid{};
+    std::memcpy(uuid.data(), ids.deviceUUID, uuid.size());
+    return uuid;
+}
+
 }  // namespace wallpaperx::testing

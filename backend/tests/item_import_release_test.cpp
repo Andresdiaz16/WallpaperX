@@ -34,6 +34,8 @@
 
 #include "kde/frame_import.h"
 #include "support/validation_grade.h"
+// For vulkanDeviceUuid only; this test brings up its own GL through QQuickRenderControl.
+#include "tests/gl_import_harness.h"
 #include "tests/qt_frame_reply.h"
 #include "tests/test_report.h"
 #include "vulkan/device.h"
@@ -204,19 +206,7 @@ GLuint nativeName(QSGTexture* texture) {
     return opengl == nullptr ? 0 : opengl->nativeTexture();
 }
 
-// The UUID of the GPU a Vulkan device runs on, which the GL context must match for an opaque fd
-// to be importable at all.
-std::array<uint8_t, 16> vulkanDeviceUuid(VkPhysicalDevice physical) {
-    VkPhysicalDeviceIDProperties ids{};
-    ids.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES;
-    VkPhysicalDeviceProperties2 properties{};
-    properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
-    properties.pNext = &ids;
-    vkGetPhysicalDeviceProperties2(physical, &properties);
-    std::array<uint8_t, 16> uuid{};
-    std::memcpy(uuid.data(), ids.deviceUUID, uuid.size());
-    return uuid;
-}
+using wallpaperx::testing::vulkanDeviceUuid;
 
 // GL_DEVICE_UUID_EXT, read from whatever context is current. False when the context has no
 // GL_EXT_memory_object -- which is also a context that could not have imported anything.
@@ -533,7 +523,16 @@ bool runReleaseChecks() {
         //       on the GUI thread, which is what shipped before -> the same check red with the
         //       same diagnostic. Observed 2026-08-22. Reverted.
         DestroyObservation seen;
-        QObject::connect(
+        // Disconnected on every exit, and declared AFTER `seen` so it runs BEFORE `seen` dies.
+        // The connection is scoped to `window`, which is declared earlier and so outlives these
+        // locals: a texture reaped during ~QQuickWindow would otherwise run the lambda and write
+        // through a dead stack frame -- on exactly the paths where the checks below went red.
+        struct Disconnector {
+            QMetaObject::Connection connection;
+            ~Disconnector() { QObject::disconnect(connection); }
+        };
+        Disconnector guard;
+        guard.connection = QObject::connect(
             texture, &QObject::destroyed, &window,
             [&] {
                 ++seen.count;
