@@ -25,9 +25,9 @@ public:
     enum class HandleType { OpaqueFd = 0, DmaBuf = 1 };
 
     struct Request {
-        // Set to -1 once import() has consumed it; the caller closes it only if still >= 0.
-        // Not keyed on success -- GL takes it before the texture exists, so a failed import
-        // can still have consumed it.
+        // Set to -1 only when import() succeeded and consumed it; the caller closes it if still
+        // >= 0. A failed import never consumes it: the driver is handed a duplicate, so the
+        // caller's descriptor is its own on every failure path.
         int fd = -1;
         uint32_t width = 0;
         uint32_t height = 0;
@@ -55,6 +55,12 @@ public:
     // extension strings the driver advertises, NOT against whether the entry points resolve:
     // eglGetProcAddress hands back a non-null pointer for functions the driver does not
     // support, so a resolve-based check reports yes and then fails at the call.
+    // The `error` set when the driver refuses the descriptor at the hand-over itself, rather
+    // than at one of the checks before or the texture allocation after. Named because a test
+    // that grades the hand-over branch has to tell it from every other refusal, and comparing
+    // against its own copy of the sentence would silently stop matching if this one changed.
+    static constexpr const char* kImportRejectedError = "glImportMemoryFdEXT rejected the exported memory";
+
     static bool supports(HandleType type, std::string* whyNot = nullptr);
 
     // Imports `request` into a new texture. By reference so it can report the fd's fate.

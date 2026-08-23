@@ -152,7 +152,7 @@ private:
     bool m_subscribed = false;
     QString m_fetchReason;         // GUI thread only
     QString m_unavailableReason;   // GUI thread only, what QML reads
-    bool m_frameShown = false;     // GUI thread only, derived from m_shownGeneration in publishReason()
+    bool m_frameShown = false;     // GUI thread only, derived from m_nodeHasFrame in publishReason()
 
     std::mutex m_pendingMutex;
     std::optional<PendingFrame> m_pending;  // guarded by m_pendingMutex
@@ -161,6 +161,13 @@ private:
     // and setMonitorId, which is why it is guarded.
     std::mutex m_importedMutex;
     quint64 m_shownGeneration = 0;  // guarded by m_importedMutex
+    // Separate from m_shownGeneration, which answers a different question. That one is a
+    // staleness mark and is cleared whenever generations stop meaning anything -- a daemon
+    // restart, a monitor change -- while the node keeps drawing the frame it already has. This
+    // one says only whether a node with a live texture is on screen, so it is cleared where the
+    // node actually dies. Deriving the message panel from the staleness mark put the panel over
+    // a wallpaper that was still correctly displayed.
+    bool m_nodeHasFrame = false;  // guarded by m_importedMutex
     // Bumped every time the marks are invalidated, so the render thread can tell whether the
     // shown generation it read is still the one it is about to write back to.
     quint64 m_generationEpoch = 0;  // guarded by m_importedMutex

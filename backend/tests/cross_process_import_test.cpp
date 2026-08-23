@@ -856,7 +856,7 @@ bool runChecks() {
         // Matched against the importer's own words for the failure at the descriptor hand-over.
         // Any other refusal happened before the fd was given away, which is a branch this phase
         // does not grade -- so it is reported as this harness failing to set the case up.
-        const bool stagedAtHandover = stagedError == "glImportMemoryFdEXT rejected the exported memory";
+        const bool stagedAtHandover = stagedError == wallpaperx::FrameImport::kImportRejectedError;
         if (firstOutcome == Outcome::NeverAttempted) {
             // requestFromFrame has already reported why; nothing below is measurable.
         } else if (firstOutcome == Outcome::Imported) {

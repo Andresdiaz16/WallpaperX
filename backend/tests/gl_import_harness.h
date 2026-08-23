@@ -64,6 +64,14 @@ public:
             return false;
         }
 
+        // An all-zero wanted UUID means the caller never learned the exporting GPU's identity.
+        // Matching on it would bind whichever device also answers zeros, and the import failure
+        // that follows would be charged to the importer rather than to this harness.
+        if (wantedUuid == std::array<uint8_t, 16>{}) {
+            why = "the exporting device's UUID is all zeros, so there is no identity to match a GL context against";
+            return false;
+        }
+
         std::array<EGLDeviceEXT, 16> devices{};
         EGLint deviceCount = 0;
         if (queryDevices(static_cast<EGLint>(devices.size()), devices.data(), &deviceCount) != EGL_TRUE) {
@@ -176,6 +184,11 @@ inline std::vector<unsigned char> readSampled(GLuint texture, uint32_t width, ui
                                          "  colour = texelFetch(source, ivec2(gl_FragCoord.xy), 0);\n"
                                          "}\n";
 
+    // Drained first: GL keeps errors queued until read, so one left by the caller would be
+    // attributed to this sampling and turn the pixel check into a skip about the wrong thing.
+    while (glGetError() != GL_NO_ERROR) {
+    }
+
     std::vector<unsigned char> pixels;
     GLuint vertex = 0;
     GLuint fragment = 0;
@@ -198,8 +211,10 @@ inline std::vector<unsigned char> readSampled(GLuint texture, uint32_t width, ui
         return 0;
     };
 
-    // Every exit below runs this, so a failure partway through leaves the context as it was
-    // found -- the descriptor and object accounting a caller measures is taken against it.
+    // Every exit below runs this, so a failure partway through frees everything this function
+    // made -- the descriptor and object accounting a caller measures is taken against it. It
+    // does NOT restore the caller's bindings: they are zeroed, and the sampled texture keeps the
+    // filter and wrap this set. A caller that had bindings worth keeping must save them itself.
     const auto tidy = [&] {
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
         glUseProgram(0);

@@ -253,8 +253,14 @@ Item {
 )");
 }
 
+// Nonzero when the validation layer was absent. Its own counter, because charging that to
+// failures turned every deliberate skip below into exit 1: a host without the layer package
+// reported "not verified" in its output and FAILED to ctest, blaming the plugin for a package.
+int g_ungradedValidation = 0;
+
 bool runReleaseChecks() {
     return wallpaperx::testing::gradedRun("item_import_release_test", [](wallpaperx::testing::ValidationGrade& grade) {
+        grade.reportUngradedTo(g_ungradedValidation);
         wallpaperx::Device device(/*enableValidation=*/true);
         grade.watch(device);
         wallpaperx::OffscreenTargetManager targets(device);
@@ -315,8 +321,11 @@ bool runReleaseChecks() {
             insideRenderPass = true;
             control.sync();
             if (withContext) withContext();
-            insideRenderPass = false;
+            // Cleared AFTER endFrame(): Qt is free to reap scene-graph nodes there rather than in
+            // sync(), and clearing first would fail the context check on a correct Qt build --
+            // blaming the plugin for where Qt chose to do its teardown.
             control.endFrame();
+            insideRenderPass = false;
             if (QOpenGLContext* current = QOpenGLContext::currentContext()) current->doneCurrent();
         };
 
@@ -324,19 +333,35 @@ bool runReleaseChecks() {
         // different device says nothing about the release path. Asked, not assumed: a headless
         // EGL context on this machine comes up on llvmpipe even where Vulkan resolves to NVIDIA.
         bool sameDevice = false;
+        bool uuidQueryable = false;
         std::array<uint8_t, 16> glUuid{};
         std::string glRenderer = "(unknown)";
         renderPass([&] {
             const GLubyte* name = glGetString(GL_RENDERER);
             if (name != nullptr) glRenderer = reinterpret_cast<const char*>(name);
-            sameDevice = glDeviceUuid(glUuid) && glUuid == vulkanDeviceUuid(device.physicalDevice());
+            uuidQueryable = glDeviceUuid(glUuid);
+            sameDevice = uuidQueryable && glUuid == vulkanDeviceUuid(device.physicalDevice());
         });
         // CONTROL: run with VK_ICD_FILENAMES pointed at lavapipe, so Vulkan resolves to llvmpipe
         //       while the session's GL context is still NVIDIA -> "NOT VERIFIED -- ... the scene
         //       graph's GL context is not on the device the Vulkan export came from (GL reports
         //       NVIDIA GeForce RTX 3080 Ti/PCIe/SSE2)", exit 77 rather than a failure blamed on
         //       the plugin. Observed 2026-08-22.
-        if (!sameDevice) {
+        // Only the opaque path needs the match. A dma_buf is importable across devices, so
+        // refusing to run for a UUID mismatch would skip every AMD and Intel host with a reason
+        // that is not true of them.
+        const bool needsSameDevice = stub.handleType() != 1;
+
+        // Two causes, named apart: a context on another GPU, and a context that cannot answer
+        // which GPU it is on. Both mean this run establishes nothing, but reporting the second
+        // as the first sends the reader hunting for a device mismatch that may not exist.
+        if (needsSameDevice && !uuidQueryable) {
+            notVerified(kGoal, "this GL context does not answer GL_DEVICE_UUID_EXT (GL reports " + glRenderer +
+                                   "), so whether it is on the exporting device could not be established");
+            control.invalidate();
+            return true;
+        }
+        if (needsSameDevice && !sameDevice) {
             notVerified(kGoal, "the scene graph's GL context is not on the device the Vulkan export came from (GL "
                                "reports " + glRenderer + "), so the frame is not importable here at all");
             control.invalidate();
@@ -361,6 +386,15 @@ bool runReleaseChecks() {
         }
         rootItem->setParentItem(window.contentItem());
         auto* item = qobject_cast<QQuickItem*>(root->property("rendererItem").value<QObject*>());
+        if (item == nullptr) {
+            // Checked, or a QML wiring fault spins the pump for its full deadline and then
+            // reports "the item never imported the frame" -- blaming the import path for a
+            // property this file failed to resolve.
+            wallpaperx::testing::harnessFailure(
+                "the root object exposed no rendererItem, so there was no WallpaperXRenderer to drive");
+            control.invalidate();
+            return true;
+        }
 
         // Bounded, with a failure branch: everything below is gated on a texture existing, so a
         // run that never imported must not fall through into checks about freeing one.
@@ -622,6 +656,9 @@ int main(int argc, char** argv) {
         wallpaperx::testing::harnessFailure(std::string("the harness could not build its preconditions: ") + e.what());
     }
 
+    if (g_ungradedValidation > 0) {
+        notVerified(kGoal, "VK_LAYER_KHRONOS_validation is not loaded, so this run's Vulkan work went ungraded");
+    }
     const bool checksRed = wallpaperx::testing::reportCheckFailures();
     const bool harnessRed = wallpaperx::testing::reportHarnessFaults("in this test file, not in the plugin");
     if (!ok || checksRed || harnessRed) return 1;

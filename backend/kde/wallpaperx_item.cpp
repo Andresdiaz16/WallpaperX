@@ -126,7 +126,7 @@ void WallpaperXItem::publishReason() {
         render = m_renderReason;
         // Derived, never stored twice: a hand-maintained copy has to be cleared again on every
         // teardown path, and missing one leaves the desktop claiming a frame it no longer has.
-        shown = m_shownGeneration != 0;
+        shown = m_nodeHasFrame;
     }
     if (m_frameShown != shown) {
         m_frameShown = shown;
@@ -350,21 +350,17 @@ QSGNode* WallpaperXItem::updatePaintNode(QSGNode* old, UpdatePaintNodeData*) {
     // OpenGL only. Checked every pass rather than once, because the window can change.
     if (host->rendererInterface()->graphicsApi() != QSGRendererInterface::OpenGL) {
         setRenderReason(tr("This desktop is not running on OpenGL, which WallpaperX needs to show a frame."));
-        if (node != nullptr) {
-            // The release tied to the texture must NOT run here. It calls glDeleteTextures and
-            // glDeleteMemoryObjectsEXT, and this branch is reached precisely because the scene
-            // graph is not on OpenGL -- so there is no current context and those calls are silent
-            // no-ops that look like a free. Disconnected instead, and the handles are abandoned
-            // deliberately: the GL context that owned them is gone, and a context's objects die
-            // with it.
-            if (QSGTexture* texture = node->texture()) {
-                QObject::disconnect(texture, &QObject::destroyed, nullptr, nullptr);
-            }
-            delete node;
-        }
+        // The release runs, and must. Reaching here means no OpenGL context is current, so its
+        // glDeleteTextures and glDeleteMemoryObjectsEXT are silent no-ops -- but the GL context
+        // that owned those names is gone and took them with it. Its eglDestroyImageKHR is the
+        // part that matters: an EGLImage belongs to the display, not the context, needs no
+        // current context, and nothing else destroys it. Cancelling the release to avoid the two
+        // no-ops would pin the daemon's dma_buf for the life of the session.
+        delete node;
         {
             std::lock_guard<std::mutex> lock(m_importedMutex);
             m_shownGeneration = 0;
+            m_nodeHasFrame = false;
         }
         return nullptr;
     }
@@ -414,6 +410,7 @@ QSGNode* WallpaperXItem::updatePaintNode(QSGNode* old, UpdatePaintNodeData*) {
             {
                 std::lock_guard<std::mutex> lock(m_importedMutex);
                 m_shownGeneration = 0;
+                m_nodeHasFrame = false;
             }
             // Asked for once more. A still wallpaper sends no further FrameReady, so without this
             // a transient failure is permanent. The whole decision runs on the item's own thread,
@@ -454,6 +451,9 @@ QSGNode* WallpaperXItem::updatePaintNode(QSGNode* old, UpdatePaintNodeData*) {
                 // in that gap -- and writing this number back afterwards would judge the next
                 // screen's, or the next daemon's, frames against a number that outlived them.
                 if (m_generationEpoch == epoch) m_shownGeneration = incoming->generation;
+                // Not epoch-guarded, unlike the mark above: this says a node is drawing, which is
+                // true whatever the epoch did while the import ran.
+                m_nodeHasFrame = true;
             }
             // Cleared so "retried once" means once per failure, not once per session: the same
             // generation can be re-fetched later (a window change re-asks) and must be allowed
@@ -486,6 +486,7 @@ void WallpaperXItem::releaseResources() {
     {
         std::lock_guard<std::mutex> lock(m_importedMutex);
         m_shownGeneration = 0;
+        m_nodeHasFrame = false;
         ++m_generationEpoch;
     }
     // Scoped above, because this takes the same non-recursive mutex.

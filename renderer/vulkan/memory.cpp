@@ -261,6 +261,19 @@ AllocatedImage Memory::createExportableImage(const VkImageCreateInfo& imageInfoI
                                      (debugName ? debugName : "(unnamed exportable image)") +
                                      " as an opaque fd with the requested format, tiling and usage");
         }
+
+        // The extent is not part of the query, so the answer has to be checked against it -- the
+        // same reason usableDrmModifiers() checks it. Skipping it moves the failure to
+        // vkCreateImage, whose error names neither the size nor the export as the cause.
+        const VkExtent3D& maxExtent = formatProps.imageFormatProperties.maxExtent;
+        if (imageInfo.extent.width > maxExtent.width || imageInfo.extent.height > maxExtent.height ||
+            imageInfo.extent.depth > maxExtent.depth) {
+            throw std::runtime_error(std::string("Memory: ") + (debugName ? debugName : "(unnamed exportable image)") +
+                                     " is larger than this device can export as an opaque fd (" +
+                                     std::to_string(imageInfo.extent.width) + "x" +
+                                     std::to_string(imageInfo.extent.height) + " exceeds " +
+                                     std::to_string(maxExtent.width) + "x" + std::to_string(maxExtent.height) + ")");
+        }
     }
 
     VkExportMemoryAllocateInfo exportInfo{VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO};

@@ -148,7 +148,7 @@ if(EGL_FOUND AND OpenGL_OpenGL_FOUND)
         wallpaperx-frame-import wallpaperx-renderer)
     add_dependencies(wallpaperx-frame-import-probe wallpaperx-shaders)
     target_include_directories(wallpaperx-frame-import-probe PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/../renderer/tests)
+        ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../renderer/tests)
     # Its own asset directory, not the renderer's: that one is a plain variable in the renderer's
     # scope and arrives here empty, which showed up as a write to "/frame_import_gradient.png".
     # A separate directory is also what keeps this probe off the path its lavapipe twin writes.
@@ -760,11 +760,22 @@ if(DBUS_RUN_SESSION)
                 RESOURCE_LOCK wallpaperx_bus_tests
                 SKIP_RETURN_CODE 77)
         else()
+            # Registered anyway, as an entry that always skips. An unregistered test is one
+            # nobody runs and nobody misses: ctest prints a full green run with no line for it,
+            # which reads exactly like a passing check. The same reasoning registers
+            # frame_import_probe unconditionally above.
+            add_test(NAME item_import_release
+                     COMMAND ${CMAKE_COMMAND} -E echo
+                     "item_import_release: NOT VERIFIED -- Qt6 QuickPrivate headers were not found at configure "
+                     "time, so this check was not built. It is the only check that the GL objects imported from a "
+                     "daemon frame are freed by the scene graph's own teardown, on its thread with its context "
+                     "current; without it a build that leaks a screen's worth of GPU memory per frame is green. "
+                     "Install the Qt6 Quick private headers and re-configure.")
+            set_tests_properties(item_import_release PROPERTIES SKIP_REGULAR_EXPRESSION "NOT VERIFIED")
             message(WARNING
-                "Qt6 QuickPrivate headers not found -- item_import_release is not built. That is the "
-                "only check that the GL objects imported from a daemon frame are freed by the scene "
-                "graph's own teardown, on its thread with its context current; without it a build that "
-                "leaks a screen's worth of GPU memory per frame is green.")
+                "Qt6 QuickPrivate headers not found -- item_import_release is registered as a permanent SKIP "
+                "rather than built. That is the only check that the GL objects imported from a daemon frame "
+                "are freed by the scene graph's own teardown.")
         endif()
     endif()
 

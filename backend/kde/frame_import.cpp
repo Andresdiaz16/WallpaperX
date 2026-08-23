@@ -92,8 +92,8 @@ bool hasGlExtension(const char* wanted) {
 // kcmp compares the kernel's open file description. fstat would compare the FILE, and those
 // differ exactly where it matters: a re-open of the same file matches on st_dev/st_ino while
 // being a different description, so fstat can answer "still yours" about a descriptor that now
-// belongs to something else. Measured. fstat remains only as the fallback for kernels built
-// without CONFIG_KCMP, where it still beats guessing.
+// belongs to something else. fstat remains only as the fallback for kernels built without
+// CONFIG_KCMP, where it still beats guessing.
 bool sameOpenFile(int candidate, int reference) {
     const long compared = ::syscall(SYS_kcmp, ::getpid(), ::getpid(), KCMP_FILE, candidate, reference);
     if (compared >= 0) return compared == 0;
@@ -357,10 +357,9 @@ FrameImport::Result FrameImport::import(Request& request) {
     // The driver is handed a DUPLICATE and the caller's descriptor never leaves our hands.
     //
     // The spec transfers ownership only on a SUCCESSFUL import and says nothing about failure,
-    // and drivers disagree: NVIDIA leaves the descriptor open (measured -- 200 failed imports
-    // leaked 197 descriptors), while Mesa closes it on its backend path and leaks it on its
-    // argument-validation paths. So "does this driver close on failure" is not even constant
-    // within one driver, and nothing can be keyed on it.
+    // and drivers disagree: NVIDIA leaves the descriptor open, while Mesa closes it on its
+    // backend path and leaks it on its argument-validation paths. So "does this driver close on
+    // failure" is not even constant within one driver, and nothing can be keyed on it.
     //
     // Duplicating makes the question decidable instead of guessed: the retained original pins
     // the open file, so afterwards the duplicate's identity can still be compared against it.
@@ -376,9 +375,13 @@ FrameImport::Result FrameImport::import(Request& request) {
     if (glGetError() != GL_NO_ERROR) {
         // Compared while the original is still open -- it is the operand. A driver that took the
         // duplicate leaves it closed or reused, and either way it is not ours to close.
-        if (sameOpenFile(gift, request.fd)) ::close(gift);
+        const bool giftStillOurs = sameOpenFile(gift, request.fd);
+        // Destroyed BEFORE the close: a driver that took the descriptor on the failing call and
+        // releases it when the object dies would otherwise close a number this already freed --
+        // and inside plasmashell that number can belong to another thread by then.
         api.destroy(1, &memory);
-        out.error = "glImportMemoryFdEXT rejected the exported memory";
+        if (giftStillOurs) ::close(gift);
+        out.error = kImportRejectedError;
         // request.fd is untouched: a failed import never consumes the caller's descriptor now.
         return out;
     }
