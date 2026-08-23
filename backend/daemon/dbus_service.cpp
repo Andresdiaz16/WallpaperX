@@ -229,6 +229,15 @@ void DbusService::completeGetFrameFd(FrameFdCall call, int32_t monitorId) {
         planes.emplace_back(plane.offset, plane.rowPitch);
     }
 
+    // The one line that shows a consumer actually took a frame. Without it the log records
+    // wallpapers being set and nothing collecting them, so a plugin that never fetched and one
+    // that fetched and drew read identically -- which cost a whole session of misreading a
+    // silent log as a failure.
+    std::printf("wallpaperx-daemon: GetFrameFd(monitor=%d) served generation %llu as %s\n", monitorId,
+                static_cast<unsigned long long>(exported.handle->generation),
+                frame.type == ExportedFrame::HandleType::DmaBuf ? "dma_buf" : "opaque fd");
+    std::fflush(stdout);
+
     call.returnResults(fd, frame.width, frame.height, frame.memorySize,
                        frame.type == ExportedFrame::HandleType::DmaBuf ? 1 : 0,
                        // sync_fds: empty because the export waits on a fence before returning,
