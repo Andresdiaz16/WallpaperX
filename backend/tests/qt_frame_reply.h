@@ -60,9 +60,9 @@ inline void registerFrameReplyTypes() {
 // fd, width, height, memory_size, handle_type, sync_fds, frame_generation, drm_format,
 // drm_modifier, planes.
 //
-// sync_fds defaults to empty because that is what the daemon sends, but it IS a parameter: the
-// item refuses a reply carrying any, and a helper that cannot express one leaves that refusal
-// unreachable from every test -- the branch would exist with nothing able to enter it.
+// sync_fds defaults to empty because that is what the daemon sends. It is a parameter so the
+// item's refusal of a fenced reply CAN be reached -- but no test passes one yet, so that branch
+// is still entered by nothing. Expressible, not covered; do not read the parameter as coverage.
 inline QList<QVariant> frameReplyFields(const QDBusUnixFileDescriptor& handle, quint32 width, quint32 height,
                                         quint64 memorySize, int handleType, quint64 generation, quint32 drmFormat,
                                         quint64 drmModifier, const QList<FramePlane>& planes,

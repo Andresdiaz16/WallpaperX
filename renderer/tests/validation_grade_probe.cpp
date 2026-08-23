@@ -63,9 +63,13 @@ void graded(bool ok, std::string_view what) {
 
 // COVERAGE-ASSERT for both phases: each states how many comparisons its source makes, and
 // a green run that made a different number fails here. The counts are fixed by the source,
-// so an edit that folds a check away or returns early past one cannot go quiet. Skipped
-// when something already failed, because a failure legitimately bypasses the checks that
-// depend on it and the mismatch would then be noise on top of a real red line.
+// so an edit that folds a check away cannot go quiet. Skipped when something already failed,
+// because a failure legitimately bypasses the checks that depend on it and the mismatch would
+// then be noise on top of a real red line.
+//
+// It does NOT cover the early returns that abandon a phase when its precondition could not be
+// built -- those return before reaching this, so the count is never compared. They are not
+// silent for a different reason: each prints the line saying which checks were not reached.
 //
 // CONTROL: the adopt() comparison in the installed phase replaced by `(void)adopted;`.
 //       Observed: "this phase evaluated 7 of the 8 comparisons its source makes -- a check
@@ -218,6 +222,9 @@ bool runInstalledPhase() {
     unsetenv("WALLPAPERX_ALLOW_NO_VALIDATION");
     graded(waived.failures == 0 && waived.ungraded == 0,
            "the operator's waiver excuses an absent validator instead of charging either bucket");
+    // Grades THIS FILE, not production: no change to the code under test can red it. It guards
+    // the scrub above, so a later phase added here cannot silently inherit the waiver -- nothing
+    // depends on it today.
     // CONTROL: the unsetenv two lines above deleted -> this line red, 1 failure, exit 1. Reverted.
     graded(!validationWaived(), "the probe cleared the waiver switch again after grading its effect");
 

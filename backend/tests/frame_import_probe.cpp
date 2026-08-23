@@ -63,13 +63,21 @@ constexpr uint32_t kHeight = 36;
 
 // How many descriptors this process holds. Its own copy rather than the one in
 // tests/client/daemon_client.h, which this binary cannot include -- that header pulls in sdbus.
-// The SENTINEL must stay identical to it: 0 for a directory that cannot be read. It answered -1
-// here, so a guard written against one is silently wrong against the other.
+// The SENTINEL must stay identical to it: 0 for a directory that could not be walked, which no
+// live process can reach as a real count.
 size_t openFdCount() {
     DIR* dir = ::opendir("/proc/self/fd");
     if (dir == nullptr) return 0;
     size_t count = 0;
+    // errno cleared first: readdir returns null for both end-of-directory and failure, and
+    // treating a mid-walk failure as the end reports a short count that no guard can catch --
+    // it is neither the sentinel nor the truth.
+    errno = 0;
     while (::readdir(dir) != nullptr) ++count;
+    if (errno != 0) {
+        ::closedir(dir);
+        return 0;
+    }
     ::closedir(dir);
     return count;
 }
@@ -356,9 +364,10 @@ bool runImportChecks() {
         //       FrameImport::import -> "FAIL: a failed import leaves its file descriptor with the
         //       caller, neither closed nor leaked", printing "55 open fds before the failed
         //       import, 54 after". Observed 2026-08-21 on both entries. Reverted.
-        // COVERAGE-ASSERT: every count below comes from /proc/self/fd, which returns -1 when it
-        //       cannot be read. Left ungraded, every comparison here is -1 against -1 and the
-        //       whole phase passes having counted nothing; asserted so that becomes a skip.
+        // COVERAGE-ASSERT: every count below comes from /proc/self/fd, which answers 0 when it
+        //       cannot be read -- a count no live process can reach, since it holds at least
+        //       stdin, stdout and stderr. Left ungraded, every comparison here is 0 against 0 and
+        //       the whole phase passes having counted nothing; asserted so that becomes a skip.
 
         // A failure that never reaches the driver: the fd must come back untouched.
         wallpaperx::FrameImport::Request rejected;
