@@ -21,24 +21,13 @@
 #include "support/gpu_readback.h"
 #include "support/test_image.h"
 #include "support/validation_grade.h"
-// The headless context on a named GPU, and the sampled read-back, shared with
-// cross_process_import_test: both need a GL context on the SAME device a Vulkan frame came from,
-// and both must read the texture through a shader to see the swizzle at all.
+// Must precede any GL use: it supplies the entry-point setup and the GL/EGL headers.
 #include "tests/gl_import_harness.h"
 #include "tests/test_report.h"
 #include "vulkan/device.h"
 #include "vulkan/frame_export.h"
 #include "vulkan/offscreen.h"
 #include "renderers/static_renderer.h"
-
-// The framebuffer entry points are GL 3.0 core, and gl.h declares only GL 1.x unless this
-// is set. Fine for a probe linked against libGL; the importer itself resolves through
-// eglGetProcAddress instead, because the plugin runs inside a context it does not own.
-#define GL_GLEXT_PROTOTYPES 1
-#include <EGL/egl.h>
-#include <EGL/eglext.h>
-#include <GL/gl.h>
-#include <GL/glext.h>
 
 #include <dirent.h>
 #include <fcntl.h>

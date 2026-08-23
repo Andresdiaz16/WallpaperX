@@ -32,6 +32,7 @@
 // run reports NOT VERIFIED when this host cannot pair a GL context with the Vulkan device that
 // produced it: an opaque fd is importable only by the driver that made it.
 
+#include "kde/frame_import.h"
 #include "support/validation_grade.h"
 #include "tests/qt_frame_reply.h"
 #include "tests/test_report.h"
@@ -370,13 +371,38 @@ bool runReleaseChecks() {
             },
             10000);
         if (!imported) {
-            notVerified(kGoal, std::string("the item never imported the exported frame, so there was nothing to "
-                                           "release -- it asked ") +
-                                   std::to_string(stub.requests()) + " time(s), the stub served " +
-                                   std::to_string(stub.served()) + ", handle type " +
-                                   std::to_string(stub.handleType()) + ", export error [" + stub.exportError() +
-                                   "], the item reports [" +
-                                   root->property("publishedReason").toString().toStdString() + "]");
+            const std::string detail = std::string("it asked ") + std::to_string(stub.requests()) +
+                                       " time(s), the stub served " + std::to_string(stub.served()) +
+                                       ", handle type " + std::to_string(stub.handleType()) + ", export error [" +
+                                       stub.exportError() + "], the item reports [" +
+                                       root->property("publishedReason").toString().toStdString() + "]";
+            std::fprintf(stderr, "  %s\n", detail.c_str());
+
+            // One outcome, two causes needing opposite verdicts: a host whose GL context cannot
+            // import what was served (a real skip), and a plugin that never asked or refused a
+            // frame this host CAN import (a failure). Everything needed to tell them apart was
+            // already gathered here and only printed, so both skipped and the suite stayed green.
+            if (stub.requests() == 0) {
+                check(false, "the item asked the daemon for a frame");
+            } else if (stub.served() == 0 && !stub.exportError().empty()) {
+                notVerified(kGoal, "the stub could not export a frame on this host, so there was nothing to import");
+            } else {
+                std::string whyNot;
+                bool supported = false;
+                renderPass([&] {
+                    supported = wallpaperx::FrameImport::supports(
+                        stub.handleType() == 1 ? wallpaperx::FrameImport::HandleType::DmaBuf
+                                               : wallpaperx::FrameImport::HandleType::OpaqueFd,
+                        &whyNot);
+                });
+                // Queried inside a render pass: with no context current the extension strings come
+                // back empty and every failure would read as a host limit again.
+                if (supported) {
+                    check(false, "the item imported the frame the daemon served");
+                } else {
+                    notVerified(kGoal, whyNot);
+                }
+            }
             root.reset();
             renderPass(nullptr);
             control.invalidate();

@@ -741,11 +741,15 @@ if(DBUS_RUN_SESSION)
         find_package(Qt6 QUIET COMPONENTS QuickPrivate)
         if(Qt6QuickPrivate_FOUND)
             add_executable(wallpaperx-item-import-release-test tests/item_import_release_test.cpp)
+            # wallpaperx-frame-import so the test can ask whether THIS host can import at all:
+            # without it, a plugin that stopped importing and a host that never could are the
+            # same observation, and the run skips green for both.
             target_link_libraries(wallpaperx-item-import-release-test PRIVATE
-                wallpaperx-renderer Qt6::Core Qt6::DBus Qt6::Gui Qt6::Qml Qt6::Quick Qt6::QuickPrivate
+                wallpaperx-renderer wallpaperx-frame-import
+                Qt6::Core Qt6::DBus Qt6::Gui Qt6::Qml Qt6::Quick Qt6::QuickPrivate
                 PkgConfig::EGL OpenGL::GL)
             target_include_directories(wallpaperx-item-import-release-test PRIVATE
-                ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/../renderer/tests)
+                ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../renderer/tests)
             target_compile_definitions(wallpaperx-item-import-release-test PRIVATE
                 WALLPAPERX_QML_MODULE_PATH="${CMAKE_CURRENT_BINARY_DIR}/qml")
             add_dependencies(wallpaperx-item-import-release-test wallpaperxplugin)

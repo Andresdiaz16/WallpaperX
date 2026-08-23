@@ -249,6 +249,19 @@ public:
     bool timedOut() const { return m_killedAfterTimeout; }
     int termSignal() const { return m_termSignal; }
 
+    // Non-null when the child died before the exec'd program ran, naming which preamble step
+    // failed. Without it "the daemon could not start" and "the daemon was slow" are the same
+    // observation, and a binary that cannot load reads as a host that cannot run the test.
+    // WNOWAIT, not a consuming wait: the destructor and shutdown() still need a reapable child.
+    const char* startupFault() const {
+        if (m_pid <= 0) return nullptr;
+        siginfo_t info{};
+        info.si_pid = 0;
+        if (waitid(P_PID, static_cast<id_t>(m_pid), &info, WEXITED | WNOHANG | WNOWAIT) != 0) return nullptr;
+        if (info.si_pid == 0 || info.si_code != CLD_EXITED) return nullptr;
+        return wallpaperx::testing::forkPreambleFault(info.si_status);
+    }
+
     // SIGTERM, then reap. Returns the exit status, or -1 if it did not exit normally; ask
     // timedOut() and termSignal() for which of the two that was.
     int shutdown() {
@@ -405,7 +418,9 @@ GpuUuid vulkanUuidForDeviceNamed(const std::string& wanted) {
 // What one staged-to-fail import did with the descriptor it was given. Three states and not two:
 // "was it refused" and "did it hand the descriptor back" are separate questions, and conflating
 // them is what made an earlier version of the refusal phase unable to fail for its own defect.
-enum class Outcome { Imported, RefusedAndHandedBack, RefusedAndConsumed };
+// NeverAttempted is a fourth state because a harness that could not duplicate the descriptor
+// established nothing: counting it as a refusal would grade the importer for this file's failure.
+enum class Outcome { Imported, RefusedAndHandedBack, RefusedAndConsumed, NeverAttempted };
 
 // Fills a Request from a GetFrameFd reply. The descriptor is DUPLICATED, exactly as
 // WallpaperXItem::onFrameReply does with the one QDBusUnixFileDescriptor hands it: the reply
@@ -414,6 +429,11 @@ enum class Outcome { Imported, RefusedAndHandedBack, RefusedAndConsumed };
 wallpaperx::FrameImport::Request requestFromFrame(const wallpaperx::testing::Frame& frame) {
     wallpaperx::FrameImport::Request request;
     request.fd = ::dup(frame.fd.get());
+    // Reported here rather than at each call site: two of the three forgot, and a descriptor this
+    // file failed to duplicate is indistinguishable from one the importer refused to take.
+    if (request.fd < 0) {
+        harnessFailure(std::string("the frame's descriptor could not be duplicated: ") + std::strerror(errno));
+    }
     request.width = frame.width;
     request.height = frame.height;
     request.memorySize = frame.memorySize;
@@ -442,6 +462,10 @@ bool runChecks() {
 
     DaemonChild daemon({configHome.env(), configHome.stateEnv()});
     if (!daemon.waitForOutput(std::string("serving ") + DbusService::kBusName, std::chrono::seconds(45))) {
+        if (const char* fault = daemon.startupFault()) {
+            harnessFailure(std::string("the daemon child never ran: ") + fault);
+            return false;
+        }
         notVerified(kGoals, "the daemon this test started never announced that it was serving the bus name, so "
                             "there was nothing to ask for a frame");
         return true;
@@ -708,7 +732,9 @@ bool runChecks() {
     // COVERAGE-ASSERT: the number of cycles that actually imported is asserted, and a run that
     //       could not read /proc/self/fd reports itself unexercised rather than passing.
     //       openFdCount() answers 0 for a directory it cannot read, and 0 <= 0 is a passing
-    //       comparison of nothing.
+    //       comparison of nothing. The procfs attribution is reached only once every cycle
+    //       imported: an early break leaves the same 0 behind, and would otherwise be blamed
+    //       on the host.
     // CONTROL (that guard): the directory openFdCount() walks in tests/client/daemon_client.h
     //       pointed at a path that does not exist -> both descriptor phases reported NOT
     //       VERIFIED naming /proc/self/fd, and the binary exited 77 instead of 0. Observed
@@ -721,6 +747,9 @@ bool runChecks() {
         {
             const wallpaperx::testing::Frame again = wallpaperx::testing::getFrameFd(*proxy, kMonitor);
             wallpaperx::FrameImport::Request request2 = requestFromFrame(again);
+            // requestFromFrame has already reported it. Importing a -1 would fail and be counted
+            // against the importer for a descriptor this file never produced.
+            if (request2.fd < 0) return true;
             const wallpaperx::FrameImport::Result round = wallpaperx::FrameImport::import(request2);
             if (round.texture == 0) {
                 if (request2.fd >= 0) close(request2.fd);
@@ -743,14 +772,19 @@ bool runChecks() {
         std::fprintf(stderr, "  %d of %d cycles imported; the first failure was: %s\n", importedCycles, kCycles,
                      cycleError.empty() ? "(none recorded)" : cycleError.c_str());
     }
-    if (afterFirstCycle == 0 || afterAllCycles == 0) {
+    if (importedCycles != kCycles) {
+        // Taken first, because a run that broke out of the loop early never reached the first
+        // count and leaves it 0 -- the same value openFdCount() returns for a directory it
+        // cannot read. Attributing that to procfs names the wrong cause; the check above is
+        // already red with the real one.
+    } else if (afterFirstCycle == 0 || afterAllCycles == 0) {
         // A host whose /proc/self/fd cannot be read has not exercised this, and must not report
         // that it has: openFdCount() answers 0 there, and 0 <= 0 is a passing comparison of
         // nothing. Attributed as unexercised rather than as a failure -- it is a property of the
         // host, not of the importer.
         notVerified(kGoals, "/proc/self/fd could not be read while importing frame after frame, so no descriptor "
                             "was counted");
-    } else if (importedCycles == kCycles) {
+    } else {
         const bool steady = afterAllCycles <= afterFirstCycle;
         check(steady, "fetching and importing frame after frame does not accumulate file descriptors");
         if (!steady) {
@@ -800,6 +834,7 @@ bool runChecks() {
         // which are checked before the descriptor is handed over.
         const auto stageOnce = [&doomed](std::string& error) -> Outcome {
             wallpaperx::FrameImport::Request rejected = requestFromFrame(doomed);
+            if (rejected.fd < 0) return Outcome::NeverAttempted;
             rejected.memorySize = doomed.memorySize * 4 + 4096;
             const wallpaperx::FrameImport::Result result = wallpaperx::FrameImport::import(rejected);
             error = result.error;
@@ -822,7 +857,9 @@ bool runChecks() {
         // Any other refusal happened before the fd was given away, which is a branch this phase
         // does not grade -- so it is reported as this harness failing to set the case up.
         const bool stagedAtHandover = stagedError == "glImportMemoryFdEXT rejected the exported memory";
-        if (firstOutcome == Outcome::Imported) {
+        if (firstOutcome == Outcome::NeverAttempted) {
+            // requestFromFrame has already reported why; nothing below is measurable.
+        } else if (firstOutcome == Outcome::Imported) {
             harnessFailure("the frame staged to be refused imported successfully, so nothing was established about "
                            "what a refused import does with its descriptor");
         } else if (!stagedAtHandover) {
@@ -833,13 +870,24 @@ bool runChecks() {
             const size_t beforeRefusals = openFdCount();
             int refusedAtHandover = 0;
             int handedBack = 0;
+            bool neverAttempted = false;
             std::string lastError;
             for (int i = 0; i < kRefusals; ++i) {
                 const Outcome outcome = stageOnce(lastError);
-                if (outcome != Outcome::Imported) ++refusedAtHandover;
+                if (outcome == Outcome::NeverAttempted) {
+                    neverAttempted = true;
+                    break;
+                }
+                // Only a refusal that reached the driver counts. An import this file never made
+                // is not evidence about what the importer does with a descriptor.
+                if (outcome == Outcome::RefusedAndHandedBack || outcome == Outcome::RefusedAndConsumed) {
+                    ++refusedAtHandover;
+                }
                 if (outcome == Outcome::RefusedAndHandedBack) ++handedBack;
             }
             const size_t afterRefusals = openFdCount();
+
+            if (neverAttempted) return true;
 
             check(refusedAtHandover == kRefusals,
                   "every staged frame in the refusal sweep really was refused, so the descriptor count below was "
