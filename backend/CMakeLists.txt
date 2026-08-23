@@ -724,6 +724,83 @@ if(DBUS_RUN_SESSION)
             LABELS "novulkan"
             RESOURCE_LOCK wallpaperx_bus_tests
             SKIP_RETURN_CODE 77)
+
+        # The same item, driven by a stub that serves a frame the importer ACCEPTS -- a real
+        # Vulkan export -- so that what the scene graph does with the imported GL objects when it
+        # drops them is observable. Needs Vulkan as well as OpenGL, and needs both to resolve to
+        # the SAME device: an opaque fd is importable only by the driver that produced it, so this
+        # reports a named skip on a host where they differ rather than a pass.
+        #
+        # No LABELS, for the reason the renderer's GPU probes carry none: it cannot run on the
+        # hosted CI runner, which has no Vulkan device that a GL context can be paired with.
+        #
+        # QuickPrivate is asked for by name because Qt only loads its private module packages on
+        # request. It is needed for QQuickItemPrivate::paintNode, the only route to the QSGTexture
+        # an item handed the scene graph -- Qt's private API, deliberately, so that the plugin
+        # never grows a test-only accessor for it.
+        find_package(Qt6 QUIET COMPONENTS QuickPrivate)
+        if(Qt6QuickPrivate_FOUND)
+            add_executable(wallpaperx-item-import-release-test tests/item_import_release_test.cpp)
+            target_link_libraries(wallpaperx-item-import-release-test PRIVATE
+                wallpaperx-renderer Qt6::Core Qt6::DBus Qt6::Gui Qt6::Qml Qt6::Quick Qt6::QuickPrivate
+                PkgConfig::EGL OpenGL::GL)
+            target_include_directories(wallpaperx-item-import-release-test PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/../renderer/tests)
+            target_compile_definitions(wallpaperx-item-import-release-test PRIVATE
+                WALLPAPERX_QML_MODULE_PATH="${CMAKE_CURRENT_BINARY_DIR}/qml")
+            add_dependencies(wallpaperx-item-import-release-test wallpaperxplugin)
+            add_test(NAME item_import_release
+                     COMMAND ${DBUS_RUN_SESSION} -- $<TARGET_FILE:wallpaperx-item-import-release-test>)
+            set_tests_properties(item_import_release PROPERTIES
+                ENVIRONMENT "QT_QPA_PLATFORM=wayland\;xcb\;offscreen;QT_NO_XDG_DESKTOP_PORTAL=1"
+                RESOURCE_LOCK wallpaperx_bus_tests
+                SKIP_RETURN_CODE 77)
+        else()
+            message(WARNING
+                "Qt6 QuickPrivate headers not found -- item_import_release is not built. That is the "
+                "only check that the GL objects imported from a daemon frame are freed by the scene "
+                "graph's own teardown, on its thread with its context current; without it a build that "
+                "leaks a screen's worth of GPU memory per frame is green.")
+        endif()
+    endif()
+
+    # The cross-process half of the import path, and the only entry that has it: the real daemon
+    # binary exports a frame in its own process, and THIS process imports it into a GL context and
+    # reads the pixels back. frame_import_probe performs a genuine export and import but inside one
+    # process, so no descriptor ever crosses a boundary; daemon_system_test crosses it but can only
+    # read the pixels of a LINEAR dma_buf, which is precisely the path a real GPU here does not use.
+    #
+    # No LABELS, for the reason the renderer's GPU probes carry none: the hosted CI runner has no
+    # GPU, and this needs a Vulkan device and a GL context that resolve to the same one. That also
+    # makes the ThreadSanitizer block below DISABLE it, which is right -- the proprietary driver
+    # SEGVs inside its own uninstrumented code there.
+    if(WALLPAPERX_HAVE_FRAME_IMPORT)
+        add_executable(wallpaperx-cross-process-import-test tests/cross_process_import_test.cpp)
+        target_link_libraries(wallpaperx-cross-process-import-test PRIVATE
+            wallpaperx-daemon-lib wallpaperx-frame-import)
+        target_include_directories(wallpaperx-cross-process-import-test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../renderer/tests)
+        # Its own asset directory. The fixture is written by this test and read by the daemon it
+        # spawns, and a directory shared with another entry is one another entry can be mid-write in.
+        set(WALLPAPERX_XPROC_ASSET_DIR ${CMAKE_CURRENT_BINARY_DIR}/cross_process_assets)
+        file(MAKE_DIRECTORY ${WALLPAPERX_XPROC_ASSET_DIR})
+        target_compile_definitions(wallpaperx-cross-process-import-test PRIVATE
+            WALLPAPERX_TEST_IMAGE_DIR="${WALLPAPERX_XPROC_ASSET_DIR}"
+            WALLPAPERX_DAEMON_BINARY="$<TARGET_FILE:wallpaperx-daemon>")
+        # Baking the path in is not enough: without this the test can be built and run against a
+        # stale daemon binary, and would report an old daemon's behaviour as the current one's.
+        add_dependencies(wallpaperx-cross-process-import-test wallpaperx-daemon)
+        if(WALLPAPERX_BUILD_KDE_PLUGIN)
+            set_target_properties(wallpaperx-cross-process-import-test PROPERTIES
+                AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+        endif()
+        add_test(NAME cross_process_import
+                 COMMAND ${DBUS_RUN_SESSION} -- $<TARGET_FILE:wallpaperx-cross-process-import-test>)
+        # SKIP_RETURN_CODE because a host whose GL and Vulkan resolve to different drivers, or whose
+        # daemon exports a dma_buf, has not exercised this and must not report that it has.
+        set_tests_properties(cross_process_import PROPERTIES
+            RESOURCE_LOCK wallpaperx_bus_tests
+            SKIP_RETURN_CODE 77)
     endif()
 else()
     message(WARNING

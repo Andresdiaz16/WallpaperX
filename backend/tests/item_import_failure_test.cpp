@@ -15,13 +15,12 @@
 // still cannot be used, because it forces the software scene graph and the item imports only under
 // OpenGL. A host that has no OpenGL platform skips, with the reason named.
 
+#include "tests/qt_frame_reply.h"
 #include "tests/test_report.h"
 
 #include <QCoreApplication>
-#include <QDBusArgument>
 #include <QDBusConnection>
 #include <QDBusMessage>
-#include <QDBusMetaType>
 #include <QDBusUnixFileDescriptor>
 #include <QDBusVirtualObject>
 #include <QElapsedTimer>
@@ -45,38 +44,12 @@
 #include <memory>
 #include <string>
 
-namespace wpxtest {
-
-// The per-plane (offset, rowPitch) struct GetFrameFd's tenth field carries. Declared here so the
-// stub's reply marshals with the same signature the daemon's does.
-struct Plane {
-    quint64 offset = 0;
-    quint64 pitch = 0;
-};
-
-QDBusArgument& operator<<(QDBusArgument& arg, const Plane& plane) {
-    arg.beginStructure();
-    arg << plane.offset << plane.pitch;
-    arg.endStructure();
-    return arg;
-}
-
-const QDBusArgument& operator>>(const QDBusArgument& arg, Plane& plane) {
-    arg.beginStructure();
-    arg >> plane.offset >> plane.pitch;
-    arg.endStructure();
-    return arg;
-}
-
-}  // namespace wpxtest
-
-Q_DECLARE_METATYPE(wpxtest::Plane)
-
 namespace {
 
 using wallpaperx::testing::check;
+using wallpaperx::testing::FramePlane;
+using wallpaperx::testing::frameReplyFields;
 using wallpaperx::testing::notVerified;
-using wpxtest::Plane;
 
 constexpr const char* kService = "io.wallpaperx.Daemon";
 constexpr const char* kPath = "/io/wallpaperx/Daemon";
@@ -134,23 +107,13 @@ public:
         QDBusUnixFileDescriptor handle(fd);
         ::close(fd);  // QDBusUnixFileDescriptor took its own duplicate.
 
-        QList<Plane> planes;
-        planes.append(Plane{0, static_cast<quint64>(kFrameWidth) * 4});
-
-        const QList<QVariant> fields = {
-            QVariant::fromValue(handle),
-            QVariant::fromValue(static_cast<quint32>(kFrameWidth)),
-            QVariant::fromValue(static_cast<quint32>(kFrameHeight)),
-            QVariant::fromValue(memorySize),
-            QVariant::fromValue(0),  // handle_type: opaque fd
-            QVariant::fromValue(QList<QDBusUnixFileDescriptor>{}),
-            QVariant::fromValue(static_cast<quint64>(1)),  // frame_generation
-            QVariant::fromValue(kUnimportableFourcc),
-            QVariant::fromValue(static_cast<quint64>(0)),  // drm_modifier: LINEAR
-            QVariant::fromValue(planes)};
+        QList<FramePlane> planes;
+        planes.append(FramePlane{0, static_cast<quint64>(kFrameWidth) * 4});
 
         ++m_served;
-        return connection.send(message.createReply(fields));
+        return connection.send(message.createReply(
+            frameReplyFields(handle, kFrameWidth, kFrameHeight, memorySize, /*handleType=*/0,
+                             /*generation=*/1, kUnimportableFourcc, /*drmModifier=*/0, planes)));
     }
 
     int requests() const { return m_requests; }
@@ -210,9 +173,7 @@ Item {
 int main(int argc, char** argv) {
     wallpaperx::testing::g_testName = "item_import_failure_test";
 
-    qDBusRegisterMetaType<Plane>();
-    qDBusRegisterMetaType<QList<Plane>>();
-    qDBusRegisterMetaType<QList<QDBusUnixFileDescriptor>>();
+    wallpaperx::testing::registerFrameReplyTypes();
 
     // Set before the window exists: the item refuses to import at all unless the scene graph
     // reports OpenGL, and Qt picks the API at first window creation.
