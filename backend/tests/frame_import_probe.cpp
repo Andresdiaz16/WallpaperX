@@ -61,13 +61,14 @@ constexpr uint32_t kWidth = 68;
 constexpr uint32_t kHeight = 36;
 
 
-// How many descriptors this process holds. /proc/self/fd is the only view that counts what the
-// driver opened as well as what this code did, which is the point: the fd accounting under test
-// crosses into GL and EGL.
-int openFdCount() {
+// How many descriptors this process holds. Its own copy rather than the one in
+// tests/client/daemon_client.h, which this binary cannot include -- that header pulls in sdbus.
+// The SENTINEL must stay identical to it: 0 for a directory that cannot be read. It answered -1
+// here, so a guard written against one is silently wrong against the other.
+size_t openFdCount() {
     DIR* dir = ::opendir("/proc/self/fd");
-    if (dir == nullptr) return -1;
-    int count = 0;
+    if (dir == nullptr) return 0;
+    size_t count = 0;
     while (::readdir(dir) != nullptr) ++count;
     ::closedir(dir);
     return count;
@@ -194,7 +195,7 @@ bool runImportChecks() {
         //       alone; `if (true)`, sending an opaque fd through EGLImage, reds the NVIDIA entry
         //       alone. Neither wrong path is quietly importable, and it takes both entries to
         //       show it. Observed 2026-08-21. Both reverted.
-        const int beforeImport = openFdCount();
+        const size_t beforeImport = openFdCount();
         const wallpaperx::FrameImport::Result imported = wallpaperx::FrameImport::import(request);
         const bool importedOk = imported.texture != 0;
         check(importedOk, "an exported frame imports into a GL context on the same device");
@@ -366,20 +367,20 @@ bool runImportChecks() {
         rejected.height = kHeight;
         rejected.memorySize = 4096;
         rejected.handleType = request.handleType;
-        const int beforeRejected = openFdCount();
+        const size_t beforeRejected = openFdCount();
         const wallpaperx::FrameImport::Result none = wallpaperx::FrameImport::import(rejected);
-        const int afterRejected = openFdCount();
+        const size_t afterRejected = openFdCount();
         check(none.texture == 0, "an import that cannot proceed produces no texture");
-        if (beforeRejected < 0 || afterRejected < 0) {
+        if (beforeRejected == 0 || afterRejected == 0) {
             notVerified(kGoals, "/proc/self/fd could not be read, so no descriptor was counted -- reported as "
-                                "uncounted rather than as a passing comparison of -1 against -1");
+                                "uncounted rather than as a passing comparison of 0 against 0");
             if (rejected.fd >= 0) ::close(rejected.fd);
             return true;
         }
         check(afterRejected == beforeRejected,
               "a failed import leaves its file descriptor with the caller, neither closed nor leaked");
         if (afterRejected != beforeRejected) {
-            std::fprintf(stderr, "  %d open fds before the failed import, %d after\n", beforeRejected,
+            std::fprintf(stderr, "  %zu open fds before the failed import, %zu after\n", beforeRejected,
                          afterRejected);
         }
         // Closed here, or this descriptor stays open for the run and the counts printed by the
@@ -495,7 +496,7 @@ bool runImportChecks() {
         // one descriptor of its own for an imported allocation and release it only with the
         // context -- measured here, NVIDIA does exactly that -- and a single import cannot tell
         // that apart from a leak. A wallpaper that changes every few seconds can.
-        int afterFirstCycle = 0;
+        size_t afterFirstCycle = 0;
         for (int cycle = 0; cycle < 8; ++cycle) {
             const auto& spare = targets.create(0, kWidth, kHeight);
             targets.render(renderer, spare);
@@ -521,8 +522,8 @@ bool runImportChecks() {
             if (cycle == 0) afterFirstCycle = openFdCount();
         }
 
-        const int atEnd = openFdCount();
-        if (beforeImport < 0 || afterFirstCycle < 0 || atEnd < 0) {
+        const size_t atEnd = openFdCount();
+        if (beforeImport == 0 || afterFirstCycle == 0 || atEnd == 0) {
             notVerified(kGoals, "/proc/self/fd stopped answering partway through the import cycles, so growth could "
                                 "not be measured");
             return true;
@@ -530,7 +531,7 @@ bool runImportChecks() {
         const bool steady = atEnd <= afterFirstCycle;
         check(steady, "importing and releasing repeatedly does not accumulate descriptors");
         if (!steady) {
-            std::fprintf(stderr, "  %d open fds before, %d after one cycle, %d after eight\n", beforeImport,
+            std::fprintf(stderr, "  %zu open fds before, %zu after one cycle, %zu after eight\n", beforeImport,
                          afterFirstCycle, atEnd);
         }
         return true;

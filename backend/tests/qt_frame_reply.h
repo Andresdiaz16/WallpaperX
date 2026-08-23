@@ -4,11 +4,10 @@
 
 // The ten fields GetFrameFd answers with, marshalled in one place for the Qt-side stub daemons.
 //
-// Two tests now stand a stub in front of WallpaperXItem -- one serving a frame the importer must
-// refuse, one serving a frame it must accept -- and the point of both is that the item reads the
-// DAEMON'S reply shape. Two hand-written copies of a ten-field signature is two things that can
-// disagree, and the one that drifts still compiles, still runs and still reads as coverage; the
-// same duplication in the client-side wire helpers has already shipped half-applied once.
+// Three tests stand a stub in front of WallpaperXItem -- one serving a frame the importer must
+// refuse, two serving frames it must accept -- and the point of all three is that the item reads
+// the DAEMON'S reply shape. Hand-written copies of a ten-field signature are things that can
+// disagree, and the one that drifts still compiles, still runs and still reads as coverage.
 //
 // Deliberately not an adaptor over a C++ signature: the field order and the exact D-Bus types are
 // what is under test, so Qt's marshalling of a method signature must not sit between the stub and
@@ -61,17 +60,19 @@ inline void registerFrameReplyTypes() {
 // fd, width, height, memory_size, handle_type, sync_fds, frame_generation, drm_format,
 // drm_modifier, planes.
 //
-// sync_fds is not a parameter because the daemon sends none and the item REFUSES a reply that
-// carries any -- a stub that could pass some would be exercising a path the daemon does not have.
+// sync_fds defaults to empty because that is what the daemon sends, but it IS a parameter: the
+// item refuses a reply carrying any, and a helper that cannot express one leaves that refusal
+// unreachable from every test -- the branch would exist with nothing able to enter it.
 inline QList<QVariant> frameReplyFields(const QDBusUnixFileDescriptor& handle, quint32 width, quint32 height,
                                         quint64 memorySize, int handleType, quint64 generation, quint32 drmFormat,
-                                        quint64 drmModifier, const QList<FramePlane>& planes) {
+                                        quint64 drmModifier, const QList<FramePlane>& planes,
+                                        const QList<QDBusUnixFileDescriptor>& syncFds = {}) {
     return {QVariant::fromValue(handle),
             QVariant::fromValue(width),
             QVariant::fromValue(height),
             QVariant::fromValue(memorySize),
             QVariant::fromValue(handleType),
-            QVariant::fromValue(QList<QDBusUnixFileDescriptor>{}),
+            QVariant::fromValue(syncFds),
             QVariant::fromValue(generation),
             QVariant::fromValue(drmFormat),
             QVariant::fromValue(drmModifier),

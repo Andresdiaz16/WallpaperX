@@ -214,9 +214,11 @@ inline std::vector<unsigned char> readSampled(GLuint texture, uint32_t width, ui
     };
 
     // Every exit below runs this, so a failure partway through frees everything this function
-    // made -- the descriptor and object accounting a caller measures is taken against it. It
-    // does NOT restore the caller's bindings: they are zeroed, and the sampled texture keeps the
-    // filter and wrap this set. A caller that had bindings worth keeping must save them itself.
+    // made -- the descriptor and object accounting a caller measures is taken against it.
+    //
+    // It restores NOTHING. Bindings are zeroed rather than put back; the sampled texture keeps the
+    // filter and wrap this set; and blend, scissor and depth test are left disabled with the
+    // viewport left at the sampled size. A caller with state worth keeping must save it itself.
     const auto tidy = [&] {
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
         glUseProgram(0);
