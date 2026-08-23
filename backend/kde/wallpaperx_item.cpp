@@ -418,7 +418,15 @@ QSGNode* WallpaperXItem::updatePaintNode(QSGNode* old, UpdatePaintNodeData*) {
             const quint64 failed = incoming->generation;
             QMetaObject::invokeMethod(
                 this,
-                [this, failed] {
+                [this, failed, epoch] {
+                    // Epoch-guarded like the mark above, and for the same reason: a monitor
+                    // change or daemon restart can land between the post and its delivery, and
+                    // recording a retry for a generation that has since been discarded burns the
+                    // one retry a later, real failure would need.
+                    {
+                        std::lock_guard<std::mutex> lock(m_importedMutex);
+                        if (m_generationEpoch != epoch) return;
+                    }
                     if (m_retriedGeneration == failed) return;
                     m_retriedGeneration = failed;
                     m_fetchedGeneration = 0;

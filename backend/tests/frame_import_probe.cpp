@@ -76,6 +76,10 @@ int openFdCount() {
 // Reads an imported texture back through a framebuffer object. glGetTexImage would be shorter
 // but is not available on GLES-shaped contexts, and the plugin's own context may be one.
 std::vector<unsigned char> readTexture(GLuint texture, uint32_t width, uint32_t height, std::string& why) {
+    // Drained first: GL queues errors until read, so one left by the caller would be attributed
+    // to this read and reported as a texture that could not be read back.
+    while (glGetError() != GL_NO_ERROR) {
+    }
     GLuint fbo = 0;
     glGenFramebuffers(1, &fbo);
     glBindFramebuffer(GL_FRAMEBUFFER, fbo);
@@ -189,8 +193,8 @@ bool runImportChecks() {
         const bool importedOk = imported.texture != 0;
         check(importedOk, "an exported frame imports into a GL context on the same device");
         if (!importedOk) {
-            // request, not frame: import() clears the one it consumed, and a failed import may
-            // still have consumed it.
+            // request, not frame: import() clears the descriptor only when it consumed it, which
+            // a failed import never does -- so this one is still ours to close.
             if (request.fd >= 0) ::close(request.fd);
             std::fprintf(stderr, "  on %s: %s\n", gl.renderer().c_str(), imported.error.c_str());
             return true;

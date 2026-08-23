@@ -816,6 +816,16 @@ if(DBUS_RUN_SESSION)
         set_tests_properties(cross_process_import PROPERTIES
             RESOURCE_LOCK wallpaperx_bus_tests
             SKIP_RETURN_CODE 77)
+    else()
+        # Registered as a permanent skip rather than left absent, for the reason above: a missing
+        # entry reads as a green run, and this is the only check that an fd exported by one
+        # process imports as correct pixels in another.
+        add_test(NAME cross_process_import
+                 COMMAND ${CMAKE_COMMAND} -E echo
+                 "cross_process_import: NOT VERIFIED -- the frame importer was not built (EGL/OpenGL missing at "
+                 "configure time), so nothing checked that an opaque fd exported by one process imports as "
+                 "correct pixels in another.")
+        set_tests_properties(cross_process_import PROPERTIES SKIP_REGULAR_EXPRESSION "NOT VERIFIED")
     endif()
 else()
     message(WARNING

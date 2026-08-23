@@ -385,18 +385,15 @@ GpuUuid vulkanUuidForDeviceNamed(const std::string& wanted) {
     int matches = 0;
     std::string seen;
     for (VkPhysicalDevice device : devices) {
-        VkPhysicalDeviceIDProperties ids{};
-        ids.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES;
         VkPhysicalDeviceProperties2 properties{};
         properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
-        properties.pNext = &ids;
         vkGetPhysicalDeviceProperties2(device, &properties);
 
         if (!seen.empty()) seen += ", ";
         seen += properties.properties.deviceName;
         if (wanted != properties.properties.deviceName) continue;
         ++matches;
-        std::memcpy(out.uuid.data(), ids.deviceUUID, out.uuid.size());
+        out.uuid = wallpaperx::testing::vulkanDeviceUuid(device);
     }
     vkDestroyInstance(instance, nullptr);
 
