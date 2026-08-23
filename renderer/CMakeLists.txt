@@ -234,6 +234,9 @@ wallpaperx_add_shader_probe(wallpaperx-modifier-roundtrip-probe tests/modifier_r
 add_executable(wallpaperx-handle-type-env-test tests/handle_type_env_test.cpp)
 target_link_libraries(wallpaperx-handle-type-env-test PRIVATE wallpaperx-renderer)
 
+add_executable(wallpaperx-validation-grade-probe tests/validation_grade_probe.cpp)
+target_link_libraries(wallpaperx-validation-grade-probe PRIVATE wallpaperx-renderer)
+
 enable_testing()
 add_test(NAME tier_selection COMMAND wallpaperx-tier-selection-test)
 add_test(NAME memory_export COMMAND wallpaperx-memory-export-test)
@@ -277,6 +280,22 @@ add_test(NAME frame_export_probe COMMAND wallpaperx-frame-export-probe)
 # unverified when the round trip demonstrably passed.
 add_test(NAME modifier_roundtrip_probe COMMAND wallpaperx-modifier-roundtrip-probe roundtrip)
 add_test(NAME modifier_sensitivity_probe COMMAND wallpaperx-modifier-roundtrip-probe sensitivity)
+
+# Two entries, one binary, and they cannot share a process. The probe asks the loader
+# whether the validation layer exists at all, that answer is cached for the life of the
+# process, and the two directions it grades need opposite answers. The binary sets the
+# loader's layer filter itself (see its main()) rather than taking it from an ENVIRONMENT
+# property here, so it means the same thing run by hand and an edit to this file cannot
+# turn the "absent" entry into a second copy of "installed".
+add_test(NAME validation_grade_installed COMMAND wallpaperx-validation-grade-probe installed)
+add_test(NAME validation_grade_absent COMMAND wallpaperx-validation-grade-probe absent)
+
+# 77 means the host could not be put in the state the entry grades: no validation-layer
+# package for the installed direction, or a loader too old for the layer filter for the
+# absent one. Without SKIP_RETURN_CODE such a run exits 0, and "the split was verified"
+# becomes indistinguishable from "the question could not be asked" -- which is the exact
+# confusion this probe exists to remove.
+set_tests_properties(validation_grade_installed validation_grade_absent PROPERTIES SKIP_RETURN_CODE 77)
 
 # static_renderer_probe and its _lavapipe twin run the same binary and both
 # read/write the same WALLPAPERX_TEST_IMAGE_DIR path -- lock them to the same
@@ -330,6 +349,11 @@ if(WALLPAPERX_LAVAPIPE_ICD)
     add_test(NAME frame_export_probe_lavapipe COMMAND wallpaperx-frame-export-probe)
     add_test(NAME modifier_roundtrip_probe_lavapipe COMMAND wallpaperx-modifier-roundtrip-probe roundtrip)
     add_test(NAME modifier_sensitivity_probe_lavapipe COMMAND wallpaperx-modifier-roundtrip-probe sensitivity)
+    # Registered here for the label, not for the ICD: what this probe grades is loader- and
+    # driver-independent. CI selects by the lavapipe label and has no GPU, so without these two
+    # the only check of how a missing validator is reported never runs there.
+    add_test(NAME validation_grade_installed_lavapipe COMMAND wallpaperx-validation-grade-probe installed)
+    add_test(NAME validation_grade_absent_lavapipe COMMAND wallpaperx-validation-grade-probe absent)
     set_tests_properties(
         device_probe_lavapipe
         offscreen_probe_lavapipe
@@ -340,6 +364,8 @@ if(WALLPAPERX_LAVAPIPE_ICD)
         frame_export_probe_lavapipe
         modifier_roundtrip_probe_lavapipe
         modifier_sensitivity_probe_lavapipe
+        validation_grade_installed_lavapipe
+        validation_grade_absent_lavapipe
         PROPERTIES
             # WALLPAPERX_ALLOW_NO_HEAP_TIER tells descriptor_allocator_probe's
             # Heap-tier tests that resolving to a non-Heap tier here is expected
@@ -354,4 +380,6 @@ if(WALLPAPERX_LAVAPIPE_ICD)
     set_tests_properties(frame_export_probe_lavapipe PROPERTIES RESOURCE_LOCK frame_export_probe_test_image)
     set_tests_properties(modifier_roundtrip_probe_lavapipe modifier_sensitivity_probe_lavapipe
                          PROPERTIES RESOURCE_LOCK modifier_roundtrip_probe_test_image SKIP_RETURN_CODE 77)
+    set_tests_properties(validation_grade_installed_lavapipe validation_grade_absent_lavapipe
+                         PROPERTIES SKIP_RETURN_CODE 77)
 endif()
