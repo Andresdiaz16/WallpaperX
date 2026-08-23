@@ -5848,9 +5848,10 @@ int main() {
     //       else before this run". Holding an unrelated path -> "HARNESS FAULT -- the
     //       config-isolation guard ... changed during this run but holds none of this run's
     //       paths", and no FAIL. The scratch directory was removed afterwards. An earlier
-    //       round controlled the accusing branch by removing SpawnedDaemon's XDG_CONFIG_HOME
-    //       injection instead; that mutation writes this suite's wallpapers into the
-    //       developer's real config -- it did, once, by accident -- and is not repeated.
+    //       round controlled the accusing branch by removing the XDG_CONFIG_HOME injection in
+    //       SpawnedDaemon's constructor (tests/spawned_daemon.h) instead; that mutation writes
+    //       this suite's wallpapers into the developer's real config -- it did, once, by
+    //       accident -- and is not repeated.
     const RealConfigWitness realConfig = witnessRealConfig();
 
     std::string daemonOutput;
