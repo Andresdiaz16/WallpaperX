@@ -7,6 +7,10 @@
 
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
+// Declares the core GL 3.0+ entry points glext.h otherwise hides. Needed for glGetStringi, which
+// libGL exports and which must NOT be resolved through eglGetProcAddress -- see hasGlExtension.
+// Extension entry points are still resolved at runtime; this only makes core ones callable.
+#define GL_GLEXT_PROTOTYPES
 #include <GL/gl.h>
 #include <GL/glext.h>
 
@@ -59,15 +63,17 @@ const MemoryObjectApi& memoryObjectApi() {
 
 // Walked with glGetStringi rather than glGetString(GL_EXTENSIONS): the single-string form is
 // removed in a core profile and returns null there, which reads as "no extensions at all".
+//
+// Called directly rather than resolved through eglGetProcAddress: glGetStringi is CORE GL 3.0,
+// and EGL only promises to resolve core client-API functions under EGL 1.5 or
+// EGL_KHR_get_all_proc_addresses. Where it does not, the lookup returns null and every extension
+// below reads as absent -- reporting "this driver has no GL_EXT_memory_object" for a driver that
+// does, which is both false and unactionable.
 bool hasGlExtension(const char* wanted) {
-    using GetStringiFn = const GLubyte* (*)(GLenum, GLuint);
-    static const auto getStringi = reinterpret_cast<GetStringiFn>(eglGetProcAddress("glGetStringi"));
-    if (getStringi == nullptr) return false;
-
     GLint count = 0;
     glGetIntegerv(GL_NUM_EXTENSIONS, &count);
     for (GLint i = 0; i < count; ++i) {
-        const GLubyte* name = getStringi(GL_EXTENSIONS, static_cast<GLuint>(i));
+        const GLubyte* name = glGetStringi(GL_EXTENSIONS, static_cast<GLuint>(i));
         if (name != nullptr && std::strcmp(reinterpret_cast<const char*>(name), wanted) == 0) {
             return true;
         }
@@ -96,8 +102,10 @@ struct EglImageApi {
 const EglImageApi& eglImageApi() {
     static const EglImageApi api = [] {
         EglImageApi resolved;
-        // The EXT spelling, not KHR: it takes EGLAttrib (64-bit), which the modifier halves and
-        // plane offsets need. The KHR form's EGLint attributes cannot carry them.
+        // eglCreateImage is core EGL 1.5, and it takes EGLAttrib rather than the KHR form's
+        // EGLint. That is not what carries the 64-bit modifier, though: the dma_buf extension
+        // splits that across LO/HI attributes precisely so 32-bit values can carry it, which is
+        // what the attribute list below does.
         resolved.create = reinterpret_cast<EglImageApi::CreateFn>(eglGetProcAddress("eglCreateImage"));
         resolved.destroy = reinterpret_cast<EglImageApi::DestroyFn>(eglGetProcAddress("eglDestroyImage"));
         resolved.targetTexture =
@@ -299,6 +307,9 @@ FrameImport::Result FrameImport::import(Request& request) {
     GLuint memory = 0;
     api.create(1, &memory);
     if (memory == 0 || glGetError() != GL_NO_ERROR) {
+        // A name AND an error means the object exists and is ours to destroy; every other
+        // failure below already does this, and returning here was the one that did not.
+        if (memory != 0) api.destroy(1, &memory);
         out.error = "glCreateMemoryObjectsEXT failed";
         return out;
     }

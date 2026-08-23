@@ -36,15 +36,17 @@ WallpaperXItem::PendingFrame::~PendingFrame() {
     if (request.fd >= 0) ::close(request.fd);
 }
 
+// Moved, not copied. Request holds a std::vector, so copying it can throw -- and a throw out of
+// a noexcept function is std::terminate, here inside plasmashell.
 WallpaperXItem::PendingFrame::PendingFrame(PendingFrame&& other) noexcept
-    : request(other.request), generation(other.generation) {
+    : request(std::move(other.request)), generation(other.generation) {
     other.request.fd = -1;
 }
 
 WallpaperXItem::PendingFrame& WallpaperXItem::PendingFrame::operator=(PendingFrame&& other) noexcept {
     if (this != &other) {
         if (request.fd >= 0) ::close(request.fd);
-        request = other.request;
+        request = std::move(other.request);
         generation = other.generation;
         other.request.fd = -1;
     }
@@ -347,19 +349,23 @@ QSGNode* WallpaperXItem::updatePaintNode(QSGNode* old, UpdatePaintNodeData*) {
         return nullptr;
     }
 
-    std::optional<PendingFrame> incoming;
-    {
-        std::lock_guard<std::mutex> lock(m_pendingMutex);
-        incoming = std::move(m_pending);
-        m_pending.reset();
-    }
-
+    // The epoch is read BEFORE the frame is claimed, not after. forgetGenerations() clears
+    // m_pending and bumps the epoch under two separate locks, in that order, so an epoch read
+    // afterwards can be the new one while the frame in hand is the old monitor's -- and the
+    // write-back guard would then accept a mark that outlived the frames it describes.
     quint64 shown = 0;
     quint64 epoch = 0;
     {
         std::lock_guard<std::mutex> lock(m_importedMutex);
         shown = m_shownGeneration;
         epoch = m_generationEpoch;
+    }
+
+    std::optional<PendingFrame> incoming;
+    {
+        std::lock_guard<std::mutex> lock(m_pendingMutex);
+        incoming = std::move(m_pending);
+        m_pending.reset();
     }
     // Dropped if it is older than what is on screen; its fd is closed by ~PendingFrame.
     if (incoming.has_value() && !supersedesShown(Arriving{incoming->generation}, Held{shown})) {
@@ -429,6 +435,11 @@ QSGNode* WallpaperXItem::updatePaintNode(QSGNode* old, UpdatePaintNodeData*) {
                 // screen's, or the next daemon's, frames against a number that outlived them.
                 if (m_generationEpoch == epoch) m_shownGeneration = incoming->generation;
             }
+            // Cleared so "retried once" means once per failure, not once per session: the same
+            // generation can be re-fetched later (a window change re-asks) and must be allowed
+            // its retry again if that import fails too.
+            QMetaObject::invokeMethod(
+                this, [this] { m_retriedGeneration = 0; }, Qt::QueuedConnection);
             setRenderReason(QString());
         }
     }

@@ -23,7 +23,7 @@ using wallpaperx::WallpaperXItem;
 using wallpaperx::testing::check;
 
 // GOAL: S12.5 -- a FrameReady for a generation already fetched costs nothing. False if it
-//       refetches: that is a blocking bus call, a fresh export by the daemon and a dup here,
+//       refetches: that is a bus round trip, a fresh export by the daemon and a dup here,
 //       per signal, and the daemon emits one per render.
 // WHY-THIS-SHAPE: equality is tested as well as strict ordering, because the repeat case IS
 //       equality -- the daemon re-announcing the frame already held. A `>` written as `>=`

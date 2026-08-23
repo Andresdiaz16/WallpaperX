@@ -139,8 +139,13 @@ WallpaperItem {
             root.pending = null;
             root.pendingPolls = 0;
             late.abort();
-            // Nothing answered within the deadline, which is what "not running" describes.
-            root.apply(0, "");
+            // Abandoned, but NOT reported as "not running". A slow /config says nothing about the
+            // frame path: the daemon can be answering D-Bus perfectly while this endpoint is
+            // parked behind a large decode. Calling apply(0, "") here would clear `answered`,
+            // drive screenState to "unreachable", deactivate the Loader, destroy the renderer
+            // item and with it release every GL object it imported -- tearing down the expensive
+            // path because the cheap one was slow. A genuine connection failure still arrives as
+            // status 0 on a COMPLETED request below, which does report it.
             return;
         }
 
