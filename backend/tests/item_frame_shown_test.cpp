@@ -32,7 +32,7 @@
 #include "support/validation_grade.h"
 // For vulkanDeviceUuid only; this test brings up its own GL through QQuickRenderControl.
 #include "tests/gl_import_harness.h"
-#include "tests/qt_frame_reply.h"
+#include "tests/item_stub_scene.h"
 #include "tests/test_report.h"
 #include "vulkan/device.h"
 #include "vulkan/frame_export.h"
@@ -80,155 +80,26 @@
 namespace {
 
 using wallpaperx::testing::check;
-using wallpaperx::testing::FramePlane;
-using wallpaperx::testing::frameReplyFields;
+using wallpaperx::testing::claimsFrameShown;
+using wallpaperx::testing::ExportingStub;
+using wallpaperx::testing::glDeviceUuid;
+using wallpaperx::testing::itemPaintNode;
+using wallpaperx::testing::itemTexture;
+using wallpaperx::testing::kFirstMonitor;
+using wallpaperx::testing::kHeight;
+using wallpaperx::testing::kPath;
+using wallpaperx::testing::kSecondMonitor;
+using wallpaperx::testing::kService;
+using wallpaperx::testing::kWidth;
 using wallpaperx::testing::notVerified;
+using wallpaperx::testing::pumpUntil;
+using wallpaperx::testing::qmlSource;
+using wallpaperx::testing::vulkanDeviceUuid;
 
-constexpr const char* kService = "io.wallpaperx.Daemon";
-constexpr const char* kPath = "/io/wallpaperx/Daemon";
-constexpr const char* kInterface = "io.wallpaperx.Daemon";
 
 constexpr const char* kGoal = "S12.7 (the plugin's claim that a frame is on screen follows what is actually drawn: "
                               "withdrawn when the scene graph takes the node away, kept while the node still holds "
                               "a frame)";
-
-// Not square and not a round number of pixels wide, for frame_export_probe's reason: a square
-// target imports fine with width and height transposed.
-constexpr uint32_t kWidth = 68;
-constexpr uint32_t kHeight = 36;
-
-// The monitor id the QML below asks for, and the one it is moved to. Different, and neither is
-// the -1 the item refuses to fetch for.
-constexpr int kFirstMonitor = 0;
-constexpr int kSecondMonitor = 1;
-
-// Serves ONE real exported frame and then refuses.
-//
-// The refusal is the barrier the second direction rests on. Moving the item to another monitor id
-// makes it fetch again; if that fetch could be answered with a frame, the next render pass would
-// import it and set the "a node is drawing" fact back to true -- which would mask exactly the
-// mutation that check exists to catch. A refusal reaches the item as a fetch reason and touches
-// neither the node nor the texture.
-class ExportingStub : public QDBusVirtualObject {
-public:
-    ExportingStub(wallpaperx::Device& device, const wallpaperx::OffscreenTarget& target)
-        : m_device(device), m_target(target) {}
-
-    QString introspect(const QString&) const override { return QString(); }
-
-    bool handleMessage(const QDBusMessage& message, const QDBusConnection& connection) override {
-        if (message.interface() != QLatin1String(kInterface) || message.member() != QLatin1String("GetFrameFd")) {
-            return false;
-        }
-        // Counted before anything here can go wrong, so "the item asked" and "the stub answered"
-        // stay separate verdicts.
-        ++m_requests;
-        if (m_served > 0) {
-            return connection.send(message.createErrorReply(QStringLiteral("io.wallpaperx.Error.NoFrame"),
-                                                            QStringLiteral("this stub serves one frame per run")));
-        }
-
-        wallpaperx::ExportedFrame frame;
-        try {
-            frame = wallpaperx::exportFrame(m_device, m_target);
-        } catch (const std::exception& e) {
-            m_exportError = e.what();
-            return connection.send(message.createErrorReply(QStringLiteral("io.wallpaperx.Error.ExportFailed"),
-                                                            QString::fromStdString(m_exportError)));
-        }
-        if (frame.fd < 0) {
-            m_exportError = "exportFrame produced no descriptor";
-            return connection.send(message.createErrorReply(QStringLiteral("io.wallpaperx.Error.ExportFailed"),
-                                                            QString::fromStdString(m_exportError)));
-        }
-
-        QDBusUnixFileDescriptor handle(frame.fd);
-        ::close(frame.fd);  // QDBusUnixFileDescriptor took its own duplicate.
-
-        QList<FramePlane> planes;
-        for (const wallpaperx::ExportedFramePlane& plane : frame.planes) {
-            planes.append(FramePlane{plane.offset, plane.rowPitch});
-        }
-
-        m_handleType = frame.type == wallpaperx::ExportedFrame::HandleType::DmaBuf ? 1 : 0;
-        ++m_served;
-        return connection.send(message.createReply(frameReplyFields(handle, frame.width, frame.height,
-                                                                    frame.memorySize, m_handleType,
-                                                                    /*generation=*/1, frame.drmFormat, frame.modifier,
-                                                                    planes)));
-    }
-
-    int requests() const { return m_requests; }
-    int served() const { return m_served; }
-    int handleType() const { return m_handleType; }
-    const std::string& exportError() const { return m_exportError; }
-
-private:
-    wallpaperx::Device& m_device;
-    const wallpaperx::OffscreenTarget& m_target;
-    int m_requests = 0;
-    int m_served = 0;
-    int m_handleType = -1;
-    std::string m_exportError;
-};
-
-bool pumpUntil(const std::function<bool()>& done, int limitMs) {
-    QElapsedTimer clock;
-    clock.start();
-    while (!done()) {
-        if (clock.elapsed() > limitMs) return false;
-        QCoreApplication::processEvents(QEventLoop::AllEvents, 10);
-    }
-    return true;
-}
-
-QSGNode* itemPaintNode(QQuickItem* item) {
-    return item == nullptr ? nullptr : QQuickItemPrivate::get(item)->paintNode;
-}
-
-QSGTexture* itemTexture(QQuickItem* item) {
-    auto* node = static_cast<QSGSimpleTextureNode*>(itemPaintNode(item));
-    return node == nullptr ? nullptr : node->texture();
-}
-
-bool claimsFrameShown(QQuickItem* item) { return item->property("frameShown").toBool(); }
-
-using wallpaperx::testing::vulkanDeviceUuid;
-
-// GL_DEVICE_UUID_EXT, read from whatever context is current. False when the context has no
-// GL_EXT_memory_object -- which is also a context that could not have imported anything.
-bool glDeviceUuid(std::array<uint8_t, 16>& out) {
-    using GetUnsignedBytevFn = void (*)(GLenum, GLubyte*);
-    auto getBytes = reinterpret_cast<GetUnsignedBytevFn>(eglGetProcAddress("glGetUnsignedBytevEXT"));
-    if (getBytes == nullptr) return false;
-    while (glGetError() != GL_NO_ERROR) {
-    }
-    constexpr GLenum kDeviceUuidExt = 0x9597;  // GL_DEVICE_UUID_EXT
-    getBytes(kDeviceUuidExt, out.data());
-    return glGetError() == GL_NO_ERROR;
-}
-
-QString qmlSource() {
-    return QStringLiteral(R"(
-import QtQuick
-import com.wallpaperx
-
-Item {
-    width: 68
-    height: 36
-    property Item rendererItem: renderer
-    // Read only by the "never imported" skip, so that a run which could not set up says what the
-    // item thought was wrong instead of naming nothing.
-    property string publishedReason: renderer.unavailableReason
-
-    WallpaperXRenderer {
-        id: renderer
-        anchors.fill: parent
-        monitorId: 0
-    }
-}
-)");
-}
 
 // Nonzero when the validation layer was absent. Its own counter, because charging that to
 // failures turns every deliberate skip below into exit 1: a host without the layer package would

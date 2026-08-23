@@ -1,0 +1,191 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#pragma once
+
+// The scene two tests stand WallpaperXItem up in: a stub daemon that serves one real exported
+// frame, the QML that instantiates the plugin's own type, and the readers that ask what the item
+// ended up with.
+//
+// Shared because both tests need the same precondition -- a frame genuinely imported and attached
+// to a scene-graph node -- and reach it identically; only what they then do to it differs. Kept
+// as one definition rather than two copies: a copy that drifts still compiles, still runs, and
+// still reads as coverage, and the two copies had already lost two CONTROL annotations between
+// them.
+
+#include "kde/frame_import.h"
+#include "tests/qt_frame_reply.h"
+#include "vulkan/device.h"
+#include "vulkan/frame_export.h"
+#include "vulkan/offscreen.h"
+
+#include <QCoreApplication>
+#include <QDBusConnection>
+#include <QDBusMessage>
+#include <QDBusVirtualObject>
+#include <QElapsedTimer>
+#include <QEventLoop>
+#include <QQuickItem>
+#include <QSGSimpleTextureNode>
+#include <QString>
+#include <QtQuick/private/qquickitem_p.h>
+
+#include <EGL/egl.h>
+#include <GL/gl.h>
+#include <unistd.h>
+
+#include <array>
+#include <cstdint>
+#include <exception>
+#include <functional>
+#include <string>
+
+namespace wallpaperx::testing {
+
+// The bus name, path and interface the plugin talks to. Literals rather than the daemon's own
+// constants: what is under test is that the item speaks the wire the daemon declares, and taking
+// both sides from one symbol would let a rename pass unnoticed.
+inline constexpr const char* kService = "io.wallpaperx.Daemon";
+inline constexpr const char* kPath = "/io/wallpaperx/Daemon";
+inline constexpr const char* kInterface = "io.wallpaperx.Daemon";
+
+// Not square and not a round number of pixels wide, for frame_export_probe's reason: a square
+// target imports fine with width and height transposed.
+inline constexpr uint32_t kWidth = 68;
+inline constexpr uint32_t kHeight = 36;
+
+// The monitor id the QML below asks for, and the one a test may move it to. Different, and
+// neither is the -1 the item refuses to fetch for.
+inline constexpr int kFirstMonitor = 0;
+inline constexpr int kSecondMonitor = 1;
+
+// Serves ONE real exported frame and then refuses.
+//
+// The refusal is a barrier tests rest on. Making the item fetch again -- by moving it to another
+// monitor id -- must not produce a second importable frame, or the next render pass would import
+// it and set the "a node is drawing" fact back to true, masking the mutation a check exists to
+// catch. A refusal reaches the item as a fetch reason and touches neither the node nor the
+// texture.
+class ExportingStub : public QDBusVirtualObject {
+public:
+    ExportingStub(wallpaperx::Device& device, const wallpaperx::OffscreenTarget& target)
+        : m_device(device), m_target(target) {}
+
+    QString introspect(const QString&) const override { return QString(); }
+
+    bool handleMessage(const QDBusMessage& message, const QDBusConnection& connection) override {
+        if (message.interface() != QLatin1String(kInterface) || message.member() != QLatin1String("GetFrameFd")) {
+            return false;
+        }
+        // Counted before anything here can go wrong, so "the item asked" and "the stub answered"
+        // stay separate verdicts.
+        ++m_requests;
+        if (m_served > 0) {
+            return connection.send(message.createErrorReply(QStringLiteral("io.wallpaperx.Error.NoFrame"),
+                                                            QStringLiteral("this stub serves one frame per run")));
+        }
+
+        wallpaperx::ExportedFrame frame;
+        try {
+            frame = wallpaperx::exportFrame(m_device, m_target);
+        } catch (const std::exception& e) {
+            m_exportError = e.what();
+            return connection.send(message.createErrorReply(QStringLiteral("io.wallpaperx.Error.ExportFailed"),
+                                                            QString::fromStdString(m_exportError)));
+        }
+        if (frame.fd < 0) {
+            m_exportError = "exportFrame produced no descriptor";
+            return connection.send(message.createErrorReply(QStringLiteral("io.wallpaperx.Error.ExportFailed"),
+                                                            QString::fromStdString(m_exportError)));
+        }
+
+        QDBusUnixFileDescriptor handle(frame.fd);
+        ::close(frame.fd);  // QDBusUnixFileDescriptor took its own duplicate.
+
+        QList<FramePlane> planes;
+        for (const wallpaperx::ExportedFramePlane& plane : frame.planes) {
+            planes.append(FramePlane{plane.offset, plane.rowPitch});
+        }
+
+        m_handleType = frame.type == wallpaperx::ExportedFrame::HandleType::DmaBuf ? 1 : 0;
+        ++m_served;
+        return connection.send(message.createReply(frameReplyFields(handle, frame.width, frame.height,
+                                                                    frame.memorySize, m_handleType,
+                                                                    /*generation=*/1, frame.drmFormat, frame.modifier,
+                                                                    planes)));
+    }
+
+    int requests() const { return m_requests; }
+    int served() const { return m_served; }
+    int handleType() const { return m_handleType; }
+    const std::string& exportError() const { return m_exportError; }
+
+private:
+    wallpaperx::Device& m_device;
+    const wallpaperx::OffscreenTarget& m_target;
+    int m_requests = 0;
+    int m_served = 0;
+    int m_handleType = -1;
+    std::string m_exportError;
+};
+
+// Runs the event loop until `done` or the deadline. Bounded, and the caller must have a branch
+// for false: a run that never reached its precondition must say so rather than fall through.
+inline bool pumpUntil(const std::function<bool()>& done, int limitMs) {
+    QElapsedTimer clock;
+    clock.start();
+    while (!done()) {
+        if (clock.elapsed() > limitMs) return false;
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 10);
+    }
+    return true;
+}
+
+inline QSGNode* itemPaintNode(QQuickItem* item) {
+    return item == nullptr ? nullptr : QQuickItemPrivate::get(item)->paintNode;
+}
+
+inline QSGTexture* itemTexture(QQuickItem* item) {
+    auto* node = static_cast<QSGSimpleTextureNode*>(itemPaintNode(item));
+    return node == nullptr ? nullptr : node->texture();
+}
+
+inline bool claimsFrameShown(QQuickItem* item) { return item->property("frameShown").toBool(); }
+
+// GL_DEVICE_UUID_EXT, read from whatever context is current. False when the context has no
+// GL_EXT_memory_object -- which is also a context that could not have imported anything.
+inline bool glDeviceUuid(std::array<uint8_t, 16>& out) {
+    using GetUnsignedBytevFn = void (*)(GLenum, GLubyte*);
+    auto getBytes = reinterpret_cast<GetUnsignedBytevFn>(eglGetProcAddress("glGetUnsignedBytevEXT"));
+    if (getBytes == nullptr) return false;
+    while (glGetError() != GL_NO_ERROR) {
+    }
+    constexpr GLenum kDeviceUuidExt = 0x9597;  // GL_DEVICE_UUID_EXT
+    getBytes(kDeviceUuidExt, out.data());
+    return glGetError() == GL_NO_ERROR;
+}
+
+// Instantiates the plugin's own registered type, so a module that fails to load or a type that
+// stops resolving is a failure of the thing under test rather than of this scene.
+inline QString qmlSource() {
+    return QStringLiteral(R"(
+import QtQuick
+import com.wallpaperx
+
+Item {
+    width: 68
+    height: 36
+    property Item rendererItem: renderer
+    // Read only by the "never imported" skip, so that a run which could not set up says what the
+    // item thought was wrong instead of naming nothing.
+    property string publishedReason: renderer.unavailableReason
+
+    WallpaperXRenderer {
+        id: renderer
+        anchors.fill: parent
+        monitorId: 0
+    }
+}
+)");
+}
+
+}  // namespace wallpaperx::testing
