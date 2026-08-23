@@ -16,7 +16,6 @@
 
 #include <fcntl.h>
 #include <linux/kcmp.h>
-#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -92,17 +91,18 @@ bool hasGlExtension(const char* wanted) {
 // kcmp compares the kernel's open file description. fstat would compare the FILE, and those
 // differ exactly where it matters: a re-open of the same file matches on st_dev/st_ino while
 // being a different description, so fstat can answer "still yours" about a descriptor that now
-// belongs to something else. fstat remains only as the fallback for kernels built without
-// CONFIG_KCMP, where it still beats guessing.
+// belongs to something else.
+//
+// There is NO fstat fallback, and that is the point. Every opaque export from this driver shares
+// one anonymous inode, so fstat reports "same file" for descriptors naming different frames --
+// measured, see PLAN.md. Using it on a kernel built without CONFIG_KCMP would answer "still
+// yours" about a descriptor belonging to another frame, and closing that inside plasmashell frees
+// a number another thread is using. Answering "not ours" instead leaks one descriptor per failed
+// import on such a kernel, which is a bounded cost on an error path and cannot corrupt anything.
 bool sameOpenFile(int candidate, int reference) {
     const long compared = ::syscall(SYS_kcmp, ::getpid(), ::getpid(), KCMP_FILE, candidate, reference);
     if (compared >= 0) return compared == 0;
-    if (errno == EBADF) return false;  // the driver closed it
-
-    struct ::stat mine{};
-    struct ::stat theirs{};
-    if (::fstat(candidate, &mine) != 0 || ::fstat(reference, &theirs) != 0) return false;
-    return mine.st_dev == theirs.st_dev && mine.st_ino == theirs.st_ino;
+    return false;
 }
 
 void setWhyNot(std::string* whyNot, const char* reason) {
