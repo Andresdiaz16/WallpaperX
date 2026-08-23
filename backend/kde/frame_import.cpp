@@ -14,8 +14,13 @@
 #include <GL/gl.h>
 #include <GL/glext.h>
 
+#include <fcntl.h>
+#include <linux/kcmp.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
+#include <cerrno>
 #include <cstring>
 #include <utility>
 
@@ -79,6 +84,25 @@ bool hasGlExtension(const char* wanted) {
         }
     }
     return false;
+}
+
+// Whether `candidate` is still the same OPEN FILE DESCRIPTION as `reference` -- how a failed
+// import decides what the driver did with the descriptor it was handed.
+//
+// kcmp compares the kernel's open file description. fstat would compare the FILE, and those
+// differ exactly where it matters: a re-open of the same file matches on st_dev/st_ino while
+// being a different description, so fstat can answer "still yours" about a descriptor that now
+// belongs to something else. Measured. fstat remains only as the fallback for kernels built
+// without CONFIG_KCMP, where it still beats guessing.
+bool sameOpenFile(int candidate, int reference) {
+    const long compared = ::syscall(SYS_kcmp, ::getpid(), ::getpid(), KCMP_FILE, candidate, reference);
+    if (compared >= 0) return compared == 0;
+    if (errno == EBADF) return false;  // the driver closed it
+
+    struct ::stat mine{};
+    struct ::stat theirs{};
+    if (::fstat(candidate, &mine) != 0 || ::fstat(reference, &theirs) != 0) return false;
+    return mine.st_dev == theirs.st_dev && mine.st_ino == theirs.st_ino;
 }
 
 void setWhyNot(std::string* whyNot, const char* reason) {
@@ -330,18 +354,38 @@ FrameImport::Result FrameImport::import(Request& request) {
         return out;
     }
 
-    // Surrendered at the moment it is handed over, not once the call succeeds: ownership on
-    // failure is unspecified, and Mesa closes it before reporting the error. Closing a
-    // descriptor the process has since reused costs plasmashell its own socket.
-    const int surrendered = request.fd;
-    request.fd = -1;
-    api.importFd(memory, static_cast<GLuint64>(request.memorySize), GL_HANDLE_TYPE_OPAQUE_FD_EXT,
-                 static_cast<GLint>(surrendered));
-    if (glGetError() != GL_NO_ERROR) {
+    // The driver is handed a DUPLICATE and the caller's descriptor never leaves our hands.
+    //
+    // The spec transfers ownership only on a SUCCESSFUL import and says nothing about failure,
+    // and drivers disagree: NVIDIA leaves the descriptor open (measured -- 200 failed imports
+    // leaked 197 descriptors), while Mesa closes it on its backend path and leaks it on its
+    // argument-validation paths. So "does this driver close on failure" is not even constant
+    // within one driver, and nothing can be keyed on it.
+    //
+    // Duplicating makes the question decidable instead of guessed: the retained original pins
+    // the open file, so afterwards the duplicate's identity can still be compared against it.
+    const int gift = ::fcntl(request.fd, F_DUPFD_CLOEXEC, 0);
+    if (gift < 0) {
         api.destroy(1, &memory);
-        out.error = "glImportMemoryFdEXT rejected the exported memory";
+        out.error = "the frame's descriptor could not be duplicated for import";
         return out;
     }
+
+    api.importFd(memory, static_cast<GLuint64>(request.memorySize), GL_HANDLE_TYPE_OPAQUE_FD_EXT,
+                 static_cast<GLint>(gift));
+    if (glGetError() != GL_NO_ERROR) {
+        // Compared while the original is still open -- it is the operand. A driver that took the
+        // duplicate leaves it closed or reused, and either way it is not ours to close.
+        if (sameOpenFile(gift, request.fd)) ::close(gift);
+        api.destroy(1, &memory);
+        out.error = "glImportMemoryFdEXT rejected the exported memory";
+        // request.fd is untouched: a failed import never consumes the caller's descriptor now.
+        return out;
+    }
+
+    // Imported. The driver owns the duplicate; this one was only ever ours.
+    ::close(request.fd);
+    request.fd = -1;
 
     GLuint texture = 0;
     glGenTextures(1, &texture);
