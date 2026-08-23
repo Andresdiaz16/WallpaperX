@@ -26,6 +26,7 @@
 #include "tests/client/daemon_client.h"
 #include "tests/client/scratch_dir.h"
 #include "tests/gl_import_harness.h"
+#include "tests/spawned_daemon.h"
 #include "tests/test_report.h"
 
 #include <vulkan/vulkan.h>
@@ -63,7 +64,8 @@ using wallpaperx::testing::check;
 using wallpaperx::testing::harnessFailure;
 using wallpaperx::testing::notVerified;
 using wallpaperx::testing::openFdCount;
-using Clock = std::chrono::steady_clock;
+using wallpaperx::testing::Clock;
+using wallpaperx::testing::SpawnedDaemon;
 
 constexpr const char* kGoals =
     "S12.1 and S12.3, cross-process half (a frame the daemon exported in another process imports "
@@ -150,223 +152,6 @@ std::string writeQuadrantPng(const std::string& path, int width, int height) {
     return path;
 }
 
-// ---------------------------------------------------------------------------- //
-// The daemon under test, as a child process.
-// ---------------------------------------------------------------------------- //
-//
-// Deliberately much smaller than daemon_system_test's SpawnedDaemon: nothing here grades what the
-// daemon printed on the way down, so all this needs is a child whose output can be waited on and
-// which cannot outlive this process.
-class DaemonChild {
-public:
-    explicit DaemonChild(const std::vector<std::string>& extraEnv) {
-        int fds[2];
-        if (pipe2(fds, O_CLOEXEC) != 0) throw std::runtime_error("pipe2 failed");
-
-        // Assembled before fork(). Between fork() and exec() only async-signal-safe calls are
-        // legal, and this process has an sdbus dispatch thread running -- setenv() in the child
-        // could deadlock on a lock some other thread held at the instant of the fork.
-        std::vector<std::string> env;
-        for (char** e = environ; *e != nullptr; ++e) {
-            const std::string entry(*e);
-            const size_t eq = entry.find('=');
-            const std::string key = eq == std::string::npos ? entry : entry.substr(0, eq);
-            bool overridden = false;
-            for (const std::string& extra : extraEnv) {
-                if (extra.rfind(key + "=", 0) == 0) overridden = true;
-            }
-            if (!overridden) env.push_back(entry);
-        }
-        env.insert(env.end(), extraEnv.begin(), extraEnv.end());
-        std::vector<char*> envp;
-        envp.reserve(env.size() + 1);
-        for (std::string& entry : env) envp.push_back(entry.data());
-        envp.push_back(nullptr);
-
-        std::string binary = WALLPAPERX_DAEMON_BINARY;
-        char* argv[] = {binary.data(), nullptr};
-
-        const pid_t parentBeforeFork = getpid();
-        m_pid = fork();
-        if (m_pid < 0) {
-            close(fds[0]);
-            close(fds[1]);
-            throw std::runtime_error("fork failed");
-        }
-        if (m_pid == 0) {
-            // dup2 clears FD_CLOEXEC on the new descriptor, which is why the pipe can be opened
-            // O_CLOEXEC and still survive into the exec'd program on 1 and 2. Checked: a silent
-            // failure here leaves the daemon running with its original stdout and this harness
-            // waiting forever for a line it will never capture.
-            if (dup2(fds[1], STDOUT_FILENO) == -1 || dup2(fds[1], STDERR_FILENO) == -1) {
-                _exit(wallpaperx::testing::kChildDup2FailedExit);
-            }
-            wallpaperx::testing::execChildOrDie(parentBeforeFork, binary.c_str(), argv, envp.data());
-        }
-
-        close(fds[1]);
-        m_readFd = fds[0];
-        // Past fork(), so the child exists but this object does not yet -- a throw here would skip
-        // ~DaemonChild entirely, leaving a daemon holding the bus name with nothing tracking it.
-        try {
-            m_reader = std::thread([this] { readLoop(); });
-        } catch (...) {
-            kill(m_pid, SIGKILL);
-            int status = 0;
-            waitpid(m_pid, &status, 0);
-            m_pid = -1;
-            close(m_readFd);
-            m_readFd = -1;
-            throw;
-        }
-    }
-
-    ~DaemonChild() {
-        if (m_pid > 0) {
-            kill(m_pid, SIGKILL);
-            int status = 0;
-            waitpid(m_pid, &status, 0);
-            m_pid = -1;
-        }
-        m_stopping.store(true, std::memory_order_release);
-        if (m_reader.joinable()) m_reader.join();
-        if (m_readFd >= 0) close(m_readFd);
-    }
-
-    DaemonChild(const DaemonChild&) = delete;
-    DaemonChild& operator=(const DaemonChild&) = delete;
-
-    pid_t pid() const { return m_pid; }
-
-    // Blocks until the daemon has printed `needle`, or the deadline passes. Returns false on
-    // timeout -- every call site must have a failure branch, or a daemon that never started would
-    // be graded as one that did.
-    bool waitForOutput(std::string_view needle, Clock::duration timeout) {
-        std::unique_lock<std::mutex> lock(m_mutex);
-        return m_arrived.wait_for(lock, timeout, [&] { return m_output.find(needle) != std::string::npos; });
-    }
-
-    // Set by shutdown(). Three outcomes -- exited, died on a signal, never exited -- do not fit in
-    // one int, and collapsing them printed a daemon that had to be SIGKILLed as one that exited.
-    bool timedOut() const { return m_killedAfterTimeout; }
-    int termSignal() const { return m_termSignal; }
-
-    // Non-null when the child died before the exec'd program ran, naming which preamble step
-    // failed. Without it "the daemon could not start" and "the daemon was slow" are the same
-    // observation, and a binary that cannot load reads as a host that cannot run the test.
-    // WNOWAIT, not a consuming wait: the destructor and shutdown() still need a reapable child.
-    const char* startupFault() const {
-        if (m_pid <= 0) return nullptr;
-        siginfo_t info{};
-        info.si_pid = 0;
-        if (waitid(P_PID, static_cast<id_t>(m_pid), &info, WEXITED | WNOHANG | WNOWAIT) != 0) return nullptr;
-        if (info.si_pid == 0 || info.si_code != CLD_EXITED) return nullptr;
-        return wallpaperx::testing::forkPreambleFault(info.si_status);
-    }
-
-    // Whether the child is already dead, and how. startupFault() only recognises the fork
-    // preamble's own exit codes, so a daemon that segfaulted or exited 1 during startup looked
-    // identical to one that was merely slow -- and that was reported as a host limitation, which
-    // ctest prints as Skipped. A dead daemon is never a host limitation.
-    struct Death {
-        bool dead = false;
-        bool bySignal = false;
-        int status = 0;  // exit code, or signal number when bySignal
-    };
-
-    Death death() const {
-        Death out;
-        if (m_pid <= 0) return out;
-        siginfo_t info{};
-        info.si_pid = 0;
-        if (waitid(P_PID, static_cast<id_t>(m_pid), &info, WEXITED | WNOHANG | WNOWAIT) != 0) return out;
-        if (info.si_pid == 0) return out;
-        out.dead = true;
-        out.bySignal = info.si_code != CLD_EXITED;
-        out.status = info.si_status;
-        return out;
-    }
-
-    // SIGTERM, then reap. Returns the exit status, or -1 if it did not exit normally; ask
-    // timedOut() and termSignal() for which of the two that was.
-    int shutdown() {
-        if (m_pid <= 0) return -1;
-        kill(m_pid, SIGTERM);
-        const auto deadline = Clock::now() + std::chrono::seconds(20);
-        int status = 0;
-        while (Clock::now() < deadline) {
-            const pid_t done = waitpid(m_pid, &status, WNOHANG);
-            if (done == m_pid) {
-                m_pid = -1;
-                m_stopping.store(true, std::memory_order_release);
-                if (m_reader.joinable()) m_reader.join();
-                m_termSignal = WIFSIGNALED(status) ? WTERMSIG(status) : 0;
-                return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(20));
-        }
-        m_killedAfterTimeout = true;
-        kill(m_pid, SIGKILL);
-        waitpid(m_pid, &status, 0);
-        m_pid = -1;
-        m_stopping.store(true, std::memory_order_release);
-        if (m_reader.joinable()) m_reader.join();
-        return -1;
-    }
-
-private:
-    // Polled rather than blocked in read(). A dead child does not necessarily close the capture
-    // pipe: anything it forked inherits the write end, so a plain read() can block forever on a
-    // process that no longer exists -- and the join in the destructor with it, which is a test
-    // that hangs instead of reporting. Measured while building a control that stood a shell
-    // script in for the daemon.
-    void readLoop() {
-        std::string pending;
-        char buffer[4096];
-        while (true) {
-            struct pollfd waiting {
-                m_readFd, POLLIN, 0
-            };
-            const int ready = ::poll(&waiting, 1, 200);
-            if (ready < 0) {
-                if (errno == EINTR) continue;
-                break;
-            }
-            if (ready == 0) {
-                if (m_stopping.load(std::memory_order_acquire)) break;
-                continue;
-            }
-            const ssize_t got = read(m_readFd, buffer, sizeof(buffer));
-            if (got < 0 && (errno == EINTR || errno == EAGAIN)) continue;
-            if (got <= 0) break;
-            {
-                std::lock_guard<std::mutex> lock(m_mutex);
-                m_output.append(buffer, static_cast<size_t>(got));
-            }
-            m_arrived.notify_all();
-            pending.append(buffer, static_cast<size_t>(got));
-            size_t nl = pending.find('\n');
-            while (nl != std::string::npos) {
-                std::printf("  [daemon] %s\n", pending.substr(0, nl).c_str());
-                pending.erase(0, nl + 1);
-                nl = pending.find('\n');
-            }
-            std::fflush(stdout);
-        }
-        if (!pending.empty()) std::printf("  [daemon] %s\n", pending.c_str());
-        std::fflush(stdout);
-    }
-
-    pid_t m_pid = -1;
-    bool m_killedAfterTimeout = false;
-    int m_termSignal = 0;
-    int m_readFd = -1;
-    std::atomic<bool> m_stopping{false};
-    std::thread m_reader;
-    std::mutex m_mutex;
-    std::condition_variable m_arrived;
-    std::string m_output;
-};
 
 // ---------------------------------------------------------------------------- //
 // Finding the GPU the daemon rendered on.
@@ -502,7 +287,7 @@ bool runChecks() {
         return true;
     }
 
-    DaemonChild daemon({configHome.env(), configHome.stateEnv()});
+    SpawnedDaemon daemon({configHome.env(), configHome.stateEnv()});
     if (!daemon.waitForOutput(std::string("serving ") + DbusService::kBusName, std::chrono::seconds(45))) {
         if (const char* fault = daemon.startupFault()) {
             harnessFailure(std::string("the daemon child never ran: ") + fault);
@@ -510,7 +295,7 @@ bool runChecks() {
         }
         // A daemon that died is the daemon failing, not the host refusing to run the test. Only a
         // child still running -- one that simply never printed the line -- can be a skip.
-        const DaemonChild::Death died = daemon.death();
+        const SpawnedDaemon::Death died = daemon.death();
         if (died.dead) {
             check(false, died.bySignal ? "the daemon stayed alive long enough to announce the bus name"
                                        : "the daemon started successfully enough to announce the bus name");
@@ -1017,7 +802,7 @@ bool runChecks() {
     // Torn down before the GL context, and before this function returns: the daemon holds the
     // exported image, and a test that walked away from it would leave the next entry in the run
     // sharing a bus name with a process nobody is managing.
-    const int exitCode = daemon.shutdown();
+    const int exitCode = daemon.shutdown(SIGTERM);
     const char* kNotGraded = " (not graded here -- daemon_system_test owns the shutdown contract)\n";
     if (daemon.timedOut()) {
         std::printf("cross_process_import_test: the daemon did not exit within 20s of SIGTERM and had to be "
