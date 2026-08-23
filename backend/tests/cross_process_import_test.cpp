@@ -93,18 +93,34 @@ constexpr Rgba kTopRight{20, 220, 40, 64};
 constexpr Rgba kBottomLeft{30, 40, 210, 64};
 constexpr Rgba kBottomRight{240, 200, 20, 64};
 
+constexpr std::array<Rgba, 4> kQuadrants{kTopLeft, kTopRight, kBottomLeft, kBottomRight};
+
+constexpr bool differsInRgb(const Rgba& a, const Rgba& b) { return a.r != b.r || a.g != b.g || a.b != b.b; }
+constexpr Rgba redBlueSwapped(const Rgba& c) { return Rgba{c.b, c.g, c.r, c.a}; }
+
+// Looped rather than enumerated: six pairs written out by hand had two missing, and nothing tied
+// the list to the colours, so retuning a quadrant did not force the pairs to be revisited.
+constexpr bool allQuadrantsDistinct() {
+    for (size_t i = 0; i < kQuadrants.size(); ++i)
+        for (size_t j = i + 1; j < kQuadrants.size(); ++j)
+            if (!differsInRgb(kQuadrants[i], kQuadrants[j])) return false;
+    return true;
+}
+
+// A quadrant whose red and blue are exchanged must match no quadrant at all -- itself included,
+// or the swizzle is invisible where it happens; any other, or a transposed frame reads as a
+// correctly laid out one.
+constexpr bool noSwapCollidesWithAnyQuadrant() {
+    for (const Rgba& c : kQuadrants)
+        for (const Rgba& other : kQuadrants)
+            if (!differsInRgb(redBlueSwapped(c), other)) return false;
+    return true;
+}
+
 // The quadrant colours must be distinct in EVERY channel pair that a layout error could
 // exchange, or the check that compares them would pass for a frame that is laid out wrongly.
-static_assert(kTopLeft.r != kTopRight.r || kTopLeft.g != kTopRight.g || kTopLeft.b != kTopRight.b);
-static_assert(kTopLeft.r != kBottomLeft.r || kTopLeft.g != kBottomLeft.g || kTopLeft.b != kBottomLeft.b);
-static_assert(kTopRight.r != kBottomLeft.r || kTopRight.g != kBottomLeft.g || kTopRight.b != kBottomLeft.b);
-static_assert(kBottomRight.r != kTopLeft.r || kBottomRight.g != kTopLeft.g || kBottomRight.b != kTopLeft.b);
-// Red and blue swapped must land on a colour NO quadrant has, or the swizzle check is blind to
-// the transposition it exists to catch.
-static_assert(kTopLeft.b != kTopLeft.r);
-static_assert(kTopRight.b != kTopRight.r);
-static_assert(kBottomLeft.b != kBottomLeft.r);
-static_assert(kBottomRight.b != kBottomRight.r);
+static_assert(allQuadrantsDistinct());
+static_assert(noSwapCollidesWithAnyQuadrant());
 
 const Rgba& quadrantColour(uint32_t x, uint32_t y, uint32_t width, uint32_t height) {
     const bool right = x >= width / 2;
@@ -228,7 +244,13 @@ public:
         return m_arrived.wait_for(lock, timeout, [&] { return m_output.find(needle) != std::string::npos; });
     }
 
-    // SIGTERM, then reap. Returns the exit status, or -1 if it had to be killed.
+    // Set by shutdown(). Three outcomes -- exited, died on a signal, never exited -- do not fit in
+    // one int, and collapsing them printed a daemon that had to be SIGKILLed as one that exited.
+    bool timedOut() const { return m_killedAfterTimeout; }
+    int termSignal() const { return m_termSignal; }
+
+    // SIGTERM, then reap. Returns the exit status, or -1 if it did not exit normally; ask
+    // timedOut() and termSignal() for which of the two that was.
     int shutdown() {
         if (m_pid <= 0) return -1;
         kill(m_pid, SIGTERM);
@@ -240,10 +262,12 @@ public:
                 m_pid = -1;
                 m_stopping.store(true, std::memory_order_release);
                 if (m_reader.joinable()) m_reader.join();
+                m_termSignal = WIFSIGNALED(status) ? WTERMSIG(status) : 0;
                 return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
         }
+        m_killedAfterTimeout = true;
         kill(m_pid, SIGKILL);
         waitpid(m_pid, &status, 0);
         m_pid = -1;
@@ -295,6 +319,8 @@ private:
     }
 
     pid_t m_pid = -1;
+    bool m_killedAfterTimeout = false;
+    int m_termSignal = 0;
     int m_readFd = -1;
     std::atomic<bool> m_stopping{false};
     std::thread m_reader;
@@ -850,10 +876,16 @@ bool runChecks() {
     // exported image, and a test that walked away from it would leave the next entry in the run
     // sharing a bus name with a process nobody is managing.
     const int exitCode = daemon.shutdown();
-    if (exitCode != 0) {
-        std::printf("cross_process_import_test: the daemon exited with %d after SIGTERM (not graded here -- "
-                    "daemon_system_test owns the shutdown contract)\n",
-                    exitCode);
+    const char* kNotGraded = " (not graded here -- daemon_system_test owns the shutdown contract)\n";
+    if (daemon.timedOut()) {
+        std::printf("cross_process_import_test: the daemon did not exit within 20s of SIGTERM and had to be "
+                    "SIGKILLed%s",
+                    kNotGraded);
+    } else if (daemon.termSignal() != 0) {
+        std::printf("cross_process_import_test: the daemon died on signal %d after SIGTERM%s", daemon.termSignal(),
+                    kNotGraded);
+    } else if (exitCode != 0) {
+        std::printf("cross_process_import_test: the daemon exited with %d after SIGTERM%s", exitCode, kNotGraded);
     }
     return true;
 }

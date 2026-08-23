@@ -807,12 +807,14 @@ else()
         "dbus-run-session not found -- ALL bus-driven tests are unregistered: dbus_service, "
         "dbus_service_classic, dbus_service_lavapipe, dbus_service_classic_lavapipe, http_config, "
         "http_config_lavapipe, daemon_system, "
-        "daemon_system_lavapipe, item_import_failure. That "
+        "daemon_system_lavapipe, item_import_failure, item_import_release, cross_process_import. That "
         "removes the only coverage of the DBus wire contract, the DMA_BUF metadata, the HTTP config "
         "server, the Classic "
-        "descriptor tier through the daemon, and the daemon's "
+        "descriptor tier through the daemon, the release of GL objects imported from a daemon "
+        "frame by the scene graph's own teardown, the only check that an opaque fd exported by "
+        "one process imports as correct pixels in another, and the daemon's "
         "process-level behaviour (name acquisition, second-instance refusal, SIGTERM/SIGINT "
-        "shutdown, cross-process frame import). A green ctest run without them means much less "
+        "shutdown). A green ctest run without them means much less "
         "than it looks like. Install dbus.")
 endif()
 

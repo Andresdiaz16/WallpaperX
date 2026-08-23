@@ -90,10 +90,6 @@ void WallpaperXItem::setMonitorId(int monitorId) {
 void WallpaperXItem::forgetGenerations() {
     m_fetchedGeneration = 0;
     m_retriedGeneration = 0;
-    if (m_frameShown) {
-        m_frameShown = false;
-        emit frameShownChanged();
-    }
     {
         std::lock_guard<std::mutex> lock(m_pendingMutex);
         m_pending.reset();
@@ -103,6 +99,7 @@ void WallpaperXItem::forgetGenerations() {
         m_shownGeneration = 0;
         ++m_generationEpoch;
     }
+    publishReason();
 }
 
 // The two producers write their own fact and never the published string, because a queued clear
@@ -123,9 +120,17 @@ void WallpaperXItem::setRenderReason(const QString& reason) {
 
 void WallpaperXItem::publishReason() {
     QString render;
+    bool shown = false;
     {
         std::lock_guard<std::mutex> lock(m_importedMutex);
         render = m_renderReason;
+        // Derived, never stored twice: a hand-maintained copy has to be cleared again on every
+        // teardown path, and missing one leaves the desktop claiming a frame it no longer has.
+        shown = m_shownGeneration != 0;
+    }
+    if (m_frameShown != shown) {
+        m_frameShown = shown;
+        emit frameShownChanged();
     }
     // The fetch side wins: it describes the newer observation, and a frame that cannot be
     // imported matters less than not having reached the daemon at all.
@@ -455,13 +460,7 @@ QSGNode* WallpaperXItem::updatePaintNode(QSGNode* old, UpdatePaintNodeData*) {
             // its retry again if that import fails too.
             QMetaObject::invokeMethod(
                 this,
-                [this] {
-                    m_retriedGeneration = 0;
-                    if (!m_frameShown) {
-                        m_frameShown = true;
-                        emit frameShownChanged();
-                    }
-                },
+                [this] { m_retriedGeneration = 0; },
                 Qt::QueuedConnection);
             setRenderReason(QString());
         }
@@ -484,9 +483,13 @@ void WallpaperXItem::itemChange(ItemChange change, const ItemChangeData& value) 
 // nodes already manage -- so all this drops is the marks, which no longer describe anything.
 void WallpaperXItem::releaseResources() {
     m_fetchedGeneration = 0;
-    std::lock_guard<std::mutex> lock(m_importedMutex);
-    m_shownGeneration = 0;
-    ++m_generationEpoch;
+    {
+        std::lock_guard<std::mutex> lock(m_importedMutex);
+        m_shownGeneration = 0;
+        ++m_generationEpoch;
+    }
+    // Scoped above, because this takes the same non-recursive mutex.
+    publishReason();
 }
 
 }  // namespace wallpaperx

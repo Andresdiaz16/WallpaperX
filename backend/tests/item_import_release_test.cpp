@@ -511,12 +511,6 @@ bool runReleaseChecks() {
         if (!destroyed) {
             std::fprintf(stderr, "  QSGTexture::destroyed never fired, so nothing could have released the import\n");
         } else {
-            // No control, and it is not clear one exists: nothing a production change can do
-            // makes Qt emit destroyed() twice for one object. Kept because every field of `seen`
-            // holds the LAST firing, so a second one would quietly change what the checks below
-            // are about rather than announcing itself.
-            check(seen.count == 1, "the imported texture was destroyed exactly once");
-
             // GOAL: the destruction -- and therefore the release attached to it -- happens with a
             //       GL context current on the destroying thread. False for a free on the GUI
             //       thread outside a render pass, where glDeleteTextures is a silent no-op.
@@ -565,9 +559,12 @@ bool runReleaseChecks() {
             // thing this project refuses to ship. The falsifiable form of the same property is
             // the render-pass and context checks above: a release that moved off the scene
             // graph's thread would have no context current on the thread it ran on.
-            std::printf("item_import_release_test: destroyed on %p, synchronised on %p, in a render pass: %s, Qt "
-                        "context current: %s, EGL context current: %s, driver answered: %s\n",
-                        static_cast<void*>(seen.thread), static_cast<void*>(syncThread),
+            // The count rides here for the same reason: every field of `seen` holds the LAST
+            // firing, so a second one would quietly change what the checks above are about --
+            // worth seeing, but not something a production change can cause.
+            std::printf("item_import_release_test: destroyed %d time(s) on %p, synchronised on %p, in a render "
+                        "pass: %s, Qt context current: %s, EGL context current: %s, driver answered: %s\n",
+                        seen.count, static_cast<void*>(seen.thread), static_cast<void*>(syncThread),
                         seen.insideRenderPass ? "yes" : "no", seen.qtContextCurrent ? "yes" : "no",
                         seen.eglContextCurrent ? "yes" : "no", seen.glAnswered ? "yes" : "no");
             std::fflush(stdout);

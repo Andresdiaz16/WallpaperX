@@ -152,7 +152,7 @@ private:
     bool m_subscribed = false;
     QString m_fetchReason;         // GUI thread only
     QString m_unavailableReason;   // GUI thread only, what QML reads
-    bool m_frameShown = false;     // GUI thread only, set from the render thread via a hop
+    bool m_frameShown = false;     // GUI thread only, derived from m_shownGeneration in publishReason()
 
     std::mutex m_pendingMutex;
     std::optional<PendingFrame> m_pending;  // guarded by m_pendingMutex
