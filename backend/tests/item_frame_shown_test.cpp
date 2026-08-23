@@ -535,11 +535,17 @@ int main(int argc, char** argv) {
         wallpaperx::testing::harnessFailure(std::string("the harness could not build its preconditions: ") + e.what());
     }
 
-    if (g_ungradedValidation > 0) {
-        notVerified(kGoal, "VK_LAYER_KHRONOS_validation is not loaded, so this run's Vulkan work went ungraded");
-    }
     const bool checksRed = wallpaperx::testing::reportCheckFailures();
     const bool harnessRed = wallpaperx::testing::reportHarnessFaults("in this test file, not in the plugin");
     if (!ok || checksRed || harnessRed) return 1;
+    // NOT a skip: the checks above ran and passed. Marking this Skipped would erase the only
+    // grade of the black-desktop defect. Only the GPU-side cleanliness went unjudged.
+    if (g_ungradedValidation > 0) {
+        std::fprintf(stderr,
+                     "item_frame_shown_test: the validation grade could not be made -- "
+                     "VK_LAYER_KHRONOS_validation is not loaded. The checks that ran are still judged; the "
+                     "GPU-side cleanliness of this run is not.\n");
+        return 1;
+    }
     return wallpaperx::testing::reportNotVerifiedOrPassed();
 }

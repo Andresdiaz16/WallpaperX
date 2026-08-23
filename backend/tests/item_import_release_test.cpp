@@ -655,11 +655,18 @@ int main(int argc, char** argv) {
         wallpaperx::testing::harnessFailure(std::string("the harness could not build its preconditions: ") + e.what());
     }
 
-    if (g_ungradedValidation > 0) {
-        notVerified(kGoal, "VK_LAYER_KHRONOS_validation is not loaded, so this run's Vulkan work went ungraded");
-    }
     const bool checksRed = wallpaperx::testing::reportCheckFailures();
     const bool harnessRed = wallpaperx::testing::reportHarnessFaults("in this test file, not in the plugin");
     if (!ok || checksRed || harnessRed) return 1;
+    // NOT a skip: the checks above ran and passed, so reporting the goal as unexercised is false
+    // and marks the entry Skipped, erasing the coverage. Only the GPU-side cleanliness went
+    // unjudged. Same shape as device_affinity_probe.
+    if (g_ungradedValidation > 0) {
+        std::fprintf(stderr,
+                     "item_import_release_test: the validation grade could not be made -- "
+                     "VK_LAYER_KHRONOS_validation is not loaded. The checks that ran are still judged; the "
+                     "GPU-side cleanliness of this run is not.\n");
+        return 1;
+    }
     return wallpaperx::testing::reportNotVerifiedOrPassed();
 }

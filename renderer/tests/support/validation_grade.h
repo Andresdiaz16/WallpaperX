@@ -55,6 +55,29 @@ inline bool validationWaived() {
     return env != nullptr && std::strcmp(env, "1") == 0;
 }
 
+// Whether VK_LAYER_KHRONOS_validation can be loaded on this HOST, asked through the loader.
+// Distinct from Device::validationLayerActive(), which says whether a validator is attached to a
+// device WE built -- and those differ exactly where it matters. A regression that stops the layer
+// being requested, or stops the debug messenger being created, leaves the device flag false on a
+// machine where the package is installed. Reading that as "the host has no validator" turns the
+// loss of the only GPU-side oracle into a green skip.
+//
+// Cached: it is asked from destructors, once per process is enough, and the answer cannot change
+// while the process runs.
+inline bool validationLayerAvailable() {
+    static const bool available = [] {
+        uint32_t count = 0;
+        if (vkEnumerateInstanceLayerProperties(&count, nullptr) != VK_SUCCESS) return false;
+        std::vector<VkLayerProperties> layers(count);
+        if (vkEnumerateInstanceLayerProperties(&count, layers.data()) != VK_SUCCESS) return false;
+        for (const VkLayerProperties& layer : layers) {
+            if (std::strcmp(layer.layerName, "VK_LAYER_KHRONOS_validation") == 0) return true;
+        }
+        return false;
+    }();
+    return available;
+}
+
 class ValidationGrade {
 public:
     ValidationGrade(std::string label, int& failures) : m_label(std::move(label)), m_failures(failures) {}
@@ -119,6 +142,15 @@ public:
             // All reverted.
             if (validationWaived()) {
                 announceWaiverOnce();
+                return;
+            }
+            // The ungraded channel is for a host that cannot supply a validator. If the package IS
+            // installed and this device still has none, that is a defect in the code that built
+            // the device -- routing it to a skip would retire the GPU-side oracle silently.
+            if (validationLayerAvailable()) {
+                fail(m_failures,
+                     "VK_LAYER_KHRONOS_validation is installed but this Device did not activate it, so nothing "
+                     "graded its Vulkan usage");
                 return;
             }
             fail(m_ungraded ? *m_ungraded : m_failures,

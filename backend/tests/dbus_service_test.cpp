@@ -91,11 +91,12 @@ using wallpaperx::testing::wallpaperStatus;
 // The pass / fail contract lives in tests/test_report.h, shared with the other five test
 // binaries so the wording and the exit codes cannot drift apart.
 //
-// All three channels are live. The skip channel exists for one case only -- a host with no
-// validation-layer package, which grades nothing and breaks nothing -- and its four ctest
-// entries in backend/CMakeLists.txt carry SKIP_RETURN_CODE 77 so that reads as a skip rather
-// than as a defect in the daemon. Nothing else here may reach for it: every other shortfall in
-// this file is a real failure.
+// This file uses only two of its three channels. It has no notVerified() call: every shortfall
+// it can reach is a real failure, including a host with no validation-layer package -- that host
+// loses the only GPU-side oracle the suite has, and reporting it as a skip would retire that
+// oracle quietly. reportNotVerifiedOrPassed() below therefore always takes its all-passed
+// branch, and is called for the failure guard it applies rather than for a skip this file
+// can produce.
 
 // Deliberately not square. With equal dimensions a width/height swap anywhere between
 // the target and the wire would satisfy every assertion below.
@@ -2036,15 +2037,17 @@ void runWorkerCoalescingChecks(const wallpaperx::WallpaperManager::Config& confi
                 wallpaperx::testing::ValidationGrade grade(
                     "dbus_service_test (worker-coalescing phase)", failures);
                 if (wallpaperx::testing::validationWaived()) grade.expectNoDevice();
-                // A missing layer package is a fact about the host, not about this daemon.
-                // Charged to failures it made the whole entry red on any machine without
-                // vulkan-validation-layers, which reads as a defect in the code under test.
+                // Its own bucket: an absent layer PACKAGE says nothing about this daemon, so it
+                // must not be charged to the check below. ValidationGrade still charges failures
+                // when the package is present and the device simply did not activate it, which
+                // is a defect here.
                 grade.reportUngradedTo(ungraded);
                 grade.adopt(counter, layerActive);
             }
             if (ungraded > 0) {
-                wallpaperx::testing::notVerified("the worker-coalescing phase's validation grade",
-                            "VK_LAYER_KHRONOS_validation is not loaded, so its Vulkan work went ungraded");
+                std::fprintf(stderr,
+                             "dbus_service_test: the worker-coalescing phase's validation grade could not be made "
+                             "-- VK_LAYER_KHRONOS_validation is not loaded. The phase itself is still judged.\n");
             }
             // Named for what was actually judged. ValidationGrade has already printed the
             // specific verdict -- no device, no validator, or a nonzero count -- so a
@@ -2576,13 +2579,21 @@ int main() {
                      "nothing -- see the render failures above for the cause.\n");
         ++wallpaperx::testing::g_failures;
     } else if (!validationLayerWasActive) {
-        // A skip, not a failure: the package is absent from the host, which grades nothing here
-        // and breaks nothing in the daemon. Charged to failures it made this entry red on any
-        // machine without vulkan-validation-layers, which reads as a defect in the code.
-        wallpaperx::testing::notVerified(
-            "the render, export and teardown path produces zero Vulkan validation warnings",
-            "VK_LAYER_KHRONOS_validation was requested but is not loaded, so the zero-warning check below would "
-            "have passed without validating anything. Install the Vulkan validation layers.");
+        // Two causes, opposite verdicts. The package missing from the host says nothing about
+        // this daemon; the package present while the daemon's own Device failed to activate it
+        // is a defect here, and reporting that as a host fact retires the GPU-side oracle
+        // silently. Either way this is not a ctest skip: the rest of the run was judged.
+        if (wallpaperx::testing::validationLayerAvailable()) {
+            std::fprintf(stderr,
+                         "FAIL: VK_LAYER_KHRONOS_validation is installed but the daemon's Device did not activate "
+                         "it -- the zero-warning check below would have validated nothing.\n");
+        } else {
+            std::fprintf(stderr,
+                         "FAIL: VK_LAYER_KHRONOS_validation is not installed on this host, so the zero-warning "
+                         "check below would have passed without validating anything. Install the Vulkan "
+                         "validation layers, or set WALLPAPERX_ALLOW_NO_VALIDATION=1 to accept the loss.\n");
+        }
+        ++wallpaperx::testing::g_failures;
     } else {
         const int warnings = validationCounter->load();
         check(warnings == 0, "the render, export and teardown path produced zero Vulkan validation warnings");

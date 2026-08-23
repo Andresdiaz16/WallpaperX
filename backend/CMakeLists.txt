@@ -586,12 +586,7 @@ if(DBUS_RUN_SESSION)
     # otherwise turn this entry -- and the lavapipe twin below -- into further copies of
     # dbus_service_classic. All three would pass, the tier assertion included, while
     # Heap and Buffer went entirely unexercised through the daemon.
-    # SKIP_RETURN_CODE so the test can say "not verified" at all. Without it, exit 77 reads to
-    # ctest as a failure, so a host with no vulkan-validation-layers package -- which grades
-    # nothing but breaks nothing -- turned the whole entry red as though the daemon were at fault.
-    set_tests_properties(dbus_service PROPERTIES
-        ENVIRONMENT "WALLPAPERX_FORCE_TIER="
-        SKIP_RETURN_CODE 77)
+    set_tests_properties(dbus_service PROPERTIES ENVIRONMENT "WALLPAPERX_FORCE_TIER=")
 
     # The test now renders and exports a real frame, so it exercises the export path
     # end to end -- and on the owner's NVIDIA GPU that path is OPAQUE_FD only. The
@@ -603,8 +598,7 @@ if(DBUS_RUN_SESSION)
                  COMMAND ${DBUS_RUN_SESSION} -- $<TARGET_FILE:wallpaperx-dbus-service-test>)
         set_tests_properties(dbus_service_lavapipe PROPERTIES
             ENVIRONMENT "VK_ICD_FILENAMES=${WALLPAPERX_LAVAPIPE_ICD};WALLPAPERX_FORCE_TIER="
-            LABELS "lavapipe"
-            SKIP_RETURN_CODE 77)
+            LABELS "lavapipe")
     endif()
 
     # DoD 12 wants the Classic descriptor tier verified end to end *through the
@@ -616,8 +610,7 @@ if(DBUS_RUN_SESSION)
     add_test(NAME dbus_service_classic
              COMMAND ${DBUS_RUN_SESSION} -- $<TARGET_FILE:wallpaperx-dbus-service-test>)
     set_tests_properties(dbus_service_classic PROPERTIES
-        ENVIRONMENT "WALLPAPERX_FORCE_TIER=classic"
-        SKIP_RETURN_CODE 77)
+        ENVIRONMENT "WALLPAPERX_FORCE_TIER=classic")
 
     # The Classic tier needs a lavapipe twin of its own, and not for coverage symmetry.
     # The TSan tier can only run lavapipe entries (the proprietary driver SEGVs under
@@ -631,8 +624,7 @@ if(DBUS_RUN_SESSION)
         set_tests_properties(dbus_service_classic_lavapipe PROPERTIES
             ENVIRONMENT "VK_ICD_FILENAMES=${WALLPAPERX_LAVAPIPE_ICD};WALLPAPERX_FORCE_TIER=classic"
             LABELS "lavapipe"
-            RESOURCE_LOCK wallpaperx_bus_tests
-            SKIP_RETURN_CODE 77)
+            RESOURCE_LOCK wallpaperx_bus_tests)
     endif()
 
     # One lock across every bus-driven test, not one per tier. Two reasons, and the
@@ -673,8 +665,7 @@ if(DBUS_RUN_SESSION)
         set_tests_properties(http_config_lavapipe PROPERTIES
             ENVIRONMENT "VK_ICD_FILENAMES=${WALLPAPERX_LAVAPIPE_ICD};WALLPAPERX_FORCE_TIER="
             LABELS "lavapipe"
-            RESOURCE_LOCK wallpaperx_bus_tests
-            SKIP_RETURN_CODE 77)
+            RESOURCE_LOCK wallpaperx_bus_tests)
     endif()
 
     # Same private-bus wrapper, one tier up: this one spawns the real daemon binary.
@@ -701,8 +692,7 @@ if(DBUS_RUN_SESSION)
         set_tests_properties(daemon_system_lavapipe PROPERTIES
             ENVIRONMENT "VK_ICD_FILENAMES=${WALLPAPERX_LAVAPIPE_ICD}"
             LABELS "lavapipe"
-            RESOURCE_LOCK wallpaperx_bus_tests
-            SKIP_RETURN_CODE 77)
+            RESOURCE_LOCK wallpaperx_bus_tests)
     endif()
 
     # The QQuickItem driven by a stub daemon answering GetFrameFd with a frame the importer must

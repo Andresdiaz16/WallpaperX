@@ -550,12 +550,21 @@ int main() {
         wallpaperx::testing::harnessFailure(std::string("the probe could not build its preconditions: ") +
                                             e.what());
     }
-    if (g_ungradedValidation > 0) {
-        notVerified(kGoals, "VK_LAYER_KHRONOS_validation is not loaded, so this run's Vulkan work went ungraded");
-    }
     // Both reports run before the verdict, or a fault's reason line is never printed.
     const bool failed = wallpaperx::testing::reportCheckFailures();
     const bool faulted = wallpaperx::testing::reportHarnessFaults("while importing an exported frame");
     if (!ok || failed || faulted) return 1;
+    // NOT a skip, and not folded into the goals above: those checks ran and passed, so saying they
+    // could not be exercised is false, and marking the entry Skipped erases the only real-GPU
+    // import coverage there is. Only the GPU-side cleanliness of this run went unjudged. Same
+    // shape as device_affinity_probe; a host that legitimately has no layer package sets
+    // WALLPAPERX_ALLOW_NO_VALIDATION=1, which announces the waiver and never reaches here.
+    if (g_ungradedValidation > 0) {
+        std::fprintf(stderr,
+                     "frame_import_probe: the validation grade could not be made -- VK_LAYER_KHRONOS_validation is "
+                     "not loaded. The checks that ran are still judged; the GPU-side cleanliness of this run is "
+                     "not.\n");
+        return 1;
+    }
     return wallpaperx::testing::reportNotVerifiedOrPassed();
 }
