@@ -104,9 +104,13 @@ bool hasGlExtension(const char* wanted) {
 // at all -- no CONFIG_KCMP, or a seccomp policy returning EPERM -- that repeats for every refusal,
 // so a budget bounds it and supports() refuses the path once spent.
 //
-// A budget rather than a latch, and cleared by any import that succeeds: refusals are transient
-// (an allocation race, a mode change) and the item retries them. A single one must not cost the
-// wallpaper for the life of the session on a host that was drawing it perfectly well.
+// A budget rather than a latch, and NEVER cleared: the count only rises on a host where kcmp
+// cannot answer, which is a property of the kernel build or the seccomp policy and does not change
+// while the process runs. Clearing it on a successful import would key it on evidence about a
+// different question and leave the leak unbounded, since successes are the norm even there.
+//
+// 16 is what this pays to survive the sporadic refusal that a latch killed the session for. Once
+// spent, the path is refused for good and the desktop says why.
 constexpr int kAbandonBudget = 16;
 std::atomic<int> g_abandonedDescriptors{0};
 
@@ -409,8 +413,6 @@ FrameImport::Result FrameImport::import(Request& request) {
     // Imported. The driver owns the duplicate; this one was only ever ours.
     ::close(request.fd);
     request.fd = -1;
-    // Anything abandoned before this was transient, not a host that cannot reclaim.
-    g_abandonedDescriptors.store(0, std::memory_order_relaxed);
 
     GLuint texture = 0;
     glGenTextures(1, &texture);
