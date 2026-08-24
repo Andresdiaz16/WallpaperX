@@ -569,7 +569,6 @@ int main() {
     // import coverage there is. Only the GPU-side cleanliness of this run went unjudged. Same
     // shape as device_affinity_probe; a host that legitimately has no layer package sets
     // WALLPAPERX_ALLOW_NO_VALIDATION=1, which announces the waiver and never reaches here.
-    if (wallpaperx::testing::g_notVerified > 0) return wallpaperx::testing::reportNotVerifiedOrPassed();
     if (g_ungradedValidation > 0) {
         std::fprintf(stderr,
                      "frame_import_probe: the validation grade could not be made -- VK_LAYER_KHRONOS_validation is "

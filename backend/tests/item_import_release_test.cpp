@@ -541,7 +541,6 @@ int main(int argc, char** argv) {
     // NOT a skip: the checks above ran and passed, so reporting the goal as unexercised is false
     // and marks the entry Skipped, erasing the coverage. Only the GPU-side cleanliness went
     // unjudged. Same shape as device_affinity_probe.
-    if (wallpaperx::testing::g_notVerified > 0) return wallpaperx::testing::reportNotVerifiedOrPassed();
     if (g_ungradedValidation > 0) {
         std::fprintf(stderr,
                      "item_import_release_test: the validation grade could not be made -- "

@@ -102,16 +102,20 @@ bool hasGlExtension(const char* wanted) {
 //
 // Answering "not ours" instead leaks one descriptor per failed import. Where kcmp cannot answer
 // at all -- no CONFIG_KCMP, or a seccomp policy returning EPERM -- that repeats for every refusal,
-// so the fact is latched and supports() then refuses the path rather than leaking at frame rate.
-// One descriptor, once. A leak degrades; a wrong close corrupts another thread.
-std::atomic<bool> g_kcmpUnusable{false};
+// so a budget bounds it and supports() refuses the path once spent.
+//
+// A budget rather than a latch, and cleared by any import that succeeds: refusals are transient
+// (an allocation race, a mode change) and the item retries them. A single one must not cost the
+// wallpaper for the life of the session on a host that was drawing it perfectly well.
+constexpr int kAbandonBudget = 16;
+std::atomic<int> g_abandonedDescriptors{0};
 
-bool kcmpUnusable() { return g_kcmpUnusable.load(std::memory_order_relaxed); }
+bool kcmpBudgetSpent() { return g_abandonedDescriptors.load(std::memory_order_relaxed) >= kAbandonBudget; }
 
 bool sameOpenFile(int candidate, int reference) {
     const long compared = ::syscall(SYS_kcmp, ::getpid(), ::getpid(), KCMP_FILE, candidate, reference);
     if (compared >= 0) return compared == 0;
-    if (errno == ENOSYS || errno == EPERM) g_kcmpUnusable.store(true, std::memory_order_relaxed);
+    if (errno == ENOSYS || errno == EPERM) g_abandonedDescriptors.fetch_add(1, std::memory_order_relaxed);
     return false;
 }
 
@@ -190,10 +194,10 @@ bool FrameImport::supports(HandleType type, std::string* whyNot) {
         return true;
     }
 
-    // Latched by sameOpenFile after kcmp proved unanswerable. Without it a refused import cannot
-    // work out which descriptor the driver kept, so every further attempt abandons one.
-    if (kcmpUnusable()) {
-        setWhyNot(whyNot, "this kernel will not answer kcmp, so a refused import cannot reclaim its descriptor");
+    // Counted by sameOpenFile when kcmp cannot answer. Without an answer a refused import cannot
+    // work out which descriptor the driver kept, so each one abandons a descriptor.
+    if (kcmpBudgetSpent()) {
+        setWhyNot(whyNot, "this kernel will not answer kcmp, so refused imports cannot reclaim their descriptors");
         return false;
     }
     if (!hasGlExtension("GL_EXT_memory_object")) {
@@ -405,6 +409,8 @@ FrameImport::Result FrameImport::import(Request& request) {
     // Imported. The driver owns the duplicate; this one was only ever ours.
     ::close(request.fd);
     request.fd = -1;
+    // Anything abandoned before this was transient, not a host that cannot reclaim.
+    g_abandonedDescriptors.store(0, std::memory_order_relaxed);
 
     GLuint texture = 0;
     glGenTextures(1, &texture);

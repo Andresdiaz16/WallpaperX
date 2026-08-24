@@ -696,7 +696,13 @@ bool runChecks() {
     //       the leak check unreachable under the very defect it grades, because the leaking
     //       shape also stops handing the descriptor back. Measured, not reasoned: the first
     //       version of this block passed its control by failing a different check.
-    {
+    if (!kcmpUsable()) {
+        // Asked BEFORE anything is staged: the importer spends a descriptor budget on a host that
+        // cannot answer kcmp, and a sweep run here would spend it and then be refused by the
+        // importer's own guard -- reported as a harness fault rather than the host fact it is.
+        notVerified(kGoals, "kcmp is unavailable on this host, so the importer cannot decide who owns a "
+                            "refused frame's descriptor and leaks it by design");
+    } else {
         const wallpaperx::testing::Frame doomed = wallpaperx::testing::getFrameFd(*proxy, kMonitor);
 
         // A size the driver cannot match against the allocation behind the fd. Derived from the
@@ -787,14 +793,7 @@ bool runChecks() {
                 std::fprintf(stderr, "  %d of %d refusals handed the descriptor back; %d reported it consumed\n",
                              handedBack, kRefusals, refusedAtHandover - handedBack);
             }
-            if (!kcmpUsable()) {
-                // The importer can only reclaim the duplicate where it can decide descriptor
-                // identity, and kcmp is its only means of doing so. Without it, production leaks
-                // one per refusal by documented decision -- grading that as a defect here would
-                // report a deliberate trade as a bug, with nothing naming kcmp.
-                notVerified(kGoals, "kcmp is unavailable on this host, so the importer cannot decide who owns a "
-                                    "refused frame's descriptor and leaks it by design");
-            } else if (beforeRefusals == 0 || afterRefusals == 0) {
+            if (beforeRefusals == 0 || afterRefusals == 0) {
                 notVerified(kGoals, "/proc/self/fd could not be read around the refusal sweep, so no descriptor was "
                                     "counted");
             } else if (refusedAtHandover == kRefusals) {
