@@ -328,9 +328,9 @@ bool runFrameShownChecks() {
             std::fprintf(stderr, "  the monitor-id change produced no new request, so the path that invalidates the "
                                  "generation marks may not have been entered at all\n");
         }
-        // Gated on the item having PROCESSED the refusal, not merely on the stub having received
-        // the request: reading in between passes without the refusal ever reaching the item, which
-        // is the state this check exists to grade.
+        // WEAKER THAN IT LOOKS, measured: the refusal publishes no reason of its own, so this
+        // waits on a reason an earlier step already set. It establishes that a reason exists, not
+        // that the refusal was processed. Nothing the item exposes distinguishes the two.
         const bool refusalHandled =
             pumpUntil([&] { return !root->property("publishedReason").toString().isEmpty(); }, 5000);
         renderPass(nullptr);
