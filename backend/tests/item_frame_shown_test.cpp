@@ -339,8 +339,8 @@ bool runFrameShownChecks() {
                 "the item never reported the refused fetch, so whether the claim survives it was not established");
         } else {
             check(claimsFrameShown(item), "the claim survives the refused fetch and the render pass after it");
+            check(itemTexture(item) == texture, "and the frame is still the one on screen");
         }
-        check(itemTexture(item) == texture, "and the frame is still the one on screen");
 
         // GOAL: when the scene graph takes the item's resources away, the claim is withdrawn.
         //       False if it survives: main.qml keeps the message panel hidden while nothing is

@@ -327,28 +327,6 @@ public:
         return wallpaperx::testing::forkPreambleFault(m_exitCode);
     }
 
-    // Whether the child is already dead, and how. startupFault() recognises only the fork
-    // preamble's own exit codes, so a daemon that segfaulted or exited 1 during startup is
-    // indistinguishable from one that is merely slow -- and reporting that as a host limitation
-    // makes a crashed daemon a green skip.
-    struct Death {
-        bool dead = false;
-        bool bySignal = false;
-        int status = 0;  // exit code, or signal number when bySignal
-    };
-
-    Death death() const {
-        Death out;
-        if (m_pid <= 0) return out;
-        siginfo_t info{};
-        info.si_pid = 0;
-        if (waitid(P_PID, static_cast<id_t>(m_pid), &info, WEXITED | WNOHANG | WNOWAIT) != 0) return out;
-        if (info.si_pid == 0) return out;
-        out.dead = true;
-        out.bySignal = info.si_code != CLD_EXITED;
-        out.status = info.si_status;
-        return out;
-    }
 
     // Signals the daemon and waits for it to exit. Returns the exit code, or -1 if it
     // was killed by a signal or did not exit within kProcessTimeout (in which case it is

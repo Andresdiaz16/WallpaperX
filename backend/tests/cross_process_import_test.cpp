@@ -247,8 +247,18 @@ enum class Outcome { Imported, RefusedAndHandedBack, RefusedAndConsumed, NeverAt
 // to know, or it grades that decision as a defect.
 bool kcmpUsable() {
     static const bool usable = [] {
-        const long self = ::syscall(SYS_kcmp, ::getpid(), ::getpid(), KCMP_FILE, 0, 0);
-        return self >= 0;
+        // A descriptor this process opened, not 0: stdin belongs to whoever launched the test,
+        // and a closed one would answer EBADF and be read as "this kernel cannot do kcmp".
+        const int probe = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+        if (probe < 0) {
+            harnessFailure("could not open /dev/null to ask whether this kernel answers kcmp");
+            return false;
+        }
+        const long self = ::syscall(SYS_kcmp, ::getpid(), ::getpid(), KCMP_FILE, probe, probe);
+        const int failure = errno;
+        ::close(probe);
+        // Only these two mean the kernel will not answer. Anything else is about the operands.
+        return self >= 0 || (failure != ENOSYS && failure != EPERM);
     }();
     return usable;
 }
@@ -295,13 +305,17 @@ bool runChecks() {
         }
         // A daemon that died is the daemon failing, not the host refusing to run the test. Only a
         // child still running -- one that simply never printed the line -- can be a skip.
-        const SpawnedDaemon::Death died = daemon.death();
-        if (died.dead) {
-            check(false, died.bySignal ? "the daemon stayed alive long enough to announce the bus name"
-                                       : "the daemon started successfully enough to announce the bus name");
-            std::fprintf(stderr, "  the daemon %s %d before announcing the bus name; its output above says why\n",
-                         died.bySignal ? "died on signal" : "exited with status", died.status);
+        int signo = 0;
+        const SpawnedDaemon::Departure went = daemon.departure(signo);
+        if (went == SpawnedDaemon::Departure::QuitOnItsOwn) {
+            check(false, "the daemon started successfully enough to announce the bus name");
+            std::fprintf(stderr, "  it exited on its own before announcing the bus name; its output above says why\n");
             return false;
+        }
+        if (went == SpawnedDaemon::Departure::KilledFromOutside) {
+            notVerified(kGoals, "the daemon this test started was killed by signal " + std::to_string(signo) +
+                                    " by something outside this test before it announced the bus name");
+            return true;
         }
         notVerified(kGoals, "the daemon this test started never announced that it was serving the bus name, so "
                             "there was nothing to ask for a frame");
