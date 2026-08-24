@@ -5,9 +5,8 @@
 // The daemon under test, as a child process, shared by every test that needs a real one.
 //
 // One definition rather than one per test binary: the fork preamble, the capture-pipe reader and
-// the shutdown/reap sequence are the parts where a copy silently diverges, and a divergent copy
-// still compiles, still runs, and still reads as coverage. A second copy had already lost the
-// ability to tell a daemon that crashed from a daemon that was merely slow.
+// the shutdown/reap sequence are where a copy diverges silently, and a divergent copy still
+// compiles, still runs, and still reads as coverage.
 
 #include "support/forked_child.h"
 #include "tests/client/scratch_dir.h"
@@ -252,7 +251,7 @@ public:
     // accord (the daemon's defect) from one the machine killed (not the daemon's defect).
     // exited() cannot: the capture pipe's end-of-file carries no exit status.
     //
-    // waitid with WNOWAIT, as startupFault() above: WNOHANG *consumes* the status, so reap()
+    // waitid with WNOWAIT, as startupFault(): WNOHANG *consumes* the status, so reap()
     // would then hit ECHILD and invent a second fault on top of the real one. WNOWAIT leaves
     // the child reapable, so shutdown()/waitForExit() are unaffected.
     //

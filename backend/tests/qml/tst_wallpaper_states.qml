@@ -26,6 +26,9 @@ TestCase {
     // name, which is why main.qml takes an override the connector binding prefers when set.
     readonly property string namedScreen: "DP-3"
 
+    // Spelled once. The case table below and the recovery check both key on it.
+    readonly property string unreachableFragment: "Start the wallpaperx-daemon service"
+
     readonly property string goodReply:
         '{"output":"DP-3","known":true,"path":"/home/u/Pictures/beach.png"}'
 
@@ -92,7 +95,7 @@ TestCase {
                 connector: suite.namedScreen,
                 drive: [0, ""],
                 state: "unreachable",
-                says: "Start the wallpaperx-daemon service"
+                says: suite.unreachableFragment
             },
             {
                 tag: "3-refused",
@@ -910,7 +913,8 @@ TestCase {
         verify(backdrop.visible, "the message comes back when the wallpaper stops");
         // The message names THIS cause. Any branch of describe() returns a non-empty string, so
         // asserting only that it has one passes while the desktop shows the wrong explanation.
-        verify(item.describe().indexOf("WallpaperX is not running") === 0,
+        // The fragment comes from the case table, which is the one place it is spelled.
+        verify(item.describe().indexOf(suite.unreachableFragment) >= 0,
                "and the message names the daemon being gone, not the previous cause");
     }
 

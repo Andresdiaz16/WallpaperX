@@ -34,28 +34,20 @@
 #include <sdbus-c++/sdbus-c++.h>
 
 #include <fcntl.h>
-#include <poll.h>
 #include <signal.h>
 #include <linux/kcmp.h>
 #include <sys/syscall.h>
-#include <sys/wait.h>
 #include <unistd.h>
 
 #include <array>
-#include <atomic>
 #include <cerrno>
 #include <chrono>
-#include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <exception>
-#include <mutex>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <vector>
-
-extern char** environ;
 
 namespace {
 
