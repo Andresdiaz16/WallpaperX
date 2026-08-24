@@ -408,13 +408,19 @@ public:
     bool waitForOutput(std::string_view needle, Clock::duration timeout) const {
         const auto deadline = Clock::now() + timeout;
         while (true) {
-            if (output().find(needle) != std::string::npos) return true;
+            {
+                // Searched under the lock rather than through output(), which copies the whole
+                // captured log on every turn of this wait.
+                std::lock_guard<std::mutex> lock(m_mutex);
+                if (m_output.find(needle) != std::string::npos) return true;
+            }
             // EOF on the capture pipe means every write end is closed, i.e. the child is
             // gone. Without this the wait would burn the whole timeout on a daemon that
             // died at startup -- and a 30-second stall is exactly how a setup failure
             // gets mistaken for a slow one.
             if (m_readerDone.load(std::memory_order_acquire)) {
-                return output().find(needle) != std::string::npos;
+                std::lock_guard<std::mutex> lock(m_mutex);
+                return m_output.find(needle) != std::string::npos;
             }
             if (Clock::now() >= deadline) return false;
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -426,6 +432,20 @@ private:
         char buf[4096];
         std::string pending;
         while (true) {
+            // Polled rather than blocked in read(): a child that forks something inheriting this
+            // pipe leaves it open after the daemon exits, and a blocking read would then never
+            // return and the join below would hang instead of reporting.
+            pollfd pfd{m_readFd, POLLIN, 0};
+            const int ready = poll(&pfd, 1, 200);
+            if (ready == 0) {
+                if (m_stopReader.load(std::memory_order_acquire)) break;
+                continue;
+            }
+            if (ready < 0 && errno == EINTR) continue;
+            if (ready < 0) {
+                m_readFailed.store(true, std::memory_order_release);
+                break;
+            }
             const ssize_t n = read(m_readFd, buf, sizeof(buf));
             // EINTR is not EOF. Treating it as one truncates the capture, and every
             // assertion about the daemon's output below -- "stopped cleanly", the signal
@@ -486,6 +506,7 @@ private:
 
         // Joined only after the child is gone: the reader ends at EOF, and EOF arrives
         // only once every write end of the pipe is closed, which the child's exit does.
+        m_stopReader.store(true, std::memory_order_release);
         if (m_reader.joinable()) m_reader.join();
         close(m_readFd);
         m_readFd = -1;
@@ -512,6 +533,7 @@ private:
     int m_termSignal = 0;
     std::thread m_reader;
     std::atomic<bool> m_readerDone{false};
+    std::atomic<bool> m_stopReader{false};
     std::atomic<bool> m_readFailed{false};
     mutable std::mutex m_mutex;
     std::string m_output;

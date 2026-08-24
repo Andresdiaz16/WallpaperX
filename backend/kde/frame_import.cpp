@@ -392,10 +392,10 @@ FrameImport::Result FrameImport::import(Request& request) {
         // Destroyed first: a driver that took the descriptor on the failing call may release it
         // with the object, and closing before that frees a number the driver then closes again.
         api.destroy(1, &memory);
-        // Compared AFTER the destroy and immediately before the close, never cached across it.
-        // The answer describes one instant, and the destroy is exactly what can change it: a
-        // driver that has just released the duplicate leaves this false, and the retained
-        // original still pins the open file, so the comparison is valid where it is used.
+        // Compared AFTER the destroy and immediately before the close, never cached across it:
+        // the destroy is what can change the answer. Another thread can take the freed number in
+        // that window, but it cannot make this compare equal -- kcmp answers true only for the
+        // same open file description as request.fd, and nothing outside this call holds that.
         if (sameOpenFile(gift, request.fd)) ::close(gift);
         out.error = kImportRejectedError;
         // request.fd is untouched: a failed import never consumes the caller's descriptor now.
