@@ -17,19 +17,14 @@ pkg_check_modules(PIPEWIRE REQUIRED libpipewire-0.3)
 pkg_check_modules(FFTW3    REQUIRED fftw3)
 pkg_check_modules(SHADERC  REQUIRED shaderc)
 
-# libmpv — no pkg-config on some distros, find manually
-find_library(MPV_LIBRARY NAMES mpv REQUIRED
-    DOC "libmpv shared library")
-find_path(MPV_INCLUDE_DIR NAMES mpv/client.h REQUIRED
-    DOC "libmpv include directory")
-
-if(NOT MPV_LIBRARY OR NOT MPV_INCLUDE_DIR)
-    message(FATAL_ERROR
-        "libmpv not found.\n"
-        "Install mpv development package for your distro.\n"
-        "See renderer/DEPENDENCIES.md for package names."
-    )
-endif()
+# ffmpeg — decode for the video renderer. libavcodec decodes into the Vulkan device
+# this renderer already owns (AVVulkanDeviceContext takes an existing VkDevice and
+# returns VkImages), which is why no second GPU context is needed for video.
+pkg_check_modules(LIBAV REQUIRED IMPORTED_TARGET
+    libavcodec>=61
+    libavformat>=61
+    libavutil>=59
+)
 
 # VulkanMemoryAllocator — vendored single header
 set(VMA_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
@@ -86,7 +81,6 @@ target_include_directories(wallpaperx-renderer
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${Vulkan_INCLUDE_DIRS}
-        ${MPV_INCLUDE_DIR}
         ${STB_INCLUDE_DIR}
         ${VMA_INCLUDE_DIR}
 )
@@ -95,7 +89,7 @@ target_link_libraries(wallpaperx-renderer
     PUBLIC
         Vulkan::Vulkan
         ${CMAKE_DL_LIBS}
-        ${MPV_LIBRARY}
+        PkgConfig::LIBAV
         ${PIPEWIRE_LIBRARIES}
         ${FFTW3_LIBRARIES}
         ${SHADERC_LIBRARIES}
@@ -114,7 +108,7 @@ target_compile_options(wallpaperx-renderer PRIVATE
 
 message(STATUS "wallpaperx-renderer configured")
 message(STATUS "  Vulkan:   ${Vulkan_VERSION}")
-message(STATUS "  MPV lib:  ${MPV_LIBRARY}")
+message(STATUS "  ffmpeg:   libavcodec ${LIBAV_libavcodec_VERSION}")
 message(STATUS "  PipeWire: ${PIPEWIRE_VERSION}")
 message(STATUS "  FFTW3:    ${FFTW3_VERSION}")
 message(STATUS "  shaderc:  ${SHADERC_VERSION}")
