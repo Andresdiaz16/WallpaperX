@@ -25,10 +25,9 @@ public:
     enum class HandleType { OpaqueFd = 0, DmaBuf = 1 };
 
     struct Request {
-        // Set to -1 once import() has consumed it; the caller closes it only if still >= 0.
-        // Keyed on the hand-over, NOT on the overall result: the driver is given a duplicate, so
-        // a refusal at glImportMemoryFdEXT leaves this untouched -- but once that call accepts,
-        // this one is closed, and a later step failing does not give it back.
+        // Set to -1 once import() has consumed it; the caller closes it only if still >= 0. The
+        // sentinel is the only thing to key on -- WHEN it is consumed differs by handle type, and
+        // each path documents its own rule in frame_import.cpp.
         int fd = -1;
         uint32_t width = 0;
         uint32_t height = 0;

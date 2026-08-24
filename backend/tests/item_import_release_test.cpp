@@ -220,7 +220,7 @@ bool runReleaseChecks() {
         // Only the opaque path needs the match. A dma_buf is importable across devices, so
         // refusing to run for a UUID mismatch would skip every AMD and Intel host with a reason
         // that is not true of them.
-        const bool needsSameDevice = stub.handleType() != 1;
+        const bool needsSameDevice = wallpaperx::testing::exportNeedsSameDevice(device, target);
 
         // Two causes, named apart: a context on another GPU, and a context that cannot answer
         // which GPU it is on. Both mean this run establishes nothing, but reporting the second

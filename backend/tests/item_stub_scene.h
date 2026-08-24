@@ -128,6 +128,16 @@ private:
     std::string m_exportError;
 };
 
+// Whether the GL context must be on the same GPU as the exporter. Only an opaque fd is device
+// bound; a dma_buf imports across devices. Asked of a real export, because the stub does not know
+// its handle type until it has served a frame, which is after every caller's gate.
+inline bool exportNeedsSameDevice(wallpaperx::Device& device, const wallpaperx::OffscreenTarget& target) {
+    wallpaperx::ExportedFrame probe = wallpaperx::exportFrame(device, target);
+    const bool needs = probe.type != wallpaperx::ExportedFrame::HandleType::DmaBuf;
+    if (probe.fd >= 0) ::close(probe.fd);
+    return needs;
+}
+
 // Runs the event loop until `done` or the deadline. Bounded, and the caller must have a branch
 // for false: a run that never reached its precondition must say so rather than fall through.
 inline bool pumpUntil(const std::function<bool()>& done, int limitMs) {

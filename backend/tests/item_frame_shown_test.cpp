@@ -168,12 +168,7 @@ bool runFrameShownChecks() {
         // refusing to run for a UUID mismatch would skip every AMD and Intel host with a reason
         // untrue of them. Asked of a real export rather than of the stub, which does not know its
         // handle type until it has served a frame -- and that is after this gate.
-        bool needsSameDevice = true;
-        {
-            wallpaperx::ExportedFrame probe = wallpaperx::exportFrame(device, target);
-            needsSameDevice = probe.type != wallpaperx::ExportedFrame::HandleType::DmaBuf;
-            if (probe.fd >= 0) ::close(probe.fd);
-        }
+        const bool needsSameDevice = wallpaperx::testing::exportNeedsSameDevice(device, target);
 
         // Two causes, named apart: a context on another GPU, and a context that cannot answer
         // which GPU it is on. Both mean this run establishes nothing, but reporting the second as

@@ -19,6 +19,7 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <cerrno>
 #include <cstring>
 #include <utility>
@@ -99,13 +100,18 @@ bool hasGlExtension(const char* wanted) {
 // descriptor belonging to another frame, and closing that inside plasmashell frees a number
 // another thread is using.
 //
-// The cost of answering "not ours" instead is one leaked descriptor per FAILED import, and that
-// is not self-limiting: where kcmp is missing (no CONFIG_KCMP) or blocked (a seccomp policy
-// returning EPERM), a driver that keeps refusing frames leaks one per attempt until the process
-// hits its limit. Preferred anyway -- a leak degrades, a wrong close corrupts another thread.
+// Answering "not ours" instead leaks one descriptor per failed import. Where kcmp cannot answer
+// at all -- no CONFIG_KCMP, or a seccomp policy returning EPERM -- that repeats for every refusal,
+// so the fact is latched and supports() then refuses the path rather than leaking at frame rate.
+// One descriptor, once. A leak degrades; a wrong close corrupts another thread.
+std::atomic<bool> g_kcmpUnusable{false};
+
+bool kcmpUnusable() { return g_kcmpUnusable.load(std::memory_order_relaxed); }
+
 bool sameOpenFile(int candidate, int reference) {
     const long compared = ::syscall(SYS_kcmp, ::getpid(), ::getpid(), KCMP_FILE, candidate, reference);
     if (compared >= 0) return compared == 0;
+    if (errno == ENOSYS || errno == EPERM) g_kcmpUnusable.store(true, std::memory_order_relaxed);
     return false;
 }
 
@@ -184,6 +190,12 @@ bool FrameImport::supports(HandleType type, std::string* whyNot) {
         return true;
     }
 
+    // Latched by sameOpenFile after kcmp proved unanswerable. Without it a refused import cannot
+    // work out which descriptor the driver kept, so every further attempt abandons one.
+    if (kcmpUnusable()) {
+        setWhyNot(whyNot, "this kernel will not answer kcmp, so a refused import cannot reclaim its descriptor");
+        return false;
+    }
     if (!hasGlExtension("GL_EXT_memory_object")) {
         setWhyNot(whyNot, "this GL context does not advertise GL_EXT_memory_object");
         return false;

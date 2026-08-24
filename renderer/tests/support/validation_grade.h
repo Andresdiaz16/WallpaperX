@@ -36,6 +36,7 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <vector>
 #include <utility>
 
 namespace wallpaperx::testing {
@@ -62,14 +63,20 @@ inline bool validationWaived() {
 // machine where the package is installed. Reading that as "the host has no validator" turns the
 // loss of the only GPU-side oracle into a green skip.
 //
-// Cached: it is asked from destructors, once per process is enough, and the answer cannot change
-// while the process runs.
+// Cached, and PRIMED from a normal call path rather than first asked in a destructor: it
+// allocates and calls the loader, and ~ValidationGrade can run while an exception unwinds.
+// ValidationGrade's constructor primes it.
+//
+// An enumeration that FAILS answers true, not false. False is the "host has no package" verdict,
+// which routes a missing validator to a skip -- so a loader error would silently retire the
+// oracle, the exact failure this function exists to prevent. True charges a failure instead,
+// which is the safe direction when the question cannot be answered.
 inline bool validationLayerAvailable() {
     static const bool available = [] {
         uint32_t count = 0;
-        if (vkEnumerateInstanceLayerProperties(&count, nullptr) != VK_SUCCESS) return false;
+        if (vkEnumerateInstanceLayerProperties(&count, nullptr) != VK_SUCCESS) return true;
         std::vector<VkLayerProperties> layers(count);
-        if (vkEnumerateInstanceLayerProperties(&count, layers.data()) != VK_SUCCESS) return false;
+        if (vkEnumerateInstanceLayerProperties(&count, layers.data()) != VK_SUCCESS) return true;
         for (const VkLayerProperties& layer : layers) {
             if (std::strcmp(layer.layerName, "VK_LAYER_KHRONOS_validation") == 0) return true;
         }
@@ -80,7 +87,10 @@ inline bool validationLayerAvailable() {
 
 class ValidationGrade {
 public:
-    ValidationGrade(std::string label, int& failures) : m_label(std::move(label)), m_failures(failures) {}
+    ValidationGrade(std::string label, int& failures) : m_label(std::move(label)), m_failures(failures) {
+        // Primed here so the destructor never has to allocate or call the loader.
+        (void)validationLayerAvailable();
+    }
 
     ValidationGrade(const ValidationGrade&) = delete;
     ValidationGrade& operator=(const ValidationGrade&) = delete;
