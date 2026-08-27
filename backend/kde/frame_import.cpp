@@ -19,6 +19,8 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <cstring>
@@ -36,18 +38,23 @@ struct MemoryObjectApi {
     using ImportFdFn = void (*)(GLuint, GLuint64, GLenum, GLint);
     using ParameterivFn = void (*)(GLuint, GLenum, const GLint*);
     using TexStorageFn = void (*)(GLenum, GLsizei, GLenum, GLsizei, GLsizei, GLuint, GLuint64);
+    using GetBytesFn = void (*)(GLenum, GLubyte*);
 
     CreateFn create = nullptr;
     DeleteFn destroy = nullptr;
     ImportFdFn importFd = nullptr;
     ParameterivFn parameteriv = nullptr;
     TexStorageFn texStorage = nullptr;
+    GetBytesFn getBytes = nullptr;
 
     bool complete() const {
         // parameteriv included: without it the dedicated flag cannot be set, and an import that
         // skips the flag succeeds and samples blank.
+        //
+        // getBytes included so the device check cannot be skipped. GL_EXT_memory_object mandates
+        // it, so absent here means a driver advertising the extension without implementing it.
         return create != nullptr && destroy != nullptr && importFd != nullptr && parameteriv != nullptr &&
-               texStorage != nullptr;
+               texStorage != nullptr && getBytes != nullptr;
     }
 };
 
@@ -61,6 +68,8 @@ const MemoryObjectApi& memoryObjectApi() {
             reinterpret_cast<MemoryObjectApi::ParameterivFn>(eglGetProcAddress("glMemoryObjectParameterivEXT"));
         resolved.texStorage =
             reinterpret_cast<MemoryObjectApi::TexStorageFn>(eglGetProcAddress("glTexStorageMem2DEXT"));
+        resolved.getBytes =
+            reinterpret_cast<MemoryObjectApi::GetBytesFn>(eglGetProcAddress("glGetUnsignedBytevEXT"));
         return resolved;
     }();
     return api;
@@ -115,6 +124,18 @@ constexpr int kAbandonBudget = 16;
 std::atomic<int> g_abandonedDescriptors{0};
 
 bool kcmpBudgetSpent() { return g_abandonedDescriptors.load(std::memory_order_relaxed) >= kAbandonBudget; }
+
+// Hex, so a device mismatch can name the two GPUs instead of only asserting they differ.
+std::string uuidText(const uint8_t* bytes, size_t count) {
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::string out;
+    out.reserve(count * 2);
+    for (size_t i = 0; i < count; ++i) {
+        out.push_back(kHex[bytes[i] >> 4]);
+        out.push_back(kHex[bytes[i] & 0xf]);
+    }
+    return out;
+}
 
 bool sameOpenFile(int candidate, int reference) {
     const long compared = ::syscall(SYS_kcmp, ::getpid(), ::getpid(), KCMP_FILE, candidate, reference);
@@ -351,6 +372,27 @@ FrameImport::Result FrameImport::import(Request& request) {
     }
 
     const MemoryObjectApi& api = memoryObjectApi();
+
+    // An opaque fd names memory on one particular GPU and is importable on no other. The way
+    // this is reached in the field is a hybrid-graphics machine: the daemon prefers the discrete
+    // card while plasmashell's context is on the integrated one, so every frame fails and the
+    // driver's refusal names neither device.
+    if (request.deviceUuid.size() != GL_UUID_SIZE_EXT) {
+        out.error = "the frame does not say which GPU it was allocated on";
+        return out;
+    }
+    std::array<GLubyte, GL_UUID_SIZE_EXT> contextUuid{};
+    api.getBytes(GL_DEVICE_UUID_EXT, contextUuid.data());
+    if (glGetError() != GL_NO_ERROR) {
+        out.error = "this GL context would not say which GPU it runs on";
+        return out;
+    }
+    if (!std::equal(contextUuid.begin(), contextUuid.end(), request.deviceUuid.begin())) {
+        out.error = "the frame was rendered on GPU " + uuidText(request.deviceUuid.data(), request.deviceUuid.size()) +
+                    " but the desktop draws on GPU " + uuidText(contextUuid.data(), contextUuid.size()) +
+                    "; this frame cannot cross devices";
+        return out;
+    }
 
     GLuint memory = 0;
     api.create(1, &memory);

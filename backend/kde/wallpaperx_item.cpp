@@ -267,7 +267,7 @@ void WallpaperXItem::takeFrameReply(const QDBusMessage& call) {
     }
 
     const QList<QVariant> args = call.arguments();
-    // Ten fields, in the order GetFrameFd declares them. Checked rather than assumed: a daemon
+    // Eleven fields, in the order GetFrameFd declares them. Checked rather than assumed: a daemon
     // from a newer build could answer with more, and reading past the end of a short reply is
     // the kind of crash that takes plasmashell with it.
     if (!replyIsReadable(static_cast<int>(args.size()))) {
@@ -318,6 +318,11 @@ void WallpaperXItem::takeFrameReply(const QDBusMessage& call) {
         frame.request.planes.emplace_back(offset, pitch);
     }
     planes.endArray();
+
+    // Field 10, device_uuid: which GPU allocated the memory. Validated by the importer, the
+    // only place that knows which device the import would run on.
+    const QByteArray uuid = args.at(10).toByteArray();
+    frame.request.deviceUuid.assign(uuid.begin(), uuid.end());
 
     if (frame.request.fd < 0) {
         setFetchReason(tr("WallpaperX sent a frame this plugin could not take hold of."));

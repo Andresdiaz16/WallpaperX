@@ -113,7 +113,10 @@ public:
         ++m_served;
         return connection.send(message.createReply(
             frameReplyFields(handle, kFrameWidth, kFrameHeight, memorySize, /*handleType=*/0,
-                             /*generation=*/1, kUnimportableFourcc, /*drmModifier=*/0, planes)));
+                             /*generation=*/1, kUnimportableFourcc, /*drmModifier=*/0, planes,
+                             // Not this device, and it does not have to be: the fourcc this
+                             // phase grades is refused before the importer looks at the GPU.
+                             QByteArray(16, '\0'))));
     }
 
     int requests() const { return m_requests; }

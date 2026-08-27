@@ -168,6 +168,7 @@ bool runImportChecks() {
                                       : wallpaperx::FrameImport::HandleType::OpaqueFd;
         request.drmFormat = frame.drmFormat;
         request.drmModifier = frame.modifier;
+        request.deviceUuid.assign(frame.deviceUuid.begin(), frame.deviceUuid.end());
         for (const auto& plane : frame.planes) {
             request.planes.emplace_back(plane.offset, plane.rowPitch);
         }

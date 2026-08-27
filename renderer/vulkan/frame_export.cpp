@@ -166,6 +166,7 @@ void releaseToExternalConsumer(Device& device, const OffscreenTarget& target, Ex
                              &barrier);
     });
 
+    target.releasedFromLayout = barrier.oldLayout;
     target.exportLayout = VK_IMAGE_LAYOUT_GENERAL;
     target.externalOwner = dstQueueFamily;
 }
@@ -218,6 +219,7 @@ ExportedFrame exportFrame(Device& device, const OffscreenTarget& target) {
     // blue the wrong way round -- which is exactly what the first cross-process frame looked
     // like.
     frame.drmFormat = drmFormat;
+    frame.deviceUuid = device.info().deviceUuid;
     frame.type = (handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT) ? ExportedFrame::HandleType::OpaqueFd
                                                                                : ExportedFrame::HandleType::DmaBuf;
 

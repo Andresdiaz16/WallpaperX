@@ -304,6 +304,12 @@ void Device::selectPhysicalDevice() {
     m_info.gpuName = bestProps.deviceName;
     m_info.vendor = vendorFromId(bestProps.vendorID);
 
+    VkPhysicalDeviceIDProperties idProps{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
+    VkPhysicalDeviceProperties2 props2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+    props2.pNext = &idProps;
+    vkGetPhysicalDeviceProperties2(m_physicalDevice, &props2);
+    std::memcpy(m_info.deviceUuid.data(), idProps.deviceUUID, VK_UUID_SIZE);
+
     uint32_t extCount = 0;
     vkEnumerateDeviceExtensionProperties(m_physicalDevice, nullptr, &extCount, nullptr);
     std::vector<VkExtensionProperties> extensions(extCount);

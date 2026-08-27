@@ -184,6 +184,7 @@ struct Frame {
     uint32_t drmFormat = 0;
     uint64_t drmModifier = 0;
     std::vector<sdbus::Struct<uint64_t, uint64_t>> planes;
+    std::vector<uint8_t> deviceUuid;
 };
 
 inline Frame getFrameFd(sdbus::IProxy& proxy, int32_t monitorId) {
@@ -192,7 +193,7 @@ inline Frame getFrameFd(sdbus::IProxy& proxy, int32_t monitorId) {
         .onInterface(DbusService::kInterface)
         .withArguments(monitorId)
         .storeResultsTo(frame.fd, frame.width, frame.height, frame.memorySize, frame.handleType, frame.syncFds,
-                        frame.generation, frame.drmFormat, frame.drmModifier, frame.planes);
+                        frame.generation, frame.drmFormat, frame.drmModifier, frame.planes, frame.deviceUuid);
     return frame;
 }
 

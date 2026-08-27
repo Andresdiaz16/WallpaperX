@@ -87,7 +87,7 @@ void DbusService::registerVTable() {
                 })
                 .withInputParamNames("monitor_id")
                 .withOutputParamNames("fd", "width", "height", "memory_size", "handle_type", "sync_fds",
-                                      "frame_generation", "drm_format", "drm_modifier", "planes"),
+                                      "frame_generation", "drm_format", "drm_modifier", "planes", "device_uuid"),
             sdbus::registerMethod("SetMonitorOutput")
                 .implementedAs([this](int32_t monitorId, const std::string& outputName) {
                     setMonitorOutput(monitorId, outputName);
@@ -245,7 +245,10 @@ void DbusService::completeGetFrameFd(FrameFdCall call, int32_t monitorId) {
                        // an async export; a client that cannot wait must refuse a non-empty one
                        // rather than sample a half-drawn frame.
                        std::vector<sdbus::UnixFd>{},
-                       exported.handle->generation, frame.drmFormat, frame.modifier, planes);
+                       exported.handle->generation, frame.drmFormat, frame.modifier, planes,
+                       // Which GPU allocated the memory. An opaque fd is importable only on that
+                       // device, and without this the plugin can only report the driver's refusal.
+                       std::vector<uint8_t>(frame.deviceUuid.begin(), frame.deviceUuid.end()));
 }
 
 std::string DbusService::getStatus() {

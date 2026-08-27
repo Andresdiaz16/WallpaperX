@@ -89,8 +89,11 @@ void OffscreenTargetManager::render(IRenderer& renderer, const OffscreenTarget& 
                 VkImageMemoryBarrier acquire{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
                 acquire.srcAccessMask = 0;  // the release side made the writes available
                 acquire.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-                acquire.oldLayout = target.exportLayout;
-                acquire.newLayout = target.exportLayout;  // ownership only; the render pass re-transitions
+                // The same pair the release named. A transfer performs its transition once,
+                // on whichever side the driver picks, so halves that disagree leave the
+                // conversion undone. The render pass discards from GENERAL anyway.
+                acquire.oldLayout = target.releasedFromLayout;
+                acquire.newLayout = VK_IMAGE_LAYOUT_GENERAL;
                 acquire.srcQueueFamilyIndex = target.externalOwner;
                 acquire.dstQueueFamilyIndex = m_device.graphicsQueueFamily();
                 acquire.image = target.image.image;

@@ -41,6 +41,9 @@ public:
         // 0 -- 0 is LINEAR, a perfectly valid layout.
         uint64_t drmModifier = 0;
         std::vector<std::pair<uint64_t, uint64_t>> planes;  // offset, rowPitch
+        // The GPU the daemon allocated on. OPAQUE_FD only: that memory is importable on no
+        // other device, so a mismatch is refused here rather than left to the driver.
+        std::vector<uint8_t> deviceUuid;
     };
 
     struct Result {

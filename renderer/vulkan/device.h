@@ -6,6 +6,8 @@
 #include "memory.h"
 #include "tier_selection.h"
 
+#include <array>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <stdexcept>
@@ -33,6 +35,10 @@ struct WallpaperContentError : std::runtime_error {
 struct DeviceInfo {
     std::string gpuName;
     GpuVendor vendor = GpuVendor::Other;
+
+    // Names the physical GPU across APIs and processes: an importer compares it against
+    // GL_DEVICE_UUID_EXT, since an opaque fd is only importable on the device that made it.
+    std::array<uint8_t, VK_UUID_SIZE> deviceUuid{};
     bool hasDescriptorHeap = false;
     bool hasDescriptorBuffer = false;
     bool hasExternalMemoryDmaBuf = false;

@@ -75,7 +75,7 @@ public:
     // How many fields GetFrameFd declares. A reply with fewer is not ours, and reading past the
     // end of one is a crash inside the compositor -- which is why this is a named constant and
     // a predicate rather than a literal buried in the parse.
-    static constexpr int kFrameReplyFields = 10;
+    static constexpr int kFrameReplyFields = 11;
 
     // Whether a reply carries enough fields to be read. A newer daemon may send MORE, which is
     // fine; fewer is not.

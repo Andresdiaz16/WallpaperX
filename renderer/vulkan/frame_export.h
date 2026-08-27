@@ -5,6 +5,7 @@
 #include "drm_formats.h"
 #include "memory.h"
 
+#include <array>
 #include <cstdint>
 #include <vector>
 
@@ -40,6 +41,10 @@ struct ExportedFrame {
     // The channel order, reported on BOTH paths: an opaque fd carries no layout but its bytes
     // still have an order, and an importer that guesses draws red and blue transposed.
     uint32_t drmFormat = 0;
+
+    // Which GPU allocated this memory. Reported on both paths, enforced only on the opaque
+    // one, where importing on any other device cannot work.
+    std::array<uint8_t, VK_UUID_SIZE> deviceUuid{};
 
     // DMA-BUF layout metadata (AMD/Intel), describing how to interpret the bytes
     // behind `fd`. Populated on the DmaBuf path only; the OpaqueFd (NVIDIA) path

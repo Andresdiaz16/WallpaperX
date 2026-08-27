@@ -51,6 +51,10 @@ struct OffscreenTarget {
     // render is where a driver's compressed-modifier metadata resolve goes wrong.
     mutable uint32_t externalOwner = VK_QUEUE_FAMILY_IGNORED;
 
+    // What the release named as oldLayout, so the acquire can name the same. exportLayout
+    // is no use for that -- the release overwrites it to GENERAL.
+    mutable VkImageLayout releasedFromLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
     // Records that the image is now in `layout`. Anything that transitions the image
     // outside OffscreenTargetManager::render() / exportFrame() -- a readback barrier,
     // for instance -- must call this, or the export path's barrier will declare a

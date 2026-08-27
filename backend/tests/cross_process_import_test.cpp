@@ -270,6 +270,7 @@ wallpaperx::FrameImport::Request requestFromFrame(const wallpaperx::testing::Fra
                                                : wallpaperx::FrameImport::HandleType::OpaqueFd;
     request.drmFormat = frame.drmFormat;
     request.drmModifier = frame.drmModifier;
+    request.deviceUuid = frame.deviceUuid;
     for (const auto& plane : frame.planes) request.planes.emplace_back(plane.get<0>(), plane.get<1>());
     return request;
 }
