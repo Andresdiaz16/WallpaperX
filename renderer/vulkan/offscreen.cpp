@@ -19,9 +19,11 @@ OffscreenTargetManager::OffscreenTargetManager(Device& device) : m_device(device
 }
 
 OffscreenTargetManager::~OffscreenTargetManager() {
+    std::vector<OffscreenTarget*> all;
     for (auto& [id, ring] : m_targets) {
-        for (OffscreenTarget& target : ring.images) destroyTarget(target);
+        for (OffscreenTarget& target : ring.images) all.push_back(&target);
     }
+    destroyTargets(all);
     if (m_renderPass) vkDestroyRenderPass(m_device.device(), m_renderPass, nullptr);
 }
 
@@ -147,12 +149,16 @@ const OffscreenTarget& OffscreenTargetManager::create(int monitorId, uint32_t wi
             ring.images.push_back(makeTarget(width, height));
         }
     } catch (...) {
-        for (OffscreenTarget& built : ring.images) destroyTarget(built);
+        std::vector<OffscreenTarget*> built;
+        for (OffscreenTarget& image : ring.images) built.push_back(&image);
+        destroyTargets(built);
         throw;
     }
 
     if (auto existing = m_targets.find(monitorId); existing != m_targets.end()) {
-        for (OffscreenTarget& old : existing->second.images) destroyTarget(old);
+        std::vector<OffscreenTarget*> old;
+        for (OffscreenTarget& image : existing->second.images) old.push_back(&image);
+        destroyTargets(old);
     }
 
     auto [it, inserted] = m_targets.insert_or_assign(monitorId, std::move(ring));
@@ -215,22 +221,33 @@ OffscreenTarget OffscreenTargetManager::makeTarget(uint32_t width, uint32_t heig
 void OffscreenTargetManager::destroy(int monitorId) {
     auto it = m_targets.find(monitorId);
     if (it == m_targets.end()) return;
-    for (OffscreenTarget& target : it->second.images) destroyTarget(target);
+    std::vector<OffscreenTarget*> ring;
+    for (OffscreenTarget& target : it->second.images) ring.push_back(&target);
+    destroyTargets(ring);
     m_targets.erase(it);
 }
 
 void OffscreenTargetManager::destroyTarget(OffscreenTarget& target) {
-    m_device.assertGpuThread("OffscreenTargetManager::destroyTarget");
+    std::vector<OffscreenTarget*> one{&target};
+    destroyTargets(one);
+}
 
-    // The image/view/framebuffer may still be referenced by in-flight GPU work
-    // (e.g. a monitor resized while its previous frame is still executing). Destroying
-    // them under the GPU is a use-after-free, so wait for the device to go idle first.
-    // All destruction paths (destroy(), the create() replace path, the destructor, and
-    // create()'s own error cleanup) funnel through here, so this is the one guard point.
-    // Ignore the result: this runs in teardown paths (including a destructor) where
-    // throwing is not an option, and a lost device is being torn down anyway.
+// The images may still be referenced by in-flight GPU work, so the device has to go idle
+// before any of them is freed. One wait for the whole batch: per target, dropping a ring cost
+// a full device stall per slot, which any client able to trigger a rebuild could repeat.
+//
+// Every destruction path funnels through here -- destroy(), create()'s replace and error
+// paths, and the destructor. The wait's result is ignored: this runs from a destructor where
+// throwing is not an option, and a lost device is being torn down anyway.
+void OffscreenTargetManager::destroyTargets(const std::vector<OffscreenTarget*>& images) {
+    m_device.assertGpuThread("OffscreenTargetManager::destroyTargets");
+    if (images.empty()) return;
+
     vkDeviceWaitIdle(m_device.device());
+    for (OffscreenTarget* image : images) dropTarget(*image);
+}
 
+void OffscreenTargetManager::dropTarget(OffscreenTarget& target) {
     if (auto* heap = dynamic_cast<DescriptorHeapAllocator*>(&m_device.descriptorAllocator())) {
         heap->unregisterImageView(target.view);
     }

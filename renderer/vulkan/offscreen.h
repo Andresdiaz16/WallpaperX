@@ -121,6 +121,10 @@ public:
 private:
     void createRenderPass();
     void destroyTarget(OffscreenTarget& target);
+    // One device-idle wait for the whole batch, then each is freed.
+    void destroyTargets(const std::vector<OffscreenTarget*>& images);
+    // Frees one, assuming the caller has already waited. Never call directly.
+    void dropTarget(OffscreenTarget& target);
     OffscreenTarget makeTarget(uint32_t width, uint32_t height);
 
     // One monitor's images and which of them is current. A vector sized once at create() and
