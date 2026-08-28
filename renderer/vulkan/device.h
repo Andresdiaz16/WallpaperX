@@ -9,6 +9,7 @@
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <vector>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -49,6 +50,12 @@ struct DeviceInfo {
     // modifier extension it can still export and render -- the frame just carries no
     // layout metadata. Conflating them turns the second case into a hard failure.
     bool hasImageDrmFormatModifier = false;
+
+    // VK_KHR_external_semaphore_fd: lets a semaphore be exported as an fd and waited on by the
+    // importing process. Without it the only cross-process ordering available is a host fence,
+    // which is a happens-before through the host while the acquire it must order is on the
+    // device. Optional: nothing needs it until a consumer waits on the GPU side.
+    bool hasExternalSemaphoreFd = false;
 
     // VK_EXT_queue_family_foreign: lets the exported image's queue-family ownership
     // be released to a non-Vulkan consumer (a compositor). Without it the release
@@ -101,6 +108,25 @@ public:
 
     VkCommandPool commandPool() const { return m_commandPool; }
 
+    // What one submission waits on and what it signals. All empty is immediateSubmit's case:
+    // no ordering beyond this queue, and the caller blocked on the host fence.
+    //
+    // A signal semaphore is the only way to order work in another queue or another process
+    // against this submission. A host fence cannot stand in for it: the fence is a
+    // happens-before through the host, while the consumer's acquire happens on the device.
+    struct SubmitScope {
+        // Paired by index: wait[i] is waited on at waitStages[i], so the two must be the
+        // same length. Vulkan takes them as separate arrays and silently misreads a short one.
+        std::vector<VkSemaphore> wait;
+        std::vector<VkPipelineStageFlags> waitStages;
+        std::vector<VkSemaphore> signal;
+    };
+
+    // Records and submits `record`, then waits for it. Throws GpuFailure on any Vulkan
+    // failure, and std::invalid_argument if scope.wait and scope.waitStages differ in length.
+    void submit(const std::function<void(VkCommandBuffer)>& record, const SubmitScope& scope);
+
+    // submit() with no semaphores. Every caller that renders once per wallpaper wants this.
     void immediateSubmit(const std::function<void(VkCommandBuffer)>& record);
 
     // Aborts unless called from the thread that created this Device.

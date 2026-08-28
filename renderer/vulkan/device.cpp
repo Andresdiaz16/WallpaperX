@@ -338,6 +338,7 @@ void Device::selectPhysicalDevice() {
     // import for no frame at all.
     m_info.hasImageDrmFormatModifier = hasExtension(extensions, VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME);
     m_info.hasQueueFamilyForeign = hasExtension(extensions, VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME);
+    m_info.hasExternalSemaphoreFd = hasExtension(extensions, VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME);
 
     if (m_info.hasDescriptorHeap) {
         // The heap tier doesn't just need VK_EXT_descriptor_heap: createLogicalDevice()
@@ -394,6 +395,9 @@ void Device::createLogicalDevice() {
     }
     if (m_info.hasQueueFamilyForeign) {
         deviceExtensions.push_back(VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME);
+    }
+    if (m_info.hasExternalSemaphoreFd) {
+        deviceExtensions.push_back(VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME);
     }
     if (useHeap) {
         deviceExtensions.push_back(VK_EXT_DESCRIPTOR_HEAP_EXTENSION_NAME);
@@ -495,7 +499,20 @@ void Device::assertGpuThread(const char* what) const {
 }
 
 void Device::immediateSubmit(const std::function<void(VkCommandBuffer)>& record) {
+    // Asserted here too, though submit() asserts as well: the abort has to name the entry
+    // point the caller used, not the one it happens to delegate to.
     assertGpuThread("Device::immediateSubmit");
+    submit(record, {});
+}
+
+void Device::submit(const std::function<void(VkCommandBuffer)>& record, const SubmitScope& scope) {
+    assertGpuThread("Device::submit");
+
+    // Checked, not assumed: Vulkan reads pWaitDstStageMask as waitSemaphoreCount entries, so a
+    // short stage list is an out-of-bounds read the validation layers do not always catch.
+    if (scope.wait.size() != scope.waitStages.size()) {
+        throw std::invalid_argument("Device::submit: one wait stage is required per wait semaphore");
+    }
 
     VkCommandBufferAllocateInfo allocInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
     allocInfo.commandPool = m_commandPool;
@@ -504,7 +521,7 @@ void Device::immediateSubmit(const std::function<void(VkCommandBuffer)>& record)
 
     VkCommandBuffer cmd = VK_NULL_HANDLE;
     if (vkAllocateCommandBuffers(m_device, &allocInfo, &cmd) != VK_SUCCESS) {
-        throw GpuFailure("Device::immediateSubmit: failed to allocate command buffer");
+        throw GpuFailure("Device::submit: failed to allocate command buffer");
     }
 
     VkFence fence = VK_NULL_HANDLE;
@@ -528,26 +545,31 @@ void Device::immediateSubmit(const std::function<void(VkCommandBuffer)>& record)
     VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     if (vkBeginCommandBuffer(cmd, &beginInfo) != VK_SUCCESS) {
-        throw GpuFailure("Device::immediateSubmit: vkBeginCommandBuffer failed");
+        throw GpuFailure("Device::submit: vkBeginCommandBuffer failed");
     }
 
     record(cmd);
 
     if (vkEndCommandBuffer(cmd) != VK_SUCCESS) {
-        throw GpuFailure("Device::immediateSubmit: vkEndCommandBuffer failed");
+        throw GpuFailure("Device::submit: vkEndCommandBuffer failed");
     }
 
     VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     if (vkCreateFence(m_device, &fenceInfo, nullptr, &fence) != VK_SUCCESS) {
-        throw GpuFailure("Device::immediateSubmit: failed to create fence");
+        throw GpuFailure("Device::submit: failed to create fence");
     }
 
     VkSubmitInfo submitInfo{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     submitInfo.commandBufferCount = 1;
     submitInfo.pCommandBuffers = &cmd;
+    submitInfo.waitSemaphoreCount = static_cast<uint32_t>(scope.wait.size());
+    submitInfo.pWaitSemaphores = scope.wait.empty() ? nullptr : scope.wait.data();
+    submitInfo.pWaitDstStageMask = scope.waitStages.empty() ? nullptr : scope.waitStages.data();
+    submitInfo.signalSemaphoreCount = static_cast<uint32_t>(scope.signal.size());
+    submitInfo.pSignalSemaphores = scope.signal.empty() ? nullptr : scope.signal.data();
 
     if (vkQueueSubmit(m_graphicsQueue, 1, &submitInfo, fence) != VK_SUCCESS) {
-        throw GpuFailure("Device::immediateSubmit: vkQueueSubmit failed");
+        throw GpuFailure("Device::submit: vkQueueSubmit failed");
     }
 
     if (vkWaitForFences(m_device, 1, &fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) {
@@ -555,7 +577,7 @@ void Device::immediateSubmit(const std::function<void(VkCommandBuffer)>& record)
         // flight: reclaiming them here or in the caller is undefined until the device is
         // idle. On a lost device this returns at once rather than waiting.
         vkDeviceWaitIdle(m_device);
-        throw GpuFailure("Device::immediateSubmit: vkWaitForFences failed");
+        throw GpuFailure("Device::submit: vkWaitForFences failed");
     }
 }
 
