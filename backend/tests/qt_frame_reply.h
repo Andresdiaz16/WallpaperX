@@ -2,7 +2,7 @@
 
 #pragma once
 
-// The ten fields GetFrameFd answers with, marshalled in one place for the Qt-side stub daemons.
+// The twelve fields GetFrameFd answers with, marshalled in one place for the Qt-side stubs.
 //
 // Three tests stand a stub in front of WallpaperXItem -- one serving a frame the importer must
 // refuse, two serving frames it must accept -- and the point of all three is that the item reads

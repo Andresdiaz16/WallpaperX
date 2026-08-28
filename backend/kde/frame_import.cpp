@@ -364,8 +364,9 @@ std::vector<uint64_t> FrameImport::importableModifiers(uint32_t drmFormat, std::
         EGL_TRUE) {
         return refuse("eglQueryDmaBufModifiersEXT refused to list the modifiers");
     }
-    // The second call may report fewer than the first; anything past it is uninitialised.
-    raw.resize(static_cast<size_t>(count < 0 ? 0 : count));
+    // Only shrinks: growing would add zeros, and zero is LINEAR -- a layout never listed.
+    const size_t written = count < 0 ? 0 : static_cast<size_t>(count);
+    raw.resize(std::min(written, raw.size()));
     externalOnly.resize(raw.size());
 
     std::vector<uint64_t> usable;

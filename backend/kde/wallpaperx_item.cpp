@@ -23,6 +23,9 @@ namespace wallpaperx {
 
 namespace {
 
+// The EGL driver's answer, not an item's. Cleared on a daemon restart.
+std::atomic<bool> g_modifiersReported{false};
+
 constexpr const char* kService = "io.wallpaperx.Daemon";
 constexpr const char* kPath = "/io/wallpaperx/Daemon";
 constexpr const char* kInterface = "io.wallpaperx.Daemon";
@@ -173,6 +176,7 @@ void WallpaperXItem::connectToDaemon() {
                 // Gated: an unconditional retry would add a duplicate match rule per restart,
                 // which is one of the things that makes the subscription fail in the first place.
                 if (!m_subscribed) m_subscribed = subscribeToFrameReady();
+                g_modifiersReported.store(false);
                 // A restarted daemon numbers from scratch, so every mark is meaningless now.
                 forgetGenerations();
                 fetchFrame(0);
@@ -251,14 +255,13 @@ void WallpaperXItem::fetchFrame(quint64 generation) {
 // hold one WallpaperXItem per screen and they all import through the same driver -- so it is
 // queried and sent once, and every later caller returns immediately.
 void WallpaperXItem::reportImportModifiersOnce(quint32 drmFormat) {
-    static std::atomic<bool> reported{false};
-    if (reported.exchange(true)) return;
+    if (g_modifiersReported.exchange(true)) return;
 
     std::string whyNot;
     const std::vector<uint64_t> modifiers = FrameImport::importableModifiers(drmFormat, &whyNot);
     if (modifiers.empty()) {
-        // Not an error and not retried: a driver with no such query has none to report, and the
-        // daemon's unnegotiated default is what it already uses.
+        // Stays latched: a driver with no such query will not grow one, and the daemon's
+        // unnegotiated default is what it already uses.
         std::fprintf(stderr, "wallpaperx: not reporting import modifiers -- %s\n", whyNot.c_str());
         return;
     }
@@ -269,7 +272,10 @@ void WallpaperXItem::reportImportModifiersOnce(quint32 drmFormat) {
         this,
         [drmFormat, modifiers] {
             QDBusConnection bus = QDBusConnection::sessionBus();
-            if (!bus.isConnected()) return;
+            if (!bus.isConnected()) {
+                g_modifiersReported.store(false);  // retry on the next frame
+                return;
+            }
             QDBusMessage request = QDBusMessage::createMethodCall(
                 QString::fromUtf8(kService), QString::fromUtf8(kPath), QString::fromUtf8(kInterface),
                 QStringLiteral("SetImportModifiers"));
@@ -304,7 +310,7 @@ void WallpaperXItem::takeFrameReply(const QDBusMessage& call) {
     }
 
     const QList<QVariant> args = call.arguments();
-    // Eleven fields, in the order GetFrameFd declares them. Checked rather than assumed: a daemon
+    // Twelve fields, in the order GetFrameFd declares them. Checked rather than assumed: a daemon
     // from a newer build could answer with more, and reading past the end of a short reply is
     // the kind of crash that takes plasmashell with it.
     if (!replyIsReadable(static_cast<int>(args.size()))) {

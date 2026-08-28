@@ -396,7 +396,10 @@ void WallpaperManager::applyImportModifiersLocked() {
         if (!m_importModifiersPending) return;
         modifiers = m_importModifiers;
         m_importModifiersPending = false;
-        for (const auto& [id, state] : m_monitors) monitorIds.push_back(id);
+        for (auto& [id, state] : m_monitors) {
+            state.hasFrame = false;
+            monitorIds.push_back(id);
+        }
     }
     m_device->memory().setConsumerModifiers(std::move(modifiers));
 

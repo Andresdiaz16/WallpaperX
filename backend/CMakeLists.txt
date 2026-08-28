@@ -640,11 +640,8 @@ if(DBUS_RUN_SESSION)
         set_tests_properties(dbus_service_lavapipe PROPERTIES RESOURCE_LOCK wallpaperx_bus_tests)
     endif()
 
-    # Two states this binary can reach are genuinely inconclusive rather than passing: a
-    # process that can read a mode-000 file (root) learns nothing from the unreadable-file
-    # check, and a device exporting OPAQUE_FD carries no bytes the content check can compare.
-    # Both are reported through exit 77, which without this property reads to ctest as a
-    # failure -- so the property has to exist before the calls that produce it.
+    # Set ahead of the calls that will produce it. Nothing in this binary returns 77 yet: its
+    # three inconclusive states still print and exit 0, so they still report as passes.
     set_tests_properties(dbus_service dbus_service_classic PROPERTIES SKIP_RETURN_CODE 77)
     if(WALLPAPERX_LAVAPIPE_ICD)
         set_tests_properties(dbus_service_lavapipe dbus_service_classic_lavapipe

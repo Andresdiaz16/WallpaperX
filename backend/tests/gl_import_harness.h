@@ -217,7 +217,7 @@ inline std::vector<unsigned char> readSampled(GLuint texture, uint32_t width, ui
     // made -- the descriptor and object accounting a caller measures is taken against it.
     //
     // It restores NOTHING. Bindings are zeroed rather than put back; the sampled texture keeps the
-    // filter and wrap this set; and blend, scissor and depth test are left disabled with the
+    // wrap this set; and blend, scissor and depth test are left disabled with the
     // viewport left at the sampled size. A caller with state worth keeping must save it itself.
     const auto tidy = [&] {
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
@@ -265,10 +265,9 @@ inline std::vector<unsigned char> readSampled(GLuint texture, uint32_t width, ui
         return pixels;
     }
 
-    // Deliberately sets NO filter. An imported texture has one level, and the default
-    // minification filter wants a mipmap chain, so an importer that leaves the level bound
-    // unset delivers an incomplete texture that samples black. Setting one here would hide
-    // exactly that -- it is the importer's job, and this is where it gets graded.
+    // Sets no filter on purpose: a one-level texture under the default mipmap filter is
+    // incomplete and samples black, and fixing that is the importer's job. Grades its
+    // MIN_FILTER, not its MAX_LEVEL -- removing MAX_LEVEL alone reddens nothing.
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, texture);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
