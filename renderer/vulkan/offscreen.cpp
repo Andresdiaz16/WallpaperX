@@ -20,7 +20,7 @@ OffscreenTargetManager::OffscreenTargetManager(Device& device) : m_device(device
 
 OffscreenTargetManager::~OffscreenTargetManager() {
     for (auto& [id, ring] : m_targets) {
-        for (OffscreenTarget& target : ring.slots) destroyTarget(target);
+        for (OffscreenTarget& target : ring.images) destroyTarget(target);
     }
     if (m_renderPass) vkDestroyRenderPass(m_device.device(), m_renderPass, nullptr);
 }
@@ -141,22 +141,22 @@ const OffscreenTarget& OffscreenTargetManager::create(int monitorId, uint32_t wi
     // monitor with no image at all if the second allocation failed, where this leaves the one
     // it already had.
     Ring ring;
-    ring.slots.reserve(depth);
+    ring.images.reserve(depth);
     try {
         for (uint32_t slot = 0; slot < depth; ++slot) {
-            ring.slots.push_back(makeTarget(width, height));
+            ring.images.push_back(makeTarget(width, height));
         }
     } catch (...) {
-        for (OffscreenTarget& built : ring.slots) destroyTarget(built);
+        for (OffscreenTarget& built : ring.images) destroyTarget(built);
         throw;
     }
 
     if (auto existing = m_targets.find(monitorId); existing != m_targets.end()) {
-        for (OffscreenTarget& old : existing->second.slots) destroyTarget(old);
+        for (OffscreenTarget& old : existing->second.images) destroyTarget(old);
     }
 
     auto [it, inserted] = m_targets.insert_or_assign(monitorId, std::move(ring));
-    return it->second.slots[it->second.current];
+    return it->second.images[it->second.current];
 }
 
 OffscreenTarget OffscreenTargetManager::makeTarget(uint32_t width, uint32_t height) {
@@ -215,7 +215,7 @@ OffscreenTarget OffscreenTargetManager::makeTarget(uint32_t width, uint32_t heig
 void OffscreenTargetManager::destroy(int monitorId) {
     auto it = m_targets.find(monitorId);
     if (it == m_targets.end()) return;
-    for (OffscreenTarget& target : it->second.slots) destroyTarget(target);
+    for (OffscreenTarget& target : it->second.images) destroyTarget(target);
     m_targets.erase(it);
 }
 
@@ -245,17 +245,17 @@ bool OffscreenTargetManager::has(int monitorId) const {
 
 const OffscreenTarget& OffscreenTargetManager::get(int monitorId) const {
     const Ring& ring = m_targets.at(monitorId);
-    return ring.slots[ring.current];
+    return ring.images[ring.current];
 }
 
 const OffscreenTarget& OffscreenTargetManager::advance(int monitorId) {
     Ring& ring = m_targets.at(monitorId);
-    ring.current = (ring.current + 1) % ring.slots.size();
-    return ring.slots[ring.current];
+    ring.current = (ring.current + 1) % ring.images.size();
+    return ring.images[ring.current];
 }
 
 uint32_t OffscreenTargetManager::depth(int monitorId) const {
-    return static_cast<uint32_t>(m_targets.at(monitorId).slots.size());
+    return static_cast<uint32_t>(m_targets.at(monitorId).images.size());
 }
 
 }

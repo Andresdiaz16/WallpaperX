@@ -125,8 +125,11 @@ private:
 
     // One monitor's images and which of them is current. A vector sized once at create() and
     // never grown, so the references get() hands out stay valid.
+    //
+    // NOT named `slots`: Qt defines that as an empty macro, and this header is included from
+    // the plugin's Qt translation units, where the member would silently disappear.
     struct Ring {
-        std::vector<OffscreenTarget> slots;
+        std::vector<OffscreenTarget> images;
         size_t current = 0;
     };
 

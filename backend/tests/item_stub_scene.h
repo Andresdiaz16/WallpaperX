@@ -108,10 +108,14 @@ public:
 
         m_handleType = frame.type == wallpaperx::ExportedFrame::HandleType::DmaBuf ? 1 : 0;
         ++m_served;
-        return connection.send(message.createReply(frameReplyFields(handle, frame.width, frame.height,
-                                                                    frame.memorySize, m_handleType,
-                                                                    /*generation=*/1, frame.drmFormat, frame.modifier,
-                                                                    planes)));
+        // Both taken from the export rather than invented: the importer refuses a frame whose
+        // device is not the one this context runs on, and these tests import for real.
+        return connection.send(message.createReply(
+            frameReplyFields(handle, frame.width, frame.height, frame.memorySize, m_handleType,
+                             /*generation=*/1, frame.drmFormat, frame.modifier, planes,
+                             QByteArray(reinterpret_cast<const char*>(frame.deviceUuid.data()),
+                                        static_cast<qsizetype>(frame.deviceUuid.size())),
+                             frame.bufferId)));
     }
 
     int requests() const { return m_requests; }
