@@ -27,6 +27,21 @@ const char* toString(DescriptorTier tier) {
 
 namespace {
 
+// Preference order among devices that already passed the capability checks. A rank, not a
+// "discrete beats everything else" test: that form never displaced whatever enumerated first,
+// so a software rasteriser ahead of an integrated GPU in the list kept the wallpaper on the CPU.
+int deviceRank(VkPhysicalDeviceType type) {
+    switch (type) {
+        case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU: return 4;
+        case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU: return 3;
+        case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU: return 2;
+        // Last, never excluded: it is the only device in continuous integration, where the
+        // software rasteriser is the whole point.
+        case VK_PHYSICAL_DEVICE_TYPE_CPU: return 1;
+        default: return 0;
+    }
+}
+
 bool hasExtension(const std::vector<VkExtensionProperties>& extensions, const char* name) {
     for (const auto& ext : extensions) {
         if (std::strcmp(ext.extensionName, name) == 0) return true;
@@ -284,9 +299,7 @@ void Device::selectPhysicalDevice() {
         VkPhysicalDeviceProperties props{};
         vkGetPhysicalDeviceProperties(candidate, &props);
 
-        const bool isBetter = best == VK_NULL_HANDLE ||
-            (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU &&
-             bestProps.deviceType != VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU);
+        const bool isBetter = best == VK_NULL_HANDLE || deviceRank(props.deviceType) > deviceRank(bestProps.deviceType);
 
         if (isBetter) {
             best = candidate;

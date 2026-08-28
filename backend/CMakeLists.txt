@@ -640,6 +640,17 @@ if(DBUS_RUN_SESSION)
         set_tests_properties(dbus_service_lavapipe PROPERTIES RESOURCE_LOCK wallpaperx_bus_tests)
     endif()
 
+    # Two states this binary can reach are genuinely inconclusive rather than passing: a
+    # process that can read a mode-000 file (root) learns nothing from the unreadable-file
+    # check, and a device exporting OPAQUE_FD carries no bytes the content check can compare.
+    # Both are reported through exit 77, which without this property reads to ctest as a
+    # failure -- so the property has to exist before the calls that produce it.
+    set_tests_properties(dbus_service dbus_service_classic PROPERTIES SKIP_RETURN_CODE 77)
+    if(WALLPAPERX_LAVAPIPE_ICD)
+        set_tests_properties(dbus_service_lavapipe dbus_service_classic_lavapipe
+                             PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
+
     # Step 7's HTTP config server. Needs a session bus for the same reason the entries
     # above do -- it compares /config against GetStatus, and GetStatus is only reachable
     # over the wire.
