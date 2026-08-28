@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <unordered_map>
+#include <vector>
 
 namespace wallpaperx {
 
@@ -83,10 +84,22 @@ public:
     OffscreenTargetManager(const OffscreenTargetManager&) = delete;
     OffscreenTargetManager& operator=(const OffscreenTargetManager&) = delete;
 
-    const OffscreenTarget& create(int monitorId, uint32_t width, uint32_t height);
+    // `depth` images for this monitor, rotated by advance(). One is right for a wallpaper
+    // drawn once; a moving one needs enough that the producer can draw while the consumer
+    // still holds the frame it is showing. Replaces any existing entry, waiting for idle.
+    const OffscreenTarget& create(int monitorId, uint32_t width, uint32_t height, uint32_t depth = 1);
     void destroy(int monitorId);
     bool has(int monitorId) const;
+
+    // The slot currently being drawn into. Stable until destroy(): the slots are allocated
+    // once at create() and never grow, so a reference outlives any number of advance() calls.
     const OffscreenTarget& get(int monitorId) const;
+
+    // Rotates to the next slot and returns it. With depth 1 this returns the same target,
+    // which is what makes the draw-once path indifferent to being called or not.
+    const OffscreenTarget& advance(int monitorId);
+
+    uint32_t depth(int monitorId) const;
 
     // Renders `renderer` into `target` and submits it.
     //
@@ -102,10 +115,18 @@ public:
 private:
     void createRenderPass();
     void destroyTarget(OffscreenTarget& target);
+    OffscreenTarget makeTarget(uint32_t width, uint32_t height);
+
+    // One monitor's images and which of them is current. A vector sized once at create() and
+    // never grown, so the references get() hands out stay valid.
+    struct Ring {
+        std::vector<OffscreenTarget> slots;
+        size_t current = 0;
+    };
 
     Device& m_device;
     VkRenderPass m_renderPass = VK_NULL_HANDLE;
-    std::unordered_map<int, OffscreenTarget> m_targets;
+    std::unordered_map<int, Ring> m_targets;
 };
 
 }

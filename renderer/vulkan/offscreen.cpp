@@ -19,8 +19,8 @@ OffscreenTargetManager::OffscreenTargetManager(Device& device) : m_device(device
 }
 
 OffscreenTargetManager::~OffscreenTargetManager() {
-    for (auto& [id, target] : m_targets) {
-        destroyTarget(target);
+    for (auto& [id, ring] : m_targets) {
+        for (OffscreenTarget& target : ring.slots) destroyTarget(target);
     }
     if (m_renderPass) vkDestroyRenderPass(m_device.device(), m_renderPass, nullptr);
 }
@@ -130,9 +130,36 @@ void OffscreenTargetManager::render(IRenderer& renderer, const OffscreenTarget& 
     target.notifyLayout(resultingLayout);
 }
 
-const OffscreenTarget& OffscreenTargetManager::create(int monitorId, uint32_t width, uint32_t height) {
+const OffscreenTarget& OffscreenTargetManager::create(int monitorId, uint32_t width, uint32_t height,
+                                                      uint32_t depth) {
     m_device.assertGpuThread("OffscreenTargetManager::create");
+    if (depth == 0) {
+        throw std::runtime_error("OffscreenTargetManager: a monitor needs at least one target");
+    }
 
+    // Every slot is built before anything existing is destroyed. Replacing first would leave a
+    // monitor with no image at all if the second allocation failed, where this leaves the one
+    // it already had.
+    Ring ring;
+    ring.slots.reserve(depth);
+    try {
+        for (uint32_t slot = 0; slot < depth; ++slot) {
+            ring.slots.push_back(makeTarget(width, height));
+        }
+    } catch (...) {
+        for (OffscreenTarget& built : ring.slots) destroyTarget(built);
+        throw;
+    }
+
+    if (auto existing = m_targets.find(monitorId); existing != m_targets.end()) {
+        for (OffscreenTarget& old : existing->second.slots) destroyTarget(old);
+    }
+
+    auto [it, inserted] = m_targets.insert_or_assign(monitorId, std::move(ring));
+    return it->second.slots[it->second.current];
+}
+
+OffscreenTarget OffscreenTargetManager::makeTarget(uint32_t width, uint32_t height) {
     VkImageCreateInfo imageInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     imageInfo.imageType = VK_IMAGE_TYPE_2D;
     imageInfo.format = kFormat;
@@ -181,18 +208,13 @@ const OffscreenTarget& OffscreenTargetManager::create(int monitorId, uint32_t wi
         throw std::runtime_error("OffscreenTargetManager: failed to create framebuffer");
     }
 
-    if (auto existing = m_targets.find(monitorId); existing != m_targets.end()) {
-        destroyTarget(existing->second);
-    }
-
-    auto [it, inserted] = m_targets.insert_or_assign(monitorId, std::move(target));
-    return it->second;
+    return target;
 }
 
 void OffscreenTargetManager::destroy(int monitorId) {
     auto it = m_targets.find(monitorId);
     if (it == m_targets.end()) return;
-    destroyTarget(it->second);
+    for (OffscreenTarget& target : it->second.slots) destroyTarget(target);
     m_targets.erase(it);
 }
 
@@ -221,7 +243,18 @@ bool OffscreenTargetManager::has(int monitorId) const {
 }
 
 const OffscreenTarget& OffscreenTargetManager::get(int monitorId) const {
-    return m_targets.at(monitorId);
+    const Ring& ring = m_targets.at(monitorId);
+    return ring.slots[ring.current];
+}
+
+const OffscreenTarget& OffscreenTargetManager::advance(int monitorId) {
+    Ring& ring = m_targets.at(monitorId);
+    ring.current = (ring.current + 1) % ring.slots.size();
+    return ring.slots[ring.current];
+}
+
+uint32_t OffscreenTargetManager::depth(int monitorId) const {
+    return static_cast<uint32_t>(m_targets.at(monitorId).slots.size());
 }
 
 }
