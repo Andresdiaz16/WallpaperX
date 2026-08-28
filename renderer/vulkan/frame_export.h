@@ -46,6 +46,11 @@ struct ExportedFrame {
     // one, where importing on any other device cannot work.
     std::array<uint8_t, VK_UUID_SIZE> deviceUuid{};
 
+    // Which image these bytes are, distinct from `generation`, which counts renders. A
+    // consumer holding several buffers keys its imports on this: the same id is the same
+    // memory and needs no second import, a new id is a buffer it has never seen.
+    uint64_t bufferId = 0;
+
     // DMA-BUF layout metadata (AMD/Intel), describing how to interpret the bytes
     // behind `fd`. Populated on the DmaBuf path only; the OpaqueFd (NVIDIA) path
     // leaves them at their unset sentinels because an opaque fd is importable only

@@ -44,6 +44,9 @@ public:
         // The GPU the daemon allocated on. OPAQUE_FD only: that memory is importable on no
         // other device, so a mismatch is refused here rather than left to the driver.
         std::vector<uint8_t> deviceUuid;
+        // Which image this is, so a caller holding several can import each once. Not used by
+        // import() itself -- it describes the buffer, not how to map it.
+        uint64_t bufferId = 0;
     };
 
     struct Result {

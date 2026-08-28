@@ -64,7 +64,8 @@ private:
     // keeps it fixed -- no DBus handler touches the GPU -- is enforced by assertGpuThread().
     using FrameFdCall =
         sdbus::Result<sdbus::UnixFd, uint32_t, uint32_t, uint64_t, int32_t, std::vector<sdbus::UnixFd>, uint64_t,
-                      uint32_t, uint64_t, std::vector<sdbus::Struct<uint64_t, uint64_t>>, std::vector<uint8_t>>;
+                      uint32_t, uint64_t, std::vector<sdbus::Struct<uint64_t, uint64_t>>, std::vector<uint8_t>,
+                      uint64_t>;
     void completeGetFrameFd(FrameFdCall call, int32_t monitorId);
 
     // Records what the consumer can import and re-posts the monitors whose images were built

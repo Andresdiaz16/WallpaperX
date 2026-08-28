@@ -563,7 +563,8 @@ void runHostChecks(sdbus::IProxy& proxy, const std::string& imagePath, const Che
                  {"out", "u:drm_format"},
                  {"out", "t:drm_modifier"},
                  {"out", "a(tt):planes"},
-                 {"out", "ay:device_uuid"}}},
+                 {"out", "ay:device_uuid"},
+                 {"out", "t:buffer_id"}}},
         // CONTROL: the second name in `.withInputParamNames("monitor_id", "output_name")` in
         //       DbusService::registerVTable (backend/daemon/dbus_service.cpp) changed to
         //       "output" -> "FAIL: wire signature of method SetMonitorOutput is unchanged",

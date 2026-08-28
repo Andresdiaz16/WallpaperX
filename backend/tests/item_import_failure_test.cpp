@@ -116,7 +116,7 @@ public:
                              /*generation=*/1, kUnimportableFourcc, /*drmModifier=*/0, planes,
                              // Not this device, and it does not have to be: the fourcc this
                              // phase grades is refused before the importer looks at the GPU.
-                             QByteArray(16, '\0'))));
+                             QByteArray(16, '\0'), /*bufferId=*/1)));
     }
 
     int requests() const { return m_requests; }

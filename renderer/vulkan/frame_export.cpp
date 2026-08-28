@@ -220,6 +220,7 @@ ExportedFrame exportFrame(Device& device, const OffscreenTarget& target) {
     // like.
     frame.drmFormat = drmFormat;
     frame.deviceUuid = device.info().deviceUuid;
+    frame.bufferId = target.bufferId;
     frame.type = (handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT) ? ExportedFrame::HandleType::OpaqueFd
                                                                                : ExportedFrame::HandleType::DmaBuf;
 

@@ -173,6 +173,7 @@ OffscreenTarget OffscreenTargetManager::makeTarget(uint32_t width, uint32_t heig
     imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
     OffscreenTarget target;
+    target.bufferId = m_nextBufferId++;
     target.width = width;
     target.height = height;
     target.image = m_device.memory().createExportableImage(

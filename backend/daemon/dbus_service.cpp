@@ -87,7 +87,8 @@ void DbusService::registerVTable() {
                 })
                 .withInputParamNames("monitor_id")
                 .withOutputParamNames("fd", "width", "height", "memory_size", "handle_type", "sync_fds",
-                                      "frame_generation", "drm_format", "drm_modifier", "planes", "device_uuid"),
+                                      "frame_generation", "drm_format", "drm_modifier", "planes", "device_uuid",
+                                      "buffer_id"),
             sdbus::registerMethod("SetImportModifiers")
                 .implementedAs([this](uint32_t drmFormat, const std::vector<uint64_t>& modifiers) {
                     setImportModifiers(drmFormat, modifiers);
@@ -272,7 +273,10 @@ void DbusService::completeGetFrameFd(FrameFdCall call, int32_t monitorId) {
                        exported.handle->generation, frame.drmFormat, frame.modifier, planes,
                        // Which GPU allocated the memory. An opaque fd is importable only on that
                        // device, and without this the plugin can only report the driver's refusal.
-                       std::vector<uint8_t>(frame.deviceUuid.begin(), frame.deviceUuid.end()));
+                       std::vector<uint8_t>(frame.deviceUuid.begin(), frame.deviceUuid.end()),
+                       // Which image, as against frame_generation's which render. A consumer
+                       // keeping several buffers imports each id once.
+                       frame.bufferId);
 }
 
 std::string DbusService::getStatus() {

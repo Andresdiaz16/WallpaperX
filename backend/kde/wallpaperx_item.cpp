@@ -361,6 +361,11 @@ void WallpaperXItem::takeFrameReply(const QDBusMessage& call) {
     const QByteArray uuid = args.at(10).toByteArray();
     frame.request.deviceUuid.assign(uuid.begin(), uuid.end());
 
+    // Field 11, buffer_id: which image, where frame_generation says which render. Carried so
+    // the import can be keyed on it once Stage F keeps imported buffers instead of redoing one
+    // per frame; nothing reads it yet.
+    frame.request.bufferId = args.at(11).toULongLong();
+
     if (frame.request.fd < 0) {
         setFetchReason(tr("WallpaperX sent a frame this plugin could not take hold of."));
         return;

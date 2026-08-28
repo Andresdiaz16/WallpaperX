@@ -58,7 +58,7 @@ inline void registerFrameReplyTypes() {
 
 // GetFrameFd's out arguments, in the order the daemon declares them:
 // fd, width, height, memory_size, handle_type, sync_fds, frame_generation, drm_format,
-// drm_modifier, planes, device_uuid.
+// drm_modifier, planes, device_uuid, buffer_id.
 //
 // deviceUuid has no default: the item refuses a reply with the wrong field count before reading
 // any of it, so a helper that could omit it would turn every caller's chosen refusal into that
@@ -70,7 +70,7 @@ inline void registerFrameReplyTypes() {
 inline QList<QVariant> frameReplyFields(const QDBusUnixFileDescriptor& handle, quint32 width, quint32 height,
                                         quint64 memorySize, int handleType, quint64 generation, quint32 drmFormat,
                                         quint64 drmModifier, const QList<FramePlane>& planes,
-                                        const QByteArray& deviceUuid,
+                                        const QByteArray& deviceUuid, quint64 bufferId,
                                         const QList<QDBusUnixFileDescriptor>& syncFds = {}) {
     return {QVariant::fromValue(handle),
             QVariant::fromValue(width),
@@ -82,7 +82,8 @@ inline QList<QVariant> frameReplyFields(const QDBusUnixFileDescriptor& handle, q
             QVariant::fromValue(drmFormat),
             QVariant::fromValue(drmModifier),
             QVariant::fromValue(planes),
-            QVariant::fromValue(deviceUuid)};
+            QVariant::fromValue(deviceUuid),
+            QVariant::fromValue(bufferId)};
 }
 
 }  // namespace wallpaperx::testing
