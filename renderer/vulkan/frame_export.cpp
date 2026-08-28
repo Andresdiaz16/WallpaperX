@@ -6,7 +6,9 @@
 #include "memory_export.h"
 #include "offscreen.h"
 
+#include <algorithm>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -76,6 +78,21 @@ void populateDmaBufLayout(Device& device, const OffscreenTarget& target, Exporte
     }
     if (planeCount == 0) {
         throw std::runtime_error("exportFrame: driver reported a DRM format modifier it does not list as supported");
+    }
+
+    // The driver picks from the list it was offered; nothing until here checks what it picked.
+    // A pick outside the consumer's reported set exports cleanly and fails every import, with
+    // has_frame true and no error to explain it.
+    const std::vector<uint64_t>& agreed = device.memory().consumerModifiers();
+    if (!agreed.empty() &&
+        std::find(agreed.begin(), agreed.end(), modifierProps.drmFormatModifier) == agreed.end()) {
+        throw std::runtime_error("exportFrame: the driver chose DRM format modifier " +
+                                 std::to_string(modifierProps.drmFormatModifier) +
+                                 ", which the frame consumer did not report as importable");
+    }
+    if (planeCount > kMaxExportedPlanes) {
+        throw std::runtime_error("exportFrame: the driver chose a DRM format modifier spanning " +
+                                 std::to_string(planeCount) + " memory planes, more than the importer describes");
     }
 
     constexpr VkImageAspectFlagBits kMemoryPlaneAspects[] = {
