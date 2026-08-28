@@ -17,7 +17,10 @@
 
 #include <unistd.h>
 
+#include <algorithm>
+#include <mutex>
 #include <utility>
+#include <vector>
 
 namespace wallpaperx {
 
@@ -25,6 +28,14 @@ namespace {
 
 // The EGL driver's answer, not an item's. Cleared on a daemon restart.
 std::atomic<bool> g_modifiersReported{false};
+
+// The set last reported, kept so a modifier that turns out not to import can be withdrawn.
+// eglQueryDmaBufModifiersEXT is not the last word: NVIDIA advertises modifiers for this format
+// that eglCreateImage then refuses for a Vulkan-exported buffer.
+std::mutex g_reportedMutex;
+std::vector<uint64_t> g_reportedModifiers;
+
+void sendImportModifiers(QObject* context, quint32 drmFormat, const std::vector<uint64_t>& modifiers);
 
 constexpr const char* kService = "io.wallpaperx.Daemon";
 constexpr const char* kPath = "/io/wallpaperx/Daemon";
@@ -266,10 +277,38 @@ void WallpaperXItem::reportImportModifiersOnce(quint32 drmFormat) {
         return;
     }
 
-    // Sent from the GUI thread: this one owns no bus connection, and QDBusConnection is not
-    // safe to use from the scene graph's thread.
+    {
+        std::lock_guard<std::mutex> lock(g_reportedMutex);
+        g_reportedModifiers = modifiers;
+    }
+    sendImportModifiers(this, drmFormat, modifiers);
+}
+
+// Withdraws a modifier the daemon may still choose, after an import of it actually failed.
+// Re-reporting the narrowed set is the whole mechanism: the daemon treats a changed set as a
+// re-render, so the next frame arrives in a layout this driver has demonstrated it can take.
+void WallpaperXItem::withdrawImportModifier(quint32 drmFormat, quint64 modifier) {
+    std::vector<uint64_t> narrowed;
+    {
+        std::lock_guard<std::mutex> lock(g_reportedMutex);
+        const auto it = std::find(g_reportedModifiers.begin(), g_reportedModifiers.end(), modifier);
+        if (it == g_reportedModifiers.end()) return;
+        // The daemon refuses an empty set, and rightly: "I can import nothing" is not a report.
+        // Leaving the last one stands a better chance than withdrawing it.
+        if (g_reportedModifiers.size() == 1) return;
+        g_reportedModifiers.erase(it);
+        narrowed = g_reportedModifiers;
+    }
+    sendImportModifiers(this, drmFormat, narrowed);
+}
+
+namespace {
+
+void sendImportModifiers(QObject* context, quint32 drmFormat, const std::vector<uint64_t>& modifiers) {
+    // Sent from the GUI thread: the render thread owns no bus connection, and QDBusConnection
+    // is not safe to use from it.
     QMetaObject::invokeMethod(
-        this,
+        context,
         [drmFormat, modifiers] {
             QDBusConnection bus = QDBusConnection::sessionBus();
             if (!bus.isConnected()) {
@@ -289,6 +328,8 @@ void WallpaperXItem::reportImportModifiersOnce(quint32 drmFormat) {
         },
         Qt::QueuedConnection);
 }
+
+}  // namespace
 
 void WallpaperXItem::takeFrameReply(const QDBusMessage& call) {
     if (call.type() != QDBusMessage::ReplyMessage) {
@@ -461,6 +502,11 @@ QSGNode* WallpaperXItem::updatePaintNode(QSGNode* old, UpdatePaintNodeData*) {
                       {});
         if (texture == nullptr) {
             if (imported.texture != 0) FrameImport::release(imported);
+            // A failed import outranks what EGL said it could take: this modifier demonstrably
+            // does not work here, so stop the daemon choosing it again.
+            if (incoming->request.handleType == FrameImport::HandleType::DmaBuf) {
+                withdrawImportModifier(incoming->request.drmFormat, incoming->request.drmModifier);
+            }
             setRenderReason(tr("WallpaperX produced a frame this desktop could not import."));
             // The node goes too: keeping one would leave the desktop showing a frame while the
             // item reports it is drawing nothing.

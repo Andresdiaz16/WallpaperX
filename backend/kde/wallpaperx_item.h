@@ -134,6 +134,9 @@ private:
     // Tells the daemon which dma_buf layouts this driver can import, so it stops choosing ones
     // this process cannot take. Render thread; sends from the GUI thread. Once per process.
     void reportImportModifiersOnce(quint32 drmFormat);
+    // Drops a modifier the daemon may choose but this driver could not actually import, and
+    // re-reports. Render thread; sends from the GUI thread.
+    void withdrawImportModifier(quint32 drmFormat, quint64 modifier);
     // The reason has two independent producers -- see the definitions for why neither writes the
     // published string directly.
     void setFetchReason(const QString& reason);   // GUI thread
