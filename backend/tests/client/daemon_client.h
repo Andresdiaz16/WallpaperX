@@ -290,6 +290,19 @@ inline void setMonitorOutput(sdbus::IProxy& proxy, int32_t monitorId, const std:
         .withArguments(monitorId, outputName);
 }
 
+// Reports what the frame consumer can import, as the plugin's render thread does.
+//
+// Here rather than in one test file for the same reason as setMonitorOutput above: the
+// argument order (format first, then the list) is a wire fact, and a private copy would go
+// on compiling and passing if it ever changed.
+inline void setImportModifiers(sdbus::IProxy& proxy, uint32_t drmFormat, const std::vector<uint64_t>& modifiers,
+                               std::chrono::microseconds timeout = {}) {
+    proxy.callMethod("SetImportModifiers")
+        .onInterface(DbusService::kInterface)
+        .withTimeout(timeout)
+        .withArguments(drmFormat, modifiers);
+}
+
 // `timeout` as on setWallpaper() above: zero means the bus's default.
 inline StatusReply getStatus(sdbus::IProxy& proxy, std::chrono::microseconds timeout = {}) {
     std::string status;

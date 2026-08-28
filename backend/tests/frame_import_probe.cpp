@@ -54,6 +54,13 @@ using wallpaperx::testing::variesInBothAxes;
 constexpr const char* kGoals = "S12.1, S12.2 (a frame the daemon exported reaches the screen as the pixels that "
                                "were rendered, imported by the path the driver actually supports)";
 
+// Reported separately from kGoals: the round trip above can be fully established on a host
+// where the modifier negotiation cannot be exercised at all, and collapsing the two would
+// mean either claiming this ran when it did not, or marking the import coverage unverified
+// when it demonstrably held.
+constexpr const char* kModifierGoal =
+    "S12.6 (every DRM format modifier this importer reports to the daemon is one it can actually import)";
+
 // Not square, and not a round number of pixels wide, for the reason frame_export_probe gives:
 // a square target passes with width and height transposed, and a power-of-two width hides a
 // stride that ignores padding.
@@ -543,6 +550,172 @@ bool runImportChecks() {
         if (!steady) {
             std::fprintf(stderr, "  %zu open fds before, %zu after one cycle, %zu after eight\n", beforeImport,
                          afterFirstCycle, atEnd);
+        }
+
+        // ------------------------------------------------------------------ //
+        // The modifier negotiation, closed end to end in one process.
+        //
+        // FrameImport::importableModifiers() is what the plugin sends over
+        // SetImportModifiers; Memory::setConsumerModifiers() is where the daemon puts it.
+        // Both halves are here, so the claim can be tested rather than reasoned about:
+        // every layout the consumer reports, and this GPU can produce, must actually
+        // import. An over-report is the failure that matters -- the daemon then exports a
+        // layout the compositor cannot read, the import fails, and GetStatus still reports
+        // has_frame with no error, so the wallpaper is blank with nothing naming a cause.
+        //
+        // Runs only on the dma_buf entry: modifiers describe a dma_buf and an opaque fd has
+        // none. Last in the function so the descriptor accounting above is not measured
+        // across it.
+        // ------------------------------------------------------------------ //
+        if (!isDmaBuf) return true;
+
+        std::string modifierWhyNot;
+        const std::vector<uint64_t> reportable =
+            wallpaperx::FrameImport::importableModifiers(frame.drmFormat, &modifierWhyNot);
+        if (reportable.empty()) {
+            notVerified(kModifierGoal, "this EGL implementation reports no importable modifier to negotiate with: " +
+                                           modifierWhyNot);
+            return true;
+        }
+
+        // GOAL: the negotiation as the product performs it works -- the exporter given the
+        //       importer's whole reported set produces a frame this importer can take.
+        //       False if the two agree on a layout the import then refuses, which is a
+        //       blank wallpaper with GetStatus still reporting has_frame and no error.
+        // WHY-THIS-SHAPE: the reported set is handed to Memory::setConsumerModifiers
+        //       exactly as SetImportModifiers does, and the driver is then left to pick
+        //       from the intersection, because that free pick is what ships. Asserting
+        //       instead that EVERY reported modifier imports is a stronger claim and a
+        //       false one: measured on this machine, NVIDIA's EGL advertises
+        //       0x300000000606015 as importable for XRGB8888 and then rejects a
+        //       Vulkan-exported dma_buf carrying it, with no defect in either half of this
+        //       code. That measurement is printed below rather than asserted, for the same
+        //       reason.
+        // CONTROL: `modifiers` narrowed to {0x300000000606015} after the intersection in
+        //       Memory::createExportableImage (renderer/vulkan/memory.cpp), forcing the
+        //       negotiated pick onto the one advertised modifier this EGL refuses -> "FAIL:
+        //       a frame exported under the importer's own reported modifier set imports
+        //       into this context", naming that modifier. NVIDIA only; Lavapipe has no such
+        //       modifier to force. Reverted. Dropping the
+        //       EGL_DMA_BUF_PLANE0_MODIFIER_LO/HI_EXT pair from importDmaBuf was tried
+        //       first and is NOT a control for this line -- it reds the plain import
+        //       hundreds of lines above, which returns before reaching here.
+        device.memory().setConsumerModifiers(reportable);
+        bool negotiatedRoundTrip = false;
+        std::string negotiatedError = "the exporter could not build an image from the reported set";
+        uint64_t negotiatedChoice = 0;
+        try {
+            const wallpaperx::OffscreenTarget& agreed = targets.create(/*monitorId=*/99, kWidth, kHeight);
+            targets.render(renderer, agreed);
+            wallpaperx::ExportedFrame agreedFrame = wallpaperx::exportFrame(device, agreed);
+            negotiatedChoice = agreedFrame.modifier;
+            wallpaperx::FrameImport::Request agreedRequest = request;
+            agreedRequest.fd = agreedFrame.fd;
+            agreedRequest.memorySize = agreedFrame.memorySize;
+            agreedRequest.drmFormat = agreedFrame.drmFormat;
+            agreedRequest.drmModifier = agreedFrame.modifier;
+            agreedRequest.planes.clear();
+            for (const auto& plane : agreedFrame.planes) agreedRequest.planes.emplace_back(plane.offset, plane.rowPitch);
+            const wallpaperx::FrameImport::Result agreedImport = wallpaperx::FrameImport::import(agreedRequest);
+            negotiatedRoundTrip = agreedImport.texture != 0;
+            if (negotiatedRoundTrip) {
+                wallpaperx::FrameImport::release(agreedImport);
+            } else {
+                negotiatedError = agreedImport.error;
+                if (agreedRequest.fd >= 0) ::close(agreedRequest.fd);
+            }
+        } catch (const std::exception& e) {
+            negotiatedError = e.what();
+        }
+        check(negotiatedRoundTrip,
+              "a frame exported under the importer's own reported modifier set imports into this context");
+        if (!negotiatedRoundTrip) {
+            std::fprintf(stderr, "  the negotiated export (modifier 0x%llx) did not import: %s\n",
+                         static_cast<unsigned long long>(negotiatedChoice), negotiatedError.c_str());
+        }
+
+        // PRINTED, NOT ASSERTED, and the distinction is the finding rather than an
+        // oversight. Sweeping the reported set one modifier at a time answers "is the
+        // report honest", and on this machine it is not: one of NVIDIA's twelve advertised
+        // modifiers for XRGB8888 is refused at eglCreateImage when the buffer came from
+        // Vulkan. Nothing in this project can fix that, and asserting it would report a
+        // driver's interop gap as a plugin defect -- which is the attribution error X.3
+        // forbids. It is swept and printed because the daemon's free pick above could
+        // land on such a modifier on another GPU, and the printed list is the only place
+        // that would be visible before a user's desktop went blank.
+        size_t exercised = 0;
+        size_t refusedCount = 0;
+        uint64_t firstBad = 0;
+        std::string firstBadError;
+        int negotiationMonitor = 100;
+        for (const uint64_t candidate : reportable) {
+            device.memory().setConsumerModifiers({candidate});
+            const wallpaperx::OffscreenTarget* negotiated = nullptr;
+            try {
+                negotiated = &targets.create(negotiationMonitor++, kWidth, kHeight);
+            } catch (const std::exception&) {
+                continue;  // this GPU cannot produce that layout: the negotiation refusing it
+            }
+            targets.render(renderer, *negotiated);
+            wallpaperx::ExportedFrame negotiatedFrame = wallpaperx::exportFrame(device, *negotiated);
+            if (negotiatedFrame.modifier != candidate || negotiatedFrame.planes.empty()) {
+                // The exporter did not end up on the modifier it was told, so importing this
+                // frame would say nothing about `candidate`. consumer_modifier_probe is what
+                // grades that narrowing; here it is only a precondition.
+                if (negotiatedFrame.fd >= 0) ::close(negotiatedFrame.fd);
+                continue;
+            }
+
+            wallpaperx::FrameImport::Request negotiatedRequest = request;
+            negotiatedRequest.fd = negotiatedFrame.fd;
+            negotiatedRequest.memorySize = negotiatedFrame.memorySize;
+            negotiatedRequest.drmFormat = negotiatedFrame.drmFormat;
+            negotiatedRequest.drmModifier = negotiatedFrame.modifier;
+            negotiatedRequest.planes.clear();
+            for (const auto& plane : negotiatedFrame.planes) {
+                negotiatedRequest.planes.emplace_back(plane.offset, plane.rowPitch);
+            }
+
+            const wallpaperx::FrameImport::Result negotiatedImport =
+                wallpaperx::FrameImport::import(negotiatedRequest);
+            ++exercised;
+            if (negotiatedImport.texture == 0) {
+                if (negotiatedRequest.fd >= 0) ::close(negotiatedRequest.fd);
+                if (refusedCount == 0) {
+                    firstBad = candidate;
+                    firstBadError = negotiatedImport.error;
+                }
+                ++refusedCount;
+                std::fprintf(stderr, "  reported modifier 0x%llx does not import: %s\n",
+                             static_cast<unsigned long long>(candidate), negotiatedImport.error.c_str());
+                continue;
+            }
+            wallpaperx::FrameImport::release(negotiatedImport);
+        }
+        // Restored before anything else uses the device, so a later export is not stuck on
+        // whichever modifier the loop last reported.
+        device.memory().setConsumerModifiers({});
+
+        // COVERAGE: how many reported modifiers actually completed an export-and-import
+        // round trip. A sweep that exercised none says nothing, and without this line it
+        // would print the same reassuring sentence as one that exercised all of them.
+        std::printf("frame_import_probe: the importer reports %zu modifier(s) for format 0x%08x; %zu of them could "
+                    "be exported here, and %zu of those %zu were refused at import. The daemon's negotiated pick "
+                    "was 0x%llx.\n",
+                    reportable.size(), frame.drmFormat, exercised, refusedCount, exercised,
+                    static_cast<unsigned long long>(negotiatedChoice));
+        if (refusedCount != 0) {
+            std::fprintf(stderr,
+                         "frame_import_probe: NOTE -- %zu advertised modifier(s) do not import; the first is 0x%llx "
+                         "(%s). Not a failure of this code: the daemon picks from the intersection and the pick it "
+                         "made above did import. It is printed because a driver whose free pick landed on one of "
+                         "these would show a blank wallpaper with no error anywhere.\n",
+                         refusedCount, static_cast<unsigned long long>(firstBad), firstBadError.c_str());
+        }
+        if (exercised == 0) {
+            notVerified(kModifierGoal,
+                        "this GPU can produce none of the " + std::to_string(reportable.size()) +
+                            " modifier(s) the importer reports, so the honesty of the report was not swept");
         }
         return true;
     });

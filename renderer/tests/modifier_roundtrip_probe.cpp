@@ -39,15 +39,18 @@
 //                 modifier -- there the row stride is implied by the modifier, and the
 //                 field the exporter publishes is simply not consulted. So this probe
 //                 does not test rowPitch on tiled layouts; nothing here can.
-//   queue-family  NOT established. exportFrame() releases to VK_QUEUE_FAMILY_FOREIGN_EXT
-//   ownership     and acquireFromExternal() performs the matching acquire, so the pair
-//                 is exercised and a malformed barrier would be caught by validation.
-//                 But dropping the acquire entirely -- IGNORED/IGNORED with an UNDEFINED
-//                 oldLayout -- still produces correct pixels on both backends, so this
-//                 probe cannot tell a correct transfer from a missing one. The visible
+//   queue-family  NOT established HERE. exportFrame() releases to
+//   ownership     VK_QUEUE_FAMILY_FOREIGN_EXT and acquireFromExternal() performs the
+//                 matching acquire, so the pair is exercised. But dropping the acquire
+//                 entirely -- IGNORED/IGNORED with an UNDEFINED oldLayout -- still
+//                 produces correct pixels on both backends, so no pixel comparison in
+//                 this file can tell a correct transfer from a missing one. The visible
 //                 failure is expected to be AMD/Intel-only (compressed modifiers, where
 //                 an unpaired release leaves metadata unresolved), which is hardware
-//                 nobody here has. Treat the transfer as unverified.
+//                 nobody here has. What IS graded, in ownership_transfer_probe, is the
+//                 declaration rather than its effect: that the release and the acquire
+//                 the renderer submits name the same layout pair. That check reads the
+//                 barriers directly and needs no driver to answer.
 
 #include "vulkan/device.h"
 #include "support/validation_grade.h"
@@ -324,29 +327,35 @@ void importFrame(wallpaperx::Device& device, int fd, uint64_t modifier,
 }
 
 // Takes ownership of the imported image back from the external consumer and leaves it
-// in TRANSFER_SRC_OPTIMAL, ready to be copied out.
+// ready to be copied out.
 //
 // srcQueueFamily must be the family exportFrame() released to, or the transfer is
 // unpaired and the contents are formally undefined. It is derived the same way rather
 // than hard-coded, so the two cannot drift.
 //
-// Correctly formed, but not something this probe can prove is necessary -- see the
-// queue-family line in the header. Removing it entirely still yields correct pixels on
-// both available backends. It is written properly because the spec requires it and
-// because AMD/Intel are expected to need it, not because a check here would notice.
-void acquireFromExternal(wallpaperx::Device& device, VkImage image) {
+// TWO BARRIERS, NOT ONE, and that is the point. A queue-family ownership transfer
+// performs its layout transition exactly once, on whichever side the driver chooses, so
+// the acquire must name the SAME oldLayout and newLayout the release named --
+// `releasedFrom` -> GENERAL, taken from the target the release recorded it on rather than
+// restated here. Folding the move to TRANSFER_SRC_OPTIMAL into the acquire (which this
+// did) makes the pair disagree, which is the same defect
+// OffscreenTargetManager::render() had and which ownership_transfer_probe now grades in
+// production. The copy-out layout is reached by a second, ordinary same-family barrier.
+//
+// Not something this probe can prove is necessary -- see the queue-family line in the
+// header. Removing the acquire entirely still yields correct pixels on both available
+// backends. It is written correctly because the spec requires it and because AMD/Intel
+// are expected to need it, not because a check here would notice.
+void acquireFromExternal(wallpaperx::Device& device, VkImage image, VkImageLayout releasedFrom) {
     const uint32_t srcQueueFamily =
         device.info().hasQueueFamilyForeign ? VK_QUEUE_FAMILY_FOREIGN_EXT : VK_QUEUE_FAMILY_EXTERNAL;
 
     device.immediateSubmit([&](VkCommandBuffer cmd) {
         VkImageMemoryBarrier acquire{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         acquire.srcAccessMask = 0;  // the release side made the writes available
-        acquire.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-        // GENERAL is what the release transitioned the image to. Naming anything else
-        // (including UNDEFINED, which would be legal but discards the contents) makes
-        // the acquire fail to preserve the very pixels this probe is checking.
-        acquire.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-        acquire.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        acquire.dstAccessMask = 0;  // ownership acquire only; the transition below does the rest
+        acquire.oldLayout = releasedFrom;
+        acquire.newLayout = VK_IMAGE_LAYOUT_GENERAL;
         acquire.srcQueueFamilyIndex = srcQueueFamily;
         acquire.dstQueueFamilyIndex = device.graphicsQueueFamily();
         acquire.image = image;
@@ -354,6 +363,21 @@ void acquireFromExternal(wallpaperx::Device& device, VkImage image) {
 
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
                              nullptr, 1, &acquire);
+
+        // Same family on both sides: an ordinary transition, not a transfer, so the
+        // pairing rule does not apply to it.
+        VkImageMemoryBarrier toTransferSrc{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        toTransferSrc.srcAccessMask = 0;
+        toTransferSrc.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        toTransferSrc.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        toTransferSrc.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        toTransferSrc.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toTransferSrc.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toTransferSrc.image = image;
+        toTransferSrc.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+                             nullptr, 1, &toTransferSrc);
     });
 }
 
@@ -527,7 +551,9 @@ int run(Mode mode) {
             return outcome;
         }
 
-        acquireFromExternal(device, imported.image);
+        // The layout the release actually named, read off the target it was recorded on
+        // rather than restated as a constant -- restating it is how the two halves drift.
+        acquireFromExternal(device, imported.image, target.releasedFromLayout);
         const std::vector<unsigned char> pixels = readbackImage(device, imported.image, kWidth, kHeight);
         outcome.rows = static_cast<long>(countDifferingRows(reference, pixels, kWidth, kHeight));
         return outcome;

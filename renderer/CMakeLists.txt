@@ -225,6 +225,17 @@ wallpaperx_add_shader_probe(wallpaperx-frame-export-probe tests/frame_export_pro
 
 wallpaperx_add_shader_probe(wallpaperx-modifier-roundtrip-probe tests/modifier_roundtrip_probe.cpp)
 
+# Interposes vkCmdPipelineBarrier to read back the ownership-transfer barriers the export
+# and the next render actually submitted. Unlike image_bounds_probe's malloc instrument
+# this coexists with every sanitizer -- it replaces a Vulkan entry point, not the
+# allocator -- so it needs no WALLPAPERX_SANITIZE opt-out.
+wallpaperx_add_shader_probe(wallpaperx-ownership-transfer-probe tests/ownership_transfer_probe.cpp)
+
+# The exporter's half of the dma_buf modifier negotiation the daemon's SetImportModifiers
+# drives. Forces the dma_buf handle type itself (see its main()), so it runs on this GPU as
+# well as on Lavapipe.
+wallpaperx_add_shader_probe(wallpaperx-consumer-modifier-probe tests/consumer_modifier_probe.cpp)
+
 add_executable(wallpaperx-handle-type-env-test tests/handle_type_env_test.cpp)
 target_link_libraries(wallpaperx-handle-type-env-test PRIVATE wallpaperx-renderer)
 
@@ -274,6 +285,19 @@ add_test(NAME frame_export_probe COMMAND wallpaperx-frame-export-probe)
 # unverified when the round trip demonstrably passed.
 add_test(NAME modifier_roundtrip_probe COMMAND wallpaperx-modifier-roundtrip-probe roundtrip)
 add_test(NAME modifier_sensitivity_probe COMMAND wallpaperx-modifier-roundtrip-probe sensitivity)
+add_test(NAME ownership_transfer_probe COMMAND wallpaperx-ownership-transfer-probe)
+add_test(NAME consumer_modifier_probe COMMAND wallpaperx-consumer-modifier-probe)
+
+# 77 means the driver has no dma_buf with a describable layout, or offers only one usable
+# modifier so narrowing cannot be observed. Its own PNG fixture, hence its own lock.
+set_tests_properties(consumer_modifier_probe PROPERTIES
+                     RESOURCE_LOCK consumer_modifier_probe_test_image SKIP_RETURN_CODE 77)
+
+# 77 means the driver could not export at all, so no ownership transfer was ever issued
+# and the pairing rule was not exercised. Its own PNG fixture, so its two entries share a
+# lock of their own.
+set_tests_properties(ownership_transfer_probe PROPERTIES
+                     RESOURCE_LOCK ownership_transfer_probe_test_image SKIP_RETURN_CODE 77)
 
 # Two entries, one binary, and they cannot share a process. The probe asks the loader
 # whether the validation layer exists at all, that answer is cached for the life of the
@@ -343,6 +367,8 @@ if(WALLPAPERX_LAVAPIPE_ICD)
     add_test(NAME frame_export_probe_lavapipe COMMAND wallpaperx-frame-export-probe)
     add_test(NAME modifier_roundtrip_probe_lavapipe COMMAND wallpaperx-modifier-roundtrip-probe roundtrip)
     add_test(NAME modifier_sensitivity_probe_lavapipe COMMAND wallpaperx-modifier-roundtrip-probe sensitivity)
+    add_test(NAME ownership_transfer_probe_lavapipe COMMAND wallpaperx-ownership-transfer-probe)
+    add_test(NAME consumer_modifier_probe_lavapipe COMMAND wallpaperx-consumer-modifier-probe)
     # Registered here for the label, not for the ICD: what this probe grades is loader- and
     # driver-independent. CI selects by the lavapipe label and has no GPU, so without these two
     # the only check of how a missing validator is reported never runs there.
@@ -358,6 +384,8 @@ if(WALLPAPERX_LAVAPIPE_ICD)
         frame_export_probe_lavapipe
         modifier_roundtrip_probe_lavapipe
         modifier_sensitivity_probe_lavapipe
+        ownership_transfer_probe_lavapipe
+        consumer_modifier_probe_lavapipe
         validation_grade_installed_lavapipe
         validation_grade_absent_lavapipe
         PROPERTIES
@@ -374,6 +402,10 @@ if(WALLPAPERX_LAVAPIPE_ICD)
     set_tests_properties(frame_export_probe_lavapipe PROPERTIES RESOURCE_LOCK frame_export_probe_test_image)
     set_tests_properties(modifier_roundtrip_probe_lavapipe modifier_sensitivity_probe_lavapipe
                          PROPERTIES RESOURCE_LOCK modifier_roundtrip_probe_test_image SKIP_RETURN_CODE 77)
+    set_tests_properties(ownership_transfer_probe_lavapipe PROPERTIES
+                         RESOURCE_LOCK ownership_transfer_probe_test_image SKIP_RETURN_CODE 77)
+    set_tests_properties(consumer_modifier_probe_lavapipe PROPERTIES
+                         RESOURCE_LOCK consumer_modifier_probe_test_image SKIP_RETURN_CODE 77)
     set_tests_properties(validation_grade_installed_lavapipe validation_grade_absent_lavapipe
                          PROPERTIES SKIP_RETURN_CODE 77)
 endif()

@@ -83,6 +83,7 @@ using wallpaperx::testing::FrameReadyLog;
 using wallpaperx::testing::getFrameFd;
 using wallpaperx::testing::getStatusOrExplain;
 using wallpaperx::testing::openFdCount;
+using wallpaperx::testing::setImportModifiers;
 using wallpaperx::testing::setWallpaper;
 using wallpaperx::testing::StatusReply;
 using wallpaperx::testing::validationWaived;
@@ -91,12 +92,19 @@ using wallpaperx::testing::wallpaperStatus;
 // The pass / fail contract lives in tests/test_report.h, shared with the other five test
 // binaries so the wording and the exit codes cannot drift apart.
 //
-// This file uses only two of its three channels. It has no notVerified() call: every shortfall
-// it can reach is a real failure, including a host with no validation-layer package -- that host
-// loses the only GPU-side oracle the suite has, and reporting it as a skip would retire that
-// oracle quietly. reportNotVerifiedOrPassed() below therefore always takes its all-passed
-// branch, and is called for the failure guard it applies rather than for a skip this file
-// can produce.
+// All three channels are used. A host with no validation-layer package is still a hard
+// failure, not a skip -- that host loses the only GPU-side oracle the suite has, and reporting
+// it as a skip would retire that oracle quietly. But two goals here genuinely cannot be asked
+// on every host, and both used to print a reason and exit 0, which ctest cannot tell apart from
+// a run that established them:
+//
+//   S6.12's unreadable-file clause  needs a process that cannot read a mode-000 file. Root can.
+//   S6.24's content half            needs a CPU-addressable export: DMA_BUF on a LINEAR
+//                                   modifier, seekable, mappable. NVIDIA ships OPAQUE_FD.
+//
+// Those now call notVerified(), so ctest reports the run as a skip. The wording names the
+// clause rather than the whole goal in the first case: S6.12's is_regular_file half runs and
+// holds on every host, and marking all of S6.12 unverified would understate what ran.
 
 // Deliberately not square. With equal dimensions a width/height swap anywhere between
 // the target and the wire would satisfy every assertion below.
@@ -142,6 +150,24 @@ constexpr int32_t kMonitorOutputB = 16;
 constexpr int32_t kMonitorOutputRejected = 17;
 constexpr int32_t kMonitorOutputAtCap = 18;
 constexpr int32_t kMonitorOutputHostile = 19;
+
+// runImportModifierChecks brings a manager of its own, for the reason that function's
+// header gives. Two monitors, because the property under test is what happens to the one
+// whose re-render has NOT run yet -- a single monitor cannot express it.
+constexpr int32_t kMonitorModifiersRerendered = 20;
+constexpr int32_t kMonitorModifiersPending = 21;
+
+// On the SHARED manager, unlike the two above: runImportModifierWireChecks drives the real
+// daemon over the bus. Its own id so the exact generation it waits for is a fact about
+// this monitor alone and cannot be reached by another phase's render.
+constexpr int32_t kMonitorModifiersWire = 22;
+
+// The barrier for the repeated-report check, and deliberately a monitor of its own rather
+// than the one above: a barrier posted on the same monitor can be coalesced with the
+// re-render the check is looking for, which makes the defect and the fix produce identical
+// evidence. Set for the first time inside that check, so it is absent from the manager's
+// map while the repeat is processed and cannot be re-posted by it.
+constexpr int32_t kMonitorModifiersBarrier = 23;
 
 // The bytes that make the hostile connector name hostile, named once so the fixture and
 // the scan that looks for them in GetStatus's reply cannot drift apart. Spelled as the
@@ -421,10 +447,18 @@ void runHostChecks(sdbus::IProxy& proxy, const std::string& imagePath, const Che
               "org.freedesktop.DBus.Error.InvalidArgs",
           "a directory is rejected synchronously as InvalidArgs");
 
-    // Skipped rather than asserted when the test runs as root, where mode 000 is still
-    // readable: a root run would otherwise report a daemon defect for a property of the
-    // caller's uid. Announced, because an unnoticed skip here is a silent loss of the
-    // access(R_OK) half.
+    // GOAL: S6.12's access(R_OK) clause is either exercised or reported as unexercised --
+    //       never silently passed over.
+    // WHY-THIS-SHAPE: notVerified() names the clause, not all of S6.12. The
+    //       is_regular_file half two lines up runs on every host including root, so
+    //       marking the whole goal unverified would understate what the run established.
+    //       The obvious simpler alternative -- check(false) when the file stays readable
+    //       -- reports a property of the caller's uid as a daemon defect, which is the
+    //       attribution error X.3 forbids.
+    // CONTROL: the `|| ::access(...) == 0` disjunct forced true. Observed: "NOT VERIFIED
+    //       -- S6.12's unreadable-file clause ... could not be exercised", the summary
+    //       line "1 goal(s) could not be exercised on this host", exit 77 instead of 0,
+    //       and ctest reporting the entry as Skipped rather than Passed. Reverted.
     const std::string unreadablePath = testAssetDir() + "/dbus_test_unreadable.png";
     {
         std::ofstream out(unreadablePath, std::ios::binary);
@@ -434,9 +468,10 @@ void runHostChecks(sdbus::IProxy& proxy, const std::string& imagePath, const Che
     std::filesystem::permissions(unreadablePath, std::filesystem::perms::none,
                                  std::filesystem::perm_options::replace, permEc);
     if (permEc || ::access(unreadablePath.c_str(), R_OK) == 0) {
-        std::printf(
-            "dbus_service_test: unreadable-file check skipped -- this process can still read a mode-000 file "
-            "(running as root?), so its acceptance would say nothing about the daemon.\n");
+        wallpaperx::testing::notVerified(
+            "S6.12's unreadable-file clause (its is_regular_file clause ran and held above)",
+            "this process can still read a mode-000 file (running as root?), so the daemon accepting or "
+            "rejecting it would say nothing about the access(R_OK) check");
     } else {
         check(errorNameFrom([&] { setWallpaper(proxy, "static", unreadablePath, kMonitorRejectedPaths); }) ==
                   "org.freedesktop.DBus.Error.InvalidArgs",
@@ -1699,6 +1734,291 @@ void runUnservicedRequestChecks(const wallpaperx::WallpaperManager::Config& conf
 }
 
 // --------------------------------------------------------------------------- //
+// SetImportModifiers on the wire: what the method refuses, and what an accepted report
+// actually makes the daemon do.
+//
+// Runs on the shared manager and after every other bus phase, deliberately: an accepted
+// report drops every monitor's offscreen image and re-renders each one, so a phase running
+// after this would be measuring monitors it did not put in that state.
+// --------------------------------------------------------------------------- //
+void runImportModifierWireChecks(sdbus::IProxy& proxy, FrameReadyLog& signals, const std::string& imagePath,
+                                 const Check& check) {
+    const uint32_t exportedFormat = wallpaperx::drmFourccForVkFormat(wallpaperx::OffscreenTargetManager::kFormat);
+    const std::vector<uint64_t> reported{wallpaperx::testing::kDrmModifierLinear};
+
+    // GOAL: the daemon refuses a report it cannot act on -- another pixel format, an empty
+    //       set, or a list long enough to be a way of sizing daemon state from the bus --
+    //       and refuses it on the reply, as InvalidArgs.
+    // WHY-THIS-SHAPE: all three are asserted, not one representative. They are three
+    //       separate clauses in setImportModifiers and a check on one says nothing about
+    //       the others; the empty case matters most, because an empty stored set reads
+    //       identically to "nobody has reported yet" and would silently restore the
+    //       unnegotiated behaviour rather than being refused.
+    // CONTROL: each clause disabled in turn in WallpaperManager::setImportModifiers
+    //       (backend/daemon/wallpaper_manager.cpp); see the report for the observed lines.
+    check(errorNameFrom([&] { setImportModifiers(proxy, exportedFormat ^ 0xFFu, reported); }) ==
+              "org.freedesktop.DBus.Error.InvalidArgs",
+          "a modifier report for a format this daemon does not export is refused as InvalidArgs");
+    check(errorNameFrom([&] { setImportModifiers(proxy, exportedFormat, {}); }) ==
+              "org.freedesktop.DBus.Error.InvalidArgs",
+          "an empty modifier report is refused as InvalidArgs rather than stored");
+    check(errorNameFrom([&] {
+              setImportModifiers(proxy, exportedFormat,
+                                 std::vector<uint64_t>(wallpaperx::WallpaperManager::kMaxImportModifiers + 1, 0));
+          }) == "org.freedesktop.DBus.Error.InvalidArgs",
+          "a modifier report longer than the daemon's limit is refused as InvalidArgs");
+
+    // A monitor of this phase's own, driven to a known generation before anything is
+    // reported. Everything below counts renders on it, and a threshold read from a monitor
+    // another phase is still driving would not be a threshold at all.
+    setWallpaper(proxy, "static", imagePath, kMonitorModifiersWire);
+    if (!signals.wait(kMonitorModifiersWire, 1)) {
+        // X.1: a lost signal abandons the phase with a reason. Falling through would leave
+        // every count below measuring a monitor that never rendered, and the idempotency
+        // check -- which asserts an exact count -- would then pass on the daemon having
+        // done nothing at all.
+        check(false, "the import-modifier wire phase's own monitor produced its first frame");
+        return;
+    }
+
+    // GOAL: an accepted report is not merely stored -- the daemon rebuilds the images that
+    //       were made against the old set and announces each one.
+    // WHY-THIS-SHAPE: waits for the exact next generation rather than "any newer frame".
+    //       The monitor is quiesced first (its generation-1 signal has arrived and nothing
+    //       else drives it), and setImportModifiers bumps each renderable monitor's request
+    //       exactly once, so exactly one further render is the daemon's own contract and
+    //       not a scheduler outcome. waitAtLeast would be satisfied by the frame already in
+    //       hand and would grade nothing.
+    // CONTROL: the `m_worker.post(monitorId)` loop deleted from
+    //       DbusService::setImportModifiers (backend/daemon/dbus_service.cpp) -> the wait
+    //       below times out and this goes red.
+    setImportModifiers(proxy, exportedFormat, reported);
+    const bool reRendered = signals.wait(kMonitorModifiersWire, 2);
+    check(reRendered, "an accepted modifier report re-renders a monitor that already had a frame, and announces it");
+    if (!reRendered) {
+        std::fprintf(stderr, "  no FrameReady(monitor=%d, generation=2) arrived after the report\n",
+                     kMonitorModifiersWire);
+        return;
+    }
+    check(getFrameFd(proxy, kMonitorModifiersWire).generation == 2,
+          "the frame served after an accepted report is the rebuilt one");
+
+    // GOAL: a repeat of the same report costs nothing -- several plugin instances share one
+    //       process and all report the same answer, so a re-render per instance would
+    //       rebuild every image on every screen for no change.
+    // WHY-THIS-SHAPE: a negative ("no render happened") settled by a later positive, which
+    //       is this file's standing idiom, but the barrier is on a SEPARATE monitor and
+    //       that is load-bearing. Barriering on this monitor instead -- the obvious
+    //       shape, and the one written first -- lets RenderWorker::post() collapse the
+    //       repeat's re-render into the barrier's own queued entry, so the defect produces
+    //       exactly the same signal count as the fix and the check passes. Observed: with
+    //       the early-out disabled, the same-monitor form stayed green. The barrier monitor
+    //       is also set for the first time here, so it was not in the map when the repeat
+    //       was processed and cannot have been re-posted by it.
+    // COVERAGE-ASSERT: the exact signal count for this monitor, not a bare "no third
+    //       signal". The count is what makes the check fail rather than go quiet if a
+    //       future edit stops this monitor rendering at all.
+    // CONTROL: the `if (m_importModifiers == modifiers) return {};` early-out disabled in
+    //       WallpaperManager::setImportModifiers -> "a repeated modifier report starts no
+    //       render", reporting 3 announcements where 2 are expected.
+    setImportModifiers(proxy, exportedFormat, reported);
+    setWallpaper(proxy, "static", imagePath, kMonitorModifiersBarrier);
+    if (!signals.wait(kMonitorModifiersBarrier, 1)) {
+        // X.1 again: without this the count below would be read while the repeat's work
+        // might still be queued, and "no extra render happened" would be indistinguishable
+        // from "it has not happened yet".
+        check(false, "the barrier frame arrives after a repeated modifier report");
+        return;
+    }
+    const size_t signalCount = signals.countFor(kMonitorModifiersWire);
+    check(signalCount == 2, "a repeated modifier report starts no render");
+    if (signalCount != 2) {
+        std::fprintf(stderr, "  monitor %d announced %zu frames; expected exactly 2 (its first render and the "
+                             "report's rebuild)\n",
+                     kMonitorModifiersWire, signalCount);
+    }
+}
+
+// --------------------------------------------------------------------------- //
+// What a consumer's modifier report does to monitors that have already rendered.
+//
+// SetImportModifiers destroys every monitor's offscreen target -- the images it drops were
+// built against the old set and cannot be re-labelled -- and returns the monitors to
+// re-post so each rebuilds one. Those re-renders happen one at a time on the render
+// worker, so between the first and the last there is a window in which a monitor has no
+// target. What the daemon must not do in that window is keep claiming the monitor still
+// has a frame: GetFrameFd trusts that flag and then reaches for a target that is gone.
+//
+// WHY THIS DRIVES THE MANAGER DIRECTLY AND NOT THE BUS, which is the same reason
+// runUnservicedRequestChecks gives. RenderWorker runs one FIFO for renders and exports
+// alike, and DbusService::setImportModifiers posts every returned monitor's re-render from
+// the event-loop thread before any later GetFrameFd can post its export. So over the wire
+// the export is unconditionally behind both re-renders and the window is unreachable --
+// racing one would be an assertion on the scheduler, which X.2 forbids. Calling
+// renderPending() for one monitor and then exportCurrentFrame() for the other puts the
+// daemon in exactly that state with no race at all.
+// --------------------------------------------------------------------------- //
+void runImportModifierChecks(const wallpaperx::WallpaperManager::Config& config, const std::string& imagePath,
+                             const Check& check) {
+    // Same shape as runWorkerCoalescingChecks': its own manager means its own Device, so
+    // it needs its own validation grade, and the grade must run after the manager is
+    // destroyed for the layer's teardown complaints to be countable.
+    std::shared_ptr<const std::atomic<int>> counter;
+    bool layerActive = false;
+    struct GradeOnExit {
+        const std::shared_ptr<const std::atomic<int>>& counter;
+        const bool& layerActive;
+        const Check& check;
+        ~GradeOnExit() {
+            int failures = 0;
+            int ungraded = 0;
+            {
+                wallpaperx::testing::ValidationGrade grade("dbus_service_test (import-modifier phase)", failures);
+                if (wallpaperx::testing::validationWaived()) grade.expectNoDevice();
+                grade.reportUngradedTo(ungraded);
+                grade.adopt(counter, layerActive);
+            }
+            if (ungraded > 0) {
+                std::fprintf(stderr,
+                             "dbus_service_test: the import-modifier phase's validation grade could not be made "
+                             "-- VK_LAYER_KHRONOS_validation is not loaded. The phase itself is still judged.\n");
+            }
+            check(failures == 0, "the import-modifier phase's own device passed its validation grade");
+        }
+    } gradeOnExit{counter, layerActive, check};
+
+    wallpaperx::WallpaperManager manager(config);
+    struct CaptureOnExit {
+        const wallpaperx::WallpaperManager& manager;
+        std::shared_ptr<const std::atomic<int>>& counter;
+        bool& layerActive;
+        ~CaptureOnExit() {
+            counter = manager.validationCounter();
+            layerActive = manager.validationLayerActive();
+        }
+    } captureOnExit{manager, counter, layerActive};
+
+    // Closes the fd an export hands back. Every successful export here is a real
+    // descriptor, and this phase performs several -- leaking them would eventually fail
+    // the fd-count checks elsewhere in the binary rather than anything here.
+    const auto exportOnce = [&manager](int32_t monitorId) {
+        wallpaperx::FrameExport out = manager.exportCurrentFrame(monitorId);
+        const bool gotFrame = out.handle.has_value();
+        const wallpaperx::NoFrameReason reason = out.reason;
+        if (gotFrame && out.handle->frame.fd >= 0) close(out.handle->frame.fd);
+        return std::pair{gotFrame, reason};
+    };
+
+    manager.requestWallpaper("static", imagePath, kMonitorModifiersRerendered);
+    manager.requestWallpaper("static", imagePath, kMonitorModifiersPending);
+    const wallpaperx::RenderOutcome firstRerendered = manager.renderPending(kMonitorModifiersRerendered);
+    const wallpaperx::RenderOutcome firstPending = manager.renderPending(kMonitorModifiersPending);
+    if (!firstRerendered.rendered || !firstPending.rendered) {
+        wallpaperx::testing::notVerified(
+            "S6.44",
+            "neither monitor could be given a frame to begin with, so the state this phase is about -- a "
+            "monitor that HAD a frame and whose target the modifier report then dropped -- was never reached");
+        return;
+    }
+
+    // LINEAR because it is the one modifier every dma_buf-capable driver here offers, so
+    // the intersection in Memory::createExportableImage is non-empty on Lavapipe. On this
+    // GPU the export is OPAQUE_FD, which carries no modifier at all and ignores the set --
+    // the daemon-side bookkeeping this phase grades runs either way.
+    const std::vector<uint64_t> reported{wallpaperx::testing::kDrmModifierLinear};
+    const uint32_t exportedFormat = wallpaperx::drmFourccForVkFormat(wallpaperx::OffscreenTargetManager::kFormat);
+    const std::vector<int> toRender = manager.setImportModifiers(exportedFormat, reported);
+
+    // The premise, asserted rather than assumed: a set that changed nothing would return
+    // no monitors, no target would be dropped, and every check below would pass over a
+    // daemon that never entered the state under test.
+    check(std::find(toRender.begin(), toRender.end(), kMonitorModifiersRerendered) != toRender.end() &&
+              std::find(toRender.begin(), toRender.end(), kMonitorModifiersPending) != toRender.end(),
+          "a new import-modifier set returns both rendered monitors for re-render");
+
+    // Only one of the two. This is the window: the modifier set is applied on the first
+    // re-render, which drops BOTH monitors' targets, and the second monitor's re-render
+    // has not happened.
+    const wallpaperx::RenderOutcome reRendered = manager.renderPending(kMonitorModifiersRerendered);
+    check(reRendered.rendered && reRendered.generation > firstRerendered.generation,
+          "the monitor that was re-posted first rebuilds its image and commits a newer generation");
+
+    // GOAL: a monitor whose offscreen target the modifier report dropped, and whose
+    //       re-render has not run yet, answers GetFrameFd with NoFrame -- it does not
+    //       claim to still hold a frame it cannot produce.
+    // WHY-THIS-SHAPE: the assertion is on the reply, not on the flag, because the defect
+    //       is only harmful through the reply. exportCurrentFrame() reads hasFrame, finds
+    //       it set, then discovers the target is gone and throws -- which reaches the
+    //       client as a generic org.freedesktop.DBus.Error.Failed, not as NoFrame, so a
+    //       polling consumer sees an error instead of "ask again". Checking
+    //       snapshot().hasFrame instead would grade the same bit one layer earlier but
+    //       would not show that the reply is the *right* one; NotRendered is asserted
+    //       here precisely because that is the answer a consumer can act on.
+    // CONTROL: `state.hasFrame = false;` deleted from
+    //       WallpaperManager::applyImportModifiersLocked (backend/daemon/
+    //       wallpaper_manager.cpp) -- the defect commit 5fb5072 fixed. Observed red on
+    //       both ICDs with the exception text quoted below; every other check in this
+    //       binary stayed green.
+    bool threw = false;
+    std::string threwWhat;
+    bool pendingHasFrame = true;
+    wallpaperx::NoFrameReason pendingReason = wallpaperx::NoFrameReason::NeverRequested;
+    try {
+        std::tie(pendingHasFrame, pendingReason) = exportOnce(kMonitorModifiersPending);
+    } catch (const std::exception& e) {
+        threw = true;
+        threwWhat = e.what();
+    }
+    check(!threw, "a monitor awaiting its re-render answers GetFrameFd rather than throwing");
+    if (threw) {
+        std::fprintf(stderr, "  the export threw: %s\n", threwWhat.c_str());
+    } else {
+        check(!pendingHasFrame && pendingReason == wallpaperx::NoFrameReason::NotRendered,
+              "a monitor awaiting its re-render is NotRendered, not still holding its old frame");
+    }
+
+    // The state recovers: once the second monitor's re-render runs it has a frame again.
+    // Without this the checks above are satisfied by a daemon that dropped the monitor
+    // permanently, which is a different defect with the same symptom in this window.
+    const wallpaperx::RenderOutcome pendingReRendered = manager.renderPending(kMonitorModifiersPending);
+    check(pendingReRendered.rendered && pendingReRendered.generation > firstPending.generation,
+          "the monitor that waited also rebuilds its image once its re-render runs");
+    bool recoveredHasFrame = false;
+    try {
+        recoveredHasFrame = exportOnce(kMonitorModifiersPending).first;
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "  the recovery export threw: %s\n", e.what());
+    }
+    check(recoveredHasFrame, "the monitor that waited exports a frame again after its re-render");
+
+    // GOAL: an identical report is a no-op -- it must not drop a target and strand every
+    //       monitor for a set that changed nothing.
+    // WHY-THIS-SHAPE: checked through the export rather than through the empty return
+    //       value alone, because the return value is what the DBus layer posts and a
+    //       daemon could return {} while still having applied the set. Both monitors must
+    //       still export.
+    // CONTROL: two, both in WallpaperManager::setImportModifiers (backend/daemon/
+    //       wallpaper_manager.cpp), because the two checks fail to different defects.
+    //       (a) the `if (m_importModifiers == modifiers) return {};` early-out disabled ->
+    //       "an identical import-modifier report changes nothing", and ONLY that: the set
+    //       is applied on the render thread, so a repeat that re-posts work still leaves
+    //       both frames in place until something re-renders. (b) `for (auto& [id, state] :
+    //       m_monitors) state.hasFrame = false;` inserted above the early-out, the eager
+    //       form of the invalidation -> "both monitors still hold their frames after an
+    //       identical report". Both reverted.
+    const std::vector<int> repeated = manager.setImportModifiers(exportedFormat, reported);
+    check(repeated.empty(), "an identical import-modifier report changes nothing");
+    bool bothStillHaveFrames = false;
+    try {
+        bothStillHaveFrames = exportOnce(kMonitorModifiersRerendered).first &&
+                              exportOnce(kMonitorModifiersPending).first;
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "  an export after the repeated report threw: %s\n", e.what());
+    }
+    check(bothStillHaveFrames, "both monitors still hold their frames after an identical report");
+}
+
+// --------------------------------------------------------------------------- //
 // Coalescing, driven at the level the mechanisms actually live at.
 //
 // Two independent mechanisms collapse a burst, and both sit below DBus:
@@ -2348,18 +2668,36 @@ void runCoalescingChecks(sdbus::IProxy& proxy, FrameReadyLog& signals, const std
     std::printf("dbus_service_test: %d rapid requests over the bus produced generation %llu\n", kBurstSize,
                 static_cast<unsigned long long>(frame.generation));
 
+    // GOAL: S6.24's content half -- that the *pixels* of the exported frame are the last
+    //       burst request's, not the first's -- is either decided or reported as
+    //       undecided. It must never exit 0 having read no pixels.
+    // WHY-THIS-SHAPE: notVerified() rather than a print, and scoped to the content half
+    //       alone. The outcome checks above decide first-wins vs last-wins without
+    //       touching the frame's bytes and run on every ICD, so they are not in question
+    //       here; only the pixel comparison is. A check(false) would be wrong in the
+    //       other direction -- an OPAQUE_FD device is a correct daemon on hardware this
+    //       comparison cannot be performed on at all.
+    // CONTROL: `frame.handleType != 1` forced true on the Lavapipe tier, which normally
+    //       exports DMA_BUF/LINEAR and reaches the pixel loop. Observed: "NOT VERIFIED --
+    //       S6.24's content half ... this device exports OPAQUE_FD", "1 goal(s) could not
+    //       be exercised on this host", exit 77 where the unmutated run exits 0, and
+    //       ctest reporting dbus_service_test_lavapipe as Skipped. Reverted.
+    const char* kContentGoal = "S6.24's content half -- which request's pixels reached the exported frame "
+                               "(its outcome half ran and held above)";
     if (frame.handleType != 1) {
-        std::printf(
-            "dbus_service_test: content check skipped -- this device exports OPAQUE_FD, whose bytes are "
-            "importable only by another Vulkan/GL context on the same device. The outcome checks above still "
-            "ran, and they decide first-wins vs last-wins on their own.\n");
+        wallpaperx::testing::notVerified(
+            kContentGoal,
+            "this device exports OPAQUE_FD, whose bytes are importable only by another Vulkan/GL context on "
+            "the same device");
         return;
     }
     if (frame.drmModifier != wallpaperx::testing::kDrmModifierLinear) {
-        std::printf(
-            "dbus_service_test: content check skipped -- modifier 0x%llx is tiled, so its rows are not "
-            "CPU-addressable and a byte comparison would fail a correct export.\n",
-            static_cast<unsigned long long>(frame.drmModifier));
+        char why[160];
+        std::snprintf(why, sizeof(why),
+                      "modifier 0x%llx is tiled, so its rows are not CPU-addressable and a byte comparison "
+                      "would fail a correct export",
+                      static_cast<unsigned long long>(frame.drmModifier));
+        wallpaperx::testing::notVerified(kContentGoal, why);
         return;
     }
     if (frame.planes.empty()) {
@@ -2381,10 +2719,12 @@ void runCoalescingChecks(sdbus::IProxy& proxy, FrameReadyLog& signals, const std
         // object, so a shorter object maps cleanly and the pixel loop below dies of
         // SIGBUS with no FAIL line at all. Losing the content check on a non-seekable
         // exporter is a stated gap; a crash is not.
-        std::printf(
-            "dbus_service_test: content check skipped -- lseek on the exported fd failed (%s), so its real size "
-            "cannot be confirmed against the published memory_size of %llu before mapping it.\n",
-            std::strerror(errno), static_cast<unsigned long long>(frame.memorySize));
+        char why[256];
+        std::snprintf(why, sizeof(why),
+                      "lseek on the exported fd failed (%s), so its real size cannot be confirmed against the "
+                      "published memory_size of %llu before mapping it",
+                      std::strerror(errno), static_cast<unsigned long long>(frame.memorySize));
+        wallpaperx::testing::notVerified(kContentGoal, why);
         return;
     }
     if (static_cast<uint64_t>(fdSize) < frame.memorySize) {
@@ -2396,8 +2736,7 @@ void runCoalescingChecks(sdbus::IProxy& proxy, FrameReadyLog& signals, const std
 
     const wallpaperx::testing::MappedFrame mapping(frame.fd.get(), frame.memorySize);
     if (!mapping.valid()) {
-        std::printf("dbus_service_test: content check skipped -- mmap of the exported fd failed (%s).\n",
-                    mapping.error().c_str());
+        wallpaperx::testing::notVerified(kContentGoal, "mmap of the exported fd failed: " + mapping.error());
         return;
     }
 
@@ -2545,11 +2884,19 @@ int main() {
         }
         runRenderChecks(*proxy, signals, imagePath, corruptPath, videoPath, check);
         runCoalescingChecks(*proxy, signals, imagePath, corruptPath, burstPaths, check);
+        // Last of the shared-manager phases, on purpose: an accepted report rebuilds every
+        // monitor's image, so anything after it would be reading state it did not set.
+        runImportModifierWireChecks(*proxy, signals, imagePath, check);
 
         // Its own manager, connection and service; no GPU work at all. Placed before the
         // worker-coalescing phase only for reading order -- it shares no state with
         // either neighbour.
         runUnservicedRequestChecks(config, imagePath, videoPath, check);
+
+        // Its own manager and Device, both created and destroyed on this thread -- the
+        // phase drives renderPending() directly, so there is no worker thread for the
+        // Device to be pinned to.
+        runImportModifierChecks(config, imagePath, check);
 
         // Its own manager and Device, scoped inside the call so both are torn down
         // before the validation warning count is read below.

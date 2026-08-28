@@ -640,8 +640,9 @@ if(DBUS_RUN_SESSION)
         set_tests_properties(dbus_service_lavapipe PROPERTIES RESOURCE_LOCK wallpaperx_bus_tests)
     endif()
 
-    # Set ahead of the calls that will produce it. Nothing in this binary returns 77 yet: its
-    # three inconclusive states still print and exit 0, so they still report as passes.
+    # 77 means a goal could not be asked on this host: S6.12's unreadable-file clause under
+    # root, or S6.24's content half on an export whose bytes are not CPU-addressable (this
+    # GPU's OPAQUE_FD, a tiled modifier, a non-seekable or unmappable fd).
     set_tests_properties(dbus_service dbus_service_classic PROPERTIES SKIP_RETURN_CODE 77)
     if(WALLPAPERX_LAVAPIPE_ICD)
         set_tests_properties(dbus_service_lavapipe dbus_service_classic_lavapipe
