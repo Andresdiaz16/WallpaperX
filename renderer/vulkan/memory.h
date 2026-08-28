@@ -101,6 +101,16 @@ public:
     // OPAQUE_FD always keeps the caller's tiling: that handle type is only importable
     // by another Vulkan/GL context on the same device, which needs no layout metadata.
     AllocatedImage createExportableImage(const VkImageCreateInfo& imageInfo, VkExternalMemoryHandleTypeFlagBits exportHandleType, const char* debugName = nullptr);
+
+    // What the consumer that will import these frames says it can take. Vulkan cannot answer
+    // this: its importable bit describes Vulkan, and the consumer here is EGL in another
+    // process, so the only correct source is the consumer itself. Until one reports, the set
+    // is empty and only the plane limit applies.
+    //
+    // Images already created keep the modifier they were made with -- the caller must destroy
+    // and re-create them for a change to take effect. GPU thread only.
+    void setConsumerModifiers(std::vector<uint64_t> modifiers) { m_consumerModifiers = std::move(modifiers); }
+    const std::vector<uint64_t>& consumerModifiers() const { return m_consumerModifiers; }
     AllocatedImage createImage(const VkImageCreateInfo& imageInfo, const char* debugName = nullptr);
     void destroyImage(AllocatedImage& image);
     VkDeviceMemory imageDeviceMemory(const AllocatedImage& image) const;
@@ -118,6 +128,7 @@ private:
     VmaAllocator m_allocator = nullptr;
     VkPhysicalDevice m_physicalDevice = VK_NULL_HANDLE;  // for the modifier queries above
     bool m_drmFormatModifierSupported = false;
+    std::vector<uint64_t> m_consumerModifiers;
 
     // Tracks the debug name of every live allocation. Used both for shutdown()'s
     // leaked-allocation diagnostic and by requireLiveAllocation() to reject use of

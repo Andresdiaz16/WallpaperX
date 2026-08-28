@@ -161,6 +161,11 @@ public:
     // on the session bus can drive. Finite, not tight.
     static constexpr int kMaxMonitors = 32;
 
+    // Bounds the import-modifier list a client may report. Mesa publishes tens per format, so
+    // this is far above any real driver and exists only to keep a client from sizing daemon
+    // state.
+    static constexpr size_t kMaxImportModifiers = 512;
+
     struct Config {
         // Placeholder geometry: no source of real monitor dimensions exists until the app
         // supplies them via KScreen (Step 15). Tests override it to keep software-rasterised
@@ -200,6 +205,19 @@ public:
     // makes it outlive a restart. Idempotent; a call that changes nothing already on disk does
     // not write, since the write parks the calling thread.
     void setMonitorOutput(int monitorId, const std::string& outputName);
+
+    // Records what the frame consumer says it can import, and returns the monitors to re-post
+    // so their images are rebuilt against it. GPU-free, like requestWallpaper: the set is
+    // applied on the render thread at the next render.
+    //
+    // The daemon cannot answer this for itself -- Vulkan's importable bit describes Vulkan, and
+    // the importer is EGL in another process -- so the consumer reports and the exporter
+    // intersects. Frames already exported keep their layout until re-rendered, which is why
+    // this returns work rather than doing it.
+    //
+    // Throws InvalidRequest for a format this daemon does not export, or an implausibly long
+    // list. Idempotent: an identical set changes nothing and returns no monitors.
+    std::vector<int> setImportModifiers(uint32_t drmFormat, const std::vector<uint64_t>& modifiers);
 
     // Applies the config file's wallpapers, returning the monitor ids to post to the worker.
     // Call once. Writes nothing: a repair it computed is held for writeRepairedConfig().
@@ -387,6 +405,16 @@ private:
     // Connector name -> monitor id, and the only authority on which is which. Guarded by
     // m_stateMutex.
     std::map<std::string, int> m_outputs;
+
+    // What the consumer reported it can import, and whether the GPU side has caught up.
+    // Guarded by m_stateMutex; the render thread reads and clears the flag under m_gpuMutex
+    // first, so the two locks keep their declared order.
+    std::vector<uint64_t> m_importModifiers;
+    bool m_importModifiersPending = false;
+    // Hands a newly reported import-modifier set to the GPU side and drops the images built
+    // against the old one. Render thread, m_gpuMutex held, before any target is created.
+    void applyImportModifiersLocked();
+
     // Member pointer picks the check, so a caller cannot record into a field it did not
     // mean and the sanitizing happens in one place.
     void recordHealth(HealthCheck DaemonHealth::*which, HealthStatus status, const std::string& detail);

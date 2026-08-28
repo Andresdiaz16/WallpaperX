@@ -572,6 +572,7 @@ void runHostChecks(sdbus::IProxy& proxy, const std::string& imagePath, const Che
         //       control: sd-bus refuses a vtable whose parameter-name count disagrees with
         //       the signature, so the daemon fails to register at all and the run reports an
         //       exception instead of this line.
+        {"method", "SetImportModifiers", ArgList{{"in", "u:drm_format"}, {"in", "at:modifiers"}}},
         {"method", "SetMonitorOutput", ArgList{{"in", "i:monitor_id"}, {"in", "s:output_name"}}},
         {"method", "GetStatus", ArgList{{"out", "s:status"}}},
         // A signal's args carry no direction attribute, hence the empty first field.

@@ -2,8 +2,12 @@
 
 #define VMA_IMPLEMENTATION
 #include "memory.h"
+
+#include "drm_formats.h"
+
 #include "../third_party/vk_mem_alloc.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <stdexcept>
 #include <string>
@@ -129,6 +133,13 @@ std::vector<uint64_t> usableDrmModifiers(VkPhysicalDevice physicalDevice, VkForm
     // with no indication of which requirement was the problem.
     std::vector<uint64_t> usable;
     for (const auto& candidate : all) {
+        // Asked before the capability queries, because this one is about our own importer rather
+        // than the driver: a layout it cannot describe is not usable however well the GPU
+        // supports it. See kMaxExportedPlanes.
+        if (candidate.drmFormatModifierPlaneCount > kMaxExportedPlanes) {
+            continue;
+        }
+
         VkPhysicalDeviceImageDrmFormatModifierInfoEXT modifierInfo{
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT};
         modifierInfo.drmFormatModifier = candidate.drmFormatModifier;
@@ -214,9 +225,31 @@ AllocatedImage Memory::createExportableImage(const VkImageCreateInfo& imageInfoI
             VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT | VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT);
         if (modifiers.empty()) {
             throw std::runtime_error(
-                std::string("Memory: no DRM format modifier is both exportable and importable for ") +
+                std::string("Memory: no single-plane DRM format modifier is both exportable and importable for ") +
                 std::to_string(imageInfo.extent.width) + "x" + std::to_string(imageInfo.extent.height) +
                 " with the requested usage for " + (debugName ? debugName : "(unnamed exportable image)"));
+        }
+
+        // Narrowed to what the consumer reported, once it has. Checked after the list above is
+        // known non-empty so "this GPU offers nothing" and "we agree on nothing" stay distinct
+        // diagnoses. Vulkan's extension leaves this to the application deliberately: its
+        // importable bit answers for Vulkan, and the importer here is EGL in another process.
+        if (!m_consumerModifiers.empty()) {
+            std::vector<uint64_t> agreed;
+            for (uint64_t candidate : modifiers) {
+                if (std::find(m_consumerModifiers.begin(), m_consumerModifiers.end(), candidate) !=
+                    m_consumerModifiers.end()) {
+                    agreed.push_back(candidate);
+                }
+            }
+            if (agreed.empty()) {
+                throw std::runtime_error(
+                    std::string("Memory: this GPU and the frame consumer share no DRM format modifier for ") +
+                    (debugName ? debugName : "(unnamed exportable image)") + " (" +
+                    std::to_string(modifiers.size()) + " usable here, " +
+                    std::to_string(m_consumerModifiers.size()) + " accepted there)");
+            }
+            modifiers = std::move(agreed);
         }
 
         // Offering the driver every usable modifier lets it pick its most efficient

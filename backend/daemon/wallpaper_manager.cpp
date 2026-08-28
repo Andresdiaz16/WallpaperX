@@ -345,6 +345,67 @@ void WallpaperManager::releaseTarget(int monitorId) {
     }
 }
 
+std::vector<int> WallpaperManager::setImportModifiers(uint32_t drmFormat, const std::vector<uint64_t>& modifiers) {
+    // Only the format this daemon exports is meaningful. A report about another one is a
+    // client mistake, and silently keeping it would leave the exporter narrowed by a set that
+    // describes a different pixel layout.
+    const uint32_t exported = drmFourccForVkFormat(OffscreenTargetManager::kFormat);
+    if (drmFormat != exported) {
+        throw InvalidRequest("import modifiers were reported for DRM format " + std::to_string(drmFormat) +
+                             ", but this daemon exports " + std::to_string(exported));
+    }
+    // Bounded for the same reason every other client-supplied length is: this is copied into
+    // daemon state and walked per image creation. A driver publishing more than this is not a
+    // case worth carrying.
+    if (modifiers.size() > kMaxImportModifiers) {
+        throw InvalidRequest("too many import modifiers reported (" + std::to_string(modifiers.size()) +
+                             ", limit " + std::to_string(kMaxImportModifiers) + ")");
+    }
+    if (modifiers.empty()) {
+        // An empty set means "I can import nothing", which no consumer means. Refused rather
+        // than stored, because storing it reads identically to "nobody has reported yet" and
+        // would silently restore the unnegotiated behaviour.
+        throw InvalidRequest("the reported import modifier set is empty");
+    }
+
+    std::lock_guard<std::mutex> stateLock(m_stateMutex);
+    if (m_importModifiers == modifiers) {
+        return {};  // idempotent: several plugin instances share one process and one answer
+    }
+    m_importModifiers = modifiers;
+    m_importModifiersPending = true;
+
+    // Every monitor holding a renderable request needs a new image: the one it has was built
+    // against the old set. Bumping requestSeq is what makes renderPending() act -- it refuses
+    // to re-render a request it has already serviced.
+    std::vector<int> toRender;
+    for (auto& [id, state] : m_monitors) {
+        if (!isRenderableType(state.type)) continue;
+        ++state.requestSeq;
+        toRender.push_back(id);
+    }
+    return toRender;
+}
+
+// Runs on the render thread with m_gpuMutex held, before any target is created.
+void WallpaperManager::applyImportModifiersLocked() {
+    std::vector<uint64_t> modifiers;
+    std::vector<int> monitorIds;
+    {
+        std::lock_guard<std::mutex> stateLock(m_stateMutex);
+        if (!m_importModifiersPending) return;
+        modifiers = m_importModifiers;
+        m_importModifiersPending = false;
+        for (const auto& [id, state] : m_monitors) monitorIds.push_back(id);
+    }
+    m_device->memory().setConsumerModifiers(std::move(modifiers));
+
+    // Existing images keep the modifier they were created with, so a new set only affects
+    // images made after it. Dropping them is what makes it take effect; acquireTarget()
+    // rebuilds each on its next render.
+    for (int id : monitorIds) releaseTarget(id);
+}
+
 void WallpaperManager::requestWallpaper(const std::string& type, const std::string& path, int monitorId) {
     if (!isKnownType(type)) {
         // Sanitized because this message is echoed to the log and returned over the bus,
@@ -821,6 +882,9 @@ RenderOutcome WallpaperManager::renderPending(int monitorId) {
     const OffscreenTarget* target = nullptr;
     try {
         ensureGpu();
+        // Before the target is acquired, so a set reported since the last render rebuilds the
+        // image rather than being applied to one already allocated against the old one.
+        applyImportModifiersLocked();
         target = &acquireTarget(monitorId);
         // Not retained past this call. A static wallpaper renders once, so keeping the
         // texture, pipeline and descriptor alive per monitor would hold VRAM for

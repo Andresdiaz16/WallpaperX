@@ -66,6 +66,18 @@ public:
     // support, so a resolve-based check reports yes and then fails at the call.
     static bool supports(HandleType type, std::string* whyNot = nullptr);
 
+    // Every DRM format modifier this EGL implementation can import `drmFormat` as. The daemon
+    // cannot work this out for itself: Vulkan's importable bit answers for Vulkan, and this is
+    // the only API that answers for the one doing the importing.
+    //
+    // Empty with a reason set when the driver has no such query, which is not a failure -- the
+    // caller reports nothing and the daemon keeps its unnegotiated default. Needs a current
+    // context, so the render thread.
+    //
+    // Modifiers flagged external-only are excluded: they sample through
+    // GL_TEXTURE_EXTERNAL_OES, and import() builds a GL_TEXTURE_2D.
+    static std::vector<uint64_t> importableModifiers(uint32_t drmFormat, std::string* whyNot = nullptr);
+
     // Imports `request` into a new texture. By reference so it can report the fd's fate.
     static Result import(Request& request);
 

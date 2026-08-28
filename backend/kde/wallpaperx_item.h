@@ -131,6 +131,9 @@ private:
     void fetchFrame(quint64 generation);
     // The reply half of fetchFrame, on the GUI thread once the bus answers.
     void takeFrameReply(const QDBusMessage& call);
+    // Tells the daemon which dma_buf layouts this driver can import, so it stops choosing ones
+    // this process cannot take. Render thread; sends from the GUI thread. Once per process.
+    void reportImportModifiersOnce(quint32 drmFormat);
     // The reason has two independent producers -- see the definitions for why neither writes the
     // published string directly.
     void setFetchReason(const QString& reason);   // GUI thread

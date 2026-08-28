@@ -67,6 +67,11 @@ private:
                       uint32_t, uint64_t, std::vector<sdbus::Struct<uint64_t, uint64_t>>, std::vector<uint8_t>>;
     void completeGetFrameFd(FrameFdCall call, int32_t monitorId);
 
+    // Records what the consumer can import and re-posts the monitors whose images were built
+    // against the previous set. Synchronous: it touches bookkeeping only, and the GPU work
+    // happens on the worker like every other render.
+    void setImportModifiers(uint32_t drmFormat, const std::vector<uint64_t>& modifiers);
+
     std::string getStatus();
 
     // ~DbusService stops the worker before any member is destroyed: the ordering cannot be

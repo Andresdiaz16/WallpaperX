@@ -125,6 +125,15 @@ std::atomic<int> g_abandonedDescriptors{0};
 
 bool kcmpBudgetSpent() { return g_abandonedDescriptors.load(std::memory_order_relaxed) >= kAbandonBudget; }
 
+// An imported texture has one level, and the default minification filter wants a mipmap chain,
+// which leaves it incomplete and sampling black. MAX_LEVEL is the fix; the filters keep the two
+// import paths delivering textures that sample alike. Call with the texture bound.
+void completeImportedTexture() {
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+}
+
 // Hex, so a device mismatch can name the two GPUs instead of only asserting they differ.
 std::string uuidText(const uint8_t* bytes, size_t count) {
     static constexpr char kHex[] = "0123456789abcdef";
@@ -154,10 +163,15 @@ struct EglImageApi {
     using CreateFn = EGLImageKHR (*)(EGLDisplay, EGLContext, EGLenum, EGLClientBuffer, const EGLAttrib*);
     using DestroyFn = EGLBoolean (*)(EGLDisplay, EGLImageKHR);
     using TargetTextureFn = void (*)(GLenum, GLeglImageOES);
+    using QueryModifiersFn = EGLBoolean (*)(EGLDisplay, EGLint, EGLint, EGLuint64KHR*, EGLBoolean*, EGLint*);
 
     CreateFn create = nullptr;
     DestroyFn destroy = nullptr;
     TargetTextureFn targetTexture = nullptr;
+
+    // Not part of complete(): importing works without it, and only the modifier report needs
+    // it. Folding it in would refuse the whole path on a driver missing just the query.
+    QueryModifiersFn queryModifiers = nullptr;
 
     bool complete() const { return create != nullptr && destroy != nullptr && targetTexture != nullptr; }
 };
@@ -173,6 +187,8 @@ const EglImageApi& eglImageApi() {
         resolved.destroy = reinterpret_cast<EglImageApi::DestroyFn>(eglGetProcAddress("eglDestroyImage"));
         resolved.targetTexture =
             reinterpret_cast<EglImageApi::TargetTextureFn>(eglGetProcAddress("glEGLImageTargetTexture2DOES"));
+        resolved.queryModifiers =
+            reinterpret_cast<EglImageApi::QueryModifiersFn>(eglGetProcAddress("eglQueryDmaBufModifiersEXT"));
         return resolved;
     }();
     return api;
@@ -253,10 +269,10 @@ FrameImport::Result FrameImport::importDmaBuf(Request& request) {
         out.error = "a dma_buf frame carries no plane layout, so EGL cannot be told where the pixels are";
         return out;
     }
-    // One plane is what this handles. A compressed modifier on Intel or AMD can carry a second
-    // metadata plane, and silently importing only the first would draw the image without its
-    // compression metadata -- garbage, not a degraded picture.
-    if (request.planes.size() > 1) {
+    // The same limit the exporter selects modifiers against, so the two cannot disagree about
+    // what is exportable. Importing only the first plane of a compressed layout would draw the
+    // image without its compression metadata -- garbage, not a degraded picture.
+    if (request.planes.size() > kMaxExportedPlanes) {
         out.error = "this frame has more than one memory plane, which the importer does not describe yet";
         return out;
     }
@@ -293,6 +309,7 @@ FrameImport::Result FrameImport::importDmaBuf(Request& request) {
     glBindTexture(GL_TEXTURE_2D, texture);
     api.targetTexture(GL_TEXTURE_2D, static_cast<GLeglImageOES>(image));
     const bool bound = glGetError() == GL_NO_ERROR;
+    if (bound) completeImportedTexture();
     glBindTexture(GL_TEXTURE_2D, 0);
 
     if (!bound) {
@@ -311,6 +328,56 @@ FrameImport::Result FrameImport::importDmaBuf(Request& request) {
     out.eglImage = image;
     out.eglDisplay = display;
     return out;
+}
+
+std::vector<uint64_t> FrameImport::importableModifiers(uint32_t drmFormat, std::string* whyNot) {
+    const auto refuse = [whyNot](const char* reason) {
+        if (whyNot != nullptr) *whyNot = reason;
+        return std::vector<uint64_t>{};
+    };
+
+    if (!hasEglExtension("EGL_EXT_image_dma_buf_import_modifiers")) {
+        return refuse("this driver does not advertise EGL_EXT_image_dma_buf_import_modifiers");
+    }
+    const EglImageApi& api = eglImageApi();
+    if (api.queryModifiers == nullptr) {
+        return refuse("eglQueryDmaBufModifiersEXT could not be resolved");
+    }
+    EGLDisplay display = eglGetCurrentDisplay();
+    if (display == EGL_NO_DISPLAY) {
+        return refuse("no current EGL display to ask");
+    }
+
+    // Two calls: the first asks how many there are, the second fills them in. Asking for a
+    // count of 0 with null buffers is how the extension reports the size.
+    EGLint count = 0;
+    if (api.queryModifiers(display, static_cast<EGLint>(drmFormat), 0, nullptr, nullptr, &count) != EGL_TRUE) {
+        return refuse("eglQueryDmaBufModifiersEXT refused to report a count for this format");
+    }
+    if (count <= 0) {
+        return refuse("this driver imports no modifier for the format the daemon exports");
+    }
+
+    std::vector<EGLuint64KHR> raw(static_cast<size_t>(count));
+    std::vector<EGLBoolean> externalOnly(static_cast<size_t>(count));
+    if (api.queryModifiers(display, static_cast<EGLint>(drmFormat), count, raw.data(), externalOnly.data(), &count) !=
+        EGL_TRUE) {
+        return refuse("eglQueryDmaBufModifiersEXT refused to list the modifiers");
+    }
+    // The second call may report fewer than the first; anything past it is uninitialised.
+    raw.resize(static_cast<size_t>(count < 0 ? 0 : count));
+    externalOnly.resize(raw.size());
+
+    std::vector<uint64_t> usable;
+    usable.reserve(raw.size());
+    for (size_t i = 0; i < raw.size(); ++i) {
+        if (externalOnly[i] == EGL_TRUE) continue;
+        usable.push_back(static_cast<uint64_t>(raw[i]));
+    }
+    if (usable.empty()) {
+        return refuse("every modifier this driver imports for that format is external-only");
+    }
+    return usable;
 }
 
 FrameImport::Result FrameImport::import(Request& request) {
@@ -477,6 +544,9 @@ FrameImport::Result FrameImport::import(Request& request) {
     if (alphaIsUndefined) {
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_A, GL_ONE);
     }
+    // Complete already, since glTexStorageMem2DEXT makes the texture immutable with one level.
+    // Set anyway so both paths hand back a texture that samples the same way.
+    completeImportedTexture();
     glBindTexture(GL_TEXTURE_2D, 0);
 
     out.texture = texture;

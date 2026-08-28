@@ -265,13 +265,12 @@ inline std::vector<unsigned char> readSampled(GLuint texture, uint32_t width, ui
         return pixels;
     }
 
-    // NEAREST, and not for filtering's sake: the default minification filter wants mipmaps, and
-    // an imported texture has exactly one level -- left alone it is an incomplete texture and
-    // every lookup returns black, which would read as a wrong import.
+    // Deliberately sets NO filter. An imported texture has one level, and the default
+    // minification filter wants a mipmap chain, so an importer that leaves the level bound
+    // unset delivers an incomplete texture that samples black. Setting one here would hide
+    // exactly that -- it is the importer's job, and this is where it gets graded.
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, texture);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 

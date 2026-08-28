@@ -16,6 +16,11 @@ namespace wallpaperx {
 // valid DRM_FORMAT_MOD_LINEAR and would otherwise be mistaken for a real layout.
 inline constexpr uint64_t kDrmModifierInvalid = (1ULL << 56) - 1;
 
+// The most memory planes an exported dma_buf may span. The importer describes exactly one plane
+// to EGL, so a two-plane layout -- the efficient one on AMD and Intel -- would export cleanly and
+// then fail every import, permanently and with nothing reporting why.
+inline constexpr uint32_t kMaxExportedPlanes = 1;
+
 // DRM fourcc codes (from drm_fourcc.h, redefined to avoid a libdrm dependency). The
 // DRM naming is little-endian channel order, so DRM's "ARGB8888" is the same byte
 // layout as Vulkan's VK_FORMAT_B8G8R8A8_UNORM -- they are not a typo for each other.

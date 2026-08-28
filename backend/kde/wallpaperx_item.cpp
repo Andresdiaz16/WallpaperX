@@ -247,6 +247,43 @@ void WallpaperXItem::fetchFrame(quint64 generation) {
             });
 }
 
+// Render thread. The set belongs to the process's EGL driver, not to an item -- plasmashell can
+// hold one WallpaperXItem per screen and they all import through the same driver -- so it is
+// queried and sent once, and every later caller returns immediately.
+void WallpaperXItem::reportImportModifiersOnce(quint32 drmFormat) {
+    static std::atomic<bool> reported{false};
+    if (reported.exchange(true)) return;
+
+    std::string whyNot;
+    const std::vector<uint64_t> modifiers = FrameImport::importableModifiers(drmFormat, &whyNot);
+    if (modifiers.empty()) {
+        // Not an error and not retried: a driver with no such query has none to report, and the
+        // daemon's unnegotiated default is what it already uses.
+        std::fprintf(stderr, "wallpaperx: not reporting import modifiers -- %s\n", whyNot.c_str());
+        return;
+    }
+
+    // Sent from the GUI thread: this one owns no bus connection, and QDBusConnection is not
+    // safe to use from the scene graph's thread.
+    QMetaObject::invokeMethod(
+        this,
+        [drmFormat, modifiers] {
+            QDBusConnection bus = QDBusConnection::sessionBus();
+            if (!bus.isConnected()) return;
+            QDBusMessage request = QDBusMessage::createMethodCall(
+                QString::fromUtf8(kService), QString::fromUtf8(kPath), QString::fromUtf8(kInterface),
+                QStringLiteral("SetImportModifiers"));
+            QList<quint64> wire;
+            wire.reserve(static_cast<qsizetype>(modifiers.size()));
+            for (uint64_t modifier : modifiers) wire.append(modifier);
+            request.setArguments({drmFormat, QVariant::fromValue(wire)});
+            // Fire and forget: the daemon answers by re-rendering and announcing FrameReady,
+            // which this item already listens for. Waiting here would park the desktop's UI.
+            bus.asyncCall(request);
+        },
+        Qt::QueuedConnection);
+}
+
 void WallpaperXItem::takeFrameReply(const QDBusMessage& call) {
     if (call.type() != QDBusMessage::ReplyMessage) {
         // A bus error is jargon about transport ("The name io.wallpaperx.Daemon was not provided
@@ -394,6 +431,12 @@ QSGNode* WallpaperXItem::updatePaintNode(QSGNode* old, UpdatePaintNodeData*) {
     }
 
     if (incoming.has_value()) {
+        // Before the import, deliberately. If the daemon chose a layout this driver cannot take,
+        // the import below fails -- and reporting only on success would mean the one case
+        // negotiation exists for never reaches the daemon.
+        if (incoming->request.handleType == FrameImport::HandleType::DmaBuf) {
+            reportImportModifiersOnce(incoming->request.drmFormat);
+        }
         const FrameImport::Result imported = FrameImport::import(incoming->request);
         // Null means nothing took ownership of the import, so it is freed by hand here.
         QSGTexture* texture =

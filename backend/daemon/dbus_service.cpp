@@ -88,6 +88,11 @@ void DbusService::registerVTable() {
                 .withInputParamNames("monitor_id")
                 .withOutputParamNames("fd", "width", "height", "memory_size", "handle_type", "sync_fds",
                                       "frame_generation", "drm_format", "drm_modifier", "planes", "device_uuid"),
+            sdbus::registerMethod("SetImportModifiers")
+                .implementedAs([this](uint32_t drmFormat, const std::vector<uint64_t>& modifiers) {
+                    setImportModifiers(drmFormat, modifiers);
+                })
+                .withInputParamNames("drm_format", "modifiers"),
             sdbus::registerMethod("SetMonitorOutput")
                 .implementedAs([this](int32_t monitorId, const std::string& outputName) {
                     setMonitorOutput(monitorId, outputName);
@@ -147,6 +152,25 @@ void DbusService::setWallpaper(const std::string& type, const std::string& path,
     // need their monitor's target released, and that is GPU work, so it belongs on the
     // worker rather than in this handler.
     m_worker.post(monitorId);
+}
+
+void DbusService::setImportModifiers(uint32_t drmFormat, const std::vector<uint64_t>& modifiers) {
+    std::printf("wallpaperx-daemon: SetImportModifiers(drm_format=%u, count=%zu)\n", drmFormat, modifiers.size());
+    std::fflush(stdout);
+
+    std::vector<int> toRender;
+    try {
+        toRender = m_manager.setImportModifiers(drmFormat, modifiers);
+    } catch (const InvalidRequest& e) {
+        std::fprintf(stderr, "wallpaperx-daemon: SetImportModifiers rejected: %s\n", e.what());
+        throw sdbus::Error(sdbus::Error::Name{kErrorInvalidArgs}, e.what());
+    }
+
+    // Every monitor holding a frame built against the old set. Each re-render announces its own
+    // FrameReady, which is what tells the consumer to fetch the newly compatible frame.
+    for (int monitorId : toRender) {
+        m_worker.post(monitorId);
+    }
 }
 
 void DbusService::setMonitorOutput(int32_t monitorId, const std::string& outputName) {
