@@ -50,6 +50,7 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <future>
 #include <cstdio>
@@ -58,6 +59,7 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <regex>
 #include <stdexcept>
 #include <string>
@@ -190,6 +192,13 @@ constexpr int32_t kMonitorWithdrawBarrier = 26;
 constexpr int32_t kMonitorModifiersUnrenderable = 27;
 constexpr int32_t kMonitorModifiersUndoneA = 28;
 constexpr int32_t kMonitorModifiersUndoneB = 29;
+
+// On runImportModifierAnnouncementChecks' own manager, which renders nothing. The pair exists to
+// separate "the set changed" from "a monitor has to be redrawn": the first is a type this build
+// cannot draw, so it is never handed back to re-render, and the second is a renderable monitor
+// with no frame yet, which is handed back on every change.
+constexpr int32_t kMonitorAnnounceUnrenderable = 30;
+constexpr int32_t kMonitorAnnounceCondemned = 31;
 
 // Well-formed DRM format modifiers that no driver in this suite can allocate: 0x0f is an
 // unassigned vendor byte in drm_fourcc.h, so these cannot collide with a real layout however
@@ -2881,6 +2890,242 @@ void runImportModifierClientWireChecks(const wallpaperx::WallpaperManager::Confi
 }
 
 // --------------------------------------------------------------------------- //
+// The daemon announces that the layouts in force have changed (S6.58, S6.59, S6.60).
+//
+// WHY THE SIGNAL EXISTS AT ALL, because it is what every check below is shaped around. A report
+// can be refused for sharing no layout with ANOTHER consumer -- a verdict the caller cannot
+// change by editing its own list. If that other consumer later leaves the bus and the set in
+// force widens, a refused consumer with nothing to listen for never asks again and runs
+// unnegotiated for the rest of the session. So this has to be an event, and it has to be exact
+// in both directions: a signal that never fires leaves the consumer latched, and a signal that
+// fires on every call is the poll it was built to replace.
+//
+// TWO TIERS, because the property splits and neither tier can see the other's half.
+//
+//   The manager decides WHETHER the set changed, and returns that as a flag beside the list of
+//   monitors that have to be redrawn. Those two answers are deliberately different, and that
+//   difference is invisible over the bus: "no signal" and "a signal withheld because nothing
+//   needed redrawing" are the same silence on the wire.
+//
+//   The wire decides what the flag DOES. Only here is it observable that the flag gates an
+//   emission at all, that a departure goes through the same path, and that an identical
+//   re-report is silent.
+//
+// Its own manager, connection and service, on the connection's unique bus name rather than
+// io.wallpaperx.Daemon, which the shared phases own. Nothing renders -- requestWallpaper only
+// records a request -- so no Device is built here and this manager has no validation grade to
+// make. The wire half deliberately drives a manager with NO monitors at all, so every change it
+// makes is one that condemns nothing: that is the case S6.60 is about, and it is also the state
+// a freshly started daemon is in, which is when a consumer is most likely to have been refused.
+// --------------------------------------------------------------------------- //
+
+// Counts ImportModifiersChanged. The signal carries no arguments, so the count is the entire
+// observable, and every wait has a failure branch its caller must read (X.1).
+class AnnouncementLog {
+public:
+    void record() {
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            ++m_count;
+        }
+        m_arrived.notify_all();
+    }
+
+    bool waitFor(int atLeast) {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        return m_arrived.wait_for(lock, std::chrono::seconds(5), [&] { return m_count >= atLeast; });
+    }
+
+    int count() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_count;
+    }
+
+private:
+    mutable std::mutex m_mutex;
+    std::condition_variable m_arrived;
+    int m_count = 0;
+};
+
+void runImportModifierAnnouncementChecks(const wallpaperx::WallpaperManager::Config& config,
+                                         const std::string& imagePath, const std::string& videoPath,
+                                         const Check& check) {
+    const uint32_t exportedFormat = wallpaperx::drmFourccForVkFormat(wallpaperx::OffscreenTargetManager::kFormat);
+    const std::string consumer = ":test.announce.consumer";
+
+    {
+        wallpaperx::WallpaperManager bookkeeping(config);
+
+        // Recorded as a type this build cannot draw, so it is never handed back to re-render.
+        // With it as the only monitor, every change below condemns nothing.
+        bookkeeping.requestWallpaper("video", videoPath, kMonitorAnnounceUnrenderable);
+
+        // GOAL: S6.60 -- a change that condemns no monitor is still reported as a change. The
+        //       daemon has no frame to invalidate here, which is the state it starts in.
+        // WHY-THIS-SHAPE: asserts the flag and the monitor list TOGETHER, and that pairing is
+        //       the whole check: `changed` alone is satisfied by a daemon that returns "changed"
+        //       whenever it returns anything, and the empty list is what pins this as the case
+        //       where the two answers differ. The obvious alternative -- grading S6.60 over the
+        //       bus by counting signals from a daemon with no monitors -- cannot distinguish
+        //       "the set did not change" from "nothing needed redrawing", because both are
+        //       silence.
+        // CONTROL: the last line of WallpaperManager::adoptImportModifiersLocked
+        //       (backend/daemon/wallpaper_manager.cpp) changed to
+        //       `return ImportModifierUpdate{!toRender.empty(), std::move(toRender)};`.
+        //       Observed red here and at the wire tier's first announcement, whose manager also
+        //       has no monitor to condemn; 2 failures. The condemning check below stayed GREEN,
+        //       which is what makes this property separable from "a change is announced at all".
+        //       Reverted.
+        const wallpaperx::ImportModifierUpdate condemnsNothing =
+            bookkeeping.setImportModifiers(consumer, exportedFormat, {kUnavailableModifierA, kUnavailableModifierB});
+        check(condemnsNothing.changed && condemnsNothing.toRender.empty(),
+              "a report that changes the layouts in force but condemns no monitor is still reported as a change");
+        if (!condemnsNothing.toRender.empty()) {
+            std::fprintf(stderr, "  %zu monitor(s) were handed back for re-render; only a type this build cannot "
+                                 "draw was registered, so this phase's premise is gone\n",
+                         condemnsNothing.toRender.size());
+        }
+
+        // GOAL: S6.59 at the manager tier -- a report that leaves the set in force exactly as it
+        //       was is not a change. This is what keeps the wire tier's silence from being an
+        //       accident of the emission code.
+        // CONTROL: the `if (m_importModifiers == modifiers) return {};` guard deleted from
+        //       WallpaperManager::adoptImportModifiersLocked (backend/daemon/
+        //       wallpaper_manager.cpp). Observed red here, at the wire tier's silence check, and
+        //       at five pre-existing "changes nothing" checks; 7 failures. Reverted.
+        const wallpaperx::ImportModifierUpdate unchanged =
+            bookkeeping.setImportModifiers(consumer, exportedFormat, {kUnavailableModifierA, kUnavailableModifierB});
+        check(!unchanged.changed && unchanged.toRender.empty(),
+              "re-reporting the set already in force is not reported as a change");
+
+        // GOAL: S6.60's other side -- a change that DOES condemn a monitor is reported as a
+        //       change as well. Without it the check above is equally satisfied by a daemon that
+        //       hardcodes `changed` to true, which would make S6.59 unenforceable.
+        // WHY-THIS-SHAPE: the monitor added here is a renderable one with no frame at all, which
+        //       is handed back on every change on every host. Using a monitor whose committed
+        //       layout the report excludes -- the obvious way to condemn something -- would need
+        //       a real render and would be unreachable wherever the export is an opaque fd, which
+        //       is this project's target GPU.
+        // CONTROL: `toRender.push_back(id);` deleted from the loop in
+        //       WallpaperManager::adoptImportModifiersLocked (backend/daemon/
+        //       wallpaper_manager.cpp). Observed red here, with four pre-existing checks that
+        //       read the same list; 5 failures. Reverted.
+        bookkeeping.requestWallpaper("static", imagePath, kMonitorAnnounceCondemned);
+        const wallpaperx::ImportModifierUpdate condemns =
+            bookkeeping.setImportModifiers(consumer, exportedFormat, {kUnavailableModifierA});
+        check(condemns.changed && !condemns.toRender.empty(),
+              "a report that condemns a monitor is reported as a change too");
+    }
+
+    wallpaperx::WallpaperManager announcer(config);
+    auto serviceConn = sdbus::createSessionBusConnection();
+    DbusService service(*serviceConn, announcer);
+    serviceConn->enterEventLoopAsync();
+    const sdbus::ServiceName daemonName{serviceConn->getUniqueName()};
+    const sdbus::ObjectPath objectPath{DbusService::kObjectPath};
+
+    // Declared before the proxy whose dispatch thread writes to it, so it outlives that thread.
+    AnnouncementLog announced;
+    // A subscriber that never reports anything, which is what a consumer already latched on a
+    // refusal is: the whole point of the signal is that such a consumer hears about a change it
+    // did not cause.
+    auto listener = sdbus::createProxy(daemonName, objectPath);
+    listener->uponSignal("ImportModifiersChanged")
+        .onInterface(DbusService::kInterface)
+        .call([&announced] { announced.record(); });
+
+    // Each on a connection of its own: that is what gives it a distinct unique bus name, and
+    // what makes destroying one a real departure the daemon is told about.
+    auto reporter = sdbus::createProxy(daemonName, objectPath);
+    auto departing = sdbus::createProxy(daemonName, objectPath);
+
+    // GOAL: S6.58's first half -- a report that moves the intersection reaches subscribers as
+    //       ImportModifiersChanged. The interface inventory elsewhere in this file asserts the
+    //       signal is EXPORTED with no arguments, which says nothing about it ever being sent.
+    // WHY-THIS-SHAPE: the subscriber is a third connection that reports nothing, not the
+    //       reporting proxy itself. A consumer hearing its own call's effect would be graded on
+    //       a delivery path a refused consumer never uses, and refused consumers are the entire
+    //       audience for this signal. The wait is bounded and reaching the bound fails with a
+    //       printed count rather than falling through into the count comparison below (X.1).
+    // CONTROL: the `m_object->emitSignal("ImportModifiersChanged").onInterface(kInterface);`
+    //       call deleted from DbusService::applyImportModifierUpdate (backend/daemon/
+    //       dbus_service.cpp). Observed red here and the only failure in that run -- the checks
+    //       below never ran, because this one abandons the phase rather than counting an
+    //       announcement that cannot arrive. Reverted.
+    setImportModifiers(*reporter, exportedFormat, {kUnavailableModifierA, kUnavailableModifierB});
+    const bool announcedReport = announced.waitFor(1);
+    check(announcedReport, "a report that changes the layouts in force is announced to a subscriber");
+    if (!announcedReport) {
+        std::fprintf(stderr, "  no ImportModifiersChanged arrived within 5 s of an accepted report\n");
+        return;
+    }
+
+    // The identical re-report, then a report that really does narrow the set. The second is a
+    // BARRIER, not decoration: signals from one emitter to one subscriber are delivered in the
+    // order they were sent, and the re-report's own reply proves its handler had already run
+    // when the barrier call was made. So once the barrier's signal has arrived, any signal the
+    // re-report would have emitted is already counted. Sleeping and then counting is the
+    // alternative, and it grades the host's timing rather than the daemon.
+    //
+    // The barrier's own check has no control of its own: every mutation that falsifies it
+    // falsifies the announcement check above, which abandons the phase before this line is
+    // reached. It is asserted rather than assumed because reaching its bound means the count
+    // below has no barrier under it, and counting anyway would read a stall as silence.
+    setImportModifiers(*reporter, exportedFormat, {kUnavailableModifierA, kUnavailableModifierB});
+    setImportModifiers(*departing, exportedFormat, {kUnavailableModifierA});
+    const bool announcedBarrier = announced.waitFor(2);
+    check(announcedBarrier, "a second consumer's report narrowing the layouts in force is announced");
+    if (!announcedBarrier) {
+        std::fprintf(stderr, "  only %d announcement(s) arrived; the silence check below has no barrier and was "
+                             "abandoned\n",
+                     announced.count());
+        return;
+    }
+
+    // GOAL: S6.59 on the wire -- re-reporting the set already in force announces nothing. False
+    //       makes the signal the poll it replaces, and worse than a poll: a consumer wakes on
+    //       it and reports, and that report is another change.
+    // WHY-THIS-SHAPE: an exact count, taken only after the barrier above has landed, so the
+    //       claim is "the re-report contributed nothing" rather than "nothing had arrived yet".
+    //       Asserting `count() == 1` immediately after the re-report returns would rest on the
+    //       reply overtaking a signal sent from the same connection a moment earlier, which is
+    //       the opposite of the ordering D-Bus gives.
+    // CONTROL: the `if (!update.changed) return;` line deleted from
+    //       DbusService::applyImportModifierUpdate (backend/daemon/dbus_service.cpp), so every
+    //       accepted call emits. Observed red on both ICDs -- "3 announcement(s) arrived across
+    //       two changes and one identical re-report" -- and the only failure in either run.
+    //       Reverted.
+    check(announced.count() == 2, "re-reporting the set already in force announces nothing");
+    if (announced.count() != 2) {
+        std::fprintf(stderr, "  %d announcement(s) arrived across two changes and one identical re-report\n",
+                     announced.count());
+    }
+
+    // GOAL: S6.58's second half -- a reporting consumer leaving the bus is announced too. This
+    //       is the case the signal was added for: the departure widens the set in force, and a
+    //       consumer refused for sharing no layout with the departed one has no other way to
+    //       learn that its list would now be accepted.
+    // WHY-THIS-SHAPE: graded on the SUBSCRIBER, which is a different consumer from the one that
+    //       left and from the one that reported. Retrying the refused report until it is
+    //       accepted -- which is how the departure itself is graded elsewhere in this file --
+    //       establishes that the set widened and says nothing about anybody being told.
+    // CONTROL: `applyImportModifierUpdate(m_manager.forgetImportModifiers(name));` in
+    //       DbusService::watchClientExits (backend/daemon/dbus_service.cpp) replaced by a bare
+    //       `m_manager.forgetImportModifiers(name);`, so the set still widens and nothing is
+    //       announced. Observed red here -- "2 announcement(s) arrived ... 3 were expected" --
+    //       alongside S6.51's re-render check, which the same line also posts; 2 failures. The
+    //       two checks above stayed green. Reverted.
+    departing.reset();
+    const bool announcedDeparture = announced.waitFor(3);
+    check(announcedDeparture, "a reporting consumer leaving the bus is announced to the others");
+    if (!announcedDeparture) {
+        std::fprintf(stderr, "  %d announcement(s) arrived within 5 s of the reporting consumer's departure; 3 were "
+                             "expected\n",
+                     announced.count());
+    }
+}
+
+// --------------------------------------------------------------------------- //
 // Coalescing, driven at the level the mechanisms actually live at.
 //
 // Two independent mechanisms collapse a burst, and both sit below DBus:
@@ -3763,6 +4008,7 @@ int main() {
         // still answers for them.
         runImportModifierClientChecks(config, imagePath, check);
         runImportModifierClientWireChecks(config, check);
+        runImportModifierAnnouncementChecks(config, imagePath, videoPath, check);
 
         // Its own manager and Device, both created and destroyed on this thread -- the
         // phase drives renderPending() directly, so there is no worker thread for the

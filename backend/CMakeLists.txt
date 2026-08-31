@@ -770,6 +770,26 @@ if(DBUS_RUN_SESSION)
             RESOURCE_LOCK wallpaperx_bus_tests
             SKIP_RETURN_CODE 77)
 
+        # The same item again, driven by a stub that announces ImportModifiersChanged. Its own
+        # binary rather than another phase of item_modifier_report: the plugin's report latch is
+        # process-wide, so a run can be in the refused state or the accepted one, and the file
+        # above ends with a withdrawal on every frame -- which would make "no further report
+        # arrived" unaskable. No Vulkan, for the same reason as the file above.
+        add_executable(wallpaperx-item-modifier-retry-test tests/item_modifier_retry_test.cpp)
+        target_link_libraries(wallpaperx-item-modifier-retry-test PRIVATE
+            wallpaperx-frame-import Qt6::Core Qt6::DBus Qt6::Gui Qt6::Qml Qt6::Quick)
+        target_include_directories(wallpaperx-item-modifier-retry-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        target_compile_definitions(wallpaperx-item-modifier-retry-test PRIVATE
+            WALLPAPERX_QML_MODULE_PATH="${CMAKE_CURRENT_BINARY_DIR}/qml")
+        add_dependencies(wallpaperx-item-modifier-retry-test wallpaperxplugin)
+        add_test(NAME item_modifier_retry
+                 COMMAND ${DBUS_RUN_SESSION} -- $<TARGET_FILE:wallpaperx-item-modifier-retry-test>)
+        set_tests_properties(item_modifier_retry PROPERTIES
+            ENVIRONMENT "QT_QPA_PLATFORM=wayland\;xcb\;offscreen;QT_NO_XDG_DESKTOP_PORTAL=1"
+            LABELS "novulkan"
+            RESOURCE_LOCK wallpaperx_bus_tests
+            SKIP_RETURN_CODE 77)
+
         # The same item, driven by a stub that serves a frame the importer ACCEPTS -- a real
         # Vulkan export -- so that what the scene graph does with the imported GL objects when it
         # drops them is observable. Needs Vulkan as well as OpenGL, and needs both to resolve to
