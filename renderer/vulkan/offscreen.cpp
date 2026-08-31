@@ -109,8 +109,9 @@ void OffscreenTargetManager::createRenderPass() {
     renderPassInfo.dependencyCount = static_cast<uint32_t>(dependencies.size());
     renderPassInfo.pDependencies = dependencies.data();
 
-    if (vkCreateRenderPass(m_device.device(), &renderPassInfo, nullptr, &m_renderPass) != VK_SUCCESS) {
-        throw std::runtime_error("OffscreenTargetManager: failed to create render pass");
+    if (const VkResult r = vkCreateRenderPass(m_device.device(), &renderPassInfo, nullptr, &m_renderPass);
+        r != VK_SUCCESS) {
+        throwVkFailure("OffscreenTargetManager: vkCreateRenderPass", r);
     }
 }
 
@@ -240,9 +241,9 @@ OffscreenTarget OffscreenTargetManager::makeTarget(uint32_t width, uint32_t heig
     viewInfo.format = kFormat;
     viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
 
-    if (vkCreateImageView(m_device.device(), &viewInfo, nullptr, &target.view) != VK_SUCCESS) {
+    if (const VkResult r = vkCreateImageView(m_device.device(), &viewInfo, nullptr, &target.view); r != VK_SUCCESS) {
         destroyTarget(target);
-        throw std::runtime_error("OffscreenTargetManager: failed to create image view");
+        throwVkFailure("OffscreenTargetManager: vkCreateImageView", r);
     }
 
     if (auto* heap = dynamic_cast<DescriptorHeapAllocator*>(&m_device.descriptorAllocator())) {
@@ -257,9 +258,10 @@ OffscreenTarget OffscreenTargetManager::makeTarget(uint32_t width, uint32_t heig
     fbInfo.height = height;
     fbInfo.layers = 1;
 
-    if (vkCreateFramebuffer(m_device.device(), &fbInfo, nullptr, &target.framebuffer) != VK_SUCCESS) {
+    if (const VkResult r = vkCreateFramebuffer(m_device.device(), &fbInfo, nullptr, &target.framebuffer);
+        r != VK_SUCCESS) {
         destroyTarget(target);
-        throw std::runtime_error("OffscreenTargetManager: failed to create framebuffer");
+        throwVkFailure("OffscreenTargetManager: vkCreateFramebuffer", r);
     }
 
     return target;

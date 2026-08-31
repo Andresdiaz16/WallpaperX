@@ -2,6 +2,8 @@
 
 #include "descriptor_buffer.h"
 
+#include "gpu_fault.h"
+
 #include <array>
 #include <stdexcept>
 
@@ -36,15 +38,17 @@ DescriptorBufferAllocator::DescriptorBufferAllocator(VkPhysicalDevice physicalDe
         layoutInfo.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
         layoutInfo.bindingCount = static_cast<uint32_t>(bindings.size());
         layoutInfo.pBindings = bindings.data();
-        if (vkCreateDescriptorSetLayout(m_device, &layoutInfo, nullptr, &m_setLayout) != VK_SUCCESS) {
-            throw std::runtime_error("DescriptorBufferAllocator: failed to create descriptor set layout");
+        if (const VkResult r = vkCreateDescriptorSetLayout(m_device, &layoutInfo, nullptr, &m_setLayout);
+            r != VK_SUCCESS) {
+            throwVkFailure("DescriptorBufferAllocator: vkCreateDescriptorSetLayout", r);
         }
 
         VkPipelineLayoutCreateInfo pipelineLayoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         pipelineLayoutInfo.setLayoutCount = 1;
         pipelineLayoutInfo.pSetLayouts = &m_setLayout;
-        if (vkCreatePipelineLayout(m_device, &pipelineLayoutInfo, nullptr, &m_pipelineLayout) != VK_SUCCESS) {
-            throw std::runtime_error("DescriptorBufferAllocator: failed to create pipeline layout");
+        if (const VkResult r = vkCreatePipelineLayout(m_device, &pipelineLayoutInfo, nullptr, &m_pipelineLayout);
+            r != VK_SUCCESS) {
+            throwVkFailure("DescriptorBufferAllocator: vkCreatePipelineLayout", r);
         }
 
         VkDeviceSize layoutSize = 0;
@@ -94,7 +98,9 @@ void DescriptorBufferAllocator::loadFunctions() {
 
     if (!m_pfnGetLayoutSize || !m_pfnGetBindingOffset || !m_pfnGetDescriptor ||
         !m_pfnCmdBindBuffers || !m_pfnCmdSetOffsets) {
-        throw std::runtime_error("DescriptorBufferAllocator: VK_EXT_descriptor_buffer entry points missing");
+        // This tier is only selected when the extension was reported and enabled, so a
+        // missing entry point is the driver withholding what it advertised.
+        throw GpuFailure("DescriptorBufferAllocator: VK_EXT_descriptor_buffer entry points missing");
     }
 }
 

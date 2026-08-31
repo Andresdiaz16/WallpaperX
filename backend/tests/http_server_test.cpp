@@ -130,39 +130,74 @@ using wallpaperx::testing::wallpaperStatus;
 // below from being an assertion on the scheduler (X.2).
 namespace {
 
-struct SubmitFaultPlan {
-    int observed = 0;  // submits made on the arming thread while armed
-    int failAt = 0;    // 1-based index of the submit to fail; 0 counts and fails nothing
+// One armed driver call. Three entry points are interposed in this file and the bookkeeping
+// is identical for all three, so it is written once: three hand-copied versions are three
+// things that can drift, and the one that quietly loses its exception-safe disarm leaves a
+// plan armed into an unrelated phase with nothing to say so.
+struct VkCallFaultPlan {
+    int observed = 0;  // calls made on the arming thread while armed
+    int failAt = 0;    // 1-based index of the call to fail; 0 counts and fails nothing
     int injected = 0;  // faults actually returned, so a bypassed interposer is visible
+    VkResult result = VK_ERROR_UNKNOWN;  // what the failed call hands back
 };
 
-thread_local SubmitFaultPlan* t_submitFault = nullptr;
+// Returns the result to inject, or VK_SUCCESS for "let this one through" -- which is why no
+// interposer here can be asked to inject VK_SUCCESS, and none needs to. Called from the
+// interposer bodies, the only things that know their own entry point's signature.
+VkResult armedFault(VkCallFaultPlan* plan) {
+    if (plan == nullptr) return VK_SUCCESS;
+    ++plan->observed;
+    if (plan->failAt == 0 || plan->observed != plan->failAt) return VK_SUCCESS;
+    ++plan->injected;
+    return plan->result;
+}
 
-// Arms the interposer for the current thread only, and disarms on every exit path
-// including an exception (X.4) -- a plan left armed would inject into an unrelated phase.
-class SubmitFault {
+// Arms one interposer for the current thread only, and disarms on every exit path including
+// an exception (X.4) -- a plan left armed would inject into an unrelated phase. `slot` is
+// the interposer's own thread_local pointer; taking its address is safe because this is
+// always a stack object, so the arm and the disarm happen on one thread.
+class VkCallFault {
 public:
-    explicit SubmitFault(int failAt) : m_previous(t_submitFault) {
+    VkCallFault(VkCallFaultPlan** slot, int failAt, VkResult result) : m_slot(slot), m_previous(*slot) {
         m_plan.failAt = failAt;
-        t_submitFault = &m_plan;
+        m_plan.result = result;
+        *slot = &m_plan;
     }
-    ~SubmitFault() { disarm(); }
-    SubmitFault(const SubmitFault&) = delete;
-    SubmitFault& operator=(const SubmitFault&) = delete;
+    ~VkCallFault() { disarm(); }
+    VkCallFault(const VkCallFault&) = delete;
+    VkCallFault& operator=(const VkCallFault&) = delete;
 
     // Restores whatever was armed before rather than clearing, so a nested fault cannot
     // silently disarm an outer one still in scope. Idempotent: after an explicit disarm()
     // the destructor's own call is a no-op.
     void disarm() {
-        if (t_submitFault == &m_plan) t_submitFault = m_previous;
+        if (*m_slot == &m_plan) *m_slot = m_previous;
     }
 
     int observed() const { return m_plan.observed; }
     int injected() const { return m_plan.injected; }
 
 private:
-    SubmitFaultPlan m_plan;
-    SubmitFaultPlan* m_previous;
+    VkCallFaultPlan** m_slot;
+    VkCallFaultPlan m_plan;
+    VkCallFaultPlan* m_previous;
+};
+
+thread_local VkCallFaultPlan* t_submitFault = nullptr;
+
+// Named wrapper rather than a bare VkCallFault at each site: the result is fixed for this
+// entry point (see the interposer below), and four of the five uses arm only to count, where
+// naming a result would read as though one were going to be injected.
+class SubmitFault {
+public:
+    explicit SubmitFault(int failAt) : m_fault(&t_submitFault, failAt, VK_ERROR_DEVICE_LOST) {}
+
+    void disarm() { m_fault.disarm(); }
+    int observed() const { return m_fault.observed(); }
+    int injected() const { return m_fault.injected(); }
+
+private:
+    VkCallFault m_fault;
 };
 
 }  // namespace
@@ -182,13 +217,7 @@ extern "C" VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmit(VkQueue queue, uint32_t 
         realSubmit.store(real, std::memory_order_relaxed);
     }
 
-    if (SubmitFaultPlan* plan = t_submitFault; plan != nullptr) {
-        ++plan->observed;
-        if (plan->failAt != 0 && plan->observed == plan->failAt) {
-            ++plan->injected;
-            return VK_ERROR_DEVICE_LOST;
-        }
-    }
+    if (const VkResult injected = armedFault(t_submitFault); injected != VK_SUCCESS) return injected;
 
     auto* realFn = reinterpret_cast<PFN_vkQueueSubmit>(real);
     if (realFn == nullptr) return VK_ERROR_INITIALIZATION_FAILED;
@@ -216,17 +245,10 @@ extern "C" VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmit(VkQueue queue, uint32_t 
 // the plan, so the counts below are not an assertion on the scheduler (X.2).
 namespace {
 
-struct GetMemoryFdFaultPlan {
-    int observed = 0;  // vkGetMemoryFdKHR calls made on the arming thread while armed
-    int failAt = 0;    // 1-based index of the call to fail; 0 counts and fails nothing
-    int injected = 0;  // faults actually returned, so a bypassed interposer is visible
-    // Which failure to hand back. Selectable because exportFrame now classifies its results:
-    // the two the spec permits are host resource limits and must not touch the GPU's
-    // recorded health, and anything else is the driver going wrong and must.
-    VkResult result = VK_ERROR_TOO_MANY_OBJECTS;
-};
-
-thread_local GetMemoryFdFaultPlan* t_getMemoryFdFault = nullptr;
+// The result is selectable per arming because exportFrame classifies its results: the two
+// the spec permits are host resource limits and must not touch the GPU's recorded health,
+// and anything else is the driver going wrong and must.
+thread_local VkCallFaultPlan* t_getMemoryFdFault = nullptr;
 
 PFN_vkVoidFunction realDeviceProcAddr(VkDevice device, const char* name) {
     // RTLD_NEXT skips this executable and lands on the loader's own entry point. Idempotent,
@@ -244,42 +266,23 @@ PFN_vkVoidFunction realDeviceProcAddr(VkDevice device, const char* name) {
 // *pFd is left untouched: exportFrame initialises it to -1 and rejects a non-VK_SUCCESS
 // result anyway.
 VKAPI_ATTR VkResult VKAPI_CALL faultingGetMemoryFd(VkDevice device, const VkMemoryGetFdInfoKHR* info, int* pFd) {
-    if (GetMemoryFdFaultPlan* plan = t_getMemoryFdFault; plan != nullptr) {
-        ++plan->observed;
-        if (plan->failAt != 0 && plan->observed == plan->failAt) {
-            ++plan->injected;
-            return plan->result;
-        }
-    }
+    if (const VkResult injected = armedFault(t_getMemoryFdFault); injected != VK_SUCCESS) return injected;
+
     auto* realFn = reinterpret_cast<PFN_vkGetMemoryFdKHR>(realDeviceProcAddr(device, "vkGetMemoryFdKHR"));
     if (realFn == nullptr) return VK_ERROR_INITIALIZATION_FAILED;
     return realFn(device, info, pFd);
 }
 
-// Arms for the current thread only, and disarms on every exit path including an exception
-// (X.4) -- a plan left armed would inject into an unrelated phase. Restores whatever was
-// armed before rather than clearing, and disarm() is idempotent.
 class GetMemoryFdFault {
 public:
-    GetMemoryFdFault(int failAt, VkResult result) : m_previous(t_getMemoryFdFault) {
-        m_plan.failAt = failAt;
-        m_plan.result = result;
-        t_getMemoryFdFault = &m_plan;
-    }
-    ~GetMemoryFdFault() { disarm(); }
-    GetMemoryFdFault(const GetMemoryFdFault&) = delete;
-    GetMemoryFdFault& operator=(const GetMemoryFdFault&) = delete;
+    GetMemoryFdFault(int failAt, VkResult result) : m_fault(&t_getMemoryFdFault, failAt, result) {}
 
-    void disarm() {
-        if (t_getMemoryFdFault == &m_plan) t_getMemoryFdFault = m_previous;
-    }
-
-    int observed() const { return m_plan.observed; }
-    int injected() const { return m_plan.injected; }
+    void disarm() { m_fault.disarm(); }
+    int observed() const { return m_fault.observed(); }
+    int injected() const { return m_fault.injected(); }
 
 private:
-    GetMemoryFdFaultPlan m_plan;
-    GetMemoryFdFaultPlan* m_previous;
+    VkCallFault m_fault;
 };
 
 }  // namespace
@@ -294,6 +297,71 @@ extern "C" VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(VkDevice
     }
     return realDeviceProcAddr(device, pName);
 }
+
+// ---------------------------------------------------------------------------- //
+// Failing one vkCreateSampler, from the test binary
+// ---------------------------------------------------------------------------- //
+//
+// The two levers above reach the render's submit and the export's file-descriptor query.
+// Neither reaches the *object creation* a render does before it submits anything, and that
+// is where renderer/vulkan/gpu_fault.cpp's throwVkFailure is called from most of its sites:
+// allocator, buffer and image creates, render pass, image views, framebuffers, the three
+// descriptor tiers and the static renderer's own objects. Whether a resource limit raised
+// there stays off the GPU's recorded health is a different question from whether a failed
+// submit reaches it, and only this lever can ask it.
+//
+// vkCreateSampler is the aim for two reasons. It has exactly one caller in this executable
+// -- StaticRenderer::createSampler in renderer/renderers/static_renderer.cpp -- so a fault
+// on the first call cannot land somewhere else and be graded as though it had landed here.
+// And a static wallpaper builds a fresh StaticRenderer for every render rather than keeping
+// one, so the aim stays live after the first render instead of being reachable once. It is
+// called as an undefined symbol, resolved through the Vulkan loader, so a definition here is
+// what production binds to.
+//
+// Nothing in backend/daemon or renderer/ changes, so this is not the test-only hook in a
+// production file that X.6 forbids -- it is the technique this file already uses on
+// vkQueueSubmit. thread_local for the same reason: no other thread in this process can see
+// the plan, so the counts below are not an assertion on the scheduler (X.2).
+namespace {
+thread_local VkCallFaultPlan* t_createSamplerFault = nullptr;
+}  // namespace
+
+// *pSampler is left untouched: production checks the result before it reads the handle, and
+// StaticRenderer's member is VK_NULL_HANDLE until this call assigns it.
+extern "C" VKAPI_ATTR VkResult VKAPI_CALL vkCreateSampler(VkDevice device, const VkSamplerCreateInfo* pCreateInfo,
+                                                          const VkAllocationCallbacks* pAllocator,
+                                                          VkSampler* pSampler) {
+    // RTLD_NEXT skips this executable and lands on the loader's own entry point. Idempotent,
+    // so the relaxed racing store can only ever write the same value twice.
+    static std::atomic<void*> real{nullptr};
+    void* p = real.load(std::memory_order_relaxed);
+    if (p == nullptr) {
+        p = ::dlsym(RTLD_NEXT, "vkCreateSampler");
+        real.store(p, std::memory_order_relaxed);
+    }
+
+    if (const VkResult injected = armedFault(t_createSamplerFault); injected != VK_SUCCESS) return injected;
+
+    auto* realFn = reinterpret_cast<PFN_vkCreateSampler>(p);
+    if (realFn == nullptr) return VK_ERROR_INITIALIZATION_FAILED;
+    return realFn(device, pCreateInfo, pAllocator, pSampler);
+}
+
+namespace {
+
+class CreateSamplerFault {
+public:
+    CreateSamplerFault(int failAt, VkResult result) : m_fault(&t_createSamplerFault, failAt, result) {}
+
+    void disarm() { m_fault.disarm(); }
+    int observed() const { return m_fault.observed(); }
+    int injected() const { return m_fault.injected(); }
+
+private:
+    VkCallFault m_fault;
+};
+
+}  // namespace
 
 // ---------------------------------------------------------------------------- //
 // Failing one allocation inside an HTTP handler, from the test binary
@@ -3025,6 +3093,190 @@ void runGpuFailureChecks(const std::string& bluePath, const WallpaperManager::Co
                              driverFault.threw ? driverFault.error.c_str() : "no");
             }
         }
+    }
+
+    // ------------------------------------------------------------------ //
+    // The object creation a render does before it submits anything
+    // ------------------------------------------------------------------ //
+    //
+    // The two levers used above reach exactly two driver calls: the render's submit and the
+    // export's file-descriptor query. renderer/vulkan/gpu_fault.cpp's throwVkFailure is
+    // called from well over a dozen other sites -- the allocator and its buffer and image
+    // creates, the render pass, image views, framebuffers, the three descriptor tiers, the
+    // static renderer's own objects -- and every one of them classifies a resource limit
+    // apart from a driver fault. Deleting that classification outright leaves both suites
+    // green without the two arms below, so what follows is the only thing in either suite
+    // that grades an object create's classification reaching the daemon's health.
+    //
+    // Both arms drive one whole render with StaticRenderer's vkCreateSampler failed, and
+    // differ only in the result injected and in what they then require of `gpu`. Each is
+    // preceded by a successful render that puts the recorded health back to ok, so neither
+    // inherits the other's verdict.
+    struct SamplerFaultOutcome {
+        bool reached = false;  // the fault was returned to production exactly once
+        int observed = 0;
+        bool committed = false;
+        std::string lastError;
+        HttpReply health;
+    };
+    auto renderWithSamplerFault = [&daemon, &bluePath](VkResult injected) {
+        SamplerFaultOutcome outcome;
+        {
+            CreateSamplerFault fault(/*failAt=*/1, injected);
+            daemon.manager().requestWallpaper("static", bluePath, 0);
+            daemon.manager().renderPending(0);
+            outcome.observed = fault.observed();
+            outcome.reached = fault.injected() == 1;
+        }
+        const WallpaperManager::Snapshot snap = daemon.manager().snapshot();
+        if (const auto it = snap.monitors.find(0); it != snap.monitors.end()) {
+            outcome.committed = it->second.hasFrame;
+            outcome.lastError = it->second.lastError;
+        }
+        outcome.health = daemon.health();
+        return outcome;
+    };
+
+    // One successful render, whose only job is to leave `gpu` reading ok. Returns the detail
+    // it left behind, which is the baseline "was left alone" is measured against; an empty
+    // string means the daemon could not be put into that state, and the caller must skip
+    // rather than grade. A daemon reporting no GPU name is refused for the reason the
+    // recovery check above gives: the detail would be " ()", and comparing against that
+    // establishes nothing.
+    auto restoreHealthyGpu = [&daemon, &bluePath]() -> std::string {
+        daemon.manager().requestWallpaper("static", bluePath, 0);
+        daemon.manager().renderPending(0);
+        const WallpaperManager::Snapshot snap = daemon.manager().snapshot();
+        const auto it = snap.monitors.find(0);
+        if (it == snap.monitors.end() || !it->second.hasFrame || snap.gpu.name.empty()) return {};
+        const HttpReply health = daemon.health();
+        if (!health.ok() || healthCheckStatus(health.json, "gpu") != "ok") return {};
+        return healthCheckDetail(health.json, "gpu");
+    };
+
+    // GOAL: S7.10i -- a driver call that fails because a host or device resource ran out
+    //       fails the render and tells the caller which call failed, and leaves the daemon's
+    //       recorded GPU health exactly as it was. False if one out-of-host-memory inside a
+    //       render makes /health report the graphics driver as broken, which sends an
+    //       operator after their driver for a shortage of memory.
+    // WHY-THIS-SHAPE: aimed at an object create (vkCreateSampler) rather than at the submit
+    //       the phase above already fails. Injecting a limit at the submit is the obvious
+    //       cheaper alternative and it grades one code path twice -- Device::submit's
+    //       classification is the one already covered -- while leaving every create site,
+    //       which is where throwVkFailure is actually called from, ungraded. The status AND
+    //       the detail recorded before the fault are both compared afterwards: "left alone"
+    //       is a claim about the whole record, and a status-only check passes on a daemon
+    //       that reports ok while its detail holds the text of a failure.
+    // CONTROL: the `isResourceExhaustion(result)` branch deleted from throwVkFailure in
+    //       renderer/vulkan/gpu_fault.cpp, so every failure becomes a GpuFailure -> "FAIL: a
+    //       render that fails on a resource limit leaves the GPU's recorded health alone"
+    //       and "FAIL: a render that fails on a resource limit leaves the recorded GPU
+    //       detail alone", printing "gpu after a resource-limit render: fail (StaticRenderer:
+    //       vkCreateSampler failed with VK_ERROR_OUT_OF_HOST_MEMORY) (expected ok / NVIDIA
+    //       GeForce RTX 3080 Ti (Heap))". Under that same mutation exactly three of the 58
+    //       backend entries went red -- this one on both drivers, plus renderer/tests/
+    //       gpu_fault_test.cpp -- and the other 55 stayed green, which is the measurement
+    //       this arm exists for. The export arm above is among the 55: frame_export.cpp
+    //       classifies its own results and never calls throwVkFailure. Reverted.
+    // COVERAGE-ASSERT: `reached` must be true and the render must have failed. An interposer
+    //       that stopped landing leaves a successful render and a gpu reading ok for the
+    //       ordinary reason -- which is this arm's own pass condition -- so it skips.
+    //       Observed with the armedFault() call deleted from this file's vkCreateSampler:
+    //       "the render made 0 vkCreateSampler call(s) ... and still committed a frame", and
+    //       ctest recorded a Skip rather than a pass.
+    const std::string healthyDetail = restoreHealthyGpu();
+    if (healthyDetail.empty()) {
+        notVerified("S7.10i (a resource limit inside a render is not blamed on the GPU)",
+                    "the daemon could not be returned to a state where gpu reads ok with a name, so there is no "
+                    "baseline for \"the record was left alone\" to be compared against");
+    } else {
+        const SamplerFaultOutcome limit = renderWithSamplerFault(VK_ERROR_OUT_OF_HOST_MEMORY);
+        if (!limit.reached || limit.committed) {
+            notVerified("S7.10i (a resource limit inside a render is not blamed on the GPU)",
+                        "the render made " + std::to_string(limit.observed) +
+                            " vkCreateSampler call(s) with the interposer armed on the first, and " +
+                            (limit.committed ? "still committed a frame" : "no fault reached production") +
+                            " -- either StaticRenderer no longer creates a sampler, or this executable's "
+                            "vkCreateSampler is not what it calls");
+        } else if (!limit.health.ok()) {
+            check(false, "the resource-limit daemon answered /health with a parseable 200");
+        } else {
+            check(limit.lastError.find("StaticRenderer: vkCreateSampler") != std::string::npos,
+                  "a render that fails on a resource limit tells the caller which driver call failed");
+            check(healthCheckStatus(limit.health.json, "gpu") == "ok",
+                  "a render that fails on a resource limit leaves the GPU's recorded health alone");
+            check(healthCheckDetail(limit.health.json, "gpu") == healthyDetail,
+                  "a render that fails on a resource limit leaves the recorded GPU detail alone");
+            // Attribution, as on the submit arm: the shader directory resolved fine and a
+            // sampler that could not be created says nothing about it.
+            check(healthCheckStatus(limit.health.json, "shaders") == "ok",
+                  "a render that fails on a resource limit does not implicate the shaders");
+            if (healthCheckStatus(limit.health.json, "gpu") != "ok" ||
+                healthCheckDetail(limit.health.json, "gpu") != healthyDetail) {
+                std::fprintf(stderr, "  gpu after a resource-limit render: %s (%s) (expected ok / %s); render said: %s\n",
+                             healthCheckStatus(limit.health.json, "gpu").c_str(),
+                             healthCheckDetail(limit.health.json, "gpu").c_str(), healthyDetail.c_str(),
+                             limit.lastError.c_str());
+            }
+        }
+    }
+
+    // GOAL: S7.10j -- the other direction, at a site the submit arm above does not cover: a
+    //       driver call that fails with a lost device while *creating an object* is recorded
+    //       against the GPU. False if a daemon whose every render dies in vkCreateSampler
+    //       still reports gpu ok, which is a watchdog being shown a blank desktop and told
+    //       the graphics stack is fine.
+    // WHY-THIS-SHAPE: a fresh successful render runs first, so this arm starts from gpu ok
+    //       whatever the arm above concluded -- without it, a bug that made the resource
+    //       limit record a failure would leave gpu already reading fail and this check would
+    //       pass on the previous arm's damage. VK_ERROR_DEVICE_LOST rather than an
+    //       out-of-range code because a create is permitted to return it, so the daemon is
+    //       being asked to classify a real failure rather than an impossible one.
+    // CONTROL: two, both reverted. (1) `case VK_ERROR_DEVICE_LOST:` added to
+    //       isResourceExhaustion in renderer/vulkan/gpu_fault.cpp, so a lost device is raised
+    //       as an unclassified runtime_error -> "FAIL: a render whose object create reports a
+    //       lost device is recorded against the GPU" and "FAIL: the gpu detail names the
+    //       object create that failed", printing "gpu after a lost-device object create: ok
+    //       (NVIDIA GeForce RTX 3080 Ti (Heap))". That one also reddens the submit arm above,
+    //       which is expected -- it mutates the classifier both share. (2) The site alone:
+    //       the sampler create in renderer/renderers/static_renderer.cpp changed from
+    //       throwVkFailure to `throw std::runtime_error(...)` -> the same two reds and
+    //       nothing else, the submit arm green. That is what establishes these two are not
+    //       one check wearing two hats.
+    // COVERAGE-ASSERT: same as the arm above -- `reached` true and the render failed, or the
+    //       phase skips. Here a missed interposer would produce a successful render and gpu
+    //       ok, which fails this check rather than passing it, so the guard is about naming
+    //       the right component (X.3) rather than about vacuity.
+    const std::string healthyDetailBeforeFault = restoreHealthyGpu();
+    if (healthyDetailBeforeFault.empty()) {
+        notVerified("S7.10j (a lost device inside a render's object creation is blamed on the GPU)",
+                    "the daemon could not be returned to a state where gpu reads ok, so a later gpu: fail could "
+                    "not be told from one left over by the arm before this");
+        return;
+    }
+
+    const SamplerFaultOutcome lostDevice = renderWithSamplerFault(VK_ERROR_DEVICE_LOST);
+    if (!lostDevice.reached || lostDevice.committed) {
+        notVerified("S7.10j (a lost device inside a render's object creation is blamed on the GPU)",
+                    "the render made " + std::to_string(lostDevice.observed) +
+                        " vkCreateSampler call(s) with the interposer armed on the first, and " +
+                        (lostDevice.committed ? "still committed a frame" : "no fault reached production"));
+        return;
+    }
+    if (!lostDevice.health.ok()) {
+        check(false, "the lost-device daemon answered /health with a parseable 200");
+        return;
+    }
+    check(healthCheckStatus(lostDevice.health.json, "gpu") == "fail",
+          "a render whose object create reports a lost device is recorded against the GPU");
+    check(healthCheckDetail(lostDevice.health.json, "gpu").find("vkCreateSampler") != std::string::npos,
+          "the gpu detail names the object create that failed");
+    check(healthCheckStatus(lostDevice.health.json, "shaders") == "ok",
+          "a lost device during object creation does not implicate the shaders");
+    if (healthCheckStatus(lostDevice.health.json, "gpu") != "fail") {
+        std::fprintf(stderr, "  gpu after a lost-device object create: %s (%s)\n",
+                     healthCheckStatus(lostDevice.health.json, "gpu").c_str(),
+                     healthCheckDetail(lostDevice.health.json, "gpu").c_str());
     }
 }
 

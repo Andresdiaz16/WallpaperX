@@ -4,6 +4,7 @@
 #include "memory.h"
 
 #include "drm_formats.h"
+#include "gpu_fault.h"
 
 #include "../third_party/vk_mem_alloc.h"
 
@@ -24,8 +25,8 @@ void Memory::init(VkInstance instance, VkPhysicalDevice physicalDevice, VkDevice
         info.flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
     }
 
-    if (vmaCreateAllocator(&info, &m_allocator) != VK_SUCCESS) {
-        throw std::runtime_error("Memory: vmaCreateAllocator failed");
+    if (const VkResult r = vmaCreateAllocator(&info, &m_allocator); r != VK_SUCCESS) {
+        throwVkFailure("Memory: vmaCreateAllocator", r);
     }
     m_physicalDevice = physicalDevice;
     m_drmFormatModifierSupported = drmFormatModifierSupported;
@@ -69,8 +70,10 @@ AllocatedBuffer Memory::createBuffer(VkDeviceSize size, VkBufferUsageFlags usage
 
     AllocatedBuffer result;
     VmaAllocationInfo outInfo{};
-    if (vmaCreateBuffer(m_allocator, &bufferInfo, &allocInfo, &result.buffer, &result.allocation, &outInfo) != VK_SUCCESS) {
-        throw std::runtime_error(std::string("Memory: failed to create buffer ") + (debugName ? debugName : ""));
+    if (const VkResult r =
+            vmaCreateBuffer(m_allocator, &bufferInfo, &allocInfo, &result.buffer, &result.allocation, &outInfo);
+        r != VK_SUCCESS) {
+        throwVkFailure(std::string("Memory: vmaCreateBuffer for ") + (debugName ? debugName : "(unnamed buffer)"), r);
     }
     result.mapped = outInfo.pMappedData;
     m_liveAllocations[result.allocation] = debugName ? debugName : "(unnamed buffer)";
@@ -186,16 +189,22 @@ uint64_t queryImageDrmModifier(VkDevice device, VkImage image) {
     auto pfnGetModifierProps = reinterpret_cast<PFN_vkGetImageDrmFormatModifierPropertiesEXT>(
         vkGetDeviceProcAddr(device, "vkGetImageDrmFormatModifierPropertiesEXT"));
     if (!pfnGetModifierProps) {
-        throw std::runtime_error("queryImageDrmModifier: vkGetImageDrmFormatModifierPropertiesEXT entry point missing");
+        // Only ever called for a modifier-tiled image, which Memory refuses to create unless
+        // VK_EXT_image_drm_format_modifier was reported and enabled -- so a missing entry
+        // point is the driver withholding what it advertised.
+        throw GpuFailure("queryImageDrmModifier: vkGetImageDrmFormatModifierPropertiesEXT entry point missing");
     }
 
     VkImageDrmFormatModifierPropertiesEXT props{VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_PROPERTIES_EXT};
-    if (pfnGetModifierProps(device, image, &props) != VK_SUCCESS) {
-        throw std::runtime_error("queryImageDrmModifier: failed to query the image's DRM format modifier");
+    if (const VkResult r = pfnGetModifierProps(device, image, &props); r != VK_SUCCESS) {
+        throwVkFailure("queryImageDrmModifier: vkGetImageDrmFormatModifierPropertiesEXT", r);
     }
     if (props.drmFormatModifier == kDrmModifierInvalid) {
-        throw std::runtime_error("queryImageDrmModifier: driver reported DRM_FORMAT_MOD_INVALID for an "
-                                 "explicit-modifier image");
+        // The image was created from an explicit modifier list, so the driver is contradicting
+        // its own choice -- the same self-contradiction exportFrame records against the GPU
+        // when the chosen modifier is absent from the driver's list.
+        throw GpuFailure("queryImageDrmModifier: driver reported DRM_FORMAT_MOD_INVALID for an "
+                         "explicit-modifier image");
     }
     return props.drmFormatModifier;
 }
@@ -337,8 +346,12 @@ AllocatedImage Memory::createExportableImage(const VkImageCreateInfo& imageInfoI
     allocInfo.flags = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
 
     AllocatedImage result;
-    if (vmaCreateDedicatedImage(m_allocator, &imageInfo, &allocInfo, &exportInfo, &result.image, &result.allocation, nullptr) != VK_SUCCESS) {
-        throw std::runtime_error(std::string("Memory: failed to create exportable image ") + (debugName ? debugName : ""));
+    if (const VkResult r = vmaCreateDedicatedImage(m_allocator, &imageInfo, &allocInfo, &exportInfo, &result.image,
+                                                   &result.allocation, nullptr);
+        r != VK_SUCCESS) {
+        throwVkFailure(std::string("Memory: vmaCreateDedicatedImage for ") +
+                           (debugName ? debugName : "(unnamed exportable image)"),
+                       r);
     }
     result.drmModifierTiled = drmModifierTiled;
     m_liveAllocations[result.allocation] = debugName ? debugName : "(unnamed exportable image)";
@@ -350,8 +363,10 @@ AllocatedImage Memory::createImage(const VkImageCreateInfo& imageInfo, const cha
     allocInfo.usage = VMA_MEMORY_USAGE_AUTO;
 
     AllocatedImage result;
-    if (vmaCreateImage(m_allocator, &imageInfo, &allocInfo, &result.image, &result.allocation, nullptr) != VK_SUCCESS) {
-        throw std::runtime_error(std::string("Memory: failed to create image ") + (debugName ? debugName : ""));
+    if (const VkResult r =
+            vmaCreateImage(m_allocator, &imageInfo, &allocInfo, &result.image, &result.allocation, nullptr);
+        r != VK_SUCCESS) {
+        throwVkFailure(std::string("Memory: vmaCreateImage for ") + (debugName ? debugName : "(unnamed image)"), r);
     }
     m_liveAllocations[result.allocation] = debugName ? debugName : "(unnamed image)";
     return result;

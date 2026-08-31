@@ -235,8 +235,8 @@ void Device::createInstance(bool enableValidation) {
     createInfo.enabledExtensionCount = static_cast<uint32_t>(instanceExtensions.size());
     createInfo.ppEnabledExtensionNames = instanceExtensions.data();
 
-    if (vkCreateInstance(&createInfo, nullptr, &m_instance) != VK_SUCCESS) {
-        throw std::runtime_error("Device: vkCreateInstance failed");
+    if (const VkResult r = vkCreateInstance(&createInfo, nullptr, &m_instance); r != VK_SUCCESS) {
+        throwVkFailure("Device: vkCreateInstance", r);
     }
 
     if (validationAvailable) {
@@ -455,8 +455,8 @@ void Device::createLogicalDevice() {
     deviceInfo.enabledExtensionCount = static_cast<uint32_t>(deviceExtensions.size());
     deviceInfo.ppEnabledExtensionNames = deviceExtensions.data();
 
-    if (vkCreateDevice(m_physicalDevice, &deviceInfo, nullptr, &m_device) != VK_SUCCESS) {
-        throw std::runtime_error("Device: vkCreateDevice failed");
+    if (const VkResult r = vkCreateDevice(m_physicalDevice, &deviceInfo, nullptr, &m_device); r != VK_SUCCESS) {
+        throwVkFailure("Device: vkCreateDevice", r);
     }
 
     vkGetDeviceQueue(m_device, m_graphicsQueueFamily, 0, &m_graphicsQueue);
@@ -481,8 +481,8 @@ void Device::createCommandPool() {
     poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     poolInfo.queueFamilyIndex = m_graphicsQueueFamily;
 
-    if (vkCreateCommandPool(m_device, &poolInfo, nullptr, &m_commandPool) != VK_SUCCESS) {
-        throw std::runtime_error("Device: failed to create command pool");
+    if (const VkResult r = vkCreateCommandPool(m_device, &poolInfo, nullptr, &m_commandPool); r != VK_SUCCESS) {
+        throwVkFailure("Device: vkCreateCommandPool", r);
     }
 }
 
@@ -520,8 +520,8 @@ void Device::submit(const std::function<void(VkCommandBuffer)>& record, const Su
     allocInfo.commandBufferCount = 1;
 
     VkCommandBuffer cmd = VK_NULL_HANDLE;
-    if (vkAllocateCommandBuffers(m_device, &allocInfo, &cmd) != VK_SUCCESS) {
-        throw GpuFailure("Device::submit: failed to allocate command buffer");
+    if (const VkResult r = vkAllocateCommandBuffers(m_device, &allocInfo, &cmd); r != VK_SUCCESS) {
+        throwVkFailure("Device::submit: vkAllocateCommandBuffers", r);
     }
 
     VkFence fence = VK_NULL_HANDLE;
@@ -544,19 +544,19 @@ void Device::submit(const std::function<void(VkCommandBuffer)>& record, const Su
 
     VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    if (vkBeginCommandBuffer(cmd, &beginInfo) != VK_SUCCESS) {
-        throw GpuFailure("Device::submit: vkBeginCommandBuffer failed");
+    if (const VkResult r = vkBeginCommandBuffer(cmd, &beginInfo); r != VK_SUCCESS) {
+        throwVkFailure("Device::submit: vkBeginCommandBuffer", r);
     }
 
     record(cmd);
 
-    if (vkEndCommandBuffer(cmd) != VK_SUCCESS) {
-        throw GpuFailure("Device::submit: vkEndCommandBuffer failed");
+    if (const VkResult r = vkEndCommandBuffer(cmd); r != VK_SUCCESS) {
+        throwVkFailure("Device::submit: vkEndCommandBuffer", r);
     }
 
     VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-    if (vkCreateFence(m_device, &fenceInfo, nullptr, &fence) != VK_SUCCESS) {
-        throw GpuFailure("Device::submit: failed to create fence");
+    if (const VkResult r = vkCreateFence(m_device, &fenceInfo, nullptr, &fence); r != VK_SUCCESS) {
+        throwVkFailure("Device::submit: vkCreateFence", r);
     }
 
     VkSubmitInfo submitInfo{VK_STRUCTURE_TYPE_SUBMIT_INFO};
@@ -568,16 +568,16 @@ void Device::submit(const std::function<void(VkCommandBuffer)>& record, const Su
     submitInfo.signalSemaphoreCount = static_cast<uint32_t>(scope.signal.size());
     submitInfo.pSignalSemaphores = scope.signal.empty() ? nullptr : scope.signal.data();
 
-    if (vkQueueSubmit(m_graphicsQueue, 1, &submitInfo, fence) != VK_SUCCESS) {
-        throw GpuFailure("Device::submit: vkQueueSubmit failed");
+    if (const VkResult r = vkQueueSubmit(m_graphicsQueue, 1, &submitInfo, fence); r != VK_SUCCESS) {
+        throwVkFailure("Device::submit: vkQueueSubmit", r);
     }
 
-    if (vkWaitForFences(m_device, 1, &fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) {
+    if (const VkResult r = vkWaitForFences(m_device, 1, &fence, VK_TRUE, UINT64_MAX); r != VK_SUCCESS) {
         // The submit went through, so the command buffer and whatever it reads are still in
         // flight: reclaiming them here or in the caller is undefined until the device is
         // idle. On a lost device this returns at once rather than waiting.
         vkDeviceWaitIdle(m_device);
-        throw GpuFailure("Device::submit: vkWaitForFences failed");
+        throwVkFailure("Device::submit: vkWaitForFences", r);
     }
 }
 

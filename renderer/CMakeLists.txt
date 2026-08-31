@@ -65,6 +65,7 @@ find_file(WALLPAPERX_LAVAPIPE_ICD
 
 add_library(wallpaperx-renderer STATIC
     renderer.cpp
+    vulkan/gpu_fault.cpp
     vulkan/device.cpp
     vulkan/memory.cpp
     vulkan/memory_export.cpp
@@ -176,6 +177,9 @@ target_link_libraries(wallpaperx-tier-selection-test PRIVATE wallpaperx-renderer
 add_executable(wallpaperx-memory-export-test tests/memory_export_test.cpp)
 target_link_libraries(wallpaperx-memory-export-test PRIVATE wallpaperx-renderer)
 
+add_executable(wallpaperx-gpu-fault-test tests/gpu_fault_test.cpp)
+target_link_libraries(wallpaperx-gpu-fault-test PRIVATE wallpaperx-renderer)
+
 add_executable(wallpaperx-offscreen-probe tests/offscreen_probe.cpp)
 target_link_libraries(wallpaperx-offscreen-probe PRIVATE wallpaperx-renderer)
 
@@ -245,6 +249,7 @@ target_link_libraries(wallpaperx-validation-grade-probe PRIVATE wallpaperx-rende
 enable_testing()
 add_test(NAME tier_selection COMMAND wallpaperx-tier-selection-test)
 add_test(NAME memory_export COMMAND wallpaperx-memory-export-test)
+add_test(NAME gpu_fault COMMAND wallpaperx-gpu-fault-test)
 
 # The two-argument externalMemoryHandleType() caches WALLPAPERX_FORCE_HANDLE_TYPE in a
 # function-local static, so one process can only ever observe one value of it. Three
@@ -261,12 +266,12 @@ set_tests_properties(handle_type_env_dmabuf PROPERTIES ENVIRONMENT "WALLPAPERX_F
 set_tests_properties(handle_type_env_default PROPERTIES ENVIRONMENT "WALLPAPERX_FORCE_HANDLE_TYPE=")
 
 # Labelled so the TSan tier can tell "never loads an ICD" apart from "not a lavapipe
-# entry". None of these five constructs a Device or calls a vk* entry point, so the
+# entry". None of these six constructs a Device or calls a vk* entry point, so the
 # proprietary-driver SEGV that forces that tier to lavapipe-only cannot reach them.
 # backend/CMakeLists.txt previously keyed its disable on the *absence* of a lavapipe
 # label, which swept all five out and left tier selection and the handle-type cache
 # unexercised under the sanitizer -- while the run still reported green.
-set_tests_properties(tier_selection memory_export
+set_tests_properties(tier_selection memory_export gpu_fault
                      handle_type_env_default handle_type_env_opaque handle_type_env_dmabuf
                      PROPERTIES LABELS "novulkan")
 

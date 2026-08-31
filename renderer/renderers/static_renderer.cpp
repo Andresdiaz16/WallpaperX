@@ -269,8 +269,8 @@ void StaticRenderer::loadAndUploadTexture(const std::string& imagePath) {
     viewInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
     viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
 
-    if (vkCreateImageView(m_device.device(), &viewInfo, nullptr, &m_textureView) != VK_SUCCESS) {
-        throw std::runtime_error("StaticRenderer: failed to create texture image view");
+    if (const VkResult r = vkCreateImageView(m_device.device(), &viewInfo, nullptr, &m_textureView); r != VK_SUCCESS) {
+        throwVkFailure("StaticRenderer: vkCreateImageView", r);
     }
 
     if (m_heapAllocator) {
@@ -288,8 +288,8 @@ void StaticRenderer::createSampler() {
     samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
     samplerInfo.maxLod = 0.0f;
 
-    if (vkCreateSampler(m_device.device(), &samplerInfo, nullptr, &m_sampler) != VK_SUCCESS) {
-        throw std::runtime_error("StaticRenderer: failed to create sampler");
+    if (const VkResult r = vkCreateSampler(m_device.device(), &samplerInfo, nullptr, &m_sampler); r != VK_SUCCESS) {
+        throwVkFailure("StaticRenderer: vkCreateSampler", r);
     }
 
     if (m_heapAllocator) {
@@ -340,8 +340,12 @@ VkShaderModule StaticRenderer::createShaderModule(VkDevice device, const std::ve
     info.pCode = spirv.data();
 
     VkShaderModule module = VK_NULL_HANDLE;
-    if (vkCreateShaderModule(device, &info, nullptr, &module) != VK_SUCCESS) {
-        throw std::runtime_error("StaticRenderer: failed to create shader module");
+    // Deliberately not classified against the GPU, unlike the other driver calls here: the
+    // input is a file off disk that readSpirv only size-checks, so a driver that rejects it
+    // is as likely to be reporting a bad shader bundle as a fault of its own -- and blaming
+    // the GPU for a broken install is the misdiagnosis this classification exists to avoid.
+    if (const VkResult r = vkCreateShaderModule(device, &info, nullptr, &module); r != VK_SUCCESS) {
+        throw std::runtime_error("StaticRenderer: vkCreateShaderModule failed with " + vkResultName(r));
     }
     return module;
 }
@@ -453,10 +457,11 @@ void StaticRenderer::createPipeline(VkRenderPass renderPass, const std::string& 
         layoutInfo.setLayoutCount = 1;
         layoutInfo.pSetLayouts = &setLayout;
 
-        if (vkCreatePipelineLayout(m_device.device(), &layoutInfo, nullptr, &m_pipelineLayout) != VK_SUCCESS) {
+        if (const VkResult r = vkCreatePipelineLayout(m_device.device(), &layoutInfo, nullptr, &m_pipelineLayout);
+            r != VK_SUCCESS) {
             vkDestroyShaderModule(m_device.device(), vertModule, nullptr);
             vkDestroyShaderModule(m_device.device(), fragModule, nullptr);
-            throw std::runtime_error("StaticRenderer: failed to create pipeline layout");
+            throwVkFailure("StaticRenderer: vkCreatePipelineLayout", r);
         }
         pipelineInfo.layout = m_pipelineLayout;
     }
@@ -467,7 +472,9 @@ void StaticRenderer::createPipeline(VkRenderPass renderPass, const std::string& 
     vkDestroyShaderModule(m_device.device(), fragModule, nullptr);
 
     if (result != VK_SUCCESS) {
-        throw std::runtime_error("StaticRenderer: failed to create graphics pipeline");
+        // Unclassified for the same reason as vkCreateShaderModule above: the shader modules
+        // are compiled here, so a rejection may be the shader bundle rather than the driver.
+        throw std::runtime_error("StaticRenderer: vkCreateGraphicsPipelines failed with " + vkResultName(result));
     }
 }
 

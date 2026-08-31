@@ -3,6 +3,7 @@
 #pragma once
 
 #include "descriptor_allocator.h"
+#include "gpu_fault.h"
 #include "memory.h"
 #include "tier_selection.h"
 
@@ -17,21 +18,6 @@
 #include <thread>
 
 namespace wallpaperx {
-
-// A failure of the GPU itself -- submission, fences, command buffers -- as opposed to a
-// failure of the thing being rendered. Lets a caller attribute the fault without matching
-// on message text; a bad image and a lost device are both runtime_error otherwise.
-struct GpuFailure : std::runtime_error {
-    using std::runtime_error::runtime_error;
-};
-
-// A rejection of the thing being rendered -- unreadable, undecodable, or too large an image.
-// The user can fix it and the daemon cannot, so it must not mark the daemon unhealthy. It is
-// named rather than inferred because the alternative default -- treat anything unrecognised
-// as the wallpaper's fault -- reports a healthy daemon showing nothing.
-struct WallpaperContentError : std::runtime_error {
-    using std::runtime_error::runtime_error;
-};
 
 struct DeviceInfo {
     std::string gpuName;

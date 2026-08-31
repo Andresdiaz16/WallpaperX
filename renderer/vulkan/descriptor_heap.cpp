@@ -2,6 +2,8 @@
 
 #include "descriptor_heap.h"
 
+#include "gpu_fault.h"
+
 #include <algorithm>
 #include <stdexcept>
 
@@ -114,7 +116,9 @@ void DescriptorHeapAllocator::loadFunctions() {
 
     if (!m_pfnWriteResource || !m_pfnWriteSampler || !m_pfnCmdBindResourceHeap || !m_pfnCmdBindSamplerHeap ||
         !m_pfnCmdPushData) {
-        throw std::runtime_error("DescriptorHeapAllocator: VK_EXT_descriptor_heap entry points missing");
+        // This tier is only selected when the extension was reported and enabled, so a
+        // missing entry point is the driver withholding what it advertised.
+        throw GpuFailure("DescriptorHeapAllocator: VK_EXT_descriptor_heap entry points missing");
     }
 }
 
@@ -183,17 +187,17 @@ DescriptorHandle DescriptorHeapAllocator::allocate(VkImageView view, VkSampler s
     VkHostAddressRangeEXT resourceDst{};
     resourceDst.address = static_cast<uint8_t*>(m_resourceHeap.mapped) + slot * m_properties.imageDescriptorSize;
     resourceDst.size = m_properties.imageDescriptorSize;
-    if (m_pfnWriteResource(m_device, 1, &resourceInfo, &resourceDst) != VK_SUCCESS) {
+    if (const VkResult r = m_pfnWriteResource(m_device, 1, &resourceInfo, &resourceDst); r != VK_SUCCESS) {
         m_freeImageSlots.push_back(slot);
-        throw std::runtime_error("DescriptorHeapAllocator: vkWriteResourceDescriptorsEXT failed");
+        throwVkFailure("DescriptorHeapAllocator: vkWriteResourceDescriptorsEXT", r);
     }
 
     VkHostAddressRangeEXT samplerDst{};
     samplerDst.address = static_cast<uint8_t*>(m_samplerHeap.mapped) + slot * m_properties.samplerDescriptorSize;
     samplerDst.size = m_properties.samplerDescriptorSize;
-    if (m_pfnWriteSampler(m_device, 1, &samplerIt->second, &samplerDst) != VK_SUCCESS) {
+    if (const VkResult r = m_pfnWriteSampler(m_device, 1, &samplerIt->second, &samplerDst); r != VK_SUCCESS) {
         m_freeImageSlots.push_back(slot);
-        throw std::runtime_error("DescriptorHeapAllocator: vkWriteSamplerDescriptorsEXT failed");
+        throwVkFailure("DescriptorHeapAllocator: vkWriteSamplerDescriptorsEXT", r);
     }
 
     m_memory.flushForHostWrite(m_resourceHeap);
@@ -223,9 +227,9 @@ DescriptorHandle DescriptorHeapAllocator::allocateUniform(VkBuffer buffer, VkDev
     dst.address =
         static_cast<uint8_t*>(m_resourceHeap.mapped) + m_uniformRegionOffset + slot * m_properties.bufferDescriptorSize;
     dst.size = m_properties.bufferDescriptorSize;
-    if (m_pfnWriteResource(m_device, 1, &resourceInfo, &dst) != VK_SUCCESS) {
+    if (const VkResult r = m_pfnWriteResource(m_device, 1, &resourceInfo, &dst); r != VK_SUCCESS) {
         m_freeUniformSlots.push_back(slot);
-        throw std::runtime_error("DescriptorHeapAllocator: vkWriteResourceDescriptorsEXT (uniform) failed");
+        throwVkFailure("DescriptorHeapAllocator: vkWriteResourceDescriptorsEXT (uniform)", r);
     }
 
     m_memory.flushForHostWrite(m_resourceHeap);
