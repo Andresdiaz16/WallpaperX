@@ -187,6 +187,15 @@ OffscreenTarget OffscreenTargetManager::makeTarget(uint32_t width, uint32_t heig
         externalMemoryHandleType(m_device.info().vendor, m_device.info().hasExternalMemoryDmaBuf),
         "offscreen-target");
 
+    if (target.image.drmModifierTiled) {
+        try {
+            target.drmModifier = queryImageDrmModifier(m_device.device(), target.image.image);
+        } catch (...) {
+            destroyTarget(target);
+            throw;
+        }
+    }
+
     VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     viewInfo.image = target.image.image;
     viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;

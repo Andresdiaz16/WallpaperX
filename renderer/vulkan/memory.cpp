@@ -182,6 +182,24 @@ std::vector<uint64_t> usableDrmModifiers(VkPhysicalDevice physicalDevice, VkForm
     return usable;
 }
 
+uint64_t queryImageDrmModifier(VkDevice device, VkImage image) {
+    auto pfnGetModifierProps = reinterpret_cast<PFN_vkGetImageDrmFormatModifierPropertiesEXT>(
+        vkGetDeviceProcAddr(device, "vkGetImageDrmFormatModifierPropertiesEXT"));
+    if (!pfnGetModifierProps) {
+        throw std::runtime_error("queryImageDrmModifier: vkGetImageDrmFormatModifierPropertiesEXT entry point missing");
+    }
+
+    VkImageDrmFormatModifierPropertiesEXT props{VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_PROPERTIES_EXT};
+    if (pfnGetModifierProps(device, image, &props) != VK_SUCCESS) {
+        throw std::runtime_error("queryImageDrmModifier: failed to query the image's DRM format modifier");
+    }
+    if (props.drmFormatModifier == kDrmModifierInvalid) {
+        throw std::runtime_error("queryImageDrmModifier: driver reported DRM_FORMAT_MOD_INVALID for an "
+                                 "explicit-modifier image");
+    }
+    return props.drmFormatModifier;
+}
+
 AllocatedImage Memory::createExportableImage(const VkImageCreateInfo& imageInfoIn, VkExternalMemoryHandleTypeFlagBits exportHandleType, const char* debugName) {
     VkExternalMemoryImageCreateInfo externalImageInfo{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO};
     externalImageInfo.handleTypes = exportHandleType;
@@ -253,8 +271,8 @@ AllocatedImage Memory::createExportableImage(const VkImageCreateInfo& imageInfoI
         }
 
         // Offering the driver every usable modifier lets it pick its most efficient
-        // layout; the one it actually chose is read back after creation via
-        // vkGetImageDrmFormatModifierPropertiesEXT (see exportFrame).
+        // layout; the one it actually chose is read back right after creation via
+        // queryImageDrmModifier (see OffscreenTargetManager::makeTarget).
         modifierListInfo.drmFormatModifierCount = static_cast<uint32_t>(modifiers.size());
         modifierListInfo.pDrmFormatModifiers = modifiers.data();
         modifierListInfo.pNext = &externalImageInfo;

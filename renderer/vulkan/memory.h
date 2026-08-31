@@ -61,6 +61,10 @@ std::vector<uint64_t> usableDrmModifiers(VkPhysicalDevice physicalDevice, VkForm
                                          VkImageUsageFlags usage, VkExtent3D extent,
                                          VkExternalMemoryFeatureFlags requiredFeatures);
 
+// Which modifier the driver picked from the list an image was offered. Only legal for an image
+// created with VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT -- see AllocatedImage::drmModifierTiled.
+uint64_t queryImageDrmModifier(VkDevice device, VkImage image);
+
 class Memory {
 public:
     void init(VkInstance instance, VkPhysicalDevice physicalDevice, VkDevice device, uint32_t apiVersion, bool bufferDeviceAddressEnabled, bool drmFormatModifierSupported);

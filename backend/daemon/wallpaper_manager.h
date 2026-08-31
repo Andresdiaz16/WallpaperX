@@ -206,18 +206,30 @@ public:
     // not write, since the write parks the calling thread.
     void setMonitorOutput(int monitorId, const std::string& outputName);
 
-    // Records what the frame consumer says it can import, and returns the monitors to re-post
-    // so their images are rebuilt against it. GPU-free, like requestWallpaper: the set is
-    // applied on the render thread at the next render.
+    // Records what the consumer named by `client` says it can import, and returns the monitors
+    // to re-post so their images are rebuilt against it. GPU-free, like requestWallpaper: the
+    // set is applied on the render thread at the next render.
     //
     // The daemon cannot answer this for itself -- Vulkan's importable bit describes Vulkan, and
     // the importer is EGL in another process -- so the consumer reports and the exporter
     // intersects. Frames already exported keep their layout until re-rendered, which is why
     // this returns work rather than doing it.
     //
-    // Throws InvalidRequest for a format this daemon does not export, or an implausibly long
-    // list. Idempotent: an identical set changes nothing and returns no monitors.
-    std::vector<int> setImportModifiers(uint32_t drmFormat, const std::vector<uint64_t>& modifiers);
+    // `client` is the caller's DBus unique name. Several consumers may report at once and every
+    // one of them has to be able to read the frame, so what takes effect is the intersection.
+    // The name is also what forgetImportModifiers() later withdraws: a set that outlived its
+    // reporter would narrow the exporter on behalf of a process that no longer exists.
+    //
+    // Throws InvalidRequest for a format this daemon does not export, an implausibly long list,
+    // or a set that leaves no layout every reporting consumer can read. Idempotent: an
+    // unchanged intersection returns no monitors.
+    std::vector<int> setImportModifiers(const std::string& client, uint32_t drmFormat,
+                                        const std::vector<uint64_t>& modifiers);
+
+    // Drops what `client` reported, because it left the bus, and returns the monitors to re-post.
+    // Widening the intersection cannot invalidate an image, but it does un-block a monitor the
+    // departed consumer's set left with no frame at all -- and nothing else will ever retry it.
+    std::vector<int> forgetImportModifiers(const std::string& client);
 
     // Applies the config file's wallpapers, returning the monitor ids to post to the worker.
     // Call once. Writes nothing: a repair it computed is held for writeRepairedConfig().
@@ -307,6 +319,13 @@ private:
         // without touching GPU state and therefore without waiting behind a render.
         uint32_t width = 0;
         uint32_t height = 0;
+
+        // The memory layout the committed frame was built with, copied at commit time for the
+        // same reason as the size: a bus handler must decide whether a new import-modifier
+        // report invalidates this frame without taking the GPU lock. kDrmModifierInvalid means
+        // the frame was exported as an opaque fd, which carries no layout for a report to
+        // exclude. Meaningless unless hasFrame.
+        uint64_t frameModifier = kDrmModifierInvalid;
     };
 
     // Creates the Device and target manager on first use, so a machine with no working Vulkan
@@ -406,11 +425,33 @@ private:
     // m_stateMutex.
     std::map<std::string, int> m_outputs;
 
-    // What the consumer reported it can import, and whether the GPU side has caught up.
+    // What each consumer reported it can import, keyed by its DBus unique name, and the
+    // intersection currently in force. Per-consumer because the daemon must satisfy all of
+    // them at once, and because a set has to die with the process that reported it -- one
+    // left behind by a crashed consumer would narrow the exporter for its replacement.
+    //
     // Guarded by m_stateMutex; the render thread reads and clears the flag under m_gpuMutex
     // first, so the two locks keep their declared order.
+    std::map<std::string, std::vector<uint64_t>> m_importModifiersByClient;
     std::vector<uint64_t> m_importModifiers;
     bool m_importModifiersPending = false;
+
+    // The monitors the pending set invalidates, chosen when it was accepted rather than when
+    // it is applied: only these lose their images and re-render. Guarded by m_stateMutex.
+    std::vector<int> m_importModifiersInvalidated;
+
+    // Caller must hold m_stateMutex. Empty when no consumer has reported, which is what
+    // "unconstrained" means to the exporter.
+    std::vector<uint64_t> intersectImportModifiersLocked() const;
+
+    // Whether this monitor's committed frame can still be read under the set in force. Caller
+    // must hold m_stateMutex.
+    bool frameStillReadableLocked(const MonitorState& state) const;
+
+    // Records `modifiers` as the effective set and marks the monitors it invalidates. Caller
+    // must hold m_stateMutex. Returns the monitors to re-render.
+    std::vector<int> adoptImportModifiersLocked(std::vector<uint64_t> modifiers);
+
     // Hands a newly reported import-modifier set to the GPU side and drops the images built
     // against the old one. Render thread, m_gpuMutex held, before any target is created.
     void applyImportModifiersLocked();

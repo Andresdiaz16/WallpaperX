@@ -38,29 +38,16 @@ uint32_t drmFourccForVkFormat(VkFormat format) {
 
 namespace {
 
-// Reads back the layout the driver actually chose for an explicit-modifier image:
-// which DRM format modifier, and where each memory plane sits inside the exported
-// allocation. Without this an importer only has an fd and no way to interpret it.
+// Describes where each memory plane sits inside the exported allocation. Without this an
+// importer only has an fd and no way to interpret it.
 //
-// This is only valid because createExportableImage() built the image with
-// VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT -- the same queries on an OPTIMAL image
-// are a spec violation (VUID-vkGetImageDrmFormatModifierPropertiesEXT-image-02272),
-// and at least one driver answers them anyway with a plausible-but-wrong LINEAR.
+// Valid only for an image built with VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT: asking
+// vkGetImageSubresourceLayout for a VK_IMAGE_ASPECT_MEMORY_PLANE_n_BIT_EXT aspect requires
+// modifier tiling. createExportableImage() guarantees it, and the call site checks
+// target.image.drmModifierTiled before getting here.
 void populateDmaBufLayout(Device& device, const OffscreenTarget& target, ExportedFrame& frame) {
-    auto pfnGetModifierProps = reinterpret_cast<PFN_vkGetImageDrmFormatModifierPropertiesEXT>(
-        vkGetDeviceProcAddr(device.device(), "vkGetImageDrmFormatModifierPropertiesEXT"));
-    if (!pfnGetModifierProps) {
-        throw std::runtime_error("exportFrame: vkGetImageDrmFormatModifierPropertiesEXT entry point missing");
-    }
-
-    VkImageDrmFormatModifierPropertiesEXT modifierProps{
-        VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_PROPERTIES_EXT};
-    if (pfnGetModifierProps(device.device(), target.image.image, &modifierProps) != VK_SUCCESS) {
-        throw std::runtime_error("exportFrame: failed to query the image's DRM format modifier");
-    }
-    if (modifierProps.drmFormatModifier == kDrmModifierInvalid) {
-        throw std::runtime_error("exportFrame: driver reported DRM_FORMAT_MOD_INVALID for an explicit-modifier image");
-    }
+    // Recorded when the image was created; an image's modifier cannot change afterwards.
+    const uint64_t chosen = target.drmModifier;
 
     // How many memory planes that modifier uses is a property of the modifier, not
     // the format, so it has to come back from the same list the image was created
@@ -71,7 +58,7 @@ void populateDmaBufLayout(Device& device, const OffscreenTarget& target, Exporte
 
     uint32_t planeCount = 0;
     for (const auto& candidate : all) {
-        if (candidate.drmFormatModifier == modifierProps.drmFormatModifier) {
+        if (candidate.drmFormatModifier == chosen) {
             planeCount = candidate.drmFormatModifierPlaneCount;
             break;
         }
@@ -85,9 +72,9 @@ void populateDmaBufLayout(Device& device, const OffscreenTarget& target, Exporte
     // has_frame true and no error to explain it.
     const std::vector<uint64_t>& agreed = device.memory().consumerModifiers();
     if (!agreed.empty() &&
-        std::find(agreed.begin(), agreed.end(), modifierProps.drmFormatModifier) == agreed.end()) {
+        std::find(agreed.begin(), agreed.end(), chosen) == agreed.end()) {
         throw std::runtime_error("exportFrame: the driver chose DRM format modifier " +
-                                 std::to_string(modifierProps.drmFormatModifier) +
+                                 std::to_string(chosen) +
                                  ", which the frame consumer did not report as importable");
     }
     if (planeCount > kMaxExportedPlanes) {
@@ -111,7 +98,7 @@ void populateDmaBufLayout(Device& device, const OffscreenTarget& target, Exporte
         frame.planes.push_back(ExportedFramePlane{layout.offset, layout.rowPitch});
     }
 
-    frame.modifier = modifierProps.drmFormatModifier;
+    frame.modifier = chosen;
 }
 
 // The pipeline stage and access scope that produced the image's current contents,

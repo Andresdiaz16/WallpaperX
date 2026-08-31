@@ -734,6 +734,28 @@ if(DBUS_RUN_SESSION)
             RESOURCE_LOCK wallpaperx_bus_tests
             SKIP_RETURN_CODE 77)
 
+        # The same item again, driven by a stub that REFUSES the plugin's import-modifier report.
+        # No Vulkan: the frame it serves is a memfd with synthesized fields, because what is under
+        # test is what the plugin does with the daemon's answer, not what it does with the pixels.
+        #
+        # wallpaperx-frame-import is linked so the test can ask this host's EGL the same question
+        # the plugin asks: a driver that publishes no importable layout makes the plugin decline to
+        # report at all, by design, and without that gate the run would grade the host.
+        add_executable(wallpaperx-item-modifier-report-test tests/item_modifier_report_test.cpp)
+        target_link_libraries(wallpaperx-item-modifier-report-test PRIVATE
+            wallpaperx-frame-import Qt6::Core Qt6::DBus Qt6::Gui Qt6::Qml Qt6::Quick)
+        target_include_directories(wallpaperx-item-modifier-report-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        target_compile_definitions(wallpaperx-item-modifier-report-test PRIVATE
+            WALLPAPERX_QML_MODULE_PATH="${CMAKE_CURRENT_BINARY_DIR}/qml")
+        add_dependencies(wallpaperx-item-modifier-report-test wallpaperxplugin)
+        add_test(NAME item_modifier_report
+                 COMMAND ${DBUS_RUN_SESSION} -- $<TARGET_FILE:wallpaperx-item-modifier-report-test>)
+        set_tests_properties(item_modifier_report PROPERTIES
+            ENVIRONMENT "QT_QPA_PLATFORM=wayland\;xcb\;offscreen;QT_NO_XDG_DESKTOP_PORTAL=1"
+            LABELS "novulkan"
+            RESOURCE_LOCK wallpaperx_bus_tests
+            SKIP_RETURN_CODE 77)
+
         # The same item, driven by a stub that serves a frame the importer ACCEPTS -- a real
         # Vulkan export -- so that what the scene graph does with the imported GL objects when it
         # drops them is observable. Needs Vulkan as well as OpenGL, and needs both to resolve to

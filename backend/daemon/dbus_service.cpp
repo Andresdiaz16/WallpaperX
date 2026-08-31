@@ -39,6 +39,25 @@ DbusService::DbusService(sdbus::IConnection& connection, WallpaperManager& manag
     // The worker starts idle -- it can only do anything once a handler posts to it, and
     // no handler can be dispatched until the vtable below is registered.
     registerVTable();
+    watchClientExits();
+}
+
+void DbusService::watchClientExits() {
+    m_busWatch = sdbus::createProxy(m_object->getConnection(), sdbus::ServiceName{"org.freedesktop.DBus"},
+                                    sdbus::ObjectPath{"/org/freedesktop/DBus"});
+    m_busWatch->uponSignal("NameOwnerChanged")
+        .onInterface("org.freedesktop.DBus")
+        .call([this](const std::string& name, const std::string& oldOwner, const std::string& newOwner) {
+            // Only a departure. The same signal announces arrivals and well-known-name handovers,
+            // and reacting to those would drop a live consumer's set.
+            if (!oldOwner.empty() && newOwner.empty()) {
+                // A monitor the departed consumer's set left with no frame can be drawn again
+                // now that the constraint is gone, and this is the only thing that will retry it.
+                for (const int monitorId : m_manager.forgetImportModifiers(name)) {
+                    m_worker.post(monitorId);
+                }
+            }
+        });
 }
 
 DbusService::~DbusService() {
@@ -46,6 +65,10 @@ DbusService::~DbusService() {
     // dispatching, setWallpaper() posts to m_worker and getFrameFd's task touches m_object, so
     // destroying either first leaves the other dangling. stop() joins the render thread, then
     // leaves post() a no-op for any handler still in flight.
+    //
+    // The bus watch goes first: its callback reaches into the manager, and it must stop firing
+    // before anything else is torn down.
+    m_busWatch.reset();
     m_worker.stop();
 }
 
@@ -91,7 +114,11 @@ void DbusService::registerVTable() {
                                       "buffer_id"),
             sdbus::registerMethod("SetImportModifiers")
                 .implementedAs([this](uint32_t drmFormat, const std::vector<uint64_t>& modifiers) {
-                    setImportModifiers(drmFormat, modifiers);
+                    // The sender's unique name, not anything it could put in the arguments: the
+                    // bus assigns it, so a consumer cannot report on another's behalf, and it is
+                    // what NameOwnerChanged later names when the reporter exits.
+                    const char* sender = m_object->getCurrentlyProcessedMessage().getSender();
+                    setImportModifiers(sender ? sender : "", drmFormat, modifiers);
                 })
                 .withInputParamNames("drm_format", "modifiers"),
             sdbus::registerMethod("SetMonitorOutput")
@@ -155,13 +182,15 @@ void DbusService::setWallpaper(const std::string& type, const std::string& path,
     m_worker.post(monitorId);
 }
 
-void DbusService::setImportModifiers(uint32_t drmFormat, const std::vector<uint64_t>& modifiers) {
-    std::printf("wallpaperx-daemon: SetImportModifiers(drm_format=%u, count=%zu)\n", drmFormat, modifiers.size());
+void DbusService::setImportModifiers(const std::string& client, uint32_t drmFormat,
+                                     const std::vector<uint64_t>& modifiers) {
+    std::printf("wallpaperx-daemon: SetImportModifiers(client=%s, drm_format=%u, count=%zu)\n",
+                sanitizeForLog(client).c_str(), drmFormat, modifiers.size());
     std::fflush(stdout);
 
     std::vector<int> toRender;
     try {
-        toRender = m_manager.setImportModifiers(drmFormat, modifiers);
+        toRender = m_manager.setImportModifiers(client, drmFormat, modifiers);
     } catch (const InvalidRequest& e) {
         std::fprintf(stderr, "wallpaperx-daemon: SetImportModifiers rejected: %s\n", e.what());
         throw sdbus::Error(sdbus::Error::Name{kErrorInvalidArgs}, e.what());

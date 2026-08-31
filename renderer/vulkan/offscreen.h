@@ -2,6 +2,7 @@
 
 #pragma once
 
+#include "drm_formats.h"
 #include "memory.h"
 
 #include <cstdint>
@@ -24,6 +25,11 @@ struct OffscreenTarget {
     // the life of the process rather than a slot index: a ring rebuilt at a new size would
     // otherwise reuse indices for different images.
     uint64_t bufferId = 0;
+
+    // Which memory layout the driver picked from the list this image was offered, or
+    // kDrmModifierInvalid for an opaque-fd export, which has no modifier at all. Read once at
+    // creation: a consumer's later report only invalidates images whose layout it excludes.
+    uint64_t drmModifier = kDrmModifierInvalid;
 
     AllocatedImage image;
     VkImageView view = VK_NULL_HANDLE;

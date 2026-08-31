@@ -71,7 +71,13 @@ private:
     // Records what the consumer can import and re-posts the monitors whose images were built
     // against the previous set. Synchronous: it touches bookkeeping only, and the GPU work
     // happens on the worker like every other render.
-    void setImportModifiers(uint32_t drmFormat, const std::vector<uint64_t>& modifiers);
+    void setImportModifiers(const std::string& client, uint32_t drmFormat, const std::vector<uint64_t>& modifiers);
+
+    // Subscribes to the bus's own NameOwnerChanged so a consumer that reported import
+    // modifiers and then exited stops constraining the exporter. Without it the daemon would
+    // keep narrowing every image for a process that is gone, and the narrowest set any
+    // consumer ever reported would outlive them all.
+    void watchClientExits();
 
     std::string getStatus();
 
@@ -79,6 +85,7 @@ private:
     // left to declaration order alone, and that destructor says why.
     WallpaperManager& m_manager;
     std::unique_ptr<sdbus::IObject> m_object;
+    std::unique_ptr<sdbus::IProxy> m_busWatch;
     RenderWorker m_worker;
 };
 

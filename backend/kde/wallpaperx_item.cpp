@@ -35,7 +35,8 @@ std::atomic<bool> g_modifiersReported{false};
 std::mutex g_reportedMutex;
 std::vector<uint64_t> g_reportedModifiers;
 
-void sendImportModifiers(QObject* context, quint32 drmFormat, const std::vector<uint64_t>& modifiers);
+void sendImportModifiers(QObject* context, quint32 drmFormat, const std::vector<uint64_t>& modifiers,
+                         std::vector<uint64_t> restoreOnFailure);
 
 constexpr const char* kService = "io.wallpaperx.Daemon";
 constexpr const char* kPath = "/io/wallpaperx/Daemon";
@@ -281,7 +282,13 @@ void WallpaperXItem::reportImportModifiersOnce(quint32 drmFormat) {
         std::lock_guard<std::mutex> lock(g_reportedMutex);
         g_reportedModifiers = modifiers;
     }
-    sendImportModifiers(this, drmFormat, modifiers);
+    // Stays latched even if the daemon refuses, and the record keeps the list that was sent.
+    // Every refusal is a verdict on the list's contents -- a format this daemon does not export,
+    // a length over its cap, or no layout in common with another consumer -- so re-sending the
+    // same list gets the same answer, once per frame, forever. Recovery does not need a retry:
+    // an import that actually fails narrows this record and sends a different list, which is a
+    // question the daemon has not already answered.
+    sendImportModifiers(this, drmFormat, modifiers, modifiers);
 }
 
 // Withdraws a modifier the daemon may still choose, after an import of it actually failed.
@@ -289,6 +296,7 @@ void WallpaperXItem::reportImportModifiersOnce(quint32 drmFormat) {
 // re-render, so the next frame arrives in a layout this driver has demonstrated it can take.
 void WallpaperXItem::withdrawImportModifier(quint32 drmFormat, quint64 modifier) {
     std::vector<uint64_t> narrowed;
+    std::vector<uint64_t> previous;
     {
         std::lock_guard<std::mutex> lock(g_reportedMutex);
         const auto it = std::find(g_reportedModifiers.begin(), g_reportedModifiers.end(), modifier);
@@ -296,20 +304,27 @@ void WallpaperXItem::withdrawImportModifier(quint32 drmFormat, quint64 modifier)
         // The daemon refuses an empty set, and rightly: "I can import nothing" is not a report.
         // Leaving the last one stands a better chance than withdrawing it.
         if (g_reportedModifiers.size() == 1) return;
+        previous = g_reportedModifiers;
         g_reportedModifiers.erase(it);
         narrowed = g_reportedModifiers;
     }
-    sendImportModifiers(this, drmFormat, narrowed);
+    // Still latched on refusal: the daemon has an earlier report of ours that stands.
+    sendImportModifiers(this, drmFormat, narrowed, std::move(previous));
 }
 
 namespace {
 
-void sendImportModifiers(QObject* context, quint32 drmFormat, const std::vector<uint64_t>& modifiers) {
+// `restoreOnFailure` is what this plugin's record should go back to if the daemon refuses. It
+// matters because a caller narrows the record BEFORE sending: a refusal the caller never hears
+// about leaves this plugin and the daemon disagreeing about what was reported, and the daemon
+// then keeps choosing the very layout that failed to import.
+void sendImportModifiers(QObject* context, quint32 drmFormat, const std::vector<uint64_t>& modifiers,
+                         std::vector<uint64_t> restoreOnFailure) {
     // Sent from the GUI thread: the render thread owns no bus connection, and QDBusConnection
     // is not safe to use from it.
     QMetaObject::invokeMethod(
         context,
-        [drmFormat, modifiers] {
+        [context, drmFormat, modifiers, restoreOnFailure = std::move(restoreOnFailure)] {
             QDBusConnection bus = QDBusConnection::sessionBus();
             if (!bus.isConnected()) {
                 g_modifiersReported.store(false);  // retry on the next frame
@@ -322,9 +337,24 @@ void sendImportModifiers(QObject* context, quint32 drmFormat, const std::vector<
             wire.reserve(static_cast<qsizetype>(modifiers.size()));
             for (uint64_t modifier : modifiers) wire.append(modifier);
             request.setArguments({drmFormat, QVariant::fromValue(wire)});
-            // Fire and forget: the daemon answers by re-rendering and announcing FrameReady,
-            // which this item already listens for. Waiting here would park the desktop's UI.
-            bus.asyncCall(request);
+
+            // Watched, not waited on: a success needs nothing here (the daemon answers by
+            // re-rendering and announcing FrameReady, which this item already listens for), but
+            // a refusal has to be undone. Blocking would park the desktop's UI.
+            auto* watcher = new QDBusPendingCallWatcher(bus.asyncCall(request), context);
+            QObject::connect(
+                watcher, &QDBusPendingCallWatcher::finished, context,
+                [modifiers, restoreOnFailure](QDBusPendingCallWatcher* done) {
+                    done->deleteLater();
+                    if (!done->isError()) return;
+
+                    std::fprintf(stderr, "wallpaperx: the daemon refused the import modifier report -- %s\n",
+                                 done->error().message().toUtf8().constData());
+                    std::lock_guard<std::mutex> lock(g_reportedMutex);
+                    // Only if nothing has moved since. A withdrawal that landed while this call
+                    // was in flight must not be undone by an older one failing.
+                    if (g_reportedModifiers == modifiers) g_reportedModifiers = restoreOnFailure;
+                });
         },
         Qt::QueuedConnection);
 }

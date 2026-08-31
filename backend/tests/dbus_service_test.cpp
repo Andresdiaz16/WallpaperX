@@ -169,6 +169,39 @@ constexpr int32_t kMonitorModifiersWire = 22;
 // map while the repeat is processed and cannot be re-posted by it.
 constexpr int32_t kMonitorModifiersBarrier = 23;
 
+// runImportModifierClientChecks brings a manager of its own and never renders. Its monitor
+// holds a recorded request and no frame, which is what makes the list setImportModifiers
+// returns a usable "did the effective set change" probe: such a monitor is re-posted on every
+// real change and on nothing else.
+constexpr int32_t kMonitorModifiersIdle = 24;
+
+// On the SHARED manager: runModifierWithdrawalRenderChecks needs a monitor it can hold at "no
+// frame at all" across a consumer's departure, and a barrier of its own to prove the render
+// worker has drained. Two ids rather than one because the barrier's own render must not be
+// the render the check is waiting for.
+constexpr int32_t kMonitorWithdrawRender = 25;
+constexpr int32_t kMonitorWithdrawBarrier = 26;
+
+// On runImportModifierChecks' own manager. The first is driven to a wallpaper type this build
+// cannot draw while it still owns the image it rendered as a static one -- the state S6.53 is
+// about. The other two are a pair whose frames must survive a report that is undone before the
+// render thread sees it (S6.54); two, because the monitor that proves it must be one that is
+// never re-rendered, and something else has to carry the set across to the GPU side.
+constexpr int32_t kMonitorModifiersUnrenderable = 27;
+constexpr int32_t kMonitorModifiersUndoneA = 28;
+constexpr int32_t kMonitorModifiersUndoneB = 29;
+
+// Well-formed DRM format modifiers that no driver in this suite can allocate: 0x0f is an
+// unassigned vendor byte in drm_fourcc.h, so these cannot collide with a real layout however
+// the host's driver changes. A consumer reporting one is reporting a layout it can read and
+// this GPU cannot produce, which is the state the invalidation half of the contract needs.
+// Deliberately not kDrmModifierInvalid: that is the "no layout at all" sentinel, and a report
+// naming it would be testing the sentinel rather than an unavailable layout.
+constexpr uint64_t kUnavailableModifierA = 0x0f00000000000001ull;
+constexpr uint64_t kUnavailableModifierB = 0x0f00000000000002ull;
+constexpr uint64_t kUnavailableModifierC = 0x0f00000000000003ull;
+constexpr uint64_t kUnavailableModifierD = 0x0f00000000000004ull;
+
 // The bytes that make the hostile connector name hostile, named once so the fixture and
 // the scan that looks for them in GetStatus's reply cannot drift apart. Spelled as the
 // HTTP tier spells them (http_server_test.cpp), which carries the same pair.
@@ -207,23 +240,29 @@ std::string errorMessageFrom(const std::function<void()>& call) {
     return "";
 }
 
-std::string writeTestImage() {
-    std::filesystem::create_directories(testAssetDir());
-    const std::string path = testAssetDir() + "/dbus_test_blue.png";
-
+// Overwrites `path` with a solid-colour PNG. Separate from writeTestImage because one phase
+// turns an undecodable file into a decodable one at a moment of its choosing, and the path has
+// to stay the same across that change -- a new path would need a SetWallpaper, which is itself
+// a re-post and would grade nothing about who posted the render.
+void writeSolidPng(const std::string& path, unsigned char r, unsigned char g, unsigned char b) {
     const int w = 8;
     const int h = 8;
     std::vector<unsigned char> pixels(static_cast<size_t>(w) * h * 4);
     for (int i = 0; i < w * h; ++i) {
-        pixels[i * 4 + 0] = 0;
-        pixels[i * 4 + 1] = 0;
-        pixels[i * 4 + 2] = 255;
+        pixels[i * 4 + 0] = r;
+        pixels[i * 4 + 1] = g;
+        pixels[i * 4 + 2] = b;
         pixels[i * 4 + 3] = 255;
     }
-
     if (!stbi_write_png(path.c_str(), w, h, 4, pixels.data(), w * 4)) {
-        throw std::runtime_error("dbus_service_test: failed to write test image");
+        throw std::runtime_error("dbus_service_test: failed to write " + path);
     }
+}
+
+std::string writeTestImage() {
+    std::filesystem::create_directories(testAssetDir());
+    const std::string path = testAssetDir() + "/dbus_test_blue.png";
+    writeSolidPng(path, 0, 0, 255);
     return path;
 }
 
@@ -1734,12 +1773,18 @@ void runUnservicedRequestChecks(const wallpaperx::WallpaperManager::Config& conf
 }
 
 // --------------------------------------------------------------------------- //
-// SetImportModifiers on the wire: what the method refuses, and what an accepted report
-// actually makes the daemon do.
+// SetImportModifiers on the wire: what the method refuses, and which monitors an accepted
+// report actually reaches.
 //
-// Runs on the shared manager and after every other bus phase, deliberately: an accepted
-// report drops every monitor's offscreen image and re-renders each one, so a phase running
-// after this would be measuring monitors it did not put in that state.
+// Runs on the shared manager and after every other bus phase, deliberately: a report that
+// excludes the layout in use drops those monitors' images and re-renders them, so a phase
+// running after this would be measuring monitors it did not put in that state.
+//
+// WHICH HALF OF THE CONTRACT A HOST CAN ANSWER depends on its export. An opaque fd carries no
+// DRM format modifier, so no report can exclude it and the only observable is that nothing
+// happens (S6.47). A dma_buf frame carries a real layout, so both directions are reachable
+// (S6.45 and S6.46). The phase reads the committed frame's modifier off the wire and asks the
+// question the host can answer, rather than pinning one of the two and failing on the other.
 // --------------------------------------------------------------------------- //
 void runImportModifierWireChecks(sdbus::IProxy& proxy, FrameReadyLog& signals, const std::string& imagePath,
                                  const Check& check) {
@@ -1774,80 +1819,312 @@ void runImportModifierWireChecks(sdbus::IProxy& proxy, FrameReadyLog& signals, c
     setWallpaper(proxy, "static", imagePath, kMonitorModifiersWire);
     if (!signals.wait(kMonitorModifiersWire, 1)) {
         // X.1: a lost signal abandons the phase with a reason. Falling through would leave
-        // every count below measuring a monitor that never rendered, and the idempotency
-        // check -- which asserts an exact count -- would then pass on the daemon having
+        // every count below measuring a monitor that never rendered, and the signal-count
+        // check -- which asserts an exact number -- would then pass on the daemon having
         // done nothing at all.
         check(false, "the import-modifier wire phase's own monitor produced its first frame");
         return;
     }
 
-    // GOAL: an accepted report is not merely stored -- the daemon rebuilds the images that
-    //       were made against the old set and announces each one.
-    // WHY-THIS-SHAPE: waits for the exact next generation rather than "any newer frame".
-    //       The monitor is quiesced first (its generation-1 signal has arrived and nothing
-    //       else drives it), and setImportModifiers bumps each renderable monitor's request
-    //       exactly once, so exactly one further render is the daemon's own contract and
-    //       not a scheduler outcome. waitAtLeast would be satisfied by the frame already in
-    //       hand and would grade nothing.
-    // CONTROL: the `m_worker.post(monitorId)` loop deleted from
-    //       DbusService::setImportModifiers (backend/daemon/dbus_service.cpp) -> the wait
-    //       below times out and this goes red.
-    setImportModifiers(proxy, exportedFormat, reported);
-    const bool reRendered = signals.wait(kMonitorModifiersWire, 2);
-    check(reRendered, "an accepted modifier report re-renders a monitor that already had a frame, and announces it");
-    if (!reRendered) {
-        std::fprintf(stderr, "  no FrameReady(monitor=%d, generation=2) arrived after the report\n",
-                     kMonitorModifiersWire);
+    // Which layout the committed frame actually carries decides which half of the contract
+    // this host can be asked about, so it is read off the wire rather than assumed. An opaque
+    // fd publishes kDrmModifierInvalid, which is not a layout: no report can exclude it.
+    uint64_t committed = wallpaperx::kDrmModifierInvalid;
+    try {
+        committed = getFrameFd(proxy, kMonitorModifiersWire).drmModifier;
+    } catch (const sdbus::Error& e) {
+        check(false, "the import-modifier wire phase's own monitor serves the frame it just announced");
+        std::fprintf(stderr, "  GetFrameFd(monitor=%d) answered '%s'\n", kMonitorModifiersWire, e.getName().c_str());
         return;
     }
-    check(getFrameFd(proxy, kMonitorModifiersWire).generation == 2,
-          "the frame served after an accepted report is the rebuilt one");
+    const bool opaqueExport = committed == wallpaperx::kDrmModifierInvalid;
 
-    // GOAL: a repeat of the same report costs nothing -- several plugin instances share one
-    //       process and all report the same answer, so a re-render per instance would
-    //       rebuild every image on every screen for no change.
-    // WHY-THIS-SHAPE: a negative ("no render happened") settled by a later positive, which
-    //       is this file's standing idiom, but the barrier is on a SEPARATE monitor and
-    //       that is load-bearing. Barriering on this monitor instead -- the obvious
-    //       shape, and the one written first -- lets RenderWorker::post() collapse the
-    //       repeat's re-render into the barrier's own queued entry, so the defect produces
-    //       exactly the same signal count as the fix and the check passes. Observed: with
-    //       the early-out disabled, the same-monitor form stayed green. The barrier monitor
-    //       is also set for the first time here, so it was not in the map when the repeat
-    //       was processed and cannot have been re-posted by it.
-    // COVERAGE-ASSERT: the exact signal count for this monitor, not a bare "no third
-    //       signal". The count is what makes the check fail rather than go quiet if a
-    //       future edit stops this monitor rendering at all.
-    // CONTROL: the `if (m_importModifiers == modifiers) return {};` early-out disabled in
-    //       WallpaperManager::setImportModifiers -> "a repeated modifier report starts no
-    //       render", reporting 3 announcements where 2 are expected.
-    setImportModifiers(proxy, exportedFormat, reported);
+    // GOAL: S6.45 / S6.47 over the wire -- an accepted report leaves alone a monitor whose
+    //       committed frame it does not exclude. On a dma_buf host that is a frame whose
+    //       layout the report still names (S6.45); on an opaque-fd host it is every frame,
+    //       because an opaque handle carries no layout at all (S6.47).
+    // WHY-THIS-SHAPE: a negative ("no render happened") settled by a later positive on a
+    //       SEPARATE monitor, and the separate monitor is load-bearing. Barriering on this
+    //       monitor instead -- the obvious shape -- lets RenderWorker::post() collapse the
+    //       re-render being looked for into the barrier's own queued entry, so the defect and
+    //       the fix produce identical signal counts. Sleeping a fixed interval and then
+    //       counting would grade the scheduler instead; the barrier monitor is set for the
+    //       first time here, so its frame proves the worker has drained past the report.
+    // COVERAGE-ASSERT: the exact signal count for this monitor, not a bare "no second
+    //       signal", so an edit that stops this monitor rendering at all fails here rather
+    //       than going quiet.
+    // CONTROL: `if (stillReadable) continue;` disabled in
+    //       WallpaperManager::adoptImportModifiersLocked (backend/daemon/
+    //       wallpaper_manager.cpp) -- the pre-2026-08-30 "every renderable monitor is
+    //       re-posted" behaviour. Observed red on both ICDs, this check reporting
+    //       "monitor 22 announced 2 frames; expected exactly 1", together with the serve
+    //       check below and the two manager-tier checks; 4 failures in all. Reverted.
+    std::vector<uint64_t> keep{kUnavailableModifierA};
+    if (!opaqueExport) keep.push_back(committed);
+    setImportModifiers(proxy, exportedFormat, keep);
     setWallpaper(proxy, "static", imagePath, kMonitorModifiersBarrier);
     if (!signals.wait(kMonitorModifiersBarrier, 1)) {
-        // X.1 again: without this the count below would be read while the repeat's work
-        // might still be queued, and "no extra render happened" would be indistinguishable
-        // from "it has not happened yet".
-        check(false, "the barrier frame arrives after a repeated modifier report");
+        // X.1 again: without this the count below would be read while the report's work might
+        // still be queued, and "no extra render happened" would be indistinguishable from
+        // "it has not happened yet".
+        check(false, "the barrier frame arrives after an import-modifier report");
         return;
     }
-    const size_t signalCount = signals.countFor(kMonitorModifiersWire);
-    check(signalCount == 2, "a repeated modifier report starts no render");
-    if (signalCount != 2) {
-        std::fprintf(stderr, "  monitor %d announced %zu frames; expected exactly 2 (its first render and the "
-                             "report's rebuild)\n",
-                     kMonitorModifiersWire, signalCount);
+    const size_t afterKeep = signals.countFor(kMonitorModifiersWire);
+    check(afterKeep == 1, opaqueExport
+                              ? "a modifier report does not re-render a monitor whose frame is an opaque fd"
+                              : "a modifier report does not re-render a monitor whose frame's layout it still names");
+    if (afterKeep != 1) {
+        std::fprintf(stderr, "  monitor %d announced %zu frames; expected exactly 1 -- its first render, and no "
+                             "rebuild for a report that excludes nothing it holds\n",
+                     kMonitorModifiersWire, afterKeep);
+    }
+    uint64_t servedAfterKeep = 0;
+    try {
+        servedAfterKeep = getFrameFd(proxy, kMonitorModifiersWire).generation;
+    } catch (const sdbus::Error& e) {
+        std::fprintf(stderr, "  GetFrameFd after the report answered '%s'\n", e.getName().c_str());
+    }
+    check(servedAfterKeep == 1, "the monitor a report did not exclude still serves the frame it already had");
+
+    if (opaqueExport) {
+        // Stated rather than silently skipped. The excluding half below needs a committed
+        // frame that HAS a layout, and this host's export has none; the manager-tier phase
+        // records the same fact through notVerified(), which is what makes ctest call the
+        // run a skip, so repeating that call here would only double the line.
+        std::printf("dbus_service_test: this host exports opaque fds, so the wire tier grades S6.47 -- a report "
+                    "invalidates nothing -- and cannot reach S6.46, which needs a report that excludes the "
+                    "committed layout\n");
+        std::fflush(stdout);
+        return;
+    }
+
+    // GOAL: S6.46 over the wire -- a report that excludes the committed frame's layout does
+    //       reach that monitor, and the frame no reporting consumer could read is withdrawn.
+    // WHY-THIS-SHAPE: polls GetStatus rather than waiting for FrameReady. On a driver whose
+    //       only usable layout is the one just excluded the rebuild cannot succeed and no
+    //       signal will ever arrive, so a FrameReady wait would spend the 30 s timeout and
+    //       then have to treat the stall as data. The poll distinguishes the two endings the
+    //       daemon may legitimately reach -- rebuilt at a newer generation, or failed with a
+    //       recorded cause -- and fails outright if it reaches neither, so a wedged worker
+    //       cannot be graded as either.
+    // CONTROL: two, both on backend/daemon/wallpaper_manager.cpp, because the two endings
+    //       fail to different defects. `it->second.frameModifier = target->drmModifier;`
+    //       deleted from WallpaperManager::renderPending leaves every frame looking
+    //       layout-less, so nothing is ever condemned -> the settled-state check goes red on
+    //       Lavapipe (7 failures in that run). `state.hasFrame = false` deleted from
+    //       applyImportModifiersLocked -- the defect 5fb5072 fixed -> the withdrawal check
+    //       goes red (4 failures). Both reverted.
+    // LINEAR is offered unless the committed layout already IS linear, so that on a driver
+    // with more than one usable layout the report leaves something to rebuild into and the
+    // rebuild is graded rather than skipped. A set of purely unallocatable layouts would make
+    // every driver take the "nothing left to allocate" branch, which grades strictly less.
+    std::vector<uint64_t> exclude{kUnavailableModifierA};
+    if (committed != wallpaperx::testing::kDrmModifierLinear) {
+        exclude.push_back(wallpaperx::testing::kDrmModifierLinear);
+    }
+    setImportModifiers(proxy, exportedFormat, exclude);
+
+    uint64_t excludedGeneration = 0;
+    bool excludedHasFrame = true;
+    std::string excludedError;
+    bool settled = false;
+    for (int attempt = 0; attempt < 100 && !settled; ++attempt) {
+        // The reply is bound to a named local: wallpaperStatus() returns a pointer into it, and
+        // reading through a pointer into a temporary is undefined behaviour, not a lint.
+        const StatusReply reply = getStatusOrExplain(proxy);
+        const nlohmann::json* state = wallpaperStatus(reply, std::to_string(kMonitorModifiersWire));
+        if (state != nullptr) {
+            excludedHasFrame = state->value("has_frame", false);
+            excludedGeneration = state->value("generation", uint64_t{0});
+            excludedError = state->value("last_error", std::string());
+            settled = (excludedHasFrame && excludedGeneration > 1) || !excludedError.empty();
+        }
+        if (!settled) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    if (!settled) {
+        // X.1: the stall is a failure, never data. Falling through would let a worker that
+        // never picked the re-render up read as "the frame was correctly withdrawn".
+        check(false, "the monitor whose layout a report excluded reaches a settled state");
+        std::fprintf(stderr, "  monitor %d still reports has_frame=%d generation=%llu with no error after 5 s\n",
+                     kMonitorModifiersWire, static_cast<int>(excludedHasFrame),
+                     static_cast<unsigned long long>(excludedGeneration));
+        return;
+    }
+    if (excludedError.empty()) {
+        check(excludedGeneration > 1,
+              "a report that excludes the committed frame's layout withdraws that frame and rebuilds it");
+    } else {
+        // Printed, not skipped. S6.46 is about the daemon withdrawing a frame no reporting
+        // consumer could read, and that half IS asserted here -- the poll only leaves this
+        // branch once the daemon has recorded a cause, so a worker that never picked the
+        // re-render up fails above instead of landing here. What is missing is a stronger
+        // assertion nobody can make on a single-layout driver: that the rebuilt image comes
+        // back in one of the reported layouts. That is graded on the real GPU by the
+        // renderer's consumer_modifier_probe.
+        check(!excludedHasFrame, "a report that excludes the committed frame's layout withdraws that frame");
+        std::printf("dbus_service_test: the withdrawn frame was not rebuilt -- this driver offers no layout in "
+                    "the reported set: %s\n",
+                    excludedError.c_str());
+        std::fflush(stdout);
+    }
+
+    // The state recovers, which is what separates "withdrawn" from "lost". Without it the
+    // check above is equally satisfied by a daemon that drops the monitor for good.
+    setImportModifiers(proxy, exportedFormat, keep);
+    bool recovered = false;
+    for (int attempt = 0; attempt < 100 && !recovered; ++attempt) {
+        const StatusReply reply = getStatusOrExplain(proxy);
+        const nlohmann::json* state = wallpaperStatus(reply, std::to_string(kMonitorModifiersWire));
+        recovered = state != nullptr && state->value("has_frame", false);
+        if (!recovered) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    check(recovered, "a monitor a report withdrew renders again once a layout it can use is reported");
+}
+
+// --------------------------------------------------------------------------- //
+// A departing consumer's set stops blocking, and something re-renders what it blocked.
+//
+// S6.50 is about the effective set widening when a reporter leaves the bus. S6.51 is the half
+// that widening on its own does not give you: a monitor the departed set left with NO frame
+// recovers only if the daemon hands it back AND something posts it. Two pieces of production
+// code are involved and neither is visible from the other tier -- WallpaperManager::
+// forgetImportModifiers() returns the monitors, and DbusService::watchClientExits()'s callback
+// posts each one to the render worker -- so this drives the real daemon over the real bus.
+//
+// WHAT KEEPS THE MONITOR FRAMELESS IS THE IMAGE FILE, NOT THE MODIFIER SET, and that is what
+// makes the phase answerable on every host. Using the set to block the render would need a
+// report that excludes the layout in use, which does not exist where the export is an opaque fd
+// -- the shipped path on this project's target GPU. An undecodable file blocks the render on
+// any driver, so the modifier sets here only have to CHANGE, never to be unallocatable.
+//
+// Runs on the shared manager, after runImportModifierWireChecks: it re-reports a wider set from
+// the shared proxy, so a phase running after it would be reading a set it did not choose.
+// --------------------------------------------------------------------------- //
+void runModifierWithdrawalRenderChecks(sdbus::IProxy& proxy, FrameReadyLog& signals, const std::string& imagePath,
+                                       const Check& check) {
+    const uint32_t exportedFormat = wallpaperx::drmFourccForVkFormat(wallpaperx::OffscreenTargetManager::kFormat);
+
+    // A reference frame of this phase's own, before anything is reported: its layout is what
+    // every set below keeps, so nothing here invalidates a live image and the only monitor that
+    // can be re-posted for a set change is the frameless one this phase blocks.
+    setWallpaper(proxy, "static", imagePath, kMonitorWithdrawBarrier);
+    if (!signals.wait(kMonitorWithdrawBarrier, 1)) {
+        check(false, "the withdrawal phase's barrier monitor produced its first frame");
+        return;
+    }
+    uint64_t committed = wallpaperx::kDrmModifierInvalid;
+    try {
+        committed = getFrameFd(proxy, kMonitorWithdrawBarrier).drmModifier;
+    } catch (const sdbus::Error& e) {
+        check(false, "the withdrawal phase's barrier monitor serves the frame it just announced");
+        std::fprintf(stderr, "  GetFrameFd(monitor=%d) answered '%s'\n", kMonitorWithdrawBarrier, e.getName().c_str());
+        return;
+    }
+
+    // Nested, so the departing consumer's set is a strict subset: the departure must WIDEN what
+    // is in force, which is the only thing that hands a frameless monitor back. Both carry the
+    // committed layout on a host whose export has one, so neither set can withdraw a frame --
+    // this phase is about scheduling, not invalidation.
+    std::vector<uint64_t> wide{kUnavailableModifierA, kUnavailableModifierB};
+    std::vector<uint64_t> narrow{kUnavailableModifierA};
+    if (committed != wallpaperx::kDrmModifierInvalid) {
+        wide.push_back(committed);
+        narrow.push_back(committed);
+    }
+    setImportModifiers(proxy, exportedFormat, wide);
+
+    // Held at "no frame at all" by a file that cannot be decoded, then made decodable at a
+    // moment this phase picks. SetWallpaper is not used to unblock it, because a SetWallpaper is
+    // itself a post and would grade nothing about who posted the render.
+    const std::string blockedPath =
+        wallpaperx::testing::writeUndecodableFile(testAssetDir(), "dbus_test_withdraw.png");
+    setWallpaper(proxy, "static", blockedPath, kMonitorWithdrawRender);
+    bool blocked = false;
+    for (int attempt = 0; attempt < 100 && !blocked; ++attempt) {
+        const StatusReply reply = getStatusOrExplain(proxy);
+        const nlohmann::json* state = wallpaperStatus(reply, std::to_string(kMonitorWithdrawRender));
+        blocked = state != nullptr && !state->value("last_error", std::string()).empty();
+        if (!blocked) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    if (!blocked) {
+        // X.1: the stall is abandoned with a reason, never fallen through. Every check below
+        // measures a monitor this phase believes has no frame, and "the render has not run yet"
+        // would satisfy them all while establishing nothing.
+        check(false, "the withdrawal phase's blocked monitor records why it could not render");
+        return;
+    }
+
+    // The departing consumer, on a connection of its own -- that is what gives it a unique bus
+    // name to lose, and what makes destroying it a real departure the daemon is told about.
+    auto leaver = sdbus::createProxy(sdbus::ServiceName{DbusService::kBusName}, sdbus::ObjectPath{DbusService::kObjectPath});
+    setImportModifiers(*leaver, exportedFormat, narrow);
+
+    // Drains the worker past the re-render the narrowing just posted, so the count below is read
+    // from a settled daemon. A barrier on a DIFFERENT monitor, for the reason the phase above
+    // gives: a barrier posted on the blocked monitor itself can be coalesced with the render
+    // being counted.
+    setWallpaper(proxy, "static", imagePath, kMonitorWithdrawBarrier);
+    if (!signals.wait(kMonitorWithdrawBarrier, 2)) {
+        check(false, "the withdrawal phase's barrier frame arrives after the narrowing report");
+        return;
+    }
+
+    // Only now, with the worker drained, does the file become decodable -- so the ONLY render
+    // that can produce a frame for this monitor is one posted after this line.
+    writeSolidPng(blockedPath, 0, 255, 0);
+    if (signals.countFor(kMonitorWithdrawRender) != 0) {
+        check(false, "the withdrawal phase's blocked monitor announced no frame before the departure");
+        std::fprintf(stderr, "  monitor %d announced %zu frame(s) while its file could not be decoded\n",
+                     kMonitorWithdrawRender, signals.countFor(kMonitorWithdrawRender));
+        return;
+    }
+
+    // GOAL: S6.51 end to end -- a consumer leaving the bus does not merely widen the effective
+    //       set, it gets the monitors that set was blocking re-rendered.
+    // WHY-THIS-SHAPE: the observable is a FRAME, not the set, because the set widening is
+    //       exactly what S6.50 already grades and a daemon that widens while scheduling nothing
+    //       passes every one of those checks. Nothing else in this phase can post this monitor:
+    //       its file was made decodable after the worker was drained, and no SetWallpaper
+    //       follows. The wait is bounded and reaching the bound FAILS with the monitor's own
+    //       recorded state printed, so a daemon that never posts cannot be graded as a slow one.
+    // CONTROL: two, both of which redden this check. `return adoptImportModifiersLocked(...)`
+    //       in WallpaperManager::forgetImportModifiers (backend/daemon/wallpaper_manager.cpp)
+    //       changed to `adoptImportModifiersLocked(...); return {};`, and separately the
+    //       `for (...) m_worker.post(monitorId);` loop deleted from
+    //       DbusService::watchClientExits (backend/daemon/dbus_service.cpp). Observed red on
+    //       the NVIDIA host: the first mutation reddens this and the manager-tier check (2
+    //       failures), the second reddens this one alone. Both printed the monitor's stale
+    //       decode error, so no render had run. Both reverted.
+    leaver.reset();
+    const bool rendered = signals.wait(kMonitorWithdrawRender, 1);
+    check(rendered, "a consumer leaving the bus gets the monitor its set was blocking re-rendered");
+    if (!rendered) {
+        const StatusReply reply = getStatusOrExplain(proxy);
+        const nlohmann::json* state = wallpaperStatus(reply, std::to_string(kMonitorWithdrawRender));
+        std::fprintf(stderr, "  monitor %d announced no frame after the reporting consumer left; has_frame=%d "
+                             "last_error='%s'\n",
+                     kMonitorWithdrawRender, state != nullptr && state->value("has_frame", false),
+                     state != nullptr ? state->value("last_error", std::string()).c_str() : "(no status)");
     }
 }
 
 // --------------------------------------------------------------------------- //
 // What a consumer's modifier report does to monitors that have already rendered.
 //
-// SetImportModifiers destroys every monitor's offscreen target -- the images it drops were
-// built against the old set and cannot be re-labelled -- and returns the monitors to
-// re-post so each rebuilds one. Those re-renders happen one at a time on the render
-// worker, so between the first and the last there is a window in which a monitor has no
-// target. What the daemon must not do in that window is keep claiming the monitor still
-// has a frame: GetFrameFd trusts that flag and then reaches for a target that is gone.
+// SetImportModifiers destroys the offscreen target of every monitor whose committed layout
+// the new set excludes -- those images cannot be re-labelled -- and returns those monitors to
+// re-post so each rebuilds one. Monitors the set still allows, and monitors exporting an
+// opaque fd (which has no layout at all), keep the image they have. The re-renders happen one
+// at a time on the render worker, so between the first and the last there is a window in
+// which a condemned monitor has no target. What the daemon must not do in that window is keep
+// claiming the monitor still has a frame: GetFrameFd trusts that flag and then reaches for a
+// target that is gone.
+//
+// The phase therefore has two halves and a host decides which it can answer. It reads the
+// committed frame's own DRM format modifier off a real export: kDrmModifierInvalid means an
+// opaque fd, where only the "nothing is invalidated" half exists (S6.47) and the window is
+// unreachable, so S6.44 and S6.46 are reported as unexercised rather than asserted weakly.
 //
 // WHY THIS DRIVES THE MANAGER DIRECTLY AND NOT THE BUS, which is the same reason
 // runUnservicedRequestChecks gives. RenderWorker runs one FIFO for renders and exports
@@ -1859,7 +2136,7 @@ void runImportModifierWireChecks(sdbus::IProxy& proxy, FrameReadyLog& signals, c
 // daemon in exactly that state with no race at all.
 // --------------------------------------------------------------------------- //
 void runImportModifierChecks(const wallpaperx::WallpaperManager::Config& config, const std::string& imagePath,
-                             const Check& check) {
+                             const std::string& videoPath, const Check& check) {
     // Same shape as runWorkerCoalescingChecks': its own manager means its own Device, so
     // it needs its own validation grade, and the grade must run after the manager is
     // destroyed for the layer's teardown complaints to be countable.
@@ -1887,6 +2164,10 @@ void runImportModifierChecks(const wallpaperx::WallpaperManager::Config& config,
         }
     } gradeOnExit{counter, layerActive, check};
 
+    // Stands in for the DBus unique name the bus would assign the reporting consumer. Any
+    // stable string does: the manager only uses it to tell reporters apart.
+    const std::string kConsumerName = ":test.consumer";
+
     wallpaperx::WallpaperManager manager(config);
     struct CaptureOnExit {
         const wallpaperx::WallpaperManager& manager;
@@ -1898,15 +2179,29 @@ void runImportModifierChecks(const wallpaperx::WallpaperManager::Config& config,
         }
     } captureOnExit{manager, counter, layerActive};
 
+    // What one export said, including the layout the frame carries: kDrmModifierInvalid means
+    // an opaque fd, which has no layout for a report to exclude. Reading it here rather than
+    // deriving it from the vendor keeps the phase honest on a host whose export policy
+    // changes -- WALLPAPERX_FORCE_HANDLE_TYPE alone flips it on this GPU.
+    struct Exported {
+        bool hasFrame = false;
+        wallpaperx::NoFrameReason reason = wallpaperx::NoFrameReason::NeverRequested;
+        uint64_t modifier = wallpaperx::kDrmModifierInvalid;
+    };
+
     // Closes the fd an export hands back. Every successful export here is a real
     // descriptor, and this phase performs several -- leaking them would eventually fail
     // the fd-count checks elsewhere in the binary rather than anything here.
     const auto exportOnce = [&manager](int32_t monitorId) {
-        wallpaperx::FrameExport out = manager.exportCurrentFrame(monitorId);
-        const bool gotFrame = out.handle.has_value();
-        const wallpaperx::NoFrameReason reason = out.reason;
-        if (gotFrame && out.handle->frame.fd >= 0) close(out.handle->frame.fd);
-        return std::pair{gotFrame, reason};
+        Exported out;
+        wallpaperx::FrameExport got = manager.exportCurrentFrame(monitorId);
+        out.hasFrame = got.handle.has_value();
+        out.reason = got.reason;
+        if (out.hasFrame) {
+            out.modifier = got.handle->frame.modifier;
+            if (got.handle->frame.fd >= 0) close(got.handle->frame.fd);
+        }
+        return out;
     };
 
     manager.requestWallpaper("static", imagePath, kMonitorModifiersRerendered);
@@ -1915,33 +2210,99 @@ void runImportModifierChecks(const wallpaperx::WallpaperManager::Config& config,
     const wallpaperx::RenderOutcome firstPending = manager.renderPending(kMonitorModifiersPending);
     if (!firstRerendered.rendered || !firstPending.rendered) {
         wallpaperx::testing::notVerified(
-            "S6.44",
-            "neither monitor could be given a frame to begin with, so the state this phase is about -- a "
-            "monitor that HAD a frame and whose target the modifier report then dropped -- was never reached");
+            "S6.44 through S6.47",
+            "neither monitor could be given a frame to begin with, so the states these goals are about -- a "
+            "monitor that HAS a frame and a report that does or does not exclude its layout -- were never reached");
         return;
     }
 
-    // LINEAR because it is the one modifier every dma_buf-capable driver here offers, so
-    // the intersection in Memory::createExportableImage is non-empty on Lavapipe. On this
-    // GPU the export is OPAQUE_FD, which carries no modifier at all and ignores the set --
-    // the daemon-side bookkeeping this phase grades runs either way.
-    const std::vector<uint64_t> reported{wallpaperx::testing::kDrmModifierLinear};
     const uint32_t exportedFormat = wallpaperx::drmFourccForVkFormat(wallpaperx::OffscreenTargetManager::kFormat);
-    const std::vector<int> toRender = manager.setImportModifiers(exportedFormat, reported);
 
-    // The premise, asserted rather than assumed: a set that changed nothing would return
-    // no monitors, no target would be dropped, and every check below would pass over a
-    // daemon that never entered the state under test.
+    // Which layout the committed frame carries is read off a real export rather than derived
+    // from the vendor: WALLPAPERX_FORCE_HANDLE_TYPE alone flips this GPU between the two, and
+    // a phase that assumed one would grade the wrong half without saying so.
+    const Exported firstExport = exportOnce(kMonitorModifiersRerendered);
+    if (!firstExport.hasFrame) {
+        check(false, "the monitor this phase just rendered exports the frame it committed");
+        return;
+    }
+    const uint64_t committed = firstExport.modifier;
+    const bool opaqueExport = committed == wallpaperx::kDrmModifierInvalid;
+
+    // GOAL: S6.45 on a dma_buf host, S6.47 on an opaque-fd one -- an accepted report neither
+    //       re-renders nor withdraws the frame of a monitor it does not exclude. Before
+    //       2026-08-30 ANY accepted report destroyed EVERY monitor's image, so a consumer
+    //       withdrawing one layout it had never been given blanked and rebuilt every screen.
+    // WHY-THIS-SHAPE: two checks, not one, because the daemon decides in two places and only
+    //       the second is what a consumer sees. adoptImportModifiersLocked() picks the
+    //       monitors to re-post (the empty return below), and applyImportModifiersLocked()
+    //       clears hasFrame and drops targets on the render thread. Asserting the return
+    //       value alone would pass for a daemon that re-posts nothing and then blanks
+    //       everything at the next render, which is the worse of the two failures. Forcing a
+    //       render on the OTHER monitor is what carries the accepted set across to the GPU
+    //       side, since a report that re-posts nobody applies nothing until something else
+    //       renders -- without it the second check grades a set the render thread never saw.
+    // COVERAGE-ASSERT: "the render that carries the accepted set to the GPU side ran" has no
+    //       control of its own and is not meant to -- it exists so the survivor check below
+    //       cannot pass on a render that never happened, and every mutation that falsifies it
+    //       falsifies an earlier phase of this binary first.
+    // CONTROL: `if (stillReadable) continue;` disabled in
+    //       WallpaperManager::adoptImportModifiersLocked -> the re-post check goes red (4
+    //       failures across this binary on both ICDs). Separately, `monitorIds` in
+    //       WallpaperManager::applyImportModifiersLocked restored to every entry of
+    //       m_monitors -> the survivor check goes red, with the wire tier's serve check (2
+    //       failures). Both in backend/daemon/wallpaper_manager.cpp; both reverted.
+    std::vector<uint64_t> keep{kUnavailableModifierA};
+    if (!opaqueExport) keep.push_back(committed);
+    const std::vector<int> keepRender = manager.setImportModifiers(kConsumerName, exportedFormat, keep);
+    check(keepRender.empty(),
+          opaqueExport ? "a modifier report re-posts no monitor whose frame is an opaque fd"
+                       : "a modifier report re-posts no monitor whose frame's layout it still names");
+
+    manager.requestWallpaper("static", imagePath, kMonitorModifiersRerendered);
+    const wallpaperx::RenderOutcome carriedSet = manager.renderPending(kMonitorModifiersRerendered);
+    check(carriedSet.rendered, "the render that carries the accepted set to the GPU side ran");
+    const Exported survivor = exportOnce(kMonitorModifiersPending);
+    check(survivor.hasFrame,
+          opaqueExport ? "an opaque-fd frame survives a report being applied on the render thread"
+                       : "a frame whose layout the report still names survives the report being applied");
+
+    if (opaqueExport) {
+        wallpaperx::testing::notVerified(
+            "S6.44, S6.46, S6.53 and S6.54",
+            "this host exports opaque file descriptors, which carry no DRM format modifier, so no report can "
+            "exclude the committed frame and the state all four goals are about -- a monitor that HAD a frame and "
+            "whose target a report then dropped -- cannot be reached here at all");
+        return;
+    }
+
+    // GOAL: S6.46 -- a report that excludes the committed frame's layout does reach those
+    //       monitors: both are returned for re-render, and the frame no reporting consumer
+    //       could read is withdrawn rather than left published.
+    // WHY-THIS-SHAPE: both monitors are asserted, not one. The window S6.44 is about only
+    //       exists because the report condemns several monitors and the worker services them
+    //       one at a time; a single-monitor form cannot express it.
+    // CONTROL: `it->second.frameModifier = target->drmModifier;` deleted from
+    //       WallpaperManager::renderPending (backend/daemon/wallpaper_manager.cpp), which
+    //       leaves every committed frame looking layout-less so no report can exclude it.
+    //       Observed red on Lavapipe -- this check plus six more, including the NotRendered
+    //       window and both recovery checks. Reverted.
+    // LINEAR unless the committed layout already is linear: on a driver with a second usable
+    // layout that leaves something to rebuild into, so the rebuild is graded rather than
+    // reported as unreachable. A set of purely unallocatable layouts grades strictly less.
+    std::vector<uint64_t> exclude{kUnavailableModifierA};
+    if (committed != wallpaperx::testing::kDrmModifierLinear) {
+        exclude.push_back(wallpaperx::testing::kDrmModifierLinear);
+    }
+    const std::vector<int> toRender = manager.setImportModifiers(kConsumerName, exportedFormat, exclude);
     check(std::find(toRender.begin(), toRender.end(), kMonitorModifiersRerendered) != toRender.end() &&
               std::find(toRender.begin(), toRender.end(), kMonitorModifiersPending) != toRender.end(),
-          "a new import-modifier set returns both rendered monitors for re-render");
+          "a report excluding the committed frame's layout returns both rendered monitors for re-render");
 
     // Only one of the two. This is the window: the modifier set is applied on the first
     // re-render, which drops BOTH monitors' targets, and the second monitor's re-render
     // has not happened.
     const wallpaperx::RenderOutcome reRendered = manager.renderPending(kMonitorModifiersRerendered);
-    check(reRendered.rendered && reRendered.generation > firstRerendered.generation,
-          "the monitor that was re-posted first rebuilds its image and commits a newer generation");
 
     // GOAL: a monitor whose offscreen target the modifier report dropped, and whose
     //       re-render has not run yet, answers GetFrameFd with NoFrame -- it does not
@@ -1961,10 +2322,9 @@ void runImportModifierChecks(const wallpaperx::WallpaperManager::Config& config,
     //       binary stayed green.
     bool threw = false;
     std::string threwWhat;
-    bool pendingHasFrame = true;
-    wallpaperx::NoFrameReason pendingReason = wallpaperx::NoFrameReason::NeverRequested;
+    Exported pending;
     try {
-        std::tie(pendingHasFrame, pendingReason) = exportOnce(kMonitorModifiersPending);
+        pending = exportOnce(kMonitorModifiersPending);
     } catch (const std::exception& e) {
         threw = true;
         threwWhat = e.what();
@@ -1973,49 +2333,542 @@ void runImportModifierChecks(const wallpaperx::WallpaperManager::Config& config,
     if (threw) {
         std::fprintf(stderr, "  the export threw: %s\n", threwWhat.c_str());
     } else {
-        check(!pendingHasFrame && pendingReason == wallpaperx::NoFrameReason::NotRendered,
+        check(!pending.hasFrame && pending.reason == wallpaperx::NoFrameReason::NotRendered,
               "a monitor awaiting its re-render is NotRendered, not still holding its old frame");
     }
 
-    // The state recovers: once the second monitor's re-render runs it has a frame again.
-    // Without this the checks above are satisfied by a daemon that dropped the monitor
-    // permanently, which is a different defect with the same symptom in this window.
+    // GOAL: the rebuild half of S6.46 -- the re-render the report scheduled produces an image
+    //       in a layout the consumer reported, not merely any image.
+    // WHY-THIS-SHAPE: branched on whether the rebuild succeeded rather than asserting that it
+    //       does, because on a driver whose only usable layout is the one just excluded there
+    //       is nothing left to allocate and the failure is the driver's, not the daemon's.
+    //       Asserting success unconditionally would report a single-layout ICD as a daemon
+    //       defect (X.3); dropping the assertion entirely would let a daemon that rebuilds
+    //       into the layout it was told not to use pass. The failing branch is not a free
+    //       pass either -- it asserts that the daemon recorded a cause, so a re-render that
+    //       was posted and never serviced fails there rather than printing and moving on.
+    // CONTROL: `modifiers = std::move(agreed);` deleted from Memory::createExportableImage
+    //       (renderer/vulkan/memory.cpp), so the driver is offered every usable layout rather
+    //       than the agreed ones, PLUS the chosen-modifier guard in populateDmaBufLayout
+    //       (renderer/vulkan/frame_export.cpp) disabled -- without the second the guard throws
+    //       first and this check is never reached. Observed under
+    //       WALLPAPERX_FORCE_HANDLE_TYPE=dmabuf on the NVIDIA host: red, with the rebuild
+    //       printing 0x300000000606013 where the reported set held only LINEAR. Both reverted.
+    if (reRendered.rendered) {
+        check(reRendered.generation > carriedSet.generation,
+              "the monitor that was re-posted first rebuilds its image and commits a newer generation");
+        const Exported rebuilt = exportOnce(kMonitorModifiersRerendered);
+        check(rebuilt.hasFrame && std::find(exclude.begin(), exclude.end(), rebuilt.modifier) != exclude.end(),
+              "the rebuilt frame carries a layout from the set the consumer reported");
+        if (rebuilt.hasFrame) {
+            std::printf("dbus_service_test: the excluded frame's layout 0x%llx was rebuilt as 0x%llx\n",
+                        static_cast<unsigned long long>(committed),
+                        static_cast<unsigned long long>(rebuilt.modifier));
+            std::fflush(stdout);
+        }
+    } else {
+        const wallpaperx::WallpaperManager::Snapshot snapshot = manager.snapshot();
+        const auto entry = snapshot.monitors.find(kMonitorModifiersRerendered);
+        const std::string why = entry != snapshot.monitors.end() ? entry->second.lastError : std::string();
+        // Printed rather than skipped, and the assertion beside it is what keeps that honest:
+        // a re-render that was never serviced records no cause, so a daemon that dropped the
+        // work fails here rather than reaching a quiet print. What a single-layout driver
+        // costs is only the stronger claim below -- that the rebuild lands inside the
+        // reported set -- which the renderer's consumer_modifier_probe grades on the real GPU.
+        check(!why.empty(), "a re-render that could not rebuild records why");
+        std::printf("dbus_service_test: the re-render this report scheduled had nothing left to allocate, so the "
+                    "rebuilt frame's layout was not graded: %s\n",
+                    why.empty() ? "(no cause recorded)" : why.c_str());
+        std::fflush(stdout);
+    }
+
+    // The state recovers, which is what separates "withdrawn" from "lost": once a layout this
+    // GPU can use is reported again, both monitors render and export. Without this the checks
+    // above are equally satisfied by a daemon that dropped both monitors for good.
+    const std::vector<int> restored = manager.setImportModifiers(kConsumerName, exportedFormat, keep);
+    check(std::find(restored.begin(), restored.end(), kMonitorModifiersPending) != restored.end(),
+          "a later report re-posts a monitor the previous one left without a frame");
     const wallpaperx::RenderOutcome pendingReRendered = manager.renderPending(kMonitorModifiersPending);
+    const wallpaperx::RenderOutcome rerenderedAgain = manager.renderPending(kMonitorModifiersRerendered);
     check(pendingReRendered.rendered && pendingReRendered.generation > firstPending.generation,
-          "the monitor that waited also rebuilds its image once its re-render runs");
-    bool recoveredHasFrame = false;
+          "the monitor that waited rebuilds its image once a layout this GPU can use is reported");
+    bool bothExportAgain = false;
     try {
-        recoveredHasFrame = exportOnce(kMonitorModifiersPending).first;
+        bothExportAgain = exportOnce(kMonitorModifiersPending).hasFrame &&
+                          exportOnce(kMonitorModifiersRerendered).hasFrame && rerenderedAgain.rendered;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "  the recovery export threw: %s\n", e.what());
     }
-    check(recoveredHasFrame, "the monitor that waited exports a frame again after its re-render");
+    check(bothExportAgain, "both monitors export a frame again once the withdrawn layout is replaced");
 
-    // GOAL: an identical report is a no-op -- it must not drop a target and strand every
-    //       monitor for a set that changed nothing.
-    // WHY-THIS-SHAPE: checked through the export rather than through the empty return
-    //       value alone, because the return value is what the DBus layer posts and a
-    //       daemon could return {} while still having applied the set. Both monitors must
-    //       still export.
-    // CONTROL: two, both in WallpaperManager::setImportModifiers (backend/daemon/
-    //       wallpaper_manager.cpp), because the two checks fail to different defects.
-    //       (a) the `if (m_importModifiers == modifiers) return {};` early-out disabled ->
-    //       "an identical import-modifier report changes nothing", and ONLY that: the set
-    //       is applied on the render thread, so a repeat that re-posts work still leaves
-    //       both frames in place until something re-renders. (b) `for (auto& [id, state] :
-    //       m_monitors) state.hasFrame = false;` inserted above the early-out, the eager
-    //       form of the invalidation -> "both monitors still hold their frames after an
-    //       identical report". Both reverted.
-    const std::vector<int> repeated = manager.setImportModifiers(exportedFormat, reported);
-    check(repeated.empty(), "an identical import-modifier report changes nothing");
-    bool bothStillHaveFrames = false;
-    try {
-        bothStillHaveFrames = exportOnce(kMonitorModifiersRerendered).first &&
-                              exportOnce(kMonitorModifiersPending).first;
-    } catch (const std::exception& e) {
-        std::fprintf(stderr, "  an export after the repeated report threw: %s\n", e.what());
+    // Two monitors of this phase's own, both holding a frame under the set in force, so the
+    // blocks below start from a state neither of the monitors above is still being driven
+    // through. `keep` is what allocated them, so their layout is one `keep` names.
+    manager.requestWallpaper("static", imagePath, kMonitorModifiersUndoneA);
+    manager.requestWallpaper("static", imagePath, kMonitorModifiersUndoneB);
+    const wallpaperx::RenderOutcome undoneA = manager.renderPending(kMonitorModifiersUndoneA);
+    const wallpaperx::RenderOutcome undoneB = manager.renderPending(kMonitorModifiersUndoneB);
+    if (!undoneA.rendered || !undoneB.rendered) {
+        check(false, "the pair S6.53 and S6.54 are graded on both hold a frame to begin with");
+        return;
     }
-    check(bothStillHaveFrames, "both monitors still hold their frames after an identical report");
+
+    // Excludes every layout any driver can allocate, so what happens next does not depend on
+    // how many layouts this one offers: a monitor condemned under it, and re-rendered under it,
+    // can only fail -- which is exactly what makes "the old image was released" observable.
+    const std::vector<uint64_t> unusable{kUnavailableModifierA};
+
+    // GOAL: S6.54 -- the condemned set is re-derived from the set in force, not accumulated. A
+    //       monitor condemned by a narrow report whose set widens again before the render thread
+    //       has applied anything keeps the frame it already had.
+    // WHY-THIS-SHAPE: two monitors, and the one that proves it is the one never re-rendered.
+    //       Both are condemned by the narrow report, so both had their request sequence bumped;
+    //       rendering A is what carries the widened set across to the render thread, and B is
+    //       then read without ever being serviced -- so a frame B still has is a frame that was
+    //       never withdrawn, not one that was withdrawn and rebuilt. Reading B through a single
+    //       monitor would be impossible: the monitor that triggers the apply is the monitor that
+    //       rebuilds, and a rebuild hides exactly the teardown this asks about.
+    // CONTROL: the std::erase_if block deleted from
+    //       WallpaperManager::adoptImportModifiersLocked (backend/daemon/wallpaper_manager.cpp).
+    //       Observed red on Lavapipe -- "a monitor whose condemnation was undone before the
+    //       render thread saw it keeps its frame", the only failure in that run. Reverted.
+    const std::vector<int> condemned = manager.setImportModifiers(kConsumerName, exportedFormat, unusable);
+    check(std::find(condemned.begin(), condemned.end(), kMonitorModifiersUndoneA) != condemned.end() &&
+              std::find(condemned.begin(), condemned.end(), kMonitorModifiersUndoneB) != condemned.end(),
+          "a report excluding both monitors' layout condemns both");
+    manager.setImportModifiers(kConsumerName, exportedFormat, keep);
+    const wallpaperx::RenderOutcome carriedUndo = manager.renderPending(kMonitorModifiersUndoneA);
+    check(carriedUndo.rendered, "the render that carries the undone report to the GPU side ran");
+    bool keptItsFrame = false;
+    try {
+        keptItsFrame = exportOnce(kMonitorModifiersUndoneB).hasFrame;
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "  the export of the monitor whose condemnation was undone threw: %s\n", e.what());
+    }
+    check(keptItsFrame, "a monitor whose condemnation was undone before the render thread saw it keeps its frame");
+
+    // GOAL: S6.53 -- a monitor whose wallpaper type this build cannot draw still loses the image
+    //       it holds when a report excludes that image's layout. The image is released, so it is
+    //       not there to be reused when the monitor becomes renderable again.
+    // WHY-THIS-SHAPE: the type is changed to `video` while the offscreen image from its static
+    //       render is still allocated -- renderPending() releases a non-renderable monitor's
+    //       image itself, so the state only exists between the request and the pass that
+    //       services it, and nothing else in this suite reaches it. What is asserted is the
+    //       re-render AFTER the monitor is renderable again: acquireTarget() reuses an image
+    //       whose dimensions match, so a surviving image is silently drawn into and every export
+    //       of it then carries a layout the consumer refused. Asserting "the report returned no
+    //       monitor" instead would grade the wrong half -- that clause is true both with the fix
+    //       and without it.
+    // CONTROL: `if (!isRenderableType(state.type)) continue;` restored as the first statement of
+    //       the loop body in WallpaperManager::adoptImportModifiersLocked (backend/daemon/
+    //       wallpaper_manager.cpp). Observed red on Lavapipe: this check, the export check and
+    //       the two below it; 4 failures, with the export throwing "exportFrame: the driver
+    //       chose DRM format modifier 0, which the frame consumer did not report as importable"
+    //       -- the reused image. Reverted. The "not asked to re-render" check just above has a
+    //       control of its own: deleting the SECOND isRenderableType test, the one guarding the
+    //       requestSeq bump, reddens it alone.
+    manager.requestWallpaper("static", imagePath, kMonitorModifiersUnrenderable);
+    const wallpaperx::RenderOutcome unrenderableFirst = manager.renderPending(kMonitorModifiersUnrenderable);
+    if (!unrenderableFirst.rendered) {
+        check(false, "the monitor S6.53 is graded on holds an image before its type changes");
+        return;
+    }
+    manager.requestWallpaper("video", videoPath, kMonitorModifiersUnrenderable);
+
+    const std::vector<int> condemnedAgain = manager.setImportModifiers(kConsumerName, exportedFormat, unusable);
+    check(std::find(condemnedAgain.begin(), condemnedAgain.end(), kMonitorModifiersUnrenderable) ==
+              condemnedAgain.end(),
+          "a monitor whose type this build cannot draw is not asked to re-render");
+    // Carries the report to the render thread, which is where the condemned images are actually
+    // released. This render cannot succeed -- no driver can allocate the reported layout -- and
+    // does not need to: the release happens before the allocation is attempted.
+    manager.renderPending(kMonitorModifiersUndoneA);
+
+    manager.requestWallpaper("static", imagePath, kMonitorModifiersUnrenderable);
+    const wallpaperx::RenderOutcome reused = manager.renderPending(kMonitorModifiersUnrenderable);
+    check(!reused.rendered,
+          "a monitor that was unrenderable when the report arrived has no old image left to draw into");
+    bool staleThrew = false;
+    Exported stale;
+    try {
+        stale = exportOnce(kMonitorModifiersUnrenderable);
+    } catch (const std::exception& e) {
+        staleThrew = true;
+        std::fprintf(stderr, "  exporting it threw, which is what a reused image does: %s\n", e.what());
+    }
+    check(!staleThrew && !stale.hasFrame,
+          "it reports no frame rather than serving an image in a layout the consumer excluded");
+    {
+        const wallpaperx::WallpaperManager::Snapshot snapshot = manager.snapshot();
+        const auto entry = snapshot.monitors.find(kMonitorModifiersUnrenderable);
+        const std::string why = entry != snapshot.monitors.end() ? entry->second.lastError : std::string();
+        // A render that was never serviced records no cause, so this is what keeps the negative
+        // above from passing on work the daemon silently dropped.
+        check(!why.empty(), "the render that found no image to reuse records why it could not make one");
+        std::printf("dbus_service_test: the unrenderable monitor's image was released, so its re-render had to "
+                    "allocate: %s\n",
+                    why.empty() ? "(no cause recorded)" : why.c_str());
+        std::fflush(stdout);
+    }
+
+    // Recovers, which separates "released" from "lost": with a usable layout reported again the
+    // monitor renders and exports like any other.
+    manager.setImportModifiers(kConsumerName, exportedFormat, keep);
+    const wallpaperx::RenderOutcome unrenderableBack = manager.renderPending(kMonitorModifiersUnrenderable);
+    bool exportsAgain = false;
+    try {
+        exportsAgain = unrenderableBack.rendered && exportOnce(kMonitorModifiersUnrenderable).hasFrame;
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "  the recovery export threw: %s\n", e.what());
+    }
+    check(exportsAgain, "that monitor renders and exports again once a usable layout is reported");
+}
+
+// --------------------------------------------------------------------------- //
+// Whose report is it: the per-consumer bookkeeping behind SetImportModifiers.
+//
+// Several consumers may report at once -- one plugin instance per screen, plus anything else
+// importing the frame -- and every one of them has to be able to read the image, so what
+// takes effect is the INTERSECTION of what they reported. Two consequences follow, and
+// neither is observable from a single consumer: a report that would leave that intersection
+// empty must be refused rather than stored, and a list must die with the process that
+// reported it, or the narrowest list any consumer ever sent binds every consumer after it --
+// including the replacement for one that crashed.
+//
+// Drives the manager directly and creates no Device at all: the property is bookkeeping under
+// m_stateMutex, and the observable it needs -- "did the effective set change" -- is the
+// monitor list setImportModifiers returns, which is exact here and only implied over the bus.
+// A monitor with a recorded request and no frame is re-posted whenever the effective set
+// changes and never when it does not, which is what makes that list a usable probe. The wire
+// tier below then grades the two things this tier cannot see: that the stored key is the
+// caller's own bus name, and that a departure withdraws it.
+//
+// The modifiers are the deliberately-unavailable ones. Nothing renders here, so their being
+// unallocatable costs nothing, and using them keeps the phase's verdict independent of which
+// layouts the host's driver happens to offer.
+// --------------------------------------------------------------------------- //
+void runImportModifierClientChecks(const wallpaperx::WallpaperManager::Config& config, const std::string& imagePath,
+                                   const Check& check) {
+    wallpaperx::WallpaperManager manager(config);
+    const uint32_t exportedFormat = wallpaperx::drmFourccForVkFormat(wallpaperx::OffscreenTargetManager::kFormat);
+
+    // Recorded, never rendered -- so it is re-posted exactly when the effective set changes.
+    manager.requestWallpaper("static", imagePath, kMonitorModifiersIdle);
+
+    struct Report {
+        bool refused = false;
+        bool changed = false;
+        std::string why;
+    };
+    int probes = 0;
+    const auto report = [&](const std::string& client, const std::vector<uint64_t>& set) {
+        ++probes;
+        Report out;
+        try {
+            out.changed = !manager.setImportModifiers(client, exportedFormat, set).empty();
+        } catch (const wallpaperx::InvalidRequest& e) {
+            out.refused = true;
+            out.why = e.what();
+        }
+        return out;
+    };
+
+    // A separate name per probe, and that is load-bearing rather than tidiness: a consumer's
+    // own next report overwrites whatever a refused one left behind, so re-using a name would
+    // hide exactly the leftover entry the rollback probes exist to find. Measured -- with the
+    // rollback deleted from setImportModifiers, the one-name form stayed green.
+    const std::string consumerA = ":test.consumer.a";
+    const std::string consumerB = ":test.consumer.b";
+    const std::string consumerC = ":test.consumer.c";
+    const std::string consumerD = ":test.consumer.d";
+    const std::string consumerE = ":test.consumer.e";
+    const std::string consumerF = ":test.consumer.f";
+    const std::string consumerG = ":test.consumer.g";
+    const std::string consumerH = ":test.consumer.h";
+    constexpr uint64_t m1 = kUnavailableModifierA;
+    constexpr uint64_t m2 = kUnavailableModifierB;
+    constexpr uint64_t m3 = kUnavailableModifierC;
+
+    const Report firstA = report(consumerA, {m1, m2});
+    check(!firstA.refused && firstA.changed, "the first consumer's report takes effect");
+
+    // The idempotency clause of S6.43, moved here from the GPU-backed phase, where the same
+    // check went vacuous: with the new contract a repeat of a report that invalidated nothing
+    // is indistinguishable from the report itself. A monitor with no frame is re-posted on
+    // every real change, so here the two are distinguishable again.
+    // CONTROL: the `if (m_importModifiers == modifiers) return {};` early-out disabled in
+    //       WallpaperManager::adoptImportModifiersLocked (backend/daemon/
+    //       wallpaper_manager.cpp). Observed red on both ICDs, with the two other
+    //       unchanged-set checks in this phase; 3 failures. Reverted.
+    check(!report(consumerA, {m1, m2}).changed, "an identical report from the same consumer changes nothing");
+
+    // GOAL: S6.52 -- what a consumer reports is a SET. The same layouts sent in a different
+    //       order, or with a duplicate added, are the same report: nothing is re-posted.
+    // WHY-THIS-SHAPE: the permutation and the duplicate are asserted separately because the
+    //       daemon needs two different operations to survive them -- sorting and deduplicating
+    //       -- and either one alone leaves the other spelling observable. The consequence is
+    //       not cosmetic: a change to the effective set bumps every frameless monitor's request
+    //       sequence, which supersedes the render already in flight, so a consumer that
+    //       permutes its list per frame keeps every monitor permanently without a picture.
+    //       Asserting only the identical-order repeat above cannot see either.
+    // CONTROL: the std::sort and std::unique lines deleted from
+    //       WallpaperManager::setImportModifiers (backend/daemon/wallpaper_manager.cpp),
+    //       keeping `std::vector<uint64_t> canonical = modifiers;`. Observed red on the NVIDIA
+    //       host: exactly these two checks, and nothing else in the binary. Reverted.
+    check(!report(consumerA, {m2, m1}).changed, "the same layouts reported in a different order change nothing");
+    check(!report(consumerA, {m1, m2, m2}).changed, "the same layouts reported with a duplicate change nothing");
+
+    // GOAL: S6.52's second clause -- the length limit is applied to the list as sent, so an
+    //       over-long report cannot be admitted by collapsing its duplicates away first.
+    // WHY-THIS-SHAPE: every entry is the SAME layout, so the list is over the limit as sent and
+    //       one element long once deduplicated. A list of distinct layouts would be refused by
+    //       either ordering of the two steps and would grade nothing about which came first.
+    // CONTROL: the canonicalisation moved above the `modifiers.size() > kMaxImportModifiers`
+    //       test in WallpaperManager::setImportModifiers (backend/daemon/
+    //       wallpaper_manager.cpp). Observed red on the NVIDIA host: this check and the wire
+    //       tier's length check, plus eight more that cascade from the two over-long probes
+    //       being accepted instead of refused; 10 failures. Reverted.
+    check(report(consumerA, std::vector<uint64_t>(wallpaperx::WallpaperManager::kMaxImportModifiers + 1, m1)).refused,
+          "an over-long report of one repeated layout is refused rather than deduplicated into a short one");
+
+    // GOAL: S6.48 -- what is in force with two consumers reporting is the intersection, not
+    //       the most recent report and not the union.
+    // WHY-THIS-SHAPE: three probes, because one cannot separate the three candidate rules. A
+    //       reports {m1,m2} and B reports {m2,m3}, so the intersection is {m2}: a third
+    //       consumer reporting {m3} would be ACCEPTED under "last report wins" and under
+    //       "union", and reporting {m1} would be accepted under "first wins" and under
+    //       "union". Both must be refused, and a report of exactly {m2} must be accepted and
+    //       change nothing -- which is what pins the set to {m2} rather than to something
+    //       narrower. Reading the set directly is not available and should not be added: it
+    //       is private state, and X.6 forbids opening it for a test.
+    // COVERAGE-ASSERT: the probe count asserted at the end of the phase, so an edit that
+    //       deletes probes fails here instead of quietly narrowing what is separated.
+    // CONTROL: the intersection in WallpaperManager::setImportModifiers (backend/daemon/
+    //       wallpaper_manager.cpp) replaced by the caller's own list -- the last-report-wins
+    //       rule. Observed red on both ICDs: both refusal probes above, the exact-set probe,
+    //       and four more across this phase and the wire tier; 7 failures. Reverted.
+    check(report(consumerB, {m2, m3}).changed, "a second consumer's report narrows what is in force");
+    check(report(consumerC, {m3}).refused,
+          "a layout only one consumer reported is refused as another consumer's whole set");
+    check(report(consumerD, {m1}).refused,
+          "a layout only the first consumer reported is refused as another consumer's whole set");
+    const Report exact = report(consumerE, {m2});
+    check(!exact.refused && !exact.changed,
+          "a report of exactly the layouts in force is accepted and changes nothing");
+
+    // GOAL: S6.49 -- a refused report leaves the daemon's effective set exactly as it was,
+    //       for a caller with no earlier entry and for one with an earlier entry alike.
+    // WHY-THIS-SHAPE: the rollback is invisible in the effective set, because the refusal is
+    //       thrown before the set is adopted either way. What it is visible in is the stored
+    //       per-consumer map, which the NEXT report intersects: if the two refused reports
+    //       above had been left behind, the acceptance above could not have happened, and if
+    //       A's refused {m1} is left behind, the benign report below cannot be accepted. So
+    //       each rollback is graded by a later report from a DIFFERENT consumer that only
+    //       succeeds if the map was restored. Asserting "the throw happened" would grade
+    //       nothing about it, and re-probing with the refused consumer's own name would
+    //       overwrite the leftover before it could be seen.
+    // CONTROL: the two `m_importModifiersByClient` restore lines disabled in the empty-
+    //       intersection branch of WallpaperManager::setImportModifiers (backend/daemon/
+    //       wallpaper_manager.cpp). Observed red on both ICDs: both rollback checks here,
+    //       the exact-set probe above, and both S6.50 probes below; 5 failures. Reverted.
+    check(!exact.refused, "a refused report leaves a consumer that had no earlier entry unregistered");
+    check(report(consumerA, {m1}).refused, "a report that would leave no shared layout is refused");
+    const Report afterRollback = report(consumerF, {m1, m2});
+    check(!afterRollback.refused && !afterRollback.changed,
+          "a refused report restores the caller's earlier entry, so the set in force is untouched");
+
+    // GOAL: S6.50 -- a consumer that goes away stops constraining the exporter, and the set
+    //       widens back to the intersection of those that remain.
+    // WHY-THIS-SHAPE: probed by re-offering the exact set that was refused while the departed
+    //       consumer was present ({m3}, refused above), so the check is a before/after on one
+    //       report rather than an assertion about internal state. The second half then
+    //       forgets everyone and offers {m1}, which is disjoint from what the last remaining
+    //       consumer had reported: accepted only if "no consumer reporting" really means
+    //       unconstrained rather than "whatever the last one said".
+    // CONTROL: `m_importModifiersByClient.erase(client)` replaced by a `count()` test in
+    //       WallpaperManager::forgetImportModifiers (backend/daemon/wallpaper_manager.cpp),
+    //       so nothing is ever forgotten. Observed red on both ICDs: both checks here and the
+    //       wire tier's departure check; 3 failures. Reverted.
+    manager.forgetImportModifiers(consumerA);
+    manager.forgetImportModifiers(consumerE);
+    manager.forgetImportModifiers(consumerF);
+    const Report afterExit = report(consumerG, {m3});
+    check(!afterExit.refused,
+          "a layout a departed consumer excluded becomes reportable again once it is forgotten");
+    manager.forgetImportModifiers(consumerB);
+    manager.forgetImportModifiers(consumerG);
+    check(!report(consumerH, {m1}).refused,
+          "with no consumer left reporting, the exporter is unconstrained again");
+
+    // GOAL: S6.56 -- a consumer that has reported before and is refused for an empty
+    //       intersection is told how many OTHER consumers it shares no layout with.
+    // WHY-THIS-SHAPE: staged from a known, small population rather than asserted against the
+    //       phase's running total, so the expected number is a property of these four lines and
+    //       not of how many probes ran above. Exactly one other consumer reports here, so the
+    //       caller counting itself is the difference between "1" and "2" -- and the wire tier
+    //       already checks the error NAME, which is identical either way, so only the text can
+    //       carry this. The refusal itself is asserted too: a message check alone would pass on
+    //       a daemon that stopped refusing, since the empty string contains no wrong number.
+    // CONTROL: `others` replaced by `m_importModifiersByClient.size()` in the message built by
+    //       WallpaperManager::setImportModifiers (backend/daemon/wallpaper_manager.cpp).
+    //       Observed red on the NVIDIA host, the only failure in that run, with the refusal
+    //       quoted as "...shares no layout with the 2 already reported...". Reverted.
+    const std::string consumerI = ":test.consumer.i";
+    check(!report(consumerI, {m1, m2}).refused, "a second consumer sharing a layout with the first is accepted");
+    const Report miscounted = report(consumerI, {m2});
+    check(miscounted.refused && miscounted.why.find("with the 1 already reported") != std::string::npos,
+          "the refusal counts the other consumers, not the caller");
+    if (!miscounted.why.empty() && miscounted.why.find("with the 1 already reported") == std::string::npos) {
+        std::fprintf(stderr, "  the refusal said: %s\n  (one other consumer was reporting)\n",
+                     miscounted.why.c_str());
+    }
+
+    // GOAL: S6.51 at the manager tier -- a departure does not merely widen the effective set,
+    //       it hands back the monitors the departed set was blocking so something can re-render
+    //       them. The idle monitor here has a recorded request and no frame at all, which is
+    //       exactly the state a departed consumer's set can leave a monitor in.
+    // WHY-THIS-SHAPE: asserts the RETURN VALUE of forgetImportModifiers, which the S6.50 checks
+    //       above deliberately ignore -- they probe the set through a later report, and a
+    //       withdrawal that widens the set while scheduling nothing satisfies every one of them.
+    //       That is the whole gap: the monitor stays blank for the life of the daemon, because a
+    //       static wallpaper sends no further request. A control that stops the set widening
+    //       reddens the S6.50 checks instead and is not a control for this.
+    // CONTROL: the last line of WallpaperManager::forgetImportModifiers (backend/daemon/
+    //       wallpaper_manager.cpp) changed to `adoptImportModifiersLocked(...); return {};` --
+    //       the set still widens, nothing is scheduled. Observed red on the NVIDIA host, with
+    //       the wire tier's departure check and no S6.50 check; 2 failures. Reverted.
+    manager.forgetImportModifiers(consumerI);
+    const std::vector<int> unblocked = manager.forgetImportModifiers(consumerH);
+    check(std::find(unblocked.begin(), unblocked.end(), kMonitorModifiersIdle) != unblocked.end(),
+          "a departure hands back the frameless monitor its set was blocking, not just a wider set");
+
+    check(probes == 15, "the per-consumer phase ran every probe it grades on");
+    if (probes != 15) {
+        std::fprintf(stderr, "  %d report probes ran; expected 15\n", probes);
+    }
+}
+
+// --------------------------------------------------------------------------- //
+// The same per-consumer contract over the real wire, which is where the two halves this
+// daemon cannot see from the manager live: which name a report is filed under, and what
+// removes it.
+//
+// The key is the SENDER's unique bus name, taken from the message rather than from any
+// argument -- so a consumer cannot report on another's behalf, and the name is the one
+// NameOwnerChanged later carries. Withdrawal is DbusService::watchClientExits(), which
+// subscribes to the bus's own NameOwnerChanged and forgets a departed reporter.
+//
+// Its own manager, connection and service, on the connection's unique bus name rather than
+// io.wallpaperx.Daemon: the shared phases own that name. Nothing renders here, so this
+// manager builds no Device and has no validation grade to make. Each consumer is a proxy with
+// a connection of its own, which is what gives it a distinct unique name and what makes
+// destroying it a real departure from the bus.
+// --------------------------------------------------------------------------- //
+void runImportModifierClientWireChecks(const wallpaperx::WallpaperManager::Config& config, const Check& check) {
+    wallpaperx::WallpaperManager manager(config);
+
+    auto serviceConn = sdbus::createSessionBusConnection();
+    DbusService service(*serviceConn, manager);
+    serviceConn->enterEventLoopAsync();
+    const sdbus::ServiceName daemonName{serviceConn->getUniqueName()};
+    const sdbus::ObjectPath objectPath{DbusService::kObjectPath};
+
+    const uint32_t exportedFormat = wallpaperx::drmFourccForVkFormat(wallpaperx::OffscreenTargetManager::kFormat);
+    // Chosen so that each departure is observable in the next report's verdict, which is the
+    // only channel a client has. Leaver{A,B} and Stayer{B,C} intersect to {B}, which excludes
+    // Latecomer{C,D}; once the leaver is gone the intersection is {C}, which admits it. The
+    // stayer then still excludes {D}, and only when the stayer has gone too does {D} pass --
+    // so "forgot the wrong client" and "forgot everybody" are separable from "forgot the
+    // right one". A single shared modifier could not separate them.
+    const std::vector<uint64_t> setLeaver{kUnavailableModifierA, kUnavailableModifierB};
+    const std::vector<uint64_t> setStayer{kUnavailableModifierB, kUnavailableModifierC};
+    const std::vector<uint64_t> setLatecomer{kUnavailableModifierC, kUnavailableModifierD};
+    const std::vector<uint64_t> setLast{kUnavailableModifierD};
+
+    auto consumerA = sdbus::createProxy(daemonName, objectPath);
+    auto consumerStayer = sdbus::createProxy(daemonName, objectPath);
+    auto consumerB = sdbus::createProxy(daemonName, objectPath);
+
+    // GOAL: a report is filed under the caller's own bus name, so consumers on separate
+    //       connections are separate reporters and not one.
+    // WHY-THIS-SHAPE: the refusal is the observable. A daemon keying every report under one
+    //       constant name would treat each report as a REPLACEMENT for the last and accept
+    //       the third, which is exactly what this refuses. Asserting instead that the daemon
+    //       "stored three entries" would need state no client can see.
+    // CONTROL: the `sender` argument in DbusService::registerVTable's SetImportModifiers
+    //       handler (backend/daemon/dbus_service.cpp) replaced with a constant "". Observed
+    //       red on the NVIDIA host, with the stayer check below; 2 failures. Reverted.
+    setImportModifiers(*consumerA, exportedFormat, setLeaver);
+    setImportModifiers(*consumerStayer, exportedFormat, setStayer);
+    check(errorNameFrom([&] { setImportModifiers(*consumerB, exportedFormat, setLatecomer); }) ==
+              "org.freedesktop.DBus.Error.InvalidArgs",
+          "a report sharing no layout with what the other consumers reported is refused as InvalidArgs");
+
+    // GOAL: S6.50 end to end -- a consumer that leaves the bus stops constraining the
+    //       exporter, through the daemon's own NameOwnerChanged subscription.
+    // WHY-THIS-SHAPE: retries the report that was just refused, rather than sleeping once and
+    //       asserting. The departure is announced asynchronously by the bus and handled on the
+    //       daemon's event loop, so "how long until it is noticed" is not this test's to
+    //       assert -- but the retry loop has a bound and reaching it FAILS the check rather
+    //       than falling through, so a subscription that never fires cannot be graded as a
+    //       slow one (X.1).
+    // CONTROL: the `m_manager.forgetImportModifiers(name)` call deleted from
+    //       DbusService::watchClientExits (backend/daemon/dbus_service.cpp). Observed red on
+    //       the NVIDIA host, and the only failure in that run, with the diagnostic "the
+    //       departed consumer's set was still in force after 100 attempts over 5 s".
+    //       Reverted.
+    consumerA.reset();
+    bool acceptedAfterExit = false;
+    int attempts = 0;
+    for (; attempts < 100 && !acceptedAfterExit; ++attempts) {
+        try {
+            setImportModifiers(*consumerB, exportedFormat, setLatecomer);
+            acceptedAfterExit = true;
+        } catch (const sdbus::Error&) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    }
+    check(acceptedAfterExit, "a consumer that leaves the bus stops constraining the exporter");
+    if (!acceptedAfterExit) {
+        std::fprintf(stderr, "  the departed consumer's set was still in force after %d attempts over 5 s\n",
+                     attempts);
+        return;
+    }
+
+    // GOAL: only the departing consumer is forgotten. Without this the check above is equally
+    //       satisfied by a daemon that drops EVERY reporter whenever anybody leaves, which
+    //       silently restores the unnegotiated behaviour the whole mechanism exists to
+    //       replace -- and that daemon is not hypothetical, it is one line's difference.
+    // WHY-THIS-SHAPE: the set offered here is disjoint from the stayer's and NOT from the
+    //       late consumer's, so it is refused only while the stayer is still on the books.
+    //       An arbitrary disjoint set would be refused either way and would grade nothing;
+    //       measured -- with forgetImportModifiers() clearing the whole map, the arbitrary
+    //       form stayed green and this one goes red.
+    // CONTROL: `m_importModifiersByClient.clear();` added after the erase in
+    //       WallpaperManager::forgetImportModifiers (backend/daemon/wallpaper_manager.cpp).
+    //       Observed red on the NVIDIA host, and the only failure in that run. Reverted.
+    auto consumerLast = sdbus::createProxy(daemonName, objectPath);
+    check(errorNameFrom([&] { setImportModifiers(*consumerLast, exportedFormat, setLast); }) ==
+              "org.freedesktop.DBus.Error.InvalidArgs",
+          "the consumer that stayed still constrains the exporter after another one left");
+
+    // No control of its own: every mutation that falsifies it falsifies the departure check
+    // above first, which returns rather than falling through. What makes it more than a
+    // repetition is the check between them -- the stayer was still constraining the exporter
+    // one call ago, so this is the transition to nobody reporting, not a second look at one
+    // departure.
+    consumerStayer.reset();
+    consumerB.reset();
+    bool unconstrained = false;
+    for (int attempt = 0; attempt < 100 && !unconstrained; ++attempt) {
+        try {
+            setImportModifiers(*consumerLast, exportedFormat, setLast);
+            unconstrained = true;
+        } catch (const sdbus::Error&) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    }
+    check(unconstrained, "with every reporting consumer gone, the exporter is unconstrained again");
 }
 
 // --------------------------------------------------------------------------- //
@@ -2884,19 +3737,28 @@ int main() {
         }
         runRenderChecks(*proxy, signals, imagePath, corruptPath, videoPath, check);
         runCoalescingChecks(*proxy, signals, imagePath, corruptPath, burstPaths, check);
-        // Last of the shared-manager phases, on purpose: an accepted report rebuilds every
-        // monitor's image, so anything after it would be reading state it did not set.
+        // Last two of the shared-manager phases, on purpose and in this order: an accepted
+        // report rebuilds the images the set excludes, so anything after them would be reading
+        // state it did not set, and the second re-reports a wider set than the first leaves.
         runImportModifierWireChecks(*proxy, signals, imagePath, check);
+        runModifierWithdrawalRenderChecks(*proxy, signals, imagePath, check);
 
         // Its own manager, connection and service; no GPU work at all. Placed before the
         // worker-coalescing phase only for reading order -- it shares no state with
         // either neighbour.
         runUnservicedRequestChecks(config, imagePath, videoPath, check);
 
+        // Neither of these renders anything, so neither builds a Device: they grade the
+        // per-consumer bookkeeping behind SetImportModifiers, which is pure state. Placed
+        // before the GPU-backed phase below so that a host whose Vulkan stack cannot come up
+        // still answers for them.
+        runImportModifierClientChecks(config, imagePath, check);
+        runImportModifierClientWireChecks(config, check);
+
         // Its own manager and Device, both created and destroyed on this thread -- the
         // phase drives renderPending() directly, so there is no worker thread for the
         // Device to be pinned to.
-        runImportModifierChecks(config, imagePath, check);
+        runImportModifierChecks(config, imagePath, videoPath, check);
 
         // Its own manager and Device, scoped inside the call so both are torn down
         // before the validation warning count is read below.

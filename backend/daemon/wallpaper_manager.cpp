@@ -345,7 +345,94 @@ void WallpaperManager::releaseTarget(int monitorId) {
     }
 }
 
-std::vector<int> WallpaperManager::setImportModifiers(uint32_t drmFormat, const std::vector<uint64_t>& modifiers) {
+std::vector<uint64_t> WallpaperManager::intersectImportModifiersLocked() const {
+    std::vector<uint64_t> shared;
+    bool first = true;
+    for (const auto& [client, reported] : m_importModifiersByClient) {
+        if (first) {
+            shared = reported;
+            first = false;
+            continue;
+        }
+        std::vector<uint64_t> both;
+        for (uint64_t candidate : shared) {
+            if (std::find(reported.begin(), reported.end(), candidate) != reported.end()) {
+                both.push_back(candidate);
+            }
+        }
+        shared = std::move(both);
+        if (shared.empty()) break;
+    }
+    return shared;
+}
+
+bool WallpaperManager::frameStillReadableLocked(const MonitorState& state) const {
+    if (!state.hasFrame) return false;
+    // Empty is "nobody is reporting", which constrains nothing; kDrmModifierInvalid is an
+    // opaque-fd frame, which carries no layout for a report to exclude.
+    if (m_importModifiers.empty() || state.frameModifier == kDrmModifierInvalid) return true;
+    return std::find(m_importModifiers.begin(), m_importModifiers.end(), state.frameModifier) !=
+           m_importModifiers.end();
+}
+
+std::vector<int> WallpaperManager::adoptImportModifiersLocked(std::vector<uint64_t> modifiers) {
+    if (m_importModifiers == modifiers) {
+        return {};  // idempotent: several plugin instances share one process and one answer
+    }
+    m_importModifiers = std::move(modifiers);
+    m_importModifiersPending = true;
+
+    // A statement about the set in force, so it is re-derived whenever that set changes rather
+    // than accumulated: an entry the new set makes readable again would otherwise still cost the
+    // device-idle wait, the rebuild and a visible flicker to arrive back at a frame that was
+    // already fine.
+    std::erase_if(m_importModifiersInvalidated, [this](int id) {
+        auto it = m_monitors.find(id);
+        return it != m_monitors.end() && frameStillReadableLocked(it->second);
+    });
+
+    // Not every monitor: only those the new set actually costs something. A frame whose layout
+    // the set still allows stays readable, so rebuilding it would burn a render and a GPU stall
+    // to arrive back where it started -- and a consumer withdrawing one layout it never used
+    // would blank every monitor. A monitor with no frame is re-posted regardless: its last
+    // attempt produced nothing, and a different set may be exactly what it was missing.
+    //
+    // Bumping requestSeq is what makes renderPending() act -- it refuses to re-render a request
+    // it has already serviced.
+    std::vector<int> toRender;
+    for (auto& [id, state] : m_monitors) {
+        if (frameStillReadableLocked(state)) continue;
+
+        // Condemned whatever its type. A monitor that cannot be drawn right now still owns an
+        // image built under the old set, and acquireTarget() reuses an image whose size matches
+        // -- so skipping it here leaves a layout the consumer refused to be exported the moment
+        // the monitor becomes renderable again, permanently.
+        if (std::find(m_importModifiersInvalidated.begin(), m_importModifiersInvalidated.end(), id) ==
+            m_importModifiersInvalidated.end()) {
+            m_importModifiersInvalidated.push_back(id);
+        }
+
+        // Only a renderable one is asked to draw: posting the rest buys a pass that cannot
+        // produce a frame.
+        if (!isRenderableType(state.type)) continue;
+        ++state.requestSeq;
+        toRender.push_back(id);
+    }
+    return toRender;
+}
+
+std::vector<int> WallpaperManager::forgetImportModifiers(const std::string& client) {
+    std::lock_guard<std::mutex> stateLock(m_stateMutex);
+    if (m_importModifiersByClient.erase(client) == 0) return {};
+
+    // Through the same path as an accepted report, not a hand-rolled copy of it. Widening cannot
+    // invalidate an image, but it does un-block a monitor left with no frame at all by the
+    // departed consumer's set -- and that monitor recovers only if something re-renders it.
+    return adoptImportModifiersLocked(intersectImportModifiersLocked());
+}
+
+std::vector<int> WallpaperManager::setImportModifiers(const std::string& client, uint32_t drmFormat,
+                                                      const std::vector<uint64_t>& modifiers) {
     // Only the format this daemon exports is meaningful. A report about another one is a
     // client mistake, and silently keeping it would leave the exporter narrowed by a set that
     // describes a different pixel layout.
@@ -368,23 +455,43 @@ std::vector<int> WallpaperManager::setImportModifiers(uint32_t drmFormat, const 
         throw InvalidRequest("the reported import modifier set is empty");
     }
 
-    std::lock_guard<std::mutex> stateLock(m_stateMutex);
-    if (m_importModifiers == modifiers) {
-        return {};  // idempotent: several plugin instances share one process and one answer
-    }
-    m_importModifiers = modifiers;
-    m_importModifiersPending = true;
+    // Sorted and deduplicated so that what is stored is the set, not one spelling of it. The
+    // "has it changed?" test below compares vectors, and an order-sensitive answer let a client
+    // re-report the same layouts in a different order to bump every frameless monitor's request
+    // sequence -- which supersedes the render in flight, so no monitor ever committed a frame.
+    // The length cap above stays on the raw list, so a huge all-duplicates report is still
+    // refused rather than collapsed into a short one.
+    std::vector<uint64_t> canonical = modifiers;
+    std::sort(canonical.begin(), canonical.end());
+    canonical.erase(std::unique(canonical.begin(), canonical.end()), canonical.end());
 
-    // Every monitor holding a renderable request needs a new image: the one it has was built
-    // against the old set. Bumping requestSeq is what makes renderPending() act -- it refuses
-    // to re-render a request it has already serviced.
-    std::vector<int> toRender;
-    for (auto& [id, state] : m_monitors) {
-        if (!isRenderableType(state.type)) continue;
-        ++state.requestSeq;
-        toRender.push_back(id);
+    std::lock_guard<std::mutex> stateLock(m_stateMutex);
+
+    auto previous = m_importModifiersByClient.find(client);
+    const bool hadPrevious = previous != m_importModifiersByClient.end();
+    std::vector<uint64_t> restore;
+    if (hadPrevious) restore = previous->second;
+
+    m_importModifiersByClient[client] = std::move(canonical);
+    std::vector<uint64_t> shared = intersectImportModifiersLocked();
+    if (shared.empty()) {
+        // Counted before the rollback, which puts the caller back and would make it count itself
+        // among the others.
+        const size_t others = m_importModifiersByClient.size() - 1;
+        // Refused rather than stored: an empty intersection means no image can be created that
+        // every reporting consumer could read, so accepting it would fail every later render
+        // with the cause an unrelated call away. Undone so the caller's own report is what
+        // failed, not the others'.
+        if (hadPrevious) {
+            m_importModifiersByClient[client] = std::move(restore);
+        } else {
+            m_importModifiersByClient.erase(client);
+        }
+        throw InvalidRequest("the reported import modifier set shares no layout with the " +
+                             std::to_string(others) + " already reported by other frame consumers");
     }
-    return toRender;
+
+    return adoptImportModifiersLocked(std::move(shared));
 }
 
 // Runs on the render thread with m_gpuMutex held, before any target is created.
@@ -396,16 +503,19 @@ void WallpaperManager::applyImportModifiersLocked() {
         if (!m_importModifiersPending) return;
         modifiers = m_importModifiers;
         m_importModifiersPending = false;
-        for (auto& [id, state] : m_monitors) {
-            state.hasFrame = false;
-            monitorIds.push_back(id);
+        monitorIds = std::move(m_importModifiersInvalidated);
+        m_importModifiersInvalidated.clear();
+        for (int id : monitorIds) {
+            auto it = m_monitors.find(id);
+            if (it != m_monitors.end()) it->second.hasFrame = false;
         }
     }
     m_device->memory().setConsumerModifiers(std::move(modifiers));
 
     // Existing images keep the modifier they were created with, so a new set only affects
     // images made after it. Dropping them is what makes it take effect; acquireTarget()
-    // rebuilds each on its next render.
+    // rebuilds each on its next render. Only the monitors the set condemned -- the rest hold
+    // a layout it still allows.
     for (int id : monitorIds) releaseTarget(id);
 }
 
@@ -965,6 +1075,7 @@ RenderOutcome WallpaperManager::renderPending(int monitorId) {
             it->second.hasFrame = true;
             it->second.width = m_config.width;
             it->second.height = m_config.height;
+            it->second.frameModifier = target->drmModifier;
             // Cleared here rather than relying on requestWallpaper having cleared it. A
             // successful commit is what makes "this monitor has a frame" true, and the
             // two facts have to be set together -- otherwise a monitor can report
