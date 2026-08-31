@@ -7,9 +7,9 @@
 #include "offscreen.h"
 
 #include <algorithm>
+#include <iterator>
 #include <stdexcept>
 #include <string>
-#include <utility>
 #include <vector>
 
 #include <unistd.h>
@@ -63,8 +63,11 @@ void populateDmaBufLayout(Device& device, const OffscreenTarget& target, Exporte
             break;
         }
     }
+    // A driver contradicting its own modifier list is the driver going wrong. The two checks
+    // below are not: one is a negotiation outcome and one is this importer's limit, so they
+    // stay unclassified and leave the GPU's recorded health alone.
     if (planeCount == 0) {
-        throw std::runtime_error("exportFrame: driver reported a DRM format modifier it does not list as supported");
+        throw GpuFailure("exportFrame: driver reported a DRM format modifier it does not list as supported");
     }
 
     // The driver picks from the list it was offered; nothing until here checks what it picked.
@@ -101,93 +104,23 @@ void populateDmaBufLayout(Device& device, const OffscreenTarget& target, Exporte
     frame.modifier = chosen;
 }
 
-// The pipeline stage and access scope that produced the image's current contents,
-// inferred from the layout a renderer left it in. The release barrier has to make
-// *those* writes available; declaring a colour-attachment write for what was actually
-// a transfer or compute write means the release orders nothing, and the consumer sees
-// the previous frame. Conservative by default -- a too-wide source scope costs a
-// little on a once-per-frame barrier, a too-narrow one corrupts.
-std::pair<VkPipelineStageFlags, VkAccessFlags> sourceScopeFor(VkImageLayout layout) {
-    switch (layout) {
-        case VK_IMAGE_LAYOUT_UNDEFINED:
-            return {VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0};  // nothing was written
-        case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
-        case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:
-            return {VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT};
-        case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
-        case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
-            return {VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT};
-        default:
-            return {VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_WRITE_BIT};
-    }
-}
-
-// Hands the image over to a consumer outside this Vulkan device: transitions it to
-// VK_IMAGE_LAYOUT_GENERAL and releases queue-family ownership. Without this the image
-// is still owned by the graphics queue in whatever layout the renderer left, and what
-// an external importer sees is formally undefined -- on a compressed modifier (AMD
-// DCC, Intel CCS) the metadata we report then describes bytes the compositor cannot
-// read. Lavapipe picks LINEAR and never compresses, so it cannot witness that; the
-// visible failure is AMD/Intel-only.
-//
-// Applies to both handle types. An opaque fd is imported by a second Vulkan device,
-// which must acquire from VK_QUEUE_FAMILY_EXTERNAL -- an acquire with no matching
-// release is an incomplete transfer, so skipping this on the NVIDIA path would leave
-// the same defect there. OffscreenTargetManager::render() issues the paired acquire
-// before the next render.
-void releaseToExternalConsumer(Device& device, const OffscreenTarget& target, ExportedFrame::HandleType handleType) {
-    // Keyed on ownership, not on the layout being GENERAL: GENERAL is also a layout a
-    // renderer may legitimately leave the image in, and treating it as "already
-    // released" would skip the release entirely for such a frame.
-    if (target.externalOwner != VK_QUEUE_FAMILY_IGNORED) {
-        return;  // already released and not re-rendered since
-    }
-
-    // FOREIGN is for a consumer outside Vulkan entirely (a compositor importing a
-    // dma_buf); EXTERNAL (core since 1.1) is for another Vulkan instance, which is
-    // what an opaque fd is always imported by. FOREIGN also degrades to EXTERNAL when
-    // VK_EXT_queue_family_foreign is unavailable.
-    const bool useForeign = handleType == ExportedFrame::HandleType::DmaBuf && device.info().hasQueueFamilyForeign;
-    const uint32_t dstQueueFamily = useForeign ? VK_QUEUE_FAMILY_FOREIGN_EXT : VK_QUEUE_FAMILY_EXTERNAL;
-
-    const auto [srcStage, srcAccess] = sourceScopeFor(target.exportLayout);
-
-    VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-    barrier.srcAccessMask = srcAccess;
-    barrier.dstAccessMask = 0;  // ownership release: the acquire side does the rest
-    // Read from the target rather than assumed: exportFrame is reachable on a target
-    // that was never rendered into, whose image is still UNDEFINED, and a renderer may
-    // leave it in a layout other than the shared render pass's finalLayout.
-    barrier.oldLayout = target.exportLayout;
-    barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-    barrier.srcQueueFamilyIndex = device.graphicsQueueFamily();
-    barrier.dstQueueFamilyIndex = dstQueueFamily;
-    barrier.image = target.image.image;
-    barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-
-    device.immediateSubmit([&](VkCommandBuffer cmd) {
-        vkCmdPipelineBarrier(cmd, srcStage, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1,
-                             &barrier);
-    });
-
-    target.releasedFromLayout = barrier.oldLayout;
-    target.exportLayout = VK_IMAGE_LAYOUT_GENERAL;
-    target.externalOwner = dstQueueFamily;
-}
-
 }  // namespace
 
 ExportedFrame exportFrame(Device& device, const OffscreenTarget& target) {
-    // The export submits an ownership-release barrier, so it is GPU work like any other
-    // and belongs on the same thread as the renders it interleaves with. In the daemon
-    // this is what makes GetFrameFd's asynchronous handling load-bearing rather than
-    // stylistic: answering it inline on the DBus thread would trip this.
+    // Memory's live-allocation map is a plain container written by every image create and
+    // destroy, and the queries below read it -- so this reads GPU-owned state and belongs
+    // on the same thread as the renders it interleaves with. In the daemon this is what
+    // makes GetFrameFd's asynchronous handling load-bearing rather than stylistic:
+    // answering it inline on the DBus thread would trip this.
     device.assertGpuThread("exportFrame");
 
     auto pfnGetMemoryFd = reinterpret_cast<PFN_vkGetMemoryFdKHR>(
         vkGetDeviceProcAddr(device.device(), "vkGetMemoryFdKHR"));
     if (!pfnGetMemoryFd) {
-        throw std::runtime_error("exportFrame: vkGetMemoryFdKHR entry point missing");
+        // Device selection refuses a GPU without VK_KHR_external_memory_fd and the device is
+        // created with it enabled, so a missing entry point is the driver withholding what it
+        // advertised -- a GPU fault, not a configuration one.
+        throw GpuFailure("exportFrame: vkGetMemoryFdKHR entry point missing");
     }
 
     const VkExternalMemoryHandleTypeFlagBits handleType =
@@ -211,8 +144,21 @@ ExportedFrame exportFrame(Device& device, const OffscreenTarget& target) {
     // Lavapipe's DMA_BUF path under fd exhaustion) return VK_SUCCESS while writing
     // fd = -1, which would otherwise be handed back as a valid-looking frame with a
     // dead fd. exportFrame's contract is "a fresh valid fd, or throw".
-    if (pfnGetMemoryFd(device.device(), &getFdInfo, &frame.fd) != VK_SUCCESS || frame.fd < 0) {
-        throw std::runtime_error("exportFrame: vkGetMemoryFdKHR failed to produce a valid fd");
+    const VkResult fdResult = pfnGetMemoryFd(device.device(), &getFdInfo, &frame.fd);
+    if (fdResult != VK_SUCCESS || frame.fd < 0) {
+        // The two results this call may return are both host limits, and so is a VK_SUCCESS
+        // with no descriptor to show for it: the cause is fd exhaustion, usually a consumer
+        // leaking the ones GetFrameFd hands it. Calling that a GPU fault points an operator
+        // at their driver for a problem in RLIMIT_NOFILE. Only an unpermitted result is the
+        // driver going wrong.
+        const bool hostLimit = fdResult == VK_SUCCESS || fdResult == VK_ERROR_TOO_MANY_OBJECTS ||
+                               fdResult == VK_ERROR_OUT_OF_HOST_MEMORY;
+        if (hostLimit) {
+            throw std::runtime_error("exportFrame: vkGetMemoryFdKHR produced no file descriptor for the frame -- "
+                                     "the process is out of file descriptors, or a consumer is leaking them");
+        }
+        throw GpuFailure("exportFrame: vkGetMemoryFdKHR returned " + std::to_string(static_cast<int>(fdResult)) +
+                         ", which it is not permitted to return");
     }
 
     frame.width = target.width;
@@ -242,7 +188,6 @@ ExportedFrame exportFrame(Device& device, const OffscreenTarget& target) {
             }
             populateDmaBufLayout(device, target, frame);
         }
-        releaseToExternalConsumer(device, target, frame.type);
     } catch (...) {
         // The fd is already open at this point and nothing else will close it.
         close(frame.fd);

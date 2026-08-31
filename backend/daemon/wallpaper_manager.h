@@ -160,8 +160,8 @@ struct ImportModifierUpdate {
 // Two locks, strictly ordered: m_gpuMutex before m_stateMutex, never the reverse.
 //
 //   m_gpuMutex   the Device, the offscreen targets, and all GPU submission; held for a whole
-//                render. Also what makes export safe: OffscreenTarget's exportLayout and
-//                externalOwner are written through a const reference by render AND export.
+//                render. Also what makes export safe: it reads the Device's live-allocation
+//                map and a target that a render's create/destroy can replace underneath it.
 //   m_stateMutex the per-monitor bookkeeping only -- a map lookup or a string copy -- so
 //                GetStatus never waits on a render.
 class WallpaperManager {

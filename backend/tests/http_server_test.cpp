@@ -196,6 +196,106 @@ extern "C" VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmit(VkQueue queue, uint32_t 
 }
 
 // ---------------------------------------------------------------------------- //
+// Failing the frame export's driver call, from the test binary
+// ---------------------------------------------------------------------------- //
+//
+// Publishing a rendered frame is the render's job, so exportFrame submits nothing and the
+// lever above cannot reach it. What an export does do is ask the driver for a file
+// descriptor onto the image's memory, and that call failing is the driver going wrong --
+// which the daemon must record against the GPU rather than swallow.
+//
+// The lever is vkGetDeviceProcAddr, not vkGetMemoryFdKHR. Defining vkGetMemoryFdKHR in this
+// binary would never be reached: renderer/vulkan/frame_export.cpp calls it through the
+// pointer the loader hands back, not through the dynamic symbol. vkGetDeviceProcAddr *is*
+// called as an undefined symbol from that file, so interposing it and returning a stub is
+// what puts a fault where production actually looks.
+//
+// Nothing in backend/daemon or renderer/ changes, so this is not the test-only hook in a
+// production file that X.6 forbids -- it is the technique this file already uses on
+// vkQueueSubmit. thread_local for the same reason: no other thread in this process can see
+// the plan, so the counts below are not an assertion on the scheduler (X.2).
+namespace {
+
+struct GetMemoryFdFaultPlan {
+    int observed = 0;  // vkGetMemoryFdKHR calls made on the arming thread while armed
+    int failAt = 0;    // 1-based index of the call to fail; 0 counts and fails nothing
+    int injected = 0;  // faults actually returned, so a bypassed interposer is visible
+    // Which failure to hand back. Selectable because exportFrame now classifies its results:
+    // the two the spec permits are host resource limits and must not touch the GPU's
+    // recorded health, and anything else is the driver going wrong and must.
+    VkResult result = VK_ERROR_TOO_MANY_OBJECTS;
+};
+
+thread_local GetMemoryFdFaultPlan* t_getMemoryFdFault = nullptr;
+
+PFN_vkVoidFunction realDeviceProcAddr(VkDevice device, const char* name) {
+    // RTLD_NEXT skips this executable and lands on the loader's own entry point. Idempotent,
+    // so the relaxed racing store can only ever write the same value twice.
+    static std::atomic<void*> real{nullptr};
+    void* p = real.load(std::memory_order_relaxed);
+    if (p == nullptr) {
+        p = ::dlsym(RTLD_NEXT, "vkGetDeviceProcAddr");
+        real.store(p, std::memory_order_relaxed);
+    }
+    auto* fn = reinterpret_cast<PFN_vkGetDeviceProcAddr>(p);
+    return fn == nullptr ? nullptr : fn(device, name);
+}
+
+// *pFd is left untouched: exportFrame initialises it to -1 and rejects a non-VK_SUCCESS
+// result anyway.
+VKAPI_ATTR VkResult VKAPI_CALL faultingGetMemoryFd(VkDevice device, const VkMemoryGetFdInfoKHR* info, int* pFd) {
+    if (GetMemoryFdFaultPlan* plan = t_getMemoryFdFault; plan != nullptr) {
+        ++plan->observed;
+        if (plan->failAt != 0 && plan->observed == plan->failAt) {
+            ++plan->injected;
+            return plan->result;
+        }
+    }
+    auto* realFn = reinterpret_cast<PFN_vkGetMemoryFdKHR>(realDeviceProcAddr(device, "vkGetMemoryFdKHR"));
+    if (realFn == nullptr) return VK_ERROR_INITIALIZATION_FAILED;
+    return realFn(device, info, pFd);
+}
+
+// Arms for the current thread only, and disarms on every exit path including an exception
+// (X.4) -- a plan left armed would inject into an unrelated phase. Restores whatever was
+// armed before rather than clearing, and disarm() is idempotent.
+class GetMemoryFdFault {
+public:
+    GetMemoryFdFault(int failAt, VkResult result) : m_previous(t_getMemoryFdFault) {
+        m_plan.failAt = failAt;
+        m_plan.result = result;
+        t_getMemoryFdFault = &m_plan;
+    }
+    ~GetMemoryFdFault() { disarm(); }
+    GetMemoryFdFault(const GetMemoryFdFault&) = delete;
+    GetMemoryFdFault& operator=(const GetMemoryFdFault&) = delete;
+
+    void disarm() {
+        if (t_getMemoryFdFault == &m_plan) t_getMemoryFdFault = m_previous;
+    }
+
+    int observed() const { return m_plan.observed; }
+    int injected() const { return m_plan.injected; }
+
+private:
+    GetMemoryFdFaultPlan m_plan;
+    GetMemoryFdFaultPlan* m_previous;
+};
+
+}  // namespace
+
+extern "C" VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(VkDevice device, const char* pName) {
+    // Substituted only while a plan is armed on THIS thread, and only for this one name:
+    // the Vulkan Memory Allocator and the descriptor tiers resolve their own entry points
+    // through here, and handing any of them a stub would break the daemon rather than fail
+    // one export.
+    if (t_getMemoryFdFault != nullptr && pName != nullptr && std::strcmp(pName, "vkGetMemoryFdKHR") == 0) {
+        return reinterpret_cast<PFN_vkVoidFunction>(&faultingGetMemoryFd);
+    }
+    return realDeviceProcAddr(device, pName);
+}
+
+// ---------------------------------------------------------------------------- //
 // Failing one allocation inside an HTTP handler, from the test binary
 // ---------------------------------------------------------------------------- //
 //
@@ -2802,58 +2902,127 @@ void runGpuFailureChecks(const std::string& bluePath, const WallpaperManager::Co
                      healthCheckDetail(recovered.json, "gpu").c_str(), expectGpuDetail.c_str());
     }
 
-    // GOAL: S7.10e reaches the export too -- exportCurrentFrame is GPU work (it submits an
-    //       ownership-release barrier), so a GpuFailure there is the GPU going wrong and
-    //       must be recorded as such. False if a daemon whose every GetFrameFd dies in the
-    //       driver still reports gpu ok.
-    // WHY-THIS-SHAPE: this runs immediately after the two checks above have established
-    //       gpu == ok on this same daemon, so the fail below cannot be left over from the
-    //       render fault -- the ok is the barrier that makes it attributable to the
-    //       export. Aiming at the first submit after arming is exact rather than
-    //       index-coupled here: exportFrame issues exactly one, and if it ever issues none
-    //       the injected count catches it.
-    // CONTROL: the `try`/`catch (const GpuFailure&)` around wallpaperx::exportFrame in
-    //       WallpaperManager::exportCurrentFrame reduced to the bare call it replaced ->
-    //       "FAIL: a frame export that fails in the driver is recorded against the GPU",
-    //       gpu still reading {ok, "NVIDIA GeForce RTX 3080 Ti (Heap)"} after the export
-    //       had thrown. Reverted.
-    {
-        SubmitFault exportFault(/*failAt=*/1);
-        std::string exportError;
+    // One armed export, reported as the pair the checks below need: whether the injected
+    // result actually reached exportFrame, what it threw, and what /health said afterwards.
+    // Written once because the two arms differ only in the result injected and in what they
+    // expect of `gpu`, and a second hand-written copy of the arming, the fd hygiene and the
+    // reached-the-driver guard is a second thing to get wrong.
+    struct ExportOutcome {
+        bool reached = false;  // the fault was returned to exportFrame exactly once
+        int observed = 0;
         bool threw = false;
-        try {
-            wallpaperx::FrameExport exported = daemon.manager().exportCurrentFrame(0);
-            // Only reached if the fault missed. The caller owns the fd (exportFrame's
-            // contract), and leaking one out of a phase that then keeps running is X.4's
-            // business, not something to leave to process exit.
-            if (exported.handle && exported.handle->frame.fd >= 0) ::close(exported.handle->frame.fd);
-        } catch (const std::exception& e) {
-            threw = true;
-            exportError = e.what();
+        std::string error;
+        HttpReply health;
+    };
+    auto exportUnder = [&daemon](VkResult injected) {
+        ExportOutcome outcome;
+        {
+            GetMemoryFdFault fault(/*failAt=*/1, injected);
+            try {
+                wallpaperx::FrameExport exported = daemon.manager().exportCurrentFrame(0);
+                // Only reached if the fault missed. The caller owns the fd (exportFrame's
+                // contract), and leaking one out of a phase that then keeps running is
+                // X.4's business, not something to leave to process exit.
+                if (exported.handle && exported.handle->frame.fd >= 0) ::close(exported.handle->frame.fd);
+            } catch (const std::exception& e) {
+                outcome.threw = true;
+                outcome.error = e.what();
+            }
+            outcome.observed = fault.observed();
+            outcome.reached = fault.injected() == 1;
         }
-        exportFault.disarm();
+        outcome.health = daemon.health();
+        return outcome;
+    };
 
-        if (exportFault.injected() != 1) {
-            notVerified("S7.10e (a failed frame export is attributed to the GPU)",
-                        "exportCurrentFrame made " + std::to_string(exportFault.observed()) +
-                            " vkQueueSubmit call(s) with the interposer armed on the first, so no fault reached "
+    // GOAL: S7.10a aimed at the export -- a frame export that fails because the *host* is
+    //       out of file descriptors is not the GPU going wrong, and must leave `gpu`
+    //       reading ok while GetFrameFd still fails. False if a consumer that leaks the
+    //       descriptors GetFrameFd hands it can drive /health to blame the graphics driver,
+    //       which would send an operator to their driver for a problem in RLIMIT_NOFILE.
+    // WHY-THIS-SHAPE: VK_ERROR_TOO_MANY_OBJECTS is one of the two results the spec permits
+    //       this call to return, and it is what fd exhaustion produces. Run before the
+    //       unpermitted-result arm below, not after: that arm records a GPU failure that
+    //       only a later successful render clears, so afterwards "gpu is ok" would be
+    //       unreachable and this check could only ever be red or vacuous.
+    // CONTROL: renderer/vulkan/frame_export.cpp -- the `hostLimit` branch's
+    //       `throw std::runtime_error(...)` changed to `throw GpuFailure(...)`, which is the
+    //       classification this split replaced -> "FAIL: a frame export that fails on a host
+    //       resource limit leaves the GPU's recorded health alone", printing "gpu after an
+    //       fd-exhaustion export: fail (exportFrame: vkGetMemoryFdKHR produced no file
+    //       descriptor for the frame ...)". Reverted.
+    // COVERAGE-ASSERT: reached must be true. An interposer that stopped landing would leave
+    //       a successful export and a gpu that reads ok for the ordinary reason, which is
+    //       exactly this check's pass condition -- so it is skipped, not passed.
+    {
+        const ExportOutcome hostLimit = exportUnder(VK_ERROR_TOO_MANY_OBJECTS);
+        if (!hostLimit.reached) {
+            notVerified("S7.10a (an fd-exhaustion export is not blamed on the GPU)",
+                        "exportCurrentFrame made " + std::to_string(hostLimit.observed) +
+                            " vkGetMemoryFdKHR call(s) with the interposer armed on the first, so no fault reached "
                             "the export path on this host" +
-                            (threw ? " (it threw for another reason: " + exportError + ")" : ""));
+                            (hostLimit.threw ? " (it threw for another reason: " + hostLimit.error + ")" : ""));
+        } else if (!hostLimit.health.ok()) {
+            check(false, "the fd-exhaustion daemon answered /health with a parseable 200");
         } else {
-            const HttpReply afterExport = daemon.health();
-            if (!afterExport.ok()) {
-                check(false, "the failed-export daemon answered /health with a parseable 200");
-            } else {
-                check(threw && exportError.find("vkQueueSubmit") != std::string::npos,
-                      "exportCurrentFrame propagates the driver failure instead of returning a frame");
-                check(healthCheckStatus(afterExport.json, "gpu") == "fail",
-                      "a frame export that fails in the driver is recorded against the GPU");
-                if (healthCheckStatus(afterExport.json, "gpu") != "fail") {
-                    std::fprintf(stderr, "  gpu after a failed export: %s (%s); export threw: %s\n",
-                                 healthCheckStatus(afterExport.json, "gpu").c_str(),
-                                 healthCheckDetail(afterExport.json, "gpu").c_str(),
-                                 threw ? exportError.c_str() : "no");
-                }
+            check(hostLimit.threw && hostLimit.error.find("file descriptor") != std::string::npos,
+                  "an export that runs out of file descriptors fails the caller rather than returning a frame");
+            check(healthCheckStatus(hostLimit.health.json, "gpu") == "ok",
+                  "a frame export that fails on a host resource limit leaves the GPU's recorded health alone");
+            if (healthCheckStatus(hostLimit.health.json, "gpu") != "ok" || !hostLimit.threw) {
+                std::fprintf(stderr, "  gpu after an fd-exhaustion export: %s (%s); export threw: %s\n",
+                             healthCheckStatus(hostLimit.health.json, "gpu").c_str(),
+                             healthCheckDetail(hostLimit.health.json, "gpu").c_str(),
+                             hostLimit.threw ? hostLimit.error.c_str() : "no");
+            }
+        }
+    }
+
+    // GOAL: S7.10e reaches the export too -- when the fd query returns a result this call is
+    //       not permitted to return, the driver is what went wrong and /health must record
+    //       it against the GPU. False if a daemon whose every GetFrameFd dies in the driver
+    //       still reports gpu ok.
+    // WHY-THIS-SHAPE: the injected result is VK_ERROR_INITIALIZATION_FAILED, chosen because
+    //       it is outside the set vkGetMemoryFdKHR may return. The obvious pick,
+    //       VK_ERROR_TOO_MANY_OBJECTS, is now a host resource limit and deliberately does
+    //       NOT reach the GPU's health -- it is the arm above. Aimed at the fd query rather
+    //       than at a submit because the export no longer submits anything: publishing moved
+    //       into the render, and the submit interposer observes zero calls here. This runs
+    //       immediately after the arm above left gpu reading ok on this same daemon, so the
+    //       fail below cannot be left over from the earlier render fault.
+    // CONTROL: two, both reverted. (1) The `try`/`catch (const GpuFailure&)` around
+    //       wallpaperx::exportFrame in backend/daemon/wallpaper_manager.cpp reduced to the
+    //       bare call -> "FAIL: a frame export whose driver returned a result it may not
+    //       return is recorded against the GPU", printing "gpu after an unpermitted driver
+    //       result: ok (NVIDIA GeForce RTX 3080 Ti (Heap))". (2) The unpermitted-result
+    //       throw in renderer/vulkan/frame_export.cpp changed from GpuFailure to
+    //       std::runtime_error -> the same check red the same way, because an unclassified
+    //       throw is not attributed to the GPU. Neither reddened the propagation check, so
+    //       the two are independent.
+    // COVERAGE-ASSERT: reached must be 1. With the name test in the vkGetDeviceProcAddr
+    //       interposer disabled the phase reported "exportCurrentFrame made 0
+    //       vkGetMemoryFdKHR call(s)" and ctest recorded a skip -- an interposer that stops
+    //       landing cannot leave this looking green.
+    {
+        const ExportOutcome driverFault = exportUnder(VK_ERROR_INITIALIZATION_FAILED);
+        if (!driverFault.reached) {
+            notVerified("S7.10e (a failed frame export is attributed to the GPU)",
+                        "exportCurrentFrame made " + std::to_string(driverFault.observed) +
+                            " vkGetMemoryFdKHR call(s) with the interposer armed on the first, so no fault reached "
+                            "the export path on this host" +
+                            (driverFault.threw ? " (it threw for another reason: " + driverFault.error + ")" : ""));
+        } else if (!driverFault.health.ok()) {
+            check(false, "the failed-export daemon answered /health with a parseable 200");
+        } else {
+            check(driverFault.threw && driverFault.error.find("vkGetMemoryFdKHR") != std::string::npos,
+                  "exportCurrentFrame propagates the driver failure instead of returning a frame");
+            check(healthCheckStatus(driverFault.health.json, "gpu") == "fail",
+                  "a frame export whose driver returned a result it may not return is recorded against the GPU");
+            if (healthCheckStatus(driverFault.health.json, "gpu") != "fail") {
+                std::fprintf(stderr, "  gpu after an unpermitted driver result: %s (%s); export threw: %s\n",
+                             healthCheckStatus(driverFault.health.json, "gpu").c_str(),
+                             healthCheckDetail(driverFault.health.json, "gpu").c_str(),
+                             driverFault.threw ? driverFault.error.c_str() : "no");
             }
         }
     }

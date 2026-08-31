@@ -18,4 +18,9 @@ VkExternalMemoryHandleTypeFlagBits externalMemoryHandleType(GpuVendor vendor, bo
 VkExternalMemoryHandleTypeFlagBits externalMemoryHandleType(GpuVendor vendor, bool hasExternalMemoryDmaBuf,
                                                             const char* forceHandleType);
 
+// The queue family a published frame's ownership is released to, for memory handed over
+// as `handleType`. Derived from the handle type rather than tracked, so the family a
+// release names cannot disagree with the handle its consumer imports.
+uint32_t externalConsumerQueueFamily(VkExternalMemoryHandleTypeFlagBits handleType, bool hasQueueFamilyForeign);
+
 }

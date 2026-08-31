@@ -66,6 +66,17 @@ struct ExportedFrame {
 // produces a fresh fd via a fresh vkGetMemoryFdKHR call (Vulkan's own contract
 // -- see Key Gotchas: "Reusing fd after import" in PLAN.md); the caller owns
 // the returned fd and must close() it if it isn't handed off to an importer.
+//
+// Throws GpuFailure when the driver is what failed -- the export entry point missing, a
+// modifier absent from the driver's own list, a result the fd query is not permitted to
+// return -- and a plain runtime_error for everything else here: a broken invariant, a
+// layout the consumer refused, or the host running out of file descriptors. The daemon
+// marks its GPU unhealthy on the first and not the second.
+//
+// Reads the target, never writes it, and submits nothing: the ownership release that
+// makes the contents readable outside this device is part of the render that produced
+// them (OffscreenTargetManager::render). Exporting a target no render has published
+// hands out memory the graphics queue still owns.
 ExportedFrame exportFrame(Device& device, const OffscreenTarget& target);
 
 }

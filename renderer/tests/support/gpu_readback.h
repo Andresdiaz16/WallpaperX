@@ -116,54 +116,70 @@ inline bool variesInBothAxes(const std::vector<unsigned char>& pixels, uint32_t 
     return rowVaries && columnVaries;
 }
 
-// Renders `renderer` into a fresh target owned by `targets` and copies its pixels out
-// through Vulkan into a tightly-packed BGRA buffer.
+// Takes a rendered target back from its consumer and copies its pixels out into a
+// tightly-packed BGRA buffer. The single readback path in this suite: every probe that
+// reads a rendered frame back goes through here.
 //
-// The target is created here rather than taken as a parameter, and is deliberately NOT
-// the target whose exported fd gets compared against the result.
+// reclaim() first, and that is the whole point of this function existing. Every completed
+// render() releases queue-family ownership of the target to an external consumer, so from
+// the graphics queue's point of view the image is not ours and is in no particular layout.
+// Copying from it regardless is undefined however the barrier names its layouts, and
+// nothing reports it: the validation layer does not track ownership, and neither driver
+// available here (NVIDIA block-linear, Lavapipe LINEAR) corrupts an unowned read, so the
+// pixels come back correct and the suite stays green. reclaim() submits the acquire that
+// reverses the release, leaving the image ours in GENERAL.
 //
-// Reading a target back requires transitioning it to TRANSFER_SRC_OPTIMAL and recording
-// that via notifyLayout. exportFrame() then reads that layout and hands it to
-// sourceScopeFor(), which selects {TRANSFER_BIT, TRANSFER_WRITE_BIT}. The daemon never
-// takes that branch: in production GetFrameFd exports a target still sitting in
-// SHADER_READ_ONLY_OPTIMAL, so the release barrier uses the COLOR_ATTACHMENT arm. Doing
-// the readback on the exported target therefore moves the export off the only release
-// scope that ships, and a regression in the shipping arm -- the one documented as making
-// "the consumer see the previous frame" -- leaves the check green.
+// The barrier below therefore names GENERAL literally rather than reading a tracked field.
+// reclaim()'s post-condition is a compile-time constant, so there is nothing to read and
+// nothing that can go stale. Its source scope covers everything because what last wrote the
+// image is the renderer, and IRenderer::record may have written it as a colour attachment,
+// a compute store or a blit -- a scope narrower than the widest of those makes the writes
+// unavailable to the copy, and again no layer says so.
 //
-// Comparing across two targets is sound because the renderers here are deterministic:
-// same shader, same source image, same extent, nothing time- or randomness-dependent.
-//
-// Lives here rather than in either probe because both probes need exactly this and both
-// need the paragraph above; a second copy of it is a second thing to get wrong, and the
-// two copies had already begun to drift (one set the barrier's access masks, the other
-// relied on them being zero).
-inline std::vector<unsigned char> renderReference(Device& device, OffscreenTargetManager& targets,
-                                                  IRenderer& renderer, int monitorId, uint32_t width,
-                                                  uint32_t height) {
-    const OffscreenTarget& target = targets.create(monitorId, width, height);
-    targets.render(renderer, target);
+// The target is left unpublished, which is what makes it unsafe to export until the next
+// render: it is the caller's until then.
+inline std::vector<unsigned char> reclaimAndReadback(Device& device, OffscreenTargetManager& targets,
+                                                     const OffscreenTarget& target) {
+    targets.reclaim(target);
 
     device.immediateSubmit([&](VkCommandBuffer cmd) {
         VkImageMemoryBarrier toTransferSrc{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-        toTransferSrc.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        toTransferSrc.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
         toTransferSrc.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-        toTransferSrc.oldLayout = target.exportLayout;
+        toTransferSrc.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
         toTransferSrc.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
         toTransferSrc.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         toTransferSrc.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         toTransferSrc.image = target.image.image;
         toTransferSrc.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
 
-        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,
-                             nullptr, 0, nullptr, 1, &toTransferSrc);
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr,
+                             0, nullptr, 1, &toTransferSrc);
     });
-    target.notifyLayout(VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
 
     // readbackImage() owns its staging buffer through a guard, so a failed submit here
     // reports the submit failure instead of leaking an allocation and aborting inside
     // VMA's teardown assertion naming an unrelated buffer.
-    return readbackImage(device, target.image.image, width, height);
+    return readbackImage(device, target.image.image, target.width, target.height);
+}
+
+// Renders `renderer` into a fresh target owned by `targets` and copies its pixels out
+// through Vulkan into a tightly-packed BGRA buffer.
+//
+// The target is created here rather than taken as a parameter, and is deliberately NOT
+// the target whose exported fd gets compared against the result. Reading a target back
+// reclaims it, so the target stops being published; a probe that read back the same target
+// it exports would be exporting memory the graphics queue owns, which is the defect the
+// export is supposed to be free of, and would grade its own epilogue instead.
+//
+// Comparing across two targets is sound because the renderers here are deterministic:
+// same shader, same source image, same extent, nothing time- or randomness-dependent.
+inline std::vector<unsigned char> renderReference(Device& device, OffscreenTargetManager& targets,
+                                                  IRenderer& renderer, int monitorId, uint32_t width,
+                                                  uint32_t height) {
+    const OffscreenTarget& target = targets.create(monitorId, width, height);
+    targets.render(renderer, target);
+    return reclaimAndReadback(device, targets, target);
 }
 
 // How many rows of two tightly-packed BGRA buffers of the same geometry differ.

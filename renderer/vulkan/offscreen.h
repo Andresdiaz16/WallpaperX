@@ -15,8 +15,8 @@ class IRenderer;
 
 class Device;
 
-// The layout the offscreen render pass leaves a target in (its finalLayout). Shared
-// so the render pass and the export path's barrier cannot drift apart.
+// The layout the offscreen render pass leaves a target in (its finalLayout). Shared so a
+// renderer drawing through that pass and the pass itself cannot name different layouts.
 inline constexpr VkImageLayout kRenderedLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
 struct OffscreenTarget {
@@ -37,42 +37,44 @@ struct OffscreenTarget {
     uint32_t width = 0;
     uint32_t height = 0;
 
-    // The layout the export path believes this image is in: UNDEFINED from creation,
-    // whatever a renderer left it in after a submitted render, GENERAL once released
-    // to an external consumer. exportFrame()'s release barrier reads it as oldLayout,
-    // so tracking it is what keeps that barrier from declaring a layout the image was
-    // never in -- a target can legitimately be exported before it is ever rendered.
+    // The queue family the published frame's ownership was released to, or
+    // VK_QUEUE_FAMILY_IGNORED when the graphics queue owns the image.
+    //
+    // The image's layout is deliberately NOT tracked alongside it. It is only ever needed
+    // to name the acquire that reverses a release, so it exists exactly while a frame is
+    // published; while we own the image the render pass discards whatever is there, and a
+    // second field recording it could only drift.
     //
     // Mutable because it tracks GPU-side state of the image, not a logical property of
-    // the target: exportFrame() takes a const reference and callers export repeatedly.
+    // the target: render() takes a const reference and callers render repeatedly.
     //
     // NOT thread-safe, and a const OffscreenTarget& is therefore NOT safe to share
-    // across threads: both OffscreenTargetManager::render() and exportFrame() write
-    // this through a const reference. Callers that render and export from different
-    // threads (Step 6 task 2's DBus handlers) must serialise both under the same lock
-    // -- guarding only the export side leaves the write unsynchronised.
-    mutable VkImageLayout exportLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-
-    // The queue family this image's ownership was released to by exportFrame(), or
-    // VK_QUEUE_FAMILY_IGNORED when the graphics queue still owns it.
-    //
-    // Separate from exportLayout on purpose. Ownership is not derivable from the
-    // layout: GENERAL is both what a release leaves behind *and* a layout a renderer
-    // may legitimately end in (a compute write), so using the layout as the
-    // "already released" sentinel would silently skip the release for such a renderer.
-    // It also has to be paired -- a release with no matching acquire before the next
-    // render is where a driver's compressed-modifier metadata resolve goes wrong.
+    // across threads: OffscreenTargetManager::render() writes this and the field below
+    // through a const reference. Callers that render and export from different threads
+    // (Step 6 task 2's DBus handlers) must serialise both under the same lock.
     mutable uint32_t externalOwner = VK_QUEUE_FAMILY_IGNORED;
 
-    // What the release named as oldLayout, so the acquire can name the same. exportLayout
-    // is no use for that -- the release overwrites it to GENERAL.
+    // What the release named as oldLayout, so the acquire can name the same. Meaningless
+    // unless published().
     mutable VkImageLayout releasedFromLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
-    // Records that the image is now in `layout`. Anything that transitions the image
-    // outside OffscreenTargetManager::render() / exportFrame() -- a readback barrier,
-    // for instance -- must call this, or the export path's barrier will declare a
-    // layout the image has since left.
-    void notifyLayout(VkImageLayout layout) const { exportLayout = layout; }
+    // Whether a rendered frame is currently in the consumer's hands: what makes an export
+    // meaningful, and what a reclaim requires.
+    bool published() const { return externalOwner != VK_QUEUE_FAMILY_IGNORED; }
+
+    // Records the release that ends every render: ownership is now `queueFamily`'s and the
+    // paired acquire must name `fromLayout` -> GENERAL. One call rather than two
+    // assignments, so the two cannot be left describing different renders.
+    void notifyPublished(uint32_t queueFamily, VkImageLayout fromLayout) const {
+        externalOwner = queueFamily;
+        releasedFromLayout = fromLayout;
+    }
+
+    // Records the acquire that reverses it. The image is ours again, in GENERAL.
+    void notifyReclaimed() const {
+        externalOwner = VK_QUEUE_FAMILY_IGNORED;
+        releasedFromLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    }
 };
 
 class OffscreenTargetManager {
@@ -113,14 +115,33 @@ public:
 
     uint32_t depth(int monitorId) const;
 
-    // Renders `renderer` into `target` and submits it.
+    // Renders `renderer` into `target`, submits it, and publishes the result: one
+    // command buffer holding the acquire back from the previous publish, the render,
+    // and the release that hands the finished frame to an external consumer.
     //
-    // Owning the submit is what makes the layout bookkeeping correct: the target's
-    // tracked layout is only committed once the submit has actually succeeded. Doing
-    // it at record time would leave a target claiming a transition that never ran if
-    // the submit throws (device lost, OOM) -- and the next export would then declare
-    // that layout to the driver on an image still in its old one.
+    // Publishing here rather than at export time is what keeps the target's recorded
+    // ownership and layout describing the image as it actually is however many times
+    // -- including zero -- a consumer fetches it. A producer drawing every display
+    // frame otherwise accumulates renders that were never released.
+    //
+    // Owning the submit is what makes the bookkeeping correct: the target's tracked
+    // state is only committed once the submit has actually succeeded. Doing it at
+    // record time would leave a target claiming a transition that never ran if the
+    // submit throws (device lost, OOM), and the next acquire would then name it.
     void render(IRenderer& renderer, const OffscreenTarget& target);
+
+    // Takes a published frame back: submits the acquire that reverses render()'s release,
+    // leaving the image owned by the graphics queue in VK_IMAGE_LAYOUT_GENERAL.
+    //
+    // Anything on this device that touches the image outside render() -- a readback copy --
+    // must call this first and then transition from GENERAL. Reading an image the graphics
+    // queue does not own is undefined however the barrier names its layouts, and no
+    // validation layer says so: ownership transfers are not tracked.
+    //
+    // The target stops being published, so nothing may export it until the next render.
+    // Throws if it was not published, which is a caller bug -- only a successful render
+    // publishes, and only one reclaim can follow one render.
+    void reclaim(const OffscreenTarget& target);
 
     VkRenderPass renderPass() const { return m_renderPass; }
 

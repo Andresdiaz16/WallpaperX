@@ -14,6 +14,42 @@
 
 namespace wallpaperx {
 
+namespace {
+
+// Both halves of an ownership transfer name the same image and subresource; built here so
+// they cannot be given different ones.
+VkImageMemoryBarrier transferOf(VkImage image, VkImageLayout oldLayout, VkImageLayout newLayout, uint32_t srcFamily,
+                                uint32_t dstFamily) {
+    VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    barrier.oldLayout = oldLayout;
+    barrier.newLayout = newLayout;
+    barrier.srcQueueFamilyIndex = srcFamily;
+    barrier.dstQueueFamilyIndex = dstFamily;
+    barrier.image = image;
+    barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    return barrier;
+}
+
+// Takes a published frame back onto the graphics queue: the same layout pair the release
+// named, in the same direction. A transfer performs its transition once, on whichever side
+// the driver picks, so halves that disagree leave the conversion undone.
+//
+// The destination scope covers everything on purpose. IRenderer::record may write the image
+// as a colour attachment, a compute store or a blit, and this is recorded before record()
+// runs -- nothing here can know which. A scope too narrow for what follows makes neither the
+// acquire nor the transition visible to it, and no validation layer says so: an ownership
+// transfer's scopes are not checked. One barrier per frame, so the width costs nothing.
+void recordAcquire(VkCommandBuffer cmd, const OffscreenTarget& target, uint32_t graphicsFamily) {
+    VkImageMemoryBarrier acquire = transferOf(target.image.image, target.releasedFromLayout,
+                                              VK_IMAGE_LAYOUT_GENERAL, target.externalOwner, graphicsFamily);
+    acquire.srcAccessMask = 0;  // the release side made the writes available
+    acquire.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0,
+                         nullptr, 1, &acquire);
+}
+
+}  // namespace
+
 OffscreenTargetManager::OffscreenTargetManager(Device& device) : m_device(device) {
     createRenderPass();
 }
@@ -45,22 +81,25 @@ void OffscreenTargetManager::createRenderPass() {
     subpass.colorAttachmentCount = 1;
     subpass.pColorAttachments = &colorRef;
 
+    // These are what chain the pass's automatic layout transitions to the barriers around
+    // it -- the acquire before and the ownership release after, both in the same command
+    // buffer as the pass. Neither of those runs in a framebuffer-space stage, so naming one
+    // (FRAGMENT_SHADER, say) leaves the transition unordered against it, and BY_REGION would
+    // promise a per-region dependency the whole-image barriers do not honour.
     std::array<VkSubpassDependency, 2> dependencies{};
     dependencies[0].srcSubpass = VK_SUBPASS_EXTERNAL;
     dependencies[0].dstSubpass = 0;
-    dependencies[0].srcStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    dependencies[0].srcStageMask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
     dependencies[0].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    dependencies[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    dependencies[0].srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
     dependencies[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    dependencies[0].dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT;
 
     dependencies[1].srcSubpass = 0;
     dependencies[1].dstSubpass = VK_SUBPASS_EXTERNAL;
     dependencies[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    dependencies[1].dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    dependencies[1].dstStageMask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
     dependencies[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    dependencies[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    dependencies[1].dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT;
+    dependencies[1].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
 
     VkRenderPassCreateInfo renderPassInfo{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
     renderPassInfo.attachmentCount = 1;
@@ -76,60 +115,59 @@ void OffscreenTargetManager::createRenderPass() {
 }
 
 void OffscreenTargetManager::render(IRenderer& renderer, const OffscreenTarget& target) {
-    VkImageLayout resultingLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    bool recorded = false;
-    bool acquired = false;
-    try {
-        m_device.immediateSubmit([&](VkCommandBuffer cmd) {
-            recorded = true;
+    // Derived from the same handle-type decision exportFrame() reports to the consumer,
+    // so the family a release names cannot disagree with the handle that is imported.
+    const uint32_t consumer = externalConsumerQueueFamily(
+        externalMemoryHandleType(m_device.info().vendor, m_device.info().hasExternalMemoryDmaBuf),
+        m_device.info().hasQueueFamilyForeign);
 
-            // Take ownership back before writing. exportFrame() released it to an
-            // external consumer, and a release with no matching acquire is where a
-            // driver's compressed-modifier metadata resolve is undefined -- so the
-            // second and later renders of a target must re-acquire, not just overwrite.
-            if (target.externalOwner != VK_QUEUE_FAMILY_IGNORED) {
-                VkImageMemoryBarrier acquire{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-                acquire.srcAccessMask = 0;  // the release side made the writes available
-                acquire.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-                // The same pair the release named. A transfer performs its transition once,
-                // on whichever side the driver picks, so halves that disagree leave the
-                // conversion undone. The render pass discards from GENERAL anyway.
-                acquire.oldLayout = target.releasedFromLayout;
-                acquire.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-                acquire.srcQueueFamilyIndex = target.externalOwner;
-                acquire.dstQueueFamilyIndex = m_device.graphicsQueueFamily();
-                acquire.image = target.image.image;
-                acquire.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-                vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                                     VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1,
-                                     &acquire);
-                acquired = true;
-            }
+    VkImageLayout renderedLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    // Nothing is recorded on the target until the submit has returned. Neither barrier takes
+    // effect unless it succeeds, so a throw leaves ownership exactly where it was: with the
+    // consumer if a frame was published, with us if not.
+    m_device.immediateSubmit([&](VkCommandBuffer cmd) {
+        // Take ownership back before writing. The previous render released it to an
+        // external consumer, and a release with no matching acquire is where a driver's
+        // compressed-modifier metadata resolve is undefined.
+        if (target.published()) recordAcquire(cmd, target, m_device.graphicsQueueFamily());
 
-            resultingLayout = renderer.record(cmd, target);
-        });
-    } catch (...) {
-        // Only invalidate if commands were actually recorded. immediateSubmit can also
-        // throw from vkAllocateCommandBuffers/vkBeginCommandBuffer before reaching the
-        // lambda, in which case nothing touched the image -- stamping UNDEFINED there
-        // would discard a still-valid layout and let the next export's barrier license
-        // the driver to throw away a frame the compositor is currently displaying.
+        renderedLayout = renderer.record(cmd, target);
+
+        // Hand the finished frame over: transition it to GENERAL and release queue-family
+        // ownership. Without this the image is still owned by the graphics queue in
+        // whatever layout the renderer left, and what an external importer sees is
+        // formally undefined -- on a compressed modifier (AMD DCC, Intel CCS) the metadata
+        // the export reports then describes bytes the compositor cannot read. Lavapipe
+        // picks LINEAR and never compresses, so it cannot witness that; the visible
+        // failure is AMD/Intel-only.
         //
-        // externalOwner is deliberately NOT touched here. The acquire barrier only takes
-        // effect if the submit succeeds, so on failure the external consumer still owns
-        // the image and the next render must issue the acquire again. Clearing it at
-        // record time (as this did originally) desynchronised ownership permanently for
-        // any caller that survives a failed submit -- harmless for a probe that exits on
-        // throw, silent corruption for a long-lived daemon.
-        if (recorded) {
-            target.notifyLayout(VK_IMAGE_LAYOUT_UNDEFINED);
-        }
-        throw;
+        // In the same submit as the render, not a later one: a frame that is drawn and
+        // never fetched must still leave the target's recorded state describing the image,
+        // and a second submit per frame is what a display-rate producer cannot afford.
+        //
+        // The source scope covers everything the renderer could have done rather than
+        // being inferred from the layout it returned: SHADER_READ_ONLY_OPTIMAL is reached
+        // by a colour attachment write and by a compute store alike, and a release that
+        // names the wrong one orders nothing -- the consumer then sees the previous frame,
+        // with no validation warning. This command buffer holds only the pass and these
+        // two barriers, so there is nothing for a narrower scope to overlap with.
+        VkImageMemoryBarrier release = transferOf(target.image.image, renderedLayout, VK_IMAGE_LAYOUT_GENERAL,
+                                                  m_device.graphicsQueueFamily(), consumer);
+        release.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+        release.dstAccessMask = 0;  // ownership release: the acquire side does the rest
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0,
+                             nullptr, 0, nullptr, 1, &release);
+    });
+    target.notifyPublished(consumer, renderedLayout);
+}
+
+void OffscreenTargetManager::reclaim(const OffscreenTarget& target) {
+    if (!target.published()) {
+        throw std::runtime_error("OffscreenTargetManager::reclaim: the target has no published frame");
     }
-    if (acquired) {
-        target.externalOwner = VK_QUEUE_FAMILY_IGNORED;
-    }
-    target.notifyLayout(resultingLayout);
+    m_device.immediateSubmit(
+        [&](VkCommandBuffer cmd) { recordAcquire(cmd, target, m_device.graphicsQueueFamily()); });
+    target.notifyReclaimed();
 }
 
 const OffscreenTarget& OffscreenTargetManager::create(int monitorId, uint32_t width, uint32_t height,

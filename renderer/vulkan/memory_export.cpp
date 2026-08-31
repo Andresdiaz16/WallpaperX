@@ -75,4 +75,12 @@ VkExternalMemoryHandleTypeFlagBits externalMemoryHandleType(GpuVendor vendor, bo
     return externalMemoryHandleType(vendor, hasExternalMemoryDmaBuf, forced.c_str());
 }
 
+uint32_t externalConsumerQueueFamily(VkExternalMemoryHandleTypeFlagBits handleType, bool hasQueueFamilyForeign) {
+    // FOREIGN is for a consumer outside Vulkan entirely (a compositor importing a dma_buf);
+    // EXTERNAL (core since 1.1) covers another Vulkan or OpenGL context on the same device
+    // and driver, which is what an opaque fd is always imported by.
+    const bool foreign = handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT && hasQueueFamilyForeign;
+    return foreign ? VK_QUEUE_FAMILY_FOREIGN_EXT : VK_QUEUE_FAMILY_EXTERNAL;
+}
+
 }
