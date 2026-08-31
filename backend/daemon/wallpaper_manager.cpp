@@ -375,7 +375,7 @@ bool WallpaperManager::frameStillReadableLocked(const MonitorState& state) const
            m_importModifiers.end();
 }
 
-std::vector<int> WallpaperManager::adoptImportModifiersLocked(std::vector<uint64_t> modifiers) {
+ImportModifierUpdate WallpaperManager::adoptImportModifiersLocked(std::vector<uint64_t> modifiers) {
     if (m_importModifiers == modifiers) {
         return {};  // idempotent: several plugin instances share one process and one answer
     }
@@ -418,10 +418,10 @@ std::vector<int> WallpaperManager::adoptImportModifiersLocked(std::vector<uint64
         ++state.requestSeq;
         toRender.push_back(id);
     }
-    return toRender;
+    return ImportModifierUpdate{true, std::move(toRender)};
 }
 
-std::vector<int> WallpaperManager::forgetImportModifiers(const std::string& client) {
+ImportModifierUpdate WallpaperManager::forgetImportModifiers(const std::string& client) {
     std::lock_guard<std::mutex> stateLock(m_stateMutex);
     if (m_importModifiersByClient.erase(client) == 0) return {};
 
@@ -431,8 +431,8 @@ std::vector<int> WallpaperManager::forgetImportModifiers(const std::string& clie
     return adoptImportModifiersLocked(intersectImportModifiersLocked());
 }
 
-std::vector<int> WallpaperManager::setImportModifiers(const std::string& client, uint32_t drmFormat,
-                                                      const std::vector<uint64_t>& modifiers) {
+ImportModifierUpdate WallpaperManager::setImportModifiers(const std::string& client, uint32_t drmFormat,
+                                                          const std::vector<uint64_t>& modifiers) {
     // Only the format this daemon exports is meaningful. A report about another one is a
     // client mistake, and silently keeping it would leave the exporter narrowed by a set that
     // describes a different pixel layout.

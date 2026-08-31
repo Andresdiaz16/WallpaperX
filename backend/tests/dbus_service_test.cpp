@@ -652,6 +652,9 @@ void runHostChecks(sdbus::IProxy& proxy, const std::string& imagePath, const Che
         {"method", "GetStatus", ArgList{{"out", "s:status"}}},
         // A signal's args carry no direction attribute, hence the empty first field.
         {"signal", "FrameReady", ArgList{{"", "i:monitor_id"}, {"", "t:frame_generation"}}},
+        // Deliberately argument-free: it says the layouts in force have changed, not what they
+        // are, because what they are is what the OTHER consumers reported.
+        {"signal", "ImportModifiersChanged", ArgList{}},
     };
 
     for (const auto& [element, name, expectedArgs] : expected) {
@@ -1299,21 +1302,26 @@ void runRenderChecks(sdbus::IProxy& proxy, FrameReadyLog& signals, const std::st
         check(frame.syncFds.empty(), "sync_fds is empty (reserved slot)");
         check(frame.handleType == 0 || frame.handleType == 1, "handle_type is OPAQUE_FD (0) or DMA_BUF (1)");
 
-        // memory_size must be the exact allocation size, not merely big enough:
-        // glImportMemoryFdEXT and EGL both take it as *the* size of the imported object,
-        // so a value that is too large fails the import and one that is too small is
-        // read as a smaller buffer. A dma_buf reports its true size via SEEK_END, which
-        // is an oracle independent of whatever the daemon chose to put on the wire.
+        // GOAL: memory_size never claims more bytes than the fd actually carries.
+        //       glImportMemoryFdEXT and EGL take it as *the* size of the imported object, so a
+        //       value past the end of the allocation fails every import.
+        // WHY-THIS-SHAPE: an upper bound, not equality. `lseek` measures the page-rounded
+        //       backing object, which S5.9 records as OVER-reporting on NVIDIA -- so equality
+        //       accuses the daemon of a driver's rounding, and the check could only ever have
+        //       run on drivers that happen not to round. Paired with the pixel floor below, it
+        //       still pins memory_size into [what the frame needs, what the fd holds]: a daemon
+        //       reporting a size it invented fails one end or the other.
         if (frame.handleType == 1) {
             const off_t seekSize = lseek(frame.fd.get(), 0, SEEK_END);
-            check(seekSize > 0 && static_cast<uint64_t>(seekSize) == frame.memorySize,
-                  "memory_size equals the dma_buf's actual size");
+            check(seekSize > 0 && frame.memorySize <= static_cast<uint64_t>(seekSize),
+                  "memory_size is within the dma_buf's actual size");
             if (seekSize > 0 && static_cast<uint64_t>(seekSize) != frame.memorySize) {
-                std::fprintf(stderr, "  memory_size=%llu but the dma_buf is %lld bytes\n",
+                std::fprintf(stderr, "  memory_size=%llu, dma_buf is %lld bytes (rounding is the driver's)\n",
                              static_cast<unsigned long long>(frame.memorySize),
                              static_cast<long long>(seekSize));
             }
         }
+        // The other end of that bound, and the reason the one above may be an inequality.
         check(frame.memorySize >= static_cast<uint64_t>(kTargetWidth) * kTargetHeight * 4,
               "memory_size covers at least the frame's pixels");
 
@@ -2254,7 +2262,7 @@ void runImportModifierChecks(const wallpaperx::WallpaperManager::Config& config,
     //       failures). Both in backend/daemon/wallpaper_manager.cpp; both reverted.
     std::vector<uint64_t> keep{kUnavailableModifierA};
     if (!opaqueExport) keep.push_back(committed);
-    const std::vector<int> keepRender = manager.setImportModifiers(kConsumerName, exportedFormat, keep);
+    const std::vector<int> keepRender = manager.setImportModifiers(kConsumerName, exportedFormat, keep).toRender;
     check(keepRender.empty(),
           opaqueExport ? "a modifier report re-posts no monitor whose frame is an opaque fd"
                        : "a modifier report re-posts no monitor whose frame's layout it still names");
@@ -2294,7 +2302,7 @@ void runImportModifierChecks(const wallpaperx::WallpaperManager::Config& config,
     if (committed != wallpaperx::testing::kDrmModifierLinear) {
         exclude.push_back(wallpaperx::testing::kDrmModifierLinear);
     }
-    const std::vector<int> toRender = manager.setImportModifiers(kConsumerName, exportedFormat, exclude);
+    const std::vector<int> toRender = manager.setImportModifiers(kConsumerName, exportedFormat, exclude).toRender;
     check(std::find(toRender.begin(), toRender.end(), kMonitorModifiersRerendered) != toRender.end() &&
               std::find(toRender.begin(), toRender.end(), kMonitorModifiersPending) != toRender.end(),
           "a report excluding the committed frame's layout returns both rendered monitors for re-render");
@@ -2385,7 +2393,7 @@ void runImportModifierChecks(const wallpaperx::WallpaperManager::Config& config,
     // The state recovers, which is what separates "withdrawn" from "lost": once a layout this
     // GPU can use is reported again, both monitors render and export. Without this the checks
     // above are equally satisfied by a daemon that dropped both monitors for good.
-    const std::vector<int> restored = manager.setImportModifiers(kConsumerName, exportedFormat, keep);
+    const std::vector<int> restored = manager.setImportModifiers(kConsumerName, exportedFormat, keep).toRender;
     check(std::find(restored.begin(), restored.end(), kMonitorModifiersPending) != restored.end(),
           "a later report re-posts a monitor the previous one left without a frame");
     const wallpaperx::RenderOutcome pendingReRendered = manager.renderPending(kMonitorModifiersPending);
@@ -2432,7 +2440,7 @@ void runImportModifierChecks(const wallpaperx::WallpaperManager::Config& config,
     //       WallpaperManager::adoptImportModifiersLocked (backend/daemon/wallpaper_manager.cpp).
     //       Observed red on Lavapipe -- "a monitor whose condemnation was undone before the
     //       render thread saw it keeps its frame", the only failure in that run. Reverted.
-    const std::vector<int> condemned = manager.setImportModifiers(kConsumerName, exportedFormat, unusable);
+    const std::vector<int> condemned = manager.setImportModifiers(kConsumerName, exportedFormat, unusable).toRender;
     check(std::find(condemned.begin(), condemned.end(), kMonitorModifiersUndoneA) != condemned.end() &&
               std::find(condemned.begin(), condemned.end(), kMonitorModifiersUndoneB) != condemned.end(),
           "a report excluding both monitors' layout condemns both");
@@ -2475,7 +2483,8 @@ void runImportModifierChecks(const wallpaperx::WallpaperManager::Config& config,
     }
     manager.requestWallpaper("video", videoPath, kMonitorModifiersUnrenderable);
 
-    const std::vector<int> condemnedAgain = manager.setImportModifiers(kConsumerName, exportedFormat, unusable);
+    const std::vector<int> condemnedAgain =
+        manager.setImportModifiers(kConsumerName, exportedFormat, unusable).toRender;
     check(std::find(condemnedAgain.begin(), condemnedAgain.end(), kMonitorModifiersUnrenderable) ==
               condemnedAgain.end(),
           "a monitor whose type this build cannot draw is not asked to re-render");
@@ -2565,7 +2574,7 @@ void runImportModifierClientChecks(const wallpaperx::WallpaperManager::Config& c
         ++probes;
         Report out;
         try {
-            out.changed = !manager.setImportModifiers(client, exportedFormat, set).empty();
+            out.changed = !manager.setImportModifiers(client, exportedFormat, set).toRender.empty();
         } catch (const wallpaperx::InvalidRequest& e) {
             out.refused = true;
             out.why = e.what();
@@ -2738,7 +2747,7 @@ void runImportModifierClientChecks(const wallpaperx::WallpaperManager::Config& c
     //       the set still widens, nothing is scheduled. Observed red on the NVIDIA host, with
     //       the wire tier's departure check and no S6.50 check; 2 failures. Reverted.
     manager.forgetImportModifiers(consumerI);
-    const std::vector<int> unblocked = manager.forgetImportModifiers(consumerH);
+    const std::vector<int> unblocked = manager.forgetImportModifiers(consumerH).toRender;
     check(std::find(unblocked.begin(), unblocked.end(), kMonitorModifiersIdle) != unblocked.end(),
           "a departure hands back the frameless monitor its set was blocking, not just a wider set");
 

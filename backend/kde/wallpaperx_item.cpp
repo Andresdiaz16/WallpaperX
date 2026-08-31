@@ -29,6 +29,10 @@ namespace {
 // The EGL driver's answer, not an item's. Cleared on a daemon restart.
 std::atomic<bool> g_modifiersReported{false};
 
+// Set when the daemon refused this process's report, cleared when the retry it earns is armed.
+// Without it every consumer would re-report on every change, which is the poll this avoids.
+std::atomic<bool> g_reportRefused{false};
+
 // The set last reported, kept so a modifier that turns out not to import can be withdrawn.
 // eglQueryDmaBufModifiersEXT is not the last word: NVIDIA advertises modifiers for this format
 // that eglCreateImage then refuses for a Vulkan-exported buffer.
@@ -167,11 +171,29 @@ bool WallpaperXItem::subscribeToFrameReady() {
                                                  SLOT(onFrameReady(int, qulonglong)));
 }
 
+bool WallpaperXItem::subscribeToImportModifiersChanged() {
+    return QDBusConnection::sessionBus().connect(QString::fromUtf8(kService), QString::fromUtf8(kPath),
+                                                 QString::fromUtf8(kInterface),
+                                                 QStringLiteral("ImportModifiersChanged"), this,
+                                                 SLOT(onImportModifiersChanged()));
+}
+
+// The daemon says the layouts in force have changed. That only matters here if this process's
+// own report was refused -- the refusal may have been for sharing no layout with a consumer that
+// has since departed or widened, which is not something this process could have fixed by itself.
+// Anything else is left alone: a report the daemon accepted stands, and re-sending it would be
+// the per-frame retry this deliberately is not.
+void WallpaperXItem::onImportModifiersChanged() {
+    if (!g_reportRefused.exchange(false)) return;
+    g_modifiersReported.store(false);
+}
+
 void WallpaperXItem::connectToDaemon() {
     // Messages are built by hand rather than through QDBusInterface, whose constructor blocks on
     // an Introspect round trip -- on the thread that runs the compositor's UI, from a QML item's
     // constructor. Nothing here waits on the bus.
     m_subscribed = subscribeToFrameReady();
+    subscribeToImportModifiersChanged();
     // No early return on failure: an item that cannot hear FrameReady must still notice the
     // daemon arriving or leaving, and the watcher below is the only thing that can retry.
     if (!m_subscribed) publishReason();
@@ -350,6 +372,9 @@ void sendImportModifiers(QObject* context, quint32 drmFormat, const std::vector<
 
                     std::fprintf(stderr, "wallpaperx: the daemon refused the import modifier report -- %s\n",
                                  done->error().message().toUtf8().constData());
+                    // Armed, not retried. The same list earns the same answer until the daemon
+                    // says the layouts in force have changed.
+                    g_reportRefused.store(true);
                     std::lock_guard<std::mutex> lock(g_reportedMutex);
                     // Only if nothing has moved since. A withdrawal that landed while this call
                     // was in flight must not be undone by an older one failing.

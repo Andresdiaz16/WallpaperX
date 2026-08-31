@@ -601,6 +601,20 @@ if(DBUS_RUN_SESSION)
             LABELS "lavapipe")
     endif()
 
+    # The dma_buf export path on the GPU this project actually targets. The default entry
+    # above exports an opaque fd there, so the layout negotiation -- which layout the driver
+    # picks, whether it is one the consumer reported, what a report that excludes it does --
+    # was reachable only on Lavapipe, whose single usable layout cannot express most of it.
+    #
+    # Registered only now: it used to fail on a check that compared memory_size against
+    # lseek, which S5.9 records as over-reporting on this driver's page-rounded backing
+    # object. That check is an upper bound now, so this configuration is honest here.
+    add_test(NAME dbus_service_dmabuf
+             COMMAND ${DBUS_RUN_SESSION} -- $<TARGET_FILE:wallpaperx-dbus-service-test>)
+    set_tests_properties(dbus_service_dmabuf PROPERTIES
+        ENVIRONMENT "WALLPAPERX_FORCE_HANDLE_TYPE=dmabuf;WALLPAPERX_FORCE_TIER="
+        SKIP_RETURN_CODE 77)
+
     # DoD 12 wants the Classic descriptor tier verified end to end *through the
     # daemon*, and no machine here resolves to it on its own: NVIDIA gives Heap and
     # Lavapipe gives Buffer, so without forcing it the whole daemon-side Classic path

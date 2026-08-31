@@ -53,9 +53,7 @@ void DbusService::watchClientExits() {
             if (!oldOwner.empty() && newOwner.empty()) {
                 // A monitor the departed consumer's set left with no frame can be drawn again
                 // now that the constraint is gone, and this is the only thing that will retry it.
-                for (const int monitorId : m_manager.forgetImportModifiers(name)) {
-                    m_worker.post(monitorId);
-                }
+                applyImportModifierUpdate(m_manager.forgetImportModifiers(name));
             }
         });
 }
@@ -132,13 +130,34 @@ void DbusService::registerVTable() {
             // requests for one monitor can be in flight, a consumer receiving the signal
             // otherwise cannot tell which frame it is being told about, nor whether the
             // one it already holds is the one being announced.
-            sdbus::registerSignal("FrameReady").withParameters<int32_t, uint64_t>("monitor_id", "frame_generation"))
+            sdbus::registerSignal("FrameReady").withParameters<int32_t, uint64_t>("monitor_id", "frame_generation"),
+            // No parameters: the only thing a consumer can do with it is ask again, and telling
+            // it what the set now is would be telling it what the OTHER consumers reported.
+            //
+            // Exists because a report refused for sharing no layout with another consumer is not
+            // refused for anything the caller can fix -- and a consumer that retried on its own
+            // schedule would have to poll. This says "the answer may have changed", once.
+            sdbus::registerSignal("ImportModifiersChanged"))
         .forInterface(std::string(kInterface));
 }
 
 void DbusService::restoreSaved() {
     for (const int monitorId : m_manager.restoreSaved()) {
         m_worker.post(monitorId);
+    }
+}
+
+void DbusService::applyImportModifierUpdate(const ImportModifierUpdate& update) {
+    for (const int monitorId : update.toRender) m_worker.post(monitorId);
+    if (!update.changed) return;
+
+    try {
+        m_object->emitSignal("ImportModifiersChanged").onInterface(kInterface);
+    } catch (const std::exception& e) {
+        // Losing it costs a consumer whose report was refused the chance to retry until the
+        // next change, which is worth a line in the journal but is not worth failing the call
+        // that succeeded.
+        std::fprintf(stderr, "wallpaperx-daemon: failed to emit ImportModifiersChanged: %s\n", e.what());
     }
 }
 
@@ -188,9 +207,9 @@ void DbusService::setImportModifiers(const std::string& client, uint32_t drmForm
                 sanitizeForLog(client).c_str(), drmFormat, modifiers.size());
     std::fflush(stdout);
 
-    std::vector<int> toRender;
+    ImportModifierUpdate update;
     try {
-        toRender = m_manager.setImportModifiers(client, drmFormat, modifiers);
+        update = m_manager.setImportModifiers(client, drmFormat, modifiers);
     } catch (const InvalidRequest& e) {
         std::fprintf(stderr, "wallpaperx-daemon: SetImportModifiers rejected: %s\n", e.what());
         throw sdbus::Error(sdbus::Error::Name{kErrorInvalidArgs}, e.what());
@@ -198,9 +217,7 @@ void DbusService::setImportModifiers(const std::string& client, uint32_t drmForm
 
     // Every monitor holding a frame built against the old set. Each re-render announces its own
     // FrameReady, which is what tells the consumer to fetch the newly compatible frame.
-    for (int monitorId : toRender) {
-        m_worker.post(monitorId);
-    }
+    applyImportModifierUpdate(update);
 }
 
 void DbusService::setMonitorOutput(int32_t monitorId, const std::string& outputName) {

@@ -3,6 +3,7 @@
 #pragma once
 
 #include "render_worker.h"
+#include "wallpaper_manager.h"
 
 #include <sdbus-c++/sdbus-c++.h>
 
@@ -72,6 +73,11 @@ private:
     // against the previous set. Synchronous: it touches bookkeeping only, and the GPU work
     // happens on the worker like every other render.
     void setImportModifiers(const std::string& client, uint32_t drmFormat, const std::vector<uint64_t>& modifiers);
+
+    // Posts the re-renders a report or withdrawal asked for, and announces the change to every
+    // consumer. Both halves belong together: a consumer whose own report was refused for
+    // sharing no layout with another one learns from this that asking again is worth it.
+    void applyImportModifierUpdate(const ImportModifierUpdate& update);
 
     // Subscribes to the bus's own NameOwnerChanged so a consumer that reported import
     // modifiers and then exited stops constraining the exporter. Without it the daemon would

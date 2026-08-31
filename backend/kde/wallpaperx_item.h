@@ -107,6 +107,11 @@ private slots:
     // FrameReady(monitor_id, frame_generation) from the daemon, on the GUI thread.
     void onFrameReady(int monitorId, qulonglong generation);
 
+    // ImportModifiersChanged() from the daemon, on the GUI thread. Only a report the daemon
+    // refused is worth retrying, and only because the refusal may have been about a set this
+    // process does not control.
+    void onImportModifiersChanged();
+
 private:
     // A frame fetched but not yet imported. Owns its fd until the render thread takes it: if
     // this is destroyed with one still in it, the fd is closed here rather than leaked, since a
@@ -126,6 +131,8 @@ private:
     void connectToDaemon();
     // Installs the FrameReady match rule. False when the bus refused it.
     bool subscribeToFrameReady();
+    // Installs the ImportModifiersChanged match rule. False when the bus refused it.
+    bool subscribeToImportModifiersChanged();
     // Drops every generation mark together. See the definition for why they go as a set.
     void forgetGenerations();
     void fetchFrame(quint64 generation);

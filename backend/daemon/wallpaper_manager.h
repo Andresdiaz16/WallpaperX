@@ -143,6 +143,16 @@ struct RenderOutcome {
     uint64_t generation = 0;
 };
 
+// What a report or a withdrawal did to the layouts in force.
+//
+// `changed` is not "toRender is non-empty": a change that condemns no monitor still has to be
+// announced, because whether some other consumer's refused report would now be accepted depends
+// on the set, not on whether anything needed redrawing.
+struct ImportModifierUpdate {
+    bool changed = false;
+    std::vector<int> toRender;
+};
+
 // Owns the renderer for the daemon: one Vulkan Device, one OffscreenTargetManager keyed by
 // monitor, and the per-monitor bookkeeping behind SetWallpaper/GetFrameFd. Request and render
 // are separate phases because rendering is slow and the DBus event loop is single-threaded.
@@ -222,14 +232,14 @@ public:
     //
     // Throws InvalidRequest for a format this daemon does not export, an implausibly long list,
     // or a set that leaves no layout every reporting consumer can read. Idempotent: an
-    // unchanged intersection returns no monitors.
-    std::vector<int> setImportModifiers(const std::string& client, uint32_t drmFormat,
-                                        const std::vector<uint64_t>& modifiers);
+    // unchanged intersection reports no change and no monitors.
+    ImportModifierUpdate setImportModifiers(const std::string& client, uint32_t drmFormat,
+                                           const std::vector<uint64_t>& modifiers);
 
-    // Drops what `client` reported, because it left the bus, and returns the monitors to re-post.
-    // Widening the intersection cannot invalidate an image, but it does un-block a monitor the
-    // departed consumer's set left with no frame at all -- and nothing else will ever retry it.
-    std::vector<int> forgetImportModifiers(const std::string& client);
+    // Drops what `client` reported, because it left the bus. Widening the intersection cannot
+    // invalidate an image, but it does un-block a monitor the departed consumer's set left with
+    // no frame at all -- and nothing else will ever retry it.
+    ImportModifierUpdate forgetImportModifiers(const std::string& client);
 
     // Applies the config file's wallpapers, returning the monitor ids to post to the worker.
     // Call once. Writes nothing: a repair it computed is held for writeRepairedConfig().
@@ -449,8 +459,8 @@ private:
     bool frameStillReadableLocked(const MonitorState& state) const;
 
     // Records `modifiers` as the effective set and marks the monitors it invalidates. Caller
-    // must hold m_stateMutex. Returns the monitors to re-render.
-    std::vector<int> adoptImportModifiersLocked(std::vector<uint64_t> modifiers);
+    // must hold m_stateMutex.
+    ImportModifierUpdate adoptImportModifiersLocked(std::vector<uint64_t> modifiers);
 
     // Hands a newly reported import-modifier set to the GPU side and drops the images built
     // against the old one. Render thread, m_gpuMutex held, before any target is created.
