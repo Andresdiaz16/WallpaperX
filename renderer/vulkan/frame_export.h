@@ -79,4 +79,26 @@ struct ExportedFrame {
 // hands out memory the graphics queue still owns.
 ExportedFrame exportFrame(Device& device, const OffscreenTarget& target);
 
+// A descriptor the consumer waits on before it samples the frame `target` published, and which
+// carries the queue-family acquire reversing that render's release. -1 when this device has no
+// VK_KHR_external_semaphore_fd, which leaves the consumer reading memory the graphics queue
+// formally still owns -- undefined, and the state everything was in before this existed.
+//
+// Already signalled when it is returned, which is what makes a binary semaphore safe to send
+// across a process boundary: it is signalled by its own submit here and the descriptor is taken
+// afterwards, so a producer that dies next leaves nothing for the consumer to wait on forever.
+//
+// One payload per call, never shared. A binary semaphore is consumed by the first wait, so two
+// consumers -- or one consumer fetching the same generation twice, which the KDE plugin does on
+// every scene change -- must each be given their own.
+//
+// Submits, unlike exportFrame(), and that is the point: a semaphore signal's first synchronization
+// scope covers everything earlier in submission order on the queue, so this is what puts the
+// render's release before the consumer's acquire. It publishes nothing and touches no target
+// state.
+//
+// The caller owns the descriptor and must close() it. Throws on the same split exportFrame() uses;
+// throws runtime_error if the target has no published frame, which is a caller bug.
+int exportFrameAcquireFd(Device& device, const OffscreenTarget& target);
+
 }

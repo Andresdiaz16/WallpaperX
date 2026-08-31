@@ -68,6 +68,12 @@ struct GpuStatus {
     bool initialized = false;
     std::string name;
     std::string descriptorTier;
+
+    // Whether GetFrameFd's sync_fds carries a descriptor the consumer must wait on before it
+    // samples the frame. The one thing a consumer cannot work out for itself: it sees an empty
+    // array either because this daemon cannot produce one or because it chose not to, and the two
+    // call for different reports to the user.
+    bool frameSync = false;
 };
 
 // Pending is a real answer: nothing has been tried yet. Since restoreSaved() renders at
@@ -98,10 +104,21 @@ struct DaemonHealth {
     HealthCheck persistence;
 };
 
-// The caller owns frame.fd and must close it (or hand it to something that will).
+// One hand-over: the memory, the descriptor the consumer waits on before reading it, and which
+// render it is. The two descriptors are produced together and are the caller's to close (or to
+// hand to something that will).
+//
+// Paired here rather than inside ExportedFrame because only one of them is a property of the
+// image: exportFrame() reads a target and submits nothing, while the acquire descriptor is a
+// binary semaphore signalled per hand-over, since the first wait consumes it. Building both in one
+// place is what stops a consumer being given memory with no way to acquire it.
 struct FrameHandle {
     ExportedFrame frame;
     uint64_t generation = 0;
+
+    // -1 when the GPU cannot export one, which leaves the consumer reading without the
+    // queue-family acquire -- undefined, and what every consumer did before this existed.
+    int acquireFd = -1;
 };
 
 // The single answer to "can this build draw this type", so the render dispatch, the

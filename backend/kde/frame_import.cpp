@@ -75,6 +75,38 @@ const MemoryObjectApi& memoryObjectApi() {
     return api;
 }
 
+// The GL_EXT_semaphore / GL_EXT_semaphore_fd side, resolved once like the memory-object side and
+// for the same reason. glWaitSemaphoreEXT is the only thing in OpenGL that can express a
+// queue-family acquire and a layout transition, which is why the whole ownership handover hangs
+// off these four entry points.
+struct SemaphoreApi {
+    using GenFn = void (*)(GLsizei, GLuint*);
+    using DeleteFn = void (*)(GLsizei, const GLuint*);
+    using ImportFdFn = void (*)(GLuint, GLenum, GLint);
+    using WaitFn = void (*)(GLuint, GLuint, const GLuint*, GLuint, const GLuint*, const GLenum*);
+
+    GenFn generate = nullptr;
+    DeleteFn destroy = nullptr;
+    ImportFdFn importFd = nullptr;
+    WaitFn wait = nullptr;
+
+    bool complete() const {
+        return generate != nullptr && destroy != nullptr && importFd != nullptr && wait != nullptr;
+    }
+};
+
+const SemaphoreApi& semaphoreApi() {
+    static const SemaphoreApi api = [] {
+        SemaphoreApi resolved;
+        resolved.generate = reinterpret_cast<SemaphoreApi::GenFn>(eglGetProcAddress("glGenSemaphoresEXT"));
+        resolved.destroy = reinterpret_cast<SemaphoreApi::DeleteFn>(eglGetProcAddress("glDeleteSemaphoresEXT"));
+        resolved.importFd = reinterpret_cast<SemaphoreApi::ImportFdFn>(eglGetProcAddress("glImportSemaphoreFdEXT"));
+        resolved.wait = reinterpret_cast<SemaphoreApi::WaitFn>(eglGetProcAddress("glWaitSemaphoreEXT"));
+        return resolved;
+    }();
+    return api;
+}
+
 // Walked with glGetStringi rather than glGetString(GL_EXTENSIONS): the single-string form is
 // removed in a core profile and returns null there, which reads as "no extensions at all".
 //
@@ -256,6 +288,83 @@ bool FrameImport::supports(HandleType type, std::string* whyNot) {
     return true;
 }
 
+bool FrameImport::supportsSync(std::string* whyNot) {
+    // The same budget the opaque memory path spends: a refused semaphore import has the same
+    // undecidable descriptor as a refused memory import, and it is answered the same way.
+    if (kcmpBudgetSpent()) {
+        setWhyNot(whyNot, "this kernel will not answer kcmp, so refused imports cannot reclaim their descriptors");
+        return false;
+    }
+    if (!hasGlExtension("GL_EXT_semaphore")) {
+        setWhyNot(whyNot, "this GL context does not advertise GL_EXT_semaphore");
+        return false;
+    }
+    if (!hasGlExtension("GL_EXT_semaphore_fd")) {
+        setWhyNot(whyNot, "this GL context does not advertise GL_EXT_semaphore_fd");
+        return false;
+    }
+    if (!semaphoreApi().complete()) {
+        setWhyNot(whyNot, "the GL_EXT_semaphore_fd entry points could not be resolved");
+        return false;
+    }
+    return true;
+}
+
+// GL_LAYOUT_GENERAL_EXT because that is what the producer's release transitioned to. OpenGL has
+// no token meaning "whatever Vulkan last used", so the two sides naming the same layout is the
+// whole of the agreement -- and nothing checks it: an ownership transfer's halves are invisible
+// to the validation layers.
+bool FrameImport::acquire(Request& request, unsigned int texture, std::string& error) {
+    const SemaphoreApi& api = semaphoreApi();
+
+    for (int& syncFd : request.syncFds) {
+        if (syncFd < 0) continue;
+
+        GLuint semaphore = 0;
+        api.generate(1, &semaphore);
+        if (semaphore == 0 || glGetError() != GL_NO_ERROR) {
+            if (semaphore != 0) api.destroy(1, &semaphore);
+            error = "glGenSemaphoresEXT failed";
+            return false;
+        }
+
+        // Duplicated for the same undecidable reason as the memory import: the extension transfers
+        // the descriptor on success and says nothing about failure, so the original is retained to
+        // give kcmp something to compare against afterwards.
+        const int gift = ::fcntl(syncFd, F_DUPFD_CLOEXEC, 0);
+        if (gift < 0) {
+            api.destroy(1, &semaphore);
+            error = "the frame's sync descriptor could not be duplicated for import";
+            return false;
+        }
+
+        api.importFd(semaphore, GL_HANDLE_TYPE_OPAQUE_FD_EXT, static_cast<GLint>(gift));
+        if (glGetError() != GL_NO_ERROR) {
+            api.destroy(1, &semaphore);
+            if (sameOpenFile(gift, syncFd)) ::close(gift);
+            error = "glImportSemaphoreFdEXT rejected the frame's sync descriptor";
+            return false;
+        }
+
+        const GLuint waited = texture;
+        const GLenum layout = GL_LAYOUT_GENERAL_EXT;
+        api.wait(semaphore, 0, nullptr, 1, &waited, &layout);
+        const bool ok = glGetError() == GL_NO_ERROR;
+
+        // Deleted straight after: GL keeps a deleted object alive until the commands referring to
+        // it have run, so the queued wait is unaffected.
+        api.destroy(1, &semaphore);
+        ::close(syncFd);
+        syncFd = -1;
+
+        if (!ok) {
+            error = "glWaitSemaphoreEXT would not acquire the frame";
+            return false;
+        }
+    }
+    return true;
+}
+
 // The dma_buf path. The fd, the modifier and the per-plane offsets and pitches describe the
 // image to EGL, which hands back an EGLImage that a texture is then pointed at.
 //
@@ -407,13 +516,37 @@ FrameImport::Result FrameImport::import(Request& request) {
     if (!supports(request.handleType, &out.error)) {
         return out;
     }
+    // Checked before anything is allocated, so the caller's descriptors are all still its own.
+    const bool mustAcquire = std::any_of(request.syncFds.begin(), request.syncFds.end(),
+                                         [](int syncFd) { return syncFd >= 0; });
+    if (mustAcquire && !supportsSync(&out.error)) {
+        return out;
+    }
 
     // Cleared first: a stale error from earlier in this context would otherwise be attributed
     // to whichever call below happens to be checked next.
     while (glGetError() != GL_NO_ERROR) {
     }
 
-    if (request.handleType == HandleType::DmaBuf) return importDmaBuf(request);
+    out = request.handleType == HandleType::DmaBuf ? importDmaBuf(request) : importOpaqueFd(request);
+    if (out.texture == 0) return out;
+
+    if (mustAcquire) {
+        std::string error;
+        if (!acquire(request, out.texture, error)) {
+            // The texture is sound but was never acquired, and handing it back would sample memory
+            // whose ownership transfer is half done -- exactly what this exists to prevent.
+            release(out);
+            Result refused;
+            refused.error = std::move(error);
+            return refused;
+        }
+    }
+    return out;
+}
+
+FrameImport::Result FrameImport::importOpaqueFd(Request& request) {
+    Result out;
 
     // GL_RGBA8 carries neither the channel order nor the alpha semantics, so both are decoded
     // here and applied as swizzles below. Before anything is allocated, so a format this cannot

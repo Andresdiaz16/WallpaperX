@@ -197,4 +197,64 @@ ExportedFrame exportFrame(Device& device, const OffscreenTarget& target) {
     return frame;
 }
 
+int exportFrameAcquireFd(Device& device, const OffscreenTarget& target) {
+    device.assertGpuThread("exportFrameAcquireFd");
+
+    if (!target.published()) {
+        throw std::runtime_error("exportFrameAcquireFd: the target has no published frame to acquire");
+    }
+    if (!device.info().hasExternalSemaphoreFd) return -1;
+
+    auto pfnGetSemaphoreFd = reinterpret_cast<PFN_vkGetSemaphoreFdKHR>(
+        vkGetDeviceProcAddr(device.device(), "vkGetSemaphoreFdKHR"));
+    if (!pfnGetSemaphoreFd) {
+        // The device was created with the extension enabled, so a missing entry point is the
+        // driver withholding what it advertised.
+        throw GpuFailure("exportFrameAcquireFd: vkGetSemaphoreFdKHR entry point missing");
+    }
+
+    VkExportSemaphoreCreateInfo exportInfo{VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO};
+    exportInfo.handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT;
+    VkSemaphoreCreateInfo semaphoreInfo{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+    semaphoreInfo.pNext = &exportInfo;
+
+    VkSemaphore semaphore = VK_NULL_HANDLE;
+    if (const VkResult r = vkCreateSemaphore(device.device(), &semaphoreInfo, nullptr, &semaphore); r != VK_SUCCESS) {
+        throwVkFailure("exportFrameAcquireFd: vkCreateSemaphore", r);
+    }
+
+    // Destroyed on every path, including the throw out of submit(). The exported descriptor holds
+    // its own reference to the payload -- measured on this driver, not assumed -- so the signal
+    // survives this object by exactly as long as the consumer needs it.
+    struct Cleanup {
+        VkDevice device;
+        VkSemaphore& semaphore;
+        ~Cleanup() {
+            if (semaphore) vkDestroySemaphore(device, semaphore, nullptr);
+        }
+    } cleanup{device.device(), semaphore};
+
+    // Empty command buffer: the batch exists only to carry the signal. submit() waits on its
+    // fence, so the signal has happened by the time the descriptor below is taken.
+    device.submit([](VkCommandBuffer) {}, {{}, {}, {semaphore}});
+
+    int fd = -1;
+    VkSemaphoreGetFdInfoKHR getFdInfo{VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR};
+    getFdInfo.semaphore = semaphore;
+    getFdInfo.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT;
+    const VkResult r = pfnGetSemaphoreFd(device.device(), &getFdInfo, &fd);
+    if (r != VK_SUCCESS || fd < 0) {
+        // Classified as vkGetMemoryFdKHR's results are: running out of descriptors is the host's
+        // limit and usually a consumer leaking them, and blaming the GPU for it points an operator
+        // at their driver over RLIMIT_NOFILE.
+        if (r == VK_SUCCESS || r == VK_ERROR_TOO_MANY_OBJECTS || r == VK_ERROR_OUT_OF_HOST_MEMORY) {
+            throw std::runtime_error("exportFrameAcquireFd: vkGetSemaphoreFdKHR produced no file descriptor -- "
+                                     "the process is out of file descriptors, or a consumer is leaking them");
+        }
+        throw GpuFailure("exportFrameAcquireFd: vkGetSemaphoreFdKHR returned " +
+                         std::to_string(static_cast<int>(r)) + ", which it is not permitted to return");
+    }
+    return fd;
+}
+
 }

@@ -3,6 +3,13 @@
 // G1: when the GL import of a fetched frame fails, WallpaperXItem publishes a non-empty
 // unavailableReason and QML can read it.
 //
+// S12.11/S12.12: and the reply it fails on carries a non-empty sync_fds, so this is also where
+// the plugin's receive path for the daemon's acquire descriptor is exercised. Two properties ride
+// on that: a reply carrying one is READ rather than refused -- the refusal that shipped before
+// this existed is what the published-reason equality check below now rules out -- and every
+// descriptor such a reply carries is closed exactly once when the import fails, which is the
+// contract that a FAILED import leaves them with the caller.
+//
 // The failure is manufactured entirely on the DAEMON side of the wire: a stub service on this
 // run's private bus answers GetFrameFd with a fourcc the importer refuses to lay out (NV12), so
 // FrameImport::import() fails before it creates any GPU object. Nothing in the plugin knows a
@@ -36,7 +43,9 @@
 #include <QUrl>
 #include <QVariant>
 
+#include <dirent.h>
 #include <sys/mman.h>
+#include <sys/types.h>
 #include <unistd.h>
 
 #include <cstdio>
@@ -65,6 +74,33 @@ constexpr int kFrameHeight = 64;
 // a plain memfd -- so this is the reliable lever, not the only one.
 constexpr quint32 kUnimportableFourcc = 'N' | ('V' << 8) | ('1' << 16) | ('2' << 24);
 
+// The two memfd names the stub answers with. Distinctive because the descriptor accounting below
+// identifies the plugin's copies by reading /proc/self/fd, which is exact where a raw count of
+// open descriptors would be measuring Qt's and the driver's traffic as well.
+constexpr const char* kFrameFdName = "wallpaperx-stub-frame";
+constexpr const char* kSyncFdName = "wallpaperx-stub-sync";
+
+// How many descriptors in this process point at a memfd created under `name`. A memfd's
+// /proc/self/fd link reads "/memfd:<name> (deleted)", so the count is of the plugin's duplicates
+// and of nothing else -- every other fd this process holds is a socket, a device or a file.
+int openMemfdCount(const char* name) {
+    const std::string needle = std::string("/memfd:") + name;
+    DIR* dir = ::opendir("/proc/self/fd");
+    if (dir == nullptr) return -1;
+    int found = 0;
+    while (const dirent* entry = ::readdir(dir)) {
+        if (entry->d_name[0] == '.') continue;
+        char target[256];
+        const std::string path = std::string("/proc/self/fd/") + entry->d_name;
+        const ssize_t length = ::readlink(path.c_str(), target, sizeof(target) - 1);
+        if (length <= 0) continue;
+        target[length] = '\0';
+        if (std::string(target).rfind(needle, 0) == 0) ++found;
+    }
+    ::closedir(dir);
+    return found;
+}
+
 // What WallpaperXItem publishes when the import fails, copied from wallpaperx_item.cpp. Duplicated
 // rather than shared: the plugin exports no such constant, and adding one would be test-only
 // surface in a shipped header. A wording change in the item fails this file, deliberately -- the
@@ -90,7 +126,7 @@ public:
 
         // A real, mappable fd: the item dups it, and a bad one would be refused by the reply parse
         // ("could not take hold of") long before the import is reached.
-        const int fd = ::memfd_create("wallpaperx-stub-frame", 0);
+        const int fd = ::memfd_create(kFrameFdName, 0);
         if (fd < 0) {
             m_fdError = true;
             return connection.send(message.createErrorReply(QStringLiteral("io.wallpaperx.Error.ExportFailed"),
@@ -107,25 +143,43 @@ public:
         QDBusUnixFileDescriptor handle(fd);
         ::close(fd);  // QDBusUnixFileDescriptor took its own duplicate.
 
+        // A memfd in the sync slot too, and deliberately not a real semaphore: what this file
+        // grades about sync_fds is the RECEIVE path -- that a reply carrying one is read rather
+        // than refused, and that its descriptor is accounted for when the import fails. The
+        // acquire actually being waited on is item_import_release_test's, where the frame is one
+        // the importer accepts and the descriptor comes from a real Vulkan export.
+        const int syncFd = ::memfd_create(kSyncFdName, 0);
+        if (syncFd < 0) {
+            m_fdError = true;
+            return connection.send(message.createErrorReply(QStringLiteral("io.wallpaperx.Error.ExportFailed"),
+                                                            QStringLiteral("memfd_create failed in the stub")));
+        }
+        QList<QDBusUnixFileDescriptor> syncFds;
+        syncFds.append(QDBusUnixFileDescriptor(syncFd));
+        ::close(syncFd);
+
         QList<FramePlane> planes;
         planes.append(FramePlane{0, static_cast<quint64>(kFrameWidth) * 4});
 
         ++m_served;
+        m_syncFdsSent += static_cast<int>(syncFds.size());
         return connection.send(message.createReply(
             frameReplyFields(handle, kFrameWidth, kFrameHeight, memorySize, /*handleType=*/0,
                              /*generation=*/1, kUnimportableFourcc, /*drmModifier=*/0, planes,
                              // Not this device, and it does not have to be: the fourcc this
                              // phase grades is refused before the importer looks at the GPU.
-                             QByteArray(16, '\0'), /*bufferId=*/1)));
+                             QByteArray(16, '\0'), /*bufferId=*/1, syncFds)));
     }
 
     int requests() const { return m_requests; }
     int served() const { return m_served; }
+    int syncFdsSent() const { return m_syncFdsSent; }
     bool fdError() const { return m_fdError; }
 
 private:
     int m_requests = 0;
     int m_served = 0;
+    int m_syncFdsSent = 0;
     bool m_fdError = false;
 };
 
@@ -269,8 +323,9 @@ int main(int argc, char** argv) {
             // GOAL: the reply path itself publishes no reason -- so a non-empty reason after the
             //       next render is attributable to the import and to nothing else.
             // WHY-THIS-SHAPE: this is the anti-vacuity half. unavailableReason is non-empty for
-            //       five other causes (no subscription, daemon gone, short reply, sync fds, a fd
-            //       that could not be duplicated), and a check that only looked for "non-empty at
+            //       five other causes (no subscription, daemon gone, short reply, a reply whose
+            //       descriptors could not be taken hold of, a fd that could not be duplicated),
+            //       and a check that only looked for "non-empty at
             //       the end" would pass on any of them. Reading it here is safe because nothing
             //       renders between the reply and this line: every sync in this file is explicit.
             //       The settle is a best effort -- had the reply not landed yet, this check would
@@ -309,15 +364,28 @@ int main(int argc, char** argv) {
                 5000);
             check(reasonAppeared, "a failed import publishes a non-empty unavailableReason, readable from QML");
 
-            // GOAL: the reason names the import, rather than some other unavailability.
+            // GOAL: the reason names the import, rather than some other unavailability. Since the
+            //       reply this failed on carries a non-empty sync_fds, this is also S12.11: a
+            //       frame that must be waited on is READ and imported, not refused on sight.
             // WHY-THIS-SHAPE: equality against the shipped string, not `contains("import")`: the
-            //       looser form also matches the sync-fd and short-reply messages, and this test
-            //       exists to distinguish exactly those.
+            //       looser form also matches the short-reply and could-not-take-hold messages,
+            //       and this test exists to distinguish exactly those. The stub sending a sync
+            //       descriptor is what makes it grade S12.11 as well; without one the reply never
+            //       enters the branch that reads the field.
             // CONTROL: the texture == 0 branch of WallpaperXItem::updatePaintNode in
-            //       backend/kde/wallpaperx_item.cpp made to publish the sync-fd message
-            //       instead -> "FAIL: the
-            //       published reason is the one for an import that failed", alone, and the
-            //       diagnostic below named the wrong string. Observed 2026-08-21. Reverted.
+            //       backend/kde/wallpaperx_item.cpp made to publish the could-not-take-hold-of
+            //       message instead -> "FAIL: the published reason is the one for an import that
+            //       failed", alone, and the diagnostic below named the wrong string. Re-run
+            //       2026-08-31 -- the sync-fd message this control used to name no longer exists
+            //       in production. Reverted.
+            // CONTROL (S12.11): the pre-fix refusal restored in WallpaperXItem::takeFrameReply
+            //       (backend/kde/wallpaperx_item.cpp) -- `setFetchReason(...must be waited on...)`
+            //       and return, for a non-empty sync_fds -> "FAIL: the published reason is the
+            //       one for an import that failed", printing "published reason was: [WallpaperX
+            //       sent a frame that must be waited on...]". Observed 2026-08-31. Reverted.
+            // COVERAGE-ASSERT: the stub's sync-descriptor count is asserted below, so a reply that
+            //       silently stopped carrying one turns this back into a test of the fourcc alone
+            //       and says so, rather than going quiet.
             const QString published = root->property("publishedReason").toString();
             check(published == QLatin1String(kImportFailedReason),
                   "the published reason is the one for an import that failed");
@@ -340,6 +408,47 @@ int main(int argc, char** argv) {
             if (renderer != nullptr) {
                 check(renderer->property("unavailableReason").toString() == published,
                       "the QML binding holds the same string the property returns");
+            }
+
+            // The anti-vacuity half of the two sync_fds claims above and below: both are about
+            // what the plugin does with a descriptor it was sent, and both hold trivially if
+            // nothing was sent.
+            check(stub.syncFdsSent() == stub.served(),
+                  "the stub sent one sync descriptor with every frame it served");
+
+            // GOAL (S12.12): every descriptor a reply carries is closed exactly once when the
+            //       import fails -- the sync descriptors as well as the memory one. False if a
+            //       refused frame leaks one per fetch, which on a still wallpaper is one per
+            //       scene change and ends a login session.
+            // WHY-THIS-SHAPE: the plugin's copies are identified by reading /proc/self/fd and
+            //       matching the stub's memfd names, not by counting open descriptors before and
+            //       after. A raw count is measuring Qt's and the GL driver's own traffic too, so
+            //       it would need a tolerance, and a tolerance is exactly what hides a one-per-
+            //       frame leak. Matching the name makes the expected count zero with nothing to
+            //       tune. The item's own copies are the only ones left by now: the stub closes
+            //       its originals in handleMessage and the reply message that carried them has
+            //       long since been destroyed.
+            // CONTROL: closeDescriptors in backend/kde/wallpaperx_item.cpp cut back to
+            //       `if (request.fd >= 0) ::close(request.fd);` -- the shape it had before
+            //       sync_fds carried anything -> "FAIL: a refused frame leaves no descriptor of
+            //       the reply open, the sync ones included", printing "3 sync and 0 frame
+            //       descriptor(s) still open after the failed import". Observed 2026-08-31.
+            //       Reverted.
+            pumpFor(200);
+            const int leakedSync = openMemfdCount(kSyncFdName);
+            const int leakedFrame = openMemfdCount(kFrameFdName);
+            if (leakedSync < 0 || leakedFrame < 0) {
+                // Reading /proc is this file's instrument, so its failure is a harness fault and
+                // must not print as the plugin leaking.
+                wallpaperx::testing::harnessFailure("/proc/self/fd could not be read, so no descriptor accounting "
+                                                    "was done");
+            } else {
+                check(leakedSync == 0 && leakedFrame == 0,
+                      "a refused frame leaves no descriptor of the reply open, the sync ones included");
+                if (leakedSync != 0 || leakedFrame != 0) {
+                    std::fprintf(stderr, "  %d sync and %d frame descriptor(s) still open after the failed import\n",
+                                 leakedSync, leakedFrame);
+                }
             }
         }
     }

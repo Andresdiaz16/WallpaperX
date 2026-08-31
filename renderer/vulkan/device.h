@@ -37,10 +37,13 @@ struct DeviceInfo {
     // layout metadata. Conflating them turns the second case into a hard failure.
     bool hasImageDrmFormatModifier = false;
 
-    // VK_KHR_external_semaphore_fd: lets a semaphore be exported as an fd and waited on by the
-    // importing process. Without it the only cross-process ordering available is a host fence,
-    // which is a happens-before through the host while the acquire it must order is on the
-    // device. Optional: nothing needs it until a consumer waits on the GPU side.
+    // Whether a binary semaphore can be exported as an OPAQUE_FD for the importing process to
+    // wait on. Without it the only cross-process ordering available is a host fence, which is a
+    // happens-before through the host while the acquire it must order is on the device -- so a
+    // consumer reads a frame whose queue-family release it never acquired, which is undefined.
+    //
+    // The extension being present is NOT enough and must not be substituted: Lavapipe advertises
+    // it and supports SYNC_FD only, which GL_EXT_semaphore_fd cannot import.
     bool hasExternalSemaphoreFd = false;
 
     // VK_EXT_queue_family_foreign: lets the exported image's queue-family ownership

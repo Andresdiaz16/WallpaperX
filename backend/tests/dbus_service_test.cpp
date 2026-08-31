@@ -68,6 +68,7 @@
 #include <utility>
 #include <vector>
 
+#include <fcntl.h>
 #include <unistd.h>
 
 using wallpaperx::DbusService;
@@ -1308,8 +1309,75 @@ void runRenderChecks(sdbus::IProxy& proxy, FrameReadyLog& signals, const std::st
         // The signal's generation must name the frame the export hands back, or a
         // consumer cannot tell whether the frame it holds is the announced one.
         check(frame.generation == 1, "the exported frame carries the generation FrameReady announced");
-        check(frame.syncFds.empty(), "sync_fds is empty (reserved slot)");
         check(frame.handleType == 0 || frame.handleType == 1, "handle_type is OPAQUE_FD (0) or DMA_BUF (1)");
+
+        // GOAL (S6.63, S6.64): a frame is handed over with an acquire descriptor exactly when this
+        //       daemon says it can produce one, and with none when it says it cannot -- and the
+        //       descriptor that arrives is a live open file this client now owns.
+        // WHY-THIS-SHAPE: the two fields are compared against each other rather than either being
+        //       asserted outright. "sync_fds is non-empty" is red on Lavapipe, which advertises
+        //       VK_KHR_external_semaphore_fd and cannot export an opaque-fd semaphore; "sync_fds
+        //       is empty" was the reservation this work replaced. They are produced independently
+        //       -- gpu.frame_sync from DeviceInfo when the GPU came up, sync_fds from the export's
+        //       own return value on this call -- so a daemon that announces one mode and serves
+        //       the other fails here on whichever driver it is wrong on.
+        //       Both hand-overs of the SAME generation are graded, not just the first: the
+        //       plugin re-fetches a generation on every scene change, and an export that produced
+        //       an acquire only the first time would satisfy a check that looked once.
+        // CONTROL: `if (!device.info().hasExternalSemaphoreFd) return -1;` in exportFrameAcquireFd
+        //       (renderer/vulkan/frame_export.cpp) replaced with an unconditional `return -1;` ->
+        //       "FAIL: sync_fds carries an acquire descriptor exactly when GetStatus says this
+        //       daemon produces them" twice on dbus_service, dbus_service_dmabuf and
+        //       dbus_service_classic, with the Lavapipe entries still green. Reverted.
+        // CONTROL: in WallpaperManager::exportCurrentFrame (backend/daemon/wallpaper_manager.cpp)
+        //       the acquire export guarded by a `static int handedOut` so only the first
+        //       hand-over gets one -- a stand-in for any export that produces a payload less
+        //       often than once per hand-over -> the same FAIL, once, on the SECOND hand-over
+        //       only, with the first still green. Reverted.
+        // CONTROL: `gpuJson["frame_sync"]` in DbusService::getStatus (backend/daemon/dbus_service.cpp)
+        //       made to publish "yes"/"no" -> "FAIL: GetStatus names the frame hand-over mode as
+        //       either \"semaphore\" or \"none\"" on both drivers, and the agreement below did not
+        //       run against a mode nobody can read. Reverted.
+        // COVERAGE-ASSERT: the mode string is asserted to be one of the two names, and the number
+        //       of hand-overs actually compared is asserted. Without the first, a reply carrying
+        //       no gpu object satisfies the agreement by leaving both sides empty; without the
+        //       second, an edit that stops re-fetching leaves this grading one reply and green.
+        const StatusReply syncModeReply = getStatusOrExplain(proxy);
+        const nlohmann::json syncGpu = syncModeReply.json().contains("gpu") && syncModeReply.json()["gpu"].is_object()
+                                           ? syncModeReply.json()["gpu"]
+                                           : nlohmann::json::object();
+        const std::string syncMode = syncGpu.value("frame_sync", std::string());
+        check(syncMode == "semaphore" || syncMode == "none",
+              "GetStatus names the frame hand-over mode as either \"semaphore\" or \"none\"");
+        if (syncMode != "semaphore" && syncMode != "none") {
+            std::fprintf(stderr, "  gpu.frame_sync was [%s]\n", syncMode.c_str());
+        } else {
+            const size_t expectedSyncFds = syncMode == "semaphore" ? 1 : 0;
+            // The frame already in hand, plus one re-fetch of the same generation. Held together
+            // so the second cannot be answered by handing back the first's descriptor.
+            const Frame refetched = getFrameFd(proxy, kMonitorStatic);
+            int handOversCompared = 0;
+            for (const Frame* served : {&frame, &refetched}) {
+                ++handOversCompared;
+                check(served->syncFds.size() == expectedSyncFds,
+                      "sync_fds carries an acquire descriptor exactly when GetStatus says this daemon produces them");
+                if (served->syncFds.size() != expectedSyncFds) {
+                    std::fprintf(stderr, "  gpu.frame_sync=[%s] but this hand-over carried %zu sync fd(s)\n",
+                                 syncMode.c_str(), served->syncFds.size());
+                }
+                size_t open = 0;
+                for (const sdbus::UnixFd& syncFd : served->syncFds) {
+                    if (syncFd.get() >= 0 && fcntl(syncFd.get(), F_GETFD) != -1) ++open;
+                }
+                check(open == served->syncFds.size(),
+                      "every descriptor in sync_fds arrives as an open file the client now holds");
+            }
+            check(refetched.generation == frame.generation,
+                  "re-fetching hands back the same generation, so the two hand-overs are of one frame");
+            check(handOversCompared == 2, "both hand-overs of that generation were compared against the mode");
+            std::printf("dbus_service_test: gpu.frame_sync=%s, sync_fds per hand-over=%zu\n", syncMode.c_str(),
+                        frame.syncFds.size());
+        }
 
         // GOAL: memory_size never claims more bytes than the fd actually carries.
         //       glImportMemoryFdEXT and EGL take it as *the* size of the imported object, so a

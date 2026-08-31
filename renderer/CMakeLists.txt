@@ -240,6 +240,12 @@ wallpaperx_add_shader_probe(wallpaperx-ownership-transfer-probe tests/ownership_
 # well as on Lavapipe.
 wallpaperx_add_shader_probe(wallpaperx-consumer-modifier-probe tests/consumer_modifier_probe.cpp)
 
+# The acquire descriptor the exporter hands a consumer: that it is already signalled when it is
+# handed over, and that each hand-over gets a payload of its own. It imports the descriptor back
+# onto the same device and waits on it with a bounded fence timeout, so a defect reports as a
+# failing check rather than as a ctest timeout.
+wallpaperx_add_shader_probe(wallpaperx-frame-acquire-probe tests/frame_acquire_probe.cpp)
+
 add_executable(wallpaperx-handle-type-env-test tests/handle_type_env_test.cpp)
 target_link_libraries(wallpaperx-handle-type-env-test PRIVATE wallpaperx-renderer)
 
@@ -292,6 +298,14 @@ add_test(NAME modifier_roundtrip_probe COMMAND wallpaperx-modifier-roundtrip-pro
 add_test(NAME modifier_sensitivity_probe COMMAND wallpaperx-modifier-roundtrip-probe sensitivity)
 add_test(NAME ownership_transfer_probe COMMAND wallpaperx-ownership-transfer-probe)
 add_test(NAME consumer_modifier_probe COMMAND wallpaperx-consumer-modifier-probe)
+add_test(NAME frame_acquire_probe COMMAND wallpaperx-frame-acquire-probe)
+
+# 77 means this driver cannot export an opaque-fd binary semaphore at all, so there is no acquire
+# descriptor to wait on -- Lavapipe. That run still grades what such a driver must do (hand back
+# no descriptor rather than fail the export) and says the rest was not exercised. Its own PNG
+# fixture, so its two entries share a lock of their own.
+set_tests_properties(frame_acquire_probe PROPERTIES
+                     RESOURCE_LOCK frame_acquire_probe_test_image SKIP_RETURN_CODE 77)
 
 # 77 means the driver has no dma_buf with a describable layout, or offers only one usable
 # modifier so narrowing cannot be observed. Its own PNG fixture, hence its own lock.
@@ -374,6 +388,7 @@ if(WALLPAPERX_LAVAPIPE_ICD)
     add_test(NAME modifier_sensitivity_probe_lavapipe COMMAND wallpaperx-modifier-roundtrip-probe sensitivity)
     add_test(NAME ownership_transfer_probe_lavapipe COMMAND wallpaperx-ownership-transfer-probe)
     add_test(NAME consumer_modifier_probe_lavapipe COMMAND wallpaperx-consumer-modifier-probe)
+    add_test(NAME frame_acquire_probe_lavapipe COMMAND wallpaperx-frame-acquire-probe)
     # Registered here for the label, not for the ICD: what this probe grades is loader- and
     # driver-independent. CI selects by the lavapipe label and has no GPU, so without these two
     # the only check of how a missing validator is reported never runs there.
@@ -391,6 +406,7 @@ if(WALLPAPERX_LAVAPIPE_ICD)
         modifier_sensitivity_probe_lavapipe
         ownership_transfer_probe_lavapipe
         consumer_modifier_probe_lavapipe
+        frame_acquire_probe_lavapipe
         validation_grade_installed_lavapipe
         validation_grade_absent_lavapipe
         PROPERTIES
@@ -411,6 +427,8 @@ if(WALLPAPERX_LAVAPIPE_ICD)
                          RESOURCE_LOCK ownership_transfer_probe_test_image SKIP_RETURN_CODE 77)
     set_tests_properties(consumer_modifier_probe_lavapipe PROPERTIES
                          RESOURCE_LOCK consumer_modifier_probe_test_image SKIP_RETURN_CODE 77)
+    set_tests_properties(frame_acquire_probe_lavapipe PROPERTIES
+                         RESOURCE_LOCK frame_acquire_probe_test_image SKIP_RETURN_CODE 77)
     set_tests_properties(validation_grade_installed_lavapipe validation_grade_absent_lavapipe
                          PROPERTIES SKIP_RETURN_CODE 77)
 endif()

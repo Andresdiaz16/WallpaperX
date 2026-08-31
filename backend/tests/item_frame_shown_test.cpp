@@ -92,6 +92,7 @@ using wallpaperx::testing::kSecondMonitor;
 using wallpaperx::testing::kService;
 using wallpaperx::testing::kWidth;
 using wallpaperx::testing::notVerified;
+using wallpaperx::testing::publishOneFrame;
 using wallpaperx::testing::pumpUntil;
 using wallpaperx::testing::qmlSource;
 using wallpaperx::testing::vulkanDeviceUuid;
@@ -112,10 +113,12 @@ bool runFrameShownChecks() {
         wallpaperx::Device device(/*enableValidation=*/true);
         grade.watch(device);
         wallpaperx::OffscreenTargetManager targets(device);
-        // Created but never rendered into. Nothing here reads a pixel: what matters is that the
-        // export is a REAL one, so the item takes the success path and a node with a live texture
-        // ends up on screen. frame_import_probe is what grades that the contents survive the trip.
+        // Rendered into. Nothing here reads a pixel: what matters is that the export is a REAL
+        // one, so the item takes the success path and a node with a live texture ends up on
+        // screen. frame_import_probe is what grades that the contents survive the trip. The render
+        // is what publishes the frame, which is what the stub's acquire descriptor hands over.
         const wallpaperx::OffscreenTarget& target = targets.create(kFirstMonitor, kWidth, kHeight);
+        publishOneFrame(device, targets, target, "item_frame_shown_gradient.png");
 
         QDBusConnection bus = QDBusConnection::sessionBus();
         ExportingStub stub(device, target);

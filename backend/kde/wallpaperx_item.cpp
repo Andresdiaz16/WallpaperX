@@ -18,7 +18,9 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <mutex>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -48,26 +50,71 @@ constexpr const char* kInterface = "io.wallpaperx.Daemon";
 
 }  // namespace
 
-WallpaperXItem::PendingFrame::~PendingFrame() {
-    // Nobody imported it, so nobody consumed the fd. The import contract is that a FAILED
-    // import leaves the fd with the caller, and a frame that is superseded before the render
-    // thread arrives was never offered to the importer at all.
+namespace {
+
+// Every descriptor a request still owns. The import contract is that a FAILED import leaves them
+// with the caller, and a frame superseded before the render thread arrives was never offered to
+// the importer at all -- so both cases end here. One helper because a sync descriptor forgotten on
+// one of the three paths below leaks at exactly the same rate as the memory one, which is one per
+// frame, which ends a login session.
+void closeDescriptors(FrameImport::Request& request) {
     if (request.fd >= 0) ::close(request.fd);
+    request.fd = -1;
+    for (int& syncFd : request.syncFds) {
+        if (syncFd >= 0) ::close(syncFd);
+        syncFd = -1;
+    }
 }
+
+// Disowns them instead, for the source of a move.
+void disownDescriptors(FrameImport::Request& request) {
+    request.fd = -1;
+    for (int& syncFd : request.syncFds) syncFd = -1;
+}
+
+// Render thread, context current. A driver that imports memory but not semaphores must keep
+// drawing wallpapers: the frame is then read without the producer's queue-family acquire, which is
+// undefined and is what every consumer did before sync_fds carried anything. Dropped here rather
+// than inside import(), which refuses a wait it cannot perform -- the choice to go without is the
+// desktop's to make, not the importer's to make silently.
+//
+// Said once per process, not once per frame: the answer is a property of this driver.
+void dropUnwaitableSync(FrameImport::Request& request) {
+    if (request.syncFds.empty()) return;
+
+    static std::once_flag reported;
+    std::string whyNot;
+    if (FrameImport::supportsSync(&whyNot)) return;
+    std::call_once(reported, [&whyNot] {
+        std::fprintf(stderr,
+                     "wallpaperx: drawing frames without the producer's hand-over -- %s. The wallpaper still "
+                     "shows; what is lost is the guarantee that the compositor reads it only after the daemon "
+                     "has finished writing it.\n",
+                     whyNot.c_str());
+    });
+    for (int syncFd : request.syncFds) {
+        if (syncFd >= 0) ::close(syncFd);
+    }
+    request.syncFds.clear();
+}
+
+}  // namespace
+
+WallpaperXItem::PendingFrame::~PendingFrame() { closeDescriptors(request); }
 
 // Moved, not copied. Request holds a std::vector, so copying it can throw -- and a throw out of
 // a noexcept function is std::terminate, here inside plasmashell.
 WallpaperXItem::PendingFrame::PendingFrame(PendingFrame&& other) noexcept
     : request(std::move(other.request)), generation(other.generation) {
-    other.request.fd = -1;
+    disownDescriptors(other.request);
 }
 
 WallpaperXItem::PendingFrame& WallpaperXItem::PendingFrame::operator=(PendingFrame&& other) noexcept {
     if (this != &other) {
-        if (request.fd >= 0) ::close(request.fd);
+        closeDescriptors(request);
         request = std::move(other.request);
         generation = other.generation;
-        other.request.fd = -1;
+        disownDescriptors(other.request);
     }
     return *this;
 }
@@ -414,24 +461,6 @@ void WallpaperXItem::takeFrameReply(const QDBusMessage& call) {
         return;
     }
 
-    // Field 5, sync_fds. The daemon sends none, and that is correct rather than unfinished: it
-    // waits on a fence before answering, so the frame is complete by the time the reply leaves.
-    // Refused rather than ignored if that ever changes -- a fence this plugin does not wait on
-    // means sampling a half-drawn frame, which shows as tearing that nothing here explains.
-    const QDBusArgument syncFds = args.at(5).value<QDBusArgument>();
-    int syncFdCount = 0;
-    syncFds.beginArray();
-    while (!syncFds.atEnd()) {
-        QDBusUnixFileDescriptor ignored;
-        syncFds >> ignored;
-        ++syncFdCount;
-    }
-    syncFds.endArray();
-    if (syncFdCount > 0) {
-        setFetchReason(tr("WallpaperX sent a frame that must be waited on, which this plugin cannot do yet."));
-        return;
-    }
-
     PendingFrame frame;
     frame.request.fd = ::dup(args.at(0).value<QDBusUnixFileDescriptor>().fileDescriptor());
     frame.request.width = args.at(1).toUInt();
@@ -442,6 +471,35 @@ void WallpaperXItem::takeFrameReply(const QDBusMessage& call) {
     frame.generation = args.at(6).toULongLong();
     frame.request.drmFormat = args.at(7).toUInt();
     frame.request.drmModifier = args.at(8).toULongLong();
+
+    // Field 5, sync_fds: what must be waited on before this frame is sampled. Read into the
+    // request whatever the count -- ALL of them, not the first -- so a daemon that later sends
+    // more than one is waited on completely rather than sampled early, which is the tearing the
+    // old outright refusal of this field existed to prevent.
+    //
+    // Duplicated like the memory descriptor above: the reply's own descriptors close when this
+    // message goes out of scope.
+    const QDBusArgument syncFds = args.at(5).value<QDBusArgument>();
+    bool syncTaken = true;
+    syncFds.beginArray();
+    while (!syncFds.atEnd()) {
+        QDBusUnixFileDescriptor announced;
+        syncFds >> announced;
+        const int taken = ::dup(announced.fileDescriptor());
+        if (taken < 0) {
+            // Refused, not dropped. A wait this plugin was given and could not take hold of is a
+            // frame it would sample before the producer's hand-over completed, and the array must
+            // be read to its end regardless or the message stays half-parsed.
+            syncTaken = false;
+            continue;
+        }
+        frame.request.syncFds.push_back(taken);
+    }
+    syncFds.endArray();
+    if (!syncTaken) {
+        setFetchReason(tr("WallpaperX sent a frame this plugin could not take hold of."));
+        return;
+    }
 
     // Field 9, the per-plane offsets and pitches. Only the dma_buf path needs them, but they are
     // read for both: an opaque frame simply carries none, and reading conditionally would make
@@ -544,6 +602,7 @@ QSGNode* WallpaperXItem::updatePaintNode(QSGNode* old, UpdatePaintNodeData*) {
         if (incoming->request.handleType == FrameImport::HandleType::DmaBuf) {
             reportImportModifiersOnce(incoming->request.drmFormat);
         }
+        dropUnwaitableSync(incoming->request);
         const FrameImport::Result imported = FrameImport::import(incoming->request);
         // Null means nothing took ownership of the import, so it is freed by hand here.
         QSGTexture* texture =

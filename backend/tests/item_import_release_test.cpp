@@ -95,6 +95,7 @@ using wallpaperx::testing::kPath;
 using wallpaperx::testing::kService;
 using wallpaperx::testing::kWidth;
 using wallpaperx::testing::notVerified;
+using wallpaperx::testing::publishOneFrame;
 using wallpaperx::testing::pumpUntil;
 using wallpaperx::testing::qmlSource;
 using wallpaperx::testing::vulkanDeviceUuid;
@@ -134,12 +135,12 @@ bool runReleaseChecks() {
         wallpaperx::Device device(/*enableValidation=*/true);
         grade.watch(device);
         wallpaperx::OffscreenTargetManager targets(device);
-        // Created but never rendered into. This goal is about what happens to the GL objects an
-        // import produces, and nothing here reads a pixel -- frame_import_probe is what grades
-        // that the contents survive the trip, and it needs a renderer, a shader directory and a
-        // PNG fixture to do it. What matters here is that the export is a REAL one, so the item
-        // takes the success path rather than the refusal path.
+        // Rendered into, so the target carries a published frame. Nothing here reads a pixel --
+        // frame_import_probe is what grades that the contents survive the trip -- but the render
+        // is what makes the export a real one in both halves: an acquire descriptor is a hand-over
+        // of a publication, and exportFrameAcquireFd refuses a target that has published nothing.
         const wallpaperx::OffscreenTarget& target = targets.create(0, kWidth, kHeight);
+        publishOneFrame(device, targets, target, "item_import_release_gradient.png");
 
         QDBusConnection bus = QDBusConnection::sessionBus();
         ExportingStub stub(device, target);
@@ -266,6 +267,45 @@ bool runReleaseChecks() {
             return true;
         }
 
+        // GOAL (S12.13, S12.14): a frame that arrives with a real acquire descriptor still ends up
+        //       on screen. On a context that can wait, the wait is performed and the texture
+        //       reaches the scene graph; on one that cannot, the descriptor is dropped and the
+        //       frame is drawn without it rather than refused. False in the first direction if the
+        //       importer refuses a wait it was given, and in the second if a driver with no
+        //       GL_EXT_semaphore turns every wallpaper into a blank desktop.
+        // WHY-THIS-SHAPE: it is the SAME check for both arms -- "a texture exists" -- because the
+        //       property is the same and only the mechanism differs. Grading the two separately
+        //       would need a seam telling the test which path the plugin took, and the plugin
+        //       exposes none. Which arm this host ran is printed instead, so a reader knows what
+        //       was demonstrated. `imported` is the existing bounded pump: it cannot pass by
+        //       expiring, since expiry leaves it false and the branch below reports.
+        // CONTROL (S12.13): `return false;` at the top of FrameImport::acquire in
+        //       backend/kde/frame_import.cpp -> "FAIL: the item imported the frame the daemon
+        //       served", with the run printing that this context CAN wait and that the stub sent
+        //       one acquire descriptor. Observed 2026-08-31. Reverted.
+        // CONTROL (S12.14): two stacked, the first to reach the state and the second to violate
+        //       the property. FrameImport::supportsSync in backend/kde/frame_import.cpp forced to
+        //       return false puts this host on the cannot-wait arm -- the run printed CANNOT and
+        //       stayed GREEN, which is the property holding. dropUnwaitableSync in
+        //       backend/kde/wallpaperx_item.cpp then made an immediate `return;` on top of that ->
+        //       "FAIL: the item imported the frame the daemon served". Observed 2026-08-31. Both
+        //       reverted.
+        // COVERAGE-ASSERT: the number of acquire descriptors the stub actually sent is asserted,
+        //       against the driver's own answer to whether it can export one. Without it, a stub
+        //       that stopped sending one leaves both arms of this claim about a reply that carries
+        //       no wait at all -- which is the state that shipped before this work.
+        if (device.info().hasExternalSemaphoreFd) {
+            check(stub.acquireFdsSent() >= 1, "the stub served the frame with an acquire descriptor beside it");
+            if (stub.acquireFdsSent() < 1) {
+                std::fprintf(stderr, "  the exporter produced no acquire on a device that reports it can: [%s]\n",
+                             stub.acquireError().c_str());
+            }
+        } else {
+            std::printf("item_import_release_test: this device cannot export an acquire semaphore, so the frame is "
+                        "handed over unsynchronised and S12.13/S12.14 are not exercised here\n");
+            std::fflush(stdout);
+        }
+
         // Bounded, with a failure branch: everything below is gated on a texture existing, so a
         // run that never imported must not fall through into checks about freeing one.
         const bool imported = pumpUntil(
@@ -274,11 +314,26 @@ bool runReleaseChecks() {
                 return itemTexture(item) != nullptr;
             },
             10000);
+
+        // Which of the two arms above this host ran. Asked inside a render pass because with no
+        // context current the extension strings come back empty, which would report every host as
+        // unable to wait.
+        {
+            std::string syncWhyNot;
+            bool canWait = false;
+            renderPass([&] { canWait = wallpaperx::FrameImport::supportsSync(&syncWhyNot); });
+            std::printf("item_import_release_test: this GL context %s wait on the daemon's acquire%s%s\n",
+                        canWait ? "CAN" : "CANNOT", canWait ? "" : " -- ", canWait ? "" : syncWhyNot.c_str());
+            std::fflush(stdout);
+        }
+
         if (!imported) {
             const std::string detail = std::string("it asked ") + std::to_string(stub.requests()) +
                                        " time(s), the stub served " + std::to_string(stub.served()) +
                                        ", handle type " + std::to_string(stub.handleType()) + ", export error [" +
-                                       stub.exportError() + "], the item reports [" +
+                                       stub.exportError() + "], acquire descriptors sent " +
+                                       std::to_string(stub.acquireFdsSent()) + ", acquire error [" +
+                                       stub.acquireError() + "], the item reports [" +
                                        root->property("publishedReason").toString().toStdString() + "]";
             std::fprintf(stderr, "  %s\n", detail.c_str());
 

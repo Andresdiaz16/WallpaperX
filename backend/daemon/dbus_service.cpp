@@ -294,6 +294,15 @@ void DbusService::completeGetFrameFd(FrameFdCall call, int32_t monitorId) {
     // runs ~UnixFd -- a polling consumer calls this repeatedly, so a leak becomes EMFILE.
     sdbus::UnixFd fd(frame.fd, sdbus::adopt_fd);
 
+    // Adopted here for the same reason and just as early: it comes from the same call and leaks in
+    // exactly the same way. Adopted before it is pushed, so a throw out of the vector still runs
+    // ~UnixFd rather than losing the descriptor.
+    std::vector<sdbus::UnixFd> syncFds;
+    if (exported.handle->acquireFd >= 0) {
+        sdbus::UnixFd acquire(exported.handle->acquireFd, sdbus::adopt_fd);
+        syncFds.push_back(std::move(acquire));
+    }
+
     std::vector<sdbus::Struct<uint64_t, uint64_t>> planes;
     planes.reserve(frame.planes.size());
     for (const ExportedFramePlane& plane : frame.planes) {
@@ -304,18 +313,23 @@ void DbusService::completeGetFrameFd(FrameFdCall call, int32_t monitorId) {
     // wallpapers being set and nothing collecting them, so a plugin that never fetched and one
     // that fetched and drew read identically -- which cost a whole session of misreading a
     // silent log as a failure.
-    std::printf("wallpaperx-daemon: GetFrameFd(monitor=%d) served generation %llu as %s\n", monitorId,
+    // Whether an acquire went with it, for the same reason: a frame handed over unsynchronised is
+    // read without the queue-family acquire, and nothing downstream of here says so.
+    std::printf("wallpaperx-daemon: GetFrameFd(monitor=%d) served generation %llu as %s, %s\n", monitorId,
                 static_cast<unsigned long long>(exported.handle->generation),
-                frame.type == ExportedFrame::HandleType::DmaBuf ? "dma_buf" : "opaque fd");
+                frame.type == ExportedFrame::HandleType::DmaBuf ? "dma_buf" : "opaque fd",
+                syncFds.empty() ? "unsynchronised" : "with an acquire semaphore");
     std::fflush(stdout);
 
     call.returnResults(fd, frame.width, frame.height, frame.memorySize,
                        frame.type == ExportedFrame::HandleType::DmaBuf ? 1 : 0,
-                       // sync_fds: empty because the export waits on a fence before returning,
-                       // so the frame is complete by the time this reply is built. Reserved for
-                       // an async export; a client that cannot wait must refuse a non-empty one
-                       // rather than sample a half-drawn frame.
-                       std::vector<sdbus::UnixFd>{},
+                       // sync_fds: an already-signalled binary semaphore the consumer waits on
+                       // before sampling. It carries the queue-family acquire and the layout
+                       // transition reversing the render's release, which the importing API has
+                       // no other way to express. Empty only where the GPU cannot export one; a
+                       // consumer that cannot wait may close it and read anyway, which is
+                       // undefined but is what every consumer did before this existed.
+                       std::move(syncFds),
                        exported.handle->generation, frame.drmFormat, frame.modifier, planes,
                        // Which GPU allocated the memory. An opaque fd is importable only on that
                        // device, and without this the plugin can only report the driver's refusal.
@@ -343,6 +357,9 @@ std::string DbusService::getStatus() {
         // Which descriptor tier a machine resolved to is the first thing worth knowing
         // when a bug reproduces on one GPU and not another.
         gpuJson["descriptor_tier"] = gpu.descriptorTier;
+        // Whether GetFrameFd's sync_fds carries anything. A consumer seeing an empty array
+        // otherwise cannot tell "this daemon produces none" from "this frame had none".
+        gpuJson["frame_sync"] = gpu.frameSync ? "semaphore" : "none";
     }
     status["gpu"] = std::move(gpuJson);
 

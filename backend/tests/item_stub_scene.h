@@ -13,6 +13,8 @@
 // them.
 
 #include "kde/frame_import.h"
+#include "renderers/static_renderer.h"
+#include "support/test_image.h"
 #include "tests/qt_frame_reply.h"
 #include "vulkan/device.h"
 #include "vulkan/frame_export.h"
@@ -58,7 +60,25 @@ inline constexpr uint32_t kHeight = 36;
 inline constexpr int kFirstMonitor = 0;
 inline constexpr int kSecondMonitor = 1;
 
-// Serves ONE real exported frame and then refuses.
+// Renders once into `target`, so it carries a PUBLISHED frame.
+//
+// Not decoration: the daemon only ever exports a frame a render published, and the acquire
+// descriptor is a hand-over of that publication -- exportFrameAcquireFd refuses a target with
+// nothing published, by design. A stub exporting an unrendered target would be serving the item a
+// shape the daemon cannot produce, and the acquire half of its reply could not exist at all.
+//
+// The renderer is a local: targets.render() waits for the submission, so nothing of it is needed
+// afterwards. `fixtureName` keeps each caller's PNG on a path of its own -- these binaries share
+// WALLPAPERX_TEST_IMAGE_DIR.
+inline void publishOneFrame(wallpaperx::Device& device, wallpaperx::OffscreenTargetManager& targets,
+                            const wallpaperx::OffscreenTarget& target, const char* fixtureName) {
+    const std::string imagePath =
+        wallpaperx::testing::writeGradientPng(std::string(WALLPAPERX_TEST_IMAGE_DIR) + "/" + fixtureName, 16, 16);
+    wallpaperx::StaticRenderer renderer(device, targets.renderPass(), imagePath, WALLPAPERX_SHADER_DIR);
+    targets.render(renderer, target);
+}
+
+// Serves ONE real exported frame -- memory and acquire descriptor both -- and then refuses.
 //
 // The refusal is a barrier tests rest on. Making the item fetch again -- by moving it to another
 // monitor id -- must not produce a second importable frame, or the next render pass would import
@@ -101,6 +121,27 @@ public:
         QDBusUnixFileDescriptor handle(frame.fd);
         ::close(frame.fd);  // QDBusUnixFileDescriptor took its own duplicate.
 
+        // The acquire descriptor, exported the way the daemon exports it: a fresh already-signalled
+        // binary semaphore per hand-over. Unconditional rather than opt-in, because it is what the
+        // daemon sends whenever it can, and a stub that served an easier reply than the real
+        // producer does would leave the item's whole receive path graded against a shape nothing
+        // produces.
+        //
+        // A driver that cannot export one sends none and says so, rather than failing the reply:
+        // that is exactly what the daemon does, and a caller can then tell "this host has no
+        // acquire" from "the plugin lost it".
+        QList<QDBusUnixFileDescriptor> syncFds;
+        try {
+            const int acquireFd = wallpaperx::exportFrameAcquireFd(m_device, m_target);
+            if (acquireFd >= 0) {
+                syncFds.append(QDBusUnixFileDescriptor(acquireFd));
+                ::close(acquireFd);
+            }
+        } catch (const std::exception& e) {
+            m_acquireError = e.what();
+        }
+        m_acquireFdsSent += static_cast<int>(syncFds.size());
+
         QList<FramePlane> planes;
         for (const wallpaperx::ExportedFramePlane& plane : frame.planes) {
             planes.append(FramePlane{plane.offset, plane.rowPitch});
@@ -115,7 +156,7 @@ public:
                              /*generation=*/1, frame.drmFormat, frame.modifier, planes,
                              QByteArray(reinterpret_cast<const char*>(frame.deviceUuid.data()),
                                         static_cast<qsizetype>(frame.deviceUuid.size())),
-                             frame.bufferId)));
+                             frame.bufferId, syncFds)));
     }
 
     int requests() const { return m_requests; }
@@ -123,13 +164,21 @@ public:
     int handleType() const { return m_handleType; }
     const std::string& exportError() const { return m_exportError; }
 
+    // How many acquire descriptors went out with the frames served. Read by the checks that are
+    // ABOUT the acquire, so a stub that quietly stopped sending one turns them from a claim about
+    // the plugin into a claim about nothing.
+    int acquireFdsSent() const { return m_acquireFdsSent; }
+    const std::string& acquireError() const { return m_acquireError; }
+
 private:
     wallpaperx::Device& m_device;
     const wallpaperx::OffscreenTarget& m_target;
     int m_requests = 0;
     int m_served = 0;
     int m_handleType = -1;
+    int m_acquireFdsSent = 0;
     std::string m_exportError;
+    std::string m_acquireError;
 };
 
 // Whether the GL context must be on the same GPU as the exporter. Only an opaque fd is device

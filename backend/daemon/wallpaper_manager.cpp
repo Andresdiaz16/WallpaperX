@@ -318,6 +318,7 @@ void WallpaperManager::ensureGpu() {
         m_gpuStatus.initialized = true;
         m_gpuStatus.name = m_device->info().gpuName;
         m_gpuStatus.descriptorTier = toString(m_device->descriptorTier());
+        m_gpuStatus.frameSync = m_device->info().hasExternalSemaphoreFd;
     }
     recordHealth(&DaemonHealth::gpu, HealthStatus::Ok,
                  m_gpuStatus.name + " (" + m_gpuStatus.descriptorTier + ")");
@@ -1157,7 +1158,17 @@ FrameExport WallpaperManager::exportCurrentFrame(int monitorId) {
 
     FrameHandle handle;
     try {
-        handle.frame = wallpaperx::exportFrame(*m_device, m_targets->get(monitorId));
+        const OffscreenTarget& target = m_targets->get(monitorId);
+        handle.frame = wallpaperx::exportFrame(*m_device, target);
+        try {
+            handle.acquireFd = wallpaperx::exportFrameAcquireFd(*m_device, target);
+        } catch (...) {
+            // The memory descriptor is already open and nothing else will close it. A frame with
+            // no acquire beside it is not offered: the consumer would read unowned memory while
+            // this daemon reported a mode saying it had been handed the acquire.
+            close(handle.frame.fd);
+            throw;
+        }
     } catch (const GpuFailure& e) {
         recordHealth(&DaemonHealth::gpu, HealthStatus::Fail, e.what());
         throw;

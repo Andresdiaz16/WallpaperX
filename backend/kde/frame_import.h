@@ -47,6 +47,17 @@ public:
         // Which image this is, so a caller holding several can import each once. Not used by
         // import() itself -- it describes the buffer, not how to map it.
         uint64_t bufferId = 0;
+
+        // What the daemon says must be waited on before the frame is sampled -- the sync_fds of
+        // GetFrameFd. Each is a binary semaphore payload that is ALREADY signalled; waiting on it
+        // is what performs the queue-family acquire and the layout transition the producer's
+        // release left outstanding, which OpenGL has no other way to express.
+        //
+        // Each entry is set to -1 once import() has consumed it, like `fd`. A caller that cannot
+        // wait -- supportsSync() says no -- must close them and pass none, rather than pass them
+        // and have the import refused: reading without the acquire is undefined but works, and is
+        // the fallback.
+        std::vector<int> syncFds;
     };
 
     struct Result {
@@ -69,6 +80,11 @@ public:
     // support, so a resolve-based check reports yes and then fails at the call.
     static bool supports(HandleType type, std::string* whyNot = nullptr);
 
+    // Whether this context can wait on the daemon's sync_fds. Independent of supports(): a driver
+    // can import memory and not semaphores, and such a driver must keep drawing wallpapers rather
+    // than refuse every frame. Same extension-string rule as supports(), for the same reason.
+    static bool supportsSync(std::string* whyNot = nullptr);
+
     // Every DRM format modifier this EGL implementation can import `drmFormat` as. The daemon
     // cannot work this out for itself: Vulkan's importable bit answers for Vulkan, and this is
     // the only API that answers for the one doing the importing.
@@ -82,12 +98,24 @@ public:
     static std::vector<uint64_t> importableModifiers(uint32_t drmFormat, std::string* whyNot = nullptr);
 
     // Imports `request` into a new texture. By reference so it can report the fd's fate.
+    //
+    // Refuses outright if `syncFds` is non-empty and this context cannot wait: being handed a wait
+    // it cannot perform means the caller mis-negotiated, and the failure that hides is a texture
+    // sampled before its ownership transfer completed, which shows as tearing nothing explains.
     static Result import(Request& request);
 
 private:
     // The dma_buf half of import(), through EGLImage. Separate because the two paths share
     // nothing but their result: one hands the fd to GL, the other describes it to EGL.
     static Result importDmaBuf(Request& request);
+
+    // The opaque-fd half, through a GL memory object. Its counterpart above; import() validates
+    // once and dispatches, so neither repeats the other's checks.
+    static Result importOpaqueFd(Request& request);
+
+    // Waits on every descriptor in `request.syncFds` against `texture`, consuming them. The
+    // acquire both paths need, so it runs after either has produced a texture.
+    static bool acquire(Request& request, unsigned int texture, std::string& error);
 
 public:
     // Frees what import() returned. The GL half must run on the thread whose context created

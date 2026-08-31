@@ -815,9 +815,18 @@ if(DBUS_RUN_SESSION)
                 PkgConfig::EGL OpenGL::GL)
             target_include_directories(wallpaperx-item-import-release-test PRIVATE
                 ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../renderer/tests)
+            # The shader directory and an asset directory of their own: both binaries now RENDER
+            # into the target their stub exports, because an acquire descriptor is a hand-over of a
+            # published frame and exportFrameAcquireFd refuses a target that published nothing.
+            # They share this directory and write differently-named fixtures into it; both entries
+            # hold the wallpaperx_bus_tests lock, so neither can be mid-write while the other reads.
+            set(WALLPAPERX_ITEM_ASSET_DIR ${CMAKE_CURRENT_BINARY_DIR}/item_scene_assets)
+            file(MAKE_DIRECTORY ${WALLPAPERX_ITEM_ASSET_DIR})
             target_compile_definitions(wallpaperx-item-import-release-test PRIVATE
-                WALLPAPERX_QML_MODULE_PATH="${CMAKE_CURRENT_BINARY_DIR}/qml")
-            add_dependencies(wallpaperx-item-import-release-test wallpaperxplugin)
+                WALLPAPERX_QML_MODULE_PATH="${CMAKE_CURRENT_BINARY_DIR}/qml"
+                WALLPAPERX_SHADER_DIR="${WALLPAPERX_SHADER_OUTPUT_DIR}"
+                WALLPAPERX_TEST_IMAGE_DIR="${WALLPAPERX_ITEM_ASSET_DIR}")
+            add_dependencies(wallpaperx-item-import-release-test wallpaperxplugin wallpaperx-shaders)
             add_test(NAME item_import_release
                      COMMAND ${DBUS_RUN_SESSION} -- $<TARGET_FILE:wallpaperx-item-import-release-test>)
             set_tests_properties(item_import_release PROPERTIES
@@ -839,8 +848,10 @@ if(DBUS_RUN_SESSION)
             target_include_directories(wallpaperx-item-frame-shown-test PRIVATE
                 ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../renderer/tests)
             target_compile_definitions(wallpaperx-item-frame-shown-test PRIVATE
-                WALLPAPERX_QML_MODULE_PATH="${CMAKE_CURRENT_BINARY_DIR}/qml")
-            add_dependencies(wallpaperx-item-frame-shown-test wallpaperxplugin)
+                WALLPAPERX_QML_MODULE_PATH="${CMAKE_CURRENT_BINARY_DIR}/qml"
+                WALLPAPERX_SHADER_DIR="${WALLPAPERX_SHADER_OUTPUT_DIR}"
+                WALLPAPERX_TEST_IMAGE_DIR="${WALLPAPERX_ITEM_ASSET_DIR}")
+            add_dependencies(wallpaperx-item-frame-shown-test wallpaperxplugin wallpaperx-shaders)
             add_test(NAME item_frame_shown
                      COMMAND ${DBUS_RUN_SESSION} -- $<TARGET_FILE:wallpaperx-item-frame-shown-test>)
             set_tests_properties(item_frame_shown PROPERTIES

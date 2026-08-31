@@ -338,7 +338,20 @@ void Device::selectPhysicalDevice() {
     // import for no frame at all.
     m_info.hasImageDrmFormatModifier = hasExtension(extensions, VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME);
     m_info.hasQueueFamilyForeign = hasExtension(extensions, VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME);
-    m_info.hasExternalSemaphoreFd = hasExtension(extensions, VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME);
+    // Gated on the handle type as well as the extension, unlike every flag above. Lavapipe
+    // advertises VK_KHR_external_semaphore_fd and then fails vkCreateSemaphore with
+    // VK_ERROR_INVALID_EXTERNAL_HANDLE for an OPAQUE_FD export -- it offers SYNC_FD only, which is
+    // no use here because GL_EXT_semaphore_fd imports opaque descriptors and nothing else. The
+    // extension alone therefore answers a different question from the one every reader asks.
+    if (hasExtension(extensions, VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME)) {
+        VkPhysicalDeviceExternalSemaphoreInfo semaphoreQuery{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_SEMAPHORE_INFO};
+        semaphoreQuery.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT;
+        VkExternalSemaphoreProperties semaphoreProps{VK_STRUCTURE_TYPE_EXTERNAL_SEMAPHORE_PROPERTIES};
+        vkGetPhysicalDeviceExternalSemaphoreProperties(m_physicalDevice, &semaphoreQuery, &semaphoreProps);
+        m_info.hasExternalSemaphoreFd =
+            (semaphoreProps.externalSemaphoreFeatures & VK_EXTERNAL_SEMAPHORE_FEATURE_EXPORTABLE_BIT) != 0;
+    }
 
     if (m_info.hasDescriptorHeap) {
         // The heap tier doesn't just need VK_EXT_descriptor_heap: createLogicalDevice()
