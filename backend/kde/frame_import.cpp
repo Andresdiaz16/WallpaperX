@@ -252,21 +252,32 @@ bool hasEglExtension(const char* wanted) {
     return false;
 }
 
-// Everything supports()/supportsSync() decide that a context cannot change its mind about: which
-// extensions it advertises and whether the entry points resolve. Each field carries the whole
-// answer in `granted`'s form.
+// Everything supports(), supportsSync() and importableModifiers() decide that a context cannot
+// change its mind about: which extensions it advertises and whether the entry points resolve.
+// Each field carries the whole answer in `granted`'s form.
+//
+// The one place that asks the driver these questions. Anything else deriving its own answer from
+// the extension strings is a second copy of this that nothing keeps in step.
 struct ContextCapabilities {
     const char* dmaBuf = nullptr;
     const char* opaqueFd = nullptr;
     const char* sync = nullptr;
+    // Whether the layouts this context can import are enumerable, which is not the same question
+    // as whether it can import: the query is a separate entry point, and the two refusals cost
+    // different things -- no dma_buf frames at all, versus a daemon left on its unnegotiated
+    // default. So each carries its own reason rather than sharing one.
+    const char* modifierQuery = nullptr;
 };
 
 ContextCapabilities probeCapabilities() {
     ContextCapabilities out;
 
+    // Asked once and answered for two capabilities below.
+    const bool modifiersAdvertised = hasEglExtension("EGL_EXT_image_dma_buf_import_modifiers");
+
     if (!hasEglExtension("EGL_EXT_image_dma_buf_import")) {
         out.dmaBuf = "this EGL does not advertise EGL_EXT_image_dma_buf_import";
-    } else if (!hasEglExtension("EGL_EXT_image_dma_buf_import_modifiers")) {
+    } else if (!modifiersAdvertised) {
         // The modifier is not optional here: the daemon refuses to export a dma_buf without an
         // explicit one, so an EGL that cannot be told the modifier cannot describe the image.
         out.dmaBuf = "this EGL does not advertise EGL_EXT_image_dma_buf_import_modifiers";
@@ -274,6 +285,12 @@ ContextCapabilities probeCapabilities() {
         out.dmaBuf = "this GL context cannot bind an EGLImage to a texture (no GL_OES_EGL_image)";
     } else if (!eglImageApi().complete()) {
         out.dmaBuf = "the EGLImage entry points could not be resolved";
+    }
+
+    if (!modifiersAdvertised) {
+        out.modifierQuery = "this driver does not advertise EGL_EXT_image_dma_buf_import_modifiers";
+    } else if (eglImageApi().queryModifiers == nullptr) {
+        out.modifierQuery = "eglQueryDmaBufModifiersEXT could not be resolved";
     }
 
     if (!hasGlExtension("GL_EXT_memory_object")) {
@@ -481,13 +498,9 @@ std::vector<uint64_t> FrameImport::importableModifiers(uint32_t drmFormat, std::
         return std::vector<uint64_t>{};
     };
 
-    if (!hasEglExtension("EGL_EXT_image_dma_buf_import_modifiers")) {
-        return refuse("this driver does not advertise EGL_EXT_image_dma_buf_import_modifiers");
-    }
+    if (!granted(capabilities().modifierQuery, whyNot)) return {};
+
     const EglImageApi& api = eglImageApi();
-    if (api.queryModifiers == nullptr) {
-        return refuse("eglQueryDmaBufModifiersEXT could not be resolved");
-    }
     EGLDisplay display = eglGetCurrentDisplay();
     if (display == EGL_NO_DISPLAY) {
         return refuse("no current EGL display to ask");
