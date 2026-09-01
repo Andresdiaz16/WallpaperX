@@ -342,8 +342,9 @@ void WallpaperXItem::reportImportModifiersOnce(quint32 drmFormat) {
     std::string whyNot;
     const std::vector<uint64_t> modifiers = FrameImport::importableModifiers(drmFormat, &whyNot);
     if (modifiers.empty()) {
-        // Stays latched: a driver with no such query will not grow one, and the daemon's
-        // unnegotiated default is what it already uses.
+        // Stays latched: neither a driver without the query nor a GL context that is not
+        // EGL-backed grows one while this process runs, and the daemon's unnegotiated default
+        // is what it already uses.
         std::fprintf(stderr, "wallpaperx: not reporting import modifiers -- %s\n", whyNot.c_str());
         return;
     }

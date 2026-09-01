@@ -236,9 +236,9 @@ const EglImageApi& eglImageApi() {
     return api;
 }
 
-bool hasEglExtension(const char* wanted) {
-    EGLDisplay display = eglGetCurrentDisplay();
-    if (display == EGL_NO_DISPLAY) return false;
+// Takes the display rather than fetching one, so a false can only ever mean "this display does
+// not advertise it" -- answering for a missing display blamed the driver for an extension it has.
+bool hasEglExtension(EGLDisplay display, const char* wanted) {
     const char* extensions = eglQueryString(display, EGL_EXTENSIONS);
     if (extensions == nullptr) return false;
     // Matched as a whole token: a substring search reports EGL_EXT_image_dma_buf_import present
@@ -259,6 +259,11 @@ bool hasEglExtension(const char* wanted) {
 // The one place that asks the driver these questions. Anything else deriving its own answer from
 // the extension strings is a second copy of this that nothing keeps in step.
 struct ContextCapabilities {
+    // The display the EGL answers below were asked of, EGL_NO_DISPLAY when the thread had none.
+    // Carried rather than re-read by the callers: a second eglGetCurrentDisplay() would be a
+    // separate observation that can disagree with the one these answers describe.
+    EGLDisplay display = EGL_NO_DISPLAY;
+
     const char* dmaBuf = nullptr;
     const char* opaqueFd = nullptr;
     const char* sync = nullptr;
@@ -269,29 +274,44 @@ struct ContextCapabilities {
     const char* modifierQuery = nullptr;
 };
 
-ContextCapabilities probeCapabilities() {
+ContextCapabilities probeCapabilities(EGLDisplay display) {
     ContextCapabilities out;
+    out.display = display;
 
-    // Asked once and answered for two capabilities below.
-    const bool modifiersAdvertised = hasEglExtension("EGL_EXT_image_dma_buf_import_modifiers");
+    if (display == EGL_NO_DISPLAY) {
+        // Not the same fact as a missing extension, and the difference sends someone to a
+        // different place: a GLX-backed Qt -- the default on X11 -- has no current EGL display
+        // even with a live GL context, so the driver may advertise both extensions below to a
+        // display this thread simply does not hold.
+        out.dmaBuf = "no current EGL display: this GL context is not EGL-backed, so nothing here can import a dma_buf";
+        out.modifierQuery =
+            "no current EGL display: this GL context is not EGL-backed, so nothing can be asked which layouts "
+            "it imports";
+    } else {
+        // Asked once and answered for two capabilities below.
+        const bool modifiersAdvertised = hasEglExtension(display, "EGL_EXT_image_dma_buf_import_modifiers");
 
-    if (!hasEglExtension("EGL_EXT_image_dma_buf_import")) {
-        out.dmaBuf = "this EGL does not advertise EGL_EXT_image_dma_buf_import";
-    } else if (!modifiersAdvertised) {
-        // The modifier is not optional here: the daemon refuses to export a dma_buf without an
-        // explicit one, so an EGL that cannot be told the modifier cannot describe the image.
-        out.dmaBuf = "this EGL does not advertise EGL_EXT_image_dma_buf_import_modifiers";
-    } else if (!hasGlExtension("GL_OES_EGL_image")) {
-        out.dmaBuf = "this GL context cannot bind an EGLImage to a texture (no GL_OES_EGL_image)";
-    } else if (!eglImageApi().complete()) {
-        out.dmaBuf = "the EGLImage entry points could not be resolved";
+        if (!hasEglExtension(display, "EGL_EXT_image_dma_buf_import")) {
+            out.dmaBuf = "this EGL does not advertise EGL_EXT_image_dma_buf_import";
+        } else if (!modifiersAdvertised) {
+            // The modifier is not optional here: the daemon refuses to export a dma_buf without an
+            // explicit one, so an EGL that cannot be told the modifier cannot describe the image.
+            out.dmaBuf = "this EGL does not advertise EGL_EXT_image_dma_buf_import_modifiers";
+        } else if (!hasGlExtension("GL_OES_EGL_image")) {
+            out.dmaBuf = "this GL context cannot bind an EGLImage to a texture (no GL_OES_EGL_image)";
+        } else if (!eglImageApi().complete()) {
+            out.dmaBuf = "the EGLImage entry points could not be resolved";
+        }
+
+        if (!modifiersAdvertised) {
+            out.modifierQuery = "this driver does not advertise EGL_EXT_image_dma_buf_import_modifiers";
+        } else if (eglImageApi().queryModifiers == nullptr) {
+            out.modifierQuery = "eglQueryDmaBufModifiersEXT could not be resolved";
+        }
     }
 
-    if (!modifiersAdvertised) {
-        out.modifierQuery = "this driver does not advertise EGL_EXT_image_dma_buf_import_modifiers";
-    } else if (eglImageApi().queryModifiers == nullptr) {
-        out.modifierQuery = "eglQueryDmaBufModifiersEXT could not be resolved";
-    }
+    // The opaque-fd and sync answers below read the GL context, not EGL, so they stand on their
+    // own where there is no EGL display -- which is exactly where the opaque path is what runs.
 
     if (!hasGlExtension("GL_EXT_memory_object")) {
         out.opaqueFd = "this GL context does not advertise GL_EXT_memory_object";
@@ -316,12 +336,16 @@ ContextCapabilities probeCapabilities() {
 // is not an answer for another. Worth caching at all because walking the driver's extension list
 // costs microseconds and the render thread asks these questions for every frame.
 //
-// The key is the EGL context handle AND the number of GL extensions, because neither alone
-// identifies a context here. Under a GLX-backed Qt -- the default on X11 -- eglGetCurrentContext()
-// is EGL_NO_CONTEXT for every context, so the handle discriminates nothing; and eglDestroyContext
-// frees the handle, so a later context can be handed the same address. The count moves with the
-// driver, the API version and the profile, which between them decide every answer above. What it
-// cannot separate is two contexts advertising different lists of the same length.
+// The key is the current EGL display, the EGL context handle AND the number of GL extensions,
+// because none alone identifies a context here. Under a GLX-backed Qt -- the default on X11 --
+// eglGetCurrentContext() is EGL_NO_CONTEXT for every context, so the handle discriminates
+// nothing; and eglDestroyContext frees the handle, so a later context can be handed the same
+// address. The count moves with the driver, the API version and the profile, which between them
+// decide every answer above. What it cannot separate is two contexts advertising different lists
+// of the same length.
+//
+// The display is in the key so the refusals cached for a thread that had none are dropped the
+// moment it acquires one, rather than outliving the state that produced them.
 //
 // With no context current the count reads 0 and every answer is a refusal, which is the truth --
 // so that state needs no special case, and is cached like any other.
@@ -333,16 +357,19 @@ ContextCapabilities capabilities() {
     struct Cached {
         EGLContext context;
         GLint extensionCount;
+        // The display it was probed against lives in `answers`, so there is one copy of it.
         ContextCapabilities answers;
     };
     thread_local std::optional<Cached> cached;
 
+    const EGLDisplay display = eglGetCurrentDisplay();
     const EGLContext context = eglGetCurrentContext();
     GLint extensionCount = 0;
     glGetIntegerv(GL_NUM_EXTENSIONS, &extensionCount);
 
-    if (!cached.has_value() || cached->context != context || cached->extensionCount != extensionCount) {
-        cached = Cached{context, extensionCount, probeCapabilities()};
+    if (!cached.has_value() || cached->answers.display != display || cached->context != context ||
+        cached->extensionCount != extensionCount) {
+        cached = Cached{context, extensionCount, probeCapabilities(display)};
     }
     return cached->answers;
 }
@@ -424,7 +451,10 @@ bool FrameImport::acquire(Request& request, unsigned int texture, std::string& e
 // Unlike the memory-object path, EGL does NOT take the fd: eglCreateImage dups what it needs.
 // So on success this closes the fd itself, which is what makes both paths honour the same
 // contract -- a successful import consumes it. On failure it is left for the caller, as there.
-FrameImport::Result FrameImport::importDmaBuf(Request& request) {
+//
+// `displayHandle` comes from the grant that established there is a display at all, rather than
+// from a fresh lookup here that could answer differently with nowhere to report it.
+FrameImport::Result FrameImport::importDmaBuf(Request& request, void* displayHandle) {
     Result out;
 
     if (request.planes.empty()) {
@@ -440,11 +470,7 @@ FrameImport::Result FrameImport::importDmaBuf(Request& request) {
     }
 
     const EglImageApi& api = eglImageApi();
-    EGLDisplay display = eglGetCurrentDisplay();
-    if (display == EGL_NO_DISPLAY) {
-        out.error = "no current EGL display to import against";
-        return out;
-    }
+    const EGLDisplay display = static_cast<EGLDisplay>(displayHandle);
 
     const EGLAttrib attributes[] = {
         EGL_WIDTH, static_cast<EGLAttrib>(request.width),
@@ -498,13 +524,12 @@ std::vector<uint64_t> FrameImport::importableModifiers(uint32_t drmFormat, std::
         return std::vector<uint64_t>{};
     };
 
-    if (!granted(capabilities().modifierQuery, whyNot)) return {};
+    const ContextCapabilities capable = capabilities();
+    if (!granted(capable.modifierQuery, whyNot)) return {};
 
+    // Granted implies a display: the probe refuses this capability outright when it had none.
+    const EGLDisplay display = capable.display;
     const EglImageApi& api = eglImageApi();
-    EGLDisplay display = eglGetCurrentDisplay();
-    if (display == EGL_NO_DISPLAY) {
-        return refuse("no current EGL display to ask");
-    }
 
     // Two calls: the first asks how many there are, the second fills them in. Asking for a
     // count of 0 with null buffers is how the extension reports the size.
@@ -577,7 +602,8 @@ FrameImport::Result FrameImport::import(Request& request) {
     while (glGetError() != GL_NO_ERROR) {
     }
 
-    out = request.handleType == HandleType::DmaBuf ? importDmaBuf(request) : importOpaqueFd(request);
+    out = request.handleType == HandleType::DmaBuf ? importDmaBuf(request, capabilities().display)
+                                                   : importOpaqueFd(request);
     if (out.texture == 0) return out;
 
     if (mustAcquire) {

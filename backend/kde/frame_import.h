@@ -77,7 +77,9 @@ public:
     // Whether this context can import the given handle type at all. Checked against the
     // extension strings the driver advertises, NOT against whether the entry points resolve:
     // eglGetProcAddress hands back a non-null pointer for functions the driver does not
-    // support, so a resolve-based check reports yes and then fails at the call.
+    // support, so a resolve-based check reports yes and then fails at the call. Having no EGL
+    // display to ask is reported as itself, never as a missing extension: a GLX-backed Qt has
+    // none, and its driver advertises the extensions all the same.
     //
     // Safe to ask per frame: the extension answers are cached per GL context, and the only part
     // that can change during a run is the kcmp budget the opaque path spends.
@@ -92,7 +94,8 @@ public:
     // cannot work this out for itself: Vulkan's importable bit answers for Vulkan, and this is
     // the only API that answers for the one doing the importing.
     //
-    // Empty with a reason set when the driver has no such query, which is not a failure -- the
+    // Empty with a reason set when the layouts cannot be enumerated -- no such query, or no
+    // current EGL display to ask, which are different facts and say so. Not a failure: the
     // caller reports nothing and the daemon keeps its unnegotiated default. Needs a current
     // context, so the render thread.
     //
@@ -110,7 +113,10 @@ public:
 private:
     // The dma_buf half of import(), through EGLImage. Separate because the two paths share
     // nothing but their result: one hands the fd to GL, the other describes it to EGL.
-    static Result importDmaBuf(Request& request);
+    //
+    // `displayHandle` is the EGLDisplay supports(DmaBuf) answered for; it is never EGL_NO_DISPLAY,
+    // because having none is one of the things that refusal reports.
+    static Result importDmaBuf(Request& request, void* displayHandle);
 
     // The opaque-fd half, through a GL memory object. Its counterpart above; import() validates
     // once and dispatches, so neither repeats the other's checks.
