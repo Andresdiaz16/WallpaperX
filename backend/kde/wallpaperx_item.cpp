@@ -18,6 +18,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdio>
 #include <mutex>
 #include <string>
@@ -97,6 +98,31 @@ void dropUnwaitableSync(FrameImport::Request& request) {
         if (syncFd >= 0) ::close(syncFd);
     }
     request.syncFds.clear();
+}
+
+// Render thread, and there is one per window, so the record is shared under a lock.
+//
+// Once per distinct reason, not once per process: a failed import withdraws the modifier that
+// caused it, and the layout the daemon picks instead can fail differently -- that second
+// sentence is the one worth reading. Not "changed since last time" either, because two items on
+// different monitors can fail alternately and that would log at display rate.
+//
+// Capped because one reason names the two GPU UUIDs, and the frame's half is whatever the daemon
+// sent: without a bound, a peer that varies it defeats the once-per-reason rule.
+void reportImportFailure(const std::string& reason) {
+    constexpr std::size_t kMaxReasons = 8;
+    static std::mutex mutex;
+    static std::vector<std::string> reported;
+
+    std::lock_guard<std::mutex> lock(mutex);
+    if (reported.size() >= kMaxReasons) return;
+    if (std::find(reported.begin(), reported.end(), reason) != reported.end()) return;
+    reported.push_back(reason);
+
+    std::fprintf(stderr, "wallpaperx: this frame could not be imported -- %s\n", reason.c_str());
+    if (reported.size() == kMaxReasons) {
+        std::fprintf(stderr, "wallpaperx: no further import failures will be reported\n");
+    }
 }
 
 }  // namespace
@@ -617,6 +643,11 @@ QSGNode* WallpaperXItem::updatePaintNode(QSGNode* old, UpdatePaintNodeData*) {
                       QSize(static_cast<int>(incoming->request.width), static_cast<int>(incoming->request.height)),
                       {});
         if (texture == nullptr) {
+            // A texture name with no error is not the importer's refusal: the import succeeded and
+            // the scene graph would not wrap it, which carries no reason of its own.
+            reportImportFailure(imported.texture == 0
+                                    ? imported.error
+                                    : std::string("the scene graph would not wrap the imported texture"));
             if (imported.texture != 0) FrameImport::release(imported);
             // A failed import outranks what EGL said it could take: this modifier demonstrably
             // does not work here, so stop the daemon choosing it again.
