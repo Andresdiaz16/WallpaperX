@@ -78,7 +78,8 @@ void disownDescriptors(FrameImport::Request& request) {
 // than inside import(), which refuses a wait it cannot perform -- the choice to go without is the
 // desktop's to make, not the importer's to make silently.
 //
-// Said once per process, not once per frame: the answer is a property of this driver.
+// Asked every frame, which costs a key check: supportsSync() caches the extension answers per GL
+// context. Only the diagnostic is held to once per process.
 void dropUnwaitableSync(FrameImport::Request& request) {
     if (request.syncFds.empty()) return;
 

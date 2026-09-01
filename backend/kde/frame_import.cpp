@@ -24,6 +24,7 @@
 #include <atomic>
 #include <cerrno>
 #include <cstring>
+#include <optional>
 #include <utility>
 
 namespace wallpaperx {
@@ -155,6 +156,11 @@ bool hasGlExtension(const char* wanted) {
 constexpr int kAbandonBudget = 16;
 std::atomic<int> g_abandonedDescriptors{0};
 
+// Shared by the memory path and the sync path: a refused semaphore import has the same
+// undecidable descriptor as a refused memory import, and is answered the same way.
+constexpr const char* kKcmpBudgetSpent =
+    "this kernel will not answer kcmp, so refused imports cannot reclaim their descriptors";
+
 bool kcmpBudgetSpent() { return g_abandonedDescriptors.load(std::memory_order_relaxed) >= kAbandonBudget; }
 
 // An imported texture has one level, and the default minification filter wants a mipmap chain,
@@ -185,8 +191,12 @@ bool sameOpenFile(int candidate, int reference) {
     return false;
 }
 
-void setWhyNot(std::string* whyNot, const char* reason) {
+// One value with two named states, rather than a bool beside a reason that can disagree with it:
+// nullptr is "this context can", anything else is why it cannot.
+bool granted(const char* reason, std::string* whyNot) {
+    if (reason == nullptr) return true;
     if (whyNot != nullptr) *whyNot = reason;
+    return false;
 }
 
 // The EGLImage side, for dma_buf. A dma_buf cannot go through GL memory objects: that needs
@@ -242,72 +252,98 @@ bool hasEglExtension(const char* wanted) {
     return false;
 }
 
+// Everything supports()/supportsSync() decide that a context cannot change its mind about: which
+// extensions it advertises and whether the entry points resolve. Each field carries the whole
+// answer in `granted`'s form.
+struct ContextCapabilities {
+    const char* dmaBuf = nullptr;
+    const char* opaqueFd = nullptr;
+    const char* sync = nullptr;
+};
+
+ContextCapabilities probeCapabilities() {
+    ContextCapabilities out;
+
+    if (!hasEglExtension("EGL_EXT_image_dma_buf_import")) {
+        out.dmaBuf = "this EGL does not advertise EGL_EXT_image_dma_buf_import";
+    } else if (!hasEglExtension("EGL_EXT_image_dma_buf_import_modifiers")) {
+        // The modifier is not optional here: the daemon refuses to export a dma_buf without an
+        // explicit one, so an EGL that cannot be told the modifier cannot describe the image.
+        out.dmaBuf = "this EGL does not advertise EGL_EXT_image_dma_buf_import_modifiers";
+    } else if (!hasGlExtension("GL_OES_EGL_image")) {
+        out.dmaBuf = "this GL context cannot bind an EGLImage to a texture (no GL_OES_EGL_image)";
+    } else if (!eglImageApi().complete()) {
+        out.dmaBuf = "the EGLImage entry points could not be resolved";
+    }
+
+    if (!hasGlExtension("GL_EXT_memory_object")) {
+        out.opaqueFd = "this GL context does not advertise GL_EXT_memory_object";
+    } else if (!hasGlExtension("GL_EXT_memory_object_fd")) {
+        out.opaqueFd = "this GL context does not advertise GL_EXT_memory_object_fd";
+    } else if (!memoryObjectApi().complete()) {
+        out.opaqueFd = "the GL_EXT_memory_object_fd entry points could not be resolved";
+    }
+
+    if (!hasGlExtension("GL_EXT_semaphore")) {
+        out.sync = "this GL context does not advertise GL_EXT_semaphore";
+    } else if (!hasGlExtension("GL_EXT_semaphore_fd")) {
+        out.sync = "this GL context does not advertise GL_EXT_semaphore_fd";
+    } else if (!semaphoreApi().complete()) {
+        out.sync = "the GL_EXT_semaphore_fd entry points could not be resolved";
+    }
+
+    return out;
+}
+
+// Cached per CONTEXT and never per process: plasmashell can hold several, and what one advertises
+// is not an answer for another. Worth caching at all because walking the driver's extension list
+// costs microseconds and the render thread asks these questions for every frame.
+//
+// The key is the EGL context handle AND the number of GL extensions, because neither alone
+// identifies a context here. Under a GLX-backed Qt -- the default on X11 -- eglGetCurrentContext()
+// is EGL_NO_CONTEXT for every context, so the handle discriminates nothing; and eglDestroyContext
+// frees the handle, so a later context can be handed the same address. The count moves with the
+// driver, the API version and the profile, which between them decide every answer above. What it
+// cannot separate is two contexts advertising different lists of the same length.
+//
+// With no context current the count reads 0 and every answer is a refusal, which is the truth --
+// so that state needs no special case, and is cached like any other.
+//
+// thread_local rather than a locked table: a context is current on one thread at a time, so the
+// key check that keeps this correct is also what keeps it lock-free on the compositor's render
+// thread. Returned by value so a recompute cannot invalidate a reference a caller still holds.
+ContextCapabilities capabilities() {
+    struct Cached {
+        EGLContext context;
+        GLint extensionCount;
+        ContextCapabilities answers;
+    };
+    thread_local std::optional<Cached> cached;
+
+    const EGLContext context = eglGetCurrentContext();
+    GLint extensionCount = 0;
+    glGetIntegerv(GL_NUM_EXTENSIONS, &extensionCount);
+
+    if (!cached.has_value() || cached->context != context || cached->extensionCount != extensionCount) {
+        cached = Cached{context, extensionCount, probeCapabilities()};
+    }
+    return cached->answers;
+}
+
 }  // namespace
 
 bool FrameImport::supports(HandleType type, std::string* whyNot) {
-    if (type == HandleType::DmaBuf) {
-        if (!hasEglExtension("EGL_EXT_image_dma_buf_import")) {
-            setWhyNot(whyNot, "this EGL does not advertise EGL_EXT_image_dma_buf_import");
-            return false;
-        }
-        // The modifier is not optional here: the daemon refuses to export a dma_buf without an
-        // explicit one, so an EGL that cannot be told the modifier cannot describe the image.
-        if (!hasEglExtension("EGL_EXT_image_dma_buf_import_modifiers")) {
-            setWhyNot(whyNot, "this EGL does not advertise EGL_EXT_image_dma_buf_import_modifiers");
-            return false;
-        }
-        if (!hasGlExtension("GL_OES_EGL_image")) {
-            setWhyNot(whyNot, "this GL context cannot bind an EGLImage to a texture (no GL_OES_EGL_image)");
-            return false;
-        }
-        if (!eglImageApi().complete()) {
-            setWhyNot(whyNot, "the EGLImage entry points could not be resolved");
-            return false;
-        }
-        return true;
-    }
+    if (type == HandleType::DmaBuf) return granted(capabilities().dmaBuf, whyNot);
 
-    // Counted by sameOpenFile when kcmp cannot answer. Without an answer a refused import cannot
-    // work out which descriptor the driver kept, so each one abandons a descriptor.
-    if (kcmpBudgetSpent()) {
-        setWhyNot(whyNot, "this kernel will not answer kcmp, so refused imports cannot reclaim their descriptors");
-        return false;
-    }
-    if (!hasGlExtension("GL_EXT_memory_object")) {
-        setWhyNot(whyNot, "this GL context does not advertise GL_EXT_memory_object");
-        return false;
-    }
-    if (!hasGlExtension("GL_EXT_memory_object_fd")) {
-        setWhyNot(whyNot, "this GL context does not advertise GL_EXT_memory_object_fd");
-        return false;
-    }
-    if (!memoryObjectApi().complete()) {
-        setWhyNot(whyNot, "the GL_EXT_memory_object_fd entry points could not be resolved");
-        return false;
-    }
-    return true;
+    // Outside the cache, deliberately: this one is spent at runtime by sameOpenFile, when kcmp
+    // cannot answer and a refused import cannot work out which descriptor the driver kept.
+    if (kcmpBudgetSpent()) return granted(kKcmpBudgetSpent, whyNot);
+    return granted(capabilities().opaqueFd, whyNot);
 }
 
 bool FrameImport::supportsSync(std::string* whyNot) {
-    // The same budget the opaque memory path spends: a refused semaphore import has the same
-    // undecidable descriptor as a refused memory import, and it is answered the same way.
-    if (kcmpBudgetSpent()) {
-        setWhyNot(whyNot, "this kernel will not answer kcmp, so refused imports cannot reclaim their descriptors");
-        return false;
-    }
-    if (!hasGlExtension("GL_EXT_semaphore")) {
-        setWhyNot(whyNot, "this GL context does not advertise GL_EXT_semaphore");
-        return false;
-    }
-    if (!hasGlExtension("GL_EXT_semaphore_fd")) {
-        setWhyNot(whyNot, "this GL context does not advertise GL_EXT_semaphore_fd");
-        return false;
-    }
-    if (!semaphoreApi().complete()) {
-        setWhyNot(whyNot, "the GL_EXT_semaphore_fd entry points could not be resolved");
-        return false;
-    }
-    return true;
+    if (kcmpBudgetSpent()) return granted(kKcmpBudgetSpent, whyNot);
+    return granted(capabilities().sync, whyNot);
 }
 
 // GL_LAYOUT_GENERAL_EXT because that is what the producer's release transitioned to. OpenGL has

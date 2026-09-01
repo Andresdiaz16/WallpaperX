@@ -78,6 +78,9 @@ public:
     // extension strings the driver advertises, NOT against whether the entry points resolve:
     // eglGetProcAddress hands back a non-null pointer for functions the driver does not
     // support, so a resolve-based check reports yes and then fails at the call.
+    //
+    // Safe to ask per frame: the extension answers are cached per GL context, and the only part
+    // that can change during a run is the kcmp budget the opaque path spends.
     static bool supports(HandleType type, std::string* whyNot = nullptr);
 
     // Whether this context can wait on the daemon's sync_fds. Independent of supports(): a driver
