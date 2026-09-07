@@ -3096,6 +3096,159 @@ void runGpuFailureChecks(const std::string& bluePath, const WallpaperManager::Co
     }
 
     // ------------------------------------------------------------------ //
+    // What a failed export leaves behind in the daemon's claim ledger
+    // ------------------------------------------------------------------ //
+    //
+    // Every arm above exports for no client at all, which records nothing, so none of them
+    // reaches the bookkeeping a NAMED export does. exportCurrentFrame() charges the client with
+    // holding the image before the descriptors exist, and undoes that charge if the export then
+    // throws. That undo runs on no other path in either suite.
+    //
+    // The checks live in this file rather than beside the other hand-over checks in
+    // dbus_service_test.cpp because the lever does not travel: making an export fail on demand
+    // means interposing vkGetDeviceProcAddr, which is a process-global symbol defined by this
+    // translation unit. The alternative lever -- a consumer reporting a DRM format modifier the
+    // driver cannot produce -- only exists on a dma_buf host and would leave the goal ungraded
+    // on the NVIDIA machine this daemon targets.
+
+    // Whether the daemon still has a claim for `client` on `bufferId`, asked by ending it. The
+    // hold list is private; a release is the daemon's own report of whether there was a claim
+    // there, and it reports one either by naming a monitor to re-render or by re-announcing the
+    // committed frame -- reportFreedImageLocked() always produces exactly one of the two.
+    auto releaseFreedSomething = [&daemon](const std::string& client, uint64_t bufferId) {
+        std::vector<wallpaperx::FrameAvailable> announced;
+        const std::vector<int> toRender = daemon.manager().releaseBuffer(client, 0, bufferId, &announced);
+        return !toRender.empty() || !announced.empty();
+    };
+
+    // One export for a NAMED client with the fd query failed. VK_ERROR_TOO_MANY_OBJECTS rather
+    // than a driver fault, so this sub-phase leaves the recorded GPU health where it found it
+    // and the sampler arms below still start from a state they set themselves.
+    struct NamedExportFault {
+        bool reached = false;
+        bool threw = false;
+        int observed = 0;
+    };
+    auto faultedExportFor = [&daemon](const std::string& client) {
+        NamedExportFault outcome;
+        GetMemoryFdFault fault(/*failAt=*/1, VK_ERROR_TOO_MANY_OBJECTS);
+        try {
+            wallpaperx::FrameExport exported = daemon.manager().exportCurrentFrame(0, client);
+            if (exported.handle && exported.handle->frame.fd >= 0) ::close(exported.handle->frame.fd);
+            if (exported.handle && exported.handle->acquireFd >= 0) ::close(exported.handle->acquireFd);
+        } catch (const std::exception&) {
+            outcome.threw = true;
+        }
+        outcome.observed = fault.observed();
+        outcome.reached = fault.injected() == 1;
+        return outcome;
+    };
+
+    {
+        const std::string holder = ":test.rollback.holder";
+        const std::string newcomer = ":test.rollback.newcomer";
+
+        // The premise: one successful export, so `holder` genuinely has a claim to keep.
+        uint64_t held = 0;
+        std::string setupError;
+        try {
+            wallpaperx::FrameExport granted = daemon.manager().exportCurrentFrame(0, holder);
+            if (granted.handle) {
+                held = granted.handle->frame.bufferId;
+                if (granted.handle->frame.fd >= 0) ::close(granted.handle->frame.fd);
+                if (granted.handle->acquireFd >= 0) ::close(granted.handle->acquireFd);
+            }
+        } catch (const std::exception& e) {
+            setupError = e.what();
+        }
+        const uint64_t generationBefore = [&daemon] {
+            const WallpaperManager::Snapshot snap = daemon.manager().snapshot();
+            const auto it = snap.monitors.find(0);
+            return it == snap.monitors.end() ? 0 : it->second.generation;
+        }();
+
+        const NamedExportFault repeat = held != 0 ? faultedExportFor(holder) : NamedExportFault{};
+        const bool holderStillHolds = repeat.reached && releaseFreedSomething(holder, held);
+        const NamedExportFault fresh = held != 0 ? faultedExportFor(newcomer) : NamedExportFault{};
+        const bool newcomerCharged = fresh.reached && releaseFreedSomething(newcomer, held);
+
+        const uint64_t generationAfter = [&daemon] {
+            const WallpaperManager::Snapshot snap = daemon.manager().snapshot();
+            const auto it = snap.monitors.find(0);
+            return it == snap.monitors.end() ? 0 : it->second.generation;
+        }();
+
+        if (held == 0 || !repeat.reached || !fresh.reached || generationAfter != generationBefore) {
+            // A skip, not a check(): with no claim recorded, or with the fault landing
+            // somewhere other than the export, the two assertions below would be describing a
+            // state this phase never built and would name the daemon for a fault of the host.
+            notVerified("the export rollback (a throwing export leaves the claim ledger as it was)",
+                        held == 0 ? "the export that was to give a client a claim returned no frame" +
+                                        (setupError.empty() ? std::string() : " (it threw: " + setupError + ")")
+                        : generationAfter != generationBefore
+                            ? "monitor 0 committed a new frame during the sub-phase, so the image the claims were "
+                              "recorded against is no longer the one the exports were asked for"
+                            : "the interposed vkGetMemoryFdKHR did not land on the named exports -- " +
+                                  std::to_string(repeat.observed) + " and " + std::to_string(fresh.observed) +
+                                  " call(s) observed with the interposer armed on the first of each");
+        } else if (!repeat.threw || !fresh.threw) {
+            // Asserted, not skipped: the fault reached the driver call and production went on to
+            // return a frame anyway, which is the daemon's fault and not the host's.
+            check(false, "an export whose file-descriptor query fails is failed to its named caller rather than "
+                         "returning a frame");
+            std::fprintf(stderr, "  the repeat export %s and the newcomer's %s\n",
+                         repeat.threw ? "threw" : "returned normally", fresh.threw ? "threw" : "returned normally");
+        } else {
+            // GOAL: an export that throws for a client that did NOT already hold that image
+            //       leaves the client charged with nothing. False if a consumer whose GetFrameFd
+            //       failed is left holding an image it was never handed -- an id it cannot name
+            //       to release, which keeps that image out of the producer's ring until the
+            //       consumer leaves the bus.
+            // WHY-THIS-SHAPE: graded by asking the daemon to end the claim and requiring it to
+            //       report that there was none. Asserting on the exception alone establishes
+            //       nothing: the throw is the same with and without the rollback, and the whole
+            //       difference is in state this file cannot read directly. The claim is charged
+            //       BEFORE the descriptors exist, so "never recorded" is not the daemon's
+            //       behaviour here -- the undo is.
+            // CONTROL: the `if (claimAdded)` rollback block in the catch of
+            //       WallpaperManager::exportCurrentFrame (backend/daemon/wallpaper_manager.cpp)
+            //       deleted -> "FAIL: a client whose export threw is left holding nothing, so no
+            //       image is stranded in a claim it cannot name", printing "the prior holder
+            //       kept its claim, the newcomer was left charged with one"; the only red line
+            //       in the run, and the check below stayed green. Reverted.
+            check(!newcomerCharged,
+                  "a client whose export threw is left holding nothing, so no image is stranded in a claim it "
+                  "cannot name");
+
+            // GOAL: and the undo is limited to what that call added. A client that already held
+            //       the image keeps its claim through a failed export, because it is still
+            //       reading the image that claim is on.
+            // WHY-THIS-SHAPE: the same client is exported to twice -- once successfully, once
+            //       under the fault -- with no render in between, so the second export names the
+            //       image the first one handed over. That is the only configuration in which the
+            //       rollback and an unconditional undo disagree; a rollback test that used a
+            //       fresh client every time would pass under both.
+            // CONTROL: `if (claimAdded)` in the catch of WallpaperManager::exportCurrentFrame
+            //       (backend/daemon/wallpaper_manager.cpp) changed to `if (true)`, which is the
+            //       rollback undoing more than the call added -> "FAIL: a failed export does not
+            //       take back the claim its client already had on that image", printing "the
+            //       prior holder lost the claim it already had, the newcomer was charged with
+            //       nothing"; the only red line, and the check above stayed green. The two
+            //       controls redden one check each, so the pair is not one assertion written
+            //       twice. Reverted.
+            check(holderStillHolds,
+                  "a failed export does not take back the claim its client already had on that image");
+            if (!holderStillHolds || newcomerCharged) {
+                std::fprintf(stderr, "  after two failed exports of image %llu: the prior holder %s, the newcomer "
+                                     "%s\n",
+                             static_cast<unsigned long long>(held),
+                             holderStillHolds ? "kept its claim" : "lost the claim it already had",
+                             newcomerCharged ? "was left charged with one" : "was charged with nothing");
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------ //
     // The object creation a render does before it submits anything
     // ------------------------------------------------------------------ //
     //

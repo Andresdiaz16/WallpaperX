@@ -367,15 +367,23 @@ void WallpaperXItem::onFrameReady(int monitorId, qulonglong generation) {
     fetchFrame(generation);
 }
 
+// Zero beside no request in flight is the item genuinely having nothing: m_fetchedGeneration is
+// cleared by everything that invalidates what it holds -- a monitor change, a daemon restart,
+// leaving the scene.
+void WallpaperXItem::ensureFrameRequested() {
+    if (m_fetchInFlight || m_fetchedGeneration != 0) return;
+    fetchFrame(0);
+}
+
 void WallpaperXItem::fetchFrame(quint64 generation) {
     if (m_monitorId < 0) return;
 
     // Already have this frame, or a newer one. Asking is not free: a bus round trip, an export
     // by the daemon, a dup() here. A signal for a frame already fetched is ordinary.
     //
-    // Zero means "fetch whatever is there": it is what the two callers that are not signals
-    // pass, when this item has just learned its monitor id or just connected, and neither knows
-    // what generation the daemon is on.
+    // Zero means "fetch whatever is there", and it forces: it is what every caller that is not a
+    // FrameReady signal passes, having just discarded its marks and no idea what generation the
+    // daemon is on. A caller that may already hold the answer wants ensureFrameRequested().
     if (!worthFetching(Arriving{generation}, Held{m_fetchedGeneration})) return;
 
     // The mark above only moves when a reply lands, so it cannot suppress a burst that arrives
@@ -793,6 +801,9 @@ QSGNode* WallpaperXItem::updatePaintNode(QSGNode* old, UpdatePaintNodeData*) {
                     releaseClaim(claim);
                 },
                 Qt::DirectConnection);
+            // Deletes the texture it replaces, so a QSGTexture* kept across a re-import is freed
+            // memory -- and the allocator hands the same address back, which reads as no change.
+            // Watch QObject::destroyed, never compare pointers.
             node->setTexture(texture);
             node->markDirty(QSGNode::DirtyMaterial);
             {
@@ -822,12 +833,13 @@ QSGNode* WallpaperXItem::updatePaintNode(QSGNode* old, UpdatePaintNodeData*) {
     return node;
 }
 
-// A still wallpaper sends no further FrameReady, so a released item must ask on its own.
+// A still wallpaper sends no further FrameReady, so a released item must ask on its own. Not
+// fetchFrame(0), which forces: QML sets the monitor id moments before the item joins a scene, and
+// forcing here made every item ask the daemon twice for the frame it was already getting.
 void WallpaperXItem::itemChange(ItemChange change, const ItemChangeData& value) {
     QQuickItem::itemChange(change, value);
     if (change != ItemSceneChange || value.window == nullptr) return;
-    if (m_monitorId < 0) return;
-    fetchFrame(0);
+    ensureFrameRequested();
 }
 
 // The imported handles are the scene graph's to free -- Qt's own exemption for resources its

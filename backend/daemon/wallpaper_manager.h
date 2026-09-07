@@ -393,11 +393,20 @@ public:
 
 private:
     // One consumer's claim on a monitor's images: the buffer ids it has been handed and has
-    // not given back, oldest first. Kept in the order consumers were first served rather than
-    // in a map, so "drop the least recently served" needs no second field to order them.
+    // not given back, oldest first. The holders themselves are kept least recently served
+    // first -- a hand-over moves its holder to the back -- rather than in a map, so eviction
+    // reads the order off the container instead of a timestamp that could drift from it.
     struct BufferHold {
         std::string client;  // DBus unique name
         std::vector<uint64_t> buffers;
+    };
+
+    // What withHandover() decided: the claims that would be in force, and whether this
+    // hand-over is a new claim. `added` is false when the client already held that image, which
+    // is the one case where undoing the hand-over would take away a claim it still needs.
+    struct Handover {
+        std::vector<BufferHold> holds;
+        bool added = false;
     };
 
     struct MonitorState {
@@ -456,15 +465,22 @@ private:
     // m_stateMutex itself, so the caller must hold only m_gpuMutex.
     void forgetHolds(int monitorId);
 
+    // Both of a hand-over's descriptors, or neither and a throw with the GPU health recorded.
+    // Caller must hold m_gpuMutex, which is what keeps `target` alive across the export.
+    FrameHandle exportHandle(const OffscreenTarget& target);
+
     // The images `monitorId` has handed out and not got back. Caller must hold m_stateMutex.
     std::vector<uint64_t> heldBuffersLocked(int monitorId) const;
 
     // The claims that would be in force if `client` were handed `bufferId`, applying both caps.
-    // `client` must not be empty. One rule, applied to a copy to decide whether a hand-over may
-    // happen and to the live holds to record it, so the admission test cannot come to disagree
-    // with the bookkeeping it is predicting.
-    static std::vector<BufferHold> withHandover(std::vector<BufferHold> holds, const std::string& client,
-                                                uint64_t bufferId);
+    // `client` must not be empty. Pure, and its result is both what the reserve is tested
+    // against and what is stored: the admission test cannot disagree with the bookkeeping when
+    // they are the same value.
+    static Handover withHandover(std::vector<BufferHold> holds, const std::string& client, uint64_t bufferId);
+
+    // Ends `client`'s claim on one image, reporting whether there was one to end. Caller must
+    // hold m_stateMutex.
+    static bool dropHoldLocked(MonitorState& state, const std::string& client, uint64_t bufferId);
 
     // Every id in `holds`, which nextUnheld() takes as its membership test. Duplicates are left
     // in: two consumers may hold the same image, and both claims are real.

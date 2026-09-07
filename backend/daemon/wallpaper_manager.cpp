@@ -371,9 +371,8 @@ std::vector<uint64_t> WallpaperManager::heldBuffersLocked(int monitorId) const {
     return flattenHolds(it->second.holds);
 }
 
-std::vector<WallpaperManager::BufferHold> WallpaperManager::withHandover(std::vector<BufferHold> holds,
-                                                                        const std::string& client,
-                                                                        uint64_t bufferId) {
+WallpaperManager::Handover WallpaperManager::withHandover(std::vector<BufferHold> holds, const std::string& client,
+                                                          uint64_t bufferId) {
     auto holder = std::find_if(holds.begin(), holds.end(),
                                [&client](const BufferHold& hold) { return hold.client == client; });
     if (holder == holds.end()) {
@@ -381,18 +380,33 @@ std::vector<WallpaperManager::BufferHold> WallpaperManager::withHandover(std::ve
         // been handed a frame in the longest is the likeliest to have stopped reading.
         if (holds.size() >= kMaxHoldersPerMonitor) holds.erase(holds.begin());
         holds.push_back(BufferHold{client, {}});
-        holder = std::prev(holds.end());
+    } else {
+        // Being served moves a holder to the back, which is what makes the front least recently
+        // served rather than merely first seen.
+        std::rotate(holder, holder + 1, holds.end());
+    }
+    BufferHold& served = holds.back();
+
+    // The same image again -- the ring cycles, so a consumer is handed the buffer it already holds
+    // every kTargetDepth renders -- is the claim it already has, not a second one.
+    if (std::find(served.buffers.begin(), served.buffers.end(), bufferId) != served.buffers.end()) {
+        return Handover{std::move(holds), false};
     }
 
-    // The same image again -- the KDE plugin re-fetches a generation it already holds on every
-    // scene change -- is the claim it already has, not a second one.
-    if (std::find(holder->buffers.begin(), holder->buffers.end(), bufferId) != holder->buffers.end()) return holds;
-
-    holder->buffers.push_back(bufferId);
-    if (holder->buffers.size() > kMaxHeldPerClient) {
-        holder->buffers.erase(holder->buffers.begin(), holder->buffers.end() - kMaxHeldPerClient);
+    served.buffers.push_back(bufferId);
+    if (served.buffers.size() > kMaxHeldPerClient) {
+        served.buffers.erase(served.buffers.begin(), served.buffers.end() - kMaxHeldPerClient);
     }
-    return holds;
+    return Handover{std::move(holds), true};
+}
+
+bool WallpaperManager::dropHoldLocked(MonitorState& state, const std::string& client, uint64_t bufferId) {
+    auto holder = std::find_if(state.holds.begin(), state.holds.end(),
+                               [&client](const BufferHold& hold) { return hold.client == client; });
+    if (holder == state.holds.end()) return false;
+    if (std::erase(holder->buffers, bufferId) == 0) return false;
+    if (holder->buffers.empty()) state.holds.erase(holder);
+    return true;
 }
 
 // The one place that decides what an image coming free is worth: a render if one is owed,
@@ -415,11 +429,7 @@ std::vector<int> WallpaperManager::releaseBuffer(const std::string& client, int 
     auto it = m_monitors.find(monitorId);
     if (it == m_monitors.end()) return {};
 
-    auto holder = std::find_if(it->second.holds.begin(), it->second.holds.end(),
-                               [&client](const BufferHold& hold) { return hold.client == client; });
-    if (holder == it->second.holds.end()) return {};
-    if (std::erase(holder->buffers, bufferId) == 0) return {};
-    if (holder->buffers.empty()) it->second.holds.erase(holder);
+    if (!dropHoldLocked(it->second, client, bufferId)) return {};
 
     std::vector<int> toRender;
     reportFreedImageLocked(monitorId, it->second, toRender, announce);
@@ -1133,8 +1143,10 @@ RenderOutcome WallpaperManager::renderPending(int monitorId) {
 
     if (deferred) {
         // Every image on this monitor is in a consumer's hands, which exportCurrentFrame()'s
-        // reserve is there to prevent: reaching here means a hand-over got past it. Kept as the
-        // backstop, because the alternative to deferring is drawing into an image being read.
+        // reserve is there to prevent: it admits and records a hand-over in one acquisition, so
+        // no recorded claim ever covers the ring. Kept as the backstop because deferring is the
+        // only alternative to drawing into an image a consumer is reading, and because
+        // deferredRenders is then a report on that invariant rather than a routine count.
         // The request is left outstanding rather than waited on with the GPU lock held --
         // whatever frees an image re-posts this monitor, and until then GetStatus reports the
         // render as still owed.
@@ -1241,6 +1253,26 @@ RenderOutcome WallpaperManager::renderPending(int monitorId) {
     return RenderOutcome{committed, generation};
 }
 
+FrameHandle WallpaperManager::exportHandle(const OffscreenTarget& target) {
+    FrameHandle handle;
+    try {
+        handle.frame = wallpaperx::exportFrame(*m_device, target);
+        try {
+            handle.acquireFd = wallpaperx::exportFrameAcquireFd(*m_device, target);
+        } catch (...) {
+            // The memory descriptor is already open and nothing else will close it. A frame with
+            // no acquire beside it is not offered: the consumer would read unowned memory while
+            // this daemon reported a mode saying it had been handed the acquire.
+            close(handle.frame.fd);
+            throw;
+        }
+    } catch (const GpuFailure& e) {
+        recordHealth(&DaemonHealth::gpu, HealthStatus::Fail, e.what());
+        throw;
+    }
+    return handle;
+}
+
 FrameExport WallpaperManager::exportCurrentFrame(int monitorId, const std::string& client) {
     requireValidMonitorId(monitorId);
 
@@ -1298,49 +1330,42 @@ FrameExport WallpaperManager::exportCurrentFrame(int monitorId, const std::strin
     // come to different answers about what is free. Only a named caller is charged with a
     // claim, so only a named caller can be refused one.
     //
+    // Admitting and recording are one act under one acquisition: the claims that pass the test
+    // are the claims written back, so a ReleaseBuffer landing later cannot restore a claim the
+    // test had dropped and leave the record covering a ring the test found room in. Testing
+    // first and recording after the export was two decisions that a release could make disagree.
+    //
     // Refusing costs this consumer a frame it must ask for again; granting would cost the
     // monitor every render until somebody released, and nothing may be taken back from a
     // consumer that could still be reading it.
+    bool claimAdded = false;
     if (!client.empty()) {
         std::lock_guard<std::mutex> stateLock(m_stateMutex);
         auto it = m_monitors.find(monitorId);
-        if (it != m_monitors.end() &&
-            m_targets->nextUnheld(monitorId, flattenHolds(withHandover(it->second.holds, client, target.bufferId))) ==
-                nullptr) {
-            out.reason = NoFrameReason::NoFreeImage;
-            return out;
+        if (it != m_monitors.end()) {
+            Handover next = withHandover(it->second.holds, client, target.bufferId);
+            if (m_targets->nextUnheld(monitorId, flattenHolds(next.holds)) == nullptr) {
+                out.reason = NoFrameReason::NoFreeImage;
+                return out;
+            }
+            it->second.holds = std::move(next.holds);
+            claimAdded = next.added;
         }
     }
 
     FrameHandle handle;
     try {
-        handle.frame = wallpaperx::exportFrame(*m_device, target);
-        try {
-            handle.acquireFd = wallpaperx::exportFrameAcquireFd(*m_device, target);
-        } catch (...) {
-            // The memory descriptor is already open and nothing else will close it. A frame with
-            // no acquire beside it is not offered: the consumer would read unowned memory while
-            // this daemon reported a mode saying it had been handed the acquire.
-            close(handle.frame.fd);
-            throw;
+        handle = exportHandle(target);
+    } catch (...) {
+        // The consumer never got the image, so it must not stay charged with holding one it
+        // cannot name to release. Only what this call added is undone: a claim it already had is
+        // on an image it is still reading, and a holder this call evicted only frees images.
+        if (claimAdded) {
+            std::lock_guard<std::mutex> stateLock(m_stateMutex);
+            auto it = m_monitors.find(monitorId);
+            if (it != m_monitors.end()) dropHoldLocked(it->second, client, target.bufferId);
         }
-    } catch (const GpuFailure& e) {
-        recordHealth(&DaemonHealth::gpu, HealthStatus::Fail, e.what());
         throw;
-    }
-    // Recorded once the descriptors are out and cannot be taken back, so a client is never
-    // charged with holding an image it was not given. An unnamed caller records nothing --
-    // there would be no name to withdraw the claim under, and a claim nothing can end takes an
-    // image out of the ring permanently.
-    //
-    // Re-read rather than reusing the projection above: a ReleaseBuffer can land in between, and
-    // that only frees images, so the admission test stands.
-    if (!client.empty()) {
-        std::lock_guard<std::mutex> stateLock(m_stateMutex);
-        auto it = m_monitors.find(monitorId);
-        if (it != m_monitors.end()) {
-            it->second.holds = withHandover(std::move(it->second.holds), client, handle.frame.bufferId);
-        }
     }
 
     handle.generation = generation;

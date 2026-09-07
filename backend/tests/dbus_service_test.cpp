@@ -216,6 +216,10 @@ constexpr int32_t kMonitorHoldNeverReleases = 1;
 // caller with no bus name at all, whose claims -- if the daemon recorded any -- nothing could
 // ever withdraw.
 constexpr int32_t kMonitorHoldUnnamed = 2;
+// The fourth, and it needs its own monitor because it is the only one driven past the holder
+// limit: five consumers, where every other case here has one or two. Sharing a monitor with them
+// would leave which holder is at the front of the list decided by an earlier case's traffic.
+constexpr int32_t kMonitorHoldEviction = 3;
 
 // On runBufferReleaseWireChecks' own manager, which is driven entirely over the bus.
 constexpr int32_t kMonitorReleaseWire = 0;
@@ -229,6 +233,16 @@ constexpr int kExpectedRingDepth = 3;
 // The same, for how many images one consumer may hold before its oldest claim is dropped, and
 // deliberately not WallpaperManager::kMaxHeldPerClient for the same reason.
 constexpr int kExpectedHeldPerClient = 2;
+
+// The same again, for how many consumers may hold images on one monitor before the least
+// recently served is evicted, and deliberately not WallpaperManager::kMaxHoldersPerMonitor:
+// reading the daemon's own constant would let a change to it move both sides of every
+// comparison below and keep the eviction checks green for any limit at all.
+constexpr int kExpectedHoldersPerMonitor = 4;
+static_assert(kExpectedHoldersPerMonitor >= 3,
+              "the eviction checks need one holder that is re-served, one that is not, and at least one bystander, "
+              "so a limit below three would leave them unable to tell the two eviction policies apart");
+
 static_assert(kExpectedHeldPerClient < kExpectedRingDepth,
               "with a cap at or above the ring depth a single consumer could starve its own monitor, and the "
               "never-releasing-consumer checks would be grading a state the daemon is not supposed to have");
@@ -3791,13 +3805,15 @@ void runBufferHoldChecks(const wallpaperx::WallpaperManager::Config& config, con
     //       is meant to be unreachable now, so a non-zero count here is a report that a
     //       hand-over got past the reserve -- which is why it is asserted at zero rather than
     //       deleted along with the states it used to grade.
-    // CONTROL: the `if (!client.empty())` admission block in
-    //       WallpaperManager::exportCurrentFrame (backend/daemon/wallpaper_manager.cpp)
-    //       deleted -> "FAIL: a request made after a refusal commits rather than being
-    //       deferred", "FAIL: the frame counter moved by exactly that one render", "FAIL: the
-    //       committed frame discharged the request" and "FAIL: no render was deferred -- the
-    //       reserve kept an image free, so the backstop never fired", printing 1 deferral.
-    //       Reverted.
+    // CONTROL: the `if (m_targets->nextUnheld(...) == nullptr)` refusal inside the admission
+    //       block of WallpaperManager::exportCurrentFrame (backend/daemon/wallpaper_manager.cpp)
+    //       deleted, so claims are still recorded but no hand-over is ever refused -> "FAIL: a
+    //       request made after a refusal commits rather than being deferred", "FAIL: the frame
+    //       counter moved by exactly that one render", "FAIL: the committed frame discharged the
+    //       request" and "FAIL: no render was deferred -- the reserve kept an image free, so the
+    //       backstop never fired", printing 1 deferral; 11 red in the run. Reverted. Deleting
+    //       the whole admission block instead does NOT redden this check: with nothing recorded
+    //       no image is ever held, so no render can defer and only the refusal checks go red.
     const uint64_t generationBefore = monitorStatus(manager, kMonitorHoldRing).generation;
     const bool fourthCommitted = renderOnce(manager, kMonitorHoldRing, imagePath);
     check(fourthCommitted, "a request made after a refusal commits rather than being deferred");
@@ -3843,9 +3859,10 @@ void runBufferHoldChecks(const wallpaperx::WallpaperManager::Config& config, con
     //       still refused afterwards" -- is now true whatever the release did and would grade
     //       nothing. What a release that ended a claim produces instead is an announcement of
     //       the monitor's committed frame; one that ended nothing produces none.
-    // CONTROL: the `hold.client == client` comparison in WallpaperManager::releaseBuffer
-    //       (backend/daemon/wallpaper_manager.cpp) replaced by `true`, so any caller matches
-    //       the first holder -> "FAIL: one consumer cannot release an image another consumer
+    // CONTROL: the `hold.client == client` comparison in WallpaperManager::dropHoldLocked
+    //       (backend/daemon/wallpaper_manager.cpp), which releaseBuffer calls, replaced by
+    //       `true`, so any caller matches the first holder -> "FAIL: one consumer cannot
+    //       release an image another consumer
     //       holds", printing "it freed something and announced monitor 0 generation 4", and
     //       downstream the departure check, whose consumer had already had its claim taken.
     //       Reverted.
@@ -3980,6 +3997,117 @@ void runBufferHoldChecks(const wallpaperx::WallpaperManager::Config& config, con
         } else {
             std::fprintf(stderr, "  the three hand-overs did not name three different images, so the unnamed-caller "
                                  "check had no full ring under it and was not graded\n");
+        }
+    }
+
+    // ---------------------------------------------------------------- //
+    // The holder limit, on a monitor of its own: five consumers.
+    // ---------------------------------------------------------------- //
+
+    // GOAL: with the holder limit reached, the consumer that claims an image next evicts the
+    //       LEAST RECENTLY SERVED holder -- not the one that merely joined first. False if the
+    //       daemon drops a consumer it has just handed an image to while keeping one that has
+    //       asked for nothing since it arrived, which is a consumer being cut off mid-stream to
+    //       make room and is what the daemon did until the holder list started being reordered.
+    // WHY-THIS-SHAPE: one holder is deliberately re-served before the limit is exceeded, and
+    //       the two policies are then required to disagree about it. The obvious shape -- fill
+    //       the limit, add one more, assert somebody was dropped -- cannot tell the policies
+    //       apart at all: with no holder re-served, "least recently served" and "first to
+    //       appear" name the same consumer and the check passes under both. Which holder
+    //       survived is read through releaseBuffer, because the hold list is private and a
+    //       release is the daemon's own report of whether a claim was there to end: it frees
+    //       something for a holder it still has and nothing at all for one it has forgotten.
+    // CONTROL: the `std::rotate(holder, holder + 1, holds.end())` that moves a served holder to
+    //       the back, in WallpaperManager::withHandover (backend/daemon/wallpaper_manager.cpp),
+    //       deleted and `BufferHold& served = holds.back()` put back to `*holder`, which is the
+    //       first-appearance order this replaced -> "FAIL: the holder the daemon most recently
+    //       served survives a fifth consumer arriving, and the one that has been idle since it
+    //       joined is the one evicted", printing survivors [:test.evict.idle,
+    //       :test.evict.bystander-a, :test.evict.bystander-b, :test.evict.newcomer] -- exactly
+    //       the inverse pair, which is what says the check separates the two policies rather
+    //       than merely noticing that somebody was evicted. The only red line in the run.
+    //       Reverted.
+    // COVERAGE-ASSERT: every premise -- four holders on one image, the re-service landing on
+    //       that same image, the fifth consumer actually being served -- is asserted before any
+    //       survivor is read, so a run that never reached the limit cannot report the eviction
+    //       policy as established. The probe count beside them guards this file rather than the
+    //       daemon; see the comment on it.
+    {
+        const std::string reServed = ":test.evict.re-served";
+        const std::string idle = ":test.evict.idle";
+        const std::string bystanderA = ":test.evict.bystander-a";
+        const std::string bystanderB = ":test.evict.bystander-b";
+        const std::string newcomer = ":test.evict.newcomer";
+        static_assert(kExpectedHoldersPerMonitor == 4,
+                      "the four names below fill the holder limit exactly; a different limit needs a different "
+                      "number of them or the fifth hand-over would not evict anything");
+
+        bool builtTheState = renderOnce(manager, kMonitorHoldEviction, imagePath);
+        // Every holder claims the SAME image: nothing renders in between, so each hand-over
+        // names the monitor's one committed frame. That keeps the producer's reserve out of
+        // this -- four claims on one image still leave two of the three free -- so a refusal
+        // here would be the holder bookkeeping and not the ring running out.
+        uint64_t shared = 0;
+        int filled = 0;
+        for (const std::string& holder : {reServed, idle, bystanderA, bystanderB}) {
+            if (!builtTheState) break;
+            const Handover handed = fetchHandover(manager, kMonitorHoldEviction, holder);
+            if (!handed.served() || (shared != 0 && handed.bufferId != shared)) {
+                builtTheState = false;
+                break;
+            }
+            shared = handed.bufferId;
+            ++filled;
+        }
+        builtTheState = builtTheState && filled == kExpectedHoldersPerMonitor;
+        check(builtTheState, "four consumers hold the same image, which fills the monitor's holder limit");
+
+        // Each step is graded only once the one before it held, so one unbuilt premise produces
+        // one red line naming the thing that actually did not happen rather than three.
+        bool reServedAgain = false;
+        bool fifthServed = false;
+        if (builtTheState) {
+            // The line the whole sub-phase turns on: re-serving the holder that joined first is
+            // what makes "least recently served" and "first seen" name different consumers.
+            const Handover again = fetchHandover(manager, kMonitorHoldEviction, reServed);
+            reServedAgain = again.served() && again.bufferId == shared;
+            check(reServedAgain, "the holder that joined first is handed that image again, so it is no longer the "
+                                 "least recently served");
+            if (reServedAgain) {
+                const Handover fifth = fetchHandover(manager, kMonitorHoldEviction, newcomer);
+                fifthServed = fifth.served() && fifth.bufferId == shared;
+                check(fifthServed, "a fifth consumer past the holder limit is still served");
+            }
+        }
+
+        if (!fifthServed) {
+            std::fprintf(stderr, "  the holder limit was never reached with one holder re-served, so no eviction "
+                                 "check below was graded\n");
+        } else {
+            std::vector<std::string> survivors;
+            const std::vector<std::string> probed = {reServed, idle, bystanderA, bystanderB, newcomer};
+            for (const std::string& who : probed) {
+                std::vector<wallpaperx::FrameAvailable> announced;
+                const std::vector<int> toRender = manager.releaseBuffer(who, kMonitorHoldEviction, shared, &announced);
+                if (!toRender.empty() || !announced.empty()) survivors.push_back(who);
+            }
+            // Guards this file, not the daemon: no production change can redden it. Dropping
+            // `idle` from the probe list would leave `survivors` matching `expected` exactly and
+            // the eviction check green while nothing asked about the evicted consumer at all.
+            check(static_cast<int>(probed.size()) == kExpectedHoldersPerMonitor + 1,
+                  "every consumer that could be holding was asked whether the daemon still has a claim for it");
+
+            const std::vector<std::string> expected = {reServed, bystanderA, bystanderB, newcomer};
+            check(survivors == expected,
+                  "the holder the daemon most recently served survives a fifth consumer arriving, and the one that "
+                  "has been idle since it joined is the one evicted");
+            if (survivors != expected) {
+                std::string names;
+                for (const std::string& who : survivors) names += (names.empty() ? "" : ", ") + who;
+                std::fprintf(stderr, "  the survivors were [%s]; the least recently served holder is %s and the "
+                                     "idle one is %s\n",
+                             names.c_str(), reServed.c_str(), idle.c_str());
+            }
         }
     }
 
@@ -4276,8 +4404,9 @@ void runBufferReleaseWireChecks(const wallpaperx::WallpaperManager::Config& conf
     // WHY-THIS-SHAPE: asked of the SAME consumer that was refused above, on the same monitor,
     //       with nothing in between but the release. A fresh consumer would be served whatever
     //       the release did, since a client with no claims is never the one holding the ring.
-    // CONTROL: `std::erase(holder->buffers, bufferId)` in WallpaperManager::releaseBuffer
-    //       (backend/daemon/wallpaper_manager.cpp) changed to a `std::count(...)` that reports
+    // CONTROL: `std::erase(holder->buffers, bufferId)` in WallpaperManager::dropHoldLocked
+    //       (backend/daemon/wallpaper_manager.cpp), which releaseBuffer calls, changed to a
+    //       `std::count(...)` that reports
     //       the claim without removing it -> "FAIL: the consumer that was refused is served
     //       once an image has come free", printing "it was answered
     //       'io.wallpaperx.Daemon.Error.NoFreeImage' instead", and the only red line in the

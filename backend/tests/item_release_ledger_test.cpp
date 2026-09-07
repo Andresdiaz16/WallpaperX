@@ -340,11 +340,11 @@ bool runPhase(Phase phase) {
             scene.control.invalidate();
             return true;
         }
-        // Let the item's own startup traffic finish before anything is counted. It asks again
-        // when it joins a scene, so a phase that started driving the moment the first texture
-        // appeared would be racing a fetch it did not make -- measured: both of the stub's
-        // frames had already been served and superseded before the phase sent its own signal,
-        // and only ONE import was ever live.
+        // Let the item's own startup traffic finish before anything is counted, and read the
+        // served count from where it leaves off rather than assuming a number. A phase that
+        // started driving the moment the first texture appeared could be racing a fetch it did
+        // not make, and a reply superseded that way leaves only ONE import live -- which is the
+        // state this phase exists to avoid.
         for (int settle = 0; settle < 10; ++settle) {
             scene.renderPass();
             pumpFor(30);
@@ -382,10 +382,14 @@ bool runPhase(Phase phase) {
             Qt::DirectConnection);
 
         if (phase == Phase::RepeatImport) {
-            // GOAL: the daemon is told once per IMAGE, not once per import. The plugin re-fetches
-            //       and re-imports the image it is already showing on every scene change, so two
-            //       imports of one image are live at once; releasing on the first teardown hands
-            //       the daemon an image the older texture is still sampling from.
+            // GOAL: the daemon is told once per IMAGE, not once per import. A newer generation can
+            //       arrive in the image the item is already showing -- the daemon's ring cycles,
+            //       so it hands the same buffer id back every few frames -- and the item then has
+            //       two imports of one image live at once; releasing on the first teardown hands
+            //       the daemon an image the older texture is still sampling from. This phase
+            //       drives that state with its own FrameReady rather than waiting for a scene
+            //       re-entry, which no longer re-asks: the item's scene-change path now goes
+            //       through ensureFrameRequested(), which is silent when it already holds a reply.
             // WHY-THIS-SHAPE: the negative check comes first and is what carries the property.
             //       "One release at the end" alone is equally true of a plugin that releases on
             //       the FIRST teardown and sends nothing on the second -- which is exactly what a

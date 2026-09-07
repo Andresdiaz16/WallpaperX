@@ -142,6 +142,9 @@ private:
     // Drops every generation mark together. See the definition for why they go as a set.
     void forgetGenerations();
     void fetchFrame(quint64 generation);
+    // Asks only when this item neither holds a reply nor has a request out. The scene-change
+    // caller's question, which fetchFrame(0) cannot express because 0 forces.
+    void ensureFrameRequested();
     // The reply half of fetchFrame, on the GUI thread once the bus answers.
     void takeFrameReply(const QDBusMessage& call);
     // Tells the daemon which dma_buf layouts this driver can import, so it stops choosing ones
