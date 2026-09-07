@@ -14,6 +14,7 @@
 #include <QSGRendererInterface>
 #include <QSGSimpleTextureNode>
 #include <QSGTexture>
+#include <QSocketNotifier>
 #include <QThread>
 
 #include <unistd.h>
@@ -177,6 +178,100 @@ void releaseClaim(const BufferClaims::Claim& claim) noexcept {
     } catch (...) {
         // A release that never reaches the daemon costs promptness, not correctness: the claim
         // still expires at the hand-over cap, or when this process leaves the bus.
+    }
+}
+
+// A descriptor with one owner, so no path out of the parking below can lose one.
+struct OwnedFd {
+    int fd = -1;
+
+    OwnedFd() = default;
+    explicit OwnedFd(int owned) : fd(owned) {}
+    OwnedFd(const OwnedFd&) = delete;
+    OwnedFd& operator=(const OwnedFd&) = delete;
+    ~OwnedFd() {
+        if (fd >= 0) ::close(fd);
+    }
+
+    int take() { return std::exchange(fd, -1); }
+};
+
+// One claim waiting on the descriptor that says this process's GPU has finished reading the image.
+// GUI thread, because that is where the notifier's event loop and the bus connection are.
+//
+// It gives the claim back only when the fence signals, so until then the ledger still counts the
+// import -- which is what makes a second live import of the same image, and a daemon replaced in
+// the meantime, come out right without either being asked about here.
+class PendingRelease : public QObject {
+public:
+    PendingRelease(const BufferClaims::Claim& claim, int fenceFd, QObject* parent)
+        : QObject(parent), m_claim(claim), m_fence(fenceFd), m_signalled(fenceFd, QSocketNotifier::Read) {
+        QObject::connect(&m_signalled, &QSocketNotifier::activated, this, [this] {
+            // A signalled fence stays readable, so this would fire on every pass of the event
+            // loop until the object is gone.
+            m_signalled.setEnabled(false);
+            releaseClaim(m_claim);
+            deleteLater();
+        });
+    }
+
+private:
+    BufferClaims::Claim m_claim;
+    // Declared before the notifier so it is destroyed after it: closing a descriptor a live
+    // QSocketNotifier still watches leaves the notifier armed on whatever number is opened next.
+    OwnedFd m_fence;
+    QSocketNotifier m_signalled;
+};
+
+// Once per process: the reason is a property of the GL context, not of the image.
+void noteUnfencedRelease(const std::string& whyNot) {
+    static std::once_flag reported;
+    std::call_once(reported, [&whyNot] {
+        std::fprintf(stderr,
+                     "wallpaperx: telling the daemon an image is free as soon as this process stops using it -- "
+                     "%s. The wallpaper still shows; what is lost is the guarantee that the daemon redraws an "
+                     "image only after this desktop's queued reads of it have finished.\n",
+                     whyNot.c_str());
+    });
+}
+
+// The same, for a claim whose image this process has been READING: the daemon may draw into it the
+// moment it is told, and the commands sampling it can still be queued when the host is done with
+// the texture. So the claim waits on a fence placed after those commands instead.
+//
+// Render thread, context current, and called where the texture died: the fence covers the commands
+// issued before it, and a texture still alive can still be drawn with.
+//
+// Every path that cannot park the claim releases it now rather than dropping it -- a dropped claim
+// leaves the ledger counting an import that no longer exists, so no later import of that image
+// would be released either.
+void releaseClaimWhenReadsFinish(const BufferClaims::Claim& claim) noexcept {
+    try {
+        if (!claim.held()) return;
+        QCoreApplication* app = QCoreApplication::instance();
+        if (app == nullptr) {
+            // On the way out, with no event loop left to watch a fence with.
+            releaseClaim(claim);
+            return;
+        }
+
+        std::string whyNot;
+        OwnedFd fence{FrameImport::readsFinishedFd(&whyNot)};
+        if (fence.fd < 0) {
+            noteUnfencedRelease(whyNot);
+            releaseClaim(claim);
+            return;
+        }
+
+        if (QMetaObject::invokeMethod(
+                app, [claim, fd = fence.fd, app] { new PendingRelease(claim, fd, app); }, Qt::QueuedConnection)) {
+            fence.take();  // the post owns it now, and PendingRelease after that
+            return;
+        }
+        releaseClaim(claim);
+    } catch (...) {
+        // As releaseClaim: a release that never reaches the daemon costs promptness, not
+        // correctness.
     }
 }
 
@@ -791,14 +886,14 @@ QSGNode* WallpaperXItem::updatePaintNode(QSGNode* old, UpdatePaintNodeData*) {
             // with the context current, which release needs.
             //
             // The claim travels with the texture, since the texture is what is reading the
-            // image -- and it outlives this item. Given back only after the GL objects are gone,
-            // never before: telling the daemon first invites it to draw into memory this process
-            // still has mapped.
+            // image -- and it outlives this item. Given back only after the GL objects are gone
+            // AND the GPU has run the commands that sampled them, never before: telling the
+            // daemon first invites it to draw into memory this process is still reading.
             QObject::connect(
                 texture, &QObject::destroyed, texture,
                 [imported, claim = std::exchange(incoming->claim, BufferClaims::Claim{})] {
                     FrameImport::release(imported);
-                    releaseClaim(claim);
+                    releaseClaimWhenReadsFinish(claim);
                 },
                 Qt::DirectConnection);
             // Deletes the texture it replaces, so a QSGTexture* kept across a re-import is freed

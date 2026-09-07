@@ -108,6 +108,35 @@ const SemaphoreApi& semaphoreApi() {
     return api;
 }
 
+// The EGL_ANDROID_native_fence_sync side, resolved like the two above. It is what turns "this
+// process has finished with the image" into something the kernel decides: the fence goes into the
+// current context's command stream and the descriptor duplicated out of it becomes readable when
+// the GPU reaches it.
+struct FenceApi {
+    using CreateFn = EGLSyncKHR (*)(EGLDisplay, EGLenum, const EGLint*);
+    using DestroyFn = EGLBoolean (*)(EGLDisplay, EGLSyncKHR);
+    using DupFdFn = EGLint (*)(EGLDisplay, EGLSyncKHR);
+
+    CreateFn create = nullptr;
+    DestroyFn destroy = nullptr;
+    DupFdFn dupFd = nullptr;
+
+    bool complete() const { return create != nullptr && destroy != nullptr && dupFd != nullptr; }
+};
+
+const FenceApi& fenceApi() {
+    static const FenceApi api = [] {
+        FenceApi resolved;
+        // The KHR forms, not EGL 1.5's eglCreateSync: EGL_ANDROID_native_fence_sync is written
+        // against EGL_KHR_fence_sync and its attribute list is EGLint.
+        resolved.create = reinterpret_cast<FenceApi::CreateFn>(eglGetProcAddress("eglCreateSyncKHR"));
+        resolved.destroy = reinterpret_cast<FenceApi::DestroyFn>(eglGetProcAddress("eglDestroySyncKHR"));
+        resolved.dupFd = reinterpret_cast<FenceApi::DupFdFn>(eglGetProcAddress("eglDupNativeFenceFDANDROID"));
+        return resolved;
+    }();
+    return api;
+}
+
 // Walked with glGetStringi rather than glGetString(GL_EXTENSIONS): the single-string form is
 // removed in a core profile and returns null there, which reads as "no extensions at all".
 //
@@ -267,6 +296,11 @@ struct ContextCapabilities {
     const char* dmaBuf = nullptr;
     const char* opaqueFd = nullptr;
     const char* sync = nullptr;
+    // Whether this context can say when its reads have finished. Its own answer rather than
+    // `sync`'s: waiting on the producer's semaphore is GL_EXT_semaphore and fencing our own work
+    // is EGL, so a context can do either without the other -- and going without costs different
+    // things, a frame read before it is finished versus one redrawn while it is still being read.
+    const char* fence = nullptr;
     // Whether the layouts this context can import are enumerable, which is not the same question
     // as whether it can import: the query is a separate entry point, and the two refusals cost
     // different things -- no dma_buf frames at all, versus a daemon left on its unnegotiated
@@ -287,6 +321,9 @@ ContextCapabilities probeCapabilities(EGLDisplay display) {
         out.modifierQuery =
             "no current EGL display: this GL context is not EGL-backed, so nothing can be asked which layouts "
             "it imports";
+        out.fence =
+            "no current EGL display: this GL context is not EGL-backed, so nothing here can fence the reads it "
+            "has issued";
     } else {
         // Asked once and answered for two capabilities below.
         const bool modifiersAdvertised = hasEglExtension(display, "EGL_EXT_image_dma_buf_import_modifiers");
@@ -307,6 +344,12 @@ ContextCapabilities probeCapabilities(EGLDisplay display) {
             out.modifierQuery = "this driver does not advertise EGL_EXT_image_dma_buf_import_modifiers";
         } else if (eglImageApi().queryModifiers == nullptr) {
             out.modifierQuery = "eglQueryDmaBufModifiersEXT could not be resolved";
+        }
+
+        if (!hasEglExtension(display, "EGL_ANDROID_native_fence_sync")) {
+            out.fence = "this EGL does not advertise EGL_ANDROID_native_fence_sync";
+        } else if (!fenceApi().complete()) {
+            out.fence = "the EGL_ANDROID_native_fence_sync entry points could not be resolved";
         }
     }
 
@@ -388,6 +431,36 @@ bool FrameImport::supports(HandleType type, std::string* whyNot) {
 bool FrameImport::supportsSync(std::string* whyNot) {
     if (kcmpBudgetSpent()) return granted(kKcmpBudgetSpent, whyNot);
     return granted(capabilities().sync, whyNot);
+}
+
+int FrameImport::readsFinishedFd(std::string* whyNot) {
+    const ContextCapabilities capable = capabilities();
+    if (!granted(capable.fence, whyNot)) return -1;
+
+    // Granted implies a display, and a display is not a context: the extensions above answer for
+    // the first, and a thread holding one with nothing current fails here instead.
+    EGLSyncKHR fence = fenceApi().create(capable.display, EGL_SYNC_NATIVE_FENCE_ANDROID, nullptr);
+    if (fence == EGL_NO_SYNC_KHR) {
+        if (whyNot != nullptr) {
+            *whyNot = "eglCreateSyncKHR would not place a fence in this context's command stream";
+        }
+        return -1;
+    }
+
+    // The fence has no descriptor until the commands it follows are on their way to the GPU:
+    // eglDupNativeFenceFDANDROID answers EGL_NO_NATIVE_FENCE_FD_ANDROID for one still sitting in
+    // the client's buffer. One flush per image released, which is one per hand-over.
+    glFlush();
+    const int fd = static_cast<int>(fenceApi().dupFd(capable.display, fence));
+    // Destroyed straight after: the descriptor is an independent reference to the same fence --
+    // measured on this driver, polled after the sync object was gone.
+    fenceApi().destroy(capable.display, fence);
+
+    if (fd < 0) {
+        if (whyNot != nullptr) *whyNot = "eglDupNativeFenceFDANDROID produced no descriptor for the fence";
+        return -1;
+    }
+    return fd;
 }
 
 // GL_LAYOUT_GENERAL_EXT because that is what the producer's release transitioned to. OpenGL has

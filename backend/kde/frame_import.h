@@ -90,6 +90,21 @@ public:
     // than refuse every frame. Same extension-string rule as supports(), for the same reason.
     static bool supportsSync(std::string* whyNot = nullptr);
 
+    // A descriptor that becomes readable once everything this context has issued has finished on
+    // the GPU -- the commands sampling an imported frame among them. What makes "I have stopped
+    // reading this image" a statement about the device rather than about the host.
+    //
+    // Call it after the frame's texture is gone, with the context current: it covers the commands
+    // issued before it and nothing after, so a texture still alive can still be drawn with.
+    //
+    // A DESCRIPTOR rather than a GL fence object, because the thread that must act on it is the
+    // one with the bus connection and no GL context: this can be handed to an event loop, where
+    // glClientWaitSync could only be polled from a paint that may never come again.
+    //
+    // -1 with a reason when this context cannot produce one, which means "cannot be told when the
+    // reads end" and never "they have ended". The caller owns the descriptor and must close() it.
+    static int readsFinishedFd(std::string* whyNot = nullptr);
+
     // Every DRM format modifier this EGL implementation can import `drmFormat` as. The daemon
     // cannot work this out for itself: Vulkan's importable bit answers for Vulkan, and this is
     // the only API that answers for the one doing the importing.
