@@ -2,14 +2,14 @@
 
 #pragma once
 
-// The scene two tests stand WallpaperXItem up in: a stub daemon that serves one real exported
-// frame, the QML that instantiates the plugin's own type, and the readers that ask what the item
-// ended up with.
+// The scene several tests stand WallpaperXItem up in: a stub daemon that serves real exported
+// frames and answers ReleaseBuffer, the QML that instantiates the plugin's own type, and the
+// readers that ask what the item ended up with.
 //
-// Shared because both tests need the same precondition -- a frame genuinely imported and attached
+// Shared because they all need the same precondition -- a frame genuinely imported and attached
 // to a scene-graph node -- and reach it identically; only what they then do to it differs. Kept
-// as one definition rather than two copies: a copy that drifts still compiles, still runs, and
-// still reads as coverage, and the two copies had already lost two CONTROL annotations between
+// as one definition rather than copies: a copy that drifts still compiles, still runs, and
+// still reads as coverage, and two copies had already lost two CONTROL annotations between
 // them.
 
 #include "kde/frame_import.h"
@@ -40,6 +40,8 @@
 #include <exception>
 #include <functional>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace wallpaperx::testing {
 
@@ -78,35 +80,74 @@ inline void publishOneFrame(wallpaperx::Device& device, wallpaperx::OffscreenTar
     targets.render(renderer, target);
 }
 
-// Serves ONE real exported frame -- memory and acquire descriptor both -- and then refuses.
+// Serves a caller-chosen sequence of real exported frames -- memory and acquire descriptor both
+// -- one per request, and refuses once the sequence runs out. Also answers ReleaseBuffer and
+// records what it was told.
 //
 // The refusal is a barrier tests rest on. Making the item fetch again -- by moving it to another
-// monitor id -- must not produce a second importable frame, or the next render pass would import
-// it and set the "a node is drawing" fact back to true, masking the mutation a check exists to
-// catch. A refusal reaches the item as a fetch reason and touches neither the node nor the
-// texture.
+// monitor id -- must not produce an unplanned importable frame, or the next render pass would
+// import it and set the "a node is drawing" fact back to true, masking the mutation a check
+// exists to catch. A refusal reaches the item as a fetch reason and touches neither the node nor
+// the texture.
+//
+// ReleaseBuffer is ANSWERED rather than left to Qt's unknown-method error, and recorded, because
+// the plugin's release is otherwise invisible from outside it: it sends a message and watches no
+// reply, so a release that was never sent and one that was sent look identical to the item. The
+// log is what makes "released once per image, not once per import" a fact this side can read.
+//
+// Both counters are touched only from the thread whose event loop dispatches this connection,
+// which is the thread the tests pump on, and the plugin's release hops to that same thread
+// before it sends. No locking, and nothing here may start being called from the render thread.
 class ExportingStub : public QDBusVirtualObject {
 public:
+    // What ReleaseBuffer was told, in order.
+    struct Release {
+        int monitorId = -1;
+        quint64 bufferId = 0;
+    };
+
+    // One target, served once: what the frames-on-screen phases need.
     ExportingStub(wallpaperx::Device& device, const wallpaperx::OffscreenTarget& target)
-        : m_device(device), m_target(target) {}
+        : m_device(device), m_sequence{&target} {}
+
+    // A chosen sequence, one frame per request. The same target may appear twice -- that is what
+    // the plugin does when the scene changes and it re-imports the image it is already showing.
+    ExportingStub(wallpaperx::Device& device, std::vector<const wallpaperx::OffscreenTarget*> sequence)
+        : m_device(device), m_sequence(std::move(sequence)) {}
+
+    // Reports this buffer id on every reply, instead of each image's own. For the one check that
+    // needs two DIFFERENT images to collide on one id, which is what a daemon restart produces:
+    // ids restart at 1, so the successor's first image carries an id the previous daemon had
+    // already handed out.
+    void reportBufferIdAs(quint64 bufferId) { m_bufferIdOverride = bufferId; }
 
     QString introspect(const QString&) const override { return QString(); }
 
     bool handleMessage(const QDBusMessage& message, const QDBusConnection& connection) override {
-        if (message.interface() != QLatin1String(kInterface) || message.member() != QLatin1String("GetFrameFd")) {
-            return false;
+        if (message.interface() != QLatin1String(kInterface)) return false;
+        if (message.member() == QLatin1String("ReleaseBuffer")) {
+            const QList<QVariant> args = message.arguments();
+            if (args.size() >= 2) {
+                m_releases.push_back(Release{args.at(0).toInt(), args.at(1).toULongLong()});
+            } else {
+                ++m_malformedReleases;
+            }
+            return connection.send(message.createReply());
         }
+        if (message.member() != QLatin1String("GetFrameFd")) return false;
         // Counted before anything here can go wrong, so "the item asked" and "the stub answered"
         // stay separate verdicts.
         ++m_requests;
-        if (m_served > 0) {
-            return connection.send(message.createErrorReply(QStringLiteral("io.wallpaperx.Error.NoFrame"),
-                                                            QStringLiteral("this stub serves one frame per run")));
+        if (m_served >= static_cast<int>(m_sequence.size())) {
+            return connection.send(
+                message.createErrorReply(QStringLiteral("io.wallpaperx.Error.NoFrame"),
+                                         QStringLiteral("this stub's frame sequence is exhausted")));
         }
+        const wallpaperx::OffscreenTarget& served = *m_sequence[static_cast<size_t>(m_served)];
 
         wallpaperx::ExportedFrame frame;
         try {
-            frame = wallpaperx::exportFrame(m_device, m_target);
+            frame = wallpaperx::exportFrame(m_device, served);
         } catch (const std::exception& e) {
             m_exportError = e.what();
             return connection.send(message.createErrorReply(QStringLiteral("io.wallpaperx.Error.ExportFailed"),
@@ -132,7 +173,7 @@ public:
         // acquire" from "the plugin lost it".
         QList<QDBusUnixFileDescriptor> syncFds;
         try {
-            const int acquireFd = wallpaperx::exportFrameAcquireFd(m_device, m_target);
+            const int acquireFd = wallpaperx::exportFrameAcquireFd(m_device, served);
             if (acquireFd >= 0) {
                 syncFds.append(QDBusUnixFileDescriptor(acquireFd));
                 ::close(acquireFd);
@@ -149,20 +190,31 @@ public:
 
         m_handleType = frame.type == wallpaperx::ExportedFrame::HandleType::DmaBuf ? 1 : 0;
         ++m_served;
+        // One generation per frame served, starting at 1. The item ignores a FrameReady naming a
+        // generation it already holds, so a stub that answered 1 for every frame could never be
+        // made to fetch a second one.
+        const quint64 generation = static_cast<quint64>(m_served);
         // Both taken from the export rather than invented: the importer refuses a frame whose
         // device is not the one this context runs on, and these tests import for real.
         return connection.send(message.createReply(
-            frameReplyFields(handle, frame.width, frame.height, frame.memorySize, m_handleType,
-                             /*generation=*/1, frame.drmFormat, frame.modifier, planes,
+            frameReplyFields(handle, frame.width, frame.height, frame.memorySize, m_handleType, generation,
+                             frame.drmFormat, frame.modifier, planes,
                              QByteArray(reinterpret_cast<const char*>(frame.deviceUuid.data()),
                                         static_cast<qsizetype>(frame.deviceUuid.size())),
-                             frame.bufferId, syncFds)));
+                             m_bufferIdOverride != 0 ? m_bufferIdOverride : frame.bufferId, syncFds)));
     }
 
     int requests() const { return m_requests; }
     int served() const { return m_served; }
     int handleType() const { return m_handleType; }
     const std::string& exportError() const { return m_exportError; }
+
+    // What the plugin released, in the order it said so. Empty is a real answer, and the checks
+    // that read it say which of empty and non-empty they expect.
+    const std::vector<Release>& releases() const { return m_releases; }
+    // A ReleaseBuffer whose arguments this stub could not read. Its own counter so a wire shape
+    // this harness cannot parse is not silently counted as "no release was sent".
+    int malformedReleases() const { return m_malformedReleases; }
 
     // How many acquire descriptors went out with the frames served. Read by the checks that are
     // ABOUT the acquire, so a stub that quietly stopped sending one turns them from a claim about
@@ -172,11 +224,14 @@ public:
 
 private:
     wallpaperx::Device& m_device;
-    const wallpaperx::OffscreenTarget& m_target;
+    std::vector<const wallpaperx::OffscreenTarget*> m_sequence;
+    quint64 m_bufferIdOverride = 0;
     int m_requests = 0;
     int m_served = 0;
     int m_handleType = -1;
     int m_acquireFdsSent = 0;
+    int m_malformedReleases = 0;
+    std::vector<Release> m_releases;
     std::string m_exportError;
     std::string m_acquireError;
 };

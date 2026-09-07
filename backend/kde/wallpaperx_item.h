@@ -2,6 +2,7 @@
 
 #pragma once
 
+#include "buffer_claims.h"
 #include "frame_import.h"
 
 #include <QQuickItem>
@@ -116,9 +117,14 @@ private:
     // A frame fetched but not yet imported. Owns its fd until the render thread takes it: if
     // this is destroyed with one still in it, the fd is closed here rather than leaked, since a
     // leak of one fd per frame ends a login session.
+    //
+    // It owns the daemon's claim on the image the same way, and for the same reason: the daemon
+    // records the hold when it answers GetFrameFd, so every path that drops the frame without
+    // importing it owes a release. A successful import moves the claim on to the texture.
     struct PendingFrame {
         FrameImport::Request request;
         quint64 generation = 0;
+        BufferClaims::Claim claim;
 
         PendingFrame() = default;
         ~PendingFrame();

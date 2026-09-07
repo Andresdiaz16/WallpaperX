@@ -26,6 +26,10 @@ constexpr const char* kErrorRenderFailed = "io.wallpaperx.Daemon.Error.RenderFai
 // response: NoFrame means retry, RenderFailed means stop and show the reason, Unsupported
 // means stop asking -- nothing about this build changes while it runs.
 constexpr const char* kErrorUnsupported = "io.wallpaperx.Daemon.Error.Unsupported";
+// The fourth: there is a frame, but handing it over would leave the daemon nowhere to draw the
+// next one. Retryable like NoFrame, and the daemon says when -- a FrameReady follows every
+// release and every commit, so a consumer that waits for one is not polling.
+constexpr const char* kErrorNoFreeImage = "io.wallpaperx.Daemon.Error.NoFreeImage";
 constexpr const char* kErrorShuttingDown = "io.wallpaperx.Daemon.Error.ShuttingDown";
 constexpr const char* kErrorBusy = "io.wallpaperx.Daemon.Error.Busy";
 constexpr const char* kErrorInvalidArgs = "org.freedesktop.DBus.Error.InvalidArgs";
@@ -58,7 +62,9 @@ void DbusService::watchClientExits() {
                 // Likewise its claim on the images it was reading. A consumer that crashed
                 // holding a frame -- plasmashell restarts are routine, this daemon does not --
                 // would otherwise keep those images out of the ring for good.
-                for (const int monitorId : m_manager.forgetHeldBuffers(name)) m_worker.post(monitorId);
+                std::vector<FrameAvailable> available;
+                for (const int monitorId : m_manager.forgetHeldBuffers(name, &available)) m_worker.post(monitorId);
+                announceAvailableFrames(available);
             }
         });
 }
@@ -176,8 +182,9 @@ void DbusService::applyImportModifierUpdate(const ImportModifierUpdate& update) 
 }
 
 void DbusService::emitFrameReady(int monitorId, uint64_t generation) {
-    // Called on the render worker's thread. sdbus-c++ documents signal emission on
-    // IObject as thread-safe by design, so this needs no hop back to the event loop.
+    // Called on the render worker's thread when a frame commits, and on the event-loop thread
+    // when a release frees an image. sdbus-c++ documents signal emission on IObject as
+    // thread-safe by design, so neither needs a hop back to the event loop.
     try {
         m_object->emitSignal("FrameReady")
             .onInterface(kInterface)
@@ -259,14 +266,23 @@ void DbusService::setMonitorOutput(int32_t monitorId, const std::string& outputN
 
 void DbusService::releaseBuffer(const std::string& client, int32_t monitorId, uint64_t bufferId) {
     std::vector<int> toRender;
+    std::vector<FrameAvailable> toAnnounce;
     try {
-        toRender = m_manager.releaseBuffer(client, monitorId, bufferId);
+        toRender = m_manager.releaseBuffer(client, monitorId, bufferId, &toAnnounce);
     } catch (const InvalidRequest& e) {
         std::fprintf(stderr, "wallpaperx-daemon: ReleaseBuffer rejected (monitor=%d): %s\n", monitorId, e.what());
         throw sdbus::Error(sdbus::Error::Name{kErrorInvalidArgs}, e.what());
     }
     // A render that had nowhere to draw, now that this image is free.
     for (const int id : toRender) m_worker.post(id);
+    announceAvailableFrames(toAnnounce);
+}
+
+// Re-announces a frame nothing is going to redraw. A consumer refused for want of a free image
+// has no other trigger to ask again, and a consumer that already has this generation ignores it,
+// so this is the whole recovery mechanism and it needs no record of who was refused.
+void DbusService::announceAvailableFrames(const std::vector<FrameAvailable>& available) {
+    for (const FrameAvailable& frame : available) emitFrameReady(frame.monitorId, frame.generation);
 }
 
 void DbusService::completeGetFrameFd(FrameFdCall call, int32_t monitorId, std::string client) {
@@ -292,6 +308,21 @@ void DbusService::completeGetFrameFd(FrameFdCall call, int32_t monitorId, std::s
             call.returnError(sdbus::Error(sdbus::Error::Name{kErrorRenderFailed},
                                           "the last render for monitor " + std::to_string(monitorId) +
                                               " failed: " + exported.lastError));
+            return;
+        }
+        if (exported.reason == NoFrameReason::NoFreeImage) {
+            // Logged where the served hand-overs are logged: a wallpaper that stops changing for
+            // one consumer while the daemon keeps rendering is otherwise invisible. Named,
+            // because which of two consumers was refused is the whole diagnosis.
+            std::printf("wallpaperx-daemon: GetFrameFd(monitor=%d) refused for %s -- the monitor's other images "
+                        "are held and one must stay free to draw into\n",
+                        monitorId, sanitizeForLog(client).c_str());
+            std::fflush(stdout);
+            call.returnError(sdbus::Error(sdbus::Error::Name{kErrorNoFreeImage},
+                                          "monitor " + std::to_string(monitorId) +
+                                              " has no image free to hand over -- other consumers hold the rest "
+                                              "and one must stay free for the next render; ask again when the "
+                                              "daemon announces a frame"));
             return;
         }
         if (exported.reason == NoFrameReason::Unsupported) {

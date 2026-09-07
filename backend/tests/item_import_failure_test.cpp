@@ -331,11 +331,15 @@ int main(int argc, char** argv) {
             //       The settle is a best effort -- had the reply not landed yet, this check would
             //       be true without being informative, and the equality check below is what still
             //       refuses a reason from any other cause.
-            // CONTROL: the `setUnavailableReason(QString())` at the end of
-            //       WallpaperXItem::takeFrameReply in backend/kde/wallpaperx_item.cpp
-            //       replaced with a non-empty string -> "FAIL: no
-            //       reason is published by the fetch path itself, before any import runs", alone,
-            //       with the import checks below still green. Observed 2026-08-21. Reverted.
+            // CONTROL: the `setFetchReason(QString())` at the end of
+            //       WallpaperXItem::takeFrameReply in backend/kde/wallpaperx_item.cpp replaced
+            //       with a non-empty string -> "FAIL: no reason is published by the fetch path
+            //       itself, before any import runs". Re-run 2026-09-06: the reason string is no
+            //       longer written by one setter, so the mutation now names setFetchReason, and
+            //       it is NOT alone -- the fetch side outranks the render side in
+            //       publishReason(), so "the published reason is the one for an import that
+            //       failed" goes red printing the injected string, and the descriptor check
+            //       below goes red with one frame and one sync descriptor still open. Reverted.
             pumpFor(200);
             check(root->property("publishedReason").toString().isEmpty(),
                   "no reason is published by the fetch path itself, before any import runs");
@@ -348,10 +352,13 @@ int main(int argc, char** argv) {
             //       would be indistinguishable from a real empty reason. The loop cannot pass by
             //       timing out: expiry leaves `reasonAppeared` false, which fails the check.
             // CONTROL: on the texture == 0 branch of WallpaperXItem::updatePaintNode in
-            //       backend/kde/wallpaperx_item.cpp, the import
-            //       message replaced with `setUnavailableReason(QString())` -> "FAIL: a failed
-            //       import publishes a non-empty unavailableReason, readable from QML" plus the
-            //       next check, after the full 5s. Observed 2026-08-21. Reverted.
+            //       backend/kde/wallpaperx_item.cpp, the `setRenderReason(tr("WallpaperX
+            //       produced a frame this desktop could not import."))` call replaced with
+            //       `setRenderReason(QString())` -> "FAIL: a failed import publishes a non-empty
+            //       unavailableReason, readable from QML" plus the next check, printing
+            //       "published reason was: []", after the full 5s. Re-run 2026-09-06: the branch
+            //       no longer calls setUnavailableReason, which the earlier annotation named and
+            //       which no longer exists. Reverted.
             // COVERAGE-ASSERT: the check above -- reason empty before this loop -- and this one
             //       together pin the transition to a sync pass. A count of passes was tried and
             //       dropped: it cannot fail, since the loop increments it beside the very call it
@@ -399,10 +406,12 @@ int main(int argc, char** argv) {
             // WHY-THIS-SHAPE: the binding above is compared against a direct meta-object read of
             //       the same property. Reading the property alone cannot see a missing NOTIFY.
             // CONTROL: `emit unavailableReasonChanged();` deleted from
-            //       WallpaperXItem::setUnavailableReason in backend/kde/wallpaperx_item.cpp
-            //       -> "FAIL: the QML binding holds the same
-            //       string the property returns", with the two checks above red as well because
-            //       the binding never updated. Observed 2026-08-21. Reverted.
+            //       WallpaperXItem::publishReason in backend/kde/wallpaperx_item.cpp -> "FAIL:
+            //       the QML binding holds the same string the property returns", with the two
+            //       checks above red as well because the binding never updated. Re-run
+            //       2026-09-06: the signal is emitted from publishReason(), which recomputes the
+            //       string from the fetch and render facts; setUnavailableReason, which the
+            //       earlier annotation named, no longer exists. Reverted.
             auto* renderer = qobject_cast<QQuickItem*>(root->property("rendererItem").value<QObject*>());
             check(renderer != nullptr, "the QML scene exposes the renderer item");
             if (renderer != nullptr) {

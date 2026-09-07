@@ -2,6 +2,7 @@
 
 #include "wallpaperx_item.h"
 
+#include <QCoreApplication>
 #include <QDBusArgument>
 #include <QDBusConnection>
 #include <QDBusServiceWatcher>
@@ -48,6 +49,10 @@ void sendImportModifiers(QObject* context, quint32 drmFormat, const std::vector<
 constexpr const char* kService = "io.wallpaperx.Daemon";
 constexpr const char* kPath = "/io/wallpaperx/Daemon";
 constexpr const char* kInterface = "io.wallpaperx.Daemon";
+
+// The daemon keeps one image per monitor free to render into, and refuses a hand-over that
+// would take the last one. Not a failure of either side, and not permanent.
+constexpr const char* kErrorNoFreeImage = "io.wallpaperx.Daemon.Error.NoFreeImage";
 
 }  // namespace
 
@@ -125,23 +130,80 @@ void reportImportFailure(const std::string& reason) {
     }
 }
 
+// GUI thread only. The daemon's unique bus name as last observed, so the several items in one
+// plasmashell report a restart once between them: a spurious "the daemon changed" would forget
+// claims the daemon still holds, and they would then linger until the hand-over cap expired them.
+QString g_daemonOwner;
+
+// GUI thread. Called for every owner change of the daemon's bus name, departures included.
+void noteDaemonOwner(const QString& owner) {
+    if (owner == g_daemonOwner) return;
+    g_daemonOwner = owner;
+    BufferClaims::instance().daemonReplaced();
+}
+
+// GUI thread, where the bus connection is.
+void sendReleaseBuffer(int monitorId, quint64 bufferId) {
+    QDBusConnection bus = QDBusConnection::sessionBus();
+    if (!bus.isConnected()) return;
+
+    QDBusMessage request = QDBusMessage::createMethodCall(QString::fromUtf8(kService), QString::fromUtf8(kPath),
+                                                          QString::fromUtf8(kInterface),
+                                                          QStringLiteral("ReleaseBuffer"));
+    request.setArguments({monitorId, bufferId});
+    // The pending call is dropped rather than watched: the reply carries nothing, and the only
+    // error is a daemon that has gone -- which has already freed every claim of ours.
+    bus.asyncCall(request);
+}
+
+// Tells the daemon this process has stopped reading an image, if this was the last import of it.
+//
+// Runs on the render thread, from scene graph teardown and from a destructor, so it must neither
+// block nor throw: an exception on either path is std::terminate inside plasmashell.
+//
+// Posted to qApp rather than to the item that fetched the frame, because the scene graph destroys
+// a texture AFTER the item that imported it is gone, and that is exactly when this fires.
+void releaseClaim(const BufferClaims::Claim& claim) noexcept {
+    try {
+        if (!BufferClaims::instance().giveBack(claim)) return;
+        // Gone already: the process is on its way out, and leaving the bus frees every claim.
+        QCoreApplication* app = QCoreApplication::instance();
+        if (app == nullptr) return;
+
+        const int monitorId = claim.monitorId;
+        const quint64 bufferId = claim.bufferId;
+        QMetaObject::invokeMethod(
+            app, [monitorId, bufferId] { sendReleaseBuffer(monitorId, bufferId); }, Qt::QueuedConnection);
+    } catch (...) {
+        // A release that never reaches the daemon costs promptness, not correctness: the claim
+        // still expires at the hand-over cap, or when this process leaves the bus.
+    }
+}
+
 }  // namespace
 
-WallpaperXItem::PendingFrame::~PendingFrame() { closeDescriptors(request); }
+WallpaperXItem::PendingFrame::~PendingFrame() {
+    closeDescriptors(request);
+    releaseClaim(claim);
+}
 
 // Moved, not copied. Request holds a std::vector, so copying it can throw -- and a throw out of
 // a noexcept function is std::terminate, here inside plasmashell.
 WallpaperXItem::PendingFrame::PendingFrame(PendingFrame&& other) noexcept
-    : request(std::move(other.request)), generation(other.generation) {
+    : request(std::move(other.request)), generation(other.generation), claim(other.claim) {
     disownDescriptors(other.request);
+    other.claim = {};
 }
 
 WallpaperXItem::PendingFrame& WallpaperXItem::PendingFrame::operator=(PendingFrame&& other) noexcept {
     if (this != &other) {
         closeDescriptors(request);
+        releaseClaim(claim);
         request = std::move(other.request);
         generation = other.generation;
+        claim = other.claim;
         disownDescriptors(other.request);
+        other.claim = {};
     }
     return *this;
 }
@@ -183,8 +245,12 @@ void WallpaperXItem::setMonitorId(int monitorId) {
 void WallpaperXItem::forgetGenerations() {
     m_fetchedGeneration = 0;
     m_retriedGeneration = 0;
+    // Destroyed outside the lock: giving its claim back reaches the bus, and m_pendingMutex is
+    // taken by the render thread on every pass.
+    std::optional<PendingFrame> dropped;
     {
         std::lock_guard<std::mutex> lock(m_pendingMutex);
+        dropped = std::move(m_pending);
         m_pending.reset();
     }
     {
@@ -277,6 +343,9 @@ void WallpaperXItem::connectToDaemon() {
                                             QDBusServiceWatcher::WatchForOwnerChange, this);
     connect(watcher, &QDBusServiceWatcher::serviceOwnerChanged, this,
             [this](const QString&, const QString&, const QString& newOwner) {
+                // Before anything else, and on departures too: a claim outlives the daemon that
+                // granted it, and the next daemon starts its buffer ids over from one.
+                noteDaemonOwner(newOwner);
                 if (newOwner.isEmpty()) {
                     setFetchReason(tr("WallpaperX is not running."));
                     return;
@@ -473,6 +542,14 @@ void WallpaperXItem::takeFrameReply(const QDBusMessage& call) {
                                      : tr("WallpaperX could not be reached."));
             return;
         }
+        // Refused so the daemon keeps somewhere to draw. Reported as no reason at all, because a
+        // reason hides the wallpaper behind the backdrop -- and this item still has the frame it
+        // is showing, which is more use than a message about a fetch that will succeed on the
+        // next announcement. The daemon sends one whenever an image comes back.
+        if (name == QLatin1String(kErrorNoFreeImage)) {
+            setFetchReason(QString());
+            return;
+        }
         // Not a failure of this item: no frame yet is the ordinary state before the user has
         // chosen a wallpaper, and the daemon says which case it is.
         setFetchReason(call.errorMessage().isEmpty() ? tr("WallpaperX has no frame for this screen yet.")
@@ -490,6 +567,13 @@ void WallpaperXItem::takeFrameReply(const QDBusMessage& call) {
     }
 
     PendingFrame frame;
+    // Field 11, buffer_id: which image, where frame_generation says which render. Read and
+    // claimed BEFORE the rest of the parse, because the daemon recorded the hold when it answered
+    // -- so from here on every path that drops this frame owes it a release, and `frame` owning
+    // the claim is what makes that automatic.
+    frame.request.bufferId = args.at(11).toULongLong();
+    frame.claim = BufferClaims::instance().take(m_monitorId, frame.request.bufferId);
+
     frame.request.fd = ::dup(args.at(0).value<QDBusUnixFileDescriptor>().fileDescriptor());
     frame.request.width = args.at(1).toUInt();
     frame.request.height = args.at(2).toUInt();
@@ -549,11 +633,6 @@ void WallpaperXItem::takeFrameReply(const QDBusMessage& call) {
     const QByteArray uuid = args.at(10).toByteArray();
     frame.request.deviceUuid.assign(uuid.begin(), uuid.end());
 
-    // Field 11, buffer_id: which image, where frame_generation says which render. Carried so
-    // the import can be keyed on it once Stage F keeps imported buffers instead of redoing one
-    // per frame; nothing reads it yet.
-    frame.request.bufferId = args.at(11).toULongLong();
-
     if (frame.request.fd < 0) {
         setFetchReason(tr("WallpaperX sent a frame this plugin could not take hold of."));
         return;
@@ -563,12 +642,15 @@ void WallpaperXItem::takeFrameReply(const QDBusMessage& call) {
     // rendered again between the two, and the reply describes the frame actually in hand.
     m_fetchedGeneration = frame.generation;
 
+    std::optional<PendingFrame> superseded;
     {
         std::lock_guard<std::mutex> lock(m_pendingMutex);
         // Replaced, not queued: an older frame waiting behind this one describes a state this
-        // one already supersedes, and its destructor closes its fd.
-        m_pending = std::move(frame);
+        // one already supersedes. Taken out rather than destroyed here, because its destructor
+        // gives a claim back over the bus and this lock is on the render thread's path.
+        superseded = std::exchange(m_pending, std::move(frame));
     }
+    superseded.reset();
     setFetchReason(QString());
     update();
 }
@@ -699,8 +781,17 @@ QSGNode* WallpaperXItem::updatePaintNode(QSGNode* old, UpdatePaintNodeData*) {
             // against an unexposed window is dropped without running, and by then this is the
             // only reference left. Node teardown and setTexture both run on the render thread
             // with the context current, which release needs.
+            //
+            // The claim travels with the texture, since the texture is what is reading the
+            // image -- and it outlives this item. Given back only after the GL objects are gone,
+            // never before: telling the daemon first invites it to draw into memory this process
+            // still has mapped.
             QObject::connect(
-                texture, &QObject::destroyed, texture, [imported] { FrameImport::release(imported); },
+                texture, &QObject::destroyed, texture,
+                [imported, claim = std::exchange(incoming->claim, BufferClaims::Claim{})] {
+                    FrameImport::release(imported);
+                    releaseClaim(claim);
+                },
                 Qt::DirectConnection);
             node->setTexture(texture);
             node->markDirty(QSGNode::DirtyMaterial);

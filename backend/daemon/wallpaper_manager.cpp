@@ -357,38 +357,58 @@ void WallpaperManager::forgetHolds(int monitorId) {
     if (it != m_monitors.end()) it->second.holds.clear();
 }
 
-std::vector<uint64_t> WallpaperManager::heldBuffersLocked(int monitorId) const {
+std::vector<uint64_t> WallpaperManager::flattenHolds(const std::vector<BufferHold>& holds) {
     std::vector<uint64_t> held;
-    auto it = m_monitors.find(monitorId);
-    if (it == m_monitors.end()) return held;
-    for (const BufferHold& hold : it->second.holds) {
+    for (const BufferHold& hold : holds) {
         held.insert(held.end(), hold.buffers.begin(), hold.buffers.end());
     }
     return held;
 }
 
-void WallpaperManager::recordHandoverLocked(MonitorState& state, const std::string& client, uint64_t bufferId) {
-    auto holder = std::find_if(state.holds.begin(), state.holds.end(),
+std::vector<uint64_t> WallpaperManager::heldBuffersLocked(int monitorId) const {
+    auto it = m_monitors.find(monitorId);
+    if (it == m_monitors.end()) return {};
+    return flattenHolds(it->second.holds);
+}
+
+std::vector<WallpaperManager::BufferHold> WallpaperManager::withHandover(std::vector<BufferHold> holds,
+                                                                        const std::string& client,
+                                                                        uint64_t bufferId) {
+    auto holder = std::find_if(holds.begin(), holds.end(),
                                [&client](const BufferHold& hold) { return hold.client == client; });
-    if (holder == state.holds.end()) {
+    if (holder == holds.end()) {
         // The least recently served holder goes, not an arbitrary one: a consumer that has not
         // been handed a frame in the longest is the likeliest to have stopped reading.
-        if (state.holds.size() >= kMaxHoldersPerMonitor) state.holds.erase(state.holds.begin());
-        state.holds.push_back(BufferHold{client, {}});
-        holder = std::prev(state.holds.end());
+        if (holds.size() >= kMaxHoldersPerMonitor) holds.erase(holds.begin());
+        holds.push_back(BufferHold{client, {}});
+        holder = std::prev(holds.end());
     }
 
     // The same image again -- the KDE plugin re-fetches a generation it already holds on every
     // scene change -- is the claim it already has, not a second one.
-    if (std::find(holder->buffers.begin(), holder->buffers.end(), bufferId) != holder->buffers.end()) return;
+    if (std::find(holder->buffers.begin(), holder->buffers.end(), bufferId) != holder->buffers.end()) return holds;
 
     holder->buffers.push_back(bufferId);
     if (holder->buffers.size() > kMaxHeldPerClient) {
         holder->buffers.erase(holder->buffers.begin(), holder->buffers.end() - kMaxHeldPerClient);
     }
+    return holds;
 }
 
-std::vector<int> WallpaperManager::releaseBuffer(const std::string& client, int monitorId, uint64_t bufferId) {
+// The one place that decides what an image coming free is worth: a render if one is owed,
+// otherwise a repeat of the announcement, so a consumer refused for want of a free image hears
+// that the ring has moved. Caller must hold m_stateMutex.
+void WallpaperManager::reportFreedImageLocked(int monitorId, const MonitorState& state, std::vector<int>& toRender,
+                                              std::vector<FrameAvailable>* announce) {
+    if (state.requestSeq != state.servicedSeq) {
+        toRender.push_back(monitorId);
+        return;
+    }
+    if (announce != nullptr && state.hasFrame) announce->push_back(FrameAvailable{monitorId, state.generation});
+}
+
+std::vector<int> WallpaperManager::releaseBuffer(const std::string& client, int monitorId, uint64_t bufferId,
+                                                 std::vector<FrameAvailable>* announce) {
     requireValidMonitorId(monitorId);
 
     std::lock_guard<std::mutex> stateLock(m_stateMutex);
@@ -401,13 +421,12 @@ std::vector<int> WallpaperManager::releaseBuffer(const std::string& client, int 
     if (std::erase(holder->buffers, bufferId) == 0) return {};
     if (holder->buffers.empty()) it->second.holds.erase(holder);
 
-    // Only a monitor still owing a render: an image coming free is worth a pass exactly when
-    // there is a request that could not be drawn without it.
-    if (it->second.requestSeq == it->second.servicedSeq) return {};
-    return {monitorId};
+    std::vector<int> toRender;
+    reportFreedImageLocked(monitorId, it->second, toRender, announce);
+    return toRender;
 }
 
-std::vector<int> WallpaperManager::forgetHeldBuffers(const std::string& client) {
+std::vector<int> WallpaperManager::forgetHeldBuffers(const std::string& client, std::vector<FrameAvailable>* announce) {
     std::vector<int> toRender;
 
     std::lock_guard<std::mutex> stateLock(m_stateMutex);
@@ -415,7 +434,7 @@ std::vector<int> WallpaperManager::forgetHeldBuffers(const std::string& client) 
         const size_t before = state.holds.size();
         std::erase_if(state.holds, [&client](const BufferHold& hold) { return hold.client == client; });
         if (state.holds.size() == before) continue;
-        if (state.requestSeq != state.servicedSeq) toRender.push_back(monitorId);
+        reportFreedImageLocked(monitorId, state, toRender, announce);
     }
     return toRender;
 }
@@ -1113,10 +1132,12 @@ RenderOutcome WallpaperManager::renderPending(int monitorId) {
     }
 
     if (deferred) {
-        // Every image on this monitor is in a consumer's hands. The request is left
-        // outstanding rather than drawn over a frame in use or waited on with the GPU lock
-        // held: whatever frees an image -- a ReleaseBuffer, a consumer leaving the bus --
-        // re-posts this monitor, and until then GetStatus reports the render as still owed.
+        // Every image on this monitor is in a consumer's hands, which exportCurrentFrame()'s
+        // reserve is there to prevent: reaching here means a hand-over got past it. Kept as the
+        // backstop, because the alternative to deferring is drawing into an image being read.
+        // The request is left outstanding rather than waited on with the GPU lock held --
+        // whatever frees an image re-posts this monitor, and until then GetStatus reports the
+        // render as still owed.
         uint32_t refusals = 0;
         {
             std::lock_guard<std::mutex> stateLock(m_stateMutex);
@@ -1270,9 +1291,29 @@ FrameExport WallpaperManager::exportCurrentFrame(int monitorId, const std::strin
                                  " is marked as rendered but has no offscreen target");
     }
 
+    const OffscreenTarget& target = m_targets->get(monitorId);
+
+    // One image stays out of consumers' hands so a render always has somewhere to draw. Asked
+    // of nextUnheld(), which is the same question the render itself asks, so the two cannot
+    // come to different answers about what is free. Only a named caller is charged with a
+    // claim, so only a named caller can be refused one.
+    //
+    // Refusing costs this consumer a frame it must ask for again; granting would cost the
+    // monitor every render until somebody released, and nothing may be taken back from a
+    // consumer that could still be reading it.
+    if (!client.empty()) {
+        std::lock_guard<std::mutex> stateLock(m_stateMutex);
+        auto it = m_monitors.find(monitorId);
+        if (it != m_monitors.end() &&
+            m_targets->nextUnheld(monitorId, flattenHolds(withHandover(it->second.holds, client, target.bufferId))) ==
+                nullptr) {
+            out.reason = NoFrameReason::NoFreeImage;
+            return out;
+        }
+    }
+
     FrameHandle handle;
     try {
-        const OffscreenTarget& target = m_targets->get(monitorId);
         handle.frame = wallpaperx::exportFrame(*m_device, target);
         try {
             handle.acquireFd = wallpaperx::exportFrameAcquireFd(*m_device, target);
@@ -1291,10 +1332,15 @@ FrameExport WallpaperManager::exportCurrentFrame(int monitorId, const std::strin
     // charged with holding an image it was not given. An unnamed caller records nothing --
     // there would be no name to withdraw the claim under, and a claim nothing can end takes an
     // image out of the ring permanently.
+    //
+    // Re-read rather than reusing the projection above: a ReleaseBuffer can land in between, and
+    // that only frees images, so the admission test stands.
     if (!client.empty()) {
         std::lock_guard<std::mutex> stateLock(m_stateMutex);
         auto it = m_monitors.find(monitorId);
-        if (it != m_monitors.end()) recordHandoverLocked(it->second, client, handle.frame.bufferId);
+        if (it != m_monitors.end()) {
+            it->second.holds = withHandover(std::move(it->second.holds), client, handle.frame.bufferId);
+        }
     }
 
     handle.generation = generation;

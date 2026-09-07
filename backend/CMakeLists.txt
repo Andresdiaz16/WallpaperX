@@ -128,7 +128,10 @@ find_package(Threads REQUIRED)
 pkg_check_modules(EGL QUIET IMPORTED_TARGET egl)
 find_package(OpenGL QUIET COMPONENTS OpenGL)
 if(EGL_FOUND AND OpenGL_OpenGL_FOUND)
-    add_library(wallpaperx-frame-import STATIC kde/frame_import.cpp)
+    # buffer_claims.cpp rides along for the same reason: which of the daemon's images this
+    # process still has a live import of is decided with no Qt and no GPU, so it can be graded
+    # without either.
+    add_library(wallpaperx-frame-import STATIC kde/frame_import.cpp kde/buffer_claims.cpp)
     # Same reason as wallpaperxplugin: this ends up inside the QML plugin's shared object.
     set_target_properties(wallpaperx-frame-import PROPERTIES POSITION_INDEPENDENT_CODE ON)
     # The renderer's directory is on the path for vulkan/drm_formats.h alone -- fourcc constants
@@ -506,8 +509,22 @@ if(WALLPAPERX_BUILD_KDE_PLUGIN)
         PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
 endif()
 
+# buffer_claims.cpp is compiled straight in rather than linked from wallpaperx-frame-import:
+# that library carries EGL and OpenGL, and this decides which images the process still holds
+# with neither. Building it here is what keeps the entry registered on a host that has no EGL.
+add_executable(wallpaperx-buffer-claims-test tests/buffer_claims_test.cpp kde/buffer_claims.cpp)
+target_include_directories(wallpaperx-buffer-claims-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+set_target_properties(wallpaperx-buffer-claims-test PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+
 # Registered outside the dbus-run-session guard below: this one talks to nothing.
 add_test(NAME log_escape COMMAND $<TARGET_FILE:wallpaperx-log-escape-test>)
+
+# Outside the guard for the strongest version of log_escape's reason: no bus, no window, no
+# driver, no filesystem. `novulkan` because the sanitizer block below selects by label and an
+# unlabelled entry is disabled there.
+add_test(NAME buffer_claims COMMAND $<TARGET_FILE:wallpaperx-buffer-claims-test>)
+set_tests_properties(buffer_claims PROPERTIES LABELS "novulkan"
+                     SKIP_RETURN_CODE 77)
 # `novulkan`, for the same reason the five renderer entries carry it: the TSan block below
 # is an allow-list on labels, so an unlabelled test is DISABLED there. sanitizeForLog is a
 # pure function of bytes and opens no driver, so the proprietary-ICD SEGV that forces that
@@ -858,6 +875,33 @@ if(DBUS_RUN_SESSION)
                 ENVIRONMENT "QT_QPA_PLATFORM=wayland\;xcb\;offscreen;QT_NO_XDG_DESKTOP_PORTAL=1"
                 RESOURCE_LOCK wallpaperx_bus_tests
                 SKIP_RETURN_CODE 77)
+
+            # The same scene once more, for what the item TELLS THE DAEMON when it lets an image
+            # go. Three entries from one binary, each naming its phase, because the ledger the
+            # plugin keeps is a process-wide singleton with no reset and the daemon-restart phase
+            # has to be the first bus-name owner change its process ever sees -- phases sharing a
+            # process would carry each other's state.
+            add_executable(wallpaperx-item-release-ledger-test tests/item_release_ledger_test.cpp)
+            target_link_libraries(wallpaperx-item-release-ledger-test PRIVATE
+                wallpaperx-renderer wallpaperx-frame-import
+                Qt6::Core Qt6::DBus Qt6::Gui Qt6::Qml Qt6::Quick Qt6::QuickPrivate
+                PkgConfig::EGL OpenGL::GL)
+            target_include_directories(wallpaperx-item-release-ledger-test PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../renderer/tests)
+            target_compile_definitions(wallpaperx-item-release-ledger-test PRIVATE
+                WALLPAPERX_QML_MODULE_PATH="${CMAKE_CURRENT_BINARY_DIR}/qml"
+                WALLPAPERX_SHADER_DIR="${WALLPAPERX_SHADER_OUTPUT_DIR}"
+                WALLPAPERX_TEST_IMAGE_DIR="${WALLPAPERX_ITEM_ASSET_DIR}")
+            add_dependencies(wallpaperx-item-release-ledger-test wallpaperxplugin wallpaperx-shaders)
+            foreach(release_phase repeat-import dropped-frame daemon-restart)
+                add_test(NAME item_release_${release_phase}
+                         COMMAND ${DBUS_RUN_SESSION} --
+                                 $<TARGET_FILE:wallpaperx-item-release-ledger-test> ${release_phase})
+                set_tests_properties(item_release_${release_phase} PROPERTIES
+                    ENVIRONMENT "QT_QPA_PLATFORM=wayland\;xcb\;offscreen;QT_NO_XDG_DESKTOP_PORTAL=1"
+                    RESOURCE_LOCK wallpaperx_bus_tests
+                    SKIP_RETURN_CODE 77)
+            endforeach()
         else()
             # Registered anyway, as an entry that always skips. An unregistered test is one
             # nobody runs and nobody misses: ctest prints a full green run with no line for it,
@@ -879,6 +923,17 @@ if(DBUS_RUN_SESSION)
                      "leaves a black desktop with no message on it is green. Install the Qt6 Quick private headers "
                      "and re-configure.")
             set_tests_properties(item_frame_shown PROPERTIES SKIP_REGULAR_EXPRESSION "NOT VERIFIED")
+            foreach(release_phase repeat-import dropped-frame daemon-restart)
+                add_test(NAME item_release_${release_phase}
+                         COMMAND ${CMAKE_COMMAND} -E echo
+                         "item_release_${release_phase}: NOT VERIFIED -- Qt6 QuickPrivate headers were not found at "
+                         "configure time, so this check was not built. It is part of the only coverage that the "
+                         "plugin tells the daemon when it stops reading an image; without it a build that never "
+                         "releases -- which permanently costs every monitor two of its three images -- is green. "
+                         "Install the Qt6 Quick private headers and re-configure.")
+                set_tests_properties(item_release_${release_phase} PROPERTIES
+                    SKIP_REGULAR_EXPRESSION "NOT VERIFIED")
+            endforeach()
             message(WARNING
                 "Qt6 QuickPrivate headers not found -- item_import_release and item_frame_shown are registered "
                 "as permanent SKIPs rather than built. Those are the only checks that the GL objects imported "
@@ -1109,7 +1164,7 @@ if(WALLPAPERX_BUILD_KDE_PLUGIN)
             # load it: the type information alone looks sufficient, so `import com.wallpaperx`
             # resolves but WallpaperXRenderer never gets registered and nothing instantiates.
             NO_PLUGIN_OPTIONAL
-            SOURCES kde/wallpaperx_item.cpp kde/wallpaperx_item.h
+            SOURCES kde/wallpaperx_item.cpp kde/wallpaperx_item.h kde/buffer_claims.h
             OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/qml/com/wallpaperx)
         target_link_libraries(wallpaperxplugin PRIVATE
             wallpaperx-frame-import Qt6::Core Qt6::DBus Qt6::Quick Qt6::Qml)

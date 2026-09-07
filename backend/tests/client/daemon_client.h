@@ -160,6 +160,33 @@ public:
         return n;
     }
 
+    // Waits until FrameReady(monitorId, generation) has arrived at least `times` times.
+    //
+    // For the re-announcement a freed image produces: the daemon repeats a generation it has
+    // already announced, so wait() above is satisfied by the FIRST one and cannot see the
+    // second. Returns false on timeout, and the caller must have a branch for that -- a repeat
+    // that never came must not read as one that did.
+    bool waitForRepeat(int32_t monitorId, uint64_t generation, size_t times) {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        return m_arrived.wait_for(lock, kSignalTimeout, [&] {
+            size_t n = 0;
+            for (const auto& [id, gen] : m_events) {
+                if (id == monitorId && gen == generation) ++n;
+            }
+            return n >= times;
+        });
+    }
+
+    // How many times this exact (monitor, generation) has been announced so far.
+    size_t countOf(int32_t monitorId, uint64_t generation) const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        size_t n = 0;
+        for (const auto& [id, gen] : m_events) {
+            if (id == monitorId && gen == generation) ++n;
+        }
+        return n;
+    }
+
     size_t total() const {
         std::lock_guard<std::mutex> lock(m_mutex);
         return m_events.size();

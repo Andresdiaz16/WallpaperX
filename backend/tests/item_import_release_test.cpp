@@ -564,6 +564,56 @@ bool runReleaseChecks() {
             std::fflush(stdout);
         }
 
+        // GOAL (S12.18): the daemon is TOLD, and told which image. Freeing this process's GL
+        //       objects is only half of letting go -- until a ReleaseBuffer names the image, the
+        //       daemon goes on
+        //       treating it as held and keeps it out of the ring for the life of the connection,
+        //       which on a monitor of three images is a wallpaper that stops changing.
+        // WHY-THIS-SHAPE: the event loop is pumped AFTER the render pass that destroyed the
+        //       texture, and that pump is the whole point. The release hops to the application
+        //       object with a queued connection, so at the moment the texture is destroyed
+        //       nothing has been sent yet; a check written where the destruction checks are
+        //       would read zero for a correct plugin. The wait is bounded and its expiry leaves
+        //       the count at whatever it was, which fails the check rather than passing it.
+        //       The buffer id is compared, not just the count: a release naming the wrong image
+        //       is worse than none, since it invites the daemon to draw into one this process
+        //       may still be sampling.
+        // CONTROL: `releaseClaim(claim);` deleted from the QSGTexture::destroyed lambda in
+        //       WallpaperXItem::updatePaintNode (backend/kde/wallpaperx_item.cpp) -> "FAIL: the
+        //       plugin told the daemon it had let the image go", printing "0 release(s) arrived
+        //       in two seconds after the texture was destroyed". Reverted.
+        // CONTROL, for the id: `request.setArguments({monitorId, bufferId});` in
+        //       sendReleaseBuffer (backend/kde/wallpaperx_item.cpp) changed to `bufferId + 1`
+        //       -> "FAIL: and named the monitor and the image it had been given", printing "it
+        //       released monitor 0 image 2; it was given monitor 0 image 1". Reverted.
+        {
+            const bool sent = pumpUntil([&stub] { return !stub.releases().empty(); }, 2000);
+            check(sent, "the plugin told the daemon it had let the image go");
+            if (!sent) {
+                std::fprintf(stderr, "  %zu release(s) arrived in two seconds after the texture was destroyed\n",
+                             stub.releases().size());
+            } else {
+                const wallpaperx::testing::ExportingStub::Release& first = stub.releases().front();
+                check(first.monitorId == wallpaperx::testing::kFirstMonitor && first.bufferId == target.bufferId,
+                      "and named the monitor and the image it had been given");
+                if (first.monitorId != wallpaperx::testing::kFirstMonitor || first.bufferId != target.bufferId) {
+                    std::fprintf(stderr, "  it released monitor %d image %llu; it was given monitor %d image %llu\n",
+                                 first.monitorId, static_cast<unsigned long long>(first.bufferId),
+                                 wallpaperx::testing::kFirstMonitor,
+                                 static_cast<unsigned long long>(target.bufferId));
+                }
+            }
+            // The stub's own channel, so a ReleaseBuffer this harness could not parse is not
+            // counted as one that was never sent.
+            // CONTROL: `request.setArguments({monitorId, bufferId});` in sendReleaseBuffer
+            //       (backend/kde/wallpaperx_item.cpp) changed to `{monitorId}` -> "FAIL: every
+            //       ReleaseBuffer the stub saw carried a monitor and an image" AND "FAIL: the
+            //       plugin told the daemon it had let the image go" -- which is the point of
+            //       having both: a release the harness cannot read must not print as one the
+            //       plugin never sent. Reverted.
+            check(stub.malformedReleases() == 0, "every ReleaseBuffer the stub saw carried a monitor and an image");
+        }
+
         control.invalidate();
         return true;
     });

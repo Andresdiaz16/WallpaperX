@@ -55,6 +55,11 @@ private:
 
     void emitFrameReady(int monitorId, uint64_t generation);
 
+    // Announces frames that already exist, after an image came free. Same signal as a new
+    // frame's: "monitor M has generation N" is true either way, and a consumer that holds N
+    // already ignores it.
+    void announceAvailableFrames(const std::vector<FrameAvailable>& available);
+
     // Returns (fd, width, height, memory_size, handle_type, sync_fds, frame_generation,
     //          drm_format, drm_modifier, planes). What each field means, and why sync_fds is a
     //          reserved array rather than a bare 'h', is PLAN.md's DBus Interface section.

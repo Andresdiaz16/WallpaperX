@@ -145,10 +145,13 @@ enum class NoFrameReason {
     RenderFailed,    // the last render was attempted and failed; lastError says why
     Unsupported,     // the recorded type (video, shader) cannot be rendered by this build,
                      // so no amount of waiting or retrying will produce a frame
+    NoFreeImage,     // there IS a frame, but handing it over would leave the producer with
+                     // nowhere to draw. Temporary: the next hand-over or release frees the
+                     // ring, and both are announced with FrameReady.
 };
 
-// The result of asking for a monitor's current frame: the frame, or the reason there
-// isn't one.
+// The result of asking for a monitor's current frame: the frame, or the reason it was not
+// handed over.
 struct FrameExport {
     std::optional<FrameHandle> handle;
 
@@ -162,6 +165,15 @@ struct FrameExport {
 // What renderPending() did, so the caller knows whether to announce a new frame.
 struct RenderOutcome {
     bool rendered = false;
+    uint64_t generation = 0;
+};
+
+// A frame that is already committed and should be announced again, because a claim on one of
+// its monitor's images has just ended. A consumer refused for want of a free image has no other
+// trigger to ask again: nothing new will be rendered for a monitor whose request is already
+// serviced, so without this the refusal would stand until the user set another wallpaper.
+struct FrameAvailable {
+    int monitorId = 0;
     uint64_t generation = 0;
 };
 
@@ -204,9 +216,14 @@ public:
     static constexpr uint32_t kTargetDepth = 3;
 
     // How many of a monitor's images one consumer may hold at once. Two, because a consumer
-    // that has fetched a new frame goes on sampling the old one until the new one is on
-    // screen. A third hand-over drops its oldest claim, which is what stops a consumer that
-    // never calls ReleaseBuffer -- one built against an older daemon -- from starving the ring.
+    // that has fetched a new frame goes on sampling the old one until the new one is on screen.
+    // A third hand-over drops its oldest claim, so a consumer that never calls ReleaseBuffer --
+    // one built against an older daemon -- keeps being served rather than seizing the ring.
+    //
+    // The cap alone does not keep an image free: it only expires a claim when the same consumer
+    // is handed a NEW image, which needs a free one to render into. What guarantees the producer
+    // somewhere to draw is exportCurrentFrame() refusing the hand-over that would take the last
+    // free image.
     static constexpr size_t kMaxHeldPerClient = 2;
 
     // How many consumers may hold images on one monitor. Bounds what a peer can make the
@@ -299,13 +316,18 @@ public:
     // holding pixels of the previous wallpaper. Failures land in lastError; nobody is waiting.
     RenderOutcome renderPending(int monitorId);
 
-    // Exports the monitor's most recent frame as a fresh fd. An empty handle means there is
-    // nothing to export, with `reason` saying which state that is; a thrown exception means
-    // the export itself went wrong.
+    // Exports the monitor's most recent frame as a fresh fd. An empty handle means nothing was
+    // handed over, with `reason` saying which state that is; a thrown exception means the
+    // export itself went wrong.
     //
     // A successful export records `client` -- its DBus unique name -- as holding that image,
     // and no render draws into a held image. The claim ends at ReleaseBuffer, at the client's
     // third hand-over, or when it leaves the bus.
+    //
+    // One image per monitor always stays out of consumers' hands: a hand-over that would leave
+    // the ring with nowhere to draw is refused with NoFreeImage instead. Nothing may be taken
+    // back from a consumer that could still be sampling it, so refusing the request is the only
+    // bound on the holds that does not risk drawing into an image being read.
     //
     // The default is for a caller that is not a bus peer, and it records no claim: there would
     // be no name to withdraw it under, and a claim nothing can end takes an image out of the
@@ -317,12 +339,18 @@ public:
     // the monitors whose deferred render should be retried now that an image may be free.
     // Silent about a claim it does not hold: a consumer releasing twice, or releasing one
     // already dropped for it, is not making an error. Throws InvalidRequest for a bad id.
-    std::vector<int> releaseBuffer(const std::string& client, int monitorId, uint64_t bufferId);
+    //
+    // `announce`, when given, receives the monitors that owe no render and so will announce
+    // nothing of their own -- the freed image has to be published some other way, or a consumer
+    // refused for want of one never learns it may ask again. The two are disjoint: a monitor
+    // either owes a render or has its committed frame re-announced.
+    std::vector<int> releaseBuffer(const std::string& client, int monitorId, uint64_t bufferId,
+                                   std::vector<FrameAvailable>* announce = nullptr);
 
     // The same for every image on every monitor, because `client` left the bus. Without it a
     // consumer that crashed holding a frame would keep that image out of the ring forever --
     // and plasmashell restarts are routine, while this daemon does not.
-    std::vector<int> forgetHeldBuffers(const std::string& client);
+    std::vector<int> forgetHeldBuffers(const std::string& client, std::vector<FrameAvailable>* announce = nullptr);
 
     // One consistent snapshot of everything GetStatus reports. Deliberately not two accessors:
     // separate lock acquisitions let a render commit in between, producing a reply that claims
@@ -409,6 +437,8 @@ private:
 
         // Renders refused for want of a free image since the last committed frame. Reset by a
         // commit, so it reads as how far behind this monitor is now rather than as a total.
+        // Reads zero for as long as the reserve holds -- a non-zero count means a hand-over got
+        // past exportCurrentFrame()'s refusal, so it is now a report on that invariant.
         uint32_t deferredRenders = 0;
     };
 
@@ -429,9 +459,21 @@ private:
     // The images `monitorId` has handed out and not got back. Caller must hold m_stateMutex.
     std::vector<uint64_t> heldBuffersLocked(int monitorId) const;
 
-    // Records that `client` holds `bufferId`, applying both caps. Caller must hold
-    // m_stateMutex and must have checked that `client` is not empty.
-    void recordHandoverLocked(MonitorState& state, const std::string& client, uint64_t bufferId);
+    // The claims that would be in force if `client` were handed `bufferId`, applying both caps.
+    // `client` must not be empty. One rule, applied to a copy to decide whether a hand-over may
+    // happen and to the live holds to record it, so the admission test cannot come to disagree
+    // with the bookkeeping it is predicting.
+    static std::vector<BufferHold> withHandover(std::vector<BufferHold> holds, const std::string& client,
+                                                uint64_t bufferId);
+
+    // Every id in `holds`, which nextUnheld() takes as its membership test. Duplicates are left
+    // in: two consumers may hold the same image, and both claims are real.
+    static std::vector<uint64_t> flattenHolds(const std::vector<BufferHold>& holds);
+
+    // What an image coming free on `monitorId` is worth: appends to `toRender` or to `announce`,
+    // never both. Caller must hold m_stateMutex.
+    static void reportFreedImageLocked(int monitorId, const MonitorState& state, std::vector<int>& toRender,
+                                       std::vector<FrameAvailable>* announce);
 
     // Reads the config on a thread this can walk away from. Linux gives no way to bound a
     // filesystem call -- a hard network mount is uninterruptible by design -- so the only

@@ -72,6 +72,7 @@
 #include <stb_image_write.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -1301,9 +1302,12 @@ void checkResponsivenessUnderLoad(sdbus::IProxy& proxy, FrameReadyLog& signals, 
 // What can be asserted from out here is deliberately narrow. `requestSeq` supersede and
 // `servicedSeq` idempotence are internal, and a test that guessed at their values would
 // be asserting on the scheduler. The externally true statements are: nothing crashes,
-// every reply is either well-formed or one of the two named errors that are legitimate
+// every reply is either well-formed or one of the three named errors that are legitimate
 // mid-flight, and `generation` never goes backwards for a monitor -- which is the
-// observable consequence of both paths being correct.
+// observable consequence of both paths being correct. The third of those errors -- the
+// producer refusing to hand over its last free image -- is counted per monitor rather than
+// merely tolerated, so admitting it here does not turn the phase green for a daemon that
+// refuses everything.
 // ---------------------------------------------------------------------------- //
 struct StormResult {
     std::atomic<int> unexpectedErrors{0};
@@ -1312,6 +1316,19 @@ struct StormResult {
     std::atomic<int> calls{0};
     std::mutex mutex;
     std::string firstUnexpected;
+
+    // Per storm monitor: how many hand-overs were served, and how many were refused because
+    // granting one would have left the producer nowhere to draw. Read only after every thread
+    // has joined -- comparing them mid-storm is a race, since the thread that was served and
+    // the thread that was refused record in whichever order they are scheduled.
+    std::array<std::atomic<int>, kStormMonitors> served{};
+    std::array<std::atomic<int>, kStormMonitors> refusedForReserve{};
+
+    // Every reading of GetStatus's deferred_renders that was above zero, and how many readings
+    // were taken. renderPending()'s deferral path is a backstop the producer's reserve is meant
+    // to keep unreachable, so any non-zero reading is a report that a hand-over got past it.
+    std::atomic<int> deferralReadings{0};
+    std::atomic<int> deferralsSeen{0};
 };
 
 // Each client's own high-water mark, held on its stack -- deliberately NOT shared across
@@ -1383,7 +1400,7 @@ void stormThread(int index, const std::string& bluePath, const std::string& redP
                     // unexpected error because its name is neither of the two legitimate
                     // ones.
                     // CONTROL: DbusService::getStatus made to throw -> "FAIL: concurrent
-                    //       clients see only the two named errors that are legitimate
+                    //       clients see only the three named errors that are legitimate
                     //       mid-render", with "29 unexpected failure(s); first was:
                     //       GetStatus failed with org.sdbuscpp.Error". Reverted.
                     if (!status.ok()) recordUnexpected(result, status.error());
@@ -1393,6 +1410,13 @@ void stormThread(int index, const std::string& bluePath, const std::string& redP
                     const nlohmann::json* entry = wallpaperStatus(status, std::to_string(monitorId));
                     if (entry != nullptr) {
                         observeGeneration(result, marks, monitorId, entry->value("generation", uint64_t{0}));
+                        // Read on every pass rather than once at the end, because the count is
+                        // cleared by the next commit: a deferral that happened mid-storm would
+                        // be gone by the time a single reading after the storm was taken.
+                        if (entry->contains("deferred_renders") && (*entry)["deferred_renders"].is_number_unsigned()) {
+                            ++result.deferralReadings;
+                            if (entry->value("deferred_renders", uint32_t{0}) > 0) ++result.deferralsSeen;
+                        }
                     }
                     break;
                 }
@@ -1401,19 +1425,29 @@ void stormThread(int index, const std::string& bluePath, const std::string& redP
                     if (fcntl(frame.fd.get(), F_GETFD) == -1) {
                         recordUnexpected(result, "GetFrameFd returned a closed fd");
                     }
+                    ++result.served.at(static_cast<size_t>(monitorId - kMonitorStormBase));
                     observeGeneration(result, marks, monitorId, frame.generation);
                     break;
                 }
             }
             ++result.calls;
         } catch (const sdbus::Error& e) {
-            // Both are legitimate answers mid-storm: a monitor whose render has not
-            // committed yet has no frame, and a monitor whose most recent request was
-            // superseded before it rendered reports the previous failure. Anything else
-            // -- a timeout, a disconnect, an unhandled exception escaping a handler --
-            // is a defect.
+            // Three legitimate answers mid-storm: a monitor whose render has not committed
+            // yet has no frame; a monitor whose most recent request was superseded before
+            // it rendered reports the previous failure; and a monitor whose other images
+            // are all held refuses the hand-over that would take the producer's last one.
+            // Anything else -- a timeout, a disconnect, an unhandled exception escaping a
+            // handler -- is a defect.
+            //
+            // The third is counted per monitor rather than merely tolerated, because
+            // admitting a name to this list is otherwise a pure weakening: a daemon that
+            // refused EVERY hand-over would leave this phase green. What that count is
+            // asserted against is at the end of checkConcurrentClients().
             const std::string name = e.getName();
-            if (name != "io.wallpaperx.Daemon.Error.NoFrame" && name != "io.wallpaperx.Daemon.Error.RenderFailed") {
+            if (name == "io.wallpaperx.Daemon.Error.NoFreeImage") {
+                ++result.refusedForReserve.at(static_cast<size_t>(monitorId - kMonitorStormBase));
+            } else if (name != "io.wallpaperx.Daemon.Error.NoFrame" &&
+                       name != "io.wallpaperx.Daemon.Error.RenderFailed") {
                 recordUnexpected(result, name + ": " + e.getMessage());
             }
             ++result.calls;
@@ -1437,12 +1471,98 @@ void checkConcurrentClients(sdbus::IProxy& proxy, FrameReadyLog& signals, const 
     }
     for (std::jthread& t : threads) t.join();
 
-    check(result.unexpectedErrors == 0, "concurrent clients see only the two named errors that are legitimate "
+    check(result.unexpectedErrors == 0, "concurrent clients see only the three named errors that are legitimate "
                                         "mid-render");
     if (result.unexpectedErrors != 0) {
         std::lock_guard<std::mutex> lock(result.mutex);
         std::fprintf(stderr, "  %d unexpected failure(s); first was: %s\n", result.unexpectedErrors.load(),
                      result.firstUnexpected.c_str());
+    }
+
+    // GOAL: the producer's reserve refuses a hand-over only when it has images out on loan. A
+    //       monitor that answered "no free image" must have handed at least one image out
+    //       during this storm -- a daemon that refused unconditionally, or one whose admission
+    //       test disagreed with its own bookkeeping, would refuse a monitor it had never served.
+    // WHY-THIS-SHAPE: evaluated after every thread has joined, and per monitor, because that is
+    //       the only form of this that is not an assertion on the scheduler. Comparing the two
+    //       counters mid-storm is a race -- the thread that was served and the thread that was
+    //       refused record in whichever order they run -- and asserting that any particular
+    //       number of refusals happened would be asserting on the interleaving too, since how
+    //       many clients hold how many images at any instant is a scheduling outcome. This is
+    //       also what stops NoFreeImage's admission to the legitimate-error list above from
+    //       being a pure weakening.
+    // CONTROL: a refusal for every named caller on this phase's monitors alone, inserted ahead
+    //       of the admission block in WallpaperManager::exportCurrentFrame (backend/daemon/
+    //       wallpaper_manager.cpp) as `if (!client.empty() && monitorId >= 20) { out.reason =
+    //       NoFreeImage; return out; }` -> "FAIL: a monitor was only refused for want of a free
+    //       image after it had handed one out", printing "4 monitor(s) refused without ever
+    //       serving -- monitor 20: 0 served, 1 refused; ...". Scoped to monitor ids 20 and up
+    //       on purpose: refusing every caller everywhere throws out of an earlier phase, which
+    //       ends the run before this one is reached and would leave the check unattested. It
+    //       also reddens the monotonicity coverage assertion below, because a refused hand-over
+    //       records no generation. Reverted.
+    // COVERAGE-ASSERT: how many refusals this run actually saw is printed beside the verdict,
+    //       so a future change that stopped producing any -- which would make the check above
+    //       vacuously true -- is visible in the log rather than silent.
+    {
+        int refusalsTotal = 0;
+        int monitorsRefusedWithoutServing = 0;
+        std::string detail;
+        for (int i = 0; i < kStormMonitors; ++i) {
+            const int refused = result.refusedForReserve.at(static_cast<size_t>(i)).load();
+            const int servedHere = result.served.at(static_cast<size_t>(i)).load();
+            refusalsTotal += refused;
+            if (refused > 0 && servedHere == 0) ++monitorsRefusedWithoutServing;
+            detail += " monitor " + std::to_string(kMonitorStormBase + i) + ": " + std::to_string(servedHere) +
+                      " served, " + std::to_string(refused) + " refused;";
+        }
+        check(monitorsRefusedWithoutServing == 0,
+              "a monitor was only refused for want of a free image after it had handed one out");
+        if (monitorsRefusedWithoutServing != 0) {
+            std::fprintf(stderr, "  %d monitor(s) refused without ever serving --%s\n",
+                         monitorsRefusedWithoutServing, detail.c_str());
+        }
+        std::printf("daemon_system_test: the storm saw %d hand-over(s) refused for want of a free image --%s\n",
+                    refusalsTotal, detail.c_str());
+        std::fflush(stdout);
+    }
+
+    // GOAL: no render is ever deferred for want of a free image. exportCurrentFrame()'s reserve
+    //       is what keeps one, and renderPending()'s deferral path is a backstop that should now
+    //       be unreachable -- so any reading above zero is a report that a hand-over got past the
+    //       reserve, which is a wallpaper that stops changing on a monitor under contention.
+    // WHY-THIS-SHAPE: sampled on every GetStatus the storm makes rather than once afterwards,
+    //       because the count is cleared by the next commit: a deferral that really happened
+    //       would be gone by the time a single reading at the end was taken. Non-zero at ANY
+    //       reading is the violation, which makes it independent of the interleaving -- unlike
+    //       an assertion that some particular number of deferrals did or did not occur.
+    // CONTROL: `if (deferred)` in WallpaperManager::renderPending (backend/daemon/
+    //       wallpaper_manager.cpp) changed to `if (true)`, so every render defers -> "FAIL: no
+    //       render was ever deferred for want of a free image, which the producer's reserve is
+    //       what prevents", printing "21 of 22 readings reported a deferred render". Reverted.
+    //       Deleting exportCurrentFrame()'s reserve does NOT redden this: measured, that run
+    //       produced no deferral on any storm monitor at all, because whether four clients come
+    //       to hold all three images of one monitor is a scheduling outcome. That is the reason
+    //       the deferral claim is graded here as an invariant over every reading rather than as
+    //       a state this phase drives the daemon into -- the deterministic version of it is in
+    //       dbus_service_test's buffer-hold phase.
+    // COVERAGE-ASSERT: the number of readings is asserted, so a reply that stopped carrying
+    //       deferred_renders -- which would leave the check above true of nothing -- fails
+    //       instead of going quiet. One reading per thread is far below the measured count
+    //       (roughly a third of 4 x 24 calls land on the GetStatus arm; 22 readings measured on
+    //       this host) and is a bound a slow host cannot flake.
+    // CONTROL, for the coverage assertion: `entry["deferred_renders"] = monitor.deferredRenders;`
+    //       in DbusService::getStatus (backend/daemon/dbus_service.cpp) guarded by
+    //       `if (monitor.deferredRenders > 0)` -> "FAIL: deferred_renders was actually readable
+    //       from the storm's GetStatus replies", with the invariant check below still green on
+    //       zero readings, which is exactly the vacuous pass it exists to catch. Reverted.
+    check(result.deferralReadings >= kStormThreads,
+          "deferred_renders was actually readable from the storm's GetStatus replies");
+    check(result.deferralsSeen == 0,
+          "no render was ever deferred for want of a free image, which the producer's reserve is what prevents");
+    if (result.deferralsSeen != 0) {
+        std::fprintf(stderr, "  %d of %d readings reported a deferred render\n", result.deferralsSeen.load(),
+                     result.deferralReadings.load());
     }
     check(result.generationRegressions == 0, "a monitor's generation never goes backwards under concurrent clients");
     // GOAL: X.5 -- the monotonicity check asserts how much comparing it actually did.
