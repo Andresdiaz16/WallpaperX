@@ -8,6 +8,7 @@
 #include "device.h"
 #include "memory_export.h"
 
+#include <algorithm>
 #include <array>
 #include <stdexcept>
 #include <utility>
@@ -160,6 +161,18 @@ void OffscreenTargetManager::render(IRenderer& renderer, const OffscreenTarget& 
                              nullptr, 0, nullptr, 1, &release);
     });
     target.notifyPublished(consumer, renderedLayout);
+    makeCurrent(target);
+}
+
+void OffscreenTargetManager::makeCurrent(const OffscreenTarget& target) {
+    for (auto& [id, ring] : m_targets) {
+        for (size_t slot = 0; slot < ring.images.size(); ++slot) {
+            if (&ring.images[slot] == &target) {
+                ring.current = slot;
+                return;
+            }
+        }
+    }
 }
 
 void OffscreenTargetManager::reclaim(const OffscreenTarget& target) {
@@ -318,6 +331,21 @@ const OffscreenTarget& OffscreenTargetManager::advance(int monitorId) {
     Ring& ring = m_targets.at(monitorId);
     ring.current = (ring.current + 1) % ring.images.size();
     return ring.images[ring.current];
+}
+
+const OffscreenTarget* OffscreenTargetManager::nextUnheld(int monitorId, const std::vector<uint64_t>& held) const {
+    const Ring& ring = m_targets.at(monitorId);
+    const size_t count = ring.images.size();
+
+    // A ring whose current slot has never been drawn into starts there; every other case
+    // starts one past the published frame, so the image a consumer was most recently told
+    // about is the last slot considered rather than the first.
+    const size_t first = ring.images[ring.current].published() ? 1 : 0;
+    for (size_t step = first; step < first + count; ++step) {
+        const OffscreenTarget& candidate = ring.images[(ring.current + step) % count];
+        if (std::find(held.begin(), held.end(), candidate.bufferId) == held.end()) return &candidate;
+    }
+    return nullptr;
 }
 
 uint32_t OffscreenTargetManager::depth(int monitorId) const {

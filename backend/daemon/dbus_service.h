@@ -67,7 +67,15 @@ private:
         sdbus::Result<sdbus::UnixFd, uint32_t, uint32_t, uint64_t, int32_t, std::vector<sdbus::UnixFd>, uint64_t,
                       uint32_t, uint64_t, std::vector<sdbus::Struct<uint64_t, uint64_t>>, std::vector<uint8_t>,
                       uint64_t>;
-    void completeGetFrameFd(FrameFdCall call, int32_t monitorId);
+    // `client` is the caller's DBus unique name, read in the handler because that is the only
+    // place the message is current: by the time this runs the event loop has moved on. It is
+    // what the hand-over is recorded against, and what a departure later withdraws.
+    void completeGetFrameFd(FrameFdCall call, int32_t monitorId, std::string client);
+
+    // The consumer says it has stopped reading one image, so the producer may draw into it
+    // again. Synchronous: it touches bookkeeping only, and the renders it unblocks go to the
+    // worker like every other one.
+    void releaseBuffer(const std::string& client, int32_t monitorId, uint64_t bufferId);
 
     // Records what the consumer can import and re-posts the monitors whose images were built
     // against the previous set. Synchronous: it touches bookkeeping only, and the GPU work

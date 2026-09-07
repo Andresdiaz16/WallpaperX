@@ -56,6 +56,11 @@ struct MonitorStatus {
     // A render has been accepted and no pass has run for it yet -- "the daemon owes an answer",
     // as against "this monitor has no picture", which is also true of a superseded render.
     bool renderOutstanding = false;
+
+    // Renders refused since the last committed frame because every image on this monitor was
+    // in a consumer's hands. Published because a producer quietly drawing less often than it
+    // was asked to is otherwise indistinguishable from one that is keeping up.
+    uint32_t deferredRenders = 0;
 };
 
 // True once a config read has been abandoned mid-call. That thread is still blocked in the
@@ -193,6 +198,21 @@ public:
     // state.
     static constexpr size_t kMaxImportModifiers = 512;
 
+    // Images per monitor. Three is the smallest number that leaves the producer somewhere to
+    // draw while a consumer holds both the frame it is displaying and the one it has just
+    // fetched -- see kMaxHeldPerClient. Two would make every hand-over a stall.
+    static constexpr uint32_t kTargetDepth = 3;
+
+    // How many of a monitor's images one consumer may hold at once. Two, because a consumer
+    // that has fetched a new frame goes on sampling the old one until the new one is on
+    // screen. A third hand-over drops its oldest claim, which is what stops a consumer that
+    // never calls ReleaseBuffer -- one built against an older daemon -- from starving the ring.
+    static constexpr size_t kMaxHeldPerClient = 2;
+
+    // How many consumers may hold images on one monitor. Bounds what a peer can make the
+    // daemon remember; the least recently served holder is dropped to make room.
+    static constexpr size_t kMaxHoldersPerMonitor = 4;
+
     struct Config {
         // Placeholder geometry: no source of real monitor dimensions exists until the app
         // supplies them via KScreen (Step 15). Tests override it to keep software-rasterised
@@ -282,7 +302,27 @@ public:
     // Exports the monitor's most recent frame as a fresh fd. An empty handle means there is
     // nothing to export, with `reason` saying which state that is; a thrown exception means
     // the export itself went wrong.
-    FrameExport exportCurrentFrame(int monitorId);
+    //
+    // A successful export records `client` -- its DBus unique name -- as holding that image,
+    // and no render draws into a held image. The claim ends at ReleaseBuffer, at the client's
+    // third hand-over, or when it leaves the bus.
+    //
+    // The default is for a caller that is not a bus peer, and it records no claim: there would
+    // be no name to withdraw it under, and a claim nothing can end takes an image out of the
+    // ring for the life of the daemon. A frame exported that way can be redrawn under its
+    // reader.
+    FrameExport exportCurrentFrame(int monitorId, const std::string& client = {});
+
+    // Drops `client`'s claim on one image, because it says it has stopped reading it. Returns
+    // the monitors whose deferred render should be retried now that an image may be free.
+    // Silent about a claim it does not hold: a consumer releasing twice, or releasing one
+    // already dropped for it, is not making an error. Throws InvalidRequest for a bad id.
+    std::vector<int> releaseBuffer(const std::string& client, int monitorId, uint64_t bufferId);
+
+    // The same for every image on every monitor, because `client` left the bus. Without it a
+    // consumer that crashed holding a frame would keep that image out of the ring forever --
+    // and plasmashell restarts are routine, while this daemon does not.
+    std::vector<int> forgetHeldBuffers(const std::string& client);
 
     // One consistent snapshot of everything GetStatus reports. Deliberately not two accessors:
     // separate lock acquisitions let a render commit in between, producing a reply that claims
@@ -324,6 +364,14 @@ public:
     bool validationLayerActive() const;
 
 private:
+    // One consumer's claim on a monitor's images: the buffer ids it has been handed and has
+    // not given back, oldest first. Kept in the order consumers were first served rather than
+    // in a map, so "drop the least recently served" needs no second field to order them.
+    struct BufferHold {
+        std::string client;  // DBus unique name
+        std::vector<uint64_t> buffers;
+    };
+
     struct MonitorState {
         std::string type;
         std::string path;
@@ -353,15 +401,37 @@ private:
         // the frame was exported as an opaque fd, which carries no layout for a report to
         // exclude. Meaningless unless hasFrame.
         uint64_t frameModifier = kDrmModifierInvalid;
+
+        // Who is reading which of this monitor's images. The one authority on it: which images
+        // a render may draw into is derived from this list rather than recorded a second time.
+        // Emptied whenever the ring is rebuilt, since the ids then name images that are gone.
+        std::vector<BufferHold> holds;
+
+        // Renders refused for want of a free image since the last committed frame. Reset by a
+        // commit, so it reads as how far behind this monitor is now rather than as a total.
+        uint32_t deferredRenders = 0;
     };
 
     // Creates the Device and target manager on first use, so a machine with no working Vulkan
     // still starts and reports a clean error. Called with m_gpuMutex held.
     void ensureGpu();
 
-    // Both called with m_gpuMutex held.
-    const OffscreenTarget& acquireTarget(int monitorId);
+    // Both called with m_gpuMutex held, and both drop the monitor's holds when they change
+    // which images exist: a claim on an image that has been freed names an id nothing will
+    // ever hand out again.
+    void ensureTargets(int monitorId);
     void releaseTarget(int monitorId);
+
+    // Drops every claim on a monitor whose images have just been freed or replaced. Takes
+    // m_stateMutex itself, so the caller must hold only m_gpuMutex.
+    void forgetHolds(int monitorId);
+
+    // The images `monitorId` has handed out and not got back. Caller must hold m_stateMutex.
+    std::vector<uint64_t> heldBuffersLocked(int monitorId) const;
+
+    // Records that `client` holds `bufferId`, applying both caps. Caller must hold
+    // m_stateMutex and must have checked that `client` is not empty.
+    void recordHandoverLocked(MonitorState& state, const std::string& client, uint64_t bufferId);
 
     // Reads the config on a thread this can walk away from. Linux gives no way to bound a
     // filesystem call -- a hard network mount is uninterruptible by design -- so the only

@@ -303,6 +303,24 @@ inline void setImportModifiers(sdbus::IProxy& proxy, uint32_t drmFormat, const s
         .withArguments(drmFormat, modifiers);
 }
 
+// Tells the daemon the caller has stopped reading one image, so the producer may draw into it
+// again. `bufferId` is the value the same client was handed as GetFrameFd's `buffer_id`.
+//
+// Here rather than in one test file for the reason this header exists: the argument order
+// (monitor first, then the buffer) is a wire fact, and a private copy would go on compiling
+// and passing if it ever changed. The daemon attributes the release to the SENDER, so which
+// proxy this is called on is part of what a caller is saying -- a proxy on a shared connection
+// is the same consumer as far as the daemon can tell.
+//
+// `timeout` as on setWallpaper() above: zero means the bus's default.
+inline void releaseBuffer(sdbus::IProxy& proxy, int32_t monitorId, uint64_t bufferId,
+                          std::chrono::microseconds timeout = {}) {
+    proxy.callMethod("ReleaseBuffer")
+        .onInterface(DbusService::kInterface)
+        .withTimeout(timeout)
+        .withArguments(monitorId, bufferId);
+}
+
 // `timeout` as on setWallpaper() above: zero means the bus's default.
 inline StatusReply getStatus(sdbus::IProxy& proxy, std::chrono::microseconds timeout = {}) {
     std::string status;

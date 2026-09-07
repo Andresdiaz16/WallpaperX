@@ -54,6 +54,11 @@ void DbusService::watchClientExits() {
                 // A monitor the departed consumer's set left with no frame can be drawn again
                 // now that the constraint is gone, and this is the only thing that will retry it.
                 applyImportModifierUpdate(m_manager.forgetImportModifiers(name));
+
+                // Likewise its claim on the images it was reading. A consumer that crashed
+                // holding a frame -- plasmashell restarts are routine, this daemon does not --
+                // would otherwise keep those images out of the ring for good.
+                for (const int monitorId : m_manager.forgetHeldBuffers(name)) m_worker.post(monitorId);
             }
         });
 }
@@ -82,9 +87,12 @@ void DbusService::registerVTable() {
                 // Async: the handler hands the export to the GPU thread and returns, so
                 // the event loop keeps serving while the frame is produced.
                 .implementedAs([this](FrameFdCall&& call, int32_t monitorId) {
+                    // Read here and carried, not read on the worker: the currently-processed
+                    // message is only current inside the handler.
+                    const char* sender = m_object->getCurrentlyProcessedMessage().getSender();
                     m_worker.postTask(
-                        [this, call = std::move(call),
-                         monitorId](wallpaperx::RenderWorker::TaskState state) mutable {
+                        [this, call = std::move(call), monitorId, client = std::string(sender ? sender : "")](
+                            wallpaperx::RenderWorker::TaskState state) mutable {
                             // Answered rather than dropped: destroying the Result sends
                             // nothing, leaving a GUI client blocked for the full reply
                             // timeout on a request that will never run.
@@ -103,13 +111,19 @@ void DbusService::registerVTable() {
                                 case RenderWorker::TaskState::Run:
                                     break;
                             }
-                            completeGetFrameFd(std::move(call), monitorId);
+                            completeGetFrameFd(std::move(call), monitorId, std::move(client));
                         });
                 })
                 .withInputParamNames("monitor_id")
                 .withOutputParamNames("fd", "width", "height", "memory_size", "handle_type", "sync_fds",
                                       "frame_generation", "drm_format", "drm_modifier", "planes", "device_uuid",
                                       "buffer_id"),
+            sdbus::registerMethod("ReleaseBuffer")
+                .implementedAs([this](int32_t monitorId, uint64_t bufferId) {
+                    const char* sender = m_object->getCurrentlyProcessedMessage().getSender();
+                    releaseBuffer(sender ? sender : "", monitorId, bufferId);
+                })
+                .withInputParamNames("monitor_id", "buffer_id"),
             sdbus::registerMethod("SetImportModifiers")
                 .implementedAs([this](uint32_t drmFormat, const std::vector<uint64_t>& modifiers) {
                     // The sender's unique name, not anything it could put in the arguments: the
@@ -243,13 +257,25 @@ void DbusService::setMonitorOutput(int32_t monitorId, const std::string& outputN
     // no render to schedule and no target to release.
 }
 
-void DbusService::completeGetFrameFd(FrameFdCall call, int32_t monitorId) {
+void DbusService::releaseBuffer(const std::string& client, int32_t monitorId, uint64_t bufferId) {
+    std::vector<int> toRender;
+    try {
+        toRender = m_manager.releaseBuffer(client, monitorId, bufferId);
+    } catch (const InvalidRequest& e) {
+        std::fprintf(stderr, "wallpaperx-daemon: ReleaseBuffer rejected (monitor=%d): %s\n", monitorId, e.what());
+        throw sdbus::Error(sdbus::Error::Name{kErrorInvalidArgs}, e.what());
+    }
+    // A render that had nowhere to draw, now that this image is free.
+    for (const int id : toRender) m_worker.post(id);
+}
+
+void DbusService::completeGetFrameFd(FrameFdCall call, int32_t monitorId, std::string client) {
     // Runs on the render worker's thread, so nothing here may throw past this frame --
     // an escaping exception would be std::terminate on a bare thread. Every path below
     // either returns results or returns an error on `call`.
     FrameExport exported;
     try {
-        exported = m_manager.exportCurrentFrame(monitorId);
+        exported = m_manager.exportCurrentFrame(monitorId, client);
     } catch (const InvalidRequest& e) {
         call.returnError(sdbus::Error(sdbus::Error::Name{kErrorInvalidArgs}, e.what()));
         return;
@@ -403,6 +429,11 @@ std::string DbusService::getStatus() {
         // that appears only in the bad case is one a client learns about by hitting it.
         // Shares isRenderableType() with GetFrameFd so the two cannot disagree.
         entry["unsupported"] = !isRenderableType(monitor.type);
+        // The third reason a successful SetWallpaper produces no FrameReady: every image on
+        // this monitor is being read and the render is waiting for one back. Always emitted,
+        // and zero for a monitor that is keeping up -- a producer quietly drawing less often
+        // than it was asked to is otherwise indistinguishable from one that is not.
+        entry["deferred_renders"] = monitor.deferredRenders;
         wallpapers[std::to_string(monitorId)] = std::move(entry);
     }
     status["wallpapers"] = wallpapers;

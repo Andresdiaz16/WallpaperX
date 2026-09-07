@@ -105,13 +105,23 @@ public:
     void destroy(int monitorId);
     bool has(int monitorId) const;
 
-    // The slot currently being drawn into. Stable until destroy(): the slots are allocated
-    // once at create() and never grow, so a reference outlives any number of advance() calls.
+    // The slot holding the frame this monitor last published. Stable until destroy(): the
+    // slots are allocated once at create() and never grow, so a reference outlives any
+    // number of renders.
     const OffscreenTarget& get(int monitorId) const;
 
     // Rotates to the next slot and returns it. With depth 1 this returns the same target,
     // which is what makes the draw-once path indifferent to being called or not.
     const OffscreenTarget& advance(int monitorId);
+
+    // The slot the next render should draw into: the first one past the published frame
+    // whose bufferId is absent from `held`, or the published slot itself while nothing has
+    // been published. Null when every slot is held, which means every image on this monitor
+    // is being read and there is nowhere to draw.
+    //
+    // A query, not a rotation: render() is what makes a slot current, so a render that the
+    // caller then refuses or abandons leaves the published frame exactly where it was.
+    const OffscreenTarget* nextUnheld(int monitorId, const std::vector<uint64_t>& held) const;
 
     uint32_t depth(int monitorId) const;
 
@@ -128,6 +138,11 @@ public:
     // state is only committed once the submit has actually succeeded. Doing it at
     // record time would leave a target claiming a transition that never ran if the
     // submit throws (device lost, OOM), and the next acquire would then name it.
+    //
+    // A successful render also makes `target` its monitor's current slot, so get() and
+    // "the frame that was published" cannot name different images. That is why nothing
+    // else moves the cursor: a caller that chose a slot and then did not draw into it
+    // would otherwise leave the ring pointing at a blank one.
     void render(IRenderer& renderer, const OffscreenTarget& target);
 
     // Takes a published frame back: submits the acquire that reverses render()'s release,
@@ -147,6 +162,9 @@ public:
 
 private:
     void createRenderPass();
+    // Points the owning ring's cursor at `target`. Does nothing for a target this manager
+    // does not own, which no shipping caller can produce.
+    void makeCurrent(const OffscreenTarget& target);
     void destroyTarget(OffscreenTarget& target);
     // One device-idle wait for the whole batch, then each is freed.
     void destroyTargets(const std::vector<OffscreenTarget*>& images);
@@ -154,8 +172,8 @@ private:
     void dropTarget(OffscreenTarget& target);
     OffscreenTarget makeTarget(uint32_t width, uint32_t height);
 
-    // One monitor's images and which of them is current. A vector sized once at create() and
-    // never grown, so the references get() hands out stay valid.
+    // One monitor's images and which of them holds the published frame. A vector sized once
+    // at create() and never grown, so the references get() hands out stay valid.
     //
     // NOT named `slots`: Qt defines that as an empty macro, and this header is included from
     // the plugin's Qt translation units, where the member would silently disappear.

@@ -331,19 +331,93 @@ void WallpaperManager::ensureGpu() {
     std::fflush(stdout);
 }
 
-const OffscreenTarget& WallpaperManager::acquireTarget(int monitorId) {
+void WallpaperManager::ensureTargets(int monitorId) {
     // Keyed on the dimensions, not on mere existence: create() replaces and waits for idle, so
     // reuse is worth it, and when real monitor geometry arrives this will not go on quietly
     // rendering at the old resolution.
     const bool reusable = m_targets->has(monitorId) && m_targets->get(monitorId).width == m_config.width &&
                           m_targets->get(monitorId).height == m_config.height;
-    return reusable ? m_targets->get(monitorId) : m_targets->create(monitorId, m_config.width, m_config.height);
+    if (reusable) return;
+
+    m_targets->create(monitorId, m_config.width, m_config.height, kTargetDepth);
+    forgetHolds(monitorId);
 }
 
 void WallpaperManager::releaseTarget(int monitorId) {
     if (m_targets && m_targets->has(monitorId)) {
         m_targets->destroy(monitorId);
+        forgetHolds(monitorId);
     }
+}
+
+// Takes m_stateMutex itself, so its callers hold m_gpuMutex and not m_stateMutex.
+void WallpaperManager::forgetHolds(int monitorId) {
+    std::lock_guard<std::mutex> stateLock(m_stateMutex);
+    auto it = m_monitors.find(monitorId);
+    if (it != m_monitors.end()) it->second.holds.clear();
+}
+
+std::vector<uint64_t> WallpaperManager::heldBuffersLocked(int monitorId) const {
+    std::vector<uint64_t> held;
+    auto it = m_monitors.find(monitorId);
+    if (it == m_monitors.end()) return held;
+    for (const BufferHold& hold : it->second.holds) {
+        held.insert(held.end(), hold.buffers.begin(), hold.buffers.end());
+    }
+    return held;
+}
+
+void WallpaperManager::recordHandoverLocked(MonitorState& state, const std::string& client, uint64_t bufferId) {
+    auto holder = std::find_if(state.holds.begin(), state.holds.end(),
+                               [&client](const BufferHold& hold) { return hold.client == client; });
+    if (holder == state.holds.end()) {
+        // The least recently served holder goes, not an arbitrary one: a consumer that has not
+        // been handed a frame in the longest is the likeliest to have stopped reading.
+        if (state.holds.size() >= kMaxHoldersPerMonitor) state.holds.erase(state.holds.begin());
+        state.holds.push_back(BufferHold{client, {}});
+        holder = std::prev(state.holds.end());
+    }
+
+    // The same image again -- the KDE plugin re-fetches a generation it already holds on every
+    // scene change -- is the claim it already has, not a second one.
+    if (std::find(holder->buffers.begin(), holder->buffers.end(), bufferId) != holder->buffers.end()) return;
+
+    holder->buffers.push_back(bufferId);
+    if (holder->buffers.size() > kMaxHeldPerClient) {
+        holder->buffers.erase(holder->buffers.begin(), holder->buffers.end() - kMaxHeldPerClient);
+    }
+}
+
+std::vector<int> WallpaperManager::releaseBuffer(const std::string& client, int monitorId, uint64_t bufferId) {
+    requireValidMonitorId(monitorId);
+
+    std::lock_guard<std::mutex> stateLock(m_stateMutex);
+    auto it = m_monitors.find(monitorId);
+    if (it == m_monitors.end()) return {};
+
+    auto holder = std::find_if(it->second.holds.begin(), it->second.holds.end(),
+                               [&client](const BufferHold& hold) { return hold.client == client; });
+    if (holder == it->second.holds.end()) return {};
+    if (std::erase(holder->buffers, bufferId) == 0) return {};
+    if (holder->buffers.empty()) it->second.holds.erase(holder);
+
+    // Only a monitor still owing a render: an image coming free is worth a pass exactly when
+    // there is a request that could not be drawn without it.
+    if (it->second.requestSeq == it->second.servicedSeq) return {};
+    return {monitorId};
+}
+
+std::vector<int> WallpaperManager::forgetHeldBuffers(const std::string& client) {
+    std::vector<int> toRender;
+
+    std::lock_guard<std::mutex> stateLock(m_stateMutex);
+    for (auto& [monitorId, state] : m_monitors) {
+        const size_t before = state.holds.size();
+        std::erase_if(state.holds, [&client](const BufferHold& hold) { return hold.client == client; });
+        if (state.holds.size() == before) continue;
+        if (state.requestSeq != state.servicedSeq) toRender.push_back(monitorId);
+    }
+    return toRender;
 }
 
 std::vector<uint64_t> WallpaperManager::intersectImportModifiersLocked() const {
@@ -992,6 +1066,7 @@ RenderOutcome WallpaperManager::renderPending(int monitorId) {
     // touches the offscreen image's contents.
     std::string error;
     bool daemonFault = false;
+    bool deferred = false;
     std::optional<StaticRenderer> renderer;
     const OffscreenTarget* target = nullptr;
     try {
@@ -999,13 +1074,26 @@ RenderOutcome WallpaperManager::renderPending(int monitorId) {
         // Before the target is acquired, so a set reported since the last render rebuilds the
         // image rather than being applied to one already allocated against the old one.
         applyImportModifiersLocked();
-        target = &acquireTarget(monitorId);
-        // Not retained past this call. A static wallpaper renders once, so keeping the
-        // texture, pipeline and descriptor alive per monitor would hold VRAM for
-        // something nothing re-renders; immediateSubmit has already waited on its fence
-        // by the time render() returns, so nothing is destroyed out from under the GPU.
-        // Step 13's video renderer does need to persist and will live in MonitorState.
-        renderer.emplace(*m_device, m_targets->renderPass(), path, m_resolvedShaderDir);
+        ensureTargets(monitorId);
+
+        // Chosen before the image is decoded, so a pass that cannot draw anywhere costs
+        // nothing. Nothing can claim an image between here and the submit: hand-overs happen
+        // in exportCurrentFrame, which runs on this same worker thread, and a release only
+        // ever frees one.
+        {
+            std::lock_guard<std::mutex> stateLock(m_stateMutex);
+            target = m_targets->nextUnheld(monitorId, heldBuffersLocked(monitorId));
+        }
+        if (target == nullptr) {
+            deferred = true;
+        } else {
+            // Not retained past this call. A static wallpaper renders once, so keeping the
+            // texture, pipeline and descriptor alive per monitor would hold VRAM for
+            // something nothing re-renders; immediateSubmit has already waited on its fence
+            // by the time render() returns, so nothing is destroyed out from under the GPU.
+            // Step 13's video renderer does need to persist and will live in MonitorState.
+            renderer.emplace(*m_device, m_targets->renderPass(), path, m_resolvedShaderDir);
+        }
     } catch (const GpuFailure& e) {
         // Caught before std::exception, which it derives from. The GPU going wrong rather
         // than the image, so it re-records gpu health -- otherwise a device that dies after
@@ -1024,13 +1112,36 @@ RenderOutcome WallpaperManager::renderPending(int monitorId) {
         daemonFault = true;
     }
 
+    if (deferred) {
+        // Every image on this monitor is in a consumer's hands. The request is left
+        // outstanding rather than drawn over a frame in use or waited on with the GPU lock
+        // held: whatever frees an image -- a ReleaseBuffer, a consumer leaving the bus --
+        // re-posts this monitor, and until then GetStatus reports the render as still owed.
+        uint32_t refusals = 0;
+        {
+            std::lock_guard<std::mutex> stateLock(m_stateMutex);
+            auto it = m_monitors.find(monitorId);
+            if (it == m_monitors.end() || it->second.requestSeq != seq) return {};
+            refusals = ++it->second.deferredRenders;
+        }
+        // Once per episode. A producer drawing at display rate would otherwise write a line
+        // per frame; the running count is in GetStatus for anyone who wants the rest.
+        if (refusals == 1) {
+            std::fprintf(stderr,
+                         "wallpaperx-daemon: monitor %d has no free image -- all %u are being read, so this "
+                         "render waits for a consumer to release one\n",
+                         monitorId, kTargetDepth);
+        }
+        return {};
+    }
+
     bool committed = false;
     uint64_t generation = 0;
     {
-        // Held across the submit deliberately: the target is single-buffered, so a submit
-        // writes into memory a consumer is already displaying, and a newer request landing
-        // between check and submit would repaint the published frame with nothing on the wire
-        // to say so. Atomic check-and-submit makes it "published, or never touched".
+        // Held across the submit deliberately: the submit is what makes this image the
+        // monitor's published frame, and a newer request landing between the check and the
+        // submit would publish the older wallpaper with nothing on the wire to say so.
+        // Atomic check-and-submit makes it "published, or never touched".
         //
         // Bounded by one fullscreen-quad submit -- decode, upload and pipeline creation are all
         // above, unlocked -- so GetStatus waits on a draw, never on a decode.
@@ -1084,6 +1195,9 @@ RenderOutcome WallpaperManager::renderPending(int monitorId) {
             // last_error calls a working wallpaper broken.
             it->second.lastError.clear();
             it->second.lastErrorIsDaemonFault = false;
+            // Counts refusals since the last frame, so it says how far behind this monitor is
+            // now rather than how often it has ever been behind.
+            it->second.deferredRenders = 0;
             committed = true;
             generation = it->second.generation;
             // A commit is the GPU working, so it clears a failure recorded by an earlier
@@ -1106,7 +1220,7 @@ RenderOutcome WallpaperManager::renderPending(int monitorId) {
     return RenderOutcome{committed, generation};
 }
 
-FrameExport WallpaperManager::exportCurrentFrame(int monitorId) {
+FrameExport WallpaperManager::exportCurrentFrame(int monitorId, const std::string& client) {
     requireValidMonitorId(monitorId);
 
     std::lock_guard<std::mutex> gpuLock(m_gpuMutex);
@@ -1173,6 +1287,16 @@ FrameExport WallpaperManager::exportCurrentFrame(int monitorId) {
         recordHealth(&DaemonHealth::gpu, HealthStatus::Fail, e.what());
         throw;
     }
+    // Recorded once the descriptors are out and cannot be taken back, so a client is never
+    // charged with holding an image it was not given. An unnamed caller records nothing --
+    // there would be no name to withdraw the claim under, and a claim nothing can end takes an
+    // image out of the ring permanently.
+    if (!client.empty()) {
+        std::lock_guard<std::mutex> stateLock(m_stateMutex);
+        auto it = m_monitors.find(monitorId);
+        if (it != m_monitors.end()) recordHandoverLocked(it->second, client, handle.frame.bufferId);
+    }
+
     handle.generation = generation;
     out.handle = std::move(handle);
     return out;
@@ -1206,6 +1330,7 @@ WallpaperManager::Snapshot WallpaperManager::snapshot() const {
         entry.lastError = state.lastError;
         entry.lastErrorIsDaemonFault = state.lastErrorIsDaemonFault;
         entry.renderOutstanding = state.requestSeq != state.servicedSeq;
+        entry.deferredRenders = state.deferredRenders;
         if (state.hasFrame) {
             entry.width = state.width;
             entry.height = state.height;

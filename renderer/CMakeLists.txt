@@ -246,6 +246,12 @@ wallpaperx_add_shader_probe(wallpaperx-consumer-modifier-probe tests/consumer_mo
 # failing check rather than as a ctest timeout.
 wallpaperx_add_shader_probe(wallpaperx-frame-acquire-probe tests/frame_acquire_probe.cpp)
 
+# Which image of a monitor's ring the next render is aimed at, and that holding one really
+# does protect its pixels. Reads the held image back through Vulkan rather than through a
+# CPU mapping of its exported fd, so it answers on the opaque-fd GPU as well as on Lavapipe.
+# Writes ring_*.png into the shared asset directory -- keep that prefix.
+wallpaperx_add_shader_probe(wallpaperx-target-ring-probe tests/target_ring_probe.cpp)
+
 add_executable(wallpaperx-handle-type-env-test tests/handle_type_env_test.cpp)
 target_link_libraries(wallpaperx-handle-type-env-test PRIVATE wallpaperx-renderer)
 
@@ -299,6 +305,7 @@ add_test(NAME modifier_sensitivity_probe COMMAND wallpaperx-modifier-roundtrip-p
 add_test(NAME ownership_transfer_probe COMMAND wallpaperx-ownership-transfer-probe)
 add_test(NAME consumer_modifier_probe COMMAND wallpaperx-consumer-modifier-probe)
 add_test(NAME frame_acquire_probe COMMAND wallpaperx-frame-acquire-probe)
+add_test(NAME target_ring_probe COMMAND wallpaperx-target-ring-probe)
 
 # 77 means this driver cannot export an opaque-fd binary semaphore at all, so there is no acquire
 # descriptor to wait on -- Lavapipe. That run still grades what such a driver must do (hand back
@@ -333,6 +340,12 @@ add_test(NAME validation_grade_absent COMMAND wallpaperx-validation-grade-probe 
 # becomes indistinguishable from "the question could not be asked" -- which is the exact
 # confusion this probe exists to remove.
 set_tests_properties(validation_grade_installed validation_grade_absent PROPERTIES SKIP_RETURN_CODE 77)
+
+# Its own four ring_*.png fixtures, and like the others it is one binary registered twice,
+# so both entries share a lock. No SKIP_RETURN_CODE: nothing it grades depends on a driver
+# capability -- an offscreen image, a render pass and a device-side copy are available
+# wherever a Device comes up at all, so an inconclusive outcome has no way to arise.
+set_tests_properties(target_ring_probe PROPERTIES RESOURCE_LOCK target_ring_probe_test_image)
 
 # static_renderer_probe and its _lavapipe twin run the same binary and both
 # read/write the same WALLPAPERX_TEST_IMAGE_DIR path -- lock them to the same
@@ -389,6 +402,7 @@ if(WALLPAPERX_LAVAPIPE_ICD)
     add_test(NAME ownership_transfer_probe_lavapipe COMMAND wallpaperx-ownership-transfer-probe)
     add_test(NAME consumer_modifier_probe_lavapipe COMMAND wallpaperx-consumer-modifier-probe)
     add_test(NAME frame_acquire_probe_lavapipe COMMAND wallpaperx-frame-acquire-probe)
+    add_test(NAME target_ring_probe_lavapipe COMMAND wallpaperx-target-ring-probe)
     # Registered here for the label, not for the ICD: what this probe grades is loader- and
     # driver-independent. CI selects by the lavapipe label and has no GPU, so without these two
     # the only check of how a missing validator is reported never runs there.
@@ -407,6 +421,7 @@ if(WALLPAPERX_LAVAPIPE_ICD)
         ownership_transfer_probe_lavapipe
         consumer_modifier_probe_lavapipe
         frame_acquire_probe_lavapipe
+        target_ring_probe_lavapipe
         validation_grade_installed_lavapipe
         validation_grade_absent_lavapipe
         PROPERTIES
