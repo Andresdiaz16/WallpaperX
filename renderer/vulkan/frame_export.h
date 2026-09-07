@@ -77,6 +77,11 @@ struct ExportedFrame {
 // makes the contents readable outside this device is part of the render that produced
 // them (OffscreenTargetManager::render). Exporting a target no render has published
 // hands out memory the graphics queue still owns.
+//
+// It does wait, though, for every submission outstanding on the device: renders do not, so
+// this is what makes the returned descriptor name bytes that have actually been drawn. A
+// receiver reading them on the host has no other ordering available, and one reading them on
+// a GPU still needs the acquire below for ownership and layout.
 ExportedFrame exportFrame(Device& device, const OffscreenTarget& target);
 
 // A descriptor the consumer waits on before it samples the frame `target` published, and which

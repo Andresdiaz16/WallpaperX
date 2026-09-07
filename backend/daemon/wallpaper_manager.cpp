@@ -1118,8 +1118,9 @@ RenderOutcome WallpaperManager::renderPending(int monitorId) {
         } else {
             // Not retained past this call. A static wallpaper renders once, so keeping the
             // texture, pipeline and descriptor alive per monitor would hold VRAM for
-            // something nothing re-renders; immediateSubmit has already waited on its fence
-            // by the time render() returns, so nothing is destroyed out from under the GPU.
+            // something nothing re-renders. render() does not wait, so what keeps this from
+            // being destroyed out from under the GPU is ~StaticRenderer's own device-idle
+            // wait -- the price of dropping it here, and paid once per wallpaper change.
             // Step 13's video renderer does need to persist and will live in MonitorState.
             renderer.emplace(*m_device, m_targets->renderPass(), path, m_resolvedShaderDir);
         }

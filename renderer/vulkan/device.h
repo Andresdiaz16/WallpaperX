@@ -97,8 +97,9 @@ public:
 
     VkCommandPool commandPool() const { return m_commandPool; }
 
-    // What one submission waits on and what it signals. All empty is immediateSubmit's case:
-    // no ordering beyond this queue, and the caller blocked on the host fence.
+    // What one submission waits on and what it signals. All empty is the ordinary case:
+    // no ordering beyond this queue, where submission order and the barriers in the batch
+    // are enough.
     //
     // A signal semaphore is the only way to order work in another queue or another process
     // against this submission. A host fence cannot stand in for it: the fence is a
@@ -111,12 +112,58 @@ public:
         std::vector<VkSemaphore> signal;
     };
 
-    // Records and submits `record`, then waits for it. Throws GpuFailure on any Vulkan
-    // failure, and std::invalid_argument if scope.wait and scope.waitStages differ in length.
-    void submit(const std::function<void(VkCommandBuffer)>& record, const SubmitScope& scope);
+    // Names one submitted batch, for a caller that has to know when it finished.
+    //
+    // Deliberately carries no handle. The command buffer and the fence belong to the Device
+    // for as long as the GPU may still be reading them, so there is nothing here a caller
+    // could free, reset or submit again. Serials are never reused, which is what makes a
+    // ticket the Device no longer tracks mean "that work is done" rather than "unknown".
+    class SubmitTicket {
+    public:
+        SubmitTicket() = default;
 
-    // submit() with no semaphores. Every caller that renders once per wallpaper wants this.
+    private:
+        friend class Device;
+        explicit SubmitTicket(uint64_t serial) : m_serial(serial) {}
+        uint64_t m_serial = 0;  // 0: names nothing, and wait() on it returns at once
+    };
+
+    // Records `record` into a command buffer, submits it, and returns without waiting for the
+    // GPU. Throws GpuFailure on any Vulkan failure, and std::invalid_argument if scope.wait
+    // and scope.waitStages differ in length.
+    //
+    // The returned ticket may be dropped: a caller that only needs the work to happen, in
+    // order, before whatever it submits next, needs nothing from it. Ordering against later
+    // batches on this queue comes from submission order and the barriers in them, not from
+    // the caller having waited.
+    //
+    // Anything the batch reads -- images, buffers, pipelines, descriptors -- must stay alive
+    // until it completes. wait() and waitForSubmissions() are how a caller that is about to
+    // destroy one of those gets there.
+    SubmitTicket submit(const std::function<void(VkCommandBuffer)>& record, const SubmitScope& scope);
+
+    // submit() with no semaphores: for work whose only ordering is against other batches on
+    // this queue, which submission order and the barriers in them already give.
+    SubmitTicket submit(const std::function<void(VkCommandBuffer)>& record) { return submit(record, {}); }
+
+    // submit() with no semaphores, waited on before it returns. For work whose result the
+    // host reads next: a readback that maps the buffer it copied into, an upload whose
+    // staging buffer is freed at the end of the call.
     void immediateSubmit(const std::function<void(VkCommandBuffer)>& record);
+
+    // Blocks until `ticket`'s batch has completed. Returns at once for a batch that already
+    // has, including one submitted long enough ago that the Device has forgotten it.
+    //
+    // Bounded, unlike the unconditional fence wait this replaced: a wedged or lost GPU makes
+    // this throw GpuFailure rather than parking the render worker forever, which is the one
+    // failure the daemon has no other way out of. The bound is far above any batch this
+    // renderer submits, so a merely slow GPU cannot trip it.
+    void wait(SubmitTicket ticket);
+
+    // Blocks until every batch submitted through this Device has completed. What a caller
+    // about to destroy something a submission may still be reading needs; same bound and
+    // same failure as wait().
+    void waitForSubmissions();
 
     // Aborts unless called from the thread that created this Device.
     //
@@ -152,6 +199,29 @@ private:
     void createCommandPool();
     void destroyResources();
 
+    // One batch the GPU may still be executing. Its command buffer and fence return to the
+    // free lists only once the fence has signalled, so a handle is in exactly one of three
+    // places at any moment -- a pending batch, a free list, or destroyed -- and reusing one
+    // the GPU is still reading is not expressible rather than merely unlikely.
+    struct Pending {
+        VkCommandBuffer cmd = VK_NULL_HANDLE;
+        VkFence fence = VK_NULL_HANDLE;
+        uint64_t serial = 0;
+    };
+
+    // Moves every batch whose fence has signalled onto the free lists. Cheap enough to run
+    // on every submit: one vkGetFenceStatus per outstanding batch, and there are at most
+    // kMaxSubmissionsInFlight of those.
+    void retireCompleted();
+    void waitFences(const VkFence* fences, uint32_t count, const char* what);
+    VkCommandBuffer takeCommandBuffer();
+    VkFence takeFence();
+    // Frees a command buffer and fence that no submission accepted. Destroyed rather than
+    // recycled: after a vkQueueSubmit that returned VK_ERROR_DEVICE_LOST the driver's hold on
+    // the fence is unknowable, and this path is rare enough that one allocation is cheaper
+    // than reasoning about it.
+    void discardSubmitObjects(VkCommandBuffer cmd, VkFence fence) noexcept;
+
     VkInstance m_instance = VK_NULL_HANDLE;
     VkDebugUtilsMessengerEXT m_debugMessenger = VK_NULL_HANDLE;
     // Written from the debug callback, which the loader may invoke on any thread, and
@@ -173,6 +243,14 @@ private:
     Memory m_memory;
     std::unique_ptr<IDescriptorAllocator> m_descriptorAllocator;
     VkCommandPool m_commandPool = VK_NULL_HANDLE;
+
+    // Batches submitted and not yet known complete, oldest first. Touched only from the GPU
+    // thread, so no lock: assertGpuThread() is what keeps that true.
+    std::vector<Pending> m_pending;
+    std::vector<VkCommandBuffer> m_freeCommandBuffers;
+    // Every fence here is unsignalled -- retireCompleted() resets one before it lands.
+    std::vector<VkFence> m_freeFences;
+    uint64_t m_nextSerial = 1;
 };
 
 }

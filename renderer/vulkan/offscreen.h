@@ -139,6 +139,12 @@ public:
     // record time would leave a target claiming a transition that never ran if the
     // submit throws (device lost, OOM), and the next acquire would then name it.
     //
+    // Returns as soon as the queue has accepted the batch, not when the GPU has drawn it.
+    // The frame is safe for a consumer to read once the semaphore exportFrameAcquireFd
+    // signals, and safe for this device to touch behind any barrier submitted later. What is
+    // NOT safe is destroying something the batch reads -- a renderer's pipeline or texture --
+    // without waiting: see Device::waitForSubmissions.
+    //
     // A successful render also makes `target` its monitor's current slot, so get() and
     // "the frame that was published" cannot name different images. That is why nothing
     // else moves the cursor: a caller that chose a slot and then did not draw into it
@@ -146,7 +152,10 @@ public:
     void render(IRenderer& renderer, const OffscreenTarget& target);
 
     // Takes a published frame back: submits the acquire that reverses render()'s release,
-    // leaving the image owned by the graphics queue in VK_IMAGE_LAYOUT_GENERAL.
+    // leaving the image owned by the graphics queue in VK_IMAGE_LAYOUT_GENERAL once that
+    // batch runs. Like render() it does not wait, which costs a caller nothing: work
+    // submitted after it on this queue sees the acquire, since a barrier's first scope covers
+    // everything submitted earlier. A caller that reads the image on the HOST must wait.
     //
     // Anything on this device that touches the image outside render() -- a readback copy --
     // must call this first and then transition from GENERAL. Reading an image the graphics

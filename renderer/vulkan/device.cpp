@@ -27,6 +27,18 @@ const char* toString(DescriptorTier tier) {
 
 namespace {
 
+// How long a caller that must see its work finished waits before calling the GPU wedged.
+// Unbounded -- what this was -- parks the render worker forever on a device that never
+// completes, and the daemon has no other way to notice. Two to three orders of magnitude
+// above anything submitted here (a fullscreen quad, a texture upload, an empty batch
+// carrying a semaphore signal), so it cannot fire on a GPU that is merely slow.
+constexpr uint64_t kSubmitTimeoutSeconds = 10;
+constexpr uint64_t kSubmitTimeoutNs = kSubmitTimeoutSeconds * 1'000'000'000ull;
+
+// Ceiling on batches submitted but not yet known complete. Not a tuning knob: it is what
+// bounds the pending list, and reaching it makes the next submit wait for the oldest batch.
+constexpr size_t kMaxSubmissionsInFlight = 16;
+
 // Preference order among devices that already passed the capability checks. A rank, not a
 // "discrete beats everything else" test: that form never displaced whatever enumerated first,
 // so a software rasteriser ahead of an integrated GPU in the list kept the wallpaper on the CPU.
@@ -122,6 +134,20 @@ Device::~Device() {
 }
 
 void Device::destroyResources() {
+    // Before anything is freed, because submit() no longer waits: an executing batch is
+    // reading its own command buffer and every image, buffer and descriptor the allocator
+    // below is about to destroy. Its result is ignored -- this runs from a destructor, and a
+    // lost device returns at once and is being torn down anyway.
+    if (m_device) {
+        vkDeviceWaitIdle(m_device);
+        for (const Pending& batch : m_pending) vkDestroyFence(m_device, batch.fence, nullptr);
+        for (VkFence fence : m_freeFences) vkDestroyFence(m_device, fence, nullptr);
+    }
+    m_pending.clear();
+    m_freeFences.clear();
+    // The pool owns them; destroying it below frees them all.
+    m_freeCommandBuffers.clear();
+
     if (m_commandPool) {
         vkDestroyCommandPool(m_device, m_commandPool, nullptr);
         m_commandPool = VK_NULL_HANDLE;
@@ -497,6 +523,11 @@ void Device::createCommandPool() {
     if (const VkResult r = vkCreateCommandPool(m_device, &poolInfo, nullptr, &m_commandPool); r != VK_SUCCESS) {
         throwVkFailure("Device: vkCreateCommandPool", r);
     }
+
+    // submit() enforces the cap before it adds, so this capacity is never exceeded and the
+    // push after a successful vkQueueSubmit cannot throw -- which it must not, being the only
+    // record that a command buffer and fence are in use.
+    m_pending.reserve(kMaxSubmissionsInFlight);
 }
 
 void Device::assertGpuThread(const char* what) const {
@@ -515,10 +546,10 @@ void Device::immediateSubmit(const std::function<void(VkCommandBuffer)>& record)
     // Asserted here too, though submit() asserts as well: the abort has to name the entry
     // point the caller used, not the one it happens to delegate to.
     assertGpuThread("Device::immediateSubmit");
-    submit(record, {});
+    wait(submit(record, {}));
 }
 
-void Device::submit(const std::function<void(VkCommandBuffer)>& record, const SubmitScope& scope) {
+Device::SubmitTicket Device::submit(const std::function<void(VkCommandBuffer)>& record, const SubmitScope& scope) {
     assertGpuThread("Device::submit");
 
     // Checked, not assumed: Vulkan reads pWaitDstStageMask as waitSemaphoreCount entries, so a
@@ -527,33 +558,27 @@ void Device::submit(const std::function<void(VkCommandBuffer)>& record, const Su
         throw std::invalid_argument("Device::submit: one wait stage is required per wait semaphore");
     }
 
-    VkCommandBufferAllocateInfo allocInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-    allocInfo.commandPool = m_commandPool;
-    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    allocInfo.commandBufferCount = 1;
-
-    VkCommandBuffer cmd = VK_NULL_HANDLE;
-    if (const VkResult r = vkAllocateCommandBuffers(m_device, &allocInfo, &cmd); r != VK_SUCCESS) {
-        throwVkFailure("Device::submit: vkAllocateCommandBuffers", r);
+    retireCompleted();
+    // The only back-pressure a producer that never waits would otherwise have. Without it a
+    // caller outrunning the GPU grows m_pending -- and the driver's own queue behind it --
+    // without bound; with it, the producer paces itself against the oldest batch.
+    while (m_pending.size() >= kMaxSubmissionsInFlight) {
+        wait(SubmitTicket{m_pending.front().serial});
     }
 
-    VkFence fence = VK_NULL_HANDLE;
+    VkCommandBuffer cmd = takeCommandBuffer();
 
-    // Free the command buffer and fence on every exit path -- including the
-    // caller's record() lambda throwing, or any of the checks below. Captures the
-    // handles by value and cmd/fence by reference so it cleans up whatever exists
-    // at scope exit. (A local class can't touch Device's private members, so it
-    // takes the device/pool handles by value.)
-    struct Cleanup {
-        VkDevice device;
-        VkCommandPool pool;
-        VkCommandBuffer& cmd;
-        VkFence& fence;
-        ~Cleanup() {
-            if (fence) vkDestroyFence(device, fence, nullptr);
-            if (cmd) vkFreeCommandBuffers(device, pool, 1, &cmd);
+    // Gives the command buffer and fence back on every exit path that does not end in an
+    // accepted submission -- including record() throwing. Disarmed once the batch is the
+    // GPU's, after which they belong to m_pending until its fence signals.
+    struct Discard {
+        Device* device;
+        VkCommandBuffer cmd;
+        VkFence fence = VK_NULL_HANDLE;
+        ~Discard() {
+            if (device) device->discardSubmitObjects(cmd, fence);
         }
-    } cleanup{m_device, m_commandPool, cmd, fence};
+    } discard{this, cmd};
 
     VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
@@ -567,10 +592,8 @@ void Device::submit(const std::function<void(VkCommandBuffer)>& record, const Su
         throwVkFailure("Device::submit: vkEndCommandBuffer", r);
     }
 
-    VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-    if (const VkResult r = vkCreateFence(m_device, &fenceInfo, nullptr, &fence); r != VK_SUCCESS) {
-        throwVkFailure("Device::submit: vkCreateFence", r);
-    }
+    const VkFence fence = takeFence();
+    discard.fence = fence;
 
     VkSubmitInfo submitInfo{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     submitInfo.commandBufferCount = 1;
@@ -585,13 +608,125 @@ void Device::submit(const std::function<void(VkCommandBuffer)>& record, const Su
         throwVkFailure("Device::submit: vkQueueSubmit", r);
     }
 
-    if (const VkResult r = vkWaitForFences(m_device, 1, &fence, VK_TRUE, UINT64_MAX); r != VK_SUCCESS) {
-        // The submit went through, so the command buffer and whatever it reads are still in
-        // flight: reclaiming them here or in the caller is undefined until the device is
-        // idle. On a lost device this returns at once rather than waiting.
-        vkDeviceWaitIdle(m_device);
-        throwVkFailure("Device::submit: vkWaitForFences", r);
+    // Cannot reallocate, and must not: the batch is already the GPU's, so a throw here would
+    // lose the only record of a command buffer and fence that are in use. The reserve in
+    // createCommandPool() plus the cap above are what make this a plain move of two handles.
+    discard.device = nullptr;
+    m_pending.push_back(Pending{cmd, fence, m_nextSerial});
+    return SubmitTicket{m_nextSerial++};
+}
+
+void Device::wait(SubmitTicket ticket) {
+    assertGpuThread("Device::wait");
+
+    for (const Pending& pending : m_pending) {
+        // A serial this Device no longer tracks is one whose fence has already been seen
+        // signalled -- serials are issued in order and never reused -- so there is nothing
+        // left to wait for.
+        if (pending.serial != ticket.m_serial) continue;
+        waitFences(&pending.fence, 1, "Device::wait");
+        break;
     }
+    retireCompleted();
+}
+
+void Device::waitForSubmissions() {
+    assertGpuThread("Device::waitForSubmissions");
+    if (m_pending.empty()) return;
+
+    std::vector<VkFence> fences;
+    fences.reserve(m_pending.size());
+    for (const Pending& pending : m_pending) fences.push_back(pending.fence);
+
+    waitFences(fences.data(), static_cast<uint32_t>(fences.size()), "Device::waitForSubmissions");
+    retireCompleted();
+}
+
+void Device::waitFences(const VkFence* fences, uint32_t count, const char* what) {
+    const VkResult r = vkWaitForFences(m_device, count, fences, VK_TRUE, kSubmitTimeoutNs);
+    if (r == VK_SUCCESS) return;
+
+    if (r == VK_TIMEOUT) {
+        // The batch stays pending and keeps its command buffer and fence: it is still the
+        // GPU's, and recycling either now is how a wedged GPU turns into corruption. Every
+        // later submit hits the cap and fails here too, so the daemon reports a dead GPU
+        // rather than a thread that never comes back.
+        throw GpuFailure(std::string(what) + ": the GPU did not finish a submitted batch within " +
+                         std::to_string(kSubmitTimeoutSeconds) + " seconds");
+    }
+
+    // The submit went through, so the command buffers and whatever they read are still in
+    // flight: reclaiming them here or in the caller is undefined until the device is idle.
+    // On a lost device this returns at once rather than waiting.
+    vkDeviceWaitIdle(m_device);
+    throwVkFailure(std::string(what) + ": vkWaitForFences", r);
+}
+
+void Device::retireCompleted() {
+    if (m_pending.empty()) return;
+
+    // Reserved before anything moves, so the loop below cannot throw part way and leave a
+    // handle recorded in two places at once.
+    m_freeCommandBuffers.reserve(m_freeCommandBuffers.size() + m_pending.size());
+    m_freeFences.reserve(m_freeFences.size() + m_pending.size());
+
+    size_t kept = 0;
+    for (size_t i = 0; i < m_pending.size(); ++i) {
+        const Pending batch = m_pending[i];
+        // VK_NOT_READY is still running. VK_ERROR_DEVICE_LOST is neither: the batch stays
+        // pending forever, because after a loss nothing says whether the driver is done with
+        // these two objects, and only teardown -- which waits for idle first -- frees them.
+        if (vkGetFenceStatus(m_device, batch.fence) != VK_SUCCESS) {
+            m_pending[kept++] = batch;
+            continue;
+        }
+        vkResetFences(m_device, 1, &batch.fence);
+        m_freeFences.push_back(batch.fence);
+        m_freeCommandBuffers.push_back(batch.cmd);
+    }
+    m_pending.resize(kept);
+}
+
+VkCommandBuffer Device::takeCommandBuffer() {
+    if (!m_freeCommandBuffers.empty()) {
+        // In the executable state -- recorded and submitted once already -- which is why the
+        // pool carries RESET_COMMAND_BUFFER_BIT: vkBeginCommandBuffer then resets it
+        // implicitly instead of rejecting it.
+        const VkCommandBuffer cmd = m_freeCommandBuffers.back();
+        m_freeCommandBuffers.pop_back();
+        return cmd;
+    }
+
+    VkCommandBufferAllocateInfo allocInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    allocInfo.commandPool = m_commandPool;
+    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocInfo.commandBufferCount = 1;
+
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    if (const VkResult r = vkAllocateCommandBuffers(m_device, &allocInfo, &cmd); r != VK_SUCCESS) {
+        throwVkFailure("Device::submit: vkAllocateCommandBuffers", r);
+    }
+    return cmd;
+}
+
+VkFence Device::takeFence() {
+    if (!m_freeFences.empty()) {
+        const VkFence fence = m_freeFences.back();
+        m_freeFences.pop_back();
+        return fence;
+    }
+
+    VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    VkFence fence = VK_NULL_HANDLE;
+    if (const VkResult r = vkCreateFence(m_device, &fenceInfo, nullptr, &fence); r != VK_SUCCESS) {
+        throwVkFailure("Device::submit: vkCreateFence", r);
+    }
+    return fence;
+}
+
+void Device::discardSubmitObjects(VkCommandBuffer cmd, VkFence fence) noexcept {
+    if (fence) vkDestroyFence(m_device, fence, nullptr);
+    if (cmd) vkFreeCommandBuffers(m_device, m_commandPool, 1, &cmd);
 }
 
 }

@@ -124,10 +124,16 @@ void OffscreenTargetManager::render(IRenderer& renderer, const OffscreenTarget& 
         m_device.info().hasQueueFamilyForeign);
 
     VkImageLayout renderedLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    // Nothing is recorded on the target until the submit has returned. Neither barrier takes
-    // effect unless it succeeds, so a throw leaves ownership exactly where it was: with the
-    // consumer if a frame was published, with us if not.
-    m_device.immediateSubmit([&](VkCommandBuffer cmd) {
+    // Nothing is recorded on the target until the batch has been accepted by the queue.
+    // Neither barrier takes effect unless it is, so a throw leaves ownership exactly where it
+    // was: with the consumer if a frame was published, with us if not.
+    //
+    // Accepted, not completed: this does not wait. Whatever this monitor renders next is
+    // ordered after it by submission order -- the acquire barrier and the render pass's own
+    // external dependency both name everything submitted earlier on this queue -- and a
+    // consumer is ordered by the semaphore exportFrameAcquireFd signals, which is the only
+    // ordering a host wait here never provided.
+    m_device.submit([&](VkCommandBuffer cmd) {
         // Take ownership back before writing. The previous render released it to an
         // external consumer, and a release with no matching acquire is where a driver's
         // compressed-modifier metadata resolve is undefined.
@@ -179,8 +185,7 @@ void OffscreenTargetManager::reclaim(const OffscreenTarget& target) {
     if (!target.published()) {
         throw std::runtime_error("OffscreenTargetManager::reclaim: the target has no published frame");
     }
-    m_device.immediateSubmit(
-        [&](VkCommandBuffer cmd) { recordAcquire(cmd, target, m_device.graphicsQueueFamily()); });
+    m_device.submit([&](VkCommandBuffer cmd) { recordAcquire(cmd, target, m_device.graphicsQueueFamily()); });
     target.notifyReclaimed();
 }
 

@@ -114,6 +114,10 @@ ExportedFrame exportFrame(Device& device, const OffscreenTarget& target) {
     // answering it inline on the DBus thread would trip this.
     device.assertGpuThread("exportFrame");
 
+    // Renders do not wait, so without this the descriptor names memory the GPU is still
+    // writing, and its receiver -- a host mmap above all -- has nothing to wait with.
+    device.waitForSubmissions();
+
     auto pfnGetMemoryFd = reinterpret_cast<PFN_vkGetMemoryFdKHR>(
         vkGetDeviceProcAddr(device.device(), "vkGetMemoryFdKHR"));
     if (!pfnGetMemoryFd) {
@@ -203,7 +207,12 @@ int exportFrameAcquireFd(Device& device, const OffscreenTarget& target) {
     if (!target.published()) {
         throw std::runtime_error("exportFrameAcquireFd: the target has no published frame to acquire");
     }
-    if (!device.info().hasExternalSemaphoreFd) return -1;
+    if (!device.info().hasExternalSemaphoreFd) {
+        // exportFrame's rule again, for the caller that re-fetches an acquire without
+        // re-exporting: nothing leaves naming a frame the GPU has not finished.
+        device.waitForSubmissions();
+        return -1;
+    }
 
     auto pfnGetSemaphoreFd = reinterpret_cast<PFN_vkGetSemaphoreFdKHR>(
         vkGetDeviceProcAddr(device.device(), "vkGetSemaphoreFdKHR"));
@@ -234,9 +243,12 @@ int exportFrameAcquireFd(Device& device, const OffscreenTarget& target) {
         }
     } cleanup{device.device(), semaphore};
 
-    // Empty command buffer: the batch exists only to carry the signal. submit() waits on its
-    // fence, so the signal has happened by the time the descriptor below is taken.
-    device.submit([](VkCommandBuffer) {}, {{}, {}, {semaphore}});
+    // Empty command buffer: the batch exists only to carry the signal, whose first
+    // synchronization scope covers everything submitted earlier on this queue -- the render
+    // that published this frame included. Waited on, so the descriptor comes from a payload
+    // already signalled and a producer that dies next leaves nothing to wait on forever. That
+    // wait is transitively the render's: the export pays for the frame, the render does not.
+    device.wait(device.submit([](VkCommandBuffer) {}, {{}, {}, {semaphore}}));
 
     int fd = -1;
     VkSemaphoreGetFdInfoKHR getFdInfo{VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR};
