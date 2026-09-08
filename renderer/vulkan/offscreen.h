@@ -175,7 +175,8 @@ private:
     // does not own, which no shipping caller can produce.
     void makeCurrent(const OffscreenTarget& target);
     void destroyTarget(OffscreenTarget& target);
-    // One device-idle wait for the whole batch, then each is freed.
+    // One bounded wait for the whole batch, then each is freed -- or, if the GPU did not
+    // finish within it, none of them is and they are leaked instead.
     void destroyTargets(const std::vector<OffscreenTarget*>& images);
     // Frees one, assuming the caller has already waited. Never call directly.
     void dropTarget(OffscreenTarget& target);

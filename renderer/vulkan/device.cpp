@@ -6,7 +6,10 @@
 #include "descriptor_classic.h"
 #include "descriptor_heap.h"
 
+#include <algorithm>
+#include <array>
 #include <atomic>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -134,12 +137,24 @@ Device::~Device() {
 }
 
 void Device::destroyResources() {
-    // Before anything is freed, because submit() no longer waits: an executing batch is
-    // reading its own command buffer and every image, buffer and descriptor the allocator
-    // below is about to destroy. Its result is ignored -- this runs from a destructor, and a
-    // lost device returns at once and is being torn down anyway.
+    // Before anything is freed, because submit() does not wait: an executing batch is reading
+    // its own command buffer and every image, buffer and descriptor the allocator below is
+    // about to destroy.
+    const bool idle = drainForTeardown();
+
+    // Everything is leaked, deliberately, once anything has been abandoned -- including when
+    // the GPU has since caught up, because what was abandoned is unreachable now, and
+    // vkDestroyDevice requires every child object to be gone while VMA aborts the process
+    // outright if an allocation is still live.
+    if (m_abandoned) {
+        std::fprintf(stderr,
+                     "Device: %s, so the Vulkan device and everything it owns is leaked rather than destroyed\n",
+                     idle ? "resources were abandoned to a GPU that had not finished reading them"
+                          : "the GPU did not finish the work submitted to it");
+        return;
+    }
+
     if (m_device) {
-        vkDeviceWaitIdle(m_device);
         for (const Pending& batch : m_pending) vkDestroyFence(m_device, batch.fence, nullptr);
         for (VkFence fence : m_freeFences) vkDestroyFence(m_device, fence, nullptr);
     }
@@ -559,6 +574,12 @@ Device::SubmitTicket Device::submit(const std::function<void(VkCommandBuffer)>& 
     }
 
     retireCompleted();
+    // Refused before the queue is touched. A batch that has already had the full bound holds
+    // up everything behind it, so accepting more work would only queue renders behind a GPU
+    // that is not running them, and the wedge would surface a submission cap later rather than
+    // now. Retiring first is what lets a GPU that catches up be accepted again.
+    if (stalled()) throwStalled("Device::submit");
+
     // The only back-pressure a producer that never waits would otherwise have. Without it a
     // caller outrunning the GPU grows m_pending -- and the driver's own queue behind it --
     // without bound; with it, the producer paces itself against the oldest batch.
@@ -624,6 +645,9 @@ void Device::wait(SubmitTicket ticket) {
         // signalled -- serials are issued in order and never reused -- so there is nothing
         // left to wait for.
         if (pending.serial != ticket.m_serial) continue;
+        // Checked per batch rather than for any stalled batch at all, so waiting on work that
+        // has already finished still returns rather than failing on someone else's stall.
+        if (pending.waitExpired) throwStalled("Device::wait");
         waitFences(&pending.fence, 1, "Device::wait");
         break;
     }
@@ -633,6 +657,7 @@ void Device::wait(SubmitTicket ticket) {
 void Device::waitForSubmissions() {
     assertGpuThread("Device::waitForSubmissions");
     if (m_pending.empty()) return;
+    if (stalled()) throwStalled("Device::waitForSubmissions");
 
     std::vector<VkFence> fences;
     fences.reserve(m_pending.size());
@@ -640,6 +665,39 @@ void Device::waitForSubmissions() {
 
     waitFences(fences.data(), static_cast<uint32_t>(fences.size()), "Device::waitForSubmissions");
     retireCompleted();
+}
+
+bool Device::drainForTeardown() noexcept {
+    if (!m_device) return true;
+    if (retireCompletedNoThrow()) return true;
+
+    // Skipped once a batch has already had the full bound: nothing else can get past it on
+    // this one queue, so a second bound would only add to how long teardown takes to give the
+    // same answer. A batch that does finish is retired above, and this stops applying.
+    if (!stalled()) {
+        // A destructor has nowhere to report a failed allocation to, so the fences go in a
+        // fixed array; submit() caps m_pending at its size. Were that ever untrue the wait
+        // would cover a prefix, and the retire below -- which polls every batch -- would still
+        // report the rest as outstanding.
+        std::array<VkFence, kMaxSubmissionsInFlight> fences{};
+        const uint32_t count = static_cast<uint32_t>(std::min(m_pending.size(), fences.size()));
+        for (uint32_t i = 0; i < count; ++i) fences[i] = m_pending[i].fence;
+
+        const VkResult r = vkWaitForFences(m_device, count, fences.data(), VK_TRUE, kSubmitTimeoutNs);
+        // A lost device abandons its work rather than finishing it, so no wait will ever say
+        // otherwise and its objects are the application's to destroy -- which is the only way
+        // a lost device can be torn down at all.
+        if (r == VK_ERROR_DEVICE_LOST) return true;
+
+        const bool idle = retireCompletedNoThrow();
+        if (r == VK_TIMEOUT) {
+            for (Pending& batch : m_pending) batch.waitExpired = true;
+        }
+        if (idle) return true;
+    }
+
+    m_abandoned = true;
+    return false;
 }
 
 Device::SubmitTicket Device::lastSubmission() const {
@@ -657,6 +715,18 @@ bool Device::hasCompleted(SubmitTicket ticket) {
     return !isPending(ticket.m_serial);
 }
 
+bool Device::stalled() const {
+    for (const Pending& batch : m_pending) {
+        if (batch.waitExpired) return true;
+    }
+    return false;
+}
+
+void Device::throwStalled(const char* what) const {
+    throw GpuFailure(std::string(what) + ": the GPU still has not finished a batch it was given " +
+                     std::to_string(kSubmitTimeoutSeconds) + " seconds to complete");
+}
+
 bool Device::isPending(uint64_t serial) const {
     for (const Pending& pending : m_pending) {
         if (pending.serial == serial) return true;
@@ -670,17 +740,22 @@ void Device::waitFences(const VkFence* fences, uint32_t count, const char* what)
 
     if (r == VK_TIMEOUT) {
         // The batch stays pending and keeps its command buffer and fence: it is still the
-        // GPU's, and recycling either now is how a wedged GPU turns into corruption. Every
-        // later submit hits the cap and fails here too, so the daemon reports a dead GPU
-        // rather than a thread that never comes back.
+        // GPU's, and recycling either now is how a wedged GPU turns into corruption. Marked
+        // so that nothing spends the bound on it a second time -- the next submit is refused
+        // outright, and teardown leaks rather than freeing what the GPU is still reading.
+        for (Pending& batch : m_pending) {
+            if (std::find(fences, fences + count, batch.fence) != fences + count) batch.waitExpired = true;
+        }
         throw GpuFailure(std::string(what) + ": the GPU did not finish a submitted batch within " +
                          std::to_string(kSubmitTimeoutSeconds) + " seconds");
     }
 
-    // The submit went through, so the command buffers and whatever they read are still in
-    // flight: reclaiming them here or in the caller is undefined until the device is idle.
-    // On a lost device this returns at once rather than waiting.
-    vkDeviceWaitIdle(m_device);
+    // No device-idle wait before rethrowing. The batch stays pending, so nothing here recycles
+    // a command buffer or fence the GPU may still hold, and the two results that reach this
+    // line want opposite things: a lost device has abandoned the work, while an out-of-memory
+    // failure leaves it running for as long as it takes -- which is the unbounded wait this
+    // whole path exists to avoid. A caller about to free what the batch reads goes through
+    // drainForTeardown(), which is bounded and says whether freeing is safe.
     throwVkFailure(std::string(what) + ": vkWaitForFences", r);
 }
 
@@ -707,6 +782,17 @@ void Device::retireCompleted() {
         m_freeCommandBuffers.push_back(batch.cmd);
     }
     m_pending.resize(kept);
+}
+
+bool Device::retireCompletedNoThrow() noexcept {
+    try {
+        retireCompleted();
+    } catch (...) {
+        // Only the free lists' reserve can throw. Nothing was retired, so the batches are
+        // reported as still outstanding, which is what a caller that cannot throw must assume.
+        return false;
+    }
+    return m_pending.empty();
 }
 
 VkCommandBuffer Device::takeCommandBuffer() {

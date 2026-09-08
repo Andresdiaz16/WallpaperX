@@ -130,7 +130,9 @@ public:
 
     // Records `record` into a command buffer, submits it, and returns without waiting for the
     // GPU. Throws GpuFailure on any Vulkan failure, and std::invalid_argument if scope.wait
-    // and scope.waitStages differ in length.
+    // and scope.waitStages differ in length. Also refuses, without touching the queue, while a
+    // batch that was already given the full wait bound has still not finished: one stuck batch
+    // holds up everything behind it, so the next caller is told rather than queued behind it.
     //
     // The returned ticket may be dropped: a caller that only needs the work to happen, in
     // order, before whatever it submits next, needs nothing from it. Ordering against later
@@ -164,6 +166,16 @@ public:
     // about to destroy something a submission may still be reading needs; same bound and
     // same failure as wait().
     void waitForSubmissions();
+
+    // waitForSubmissions() for a caller that cannot throw. False means the bound expired with
+    // work still in flight, and then the caller MUST NOT free anything those batches read:
+    // from a destructor, leaking is the only choice that is not corruption, since the GPU is
+    // still reading what it was about to free.
+    //
+    // A false answer is remembered. Once anything has been abandoned this Device tears itself
+    // down by leaking too, because vkDestroyDevice requires every child object to be gone and
+    // the submitted work to have completed, and neither is true any more.
+    [[nodiscard]] bool drainForTeardown() noexcept;
 
     // Names the most recent batch submitted, or nothing at all when there has been none.
     // What a caller records when it stops using something the GPU may be reading: no batch
@@ -216,13 +228,24 @@ private:
         VkCommandBuffer cmd = VK_NULL_HANDLE;
         VkFence fence = VK_NULL_HANDLE;
         uint64_t serial = 0;
+        // Whether a wait already gave this batch the full bound and it did not finish. Kept on
+        // the batch rather than beside the list so it cannot outlive what it describes:
+        // retiring the batch takes the record with it, which is what lets a GPU that catches
+        // up be told from one that is wedged.
+        bool waitExpired = false;
     };
 
     // Moves every batch whose fence has signalled onto the free lists. Cheap enough to run
     // on every submit: one vkGetFenceStatus per outstanding batch, and there are at most
     // kMaxSubmissionsInFlight of those.
     void retireCompleted();
+    // retireCompleted() where a throw is not allowed, answering whether nothing is left
+    // outstanding. A retire that could not run answers "outstanding", the safe direction.
+    bool retireCompletedNoThrow() noexcept;
     bool isPending(uint64_t serial) const;
+    // Whether some batch has already been given the full wait bound without finishing.
+    bool stalled() const;
+    [[noreturn]] void throwStalled(const char* what) const;
     void waitFences(const VkFence* fences, uint32_t count, const char* what);
     VkCommandBuffer takeCommandBuffer();
     VkFence takeFence();
@@ -261,6 +284,12 @@ private:
     // Every fence here is unsignalled -- retireCompleted() resets one before it lands.
     std::vector<VkFence> m_freeFences;
     uint64_t m_nextSerial = 1;
+
+    // Whether something the GPU may still have been reading was left unfreed because a
+    // teardown drain expired. Never cleared: the handles are gone by then, so a GPU that
+    // later catches up does not make them destroyable, and destroying the device or the VMA
+    // allocator around them is a validation error and a hard abort respectively.
+    bool m_abandoned = false;
 };
 
 }

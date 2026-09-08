@@ -52,7 +52,18 @@ StaticRenderer::~StaticRenderer() {
 
 void StaticRenderer::cleanup() {
     VkDevice device = m_device.device();
-    vkDeviceWaitIdle(device);
+
+    // The render this was built for does not wait, and it reads every handle below. Freeing
+    // them while the GPU still has them is corruption, and this runs from a destructor where
+    // the alternative to freeing cannot be an exception -- so a GPU that has not finished
+    // within the bound gets them left behind instead. Device records that and refuses further
+    // work, which is how a wedge reaches the daemon's health report from here.
+    if (!m_device.drainForTeardown()) {
+        std::fprintf(stderr,
+                     "StaticRenderer::cleanup: the GPU has not finished the render that reads this "
+                     "wallpaper's texture, pipeline and vertex buffer, so they are leaked rather than freed\n");
+        return;
+    }
 
     if (m_pipeline) vkDestroyPipeline(device, m_pipeline, nullptr);
     if (m_pipelineLayout) vkDestroyPipelineLayout(device, m_pipelineLayout, nullptr);
@@ -132,12 +143,24 @@ struct StbFreer {
 };
 using PixelsPtr = std::unique_ptr<stbi_uc, StbFreer>;
 
-// A local buffer is unreachable from cleanup(). An orphaned VMA allocation leaks, and in a
-// build with assertions also aborts the process in Memory::shutdown.
+// A local buffer is unreachable from cleanup(), so nothing else would ever free it.
+//
+// The wait is not redundant with the one immediateSubmit already did: the path that reaches
+// here by that wait FAILING leaves the upload batch running, still reading this buffer, and
+// freeing it then is the corruption the bound exists to avoid. When the GPU has not finished,
+// the buffer is left behind instead -- Device then leaks itself rather than letting VMA abort
+// the process over the orphan.
 struct BufferGuard {
-    Memory& memory;
+    Device& device;
     AllocatedBuffer& buffer;
-    ~BufferGuard() { memory.destroyBuffer(buffer); }
+    ~BufferGuard() {
+        if (device.drainForTeardown()) {
+            device.memory().destroyBuffer(buffer);
+            return;
+        }
+        std::fprintf(stderr, "StaticRenderer: the GPU has not finished the texture upload, so its staging "
+                             "buffer is leaked rather than freed\n");
+    }
 };
 
 }  // namespace
@@ -208,7 +231,7 @@ void StaticRenderer::loadAndUploadTexture(const std::string& imagePath) {
 
     AllocatedBuffer staging = m_device.memory().createBuffer(
         imageSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, HostAccess::Write, "static-renderer-staging");
-    BufferGuard stagingGuard{m_device.memory(), staging};
+    BufferGuard stagingGuard{m_device, staging};
     std::memcpy(staging.mapped, pixels.get(), static_cast<size_t>(imageSize));
     m_device.memory().flushForHostWrite(staging);
     // Released before the GPU work, not at scope exit: it is the other half of the peak the

@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
 #include <stdexcept>
 #include <utility>
 
@@ -299,18 +300,26 @@ void OffscreenTargetManager::destroyTarget(OffscreenTarget& target) {
     destroyTargets(one);
 }
 
-// The images may still be referenced by in-flight GPU work, so the device has to go idle
-// before any of them is freed. One wait for the whole batch: per target, dropping a ring cost
-// a full device stall per slot, which any client able to trigger a rebuild could repeat.
+// The images may still be referenced by in-flight GPU work, so the GPU has to finish before
+// any of them is freed. One wait for the whole batch: per target, dropping a ring cost a full
+// device stall per slot, which any client able to trigger a rebuild could repeat.
 //
 // Every destruction path funnels through here -- destroy(), create()'s replace and error
-// paths, and the destructor. The wait's result is ignored: this runs from a destructor where
-// throwing is not an option, and a lost device is being torn down anyway.
+// paths, and the destructor -- so the answer to a GPU that has not finished has to be one a
+// destructor can take: the images are left behind rather than freed under a GPU still reading
+// them. Device records that and refuses further work, so the wedge is reported by the next
+// render rather than swallowed here.
 void OffscreenTargetManager::destroyTargets(const std::vector<OffscreenTarget*>& images) {
     m_device.assertGpuThread("OffscreenTargetManager::destroyTargets");
     if (images.empty()) return;
 
-    vkDeviceWaitIdle(m_device.device());
+    if (!m_device.drainForTeardown()) {
+        std::fprintf(stderr,
+                     "OffscreenTargetManager: the GPU has not finished reading %zu offscreen image(s), "
+                     "so they are leaked rather than freed\n",
+                     images.size());
+        return;
+    }
     for (OffscreenTarget* image : images) dropTarget(*image);
 }
 
