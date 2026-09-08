@@ -2,6 +2,8 @@
 
 #include "wallpaperx_item.h"
 
+#include "daemon/log_escape.h"
+
 #include <QCoreApplication>
 #include <QDBusArgument>
 #include <QDBusConnection>
@@ -708,8 +710,10 @@ void sendImportModifiers(QObject* context, quint32 drmFormat, const std::vector<
                     done->deleteLater();
                     if (!done->isError()) return;
 
+                    // Whatever answered on the bus wrote this text; the journal is a terminal.
+                    const std::string refusal = sanitizeForLog(done->error().message().toStdString());
                     std::fprintf(stderr, "wallpaperx: the daemon refused the import modifier report -- %s\n",
-                                 done->error().message().toUtf8().constData());
+                                 refusal.c_str());
                     // Armed, not retried. The same list earns the same answer until the daemon
                     // says the layouts in force have changed.
                     g_reportRefused.store(true);

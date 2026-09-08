@@ -420,8 +420,8 @@ uint64_t someOtherUsableModifier(VkPhysicalDevice physicalDevice, uint64_t chose
 //
 // Every exported buffer in this probe gets its own target. Sharing one would mean two
 // VkImages aliasing a single dma_buf and, worse, two acquires against a single release:
-// exportFrame() issues exactly one release to VK_QUEUE_FAMILY_FOREIGN_EXT and
-// early-returns on every later call, so a second import's acquire is unpaired and its
+// render() issues one release to VK_QUEUE_FAMILY_FOREIGN_EXT per render and exportFrame()
+// issues none, so a second import of the same render has an unpaired acquire and its
 // contents are undefined *regardless of the modifier it was told*. The wrong-modifier
 // control did exactly that, and would have kept reporting success even if the import had
 // become completely modifier-blind.

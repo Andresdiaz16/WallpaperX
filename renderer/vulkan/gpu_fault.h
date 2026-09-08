@@ -28,14 +28,20 @@ struct WallpaperContentError : std::runtime_error {
 // diagnostics: an operator reads the daemon's last_error, and an integer there names nothing.
 std::string vkResultName(VkResult result);
 
-// Raises the fault `result` describes, for a driver call that has already failed. Running out
-// of a host or device resource is a limit that says nothing about the GPU, so it stays
-// unclassified and leaves the recorded GPU health alone; everything else -- a lost device, an
-// initialization failure, a code the call may not return at all -- is the driver going wrong.
+// Running out of a host or device resource, rather than a device that stopped working. The
+// shortage may be the host's, another process's, or transient, and none of it is evidence
+// about the GPU -- so blaming the graphics driver here sends an operator after the wrong thing.
 //
-// Classified on the result rather than on a per-call list of permitted results: such a list
-// is a second copy of the specification that nothing re-checks, and its only effect would be
-// to promote a resource limit to a driver fault at calls not documented to return it.
+// Decided on the result rather than on a per-call list of permitted results: such a list is a
+// second copy of the specification that nothing re-checks, and its only effect would be to
+// promote a resource limit to a driver fault at calls not documented to return it.
+bool isResourceExhaustion(VkResult result);
+
+// Raises the fault `result` describes, for a driver call that has already failed: a resource
+// limit stays unclassified and leaves the recorded GPU health alone; everything else -- a lost
+// device, an initialization failure, a code the call may not return at all -- is the driver
+// going wrong. A site whose failure a result cannot name (a VK_SUCCESS with nothing to show
+// for it) decides with isResourceExhaustion() and throws its own.
 //
 // `context` should name the entry point, which is otherwise absent from the message.
 [[noreturn]] void throwVkFailure(const std::string& context, VkResult result);

@@ -91,6 +91,11 @@ if(NOT EXISTS "${HTTPLIB_INCLUDE_DIR}/httplib.h")
     )
 endif()
 
+# daemon/log_escape.h, header-only. A target rather than a bare include path because the
+# plugin needs it too: it logs text that arrived over the bus, exactly as the daemon does.
+add_library(wallpaperx-log-escape INTERFACE)
+target_include_directories(wallpaperx-log-escape INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})
+
 # --------------------------------------------------------------------------- #
 # wallpaperx-daemon (placeholder — sources added in later steps)
 # --------------------------------------------------------------------------- #
@@ -211,6 +216,7 @@ endif()
 
 target_link_libraries(wallpaperx-daemon-lib PUBLIC
     wallpaperx-renderer
+    wallpaperx-log-escape
     SDBusCpp::sdbus-c++
     nlohmann_json::nlohmann_json
     Threads::Threads
@@ -1186,7 +1192,7 @@ if(WALLPAPERX_BUILD_KDE_PLUGIN)
             SOURCES kde/wallpaperx_item.cpp kde/wallpaperx_item.h kde/buffer_claims.h
             OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/qml/com/wallpaperx)
         target_link_libraries(wallpaperxplugin PRIVATE
-            wallpaperx-frame-import Qt6::Core Qt6::DBus Qt6::Quick Qt6::Qml)
+            wallpaperx-frame-import wallpaperx-log-escape Qt6::Core Qt6::DBus Qt6::Quick Qt6::Qml)
 
         # The QML engine looks for lib<plugin>.so, and this target builds as
         # wallpaperxplugin.so without it -- so the module resolves, the type information is read,

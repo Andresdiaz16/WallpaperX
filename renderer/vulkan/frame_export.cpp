@@ -3,6 +3,7 @@
 #include "frame_export.h"
 
 #include "device.h"
+#include "gpu_fault.h"
 #include "memory_export.h"
 #include "offscreen.h"
 
@@ -38,6 +39,20 @@ uint32_t drmFourccForVkFormat(VkFormat format) {
 }
 
 namespace {
+
+// For a descriptor query that produced no usable descriptor. A VK_SUCCESS with a negative fd
+// is how some drivers report fd exhaustion, and no result classifier can see it, so it is
+// folded in with the limit results here: usually a consumer leaking what GetFrameFd hands it,
+// and blaming the GPU for that points an operator at their driver over RLIMIT_NOFILE.
+// Anything else is throwVkFailure's rule.
+[[noreturn]] void throwNoDescriptor(const std::string& context, VkResult result) {
+    if (result == VK_SUCCESS || isResourceExhaustion(result)) {
+        throw std::runtime_error(context + " produced no file descriptor (" + vkResultName(result) +
+                                 ") -- a resource limit, not the graphics driver: the process is out of file "
+                                 "descriptors, or a consumer is leaking them");
+    }
+    throwVkFailure(context, result);
+}
 
 // Describes where each memory plane sits inside the exported allocation. Without this an
 // importer only has an fd and no way to interpret it.
@@ -150,21 +165,7 @@ ExportedFrame exportFrame(Device& device, const OffscreenTarget& target) {
     // fd = -1, which would otherwise be handed back as a valid-looking frame with a
     // dead fd. exportFrame's contract is "a fresh valid fd, or throw".
     const VkResult fdResult = pfnGetMemoryFd(device.device(), &getFdInfo, &frame.fd);
-    if (fdResult != VK_SUCCESS || frame.fd < 0) {
-        // The two results this call may return are both host limits, and so is a VK_SUCCESS
-        // with no descriptor to show for it: the cause is fd exhaustion, usually a consumer
-        // leaking the ones GetFrameFd hands it. Calling that a GPU fault points an operator
-        // at their driver for a problem in RLIMIT_NOFILE. Only an unpermitted result is the
-        // driver going wrong.
-        const bool hostLimit = fdResult == VK_SUCCESS || fdResult == VK_ERROR_TOO_MANY_OBJECTS ||
-                               fdResult == VK_ERROR_OUT_OF_HOST_MEMORY;
-        if (hostLimit) {
-            throw std::runtime_error("exportFrame: vkGetMemoryFdKHR produced no file descriptor for the frame -- "
-                                     "the process is out of file descriptors, or a consumer is leaking them");
-        }
-        throw GpuFailure("exportFrame: vkGetMemoryFdKHR returned " + std::to_string(static_cast<int>(fdResult)) +
-                         ", which it is not permitted to return");
-    }
+    if (fdResult != VK_SUCCESS || frame.fd < 0) throwNoDescriptor("exportFrame: vkGetMemoryFdKHR", fdResult);
 
     frame.width = target.width;
     frame.height = target.height;
@@ -270,17 +271,7 @@ int exportFrameAcquireFd(Device& device, const OffscreenTarget& target) {
     getFdInfo.semaphore = semaphore;
     getFdInfo.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT;
     const VkResult r = pfnGetSemaphoreFd(device.device(), &getFdInfo, &fd);
-    if (r != VK_SUCCESS || fd < 0) {
-        // Classified as vkGetMemoryFdKHR's results are: running out of descriptors is the host's
-        // limit and usually a consumer leaking them, and blaming the GPU for it points an operator
-        // at their driver over RLIMIT_NOFILE.
-        if (r == VK_SUCCESS || r == VK_ERROR_TOO_MANY_OBJECTS || r == VK_ERROR_OUT_OF_HOST_MEMORY) {
-            throw std::runtime_error("exportFrameAcquireFd: vkGetSemaphoreFdKHR produced no file descriptor -- "
-                                     "the process is out of file descriptors, or a consumer is leaking them");
-        }
-        throw GpuFailure("exportFrameAcquireFd: vkGetSemaphoreFdKHR returned " +
-                         std::to_string(static_cast<int>(r)) + ", which it is not permitted to return");
-    }
+    if (r != VK_SUCCESS || fd < 0) throwNoDescriptor("exportFrameAcquireFd: vkGetSemaphoreFdKHR", r);
     return fd;
 }
 

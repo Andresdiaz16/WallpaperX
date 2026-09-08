@@ -3,11 +3,7 @@
 #include "gpu_fault.h"
 
 namespace wallpaperx {
-namespace {
 
-// Running out of something, rather than a device that stopped working. The shortage may be
-// the host's, another process's, or transient, and none of it is evidence about the GPU --
-// so blaming the graphics driver here sends an operator after the wrong thing entirely.
 bool isResourceExhaustion(VkResult result) {
     switch (result) {
         case VK_ERROR_OUT_OF_HOST_MEMORY:
@@ -22,8 +18,6 @@ bool isResourceExhaustion(VkResult result) {
             return false;
     }
 }
-
-}  // namespace
 
 std::string vkResultName(VkResult result) {
     switch (result) {

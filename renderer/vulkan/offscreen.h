@@ -102,6 +102,9 @@ public:
     // drawn once; a moving one needs enough that the producer can draw while the consumer
     // still holds the frame it is showing. Replaces any existing entry, waiting for idle.
     const OffscreenTarget& create(int monitorId, uint32_t width, uint32_t height, uint32_t depth = 1);
+    // Frees this monitor's images once the GPU has finished with them. If it has not within
+    // the bound they are leaked and the entry stays: the images still exist and are still
+    // being read, so has() and get() go on saying so rather than reporting a monitor with none.
     void destroy(int monitorId);
     bool has(int monitorId) const;
 
@@ -174,11 +177,12 @@ private:
     // Points the owning ring's cursor at `target`. Does nothing for a target this manager
     // does not own, which no shipping caller can produce.
     void makeCurrent(const OffscreenTarget& target);
-    void destroyTarget(OffscreenTarget& target);
-    // One bounded wait for the whole batch, then each is freed -- or, if the GPU did not
-    // finish within it, none of them is and they are leaked instead.
-    void destroyTargets(const std::vector<OffscreenTarget*>& images);
-    // Frees one, assuming the caller has already waited. Never call directly.
+    // One bounded wait for the whole batch, then each is freed. False: the GPU did not finish
+    // within the bound, none is freed, and they are leaked -- so whatever records them must
+    // keep doing so.
+    [[nodiscard]] bool destroyTargets(const std::vector<OffscreenTarget*>& images);
+    // Frees one without waiting. Only for an image no batch can be reading: one this call
+    // built and never submitted against, or one destroyTargets() has just drained for.
     void dropTarget(OffscreenTarget& target);
     OffscreenTarget makeTarget(uint32_t width, uint32_t height);
 

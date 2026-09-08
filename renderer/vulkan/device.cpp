@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -35,8 +36,8 @@ namespace {
 // completes, and the daemon has no other way to notice. Two to three orders of magnitude
 // above anything submitted here (a fullscreen quad, a texture upload, an empty batch
 // carrying a semaphore signal), so it cannot fire on a GPU that is merely slow.
-constexpr uint64_t kSubmitTimeoutSeconds = 10;
-constexpr uint64_t kSubmitTimeoutNs = kSubmitTimeoutSeconds * 1'000'000'000ull;
+constexpr std::chrono::seconds kSubmitTimeout{10};
+constexpr uint64_t kSubmitTimeoutNs = std::chrono::nanoseconds(kSubmitTimeout).count();
 
 // Ceiling on batches submitted but not yet known complete. Not a tuning knob: it is what
 // bounds the pending list, and reaching it makes the next submit wait for the oldest batch.
@@ -770,7 +771,7 @@ VkResult Device::stalledResult() const {
 void Device::throwStalled(const char* what, VkResult why) const {
     if (why == VK_TIMEOUT) {
         throw GpuFailure(std::string(what) + ": the GPU still has not finished a batch it was given " +
-                         std::to_string(kSubmitTimeoutSeconds) + " seconds to complete");
+                         std::to_string(kSubmitTimeout.count()) + " seconds to complete");
     }
     throw GpuFailure(std::string(what) + ": the GPU has not finished a submitted batch, and the wait for it "
                                          "failed with " + vkResultName(why));
@@ -801,7 +802,7 @@ void Device::waitFences(const VkFence* fences, uint32_t count, const char* what)
             if (vkGetFenceStatus(m_device, batch.fence) != VK_SUCCESS) batch.waitOutcome = VK_TIMEOUT;
         }
         throw GpuFailure(std::string(what) + ": the GPU did not finish a submitted batch within " +
-                         std::to_string(kSubmitTimeoutSeconds) + " seconds");
+                         std::to_string(kSubmitTimeout.count()) + " seconds");
     }
 
     // No device-idle wait before rethrowing. The batch stays pending, so nothing here recycles

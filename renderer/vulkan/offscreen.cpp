@@ -60,13 +60,13 @@ OffscreenTargetManager::~OffscreenTargetManager() {
     for (auto& [id, ring] : m_targets) {
         for (OffscreenTarget& target : ring.images) all.push_back(&target);
     }
-    destroyTargets(all);
+    static_cast<void>(destroyTargets(all));
 
     // Every render batch's command buffer names this render pass, so it is under the same rule
     // as the images those batches draw into: a GPU that has not finished is still reading it.
-    // Asked again rather than inferred from destroyTargets(), which is a no-op -- and drains
-    // nothing -- once destroy() has already emptied the map. A drain that failed once answers
-    // immediately, so this costs one poll on the ordinary path.
+    // Asked again rather than inferred from destroyTargets(), which drains nothing when the
+    // map is empty. A drain that failed once answers immediately, so this costs one poll on
+    // the ordinary path.
     if (!m_renderPass) return;
     if (!m_device.safeToFree("the render pass every render batch names")) return;
     vkDestroyRenderPass(m_device.device(), m_renderPass, nullptr);
@@ -206,7 +206,8 @@ const OffscreenTarget& OffscreenTargetManager::create(int monitorId, uint32_t wi
 
     // Every slot is built before anything existing is destroyed. Replacing first would leave a
     // monitor with no image at all if the second allocation failed, where this leaves the one
-    // it already had.
+    // it already had. Nothing built here has been submitted against, so on either exit that
+    // undoes the build the new images are dropped without a drain.
     Ring ring;
     ring.images.reserve(depth);
     try {
@@ -214,16 +215,20 @@ const OffscreenTarget& OffscreenTargetManager::create(int monitorId, uint32_t wi
             ring.images.push_back(makeTarget(width, height));
         }
     } catch (...) {
-        std::vector<OffscreenTarget*> built;
-        for (OffscreenTarget& image : ring.images) built.push_back(&image);
-        destroyTargets(built);
+        for (OffscreenTarget& image : ring.images) dropTarget(image);
         throw;
     }
 
     if (auto existing = m_targets.find(monitorId); existing != m_targets.end()) {
         std::vector<OffscreenTarget*> old;
         for (OffscreenTarget& image : existing->second.images) old.push_back(&image);
-        destroyTargets(old);
+        if (!destroyTargets(old)) {
+            // The old ring stays recorded: its images still exist and the GPU is still reading
+            // them, and this monitor's entry is the only record of that.
+            for (OffscreenTarget& image : ring.images) dropTarget(image);
+            throw GpuFailure("OffscreenTargetManager: the GPU has not finished reading this monitor's images, so "
+                             "they cannot be replaced");
+        }
     }
 
     auto [it, inserted] = m_targets.insert_or_assign(monitorId, std::move(ring));
@@ -256,7 +261,7 @@ OffscreenTarget OffscreenTargetManager::makeTarget(uint32_t width, uint32_t heig
         try {
             target.drmModifier = queryImageDrmModifier(m_device.device(), target.image.image);
         } catch (...) {
-            destroyTarget(target);
+            dropTarget(target);
             throw;
         }
     }
@@ -268,7 +273,7 @@ OffscreenTarget OffscreenTargetManager::makeTarget(uint32_t width, uint32_t heig
     viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
 
     if (const VkResult r = vkCreateImageView(m_device.device(), &viewInfo, nullptr, &target.view); r != VK_SUCCESS) {
-        destroyTarget(target);
+        dropTarget(target);
         throwVkFailure("OffscreenTargetManager: vkCreateImageView", r);
     }
 
@@ -286,7 +291,7 @@ OffscreenTarget OffscreenTargetManager::makeTarget(uint32_t width, uint32_t heig
 
     if (const VkResult r = vkCreateFramebuffer(m_device.device(), &fbInfo, nullptr, &target.framebuffer);
         r != VK_SUCCESS) {
-        destroyTarget(target);
+        dropTarget(target);
         throwVkFailure("OffscreenTargetManager: vkCreateFramebuffer", r);
     }
 
@@ -298,32 +303,27 @@ void OffscreenTargetManager::destroy(int monitorId) {
     if (it == m_targets.end()) return;
     std::vector<OffscreenTarget*> ring;
     for (OffscreenTarget& target : it->second.images) ring.push_back(&target);
-    destroyTargets(ring);
-    m_targets.erase(it);
-}
-
-void OffscreenTargetManager::destroyTarget(OffscreenTarget& target) {
-    std::vector<OffscreenTarget*> one{&target};
-    destroyTargets(one);
+    if (destroyTargets(ring)) m_targets.erase(it);
 }
 
 // The images may still be referenced by in-flight GPU work, so the GPU has to finish before
 // any of them is freed. One wait for the whole batch: per target, dropping a ring cost a full
 // device stall per slot, which any client able to trigger a rebuild could repeat.
 //
-// Every destruction path funnels through here -- destroy(), create()'s replace and error
-// paths, and the destructor -- so the answer to a GPU that has not finished has to be one a
-// destructor can take: the images are left behind rather than freed under a GPU still reading
-// them. Device records that and refuses further work, so the wedge is reported by the next
-// render rather than swallowed here.
-void OffscreenTargetManager::destroyTargets(const std::vector<OffscreenTarget*>& images) {
+// Every path that frees an image a render may have drawn into funnels through here --
+// destroy(), create()'s replace, and the destructor -- so the answer to a GPU that has not
+// finished has to be one a destructor can take: the images are left behind rather than freed
+// under a GPU still reading them. Device records that and refuses further work, so the wedge
+// is reported by the next render rather than swallowed here.
+bool OffscreenTargetManager::destroyTargets(const std::vector<OffscreenTarget*>& images) {
     m_device.assertGpuThread("OffscreenTargetManager::destroyTargets");
-    if (images.empty()) return;
+    if (images.empty()) return true;
 
     // No batch to name: nothing records which render last drew into which image, so any
     // pending one may still be reading these.
-    if (!m_device.safeToFree("offscreen images, their views and their framebuffers")) return;
+    if (!m_device.safeToFree("offscreen images, their views and their framebuffers")) return false;
     for (OffscreenTarget* image : images) dropTarget(*image);
+    return true;
 }
 
 void OffscreenTargetManager::dropTarget(OffscreenTarget& target) {
