@@ -32,6 +32,7 @@
 // (S7.10e, S7.12) need a device to exist, and the daemon ships with validation off;
 // dbus_service_test and daemon_system_test own that oracle.
 
+#include "daemon/crash_record.h"
 #include "daemon/dbus_service.h"
 #include "daemon/http_server.h"
 #include "daemon/log_escape.h"
@@ -45,6 +46,7 @@
 
 #include "tests/client/daemon_client.h"
 #include "tests/client/http_probe.h"
+#include "tests/client/scratch_dir.h"
 #include "tests/test_report.h"
 
 #include <httplib.h>
@@ -2100,6 +2102,90 @@ void runHealthStateChecks(const std::string& bluePath, const std::string& videoP
                 }
                 std::printf("http_server_test: unrenderable type -> %s\n", health.body.c_str());
                 std::fflush(stdout);
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------ //
+    // (a3) a wallpaper the last run died applying is refused, and that is the wallpaper's
+    //      problem and not the daemon's.
+    // ------------------------------------------------------------------ //
+    {
+        // Needs no GPU: the refusal is decided in restoreSaved(), and the render pass for a
+        // refused monitor returns before ensureGpu(). That is why it sits in this phase rather
+        // than in the after-device one -- a host with no working driver still grades it.
+        const wallpaperx::testing::ScratchDir scratch("healthquarantine");
+        const std::filesystem::path stateDir = scratch.path() / "state" / "wallpaperx";
+        const std::filesystem::path configFile = scratch.path() / "config" / "config.json";
+        bool planted = scratch.ok();
+        if (planted) {
+            try {
+                std::filesystem::create_directories(configFile.parent_path());
+                std::filesystem::create_directories(stateDir);
+                const nlohmann::json config{
+                    {"version", 1},
+                    {"monitors", nlohmann::json::array({{{"monitor_id", 0},
+                                                         {"type", "static"},
+                                                         {"path", bluePath}}})}};
+                std::ofstream(configFile) << config.dump();
+                std::ofstream(wallpaperx::crashRecordPath(stateDir, 0))
+                    << nlohmann::json{{"monitor_id", 0}, {"type", "static"}, {"path", bluePath}}.dump()
+                    << "\nsignal 11\n";
+            } catch (const std::exception& e) {
+                planted = false;
+                notVerified("S13.13 (the /health half)",
+                            std::string("the config and crash record could not be planted: ") + e.what());
+            }
+        } else {
+            notVerified("S13.13 (the /health half)", "no scratch directory for the config and state files");
+        }
+
+        if (planted) {
+            WallpaperManager::Config config = base;
+            config.configFile = configFile;
+            config.stateDir = stateDir;
+
+            IsolatedDaemon daemon(config);
+            if (!daemon.ready()) {
+                notVerified("S13.13 (the /health half)", daemon.reason());
+            } else {
+                for (int id : daemon.manager().restoreSaved()) daemon.manager().renderPending(id);
+                const HttpReply health = daemon.health();
+                if (!health.ok()) {
+                    check(false, "the daemon that refused a wallpaper answered /health with a parseable 200");
+                } else {
+                    // GOAL: S13.13's /health clause -- a monitor whose wallpaper the last run
+                    //       died applying reads `failed` with the reason, while the daemon
+                    //       itself reads `ok`. Both halves are separately false: no per-monitor
+                    //       entry leaves a frontend with a blank screen and nothing to show for
+                    //       it, and a failed aggregate makes a service manager restart a daemon
+                    //       that is working exactly as designed -- which is the crash loop
+                    //       rebuilt out of the watchdog instead of the config.
+                    // WHY-THIS-SHAPE: the aggregate is asserted to be exactly "ok", not merely
+                    //       "not fail". `pending` would also be wrong here and is what a build
+                    //       that refused the wallpaper but still owed a render would report.
+                    // CONTROL: two, one per half, both in backend/daemon/wallpaper_manager.cpp.
+                    //       `state.lastErrorIsDaemonFault = false` in restoreSaved()'s
+                    //       quarantine branch changed to `= true` -> "FAIL: a refused wallpaper
+                    //       does not make the daemon itself unhealthy", printing `aggregate:
+                    //       fail; wallpapers: 1 of 1 monitors failed inside the daemon`. And
+                    //       `state.quarantined = ...` replaced with `= false` -> "FAIL: /health
+                    //       reports a monitor whose wallpaper was refused as failed" and the
+                    //       detail check beside it. Both reverted.
+                    check(monitorState(health.json, 0) == "failed",
+                          "/health reports a monitor whose wallpaper was refused as failed");
+                    check(monitorDetail(health.json, 0).find("SIGSEGV") != std::string::npos,
+                          "/health's per-monitor detail says the daemon died applying it, and of what");
+                    check(healthCheckStatus(health.json, "wallpapers") == "ok",
+                          "a refused wallpaper is the wallpaper's problem: the wallpapers check stays ok");
+                    check(health.json.value("status", std::string()) == "ok",
+                          "a refused wallpaper does not make the daemon itself unhealthy");
+                    if (health.json.value("status", std::string()) != "ok") {
+                        std::fprintf(stderr, "  aggregate: %s; wallpapers: %s\n",
+                                     health.json.value("status", std::string()).c_str(),
+                                     healthCheckDetail(health.json, "wallpapers").c_str());
+                    }
+                }
             }
         }
     }
@@ -5397,6 +5483,17 @@ void runSilentClientShutdownChecks(WallpaperManager& manager, const Check& check
 
 int main() {
     wallpaperx::testing::g_testName = "http_server_test";
+
+    // Before any WallpaperManager::Config exists: its stateDir defaults to
+    // $XDG_STATE_HOME/wallpaperx, and this file's managers name only a scratch config. Without
+    // this, every render here writes its crash record into the developer's own state directory.
+    const wallpaperx::testing::ScratchStateHome stateHome;
+    if (!stateHome.ok()) {
+        notVerified("every goal in this file",
+                    "no scratch state directory could be created, and running without one would write this "
+                    "test's crash records into the developer's own state directory");
+        return wallpaperx::testing::reportNotVerifiedOrPassed();
+    }
 
     // Wrapped in a Check rather than called directly because every phase below takes one:
     // the std::function is what lets a phase be handed the grader without this file's

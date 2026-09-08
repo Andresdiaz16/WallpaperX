@@ -13,6 +13,7 @@
 // Client-only, like its two siblings in this directory: nothing here includes a daemon
 // header, so the out-of-process tier can use it too.
 
+#include <cstdlib>
 #include <filesystem>
 #include <string>
 #include <system_error>
@@ -98,6 +99,33 @@ private:
     }
 
     std::filesystem::path m_path;
+    bool m_ok = false;
+};
+
+// Points this whole process's state directory at a scratch directory, for a test that builds
+// a WallpaperManager in its own process.
+//
+// WallpaperManager::Config defaults stateDir to $XDG_STATE_HOME/wallpaperx -- unlike
+// configFile, which defaults to empty -- so a test that names a scratch config and says
+// nothing about state still reads and writes the developer's own state directory. Measured on
+// dbus_service_test before this existed: one run created 16 distinct applying-*.json files
+// there, each removed at the end of its render, and a run killed mid-render leaves one behind
+// for the real daemon's next start to honour.
+//
+// Construct it first in main(), before any Config: the default is evaluated when the Config is
+// constructed, so an override set afterwards changes nothing for a manager already built.
+class ScratchStateHome {
+public:
+    ScratchStateHome() : m_dir("statehome") {
+        if (!m_dir.ok()) return;
+        m_ok = ::setenv("XDG_STATE_HOME", m_dir.path().c_str(), 1) == 0;
+    }
+
+    bool ok() const { return m_ok; }
+    const std::filesystem::path& path() const { return m_dir.path(); }
+
+private:
+    ScratchDir m_dir;
     bool m_ok = false;
 };
 

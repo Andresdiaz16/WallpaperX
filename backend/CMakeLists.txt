@@ -318,6 +318,42 @@ if(WALLPAPERX_SANITIZE)
     target_compile_definitions(wallpaperx-config-store-test PRIVATE WALLPAPERX_ALLOCATION_INSTRUMENT=0)
 endif()
 
+# The crash-loop breaker's on-disk half: the record the render thread holds while a wallpaper
+# is being applied, and what the fatal-signal handler does to it. Its own binary because every
+# signal case is a forked child that dies on purpose, and folding those into a tier that also
+# holds a Vulkan device or a bus connection means forking a process that owns both.
+#
+# It needs renderer/tests on the include path for support/forked_child.h, which is where the
+# PR_SET_PDEATHSIG preamble and the core-dump suppression live -- shared with the renderer's
+# own forking probe rather than copied.
+add_executable(wallpaperx-crash-record-test tests/crash_record_test.cpp)
+target_link_libraries(wallpaperx-crash-record-test PRIVATE wallpaperx-daemon-lib)
+target_include_directories(wallpaperx-crash-record-test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../renderer/tests)
+# Nothing here is a QObject, and with WALLPAPERX_BUILD_KDE_PLUGIN=ON KDECMakeSettings turns
+# AUTOMOC on for every target in this directory.
+set_target_properties(wallpaperx-crash-record-test PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+
+# Under a sanitizer the runtime installs its own SIGSEGV/SIGABRT handlers and chooses the
+# process's exit status, so "the child still died of that signal" grades the sanitizer rather
+# than the daemon. The checks that read the death signal report themselves unexercised there
+# instead of accusing the handler; the record checks, which run before the chain reaches the
+# sanitizer's handler, are unaffected and still run.
+if(WALLPAPERX_SANITIZE)
+    target_compile_definitions(wallpaperx-crash-record-test PRIVATE WALLPAPERX_SIGNAL_EXIT_IS_THE_SIGNAL=false)
+endif()
+
+# The refusal half of the same feature: what a start does with a record it finds. Separate
+# from the binary above because this one drives a WallpaperManager and renders on the GPU,
+# while that one forks children that die on purpose -- and forking a process that owns a
+# Vulkan device is not a thing to do for convenience.
+add_executable(wallpaperx-crash-quarantine-test tests/crash_quarantine_test.cpp)
+target_link_libraries(wallpaperx-crash-quarantine-test PRIVATE wallpaperx-daemon-lib)
+# renderer/tests for support/test_image.h, the shared PNG fixture writer.
+target_include_directories(wallpaperx-crash-quarantine-test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../renderer/tests)
+set_target_properties(wallpaperx-crash-quarantine-test PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+
 # Step 9's Plasma wallpaper package (kde/kpackage), checked as text: that its metadata
 # parses, declares the structure Plasma looks for, and agrees with the install rule below
 # and with the plugin id the app's activation script will ask for.
@@ -546,6 +582,32 @@ set_tests_properties(log_escape PROPERTIES LABELS "novulkan")
 add_test(NAME config_store COMMAND $<TARGET_FILE:wallpaperx-config-store-test>)
 set_tests_properties(config_store PROPERTIES LABELS "novulkan"
                      SKIP_RETURN_CODE 77)
+
+# Outside the guard too: forked children, signals and files, with no bus, port or driver.
+# `novulkan` because the sanitizer block below selects by label and an unlabelled entry is
+# disabled there. SKIP_RETURN_CODE because a host that cannot make a scratch directory, or a
+# filesystem with no symlinks, is this test failing to set up rather than the breaker being
+# wrong. No RESOURCE_LOCK: it competes for nothing and measures no timing.
+add_test(NAME crash_record COMMAND $<TARGET_FILE:wallpaperx-crash-record-test>)
+set_tests_properties(crash_record PROPERTIES LABELS "novulkan"
+                     SKIP_RETURN_CODE 77)
+
+# Its companion needs a device, so it is registered the way the other GPU entries are: no
+# label on the default-ICD run, which is what disables it in the TSan tree (the proprietary
+# driver SEGVs there inside its own uninstrumented code), and a labelled lavapipe run that
+# survives both that tree and the hosted CI runner. SKIP_RETURN_CODE because a host with no
+# working device must report the render-dependent goals unexercised rather than green. No
+# RESOURCE_LOCK: it measures no timing and writes its fixtures into a scratch directory of
+# its own, so it competes with nothing.
+add_test(NAME crash_quarantine COMMAND $<TARGET_FILE:wallpaperx-crash-quarantine-test>)
+set_tests_properties(crash_quarantine PROPERTIES SKIP_RETURN_CODE 77)
+if(WALLPAPERX_LAVAPIPE_ICD)
+    add_test(NAME crash_quarantine_lavapipe COMMAND $<TARGET_FILE:wallpaperx-crash-quarantine-test>)
+    set_tests_properties(crash_quarantine_lavapipe PROPERTIES
+        ENVIRONMENT "VK_ICD_FILENAMES=${WALLPAPERX_LAVAPIPE_ICD}"
+        LABELS "lavapipe"
+        SKIP_RETURN_CODE 77)
+endif()
 
 # Outside the guard as well, and for the strongest version of the reason: this one opens no
 # bus, no port and no driver, and reads only files. `novulkan` because the TSan block below

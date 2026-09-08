@@ -37,6 +37,7 @@
 #include "support/exported_frame_map.h"
 #include "support/validation_grade.h"
 #include "tests/client/daemon_client.h"
+#include "tests/client/scratch_dir.h"
 #include "tests/test_report.h"
 
 #include <sdbus-c++/sdbus-c++.h>
@@ -5174,6 +5175,19 @@ void runCoalescingChecks(sdbus::IProxy& proxy, FrameReadyLog& signals, const std
 
 int main() {
     wallpaperx::testing::g_testName = "dbus_service_test";
+
+    // Before any WallpaperManager::Config exists: its stateDir defaults to
+    // $XDG_STATE_HOME/wallpaperx, and this file's managers name only a scratch config. Without
+    // this, every render here writes its crash record into the developer's own state
+    // directory -- 16 of them in one measured run.
+    const wallpaperx::testing::ScratchStateHome stateHome;
+    if (!stateHome.ok()) {
+        wallpaperx::testing::notVerified(
+            "every goal in this file",
+            "no scratch state directory could be created, and running without one would write this "
+            "test's crash records into the developer's own state directory");
+        return wallpaperx::testing::reportNotVerifiedOrPassed();
+    }
 
     // Wrapped in a Check rather than called directly because every phase below takes one:
     // the std::function is what lets a phase be handed the grader without this file's

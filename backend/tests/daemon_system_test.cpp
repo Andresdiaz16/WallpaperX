@@ -49,6 +49,11 @@
 // display-safe form of a path while the config file holds the raw bytes, and the expected
 // display form has to come from the daemon's own function rather than be spelled out here.
 #include "daemon/log_escape.h"
+// For crashRecordPath() only: the crash-refusal phase plants a record where the shipped
+// daemon looks for one, and the location has to be the daemon's own answer rather than a
+// filename spelled out here -- which would stop matching the moment the name changed, on the
+// run where the phase has to work.
+#include "daemon/crash_record.h"
 #include "tests/client/blocking_config_write.h"
 #include "tests/client/daemon_client.h"
 #include "tests/client/http_probe.h"
@@ -3928,6 +3933,148 @@ void checkConfigRestart(NameWatcher& names, const std::string& validationEnv, co
 }
 
 // ---------------------------------------------------------------------------- //
+// Step 13 -- a wallpaper the last run died applying, refused by the shipped binary.
+// ---------------------------------------------------------------------------- //
+//
+// The decision itself is graded in process (crash_quarantine_test) and the record's own
+// rules in crash_record_test. What only this tier can establish is that the SHIPPED binary
+// finds the record at all: it resolves its state directory from $XDG_STATE_HOME at startup,
+// before the bus name is claimed, and no client is involved. An in-process manager is handed
+// its state directory as a Config field, so it cannot answer that question either way.
+//
+// The record is planted rather than produced by crashing a real daemon. Producing one means
+// killing the daemon inside the window between the record's creation and the submit, which is
+// a few tens of milliseconds of a render this test cannot observe the start of -- a race, and
+// a lost race would print as a defect.
+void checkCrashRefusal(NameWatcher& names, const std::string& validationEnv, const std::string& bluePath,
+                       const Check& check) {
+    // This phase drives a daemon and an XDG_CONFIG_HOME of its own, so this id is only ever
+    // compared against its own -- the rule the id table at the top of this file sets out.
+    constexpr int32_t kMonitorRefused = 18;
+    constexpr const char* kGoals =
+        "S13.13/S13.16 through the shipped binary (a wallpaper the last run died applying is refused, and an "
+        "explicit set is the way out)";
+
+    ScratchDir configHome("crashrefusal");
+    if (!configHome.ok()) {
+        notVerified(kGoals, "a scratch XDG_CONFIG_HOME could not be created under the temp directory");
+        return;
+    }
+    // Where a daemon given this scratch directory as its XDG_STATE_HOME keeps its records.
+    // Both env entries are passed explicitly below: SpawnedDaemon only derives one from the
+    // other when it owns the config home, and here this phase does.
+    const std::filesystem::path stateDir = configHome.preservedDir();
+    const std::filesystem::path record = wallpaperx::crashRecordPath(stateDir, kMonitorRefused);
+
+    const nlohmann::json config{
+        {"version", 1},
+        {"monitors", nlohmann::json::array({{{"monitor_id", kMonitorRefused},
+                                             {"type", "static"},
+                                             {"path", bluePath}}})}};
+    const nlohmann::json recordLine{
+        {"monitor_id", kMonitorRefused}, {"type", "static"}, {"path", bluePath}};
+    if (!writeTextFile(configHome.configFile(), config.dump()) ||
+        !writeTextFile(record, recordLine.dump() + "\nsignal 11\n")) {
+        notVerified(kGoals, "the config file and crash record could not be written into the scratch directory");
+        return;
+    }
+
+    FrameReadyLog signals;
+    auto proxy =
+        sdbus::createProxy(sdbus::ServiceName{DbusService::kBusName}, sdbus::ObjectPath{DbusService::kObjectPath});
+    proxy->uponSignal("FrameReady")
+        .onInterface(DbusService::kInterface)
+        .call([&signals](int32_t monitorId, uint64_t generation) { signals.record(monitorId, generation); });
+
+    SpawnedDaemon daemon({validationEnv, configHome.env(), configHome.stateEnv()});
+    if (!names.waitFor(true)) {
+        if (!reportedStartupFault(daemon, kGoals)) {
+            notVerified(kGoals, "the daemon of the crash-refusal phase never acquired the bus name");
+        }
+        return;
+    }
+
+    // GOAL: S13.13, through the real binary -- a daemon started over a state directory
+    //       holding a record that matches its saved wallpaper refuses that wallpaper, says
+    //       which signal the last run died of, and answers GetFrameFd with RenderFailed.
+    //       False if the shipped binary looks for its records somewhere else, or does not
+    //       look before it applies the config.
+    // WHY-THIS-SHAPE: no client call precedes the assertions -- the refusal has to be the
+    //       daemon's own doing at startup. And the reason is read off GetStatus rather than
+    //       out of the daemon's stderr: a log line proves the daemon noticed, not that a
+    //       frontend can find out.
+    // CONTROL: in backend/daemon/wallpaper_manager.cpp, restoreSaved()'s
+    //       `state.quarantined = crash && ...` replaced with `= false` -> five FAIL lines,
+    //       beginning "the shipped daemon refuses a wallpaper its state directory says the
+    //       last run died applying" with an empty last_error printed, and "GetFrameFd on a
+    //       refused monitor answers RenderFailed on the shipped daemon -- GetFrameFd
+    //       answered: a frame". Reverted.
+    const StatusReply refused = getStatusOrExplain(*proxy);
+    const std::string key = std::to_string(kMonitorRefused);
+    const nlohmann::json* entry = refused.ok() ? wallpaperStatus(refused, key) : nullptr;
+    if (entry == nullptr) {
+        check(false, "the shipped daemon restored the monitor whose wallpaper it refused");
+    } else {
+        const std::string lastError = entry->value("last_error", std::string());
+        check(lastError.find("SIGSEGV") != std::string::npos,
+              "the shipped daemon refuses a wallpaper its state directory says the last run died applying");
+        check(!entry->value("has_frame", true), "the refused monitor has no frame in the shipped daemon");
+        if (lastError.find("SIGSEGV") == std::string::npos) {
+            std::fprintf(stderr, "  last_error: %s\n", lastError.c_str());
+        }
+        std::printf("daemon_system_test: the shipped daemon reports monitor %d as -- %s\n", kMonitorRefused,
+                    lastError.c_str());
+    }
+
+    const std::string frameError =
+        wallpaperx::testing::errorNameFrom([&] { (void)wallpaperx::testing::getFrameFd(*proxy, kMonitorRefused); });
+    check(frameError == "io.wallpaperx.Daemon.Error.RenderFailed",
+          "GetFrameFd on a refused monitor answers RenderFailed on the shipped daemon");
+    if (frameError != "io.wallpaperx.Daemon.Error.RenderFailed") {
+        std::fprintf(stderr, "  GetFrameFd answered: %s\n", frameError.empty() ? "a frame" : frameError.c_str());
+    }
+
+    // GOAL: S13.16, through the real binary -- setting the same wallpaper again is the way
+    //       out, and the record does not survive the render that follows. False if a user
+    //       whose daemon refused their wallpaper cannot get it back from the app, or if the
+    //       retry works and the NEXT start refuses it all over again.
+    // WHY-THIS-SHAPE: the record's absence is read off the disk, not off the bus, because
+    //       that file is what the next start reads and nothing publishes it.
+    // CONTROL: in backend/daemon/crash_record.cpp, the `::unlink(m_file.c_str())` in
+    //       ~ApplyingRecord deleted -> "FAIL: the record is gone from the state directory
+    //       once the retry has rendered". Reverted.
+    check(std::filesystem::exists(record), "the record is still on disk while the wallpaper is refused");
+    setWallpaper(*proxy, "static", bluePath, kMonitorRefused);
+    if (!signals.wait(kMonitorRefused, 1)) {
+        // Not a pass and not a failure of the refusal: this host never rendered, so what a
+        // completed retry leaves behind cannot be read here.
+        notVerified("S13.16's render half through the shipped binary",
+                    "the retry never produced a FrameReady on this host, so what a completed render does to "
+                    "the record could not be observed");
+        return;
+    }
+    const StatusReply retried = getStatusOrExplain(*proxy);
+    const nlohmann::json* after = retried.ok() ? wallpaperStatus(retried, key) : nullptr;
+    if (after == nullptr) {
+        check(false, "the shipped daemon still reports the monitor after the retry");
+    } else {
+        check(after->value("has_frame", false), "an explicit set renders the wallpaper the daemon had refused");
+        // Absence of the key, not an empty string: GetStatus omits last_error entirely when
+        // there is none, so a check written as value("last_error", "") == "" would also pass
+        // for a reply that had dropped the field.
+        check(!after->contains("last_error"), "the refusal is cleared once the wallpaper has been set again");
+        if (after->contains("last_error")) {
+            std::fprintf(stderr, "  last_error after the retry: %s\n",
+                         after->value("last_error", std::string()).c_str());
+        }
+    }
+    check(!std::filesystem::exists(record), "the record is gone from the state directory once the retry has rendered");
+
+    daemon.shutdown(SIGTERM);
+    awaitNameRelease(names, "any phase after the crash-refusal one");
+}
+
+// ---------------------------------------------------------------------------- //
 // Step 10 -- the connector name a plugin identifies itself by, across a restart.
 // ---------------------------------------------------------------------------- //
 //
@@ -6262,6 +6409,11 @@ int main() {
         // the descriptor accounting below -- their proxies and httplib clients close their
         // sockets at scope exit, which that accounting would otherwise report as a leak.
         checkConfigRestart(names, validationEnv, check);
+        // Step 13's crash-loop breaker, beside the restart phase because it is the same
+        // shape: a daemon started over a state directory this phase prepared, with no client
+        // call before the assertions. Its own phase so a host that cannot write the scratch
+        // files reports S13.13 unexercised rather than hiding inside a Step 8 skip.
+        checkCrashRefusal(names, validationEnv, bluePath, check);
         // Step 10, and beside the restart phase above because it is the same shape one goal
         // further on: that one restarts a wallpaper, this one restarts the connector name a
         // plugin instance identifies itself by. Its own phase rather than more lines inside
