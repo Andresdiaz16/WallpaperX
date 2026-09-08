@@ -7,7 +7,9 @@
 #include "offscreen.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <iterator>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -232,23 +234,41 @@ int exportFrameAcquireFd(Device& device, const OffscreenTarget& target) {
         throwVkFailure("exportFrameAcquireFd: vkCreateSemaphore", r);
     }
 
-    // Destroyed on every path, including the throw out of submit(). The exported descriptor holds
-    // its own reference to the payload -- measured on this driver, not assumed -- so the signal
-    // survives this object by exactly as long as the consumer needs it.
+    // Destroyed on every path where the GPU is not still signalling it, including the throws out
+    // of submit() and the fd query. The exported descriptor holds its own reference to the
+    // payload -- measured on this driver, not assumed -- so the signal survives this object by
+    // exactly as long as the consumer needs it.
     struct Cleanup {
-        VkDevice device;
-        VkSemaphore& semaphore;
+        Device& device;
+        VkSemaphore semaphore;
+        // Names the batch that signals this semaphore for as long as that batch may still be
+        // running: unset before submit() accepts it, and again once the wait below returns.
+        // Those are the only two states in which destroying the semaphore is legal.
+        std::optional<Device::SubmitTicket> inFlight;
+
         ~Cleanup() {
-            if (semaphore) vkDestroySemaphore(device, semaphore, nullptr);
+            // A bounded drain rather than another wait(): a destructor cannot throw, and the
+            // path that gets here is the one where the wait below already expired with the
+            // batch still holding this semaphore. Leaked rather than destroyed then, as
+            // everything else abandoned to a wedged GPU is.
+            if (inFlight && !device.drainForTeardown()) {
+                std::fprintf(stderr,
+                             "exportFrameAcquireFd: the GPU has not finished the batch that signals this "
+                             "frame's acquire semaphore, so it is leaked rather than destroyed\n");
+                return;
+            }
+            vkDestroySemaphore(device.device(), semaphore, nullptr);
         }
-    } cleanup{device.device(), semaphore};
+    } cleanup{device, semaphore, std::nullopt};
 
     // Empty command buffer: the batch exists only to carry the signal, whose first
     // synchronization scope covers everything submitted earlier on this queue -- the render
     // that published this frame included. Waited on, so the descriptor comes from a payload
     // already signalled and a producer that dies next leaves nothing to wait on forever. That
     // wait is transitively the render's: the export pays for the frame, the render does not.
-    device.wait(device.submit([](VkCommandBuffer) {}, {{}, {}, {semaphore}}));
+    cleanup.inFlight = device.submit([](VkCommandBuffer) {}, {{}, {}, {semaphore}});
+    device.wait(*cleanup.inFlight);
+    cleanup.inFlight.reset();
 
     int fd = -1;
     VkSemaphoreGetFdInfoKHR getFdInfo{VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR};

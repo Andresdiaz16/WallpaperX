@@ -62,7 +62,19 @@ OffscreenTargetManager::~OffscreenTargetManager() {
         for (OffscreenTarget& target : ring.images) all.push_back(&target);
     }
     destroyTargets(all);
-    if (m_renderPass) vkDestroyRenderPass(m_device.device(), m_renderPass, nullptr);
+
+    // Every render batch's command buffer names this render pass, so it is under the same rule
+    // as the images those batches draw into: a GPU that has not finished is still reading it.
+    // Asked again rather than inferred from destroyTargets(), which is a no-op -- and drains
+    // nothing -- once destroy() has already emptied the map. A drain that failed once answers
+    // immediately, so this costs one poll on the ordinary path.
+    if (!m_renderPass) return;
+    if (!m_device.drainForTeardown()) {
+        std::fprintf(stderr, "OffscreenTargetManager: the GPU has not finished a render, so the render pass it "
+                             "is executing is leaked rather than destroyed\n");
+        return;
+    }
+    vkDestroyRenderPass(m_device.device(), m_renderPass, nullptr);
 }
 
 void OffscreenTargetManager::createRenderPass() {
