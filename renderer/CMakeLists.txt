@@ -70,6 +70,7 @@ add_library(wallpaperx-renderer STATIC
     vulkan/memory.cpp
     vulkan/memory_export.cpp
     vulkan/tier_selection.cpp
+    vulkan/descriptor_slots.cpp
     vulkan/descriptor_classic.cpp
     vulkan/descriptor_buffer.cpp
     vulkan/descriptor_heap.cpp

@@ -25,8 +25,12 @@ VkDeviceSize roundUpToMultiple(VkDeviceSize value, VkDeviceSize multiple) {
 }
 }
 
-DescriptorHeapAllocator::DescriptorHeapAllocator(VkPhysicalDevice physicalDevice, VkDevice device, Memory& memory)
-    : m_physicalDevice(physicalDevice), m_device(device), m_memory(memory) {
+DescriptorHeapAllocator::DescriptorHeapAllocator(Device& device)
+    : m_physicalDevice(device.physicalDevice()),
+      m_device(device.device()),
+      m_memory(device.memory()),
+      m_imageSlots(device, kMaxDescriptorSlots, "DescriptorHeapAllocator: image"),
+      m_uniformSlots(device, kMaxDescriptorSlots, "DescriptorHeapAllocator: uniform") {
     loadFunctions();
 
     m_properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_HEAP_PROPERTIES_EXT;
@@ -138,30 +142,6 @@ void DescriptorHeapAllocator::unregisterSampler(VkSampler sampler) {
     m_registeredSamplers.erase(sampler);
 }
 
-uint32_t DescriptorHeapAllocator::acquireImageSlot() {
-    if (!m_freeImageSlots.empty()) {
-        uint32_t slot = m_freeImageSlots.back();
-        m_freeImageSlots.pop_back();
-        return slot;
-    }
-    if (m_nextImageSlot >= kMaxDescriptorSlots) {
-        throw std::runtime_error("DescriptorHeapAllocator: image heap exhausted");
-    }
-    return m_nextImageSlot++;
-}
-
-uint32_t DescriptorHeapAllocator::acquireUniformSlot() {
-    if (!m_freeUniformSlots.empty()) {
-        uint32_t slot = m_freeUniformSlots.back();
-        m_freeUniformSlots.pop_back();
-        return slot;
-    }
-    if (m_nextUniformSlot >= kMaxDescriptorSlots) {
-        throw std::runtime_error("DescriptorHeapAllocator: uniform heap exhausted");
-    }
-    return m_nextUniformSlot++;
-}
-
 DescriptorHandle DescriptorHeapAllocator::allocate(VkImageView view, VkSampler sampler) {
     auto viewIt = m_registeredViews.find(view);
     if (viewIt == m_registeredViews.end()) {
@@ -174,7 +154,9 @@ DescriptorHandle DescriptorHeapAllocator::allocate(VkImageView view, VkSampler s
             "DescriptorHeapAllocator::allocate: sampler was never registered via registerSampler()");
     }
 
-    const uint32_t slot = acquireImageSlot();
+    // After the registration checks: acquiring can wait for the GPU, and a caller that was
+    // going to be rejected anyway should not pay for that.
+    const uint32_t slot = m_imageSlots.acquire();
 
     VkImageDescriptorInfoEXT imageDescInfo{VK_STRUCTURE_TYPE_IMAGE_DESCRIPTOR_INFO_EXT};
     imageDescInfo.pView = &viewIt->second;
@@ -188,7 +170,7 @@ DescriptorHandle DescriptorHeapAllocator::allocate(VkImageView view, VkSampler s
     resourceDst.address = static_cast<uint8_t*>(m_resourceHeap.mapped) + slot * m_properties.imageDescriptorSize;
     resourceDst.size = m_properties.imageDescriptorSize;
     if (const VkResult r = m_pfnWriteResource(m_device, 1, &resourceInfo, &resourceDst); r != VK_SUCCESS) {
-        m_freeImageSlots.push_back(slot);
+        m_imageSlots.release(slot);
         throwVkFailure("DescriptorHeapAllocator: vkWriteResourceDescriptorsEXT", r);
     }
 
@@ -196,21 +178,18 @@ DescriptorHandle DescriptorHeapAllocator::allocate(VkImageView view, VkSampler s
     samplerDst.address = static_cast<uint8_t*>(m_samplerHeap.mapped) + slot * m_properties.samplerDescriptorSize;
     samplerDst.size = m_properties.samplerDescriptorSize;
     if (const VkResult r = m_pfnWriteSampler(m_device, 1, &samplerIt->second, &samplerDst); r != VK_SUCCESS) {
-        m_freeImageSlots.push_back(slot);
+        m_imageSlots.release(slot);
         throwVkFailure("DescriptorHeapAllocator: vkWriteSamplerDescriptorsEXT", r);
     }
 
     m_memory.flushForHostWrite(m_resourceHeap);
     m_memory.flushForHostWrite(m_samplerHeap);
 
-    m_slotView[slot] = view;
-    m_slotSampler[slot] = sampler;
-
     return DescriptorHandle{slot};
 }
 
 DescriptorHandle DescriptorHeapAllocator::allocateUniform(VkBuffer buffer, VkDeviceSize size) {
-    const uint32_t slot = acquireUniformSlot();
+    const uint32_t slot = m_uniformSlots.acquire();
 
     VkBufferDeviceAddressInfo addrInfo{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
     addrInfo.buffer = buffer;
@@ -228,13 +207,12 @@ DescriptorHandle DescriptorHeapAllocator::allocateUniform(VkBuffer buffer, VkDev
         static_cast<uint8_t*>(m_resourceHeap.mapped) + m_uniformRegionOffset + slot * m_properties.bufferDescriptorSize;
     dst.size = m_properties.bufferDescriptorSize;
     if (const VkResult r = m_pfnWriteResource(m_device, 1, &resourceInfo, &dst); r != VK_SUCCESS) {
-        m_freeUniformSlots.push_back(slot);
+        m_uniformSlots.release(slot);
         throwVkFailure("DescriptorHeapAllocator: vkWriteResourceDescriptorsEXT (uniform)", r);
     }
 
     m_memory.flushForHostWrite(m_resourceHeap);
 
-    m_activeUniformSlots.insert(slot);
     return DescriptorHandle{m_uniformIndexBase + slot};
 }
 
@@ -260,44 +238,17 @@ void DescriptorHeapAllocator::free(DescriptorHandle handle) {
     // Image indices occupy [0, kMaxDescriptorSlots); uniform indices occupy
     // [m_uniformIndexBase, m_uniformIndexBase + kMaxDescriptorSlots), and the
     // constructor guarantees m_uniformIndexBase >= kMaxDescriptorSlots, so these
-    // ranges never overlap. Both branches reject a handle that isn't currently
-    // active (already freed, or never allocated) rather than pushing it onto the
-    // free-list anyway -- doing that silently would hand the same slot out to two
-    // independent, simultaneously-live allocations.
+    // ranges never overlap.
+    //
+    // The view and sampler registrations are deliberately NOT dropped here. Their lifetime
+    // belongs to register/unregisterImageView/Sampler alone: a caller may register once and
+    // reuse across many allocate()/free() cycles, and unregistering here would make the next
+    // allocate() with the same still-live sampler fail as "never registered".
     if (handle.index >= m_uniformIndexBase) {
-        const uint32_t local = handle.index - m_uniformIndexBase;
-        if (m_activeUniformSlots.erase(local) == 0) {
-            throw std::runtime_error(
-                "DescriptorHeapAllocator::free: uniform handle already freed or never allocated");
-        }
-        m_freeUniformSlots.push_back(local);
+        m_uniformSlots.release(handle.index - m_uniformIndexBase);
         return;
     }
-
-    auto viewIt = m_slotView.find(handle.index);
-    if (viewIt == m_slotView.end()) {
-        throw std::runtime_error("DescriptorHeapAllocator::free: image handle already freed or never allocated");
-    }
-
-    // Drop the slot's tracking, but NOT the view/sampler registration. Registration
-    // lifetime is owned solely by register/unregisterImageView/Sampler, independent
-    // of descriptor-slot lifetime: a caller may register a view or sampler once and
-    // reuse it across many allocate()/free() cycles. Unregistering here would break
-    // that -- a later allocate() with the same still-live sampler would wrongly fail
-    // as "never registered".
-    m_slotView.erase(viewIt);
-
-    // allocate() always populates m_slotView and m_slotSampler together, so a
-    // slot found in one but missing from the other means that invariant broke
-    // somewhere -- fail loud rather than silently proceeding on inconsistent
-    // internal state.
-    auto samplerIt = m_slotSampler.find(handle.index);
-    if (samplerIt == m_slotSampler.end()) {
-        throw std::runtime_error("DescriptorHeapAllocator::free: internal inconsistency -- slot had a view but no sampler");
-    }
-    m_slotSampler.erase(samplerIt);
-
-    m_freeImageSlots.push_back(handle.index);
+    m_imageSlots.release(handle.index);
 }
 
 void DescriptorHeapAllocator::pushData(VkCommandBuffer cmd, uint32_t offset, const void* data, size_t size) {

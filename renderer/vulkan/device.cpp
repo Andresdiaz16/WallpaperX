@@ -504,13 +504,13 @@ void Device::createLogicalDevice() {
 void Device::createDescriptorAllocator() {
     switch (m_selectedTier) {
         case DescriptorTier::Heap:
-            m_descriptorAllocator = std::make_unique<DescriptorHeapAllocator>(m_physicalDevice, m_device, m_memory);
+            m_descriptorAllocator = std::make_unique<DescriptorHeapAllocator>(*this);
             break;
         case DescriptorTier::Buffer:
-            m_descriptorAllocator = std::make_unique<DescriptorBufferAllocator>(m_physicalDevice, m_device, m_memory);
+            m_descriptorAllocator = std::make_unique<DescriptorBufferAllocator>(*this);
             break;
         case DescriptorTier::Classic:
-            m_descriptorAllocator = std::make_unique<ClassicDescriptorAllocator>(m_device);
+            m_descriptorAllocator = std::make_unique<ClassicDescriptorAllocator>(*this);
             break;
     }
 }
@@ -640,6 +640,28 @@ void Device::waitForSubmissions() {
 
     waitFences(fences.data(), static_cast<uint32_t>(fences.size()), "Device::waitForSubmissions");
     retireCompleted();
+}
+
+Device::SubmitTicket Device::lastSubmission() const {
+    assertGpuThread("Device::lastSubmission");
+    // m_nextSerial starts at 1, so this is the null ticket until something is submitted.
+    return SubmitTicket{m_nextSerial - 1};
+}
+
+bool Device::hasCompleted(SubmitTicket ticket) {
+    assertGpuThread("Device::hasCompleted");
+    // Checked before retiring, so a ticket old enough to have been forgotten costs no driver
+    // call at all -- which is the common case for a caller polling one repeatedly.
+    if (!isPending(ticket.m_serial)) return true;
+    retireCompleted();
+    return !isPending(ticket.m_serial);
+}
+
+bool Device::isPending(uint64_t serial) const {
+    for (const Pending& pending : m_pending) {
+        if (pending.serial == serial) return true;
+    }
+    return false;
 }
 
 void Device::waitFences(const VkFence* fences, uint32_t count, const char* what) {

@@ -165,6 +165,15 @@ public:
     // same failure as wait().
     void waitForSubmissions();
 
+    // Names the most recent batch submitted, or nothing at all when there has been none.
+    // What a caller records when it stops using something the GPU may be reading: no batch
+    // submitted after this point can reach it, so this is the last one that could.
+    SubmitTicket lastSubmission() const;
+
+    // Whether `ticket`'s batch has completed, without blocking. Only ever goes from false to
+    // true, and retires whatever has finished on the way.
+    bool hasCompleted(SubmitTicket ticket);
+
     // Aborts unless called from the thread that created this Device.
     //
     // Vulkan queue submission is not free-threaded and this Device shares one command
@@ -213,6 +222,7 @@ private:
     // on every submit: one vkGetFenceStatus per outstanding batch, and there are at most
     // kMaxSubmissionsInFlight of those.
     void retireCompleted();
+    bool isPending(uint64_t serial) const;
     void waitFences(const VkFence* fences, uint32_t count, const char* what);
     VkCommandBuffer takeCommandBuffer();
     VkFence takeFence();

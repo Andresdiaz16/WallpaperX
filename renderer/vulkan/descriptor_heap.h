@@ -3,11 +3,10 @@
 #pragma once
 
 #include "descriptor_allocator.h"
+#include "descriptor_slots.h"
 #include "memory.h"
 
 #include <unordered_map>
-#include <unordered_set>
-#include <vector>
 
 namespace wallpaperx {
 
@@ -15,7 +14,9 @@ namespace wallpaperx {
 // VkSamplerCreateInfo, not from handles — callers must register() first.
 class DescriptorHeapAllocator final : public IDescriptorAllocator {
 public:
-    DescriptorHeapAllocator(VkPhysicalDevice physicalDevice, VkDevice device, Memory& memory);
+    // Built from Device mid-construction, so it may only use what is ready by then: the
+    // physical device, the logical device and Memory.
+    explicit DescriptorHeapAllocator(Device& device);
     ~DescriptorHeapAllocator() override;
 
     DescriptorHeapAllocator(const DescriptorHeapAllocator&) = delete;
@@ -36,8 +37,6 @@ public:
 
 private:
     void loadFunctions();
-    uint32_t acquireImageSlot();
-    uint32_t acquireUniformSlot();
 
     VkPhysicalDevice m_physicalDevice = VK_NULL_HANDLE;
     VkDevice m_device = VK_NULL_HANDLE;
@@ -68,17 +67,13 @@ private:
     VkDeviceSize m_samplerReservedOffset = 0;
     VkDeviceSize m_samplerReservedSize = 0;
 
-    std::vector<uint32_t> m_freeImageSlots;
-    uint32_t m_nextImageSlot = 0;
-    std::vector<uint32_t> m_freeUniformSlots;
-    uint32_t m_nextUniformSlot = 0;
+    // Which slots are live, and the only record of it: the heap bytes themselves say nothing
+    // about whether a slot is owned, and a second table saying so could only drift from this.
+    DescriptorSlotPool m_imageSlots;
+    DescriptorSlotPool m_uniformSlots;
 
     std::unordered_map<VkImageView, VkImageViewCreateInfo> m_registeredViews;
     std::unordered_map<VkSampler, VkSamplerCreateInfo> m_registeredSamplers;
-
-    std::unordered_map<uint32_t, VkImageView> m_slotView;
-    std::unordered_map<uint32_t, VkSampler> m_slotSampler;
-    std::unordered_set<uint32_t> m_activeUniformSlots;
 
     PFN_vkWriteResourceDescriptorsEXT m_pfnWriteResource = nullptr;
     PFN_vkWriteSamplerDescriptorsEXT m_pfnWriteSampler = nullptr;

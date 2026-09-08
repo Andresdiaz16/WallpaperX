@@ -5,11 +5,15 @@
 #include "gpu_fault.h"
 
 #include <array>
-#include <stdexcept>
 
 namespace wallpaperx {
 
-ClassicDescriptorAllocator::ClassicDescriptorAllocator(VkDevice device) : m_device(device) {
+ClassicDescriptorAllocator::ClassicDescriptorAllocator(Device& device)
+    : m_device(device),
+      m_imageSlots(device, 1, "ClassicDescriptorAllocator: image"),
+      m_uniformSlots(device, 1, "ClassicDescriptorAllocator: uniform") {
+    const VkDevice vk = m_device.device();
+
     std::array<VkDescriptorSetLayoutBinding, 2> bindings{};
     bindings[0].binding = kImageBinding;
     bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
@@ -27,7 +31,7 @@ ClassicDescriptorAllocator::ClassicDescriptorAllocator(VkDevice device) : m_devi
         VkDescriptorSetLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
         layoutInfo.bindingCount = static_cast<uint32_t>(bindings.size());
         layoutInfo.pBindings = bindings.data();
-        if (const VkResult r = vkCreateDescriptorSetLayout(m_device, &layoutInfo, nullptr, &m_setLayout);
+        if (const VkResult r = vkCreateDescriptorSetLayout(vk, &layoutInfo, nullptr, &m_setLayout);
             r != VK_SUCCESS) {
             throwVkFailure("ClassicDescriptorAllocator: vkCreateDescriptorSetLayout", r);
         }
@@ -41,7 +45,7 @@ ClassicDescriptorAllocator::ClassicDescriptorAllocator(VkDevice device) : m_devi
         poolInfo.maxSets = 1;
         poolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
         poolInfo.pPoolSizes = poolSizes.data();
-        if (const VkResult r = vkCreateDescriptorPool(m_device, &poolInfo, nullptr, &m_pool); r != VK_SUCCESS) {
+        if (const VkResult r = vkCreateDescriptorPool(vk, &poolInfo, nullptr, &m_pool); r != VK_SUCCESS) {
             throwVkFailure("ClassicDescriptorAllocator: vkCreateDescriptorPool", r);
         }
 
@@ -49,37 +53,43 @@ ClassicDescriptorAllocator::ClassicDescriptorAllocator(VkDevice device) : m_devi
         allocInfo.descriptorPool = m_pool;
         allocInfo.descriptorSetCount = 1;
         allocInfo.pSetLayouts = &m_setLayout;
-        if (const VkResult r = vkAllocateDescriptorSets(m_device, &allocInfo, &m_set); r != VK_SUCCESS) {
+        if (const VkResult r = vkAllocateDescriptorSets(vk, &allocInfo, &m_set); r != VK_SUCCESS) {
             throwVkFailure("ClassicDescriptorAllocator: vkAllocateDescriptorSets", r);
         }
 
         VkPipelineLayoutCreateInfo pipelineLayoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         pipelineLayoutInfo.setLayoutCount = 1;
         pipelineLayoutInfo.pSetLayouts = &m_setLayout;
-        if (const VkResult r = vkCreatePipelineLayout(m_device, &pipelineLayoutInfo, nullptr, &m_pipelineLayout);
+        if (const VkResult r = vkCreatePipelineLayout(vk, &pipelineLayoutInfo, nullptr, &m_pipelineLayout);
             r != VK_SUCCESS) {
             throwVkFailure("ClassicDescriptorAllocator: vkCreatePipelineLayout", r);
         }
     } catch (...) {
-        if (m_pipelineLayout) vkDestroyPipelineLayout(m_device, m_pipelineLayout, nullptr);
-        if (m_pool) vkDestroyDescriptorPool(m_device, m_pool, nullptr);
-        if (m_setLayout) vkDestroyDescriptorSetLayout(m_device, m_setLayout, nullptr);
+        if (m_pipelineLayout) vkDestroyPipelineLayout(vk, m_pipelineLayout, nullptr);
+        if (m_pool) vkDestroyDescriptorPool(vk, m_pool, nullptr);
+        if (m_setLayout) vkDestroyDescriptorSetLayout(vk, m_setLayout, nullptr);
         throw;
     }
 }
 
 ClassicDescriptorAllocator::~ClassicDescriptorAllocator() {
-    if (m_pipelineLayout) vkDestroyPipelineLayout(m_device, m_pipelineLayout, nullptr);
-    if (m_pool) vkDestroyDescriptorPool(m_device, m_pool, nullptr);
-    if (m_setLayout) vkDestroyDescriptorSetLayout(m_device, m_setLayout, nullptr);
+    const VkDevice vk = m_device.device();
+    if (m_pipelineLayout) vkDestroyPipelineLayout(vk, m_pipelineLayout, nullptr);
+    if (m_pool) vkDestroyDescriptorPool(vk, m_pool, nullptr);
+    if (m_setLayout) vkDestroyDescriptorSetLayout(vk, m_setLayout, nullptr);
+}
+
+void ClassicDescriptorAllocator::waitUntilSetIdle() {
+    if (!m_setMayBeInFlight) return;
+    // Every batch, not the last one: nothing here records which of them bound the set, and
+    // fences carry no guarantee of signalling in submission order.
+    m_device.waitForSubmissions();
+    m_setMayBeInFlight = false;
 }
 
 DescriptorHandle ClassicDescriptorAllocator::allocate(VkImageView view, VkSampler sampler) {
-    if (m_imageOccupied) {
-        throw std::runtime_error(
-            "ClassicDescriptorAllocator::allocate: image slot already in use — this tier supports only "
-            "one live image at a time; call free() on the previous handle first");
-    }
+    waitUntilSetIdle();
+    m_imageSlots.acquire();
 
     VkDescriptorImageInfo imageInfo{};
     imageInfo.sampler = sampler;
@@ -93,17 +103,13 @@ DescriptorHandle ClassicDescriptorAllocator::allocate(VkImageView view, VkSample
     write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     write.pImageInfo = &imageInfo;
 
-    vkUpdateDescriptorSets(m_device, 1, &write, 0, nullptr);
-    m_imageOccupied = true;
+    vkUpdateDescriptorSets(m_device.device(), 1, &write, 0, nullptr);
     return DescriptorHandle{kImageBinding};
 }
 
 DescriptorHandle ClassicDescriptorAllocator::allocateUniform(VkBuffer buffer, VkDeviceSize size) {
-    if (m_uniformOccupied) {
-        throw std::runtime_error(
-            "ClassicDescriptorAllocator::allocateUniform: uniform slot already in use — this tier supports "
-            "only one live uniform buffer at a time; call free() on the previous handle first");
-    }
+    waitUntilSetIdle();
+    m_uniformSlots.acquire();
 
     VkDescriptorBufferInfo bufferInfo{};
     bufferInfo.buffer = buffer;
@@ -117,27 +123,20 @@ DescriptorHandle ClassicDescriptorAllocator::allocateUniform(VkBuffer buffer, Vk
     write.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     write.pBufferInfo = &bufferInfo;
 
-    vkUpdateDescriptorSets(m_device, 1, &write, 0, nullptr);
-    m_uniformOccupied = true;
+    vkUpdateDescriptorSets(m_device.device(), 1, &write, 0, nullptr);
     return DescriptorHandle{kUniformBinding};
 }
 
 void ClassicDescriptorAllocator::bind(VkCommandBuffer cmd, VkPipelineBindPoint bindPoint) {
     vkCmdBindDescriptorSets(cmd, bindPoint, m_pipelineLayout, 0, 1, &m_set, 0, nullptr);
+    m_setMayBeInFlight = true;
 }
 
 void ClassicDescriptorAllocator::free(DescriptorHandle handle) {
     if (handle.index == kImageBinding) {
-        if (!m_imageOccupied) {
-            throw std::runtime_error("ClassicDescriptorAllocator::free: image handle already freed or never allocated");
-        }
-        m_imageOccupied = false;
+        m_imageSlots.release(0);
     } else if (handle.index == kUniformBinding) {
-        if (!m_uniformOccupied) {
-            throw std::runtime_error(
-                "ClassicDescriptorAllocator::free: uniform handle already freed or never allocated");
-        }
-        m_uniformOccupied = false;
+        m_uniformSlots.release(0);
     }
 }
 

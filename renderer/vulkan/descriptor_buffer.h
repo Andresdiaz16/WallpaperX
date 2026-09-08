@@ -3,13 +3,16 @@
 #pragma once
 
 #include "descriptor_allocator.h"
+#include "descriptor_slots.h"
 #include "memory.h"
 
 namespace wallpaperx {
 
 class DescriptorBufferAllocator final : public IDescriptorAllocator {
 public:
-    DescriptorBufferAllocator(VkPhysicalDevice physicalDevice, VkDevice device, Memory& memory);
+    // Built from Device mid-construction, so it may only use what is ready by then: the
+    // physical device, the logical device and Memory.
+    explicit DescriptorBufferAllocator(Device& device);
     ~DescriptorBufferAllocator() override;
 
     DescriptorBufferAllocator(const DescriptorBufferAllocator&) = delete;
@@ -47,8 +50,12 @@ private:
     PFN_vkCmdSetDescriptorBufferOffsetsEXT m_pfnCmdSetOffsets = nullptr;
 
     VkPhysicalDeviceDescriptorBufferPropertiesEXT m_properties{};
-    bool m_imageOccupied = false;
-    bool m_uniformOccupied = false;
+
+    // One binding each, at a fixed offset in m_buffer, so re-allocating rewrites the exact
+    // bytes the last draw read. Capacity 1 makes that a wait for the previous batch rather
+    // than a race -- this tier has nowhere else to put a descriptor.
+    DescriptorSlotPool m_imageSlots;
+    DescriptorSlotPool m_uniformSlots;
 };
 
 }

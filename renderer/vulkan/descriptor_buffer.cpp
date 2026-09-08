@@ -5,12 +5,15 @@
 #include "gpu_fault.h"
 
 #include <array>
-#include <stdexcept>
 
 namespace wallpaperx {
 
-DescriptorBufferAllocator::DescriptorBufferAllocator(VkPhysicalDevice physicalDevice, VkDevice device, Memory& memory)
-    : m_physicalDevice(physicalDevice), m_device(device), m_memory(memory) {
+DescriptorBufferAllocator::DescriptorBufferAllocator(Device& device)
+    : m_physicalDevice(device.physicalDevice()),
+      m_device(device.device()),
+      m_memory(device.memory()),
+      m_imageSlots(device, 1, "DescriptorBufferAllocator: image"),
+      m_uniformSlots(device, 1, "DescriptorBufferAllocator: uniform") {
     loadFunctions();
 
     m_properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_PROPERTIES_EXT;
@@ -105,11 +108,7 @@ void DescriptorBufferAllocator::loadFunctions() {
 }
 
 DescriptorHandle DescriptorBufferAllocator::allocate(VkImageView view, VkSampler sampler) {
-    if (m_imageOccupied) {
-        throw std::runtime_error(
-            "DescriptorBufferAllocator::allocate: image slot already in use — this tier supports only "
-            "one live image at a time; call free() on the previous handle first");
-    }
+    m_imageSlots.acquire();
 
     VkDescriptorImageInfo imageInfo{};
     imageInfo.sampler = sampler;
@@ -123,16 +122,11 @@ DescriptorHandle DescriptorBufferAllocator::allocate(VkImageView view, VkSampler
     m_pfnGetDescriptor(m_device, &getInfo, m_properties.combinedImageSamplerDescriptorSize,
                         static_cast<uint8_t*>(m_buffer.mapped) + m_imageOffset);
     m_memory.flushForHostWrite(m_buffer);
-    m_imageOccupied = true;
     return DescriptorHandle{kImageBinding};
 }
 
 DescriptorHandle DescriptorBufferAllocator::allocateUniform(VkBuffer buffer, VkDeviceSize size) {
-    if (m_uniformOccupied) {
-        throw std::runtime_error(
-            "DescriptorBufferAllocator::allocateUniform: uniform slot already in use — this tier supports "
-            "only one live uniform buffer at a time; call free() on the previous handle first");
-    }
+    m_uniformSlots.acquire();
 
     VkBufferDeviceAddressInfo addrInfo{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
     addrInfo.buffer = buffer;
@@ -149,7 +143,6 @@ DescriptorHandle DescriptorBufferAllocator::allocateUniform(VkBuffer buffer, VkD
     m_pfnGetDescriptor(m_device, &getInfo, m_properties.uniformBufferDescriptorSize,
                         static_cast<uint8_t*>(m_buffer.mapped) + m_uniformOffset);
     m_memory.flushForHostWrite(m_buffer);
-    m_uniformOccupied = true;
     return DescriptorHandle{kUniformBinding};
 }
 
@@ -168,16 +161,9 @@ void DescriptorBufferAllocator::bind(VkCommandBuffer cmd, VkPipelineBindPoint bi
 
 void DescriptorBufferAllocator::free(DescriptorHandle handle) {
     if (handle.index == kImageBinding) {
-        if (!m_imageOccupied) {
-            throw std::runtime_error("DescriptorBufferAllocator::free: image handle already freed or never allocated");
-        }
-        m_imageOccupied = false;
+        m_imageSlots.release(0);
     } else if (handle.index == kUniformBinding) {
-        if (!m_uniformOccupied) {
-            throw std::runtime_error(
-                "DescriptorBufferAllocator::free: uniform handle already freed or never allocated");
-        }
-        m_uniformOccupied = false;
+        m_uniformSlots.release(0);
     }
 }
 
