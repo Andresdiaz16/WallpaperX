@@ -17,24 +17,6 @@ namespace {
 // nowhere to go, and nowhere to go meant saving was disabled for the run.
 constexpr int kMaxPreservedCopies = 10;
 
-// Where a preserved copy is preferably kept: $XDG_STATE_HOME/wallpaperx, else
-// ~/.local/state/wallpaperx. Out of the config directory, so a hand edit or a tidy-up there
-// cannot take the copy with the file it was made for. Separation from the directory the user
-// edits, not protection from the user -- they own this one too. Empty when neither variable is
-// usable, which preserveConfigTo() answers by keeping the copy beside the config instead; a
-// relative value is ignored, as the basedir spec requires and defaultConfigPath() already does.
-std::filesystem::path preservedCopyDir() {
-    if (const char* xdg = std::getenv("XDG_STATE_HOME"); xdg != nullptr && *xdg != '\0') {
-        const std::filesystem::path base(xdg);
-        if (base.is_absolute()) return base / "wallpaperx";
-    }
-    if (const char* home = std::getenv("HOME"); home != nullptr && *home != '\0') {
-        const std::filesystem::path base(home);
-        if (base.is_absolute()) return base / ".local" / "state" / "wallpaperx";
-    }
-    return {};
-}
-
 // The store's own limit, not a second copy of it: a file it refuses to read is not one to
 // compare against a preserved copy.
 constexpr std::uintmax_t kMaxComparedBytes = ConfigStore::kMaxBytes;
@@ -164,11 +146,12 @@ KeptCopy keepCopyIn(const std::filesystem::path& source, const std::filesystem::
 PreservedCopy preserveConfig(const std::filesystem::path& configFile, bool move) {
     PreservedCopy result;
 
-    // The state directory is preferred but not required: the config's own directory must
-    // already be writable for any save to work, so "nowhere preferred" must not become
-    // "nowhere" -- which is what a daemon with a config path and no HOME would otherwise hit.
+    // The state directory is preferred, out of the directory the user hand-edits so a tidy-up
+    // there cannot take the copy with the file it was made for -- but not required: the
+    // config's own directory must already be writable for any save to work, so "nowhere
+    // preferred" must not become "nowhere", which is what a config path and no HOME would hit.
     std::vector<std::filesystem::path> dirs;
-    if (std::filesystem::path preferred = preservedCopyDir(); !preferred.empty()) {
+    if (std::filesystem::path preferred = defaultStateDir(); !preferred.empty()) {
         dirs.push_back(std::move(preferred));
     }
     if (std::filesystem::path beside = configFile.parent_path();

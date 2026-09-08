@@ -81,6 +81,10 @@ struct SaveResult {
 // fallback -- a daemon started from / would leave a config file there.
 std::filesystem::path defaultConfigPath();
 
+// $XDG_STATE_HOME/wallpaperx, else $HOME/.local/state/wallpaperx: the daemon's own directory,
+// apart from the one the user edits. Same rules as above for an unusable value.
+std::filesystem::path defaultStateDir();
+
 // Validates structure only; known types, id ranges and path readability are the
 // WallpaperManager's rules. Neither load() nor save() throws -- a corrupt file must not
 // stop the daemon starting, nor a failed write fail the SetWallpaper behind it.

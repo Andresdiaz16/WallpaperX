@@ -4108,6 +4108,16 @@ void runBufferHoldChecks(const wallpaperx::WallpaperManager::Config& config, con
     //       half: a daemon that forgot a holder AND refused the newcomer passes it. An existing
     //       holder is re-served first, so the limit is also required not to refuse the consumers
     //       already inside it.
+    // IMPRECISE, and measured rather than argued: asking releaseBuffer cannot separate "a claim
+    //       was there" from "the report machinery works", because that report is the only one
+    //       the manager's public interface makes -- the hold list is private and giving a test a
+    //       way in would be test-only surface in a production header. With the announce push
+    //       deleted from WallpaperManager::reportFreedImageLocked (backend/daemon/
+    //       wallpaper_manager.cpp) the survivors leg below goes red with the claim bookkeeping
+    //       untouched. It stays diagnosable: that mutation also reddens the three checks that
+    //       are about announcements ("releasing an image re-announces...", twice, and "a
+    //       departure announces..."), while the refusal check above it stays green, so five reds
+    //       including those three name the announcer and two alone name the claims.
     // CONTROL: `if (holds.size() >= kMaxHoldersPerMonitor) return {};` deleted from
     //       WallpaperManager::withHandover (backend/daemon/wallpaper_manager.cpp) -> "FAIL: a
     //       fifth consumer past the holder limit is refused", printing the image it was handed.
@@ -4276,7 +4286,10 @@ void runBufferHoldChecks(const wallpaperx::WallpaperManager::Config& config, con
     }
 
     // The refusal took nothing back: both of the consumer's claims are still there to end.
-    // Read through releaseBuffer, which is the daemon's own report of whether a claim existed.
+    // Read through releaseBuffer, which is the daemon's own report of whether a claim existed --
+    // and the only one it makes, so this cannot separate a lost claim from a dead announcer. See
+    // the IMPRECISE note on the holder-limit survivors check above: the same mutation reddens
+    // both, together with the announcement checks that make it diagnosable.
     int stillHeld = 0;
     for (uint64_t id : handedOut) {
         std::vector<wallpaperx::FrameAvailable> announced;
@@ -4390,7 +4403,30 @@ void runBufferReleaseWireChecks(const wallpaperx::WallpaperManager::Config& conf
         // it is the image the producer must keep and the refusal below is what grades that.
         if (i >= 2 * kExpectedHeldPerClient) break;
         sdbus::IProxy& taker = i < kExpectedHeldPerClient ? *alice : *bob;
-        const wallpaperx::testing::Frame frame = wallpaperx::testing::getFrameFd(taker, kMonitorReleaseWire);
+        // GOAL: the fill itself -- the ring hands out 2 * kExpectedHeldPerClient images before
+        //       the reserve refuses anyone. False for a daemon holding back more than the one
+        //       image the reserve is, which is the state every goal below is measured against.
+        // WHY-THIS-SHAPE: caught and failed here rather than left to escape. A refusal mid-fill
+        //       is a daemon answer, not a host limitation, so it must go red -- but uncaught it
+        //       reaches main's catch-all, which prints "unexpected exception: [...NoFreeImage]"
+        //       naming neither the phase nor which hand-over, and abandons every phase after
+        //       this one (the worker-coalescing checks are graded nowhere else).
+        // CONTROL: kTargetDepth in backend/daemon/wallpaper_manager.h reduced by one, dropping
+        //       the reserve -> "FAIL: the ring hands out every image but the producer's reserve",
+        //       printing "hand-over 4 of 4 was refused with 'io.wallpaperx.Daemon.Error.
+        //       NoFreeImage'", and the phases after this one still ran. Reverted.
+        wallpaperx::testing::Frame frame;
+        try {
+            frame = wallpaperx::testing::getFrameFd(taker, kMonitorReleaseWire);
+        } catch (const sdbus::Error& e) {
+            check(false, "the ring hands out every image but the producer's reserve");
+            std::fprintf(stderr,
+                         "  hand-over %d of %d was refused with '%s', so the monitor holds back more than the one "
+                         "image the reserve is, or its ring is shallower than %d -- none of the states the goals "
+                         "below are about could be built\n",
+                         i + 1, 2 * kExpectedHeldPerClient, e.getName().c_str(), kExpectedRingDepth);
+            return;
+        }
         if (frame.bufferId == 0) {
             wallpaperx::testing::notVerified(kWireGoals,
                                              "a frame came back over the bus with no buffer id, so no hand-over "
@@ -4513,10 +4549,12 @@ void runBufferReleaseWireChecks(const wallpaperx::WallpaperManager::Config& conf
     //       (renderer/vulkan/offscreen.cpp) narrowed from `first + count` to
     //       `first + count - 1`, so the producer will not reuse the slot it just published and
     //       has nowhere to draw once two images are held -> "FAIL: the monitor keeps rendering
-    //       while a consumer is being refused", printing that no FrameReady for generation 4
+    //       while a consumer is being refused", printing that no FrameReady for generation 6
     //       arrived. Chosen over forcing renderPending's deferral branch unconditionally: that
     //       stops the very first render, so this phase is never reached and the check would be
-    //       unattested. Reverted.
+    //       unattested. The mutation is to a ring shared by every phase, so the manager-tier
+    //       release checks earlier in this file go red beside it; that is the blast radius of the
+    //       production function, not a second thing this check grades. Reverted.
     wallpaperx::testing::setWallpaper(*alice, "static", imagePath, kMonitorReleaseWire);
     const bool keptRendering = signals.wait(kMonitorReleaseWire, generation + 1);
     check(keptRendering, "the monitor keeps rendering while a consumer is being refused");

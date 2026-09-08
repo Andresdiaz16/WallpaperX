@@ -3,6 +3,7 @@
 #include "wallpaper_manager.h"
 
 #include "config_preserve.h"
+#include "crash_record.h"
 #include "kept_rows.h"
 #include "log_escape.h"
 #include "renderers/static_renderer.h"
@@ -651,6 +652,7 @@ void WallpaperManager::requestWallpaper(const std::string& type, const std::stri
         state.path = path;
         ++state.requestSeq;
         state.lastError.clear();
+        state.quarantined = false;
 
         // Cleared before the render, not after a failure. Whatever happens next, the frame
         // this monitor currently holds no longer matches the request just recorded, and
@@ -878,6 +880,14 @@ std::vector<int> WallpaperManager::restoreSaved() {
     // startup path -- before the bus name is claimed, so the desktop has no daemon meanwhile.
     std::map<int, std::size_t> keptIndex;
 
+    // What the last run died applying, per monitor. Read here, outside the lock and once per
+    // monitor rather than per row, for the same reason the index above exists.
+    std::map<int, std::optional<CrashRecord>> crashes;
+    for (const PersistedWallpaper& entry : pending) {
+        if (entry.monitorId < 0 || entry.monitorId >= kMaxMonitors || crashes.count(entry.monitorId) != 0) continue;
+        crashes.emplace(entry.monitorId, readCrashRecord(m_config.stateDir, entry.monitorId));
+    }
+
     bool repaired = false;
     std::lock_guard<std::mutex> stateLock(m_stateMutex);
     for (const PersistedWallpaper& entry : pending) {
@@ -986,7 +996,25 @@ std::vector<int> WallpaperManager::restoreSaved() {
         ++state.requestSeq;
         state.lastError.clear();
         state.hasFrame = false;
-        // Once per monitor: a second entry here is a second full render of one request.
+
+        // Refused, not rendered: the last run was applying exactly this when it died, and the
+        // restart that brought this one up would otherwise re-apply it and die the same way.
+        // The record stays on disk until a pass for this monitor replaces it, which only an
+        // explicit request causes. Matched on type and path, so a wallpaper set since the crash
+        // is applied as normal.
+        const std::optional<CrashRecord>& crash = crashes[entry.monitorId];
+        state.quarantined = crash && crash->type == entry.type && crash->path == entry.path;
+        if (state.quarantined) {
+            state.lastError = sanitizeForLog(describeCrash(*crash), 1024, LogFraming::Bare);
+            state.lastErrorIsDaemonFault = false;
+            // Nothing is owed: status must not report a render in progress for one that will
+            // not be started.
+            state.servicedSeq = state.requestSeq;
+            std::fprintf(stderr, "wallpaperx-daemon: monitor %d: %s (%s)\n", entry.monitorId,
+                         state.lastError.c_str(), sanitizeForLog(entry.path).c_str());
+        }
+        // Once per monitor: a second entry here is a second full render of one request. A
+        // quarantined one is posted too, and its pass is a no-op.
         if (!alreadyRestored) monitorIds.push_back(entry.monitorId);
     }
 
@@ -1062,6 +1090,12 @@ RenderOutcome WallpaperManager::renderPending(int monitorId) {
         if (it->second.servicedSeq == it->second.requestSeq) {
             return {};
         }
+        // Re-posted for some other reason -- an import-modifier report, a freed image -- but
+        // still the request the last run died applying. Serviced without being decoded.
+        if (it->second.quarantined) {
+            it->second.servicedSeq = it->second.requestSeq;
+            return {};
+        }
         type = it->second.type;
         path = it->second.path;
         seq = it->second.requestSeq;
@@ -1072,6 +1106,9 @@ RenderOutcome WallpaperManager::renderPending(int monitorId) {
         // nothing will read it again, and holding a full-size image per monitor for a
         // wallpaper type this build cannot draw is memory kept for no one.
         releaseTarget(monitorId);
+        // A record left by a build that could draw this type would otherwise wait here for the
+        // next build that can, and refuse a wallpaper this request has since replaced.
+        removeCrashRecord(m_config.stateDir, monitorId);
 
         std::lock_guard<std::mutex> stateLock(m_stateMutex);
         auto it = m_monitors.find(monitorId);
@@ -1093,6 +1130,12 @@ RenderOutcome WallpaperManager::renderPending(int monitorId) {
     bool deferred = false;
     std::optional<StaticRenderer> renderer;
     const OffscreenTarget* target = nullptr;
+
+    // On disk from just before the decode to just after the submit -- the span in which the
+    // file's content is what runs -- so a start after a fatal signal in it refuses this
+    // wallpaper. Not around ensureGpu(): a driver that dies creating the device would be
+    // blamed on whichever picture happened to be first.
+    std::optional<ApplyingRecord> applying;
     try {
         ensureGpu();
         // Before the target is acquired, so a set reported since the last render rebuilds the
@@ -1117,6 +1160,7 @@ RenderOutcome WallpaperManager::renderPending(int monitorId) {
             // being destroyed out from under the GPU is ~StaticRenderer's own device-idle
             // wait -- the price of dropping it here, and paid once per wallpaper change.
             // Step 13's video renderer does need to persist and will live in MonitorState.
+            applying.emplace(m_config.stateDir, monitorId, type, path);
             renderer.emplace(*m_device, m_targets->renderPass(), path, m_resolvedShaderDir);
         }
     } catch (const GpuFailure& e) {
@@ -1236,6 +1280,8 @@ RenderOutcome WallpaperManager::renderPending(int monitorId) {
                                m_gpuStatus.name + " (" + m_gpuStatus.descriptorTier + ")");
         }
     }
+    // Outside the state lock: an unlink on a stalled filesystem must not hold up GetStatus.
+    applying.reset();
 
     if (!error.empty()) {
         // Outside the state lock: destroying a target waits for device idle, which has

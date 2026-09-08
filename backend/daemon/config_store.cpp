@@ -116,6 +116,18 @@ std::filesystem::path defaultConfigPath() {
     return {};
 }
 
+std::filesystem::path defaultStateDir() {
+    if (const char* xdg = std::getenv("XDG_STATE_HOME"); xdg != nullptr && *xdg != '\0') {
+        const std::filesystem::path base(xdg);
+        if (base.is_absolute()) return base / kAppDir;
+    }
+    if (const char* home = std::getenv("HOME"); home != nullptr && *home != '\0') {
+        const std::filesystem::path base(home);
+        if (base.is_absolute()) return base / ".local" / "state" / kAppDir;
+    }
+    return {};
+}
+
 ConfigStore::ConfigStore(std::filesystem::path file) : m_file(std::move(file)) {}
 
 LoadResult ConfigStore::load() const {

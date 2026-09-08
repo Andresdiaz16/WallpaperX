@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "crash_record.h"
 #include "dbus_service.h"
 #include "http_server.h"
 #include "wallpaper_manager.h"
@@ -76,6 +77,10 @@ int main() {
         std::fprintf(stderr, "wallpaperx-daemon: fatal: could not ignore SIGXFSZ\n");
         return 1;
     }
+
+    // Before any thread: a wallpaper that kills the render thread is recorded so the restart
+    // that follows does not apply it again.
+    wallpaperx::installFatalSignalHandlers();
 
     try {
         wallpaperx::WallpaperManager::Config config;

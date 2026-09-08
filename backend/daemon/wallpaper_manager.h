@@ -263,6 +263,12 @@ public:
         // default and production opts in via defaultConfigPath(), so a test that says nothing
         // about config cannot read or overwrite the developer's own.
         std::filesystem::path configFile;
+
+        // Where the record of the wallpaper being applied lives, so a start after a crash
+        // can refuse the one the last run did not survive. Empty disables that refusal. The
+        // daemon's own directory by default: reading a record there is harmless, and only a
+        // record written there protects the next start.
+        std::filesystem::path stateDir = defaultStateDir();
     };
 
     explicit WallpaperManager(Config config);
@@ -442,6 +448,12 @@ private:
         bool hasFrame = false;
         std::string lastError;
         bool lastErrorIsDaemonFault = false;
+
+        // The saved request was not applied because the last run died applying it, and no pass
+        // may decode it -- a re-post for any other reason must not either. Set only by
+        // restoreSaved(), cleared only by requestWallpaper(): a client asking for this
+        // wallpaper again is a different statement from a config being restored.
+        bool quarantined = false;
 
         // Copied from the target at commit time, so status() can report the frame's size
         // without touching GPU state and therefore without waiting behind a render.

@@ -298,11 +298,15 @@ bool run(wallpaperx::testing::ValidationGrade& grade) {
     //       is a hang until ctest's timeout rather than a failing check (X.1). An expired wait is
     //       counted as a failure and the process then ends without unwinding, because the queue
     //       is holding a batch that can never complete.
-    // CONTROL: the `device.submit(...)` line that signals the semaphore deleted from
-    //       exportFrameAcquireFd (renderer/vulkan/frame_export.cpp), so the descriptor is
-    //       exported from a semaphore nothing ever signalled -> "FAIL: the acquire descriptor is
-    //       already signalled when it is handed over" after the 5 s timeout, followed by the
-    //       exit-without-unwinding line. Observed 2026-08-31. Reverted.
+    // CONTROL: the signal list emptied from the submit in exportFrameAcquireFd
+    //       (renderer/vulkan/frame_export.cpp) -- `cleanup.inFlight =
+    //       device.submit([](VkCommandBuffer) {}, {});` -- so the descriptor is exported from a
+    //       semaphore nothing ever signalled, while the ticket stays valid and the wait and reset
+    //       around it stay meaningful -> "FAIL: the acquire descriptor is already signalled when
+    //       it is handed over" after the 5 s timeout, followed by "the first hand-over's acquire
+    //       was never signalled ... exiting without unwinding". Deleting the submit line outright
+    //       is not the mutation to use: it leaves the next line dereferencing a disengaged
+    //       optional, which is undefined behaviour rather than this run. Reverted.
     const WaitOutcome firstOutcome = consumeAcquire(device, first);
     if (firstOutcome == WaitOutcome::TimedOut) {
         fail("the acquire descriptor is already signalled when it is handed over");
@@ -324,10 +328,13 @@ bool run(wallpaperx::testing::ValidationGrade& grade) {
     //       one semaphore return two different file descriptors referring to the same payload.
     // CONTROL: the semaphore in exportFrameAcquireFd (renderer/vulkan/frame_export.cpp) made a
     //       function-local static, created and signalled on the first call only and exported on
-    //       every call -- the shape a caching "optimisation" would take -> "FAIL: a second
-    //       hand-over of the same frame carries its own payload, not one already consumed", with
-    //       the already-signalled check above it still GREEN, which is the two of them
-    //       discriminating. Observed 2026-08-31. Reverted.
+    //       every call -- the shape a caching "optimisation" would take. The Cleanup guard has to
+    //       go with it: it destroys the semaphore at the end of every call, so leaving it in
+    //       place makes the second export use a destroyed handle rather than a cached one, which
+    //       is not the defect being graded. -> "FAIL: a second hand-over of the same frame
+    //       carries its own payload, not one already consumed" after the 5 s timeout, with the
+    //       already-signalled check above it still GREEN and one check failing in total, which is
+    //       the two of them discriminating. Reverted.
     const WaitOutcome secondOutcome = consumeAcquire(device, second);
     if (secondOutcome == WaitOutcome::TimedOut) {
         fail("a second hand-over of the same frame carries its own payload, not one already consumed");

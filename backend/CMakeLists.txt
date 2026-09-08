@@ -106,6 +106,7 @@ add_library(wallpaperx-daemon-lib STATIC
     daemon/config_preserve.cpp
     daemon/config_store.cpp
     daemon/config_writer.cpp
+    daemon/crash_record.cpp
     daemon/dbus_service.cpp
     daemon/kept_rows.cpp
     daemon/http_server.cpp

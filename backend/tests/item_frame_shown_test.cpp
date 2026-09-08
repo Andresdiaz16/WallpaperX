@@ -395,9 +395,15 @@ bool runFrameShownChecks() {
             std::fprintf(stderr, "  the monitor-id change produced no new request, so the path that invalidates the "
                                  "generation marks may not have been entered at all\n");
         }
-        // WEAKER THAN IT LOOKS, measured: the refusal publishes no reason of its own, so this
-        // waits on a reason an earlier step already set. It establishes that a reason exists, not
-        // that the refusal was processed. Nothing the item exposes distinguishes the two.
+        // The refusal waited on here is the exhausted-sequence one -- refuseFurtherWith(QString())
+        // above put the sequence back in charge, and it has nothing left -- so it arrives as a
+        // plain daemon error and IS published, unlike the NoFreeImage refusal earlier in this
+        // phase. So the wait is on this refusal being processed, not merely on some reason
+        // existing. CONTROL: the general error path's setFetchReason(call.errorMessage()...) in
+        // WallpaperXItem::takeFrameReply, backend/kde/wallpaperx_item.cpp, replaced by
+        // setFetchReason(QString()) -> "FAIL (harness): the item never reported the refused fetch,
+        // so whether the claim survives it was not established", after the 5s wait expired rather
+        // than falling through. Reverted.
         const bool refusalHandled =
             pumpUntil([&] { return !root->property("publishedReason").toString().isEmpty(); }, 5000);
         renderPass(nullptr);

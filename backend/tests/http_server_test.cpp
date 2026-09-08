@@ -245,9 +245,10 @@ extern "C" VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmit(VkQueue queue, uint32_t 
 // the plan, so the counts below are not an assertion on the scheduler (X.2).
 namespace {
 
-// The result is selectable per arming because exportFrame classifies its results: the two
-// the spec permits are host resource limits and must not touch the GPU's recorded health,
-// and anything else is the driver going wrong and must.
+// The result is selectable per arming because the export classifies what it gets, on the
+// result itself rather than on a per-call list of permitted results: anything
+// isResourceExhaustion() accepts must not touch the GPU's recorded health, and everything
+// else is the driver going wrong and must.
 thread_local VkCallFaultPlan* t_getMemoryFdFault = nullptr;
 
 PFN_vkVoidFunction realDeviceProcAddr(VkDevice device, const char* name) {
@@ -3013,12 +3014,14 @@ void runGpuFailureChecks(const std::string& bluePath, const WallpaperManager::Co
     //       unpermitted-result arm below, not after: that arm records a GPU failure that
     //       only a later successful render clears, so afterwards "gpu is ok" would be
     //       unreachable and this check could only ever be red or vacuous.
-    // CONTROL: renderer/vulkan/frame_export.cpp -- the `hostLimit` branch's
-    //       `throw std::runtime_error(...)` changed to `throw GpuFailure(...)`, which is the
+    // CONTROL: renderer/vulkan/frame_export.cpp -- in throwNoDescriptor, the
+    //       `throw std::runtime_error(...)` under `result == VK_SUCCESS ||
+    //       isResourceExhaustion(result)` changed to `throw GpuFailure(...)`, which is the
     //       classification this split replaced -> "FAIL: a frame export that fails on a host
     //       resource limit leaves the GPU's recorded health alone", printing "gpu after an
     //       fd-exhaustion export: fail (exportFrame: vkGetMemoryFdKHR produced no file
-    //       descriptor for the frame ...)". Reverted.
+    //       descriptor (VK_ERROR_TOO_MANY_OBJECTS) -- a resource limit, not the graphics
+    //       driver: ...)", and nothing else in the file red. Reverted.
     // COVERAGE-ASSERT: reached must be true. An interposer that stopped landing would leave
     //       a successful export and a gpu that reads ok for the ordinary reason, which is
     //       exactly this check's pass condition -- so it is skipped, not passed.
@@ -3058,15 +3061,16 @@ void runGpuFailureChecks(const std::string& bluePath, const WallpaperManager::Co
     //       into the render, and the submit interposer observes zero calls here. This runs
     //       immediately after the arm above left gpu reading ok on this same daemon, so the
     //       fail below cannot be left over from the earlier render fault.
-    // CONTROL: two, both reverted. (1) The `try`/`catch (const GpuFailure&)` around
-    //       wallpaperx::exportFrame in backend/daemon/wallpaper_manager.cpp reduced to the
-    //       bare call -> "FAIL: a frame export whose driver returned a result it may not
-    //       return is recorded against the GPU", printing "gpu after an unpermitted driver
-    //       result: ok (NVIDIA GeForce RTX 3080 Ti (Heap))". (2) The unpermitted-result
-    //       throw in renderer/vulkan/frame_export.cpp changed from GpuFailure to
-    //       std::runtime_error -> the same check red the same way, because an unclassified
-    //       throw is not attributed to the GPU. Neither reddened the propagation check, so
-    //       the two are independent.
+    // CONTROL: two, both reverted. (1) The `recordHealth(&DaemonHealth::gpu, ...)` line
+    //       deleted from the `catch (const GpuFailure&)` in WallpaperManager::exportHandle,
+    //       backend/daemon/wallpaper_manager.cpp -> "FAIL: a frame export whose driver
+    //       returned a result it may not return is recorded against the GPU", printing "gpu
+    //       after an unpermitted driver result: ok (NVIDIA GeForce RTX 3080 Ti (Heap))".
+    //       (2) In throwNoDescriptor, renderer/vulkan/frame_export.cpp, the tail
+    //       `throwVkFailure(context, result)` replaced by `throw std::runtime_error(context)`
+    //       -> the same check red the same way, because an unclassified throw is not
+    //       attributed to the GPU. Neither reddened the propagation check, so the two are
+    //       independent.
     // COVERAGE-ASSERT: reached must be 1. With the name test in the vkGetDeviceProcAddr
     //       interposer disabled the phase reported "exportCurrentFrame made 0
     //       vkGetMemoryFdKHR call(s)" and ctest recorded a skip -- an interposer that stops
@@ -3326,11 +3330,14 @@ void runGpuFailureChecks(const std::string& bluePath, const WallpaperManager::Co
     //       and "FAIL: a render that fails on a resource limit leaves the recorded GPU
     //       detail alone", printing "gpu after a resource-limit render: fail (StaticRenderer:
     //       vkCreateSampler failed with VK_ERROR_OUT_OF_HOST_MEMORY) (expected ok / NVIDIA
-    //       GeForce RTX 3080 Ti (Heap))". Under that same mutation exactly three of the 58
+    //       GeForce RTX 3080 Ti (Heap))". Under that same mutation exactly three of the 74
     //       backend entries went red -- this one on both drivers, plus renderer/tests/
-    //       gpu_fault_test.cpp -- and the other 55 stayed green, which is the measurement
-    //       this arm exists for. The export arm above is among the 55: frame_export.cpp
-    //       classifies its own results and never calls throwVkFailure. Reverted.
+    //       gpu_fault_test.cpp -- and the other 71 stayed green, which is the measurement
+    //       this arm exists for. The export arm above is among the 71, but not because it
+    //       avoids throwVkFailure -- throwNoDescriptor in renderer/vulkan/frame_export.cpp
+    //       calls it for every result that is not a limit. It stays green because a limit
+    //       never gets there: throwNoDescriptor tests isResourceExhaustion() itself and
+    //       throws its own unclassified error first. Reverted.
     // COVERAGE-ASSERT: `reached` must be true and the render must have failed. An interposer
     //       that stopped landing leaves a successful render and a gpu reading ok for the
     //       ordinary reason -- which is this arm's own pass condition -- so it skips.
