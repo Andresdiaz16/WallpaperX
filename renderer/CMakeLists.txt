@@ -253,6 +253,15 @@ wallpaperx_add_shader_probe(wallpaperx-frame-acquire-probe tests/frame_acquire_p
 # Writes ring_*.png into the shared asset directory -- keep that prefix.
 wallpaperx_add_shader_probe(wallpaperx-target-ring-probe tests/target_ring_probe.cpp)
 
+# Whether a descriptor the GPU may still be reading can be rewritten. Interposes
+# vkWaitForFences, vkQueueSubmit and vkResetFences so "did the allocator have to wait?" is
+# answered by the driver rather than by Device::hasCompleted() -- the function a mutation
+# aimed at this fix would poison, taking any oracle routed through it along with it. Like
+# ownership_transfer_probe it replaces Vulkan entry points and not the allocator, so it
+# needs no WALLPAPERX_SANITIZE opt-out. No shaders and no PNG fixture, hence no lock.
+add_executable(wallpaperx-descriptor-inflight-probe tests/descriptor_inflight_probe.cpp)
+target_link_libraries(wallpaperx-descriptor-inflight-probe PRIVATE wallpaperx-renderer)
+
 add_executable(wallpaperx-handle-type-env-test tests/handle_type_env_test.cpp)
 target_link_libraries(wallpaperx-handle-type-env-test PRIVATE wallpaperx-renderer)
 
@@ -294,6 +303,15 @@ add_test(NAME device_affinity_probe COMMAND wallpaperx-device-affinity-probe)
 add_test(NAME static_renderer_probe COMMAND wallpaperx-static-renderer-probe)
 add_test(NAME image_bounds_probe COMMAND wallpaperx-image-bounds-probe)
 add_test(NAME descriptor_allocator_probe COMMAND wallpaperx-descriptor-allocator-probe)
+# Three entries, one binary. The three descriptor tiers protect different things and can be
+# asked on different hardware, so they cannot share a verdict: on Lavapipe the heap entry
+# genuinely cannot be answered (that driver completes outstanding work inside the descriptor
+# write, see the probe's header), while the buffer and classic entries are answered there and
+# are the only place the whole-set rule is graded in CI. One entry would report all three as a
+# skip, which is the wrong answer for two of them.
+add_test(NAME descriptor_inflight_heap COMMAND wallpaperx-descriptor-inflight-probe heap)
+add_test(NAME descriptor_inflight_buffer COMMAND wallpaperx-descriptor-inflight-probe buffer)
+add_test(NAME descriptor_inflight_classic COMMAND wallpaperx-descriptor-inflight-probe classic)
 add_test(NAME frame_export_probe COMMAND wallpaperx-frame-export-probe)
 # Two entries, one binary. The probe makes two claims that are verifiable on different
 # hardware: the round trip needs one usable DRM modifier, while modifier *sensitivity*
@@ -325,6 +343,13 @@ set_tests_properties(consumer_modifier_probe PROPERTIES
 # lock of their own.
 set_tests_properties(ownership_transfer_probe PROPERTIES
                      RESOURCE_LOCK ownership_transfer_probe_test_image SKIP_RETURN_CODE 77)
+
+# 77 means the tier could not be put in the state the entry grades: the tier is absent on
+# this driver, or nothing kept a batch in flight across the descriptor write. Without
+# SKIP_RETURN_CODE such a run exits 0 and is indistinguishable from one that established the
+# rule -- the same wrong-green this probe exists to close.
+set_tests_properties(descriptor_inflight_heap descriptor_inflight_buffer descriptor_inflight_classic
+                     PROPERTIES SKIP_RETURN_CODE 77)
 
 # Two entries, one binary, and they cannot share a process. The probe asks the loader
 # whether the validation layer exists at all, that answer is cached for the life of the
@@ -391,6 +416,9 @@ if(WALLPAPERX_LAVAPIPE_ICD)
     add_test(NAME static_renderer_probe_lavapipe COMMAND wallpaperx-static-renderer-probe)
     add_test(NAME image_bounds_probe_lavapipe COMMAND wallpaperx-image-bounds-probe)
     add_test(NAME descriptor_allocator_probe_lavapipe COMMAND wallpaperx-descriptor-allocator-probe)
+    add_test(NAME descriptor_inflight_heap_lavapipe COMMAND wallpaperx-descriptor-inflight-probe heap)
+    add_test(NAME descriptor_inflight_buffer_lavapipe COMMAND wallpaperx-descriptor-inflight-probe buffer)
+    add_test(NAME descriptor_inflight_classic_lavapipe COMMAND wallpaperx-descriptor-inflight-probe classic)
     # Unlike the Heap tier, frame export needs no capability-skip under Lavapipe:
     # Lavapipe advertises both VK_KHR_external_memory_fd and
     # VK_EXT_external_memory_dma_buf, so exportFrame() takes the DMA_BUF path and
@@ -416,6 +444,9 @@ if(WALLPAPERX_LAVAPIPE_ICD)
         static_renderer_probe_lavapipe
         image_bounds_probe_lavapipe
         descriptor_allocator_probe_lavapipe
+        descriptor_inflight_heap_lavapipe
+        descriptor_inflight_buffer_lavapipe
+        descriptor_inflight_classic_lavapipe
         frame_export_probe_lavapipe
         modifier_roundtrip_probe_lavapipe
         modifier_sensitivity_probe_lavapipe
@@ -436,6 +467,8 @@ if(WALLPAPERX_LAVAPIPE_ICD)
     set_tests_properties(static_renderer_probe_lavapipe PROPERTIES RESOURCE_LOCK static_renderer_probe_test_image)
     set_tests_properties(image_bounds_probe_lavapipe PROPERTIES
                          RESOURCE_LOCK image_bounds_probe_test_image SKIP_RETURN_CODE 77)
+    set_tests_properties(descriptor_inflight_heap_lavapipe descriptor_inflight_buffer_lavapipe
+                         descriptor_inflight_classic_lavapipe PROPERTIES SKIP_RETURN_CODE 77)
     set_tests_properties(frame_export_probe_lavapipe PROPERTIES RESOURCE_LOCK frame_export_probe_test_image)
     set_tests_properties(modifier_roundtrip_probe_lavapipe modifier_sensitivity_probe_lavapipe
                          PROPERTIES RESOURCE_LOCK modifier_roundtrip_probe_test_image SKIP_RETURN_CODE 77)
