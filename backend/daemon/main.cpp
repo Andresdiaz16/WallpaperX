@@ -96,6 +96,11 @@ int main() {
             std::fprintf(stderr, "wallpaperx-daemon: no usable XDG_CONFIG_HOME or HOME; "
                                  "wallpapers will not survive a restart\n");
         }
+        config.stateDir = wallpaperx::defaultStateDir();
+        if (config.stateDir.empty()) {
+            std::fprintf(stderr, "wallpaperx-daemon: no usable XDG_STATE_HOME or HOME; "
+                                 "a wallpaper that crashes the daemon will be applied again on restart\n");
+        }
 
         // Connected without claiming the name yet -- see the request below.
         auto connection = sdbus::createSessionBusConnection();

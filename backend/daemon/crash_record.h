@@ -35,9 +35,9 @@ void removeCrashRecord(const std::filesystem::path& stateDir, int monitorId);
 std::string describeCrash(const CrashRecord& crash);
 
 // On disk from construction to destruction, on the thread that is applying the wallpaper. One at
-// a time: the fatal-signal handler has a single slot, and a second live record would take it
-// from the first. A record that could not be written is silently absent -- there is nothing to
-// report it to that the next start would read.
+// a time, enforced: the fatal-signal handler has a single slot, and a record constructed while
+// another is live gets no slot and writes no file. A record that could not be written is
+// silently absent -- there is nothing to report it to that the next start would read.
 class ApplyingRecord {
 public:
     ApplyingRecord(const std::filesystem::path& stateDir, int monitorId, const std::string& type,

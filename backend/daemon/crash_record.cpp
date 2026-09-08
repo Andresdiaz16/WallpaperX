@@ -10,6 +10,7 @@
 #include <cerrno>
 #include <climits>
 #include <csignal>
+#include <cstdint>
 #include <cstring>
 #include <string_view>
 #include <system_error>
@@ -33,8 +34,15 @@ constexpr char kSignalPrefix[] = "signal ";
 // size is not ours to read.
 constexpr off_t kMaxRecordBytes = 64 * 1024;
 
-// The slot the handler reads. Filled by the applying thread before m_fd is published with
-// release, read after an acquire load of it; the path is only rewritten while the slot is empty.
+// The one slot the handler reads, in a single word: kFree, kHeld (a record owns it and its
+// fields are not readable), or a generation >= 2 meaning they are. Claimed by compare-exchange,
+// so a second record while one is live gets no slot and writes no file; the fields below are
+// written only by the holder, before the generation is stored with release. Generations never
+// repeat, which is what lets the handler tell that a path it copied was not rewritten under it.
+constexpr uint64_t kFree = 0;
+constexpr uint64_t kHeld = 1;
+std::atomic<uint64_t> g_slot{kFree};
+uint64_t g_lastGeneration = kHeld;  // holder-only; ordered between holders by the claim
 std::atomic<int> g_fd{-1};
 std::atomic<pid_t> g_tid{0};
 char g_path[PATH_MAX] = {};
@@ -46,20 +54,28 @@ struct sigaction g_previous[kHandlerSlots] = {};
 // Everything here is async-signal-safe: the record was formatted before the render began, so
 // this only writes a signal number to an open descriptor, or unlinks a path already spelled out.
 void onFatalSignal(int sig, siginfo_t* info, void* context) {
-    const int fd = g_fd.load(std::memory_order_acquire);
-    if (fd >= 0) {
+    const uint64_t generation = g_slot.load(std::memory_order_acquire);
+    if (generation != kFree && generation != kHeld) {
         if (::gettid() == g_tid.load(std::memory_order_relaxed)) {
+            // The record is this thread's, and this thread is here, so nothing withdraws it.
             char line[16] = "signal ";
             size_t n = sizeof(kSignalPrefix) - 1;
             if (sig >= 10) line[n++] = static_cast<char>('0' + sig / 10);
             line[n++] = static_cast<char>('0' + sig % 10);
             line[n++] = '\n';
-            const ssize_t ignored = ::write(fd, line, n);
+            const ssize_t ignored = ::write(g_fd.load(std::memory_order_relaxed), line, n);
             (void)ignored;
         } else {
             // Never written to from here: this thread's death says nothing about the wallpaper,
             // and the descriptor could be closed and reused by the applying thread meanwhile.
-            ::unlink(g_path);
+            // The path is copied and the generation re-checked, so a record withdrawn and
+            // replaced during the copy is left to its own thread rather than unlinked by a torn
+            // name. A read-modify-write rather than a load: its release half keeps the copy
+            // from drifting past it, which a fence would also do but TSan cannot model.
+            char path[PATH_MAX];
+            std::memcpy(path, g_path, sizeof(path));
+            uint64_t still = generation;
+            if (g_slot.compare_exchange_strong(still, generation, std::memory_order_acq_rel)) ::unlink(path);
         }
     }
 
@@ -165,6 +181,11 @@ ApplyingRecord::ApplyingRecord(const std::filesystem::path& stateDir, int monito
     const std::string text =
         nlohmann::json{{kKeyMonitorId, monitorId}, {kKeyType, type}, {kKeyPath, path}}.dump() + "\n";
 
+    // Before the file exists: a record the handler cannot see must not be on disk either, or
+    // a crash on another thread would leave it to refuse this wallpaper on no evidence.
+    uint64_t expected = kFree;
+    if (!g_slot.compare_exchange_strong(expected, kHeld, std::memory_order_acq_rel)) return;
+
     constexpr int kFlags = O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW;
     int fd = ::open(file.c_str(), kFlags, 0644);
     if (fd < 0 && errno == ENOENT) {
@@ -172,7 +193,10 @@ ApplyingRecord::ApplyingRecord(const std::filesystem::path& stateDir, int monito
         std::filesystem::create_directories(file.parent_path(), ec);
         if (!ec) fd = ::open(file.c_str(), kFlags, 0644);
     }
-    if (fd < 0) return;
+    if (fd < 0) {
+        g_slot.store(kFree, std::memory_order_release);
+        return;
+    }
 
     size_t written = 0;
     while (written < text.size()) {
@@ -182,6 +206,7 @@ ApplyingRecord::ApplyingRecord(const std::filesystem::path& stateDir, int monito
             // Half a record would be read as no record, so it is not worth keeping open.
             ::close(fd);
             ::unlink(file.c_str());
+            g_slot.store(kFree, std::memory_order_release);
             return;
         }
         written += static_cast<size_t>(n);
@@ -191,17 +216,19 @@ ApplyingRecord::ApplyingRecord(const std::filesystem::path& stateDir, int monito
     m_fd = fd;
     std::memcpy(g_path, m_file.c_str(), m_file.size() + 1);
     g_tid.store(::gettid(), std::memory_order_relaxed);
-    g_fd.store(fd, std::memory_order_release);
+    g_fd.store(fd, std::memory_order_relaxed);
+    g_slot.store(++g_lastGeneration, std::memory_order_release);
 }
 
 ApplyingRecord::~ApplyingRecord() {
     if (m_fd < 0) return;
-    // Withdrawn before the close, so a handler interrupting this thread finds an open record
-    // or none; another thread's handler only ever unlinks, so a reused descriptor number is
-    // never written to.
-    g_fd.store(-1, std::memory_order_release);
+    // Withdrawn before the close, so a handler interrupting this thread finds a live record
+    // or none; freed only after the unlink, so the next record -- possibly the same monitor's,
+    // at the same path -- cannot be created and then removed by this one's unlink.
+    g_slot.store(kHeld, std::memory_order_release);
     ::close(m_fd);
     ::unlink(m_file.c_str());
+    g_slot.store(kFree, std::memory_order_release);
 }
 
 void installFatalSignalHandlers() {

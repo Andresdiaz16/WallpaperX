@@ -265,10 +265,11 @@ public:
         std::filesystem::path configFile;
 
         // Where the record of the wallpaper being applied lives, so a start after a crash
-        // can refuse the one the last run did not survive. Empty disables that refusal. The
-        // daemon's own directory by default: reading a record there is harmless, and only a
-        // record written there protects the next start.
-        std::filesystem::path stateDir = defaultStateDir();
+        // can refuse the one the last run did not survive. Empty disables that refusal, and
+        // is the default for the same reason configFile's is: production opts in via
+        // defaultStateDir(), so a test that says nothing about state cannot leave a record
+        // in the developer's own directory for the real daemon's next start to honour.
+        std::filesystem::path stateDir;
     };
 
     explicit WallpaperManager(Config config);
