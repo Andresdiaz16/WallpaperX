@@ -7,7 +7,6 @@
 #include "offscreen.h"
 
 #include <algorithm>
-#include <cstdio>
 #include <iterator>
 #include <optional>
 #include <stdexcept>
@@ -241,22 +240,18 @@ int exportFrameAcquireFd(Device& device, const OffscreenTarget& target) {
     struct Cleanup {
         Device& device;
         VkSemaphore semaphore;
-        // Names the batch that signals this semaphore for as long as that batch may still be
-        // running: unset before submit() accepts it, and again once the wait below returns.
-        // Those are the only two states in which destroying the semaphore is legal.
+        // Names the batch that signals this semaphore: unset before submit() accepts it, and
+        // again once the wait below returns, which are the two states where the semaphore is
+        // known free. Set, it is the only batch that could still be holding it.
         std::optional<Device::SubmitTicket> inFlight;
 
         ~Cleanup() {
-            // A bounded drain rather than another wait(): a destructor cannot throw, and the
-            // path that gets here is the one where the wait below already expired with the
-            // batch still holding this semaphore. Leaked rather than destroyed then, as
-            // everything else abandoned to a wedged GPU is.
-            if (inFlight && !device.drainForTeardown()) {
-                std::fprintf(stderr,
-                             "exportFrameAcquireFd: the GPU has not finished the batch that signals this "
-                             "frame's acquire semaphore, so it is leaked rather than destroyed\n");
-                return;
-            }
+            // Decided from this one batch, not from the state of the queue: the wait below is
+            // the only wait this semaphore ever needed, so whether it finished is the whole
+            // answer. A drain here would spend a second full bound on the paths where that
+            // wait failed for a reason other than expiring -- host memory exhaustion, say --
+            // and would abandon a device whose own batch had in fact completed.
+            if (inFlight && !device.safeToFree("an exported frame's acquire semaphore", *inFlight)) return;
             vkDestroySemaphore(device.device(), semaphore, nullptr);
         }
     } cleanup{device, semaphore, std::nullopt};

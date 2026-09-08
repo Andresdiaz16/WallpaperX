@@ -568,7 +568,7 @@ bool runReleaseChecks() {
         //       objects is only half of letting go -- until a ReleaseBuffer names the image, the
         //       daemon goes on
         //       treating it as held and keeps it out of the ring for the life of the connection,
-        //       which on a monitor of three images is a wallpaper that stops changing.
+        //       and nothing ever takes one back, so that is a wallpaper that stops changing.
         // WHY-THIS-SHAPE: the event loop is pumped AFTER the render pass that destroyed the
         //       texture, and that pump is the whole point. The release hops to the application
         //       object with a queued connection, so at the moment the texture is destroyed
@@ -578,10 +578,10 @@ bool runReleaseChecks() {
         //       The buffer id is compared, not just the count: a release naming the wrong image
         //       is worse than none, since it invites the daemon to draw into one this process
         //       may still be sampling.
-        // CONTROL: `releaseClaim(claim);` deleted from the QSGTexture::destroyed lambda in
-        //       WallpaperXItem::updatePaintNode (backend/kde/wallpaperx_item.cpp) -> "FAIL: the
-        //       plugin told the daemon it had let the image go", printing "0 release(s) arrived
-        //       in two seconds after the texture was destroyed". Reverted.
+        // CONTROL: `releaseClaimWhenReadsFinish(claim);` deleted from the QSGTexture::destroyed
+        //       lambda in WallpaperXItem::updatePaintNode (backend/kde/wallpaperx_item.cpp) ->
+        //       "FAIL: the plugin told the daemon it had let the image go", printing "0
+        //       release(s) arrived in two seconds after the texture was destroyed". Reverted.
         // CONTROL, for the id: `request.setArguments({monitorId, bufferId});` in
         //       sendReleaseBuffer (backend/kde/wallpaperx_item.cpp) changed to `bufferId + 1`
         //       -> "FAIL: and named the monitor and the image it had been given", printing "it

@@ -4,6 +4,7 @@
 
 #include "device.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -32,13 +33,18 @@ public:
     DescriptorSlotPool(const DescriptorSlotPool&) = delete;
     DescriptorSlotPool& operator=(const DescriptorSlotPool&) = delete;
 
-    // Blocks only when nothing is spare and the longest-released slot is still being read.
+    // Blocks only when nothing is spare and every released slot is still being read.
     // Throws std::runtime_error when every slot is issued.
     uint32_t acquire();
 
     // Throws std::runtime_error unless `slot` is currently issued, which is what makes a
     // double free a reported error rather than two allocations aliasing one slot.
     void release(uint32_t slot);
+
+    // release() for a slot whose descriptor was never written -- an allocate() that failed
+    // part way. No batch can have read what was never put there, so it becomes available at
+    // once instead of waiting on a submission that has nothing to do with it.
+    void releaseUnwritten(uint32_t slot);
 
 private:
     enum class SlotState : uint8_t { Fresh, Issued, Released };
@@ -48,14 +54,17 @@ private:
         Device::SubmitTicket lastReader;
     };
 
-    // Removes m_released.front(), marks it issued and returns it.
-    uint32_t takeOldestReleased();
+    // Removes m_released[index], marks it issued and returns it.
+    uint32_t takeReleased(size_t index);
+    void releaseTo(uint32_t slot, Device::SubmitTicket lastReader);
 
     Device& m_device;
     std::string m_what;
     std::vector<SlotState> m_state;
     uint32_t m_nextFresh = 0;
-    // Oldest first, which is also lowest ticket first: release order follows submission order.
+    // Oldest first, and among those with a reader that is also lowest ticket first: release
+    // order follows submission order. A slot released unwritten carries the null ticket, which
+    // is complete by definition, so it is taken before anything is ever waited for.
     std::vector<Released> m_released;
 };
 

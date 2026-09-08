@@ -16,6 +16,7 @@
 #include <QSGTexture>
 #include <QSocketNotifier>
 #include <QThread>
+#include <QTimer>
 
 #include <unistd.h>
 
@@ -51,9 +52,15 @@ constexpr const char* kService = "io.wallpaperx.Daemon";
 constexpr const char* kPath = "/io/wallpaperx/Daemon";
 constexpr const char* kInterface = "io.wallpaperx.Daemon";
 
-// The daemon keeps one image per monitor free to render into, and refuses a hand-over that
-// would take the last one. Not a failure of either side, and not permanent.
+// The daemon keeps one image per monitor free to render into, and bounds what one consumer may
+// hold; a hand-over past either is refused rather than taken from whoever holds it. Not a failure
+// of either side, and not permanent.
 constexpr const char* kErrorNoFreeImage = "io.wallpaperx.Daemon.Error.NoFreeImage";
+
+// How long a refused item with nothing on screen waits before asking again. Long enough that it
+// is not a poll of the daemon, short enough that a desktop showing the plain backdrop recovers
+// on its own once an image comes free.
+constexpr int kRefusedRetryMs = 2000;
 
 }  // namespace
 
@@ -133,7 +140,7 @@ void reportImportFailure(const std::string& reason) {
 
 // GUI thread only. The daemon's unique bus name as last observed, so the several items in one
 // plasmashell report a restart once between them: a spurious "the daemon changed" would forget
-// claims the daemon still holds, and they would then linger until the hand-over cap expired them.
+// claims the daemon still holds, and nothing would ever give those images back.
 QString g_daemonOwner;
 
 // GUI thread. Called for every owner change of the daemon's bus name, departures included.
@@ -143,12 +150,47 @@ void noteDaemonOwner(const QString& owner) {
     BufferClaims::instance().daemonReplaced();
 }
 
+// Asks the bus who owns the daemon's name, once per process. The service watcher only reports
+// CHANGES, so without this a plugin that starts beside a running daemon never learns its unique
+// name -- which is the name every release has to be addressed to.
+void askWhoOwnsTheDaemon() {
+    static bool asked = false;
+    if (asked) return;
+
+    // On qApp, not on the item that asked: an item destroyed within the round trip would take the
+    // answer with it, and the latch below would stop any other item from asking again.
+    QCoreApplication* app = QCoreApplication::instance();
+    QDBusConnection bus = QDBusConnection::sessionBus();
+    if (app == nullptr || !bus.isConnected()) return;
+    asked = true;
+
+    QDBusMessage request = QDBusMessage::createMethodCall(QStringLiteral("org.freedesktop.DBus"),
+                                                          QStringLiteral("/org/freedesktop/DBus"),
+                                                          QStringLiteral("org.freedesktop.DBus"),
+                                                          QStringLiteral("GetNameOwner"));
+    request.setArguments({QString::fromUtf8(kService)});
+    auto* watcher = new QDBusPendingCallWatcher(bus.asyncCall(request), app);
+    QObject::connect(watcher, &QDBusPendingCallWatcher::finished, app, [](QDBusPendingCallWatcher* done) {
+        done->deleteLater();
+        // Only to fill a blank. The watcher's own reports are newer by construction -- the bus
+        // sends them after this reply -- so applying an answer over one would rewind the record.
+        if (done->isError() || !g_daemonOwner.isEmpty()) return;
+        noteDaemonOwner(done->reply().arguments().value(0).toString());
+    });
+}
+
 // GUI thread, where the bus connection is.
-void sendReleaseBuffer(int monitorId, quint64 bufferId) {
+//
+// Addressed to the unique name that granted the claim, never to the well-known one: a unique
+// name is never reused, so a release delayed past a daemon restart is dropped by the bus instead
+// of freeing the SUCCESSOR's image of the same id under whoever is reading it. Empty only before
+// this process has learned any owner, where the well-known name is all there is.
+void sendReleaseBuffer(const std::string& owner, int monitorId, quint64 bufferId) {
     QDBusConnection bus = QDBusConnection::sessionBus();
     if (!bus.isConnected()) return;
 
-    QDBusMessage request = QDBusMessage::createMethodCall(QString::fromUtf8(kService), QString::fromUtf8(kPath),
+    const QString destination = owner.empty() ? QString::fromUtf8(kService) : QString::fromStdString(owner);
+    QDBusMessage request = QDBusMessage::createMethodCall(destination, QString::fromUtf8(kPath),
                                                           QString::fromUtf8(kInterface),
                                                           QStringLiteral("ReleaseBuffer"));
     request.setArguments({monitorId, bufferId});
@@ -174,10 +216,12 @@ void releaseClaim(const BufferClaims::Claim& claim) noexcept {
         const int monitorId = claim.monitorId;
         const quint64 bufferId = claim.bufferId;
         QMetaObject::invokeMethod(
-            app, [monitorId, bufferId] { sendReleaseBuffer(monitorId, bufferId); }, Qt::QueuedConnection);
+            app, [owner = claim.owner, monitorId, bufferId] { sendReleaseBuffer(owner, monitorId, bufferId); },
+            Qt::QueuedConnection);
     } catch (...) {
-        // A release that never reaches the daemon costs promptness, not correctness: the claim
-        // still expires at the hand-over cap, or when this process leaves the bus.
+        // A release that never reaches the daemon costs the daemon an image until this process
+        // leaves the bus: nothing is ever taken back from a consumer, so no claim expires on its
+        // own. The ring is sized to survive one such consumer, not a stream of them.
     }
 }
 
@@ -202,25 +246,55 @@ struct OwnedFd {
 // It gives the claim back only when the fence signals, so until then the ledger still counts the
 // import -- which is what makes a second live import of the same image, and a daemon replaced in
 // the meantime, come out right without either being asked about here.
+//
+// The deadline bounds a fence that never signals: nothing else would ever free the claim, and the
+// daemon takes none back, so that image would be out of the ring for the session. Orders of
+// magnitude beyond the reads it covers, which are one desktop frame's worth.
+constexpr int kFenceDeadlineMs = 5000;
+
 class PendingRelease : public QObject {
 public:
     PendingRelease(const BufferClaims::Claim& claim, int fenceFd, QObject* parent)
         : QObject(parent), m_claim(claim), m_fence(fenceFd), m_signalled(fenceFd, QSocketNotifier::Read) {
-        QObject::connect(&m_signalled, &QSocketNotifier::activated, this, [this] {
-            // A signalled fence stays readable, so this would fire on every pass of the event
-            // loop until the object is gone.
-            m_signalled.setEnabled(false);
-            releaseClaim(m_claim);
-            deleteLater();
+        QObject::connect(&m_signalled, &QSocketNotifier::activated, this, [this] { release(); });
+        m_deadline.setSingleShot(true);
+        QObject::connect(&m_deadline, &QTimer::timeout, this, [this] {
+            noteTimedOutFence();
+            release();
         });
+        m_deadline.start(kFenceDeadlineMs);
     }
 
 private:
+    // Both sources are silenced first: a signalled fence stays readable, so the notifier would
+    // otherwise fire on every pass of the event loop until deleteLater() ran.
+    void release() {
+        m_signalled.setEnabled(false);
+        m_deadline.stop();
+        releaseClaim(m_claim);
+        deleteLater();
+    }
+
+    // Once per process: this is a statement about the driver, which would otherwise repeat it
+    // for every image the desktop ever shows.
+    static void noteTimedOutFence() {
+        static std::once_flag reported;
+        std::call_once(reported, [] {
+            std::fprintf(stderr,
+                         "wallpaperx: a fence saying this desktop had finished reading an image never signalled "
+                         "within %d ms, so the image is being given back anyway. The wallpaper still shows; what "
+                         "is lost is the guarantee that the daemon redraws an image only after this desktop's "
+                         "queued reads of it have finished.\n",
+                         kFenceDeadlineMs);
+        });
+    }
+
     BufferClaims::Claim m_claim;
     // Declared before the notifier so it is destroyed after it: closing a descriptor a live
     // QSocketNotifier still watches leaves the notifier armed on whatever number is opened next.
     OwnedFd m_fence;
     QSocketNotifier m_signalled;
+    QTimer m_deadline;
 };
 
 // Once per process: the reason is a property of the GL context, not of the image.
@@ -228,9 +302,9 @@ void noteUnfencedRelease(const std::string& whyNot) {
     static std::once_flag reported;
     std::call_once(reported, [&whyNot] {
         std::fprintf(stderr,
-                     "wallpaperx: telling the daemon an image is free as soon as this process stops using it -- "
-                     "%s. The wallpaper still shows; what is lost is the guarantee that the daemon redraws an "
-                     "image only after this desktop's queued reads of it have finished.\n",
+                     "wallpaperx: waiting for this desktop's GPU to go idle before telling the daemon an image is "
+                     "free -- %s. The wallpaper still shows; what this costs is a stall on the render thread "
+                     "every time an imported frame goes away.\n",
                      whyNot.c_str());
     });
 }
@@ -258,7 +332,11 @@ void releaseClaimWhenReadsFinish(const BufferClaims::Claim& claim) noexcept {
         std::string whyNot;
         OwnedFd fence{FrameImport::readsFinishedFd(&whyNot)};
         if (fence.fd < 0) {
+            // Waited out here and now, on the thread with the context: deleting the GL objects
+            // does not drain the commands that sampled them, and the daemon may draw into the
+            // image the instant it is told. Blocking is the price of saying so truthfully.
             noteUnfencedRelease(whyNot);
+            FrameImport::waitForReadsToFinish();
             releaseClaim(claim);
             return;
         }
@@ -268,10 +346,13 @@ void releaseClaimWhenReadsFinish(const BufferClaims::Claim& claim) noexcept {
             fence.take();  // the post owns it now, and PendingRelease after that
             return;
         }
+        // Nothing will ever watch that fence, so this is the unfenced case with a descriptor in
+        // hand: wait the reads out rather than tell the daemon early.
+        FrameImport::waitForReadsToFinish();
         releaseClaim(claim);
     } catch (...) {
-        // As releaseClaim: a release that never reaches the daemon costs promptness, not
-        // correctness.
+        // As releaseClaim: a release that never reaches the daemon costs that image until this
+        // process leaves the bus.
     }
 }
 
@@ -453,6 +534,9 @@ void WallpaperXItem::connectToDaemon() {
                 forgetGenerations();
                 fetchFrame(0);
             });
+    // After the watcher, so an owner change between the two is reported by it rather than lost:
+    // the bus sends its signals and this reply on one connection, in order.
+    askWhoOwnsTheDaemon();
 
     if (m_monitorId >= 0) fetchFrame(0);
 }
@@ -526,7 +610,14 @@ void WallpaperXItem::fetchFrame(quint64 generation) {
                 // Cleared before any early return, or one dropped reply stops fetching for good.
                 m_fetchInFlight = false;
                 const std::optional<quint64> queued = std::exchange(m_queuedFetch, std::nullopt);
-                if (requestedMonitor == m_monitorId) takeFrameReply(done->reply());
+                // A reply for a monitor this item has since stopped showing is still a frame the
+                // daemon recorded a hold for, so it is given back rather than dropped with the
+                // message. Nothing else would: the daemon takes no claim back on its own.
+                if (requestedMonitor == m_monitorId) {
+                    takeFrameReply(requestedMonitor, done->reply());
+                } else {
+                    releaseFrameReply(requestedMonitor, done->reply());
+                }
                 if (queued) fetchFrame(*queued);
             });
 }
@@ -633,7 +724,24 @@ void sendImportModifiers(QObject* context, quint32 drmFormat, const std::vector<
 
 }  // namespace
 
-void WallpaperXItem::takeFrameReply(const QDBusMessage& call) {
+// Which image a GetFrameFd reply granted, or 0 for a reply that granted none. One reader of
+// field 11, so the two callers below cannot disagree about where the buffer id is.
+quint64 WallpaperXItem::grantedBufferId(const QDBusMessage& call) {
+    if (call.type() != QDBusMessage::ReplyMessage) return 0;
+    const QList<QVariant> args = call.arguments();
+    if (!replyIsReadable(static_cast<int>(args.size()))) return 0;
+    return args.at(11).toULongLong();
+}
+
+// A reply this item can no longer use -- its monitor changed while the fetch was out. The daemon
+// recorded the hold when it answered, so the claim is taken and handed straight back; dropping
+// the message instead pins that image until this process leaves the bus. Reports nothing: the
+// reason it would publish describes a screen this item has stopped showing.
+void WallpaperXItem::releaseFrameReply(int monitorId, const QDBusMessage& call) {
+    releaseClaim(BufferClaims::instance().take(monitorId, grantedBufferId(call), g_daemonOwner.toStdString()));
+}
+
+void WallpaperXItem::takeFrameReply(int monitorId, const QDBusMessage& call) {
     if (call.type() != QDBusMessage::ReplyMessage) {
         // A bus error is jargon about transport ("The name io.wallpaperx.Daemon was not provided
         // by any .service files"), so it is answered in this plugin's own words. Only the
@@ -645,12 +753,21 @@ void WallpaperXItem::takeFrameReply(const QDBusMessage& call) {
                                      : tr("WallpaperX could not be reached."));
             return;
         }
-        // Refused so the daemon keeps somewhere to draw. Reported as no reason at all, because a
-        // reason hides the wallpaper behind the backdrop -- and this item still has the frame it
-        // is showing, which is more use than a message about a fetch that will succeed on the
-        // next announcement. The daemon sends one whenever an image comes back.
+        // Refused so the daemon keeps somewhere to draw, or because this item already holds as
+        // many images as one consumer may. While a frame is on screen nothing is reported: a
+        // reason hides the wallpaper behind the backdrop, and the frame being shown is more use
+        // than a message about a fetch the next announcement will serve.
+        //
+        // An item with nothing on screen is the opposite case. It has no frame to protect, and
+        // the announcement it would otherwise wait for is sent when some consumer releases an
+        // image -- which a consumer that has stopped releasing never does.
         if (name == QLatin1String(kErrorNoFreeImage)) {
-            setFetchReason(QString());
+            if (m_frameShown) {
+                setFetchReason(QString());
+            } else {
+                setFetchReason(tr("WallpaperX has no image free for this screen yet."));
+                retryWhileNothingIsShown();
+            }
             return;
         }
         // Not a failure of this item: no frame yet is the ordinary state before the user has
@@ -674,8 +791,8 @@ void WallpaperXItem::takeFrameReply(const QDBusMessage& call) {
     // claimed BEFORE the rest of the parse, because the daemon recorded the hold when it answered
     // -- so from here on every path that drops this frame owes it a release, and `frame` owning
     // the claim is what makes that automatic.
-    frame.request.bufferId = args.at(11).toULongLong();
-    frame.claim = BufferClaims::instance().take(m_monitorId, frame.request.bufferId);
+    frame.request.bufferId = grantedBufferId(call);
+    frame.claim = BufferClaims::instance().take(monitorId, frame.request.bufferId, g_daemonOwner.toStdString());
 
     frame.request.fd = ::dup(args.at(0).value<QDBusUnixFileDescriptor>().fileDescriptor());
     frame.request.width = args.at(1).toUInt();
@@ -896,9 +1013,8 @@ QSGNode* WallpaperXItem::updatePaintNode(QSGNode* old, UpdatePaintNodeData*) {
                     releaseClaimWhenReadsFinish(claim);
                 },
                 Qt::DirectConnection);
-            // Deletes the texture it replaces, so a QSGTexture* kept across a re-import is freed
-            // memory -- and the allocator hands the same address back, which reads as no change.
-            // Watch QObject::destroyed, never compare pointers.
+            // Destroys the texture it replaces, which is what runs the handler above for the
+            // previous frame and gives that image back.
             node->setTexture(texture);
             node->markDirty(QSGNode::DirtyMaterial);
             {
@@ -928,9 +1044,23 @@ QSGNode* WallpaperXItem::updatePaintNode(QSGNode* old, UpdatePaintNodeData*) {
     return node;
 }
 
+// A refused fetch with nothing on screen asks again on its own, once at a time: the announcement
+// that would otherwise wake it is sent when a consumer releases an image, and a consumer that has
+// stopped releasing sends none. Armed only while this item is showing nothing, so a desktop with
+// a wallpaper on it never polls.
+void WallpaperXItem::retryWhileNothingIsShown() {
+    if (m_retryQueued) return;
+    m_retryQueued = true;
+    QTimer::singleShot(kRefusedRetryMs, this, [this] {
+        m_retryQueued = false;
+        if (m_frameShown) return;
+        fetchFrame(0);
+    });
+}
+
 // A still wallpaper sends no further FrameReady, so a released item must ask on its own. Not
-// fetchFrame(0), which forces: QML sets the monitor id moments before the item joins a scene, and
-// forcing here made every item ask the daemon twice for the frame it was already getting.
+// fetchFrame(0), which forces: QML sets the monitor id moments before the item joins a scene, so
+// a fetch for this screen is usually already out and forcing would ask for the same frame twice.
 void WallpaperXItem::itemChange(ItemChange change, const ItemChangeData& value) {
     QQuickItem::itemChange(change, value);
     if (change != ItemSceneChange || value.window == nullptr) return;

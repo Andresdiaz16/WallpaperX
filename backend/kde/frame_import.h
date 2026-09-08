@@ -105,6 +105,12 @@ public:
     // reads end" and never "they have ended". The caller owns the descriptor and must close() it.
     static int readsFinishedFd(std::string* whyNot = nullptr);
 
+    // Blocks until this context's issued commands have finished on the GPU. The fallback for a
+    // context readsFinishedFd() cannot answer for: the producer takes no claim back, so telling
+    // it an image is free before the reads end is a wrong pixel, and not telling it pins that
+    // image for the session. Same thread and context rule as everything else here.
+    static void waitForReadsToFinish();
+
     // Every DRM format modifier this EGL implementation can import `drmFormat` as. The daemon
     // cannot work this out for itself: Vulkan's importable bit answers for Vulkan, and this is
     // the only API that answers for the one doing the importing.

@@ -10,7 +10,6 @@
 
 #include <algorithm>
 #include <array>
-#include <cstdio>
 #include <stdexcept>
 #include <utility>
 
@@ -69,11 +68,7 @@ OffscreenTargetManager::~OffscreenTargetManager() {
     // nothing -- once destroy() has already emptied the map. A drain that failed once answers
     // immediately, so this costs one poll on the ordinary path.
     if (!m_renderPass) return;
-    if (!m_device.drainForTeardown()) {
-        std::fprintf(stderr, "OffscreenTargetManager: the GPU has not finished a render, so the render pass it "
-                             "is executing is leaked rather than destroyed\n");
-        return;
-    }
+    if (!m_device.safeToFree("the render pass every render batch names")) return;
     vkDestroyRenderPass(m_device.device(), m_renderPass, nullptr);
 }
 
@@ -325,13 +320,9 @@ void OffscreenTargetManager::destroyTargets(const std::vector<OffscreenTarget*>&
     m_device.assertGpuThread("OffscreenTargetManager::destroyTargets");
     if (images.empty()) return;
 
-    if (!m_device.drainForTeardown()) {
-        std::fprintf(stderr,
-                     "OffscreenTargetManager: the GPU has not finished reading %zu offscreen image(s), "
-                     "so they are leaked rather than freed\n",
-                     images.size());
-        return;
-    }
+    // No batch to name: nothing records which render last drew into which image, so any
+    // pending one may still be reading these.
+    if (!m_device.safeToFree("offscreen images, their views and their framebuffers")) return;
     for (OffscreenTarget* image : images) dropTarget(*image);
 }
 

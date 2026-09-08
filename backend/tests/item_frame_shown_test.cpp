@@ -86,6 +86,7 @@ using wallpaperx::testing::glDeviceUuid;
 using wallpaperx::testing::itemPaintNode;
 using wallpaperx::testing::itemTexture;
 using wallpaperx::testing::kFirstMonitor;
+using wallpaperx::testing::kInterface;
 using wallpaperx::testing::kHeight;
 using wallpaperx::testing::kPath;
 using wallpaperx::testing::kSecondMonitor;
@@ -106,6 +107,15 @@ constexpr const char* kGoal = "S12.7 (the plugin's claim that a frame is on scre
 // failures turns every deliberate skip below into exit 1: a host without the layer package would
 // report "not verified" in its output and FAIL to ctest, blaming the plugin for a package.
 int g_ungradedValidation = 0;
+
+// Pumps for a fixed span, waiting for nothing. Separate from pumpUntil so no call site can
+// discard a "it never happened" answer: the one check that uses this is asserting a SILENCE, and
+// its anti-vacuity guard is the request count beside it, not the wait.
+void pumpFor(int ms) {
+    QElapsedTimer clock;
+    clock.start();
+    while (clock.elapsed() < ms) QCoreApplication::processEvents(QEventLoop::AllEvents, 10);
+}
 
 bool runFrameShownChecks() {
     return wallpaperx::testing::gradedRun("item_frame_shown_test", [](wallpaperx::testing::ValidationGrade& grade) {
@@ -290,6 +300,60 @@ bool runFrameShownChecks() {
             renderPass(nullptr);
             control.invalidate();
             return true;
+        }
+
+        // GOAL: a refused hand-over reports NOTHING while a wallpaper is on screen. The daemon
+        //       refuses whenever no image may be handed over, which is a normal and temporary
+        //       state; a reason published here puts main.qml's opaque message panel over a
+        //       wallpaper that is being drawn perfectly well, for as long as the refusals last.
+        // WHY-THIS-SHAPE: driven with the NoFreeImage error NAME specifically, because that is
+        //       the one the plugin treats as temporary -- every other error it reports, and must.
+        //       The item is required to have ASKED and to have still been claiming a frame, so
+        //       "the reason is empty" cannot pass for a run where no refusal ever reached it.
+        //       Placed here, before the monitor-id change below, because that is the last point
+        //       at which the published reason is known to be empty: a check run later would be
+        //       reading whatever an intervening step published.
+        // CONTROL: the `setFetchReason(QString());` in the `if (m_frameShown)` arm of
+        //       WallpaperXItem::takeFrameReply (backend/kde/wallpaperx_item.cpp) changed to
+        //       `setFetchReason(tr("refused"));` -> "FAIL: a refused hand-over publishes no reason
+        //       while a wallpaper is on screen", printing the reason it published. Reverted.
+        // COVERAGE-ASSERT: the request count is required to have risen, so a run in which the
+        //       FrameReady produced no fetch reports that rather than the silence.
+        {
+            const QString reasonBeforeRefusal = root->property("publishedReason").toString();
+            check(reasonBeforeRefusal.isEmpty(),
+                  "an item showing a wallpaper is reporting nothing, which is what the refusal below is read "
+                  "against");
+            const int requestsBeforeRefusal = stub.requests();
+            stub.refuseFurtherWith(QStringLiteral("io.wallpaperx.Daemon.Error.NoFreeImage"));
+            QDBusMessage ready = QDBusMessage::createSignal(QString::fromUtf8(kPath), QString::fromUtf8(kInterface),
+                                                            QStringLiteral("FrameReady"));
+            // One past the newest generation the item has read; the item ignores an announcement
+            // naming a generation it already holds, so a fixed number could never make it fetch.
+            ready.setArguments({kFirstMonitor, static_cast<qulonglong>(stub.served() + 1)});
+            bus.send(ready);
+
+            const bool askedAndRefused = pumpUntil([&] { return stub.requests() > requestsBeforeRefusal; }, 5000);
+            check(askedAndRefused, "the item asks again when a new frame is announced, and is refused");
+            if (!askedAndRefused) {
+                std::fprintf(stderr, "  the announcement produced no request, so nothing was refused and the "
+                                     "silence below says nothing\n");
+            } else {
+                // The reply hops to the GUI thread and the reason is published from there, so a
+                // read on the line after the request would be ahead of the write it is about.
+                pumpFor(300);
+                const QString reasonAfterRefusal = root->property("publishedReason").toString();
+                check(reasonAfterRefusal.isEmpty(),
+                      "a refused hand-over publishes no reason while a wallpaper is on screen");
+                if (!reasonAfterRefusal.isEmpty()) {
+                    std::fprintf(stderr, "  it published [%s] over a wallpaper it is still drawing\n",
+                                 reasonAfterRefusal.toStdString().c_str());
+                }
+                check(claimsFrameShown(item), "and it is still claiming that wallpaper is on screen");
+            }
+            // Put back, or the checks below -- which wait for a refusal to be REPORTED -- would be
+            // waiting on the one answer this plugin deliberately keeps quiet about.
+            stub.refuseFurtherWith(QString());
         }
 
         // GOAL: invalidating the generation marks must NOT withdraw the claim. Moving this screen

@@ -765,6 +765,25 @@ if(DBUS_RUN_SESSION)
             RESOURCE_LOCK wallpaperx_bus_tests
             SKIP_RETURN_CODE 77)
 
+        # The same item again, driven by a stub that only ever REFUSES. No scene graph and no
+        # window: the item is never parented into one, because joining a scene makes it ask again
+        # by itself and that is exactly what this entry has to tell apart from the retry timer.
+        # So the offscreen platform is fine here where the entries above cannot use it.
+        add_executable(wallpaperx-item-refusal-retry-test tests/item_refusal_retry_test.cpp)
+        target_link_libraries(wallpaperx-item-refusal-retry-test PRIVATE
+            Qt6::Core Qt6::DBus Qt6::Gui Qt6::Qml Qt6::Quick)
+        target_include_directories(wallpaperx-item-refusal-retry-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        target_compile_definitions(wallpaperx-item-refusal-retry-test PRIVATE
+            WALLPAPERX_QML_MODULE_PATH="${CMAKE_CURRENT_BINARY_DIR}/qml")
+        add_dependencies(wallpaperx-item-refusal-retry-test wallpaperxplugin)
+        add_test(NAME item_refusal_retry
+                 COMMAND ${DBUS_RUN_SESSION} -- $<TARGET_FILE:wallpaperx-item-refusal-retry-test>)
+        set_tests_properties(item_refusal_retry PROPERTIES
+            ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QT_NO_XDG_DESKTOP_PORTAL=1"
+            LABELS "novulkan"
+            RESOURCE_LOCK wallpaperx_bus_tests
+            SKIP_RETURN_CODE 77)
+
         # The same item again, driven by a stub that REFUSES the plugin's import-modifier report.
         # No Vulkan: the frame it serves is a memfd with synthesized fields, because what is under
         # test is what the plugin does with the daemon's answer, not what it does with the pixels.
@@ -893,7 +912,7 @@ if(DBUS_RUN_SESSION)
                 WALLPAPERX_SHADER_DIR="${WALLPAPERX_SHADER_OUTPUT_DIR}"
                 WALLPAPERX_TEST_IMAGE_DIR="${WALLPAPERX_ITEM_ASSET_DIR}")
             add_dependencies(wallpaperx-item-release-ledger-test wallpaperxplugin wallpaperx-shaders)
-            foreach(release_phase repeat-import dropped-frame daemon-restart)
+            foreach(release_phase repeat-import dropped-frame in-flight-monitor-change daemon-restart)
                 add_test(NAME item_release_${release_phase}
                          COMMAND ${DBUS_RUN_SESSION} --
                                  $<TARGET_FILE:wallpaperx-item-release-ledger-test> ${release_phase})
@@ -923,7 +942,7 @@ if(DBUS_RUN_SESSION)
                      "leaves a black desktop with no message on it is green. Install the Qt6 Quick private headers "
                      "and re-configure.")
             set_tests_properties(item_frame_shown PROPERTIES SKIP_REGULAR_EXPRESSION "NOT VERIFIED")
-            foreach(release_phase repeat-import dropped-frame daemon-restart)
+            foreach(release_phase repeat-import dropped-frame in-flight-monitor-change daemon-restart)
                 add_test(NAME item_release_${release_phase}
                          COMMAND ${CMAKE_COMMAND} -E echo
                          "item_release_${release_phase}: NOT VERIFIED -- Qt6 QuickPrivate headers were not found at "

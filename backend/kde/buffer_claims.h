@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <mutex>
+#include <string>
 #include <vector>
 
 namespace wallpaperx {
@@ -31,6 +32,11 @@ public:
         int monitorId = -1;
         uint64_t bufferId = 0;
 
+        // The unique bus name that granted it, which is where the release must be addressed:
+        // the well-known name can have moved to a successor by the time one is sent. Empty when
+        // the caller had no owner to name, and then the well-known name is all there is.
+        std::string owner;
+
         // A daemon never issues buffer id 0, so it is the "nothing claimed" state and no second
         // field is needed to say so.
         bool held() const { return bufferId != 0; }
@@ -38,7 +44,10 @@ public:
 
     // Records that the daemon has handed `bufferId` over. A `bufferId` of 0 records nothing and
     // returns an unheld claim, so a caller reading a reply need not branch before asking.
-    Claim take(int monitorId, uint64_t bufferId);
+    //
+    // `owner` is carried on the claim and nowhere else: it is the release's destination, not part
+    // of what identifies a claim, which is what `daemon` is for.
+    Claim take(int monitorId, uint64_t bufferId, std::string owner = {});
 
     // Gives one back. True only when this was the LAST live import of that image, which is the
     // one moment the daemon may be told. False for a claim already given back, and for one

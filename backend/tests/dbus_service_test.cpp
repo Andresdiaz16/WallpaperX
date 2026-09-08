@@ -206,10 +206,11 @@ constexpr int32_t kMonitorAnnounceCondemned = 31;
 // of these lives on a manager of its own, where the id space starts empty again, so the repeat
 // is only in the number and never in the state.
 //
-// On runBufferHoldChecks' own manager. The first is driven until every image on it is in a
-// consumer's hands, which needs TWO consumers -- see that phase's header. The second carries
-// the opposite case and must not share a monitor with it: one consumer that never releases
-// anything, whose claims have to expire on their own.
+// On runBufferHoldChecks' own manager. The first is driven until only the producer's reserve
+// is left free, which needs TWO consumers at their per-consumer cap -- see that phase's header.
+// The second carries the opposite case and must not share a monitor with it: one consumer that
+// never releases anything, which has to run out of hand-overs on the cap alone while the ring
+// still has images free.
 constexpr int32_t kMonitorHoldRing = 0;
 constexpr int32_t kMonitorHoldNeverReleases = 1;
 // The third case, and it needs a monitor of its own for the same reason: frames exported to a
@@ -217,35 +218,42 @@ constexpr int32_t kMonitorHoldNeverReleases = 1;
 // ever withdraw.
 constexpr int32_t kMonitorHoldUnnamed = 2;
 // The fourth, and it needs its own monitor because it is the only one driven past the holder
-// limit: five consumers, where every other case here has one or two. Sharing a monitor with them
-// would leave which holder is at the front of the list decided by an earlier case's traffic.
-constexpr int32_t kMonitorHoldEviction = 3;
+// limit: five consumers, where every other case here has one to three. On a shared monitor the
+// holder count would be decided by an earlier case's traffic rather than by this one.
+constexpr int32_t kMonitorHoldLimit = 3;
 
 // On runBufferReleaseWireChecks' own manager, which is driven entirely over the bus.
 constexpr int32_t kMonitorReleaseWire = 0;
 
 // How many images a monitor is expected to hold, written out rather than taken from
 // WallpaperManager::kTargetDepth. Comparing the daemon against its own constant would make
-// "the ring is three deep" unfalsifiable: a change to kTargetDepth would move both sides of
+// "the ring is five deep" unfalsifiable: a change to kTargetDepth would move both sides of
 // the comparison at once and the checks built on it would stay green for any depth at all.
-constexpr int kExpectedRingDepth = 3;
+constexpr int kExpectedRingDepth = 5;
 
-// The same, for how many images one consumer may hold before its oldest claim is dropped, and
-// deliberately not WallpaperManager::kMaxHeldPerClient for the same reason.
+// The same, for how many images one consumer may hold before a further hand-over is refused,
+// and deliberately not WallpaperManager::kMaxHeldPerClient for the same reason.
 constexpr int kExpectedHeldPerClient = 2;
 
-// The same again, for how many consumers may hold images on one monitor before the least
-// recently served is evicted, and deliberately not WallpaperManager::kMaxHoldersPerMonitor:
-// reading the daemon's own constant would let a change to it move both sides of every
-// comparison below and keep the eviction checks green for any limit at all.
+// The same again, for how many consumers may hold images on one monitor before a further one is
+// refused, and deliberately not WallpaperManager::kMaxHoldersPerMonitor: reading the daemon's
+// own constant would let a change to it move both sides of every comparison below and keep the
+// holder-limit checks green for any limit at all.
 constexpr int kExpectedHoldersPerMonitor = 4;
-static_assert(kExpectedHoldersPerMonitor >= 3,
-              "the eviction checks need one holder that is re-served, one that is not, and at least one bystander, "
-              "so a limit below three would leave them unable to tell the two eviction policies apart");
 
-static_assert(kExpectedHeldPerClient < kExpectedRingDepth,
-              "with a cap at or above the ring depth a single consumer could starve its own monitor, and the "
-              "never-releasing-consumer checks would be grading a state the daemon is not supposed to have");
+// The reserve check drives two consumers to their cap and needs one image still free afterwards,
+// which is the image the producer keeps. A depth the caps could not fill would leave that check
+// grading a monitor with slack in it rather than one down to its reserve.
+static_assert(kExpectedRingDepth == 2 * kExpectedHeldPerClient + 1,
+              "the ring phase fills the ring with exactly two consumers at their cap and expects one image left; a "
+              "different depth needs a different number of consumers or the reserve is never reached");
+
+// The holder-limit checks fill the limit with consumers that all claim the SAME image, so the
+// reserve stays out of it and a refusal there is the holder bookkeeping. That only works while
+// one image plus the producer's reserve is less than the depth.
+static_assert(kExpectedHoldersPerMonitor >= 2 && kExpectedRingDepth >= 2,
+              "the holder-limit checks need at least two holders on one image and a ring with room to spare, or the "
+              "refusal they grade could equally be the producer's reserve");
 
 // Well-formed DRM format modifiers that no driver in this suite can allocate: 0x0f is an
 // unassigned vendor byte in drm_fourcc.h, so these cannot collide with a real layout however
@@ -3557,14 +3565,15 @@ void runWorkerTaskAnswerChecks(wallpaperx::WallpaperManager& manager, const Chec
 }
 
 // --------------------------------------------------------------------------- //
-// Three images per monitor, and who is allowed to be drawn over.
+// Five images per monitor, and who is allowed to be drawn over.
 //
-// TWO CONSUMERS, and that is not decoration. A monitor keeps three images and one consumer
-// may hold at most two, so a single well-behaved consumer can never take the last image --
-// which means a phase driven by one consumer never reaches the state "every image on this
-// monitor is being read", and every check about deferral, refusal counting and release would
-// pass without the state they describe ever existing. The second consumer is what makes the
-// ring fillable at all.
+// THREE CONSUMERS, and that is not decoration. A monitor keeps five images and one consumer may
+// hold at most two, so it takes two consumers at their cap to bring the ring down to the image
+// the producer must keep -- and a THIRD, holding nothing, to be the one that asks for it: either
+// of the first two would be refused by the per-consumer cap whether the producer's reserve
+// existed or not. A phase driven by fewer never reaches the state "only the reserve is free", and
+// every check about refusal, refusal counting and release would pass without the state they
+// describe ever existing.
 //
 // The manager tier and the wire tier are split into two phases with a manager each, and the
 // split is forced rather than chosen: Device pins itself to the thread that created it, so a
@@ -3658,7 +3667,11 @@ struct Handover {
     wallpaperx::NoFrameReason reason = wallpaperx::NoFrameReason::NeverRequested;
 
     bool served() const { return bufferId != 0; }
-    bool refusedForReserve() const { return bufferId == 0 && reason == wallpaperx::NoFrameReason::NoFreeImage; }
+    // The daemon publishes one reason for every refusal -- the producer's reserve, the
+    // per-consumer cap and the holder limit are all NoFreeImage -- so this cannot say WHICH
+    // bound refused. Each check below distinguishes them by the state it drove the monitor into
+    // instead, and says so where it matters.
+    bool refused() const { return bufferId == 0 && reason == wallpaperx::NoFrameReason::NoFreeImage; }
 };
 
 // Every descriptor the export produced is closed here. This phase fetches a dozen frames, and
@@ -3677,6 +3690,25 @@ uint64_t fetchFrame(wallpaperx::WallpaperManager& manager, int32_t monitorId, co
     return fetchHandover(manager, monitorId, client).bufferId;
 }
 
+// True when every id is a different image and none is 0. Used as the premise of the ring checks:
+// hand-overs that repeat an id mean the ring never rotated, and the state the check is about was
+// never built.
+bool allDistinct(const std::vector<uint64_t>& ids) {
+    for (size_t i = 0; i < ids.size(); ++i) {
+        if (ids[i] == 0) return false;
+        for (size_t j = i + 1; j < ids.size(); ++j) {
+            if (ids[i] == ids[j]) return false;
+        }
+    }
+    return true;
+}
+
+std::string joinIds(const std::vector<uint64_t>& ids) {
+    std::string out;
+    for (uint64_t id : ids) out += (out.empty() ? "" : ", ") + std::to_string(id);
+    return out;
+}
+
 wallpaperx::MonitorStatus monitorStatus(const wallpaperx::WallpaperManager& manager, int32_t monitorId) {
     const wallpaperx::WallpaperManager::Snapshot snapshot = manager.snapshot();
     const auto it = snapshot.monitors.find(monitorId);
@@ -3691,12 +3723,16 @@ void runBufferHoldChecks(const wallpaperx::WallpaperManager::Config& config, con
     // the manager only ever compares them.
     const std::string alice = ":test.hold.alice";
     const std::string bob = ":test.hold.bob";
+    // The third is what makes the reserve reachable: with nothing ever taken back, alice and bob
+    // at their cap account for every image but one, and only a consumer holding none of them can
+    // ask for that last one without the per-consumer cap answering first.
+    const std::string carol = ":test.hold.carol";
 
     wallpaperx::WallpaperManager manager(config);
     CaptureGradeOnExit captureGrade{grade, manager};
 
-    const char* kHoldGoals = "the buffer-hold goals (a held image is not drawn over, the producer keeps one image "
-                             "free and refuses the hand-over that would take it, and the three ways a claim ends)";
+    const char* kHoldGoals = "the buffer-hold goals (a held image is not drawn over, every bound on the holds is a "
+                             "refusal rather than a claim taken back, and the two ways a claim ends)";
 
     if (!renderOnce(manager, kMonitorHoldRing, imagePath)) {
         // A host with no working Vulkan never gets a Device built here, and the reason has
@@ -3739,59 +3775,83 @@ void runBufferHoldChecks(const wallpaperx::WallpaperManager::Config& config, con
     check(secondId != 0 && secondId != firstId,
           "that render drew into a different image from the one the consumer holds");
 
-    // A second consumer, and this is the line that makes the rest of the phase reachable: alice
-    // now holds two images, which is her cap, so the only image still free is the one the
-    // producer must keep.
-    const bool thirdCommitted = renderOnce(manager, kMonitorHoldRing, imagePath);
-    check(thirdCommitted, "a third render commits while one consumer holds two images");
+    // A second consumer takes its own fill, and this is what makes the rest of the phase
+    // reachable: nothing is ever taken back, so two consumers at the per-consumer cap are the
+    // only way to account for every image but the one the producer must keep.
+    std::vector<uint64_t> ringIds{firstId, secondId};
+    bool everyFillCommitted = secondCommitted;
+    for (int i = 0; i < kExpectedHeldPerClient; ++i) {
+        if (!everyFillCommitted) break;
+        everyFillCommitted = renderOnce(manager, kMonitorHoldRing, imagePath);
+        const uint64_t id = everyFillCommitted ? fetchFrame(manager, kMonitorHoldRing, bob) : 0;
+        if (id == 0) everyFillCommitted = false;
+        ringIds.push_back(id);
+    }
+    // The render that fills the last image. Nobody fetches it: it is the producer's reserve, and
+    // the refusal below is the daemon declining to hand it over.
+    const bool reserveRender = everyFillCommitted && renderOnce(manager, kMonitorHoldRing, imagePath);
+    check(reserveRender, "a render commits with two consumers holding two images each");
 
     // COVERAGE-ASSERT: every check below describes a monitor whose last free image is the
-    // producer's reserve. If alice's two hand-overs did not name two different images she is not
-    // holding two, the reserve is under no pressure, and the refusal below would be grading a
-    // monitor with slack in it. Asserted before the refusal is read, so a run that never built
-    // the state cannot report the refusal as established.
-    // CONTROL: `return &ring.images[ring.current];` inserted at the top of
-    //       OffscreenTargetManager::nextUnheld (renderer/vulkan/offscreen.cpp), so every render
-    //       goes back into the slot it last published and the ring stops rotating -> "FAIL: one
-    //       consumer holds two of the monitor's three images, so exactly one is free", printing
-    //       "the ids handed out were 1 and 1", and the phase stops there so no reserve check
-    //       below is reported as established. Reverted.
-    // CONTROL, the other direction: WallpaperManager::kTargetDepth (backend/daemon/
-    //       wallpaper_manager.h) raised to 4 -> this line stays GREEN, correctly, and the
-    //       refusal check below goes red alone. That is the right attribution: the premise held
-    //       and the daemon's behaviour is what changed. Reverted. (Lowering the depth to 2
-    //       instead is not usable as a control here: a single consumer then holds both images
-    //       of a two-deep ring, an earlier phase throws NoFreeImage, and the run ends before
-    //       this phase is reached.)
-    const bool oneImageLeft = firstId != 0 && secondId != 0 && firstId != secondId && thirdCommitted;
-    check(oneImageLeft, "one consumer holds two of the monitor's three images, so exactly one is free");
-    if (!oneImageLeft) {
-        std::fprintf(stderr,
-                     "  the ids handed out were %llu and %llu, third render committed: %s; the reserve checks "
-                     "below have no pressure under them\n",
-                     static_cast<unsigned long long>(firstId), static_cast<unsigned long long>(secondId),
-                     thirdCommitted ? "yes" : "no");
+    // producer's reserve. If the four hand-overs did not name four different images the
+    // consumers are not holding four, the reserve is under no pressure, and the refusal below
+    // would be grading a monitor with slack in it. Asserted before the refusal is read, so a run
+    // that never built the state cannot report the refusal as established.
+    // CONTROL: WallpaperManager::kFullConsumers (backend/daemon/wallpaper_manager.h) lowered to
+    //       1, which shrinks the derived depth to three -> "FAIL: two consumers hold four of the
+    //       monitor's five images, so exactly one is free", printing "the ids handed out were 1,
+    //       2, 0", and the phase stops there so no reserve check below is reported as
+    //       established. Reverted.
+    // CONTROL, the other direction: that same constant raised to 3, which deepens the ring to
+    //       seven -> this line stays GREEN, correctly, and the refusal check below goes red
+    //       alone, printing "the third consumer was handed image 5". That is the right
+    //       attribution: the premise held and the daemon's behaviour is what changed. Reverted.
+    const bool ringFilled = reserveRender && ringIds.size() == static_cast<size_t>(2 * kExpectedHeldPerClient) &&
+                            allDistinct(ringIds);
+    check(ringFilled, "two consumers hold four of the monitor's five images, so exactly one is free");
+    if (!ringFilled) {
+        std::fprintf(stderr, "  the ids handed out were %s, reserve render committed: %s; the reserve checks below "
+                             "have no pressure under them\n",
+                     joinIds(ringIds).c_str(), reserveRender ? "yes" : "no");
         return;
     }
 
     // GOAL: the daemon keeps one image per monitor out of consumers' hands. A hand-over that
     //       would take the last free one is REFUSED, and refused with the reason that says so.
-    // WHY-THIS-SHAPE: the reason is asserted, not merely the absence of a handle. An empty
-    //       handle alone is equally produced by a monitor that never rendered and by an export
-    //       that failed, and this phase has just established that a frame exists -- so "no
-    //       handle" without the reason would also pass for a daemon that had quietly stopped
-    //       exporting anything at all.
-    // CONTROL: the `if (!client.empty())` admission block in
-    //       WallpaperManager::exportCurrentFrame (backend/daemon/wallpaper_manager.cpp)
-    //       deleted, restoring the unreserved hand-over -> "FAIL: the third hand-over is
-    //       refused, because granting it would leave the producer nowhere to draw", printing
-    //       the id the second consumer was handed instead. Reverted.
-    const Handover refusedForBob = fetchHandover(manager, kMonitorHoldRing, bob);
-    check(refusedForBob.refusedForReserve(),
-          "the third hand-over is refused, because granting it would leave the producer nowhere to draw");
-    if (!refusedForBob.refusedForReserve()) {
-        std::fprintf(stderr, "  the second consumer was handed image %llu instead of being refused\n",
-                     static_cast<unsigned long long>(refusedForBob.bufferId));
+    // WHY-THIS-SHAPE: asked by a THIRD consumer holding nothing, so the per-consumer cap cannot
+    //       be what answers -- alice and bob are both at their cap here, and asking either of
+    //       them would be refused whether or not the reserve existed at all. The reason is
+    //       asserted, not merely the absence of a handle: an empty handle alone is equally
+    //       produced by a monitor that never rendered and by an export that failed.
+    // CONTROL: the `m_targets->nextUnheld(monitorId, flattenHolds(next.holds)) == nullptr` half
+    //       of the refusal in WallpaperManager::exportCurrentFrame (backend/daemon/
+    //       wallpaper_manager.cpp) deleted, leaving only the cap and holder-limit half -> "FAIL:
+    //       a hand-over that would take the producer's last free image is refused", printing the
+    //       id the third consumer was handed instead. Reverted.
+    const Handover refusedForCarol = fetchHandover(manager, kMonitorHoldRing, carol);
+    check(refusedForCarol.refused(), "a hand-over that would take the producer's last free image is refused");
+    if (!refusedForCarol.refused()) {
+        std::fprintf(stderr, "  the third consumer was handed image %llu instead of being refused\n",
+                     static_cast<unsigned long long>(refusedForCarol.bufferId));
+    }
+
+    // GOAL: a refusal is counted and published per monitor. Without it a consumer that has
+    //       stopped giving images back is invisible: the daemon goes on rendering and committing,
+    //       and every other field reads like a monitor that is keeping up.
+    // WHY-THIS-SHAPE: an exact count of one, which is safe because this manager is driven from
+    //       this thread alone and exactly one hand-over on this monitor has been refused so far.
+    //       "Greater than zero" would also pass for a counter that never resets, and the reset is
+    //       half of what the field means.
+    // CONTROL: `++it->second.refusedHandovers;` deleted from WallpaperManager::exportCurrentFrame
+    //       (backend/daemon/wallpaper_manager.cpp) -> "FAIL: the refused hand-over was counted
+    //       against the monitor", printing 0. Reverted.
+    {
+        const wallpaperx::MonitorStatus afterRefusal = monitorStatus(manager, kMonitorHoldRing);
+        check(afterRefusal.refusedHandovers == 1, "the refused hand-over was counted against the monitor");
+        if (afterRefusal.refusedHandovers != 1) {
+            std::fprintf(stderr, "  the monitor reports %u refused hand-over(s) after exactly one refusal\n",
+                         afterRefusal.refusedHandovers);
+        }
     }
 
     // GOAL: refusing a consumer costs that consumer a frame, not the monitor its renders. The
@@ -3829,28 +3889,24 @@ void runBufferHoldChecks(const wallpaperx::WallpaperManager::Config& config, con
                          "impossible\n",
                          after.deferredRenders);
         }
+        // GOAL: the refusal count is reset by a served hand-over and by nothing else. A count a
+        //       commit cleared would read zero for exactly the monitor it exists to report on --
+        //       one that keeps rendering while no consumer can fetch.
+        // WHY-THIS-SHAPE: read after a commit that produced a new generation, which is the event
+        //       that resets the neighbouring deferredRenders. Asserting only that it is non-zero
+        //       somewhere would not separate the two reset rules, and those rules are the whole
+        //       difference between the two counters.
+        // CONTROL: `it->second.refusedHandovers = 0;` moved out of
+        //       WallpaperManager::exportCurrentFrame and into the commit path beside
+        //       `state.deferredRenders = 0;` in WallpaperManager::renderPending (backend/daemon/
+        //       wallpaper_manager.cpp) -> "FAIL: and a commit does not clear it -- only a served
+        //       hand-over does", printing 0. Reverted.
+        check(after.refusedHandovers == 1, "and a commit does not clear it -- only a served hand-over does");
+        if (after.refusedHandovers != 1) {
+            std::fprintf(stderr, "  the monitor reports %u refused hand-over(s) after a commit that reset nothing\n",
+                         after.refusedHandovers);
+        }
     }
-
-    // GOAL: a refused consumer is served as soon as the ring moves. The consumer ahead of it
-    //       taking a third image expires that consumer's oldest claim, and the refusal is over
-    //       -- so being refused costs a frame, not the screen.
-    // WHY-THIS-SHAPE: the second hand-over is required to name the SAME image as the first.
-    //       "bob was served something" alone is equally satisfied by a daemon that had stopped
-    //       applying the reserve at all; naming the image alice was just handed is what says
-    //       the two consumers ended up sharing the published frame, which is the state the ring
-    //       is meant to settle into.
-    // CONTROL: the `if (holder->buffers.size() > kMaxHeldPerClient)` trim in
-    //       WallpaperManager::withHandover (backend/daemon/wallpaper_manager.cpp) deleted, so
-    //       no claim ever expires -> "FAIL: the consumer ahead of it is handed the published
-    //       image, expiring its oldest claim" and "FAIL: the refused consumer is served once an
-    //       image has come free", and downstream, the release below finding no claim to end and
-    //       the never-releases phase running out of images. Reverted.
-    const Handover aliceAgain = fetchHandover(manager, kMonitorHoldRing, alice);
-    check(aliceAgain.served() && aliceAgain.bufferId != firstId && aliceAgain.bufferId != secondId,
-          "the consumer ahead of it is handed the published image, expiring its oldest claim");
-    const Handover bobAtLast = fetchHandover(manager, kMonitorHoldRing, bob);
-    check(bobAtLast.served() && bobAtLast.bufferId == aliceAgain.bufferId,
-          "the refused consumer is served once an image has come free");
 
     // GOAL: a consumer cannot release an image another consumer holds. The claim is recorded
     //       against the caller's own name, so naming somebody else's buffer frees nothing.
@@ -3896,8 +3952,7 @@ void runBufferHoldChecks(const wallpaperx::WallpaperManager::Config& config, con
     const uint64_t committed = monitorStatus(manager, kMonitorHoldRing).generation;
     {
         std::vector<wallpaperx::FrameAvailable> announced;
-        const std::vector<int> toRender =
-            manager.releaseBuffer(alice, kMonitorHoldRing, aliceAgain.bufferId, &announced);
+        const std::vector<int> toRender = manager.releaseBuffer(alice, kMonitorHoldRing, firstId, &announced);
         const bool announcedOnce = announced.size() == 1 && announced.front().monitorId == kMonitorHoldRing &&
                                    announced.front().generation == committed;
         check(announcedOnce, "releasing an image re-announces the monitor's committed frame");
@@ -3908,38 +3963,81 @@ void runBufferHoldChecks(const wallpaperx::WallpaperManager::Config& config, con
         }
     }
 
+    // GOAL: a refusal is temporary. The consumer that was refused is served once a release has
+    //       put an image back, and the monitor's refusal count goes back to zero -- so being
+    //       refused costs that consumer a frame and not its screen.
+    // WHY-THIS-SHAPE: asked of the SAME consumer that was refused above, with nothing in between
+    //       but one release. A fresh consumer would be served whatever the release did, since a
+    //       client holding nothing is never the one keeping the ring full. The reset is checked
+    //       here rather than beside the increment because a served hand-over is the only thing
+    //       that performs it, and this is the first served hand-over since the refusal.
+    // CONTROL: `std::erase(holder->buffers, bufferId)` in WallpaperManager::dropHoldLocked
+    //       (backend/daemon/wallpaper_manager.cpp) changed to a `std::count(...)` that reports
+    //       the claim without removing it -> "FAIL: the refused consumer is served once a
+    //       release has put an image back". Reverted.
+    // CONTROL, the reset leg: `it->second.refusedHandovers = 0;` deleted from
+    //       WallpaperManager::exportCurrentFrame (backend/daemon/wallpaper_manager.cpp) -> "FAIL:
+    //       and the served hand-over cleared the monitor's refusal count", with the service check
+    //       above green. Reverted.
+    const Handover carolAtLast = fetchHandover(manager, kMonitorHoldRing, carol);
+    check(carolAtLast.served(), "the refused consumer is served once a release has put an image back");
+    if (!carolAtLast.served()) {
+        // Abandoned rather than graded: the reset is a property OF a served hand-over, so with
+        // nothing served this check would report a second failure for the first one's cause.
+        std::fprintf(stderr, "  it was refused again after the release, so nothing came back into the ring, and "
+                             "the refusal-count reset had no served hand-over to be graded against\n");
+        return;
+    }
+    check(monitorStatus(manager, kMonitorHoldRing).refusedHandovers == 0,
+          "and the served hand-over cleared the monitor's refusal count");
+
     // GOAL: a consumer leaving the bus gives its images back, and that is announced too.
     //       Without the first half a consumer that crashed holding a frame keeps that image out
     //       of the ring for the life of the daemon -- plasmashell restarts are routine while
     //       this daemon does not.
     // WHY-THIS-SHAPE: the announcement alone would not establish that anything was dropped, so
-    //       the hand-over after it is the second leg: alice still holds one image nobody else
-    //       does, and only if that claim is really gone does the ring have room to serve bob a
-    //       second image. A departure that reported the monitor but dropped nothing passes the
-    //       announcement check and fails that one.
+    //       the hand-over after it is the second leg -- and the ring is driven back down to its
+    //       reserve BEFORE the departure, which is what stops that second leg from being vacuous.
+    //       Without the render and the gate below, the last committed image is one carol already
+    //       holds, so her fetch would be answered from her own claim whether or not the departure
+    //       freed anything.
     // CONTROL: `std::erase_if(state.holds, ...)` in WallpaperManager::forgetHeldBuffers
     //       (backend/daemon/wallpaper_manager.cpp) replaced by a `std::count_if` that reports
     //       the monitor without dropping the claim -> "FAIL: the departed consumer's images are
-    //       really back in the ring", printing that the surviving consumer was refused a second
-    //       image. The announcement check stayed green, which is the measurement showing the
-    //       two are not one fact. Reverted.
+    //       really back in the ring", printing that the surviving consumer was refused. The
+    //       announcement check stayed green, which is the measurement showing the two are not one
+    //       fact. Reverted.
     // CONTROL, the other leg: the `announce` argument of the reportFreedImageLocked call in
     //       WallpaperManager::forgetHeldBuffers (backend/daemon/wallpaper_manager.cpp) passed
     //       as `nullptr`, so claims are dropped but nothing is published -> "FAIL: a departure
     //       announces the monitor's committed frame", with the ring check green. Reverted.
     {
+        check(renderOnce(manager, kMonitorHoldRing, imagePath), "a render commits into the one image left free");
+        // NO CONTROL, and this is the reason rather than an omission: it is a gate on the check
+        // below, not a claim of its own. Every production mutation that would make it false --
+        // the reserve deleted, the ring deepened -- also reddens the reserve refusal earlier in
+        // this phase. What it guards is a future edit to THIS file that leaves the ring with
+        // slack here, which would make the post-departure hand-over succeed for free.
+        const Handover gate = fetchHandover(manager, kMonitorHoldRing, carol);
+        check(gate.refused(), "and the ring is down to its reserve again before the departure");
+        if (!gate.refused()) {
+            std::fprintf(stderr, "  the consumer was handed image %llu, so the departure below had a free image "
+                                 "under it and would grade nothing\n",
+                         static_cast<unsigned long long>(gate.bufferId));
+            return;
+        }
+
         std::vector<wallpaperx::FrameAvailable> announced;
         const std::vector<int> toRender = manager.forgetHeldBuffers(alice, &announced);
         check(announced.size() == 1 && announced.front().monitorId == kMonitorHoldRing,
               "a departure announces the monitor's committed frame");
         check(toRender.empty(), "and asks for no render either");
-        check(renderOnce(manager, kMonitorHoldRing, imagePath), "the render after a departure commits");
-        const Handover afterDeparture = fetchHandover(manager, kMonitorHoldRing, bob);
-        check(afterDeparture.served() && afterDeparture.bufferId != bobAtLast.bufferId,
+        const Handover afterDeparture = fetchHandover(manager, kMonitorHoldRing, carol);
+        check(afterDeparture.served() && afterDeparture.bufferId != carolAtLast.bufferId,
               "the departed consumer's images are really back in the ring");
         if (!afterDeparture.served()) {
-            std::fprintf(stderr, "  the surviving consumer was refused a second image, so the departed one's "
-                                 "claims are still holding the ring\n");
+            std::fprintf(stderr, "  the surviving consumer was refused, so the departed one's claims are still "
+                                 "holding the ring\n");
         }
     }
 
@@ -3951,52 +4049,47 @@ void runBufferHoldChecks(const wallpaperx::WallpaperManager::Config& config, con
     //       ring. A claim recorded under an empty name could never be withdrawn -- no
     //       ReleaseBuffer names it, no departure announces it -- so it would cost the monitor
     //       an image for the life of the daemon.
-    // WHY-THIS-SHAPE: TWO unnamed exports and then one named one, because the per-client cap
-    //       is two: an unnamed caller charged with its claims would hold two of the three
-    //       images, and only the third, held by a named consumer, fills the ring. One unnamed
-    //       export followed by the same question would commit either way and grade nothing.
-    //       The three ids are required to be distinct before the fourth render is judged,
-    //       since a run where they were not never built the state the check is about.
+    // WHY-THIS-SHAPE: the unnamed caller is asked for a WHOLE RING'S WORTH of hand-overs, which
+    //       is more than twice its per-consumer cap, and every one is required to name a
+    //       different image. The obvious shape -- two exports and then "a render still commits"
+    //       -- stops one hand-over short of the cap at this depth and would commit either way.
+    //       A single loop is enough because both bounds a recorded claim could hit are inside
+    //       it: charged with claims, the caller is refused at the third hand-over by the cap,
+    //       and if the cap were gone as well the reserve refuses the fifth. Measured: with the
+    //       guard removed it stopped after two, and with the cap disabled as well after four.
     // CONTROL: the `if (!client.empty())` guard around the hand-over record in
     //       WallpaperManager::exportCurrentFrame (backend/daemon/wallpaper_manager.cpp)
-    //       removed, so an empty name is recorded like any other -> "FAIL: a render after two
-    //       exports to an unnamed caller still commits, because no claim was recorded for a
-    //       name nothing could withdraw", printing the three ids. The distinctness line above
-    //       it stayed green, which is what makes the failure a statement about the claim and
-    //       not about the ring. Reverted.
-    // COVERAGE-ASSERT: the distinctness of the three hand-overs is asserted, so a run that
-    //       never put two images into the unnamed caller's hands cannot reach the final check
-    //       and report it as established.
+    //       removed, so an empty name is recorded like any other -> "FAIL: a caller with no bus
+    //       name is served for a whole ring's worth of renders", printing "it was handed [6, 7]
+    //       before stopping". The only red line in the run. Reverted.
+    // COVERAGE-ASSERT: the hand-overs are required to name kExpectedRingDepth DIFFERENT images,
+    //       not merely to succeed, so a daemon that answered every one from a ring that had
+    //       stopped rotating could not pass this.
     {
         std::vector<uint64_t> unnamedIds;
-        bool builtTheState = true;
-        for (int i = 0; i < kExpectedHeldPerClient; ++i) {
-            if (!renderOnce(manager, kMonitorHoldUnnamed, imagePath)) builtTheState = false;
-            const uint64_t id = builtTheState ? fetchFrame(manager, kMonitorHoldUnnamed, "") : 0;
-            if (id == 0) builtTheState = false;
+        bool servedThroughout = true;
+        for (int i = 0; i < kExpectedRingDepth; ++i) {
+            if (!renderOnce(manager, kMonitorHoldUnnamed, imagePath)) {
+                servedThroughout = false;
+                break;
+            }
+            const uint64_t id = fetchFrame(manager, kMonitorHoldUnnamed, "");
+            if (id == 0) {
+                servedThroughout = false;
+                break;
+            }
             unnamedIds.push_back(id);
         }
-        if (!renderOnce(manager, kMonitorHoldUnnamed, imagePath)) builtTheState = false;
-        const uint64_t namedId = builtTheState ? fetchFrame(manager, kMonitorHoldUnnamed, alice) : 0;
-        unnamedIds.push_back(namedId);
-        if (namedId == 0) builtTheState = false;
-
-        const bool distinct = builtTheState && unnamedIds.size() == 3 && unnamedIds[0] != unnamedIds[1] &&
-                              unnamedIds[1] != unnamedIds[2] && unnamedIds[0] != unnamedIds[2];
-        check(distinct, "two unnamed exports and one named one named three different images");
-        if (distinct) {
-            const bool committed = renderOnce(manager, kMonitorHoldUnnamed, imagePath);
-            check(committed, "a render after two exports to an unnamed caller still commits, because no claim was "
-                             "recorded for a name nothing could withdraw");
-            if (!committed) {
-                std::fprintf(stderr, "  the ids handed out were %llu, %llu, %llu\n",
-                             static_cast<unsigned long long>(unnamedIds[0]),
-                             static_cast<unsigned long long>(unnamedIds[1]),
-                             static_cast<unsigned long long>(unnamedIds[2]));
-            }
-        } else {
-            std::fprintf(stderr, "  the three hand-overs did not name three different images, so the unnamed-caller "
-                                 "check had no full ring under it and was not graded\n");
+        servedThroughout = servedThroughout && unnamedIds.size() == static_cast<size_t>(kExpectedRingDepth) &&
+                           allDistinct(unnamedIds);
+        static_assert(kExpectedRingDepth > kExpectedHeldPerClient,
+                      "the loop must exceed the per-consumer cap, or a daemon charging the unnamed caller with "
+                      "claims would never be refused and the check would grade nothing");
+        check(servedThroughout, "a caller with no bus name is served for a whole ring's worth of renders");
+        if (!servedThroughout) {
+            std::fprintf(stderr, "  it was handed [%s] before stopping, so a claim was charged to a name nothing "
+                                 "could withdraw\n",
+                         joinIds(unnamedIds).c_str());
         }
     }
 
@@ -4004,54 +4097,50 @@ void runBufferHoldChecks(const wallpaperx::WallpaperManager::Config& config, con
     // The holder limit, on a monitor of its own: five consumers.
     // ---------------------------------------------------------------- //
 
-    // GOAL: with the holder limit reached, the consumer that claims an image next evicts the
-    //       LEAST RECENTLY SERVED holder -- not the one that merely joined first. False if the
-    //       daemon drops a consumer it has just handed an image to while keeping one that has
-    //       asked for nothing since it arrived, which is a consumer being cut off mid-stream to
-    //       make room and is what the daemon did until the holder list started being reordered.
-    // WHY-THIS-SHAPE: one holder is deliberately re-served before the limit is exceeded, and
-    //       the two policies are then required to disagree about it. The obvious shape -- fill
-    //       the limit, add one more, assert somebody was dropped -- cannot tell the policies
-    //       apart at all: with no holder re-served, "least recently served" and "first to
-    //       appear" name the same consumer and the check passes under both. Which holder
-    //       survived is read through releaseBuffer, because the hold list is private and a
-    //       release is the daemon's own report of whether a claim was there to end: it frees
-    //       something for a holder it still has and nothing at all for one it has forgotten.
-    // CONTROL: the `std::rotate(holder, holder + 1, holds.end())` that moves a served holder to
-    //       the back, in WallpaperManager::withHandover (backend/daemon/wallpaper_manager.cpp),
-    //       deleted and `BufferHold& served = holds.back()` put back to `*holder`, which is the
-    //       first-appearance order this replaced -> "FAIL: the holder the daemon most recently
-    //       served survives a fifth consumer arriving, and the one that has been idle since it
-    //       joined is the one evicted", printing survivors [:test.evict.idle,
-    //       :test.evict.bystander-a, :test.evict.bystander-b, :test.evict.newcomer] -- exactly
-    //       the inverse pair, which is what says the check separates the two policies rather
-    //       than merely noticing that somebody was evicted. The only red line in the run.
+    // GOAL: with the holder limit reached, a consumer the daemon has never served is REFUSED,
+    //       and every holder keeps everything it had. False if the daemon makes room by
+    //       forgetting somebody's claim: that consumer is still sampling the image, and the very
+    //       next render draws into it.
+    // WHY-THIS-SHAPE: which holders survived is read through releaseBuffer, because the hold
+    //       list is private and a release is the daemon's own report of whether a claim was
+    //       there to end -- it frees something for a holder it still has and nothing at all for
+    //       one it has forgotten. "The fifth was refused" alone would not establish the second
+    //       half: a daemon that forgot a holder AND refused the newcomer passes it. An existing
+    //       holder is re-served first, so the limit is also required not to refuse the consumers
+    //       already inside it.
+    // CONTROL: `if (holds.size() >= kMaxHoldersPerMonitor) return {};` deleted from
+    //       WallpaperManager::withHandover (backend/daemon/wallpaper_manager.cpp) -> "FAIL: a
+    //       fifth consumer past the holder limit is refused", printing the image it was handed.
+    //       Reverted.
+    // CONTROL, the survivors leg: that same line replaced by the eviction it took the place of,
+    //       `if (holds.size() >= kMaxHoldersPerMonitor) holds.erase(holds.begin());` -> "FAIL: a
+    //       fifth consumer past the holder limit is refused" and "FAIL: and every holder still
+    //       has the claim it had", printing the survivor list without the evicted consumer.
     //       Reverted.
     // COVERAGE-ASSERT: every premise -- four holders on one image, the re-service landing on
-    //       that same image, the fifth consumer actually being served -- is asserted before any
-    //       survivor is read, so a run that never reached the limit cannot report the eviction
-    //       policy as established. The probe count beside them guards this file rather than the
-    //       daemon; see the comment on it.
+    //       that same image -- is asserted before any survivor is read, so a run that never
+    //       reached the limit cannot report the refusal as established. The probe count beside
+    //       them guards this file rather than the daemon; see the comment on it.
     {
-        const std::string reServed = ":test.evict.re-served";
-        const std::string idle = ":test.evict.idle";
-        const std::string bystanderA = ":test.evict.bystander-a";
-        const std::string bystanderB = ":test.evict.bystander-b";
-        const std::string newcomer = ":test.evict.newcomer";
+        const std::string reServed = ":test.limit.re-served";
+        const std::string idle = ":test.limit.idle";
+        const std::string bystanderA = ":test.limit.bystander-a";
+        const std::string bystanderB = ":test.limit.bystander-b";
+        const std::string newcomer = ":test.limit.newcomer";
         static_assert(kExpectedHoldersPerMonitor == 4,
                       "the four names below fill the holder limit exactly; a different limit needs a different "
-                      "number of them or the fifth hand-over would not evict anything");
+                      "number of them or the fifth hand-over would not be refused");
 
-        bool builtTheState = renderOnce(manager, kMonitorHoldEviction, imagePath);
+        bool builtTheState = renderOnce(manager, kMonitorHoldLimit, imagePath);
         // Every holder claims the SAME image: nothing renders in between, so each hand-over
         // names the monitor's one committed frame. That keeps the producer's reserve out of
-        // this -- four claims on one image still leave two of the three free -- so a refusal
-        // here would be the holder bookkeeping and not the ring running out.
+        // this -- four claims on one image still leave four of the five free -- so a refusal
+        // here is the holder bookkeeping and not the ring running out.
         uint64_t shared = 0;
         int filled = 0;
         for (const std::string& holder : {reServed, idle, bystanderA, bystanderB}) {
             if (!builtTheState) break;
-            const Handover handed = fetchHandover(manager, kMonitorHoldEviction, holder);
+            const Handover handed = fetchHandover(manager, kMonitorHoldLimit, holder);
             if (!handed.served() || (shared != 0 && handed.bufferId != shared)) {
                 builtTheState = false;
                 break;
@@ -4065,48 +4154,47 @@ void runBufferHoldChecks(const wallpaperx::WallpaperManager::Config& config, con
         // Each step is graded only once the one before it held, so one unbuilt premise produces
         // one red line naming the thing that actually did not happen rather than three.
         bool reServedAgain = false;
-        bool fifthServed = false;
         if (builtTheState) {
-            // The line the whole sub-phase turns on: re-serving the holder that joined first is
-            // what makes "least recently served" and "first seen" name different consumers.
-            const Handover again = fetchHandover(manager, kMonitorHoldEviction, reServed);
+            const Handover again = fetchHandover(manager, kMonitorHoldLimit, reServed);
             reServedAgain = again.served() && again.bufferId == shared;
-            check(reServedAgain, "the holder that joined first is handed that image again, so it is no longer the "
-                                 "least recently served");
-            if (reServedAgain) {
-                const Handover fifth = fetchHandover(manager, kMonitorHoldEviction, newcomer);
-                fifthServed = fifth.served() && fifth.bufferId == shared;
-                check(fifthServed, "a fifth consumer past the holder limit is still served");
-            }
+            check(reServedAgain, "a consumer already inside the limit is served again, so the limit refuses arrivals "
+                                 "and not the holders it already has");
         }
 
-        if (!fifthServed) {
-            std::fprintf(stderr, "  the holder limit was never reached with one holder re-served, so no eviction "
-                                 "check below was graded\n");
+        if (!reServedAgain) {
+            std::fprintf(stderr, "  the holder limit was never reached with one holder re-served, so the refusal "
+                                 "checks below were not graded\n");
         } else {
+            const Handover fifth = fetchHandover(manager, kMonitorHoldLimit, newcomer);
+            check(fifth.refused(), "a fifth consumer past the holder limit is refused");
+            if (!fifth.refused()) {
+                std::fprintf(stderr, "  it was handed image %llu, on a monitor with four images still free -- so "
+                                     "the limit gave way rather than refusing\n",
+                             static_cast<unsigned long long>(fifth.bufferId));
+            }
+
             std::vector<std::string> survivors;
             const std::vector<std::string> probed = {reServed, idle, bystanderA, bystanderB, newcomer};
             for (const std::string& who : probed) {
                 std::vector<wallpaperx::FrameAvailable> announced;
-                const std::vector<int> toRender = manager.releaseBuffer(who, kMonitorHoldEviction, shared, &announced);
+                const std::vector<int> toRender = manager.releaseBuffer(who, kMonitorHoldLimit, shared, &announced);
                 if (!toRender.empty() || !announced.empty()) survivors.push_back(who);
             }
             // Guards this file, not the daemon: no production change can redden it. Dropping
             // `idle` from the probe list would leave `survivors` matching `expected` exactly and
-            // the eviction check green while nothing asked about the evicted consumer at all.
+            // the check below green while nothing asked about the holder an eviction would take.
             check(static_cast<int>(probed.size()) == kExpectedHoldersPerMonitor + 1,
                   "every consumer that could be holding was asked whether the daemon still has a claim for it");
 
-            const std::vector<std::string> expected = {reServed, bystanderA, bystanderB, newcomer};
-            check(survivors == expected,
-                  "the holder the daemon most recently served survives a fifth consumer arriving, and the one that "
-                  "has been idle since it joined is the one evicted");
+            const std::vector<std::string> expected = {reServed, idle, bystanderA, bystanderB};
+            check(survivors == expected, "and every holder still has the claim it had, because nothing was taken "
+                                         "back to make room");
             if (survivors != expected) {
                 std::string names;
                 for (const std::string& who : survivors) names += (names.empty() ? "" : ", ") + who;
-                std::fprintf(stderr, "  the survivors were [%s]; the least recently served holder is %s and the "
-                                     "idle one is %s\n",
-                             names.c_str(), reServed.c_str(), idle.c_str());
+                std::fprintf(stderr, "  the survivors were [%s]; all four holders were expected, and the refused "
+                                     "newcomer %s was expected to hold nothing\n",
+                             names.c_str(), newcomer.c_str());
             }
         }
     }
@@ -4115,26 +4203,27 @@ void runBufferHoldChecks(const wallpaperx::WallpaperManager::Config& config, con
     // The other case, on a monitor of its own: one consumer, never releasing.
     // ---------------------------------------------------------------- //
 
-    // GOAL: a consumer built against a daemon that had no ReleaseBuffer keeps working. It
-    //       never releases anything, so its claims have to expire on their own -- its third
-    //       hand-over drops its oldest -- and every render it asks for still commits.
-    // WHY-THIS-SHAPE: on a monitor of its own and with a single consumer, which is the
-    //       configuration the compatibility claim is actually about; the shared monitor above
-    //       has two consumers and a departure in its history. The final check names the
-    //       expired image explicitly rather than only asserting that the fourth render
-    //       committed: a ring one image deeper would let the fourth render commit into a
-    //       fourth image with the cap never expiring anything, and the compatibility would be
-    //       an accident of depth rather than the cap doing its job.
-    // CONTROL: WallpaperManager::kMaxHeldPerClient (backend/daemon/wallpaper_manager.h) raised
-    //       to 3, so a claim is never expired -> "FAIL: a consumer that has never released
-    //       anything is still given a fourth frame" and "FAIL: the fourth render reused the
-    //       image the consumer's two-image cap let go". Reverted.
-    // COVERAGE-ASSERT: the three ids handed out before the cap can bite are required to be
-    //       three different images, so a run where the ring never actually filled cannot reach
-    //       the final comparison and report it as held.
+    // GOAL: a consumer that never releases is REFUSED past the per-consumer cap rather than
+    //       served by taking one of its own images back, and the monitor goes on rendering
+    //       regardless. False if a third hand-over drops that consumer's oldest claim: it has
+    //       given no sign of having stopped reading that image, and the next render draws into
+    //       it.
+    // WHY-THIS-SHAPE: on a monitor of its own with a SINGLE consumer, so the refusal can only be
+    //       the cap. The producer's reserve cannot be what answers here -- one consumer at a cap
+    //       of two leaves three of the five images free -- which is exactly what the free-image
+    //       check below asserts, and without it this check would pass equally for a daemon whose
+    //       ring had simply run out. The refusal is also required to leave the consumer's
+    //       existing claims alone, read back through the release probe.
+    // CONTROL: `if (holder->buffers.size() >= kMaxHeldPerClient) return {};` deleted from
+    //       WallpaperManager::withHandover (backend/daemon/wallpaper_manager.cpp), restoring the
+    //       trim it replaced -> "FAIL: a consumer at its cap is refused rather than having its
+    //       oldest claim taken back", printing the image it was handed. Reverted.
+    // COVERAGE-ASSERT: the ids handed out before the cap can bite are required to name different
+    //       images, so a run where the ring never rotated cannot reach the refusal and report it
+    //       as established.
     std::vector<uint64_t> handedOut;
     bool everyRenderCommitted = true;
-    for (int i = 0; i < kExpectedRingDepth; ++i) {
+    for (int i = 0; i < kExpectedHeldPerClient; ++i) {
         if (!renderOnce(manager, kMonitorHoldNeverReleases, imagePath)) {
             everyRenderCommitted = false;
             break;
@@ -4146,67 +4235,96 @@ void runBufferHoldChecks(const wallpaperx::WallpaperManager::Config& config, con
         }
         handedOut.push_back(id);
     }
-    check(everyRenderCommitted && handedOut.size() == static_cast<size_t>(kExpectedRingDepth),
-          "a consumer that never releases is handed one image per render until the ring is full");
-    if (!everyRenderCommitted || handedOut.size() != static_cast<size_t>(kExpectedRingDepth)) {
-        std::fprintf(stderr, "  %zu of %d hand-overs succeeded; the cap checks below were abandoned\n",
-                     handedOut.size(), kExpectedRingDepth);
-        return;
-    }
-    const bool allDistinct = handedOut[0] != handedOut[1] && handedOut[1] != handedOut[2] &&
-                             handedOut[0] != handedOut[2];
-    check(allDistinct, "those hand-overs named three different images");
-    if (!allDistinct) {
-        std::fprintf(stderr, "  the ring did not fill, so the cap below was never under pressure\n");
+    const bool capFilled = everyRenderCommitted && handedOut.size() == static_cast<size_t>(kExpectedHeldPerClient) &&
+                           allDistinct(handedOut);
+    check(capFilled, "a consumer that never releases is handed one image per render up to its cap");
+    if (!capFilled) {
+        std::fprintf(stderr, "  it was handed [%s] of an expected %d different images; the cap checks below were "
+                             "abandoned\n",
+                     joinIds(handedOut).c_str(), kExpectedHeldPerClient);
         return;
     }
 
     check(renderOnce(manager, kMonitorHoldNeverReleases, imagePath),
-          "a consumer that has never released anything is still given a fourth frame");
-    check(fetchFrame(manager, kMonitorHoldNeverReleases, alice) == handedOut.front(),
-          "the fourth render reused the image the consumer's two-image cap let go");
-    // Stated so the reader is not left to derive it: the image freed is the OLDEST of the
-    // consumer's claims, which at a cap of two is the first of the three it was handed.
-    static_assert(kExpectedHeldPerClient == 2, "the comparison above names handedOut.front() because a cap of two "
-                                               "leaves exactly the first of three hand-overs expired");
+          "the monitor still commits a render while that consumer sits at its cap");
+    const Handover pastTheCap = fetchHandover(manager, kMonitorHoldNeverReleases, alice);
+    check(pastTheCap.refused(), "a consumer at its cap is refused rather than having its oldest claim taken back");
+    if (!pastTheCap.refused()) {
+        std::fprintf(stderr, "  it was handed image %llu\n", static_cast<unsigned long long>(pastTheCap.bufferId));
+    }
+
+    // GOAL: that refusal is the CAP and not the ring running out. Without this the check above
+    //       would read the same on a daemon with no cap at all whose images had merely been
+    //       exhausted.
+    // WHY-THIS-SHAPE: a second consumer, holding nothing, asks the same monitor and must be
+    //       served. It shares the reserve with the first, so if the ring were the thing refusing
+    //       it would be refused too.
+    // NO CONTROL, and this is the reason rather than an omission: it is a gate on the check
+    //       above, not a claim of its own. The only production change that makes it false is a
+    //       ring too shallow for one consumer's cap plus the reserve, and that reddens the ring
+    //       premise earlier in this phase, which abandons before this line. Measured twice:
+    //       WallpaperManager::kFullConsumers lowered to 1 and, separately,
+    //       WallpaperManager::kTargetDepth set to `1 + kMaxHeldPerClient` (both backend/daemon/
+    //       wallpaper_manager.h) each produced "FAIL: two consumers hold four of the monitor's
+    //       five images, so exactly one is free" and nothing below it. Both reverted.
+    const Handover byAnother = fetchHandover(manager, kMonitorHoldNeverReleases, bob);
+    check(byAnother.served(), "and the monitor still had images free, so it was the cap that refused and not the "
+                              "ring");
+    if (!byAnother.served()) {
+        std::fprintf(stderr, "  a consumer holding nothing was refused too, so the ring had run out and the cap "
+                             "was not what answered\n");
+    }
+
+    // The refusal took nothing back: both of the consumer's claims are still there to end.
+    // Read through releaseBuffer, which is the daemon's own report of whether a claim existed.
+    int stillHeld = 0;
+    for (uint64_t id : handedOut) {
+        std::vector<wallpaperx::FrameAvailable> announced;
+        const std::vector<int> toRender = manager.releaseBuffer(alice, kMonitorHoldNeverReleases, id, &announced);
+        if (!toRender.empty() || !announced.empty()) ++stillHeld;
+    }
+    check(stillHeld == kExpectedHeldPerClient, "and both of its images were still claimed after the refusal");
+    if (stillHeld != kExpectedHeldPerClient) {
+        std::fprintf(stderr, "  %d of %d claims were still there to release; the rest had been taken back\n",
+                     stillHeld, kExpectedHeldPerClient);
+    }
 }
 
-// The refused-render count GetStatus reports for one monitor, read once.
+// One unsigned counter GetStatus reports for one monitor, read once.
 //
-// Read rather than waited for, because the count is now expected to stay at zero: the producer's
-// reserve is what keeps an image free, and renderPending()'s deferral path is a backstop that
-// should never fire. A wait for a non-zero count would have no success path.
+// Read rather than waited for. Both counters this is used for are expected at an exact value the
+// moment the read is made -- the monitor is quiesced by then -- and a wait for a value would have
+// a success path reachable by a timeout on the way to a number that never changed.
 //
 // Every failure to read it is a distinct, named outcome -- a reply that never arrived, an entry
 // the reply does not carry, a key the entry does not carry. A caller that only looked at `read`
 // is still told which, because `error` is filled for every one of them, and `seen` is
 // meaningless unless `read` is true.
-struct DeferralReading {
+struct CounterReading {
     bool read = false;
     uint32_t seen = 0;
     std::string error;
 };
 
-DeferralReading readDeferrals(sdbus::IProxy& proxy, int32_t monitorId) {
-    const std::string key = std::to_string(monitorId);
-    DeferralReading out;
+CounterReading readCounter(sdbus::IProxy& proxy, int32_t monitorId, const std::string& key) {
+    const std::string monitor = std::to_string(monitorId);
+    CounterReading out;
     const wallpaperx::testing::StatusReply status = wallpaperx::testing::getStatus(proxy);
     if (!status.ok()) {
         out.error = status.error();
         return out;
     }
-    const nlohmann::json* entry = wallpaperx::testing::wallpaperStatus(status, key);
+    const nlohmann::json* entry = wallpaperx::testing::wallpaperStatus(status, monitor);
     if (entry == nullptr) {
-        out.error = "GetStatus carries no entry for monitor " + key;
+        out.error = "GetStatus carries no entry for monitor " + monitor;
         return out;
     }
-    if (!entry->contains("deferred_renders") || !(*entry)["deferred_renders"].is_number_unsigned()) {
-        out.error = "GetStatus's entry for monitor " + key +
-                    " carries no unsigned deferred_renders key, so how far behind this monitor is cannot be read "
-                    "from the wire at all";
+    if (!entry->contains(key) || !(*entry)[key].is_number_unsigned()) {
+        out.error = "GetStatus's entry for monitor " + monitor + " carries no unsigned " + key +
+                    " key, so that count cannot be read from the wire at all";
         return out;
     }
-    out.seen = entry->value("deferred_renders", uint32_t{0});
+    out.seen = entry->value(key, uint32_t{0});
     out.read = true;
     return out;
 }
@@ -4238,15 +4356,20 @@ void runBufferReleaseWireChecks(const wallpaperx::WallpaperManager::Config& conf
     // tell, and this whole phase needs two.
     auto alice = sdbus::createProxy(daemonName, objectPath);
     auto bob = sdbus::createProxy(daemonName, objectPath);
+    // The one that is refused, and it has to be a third connection: alice and bob are both at
+    // their per-consumer cap by the time the reserve is reached, so asking either of them would
+    // be refused by the cap whether or not the reserve existed.
+    auto carol = sdbus::createProxy(daemonName, objectPath);
 
     const char* kWireGoals = "the buffer-release wire goals (the reserve's refusal on the wire, ReleaseBuffer over "
                              "the bus, the re-announcement a freed image produces, and a departing consumer's "
                              "claims)";
 
-    // Brings the ring down to its last free image: three frames, the first two fetched by alice.
-    // Each SetWallpaper is followed by a wait for its exact generation, which is safe here
-    // because nothing else drives this manager -- one monitor, one FIFO render thread, so
-    // generations are 1, 2, 3.
+    // Brings the ring down to its last free image: one frame per image, each fetched by alice
+    // and then bob until both are at their cap, and the last left for the producer. Each
+    // SetWallpaper is followed by a wait for its exact generation, which is safe here because
+    // nothing else drives this manager -- one monitor, one FIFO render thread, so generations
+    // run 1..kExpectedRingDepth.
     uint64_t heldByAlice = 0;
     uint64_t generation = 0;
     for (int i = 0; i < kExpectedRingDepth; ++i) {
@@ -4263,10 +4386,11 @@ void runBufferReleaseWireChecks(const wallpaperx::WallpaperManager::Config& conf
                                 "of the states these goals are about could be built");
             return;
         }
-        // Only the first two are fetched, and both by alice: her cap is two, and after them the
-        // one image still free is the one the producer must keep.
-        if (i >= kExpectedHeldPerClient) break;
-        const wallpaperx::testing::Frame frame = wallpaperx::testing::getFrameFd(*alice, kMonitorReleaseWire);
+        // alice takes her cap, then bob takes his; the last frame is fetched by nobody, because
+        // it is the image the producer must keep and the refusal below is what grades that.
+        if (i >= 2 * kExpectedHeldPerClient) break;
+        sdbus::IProxy& taker = i < kExpectedHeldPerClient ? *alice : *bob;
+        const wallpaperx::testing::Frame frame = wallpaperx::testing::getFrameFd(taker, kMonitorReleaseWire);
         if (frame.bufferId == 0) {
             wallpaperx::testing::notVerified(kWireGoals,
                                              "a frame came back over the bus with no buffer id, so no hand-over "
@@ -4281,30 +4405,31 @@ void runBufferReleaseWireChecks(const wallpaperx::WallpaperManager::Config& conf
     // WHY-THIS-SHAPE: the error NAME is compared, because that is all a client can branch on --
     //       the message is prose and the plugin matches on the name alone. Asserting merely
     //       that the call failed would be satisfied by NoFrame, which is exactly the answer
-    //       this error exists to be distinguishable from.
+    //       this error exists to be distinguishable from. Asked by a third connection holding
+    //       nothing, so the per-consumer cap cannot be what answers.
     // CONTROL: the `if (exported.reason == NoFrameReason::NoFreeImage)` branch in
     //       DbusService::completeGetFrameFd (backend/daemon/dbus_service.cpp) deleted, so the
     //       refusal falls through to the generic no-frame reply -> "FAIL: a hand-over that
     //       would take the producer's last image is refused as NoFreeImage on the wire",
     //       printing "it answered 'io.wallpaperx.Daemon.Error.NoFrame'". Reverted.
     const std::string refusedName = wallpaperx::testing::errorNameFrom(
-        [&bob] { wallpaperx::testing::getFrameFd(*bob, kMonitorReleaseWire); });
+        [&carol] { wallpaperx::testing::getFrameFd(*carol, kMonitorReleaseWire); });
     check(refusedName == "io.wallpaperx.Daemon.Error.NoFreeImage",
           "a hand-over that would take the producer's last image is refused as NoFreeImage on the wire");
     if (refusedName != "io.wallpaperx.Daemon.Error.NoFreeImage") {
         std::fprintf(stderr, "  it answered '%s'\n", refusedName.c_str());
-        wallpaperx::testing::notVerified(kWireGoals, "the second consumer was not refused, so the states the goals "
+        wallpaperx::testing::notVerified(kWireGoals, "the third consumer was not refused, so the states the goals "
                                                      "below are about were never built");
         return;
     }
 
     // GOAL: a refusal announces nothing. False for a daemon that emitted FrameReady on the way
     //       out of a refused hand-over, which would make every refused consumer re-ask forever.
-    // WHY-THIS-SHAPE: an exact count, which is safe only because the monitor is quiesced -- all
-    //       three renders have been waited for by their exact generation and the refusal above
-    //       has already returned, so no further signal can be in flight. Also the anti-vacuity
-    //       barrier for the re-announcement check further down: with this count pinned at three,
-    //       the fourth and fifth announcements there cannot be leftovers from the fill.
+    // WHY-THIS-SHAPE: an exact count, which is safe only because the monitor is quiesced -- every
+    //       render has been waited for by its exact generation and the refusal above has already
+    //       returned, so no further signal can be in flight. Also the anti-vacuity barrier for
+    //       the re-announcement check further down: with this count pinned at one per render, the
+    //       repeats there cannot be leftovers from the fill.
     // CONTROL: `emitFrameReady(monitorId, m_manager.snapshot().monitors.at(monitorId)
     //       .generation);` added at the top of the NoFreeImage branch in
     //       DbusService::completeGetFrameFd (backend/daemon/dbus_service.cpp) -> "FAIL: the
@@ -4325,21 +4450,55 @@ void runBufferReleaseWireChecks(const wallpaperx::WallpaperManager::Config& conf
     //       here is a report that a hand-over got past the reserve.
     // CONTROL: two, both reverted. `entry["deferred_renders"] = monitor.deferredRenders;` in
     //       DbusService::getStatus (backend/daemon/dbus_service.cpp) guarded by
-    //       `if (monitor.deferredRenders > 0)` -> "FAIL: GetStatus carries a refusal count for
-    //       this monitor", printing the reader's own reason. And the `if (!client.empty())`
-    //       admission block deleted from WallpaperManager::exportCurrentFrame
-    //       (backend/daemon/wallpaper_manager.cpp) -> the refusal check above goes red first and
-    //       abandons the phase, so this one is graded by the manager-tier check of the same
-    //       name instead.
+    //       `if (monitor.deferredRenders > 0)` -> "FAIL: GetStatus carries a deferred-render
+    //       count for this monitor", printing the reader's own reason. And the `if
+    //       (!client.empty())` admission block deleted from
+    //       WallpaperManager::exportCurrentFrame (backend/daemon/wallpaper_manager.cpp) -> the
+    //       refusal check above goes red first and abandons the phase, so this one is graded by
+    //       the manager-tier check of the same name instead.
     {
-        const DeferralReading deferrals = readDeferrals(*alice, kMonitorReleaseWire);
-        check(deferrals.read, "GetStatus carries a refusal count for this monitor");
+        const CounterReading deferrals = readCounter(*alice, kMonitorReleaseWire, "deferred_renders");
+        check(deferrals.read, "GetStatus carries a deferred-render count for this monitor");
         if (!deferrals.read) {
             std::fprintf(stderr, "  %s\n", deferrals.error.c_str());
         } else {
             check(deferrals.seen == 0, "and it is zero -- the reserve kept an image free rather than deferring");
             if (deferrals.seen != 0) {
                 std::fprintf(stderr, "  it reads %u, so a hand-over got past the reserve\n", deferrals.seen);
+            }
+        }
+    }
+
+    // GOAL: refused_handovers is on the wire, and it is what tells an operator that a consumer
+    //       has stopped giving images back. The count beside it cannot: deferred_renders reads
+    //       zero for exactly this monitor, because the reserve refuses the hand-over instead of
+    //       letting a render defer.
+    // WHY-THIS-SHAPE: the key's PRESENCE and its value are asserted separately, through a reader
+    //       that names each way the read can fail -- a bare `value("refused_handovers", 0) == 1`
+    //       would pass for a daemon that had stopped publishing the key and been read as its
+    //       default. The exact value is safe because the monitor is quiesced and exactly one
+    //       hand-over on it has been refused. Deliberately read AFTER the deferred_renders check
+    //       above, so the pair is graded in the same state: the two reading differently is the
+    //       whole reason the second field exists.
+    // CONTROL: `entry["refused_handovers"] = monitor.refusedHandovers;` deleted from
+    //       DbusService::getStatus (backend/daemon/dbus_service.cpp) -> "FAIL: GetStatus carries
+    //       a refused-hand-over count for this monitor", printing the reader's own reason.
+    //       Reverted.
+    // CONTROL, the value leg: `entry.refusedHandovers = state.refusedHandovers;` in
+    //       WallpaperManager::snapshot (backend/daemon/wallpaper_manager.cpp) deleted, so the
+    //       field is published but always zero -> "FAIL: and it counts the hand-over the reserve
+    //       refused, which the deferral count cannot", printing 0. Reverted.
+    {
+        const CounterReading refusals = readCounter(*alice, kMonitorReleaseWire, "refused_handovers");
+        check(refusals.read, "GetStatus carries a refused-hand-over count for this monitor");
+        if (!refusals.read) {
+            std::fprintf(stderr, "  %s\n", refusals.error.c_str());
+        } else {
+            check(refusals.seen == 1,
+                  "and it counts the hand-over the reserve refused, which the deferral count cannot");
+            if (refusals.seen != 1) {
+                std::fprintf(stderr, "  it reads %u after exactly one refused hand-over on this monitor\n",
+                             refusals.seen);
             }
         }
     }
@@ -4413,10 +4572,31 @@ void runBufferReleaseWireChecks(const wallpaperx::WallpaperManager::Config& conf
     //       run -- the re-announcement check above stayed green, which is the measurement
     //       showing announcing and freeing are two facts and not one. Reverted.
     const std::string servedName =
-        wallpaperx::testing::errorNameFrom([&bob] { wallpaperx::testing::getFrameFd(*bob, kMonitorReleaseWire); });
+        wallpaperx::testing::errorNameFrom([&carol] { wallpaperx::testing::getFrameFd(*carol, kMonitorReleaseWire); });
     check(servedName.empty(), "the consumer that was refused is served once an image has come free");
     if (!servedName.empty()) {
         std::fprintf(stderr, "  it was answered '%s' instead\n", servedName.c_str());
+    }
+
+    // GOAL: the refusal count on the wire goes back to zero once this monitor serves a
+    //       hand-over. A count that only ever rose would name every monitor that had ever
+    //       refused anything, which is no diagnosis at all.
+    // WHY-THIS-SHAPE: read after the served hand-over above and asserted at exactly zero. The
+    //       same reading was 1 earlier in this phase, so the pair together says the field moves
+    //       in both directions rather than merely being present.
+    // CONTROL: `it->second.refusedHandovers = 0;` deleted from
+    //       WallpaperManager::exportCurrentFrame (backend/daemon/wallpaper_manager.cpp) ->
+    //       "FAIL: and a served hand-over puts the refusal count back to zero", printing 1.
+    //       Reverted.
+    if (servedName.empty()) {
+        const CounterReading afterService = readCounter(*alice, kMonitorReleaseWire, "refused_handovers");
+        check(afterService.read && afterService.seen == 0,
+              "and a served hand-over puts the refusal count back to zero");
+        if (!afterService.read) {
+            std::fprintf(stderr, "  %s\n", afterService.error.c_str());
+        } else if (afterService.seen != 0) {
+            std::fprintf(stderr, "  it still reads %u after a hand-over was served\n", afterService.seen);
+        }
     }
 
     // GOAL: a consumer leaving the bus gives its images back, and that is announced too --
@@ -4424,10 +4604,11 @@ void runBufferReleaseWireChecks(const wallpaperx::WallpaperManager::Config& conf
     //       cannot reach.
     // WHY-THIS-SHAPE: three steps, and the first two are what stop the last from being vacuous.
     //       A render is driven first so the monitor has a fresh committed frame with no claim on
-    //       it; bob is then REFUSED, which is what establishes that alice's remaining claim is
+    //       it; carol is then REFUSED, which is what establishes that alice's remaining claim is
     //       the thing holding the ring; only then does alice leave. Without the refusal step,
-    //       bob's later success would be equally true of a daemon whose departure handler drops
-    //       nothing at all.
+    //       carol's later success would be equally true of a daemon whose departure handler drops
+    //       nothing at all. carol and not bob, because bob is at his per-consumer cap here and
+    //       would be refused whatever the ring had free.
     // CONTROL: the `announce` argument of the reportFreedImageLocked call in
     //       WallpaperManager::forgetHeldBuffers (backend/daemon/wallpaper_manager.cpp) passed
     //       as `nullptr`, so a departure drops claims but publishes nothing -> "FAIL: a
@@ -4447,8 +4628,8 @@ void runBufferReleaseWireChecks(const wallpaperx::WallpaperManager::Config& conf
         return;
     }
     ++generation;
-    const std::string beforeDeparture =
-        wallpaperx::testing::errorNameFrom([&bob] { wallpaperx::testing::getFrameFd(*bob, kMonitorReleaseWire); });
+    const std::string beforeDeparture = wallpaperx::testing::errorNameFrom(
+        [&carol] { wallpaperx::testing::getFrameFd(*carol, kMonitorReleaseWire); });
     // NO CONTROL, and this is the reason rather than an omission: it is a gate, not a claim.
     // Every mutation that would make it false -- the reserve removed, the hand-over cap widened,
     // the ring deepened -- also makes the FIRST refusal check above false, and that one abandons
@@ -4456,7 +4637,7 @@ void runBufferReleaseWireChecks(const wallpaperx::WallpaperManager::Config& conf
     // file that reorders the fill so the ring still has slack here; that lands in the else
     // branch, which abandons rather than grading the departure against a free image.
     check(beforeDeparture == "io.wallpaperx.Daemon.Error.NoFreeImage",
-          "with both consumers holding images the monitor is down to its reserve again");
+          "with the consumers holding images the monitor is down to its reserve again");
     if (beforeDeparture != "io.wallpaperx.Daemon.Error.NoFreeImage") {
         std::fprintf(stderr, "  it answered '%s', so the departure below had a free image under it and would "
                              "grade nothing\n",
@@ -4473,8 +4654,8 @@ void runBufferReleaseWireChecks(const wallpaperx::WallpaperManager::Config& conf
         std::fprintf(stderr, "  generation %llu was never announced a second time after the consumer left\n",
                      static_cast<unsigned long long>(generation));
     }
-    const std::string afterDeparture =
-        wallpaperx::testing::errorNameFrom([&bob] { wallpaperx::testing::getFrameFd(*bob, kMonitorReleaseWire); });
+    const std::string afterDeparture = wallpaperx::testing::errorNameFrom(
+        [&carol] { wallpaperx::testing::getFrameFd(*carol, kMonitorReleaseWire); });
     check(afterDeparture.empty(), "the departed consumer's images are really back in the ring");
     if (!afterDeparture.empty()) {
         std::fprintf(stderr, "  the surviving consumer was answered '%s' after the other one left\n",

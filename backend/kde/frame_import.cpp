@@ -452,8 +452,8 @@ int FrameImport::readsFinishedFd(std::string* whyNot) {
     // the client's buffer. One flush per image released, which is one per hand-over.
     glFlush();
     const int fd = static_cast<int>(fenceApi().dupFd(capable.display, fence));
-    // Destroyed straight after: the descriptor is an independent reference to the same fence --
-    // measured on this driver, polled after the sync object was gone.
+    // Destroyed straight after: the descriptor is an independent reference to the same fence, so
+    // the caller's wait is unaffected by the sync object going away.
     fenceApi().destroy(capable.display, fence);
 
     if (fd < 0) {
@@ -461,6 +461,12 @@ int FrameImport::readsFinishedFd(std::string* whyNot) {
         return -1;
     }
     return fd;
+}
+
+void FrameImport::waitForReadsToFinish() {
+    // glFinish, not glFlush: flushing only starts the work. This parks the render thread until
+    // the GPU is idle, which is why it is the fallback and not the path.
+    glFinish();
 }
 
 // GL_LAYOUT_GENERAL_EXT because that is what the producer's release transitioned to. OpenGL has

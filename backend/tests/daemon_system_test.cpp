@@ -1541,8 +1541,8 @@ void checkConcurrentClients(sdbus::IProxy& proxy, FrameReadyLog& signals, const 
     //       render was ever deferred for want of a free image, which the producer's reserve is
     //       what prevents", printing "21 of 22 readings reported a deferred render". Reverted.
     //       Deleting exportCurrentFrame()'s reserve does NOT redden this: measured, that run
-    //       produced no deferral on any storm monitor at all, because whether four clients come
-    //       to hold all three images of one monitor is a scheduling outcome. That is the reason
+    //       produced no deferral on any storm monitor at all, because whether the storm's clients
+    //       come to hold every image of one monitor is a scheduling outcome. That is the reason
     //       the deferral claim is graded here as an invariant over every reading rather than as
     //       a state this phase drives the daemon into -- the deterministic version of it is in
     //       dbus_service_test's buffer-hold phase.

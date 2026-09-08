@@ -53,23 +53,29 @@ StaticRenderer::~StaticRenderer() {
 void StaticRenderer::cleanup() {
     VkDevice device = m_device.device();
 
-    // The render this was built for does not wait, and it reads every handle below. Freeing
-    // them while the GPU still has them is corruption, and this runs from a destructor where
-    // the alternative to freeing cannot be an exception -- so a GPU that has not finished
-    // within the bound gets them left behind instead. Device records that and refuses further
-    // work, which is how a wedge reaches the daemon's health report from here.
-    if (!m_device.drainForTeardown()) {
-        std::fprintf(stderr,
-                     "StaticRenderer::cleanup: the GPU has not finished the render that reads this "
-                     "wallpaper's texture, pipeline and vertex buffer, so they are leaked rather than freed\n");
-        return;
+    // The render this was built for does not wait, and it reads every Vulkan object below.
+    // Freeing them while the GPU still has them is corruption, and this runs from a destructor
+    // where the alternative to freeing cannot be an exception -- so a GPU that has not finished
+    // within the bound gets them left behind instead, and the next submit is refused, which is
+    // how a wedge reaches the daemon's health report from here. No batch to name: nothing
+    // records which render last drew with this pipeline, so any pending one may still be.
+    const bool idle = m_device.safeToFree(
+        "a wallpaper's texture, that texture's view and sampler, its pipeline and pipeline "
+        "layout, and its vertex buffer");
+    if (idle) {
+        if (m_pipeline) vkDestroyPipeline(device, m_pipeline, nullptr);
+        if (m_pipelineLayout) vkDestroyPipelineLayout(device, m_pipelineLayout, nullptr);
+        m_pipeline = VK_NULL_HANDLE;
+        m_pipelineLayout = VK_NULL_HANDLE;
+        m_device.memory().destroyBuffer(m_vertexBuffer);
     }
 
-    if (m_pipeline) vkDestroyPipeline(device, m_pipeline, nullptr);
-    if (m_pipelineLayout) vkDestroyPipelineLayout(device, m_pipelineLayout, nullptr);
-    m_pipeline = VK_NULL_HANDLE;
-    m_pipelineLayout = VK_NULL_HANDLE;
-
+    // Host bookkeeping, so it runs even when the GPU objects were left behind: the slot is not
+    // a Vulkan object, and the classic and descriptor-buffer tiers have one of them -- holding
+    // it back would fail every later wallpaper as "all 1 descriptor slots are in use" long
+    // after the GPU recovered. Handing it out again is separately guarded: the pool records
+    // this batch as its last reader and will not reissue it until that batch completes.
+    //
     // cleanup() runs from both ~StaticRenderer() (implicitly noexcept -- an
     // escaping exception here would call std::terminate(), an uncontrolled
     // process abort) and the constructor's catch block (where a new exception
@@ -81,12 +87,13 @@ void StaticRenderer::cleanup() {
     } catch (const std::exception& e) {
         std::fprintf(stderr, "StaticRenderer::cleanup: descriptorAllocator().free() failed: %s\n", e.what());
     }
-    m_device.memory().destroyBuffer(m_vertexBuffer);
 
     if (m_heapAllocator) {
         m_heapAllocator->unregisterImageView(m_textureView);
         m_heapAllocator->unregisterSampler(m_sampler);
     }
+
+    if (!idle) return;
 
     if (m_sampler) vkDestroySampler(device, m_sampler, nullptr);
     if (m_textureView) vkDestroyImageView(device, m_textureView, nullptr);
@@ -145,21 +152,22 @@ using PixelsPtr = std::unique_ptr<stbi_uc, StbFreer>;
 
 // A local buffer is unreachable from cleanup(), so nothing else would ever free it.
 //
-// The wait is not redundant with the one immediateSubmit already did: the path that reaches
+// The check is not redundant with the wait immediateSubmit already did: the path that reaches
 // here by that wait FAILING leaves the upload batch running, still reading this buffer, and
 // freeing it then is the corruption the bound exists to avoid. When the GPU has not finished,
 // the buffer is left behind instead -- Device then leaks itself rather than letting VMA abort
 // the process over the orphan.
+//
+// The upload is the only batch that reads this buffer and the newest one submitted while the
+// guard is alive, so lastSubmission() names it. A batch older than the upload cannot read the
+// buffer, so naming one on the path where nothing was submitted at all is conservative only.
 struct BufferGuard {
     Device& device;
     AllocatedBuffer& buffer;
     ~BufferGuard() {
-        if (device.drainForTeardown()) {
+        if (device.safeToFree("a wallpaper texture's staging buffer", device.lastSubmission())) {
             device.memory().destroyBuffer(buffer);
-            return;
         }
-        std::fprintf(stderr, "StaticRenderer: the GPU has not finished the texture upload, so its staging "
-                             "buffer is leaked rather than freed\n");
     }
 };
 

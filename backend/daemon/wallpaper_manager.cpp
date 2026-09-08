@@ -376,28 +376,23 @@ WallpaperManager::Handover WallpaperManager::withHandover(std::vector<BufferHold
     auto holder = std::find_if(holds.begin(), holds.end(),
                                [&client](const BufferHold& hold) { return hold.client == client; });
     if (holder == holds.end()) {
-        // The least recently served holder goes, not an arbitrary one: a consumer that has not
-        // been handed a frame in the longest is the likeliest to have stopped reading.
-        if (holds.size() >= kMaxHoldersPerMonitor) holds.erase(holds.begin());
+        if (holds.size() >= kMaxHoldersPerMonitor) return {};
         holds.push_back(BufferHold{client, {}});
-    } else {
-        // Being served moves a holder to the back, which is what makes the front least recently
-        // served rather than merely first seen.
-        std::rotate(holder, holder + 1, holds.end());
+        holder = holds.end() - 1;
     }
-    BufferHold& served = holds.back();
 
     // The same image again -- the ring cycles, so a consumer is handed the buffer it already holds
     // every kTargetDepth renders -- is the claim it already has, not a second one.
-    if (std::find(served.buffers.begin(), served.buffers.end(), bufferId) != served.buffers.end()) {
-        return Handover{std::move(holds), false};
+    if (std::find(holder->buffers.begin(), holder->buffers.end(), bufferId) != holder->buffers.end()) {
+        return Handover{std::move(holds), Handover::Outcome::AlreadyHeld};
     }
 
-    served.buffers.push_back(bufferId);
-    if (served.buffers.size() > kMaxHeldPerClient) {
-        served.buffers.erase(served.buffers.begin(), served.buffers.end() - kMaxHeldPerClient);
-    }
-    return Handover{std::move(holds), true};
+    // Refused rather than trimmed: this consumer's oldest image is one it has given no sign of
+    // having stopped reading, and a claim taken back here is a render drawn under a reader.
+    if (holder->buffers.size() >= kMaxHeldPerClient) return {};
+
+    holder->buffers.push_back(bufferId);
+    return Handover{std::move(holds), Handover::Outcome::Granted};
 }
 
 bool WallpaperManager::dropHoldLocked(MonitorState& state, const std::string& client, uint64_t bufferId) {
@@ -508,7 +503,7 @@ ImportModifierUpdate WallpaperManager::adoptImportModifiersLocked(std::vector<ui
         if (frameStillReadableLocked(state)) continue;
 
         // Condemned whatever its type. A monitor that cannot be drawn right now still owns an
-        // image built under the old set, and acquireTarget() reuses an image whose size matches
+        // image built under the old set, and ensureTargets() reuses an image whose size matches
         // -- so skipping it here leaves a layout the consumer refused to be exported the moment
         // the monitor becomes renderable again, permanently.
         if (std::find(m_importModifiersInvalidated.begin(), m_importModifiersInvalidated.end(), id) ==
@@ -617,7 +612,7 @@ void WallpaperManager::applyImportModifiersLocked() {
     m_device->memory().setConsumerModifiers(std::move(modifiers));
 
     // Existing images keep the modifier they were created with, so a new set only affects
-    // images made after it. Dropping them is what makes it take effect; acquireTarget()
+    // images made after it. Dropping them is what makes it take effect; ensureTargets()
     // rebuilds each on its next render. Only the monitors the set condemned -- the rest hold
     // a layout it still allows.
     for (int id : monitorIds) releaseTarget(id);
@@ -1336,8 +1331,8 @@ FrameExport WallpaperManager::exportCurrentFrame(int monitorId, const std::strin
     // test had dropped and leave the record covering a ring the test found room in. Testing
     // first and recording after the export was two decisions that a release could make disagree.
     //
-    // Refusing costs this consumer a frame it must ask for again; granting would cost the
-    // monitor every render until somebody released, and nothing may be taken back from a
+    // Refusing costs this consumer a frame it must ask for again; granting past a cap would cost
+    // the monitor every render until somebody released, and nothing may be taken back from a
     // consumer that could still be reading it.
     bool claimAdded = false;
     if (!client.empty()) {
@@ -1345,12 +1340,15 @@ FrameExport WallpaperManager::exportCurrentFrame(int monitorId, const std::strin
         auto it = m_monitors.find(monitorId);
         if (it != m_monitors.end()) {
             Handover next = withHandover(it->second.holds, client, target.bufferId);
-            if (m_targets->nextUnheld(monitorId, flattenHolds(next.holds)) == nullptr) {
+            if (next.outcome == Handover::Outcome::Refused ||
+                m_targets->nextUnheld(monitorId, flattenHolds(next.holds)) == nullptr) {
+                ++it->second.refusedHandovers;
                 out.reason = NoFrameReason::NoFreeImage;
                 return out;
             }
             it->second.holds = std::move(next.holds);
-            claimAdded = next.added;
+            it->second.refusedHandovers = 0;
+            claimAdded = next.outcome == Handover::Outcome::Granted;
         }
     }
 
@@ -1359,8 +1357,9 @@ FrameExport WallpaperManager::exportCurrentFrame(int monitorId, const std::strin
         handle = exportHandle(target);
     } catch (...) {
         // The consumer never got the image, so it must not stay charged with holding one it
-        // cannot name to release. Only what this call added is undone: a claim it already had is
-        // on an image it is still reading, and a holder this call evicted only frees images.
+        // cannot name to release. Undoing this one id restores the whole record, because
+        // withHandover() only ever adds -- and a blind restore of the previous record would
+        // instead resurrect a claim a ReleaseBuffer ended while the export ran.
         if (claimAdded) {
             std::lock_guard<std::mutex> stateLock(m_stateMutex);
             auto it = m_monitors.find(monitorId);
@@ -1403,6 +1402,7 @@ WallpaperManager::Snapshot WallpaperManager::snapshot() const {
         entry.lastErrorIsDaemonFault = state.lastErrorIsDaemonFault;
         entry.renderOutstanding = state.requestSeq != state.servicedSeq;
         entry.deferredRenders = state.deferredRenders;
+        entry.refusedHandovers = state.refusedHandovers;
         if (state.hasFrame) {
             entry.width = state.width;
             entry.height = state.height;

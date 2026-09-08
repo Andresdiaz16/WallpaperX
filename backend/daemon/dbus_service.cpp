@@ -314,15 +314,15 @@ void DbusService::completeGetFrameFd(FrameFdCall call, int32_t monitorId, std::s
             // Logged where the served hand-overs are logged: a wallpaper that stops changing for
             // one consumer while the daemon keeps rendering is otherwise invisible. Named,
             // because which of two consumers was refused is the whole diagnosis.
-            std::printf("wallpaperx-daemon: GetFrameFd(monitor=%d) refused for %s -- the monitor's other images "
-                        "are held and one must stay free to draw into\n",
+            std::printf("wallpaperx-daemon: GetFrameFd(monitor=%d) refused for %s -- no image may be handed over "
+                        "until one is released\n",
                         monitorId, sanitizeForLog(client).c_str());
             std::fflush(stdout);
             call.returnError(sdbus::Error(sdbus::Error::Name{kErrorNoFreeImage},
                                           "monitor " + std::to_string(monitorId) +
-                                              " has no image free to hand over -- other consumers hold the rest "
-                                              "and one must stay free for the next render; ask again when the "
-                                              "daemon announces a frame"));
+                                              " has no image to hand over -- one must stay free for the next "
+                                              "render, and nothing is taken back from a consumer that may still "
+                                              "be reading; ask again when the daemon announces a frame"));
             return;
         }
         if (exported.reason == NoFrameReason::Unsupported) {
@@ -465,6 +465,9 @@ std::string DbusService::getStatus() {
         // and zero for a monitor that is keeping up -- a producer quietly drawing less often
         // than it was asked to is otherwise indistinguishable from one that is not.
         entry["deferred_renders"] = monitor.deferredRenders;
+        // Why a consumer sees no new frame while this monitor keeps committing them: its images
+        // are not coming back. Always emitted, like the count above, which cannot report this.
+        entry["refused_handovers"] = monitor.refusedHandovers;
         wallpapers[std::to_string(monitorId)] = std::move(entry);
     }
     status["wallpapers"] = wallpapers;

@@ -15,6 +15,7 @@
 #include <stdexcept>
 #include <string>
 #include <atomic>
+#include <optional>
 #include <thread>
 
 namespace wallpaperx {
@@ -160,6 +161,10 @@ public:
     // this throw GpuFailure rather than parking the render worker forever, which is the one
     // failure the daemon has no other way out of. The bound is far above any batch this
     // renderer submits, so a merely slow GPU cannot trip it.
+    //
+    // Throws without waiting when the batch is still outstanding and some batch has already
+    // been given the full bound, whichever one that is: nothing gets past a wedged batch on
+    // this queue, so a second bound would only cost the caller another ten seconds.
     void wait(SubmitTicket ticket);
 
     // Blocks until every batch submitted through this Device has completed. What a caller
@@ -167,15 +172,25 @@ public:
     // same failure as wait().
     void waitForSubmissions();
 
-    // waitForSubmissions() for a caller that cannot throw. False means the bound expired with
-    // work still in flight, and then the caller MUST NOT free anything those batches read:
-    // from a destructor, leaking is the only choice that is not corruption, since the GPU is
-    // still reading what it was about to free.
+    // The whole of what a caller that cannot throw -- a destructor, above all -- has to do
+    // before freeing something the GPU may still be reading. True means free it. False means
+    // the GPU has not finished with it and freeing it would be corruption, so the caller MUST
+    // leak it; the report naming `whatIsLeaked` is already printed and this Device is already
+    // recorded as unteardownable by the time false comes back. Neither half is the caller's to
+    // remember.
     //
-    // A false answer is remembered. Once anything has been abandoned this Device tears itself
-    // down by leaking too, because vkDestroyDevice requires every child object to be gone and
-    // the submitted work to have completed, and neither is true any more.
-    [[nodiscard]] bool drainForTeardown() noexcept;
+    // Host bookkeeping is not covered by that and must still be done on a false answer --
+    // releasing a descriptor slot, dropping a registration. Nothing there is a Vulkan object,
+    // and holding a slot back strands a pool whose capacity is one for the life of the process
+    // long after the GPU has recovered. The slot pool has its own guard against reuse under a
+    // running batch.
+    //
+    // `reader` is the one batch that can be reading it, for a caller that knows which. It is
+    // POLLED, never waited on: the precondition is that the caller has already waited for that
+    // batch, so a second bound would only re-learn what its own wait reported. Without one,
+    // every pending batch is given the full bound, because any of them might be the reader.
+    [[nodiscard]] bool safeToFree(const char* whatIsLeaked,
+                                  std::optional<SubmitTicket> reader = std::nullopt) noexcept;
 
     // Names the most recent batch submitted, or nothing at all when there has been none.
     // What a caller records when it stops using something the GPU may be reading: no batch
@@ -212,6 +227,16 @@ public:
     void adoptGpuThread() { m_gpuThread = std::this_thread::get_id(); }
 
 private:
+    // Bounded wait for every batch still pending, for a caller that cannot throw. False means
+    // the bound expired with work in flight, and its two callers -- safeToFree() and teardown
+    // -- both respond by leaking, which is why this latches rather than leaving that to them.
+    [[nodiscard]] bool drainForTeardown() noexcept;
+
+    // Records that a Vulkan object or allocation some batch may still read has been orphaned.
+    // Never cleared: the handle is unreachable by then, so a GPU that later catches up does
+    // not make it destroyable again.
+    void abandon() noexcept { m_abandoned = true; }
+
     void createInstance(bool enableValidation);
     void selectPhysicalDevice();
     void determineTier();
@@ -228,24 +253,27 @@ private:
         VkCommandBuffer cmd = VK_NULL_HANDLE;
         VkFence fence = VK_NULL_HANDLE;
         uint64_t serial = 0;
-        // Whether a wait already gave this batch the full bound and it did not finish. Kept on
-        // the batch rather than beside the list so it cannot outlive what it describes:
-        // retiring the batch takes the record with it, which is what lets a GPU that catches
-        // up be told from one that is wedged.
-        bool waitExpired = false;
+        // How a wait for this batch ended without it having finished, and VK_SUCCESS while no
+        // wait has given up on it -- VK_TIMEOUT for the full bound spent, another error for a
+        // wait that could not be made at all. The result rather than a flag because the two
+        // read the same to a caller and describe different faults to an operator. Kept on the
+        // batch rather than beside the list so it cannot outlive what it describes: retiring
+        // the batch takes the record with it, which is what lets a GPU that catches up be told
+        // from one that is wedged.
+        VkResult waitOutcome = VK_SUCCESS;
     };
 
     // Moves every batch whose fence has signalled onto the free lists. Cheap enough to run
     // on every submit: one vkGetFenceStatus per outstanding batch, and there are at most
-    // kMaxSubmissionsInFlight of those.
-    void retireCompleted();
-    // retireCompleted() where a throw is not allowed, answering whether nothing is left
-    // outstanding. A retire that could not run answers "outstanding", the safe direction.
-    bool retireCompletedNoThrow() noexcept;
+    // kMaxSubmissionsInFlight of those. noexcept is a contract the free lists' reserve in
+    // createCommandPool() pays for -- pending plus free never exceeds the cap -- so that a
+    // caller that cannot throw gets the state of the GPU and not the state of the heap.
+    void retireCompleted() noexcept;
     bool isPending(uint64_t serial) const;
-    // Whether some batch has already been given the full wait bound without finishing.
-    bool stalled() const;
-    [[noreturn]] void throwStalled(const char* what) const;
+    // How the queue stopped making progress, or VK_SUCCESS while no outstanding batch has had
+    // a wait give up on it -- so it answers "is it stalled" and "with what" in one value.
+    VkResult stalledResult() const;
+    [[noreturn]] void throwStalled(const char* what, VkResult why) const;
     void waitFences(const VkFence* fences, uint32_t count, const char* what);
     VkCommandBuffer takeCommandBuffer();
     VkFence takeFence();
@@ -285,10 +313,9 @@ private:
     std::vector<VkFence> m_freeFences;
     uint64_t m_nextSerial = 1;
 
-    // Whether something the GPU may still have been reading was left unfreed because a
-    // teardown drain expired. Never cleared: the handles are gone by then, so a GPU that
-    // later catches up does not make them destroyable, and destroying the device or the VMA
-    // allocator around them is a validation error and a hard abort respectively.
+    // Whether something the GPU may still have been reading was left unfreed. Written only by
+    // abandon(); destroying the device or the VMA allocator around an orphan is a validation
+    // error and a hard abort respectively, so teardown leaks instead once this is set.
     bool m_abandoned = false;
 };
 

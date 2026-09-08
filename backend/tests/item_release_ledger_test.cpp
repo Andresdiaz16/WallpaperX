@@ -2,8 +2,9 @@
 
 // When the KDE plugin tells the daemon it has stopped reading an image, and when it must not.
 //
-// The daemon keeps three images per monitor and will not hand over the last free one, so an
-// image a consumer never gives back is an image the producer never gets. Nothing about that is
+// The daemon keeps a fixed ring of images per monitor, will not hand over the last free one, and
+// takes nothing back from a consumer -- so an image a consumer never gives back is an image the
+// producer never gets, for the life of the connection. Nothing about that is
 // visible as a wrong pixel: a release never sent shows up as a wallpaper that stops changing,
 // and a release sent too early invites the daemon to draw into memory this process is still
 // sampling. Both are silent.
@@ -81,7 +82,7 @@ using wallpaperx::testing::pumpUntil;
 using wallpaperx::testing::qmlSource;
 using wallpaperx::testing::vulkanDeviceUuid;
 
-enum class Phase { RepeatImport, DroppedFrame, DaemonRestart };
+enum class Phase { RepeatImport, DroppedFrame, InFlightMonitorChange, DaemonRestart };
 
 const char* goalFor(Phase phase) {
     switch (phase) {
@@ -89,6 +90,9 @@ const char* goalFor(Phase phase) {
             return "S12.15 (the daemon is told once per image, when the LAST live import of it is gone)";
         case Phase::DroppedFrame:
             return "S12.16 (a frame fetched and dropped without being imported is still released)";
+        case Phase::InFlightMonitorChange:
+            return "a reply that ARRIVES for a monitor this item has stopped showing is released rather than "
+                   "dropped with the message";
         case Phase::DaemonRestart:
             return "S12.17 (a claim granted by one daemon is never released against its successor)";
     }
@@ -161,7 +165,8 @@ bool runPhase(Phase phase) {
         // asks while it is joining a scene is Qt's business and not a number to pin -- the
         // phases below settle first and then count from where they find themselves. The
         // dropped-frame phase wants exactly one served and a refusal after it, so it takes one.
-        std::vector<const wallpaperx::OffscreenTarget*> sequence(phase == Phase::DroppedFrame ? 1 : 4, &first);
+        const bool oneFrameOnly = phase == Phase::DroppedFrame || phase == Phase::InFlightMonitorChange;
+        std::vector<const wallpaperx::OffscreenTarget*> sequence(oneFrameOnly ? 1 : 4, &first);
         ExportingStub stub(device, sequence);
         if (!bus.isConnected() || !bus.registerService(QString::fromUtf8(kService)) ||
             !bus.registerVirtualObject(QString::fromUtf8(kPath), &stub)) {
@@ -214,6 +219,11 @@ bool runPhase(Phase phase) {
             return true;
         }
 
+        // Armed BEFORE the item exists: the item's first fetch can complete during construction,
+        // because subscribing to FrameReady is a blocking call to the bus daemon and Qt
+        // dispatches incoming messages while one is outstanding.
+        if (phase == Phase::InFlightMonitorChange) stub.holdNextReply();
+
         scene.engine.addImportPath(QString::fromUtf8(WALLPAPERX_QML_MODULE_PATH));
         scene.component = std::make_unique<QQmlComponent>(&scene.engine);
         scene.component->setData(qmlSource().toUtf8(),
@@ -234,6 +244,76 @@ bool runPhase(Phase phase) {
         if (scene.item == nullptr) {
             wallpaperx::testing::harnessFailure(
                 "the root object exposed no rendererItem, so there was no WallpaperXRenderer to drive");
+            scene.control.invalidate();
+            return true;
+        }
+
+        if (phase == Phase::InFlightMonitorChange) {
+            // GOAL: a reply that ARRIVES for a monitor this item has stopped showing gives its
+            //       image back. The daemon records the hold when it answers, so a reply the item
+            //       drops with the message costs that monitor an image until this process leaves
+            //       the bus -- nothing is ever taken back from a consumer.
+            // WHY-THIS-SHAPE: the stub HOLDS the reply while the monitor changes, which is the
+            //       only way to reach this state at all: with a stub that answers synchronously
+            //       the reply is always parsed for the monitor it was asked for, and the item
+            //       lands in the path item_release_ledger's dropped-frame phase already covers --
+            //       a reply it took and then walked away from, which is a different piece of
+            //       code and a different failure. The distinction is exactly what makes this
+            //       phase worth having: dropped-frame grades the PendingFrame destructor, this
+            //       one grades the branch that never builds a PendingFrame.
+            // CONTROL: the `else { releaseFrameReply(requestedMonitor, done->reply()); }` arm in
+            //       WallpaperXItem::fetchFrame (backend/kde/wallpaperx_item.cpp) emptied -> "FAIL:
+            //       a reply for a monitor the item has stopped showing is released", printing "0
+            //       release(s) arrived in five seconds after the in-flight reply landed". The only
+            //       red line across all four phases of this binary. Reverted.
+            // COVERAGE-ASSERT: the reply is required to have been HELD and then sent, and the
+            //       item required to have moved monitors before it was, so a run where the stub
+            //       answered straight away cannot report the branch as established -- it would
+            //       have exercised the dropped-frame path instead.
+            const bool held = pumpUntil([&stub] { return stub.replyIsHeld(); }, 5000);
+            check(held, "the stub is holding a reply the item asked for, so one is genuinely in flight");
+            if (!held) {
+                std::fprintf(stderr, "  the item asked %d time(s) and the stub served %d; nothing was in flight, so "
+                                     "the monitor change below would grade the dropped-reply path instead\n",
+                             stub.requests(), stub.served());
+                scene.root.reset();
+                scene.renderPass();
+                scene.control.invalidate();
+                return true;
+            }
+
+            scene.item->setProperty("monitorId", kSecondMonitor);
+            check(scene.item->property("monitorId").toInt() == kSecondMonitor,
+                  "the item has moved to another monitor while that reply is still in flight");
+            check(stub.releases().empty(), "and nothing has been released yet, because the reply has not arrived");
+
+            const bool sent = stub.sendHeldReply();
+            if (!sent) {
+                wallpaperx::testing::harnessFailure("the held reply could not be sent, so the item never received "
+                                                    "the hand-over this phase is about");
+                scene.root.reset();
+                scene.renderPass();
+                scene.control.invalidate();
+                return true;
+            }
+
+            const bool released = pumpUntil([&stub] { return !stub.releases().empty(); }, 5000);
+            check(released, "a reply for a monitor the item has stopped showing is released");
+            if (!released) {
+                std::fprintf(stderr, "  0 release(s) arrived in five seconds after the in-flight reply landed\n");
+            } else {
+                const ExportingStub::Release& sent2 = stub.releases().front();
+                check(sent2.monitorId == kFirstMonitor && sent2.bufferId == first.bufferId,
+                      "and it names the monitor and image the reply carried, not the one the item moved to");
+                if (sent2.monitorId != kFirstMonitor || sent2.bufferId != first.bufferId) {
+                    std::fprintf(stderr, "  it released monitor %d image %llu; the reply carried monitor %d image "
+                                         "%llu\n",
+                                 sent2.monitorId, static_cast<unsigned long long>(sent2.bufferId), kFirstMonitor,
+                                 static_cast<unsigned long long>(first.bufferId));
+                }
+            }
+            scene.root.reset();
+            scene.renderPass();
             scene.control.invalidate();
             return true;
         }
@@ -448,10 +528,11 @@ bool runPhase(Phase phase) {
             }
 
             // GOAL: and exactly one release when the last import goes.
-            // CONTROL: `releaseClaim(claim);` deleted from the QSGTexture::destroyed lambda in
-            //       WallpaperXItem::updatePaintNode (backend/kde/wallpaperx_item.cpp) -> "FAIL:
-            //       the last import going is what releases the image", printing "0 release(s)
-            //       for one image imported twice". Reverted.
+            // CONTROL: `releaseClaimWhenReadsFinish(claim);` deleted from the
+            //       QSGTexture::destroyed lambda in WallpaperXItem::updatePaintNode
+            //       (backend/kde/wallpaperx_item.cpp) -> "FAIL: the last import going is what
+            //       releases the image", printing "0 release(s) for one image imported twice".
+            //       Reverted.
             // CONTROL: `releaseClaim(claim);` deleted from
             //       WallpaperXItem::PendingFrame::~PendingFrame (backend/kde/wallpaperx_item.cpp)
             //       -> the same line red, for the other reason: the claim a superseded reply
@@ -564,6 +645,7 @@ Phase phaseFromArgs(int argc, char** argv, bool& recognised) {
     recognised = true;
     if (argc > 1 && std::strcmp(argv[1], "repeat-import") == 0) return Phase::RepeatImport;
     if (argc > 1 && std::strcmp(argv[1], "dropped-frame") == 0) return Phase::DroppedFrame;
+    if (argc > 1 && std::strcmp(argv[1], "in-flight-monitor-change") == 0) return Phase::InFlightMonitorChange;
     if (argc > 1 && std::strcmp(argv[1], "daemon-restart") == 0) return Phase::DaemonRestart;
     recognised = false;
     return Phase::RepeatImport;
@@ -587,7 +669,7 @@ int main(int argc, char** argv) {
         // A harness fault, not a skip: an entry that names a phase this binary does not have
         // would otherwise run the first one twice and report both as covered.
         wallpaperx::testing::harnessFailure("no phase was named on the command line; expected one of repeat-import, "
-                                            "dropped-frame, daemon-restart");
+                                            "dropped-frame, in-flight-monitor-change, daemon-restart");
         (void)wallpaperx::testing::reportHarnessFaults("in this test file, not in the plugin");
         return 1;
     }

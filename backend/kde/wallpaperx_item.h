@@ -145,8 +145,16 @@ private:
     // Asks only when this item neither holds a reply nor has a request out. The scene-change
     // caller's question, which fetchFrame(0) cannot express because 0 forces.
     void ensureFrameRequested();
-    // The reply half of fetchFrame, on the GUI thread once the bus answers.
-    void takeFrameReply(const QDBusMessage& call);
+    // The reply half of fetchFrame, on the GUI thread once the bus answers. `monitorId` is the
+    // monitor the request named, which is what the claim must be recorded against.
+    void takeFrameReply(int monitorId, const QDBusMessage& call);
+    // The same reply when this item has moved to another monitor since asking: the hold the
+    // daemon recorded is given straight back, because nothing else ends it.
+    static void releaseFrameReply(int monitorId, const QDBusMessage& call);
+    // Which image a reply granted, 0 for one that granted none.
+    static quint64 grantedBufferId(const QDBusMessage& call);
+    // Asks again after a refusal, while this item has nothing on screen. GUI thread.
+    void retryWhileNothingIsShown();
     // Tells the daemon which dma_buf layouts this driver can import, so it stops choosing ones
     // this process cannot take. Render thread; sends from the GUI thread. Once per process.
     void reportImportModifiersOnce(quint32 drmFormat);
@@ -169,6 +177,9 @@ private:
     // A GetFrameFd is out, and the highest generation announced while it was. GUI thread only.
     bool m_fetchInFlight = false;
     std::optional<quint64> m_queuedFetch;
+    // A retry after a refusal is armed. One at a time, so a refusal answered by another refusal
+    // cannot compound into a growing number of timers. GUI thread only.
+    bool m_retryQueued = false;
     // Whether FrameReady is subscribed. Without it no wallpaper change is ever heard, which no
     // single frame's success can retire.
     bool m_subscribed = false;

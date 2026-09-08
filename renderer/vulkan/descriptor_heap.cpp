@@ -169,8 +169,11 @@ DescriptorHandle DescriptorHeapAllocator::allocate(VkImageView view, VkSampler s
     VkHostAddressRangeEXT resourceDst{};
     resourceDst.address = static_cast<uint8_t*>(m_resourceHeap.mapped) + slot * m_properties.imageDescriptorSize;
     resourceDst.size = m_properties.imageDescriptorSize;
+    // Released as unwritten on both failure paths: the slot was acquired inside this call, so
+    // no handle naming it ever escaped and no submitted batch can be reading it. Stamping it
+    // with the latest submission instead would gate its reuse on a batch that never saw it.
     if (const VkResult r = m_pfnWriteResource(m_device, 1, &resourceInfo, &resourceDst); r != VK_SUCCESS) {
-        m_imageSlots.release(slot);
+        m_imageSlots.releaseUnwritten(slot);
         throwVkFailure("DescriptorHeapAllocator: vkWriteResourceDescriptorsEXT", r);
     }
 
@@ -178,7 +181,7 @@ DescriptorHandle DescriptorHeapAllocator::allocate(VkImageView view, VkSampler s
     samplerDst.address = static_cast<uint8_t*>(m_samplerHeap.mapped) + slot * m_properties.samplerDescriptorSize;
     samplerDst.size = m_properties.samplerDescriptorSize;
     if (const VkResult r = m_pfnWriteSampler(m_device, 1, &samplerIt->second, &samplerDst); r != VK_SUCCESS) {
-        m_imageSlots.release(slot);
+        m_imageSlots.releaseUnwritten(slot);
         throwVkFailure("DescriptorHeapAllocator: vkWriteSamplerDescriptorsEXT", r);
     }
 
@@ -206,8 +209,9 @@ DescriptorHandle DescriptorHeapAllocator::allocateUniform(VkBuffer buffer, VkDev
     dst.address =
         static_cast<uint8_t*>(m_resourceHeap.mapped) + m_uniformRegionOffset + slot * m_properties.bufferDescriptorSize;
     dst.size = m_properties.bufferDescriptorSize;
+    // Unwritten, as in allocate(): nothing outside this call has ever named this slot.
     if (const VkResult r = m_pfnWriteResource(m_device, 1, &resourceInfo, &dst); r != VK_SUCCESS) {
-        m_uniformSlots.release(slot);
+        m_uniformSlots.releaseUnwritten(slot);
         throwVkFailure("DescriptorHeapAllocator: vkWriteResourceDescriptorsEXT (uniform)", r);
     }
 

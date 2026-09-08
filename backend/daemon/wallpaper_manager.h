@@ -61,6 +61,12 @@ struct MonitorStatus {
     // in a consumer's hands. Published because a producer quietly drawing less often than it
     // was asked to is otherwise indistinguishable from one that is keeping up.
     uint32_t deferredRenders = 0;
+
+    // Hand-overs refused since the last one this monitor served. The published sign that a
+    // consumer has stopped giving images back: the daemon then renders and commits as normal
+    // while no consumer can fetch, which reads from every other field like a desktop that is
+    // keeping up.
+    uint32_t refusedHandovers = 0;
 };
 
 // True once a config read has been abandoned mid-call. That thread is still blocked in the
@@ -145,9 +151,10 @@ enum class NoFrameReason {
     RenderFailed,    // the last render was attempted and failed; lastError says why
     Unsupported,     // the recorded type (video, shader) cannot be rendered by this build,
                      // so no amount of waiting or retrying will produce a frame
-    NoFreeImage,     // there IS a frame, but handing it over would leave the producer with
-                     // nowhere to draw. Temporary: the next hand-over or release frees the
-                     // ring, and both are announced with FrameReady.
+    NoFreeImage,     // there IS a frame, but no image may be handed over: it would leave the
+                     // producer nowhere to draw, or this consumer already holds its fill.
+                     // Temporary: a release frees the ring, and every release is announced with
+                     // FrameReady.
 };
 
 // The result of asking for a monitor's current frame: the frame, or the reason it was not
@@ -210,24 +217,31 @@ public:
     // state.
     static constexpr size_t kMaxImportModifiers = 512;
 
-    // Images per monitor. Three is the smallest number that leaves the producer somewhere to
-    // draw while a consumer holds both the frame it is displaying and the one it has just
-    // fetched -- see kMaxHeldPerClient. Two would make every hand-over a stall.
-    static constexpr uint32_t kTargetDepth = 3;
-
     // How many of a monitor's images one consumer may hold at once. Two, because a consumer
     // that has fetched a new frame goes on sampling the old one until the new one is on screen.
-    // A third hand-over drops its oldest claim, so a consumer that never calls ReleaseBuffer --
-    // one built against an older daemon -- keeps being served rather than seizing the ring.
     //
-    // The cap alone does not keep an image free: it only expires a claim when the same consumer
-    // is handed a NEW image, which needs a free one to render into. What guarantees the producer
-    // somewhere to draw is exportCurrentFrame() refusing the hand-over that would take the last
-    // free image.
+    // A third hand-over is REFUSED, not made room for: the daemon has no evidence the consumer
+    // has stopped reading its oldest image, and drawing into one it is still sampling is the
+    // tearing this ring exists to prevent. What the cap buys is the depth below -- without a
+    // per-consumer bound, no depth guarantees a second consumer anything.
     static constexpr size_t kMaxHeldPerClient = 2;
 
-    // How many consumers may hold images on one monitor. Bounds what a peer can make the
-    // daemon remember; the least recently served holder is dropped to make room.
+    // Consumers a monitor is sized for. Two: the desktop, and one auxiliary reader -- a
+    // screenshot tool, a settings preview, a debugging fetch over busctl.
+    static constexpr size_t kFullConsumers = 2;
+
+    // Images per monitor: the producer's reserve, plus a full hold for each consumer sized for.
+    // Nothing is ever taken back, so a consumer that fetches its fill and goes quiet keeps those
+    // images for the life of the daemon; at depth three that one consumer left the desktop
+    // refused forever, with no release coming to announce that it may ask again. A third silent
+    // consumer cannot be survived at any depth for the same reason, which is where the
+    // arithmetic stops paying: each one costs ~8 MB per monitor at 1080p.
+    static constexpr uint32_t kTargetDepth = 1 + static_cast<uint32_t>(kFullConsumers * kMaxHeldPerClient);
+
+    // How many consumers may hold images on one monitor. Bounds what peers can make the daemon
+    // remember; a further one is refused like any other hand-over. Unlike the reserve it can
+    // refuse while images are free -- four consumers sharing one image leave four unheld -- which
+    // is the price of not evicting a holder to make room for the fifth.
     static constexpr size_t kMaxHoldersPerMonitor = 4;
 
     struct Config {
@@ -321,13 +335,14 @@ public:
     // export itself went wrong.
     //
     // A successful export records `client` -- its DBus unique name -- as holding that image,
-    // and no render draws into a held image. The claim ends at ReleaseBuffer, at the client's
-    // third hand-over, or when it leaves the bus.
+    // and no render draws into a held image. The claim ends at ReleaseBuffer or when the client
+    // leaves the bus, and nowhere else.
     //
-    // One image per monitor always stays out of consumers' hands: a hand-over that would leave
-    // the ring with nowhere to draw is refused with NoFreeImage instead. Nothing may be taken
-    // back from a consumer that could still be sampling it, so refusing the request is the only
-    // bound on the holds that does not risk drawing into an image being read.
+    // Every bound on the holds is a refusal, reported as NoFreeImage: the hand-over that would
+    // take the producer's last free image, the one past kMaxHeldPerClient, the one from a
+    // consumer past kMaxHoldersPerMonitor. Nothing may be taken back from a consumer that could
+    // still be sampling it, so declining the request is the only bound that does not risk
+    // drawing into an image being read.
     //
     // The default is for a caller that is not a bus peer, and it records no claim: there would
     // be no name to withdraw it under, and a claim nothing can end takes an image out of the
@@ -393,20 +408,21 @@ public:
 
 private:
     // One consumer's claim on a monitor's images: the buffer ids it has been handed and has
-    // not given back, oldest first. The holders themselves are kept least recently served
-    // first -- a hand-over moves its holder to the back -- rather than in a map, so eviction
-    // reads the order off the container instead of a timestamp that could drift from it.
+    // not given back, oldest first. A holder disappears when its last claim ends, so the list
+    // is exactly the consumers currently reading this monitor.
     struct BufferHold {
         std::string client;  // DBus unique name
         std::vector<uint64_t> buffers;
     };
 
-    // What withHandover() decided: the claims that would be in force, and whether this
-    // hand-over is a new claim. `added` is false when the client already held that image, which
-    // is the one case where undoing the hand-over would take away a claim it still needs.
+    // What withHandover() decided. One value with three states rather than a flag beside a
+    // maybe-filled list: `holds` is meaningless unless the hand-over was allowed, and only
+    // Granted may be undone -- an image the client already held is one it is still reading.
     struct Handover {
-        std::vector<BufferHold> holds;
-        bool added = false;
+        enum class Outcome { Granted, AlreadyHeld, Refused };
+
+        std::vector<BufferHold> holds;  // the claims that would be in force; empty if Refused
+        Outcome outcome = Outcome::Refused;
     };
 
     struct MonitorState {
@@ -447,8 +463,14 @@ private:
         // Renders refused for want of a free image since the last committed frame. Reset by a
         // commit, so it reads as how far behind this monitor is now rather than as a total.
         // Reads zero for as long as the reserve holds -- a non-zero count means a hand-over got
-        // past exportCurrentFrame()'s refusal, so it is now a report on that invariant.
+        // past exportCurrentFrame()'s refusal, so it is a report on that invariant and not on
+        // the consumers. What a consumer holding images produces is refusedHandovers below.
         uint32_t deferredRenders = 0;
+
+        // Hand-overs refused since the last one served. Reset by a hand-over rather than by a
+        // commit, because what it reports on is the consumers and not the renders: a monitor
+        // that keeps committing while this climbs is one whose images are not coming back.
+        uint32_t refusedHandovers = 0;
     };
 
     // Creates the Device and target manager on first use, so a machine with no working Vulkan
@@ -472,10 +494,10 @@ private:
     // The images `monitorId` has handed out and not got back. Caller must hold m_stateMutex.
     std::vector<uint64_t> heldBuffersLocked(int monitorId) const;
 
-    // The claims that would be in force if `client` were handed `bufferId`, applying both caps.
-    // `client` must not be empty. Pure, and its result is both what the reserve is tested
-    // against and what is stored: the admission test cannot disagree with the bookkeeping when
-    // they are the same value.
+    // The claims that would be in force if `client` were handed `bufferId`, or Refused when a
+    // cap stands in the way. `client` must not be empty. Pure, and it only ever adds: its result
+    // is both what the reserve is tested against and what is stored, so the admission test
+    // cannot disagree with the bookkeeping, and no caller can end a claim through it.
     static Handover withHandover(std::vector<BufferHold> holds, const std::string& client, uint64_t bufferId);
 
     // Ends `client`'s claim on one image, reporting whether there was one to end. Caller must

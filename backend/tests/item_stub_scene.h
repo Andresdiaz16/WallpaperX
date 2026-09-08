@@ -39,6 +39,7 @@
 #include <cstdint>
 #include <exception>
 #include <functional>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -121,6 +122,31 @@ public:
     // already handed out.
     void reportBufferIdAs(quint64 bufferId) { m_bufferIdOverride = bufferId; }
 
+    // Builds the next GetFrameFd reply as usual but does not send it until sendHeldReply().
+    //
+    // For the one state a synchronous stub cannot produce: a reply IN FLIGHT while the item
+    // changes which monitor it shows. The daemon records the hold when it answers, so that reply
+    // grants a claim to an item that no longer wants it, and only a stub that can pause between
+    // the two halves puts the plugin in that position at all.
+    // Refuses every further GetFrameFd with this error name, whatever the sequence has left; an
+    // empty name puts the sequence back in charge. For the checks that are about ONE named
+    // refusal, which the exhausted-sequence answer cannot express -- the plugin branches on the
+    // name, and NoFreeImage is the only one it treats as temporary.
+    void refuseFurtherWith(QString errorName) { m_refuseWith = std::move(errorName); }
+
+    void holdNextReply() { m_holdNext = true; }
+    bool replyIsHeld() const { return m_heldConnection.has_value(); }
+
+    // Sends it. False when there is none, which a caller must branch on: a phase that thinks it
+    // released a reply and did not would grade the item against a request still outstanding.
+    bool sendHeldReply() {
+        if (!m_heldConnection) return false;
+        const bool sent = m_heldConnection->send(m_heldReply);
+        m_heldConnection.reset();
+        m_heldReply = QDBusMessage();
+        return sent;
+    }
+
     QString introspect(const QString&) const override { return QString(); }
 
     bool handleMessage(const QDBusMessage& message, const QDBusConnection& connection) override {
@@ -138,6 +164,10 @@ public:
         // Counted before anything here can go wrong, so "the item asked" and "the stub answered"
         // stay separate verdicts.
         ++m_requests;
+        if (!m_refuseWith.isEmpty()) {
+            return connection.send(message.createErrorReply(
+                m_refuseWith, QStringLiteral("this stub was told to refuse every further hand-over")));
+        }
         if (m_served >= static_cast<int>(m_sequence.size())) {
             return connection.send(
                 message.createErrorReply(QStringLiteral("io.wallpaperx.Error.NoFrame"),
@@ -196,12 +226,19 @@ public:
         const quint64 generation = static_cast<quint64>(m_served);
         // Both taken from the export rather than invented: the importer refuses a frame whose
         // device is not the one this context runs on, and these tests import for real.
-        return connection.send(message.createReply(
+        const QDBusMessage reply = message.createReply(
             frameReplyFields(handle, frame.width, frame.height, frame.memorySize, m_handleType, generation,
                              frame.drmFormat, frame.modifier, planes,
                              QByteArray(reinterpret_cast<const char*>(frame.deviceUuid.data()),
                                         static_cast<qsizetype>(frame.deviceUuid.size())),
-                             m_bufferIdOverride != 0 ? m_bufferIdOverride : frame.bufferId, syncFds)));
+                             m_bufferIdOverride != 0 ? m_bufferIdOverride : frame.bufferId, syncFds));
+        if (m_holdNext) {
+            m_holdNext = false;
+            m_heldReply = reply;
+            m_heldConnection = connection;
+            return true;  // handled: the caller must not be given Qt's unknown-method error
+        }
+        return connection.send(reply);
     }
 
     int requests() const { return m_requests; }
@@ -231,6 +268,10 @@ private:
     int m_handleType = -1;
     int m_acquireFdsSent = 0;
     int m_malformedReleases = 0;
+    QString m_refuseWith;
+    bool m_holdNext = false;
+    QDBusMessage m_heldReply;
+    std::optional<QDBusConnection> m_heldConnection;
     std::vector<Release> m_releases;
     std::string m_exportError;
     std::string m_acquireError;

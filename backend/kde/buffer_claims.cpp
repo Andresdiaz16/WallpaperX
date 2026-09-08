@@ -19,7 +19,7 @@ auto findEntry(Entries& entries, int monitorId, uint64_t bufferId) {
 
 }  // namespace
 
-BufferClaims::Claim BufferClaims::take(int monitorId, uint64_t bufferId) {
+BufferClaims::Claim BufferClaims::take(int monitorId, uint64_t bufferId, std::string owner) {
     if (bufferId == 0) return {};
 
     std::lock_guard<std::mutex> lock(m_mutex);
@@ -29,7 +29,7 @@ BufferClaims::Claim BufferClaims::take(int monitorId, uint64_t bufferId) {
     } else {
         ++entry->imports;
     }
-    return Claim{m_daemon, monitorId, bufferId};
+    return Claim{m_daemon, monitorId, bufferId, std::move(owner)};
 }
 
 bool BufferClaims::giveBack(const Claim& claim) {
