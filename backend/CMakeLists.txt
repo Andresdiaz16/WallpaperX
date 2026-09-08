@@ -176,16 +176,23 @@ if(EGL_FOUND AND OpenGL_OpenGL_FOUND)
     # decide -- a host that resolves to one vendor would otherwise leave the other path covered by
     # nothing. Both are registered unconditionally so the gap is a named skip rather than an
     # absent entry; the lavapipe twin below only adds a second device for the dma_buf path.
+    # no-tsan on both: the label says "needs no lavapipe ICD", not "opens no driver" -- these two
+    # take whichever GL and Vulkan drivers the host resolves to, which here is the proprietary
+    # one. Under TSan its OpenGL library takes a SEGV inside libtsan's own calloc interceptor on
+    # a thread that library started, and the runtime aborts with "nested bug in the same thread"
+    # before any check runs. A crash inside the sanitizer is not a report, so no suppression can
+    # reach it. What that costs: under TSan the lavapipe twin below is the only import path left,
+    # so the opaque one is graded in the unsanitized trees only.
     add_test(NAME frame_import_probe COMMAND wallpaperx-frame-import-probe)
     set_tests_properties(frame_import_probe PROPERTIES
         ENVIRONMENT "WALLPAPERX_FORCE_HANDLE_TYPE=opaque"
-        LABELS "novulkan"
+        LABELS "novulkan;no-tsan"
         SKIP_RETURN_CODE 77)
 
     add_test(NAME frame_import_probe_dmabuf COMMAND wallpaperx-frame-import-probe)
     set_tests_properties(frame_import_probe_dmabuf PROPERTIES
         ENVIRONMENT "WALLPAPERX_FORCE_HANDLE_TYPE=dmabuf"
-        LABELS "novulkan"
+        LABELS "novulkan;no-tsan"
         SKIP_RETURN_CODE 77)
 
     # The generation rules are pure functions, so this needs no GPU and no daemon -- but it does
@@ -653,7 +660,14 @@ if(Qt6QuickTest_FOUND)
     # and worth stating: on such a host the whole entry reads Skipped, including the twenty-odd
     # cases that did run and pass. Inconclusive is not green, and the sentinel is printed only
     # when the stub could not be brought up at all.
-    set_tests_properties(qml_states PROPERTIES LABELS "novulkan"
+    #
+    # no-tsan: loading the second .qml file starts another QQmlThread, and ThreadSanitizer's
+    # own thread registry aborts on the reused pthread handle -- "CHECK failed:
+    # sanitizer_thread_registry.cpp:186" inside QThread::start, reproducibly, after the first
+    # file's cases pass. That is the runtime dying, not a report, so nothing in tsan.supp can
+    # reach it; and because it lands after one file, the sanitizer tier was already grading
+    # only that file. The entry runs in full in the unsanitized trees.
+    set_tests_properties(qml_states PROPERTIES LABELS "novulkan;no-tsan"
                          ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
                          RESOURCE_LOCK wallpaperx_bus_tests
                          SKIP_REGULAR_EXPRESSION "wallpaperx-qml-states: NO STUB DAEMON --")
@@ -1175,7 +1189,15 @@ elseif(WALLPAPERX_SANITIZE STREQUAL "thread")
             # test here is *loading the proprietary ICD*, which the absence of a lavapipe
             # label is a bad proxy for. Keyed on that absence, this branch also disabled
             # the CPU-only tests, which never open a driver and cannot SEGV in one.
-            if("lavapipe" IN_LIST _labels OR "novulkan" IN_LIST _labels)
+            #
+            # no-tsan overrides both, and is carried by the entry rather than listed here so
+            # the reason sits beside the test that has it -- what they share is a crash
+            # *inside the sanitizer runtime*, reached from a third-party library, which no
+            # suppression can touch. A renamed test loses the label and comes back red, which
+            # is the safe direction to fail: an entry silently dropped from the tier is the
+            # one nobody would notice.
+            if(("lavapipe" IN_LIST _labels OR "novulkan" IN_LIST _labels)
+               AND NOT "no-tsan" IN_LIST _labels)
                 # APPEND rather than read-modify-write: CMake already handles the
                 # empty-property case and the list quoting.
                 set_property(TEST "${_t}" DIRECTORY "${_dir}"
@@ -1213,7 +1235,8 @@ elseif(WALLPAPERX_SANITIZE STREQUAL "thread")
     else()
         message(STATUS "  TSan tier: ${_tsan_enabled} test(s) carry suppressions "
                        "(${_tsan_lavapipe} lavapipe) and the validation waiver; "
-                       "default-ICD tests disabled (SEGVs under TSan)")
+                       "default-ICD tests and every no-tsan entry disabled (each crashes "
+                       "the sanitizer runtime from a third-party library)")
     endif()
 endif()
 

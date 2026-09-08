@@ -365,8 +365,9 @@ void runStampedChecks(int sig, Mode mode, const char* what) {
 //       long enough to look safe. The positive direction is runStampedChecks above: the same
 //       abort moved onto the applying thread does leave a stamped record, so a build that
 //       never wrote one at all would fail there rather than pass here.
-// CONTROL: in backend/daemon/crash_record.cpp, the `::unlink(g_path)` in onFatalSignal()'s
-//       other-thread branch deleted -> "FAIL: a crash on a thread that is not applying leaves
+// CONTROL: in backend/daemon/crash_record.cpp, the `::unlink(path)` that onFatalSignal()'s
+//       other-thread branch performs once its compare-exchange confirms the copied name
+//       replaced by `(void)path` -> "FAIL: a crash on a thread that is not applying leaves
 //       no record" and "...leaves no file on disk", ctest Failed. Reverted.
 void runOtherThreadChecks() {
     ScratchDir scratch("crashother");

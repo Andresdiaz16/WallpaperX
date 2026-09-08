@@ -5484,14 +5484,16 @@ void runSilentClientShutdownChecks(WallpaperManager& manager, const Check& check
 int main() {
     wallpaperx::testing::g_testName = "http_server_test";
 
-    // Before any WallpaperManager::Config exists: its stateDir defaults to
-    // $XDG_STATE_HOME/wallpaperx, and this file's managers name only a scratch config. Without
-    // this, every render here writes its crash record into the developer's own state directory.
+    // Points $XDG_STATE_HOME at a scratch directory for the whole process. Config::stateDir
+    // defaults to empty and the one phase here that wants a state directory names its own, so
+    // nothing is expected to reach this one; it is the containment for the paths that resolve
+    // a state directory for themselves whatever the Config says -- preserveConfig() keeps its
+    // copy of an unreadable config under defaultStateDir(). Construct it before any Config.
     const wallpaperx::testing::ScratchStateHome stateHome;
     if (!stateHome.ok()) {
         notVerified("every goal in this file",
-                    "no scratch state directory could be created, and running without one would write this "
-                    "test's crash records into the developer's own state directory");
+                    "no scratch state directory could be created, and running without one would let anything "
+                    "here that resolves a state directory for itself write into the developer's own");
         return wallpaperx::testing::reportNotVerifiedOrPassed();
     }
 

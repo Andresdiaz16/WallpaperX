@@ -41,6 +41,24 @@ called_from_lib:libVkLayer_khronos_validation.so
 called_from_lib:libvulkan_lvp.so
 called_from_lib:libvulkan.so
 called_from_lib:libLLVM
+# Mesa's shared gallium object, which its EGL and Vulkan front ends both dlopen. It
+# re-initialises a pthread_barrier_t on the caller's stack while a shader thread it
+# started is still destroying it -- both accesses inside Mesa, ours only below them on the
+# stack.
+#
+# Narrow, like Qt below and unlike the three entries above: `race:` matches the report's
+# own frames, so a race between this project's threads is still reported while Mesa is
+# loaded and running. Measured 2026-09-08 -- a deliberate race between frame_import_probe's
+# main thread and one it starts is still reported with this entry active. What it does cost:
+# a report is hidden whenever a libgallium frame appears in any stack the report prints,
+# which includes the creating stack of a thread Mesa started.
+#
+# No version in the pattern, deliberately: the object is named libgallium-26.2.2-arch1.1.so
+# here, matching is substring, and an entry carrying the version would stop matching on the
+# next Mesa package and turn this gate red for a change nobody made. Measured the same day:
+# `race:libgallium-27` does not match and the race comes back, which is what a versioned
+# entry would do after an upgrade.
+race:libgallium
 
 # The Vulkan loader spawns nothing itself but dlopen's ICDs whose init TSan attributes
 # to whichever thread got there first.

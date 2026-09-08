@@ -19,6 +19,8 @@
 //    Negative cases ("no signal for this one") are settled by posting a later request
 //    that *does* signal: the daemon has a single FIFO render thread, so that later
 //    signal proves the earlier request was already processed.
+#include "daemon/config_store.h"
+#include "daemon/crash_record.h"
 #include "daemon/dbus_service.h"
 #include "daemon/render_worker.h"
 #include "daemon/wallpaper_manager.h"
@@ -5176,10 +5178,12 @@ void runCoalescingChecks(sdbus::IProxy& proxy, FrameReadyLog& signals, const std
 int main() {
     wallpaperx::testing::g_testName = "dbus_service_test";
 
-    // Before any WallpaperManager::Config exists: its stateDir defaults to
-    // $XDG_STATE_HOME/wallpaperx, and this file's managers name only a scratch config. Without
-    // this, every render here writes its crash record into the developer's own state
-    // directory -- 16 of them in one measured run.
+    // Points $XDG_STATE_HOME at a scratch directory for the whole process. Config::stateDir
+    // defaults to empty now and no manager here sets one, so nothing should reach a state
+    // directory at all -- and that is the point: this is the sandbox the check at the end of
+    // main() reads to establish it, and it bounds the damage of the regression that check
+    // exists to catch. Construct it before any Config: a manager already built has resolved
+    // whatever it was going to resolve.
     const wallpaperx::testing::ScratchStateHome stateHome;
     if (!stateHome.ok()) {
         wallpaperx::testing::notVerified(
@@ -5329,6 +5333,56 @@ int main() {
         // the FAIL lines above would ever be printed.
         std::fprintf(stderr, "FAIL: unexpected exception: %s\n", e.what());
         ++wallpaperx::testing::g_failures;
+    }
+
+    // GOAL: a WallpaperManager told nothing about a state directory writes nothing into the
+    //       user's -- the crash-record refusal is opt-in, like the config file. False if any
+    //       manager in this file left anything under $XDG_STATE_HOME, which is what the
+    //       earlier default did: stateDir came up as defaultStateDir(), and one measured run
+    //       put 16 applying-*.json files in the developer's own state directory.
+    // WHY-THIS-SHAPE: the obvious version -- assert stateDir is empty on a default-built
+    //       Config -- grades a declaration and not a behaviour, and would still pass if a
+    //       manager resolved the directory for itself somewhere else. This looks at the
+    //       filesystem, and it looks for the *directory* rather than for record files:
+    //       every completed render removes its own file, so files are gone by now and only
+    //       the parent ApplyingRecord's create_directories() left behind survives.
+    // COVERAGE-ASSERT: an empty directory proves nothing if this process's state directory
+    //       was never the scratch one, so the probe below writes a record through the same
+    //       constructor the manager uses and requires it to land inside the scratch home.
+    //       An XDG_STATE_HOME that never took effect fails there instead of making the
+    //       emptiness check vacuously true: ScratchStateHome made to export a differently
+    //       named variable left the emptiness check passing and turned this one red.
+    // CONTROL: in backend/daemon/wallpaper_manager.h, Config::stateDir declared
+    //       `= defaultStateDir()`, which is the value backend/daemon/main.cpp assigns ->
+    //       "FAIL: no manager in this file wrote anything into $XDG_STATE_HOME", printing
+    //       the leftover wallpaperx directory. Reverted.
+    {
+        std::error_code ec;
+        std::vector<std::filesystem::path> leftovers;
+        const std::filesystem::recursive_directory_iterator last;
+        auto it = std::filesystem::recursive_directory_iterator(stateHome.path(), ec);
+        for (; !ec && it != last; it.increment(ec)) leftovers.push_back(it->path());
+        // Graded, because the ec-taking iterator yields an end iterator on failure: an
+        // unreadable scratch directory would otherwise read as an empty one and pass.
+        check(!ec, "the scratch state directory could be walked");
+        check(leftovers.empty(), "no manager in this file wrote anything into $XDG_STATE_HOME");
+        for (const std::filesystem::path& left : leftovers) {
+            std::fprintf(stderr, "  left behind: %s\n", left.c_str());
+        }
+
+        constexpr int kProbeMonitor = 4242;
+        const std::filesystem::path resolved = wallpaperx::defaultStateDir();
+        // parent_path(), not a string prefix: a prefix would also accept a sibling directory
+        // whose name merely starts with the scratch one's.
+        check(!resolved.empty() && resolved.parent_path() == stateHome.path(),
+              "this process's default state directory is the scratch one, so the check above looked "
+              "where a manager would have written");
+        {
+            const wallpaperx::ApplyingRecord probe(resolved, kProbeMonitor, "static", "/nonexistent/probe.png");
+            std::error_code probeEc;
+            check(std::filesystem::exists(wallpaperx::crashRecordPath(resolved, kProbeMonitor), probeEc),
+                  "a record written into that directory does appear there, so an empty one means nobody wrote");
+        }
     }
 
     // Asking for validation is not the same as getting it: Device degrades silently when

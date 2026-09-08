@@ -105,15 +105,14 @@ private:
 // Points this whole process's state directory at a scratch directory, for a test that builds
 // a WallpaperManager in its own process.
 //
-// WallpaperManager::Config defaults stateDir to $XDG_STATE_HOME/wallpaperx -- unlike
-// configFile, which defaults to empty -- so a test that names a scratch config and says
-// nothing about state still reads and writes the developer's own state directory. Measured on
-// dbus_service_test before this existed: one run created 16 distinct applying-*.json files
-// there, each removed at the end of its render, and a run killed mid-render leaves one behind
-// for the real daemon's next start to honour.
+// WallpaperManager::Config leaves stateDir empty like configFile, so a manager told nothing
+// about state writes no record anywhere. This is still worth having for two reasons: not every
+// path takes the directory from the Config -- preserveConfig() resolves defaultStateDir()
+// itself -- and it is what lets dbus_service_test assert that an empty state directory stayed
+// empty, in a directory it owns rather than the developer's.
 //
-// Construct it first in main(), before any Config: the default is evaluated when the Config is
-// constructed, so an override set afterwards changes nothing for a manager already built.
+// Construct it first in main(), before any Config: a manager already built has resolved
+// whatever it was going to resolve, and an override set afterwards changes nothing for it.
 class ScratchStateHome {
 public:
     ScratchStateHome() : m_dir("statehome") {
