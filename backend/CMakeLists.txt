@@ -566,6 +566,10 @@ add_executable(wallpaperx-buffer-claims-test tests/buffer_claims_test.cpp kde/bu
 target_include_directories(wallpaperx-buffer-claims-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 set_target_properties(wallpaperx-buffer-claims-test PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
 
+# `novulkan` claims the test opens no Vulkan driver. CI and the TSan block are allow-lists
+# keyed on it, so attaching it is also how a test gets selected -- never attach it for that
+# reason. Verify with VK_LOADER_DEBUG=driver: no ICD load line.
+#
 # Registered outside the dbus-run-session guard below: this one talks to nothing.
 add_test(NAME log_escape COMMAND $<TARGET_FILE:wallpaperx-log-escape-test>)
 

@@ -30,14 +30,22 @@
 # plain races between instrumented threads visible, which is what makes it so convincing
 # and so dangerous.
 
+# Most entries here match nothing on this machine; they cover hardware and configurations
+# this tier does not run. Do not delete one for matching zero. To re-measure, add
+# `print_suppressions=1` -- and keep the ICD pinned to Lavapipe, or the run selects NVIDIA
+# and the sanitizer dies on a SEGV before printing, which reads as "nothing matched".
+# Counts are in PLAN.md.
+
 # The Khronos validation layer. Uninstrumented, and it keeps its own concurrent state
-# maps behind rwlocks TSan cannot pair up. This is the loudest source by far, and it is
-# present only because the tests ask for validation -- the shipped daemon does not load
-# it at all.
+# maps behind rwlocks TSan cannot pair up. Present only because the tests ask for
+# validation -- the shipped daemon does not load it at all.
 called_from_lib:libVkLayer_khronos_validation.so
 
 # Mesa / Lavapipe. Uninstrumented, and llvmpipe's rasteriser uses its own worker pool
 # with atomics and futexes TSan reads as unsynchronised.
+#
+# Still the right object despite Mesa's shared libgallium: this one neither links nor
+# dlopens it, so the Lavapipe driver is here.
 called_from_lib:libvulkan_lvp.so
 called_from_lib:libvulkan.so
 called_from_lib:libLLVM
@@ -69,6 +77,9 @@ called_from_lib:libvulkan_intel.so
 # uninstrumented and shows up on every signal emission from the render thread.
 called_from_lib:libsystemd.so
 
+# Dormant: the only test these three cover, `qml_states`, is `no-tsan` and disabled in the
+# sanitizer tier. Kept for when that label is lifted.
+#
 # Qt, for the plugin's headless state tests. Uninstrumented: the QML engine runs a
 # QQmlThread and the reply path starts a QNetworkAccessManager thread, and both are torn
 # down by Qt at exit in ways TSan cannot pair with the main thread. Measured on Qt 6.11.2 --
