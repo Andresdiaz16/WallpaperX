@@ -51,6 +51,17 @@ struct DeviceInfo {
     // be released to a non-Vulkan consumer (a compositor). Without it the release
     // falls back to VK_QUEUE_FAMILY_EXTERNAL, which is core since 1.1.
     bool hasQueueFamilyForeign = false;
+
+    // Which codecs this device's video decode queue can decode, as codec-operation bits: a
+    // caller asks `videoDecodeOps & VK_VIDEO_CODEC_OPERATION_DECODE_H264_BIT_KHR`. Zero means
+    // there is no hardware decoder to hand a file to -- no decode queue family (Lavapipe), no
+    // per-codec extension, or a feature the decoder relies on missing -- and the file has to
+    // be decoded in software. Non-zero answers only the codec; whether a particular file's
+    // profile and size are accepted is the decoder's own question, asked per file.
+    //
+    // Derived from what vkCreateDevice was actually given, after it succeeded, so it cannot
+    // name a codec whose extension is not enabled.
+    VkVideoCodecOperationFlagsKHR videoDecodeOps = 0;
 };
 
 class Device {
@@ -67,8 +78,41 @@ public:
     VkQueue graphicsQueue() const { return m_graphicsQueue; }
     uint32_t graphicsQueueFamily() const { return m_graphicsQueueFamily; }
 
+    // One queue family that can decode video, with a queue on it. `ops` is what the family
+    // decodes among the codecs whose extension is enabled, never zero. `queue` is
+    // graphicsQueue() itself where the graphics family decodes: Vulkan forbids creating a
+    // family's queue twice, and one is all a single decoder thread needs.
+    struct VideoDecodeFamily {
+        uint32_t family = UINT32_MAX;
+        VkVideoCodecOperationFlagsKHR ops = 0;
+        VkQueue queue = VK_NULL_HANDLE;
+    };
+
+    // Every decode family this device was created with; empty exactly when
+    // info().videoDecodeOps is zero. Nothing in this Device submits to these queues. They exist
+    // to be handed to a decoder library, and every one of them -- the shared graphics queue
+    // above all -- is externally synchronised, so that library has to submit on the GPU thread.
+    //
+    // What that library submits is invisible here: wait(), waitForSubmissions(), safeToFree()
+    // and teardown cover only batches this Device submitted, so a decoder's outstanding work is
+    // the decoder's to drain before anything it read or wrote is freed.
+    const std::vector<VideoDecodeFamily>& videoDecodeFamilies() const { return m_videoDecodeFamilies; }
+
     const DeviceInfo& info() const { return m_info; }
     DescriptorTier descriptorTier() const { return m_selectedTier; }
+
+    // What this device was created with, for a library that has to be told -- ffmpeg's Vulkan
+    // context wants the enabled extensions and the enabled feature chain. These are the very
+    // arrays and structs vkCreateInstance and vkCreateDevice were given, not copies made
+    // afterwards, so they cannot disagree with what was enabled. The feature chain is walked
+    // by pNext from the head, in the fixed order the EnabledFeatures comment gives.
+    const std::vector<const char*>& enabledInstanceExtensions() const { return m_enabledInstanceExtensions; }
+    const std::vector<const char*>& enabledDeviceExtensions() const { return m_enabledDeviceExtensions; }
+    const VkPhysicalDeviceFeatures2& enabledFeatures() const { return m_features.features2; }
+
+    // Read off the feature chain rather than remembered beside it.
+    bool timelineSemaphore() const { return m_features.vulkan12.timelineSemaphore == VK_TRUE; }
+    bool samplerYcbcrConversion() const { return m_features.vulkan11.samplerYcbcrConversion == VK_TRUE; }
 
     // Whether a validator was actually listening. Needed alongside the count below,
     // because 0 warnings is equally true of a clean run and an unwatched one.
@@ -105,12 +149,35 @@ public:
     // A signal semaphore is the only way to order work in another queue or another process
     // against this submission. A host fence cannot stand in for it: the fence is a
     // happens-before through the host, while the consumer's acquire happens on the device.
+    //
+    // A wait is one object holding the semaphore and the stage it is waited at, built only by a
+    // constructor that takes both: an aggregate would let `{semaphore}` compile with the stage
+    // zeroed, and a zero stage mask is no execution dependency at all -- the consumer reads
+    // while the producer still writes, and not every driver refuses it. A timeline semaphore
+    // likewise travels with its value; one in a binary list is undefined and unrefused.
     struct SubmitScope {
-        // Paired by index: wait[i] is waited on at waitStages[i], so the two must be the
-        // same length. Vulkan takes them as separate arrays and silently misreads a short one.
-        std::vector<VkSemaphore> wait;
-        std::vector<VkPipelineStageFlags> waitStages;
+        struct Wait {
+            Wait(VkSemaphore semaphore, VkPipelineStageFlags stage) : semaphore(semaphore), stage(stage) {}
+            VkSemaphore semaphore;
+            VkPipelineStageFlags stage;
+        };
+        struct TimelineWait {
+            TimelineWait(VkSemaphore semaphore, uint64_t value, VkPipelineStageFlags stage)
+                : semaphore(semaphore), value(value), stage(stage) {}
+            VkSemaphore semaphore;
+            uint64_t value;
+            VkPipelineStageFlags stage;
+        };
+        struct TimelineSignal {
+            TimelineSignal(VkSemaphore semaphore, uint64_t value) : semaphore(semaphore), value(value) {}
+            VkSemaphore semaphore;
+            uint64_t value;
+        };
+
+        std::vector<Wait> wait;
         std::vector<VkSemaphore> signal;
+        std::vector<TimelineWait> timelineWait;
+        std::vector<TimelineSignal> timelineSignal;
     };
 
     // Names one submitted batch, for a caller that has to know when it finished.
@@ -130,8 +197,8 @@ public:
     };
 
     // Records `record` into a command buffer, submits it, and returns without waiting for the
-    // GPU. Throws GpuFailure on any Vulkan failure, and std::invalid_argument if scope.wait
-    // and scope.waitStages differ in length. Also refuses, without touching the queue, while a
+    // GPU. Throws GpuFailure on any Vulkan failure, and std::invalid_argument for a wait whose
+    // stage mask is zero. Also refuses, without touching the queue, while a
     // batch that was already given the full wait bound has still not finished: one stuck batch
     // holds up everything behind it, so the next caller is told rather than queued behind it.
     //
@@ -293,6 +360,40 @@ private:
     VkDevice m_device = VK_NULL_HANDLE;
     VkQueue m_graphicsQueue = VK_NULL_HANDLE;
     uint32_t m_graphicsQueueFamily = UINT32_MAX;
+    // Filled once vkCreateDevice has succeeded, from the extension list it was given.
+    std::vector<VideoDecodeFamily> m_videoDecodeFamilies;
+    // What each decode family advertises, before the per-codec extensions are known. Only the
+    // list above, derived after creation, says what can actually be decoded.
+    std::vector<std::pair<uint32_t, VkVideoCodecOperationFlagsKHR>> m_decodeFamilyOps;
+
+    // The arrays vkCreateInstance and vkCreateDevice were given. Kept as the record of what is
+    // enabled; the strings are the header's literals, so they outlive everything.
+    std::vector<const char*> m_enabledInstanceExtensions;
+    std::vector<const char*> m_enabledDeviceExtensions;
+
+    // The feature chain vkCreateDevice was given, kept whole so it can be read back. Linked
+    // from features2 through vulkan11, vulkan12, vulkan13, then the extension structs of the
+    // descriptor tier in use. A struct is linked and its flags set in one place, or neither:
+    // that is what lets an unlinked struct read VK_FALSE throughout, which every accessor
+    // above relies on. The links point into this object, which is why the Device is not movable.
+    struct EnabledFeatures {
+        VkPhysicalDeviceFeatures2 features2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+        VkPhysicalDeviceVulkan11Features vulkan11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
+        VkPhysicalDeviceVulkan12Features vulkan12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+        VkPhysicalDeviceVulkan13Features vulkan13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+        VkPhysicalDeviceDescriptorHeapFeaturesEXT descriptorHeap{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_HEAP_FEATURES_EXT};
+        VkPhysicalDeviceMaintenance5FeaturesKHR maintenance5{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR};
+        VkPhysicalDeviceShaderUntypedPointersFeaturesKHR untypedPointers{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_UNTYPED_POINTERS_FEATURES_KHR};
+        VkPhysicalDeviceDescriptorBufferFeaturesEXT descriptorBuffer{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_FEATURES_EXT};
+
+        EnabledFeatures() = default;
+        EnabledFeatures(const EnabledFeatures&) = delete;
+        EnabledFeatures& operator=(const EnabledFeatures&) = delete;
+    };
+    EnabledFeatures m_features;
 
     // The thread that constructed this Device, and therefore the only one allowed to
     // touch it. Captured rather than configured: whoever created the device is by

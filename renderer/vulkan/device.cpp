@@ -16,6 +16,7 @@
 #include <iostream>
 #include <thread>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace wallpaperx {
@@ -43,6 +44,17 @@ constexpr uint64_t kSubmitTimeoutNs = std::chrono::nanoseconds(kSubmitTimeout).c
 // bounds the pending list, and reaching it makes the next submit wait for the oldest batch.
 constexpr size_t kMaxSubmissionsInFlight = 16;
 
+// Each codec's decode extension and the operation bit a queue family advertises for it. One
+// table, so the extension enabled and the capability reported cannot name different codecs.
+// Only codecs whose extension needs no feature of its own belong here: VP9's needs
+// videoDecodeVP9 chained at creation, so naming it by extension alone would advertise a
+// codec no session can be created for.
+constexpr std::array<std::pair<const char*, VkVideoCodecOperationFlagBitsKHR>, 3> kVideoDecodeCodecs{{
+    {VK_KHR_VIDEO_DECODE_H264_EXTENSION_NAME, VK_VIDEO_CODEC_OPERATION_DECODE_H264_BIT_KHR},
+    {VK_KHR_VIDEO_DECODE_H265_EXTENSION_NAME, VK_VIDEO_CODEC_OPERATION_DECODE_H265_BIT_KHR},
+    {VK_KHR_VIDEO_DECODE_AV1_EXTENSION_NAME, VK_VIDEO_CODEC_OPERATION_DECODE_AV1_BIT_KHR},
+}};
+
 // Preference order among devices that already passed the capability checks. A rank, not a
 // "discrete beats everything else" test: that form never displaced whatever enumerated first,
 // so a software rasteriser ahead of an integrated GPU in the list kept the wallpaper on the CPU.
@@ -63,6 +75,27 @@ bool hasExtension(const std::vector<VkExtensionProperties>& extensions, const ch
         if (std::strcmp(ext.extensionName, name) == 0) return true;
     }
     return false;
+}
+
+// A failed query is reported, not thrown: everything an extension enables here is optional,
+// so the device still builds without it. But it is reported, because an empty list also
+// reads as "this device has none" -- and for the video extensions that silently selects
+// software decode, a wrong answer that looks like a right one.
+std::vector<VkExtensionProperties> enumerateDeviceExtensions(VkPhysicalDevice physicalDevice) {
+    uint32_t count = 0;
+    VkResult r = vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &count, nullptr);
+    std::vector<VkExtensionProperties> extensions(r == VK_SUCCESS ? count : 0);
+    if (r == VK_SUCCESS && count > 0) {
+        r = vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &count, extensions.data());
+        extensions.resize(r == VK_SUCCESS ? count : 0);
+    }
+    if (r != VK_SUCCESS) {
+        std::cerr << "[vulkan] vkEnumerateDeviceExtensionProperties failed with " << vkResultName(r)
+                  << "; treating the device as having no optional extension -- no dma_buf export, no descriptor "
+                     "heap or buffer, no hardware video decode"
+                  << std::endl;
+    }
+    return extensions;
 }
 
 VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(
@@ -117,9 +150,8 @@ Device::Device(bool enableValidation) {
         selectPhysicalDevice();
         determineTier();
         createLogicalDevice();
-        const bool bufferDeviceAddressEnabled = m_selectedTier == DescriptorTier::Heap || m_selectedTier == DescriptorTier::Buffer;
-        m_memory.init(m_instance, m_physicalDevice, m_device, VK_API_VERSION_1_3, bufferDeviceAddressEnabled,
-                      m_info.hasImageDrmFormatModifier);
+        m_memory.init(m_instance, m_physicalDevice, m_device, VK_API_VERSION_1_3,
+                      m_features.vulkan12.bufferDeviceAddress == VK_TRUE, m_info.hasImageDrmFormatModifier);
         createDescriptorAllocator();
         createCommandPool();
     } catch (...) {
@@ -208,7 +240,7 @@ void Device::createInstance(bool enableValidation) {
     appInfo.engineVersion = VK_MAKE_VERSION(0, 1, 0);
     appInfo.apiVersion = VK_API_VERSION_1_3;
 
-    std::vector<const char*> instanceExtensions;
+    std::vector<const char*>& instanceExtensions = m_enabledInstanceExtensions;
     std::vector<const char*> instanceLayers;
 
     bool validationAvailable = false;
@@ -351,6 +383,11 @@ void Device::selectPhysicalDevice() {
 
         VkPhysicalDeviceProperties props{};
         vkGetPhysicalDeviceProperties(candidate, &props);
+        // The instance asks for 1.3, but a device may report lower than its instance, and this
+        // renderer creates it with the 1.3 feature block chained, which is invalid on one that does.
+        if (props.apiVersion < VK_API_VERSION_1_3) {
+            continue;
+        }
 
         const bool isBetter = best == VK_NULL_HANDLE || deviceRank(props.deviceType) > deviceRank(bestProps.deviceType);
 
@@ -362,7 +399,8 @@ void Device::selectPhysicalDevice() {
     }
 
     if (best == VK_NULL_HANDLE) {
-        throw std::runtime_error("Device: no GPU with VK_KHR_external_memory_fd and a graphics queue found");
+        throw std::runtime_error(
+            "Device: no Vulkan 1.3 GPU with VK_KHR_external_memory_fd and a graphics queue found");
     }
 
     m_physicalDevice = best;
@@ -376,10 +414,7 @@ void Device::selectPhysicalDevice() {
     vkGetPhysicalDeviceProperties2(m_physicalDevice, &props2);
     std::memcpy(m_info.deviceUuid.data(), idProps.deviceUUID, VK_UUID_SIZE);
 
-    uint32_t extCount = 0;
-    vkEnumerateDeviceExtensionProperties(m_physicalDevice, nullptr, &extCount, nullptr);
-    std::vector<VkExtensionProperties> extensions(extCount);
-    vkEnumerateDeviceExtensionProperties(m_physicalDevice, nullptr, &extCount, extensions.data());
+    const std::vector<VkExtensionProperties> extensions = enumerateDeviceExtensions(m_physicalDevice);
 
     m_info.hasDescriptorHeap = hasExtension(extensions, VK_EXT_DESCRIPTOR_HEAP_EXTENSION_NAME);
     m_info.hasDescriptorBuffer = hasExtension(extensions, VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME);
@@ -391,6 +426,26 @@ void Device::selectPhysicalDevice() {
     // import for no frame at all.
     m_info.hasImageDrmFormatModifier = hasExtension(extensions, VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME);
     m_info.hasQueueFamilyForeign = hasExtension(extensions, VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME);
+
+    // The per-family codec list is only queryable through VK_KHR_video_queue, and chaining its
+    // properties struct on a device without the extension is a validation error, not a no-op.
+    if (hasExtension(extensions, VK_KHR_VIDEO_QUEUE_EXTENSION_NAME) &&
+        hasExtension(extensions, VK_KHR_VIDEO_DECODE_QUEUE_EXTENSION_NAME)) {
+        uint32_t familyCount = 0;
+        vkGetPhysicalDeviceQueueFamilyProperties2(m_physicalDevice, &familyCount, nullptr);
+        std::vector<VkQueueFamilyVideoPropertiesKHR> video(
+            familyCount, VkQueueFamilyVideoPropertiesKHR{VK_STRUCTURE_TYPE_QUEUE_FAMILY_VIDEO_PROPERTIES_KHR});
+        std::vector<VkQueueFamilyProperties2> families(familyCount,
+                                                       VkQueueFamilyProperties2{VK_STRUCTURE_TYPE_QUEUE_FAMILY_PROPERTIES_2});
+        for (uint32_t i = 0; i < familyCount; ++i) families[i].pNext = &video[i];
+        vkGetPhysicalDeviceQueueFamilyProperties2(m_physicalDevice, &familyCount, families.data());
+
+        // Every decode family, not the first: a driver may split its codecs across families.
+        for (uint32_t i = 0; i < familyCount; ++i) {
+            if ((families[i].queueFamilyProperties.queueFlags & VK_QUEUE_VIDEO_DECODE_BIT_KHR) == 0) continue;
+            m_decodeFamilyOps.emplace_back(i, video[i].videoCodecOperations);
+        }
+    }
     // Gated on the handle type as well as the extension, unlike every flag above. Lavapipe
     // advertises VK_KHR_external_semaphore_fd and then fails vkCreateSemaphore with
     // VK_ERROR_INVALID_EXTERNAL_HANDLE for an OPAQUE_FD export -- it offers SYNC_FD only, which is
@@ -452,7 +507,8 @@ void Device::createLogicalDevice() {
     const bool useHeap = m_selectedTier == DescriptorTier::Heap;
     const bool useBuffer = m_selectedTier == DescriptorTier::Buffer;
 
-    std::vector<const char*> deviceExtensions{VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME};
+    std::vector<const char*>& deviceExtensions = m_enabledDeviceExtensions;
+    deviceExtensions = {VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME};
     if (m_info.hasExternalMemoryDmaBuf) {
         deviceExtensions.push_back(VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);
     }
@@ -475,49 +531,95 @@ void Device::createLogicalDevice() {
         deviceExtensions.push_back(VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME);
     }
 
-    VkPhysicalDeviceVulkan12Features vulkan12Features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
-    vulkan12Features.bufferDeviceAddress = (useHeap || useBuffer) ? VK_TRUE : VK_FALSE;
+    const std::vector<VkExtensionProperties> available = enumerateDeviceExtensions(m_physicalDevice);
+
+    // A decoder library's frames carry timeline semaphores and synchronization2 access masks,
+    // and it resets its result queries from the host: those three gate the decode queue. The
+    // Y'CbCr conversion feature is not the decoder's -- it is for whatever samples a decoded
+    // frame -- so it is enabled when present and reported, never required. All four are core
+    // and change nothing about how anything already here behaves.
+    VkPhysicalDeviceVulkan11Features supported11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
+    VkPhysicalDeviceVulkan12Features supported12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+    VkPhysicalDeviceVulkan13Features supported13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+    supported11.pNext = &supported12;
+    supported12.pNext = &supported13;
+    VkPhysicalDeviceFeatures2 supported{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    supported.pNext = &supported11;
+    vkGetPhysicalDeviceFeatures2(m_physicalDevice, &supported);
+
+    m_features.vulkan11.samplerYcbcrConversion = supported11.samplerYcbcrConversion;
+    m_features.vulkan12.bufferDeviceAddress = (useHeap || useBuffer) ? VK_TRUE : VK_FALSE;
     // The heap-tier fragment shader (fullscreen_heap.frag) indexes the descriptor
     // heap arrays with nonuniformEXT, which requires this feature to be enabled.
-    vulkan12Features.shaderSampledImageArrayNonUniformIndexing = useHeap ? VK_TRUE : VK_FALSE;
+    m_features.vulkan12.shaderSampledImageArrayNonUniformIndexing = useHeap ? VK_TRUE : VK_FALSE;
+    m_features.vulkan12.timelineSemaphore = supported12.timelineSemaphore;
+    m_features.vulkan12.hostQueryReset = supported12.hostQueryReset;
+    m_features.vulkan13.synchronization2 = supported13.synchronization2;
 
-    VkPhysicalDeviceShaderUntypedPointersFeaturesKHR untypedPointersFeatures{
-        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_UNTYPED_POINTERS_FEATURES_KHR};
-    untypedPointersFeatures.shaderUntypedPointers = VK_TRUE;
-    untypedPointersFeatures.pNext = &vulkan12Features;
-
-    VkPhysicalDeviceDescriptorBufferFeaturesEXT descriptorBufferFeatures{
-        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_FEATURES_EXT};
-    descriptorBufferFeatures.descriptorBuffer = VK_TRUE;
-    descriptorBufferFeatures.pNext = &vulkan12Features;
-
-    VkPhysicalDeviceMaintenance5FeaturesKHR maintenance5Features{
-        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR};
-    maintenance5Features.maintenance5 = VK_TRUE;
-    maintenance5Features.pNext = &untypedPointersFeatures;
-
-    VkPhysicalDeviceDescriptorHeapFeaturesEXT descriptorHeapFeatures{
-        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_HEAP_FEATURES_EXT};
-    descriptorHeapFeatures.descriptorHeap = VK_TRUE;
-    descriptorHeapFeatures.pNext = &maintenance5Features;
-
-    void* featureChain = &vulkan12Features;
-    if (useHeap) {
-        featureChain = &descriptorHeapFeatures;
-    } else if (useBuffer) {
-        featureChain = &descriptorBufferFeatures;
+    const bool decoderPrerequisites = m_features.vulkan12.timelineSemaphore == VK_TRUE &&
+                                      m_features.vulkan12.hostQueryReset == VK_TRUE &&
+                                      m_features.vulkan13.synchronization2 == VK_TRUE;
+    // A codec is enabled when some decode family advertises it and its extension exists.
+    std::vector<const char*> codecExtensions;
+    if (decoderPrerequisites) {
+        for (const auto& [extension, op] : kVideoDecodeCodecs) {
+            const bool advertised = std::any_of(m_decodeFamilyOps.begin(), m_decodeFamilyOps.end(),
+                                                [&](const auto& family) { return (family.second & op) != 0; });
+            if (advertised && hasExtension(available, extension)) codecExtensions.push_back(extension);
+        }
+    }
+    // A decode queue with no codec behind it would be a queue nothing can use.
+    const bool enableDecode = !codecExtensions.empty();
+    if (enableDecode) {
+        deviceExtensions.push_back(VK_KHR_VIDEO_QUEUE_EXTENSION_NAME);
+        deviceExtensions.push_back(VK_KHR_VIDEO_DECODE_QUEUE_EXTENSION_NAME);
+        deviceExtensions.insert(deviceExtensions.end(), codecExtensions.begin(), codecExtensions.end());
     }
 
+    // The chain, in the order the header states. A tier's structs are linked and their flags
+    // set together, so a struct that is out of the chain reads VK_FALSE.
+    m_features.features2.pNext = &m_features.vulkan11;
+    m_features.vulkan11.pNext = &m_features.vulkan12;
+    m_features.vulkan12.pNext = &m_features.vulkan13;
+    m_features.vulkan13.pNext = nullptr;
+    if (useHeap) {
+        m_features.vulkan13.pNext = &m_features.descriptorHeap;
+        m_features.descriptorHeap.descriptorHeap = VK_TRUE;
+        m_features.descriptorHeap.pNext = &m_features.maintenance5;
+        m_features.maintenance5.maintenance5 = VK_TRUE;
+        m_features.maintenance5.pNext = &m_features.untypedPointers;
+        m_features.untypedPointers.shaderUntypedPointers = VK_TRUE;
+        m_features.untypedPointers.pNext = nullptr;
+    } else if (useBuffer) {
+        m_features.vulkan13.pNext = &m_features.descriptorBuffer;
+        m_features.descriptorBuffer.descriptorBuffer = VK_TRUE;
+        m_features.descriptorBuffer.pNext = nullptr;
+    }
+
+    // One queue per family. A decode family that is the graphics family shares its queue: a
+    // second create info for the same family is invalid, and one queue is all a single decoder
+    // thread needs.
     const float queuePriority = 1.0f;
-    VkDeviceQueueCreateInfo queueInfo{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
-    queueInfo.queueFamilyIndex = m_graphicsQueueFamily;
-    queueInfo.queueCount = 1;
-    queueInfo.pQueuePriorities = &queuePriority;
+    std::vector<VkDeviceQueueCreateInfo> queueInfos;
+    auto addQueue = [&](uint32_t family) {
+        for (const VkDeviceQueueCreateInfo& existing : queueInfos) {
+            if (existing.queueFamilyIndex == family) return;
+        }
+        VkDeviceQueueCreateInfo queueInfo{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
+        queueInfo.queueFamilyIndex = family;
+        queueInfo.queueCount = 1;
+        queueInfo.pQueuePriorities = &queuePriority;
+        queueInfos.push_back(queueInfo);
+    };
+    addQueue(m_graphicsQueueFamily);
+    if (enableDecode) {
+        for (const auto& [family, ops] : m_decodeFamilyOps) addQueue(family);
+    }
 
     VkDeviceCreateInfo deviceInfo{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
-    deviceInfo.pNext = featureChain;
-    deviceInfo.queueCreateInfoCount = 1;
-    deviceInfo.pQueueCreateInfos = &queueInfo;
+    deviceInfo.pNext = &m_features.features2;
+    deviceInfo.queueCreateInfoCount = static_cast<uint32_t>(queueInfos.size());
+    deviceInfo.pQueueCreateInfos = queueInfos.data();
     deviceInfo.enabledExtensionCount = static_cast<uint32_t>(deviceExtensions.size());
     deviceInfo.ppEnabledExtensionNames = deviceExtensions.data();
 
@@ -526,6 +628,25 @@ void Device::createLogicalDevice() {
     }
 
     vkGetDeviceQueue(m_device, m_graphicsQueueFamily, 0, &m_graphicsQueue);
+
+    // Read back off the extension list the device was just created with, so the codecs named
+    // are exactly those whose extension is enabled. A family left with no enabled codec is
+    // not listed, and its queue -- created above, since the list was not known then -- is
+    // simply never fetched.
+    VkVideoCodecOperationFlagsKHR enabledOps = 0;
+    for (const auto& [extension, op] : kVideoDecodeCodecs) {
+        if (std::find_if(deviceExtensions.begin(), deviceExtensions.end(),
+                         [&](const char* e) { return std::strcmp(e, extension) == 0; }) != deviceExtensions.end()) {
+            enabledOps |= op;
+        }
+    }
+    for (const auto& [family, ops] : m_decodeFamilyOps) {
+        VideoDecodeFamily decode{family, ops & enabledOps, VK_NULL_HANDLE};
+        if (decode.ops == 0) continue;
+        vkGetDeviceQueue(m_device, family, 0, &decode.queue);
+        m_videoDecodeFamilies.push_back(decode);
+        m_info.videoDecodeOps |= decode.ops;
+    }
 }
 
 void Device::createDescriptorAllocator() {
@@ -585,10 +706,12 @@ void Device::immediateSubmit(const std::function<void(VkCommandBuffer)>& record)
 Device::SubmitTicket Device::submit(const std::function<void(VkCommandBuffer)>& record, const SubmitScope& scope) {
     assertGpuThread("Device::submit");
 
-    // Checked, not assumed: Vulkan reads pWaitDstStageMask as waitSemaphoreCount entries, so a
-    // short stage list is an out-of-bounds read the validation layers do not always catch.
-    if (scope.wait.size() != scope.waitStages.size()) {
-        throw std::invalid_argument("Device::submit: one wait stage is required per wait semaphore");
+    // The type stops a stage being omitted; this stops one being passed as zero.
+    for (const SubmitScope::Wait& entry : scope.wait) {
+        if (entry.stage == 0) throw std::invalid_argument("Device::submit: a wait needs a non-zero stage mask");
+    }
+    for (const SubmitScope::TimelineWait& entry : scope.timelineWait) {
+        if (entry.stage == 0) throw std::invalid_argument("Device::submit: a wait needs a non-zero stage mask");
     }
 
     retireCompleted();
@@ -634,14 +757,44 @@ Device::SubmitTicket Device::submit(const std::function<void(VkCommandBuffer)>& 
     const VkFence fence = takeFence();
     discard.fence = fence;
 
+    // Binary entries first, then timeline ones, in every array: Vulkan wants one flat list
+    // per direction, with a value for each entry once any is a timeline. A binary entry's
+    // value is ignored, so zero stands in for it.
+    std::vector<VkSemaphore> waits;
+    std::vector<VkPipelineStageFlags> waitStages;
+    std::vector<uint64_t> waitValues;
+    for (const SubmitScope::Wait& entry : scope.wait) {
+        waits.push_back(entry.semaphore);
+        waitStages.push_back(entry.stage);
+        waitValues.push_back(0);
+    }
+    for (const SubmitScope::TimelineWait& entry : scope.timelineWait) {
+        waits.push_back(entry.semaphore);
+        waitStages.push_back(entry.stage);
+        waitValues.push_back(entry.value);
+    }
+    std::vector<VkSemaphore> signals = scope.signal;
+    std::vector<uint64_t> signalValues(scope.signal.size(), 0);
+    for (const SubmitScope::TimelineSignal& entry : scope.timelineSignal) {
+        signals.push_back(entry.semaphore);
+        signalValues.push_back(entry.value);
+    }
+
+    VkTimelineSemaphoreSubmitInfo timeline{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+    timeline.waitSemaphoreValueCount = static_cast<uint32_t>(waitValues.size());
+    timeline.pWaitSemaphoreValues = waitValues.empty() ? nullptr : waitValues.data();
+    timeline.signalSemaphoreValueCount = static_cast<uint32_t>(signalValues.size());
+    timeline.pSignalSemaphoreValues = signalValues.empty() ? nullptr : signalValues.data();
+
     VkSubmitInfo submitInfo{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    if (!scope.timelineWait.empty() || !scope.timelineSignal.empty()) submitInfo.pNext = &timeline;
     submitInfo.commandBufferCount = 1;
     submitInfo.pCommandBuffers = &cmd;
-    submitInfo.waitSemaphoreCount = static_cast<uint32_t>(scope.wait.size());
-    submitInfo.pWaitSemaphores = scope.wait.empty() ? nullptr : scope.wait.data();
-    submitInfo.pWaitDstStageMask = scope.waitStages.empty() ? nullptr : scope.waitStages.data();
-    submitInfo.signalSemaphoreCount = static_cast<uint32_t>(scope.signal.size());
-    submitInfo.pSignalSemaphores = scope.signal.empty() ? nullptr : scope.signal.data();
+    submitInfo.waitSemaphoreCount = static_cast<uint32_t>(waits.size());
+    submitInfo.pWaitSemaphores = waits.empty() ? nullptr : waits.data();
+    submitInfo.pWaitDstStageMask = waitStages.empty() ? nullptr : waitStages.data();
+    submitInfo.signalSemaphoreCount = static_cast<uint32_t>(signals.size());
+    submitInfo.pSignalSemaphores = signals.empty() ? nullptr : signals.data();
 
     if (const VkResult r = vkQueueSubmit(m_graphicsQueue, 1, &submitInfo, fence); r != VK_SUCCESS) {
         throwVkFailure("Device::submit: vkQueueSubmit", r);

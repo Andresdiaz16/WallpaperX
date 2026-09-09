@@ -262,7 +262,9 @@ int exportFrameAcquireFd(Device& device, const OffscreenTarget& target) {
     // that published this frame included. Waited on, so the descriptor comes from a payload
     // already signalled and a producer that dies next leaves nothing to wait on forever. That
     // wait is transitively the render's: the export pays for the frame, the render does not.
-    cleanup.inFlight = device.submit([](VkCommandBuffer) {}, {{}, {}, {semaphore}});
+    Device::SubmitScope scope;
+    scope.signal = {semaphore};
+    cleanup.inFlight = device.submit([](VkCommandBuffer) {}, scope);
     device.wait(*cleanup.inFlight);
     cleanup.inFlight.reset();
 
