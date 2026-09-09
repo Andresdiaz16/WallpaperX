@@ -255,7 +255,7 @@ OffscreenTarget OffscreenTargetManager::makeTarget(uint32_t width, uint32_t heig
     target.image = m_device.memory().createExportableImage(
         imageInfo,
         externalMemoryHandleType(m_device.info().vendor, m_device.info().hasExternalMemoryDmaBuf),
-        "offscreen-target");
+        kFormatFeatures, "offscreen-target");
 
     if (target.image.drmModifierTiled) {
         try {

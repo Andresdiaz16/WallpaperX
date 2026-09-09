@@ -127,7 +127,8 @@ std::vector<VkDrmFormatModifierPropertiesEXT> queryDrmModifierList(VkPhysicalDev
 
 std::vector<uint64_t> usableDrmModifiers(VkPhysicalDevice physicalDevice, VkFormat format, VkImageType imageType,
                                          VkImageUsageFlags usage, VkExtent3D extent,
-                                         VkExternalMemoryFeatureFlags requiredFeatures) {
+                                         VkExternalMemoryFeatureFlags requiredFeatures,
+                                         VkFormatFeatureFlags requiredTilingFeatures) {
     const std::vector<VkDrmFormatModifierPropertiesEXT> all = queryDrmModifierList(physicalDevice, format);
 
     // A modifier appearing in the format's list only means the driver understands the
@@ -140,6 +141,14 @@ std::vector<uint64_t> usableDrmModifiers(VkPhysicalDevice physicalDevice, VkForm
         // than the driver: a layout it cannot describe is not usable however well the GPU
         // supports it. See kMaxExportedPlanes.
         if (candidate.drmFormatModifierPlaneCount > kMaxExportedPlanes) {
+            continue;
+        }
+        // Only what the caller named -- never the features `usage` maps to, which are the
+        // creation query's below to judge. A driver's per-modifier report can be narrower than
+        // its own creation query: NVIDIA's linear modifier omits COLOR_ATTACHMENT while the
+        // query accepts the usage, the validation layer is silent, and a render into such a
+        // target reads back correctly. Deriving from usage here would drop a layout that works.
+        if ((candidate.drmFormatModifierTilingFeatures & requiredTilingFeatures) != requiredTilingFeatures) {
             continue;
         }
 
@@ -209,7 +218,9 @@ uint64_t queryImageDrmModifier(VkDevice device, VkImage image) {
     return props.drmFormatModifier;
 }
 
-AllocatedImage Memory::createExportableImage(const VkImageCreateInfo& imageInfoIn, VkExternalMemoryHandleTypeFlagBits exportHandleType, const char* debugName) {
+AllocatedImage Memory::createExportableImage(const VkImageCreateInfo& imageInfoIn,
+                                             VkExternalMemoryHandleTypeFlagBits exportHandleType,
+                                             VkFormatFeatureFlags requiredTilingFeatures, const char* debugName) {
     VkExternalMemoryImageCreateInfo externalImageInfo{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO};
     externalImageInfo.handleTypes = exportHandleType;
 
@@ -249,12 +260,14 @@ AllocatedImage Memory::createExportableImage(const VkImageCreateInfo& imageInfoI
         // attributable and local.
         modifiers = usableDrmModifiers(
             m_physicalDevice, imageInfo.format, imageInfo.imageType, imageInfo.usage, imageInfo.extent,
-            VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT | VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT);
+            VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT | VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT,
+            requiredTilingFeatures);
         if (modifiers.empty()) {
             throw std::runtime_error(
                 std::string("Memory: no single-plane DRM format modifier is both exportable and importable for ") +
                 std::to_string(imageInfo.extent.width) + "x" + std::to_string(imageInfo.extent.height) +
-                " with the requested usage for " + (debugName ? debugName : "(unnamed exportable image)"));
+                " with the requested usage and tiling features for " +
+                (debugName ? debugName : "(unnamed exportable image)"));
         }
 
         // Narrowed to what the consumer reported, once it has. Checked after the list above is

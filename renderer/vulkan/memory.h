@@ -44,11 +44,16 @@ std::vector<VkDrmFormatModifierPropertiesEXT> queryDrmModifierList(VkPhysicalDev
 
 // Every DRM format modifier this driver can use for a dma_buf image with
 // `format`/`imageType`/`usage` at `extent`, restricted to those advertising every bit
-// in `requiredFeatures`. Empty if none qualify.
+// in `requiredFeatures` and, in their own tiling features, every bit in
+// `requiredTilingFeatures`. Empty if none qualify.
 //
 // Strictly narrower than queryDrmModifierList: appearing in the format's list only
 // means the driver understands the layout, not that it can render to it, sample it, or
 // hand it across a process boundary at this size.
+//
+// `requiredTilingFeatures` is for what `usage` does not imply. Image creation already holds a
+// modifier to the features each usage bit maps to; a blit destination maps from none, so a
+// caller that will blit into the image asks for VK_FORMAT_FEATURE_BLIT_DST_BIT here.
 //
 // `requiredFeatures` is explicit, with no default, because export and import are
 // different questions with different answers. VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT
@@ -59,7 +64,8 @@ std::vector<VkDrmFormatModifierPropertiesEXT> queryDrmModifierList(VkPhysicalDev
 // vkCreateImage, and the test blamed the round trip for a capability mismatch.
 std::vector<uint64_t> usableDrmModifiers(VkPhysicalDevice physicalDevice, VkFormat format, VkImageType imageType,
                                          VkImageUsageFlags usage, VkExtent3D extent,
-                                         VkExternalMemoryFeatureFlags requiredFeatures);
+                                         VkExternalMemoryFeatureFlags requiredFeatures,
+                                         VkFormatFeatureFlags requiredTilingFeatures);
 
 // Which modifier the driver picked from the list an image was offered. Only legal for an image
 // created with VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT -- see AllocatedImage::drmModifierTiled.
@@ -104,7 +110,13 @@ public:
     //
     // OPAQUE_FD always keeps the caller's tiling: that handle type is only importable
     // by another Vulkan/GL context on the same device, which needs no layout metadata.
-    AllocatedImage createExportableImage(const VkImageCreateInfo& imageInfo, VkExternalMemoryHandleTypeFlagBits exportHandleType, const char* debugName = nullptr);
+    //
+    // `requiredTilingFeatures` narrows the modifiers offered to those whose tiling supports
+    // them -- see usableDrmModifiers. Not consulted on the OPAQUE_FD path, whose tiling is
+    // the caller's and whose features the caller can query directly.
+    AllocatedImage createExportableImage(const VkImageCreateInfo& imageInfo,
+                                         VkExternalMemoryHandleTypeFlagBits exportHandleType,
+                                         VkFormatFeatureFlags requiredTilingFeatures, const char* debugName = nullptr);
 
     // What the consumer that will import these frames says it can take. Vulkan cannot answer
     // this: its importable bit describes Vulkan, and the consumer here is EGL in another

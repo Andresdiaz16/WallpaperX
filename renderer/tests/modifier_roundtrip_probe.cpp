@@ -401,7 +401,8 @@ void acquireFromExternal(wallpaperx::Device& device, VkImage image, VkImageLayou
 uint64_t someOtherUsableModifier(VkPhysicalDevice physicalDevice, uint64_t chosen, size_t planeCount) {
     const std::vector<uint64_t> usable = wallpaperx::usableDrmModifiers(
         physicalDevice, wallpaperx::OffscreenTargetManager::kFormat, VK_IMAGE_TYPE_2D, kUsage, {kWidth, kHeight, 1},
-        VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT | VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT);
+        VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT | VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT,
+        wallpaperx::OffscreenTargetManager::kFormatFeatures);
 
     const std::vector<VkDrmFormatModifierPropertiesEXT> all =
         wallpaperx::queryDrmModifierList(physicalDevice, wallpaperx::OffscreenTargetManager::kFormat);

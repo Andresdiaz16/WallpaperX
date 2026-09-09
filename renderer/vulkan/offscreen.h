@@ -88,9 +88,17 @@ public:
     // moment a renderer needs a new bit.
     //
     // TRANSFER_SRC so the rendered frame can be copied out (readback for tests, and the
-    // natural expectation for a frame we intend to export/hand off).
-    static constexpr VkImageUsageFlags kUsage =
-        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    // natural expectation for a frame we intend to export/hand off). TRANSFER_DST because
+    // VideoRenderer blits into a target rather than drawing.
+    static constexpr VkImageUsageFlags kUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                                                VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+
+    // What a target's tiling must support beyond what kUsage already implies. A usage bit is
+    // checked by image creation against the format features it maps to, and BLIT_DST maps
+    // from no usage bit at all -- so a modifier that can be transferred into but not blitted
+    // into passes every creation-time check and fails at the blit. Held to by the modifier
+    // filter for dma_buf targets and by VideoRenderer for optimal-tiled ones.
+    static constexpr VkFormatFeatureFlags kFormatFeatures = VK_FORMAT_FEATURE_BLIT_DST_BIT;
 
     explicit OffscreenTargetManager(Device& device);
     ~OffscreenTargetManager();

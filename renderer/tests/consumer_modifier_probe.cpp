@@ -115,7 +115,8 @@ bool run(wallpaperx::testing::ValidationGrade& grade) {
     const std::vector<uint64_t> usable = wallpaperx::usableDrmModifiers(
         device.physicalDevice(), wallpaperx::OffscreenTargetManager::kFormat, VK_IMAGE_TYPE_2D,
         wallpaperx::OffscreenTargetManager::kUsage, {kWidth, kHeight, 1},
-        VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT | VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT);
+        VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT | VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT,
+        wallpaperx::OffscreenTargetManager::kFormatFeatures);
     std::cout << "consumer_modifier_probe: " << device.info().gpuName << " offers " << usable.size()
               << " usable modifier(s)" << std::endl;
 

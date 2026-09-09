@@ -77,6 +77,7 @@ add_library(wallpaperx-renderer STATIC
     vulkan/offscreen.cpp
     vulkan/frame_export.cpp
     renderers/static_renderer.cpp
+    renderers/video_renderer.cpp
 )
 
 target_include_directories(wallpaperx-renderer
@@ -262,6 +263,14 @@ wallpaperx_add_shader_probe(wallpaperx-target-ring-probe tests/target_ring_probe
 add_executable(wallpaperx-descriptor-inflight-probe tests/descriptor_inflight_probe.cpp)
 target_link_libraries(wallpaperx-descriptor-inflight-probe PRIVATE wallpaperx-renderer)
 
+# The video renderer's only caller anywhere: nothing decodes yet, so without this probe its
+# 343 lines are never executed. Interposes vkCmdPipelineBarrier to read the layout transitions
+# it submitted -- like ownership_transfer_probe that replaces a Vulkan entry point and not the
+# allocator, so it needs no WALLPAPERX_SANITIZE opt-out. No shaders and no PNG fixture (it
+# builds its source frame in memory), hence no RESOURCE_LOCK.
+add_executable(wallpaperx-video-renderer-probe tests/video_renderer_probe.cpp)
+target_link_libraries(wallpaperx-video-renderer-probe PRIVATE wallpaperx-renderer)
+
 add_executable(wallpaperx-handle-type-env-test tests/handle_type_env_test.cpp)
 target_link_libraries(wallpaperx-handle-type-env-test PRIVATE wallpaperx-renderer)
 
@@ -325,6 +334,14 @@ add_test(NAME ownership_transfer_probe COMMAND wallpaperx-ownership-transfer-pro
 add_test(NAME consumer_modifier_probe COMMAND wallpaperx-consumer-modifier-probe)
 add_test(NAME frame_acquire_probe COMMAND wallpaperx-frame-acquire-probe)
 add_test(NAME target_ring_probe COMMAND wallpaperx-target-ring-probe)
+# Two entries, one binary, and they answer on different hardware. `render` needs nothing but a
+# Device, so it is answerable everywhere. `modifiers` grades that a DRM format modifier whose
+# tiling features lack a required one is dropped, and telling that apart from a filter that
+# drops everything needs a driver offering two modifiers that differ in some feature -- which
+# Lavapipe, with its single LINEAR modifier, cannot. One verdict for both would either claim
+# that measurement was made where it was not, or mark a working renderer unverified.
+add_test(NAME video_renderer_probe COMMAND wallpaperx-video-renderer-probe render)
+add_test(NAME video_modifier_filter_probe COMMAND wallpaperx-video-renderer-probe modifiers)
 
 # 77 means this driver cannot export an opaque-fd binary semaphore at all, so there is no acquire
 # descriptor to wait on -- Lavapipe. That run still grades what such a driver must do (hand back
@@ -350,6 +367,14 @@ set_tests_properties(ownership_transfer_probe PROPERTIES
 # rule -- the same wrong-green this probe exists to close.
 set_tests_properties(descriptor_inflight_heap descriptor_inflight_buffer descriptor_inflight_classic
                      PROPERTIES SKIP_RETURN_CODE 77)
+
+# 77 means the driver could not be put in the state the modifier entry grades: no DRM format
+# modifiers at all, none usable for a target-shaped image, or -- the Lavapipe case -- only one,
+# so no feature splits the set and a filter that keeps the advertisers cannot be told from one
+# that drops everything. Without SKIP_RETURN_CODE that run exits 0 and reads as a verified
+# filter. The render entry has no such code: everything it grades is available wherever a
+# Device comes up.
+set_tests_properties(video_modifier_filter_probe PROPERTIES SKIP_RETURN_CODE 77)
 
 # Two entries, one binary, and they cannot share a process. The probe asks the loader
 # whether the validation layer exists at all, that answer is cached for the life of the
@@ -432,6 +457,8 @@ if(WALLPAPERX_LAVAPIPE_ICD)
     add_test(NAME consumer_modifier_probe_lavapipe COMMAND wallpaperx-consumer-modifier-probe)
     add_test(NAME frame_acquire_probe_lavapipe COMMAND wallpaperx-frame-acquire-probe)
     add_test(NAME target_ring_probe_lavapipe COMMAND wallpaperx-target-ring-probe)
+    add_test(NAME video_renderer_probe_lavapipe COMMAND wallpaperx-video-renderer-probe render)
+    add_test(NAME video_modifier_filter_probe_lavapipe COMMAND wallpaperx-video-renderer-probe modifiers)
     # Registered here for the label, not for the ICD: what this probe grades is loader- and
     # driver-independent. CI selects by the lavapipe label and has no GPU, so without these two
     # the only check of how a missing validator is reported never runs there.
@@ -454,6 +481,8 @@ if(WALLPAPERX_LAVAPIPE_ICD)
         consumer_modifier_probe_lavapipe
         frame_acquire_probe_lavapipe
         target_ring_probe_lavapipe
+        video_renderer_probe_lavapipe
+        video_modifier_filter_probe_lavapipe
         validation_grade_installed_lavapipe
         validation_grade_absent_lavapipe
         PROPERTIES
@@ -480,4 +509,7 @@ if(WALLPAPERX_LAVAPIPE_ICD)
                          RESOURCE_LOCK frame_acquire_probe_test_image SKIP_RETURN_CODE 77)
     set_tests_properties(validation_grade_installed_lavapipe validation_grade_absent_lavapipe
                          PROPERTIES SKIP_RETURN_CODE 77)
+    # Lavapipe offers one modifier, so this entry is expected to report the split half as
+    # unverified and exit 77 there -- see the comment on the non-lavapipe entry.
+    set_tests_properties(video_modifier_filter_probe_lavapipe PROPERTIES SKIP_RETURN_CODE 77)
 endif()
