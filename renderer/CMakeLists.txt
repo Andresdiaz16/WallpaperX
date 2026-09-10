@@ -78,6 +78,7 @@ add_library(wallpaperx-renderer STATIC
     vulkan/frame_export.cpp
     renderers/static_renderer.cpp
     renderers/video_renderer.cpp
+    video/video_decoder.cpp
 )
 
 target_include_directories(wallpaperx-renderer
