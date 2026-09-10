@@ -272,6 +272,79 @@ target_link_libraries(wallpaperx-descriptor-inflight-probe PRIVATE wallpaperx-re
 add_executable(wallpaperx-video-renderer-probe tests/video_renderer_probe.cpp)
 target_link_libraries(wallpaperx-video-renderer-probe PRIVATE wallpaperx-renderer)
 
+# --------------------------------------------------------------------------- #
+# Video fixtures for the decoder probe
+# --------------------------------------------------------------------------- #
+#
+# Built with the ffmpeg command line rather than checked in: the files are derived, and each one
+# exists to make a specific decision come out a specific way, which a filename cannot record but a
+# generating command can. They are also tiny (one second at 320x240) and regenerating them is
+# cheaper than reviewing a binary in a diff.
+#
+# The command line is optional. Where it is missing nothing is generated and the probe reports a
+# named skip; the alternative -- refusing to configure -- would make a full ffmpeg install a build
+# requirement for a project that only links the libraries.
+set(WALLPAPERX_VIDEO_ASSET_DIR ${CMAKE_CURRENT_BINARY_DIR}/video_assets)
+find_program(WALLPAPERX_FFMPEG_EXECUTABLE ffmpeg)
+if(WALLPAPERX_FFMPEG_EXECUTABLE)
+    file(MAKE_DIRECTORY ${WALLPAPERX_VIDEO_ASSET_DIR})
+    set(WALLPAPERX_VIDEO_ASSETS "")
+    # name;extra encoder arguments. The height of 238 in the first is deliberate: H.264 codes in
+    # 16-pixel macroblocks, so the coded picture is 320x240 and two rows are cropped -- which is
+    # what makes "the visible rectangle is read, not assumed" a question with a wrong answer.
+    # 10-bit H.264 is what this decoder refuses outright, so it is the cheapest way to make the
+    # hardware say no; mpeg4 is a codec no Vulkan decode queue advertises.
+    set(WALLPAPERX_VIDEO_RECIPES
+        "h264_crop.mp4|-f lavfi -i testsrc2=size=320x238:rate=10:duration=1|-c:v libx264 -pix_fmt yuv420p -profile:v baseline -g 5 -colorspace bt709 -color_primaries bt709 -color_trc bt709 -color_range tv"
+        "h264_10bit.mp4|-f lavfi -i testsrc2=size=320x240:rate=10:duration=1|-c:v libx264 -pix_fmt yuv420p10le -profile:v high10 -g 5"
+        "mpeg4.avi|-f lavfi -i testsrc2=size=320x240:rate=10:duration=1|-c:v mpeg4 -g 5"
+        "h264_raw.h264|-f lavfi -i testsrc2=size=320x240:rate=10:duration=2|-c:v libx264 -pix_fmt yuv420p -profile:v baseline -g 5 -bsf:v h264_mp4toannexb -f h264"
+        "audio_only.m4a|-f lavfi -i sine=frequency=440:duration=1|-c:a aac"
+    )
+    foreach(RECIPE ${WALLPAPERX_VIDEO_RECIPES})
+        string(REPLACE "|" ";" RECIPE_PARTS "${RECIPE}")
+        list(GET RECIPE_PARTS 0 ASSET_NAME)
+        list(GET RECIPE_PARTS 1 ASSET_INPUT)
+        list(GET RECIPE_PARTS 2 ASSET_ENCODE)
+        separate_arguments(ASSET_INPUT UNIX_COMMAND "${ASSET_INPUT}")
+        separate_arguments(ASSET_ENCODE UNIX_COMMAND "${ASSET_ENCODE}")
+        add_custom_command(
+            OUTPUT ${WALLPAPERX_VIDEO_ASSET_DIR}/${ASSET_NAME}
+            COMMAND ${WALLPAPERX_FFMPEG_EXECUTABLE} -y -v error ${ASSET_INPUT} ${ASSET_ENCODE}
+                    ${WALLPAPERX_VIDEO_ASSET_DIR}/${ASSET_NAME}
+            COMMENT "Generating video fixture ${ASSET_NAME}"
+            VERBATIM
+        )
+        list(APPEND WALLPAPERX_VIDEO_ASSETS ${WALLPAPERX_VIDEO_ASSET_DIR}/${ASSET_NAME})
+    endforeach()
+    add_custom_target(wallpaperx-video-fixtures DEPENDS ${WALLPAPERX_VIDEO_ASSETS})
+else()
+    message(STATUS "  ffmpeg CLI: not found -- video decoder fixtures are not generated and "
+                   "video_decoder_probe entries will report a skip")
+endif()
+
+# The ffmpeg bridge: every path state, the refusal-versus-fault classifier, and the frame's
+# semaphore protocol. Interposes av_hwframe_ctx_init, vkQueueSubmit and
+# vkEnumerateDeviceExtensionProperties -- the first two so a failure that no available file can
+# produce is produced anyway, the third so "this device has no decoder at all" is answerable on a
+# GPU that has one. Its fixtures are its own directory, so it shares no RESOURCE_LOCK with the
+# probes that write into test_assets.
+add_executable(wallpaperx-video-decoder-probe tests/video_decoder_probe.cpp)
+target_link_libraries(wallpaperx-video-decoder-probe PRIVATE wallpaperx-renderer)
+target_compile_definitions(wallpaperx-video-decoder-probe PRIVATE
+    WALLPAPERX_VIDEO_ASSET_DIR="${WALLPAPERX_VIDEO_ASSET_DIR}")
+if(WALLPAPERX_FFMPEG_EXECUTABLE)
+    add_dependencies(wallpaperx-video-decoder-probe wallpaperx-video-fixtures)
+endif()
+
+# The Device's creation record and its video-decode surface. Interposes vkCreateInstance,
+# vkCreateDevice and vkGetPhysicalDeviceQueueFamilyProperties2, so it can compare what an
+# accessor reports against the argument the driver was actually given -- the only way to grade
+# that without a test-only seam in a production header. Replaces Vulkan entry points and not the
+# allocator, so it needs no WALLPAPERX_SANITIZE opt-out. No shaders and no PNG fixture.
+add_executable(wallpaperx-device-video-probe tests/device_video_probe.cpp)
+target_link_libraries(wallpaperx-device-video-probe PRIVATE wallpaperx-renderer)
+
 add_executable(wallpaperx-handle-type-env-test tests/handle_type_env_test.cpp)
 target_link_libraries(wallpaperx-handle-type-env-test PRIVATE wallpaperx-renderer)
 
@@ -343,6 +416,48 @@ add_test(NAME target_ring_probe COMMAND wallpaperx-target-ring-probe)
 # that measurement was made where it was not, or mark a working renderer unverified.
 add_test(NAME video_renderer_probe COMMAND wallpaperx-video-renderer-probe render)
 add_test(NAME video_modifier_filter_probe COMMAND wallpaperx-video-renderer-probe modifiers)
+
+# Six entries, one binary, because they answer different questions on different configurations.
+# `enabled` is registered three times so the feature chain is walked once per descriptor tier:
+# which structs are linked is a function of the tier, and the default entry only ever sees
+# whichever tier this GPU resolves to, leaving the other two shapes ungraded. `decode` grades the
+# invariants that hold with and without a hardware decoder, plus the family shape where there is
+# one. `shared-decode-queue` manufactures a queue-family report in which the graphics family also
+# decodes -- neither driver here does -- and exits 77 where the driver enables no video extension
+# at all, since the report cannot be manufactured onto a device that has none.
+add_test(NAME device_video_enabled COMMAND wallpaperx-device-video-probe enabled)
+add_test(NAME device_video_enabled_buffer COMMAND wallpaperx-device-video-probe enabled)
+add_test(NAME device_video_enabled_classic COMMAND wallpaperx-device-video-probe enabled)
+add_test(NAME device_video_decode COMMAND wallpaperx-device-video-probe decode)
+add_test(NAME device_video_waits COMMAND wallpaperx-device-video-probe waits)
+add_test(NAME device_video_shared_queue COMMAND wallpaperx-device-video-probe shared-decode-queue)
+set_tests_properties(device_video_enabled_buffer PROPERTIES ENVIRONMENT "WALLPAPERX_FORCE_TIER=buffer")
+set_tests_properties(device_video_enabled_classic PROPERTIES ENVIRONMENT "WALLPAPERX_FORCE_TIER=classic")
+# Explicitly cleared, like handle_type_env_default: ctest inherits the caller's environment, so a
+# developer who exported the override would otherwise turn this into a fourth copy of it.
+set_tests_properties(device_video_enabled PROPERTIES ENVIRONMENT "WALLPAPERX_FORCE_TIER=")
+set_tests_properties(device_video_shared_queue PROPERTIES SKIP_RETURN_CODE 77)
+
+# Six entries, one binary. Each needs a different device or a different injected failure, and a
+# single verdict would report states that were never reached as verified: `hardware`, `refused`,
+# `refused-after-setup` and `fault` all need a GPU that actually decodes and skip where there is
+# none, while `no-decoder` and `content` build a device with the video extensions stripped and
+# answer everywhere. `refused-after-setup` and `fault` are each other's control -- the same
+# injected ffmpeg failure, differing only in whether the device still answers -- so they must be
+# separate entries or one of the two outcomes goes ungraded.
+#
+# SKIP_RETURN_CODE on all six: without a hardware decoder, or without the ffmpeg command line at
+# configure time, these exit 0 and would be indistinguishable from a run that established
+# something.
+add_test(NAME video_decoder_hardware COMMAND wallpaperx-video-decoder-probe hardware)
+add_test(NAME video_decoder_refused COMMAND wallpaperx-video-decoder-probe refused)
+add_test(NAME video_decoder_no_decoder COMMAND wallpaperx-video-decoder-probe no-decoder)
+add_test(NAME video_decoder_refused_after_setup COMMAND wallpaperx-video-decoder-probe refused-after-setup)
+add_test(NAME video_decoder_fault COMMAND wallpaperx-video-decoder-probe fault)
+add_test(NAME video_decoder_content COMMAND wallpaperx-video-decoder-probe content)
+set_tests_properties(video_decoder_hardware video_decoder_refused video_decoder_no_decoder
+                     video_decoder_refused_after_setup video_decoder_fault video_decoder_content
+                     PROPERTIES SKIP_RETURN_CODE 77)
 
 # 77 means this driver cannot export an opaque-fd binary semaphore at all, so there is no acquire
 # descriptor to wait on -- Lavapipe. That run still grades what such a driver must do (hand back
@@ -460,6 +575,19 @@ if(WALLPAPERX_LAVAPIPE_ICD)
     add_test(NAME target_ring_probe_lavapipe COMMAND wallpaperx-target-ring-probe)
     add_test(NAME video_renderer_probe_lavapipe COMMAND wallpaperx-video-renderer-probe render)
     add_test(NAME video_modifier_filter_probe_lavapipe COMMAND wallpaperx-video-renderer-probe modifiers)
+    # The software driver is where "a device with no hardware decoder reports none and still
+    # builds, submits and tears down" is actually answered -- the real GPU cannot show it. The
+    # other three entries grade properties that hold on any driver and are registered here so CI,
+    # which selects by this label, runs them at all.
+    add_test(NAME device_video_enabled_lavapipe COMMAND wallpaperx-device-video-probe enabled)
+    add_test(NAME device_video_decode_lavapipe COMMAND wallpaperx-device-video-probe decode)
+    add_test(NAME device_video_waits_lavapipe COMMAND wallpaperx-device-video-probe waits)
+    add_test(NAME device_video_shared_queue_lavapipe COMMAND wallpaperx-device-video-probe shared-decode-queue)
+    # Only the two entries that need no hardware decoder. The other four would report a skip here
+    # and say nothing the real-GPU entries do not already say; these two exercise the software
+    # decode path and the content classifier, which are what CI can actually answer.
+    add_test(NAME video_decoder_no_decoder_lavapipe COMMAND wallpaperx-video-decoder-probe no-decoder)
+    add_test(NAME video_decoder_content_lavapipe COMMAND wallpaperx-video-decoder-probe content)
     # Registered here for the label, not for the ICD: what this probe grades is loader- and
     # driver-independent. CI selects by the lavapipe label and has no GPU, so without these two
     # the only check of how a missing validator is reported never runs there.
@@ -484,6 +612,12 @@ if(WALLPAPERX_LAVAPIPE_ICD)
         target_ring_probe_lavapipe
         video_renderer_probe_lavapipe
         video_modifier_filter_probe_lavapipe
+        device_video_enabled_lavapipe
+        device_video_decode_lavapipe
+        device_video_waits_lavapipe
+        device_video_shared_queue_lavapipe
+        video_decoder_no_decoder_lavapipe
+        video_decoder_content_lavapipe
         validation_grade_installed_lavapipe
         validation_grade_absent_lavapipe
         PROPERTIES
@@ -513,4 +647,9 @@ if(WALLPAPERX_LAVAPIPE_ICD)
     # Lavapipe offers one modifier, so this entry is expected to report the split half as
     # unverified and exit 77 there -- see the comment on the non-lavapipe entry.
     set_tests_properties(video_modifier_filter_probe_lavapipe PROPERTIES SKIP_RETURN_CODE 77)
+    # Expected to skip here: no video extension means no decode family to manufacture one onto.
+    set_tests_properties(device_video_shared_queue_lavapipe PROPERTIES SKIP_RETURN_CODE 77)
+    # 77 here means the ffmpeg command line was missing at configure time and no fixture exists.
+    set_tests_properties(video_decoder_no_decoder_lavapipe video_decoder_content_lavapipe
+                         PROPERTIES SKIP_RETURN_CODE 77)
 endif()
