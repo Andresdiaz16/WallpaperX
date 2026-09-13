@@ -3,7 +3,9 @@
 #include "video_renderer.h"
 
 #include "../vulkan/device.h"
+#include "../vulkan/format_features.h"
 #include "../vulkan/gpu_fault.h"
+#include "../vulkan/image_barrier.h"
 #include "../vulkan/memory_export.h"
 #include "../vulkan/offscreen.h"
 
@@ -16,7 +18,6 @@ namespace wallpaperx {
 
 namespace {
 
-constexpr VkImageSubresourceRange kWholeImage{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
 constexpr VkImageSubresourceLayers kBaseLayer{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
 constexpr VkImageLayout kBlitSourceLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
 
@@ -47,29 +48,6 @@ bool isUnormColour(VkFormat format) {
     }
 }
 
-// The formats a decoder or a conversion pass plausibly hands over. Anything else is named by
-// number, which is still a lookup away rather than nothing.
-std::string formatName(VkFormat format) {
-    switch (format) {
-        case VK_FORMAT_R8G8B8A8_UNORM: return "R8G8B8A8_UNORM";
-        case VK_FORMAT_B8G8R8A8_UNORM: return "B8G8R8A8_UNORM";
-        case VK_FORMAT_A8B8G8R8_UNORM_PACK32: return "A8B8G8R8_UNORM_PACK32";
-        case VK_FORMAT_R8G8B8_UNORM: return "R8G8B8_UNORM";
-        case VK_FORMAT_B8G8R8_UNORM: return "B8G8R8_UNORM";
-        case VK_FORMAT_A2B10G10R10_UNORM_PACK32: return "A2B10G10R10_UNORM_PACK32";
-        case VK_FORMAT_A2R10G10B10_UNORM_PACK32: return "A2R10G10B10_UNORM_PACK32";
-        case VK_FORMAT_R16G16B16A16_UNORM: return "R16G16B16A16_UNORM";
-        case VK_FORMAT_R16G16B16_UNORM: return "R16G16B16_UNORM";
-        case VK_FORMAT_R8G8B8A8_SRGB: return "R8G8B8A8_SRGB";
-        case VK_FORMAT_B8G8R8A8_SRGB: return "B8G8R8A8_SRGB";
-        case VK_FORMAT_R16G16B16A16_SFLOAT: return "R16G16B16A16_SFLOAT";
-        case VK_FORMAT_G8_B8R8_2PLANE_420_UNORM: return "G8_B8R8_2PLANE_420_UNORM (NV12)";
-        case VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16: return "G10X6_B10X6R10X6_2PLANE_420_UNORM (P010)";
-        case VK_FORMAT_G8_B8_R8_3PLANE_420_UNORM: return "G8_B8_R8_3PLANE_420_UNORM (YUV420P)";
-        default: return "VkFormat(" + std::to_string(static_cast<int>(format)) + ")";
-    }
-}
-
 std::string tilingName(VkImageTiling tiling) {
     switch (tiling) {
         case VK_IMAGE_TILING_OPTIMAL: return "optimal";
@@ -79,30 +57,10 @@ std::string tilingName(VkImageTiling tiling) {
     }
 }
 
-VkFormatFeatureFlags tilingFeatures(VkPhysicalDevice physicalDevice, VkFormat format, VkImageTiling tiling) {
-    VkFormatProperties properties{};
-    vkGetPhysicalDeviceFormatProperties(physicalDevice, format, &properties);
-    return tiling == VK_IMAGE_TILING_LINEAR ? properties.linearTilingFeatures : properties.optimalTilingFeatures;
-}
-
 uint32_t maxImageDimension2D(VkPhysicalDevice physicalDevice) {
     VkPhysicalDeviceProperties properties{};
     vkGetPhysicalDeviceProperties(physicalDevice, &properties);
     return properties.limits.maxImageDimension2D;
-}
-
-VkImageMemoryBarrier layoutBarrier(VkImage image, VkImageLayout oldLayout, VkImageLayout newLayout,
-                                   VkAccessFlags srcAccess, VkAccessFlags dstAccess) {
-    VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-    barrier.srcAccessMask = srcAccess;
-    barrier.dstAccessMask = dstAccess;
-    barrier.oldLayout = oldLayout;
-    barrier.newLayout = newLayout;
-    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.image = image;
-    barrier.subresourceRange = kWholeImage;
-    return barrier;
 }
 
 struct Crop {
@@ -156,8 +114,8 @@ VideoRenderer::VideoRenderer(Device& device, const VideoFrame& first) : m_device
     const bool opaque = externalMemoryHandleType(m_device.info().vendor, m_device.info().hasExternalMemoryDmaBuf) ==
                         VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
     if (opaque) {
-        const VkFormatFeatureFlags targetFeatures =
-            tilingFeatures(m_device.physicalDevice(), OffscreenTargetManager::kFormat, VK_IMAGE_TILING_OPTIMAL);
+        const VkFormatFeatureFlags2 targetFeatures =
+            formatFeatures(m_device.physicalDevice(), OffscreenTargetManager::kFormat, VK_IMAGE_TILING_OPTIMAL);
         if ((targetFeatures & OffscreenTargetManager::kFormatFeatures) != OffscreenTargetManager::kFormatFeatures) {
             throw GpuFailure("VideoRenderer: " + device.info().gpuName + " cannot blit into an optimal-tiled " +
                              formatName(OffscreenTargetManager::kFormat) + " image, which every offscreen target is");
@@ -191,7 +149,7 @@ void VideoRenderer::requireBlittable(const VideoSource& source) const {
                                     tilingName(source.tiling));
     }
 
-    const VkFormatFeatureFlags features = tilingFeatures(m_device.physicalDevice(), source.format, source.tiling);
+    const VkFormatFeatureFlags2 features = formatFeatures(m_device.physicalDevice(), source.format, source.tiling);
     if ((features & kSourceFeatures) != kSourceFeatures) {
         throw WallpaperContentError("VideoRenderer: " + formatName(source.format) + " with " +
                                     tilingName(source.tiling) + " tiling cannot be blitted with linear filtering on " +
@@ -215,9 +173,9 @@ VkImageLayout VideoRenderer::record(VkCommandBuffer cmd, const OffscreenTarget& 
     // draw -- since nothing here knows which; host writes need only have been flushed before
     // the submit, which orders them itself.
     const std::array<VkImageMemoryBarrier, 2> before{
-        layoutBarrier(target.image.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        imageLayoutBarrier(target.image.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                       VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT),
-        layoutBarrier(m_frame.image, m_frame.layout, kBlitSourceLayout, VK_ACCESS_MEMORY_WRITE_BIT,
+        imageLayoutBarrier(m_frame.image, m_frame.layout, kBlitSourceLayout, VK_ACCESS_MEMORY_WRITE_BIT,
                       VK_ACCESS_TRANSFER_READ_BIT),
     };
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
@@ -239,7 +197,7 @@ VkImageLayout VideoRenderer::record(VkCommandBuffer cmd, const OffscreenTarget& 
     // Back to the owner's layout, ordered before anything it submits next. The batch either runs
     // whole or not at all, so the frame is in that layout on both sides of every render and no
     // record of it can drift.
-    const VkImageMemoryBarrier after = layoutBarrier(m_frame.image, kBlitSourceLayout, m_frame.layout, 0,
+    const VkImageMemoryBarrier after = imageLayoutBarrier(m_frame.image, kBlitSourceLayout, m_frame.layout, 0,
                                                      VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0,
                          nullptr, 1, &after);

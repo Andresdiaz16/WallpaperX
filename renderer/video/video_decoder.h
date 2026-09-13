@@ -66,7 +66,7 @@ public:
 
     struct DeviceImage {
         VkImage image = VK_NULL_HANDLE;
-        // A multi-planar format; the converter samples it through a Y'CbCr conversion.
+        // A multi-planar format; the converter copies its planes out through plane aspects.
         VkFormat format = VK_FORMAT_UNDEFINED;
         VkImageTiling tiling = VK_IMAGE_TILING_OPTIMAL;
         VkImageUsageFlags usage = 0;
@@ -142,8 +142,8 @@ public:
         SoftwareNoDecoder,  // the device has no video decode queue at all (Lavapipe)
         SoftwareCodec,      // the device, or ffmpeg, decodes but not this codec
         // The device decodes this codec but not this stream -- profile, depth, size -- or not
-        // into one multi-planar image the renderer can sample under this profile; or ffmpeg's
-        // hardware path failed on a device that still answers.
+        // into one multi-planar image FrameConverter::readsDeviceImage() accepts and can copy
+        // from under this profile; or ffmpeg's hardware path failed on a device that still answers.
         SoftwareRefused,
     };
 

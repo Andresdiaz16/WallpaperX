@@ -32,9 +32,6 @@ private:
     void createPipeline(VkRenderPass renderPass, const std::string& shaderDir);
     void cleanup();
 
-    static std::vector<uint32_t> readSpirv(const std::string& path);
-    static VkShaderModule createShaderModule(VkDevice device, const std::vector<uint32_t>& spirv);
-
     Device& m_device;
     DescriptorHeapAllocator* m_heapAllocator = nullptr;
 

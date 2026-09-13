@@ -8,6 +8,8 @@
 #include "../vulkan/descriptor_classic.h"
 #include "../vulkan/descriptor_heap.h"
 #include "../vulkan/device.h"
+#include "../vulkan/image_barrier.h"
+#include "../vulkan/shader_module.h"
 
 #define STB_IMAGE_IMPLEMENTATION
 #include <stb_image.h>
@@ -16,7 +18,6 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
-#include <fstream>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -261,16 +262,9 @@ void StaticRenderer::loadAndUploadTexture(const std::string& imagePath) {
     m_texture = m_device.memory().createImage(imageInfo, "static-renderer-texture");
 
     m_device.immediateSubmit([&](VkCommandBuffer cmd) {
-        VkImageMemoryBarrier toTransferDst{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-        toTransferDst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        toTransferDst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-        toTransferDst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        toTransferDst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        toTransferDst.image = m_texture.image;
-        toTransferDst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-        toTransferDst.srcAccessMask = 0;
-        toTransferDst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-
+        const VkImageMemoryBarrier toTransferDst =
+            imageLayoutBarrier(m_texture.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
+                               VK_ACCESS_TRANSFER_WRITE_BIT);
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                               0, 0, nullptr, 0, nullptr, 1, &toTransferDst);
 
@@ -280,16 +274,10 @@ void StaticRenderer::loadAndUploadTexture(const std::string& imagePath) {
 
         vkCmdCopyBufferToImage(cmd, staging.buffer, m_texture.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
 
-        VkImageMemoryBarrier toShaderRead{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-        toShaderRead.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-        toShaderRead.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        toShaderRead.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        toShaderRead.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        toShaderRead.image = m_texture.image;
-        toShaderRead.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-        toShaderRead.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        toShaderRead.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-
+        const VkImageMemoryBarrier toShaderRead =
+            imageLayoutBarrier(m_texture.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                               VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
+                               VK_ACCESS_SHADER_READ_BIT);
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
                               0, 0, nullptr, 0, nullptr, 1, &toShaderRead);
     });
@@ -345,67 +333,22 @@ void StaticRenderer::createQuad() {
     m_device.memory().flushForHostWrite(m_vertexBuffer);
 }
 
-std::vector<uint32_t> StaticRenderer::readSpirv(const std::string& path) {
-    std::ifstream file(path, std::ios::binary | std::ios::ate);
-    if (!file.is_open()) {
-        throw std::runtime_error("StaticRenderer: failed to open shader file " + path);
-    }
-    const std::streamoff rawSize = file.tellg();
-    // tellg() returns -1 on a stat failure even for an open stream; casting that
-    // to size_t would request a ~16 EB allocation. A zero-byte file would build a
-    // 0-word module (codeSize == 0), which is invalid. Reject both, plus non-word
-    // sizes, before allocating.
-    if (rawSize <= 0 || static_cast<size_t>(rawSize) % sizeof(uint32_t) != 0) {
-        throw std::runtime_error("StaticRenderer: shader file is not a valid SPIR-V module: " + path);
-    }
-    const size_t size = static_cast<size_t>(rawSize);
-    std::vector<uint32_t> buffer(size / sizeof(uint32_t));
-    file.seekg(0);
-    file.read(reinterpret_cast<char*>(buffer.data()), static_cast<std::streamsize>(size));
-    return buffer;
-}
-
-VkShaderModule StaticRenderer::createShaderModule(VkDevice device, const std::vector<uint32_t>& spirv) {
-    VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-    info.codeSize = spirv.size() * sizeof(uint32_t);
-    info.pCode = spirv.data();
-
-    VkShaderModule module = VK_NULL_HANDLE;
-    // Deliberately not classified against the GPU, unlike the other driver calls here: the
-    // input is a file off disk that readSpirv only size-checks, so a driver that rejects it
-    // is as likely to be reporting a bad shader bundle as a fault of its own -- and blaming
-    // the GPU for a broken install is the misdiagnosis this classification exists to avoid.
-    if (const VkResult r = vkCreateShaderModule(device, &info, nullptr, &module); r != VK_SUCCESS) {
-        throw std::runtime_error("StaticRenderer: vkCreateShaderModule failed with " + vkResultName(r));
-    }
-    return module;
-}
-
 void StaticRenderer::createPipeline(VkRenderPass renderPass, const std::string& shaderDir) {
     const bool isHeapTier = m_heapAllocator != nullptr;
 
-    auto vertSpirv = readSpirv(shaderDir + "/fullscreen.vert.spv");
-    auto fragSpirv = readSpirv(shaderDir + (isHeapTier ? "/fullscreen_heap.frag.spv" : "/fullscreen_set.frag.spv"));
-
-    VkShaderModule vertModule = createShaderModule(m_device.device(), vertSpirv);
-    VkShaderModule fragModule = VK_NULL_HANDLE;
-    try {
-        fragModule = createShaderModule(m_device.device(), fragSpirv);
-    } catch (...) {
-        // vertModule already succeeded; without this it leaks when the fragment
-        // module fails (bad SPIR-V, OOM).
-        vkDestroyShaderModule(m_device.device(), vertModule, nullptr);
-        throw;
-    }
+    const ShaderModule vertModule(m_device.device(), shaderDir + "/fullscreen.vert.spv", "StaticRenderer");
+    const ShaderModule fragModule(m_device.device(),
+                                  shaderDir + (isHeapTier ? "/fullscreen_heap.frag.spv" : "/fullscreen_set.frag.spv"),
+                                  "StaticRenderer");
 
     VkPipelineShaderStageCreateInfo vertStage{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
     vertStage.stage = VK_SHADER_STAGE_VERTEX_BIT;
-    vertStage.module = vertModule;
+    vertStage.module = vertModule.get();
     vertStage.pName = "main";
 
     VkPipelineShaderStageCreateInfo fragStage{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
     fragStage.stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-    fragStage.module = fragModule;
+    fragStage.module = fragModule.get();
     fragStage.pName = "main";
 
     std::array<VkPipelineShaderStageCreateInfo, 2> stages{vertStage, fragStage};
@@ -490,21 +433,15 @@ void StaticRenderer::createPipeline(VkRenderPass renderPass, const std::string& 
 
         if (const VkResult r = vkCreatePipelineLayout(m_device.device(), &layoutInfo, nullptr, &m_pipelineLayout);
             r != VK_SUCCESS) {
-            vkDestroyShaderModule(m_device.device(), vertModule, nullptr);
-            vkDestroyShaderModule(m_device.device(), fragModule, nullptr);
             throwVkFailure("StaticRenderer: vkCreatePipelineLayout", r);
         }
         pipelineInfo.layout = m_pipelineLayout;
     }
 
     VkResult result = vkCreateGraphicsPipelines(m_device.device(), VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipeline);
-
-    vkDestroyShaderModule(m_device.device(), vertModule, nullptr);
-    vkDestroyShaderModule(m_device.device(), fragModule, nullptr);
-
     if (result != VK_SUCCESS) {
-        // Unclassified for the same reason as vkCreateShaderModule above: the shader modules
-        // are compiled here, so a rejection may be the shader bundle rather than the driver.
+        // Unclassified for the same reason as a rejected shader module: the shader modules are
+        // compiled here, so a rejection may be the shader bundle rather than the driver.
         throw std::runtime_error("StaticRenderer: vkCreateGraphicsPipelines failed with " + vkResultName(result));
     }
 }

@@ -2,6 +2,9 @@
 
 #include "video_decoder.h"
 
+#include "frame_converter.h"
+
+#include "../vulkan/format_features.h"
 #include "../vulkan/gpu_fault.h"
 
 extern "C" {
@@ -114,14 +117,6 @@ const void* findInChain(const void* chain, VkStructureType type) {
     return nullptr;
 }
 
-VkFormatFeatureFlags2 formatFeatures(VkPhysicalDevice physicalDevice, VkFormat format, VkImageTiling tiling) {
-    VkFormatProperties3 features{VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3};
-    VkFormatProperties2 properties{VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2};
-    properties.pNext = &features;
-    vkGetPhysicalDeviceFormatProperties2(physicalDevice, format, &properties);
-    return tiling == VK_IMAGE_TILING_LINEAR ? features.linearTilingFeatures : features.optimalTilingFeatures;
-}
-
 // The usage ffmpeg will create the images with, given what it is asked for: it adds sampled,
 // storage and both transfer usages whenever the format's own features allow them, whatever the
 // video profile allows. Predicted here so the profile is asked about the image that will exist.
@@ -177,17 +172,6 @@ private:
 // dropped it and conceals the pictures that depended on it. Whichever of send and receive ran
 // the decode reports it, and neither is retried -- the packet is gone, so a retry would spin.
 bool isDamagedPacket(int err) { return err == AVERROR_INVALIDDATA; }
-
-// Whether an image of this format can be sampled through a Y'CbCr conversion, the only way
-// this renderer reads a multi-planar image: subsampled chroma needs a sample position the
-// device supports, and Vulkan requires one of the two.
-bool ycbcrSampleable(AVPixelFormat swFormat, VkFormatFeatureFlags2 features) {
-    const AVPixFmtDescriptor* desc = av_pix_fmt_desc_get(swFormat);
-    const bool subsampled = desc->log2_chroma_w != 0 || desc->log2_chroma_h != 0;
-    constexpr VkFormatFeatureFlags2 chromaPositions =
-        VK_FORMAT_FEATURE_2_MIDPOINT_CHROMA_SAMPLES_BIT | VK_FORMAT_FEATURE_2_COSITED_CHROMA_SAMPLES_BIT;
-    return !subsampled || (features & chromaPositions) != 0;
-}
 
 }  // namespace
 
@@ -493,21 +477,22 @@ bool VideoDecoder::attachHardwareFrames(AVCodecContext* codec) {
     auto* vk = static_cast<AVVulkanFramesContext*>(context->hwctx);
     const auto* profiles = static_cast<const VkVideoProfileListInfoKHR*>(
         findInChain(vk->create_pnext, VK_STRUCTURE_TYPE_VIDEO_PROFILE_LIST_INFO_KHR));
-    // One multi-planar image per picture is what submit() and the conversion after it handle; a
-    // picture split into one image per plane is not.
-    if (profiles == nullptr || vk->format[0] == VK_FORMAT_UNDEFINED || vk->format[1] != VK_FORMAT_UNDEFINED) {
+    // One multi-planar image per picture, of a layout and format the converter reads, is what
+    // submit() and the conversion after it handle. Anything else goes to software, never to a
+    // converter that would refuse it as bad content.
+    if (profiles == nullptr || vk->format[0] == VK_FORMAT_UNDEFINED || vk->format[1] != VK_FORMAT_UNDEFINED ||
+        !FrameConverter::readsDeviceImage(m_device, context->sw_format, vk->format[0])) {
         m_path = Path::SoftwareRefused;
         return false;
     }
 
-    // The decoder's own usage plus sampling for the conversion that follows; the query is made
-    // with what ffmpeg will add to that.
-    const VkImageUsageFlags renderer = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    // The decoder's own usage plus a copy source for the conversion that follows, which copies
+    // the planes out rather than sampling them; the query is made with what ffmpeg will add.
+    const VkImageUsageFlags renderer = VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
     const VkImageUsageFlags asked =
         (vk->usage & (VK_IMAGE_USAGE_VIDEO_DECODE_DST_BIT_KHR | VK_IMAGE_USAGE_VIDEO_DECODE_DPB_BIT_KHR)) | renderer;
     const VkFormatFeatureFlags2 features = formatFeatures(m_device.physicalDevice(), vk->format[0], vk->tiling);
-    if ((usageFfmpegCreates(0, features) & renderer) != renderer || !m_device.samplerYcbcrConversion() ||
-        !ycbcrSampleable(context->sw_format, features)) {
+    if ((usageFfmpegCreates(0, features) & renderer) != renderer) {
         m_path = Path::SoftwareRefused;
         return false;
     }

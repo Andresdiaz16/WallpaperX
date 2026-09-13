@@ -76,9 +76,12 @@ add_library(wallpaperx-renderer STATIC
     vulkan/descriptor_heap.cpp
     vulkan/offscreen.cpp
     vulkan/frame_export.cpp
+    vulkan/shader_module.cpp
+    vulkan/format_features.cpp
     renderers/static_renderer.cpp
     renderers/video_renderer.cpp
     video/video_decoder.cpp
+    video/frame_converter.cpp
 )
 
 target_include_directories(wallpaperx-renderer
@@ -135,7 +138,7 @@ set(WALLPAPERX_SHADER_OUTPUT_DIR ${SHADER_OUTPUT_DIR} CACHE INTERNAL
     "Directory holding the renderer's compiled SPIR-V")
 
 set(SHADER_SPV_FILES "")
-foreach(SHADER_SRC fullscreen.vert fullscreen_set.frag fullscreen_heap.frag)
+foreach(SHADER_SRC fullscreen.vert fullscreen_set.frag fullscreen_heap.frag ycbcr_convert.vert ycbcr_convert.frag)
     set(SHADER_SPV ${SHADER_OUTPUT_DIR}/${SHADER_SRC}.spv)
     add_custom_command(
         OUTPUT ${SHADER_SPV}
@@ -317,6 +320,80 @@ if(WALLPAPERX_FFMPEG_EXECUTABLE)
         )
         list(APPEND WALLPAPERX_VIDEO_ASSETS ${WALLPAPERX_VIDEO_ASSET_DIR}/${ASSET_NAME})
     endforeach()
+
+    # The colour conversion probe's fixtures. Tags are set with the setparams filter, never with
+    # -color_primaries / -color_trc: libx264 drops those two silently, which produced streams that
+    # looked tagged and decoded untagged. SMPTE HD bars give large flat saturated regions, which is
+    # where colour is compared. The edge fixtures pad the picture in red and crop the red away, so
+    # reading past the visible rectangle is visible; the _hw pair crops whole macroblocks at a low
+    # quantiser with deblocking off, so the hardware decoder's lossy output stays flat at the edge.
+    set(BT709 "colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv")
+    set(BARS "-f lavfi -i smptehdbars=size=320x240:rate=10:duration=1")
+    set(WALLPAPERX_CONVERTER_RECIPES
+        "conv_709_tv.mp4|${BARS}|-vf format=yuv420p,setparams=${BT709} -c:v libx264 -threads 1 -g 5"
+        "conv_709_as_601.mp4|${BARS}|-vf format=yuv420p,setparams=colorspace=smpte170m:color_primaries=bt709:color_trc=bt709:range=tv -c:v libx264 -threads 1 -g 5"
+        "conv_601_pc.mp4|${BARS}|-vf format=yuv420p,setparams=colorspace=smpte170m:color_primaries=smpte170m:color_trc=smpte170m:range=pc -c:v libx264 -g 5"
+        "conv_709_tv_10bit.mp4|${BARS}|-vf format=yuv420p10le,setparams=${BT709} -c:v libx264 -profile:v high10 -g 5"
+        "conv_709_tv_422.mp4|${BARS}|-vf format=yuv422p,setparams=${BT709} -c:v libx264 -g 5"
+        "conv_709_tv_444.mp4|${BARS}|-vf format=yuv444p,setparams=${BT709} -c:v libx264 -g 5"
+        "conv_hevc10.mp4|${BARS}|-vf format=yuv420p10le,setparams=${BT709} -c:v libx265 -x265-params log-level=error -g 5"
+        "conv_hevc444.mp4|${BARS}|-vf format=yuv444p,setparams=${BT709} -c:v libx265 -x265-params log-level=error -g 5"
+        "edge_offset_420.mp4|-f lavfi -i smptehdbars=size=312x230:rate=10:duration=0.5|-vf pad=w=320:h=240:x=4:y=6:color=red,format=yuv420p,setparams=${BT709} -c:v libx264 -qp 0 -g 5 -bsf:v h264_metadata=crop_left=4:crop_right=4:crop_top=6:crop_bottom=4"
+        "edge_corner_420.mp4|-f lavfi -i smptehdbars=size=314x236:rate=10:duration=0.5|-vf pad=w=320:h=240:x=0:y=0:color=red,format=yuv420p,setparams=${BT709} -c:v libx264 -qp 0 -g 5 -bsf:v h264_metadata=crop_right=6:crop_bottom=4"
+        "edge_offset_422.mp4|-f lavfi -i smptehdbars=size=312x232:rate=10:duration=0.5|-vf format=yuv422p,pad=w=320:h=240:x=4:y=3:color=red,setparams=${BT709} -c:v libx264 -qp 0 -g 5 -bsf:v h264_metadata=crop_left=4:crop_right=4:crop_top=3:crop_bottom=5"
+        "edge_offset_444.mp4|-f lavfi -i smptehdbars=size=314x232:rate=10:duration=0.5|-vf format=yuv444p,crop=313:231:0:0,pad=w=320:h=240:x=3:y=5:color=red,setparams=${BT709} -c:v libx264 -qp 0 -g 5 -bsf:v h264_metadata=crop_left=3:crop_right=4:crop_top=5:crop_bottom=4"
+        "edge_offset_420_hw.mp4|-f lavfi -i smptehdbars=size=288x208:rate=10:duration=0.5|-vf pad=w=320:h=240:x=16:y=16:color=red,format=yuv420p,setparams=${BT709} -c:v libx264 -qp 2 -x264-params no-deblock=1 -g 5 -bsf:v h264_metadata=crop_left=16:crop_right=16:crop_top=16:crop_bottom=16"
+        "edge_corner_420_hw.mp4|-f lavfi -i smptehdbars=size=304x224:rate=10:duration=0.5|-vf pad=w=320:h=240:x=0:y=0:color=red,format=yuv420p,setparams=${BT709} -c:v libx264 -qp 2 -x264-params no-deblock=1 -g 5 -bsf:v h264_metadata=crop_right=16:crop_bottom=16"
+        "tag_p3.mp4|-f lavfi -i testsrc2=size=64x48:rate=10:duration=0.3|-vf format=yuv420p,setparams=colorspace=bt709:color_primaries=smpte432:color_trc=bt709:range=tv -c:v libx264"
+        "tag_bt470m.mp4|-f lavfi -i testsrc2=size=64x48:rate=10:duration=0.3|-vf format=yuv420p,setparams=colorspace=bt709:color_primaries=bt470m:color_trc=bt709:range=tv -c:v libx264"
+        "tag_linear.mp4|-f lavfi -i testsrc2=size=64x48:rate=10:duration=0.3|-vf format=yuv420p,setparams=colorspace=bt709:color_primaries=bt709:color_trc=linear:range=tv -c:v libx264"
+        "tag_pq.mp4|-f lavfi -i testsrc2=size=64x48:rate=10:duration=0.3|-vf format=yuv420p,setparams=colorspace=bt709:color_primaries=bt709:color_trc=smpte2084:range=tv -c:v libx264"
+        "tag_hlg.mp4|-f lavfi -i testsrc2=size=64x48:rate=10:duration=0.3|-vf format=yuv420p,setparams=colorspace=bt709:color_primaries=bt709:color_trc=arib-std-b67:range=tv -c:v libx264"
+        "tag_bt2020.mp4|-f lavfi -i testsrc2=size=64x48:rate=10:duration=0.3|-vf format=yuv420p,setparams=colorspace=bt2020nc:color_primaries=bt2020:color_trc=bt2020-10:range=tv -c:v libx264"
+        "tag_bt2020_matrix.mp4|-f lavfi -i testsrc2=size=64x48:rate=10:duration=0.3|-vf format=yuv420p,setparams=colorspace=bt2020nc:color_primaries=bt709:color_trc=bt709:range=tv -c:v libx264"
+        "tag_bt709.mp4|-f lavfi -i testsrc2=size=64x48:rate=10:duration=0.3|-vf format=yuv420p,setparams=${BT709} -c:v libx264"
+        "tag_srgb.mp4|-f lavfi -i testsrc2=size=64x48:rate=10:duration=0.3|-vf format=yuv420p,setparams=colorspace=bt709:color_primaries=bt709:color_trc=iec61966-2-1:range=tv -c:v libx264"
+        "tag_smpte170m.mp4|-f lavfi -i testsrc2=size=64x48:rate=10:duration=0.3|-vf format=yuv420p,setparams=colorspace=smpte170m:color_primaries=smpte170m:color_trc=smpte170m:range=tv -c:v libx264"
+        "tag_bt2020_10_transfer.mp4|-f lavfi -i testsrc2=size=64x48:rate=10:duration=0.3|-vf format=yuv420p,setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt2020-10:range=tv -c:v libx264"
+        "shape_part_large.h264|-f lavfi -i smptehdbars=size=320x240:rate=10:duration=0.5|-vf format=yuv420p,setparams=${BT709} -c:v libx264 -g 5 -bsf:v h264_mp4toannexb -f h264"
+        "shape_part_small.h264|-f lavfi -i smptehdbars=size=160x120:rate=10:duration=0.5|-vf format=yuv420p,setparams=${BT709} -c:v libx264 -g 5 -bsf:v h264_mp4toannexb -f h264"
+        "shape_part_pq.h264|-f lavfi -i smptehdbars=size=320x240:rate=10:duration=0.5|-vf format=yuv420p,setparams=colorspace=bt709:color_primaries=bt709:color_trc=smpte2084:range=tv -c:v libx264 -g 5 -bsf:v h264_mp4toannexb -f h264"
+    )
+    foreach(RECIPE ${WALLPAPERX_CONVERTER_RECIPES})
+        string(REPLACE "|" ";" RECIPE_PARTS "${RECIPE}")
+        list(GET RECIPE_PARTS 0 ASSET_NAME)
+        list(GET RECIPE_PARTS 1 ASSET_INPUT)
+        list(GET RECIPE_PARTS 2 ASSET_ENCODE)
+        separate_arguments(ASSET_INPUT UNIX_COMMAND "${ASSET_INPUT}")
+        separate_arguments(ASSET_ENCODE UNIX_COMMAND "${ASSET_ENCODE}")
+        add_custom_command(
+            OUTPUT ${WALLPAPERX_VIDEO_ASSET_DIR}/${ASSET_NAME}
+            COMMAND ${WALLPAPERX_FFMPEG_EXECUTABLE} -y -v error ${ASSET_INPUT} ${ASSET_ENCODE}
+                    ${WALLPAPERX_VIDEO_ASSET_DIR}/${ASSET_NAME}
+            COMMENT "Generating video fixture ${ASSET_NAME}"
+            VERBATIM
+        )
+        list(APPEND WALLPAPERX_VIDEO_ASSETS ${WALLPAPERX_VIDEO_ASSET_DIR}/${ASSET_NAME})
+    endforeach()
+    # Two elementary streams back to back: a picture that changes size, and one whose transfer
+    # changes to PQ at the same size. Raw Annex B concatenates byte for byte.
+    foreach(PAIR "shape_resize.h264|shape_part_large.h264|shape_part_small.h264"
+                 "shape_tags.h264|shape_part_large.h264|shape_part_pq.h264")
+        string(REPLACE "|" ";" PAIR_PARTS "${PAIR}")
+        list(GET PAIR_PARTS 0 PAIR_NAME)
+        list(GET PAIR_PARTS 1 PAIR_FIRST)
+        list(GET PAIR_PARTS 2 PAIR_SECOND)
+        add_custom_command(
+            OUTPUT ${WALLPAPERX_VIDEO_ASSET_DIR}/${PAIR_NAME}
+            COMMAND ${WALLPAPERX_FFMPEG_EXECUTABLE} -y -v error
+                    -i "concat:${WALLPAPERX_VIDEO_ASSET_DIR}/${PAIR_FIRST}|${WALLPAPERX_VIDEO_ASSET_DIR}/${PAIR_SECOND}"
+                    -c copy -f h264 ${WALLPAPERX_VIDEO_ASSET_DIR}/${PAIR_NAME}
+            DEPENDS ${WALLPAPERX_VIDEO_ASSET_DIR}/${PAIR_FIRST} ${WALLPAPERX_VIDEO_ASSET_DIR}/${PAIR_SECOND}
+            COMMENT "Generating video fixture ${PAIR_NAME}"
+            VERBATIM
+        )
+        list(APPEND WALLPAPERX_VIDEO_ASSETS ${WALLPAPERX_VIDEO_ASSET_DIR}/${PAIR_NAME})
+    endforeach()
     add_custom_target(wallpaperx-video-fixtures DEPENDS ${WALLPAPERX_VIDEO_ASSETS})
 else()
     message(STATUS "  ffmpeg CLI: not found -- video decoder fixtures are not generated and "
@@ -335,6 +412,30 @@ target_compile_definitions(wallpaperx-video-decoder-probe PRIVATE
     WALLPAPERX_VIDEO_ASSET_DIR="${WALLPAPERX_VIDEO_ASSET_DIR}")
 if(WALLPAPERX_FFMPEG_EXECUTABLE)
     add_dependencies(wallpaperx-video-decoder-probe wallpaperx-video-fixtures)
+endif()
+
+# The colour conversion pass, graded against libswscale told the matrix and range explicitly.
+# libswscale is a test-only dependency and optional: without it the entries that need a reference
+# exit 77 with the reason. Replaces operator new to count allocations, which a sanitizer's
+# allocator cannot coexist with, so the counter compiles out there and its entry skips.
+pkg_check_modules(SWSCALE IMPORTED_TARGET libswscale)
+add_executable(wallpaperx-frame-converter-probe tests/frame_converter_probe.cpp)
+target_link_libraries(wallpaperx-frame-converter-probe PRIVATE wallpaperx-renderer)
+target_compile_definitions(wallpaperx-frame-converter-probe PRIVATE
+    WALLPAPERX_VIDEO_ASSET_DIR="${WALLPAPERX_VIDEO_ASSET_DIR}"
+    WALLPAPERX_SHADER_DIR="${SHADER_OUTPUT_DIR}")
+add_dependencies(wallpaperx-frame-converter-probe wallpaperx-shaders)
+if(SWSCALE_FOUND)
+    target_link_libraries(wallpaperx-frame-converter-probe PRIVATE PkgConfig::SWSCALE)
+    target_compile_definitions(wallpaperx-frame-converter-probe PRIVATE WALLPAPERX_HAVE_SWSCALE)
+else()
+    message(STATUS "  libswscale: not found -- frame_converter colour entries will report a skip")
+endif()
+if(WALLPAPERX_SANITIZE)
+    target_compile_definitions(wallpaperx-frame-converter-probe PRIVATE WALLPAPERX_ALLOCATION_INSTRUMENT=0)
+endif()
+if(WALLPAPERX_FFMPEG_EXECUTABLE)
+    add_dependencies(wallpaperx-frame-converter-probe wallpaperx-video-fixtures)
 endif()
 
 # The Device's creation record and its video-decode surface. Interposes vkCreateInstance,
@@ -458,6 +559,34 @@ add_test(NAME video_decoder_content COMMAND wallpaperx-video-decoder-probe conte
 set_tests_properties(video_decoder_hardware video_decoder_refused video_decoder_no_decoder
                      video_decoder_refused_after_setup video_decoder_fault video_decoder_content
                      PROPERTIES SKIP_RETURN_CODE 77)
+
+# One entry per mode: each builds a different device -- video extensions stripped for the host-path
+# entries, a feature hidden, a plane format made unfilterable -- and one verdict would report
+# unreached states as verified. The device-path, gate, no-ycbcr and shape-fallback entries need a
+# hardware decoder and skip without one. shader_read opens no driver. SKIP_RETURN_CODE throughout:
+# a missing ffmpeg command line, libswscale or decoder must not read as a pass.
+add_test(NAME frame_converter_colour_host COMMAND wallpaperx-frame-converter-probe colour-host)
+add_test(NAME frame_converter_colour_device COMMAND wallpaperx-frame-converter-probe colour-device)
+add_test(NAME frame_converter_edges_host COMMAND wallpaperx-frame-converter-probe edges-host)
+add_test(NAME frame_converter_edges_device COMMAND wallpaperx-frame-converter-probe edges-device)
+add_test(NAME frame_converter_siting COMMAND wallpaperx-frame-converter-probe siting)
+add_test(NAME frame_converter_refusal COMMAND wallpaperx-frame-converter-probe refusal)
+add_test(NAME frame_converter_output COMMAND wallpaperx-frame-converter-probe output)
+add_test(NAME frame_converter_allocation COMMAND wallpaperx-frame-converter-probe allocation)
+add_test(NAME frame_converter_gate COMMAND wallpaperx-frame-converter-probe gate)
+add_test(NAME frame_converter_no_ycbcr COMMAND wallpaperx-frame-converter-probe no-ycbcr)
+add_test(NAME frame_converter_shape_resize COMMAND wallpaperx-frame-converter-probe shape-resize)
+add_test(NAME frame_converter_shape_tags COMMAND wallpaperx-frame-converter-probe shape-tags)
+add_test(NAME frame_converter_shape_fallback COMMAND wallpaperx-frame-converter-probe shape-fallback)
+add_test(NAME frame_converter_shader_read COMMAND wallpaperx-frame-converter-probe shader-read)
+set_tests_properties(frame_converter_colour_host frame_converter_colour_device frame_converter_edges_host
+                     frame_converter_edges_device frame_converter_siting frame_converter_refusal
+                     frame_converter_output frame_converter_allocation frame_converter_gate
+                     frame_converter_no_ycbcr frame_converter_shape_resize frame_converter_shape_tags
+                     frame_converter_shape_fallback
+                     frame_converter_shader_read
+                     PROPERTIES SKIP_RETURN_CODE 77)
+set_tests_properties(frame_converter_shader_read PROPERTIES LABELS "novulkan")
 
 # 77 means this driver cannot export an opaque-fd binary semaphore at all, so there is no acquire
 # descriptor to wait on -- Lavapipe. That run still grades what such a driver must do (hand back
@@ -652,4 +781,20 @@ if(WALLPAPERX_LAVAPIPE_ICD)
     # 77 here means the ffmpeg command line was missing at configure time and no fixture exists.
     set_tests_properties(video_decoder_no_decoder_lavapipe video_decoder_content_lavapipe
                          PROPERTIES SKIP_RETURN_CODE 77)
+    # The converter's entries that need no hardware decoder. On this driver every stream is decoded
+    # in software, so these are its host path; the device path is graded on the real GPU only.
+    add_test(NAME frame_converter_colour_host_lavapipe COMMAND wallpaperx-frame-converter-probe colour-host)
+    add_test(NAME frame_converter_edges_host_lavapipe COMMAND wallpaperx-frame-converter-probe edges-host)
+    add_test(NAME frame_converter_siting_lavapipe COMMAND wallpaperx-frame-converter-probe siting)
+    add_test(NAME frame_converter_refusal_lavapipe COMMAND wallpaperx-frame-converter-probe refusal)
+    add_test(NAME frame_converter_output_lavapipe COMMAND wallpaperx-frame-converter-probe output)
+    add_test(NAME frame_converter_allocation_lavapipe COMMAND wallpaperx-frame-converter-probe allocation)
+    add_test(NAME frame_converter_shape_resize_lavapipe COMMAND wallpaperx-frame-converter-probe shape-resize)
+    add_test(NAME frame_converter_shape_tags_lavapipe COMMAND wallpaperx-frame-converter-probe shape-tags)
+    set_tests_properties(frame_converter_colour_host_lavapipe frame_converter_edges_host_lavapipe
+                         frame_converter_siting_lavapipe frame_converter_refusal_lavapipe
+                         frame_converter_output_lavapipe frame_converter_allocation_lavapipe
+                         frame_converter_shape_resize_lavapipe frame_converter_shape_tags_lavapipe
+                         PROPERTIES ENVIRONMENT "VK_ICD_FILENAMES=${WALLPAPERX_LAVAPIPE_ICD}"
+                                    LABELS "lavapipe" SKIP_RETURN_CODE 77)
 endif()

@@ -535,9 +535,10 @@ void Device::createLogicalDevice() {
 
     // A decoder library's frames carry timeline semaphores and synchronization2 access masks,
     // and it resets its result queries from the host: those three gate the decode queue. The
-    // Y'CbCr conversion feature is not the decoder's -- it is for whatever samples a decoded
-    // frame -- so it is enabled when present and reported, never required. All four are core
-    // and change nothing about how anything already here behaves.
+    // Y'CbCr conversion feature gates nothing and nothing here samples through one; it is
+    // enabled when present because this chain is handed to ffmpeg, whose Vulkan code creates
+    // Y'CbCr conversions of its own. All four are core and change nothing about how anything
+    // already here behaves.
     VkPhysicalDeviceVulkan11Features supported11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
     VkPhysicalDeviceVulkan12Features supported12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     VkPhysicalDeviceVulkan13Features supported13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};

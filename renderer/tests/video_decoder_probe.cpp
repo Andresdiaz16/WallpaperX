@@ -18,7 +18,8 @@
 // for the whole run and for every message, which is the vacuous-green trap this project has hit
 // before.
 //
-// CONTROL for the excuse itself: kExcusedMessageId set to a string no message carries. Observed
+// CONTROL for the excuse itself: kExcusedDecoderMessageId, in support/video_probe_support.h, set
+// to a string no message carries. Observed
 // on the hardware entry: "FAIL: video_decoder_probe (hardware): 8 Vulkan validation warning(s)"
 // -- so the eight messages a green run excuses are the eight it names, and the list is not a
 // blanket. Reverted.
@@ -34,6 +35,7 @@
 
 #include "support/check.h"
 #include "support/validation_grade.h"
+#include "support/video_probe_support.h"
 
 extern "C" {
 #include <libavutil/error.h>
@@ -66,6 +68,7 @@ using wallpaperx::VideoDecoder;
 using wallpaperx::WallpaperContentError;
 using wallpaperx::testing::check;
 using wallpaperx::testing::fail;
+using wallpaperx::testing::ScratchDir;
 
 constexpr int kNotVerifiedExitCode = 77;
 bool g_notVerified = false;
@@ -133,62 +136,6 @@ bool g_recordingSubmits = false;
 std::vector<RecordedSubmit> g_submits;
 
 // ------------------------------------------------------------------------- //
-// The validation oracle: our own messenger, with one excused message id.
-// ------------------------------------------------------------------------- //
-
-// ffmpeg's Vulkan decoder binds one reference slot per DPB picture where this driver's profile
-// wants a single layered image. Reproducible with the stock ffmpeg command line, so it is a
-// defect in a dependency and not in anything here. Named exactly, so any OTHER complaint from
-// the video coding chapter still fails.
-constexpr const char* kExcusedMessageId = "VUID-VkVideoBeginCodingInfoKHR-flags-07244";
-
-std::atomic<int> g_excusedWarnings{0};
-std::shared_ptr<std::atomic<int>> g_unexpectedWarnings = std::make_shared<std::atomic<int>>(0);
-
-VKAPI_ATTR VkBool32 VKAPI_CALL probeMessengerCallback(VkDebugUtilsMessageSeverityFlagBitsEXT severity,
-                                                      VkDebugUtilsMessageTypeFlagsEXT types,
-                                                      const VkDebugUtilsMessengerCallbackDataEXT* data, void*) {
-    // The same two filters Device::debugCallback applies, so this count and the Device's count
-    // are comparable: below WARNING is not graded anywhere, and a loader-only GENERAL message is
-    // a host packaging problem rather than a complaint about this renderer.
-    if (severity < VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) return VK_FALSE;
-    if ((types & VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT) != 0 &&
-        (types & (VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
-                  VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT)) == 0) {
-        return VK_FALSE;
-    }
-    const char* id = data->pMessageIdName != nullptr ? data->pMessageIdName : "";
-    if (std::strcmp(id, kExcusedMessageId) == 0) {
-        g_excusedWarnings.fetch_add(1, std::memory_order_relaxed);
-        return VK_FALSE;
-    }
-    g_unexpectedWarnings->fetch_add(1, std::memory_order_relaxed);
-    return VK_FALSE;
-}
-
-VkDebugUtilsMessengerEXT installProbeMessenger(VkInstance instance) {
-    auto create = reinterpret_cast<PFN_vkCreateDebugUtilsMessengerEXT>(
-        vkGetInstanceProcAddr(instance, "vkCreateDebugUtilsMessengerEXT"));
-    if (create == nullptr) return VK_NULL_HANDLE;
-    VkDebugUtilsMessengerCreateInfoEXT info{VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT};
-    info.messageSeverity =
-        VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
-    info.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
-                       VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT;
-    info.pfnUserCallback = probeMessengerCallback;
-    VkDebugUtilsMessengerEXT messenger = VK_NULL_HANDLE;
-    if (create(instance, &info, nullptr, &messenger) != VK_SUCCESS) return VK_NULL_HANDLE;
-    return messenger;
-}
-
-void removeProbeMessenger(VkInstance instance, VkDebugUtilsMessengerEXT messenger) {
-    if (messenger == VK_NULL_HANDLE) return;
-    auto destroy = reinterpret_cast<PFN_vkDestroyDebugUtilsMessengerEXT>(
-        vkGetInstanceProcAddr(instance, "vkDestroyDebugUtilsMessengerEXT"));
-    if (destroy != nullptr) destroy(instance, messenger, nullptr);
-}
-
-// ------------------------------------------------------------------------- //
 // Fixtures
 // ------------------------------------------------------------------------- //
 
@@ -207,32 +154,6 @@ bool haveAssets(const std::vector<const char*>& names) {
     }
     return true;
 }
-
-// A scratch directory of this process's own. Deliberately not the shared test_assets directory
-// the PNG probes use: those hold RESOURCE_LOCKs this probe does not, and a directory-scoped
-// cleanup here would delete a fixture out from under a probe running in parallel.
-class ScratchDir {
-public:
-    ScratchDir() {
-        std::string pattern = (std::filesystem::temp_directory_path() / "wallpaperx-decoder-XXXXXX").string();
-        std::vector<char> buffer(pattern.begin(), pattern.end());
-        buffer.push_back('\0');
-        if (const char* made = mkdtemp(buffer.data())) m_path = made;
-    }
-    ~ScratchDir() {
-        if (m_path.empty()) return;
-        std::error_code ignored;
-        std::filesystem::remove_all(m_path, ignored);
-    }
-    ScratchDir(const ScratchDir&) = delete;
-    ScratchDir& operator=(const ScratchDir&) = delete;
-
-    bool ok() const { return !m_path.empty(); }
-    std::string file(const char* name) const { return (std::filesystem::path(m_path) / name).string(); }
-
-private:
-    std::string m_path;
-};
 
 // Copies an H.264 elementary stream with payload bytes flipped, skipping the first two kilobytes
 // so the sequence and picture parameter sets survive: a stream whose headers are destroyed is
@@ -761,7 +682,7 @@ void runContentChecks(Device& device) {
         g_notVerified = true;
         return;
     }
-    ScratchDir scratch;
+    ScratchDir scratch("wallpaperx-decoder");
     if (!scratch.ok()) {
         fail("video_decoder_probe (content): could not make a scratch directory, so nothing here was exercised");
         return;
@@ -1003,26 +924,7 @@ extern "C" VkResult vkEnumerateDeviceExtensionProperties(VkPhysicalDevice physic
         std::abort();
     }
     if (!g_hideVideoExtensions) return real(physicalDevice, layerName, count, properties);
-
-    uint32_t total = 0;
-    if (const VkResult r = real(physicalDevice, layerName, &total, nullptr); r != VK_SUCCESS) return r;
-    std::vector<VkExtensionProperties> all(total);
-    if (const VkResult r = real(physicalDevice, layerName, &total, all.data()); r != VK_SUCCESS) return r;
-
-    std::vector<VkExtensionProperties> kept;
-    kept.reserve(all.size());
-    for (const VkExtensionProperties& entry : all) {
-        if (std::strncmp(entry.extensionName, "VK_KHR_video", 12) == 0) continue;
-        kept.push_back(entry);
-    }
-    if (properties == nullptr) {
-        *count = static_cast<uint32_t>(kept.size());
-        return VK_SUCCESS;
-    }
-    const uint32_t give = *count < kept.size() ? *count : static_cast<uint32_t>(kept.size());
-    for (uint32_t i = 0; i < give; ++i) properties[i] = kept[i];
-    *count = give;
-    return give < kept.size() ? VK_INCOMPLETE : VK_SUCCESS;
+    return wallpaperx::testing::enumerateWithoutVideoExtensions(real, physicalDevice, layerName, count, properties);
 }
 
 extern "C" VkResult vkQueueSubmit(VkQueue queue, uint32_t count, const VkSubmitInfo* submits, VkFence fence) {
@@ -1137,22 +1039,13 @@ int main(int argc, char** argv) {
 
     const bool graded = wallpaperx::testing::gradedRun(
         "video_decoder_probe (" + mode + ")", [&](wallpaperx::testing::ValidationGrade& grade) {
-            std::shared_ptr<const std::atomic<int>> deviceCounter;
+            const std::string label = "video_decoder_probe (" + mode + ")";
+            wallpaperx::testing::DecoderValidationOracle oracle;
             {
                 std::optional<Device> device;
-                VkDebugUtilsMessengerEXT messenger = VK_NULL_HANDLE;
                 try {
                     device.emplace(/*enableValidation=*/true);
-                    deviceCounter = device->validationCounter();
-                    // The verdict is the UNEXPECTED count, not the Device's -- see the file
-                    // header. Everything else about the grade (the waiver, the "layer installed
-                    // but not attached" case) is the shared policy and is reused unchanged.
-                    grade.adopt(g_unexpectedWarnings, device->validationLayerActive());
-                    messenger = installProbeMessenger(device->instance());
-                    if (messenger == VK_NULL_HANDLE && device->validationLayerActive()) {
-                        fail("a validator is attached to the Device but this probe could not install a messenger of "
-                             "its own, so nothing classified its messages");
-                    }
+                    oracle.attach(*device, grade);
 
                     if (mode == "hardware") {
                         runHardwareChecks(*device);
@@ -1177,39 +1070,10 @@ int main(int argc, char** argv) {
                 // no bearing on what was being graded.
                 g_deviceLost = false;
                 g_failNextSubmitOnce = false;
-                if (device) removeProbeMessenger(device->instance(), messenger);
+                oracle.detach();
             }
-
-            // GOAL: the excused-message list must not become a hole. Every validation message the
-            //       Device counted has to be one this probe's messenger saw and classified;
-            //       anything left over arrived outside its window -- during instance creation, or
-            //       during teardown, which is where the layer reports objects still in flight and
-            //       allocations never freed.
-            // WHY-THIS-SHAPE: the probe's messenger cannot exist during vkCreateInstance or
-            //       vkDestroyInstance, so those windows are invisible to it. Comparing totals is
-            //       what recovers them. Asserting only "no unexpected messages" would leave a
-            //       teardown complaint completely ungraded, which is the most valuable thing the
-            //       layer says.
-            // CONTROL: renderer/vulkan/device.cpp, destroyResources() with the
-            //       `vkDestroyCommandPool` call removed, so the layer reports a live object at
-            //       vkDestroyDevice. Observed: "FAIL: 1 validation message(s) were counted by the
-            //       Device but never reached this probe's messenger". Reverted.
-            if (deviceCounter) {
-                const int deviceTotal = deviceCounter->load();
-                const int classified = g_excusedWarnings.load() + g_unexpectedWarnings->load();
-                if (deviceTotal > classified) {
-                    std::fprintf(stderr,
-                                 "FAIL: %d validation message(s) were counted by the Device but never reached this "
-                                 "probe's messenger, so they came from instance creation or teardown\n",
-                                 deviceTotal - classified);
-                    fail("a validation message was emitted outside the window this probe classifies");
-                }
-            }
-            if (g_excusedWarnings.load() > 0) {
-                std::printf("video_decoder_probe (%s): %d message(s) matching %s were excused -- ffmpeg's own Vulkan "
-                            "decoder, reproducible with the stock ffmpeg command line\n",
-                            mode.c_str(), g_excusedWarnings.load(), kExcusedMessageId);
-            }
+            // After the Device is gone: see DecoderValidationOracle::reconcile.
+            oracle.reconcile(label.c_str());
             return wallpaperx::testing::failureCount() == 0;
         });
 
