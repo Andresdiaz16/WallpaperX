@@ -142,12 +142,23 @@ VkRect2D planeRegion(VkRect2D visible, uint32_t shiftX, uint32_t shiftY) {
             {ceilShift(x + visible.extent.width, shiftX) - left, ceilShift(y + visible.extent.height, shiftY) - top}};
 }
 
-// The one multi-planar VkFormat a 4:2:0 layout of this shape decodes into, as Vulkan names
-// them: the depth picks the sample width, the plane count the family. UNDEFINED for a shape
-// Vulkan has no format for.
+// The one multi-planar VkFormat a decoder's image of this layout is held in, as Vulkan names
+// them, or UNDEFINED for one never read from a decoder's image. Vulkan's formats hold Cb before
+// Cr. 4:4:4 names only the formats a hardware decoder has been seen producing; 4:2:2 has none.
 VkFormat deviceFormatFor(const Layout& layout) {
-    if (layout.chromaShiftX != 1 || layout.chromaShiftY != 1) return VK_FORMAT_UNDEFINED;
     const bool two = layout.planeCount == 2;
+    const bool cbFirst =
+        layout.cbPlane == 1 && (two ? layout.cbComponent == VK_COMPONENT_SWIZZLE_R : layout.crPlane == 2);
+    if (!cbFirst) return VK_FORMAT_UNDEFINED;
+    if (layout.chromaShiftX == 0 && layout.chromaShiftY == 0) {
+        if (!two) return VK_FORMAT_UNDEFINED;
+        switch (layout.bitDepth) {
+            case 8: return VK_FORMAT_G8_B8R8_2PLANE_444_UNORM;
+            case 10: return VK_FORMAT_G10X6_B10X6R10X6_2PLANE_444_UNORM_3PACK16;
+            default: return VK_FORMAT_UNDEFINED;
+        }
+    }
+    if (layout.chromaShiftX != 1 || layout.chromaShiftY != 1) return VK_FORMAT_UNDEFINED;
     switch (layout.bitDepth) {
         case 8: return two ? VK_FORMAT_G8_B8R8_2PLANE_420_UNORM : VK_FORMAT_G8_B8_R8_3PLANE_420_UNORM;
         case 10:
@@ -338,7 +349,6 @@ std::variant<Planes, std::string> planesFor(const Device& device, AVPixelFormat 
     const std::optional<Layout> layout = layoutFor(format);
     if (!layout) return name + " is not a planar Y'CbCr layout this pass reads";
     const bool onDevice = storage == DecodedFrame::Storage::DeviceImage;
-    // The plane copies were verified against 4:2:0 images only.
     if (onDevice && deviceFormatFor(*layout) == VK_FORMAT_UNDEFINED) {
         return name + " is read from host memory only, not from a decoder's image";
     }

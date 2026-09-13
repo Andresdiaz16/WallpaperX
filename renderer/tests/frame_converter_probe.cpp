@@ -34,6 +34,8 @@
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavutil/error.h>
+#include <libavutil/hwcontext.h>
+#include <libavutil/hwcontext_vulkan.h>
 #include <libavutil/pixdesc.h>
 #include <libavutil/pixfmt.h>
 #ifdef WALLPAPERX_HAVE_SWSCALE
@@ -103,6 +105,18 @@ bool g_stripX6LinearFilter = false;
 // The next N avcodec_receive_frame() calls report AVERROR_EXTERNAL: the hardware decoder failing
 // part way through a stream on a device that still answers.
 int g_receiveExternalRemaining = 0;
+
+// What ffmpeg's hardware setup last proposed, recorded by the avcodec_get_hw_frames_parameters
+// interposer: tells a stream the rule refused from one ffmpeg turned away before the rule was asked.
+struct HwFramesProposal {
+    int calls = 0;
+    int result = 0;
+    AVPixelFormat swFormat = AV_PIX_FMT_NONE;
+    VkFormat imageFormat = VK_FORMAT_UNDEFINED;
+    bool singleImage = false;
+    bool profileList = false;
+};
+HwFramesProposal g_hwFrames;
 
 // Every vkQueueSubmit this executable's code makes; ffmpeg's own go through dispatch pointers.
 std::atomic<int> g_queueSubmits{0};
@@ -705,6 +719,9 @@ const ColourFixture kDeviceColourFixtures[] = {
     {"conv_601_pc.mp4", AV_PIX_FMT_YUV420P, AVCOL_SPC_SMPTE170M, AVCOL_RANGE_JPEG, SWS_CS_ITU601, true, SWS_CS_ITU709},
     {"conv_hevc10.mp4", AV_PIX_FMT_YUV420P10LE, AVCOL_SPC_BT709, AVCOL_RANGE_MPEG, SWS_CS_ITU709, false,
      SWS_CS_ITU601},
+    {"conv_hevc444.mp4", AV_PIX_FMT_YUV444P, AVCOL_SPC_BT709, AVCOL_RANGE_MPEG, SWS_CS_ITU709, false, SWS_CS_ITU601},
+    {"conv_hevc444_10.mp4", AV_PIX_FMT_YUV444P10LE, AVCOL_SPC_BT709, AVCOL_RANGE_MPEG, SWS_CS_ITU709, false,
+     SWS_CS_ITU601},
 };
 
 void runColourDeviceChecks(Device& device, const std::string& label) {
@@ -740,10 +757,15 @@ void runColourDeviceChecks(Device& device, const std::string& label) {
                 fail("a colour fixture decoded to no frames");
                 continue;
             }
+            // COVERAGE-ASSERT: a fixture that does not reach the device path makes the entry a skip,
+            //       so a layout the decoder stops sending to the device cannot leave it green with
+            //       the others graded. Observed with renderer/video/frame_converter.cpp's 8-bit
+            //       4:4:4 format refused: "conv_hevc444.mp4 took the SoftwareRefused path", exit 77.
             if (opened.frame->storage() != DecodedFrame::Storage::DeviceImage) {
                 std::printf("%s: %s took the %s path on %s, so the device path is not answerable for it\n",
                             label.c_str(), fixture.file, pathName(opened.decoder->path()),
                             device.info().gpuName.c_str());
+                g_notVerified = true;
                 continue;
             }
             if (!fixtureDecodedAsRecipe(label, fixture, *opened.frame, /*checkFormat=*/false)) continue;
@@ -757,10 +779,12 @@ void runColourDeviceChecks(Device& device, const std::string& label) {
             std::vector<uint8_t> converted = convertAndRead(device, converter, *opened.frame);
             const std::string name = std::string(fixture.file) + " on the device";
             // CONTROL: renderer/video/frame_converter.cpp, each reverted. BT.709 coefficients set
-            //       to BT.601's: the NV12 and P010 fixtures 32 codes off. R10X6 luma sample scale
-            //       1023 -> 65535: the P010 fixture alone, 255 codes off. The shape guard above:
-            //       renderer/video/video_decoder.cpp visible() two pixels narrower on device frames,
-            //       "does not describe the picture the hardware decoded" for all three.
+            //       to BT.601's: every BT.709 fixture 32-33 codes off, the BT.601 one green. R10X6
+            //       luma sample scale 1023 -> 65535: P010 and 10-bit 4:4:4 alone, 255 codes off. The
+            //       device 4:4:4 chroma region computed as if subsampled: both 4:4:4 fixtures alone,
+            //       234 and 255 codes off. The shape guard above: renderer/video/video_decoder.cpp
+            //       visible() two pixels narrower on device frames, "does not describe the picture
+            //       the hardware decoded" for all five.
             if (gradeColour(label, name.c_str(), *reference, converted, fixture.swsMatrix, fixture.fullRange,
                             fixture.swsOtherMatrix)) {
                 ++graded;
@@ -795,6 +819,8 @@ const EdgeFixture kHostEdgeFixtures[] = {
 const EdgeFixture kDeviceEdgeFixtures[] = {
     {"edge_offset_420_hw.mp4", 4},
     {"edge_corner_420_hw.mp4", 2},
+    {"edge_offset_444_hw.mp4", 4},
+    {"edge_offset_444_10_hw.mp4", 4},
 };
 
 constexpr int kMinEdgePixels = 16;
@@ -806,9 +832,11 @@ constexpr int kMinPaddingContrast = 30;
 //       past the rectangle moves an edge pixel by tens of codes. A plain cropped stream is no test:
 //       padding that repeats the edge changes nothing when read. So the padding's difference from
 //       the edge is asserted per side first, as is the count of sides that have any.
-// CONTROL: renderer/video/frame_converter.cpp, the constructor's chroma plane region, reverted. One
-//       texel wider and taller: every edge fixture red at its right and bottom ends, host and
-//       device. One texel earlier on a padded side: the offset fixtures red, the corner ones green.
+// CONTROL: renderer/video/frame_converter.cpp, the constructor's chroma plane region, each reverted.
+//       One texel wider and taller: every edge fixture red on all four edges, host and device. One
+//       texel earlier on a padded side: the offset fixtures red, the corner ones green, both paths.
+//       The device 4:4:4 region computed as if subsampled, or one texel into the padding: both
+//       4:4:4 device fixtures red on every edge, host memory green.
 //       Harness: padding smeared from the edge -> "differs by at most 0 luma and 0 Cr codes"; the
 //       corner fixture swapped for a four-side crop -> "4 sides ... not 2"; a 4:4:4 recipe that
 //       padded before converting misplaced its border -> "0 flat pixels, too few to grade".
@@ -963,9 +991,13 @@ void runEdgeChecks(Device& device, const std::string& label, bool onDevice) {
                 return;
             }
             const bool deviceFrame = opened.frame->storage() == DecodedFrame::Storage::DeviceImage;
+            // COVERAGE-ASSERT: a device fixture that falls back to software makes the entry a skip,
+            //       not a pass on the others. Observed with renderer/video/frame_converter.cpp's 8-bit
+            //       4:4:4 format refused: "edge_offset_444_hw.mp4 took the SoftwareRefused path", exit 77.
             if (onDevice && !deviceFrame) {
                 std::printf("%s: %s took the %s path, so the device path is not answerable for it\n", label.c_str(),
                             fixture.file, pathName(opened.decoder->path()));
+                g_notVerified = true;
                 return;
             }
             ColourFixture named = tags;
@@ -1294,7 +1326,8 @@ void runOutputChecks(Device& device, const std::string& label) {
     // CONTROL: renderer/video/frame_converter.cpp, each reverted. Clear colour 0.2 red: "2048 pixels
     //       ... not opaque black". clearOutput() not called: the same, plus VUID-vkCmdDraw-None-09600.
     //       Output layout SHADER_READ_ONLY, format R8G8B8A8, TRANSFER_SRC dropped, width and height
-    //       swapped: one named red each.
+    //       swapped: each reddens its own named check. The layout also draws validation errors; the
+    //       other three break the render or the readback after it.
     check(out.layout == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, "the converter's frame is not declared TRANSFER_SRC");
     check(out.source.format == VK_FORMAT_B8G8R8A8_UNORM && out.source.tiling == VK_IMAGE_TILING_OPTIMAL,
           "the converter's frame is not B8G8R8A8_UNORM optimal");
@@ -1513,51 +1546,97 @@ void runGateChecks(Device& device, const std::string& label) {
         g_notVerified = true;
         return;
     }
-    if (!haveAsset("conv_hevc444.mp4", label) || !haveAsset("conv_hevc10.mp4", label)) return;
+    // GOAL: S13.52 -- the rule accepts the two-plane 4:4:4 images a hardware decoder hands back,
+    //       Cb before Cr, at 8 and 10 bits, and refuses the same image described with Cr first.
+    // WHY-THIS-SHAPE: asked with nv24, p410le and nv42, the names ffmpeg gives a decoder's image.
+    //       yuv444p is three-plane, which no decoder produces and the rule refused both before and
+    //       after 4:4:4 was admitted, so asking about it grades nothing. nv42 is asked about the
+    //       VkFormat nv24 is accepted in, so only the plane order differs.
+    // CONTROL: renderer/video/frame_converter.cpp deviceFormatFor(), each reverted. The 8-bit 4:4:4
+    //       case returning UNDEFINED: "refuses an 8-bit 4:4:4 decoder image (nv24)". The 10-bit case
+    //       the same: "(p410le)". The Cb-before-Cr test removed: "accepts ... Cr before Cb (nv42)".
+    check(FrameConverter::readsDeviceImage(device, AV_PIX_FMT_NV24, VK_FORMAT_G8_B8R8_2PLANE_444_UNORM),
+          "readsDeviceImage refuses an 8-bit 4:4:4 decoder image (nv24)");
+    check(FrameConverter::readsDeviceImage(device, AV_PIX_FMT_P410LE,
+                                           VK_FORMAT_G10X6_B10X6R10X6_2PLANE_444_UNORM_3PACK16),
+          "readsDeviceImage refuses a 10-bit 4:4:4 decoder image (p410le)");
+    check(!FrameConverter::readsDeviceImage(device, AV_PIX_FMT_NV42, VK_FORMAT_G8_B8R8_2PLANE_444_UNORM),
+          "readsDeviceImage accepts a 4:4:4 image with Cr before Cb (nv42) in a format that holds Cb first");
 
-    // GOAL: S13.52 -- an H.265 4:4:4 stream, which this GPU's decoder takes, is refused by
-    //       readsDeviceImage and so takes the decoder's software path and converts correctly --
-    //       rather than decoding on the device into an image the converter then refuses.
-    // WHY-THIS-SHAPE: graded end to end through the decoder, since the property is that the
-    //       decoder asks the rule; a direct call to readsDeviceImage alone would pass with the
-    //       decoder never asking it.
-    // CONTROL: renderer/video/video_decoder.cpp without its readsDeviceImage() call: "did not take
-    //       the software path" and "decoded into a device image" -- so this GPU does decode the
-    //       stream, and the fallback is the rule's doing. With readsDeviceImage's answer also negated
-    //       in renderer/video/frame_converter.cpp: "accepts a 4:4:4 device image". Both reverted.
-    check(!FrameConverter::readsDeviceImage(device, AV_PIX_FMT_YUV444P, VK_FORMAT_G8_B8R8_2PLANE_444_UNORM),
-          "readsDeviceImage accepts a 4:4:4 device image");
-    try {
-        VideoDecoder decoder(device, asset("conv_hevc444.mp4"));
-        std::optional<DecodedFrame> frame = decoder.next();
-        if (!frame) {
-            fail("the H.265 4:4:4 fixture decoded to no frames");
-        } else {
-            check(decoder.path() == VideoDecoder::Path::SoftwareRefused,
-                  "an H.265 4:4:4 stream did not take the software path the rule sends it to");
-            check(frame->storage() == DecodedFrame::Storage::HostPlanes,
-                  "an H.265 4:4:4 stream was decoded into a device image");
-            std::string why;
-            const std::optional<HostPicture> picture = copyHostPicture(*frame, why);
-            if (picture) {
-                FrameConverter converter(device, *frame, kShaderDir);
-                const std::vector<uint8_t> converted = convertAndRead(device, converter, *frame);
-                if (kHaveReference) {
-                    (void)gradeColour(label, "conv_hevc444.mp4", *picture, converted, SWS_CS_ITU709, false,
-                                      SWS_CS_ITU601);
+    // GOAL: S13.52 -- the decoder asks the rule before decoding on the device: an H.265 4:4:4
+    //       12-bit stream, whose hardware setup succeeds here with an image the rule refuses, takes
+    //       SoftwareRefused and converts from host memory within one code.
+    // WHY-THIS-SHAPE: 12-bit 4:4:4 is the one stream measured here that reaches the rule and is
+    //       refused by it: 8- and 10-bit 4:4:4 are accepted, and 4:2:2, H.264 4:4:4 and AV1 4:4:4
+    //       are turned away inside avcodec_get_hw_frames_parameters, which also ends in
+    //       SoftwareRefused and would pass with the decoder never asking. So the interposed setup is
+    //       asserted to have proposed one image with a video profile first; otherwise not answerable.
+    // CONTROL: renderer/video/video_decoder.cpp without its readsDeviceImage() call: "did not take the
+    //       software path" and "was decoded into a device image", so this GPU decodes the stream and
+    //       the fallback is the rule's doing. Reverted. Harness: the interposer recording a failed
+    //       setup -> "never asked the rule -- not answerable", exit 77.
+    if (haveAsset("conv_hevc444_12.mp4", label)) {
+        try {
+            g_hwFrames = HwFramesProposal{};
+            VideoDecoder decoder(device, asset("conv_hevc444_12.mp4"));
+            std::optional<DecodedFrame> frame = decoder.next();
+            const HwFramesProposal proposal = g_hwFrames;
+            if (!frame) {
+                fail("the H.265 4:4:4 12-bit fixture decoded to no frames");
+            } else if (proposal.calls == 0 || proposal.result < 0 || !proposal.singleImage || !proposal.profileList) {
+                std::printf("%s: ffmpeg's hardware setup did not propose one image with a video profile for H.265 "
+                            "4:4:4 12-bit on %s (%d call(s), last result %d), so the decoder never asked the rule "
+                            "-- not answerable\n",
+                            label.c_str(), device.info().gpuName.c_str(), proposal.calls, proposal.result);
+                g_notVerified = true;
+            } else {
+                check(!FrameConverter::readsDeviceImage(device, proposal.swFormat, proposal.imageFormat),
+                      "readsDeviceImage accepts the 12-bit 4:4:4 image ffmpeg proposed, so this stream no longer "
+                      "shows the decoder obeying a refusal");
+                check(decoder.path() == VideoDecoder::Path::SoftwareRefused,
+                      "an H.265 4:4:4 12-bit stream the rule refuses did not take the software path");
+                check(frame->storage() == DecodedFrame::Storage::HostPlanes,
+                      "an H.265 4:4:4 12-bit stream the rule refuses was decoded into a device image");
+                const ColourFixture fixture{"conv_hevc444_12.mp4", AV_PIX_FMT_YUV444P12LE, AVCOL_SPC_BT709,
+                                            AVCOL_RANGE_MPEG, SWS_CS_ITU709, false, SWS_CS_ITU601};
+                std::string why;
+                std::optional<HostPicture> picture;
+                if (frame->storage() == DecodedFrame::Storage::HostPlanes &&
+                    fixtureDecodedAsRecipe(label, fixture, *frame, /*checkFormat=*/true)) {
+                    picture = copyHostPicture(*frame, why);
+                    if (!picture) {
+                        std::fprintf(stderr, "FAIL: %s: %s: %s\n", label.c_str(), fixture.file, why.c_str());
+                        fail("a host frame could not be copied out for the reference");
+                    }
                 }
-                int more = 0;
-                while (std::optional<DecodedFrame> next = decoder.next()) {
-                    waitReporting(device, converter.convert(*next), "a later H.265 4:4:4 frame");
-                    ++more;
+                if (picture) {
+                    FrameConverter converter(device, *frame, kShaderDir);
+                    const std::vector<uint8_t> converted = convertAndRead(device, converter, *frame);
+                    if (kHaveReference) {
+                        (void)gradeColour(label, fixture.file, *picture, converted, fixture.swsMatrix,
+                                          fixture.fullRange, fixture.swsOtherMatrix);
+                    } else {
+                        std::printf("%s: built without libswscale, so the fallback's colour is not graded -- not "
+                                    "answerable\n",
+                                    label.c_str());
+                        g_notVerified = true;
+                    }
+                    int more = 0;
+                    while (std::optional<DecodedFrame> next = decoder.next()) {
+                        waitReporting(device, converter.convert(*next), "a later H.265 4:4:4 12-bit frame");
+                        ++more;
+                    }
+                    std::printf("%s: H.265 4:4:4 12-bit -> ffmpeg proposed %s, the rule refused it, %s, %d frames "
+                                "converted\n",
+                                label.c_str(), orUnknown(av_get_pix_fmt_name(proposal.swFormat)),
+                                pathName(decoder.path()), more + 1);
                 }
-                std::printf("%s: H.265 4:4:4 -> %s, %d frames converted\n", label.c_str(), pathName(decoder.path()),
-                            more + 1);
             }
+        } catch (const std::exception& e) {
+            reportThrow(label, "the H.265 4:4:4 12-bit fixture", e);
         }
-    } catch (const std::exception& e) {
-        reportThrow(label, "the H.265 4:4:4 fixture", e);
     }
+    if (!haveAsset("conv_hevc10.mp4", label)) return;
 
     // GOAL: S13.52 -- the decoder and the constructor ask the same rule. The same device frame is
     //       accepted by both while the device can filter its plane format, and refused by both --
@@ -1992,6 +2071,29 @@ extern "C" VkResult vkCreateShaderModule(VkDevice device, const VkShaderModuleCr
     static const Fn real = realSymbol<Fn>("vkCreateShaderModule");
     g_shaderModulesCreated.fetch_add(1, std::memory_order_relaxed);
     return real(device, info, allocator, module);
+}
+
+extern "C" int avcodec_get_hw_frames_parameters(AVCodecContext* context, AVBufferRef* deviceRef,
+                                                enum AVPixelFormat hwFormat, AVBufferRef** out) {
+    using Fn = int (*)(AVCodecContext*, AVBufferRef*, enum AVPixelFormat, AVBufferRef**);
+    static const Fn real = realSymbol<Fn>("avcodec_get_hw_frames_parameters");
+    const int result = real(context, deviceRef, hwFormat, out);
+    HwFramesProposal proposal;
+    proposal.calls = g_hwFrames.calls + 1;
+    proposal.result = result;
+    if (result >= 0 && hwFormat == AV_PIX_FMT_VULKAN && out != nullptr && *out != nullptr) {
+        const auto* frames = reinterpret_cast<AVHWFramesContext*>((*out)->data);
+        const auto* vk = static_cast<AVVulkanFramesContext*>(frames->hwctx);
+        proposal.swFormat = frames->sw_format;
+        proposal.imageFormat = vk->format[0];
+        proposal.singleImage = vk->format[0] != VK_FORMAT_UNDEFINED && vk->format[1] == VK_FORMAT_UNDEFINED;
+        for (auto* node = static_cast<const VkBaseInStructure*>(vk->create_pnext); node != nullptr;
+             node = node->pNext) {
+            if (node->sType == VK_STRUCTURE_TYPE_VIDEO_PROFILE_LIST_INFO_KHR) proposal.profileList = true;
+        }
+    }
+    g_hwFrames = proposal;
+    return result;
 }
 
 extern "C" int avcodec_receive_frame(AVCodecContext* context, AVFrame* frame) {

@@ -325,8 +325,9 @@ if(WALLPAPERX_FFMPEG_EXECUTABLE)
     # -color_primaries / -color_trc: libx264 drops those two silently, which produced streams that
     # looked tagged and decoded untagged. SMPTE HD bars give large flat saturated regions, which is
     # where colour is compared. The edge fixtures pad the picture in red and crop the red away, so
-    # reading past the visible rectangle is visible; the _hw pair crops whole macroblocks at a low
-    # quantiser with deblocking off, so the hardware decoder's lossy output stays flat at the edge.
+    # reading past the visible rectangle is visible; the 4:2:0 _hw pair crops whole macroblocks at a
+    # low quantiser with deblocking off, so the hardware decoder's lossy output stays flat at the edge,
+    # and the 4:4:4 _hw pair is lossless H.265, which a hardware decoder takes at any crop offset.
     set(BT709 "colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv")
     set(BARS "-f lavfi -i smptehdbars=size=320x240:rate=10:duration=1")
     set(WALLPAPERX_CONVERTER_RECIPES
@@ -338,12 +339,16 @@ if(WALLPAPERX_FFMPEG_EXECUTABLE)
         "conv_709_tv_444.mp4|${BARS}|-vf format=yuv444p,setparams=${BT709} -c:v libx264 -g 5"
         "conv_hevc10.mp4|${BARS}|-vf format=yuv420p10le,setparams=${BT709} -c:v libx265 -x265-params log-level=error -g 5"
         "conv_hevc444.mp4|${BARS}|-vf format=yuv444p,setparams=${BT709} -c:v libx265 -x265-params log-level=error -g 5"
+        "conv_hevc444_10.mp4|${BARS}|-vf format=yuv444p10le,setparams=${BT709} -c:v libx265 -x265-params log-level=error -g 5"
+        "conv_hevc444_12.mp4|${BARS}|-vf format=yuv444p12le,setparams=${BT709} -c:v libx265 -x265-params log-level=error -g 5"
         "edge_offset_420.mp4|-f lavfi -i smptehdbars=size=312x230:rate=10:duration=0.5|-vf pad=w=320:h=240:x=4:y=6:color=red,format=yuv420p,setparams=${BT709} -c:v libx264 -qp 0 -g 5 -bsf:v h264_metadata=crop_left=4:crop_right=4:crop_top=6:crop_bottom=4"
         "edge_corner_420.mp4|-f lavfi -i smptehdbars=size=314x236:rate=10:duration=0.5|-vf pad=w=320:h=240:x=0:y=0:color=red,format=yuv420p,setparams=${BT709} -c:v libx264 -qp 0 -g 5 -bsf:v h264_metadata=crop_right=6:crop_bottom=4"
         "edge_offset_422.mp4|-f lavfi -i smptehdbars=size=312x232:rate=10:duration=0.5|-vf format=yuv422p,pad=w=320:h=240:x=4:y=3:color=red,setparams=${BT709} -c:v libx264 -qp 0 -g 5 -bsf:v h264_metadata=crop_left=4:crop_right=4:crop_top=3:crop_bottom=5"
         "edge_offset_444.mp4|-f lavfi -i smptehdbars=size=314x232:rate=10:duration=0.5|-vf format=yuv444p,crop=313:231:0:0,pad=w=320:h=240:x=3:y=5:color=red,setparams=${BT709} -c:v libx264 -qp 0 -g 5 -bsf:v h264_metadata=crop_left=3:crop_right=4:crop_top=5:crop_bottom=4"
         "edge_offset_420_hw.mp4|-f lavfi -i smptehdbars=size=288x208:rate=10:duration=0.5|-vf pad=w=320:h=240:x=16:y=16:color=red,format=yuv420p,setparams=${BT709} -c:v libx264 -qp 2 -x264-params no-deblock=1 -g 5 -bsf:v h264_metadata=crop_left=16:crop_right=16:crop_top=16:crop_bottom=16"
         "edge_corner_420_hw.mp4|-f lavfi -i smptehdbars=size=304x224:rate=10:duration=0.5|-vf pad=w=320:h=240:x=0:y=0:color=red,format=yuv420p,setparams=${BT709} -c:v libx264 -qp 2 -x264-params no-deblock=1 -g 5 -bsf:v h264_metadata=crop_right=16:crop_bottom=16"
+        "edge_offset_444_hw.mp4|-f lavfi -i smptehdbars=size=314x232:rate=10:duration=0.5|-vf format=yuv444p,crop=313:231:0:0,pad=w=320:h=240:x=3:y=5:color=red,setparams=${BT709} -c:v libx265 -x265-params log-level=error:lossless=1 -g 5 -bsf:v hevc_metadata=crop_left=3:crop_right=4:crop_top=5:crop_bottom=4"
+        "edge_offset_444_10_hw.mp4|-f lavfi -i smptehdbars=size=314x232:rate=10:duration=0.5|-vf format=yuv444p10le,crop=313:231:0:0,pad=w=320:h=240:x=3:y=5:color=red,setparams=${BT709} -c:v libx265 -x265-params log-level=error:lossless=1 -g 5 -bsf:v hevc_metadata=crop_left=3:crop_right=4:crop_top=5:crop_bottom=4"
         "tag_p3.mp4|-f lavfi -i testsrc2=size=64x48:rate=10:duration=0.3|-vf format=yuv420p,setparams=colorspace=bt709:color_primaries=smpte432:color_trc=bt709:range=tv -c:v libx264"
         "tag_bt470m.mp4|-f lavfi -i testsrc2=size=64x48:rate=10:duration=0.3|-vf format=yuv420p,setparams=colorspace=bt709:color_primaries=bt470m:color_trc=bt709:range=tv -c:v libx264"
         "tag_linear.mp4|-f lavfi -i testsrc2=size=64x48:rate=10:duration=0.3|-vf format=yuv420p,setparams=colorspace=bt709:color_primaries=bt709:color_trc=linear:range=tv -c:v libx264"
