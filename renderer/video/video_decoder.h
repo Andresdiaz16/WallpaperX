@@ -14,6 +14,7 @@ extern "C" {
 #include <functional>
 #include <optional>
 #include <string>
+#include <variant>
 
 struct AVCodecContext;
 struct AVFormatContext;
@@ -119,12 +120,12 @@ private:
 // stream -- codec, profile, bit depth, coded size, the image it would decode into -- and a no
 // selects software. When ffmpeg's hardware path fails after that yes, which it can for reasons
 // of its own, the device is asked whether it still answers: one that does not is a GpuFailure,
-// one that does means the stream is decoded in software from its first packet.
+// one that does means decoding continues in software, as next() describes.
 //
 // The decoder ffmpeg is asked for is the one that can use this device, which for AV1 is a
 // hardware-only shim, and it is opened single-threaded so ffmpeg never touches a queue off
-// the GPU thread. Neither suits software, so a refusal reopens the stream from its first
-// packet on ffmpeg's default decoder with its default threads.
+// the GPU thread. Neither suits software, so a refusal reopens the stream on ffmpeg's default
+// decoder with its default threads.
 //
 // Frames handed out may outlive this decoder but not the Device. Destroying this decoder frees
 // its image pool once no frame is out, and ffmpeg waits without bound there twice over: on each
@@ -157,11 +158,29 @@ public:
     VideoDecoder(const VideoDecoder&) = delete;
     VideoDecoder& operator=(const VideoDecoder&) = delete;
 
-    // The next picture in decode order, or nothing once the stream is exhausted. A packet the
-    // decoder cannot parse is skipped, not reported. Throws GpuFailure for a hardware fault,
-    // WallpaperContentError for a container that cannot be read or a stream that cannot be
-    // decoded, and std::runtime_error when out of memory. After a throw the decoder is not
-    // usable.
+    // The next picture in output order, or nothing once the stream is exhausted. A packet the
+    // decoder cannot parse is skipped, not reported.
+    //
+    // When hardware decoding fails part way through, software continues from the picture after
+    // the last one returned; none is returned twice. While every picture returned has carried a
+    // timestamp above the one before, that timestamp is what software resumes after: it decodes
+    // from a keyframe at or before it and drops the pictures up to it, so the call that meets the
+    // failure costs about a keyframe interval wherever in the file it falls. A seek that cannot
+    // be shown to have landed at or before that picture -- a transport stream's can land past it --
+    // is retried further back. A container that cannot seek is decoded from its first packet,
+    // exactly but at a cost that grows with the position.
+    //
+    // Pictures without timestamps -- a raw bitstream -- or whose timestamps did not increase are
+    // matched by the packet each was decoded from instead: software decodes from the first packet
+    // and drops pictures through the one decoded from the packet the last returned picture came
+    // from. That does not bound the call. If software never decodes that packet into a picture, it
+    // decodes from the first packet again and drops as many pictures as were returned, which is not
+    // exact when the two decoders emit different pictures; a stream that ends before that many
+    // throws WallpaperContentError.
+    //
+    // Throws GpuFailure for a hardware fault, WallpaperContentError for a container that cannot be
+    // read or a stream that cannot be decoded, and std::runtime_error when out of memory. After a
+    // throw the decoder is not usable.
     std::optional<DecodedFrame> next();
 
     Path path() const { return m_path; }
@@ -174,6 +193,11 @@ private:
     void openDecoder();
     void closeDecoder() noexcept;
     void reopenInSoftware();
+    int64_t streamStart() const;
+    void rewind();
+    bool admit(int64_t timestamp, std::optional<uint64_t> packet);
+    void recordReturned(int64_t timestamp, std::optional<uint64_t> packet);
+    void recordLanding();
     void attachDevice();
     bool deviceHealthy();
     int readVideoPacket();
@@ -187,13 +211,48 @@ private:
     AVFrame* m_frame = nullptr;
     PFN_vkGetPhysicalDeviceVideoFormatPropertiesKHR m_videoFormatProperties = nullptr;
     int m_stream = -1;
+    // What a software restart resumes after: how many pictures next() has returned; the last one's
+    // timestamp for as long as every one returned had a timestamp above the one before; and the
+    // number of the packet it was decoded from, when that packet was numbered.
+    uint64_t m_returned = 0;
+    std::optional<int64_t> m_lastTimestamp;
+    std::optional<uint64_t> m_lastPacket;
+    // Video packets read since the container was opened or rewound, which is each one's number.
+    // Unset after a seek: numbers counted from there would not name the same packets as another
+    // decoder's.
+    std::optional<uint64_t> m_packetsRead = 0;
+    // What a restarted software decode drops before it returns a picture again, in stream time
+    // base. Each resumes after m_lastTimestamp or m_lastPacket, which cannot change while it holds:
+    // none returns a picture.
+    //
+    // Seeked is a seek `back` before the resume point, not yet shown to have landed at or before
+    // it. Its packets show that when the first is a keyframe at or before the resume point -- no
+    // picture before a keyframe in decode order is shown after it -- and none since is timestamped
+    // past it: a decode that then ends with no picture has none left to return.
+    enum class Landing { NoPacket, NothingPast, Unproven };
+    struct Seeked {
+        int64_t back;
+        Landing landing = Landing::NoPacket;
+    };
+    //
+    // DropThrough ends at the first picture past the resume point. Unguarded: a freshly opened
+    // software decoder that has to guess a stream's reordering depth could emit a picture at or
+    // before the resume point after a later one, and it would be returned again. Not reproducible
+    // on this machine.
+    struct DropThrough {};
+    struct DropThroughPacket {};
+    struct DropCount {
+        uint64_t remaining;  // never 0
+    };
+    std::variant<std::monostate, Seeked, DropThrough, DropThroughPacket, DropCount> m_resume;
     bool m_flushed = false;
     Path m_path = Path::Undecided;
     // Set when the device accepted the stream and ffmpeg was told to decode on it, cleared when a
     // frame arrives. A format negotiation that comes back without Vulkan while this is set is
     // ffmpeg retreating from a hardware setup that failed after the device's yes.
     bool m_awaitingHardwareSetup = false;
-    // The path was decided as software on a decoder opened for hardware.
+    // The path was decided as software on a decoder opened for hardware, or a software restart's
+    // seek was not shown to land at or before the picture it resumes after.
     bool m_reopenInSoftware = false;
     // A failure decided inside the format callback, which cannot throw through ffmpeg's frames;
     // rethrown when ffmpeg reports the error that follows.

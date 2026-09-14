@@ -417,9 +417,9 @@ void runHardwareChecks(Device& device) {
 
     // GOAL: S13.42 -- a moved-from frame throws rather than dereferencing null.
     // CONTROL: renderer/video/video_decoder.cpp, DecodedFrame::frame() returning *m_frame
-    //       unconditionally. Observed: the probe died with SIGSEGV inside storage() and printed
-    //       no verdict -- which is the crash this check exists to prevent, and is red in the
-    //       only way that failure mode can be. Reverted.
+    //       unconditionally. Observed: the probe died with SIGSEGV after every earlier check passed
+    //       and printed no verdict -- the crash this check exists to prevent, red in the only way
+    //       that failure mode can be. Reverted.
     DecodedFrame moved = std::move(*first);
     bool movedFromThrew = false;
     try {
@@ -440,11 +440,10 @@ void runHardwareChecks(Device& device) {
     //       references no other picture, so a run that stopped there would exercise none of
     //       ffmpeg's reference-picture handling and would never reach the one validation message
     //       this probe excuses, leaving the excuse itself unexercised.
-    // CONTROL: renderer/video/video_decoder.cpp, `if (m_path == Path::Hardware) return
-    //       std::nullopt;` added beside next()'s `if (m_flushed) return std::nullopt;`, so the
-    //       hardware path stops as soon as ffmpeg first asks for input. Observed: "FAIL: the
-    //       hardware path decoded 1 frames where a software decode of the same file decodes 10".
-    //       Reverted.
+    // CONTROL: renderer/video/video_decoder.cpp, next()'s end-of-stream test widened to take an
+    //       EAGAIN on the hardware path as the end, so the hardware path stops as soon as ffmpeg
+    //       first asks for input. Observed: "FAIL: the hardware path decoded 1 frames where a
+    //       software decode of the same file decodes 10". Reverted.
     int hardwareFrames = 1;
     while (std::optional<DecodedFrame> more = decoder.next()) {
         ++hardwareFrames;
@@ -505,10 +504,10 @@ void runRefusedChecks(Device& device) {
     //       hardcoded number. A hardcoded number is a claim about the fixture generator; the
     //       comparison is a claim about the reopen, and it is the only form that can see a
     //       reopen which resumes where the hardware attempt stopped instead of starting again.
-    // CONTROL: renderer/video/video_decoder.cpp, reopenInSoftware() seeking half a second in
-    //       (`start + stream.time_base.den / 2`, and forward rather than AVSEEK_FLAG_BACKWARD)
-    //       instead of to the first packet. Observed: "FAIL: the software reopen produced 5
-    //       frames where a never-hardware decode of the same file produces 10". Reverted.
+    // CONTROL: renderer/video/video_decoder.cpp, reopenInSoftware() without the rewind() it makes when
+    //       no picture has a timestamp to resume after, so software carries on from the packets the
+    //       hardware attempt consumed. Observed: "FAIL: the software reopen produced 5 frames where a
+    //       never-hardware decode of the same file produces 10". Reverted.
     const DecodeResult refused = decodeAll(device, asset("h264_10bit.mp4"));
     check(refused.path == VideoDecoder::Path::SoftwareRefused,
           "10-bit H.264 did not report Path::SoftwareRefused");
@@ -634,10 +633,9 @@ void runClassifierChecks(Device& device, bool deviceStops) {
     //       stream declines it during the capability query instead.
     // CONTROL: renderer/video/video_decoder.cpp, attachHardwareFrames()'s `if (!deviceHealthy())`
     //       changed to `if (false)`. Observed: the fault entry printed "FAIL: a hardware failure
-    //       on a device that no longer answers did not raise GpuFailure" and reported
-    //       SoftwareRefused instead. The mirrored mutation, `if (true)`, makes the refusal entry
-    //       print "FAIL: a hardware failure on a device that still answers raised GpuFailure".
-    //       Both reverted.
+    //       on a device that no longer answers did not raise GpuFailure". The mirrored mutation,
+    //       `if (true)`, makes the refusal entry print "FAIL: a hardware failure on a device that
+    //       still answers raised GpuFailure". Both reverted.
     g_failNextFramesInit = true;
     g_deviceLost = deviceStops;
 

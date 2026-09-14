@@ -11,10 +11,12 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/buffer.h>
+#include <libavutil/common.h>
 #include <libavutil/error.h>
 #include <libavutil/frame.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_vulkan.h>
+#include <libavutil/mathematics.h>
 #include <libavutil/pixdesc.h>
 }
 
@@ -172,6 +174,13 @@ private:
 // dropped it and conceals the pictures that depended on it. Whichever of send and receive ran
 // the decode reports it, and neither is retried -- the packet is gone, so a retry would spin.
 bool isDamagedPacket(int err) { return err == AVERROR_INVALIDDATA; }
+
+// What VideoDecoder::readVideoPacket() numbered the packet a frame was decoded from; ffmpeg
+// carries it in `opaque`, where 0 is no number.
+std::optional<uint64_t> packetNumber(const AVFrame& frame) {
+    const auto number = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(frame.opaque));
+    return number == 0 ? std::nullopt : std::optional<uint64_t>(number);
+}
 
 }  // namespace
 
@@ -382,6 +391,7 @@ void VideoDecoder::openDecoder() {
     // Cropping is reported, not applied: ffmpeg cannot move a device image's origin, so applying
     // it would drop the left and top crop on the hardware path while honouring it in software.
     m_codec->apply_cropping = 0;
+    m_codec->flags |= AV_CODEC_FLAG_COPY_OPAQUE;
 
     if (hardware) attachDevice();
 
@@ -400,15 +410,101 @@ void VideoDecoder::reopenInSoftware() {
     m_awaitingHardwareSetup = false;
     m_parkedFailure = nullptr;
     closeDecoder();
-    // Back to the first packet on the container already open; a container that cannot seek --
-    // a raw bitstream -- is read again from the start.
-    const AVStream& stream = *m_format->streams[m_stream];
-    const int64_t start = stream.start_time == AV_NOPTS_VALUE ? 0 : stream.start_time;
-    if (av_seek_frame(m_format, m_stream, start, AVSEEK_FLAG_BACKWARD) < 0) {
+
+    if (!m_lastTimestamp) {
+        // Ending without meeting that packet's picture means software did not decode the same pictures.
+        const bool packetMissed = std::holds_alternative<DropThroughPacket>(m_resume);
+        rewind();
+        if (m_returned == 0) {
+            m_resume = std::monostate{};
+        } else if (m_lastPacket && !packetMissed) {
+            m_resume = DropThroughPacket{};
+        } else {
+            m_resume = DropCount{m_returned};
+        }
+    } else {
+        // Each retry aims twice as far back, from a second, so a demuxer that lands past its
+        // target costs a few keyframe intervals rather than the whole file.
+        const Seeked* unlanded = std::get_if<Seeked>(&m_resume);
+        const int64_t second =
+            std::max<int64_t>(1, av_rescale_q(1, AVRational{1, 1}, m_format->streams[m_stream]->time_base));
+        int64_t back = 0;
+        if (unlanded != nullptr) back = unlanded->back == 0 ? second : av_sat_add64(unlanded->back, unlanded->back);
+        const int64_t target = av_sat_sub64(*m_lastTimestamp, back);
+        if (target > streamStart() && av_seek_frame(m_format, m_stream, target, AVSEEK_FLAG_BACKWARD) >= 0) {
+            m_packetsRead.reset();
+            m_resume = Seeked{back};
+        } else {
+            rewind();
+            m_resume = DropThrough{};
+        }
+    }
+    openDecoder();
+}
+
+int64_t VideoDecoder::streamStart() const {
+    const int64_t start = m_format->streams[m_stream]->start_time;
+    return start == AV_NOPTS_VALUE ? 0 : start;
+}
+
+// Back to the first packet on the container already open; a container that cannot seek is
+// opened again.
+void VideoDecoder::rewind() {
+    if (av_seek_frame(m_format, m_stream, streamStart(), AVSEEK_FLAG_BACKWARD) < 0) {
         avformat_close_input(&m_format);
         openContainer();
     }
-    openDecoder();
+    m_packetsRead = 0;
+}
+
+// Whether a decoded picture is one next() has not yet returned. Pictures before the resume point
+// are decoded and dropped here rather than skipped as packets: later pictures reference them.
+bool VideoDecoder::admit(int64_t timestamp, std::optional<uint64_t> packet) {
+    if (auto* count = std::get_if<DropCount>(&m_resume)) {
+        if (--count->remaining == 0) m_resume = std::monostate{};
+        return false;
+    }
+    if (std::holds_alternative<DropThroughPacket>(m_resume)) {
+        // Equal, never ordered: with B-frames, pictures come out in another order than their packets.
+        if (packet == m_lastPacket) m_resume = std::monostate{};
+        return false;
+    }
+    if (std::holds_alternative<Seeked>(m_resume)) {
+        // A picture without a timestamp says nothing of where the seek landed. One past the resume
+        // point does: pictures between the two may never have been decoded.
+        if (timestamp == AV_NOPTS_VALUE) return false;
+        if (timestamp > *m_lastTimestamp) {
+            m_reopenInSoftware = true;
+        } else {
+            m_resume = DropThrough{};
+        }
+        return false;
+    }
+    if (std::holds_alternative<DropThrough>(m_resume)) {
+        if (timestamp == AV_NOPTS_VALUE || timestamp <= *m_lastTimestamp) return false;
+        m_resume = std::monostate{};
+    }
+    return true;
+}
+
+void VideoDecoder::recordReturned(int64_t timestamp, std::optional<uint64_t> packet) {
+    const bool increasing =
+        timestamp != AV_NOPTS_VALUE && (m_returned == 0 || (m_lastTimestamp && timestamp > *m_lastTimestamp));
+    m_lastTimestamp = increasing ? std::optional<int64_t>(timestamp) : std::nullopt;
+    m_lastPacket = packet;
+    ++m_returned;
+}
+
+// Called with each packet read. Only the first after a seek shows where it landed; any later one
+// can only show that a picture past the resume point was left to decode.
+void VideoDecoder::recordLanding() {
+    auto* seeked = std::get_if<Seeked>(&m_resume);
+    if (seeked == nullptr || seeked->landing == Landing::Unproven) return;
+    const int64_t at = m_packet->pts != AV_NOPTS_VALUE ? m_packet->pts : m_packet->dts;
+    const bool atOrBefore = at != AV_NOPTS_VALUE && at <= *m_lastTimestamp;
+    const bool keyframe = (m_packet->flags & AV_PKT_FLAG_KEY) != 0;
+    const bool first = seeked->landing == Landing::NoPacket;
+    seeked->landing = atOrBefore && (keyframe || !first) ? Landing::NothingPast : Landing::Unproven;
 }
 
 void VideoDecoder::attachDevice() {
@@ -609,7 +705,10 @@ int VideoDecoder::readVideoPacket() {
     for (;;) {
         const int err = av_read_frame(m_format, m_packet);
         if (err < 0) return err;
-        if (m_packet->stream_index == m_stream) return 0;
+        if (m_packet->stream_index == m_stream) {
+            if (m_packetsRead) m_packet->opaque = reinterpret_cast<void*>(static_cast<uintptr_t>(++*m_packetsRead));
+            return 0;
+        }
         av_packet_unref(m_packet);
     }
 }
@@ -641,20 +740,39 @@ std::optional<DecodedFrame> VideoDecoder::next() {
         if (err == 0) {
             m_awaitingHardwareSetup = false;
             if (m_frame->format == AV_PIX_FMT_VULKAN) m_path = Path::Hardware;
+            const int64_t timestamp = m_frame->best_effort_timestamp;
+            const std::optional<uint64_t> packet = packetNumber(*m_frame);
+            if (!admit(timestamp, packet)) {
+                av_frame_unref(m_frame);
+                continue;
+            }
             AVFrame* out = av_frame_alloc();
             if (out == nullptr) throwOutOfMemory("VideoDecoder");
             av_frame_move_ref(out, m_frame);
-            return DecodedFrame(m_device, out);
+            DecodedFrame frame(m_device, out);
+            recordReturned(timestamp, packet);
+            return frame;
         }
-        if (err == AVERROR_EOF) return std::nullopt;
+        // Nothing more can be sent after the flush, so a decoder that still asks for input has
+        // no more pictures to give.
+        if (err == AVERROR_EOF || (err == AVERROR(EAGAIN) && m_flushed)) {
+            const auto* seeked = std::get_if<Seeked>(&m_resume);
+            if ((seeked != nullptr && seeked->landing != Landing::NothingPast) ||
+                std::holds_alternative<DropThroughPacket>(m_resume)) {
+                m_reopenInSoftware = true;
+                continue;
+            }
+            if (std::holds_alternative<DropCount>(m_resume)) {
+                throw WallpaperContentError("VideoDecoder: " + m_file +
+                                            " ended before software decoding reached the pictures already returned");
+            }
+            return std::nullopt;
+        }
         if (isDamagedPacket(err)) continue;
         if (err != AVERROR(EAGAIN)) {
             failDecode("avcodec_receive_frame", err);
             continue;
         }
-        // Nothing more can be sent after the flush, so a decoder that still asks for input has
-        // no more pictures to give.
-        if (m_flushed) return std::nullopt;
 
         // A packet ffmpeg asked to see again is still held; otherwise the next one is read. A
         // container that cannot be read is fatal, unlike a packet that cannot be decoded: a
@@ -666,6 +784,8 @@ std::optional<DecodedFrame> VideoDecoder::next() {
                 m_flushed = true;
             } else if (err < 0) {
                 throwAvFailure("VideoDecoder: reading " + m_file, err);
+            } else {
+                recordLanding();
             }
         }
         err = avcodec_send_packet(m_codec, m_flushed ? nullptr : m_packet);

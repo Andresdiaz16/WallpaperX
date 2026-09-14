@@ -82,6 +82,7 @@ add_library(wallpaperx-renderer STATIC
     renderers/video_renderer.cpp
     video/video_decoder.cpp
     video/frame_converter.cpp
+    video/video_pipeline.cpp
 )
 
 target_include_directories(wallpaperx-renderer
@@ -399,6 +400,66 @@ if(WALLPAPERX_FFMPEG_EXECUTABLE)
         )
         list(APPEND WALLPAPERX_VIDEO_ASSETS ${WALLPAPERX_VIDEO_ASSET_DIR}/${PAIR_NAME})
     endforeach()
+
+    # Counter fixtures: each picture draws its own frame number, which support/picture_counter.h
+    # reads back, so a probe identifies a shown picture by its pixels and never by the timestamps
+    # or packet numbers the decoder decides from. Sized so a resume's cost is visible without a slow
+    # suite: 320 pictures with a keyframe every 24 puts a late failure twelve keyframe intervals in.
+    # Scene-cut keyframes are off so the interval is the recipe's. OFFSET starts a segment's count
+    # elsewhere, so two segments joined together still name every picture once. Commas are escaped
+    # for the filtergraph, and the backslash doubled for CMake.
+    set(COUNTER_BITS "if(lt(2*Y\\,H)\\,if(lt(2*X\\,W)\\,if(bitand(N+OFFSET\\,pow(2\\,floor(8*X/W)+4*floor(6*Y/H)))\\,235\\,16)\\,if(bitand(N+OFFSET\\,pow(2\\,floor(8*X/W)-4+4*floor(6*Y/H)))\\,16\\,235))\\,128)")
+    set(COUNTER_H264 "-c:v libx264 -threads 1 -crf 18 -keyint_min 24 -g 24 -sc_threshold 0")
+    # name|size|pictures per second|seconds|offset|encoder arguments
+    set(WALLPAPERX_COUNTER_RECIPES
+        "counter_long.mp4|320x240|30|10.667|0|${COUNTER_H264} -bf 3"
+        "counter_short.mp4|320x240|10|2|0|${COUNTER_H264} -bf 3"
+        "counter_bframes.h264|320x240|30|3|0|${COUNTER_H264} -bf 3 -bsf:v h264_mp4toannexb -f h264"
+        "counter_seg.ts|320x240|30|4|0|${COUNTER_H264} -bf 3 -f mpegts"
+        "counter_jump_a.ts|320x240|30|2|0|${COUNTER_H264} -bf 0 -f mpegts"
+        "counter_jump_b.ts|320x240|30|2|1000|${COUNTER_H264} -bf 0 -f mpegts"
+        "counter_repeat.mkv|320x240|30|2|0|${COUNTER_H264} -bf 0 -bsf:v setts=pts=2*trunc(N/2)+2:dts=N -f matroska"
+        "counter_resize_large.h264|320x240|30|1|0|${COUNTER_H264} -bf 3 -bsf:v h264_mp4toannexb -f h264"
+        "counter_resize_small.h264|160x120|30|1|30|${COUNTER_H264} -bf 3 -bsf:v h264_mp4toannexb -f h264"
+    )
+    foreach(RECIPE ${WALLPAPERX_COUNTER_RECIPES})
+        string(REPLACE "|" ";" RECIPE_PARTS "${RECIPE}")
+        list(GET RECIPE_PARTS 0 ASSET_NAME)
+        list(GET RECIPE_PARTS 1 COUNTER_SIZE)
+        list(GET RECIPE_PARTS 2 COUNTER_RATE)
+        list(GET RECIPE_PARTS 3 COUNTER_SECONDS)
+        list(GET RECIPE_PARTS 4 COUNTER_OFFSET)
+        list(GET RECIPE_PARTS 5 ASSET_ENCODE)
+        string(REPLACE "OFFSET" "${COUNTER_OFFSET}" COUNTER_EXPRESSION "${COUNTER_BITS}")
+        separate_arguments(ASSET_ENCODE UNIX_COMMAND "${ASSET_ENCODE}")
+        add_custom_command(
+            OUTPUT ${WALLPAPERX_VIDEO_ASSET_DIR}/${ASSET_NAME}
+            COMMAND ${WALLPAPERX_FFMPEG_EXECUTABLE} -y -v error -f lavfi
+                    -i color=size=${COUNTER_SIZE}:rate=${COUNTER_RATE}:duration=${COUNTER_SECONDS}
+                    -vf format=yuv420p,geq=lum=${COUNTER_EXPRESSION}:cb=128:cr=128,setparams=${BT709}
+                    ${ASSET_ENCODE} ${WALLPAPERX_VIDEO_ASSET_DIR}/${ASSET_NAME}
+            COMMENT "Generating video fixture ${ASSET_NAME}"
+            VERBATIM
+        )
+        list(APPEND WALLPAPERX_VIDEO_ASSETS ${WALLPAPERX_VIDEO_ASSET_DIR}/${ASSET_NAME})
+    endforeach()
+    # Joined byte for byte: two transport streams whose timestamps both start at the same value, so
+    # the second half's jump backwards; and a picture that halves in size part way through.
+    foreach(PAIR "counter_jump.ts|counter_jump_a.ts|counter_jump_b.ts"
+                 "counter_resize.h264|counter_resize_large.h264|counter_resize_small.h264")
+        string(REPLACE "|" ";" PAIR_PARTS "${PAIR}")
+        list(GET PAIR_PARTS 0 PAIR_NAME)
+        list(GET PAIR_PARTS 1 PAIR_FIRST)
+        list(GET PAIR_PARTS 2 PAIR_SECOND)
+        add_custom_command(
+            OUTPUT ${WALLPAPERX_VIDEO_ASSET_DIR}/${PAIR_NAME}
+            COMMAND ${CMAKE_COMMAND} -E cat ${WALLPAPERX_VIDEO_ASSET_DIR}/${PAIR_FIRST}
+                    ${WALLPAPERX_VIDEO_ASSET_DIR}/${PAIR_SECOND} > ${WALLPAPERX_VIDEO_ASSET_DIR}/${PAIR_NAME}
+            DEPENDS ${WALLPAPERX_VIDEO_ASSET_DIR}/${PAIR_FIRST} ${WALLPAPERX_VIDEO_ASSET_DIR}/${PAIR_SECOND}
+            COMMENT "Generating video fixture ${PAIR_NAME}"
+        )
+        list(APPEND WALLPAPERX_VIDEO_ASSETS ${WALLPAPERX_VIDEO_ASSET_DIR}/${PAIR_NAME})
+    endforeach()
     add_custom_target(wallpaperx-video-fixtures DEPENDS ${WALLPAPERX_VIDEO_ASSETS})
 else()
     message(STATUS "  ffmpeg CLI: not found -- video decoder fixtures are not generated and "
@@ -441,6 +502,21 @@ if(WALLPAPERX_SANITIZE)
 endif()
 if(WALLPAPERX_FFMPEG_EXECUTABLE)
     add_dependencies(wallpaperx-frame-converter-probe wallpaperx-video-fixtures)
+endif()
+
+# VideoPipeline, and VideoDecoder's resume after a mid-stream hardware failure, graded by the frame
+# number each counter fixture draws into its pictures. Interposes ffmpeg's decode, seek and open
+# entry points to inject the failure and count what the resume costs, and Vulkan's create and wait
+# entry points to count what a steady picture costs; no allocator replacement, so no
+# WALLPAPERX_SANITIZE opt-out.
+add_executable(wallpaperx-video-pipeline-probe tests/video_pipeline_probe.cpp)
+target_link_libraries(wallpaperx-video-pipeline-probe PRIVATE wallpaperx-renderer)
+target_compile_definitions(wallpaperx-video-pipeline-probe PRIVATE
+    WALLPAPERX_VIDEO_ASSET_DIR="${WALLPAPERX_VIDEO_ASSET_DIR}"
+    WALLPAPERX_SHADER_DIR="${SHADER_OUTPUT_DIR}")
+add_dependencies(wallpaperx-video-pipeline-probe wallpaperx-shaders)
+if(WALLPAPERX_FFMPEG_EXECUTABLE)
+    add_dependencies(wallpaperx-video-pipeline-probe wallpaperx-video-fixtures)
 endif()
 
 # The Device's creation record and its video-decode surface. Interposes vkCreateInstance,
@@ -584,6 +660,10 @@ add_test(NAME frame_converter_shape_resize COMMAND wallpaperx-frame-converter-pr
 add_test(NAME frame_converter_shape_tags COMMAND wallpaperx-frame-converter-probe shape-tags)
 add_test(NAME frame_converter_shape_fallback COMMAND wallpaperx-frame-converter-probe shape-fallback)
 add_test(NAME frame_converter_shader_read COMMAND wallpaperx-frame-converter-probe shader-read)
+add_test(NAME frame_converter_pipeline_colour_host COMMAND wallpaperx-frame-converter-probe pipeline-colour-host)
+add_test(NAME frame_converter_pipeline_colour_device COMMAND wallpaperx-frame-converter-probe pipeline-colour-device)
+set_tests_properties(frame_converter_pipeline_colour_host frame_converter_pipeline_colour_device
+                     PROPERTIES SKIP_RETURN_CODE 77)
 set_tests_properties(frame_converter_colour_host frame_converter_colour_device frame_converter_edges_host
                      frame_converter_edges_device frame_converter_siting frame_converter_refusal
                      frame_converter_output frame_converter_allocation frame_converter_gate
@@ -592,6 +672,17 @@ set_tests_properties(frame_converter_colour_host frame_converter_colour_device f
                      frame_converter_shader_read
                      PROPERTIES SKIP_RETURN_CODE 77)
 set_tests_properties(frame_converter_shader_read PROPERTIES LABELS "novulkan")
+
+# One entry per mode. The resume entries and the two _device entries need a hardware decoder and skip
+# without one; the _host entries and shape build a device with the video extensions stripped.
+# SKIP_RETURN_CODE throughout: a missing ffmpeg command line or decoder must not read as a pass.
+set(WALLPAPERX_PIPELINE_MODES sequence-device sequence-host resume-timestamps resume-no-timestamps
+    resume-late-seek resume-end resume-seek-failure resume-drop-count shape steady-device steady-host)
+foreach(MODE ${WALLPAPERX_PIPELINE_MODES})
+    string(REPLACE "-" "_" MODE_NAME "${MODE}")
+    add_test(NAME video_pipeline_${MODE_NAME} COMMAND wallpaperx-video-pipeline-probe ${MODE})
+    set_tests_properties(video_pipeline_${MODE_NAME} PROPERTIES SKIP_RETURN_CODE 77)
+endforeach()
 
 # 77 means this driver cannot export an opaque-fd binary semaphore at all, so there is no acquire
 # descriptor to wait on -- Lavapipe. That run still grades what such a driver must do (hand back
@@ -796,10 +887,21 @@ if(WALLPAPERX_LAVAPIPE_ICD)
     add_test(NAME frame_converter_allocation_lavapipe COMMAND wallpaperx-frame-converter-probe allocation)
     add_test(NAME frame_converter_shape_resize_lavapipe COMMAND wallpaperx-frame-converter-probe shape-resize)
     add_test(NAME frame_converter_shape_tags_lavapipe COMMAND wallpaperx-frame-converter-probe shape-tags)
+    add_test(NAME frame_converter_pipeline_colour_host_lavapipe
+             COMMAND wallpaperx-frame-converter-probe pipeline-colour-host)
     set_tests_properties(frame_converter_colour_host_lavapipe frame_converter_edges_host_lavapipe
                          frame_converter_siting_lavapipe frame_converter_refusal_lavapipe
                          frame_converter_output_lavapipe frame_converter_allocation_lavapipe
                          frame_converter_shape_resize_lavapipe frame_converter_shape_tags_lavapipe
+                         frame_converter_pipeline_colour_host_lavapipe
                          PROPERTIES ENVIRONMENT "VK_ICD_FILENAMES=${WALLPAPERX_LAVAPIPE_ICD}"
                                     LABELS "lavapipe" SKIP_RETURN_CODE 77)
+    # The pipeline's entries that need no hardware decoder.
+    foreach(MODE sequence-host shape steady-host)
+        string(REPLACE "-" "_" MODE_NAME "${MODE}")
+        add_test(NAME video_pipeline_${MODE_NAME}_lavapipe COMMAND wallpaperx-video-pipeline-probe ${MODE})
+        set_tests_properties(video_pipeline_${MODE_NAME}_lavapipe
+                             PROPERTIES ENVIRONMENT "VK_ICD_FILENAMES=${WALLPAPERX_LAVAPIPE_ICD}"
+                                        LABELS "lavapipe" SKIP_RETURN_CODE 77)
+    endforeach()
 endif()

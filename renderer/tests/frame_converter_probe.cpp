@@ -21,6 +21,7 @@
 #include "renderers/video_renderer.h"
 #include "video/frame_converter.h"
 #include "video/video_decoder.h"
+#include "video/video_pipeline.h"
 #include "vulkan/device.h"
 #include "vulkan/gpu_fault.h"
 #include "vulkan/offscreen.h"
@@ -28,6 +29,7 @@
 
 #include "support/check.h"
 #include "support/gpu_readback.h"
+#include "support/picture_counter.h"
 #include "support/validation_grade.h"
 #include "support/video_probe_support.h"
 
@@ -80,6 +82,7 @@ using wallpaperx::OffscreenTarget;
 using wallpaperx::OffscreenTargetManager;
 using wallpaperx::VideoDecoder;
 using wallpaperx::VideoFrame;
+using wallpaperx::VideoPipeline;
 using wallpaperx::VideoRenderer;
 using wallpaperx::WallpaperContentError;
 using wallpaperx::testing::check;
@@ -105,6 +108,9 @@ bool g_stripX6LinearFilter = false;
 // The next N avcodec_receive_frame() calls report AVERROR_EXTERNAL: the hardware decoder failing
 // part way through a stream on a device that still answers.
 int g_receiveExternalRemaining = 0;
+// The format of the last picture avcodec_receive_frame() handed back: tells where a decoder that
+// is not reachable from here, VideoPipeline's, decoded.
+AVPixelFormat g_lastReceivedFormat = AV_PIX_FMT_NONE;
 
 // What ffmpeg's hardware setup last proposed, recorded by the avcodec_get_hw_frames_parameters
 // interposer: tells a stream the rule refused from one ffmpeg turned away before the rule was asked.
@@ -1775,6 +1781,100 @@ void runNoYcbcrChecks(Device& device, const std::string& label) {
 // ------------------------------------------------------------------------- //
 
 // Expects convert() to throw exactly `Expected` and to submit nothing.
+// ------------------------------------------------------------------------- //
+// S13.68 -- VideoPipeline's target against the reference
+// ------------------------------------------------------------------------- //
+
+void runPipelineColourChecks(Device& device, const std::string& label, bool onDevice) {
+    if (!kHaveReference) {
+        std::printf("%s: built without libswscale, so there is no independent reference -- not answerable\n",
+                    label.c_str());
+        g_notVerified = true;
+        return;
+    }
+    if (onDevice && device.info().videoDecodeOps == 0) {
+        std::printf("%s: %s has no hardware decoder, so no picture reaches the device path -- not answerable\n",
+                    label.c_str(), device.info().gpuName.c_str());
+        g_notVerified = true;
+        return;
+    }
+    if (!onDevice && !videoExtensionsHidden(device, label)) return;
+
+    // GOAL: S13.68 -- what VideoPipeline leaves on a target the size of the picture is within one code
+    //       of libswscale told the matrix and range explicitly, from host planes and from device images.
+    // WHY-THIS-SHAPE: colour-host and colour-device grade FrameConverter's image; this grades the
+    //       target after decode, convert and blit together, which they cannot: a blit ahead of its
+    //       conversion, or a stage showing another image, leaves the converter's image right. The
+    //       target is the visible size, so the blit is one to one and each pixel is the picture's.
+    //       The device fixtures are the converter's own; one that decodes in software here is a skip.
+    // CONTROL: each reverted. renderer/video/frame_converter.cpp BT.709 coefficients set to BT.601's:
+    //       every BT.709 fixture 32-33 codes off on both paths, the two BT.601 ones green.
+    //       renderer/video/video_pipeline.cpp renderNext() rendering before converting: every fixture
+    //       "differs from libswscale by 255 codes", the target black.
+    // COVERAGE-ASSERT: gradeColour's own -- a quarter of the picture compared, wrong readings at least
+    //       12 codes away -- plus each fixture's tags: red with a BT.601-tagged file under the BT.709
+    //       name, "decoded with matrix smpte170m".
+    int graded = 0;
+    for (const ColourFixture& fixture : onDevice ? std::vector<ColourFixture>(std::begin(kDeviceColourFixtures),
+                                                                              std::end(kDeviceColourFixtures))
+                                                 : std::vector<ColourFixture>(std::begin(kHostColourFixtures),
+                                                                              std::end(kHostColourFixtures))) {
+        if (!haveAsset(fixture.file, label)) continue;
+        try {
+            std::string why;
+            std::optional<HostPicture> reference = softwareFirstFrame(asset(fixture.file), why);
+            if (!reference) {
+                std::fprintf(stderr, "FAIL: %s: %s: %s\n", label.c_str(), fixture.file, why.c_str());
+                fail("the software reference decode failed");
+                continue;
+            }
+            if (reference->colour.matrix != fixture.matrix || reference->colour.range != fixture.range) {
+                std::fprintf(stderr, "FAIL: %s: %s decoded with %s\n", label.c_str(), fixture.file,
+                             describeColour(reference->colour).c_str());
+                fail("a colour fixture does not carry what its recipe tags, so this probe was not given the stream "
+                     "it grades");
+                continue;
+            }
+            std::vector<unsigned char> shown;
+            bool deviceFrame = false;
+            {
+                OffscreenTargetManager targets(device);
+                const OffscreenTarget& target =
+                    targets.create(1, reference->visible.extent.width, reference->visible.extent.height);
+                VideoPipeline pipeline(device, asset(fixture.file), kShaderDir);
+                g_lastReceivedFormat = AV_PIX_FMT_NONE;
+                if (!pipeline.renderNext(targets, target)) {
+                    fail("a colour fixture played no picture through the pipeline");
+                    continue;
+                }
+                deviceFrame = g_lastReceivedFormat == AV_PIX_FMT_VULKAN;
+                shown = wallpaperx::testing::reclaimAndReadback(device, targets, target);
+            }
+            if (onDevice && !deviceFrame) {
+                std::printf("%s: %s did not decode on the device -- not answerable for it\n", label.c_str(),
+                            fixture.file);
+                g_notVerified = true;
+                continue;
+            }
+            if (!onDevice && deviceFrame) {
+                fail("a software-only device decoded a picture on the device");
+                continue;
+            }
+            const std::string name = std::string(fixture.file) + " through the pipeline";
+            if (gradeColour(label, name.c_str(), *reference, shown, fixture.swsMatrix, fixture.fullRange,
+                            fixture.swsOtherMatrix)) {
+                ++graded;
+            }
+        } catch (const std::exception& e) {
+            reportThrow(label, fixture.file, e);
+        }
+    }
+    if (graded == 0 && wallpaperx::testing::failureCount() == 0) {
+        std::printf("%s: no fixture was graded -- not answerable\n", label.c_str());
+        g_notVerified = true;
+    }
+}
+
 template <class Expected>
 bool refusedWithoutSubmitting(FrameConverter& converter, DecodedFrame& frame, const std::string& label,
                               const char* what) {
@@ -1891,33 +1991,52 @@ void runShapeFallbackChecks(Device& device, const std::string& label) {
         g_notVerified = true;
         return;
     }
-    if (!haveAsset("conv_709_tv.mp4", label)) return;
+    const char* const file = "counter_short.mp4";
+    if (!haveAsset(file, label)) return;
 
     // GOAL: S13.55 -- when the hardware decoder fails part way through a stream on a device that
     //       still answers, later frames arrive from host memory, the converter built for the device
-    //       frames refuses them with std::invalid_argument before submitting, and the software
-    //       decode starts again from the stream's first packet.
+    //       frames refuses the first with std::invalid_argument before submitting, the path is
+    //       SoftwareRefused, and every picture of the stream is converted once, in order.
     // WHY-THIS-SHAPE: the failure is injected at avcodec_receive_frame after three device frames,
-    //       because no file makes a working hardware decoder fail mid-stream. The frame count after
-    //       the fallback is compared with a never-hardware decode of the same file, which is what
-    //       tells "starts again" from "resumes".
-    // CONTROL: renderer/video/video_decoder.cpp reopenInSoftware() seeking half a second forward:
-    //       "5 host frames arrived; a never-hardware decode yields 10". renderer/video/
-    //       frame_converter.cpp's picture refusal as std::runtime_error: "raised the wrong exception".
-    //       Both reverted. Harness: the interposer never consuming its injection -> "never consumed".
-    // COVERAGE-ASSERT: the injection must have been consumed, and three device frames seen first.
+    //       because no file makes a working hardware decoder fail mid-stream. Each conversion is read
+    //       back and identified by the frame number the fixture draws into it, against libavcodec
+    //       decoding the file directly. A frame count cannot tell a repeat and a skip that cancel, and
+    //       the decoder's timestamps are what it decides from.
+    // CONTROL: each reverted. renderer/video/video_decoder.cpp admit()'s DropThrough test `<=` made `<`:
+    //       "21 pictures converted against 20 ... 1 converted more than once". DropThrough also dropping
+    //       the first picture past the resume point: "19 ... 1 never converted".
+    //       renderer/video/frame_converter.cpp's picture refusal as std::runtime_error: "raised the wrong
+    //       exception".
+    // COVERAGE-ASSERT: the injection consumed, three device frames seen first, and the independent
+    //       decode naming every picture once -- red with the colour-bars fixture substituted, "does not
+    //       name each picture once".
     constexpr int kDeviceFramesFirst = 3;
     try {
-        const int softwareFrames = softwareFrameCount(asset("conv_709_tv.mp4"));
-        VideoDecoder decoder(device, asset("conv_709_tv.mp4"));
+        std::string why;
+        const std::optional<wallpaperx::testing::CounterReference> reference =
+            wallpaperx::testing::decodeCounterReference(asset(file), why);
+        if (!reference || !reference->distinctAndReadable()) {
+            std::fprintf(stderr, "FAIL: %s: %s: %s\n", label.c_str(), file,
+                         reference ? "does not name each picture once" : why.c_str());
+            fail("the counter fixture gives no sequence to grade against");
+            return;
+        }
+        VideoDecoder decoder(device, asset(file));
         std::optional<FrameConverter> converter;
+        std::vector<int> converted;
         int deviceFrames = 0;
         int hostFrames = 0;
         bool refusedTheSwitch = false;
+        auto identify = [&](DecodedFrame& frame) {
+            const std::vector<uint8_t> pixels = convertAndRead(device, *converter, frame);
+            converted.push_back(wallpaperx::testing::counterFromBgra(pixels, converter->frame().source.width,
+                                                                     converter->frame().source.height));
+        };
         while (std::optional<DecodedFrame> frame = decoder.next()) {
             if (frame->storage() == DecodedFrame::Storage::DeviceImage) {
                 if (!converter) converter.emplace(device, *frame, kShaderDir);
-                waitReporting(device, converter->convert(*frame), "a device frame");
+                identify(*frame);
                 if (++deviceFrames == kDeviceFramesFirst) g_receiveExternalRemaining = 1;
                 continue;
             }
@@ -1928,7 +2047,11 @@ void runShapeFallbackChecks(Device& device, const std::string& label) {
                 converter.reset();
             }
             if (!converter) converter.emplace(device, *frame, kShaderDir);
-            waitReporting(device, converter->convert(*frame), "a host frame after the fallback");
+            identify(*frame);
+            if (converted.size() > reference->ids.size() + 8) {
+                fail("the decoder went on returning pictures past the end of the stream");
+                break;
+            }
         }
         const int unconsumed = g_receiveExternalRemaining;
         g_receiveExternalRemaining = 0;
@@ -1942,15 +2065,24 @@ void runShapeFallbackChecks(Device& device, const std::string& label) {
         check(decoder.path() == VideoDecoder::Path::SoftwareRefused,
               "a hardware failure mid-stream did not leave the decoder on SoftwareRefused");
         check(refusedTheSwitch, "the converter built for device frames did not refuse the first host frame");
-        if (hostFrames != softwareFrames) {
+        if (converted != reference->ids) {
+            std::vector<int> times(1 << wallpaperx::testing::kCounterBits, 0);
+            for (int id : converted) {
+                if (id >= 0) ++times[static_cast<size_t>(id)];
+            }
+            int repeated = 0;
+            for (int count : times) repeated += count > 1 ? 1 : 0;
+            int missing = 0;
+            for (int id : reference->ids) missing += times[static_cast<size_t>(id)] == 0 ? 1 : 0;
             std::fprintf(stderr,
-                         "FAIL: %s: after the fallback %d host frames arrived; a never-hardware decode yields %d\n",
-                         label.c_str(), hostFrames, softwareFrames);
-            fail("the software decode after a mid-stream fallback did not start from the first packet");
+                         "FAIL: %s: %zu pictures converted against %zu in an independent decode: %d converted more "
+                         "than once, %d never converted\n",
+                         label.c_str(), converted.size(), reference->ids.size(), repeated, missing);
+            fail("the pictures converted across a mid-stream fallback are not the stream's, each once, in order");
         }
-        std::printf("%s: %d device frames, then the hardware failed; %d host frames followed (a software decode of "
-                    "the file yields %d)\n",
-                    label.c_str(), deviceFrames, hostFrames, softwareFrames);
+        std::printf("%s: %d device frames, then the hardware failed; %d host frames followed, %zu pictures converted "
+                    "against %zu in the stream\n",
+                    label.c_str(), deviceFrames, hostFrames, converted.size(), reference->ids.size());
     } catch (const std::exception& e) {
         g_receiveExternalRemaining = 0;
         reportThrow(label, "the mid-stream fallback", e);
@@ -2103,7 +2235,9 @@ extern "C" int avcodec_receive_frame(AVCodecContext* context, AVFrame* frame) {
         --g_receiveExternalRemaining;
         return AVERROR_EXTERNAL;
     }
-    return real(context, frame);
+    const int err = real(context, frame);
+    if (err == 0) g_lastReceivedFormat = static_cast<AVPixelFormat>(frame->format);
+    return err;
 }
 
 #if WALLPAPERX_ALLOCATION_INSTRUMENT
@@ -2156,7 +2290,8 @@ int main(int argc, char** argv) {
     const std::vector<std::string> modes = {"colour-host", "colour-device", "edges-host", "edges-device",
                                             "siting",      "refusal",       "output",     "allocation",
                                             "gate",        "no-ycbcr",      "shape-resize", "shape-tags",
-                                            "shape-fallback", "shader-read"};
+                                            "shape-fallback", "shader-read", "pipeline-colour-host",
+                                            "pipeline-colour-device"};
     if (std::find(modes.begin(), modes.end(), mode) == modes.end()) {
         std::fprintf(stderr, "usage: %s <mode>, one of:", argv[0]);
         for (const std::string& m : modes) std::fprintf(stderr, " %s", m.c_str());
@@ -2177,7 +2312,8 @@ int main(int argc, char** argv) {
                 try {
                     // Read while the Device is built, and off again before anything else builds one.
                     g_hideVideoExtensions =
-                        mode == "colour-host" || mode == "edges-host" || mode == "shape-resize";
+                        mode == "colour-host" || mode == "edges-host" || mode == "shape-resize" ||
+                        mode == "pipeline-colour-host";
                     g_hideYcbcrFeature = mode == "no-ycbcr";
                     try {
                         device.emplace(/*enableValidation=*/true);
@@ -2204,6 +2340,8 @@ int main(int argc, char** argv) {
                     if (mode == "shape-resize") runShapeResizeChecks(*device, label);
                     if (mode == "shape-tags") runShapeTagChecks(*device, label);
                     if (mode == "shape-fallback") runShapeFallbackChecks(*device, label);
+                    if (mode == "pipeline-colour-host") runPipelineColourChecks(*device, label, /*onDevice=*/false);
+                    if (mode == "pipeline-colour-device") runPipelineColourChecks(*device, label, /*onDevice=*/true);
                     device->waitForSubmissions();
                 } catch (const std::exception& e) {
                     // Reported, not rethrown: an escaping exception would skip the reconciliation
