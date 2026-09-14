@@ -421,6 +421,15 @@ if(WALLPAPERX_FFMPEG_EXECUTABLE)
         "counter_repeat.mkv|320x240|30|2|0|${COUNTER_H264} -bf 0 -bsf:v setts=pts=2*trunc(N/2)+2:dts=N -f matroska"
         "counter_resize_large.h264|320x240|30|1|0|${COUNTER_H264} -bf 3 -bsf:v h264_mp4toannexb -f h264"
         "counter_resize_small.h264|160x120|30|1|30|${COUNTER_H264} -bf 3 -bsf:v h264_mp4toannexb -f h264"
+        "counter_bf2.mkv|320x240|30|2|0|${COUNTER_H264} -bf 2 -f matroska"
+        # Pairs that differ only in length, 20 and 3000 pictures, for a loop boundary's cost. 128x96
+        # still decodes on the GPU and keeps 3000 pictures quick.
+        "counter_loop_short.mp4|128x96|30|0.65|0|${COUNTER_H264} -bf 3"
+        "counter_loop_long.mp4|128x96|30|100|0|${COUNTER_H264} -bf 3"
+        "counter_loop_short.ts|128x96|30|0.65|0|${COUNTER_H264} -bf 3 -f mpegts"
+        "counter_loop_long.ts|128x96|30|100|0|${COUNTER_H264} -bf 3 -f mpegts"
+        "counter_loop_short.h264|128x96|30|0.65|0|${COUNTER_H264} -bf 3 -bsf:v h264_mp4toannexb -f h264"
+        "counter_loop_long.h264|128x96|30|100|0|${COUNTER_H264} -bf 3 -bsf:v h264_mp4toannexb -f h264"
     )
     foreach(RECIPE ${WALLPAPERX_COUNTER_RECIPES})
         string(REPLACE "|" ";" RECIPE_PARTS "${RECIPE}")
@@ -673,11 +682,12 @@ set_tests_properties(frame_converter_colour_host frame_converter_colour_device f
                      PROPERTIES SKIP_RETURN_CODE 77)
 set_tests_properties(frame_converter_shader_read PROPERTIES LABELS "novulkan")
 
-# One entry per mode. The resume entries and the two _device entries need a hardware decoder and skip
+# One entry per mode. The resume entries and the _device entries need a hardware decoder and skip
 # without one; the _host entries and shape build a device with the video extensions stripped.
 # SKIP_RETURN_CODE throughout: a missing ffmpeg command line or decoder must not read as a pass.
 set(WALLPAPERX_PIPELINE_MODES sequence-device sequence-host resume-timestamps resume-no-timestamps
-    resume-late-seek resume-end resume-seek-failure resume-drop-count shape steady-device steady-host)
+    resume-late-seek resume-end resume-seek-failure resume-drop-count shape steady-device steady-host
+    loop-device loop-host loop-cost-device loop-cost-host loop-resume)
 foreach(MODE ${WALLPAPERX_PIPELINE_MODES})
     string(REPLACE "-" "_" MODE_NAME "${MODE}")
     add_test(NAME video_pipeline_${MODE_NAME} COMMAND wallpaperx-video-pipeline-probe ${MODE})
@@ -897,7 +907,7 @@ if(WALLPAPERX_LAVAPIPE_ICD)
                          PROPERTIES ENVIRONMENT "VK_ICD_FILENAMES=${WALLPAPERX_LAVAPIPE_ICD}"
                                     LABELS "lavapipe" SKIP_RETURN_CODE 77)
     # The pipeline's entries that need no hardware decoder.
-    foreach(MODE sequence-host shape steady-host)
+    foreach(MODE sequence-host shape steady-host loop-host loop-cost-host)
         string(REPLACE "-" "_" MODE_NAME "${MODE}")
         add_test(NAME video_pipeline_${MODE_NAME}_lavapipe COMMAND wallpaperx-video-pipeline-probe ${MODE})
         set_tests_properties(video_pipeline_${MODE_NAME}_lavapipe

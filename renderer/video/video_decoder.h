@@ -19,6 +19,7 @@ extern "C" {
 struct AVCodecContext;
 struct AVFormatContext;
 struct AVFrame;
+struct AVIOContext;
 struct AVPacket;
 
 namespace wallpaperx {
@@ -183,6 +184,15 @@ public:
     // throw the decoder is not usable.
     std::optional<DecodedFrame> next();
 
+    // Starts the stream again: the next picture is its first, and a later hardware failure resumes
+    // among the pictures returned since, never earlier ones. The path is kept, so a decoder that fell
+    // back to software stays there. The codec is flushed, not reopened, and the container rewound;
+    // the rewind reopens the container only when no seek is shown to reach its first video packet,
+    // and then reads the file this decoder opened even if its path has since been deleted or renamed
+    // over. The file must not be rewritten in place while this decoder holds it: nothing can detect
+    // that, so replacing a wallpaper takes a new decoder or pipeline. Throws as next() does.
+    void restart();
+
     Path path() const { return m_path; }
 
 private:
@@ -192,37 +202,57 @@ private:
     void openContainer();
     void openDecoder();
     void closeDecoder() noexcept;
+    void closeAll() noexcept;
     void reopenInSoftware();
     int64_t streamStart() const;
     void rewind();
+    bool seekToFirstPacket();
+    bool seekLandsOnFirstPacket(int64_t target, int flags);
+    bool isFirstPacket() const;
     bool admit(int64_t timestamp, std::optional<uint64_t> packet);
     void recordReturned(int64_t timestamp, std::optional<uint64_t> packet);
     void recordLanding();
     void attachDevice();
     bool deviceHealthy();
     int readVideoPacket();
+    void numberPacket();
     void failDecode(const char* what, int err);
 
     Device& m_device;
     std::string m_file;
+    // The file, opened once. Every container reads through it and closing one leaves it open, so a
+    // reopened container reads the same file after its path is deleted or renamed over.
+    AVIOContext* m_io = nullptr;
     AVFormatContext* m_format = nullptr;
     AVCodecContext* m_codec = nullptr;
     AVPacket* m_packet = nullptr;
     AVFrame* m_frame = nullptr;
     PFN_vkGetPhysicalDeviceVideoFormatPropertiesKHR m_videoFormatProperties = nullptr;
     int m_stream = -1;
-    // What a software restart resumes after: how many pictures next() has returned; the last one's
-    // timestamp for as long as every one returned had a timestamp above the one before; and the
-    // number of the packet it was decoded from, when that packet was numbered.
-    uint64_t m_returned = 0;
-    std::optional<int64_t> m_lastTimestamp;
-    std::optional<uint64_t> m_lastPacket;
+    // What a software restart resumes after, since the stream was opened or restarted: how many
+    // pictures next() has returned; the last one's timestamp for as long as every one returned had a
+    // timestamp above the one before; and the number of the packet it was decoded from, when that
+    // packet was numbered.
+    struct Returned {
+        uint64_t count = 0;
+        std::optional<int64_t> lastTimestamp;
+        std::optional<uint64_t> lastPacket;
+    };
+    Returned m_returned;
     // Video packets read since the container was opened or rewound, which is each one's number.
     // Unset after a seek: numbers counted from there would not name the same packets as another
     // decoder's.
     std::optional<uint64_t> m_packetsRead = 0;
+    // Packet 1 as last read, which is how a rewind recognises it.
+    struct FirstPacket {
+        std::optional<int64_t> position;  // unset when the demuxer gave none
+        int64_t dts;
+        int64_t pts;
+        int size;
+    };
+    std::optional<FirstPacket> m_firstPacket;
     // What a restarted software decode drops before it returns a picture again, in stream time
-    // base. Each resumes after m_lastTimestamp or m_lastPacket, which cannot change while it holds:
+    // base. Each resumes after m_returned's timestamp or packet, which cannot change while it holds:
     // none returns a picture.
     //
     // Seeked is a seek `back` before the resume point, not yet shown to have landed at or before

@@ -279,8 +279,8 @@ void runHardwareChecks(Device& device) {
     //       at 320x240 the two would be equal and the check could not tell them apart.
     // CONTROL: renderer/video/video_decoder.cpp, two, both reverted. (1) visible() changed to
     //       return the uncropped frame at the origin: "FAIL: the visible rectangle is the coded
-    //       extent, so the crop the stream declares was not read", and the matching line on the
-    //       no-decoder entry. (2) the DecodedFrame constructor's `m_colour = FrameColour{...}`
+    //       extent, so the crop the stream declares was not read", and on the no-decoder entry "FAIL:
+    //       a software frame does not report the visible rectangle". (2) the DecodedFrame constructor's `m_colour = FrameColour{...}`
     //       replaced by a default-constructed FrameColour, which is the assume-a-default defect:
     //       "FAIL: the frame's colour matrix is not the BT.709 the fixture is tagged with" and
     //       "... colour range is not the limited range ...".
@@ -386,8 +386,8 @@ void runHardwareChecks(Device& device) {
     // CONTROL: renderer/video/video_decoder.cpp, move `vk->sem_value[0] = current + 1;` above
     //       the `m_device->submit(...)` call. Observed: "FAIL: a submit that threw still
     //       advanced the frame's stored semaphore value", then the wait for that batch reporting
-    //       the Device's ten-second bound -- the teardown hang the header warns about,
-    //       demonstrated. Reverted.
+    //       the Device's ten-second bound, and the process hanging in teardown until killed at a
+    //       300-second timeout -- the teardown hang the header warns about. Reverted.
     bool submitThrew = false;
     g_failNextSubmitOnce = true;
     try {

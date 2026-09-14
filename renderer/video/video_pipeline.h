@@ -18,7 +18,8 @@ class OffscreenTargetManager;
 struct OffscreenTarget;
 
 // Takes one video file onto offscreen targets a picture per call: decode, convert, blit. Paces
-// nothing and loops nothing -- each call shows the next picture whenever it is made.
+// nothing -- each call shows the next picture whenever it is made. A looping pipeline shows the
+// first picture in the call after the last, on the same stage when their shape matches.
 //
 // Each picture the decoder returns is shown once, in its output order; the decoder is what keeps
 // a hardware failure from returning one twice. The call that meets the failure returns once
@@ -36,15 +37,19 @@ struct OffscreenTarget;
 // GPU thread only, destruction included. Must be destroyed before the Device.
 class VideoPipeline {
 public:
+    enum class Playback { Once, Loop };
+
     // Opens `file`; nothing is decoded until the first call. Throws what VideoDecoder's
     // constructor throws.
-    VideoPipeline(Device& device, const std::string& file, const std::string& shaderDir);
+    VideoPipeline(Device& device, const std::string& file, const std::string& shaderDir,
+                  Playback playback = Playback::Once);
 
     VideoPipeline(const VideoPipeline&) = delete;
     VideoPipeline& operator=(const VideoPipeline&) = delete;
 
     // Renders the next picture not yet shown onto `target`, which `targets` owns. False, with
-    // nothing rendered, once the stream is exhausted. Throws WallpaperContentError for a file or
+    // nothing rendered, once the stream is exhausted; when looping, only when the stream has shown
+    // nothing or has no picture to start again from. Throws WallpaperContentError for a file or
     // picture this pipeline cannot show, GpuFailure for a GPU that has stopped answering, and
     // std::runtime_error and std::logic_error as the decoder, converter and renderer do. After a
     // throw this pipeline is not usable.
@@ -60,6 +65,7 @@ private:
 
     Device& m_device;
     std::string m_shaderDir;
+    Playback m_playback;
     VideoDecoder m_decoder;
     // Null until the first picture.
     std::unique_ptr<Stage> m_stage;
