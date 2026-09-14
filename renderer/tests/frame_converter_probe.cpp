@@ -1910,9 +1910,8 @@ void runShapeResizeChecks(Device& device, const std::string& label) {
     //       decoder, so what reaches convert() is what a mid-stream change produces rather than a
     //       frame this probe could not build on its own. Submissions are counted at vkQueueSubmit
     //       so "nothing is submitted on a throw" is measured, not inferred from the exception.
-    //       Decoded in software on purpose: ffmpeg's Vulkan H.264 decoder segfaults at this size
-    //       change, inside avcodec_send_packet, with the stock `ffmpeg -hwaccel vulkan` command line
-    //       too -- so the hardware half is not gradable here.
+    //       Decoded in software: the refusal is the converter's and does not depend on the path, and
+    //       a size change on the hardware path is graded by video_pipeline_probe's shape-device entry.
     // CONTROL: renderer/video/frame_converter.cpp convert(), each reverted. An empty submit ahead of
     //       the picture check: "submitted a batch before throwing". The refusal as std::runtime_error:
     //       "raised the wrong exception". Harness: a single-size stream -> both coverage lines; video

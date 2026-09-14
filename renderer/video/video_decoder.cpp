@@ -340,15 +340,33 @@ bool VideoDecoder::deviceHealthy() {
     }
 }
 
-// Freeing the codec frees its image pool once no frame is out, and ffmpeg waits without bound
-// on every image's semaphore first. The codec context is what owns the pool, so it is all that
-// is leaked; the scratch objects hold no GPU work.
+// Freeing the codec and the frames contexts frees their image pools once no frame is out, and
+// ffmpeg waits without bound on every image's semaphore first. Those are what own the pools, so
+// they are all that is leaked; the scratch objects hold no GPU work.
 void VideoDecoder::closeDecoder() noexcept {
     av_frame_free(&m_frame);
-    if (m_codec != nullptr && m_codec->hw_frames_ctx != nullptr && !m_device.safeToFree("the video decoder's images")) {
+    if (!m_framesContexts.empty() && !m_device.safeToFree("the video decoder's images")) {
         m_codec = nullptr;
+        m_framesContexts.clear();
     }
     avcodec_free_context(&m_codec);
+    for (HeldFrames& held : m_framesContexts) av_buffer_unref(&held.ref);
+    m_framesContexts.clear();
+}
+
+// A context only this decoder references has no picture left, in ffmpeg or handed out, and no
+// decode work: ffmpeg waits out its decode batches before the codec drops its reference. Only
+// batches submitted before then can still read the images, and those are polled, never waited on.
+void VideoDecoder::releaseIdleFramesContexts() noexcept {
+    std::erase_if(m_framesContexts, [this](HeldFrames& held) {
+        if (!held.lastReader) {
+            if (av_buffer_get_ref_count(held.ref) != 1) return false;
+            held.lastReader = m_device.lastSubmission();
+        }
+        if (!m_device.hasCompleted(*held.lastReader)) return false;
+        av_buffer_unref(&held.ref);
+        return true;
+    });
 }
 
 // The first call opens the file; a later one reads it again from its start.
@@ -702,6 +720,10 @@ bool VideoDecoder::attachHardwareFrames(AVCodecContext* codec) {
         m_path = Path::SoftwareRefused;
         return false;
     }
+    m_framesContexts.reserve(m_framesContexts.size() + 1);
+    AVBufferRef* held = av_buffer_ref(frames.ref);
+    if (held == nullptr) throwOutOfMemory("VideoDecoder");
+    m_framesContexts.push_back({held, std::nullopt});
     codec->hw_frames_ctx = frames.release();
     return true;
 }
@@ -801,6 +823,7 @@ void VideoDecoder::failDecode(const char* what, int err) {
 
 std::optional<DecodedFrame> VideoDecoder::next() {
     m_device.assertGpuThread("VideoDecoder::next");
+    releaseIdleFramesContexts();
     for (;;) {
         // What the format callback decided during the last ffmpeg call comes before what that
         // call returned: a refusal of every format reads as bad input or as the end otherwise.

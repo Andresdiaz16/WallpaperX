@@ -15,7 +15,9 @@ extern "C" {
 #include <optional>
 #include <string>
 #include <variant>
+#include <vector>
 
+struct AVBufferRef;
 struct AVCodecContext;
 struct AVFormatContext;
 struct AVFrame;
@@ -128,13 +130,15 @@ private:
 // the GPU thread. Neither suits software, so a refusal reopens the stream on ffmpeg's default
 // decoder with its default threads.
 //
-// Frames handed out may outlive this decoder but not the Device. Destroying this decoder frees
-// its image pool once no frame is out, and ffmpeg waits without bound there twice over: on each
-// image's semaphore, which covers this renderer's reads of it, and on its own decode work. The
-// Device's bounded wait guards only the first -- a read batch of this renderer's that has not
-// finished makes the destructor leak the codec context rather than wait. The second has no
-// guard here: a device that is declared lost returns from ffmpeg's waits with an error, but one
-// that merely stops does not, and that destructor hangs inside ffmpeg.
+// Frames handed out may outlive this decoder but not the Device. A stream that changes size or
+// format mid-stream leaves an image pool no picture uses; next() frees it once this renderer's
+// last read of it has finished, and never waits for that. Destroying this decoder frees the
+// rest once no frame is out, and ffmpeg waits without bound there twice over: on each image's
+// semaphore, which covers this renderer's reads of it, and on its own decode work. The Device's
+// bounded wait guards only the first -- a read batch of this renderer's that has not finished
+// makes the destructor leak the codec context and every pool rather than wait. The second has
+// no guard here: a device that is declared lost returns from ffmpeg's waits with an error, but
+// one that merely stops does not, and that destructor hangs inside ffmpeg.
 class VideoDecoder {
 public:
     // Where frames come from. The software states say why hardware was not used.
@@ -199,6 +203,7 @@ private:
     static AVPixelFormat chooseFormat(AVCodecContext* codec, const AVPixelFormat* offered);
     AVPixelFormat choose(AVCodecContext* codec, const AVPixelFormat* offered);
     bool attachHardwareFrames(AVCodecContext* codec);
+    void releaseIdleFramesContexts() noexcept;
     void openContainer();
     void openDecoder();
     void closeDecoder() noexcept;
@@ -227,6 +232,16 @@ private:
     AVCodecContext* m_codec = nullptr;
     AVPacket* m_packet = nullptr;
     AVFrame* m_frame = nullptr;
+    // Every hardware frames context installed on m_codec, referenced until nothing else does. A
+    // stream that changes size or format mid-stream makes ffmpeg drop its own reference, and it then
+    // frees each old picture's frame before the state that waits on that frame's semaphore: without
+    // this reference the last one destroys the semaphore under that wait.
+    struct HeldFrames {
+        AVBufferRef* ref;
+        // The last batch that could read its images, taken once this reference is the only one.
+        std::optional<Device::SubmitTicket> lastReader;
+    };
+    std::vector<HeldFrames> m_framesContexts;
     PFN_vkGetPhysicalDeviceVideoFormatPropertiesKHR m_videoFormatProperties = nullptr;
     int m_stream = -1;
     // What a software restart resumes after, since the stream was opened or restarted: how many

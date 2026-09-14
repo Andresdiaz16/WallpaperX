@@ -410,8 +410,45 @@ if(WALLPAPERX_FFMPEG_EXECUTABLE)
     # for the filtergraph, and the backslash doubled for CMake.
     set(COUNTER_BITS "if(lt(2*Y\\,H)\\,if(lt(2*X\\,W)\\,if(bitand(N+OFFSET\\,pow(2\\,floor(8*X/W)+4*floor(6*Y/H)))\\,235\\,16)\\,if(bitand(N+OFFSET\\,pow(2\\,floor(8*X/W)-4+4*floor(6*Y/H)))\\,16\\,235))\\,128)")
     set(COUNTER_H264 "-c:v libx264 -threads 1 -crf 18 -keyint_min 24 -g 24 -sc_threshold 0")
+    set(COUNTER_H264_RAW "${COUNTER_H264} -bf 3 -bsf:v h264_mp4toannexb -f h264")
+    set(COUNTER_HEVC_RAW "-c:v libx265 -x265-params log-level=error:keyint=24:min-keyint=24:scenecut=0:bframes=3 -bsf:v hevc_mp4toannexb -f hevc")
+    # The size-change parts: one second each, the count continuing across the parts of a join. 160x120
+    # HEVC is below what this GPU decodes, so that join's middle is a refusal.
+    set(WALLPAPERX_SIZE_CHANGE_PARTS
+        "counter_grow_small.h264|160x120|30|1|0|${COUNTER_H264_RAW}"
+        "counter_grow_large.h264|320x240|30|1|30|${COUNTER_H264_RAW}"
+        "counter_back_large.h264|320x240|30|1|60|${COUNTER_H264_RAW}"
+        "counter_big_0.h264|640x480|30|1|0|${COUNTER_H264_RAW}"
+        "counter_big_30.h264|320x240|30|1|30|${COUNTER_H264_RAW}"
+        "counter_big_60.h264|640x480|30|1|60|${COUNTER_H264_RAW}"
+        "counter_sg_0.ts|320x240|30|1|0|${COUNTER_H264} -bf 3 -f mpegts"
+        "counter_sg_30.ts|160x120|30|1|30|${COUNTER_H264} -bf 3 -f mpegts"
+        "counter_sg_60.ts|320x240|30|1|60|${COUNTER_H264} -bf 3 -f mpegts"
+        "counter_sg_0.hevc|320x240|30|1|0|${COUNTER_HEVC_RAW}"
+        "counter_sg_30.hevc|160x120|30|1|30|${COUNTER_HEVC_RAW}"
+        "counter_sg_60.hevc|320x240|30|1|60|${COUNTER_HEVC_RAW}"
+        "counter_big_0.hevc|640x480|30|1|0|${COUNTER_HEVC_RAW}"
+        "counter_big_30.hevc|320x240|30|1|30|${COUNTER_HEVC_RAW}"
+        "counter_big_60.hevc|640x480|30|1|60|${COUNTER_HEVC_RAW}"
+    )
+    # AV1 only where the command line has an encoder for it; without one the probe names the fixture as
+    # not generated and skips. Sizes stay above AV1's 128x128 decode minimum on this GPU.
+    execute_process(COMMAND ${WALLPAPERX_FFMPEG_EXECUTABLE} -hide_banner -encoders
+                    OUTPUT_VARIABLE WALLPAPERX_FFMPEG_ENCODERS ERROR_QUIET)
+    set(WALLPAPERX_SIZE_CHANGE_JOINS "")
+    if(WALLPAPERX_FFMPEG_ENCODERS MATCHES "libaom-av1")
+        set(COUNTER_AV1_RAW "-c:v libaom-av1 -cpu-used 8 -g 24 -keyint_min 24 -f obu")
+        list(APPEND WALLPAPERX_SIZE_CHANGE_PARTS
+            "counter_big_0.obu|640x480|30|1|0|${COUNTER_AV1_RAW}"
+            "counter_big_30.obu|320x240|30|1|30|${COUNTER_AV1_RAW}"
+            "counter_big_60.obu|640x480|30|1|60|${COUNTER_AV1_RAW}")
+        list(APPEND WALLPAPERX_SIZE_CHANGE_JOINS "counter_big.obu|counter_big_0.obu|counter_big_30.obu|counter_big_60.obu")
+    else()
+        message(STATUS "  ffmpeg CLI: no libaom-av1 encoder -- the AV1 size-change fixture is not generated")
+    endif()
     # name|size|pictures per second|seconds|offset|encoder arguments
     set(WALLPAPERX_COUNTER_RECIPES
+        ${WALLPAPERX_SIZE_CHANGE_PARTS}
         "counter_long.mp4|320x240|30|10.667|0|${COUNTER_H264} -bf 3"
         "counter_short.mp4|320x240|10|2|0|${COUNTER_H264} -bf 3"
         "counter_bframes.h264|320x240|30|3|0|${COUNTER_H264} -bf 3 -bsf:v h264_mp4toannexb -f h264"
@@ -453,22 +490,46 @@ if(WALLPAPERX_FFMPEG_EXECUTABLE)
         list(APPEND WALLPAPERX_VIDEO_ASSETS ${WALLPAPERX_VIDEO_ASSET_DIR}/${ASSET_NAME})
     endforeach()
     # Joined byte for byte: two transport streams whose timestamps both start at the same value, so
-    # the second half's jump backwards; and a picture that halves in size part way through.
-    foreach(PAIR "counter_jump.ts|counter_jump_a.ts|counter_jump_b.ts"
-                 "counter_resize.h264|counter_resize_large.h264|counter_resize_small.h264")
-        string(REPLACE "|" ";" PAIR_PARTS "${PAIR}")
-        list(GET PAIR_PARTS 0 PAIR_NAME)
-        list(GET PAIR_PARTS 1 PAIR_FIRST)
-        list(GET PAIR_PARTS 2 PAIR_SECOND)
+    # the second half's jump backwards; and pictures that change size part way through, which raw
+    # bitstreams and transport streams carry in band. A transport stream join restarts its timestamps.
+    list(APPEND WALLPAPERX_SIZE_CHANGE_JOINS
+        "counter_resize.h264|counter_resize_large.h264|counter_resize_small.h264"
+        "counter_grow.h264|counter_grow_small.h264|counter_grow_large.h264"
+        "counter_shrink_grow.h264|counter_resize_large.h264|counter_resize_small.h264|counter_back_large.h264"
+        "counter_big.h264|counter_big_0.h264|counter_big_30.h264|counter_big_60.h264"
+        "counter_shrink_grow.ts|counter_sg_0.ts|counter_sg_30.ts|counter_sg_60.ts"
+        "counter_shrink_grow.hevc|counter_sg_0.hevc|counter_sg_30.hevc|counter_sg_60.hevc"
+        "counter_big.hevc|counter_big_0.hevc|counter_big_30.hevc|counter_big_60.hevc")
+    foreach(JOIN "counter_jump.ts|counter_jump_a.ts|counter_jump_b.ts" ${WALLPAPERX_SIZE_CHANGE_JOINS})
+        string(REPLACE "|" ";" JOIN_PARTS "${JOIN}")
+        list(POP_FRONT JOIN_PARTS JOIN_NAME)
+        list(TRANSFORM JOIN_PARTS PREPEND ${WALLPAPERX_VIDEO_ASSET_DIR}/)
         add_custom_command(
-            OUTPUT ${WALLPAPERX_VIDEO_ASSET_DIR}/${PAIR_NAME}
-            COMMAND ${CMAKE_COMMAND} -E cat ${WALLPAPERX_VIDEO_ASSET_DIR}/${PAIR_FIRST}
-                    ${WALLPAPERX_VIDEO_ASSET_DIR}/${PAIR_SECOND} > ${WALLPAPERX_VIDEO_ASSET_DIR}/${PAIR_NAME}
-            DEPENDS ${WALLPAPERX_VIDEO_ASSET_DIR}/${PAIR_FIRST} ${WALLPAPERX_VIDEO_ASSET_DIR}/${PAIR_SECOND}
-            COMMENT "Generating video fixture ${PAIR_NAME}"
+            OUTPUT ${WALLPAPERX_VIDEO_ASSET_DIR}/${JOIN_NAME}
+            COMMAND ${CMAKE_COMMAND} -E cat ${JOIN_PARTS} > ${WALLPAPERX_VIDEO_ASSET_DIR}/${JOIN_NAME}
+            DEPENDS ${JOIN_PARTS}
+            COMMENT "Generating video fixture ${JOIN_NAME}"
         )
-        list(APPEND WALLPAPERX_VIDEO_ASSETS ${WALLPAPERX_VIDEO_ASSET_DIR}/${PAIR_NAME})
+        list(APPEND WALLPAPERX_VIDEO_ASSETS ${WALLPAPERX_VIDEO_ASSET_DIR}/${JOIN_NAME})
     endforeach()
+    # Matroska cannot be joined byte for byte: ffmpeg's concat demuxer remuxes the transport stream
+    # parts, whose parameter sets stay in band, and its timestamps rise across the join.
+    set(SG_MKV_PARTS ${WALLPAPERX_VIDEO_ASSET_DIR}/counter_sg_0.ts ${WALLPAPERX_VIDEO_ASSET_DIR}/counter_sg_30.ts
+                     ${WALLPAPERX_VIDEO_ASSET_DIR}/counter_sg_60.ts)
+    set(SG_MKV_LIST ${WALLPAPERX_VIDEO_ASSET_DIR}/counter_shrink_grow_mkv.txt)
+    list(TRANSFORM SG_MKV_PARTS PREPEND "file '" OUTPUT_VARIABLE SG_MKV_LINES)
+    list(TRANSFORM SG_MKV_LINES APPEND "'")
+    list(JOIN SG_MKV_LINES "\n" SG_MKV_TEXT)
+    file(WRITE ${SG_MKV_LIST} "${SG_MKV_TEXT}\n")
+    add_custom_command(
+        OUTPUT ${WALLPAPERX_VIDEO_ASSET_DIR}/counter_shrink_grow.mkv
+        COMMAND ${WALLPAPERX_FFMPEG_EXECUTABLE} -y -v error -f concat -safe 0 -i ${SG_MKV_LIST} -c copy -f matroska
+                ${WALLPAPERX_VIDEO_ASSET_DIR}/counter_shrink_grow.mkv
+        DEPENDS ${SG_MKV_PARTS}
+        COMMENT "Generating video fixture counter_shrink_grow.mkv"
+        VERBATIM
+    )
+    list(APPEND WALLPAPERX_VIDEO_ASSETS ${WALLPAPERX_VIDEO_ASSET_DIR}/counter_shrink_grow.mkv)
     add_custom_target(wallpaperx-video-fixtures DEPENDS ${WALLPAPERX_VIDEO_ASSETS})
 else()
     message(STATUS "  ffmpeg CLI: not found -- video decoder fixtures are not generated and "
@@ -684,10 +745,12 @@ set_tests_properties(frame_converter_shader_read PROPERTIES LABELS "novulkan")
 
 # One entry per mode. The resume entries and the _device entries need a hardware decoder and skip
 # without one; the _host entries and shape build a device with the video extensions stripped.
+# shape-device, loop-device and release-device decode size changes on the hardware and run in forked
+# children, so a crash is reported rather than ending the probe.
 # SKIP_RETURN_CODE throughout: a missing ffmpeg command line or decoder must not read as a pass.
 set(WALLPAPERX_PIPELINE_MODES sequence-device sequence-host resume-timestamps resume-no-timestamps
-    resume-late-seek resume-end resume-seek-failure resume-drop-count shape steady-device steady-host
-    loop-device loop-host loop-cost-device loop-cost-host loop-resume)
+    resume-late-seek resume-end resume-seek-failure resume-drop-count shape shape-device steady-device
+    steady-host loop-device loop-host loop-cost-device loop-cost-host loop-resume release-device)
 foreach(MODE ${WALLPAPERX_PIPELINE_MODES})
     string(REPLACE "-" "_" MODE_NAME "${MODE}")
     add_test(NAME video_pipeline_${MODE_NAME} COMMAND wallpaperx-video-pipeline-probe ${MODE})
