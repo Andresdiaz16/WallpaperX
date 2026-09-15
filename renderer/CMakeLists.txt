@@ -1,6 +1,12 @@
 cmake_minimum_required(VERSION 3.25)
 project(wallpaperx-renderer VERSION 0.1.0 LANGUAGES CXX)
 
+# Optimised with debug info unless the caller chose. A tree configured with no build type
+# was silently unoptimised, which made every timing taken against it pessimistic.
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Build type" FORCE)
+endif()
+
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -432,7 +438,8 @@ if(WALLPAPERX_FFMPEG_EXECUTABLE)
         "counter_big_60.hevc|640x480|30|1|60|${COUNTER_HEVC_RAW}"
     )
     # AV1 only where the command line has an encoder for it; without one the probe names the fixture as
-    # not generated and skips. Sizes stay above AV1's 128x128 decode minimum on this GPU.
+    # not generated and skips. counter_tiny.obu drops to 160x120, below AV1's 128x128 decode minimum on
+    # this GPU in height; counter_grow.obu grows past the images ffmpeg made for its first size.
     execute_process(COMMAND ${WALLPAPERX_FFMPEG_EXECUTABLE} -hide_banner -encoders
                     OUTPUT_VARIABLE WALLPAPERX_FFMPEG_ENCODERS ERROR_QUIET)
     set(WALLPAPERX_SIZE_CHANGE_JOINS "")
@@ -441,8 +448,13 @@ if(WALLPAPERX_FFMPEG_EXECUTABLE)
         list(APPEND WALLPAPERX_SIZE_CHANGE_PARTS
             "counter_big_0.obu|640x480|30|1|0|${COUNTER_AV1_RAW}"
             "counter_big_30.obu|320x240|30|1|30|${COUNTER_AV1_RAW}"
-            "counter_big_60.obu|640x480|30|1|60|${COUNTER_AV1_RAW}")
-        list(APPEND WALLPAPERX_SIZE_CHANGE_JOINS "counter_big.obu|counter_big_0.obu|counter_big_30.obu|counter_big_60.obu")
+            "counter_big_60.obu|640x480|30|1|60|${COUNTER_AV1_RAW}"
+            "counter_tiny_30.obu|160x120|30|1|30|${COUNTER_AV1_RAW}"
+            "counter_av1_small_0.obu|320x240|30|1|0|${COUNTER_AV1_RAW}"
+            "counter_av1_large_30.obu|640x480|30|1|30|${COUNTER_AV1_RAW}")
+        list(APPEND WALLPAPERX_SIZE_CHANGE_JOINS "counter_big.obu|counter_big_0.obu|counter_big_30.obu|counter_big_60.obu"
+             "counter_tiny.obu|counter_big_0.obu|counter_tiny_30.obu|counter_big_60.obu"
+             "counter_grow.obu|counter_av1_small_0.obu|counter_av1_large_30.obu")
     else()
         message(STATUS "  ffmpeg CLI: no libaom-av1 encoder -- the AV1 size-change fixture is not generated")
     endif()
@@ -745,12 +757,12 @@ set_tests_properties(frame_converter_shader_read PROPERTIES LABELS "novulkan")
 
 # One entry per mode. The resume entries and the _device entries need a hardware decoder and skip
 # without one; the _host entries and shape build a device with the video extensions stripped.
-# shape-device, loop-device and release-device decode size changes on the hardware and run in forked
-# children, so a crash is reported rather than ending the probe.
+# shape-device, loop-device, release-device and retire-device decode size changes on the hardware and
+# run in forked children, so a crash is reported rather than ending the probe.
 # SKIP_RETURN_CODE throughout: a missing ffmpeg command line or decoder must not read as a pass.
 set(WALLPAPERX_PIPELINE_MODES sequence-device sequence-host resume-timestamps resume-no-timestamps
     resume-late-seek resume-end resume-seek-failure resume-drop-count shape shape-device steady-device
-    steady-host loop-device loop-host loop-cost-device loop-cost-host loop-resume release-device)
+    steady-host loop-device loop-host loop-cost-device loop-cost-host loop-resume release-device retire-device)
 foreach(MODE ${WALLPAPERX_PIPELINE_MODES})
     string(REPLACE "-" "_" MODE_NAME "${MODE}")
     add_test(NAME video_pipeline_${MODE_NAME} COMMAND wallpaperx-video-pipeline-probe ${MODE})

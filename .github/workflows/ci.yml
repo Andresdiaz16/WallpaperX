@@ -32,6 +32,7 @@ jobs:
             libvulkan-dev vulkan-validation-layers mesa-vulkan-drivers \
             glslc libshaderc-dev \
             libavcodec-dev libavformat-dev libavutil-dev \
+            libswscale-dev ffmpeg \
             libpipewire-0.3-dev libfftw3-dev \
             libstb-dev nlohmann-json3-dev
 
@@ -80,6 +81,7 @@ jobs:
             libvulkan-dev vulkan-validation-layers mesa-vulkan-drivers \
             glslc libshaderc-dev \
             libavcodec-dev libavformat-dev libavutil-dev \
+            libswscale-dev ffmpeg \
             libpipewire-0.3-dev libfftw3-dev \
             libstb-dev nlohmann-json3-dev \
             libzip-dev libsystemd-dev dbus

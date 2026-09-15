@@ -147,6 +147,27 @@ bool isVideoRefusal(VkResult result) {
     }
 }
 
+// The smallest coded picture the device decodes under `profile`, which the video session ffmpeg
+// creates from it holds every decode to.
+VkResult minCodedExtent(PFN_vkGetPhysicalDeviceVideoCapabilitiesKHR query, VkPhysicalDevice gpu,
+                        const VkVideoProfileInfoKHR& profile, VkExtent2D& out) {
+    VkVideoDecodeH264CapabilitiesKHR h264{VK_STRUCTURE_TYPE_VIDEO_DECODE_H264_CAPABILITIES_KHR};
+    VkVideoDecodeH265CapabilitiesKHR h265{VK_STRUCTURE_TYPE_VIDEO_DECODE_H265_CAPABILITIES_KHR};
+    VkVideoDecodeAV1CapabilitiesKHR av1{VK_STRUCTURE_TYPE_VIDEO_DECODE_AV1_CAPABILITIES_KHR};
+    VkVideoDecodeCapabilitiesKHR decode{VK_STRUCTURE_TYPE_VIDEO_DECODE_CAPABILITIES_KHR};
+    switch (profile.videoCodecOperation) {
+        case VK_VIDEO_CODEC_OPERATION_DECODE_H264_BIT_KHR: decode.pNext = &h264; break;
+        case VK_VIDEO_CODEC_OPERATION_DECODE_H265_BIT_KHR: decode.pNext = &h265; break;
+        case VK_VIDEO_CODEC_OPERATION_DECODE_AV1_BIT_KHR: decode.pNext = &av1; break;
+        default: return VK_ERROR_VIDEO_PROFILE_CODEC_NOT_SUPPORTED_KHR;
+    }
+    VkVideoCapabilitiesKHR caps{VK_STRUCTURE_TYPE_VIDEO_CAPABILITIES_KHR};
+    caps.pNext = &decode;
+    const VkResult result = query(gpu, &profile, &caps);
+    out = caps.minCodedExtent;
+    return result;
+}
+
 AVHWFramesContext* framesContext(const AVFrame& frame) {
     return reinterpret_cast<AVHWFramesContext*>(frame.hw_frames_ctx->data);
 }
@@ -203,6 +224,11 @@ DecodedFrame::DecodedFrame(Device& device, AVFrame* frame) : m_device(&device), 
             throw std::logic_error("DecodedFrame: ffmpeg made the image exclusive to queue family " +
                                    std::to_string(vk->queue_family[0]) + ", which is not the graphics family");
         }
+        const AVHWFramesContext* frames = framesContext(*m_frame);
+        if (m_frame->width > frames->width || m_frame->height > frames->height) {
+            release();
+            throw std::logic_error("DecodedFrame: ffmpeg decoded a picture larger than the image it is in");
+        }
     }
     m_colour = FrameColour{m_frame->colorspace, m_frame->color_range, m_frame->color_primaries, m_frame->color_trc,
                            m_frame->chroma_location};
@@ -255,11 +281,7 @@ uint32_t DecodedFrame::bitDepth() const {
 
 VkExtent2D DecodedFrame::extent() const {
     // With cropping left to the caller, ffmpeg's width and height are the coded size on both
-    // paths, and the image pool's own size is the same rounded to the chroma subsampling.
-    if (storage() == Storage::DeviceImage) {
-        const AVHWFramesContext* frames = framesContext(frame());
-        return {static_cast<uint32_t>(frames->width), static_cast<uint32_t>(frames->height)};
-    }
+    // paths, never the image pool's size.
     return {static_cast<uint32_t>(frame().width), static_cast<uint32_t>(frame().height)};
 }
 
@@ -342,16 +364,40 @@ bool VideoDecoder::deviceHealthy() {
 
 // Freeing the codec and the frames contexts frees their image pools once no frame is out, and
 // ffmpeg waits without bound on every image's semaphore first. Those are what own the pools, so
-// they are all that is leaked; the scratch objects hold no GPU work.
+// they are all that is leaked; the scratch objects and a software codec hold no GPU work. Nor does
+// a hardware codec with no context held: ffmpeg's Vulkan decoder references its frames context.
 void VideoDecoder::closeDecoder() noexcept {
     av_frame_free(&m_frame);
     if (!m_framesContexts.empty() && !m_device.safeToFree("the video decoder's images")) {
-        m_codec = nullptr;
+        if (m_codec != nullptr && m_codec->hw_device_ctx != nullptr) m_codec = nullptr;
+        m_retiredCodec.reset();
         m_framesContexts.clear();
     }
+    if (m_retiredCodec) avcodec_free_context(&m_retiredCodec->codec);
+    m_retiredCodec.reset();
     avcodec_free_context(&m_codec);
     for (HeldFrames& held : m_framesContexts) av_buffer_unref(&held.ref);
     m_framesContexts.clear();
+}
+
+// Playback's close, which waits on none of this renderer's reads. A hardware codec is kept for
+// releaseRetiredCodec(), and the frames contexts for releaseIdleFramesContexts(). The path never
+// returns to hardware, so no codec is retired while another is.
+void VideoDecoder::retireDecoder() noexcept {
+    av_frame_free(&m_frame);
+    if (m_codec == nullptr || m_codec->hw_device_ctx == nullptr) {
+        avcodec_free_context(&m_codec);
+        return;
+    }
+    m_retiredCodec = RetiredCodec{std::exchange(m_codec, nullptr), m_device.lastSubmission()};
+}
+
+// Before releaseIdleFramesContexts(), so the contexts this codec held are released in the same call.
+// The free waits without bound on ffmpeg's own outstanding decode work.
+void VideoDecoder::releaseRetiredCodec() noexcept {
+    if (!m_retiredCodec || !m_device.hasCompleted(m_retiredCodec->lastReader)) return;
+    avcodec_free_context(&m_retiredCodec->codec);
+    m_retiredCodec.reset();
 }
 
 // A context only this decoder references has no picture left, in ffmpeg or handed out, and no
@@ -429,7 +475,10 @@ void VideoDecoder::openDecoder() {
     m_codec->apply_cropping = 0;
     m_codec->flags |= AV_CODEC_FLAG_COPY_OPAQUE;
 
-    if (hardware) attachDevice();
+    if (hardware) {
+        attachDevice();
+        m_codec->get_buffer2 = &VideoDecoder::allocatePicture;
+    }
 
     if (const int err = avcodec_open2(m_codec, codec, nullptr); err < 0) {
         throwAvFailure("VideoDecoder: cannot open the decoder for " + m_file, err);
@@ -444,7 +493,7 @@ void VideoDecoder::reopenInSoftware() {
     m_flushed = false;
     m_awaitingHardwareSetup = false;
     m_parkedFailure = nullptr;
-    closeDecoder();
+    retireDecoder();
     av_packet_unref(m_packet);
 
     if (!m_returned.lastTimestamp) {
@@ -621,6 +670,12 @@ void VideoDecoder::attachDevice() {
         throw GpuFailure("VideoDecoder: " + m_device.info().gpuName +
                          " enables VK_KHR_video_queue but has no vkGetPhysicalDeviceVideoFormatPropertiesKHR");
     }
+    m_videoCapabilities = reinterpret_cast<PFN_vkGetPhysicalDeviceVideoCapabilitiesKHR>(
+        vkGetInstanceProcAddr(m_device.instance(), "vkGetPhysicalDeviceVideoCapabilitiesKHR"));
+    if (m_videoCapabilities == nullptr) {
+        throw GpuFailure("VideoDecoder: " + m_device.info().gpuName +
+                         " enables VK_KHR_video_queue but has no vkGetPhysicalDeviceVideoCapabilitiesKHR");
+    }
     m_codec->hw_device_ctx = ref.release();
 }
 
@@ -657,8 +712,8 @@ bool VideoDecoder::attachHardwareFrames(AVCodecContext* codec) {
     // One multi-planar image per picture, of a layout and format the converter reads, is what
     // submit() and the conversion after it handle. Anything else goes to software, never to a
     // converter that would refuse it as bad content.
-    if (profiles == nullptr || vk->format[0] == VK_FORMAT_UNDEFINED || vk->format[1] != VK_FORMAT_UNDEFINED ||
-        !FrameConverter::readsDeviceImage(m_device, context->sw_format, vk->format[0])) {
+    if (profiles == nullptr || profiles->profileCount == 0 || vk->format[0] == VK_FORMAT_UNDEFINED ||
+        vk->format[1] != VK_FORMAT_UNDEFINED || !FrameConverter::readsDeviceImage(m_device, context->sw_format, vk->format[0])) {
         m_path = Path::SoftwareRefused;
         return false;
     }
@@ -706,6 +761,9 @@ bool VideoDecoder::attachHardwareFrames(AVCodecContext* codec) {
         m_path = Path::SoftwareRefused;
         return false;
     }
+    VkExtent2D minCoded{};
+    result = minCodedExtent(m_videoCapabilities, m_device.physicalDevice(), profiles->pProfiles[0], minCoded);
+    if (result != VK_SUCCESS) throwVkFailure("VideoDecoder: vkGetPhysicalDeviceVideoCapabilitiesKHR", result);
     vk->usage = static_cast<VkImageUsageFlagBits>(asked);
     vk->img_flags = flags;
 
@@ -723,7 +781,7 @@ bool VideoDecoder::attachHardwareFrames(AVCodecContext* codec) {
     m_framesContexts.reserve(m_framesContexts.size() + 1);
     AVBufferRef* held = av_buffer_ref(frames.ref);
     if (held == nullptr) throwOutOfMemory("VideoDecoder");
-    m_framesContexts.push_back({held, std::nullopt});
+    m_framesContexts.push_back({held, minCoded, std::nullopt});
     codec->hw_frames_ctx = frames.release();
     return true;
 }
@@ -786,6 +844,28 @@ AVPixelFormat VideoDecoder::choose(AVCodecContext* codec, const AVPixelFormat* o
     return AV_PIX_FMT_NONE;
 }
 
+// ffmpeg's request for the image a picture decodes into, made before any decode work for it is
+// recorded. AV1 keeps its images across a size change within one pixel format, so a picture can
+// arrive that they cannot hold or that the device cannot decode; either is the device declining it.
+int VideoDecoder::allocatePicture(AVCodecContext* codec, AVFrame* frame, int flags) {
+    auto* self = static_cast<VideoDecoder*>(codec->opaque);
+    if (codec->hw_frames_ctx != nullptr && !self->holds(*codec->hw_frames_ctx, frame->width, frame->height)) {
+        self->m_path = Path::SoftwareRefused;
+        self->m_reopenInSoftware = true;
+        return AVERROR(ENOSYS);
+    }
+    return avcodec_default_get_buffer2(codec, frame, flags);
+}
+
+bool VideoDecoder::holds(const AVBufferRef& frames, int width, int height) const {
+    const auto held = std::find_if(m_framesContexts.begin(), m_framesContexts.end(),
+                                   [&](const HeldFrames& h) { return h.ref->data == frames.data; });
+    if (held == m_framesContexts.end()) return false;
+    const auto* context = reinterpret_cast<const AVHWFramesContext*>(frames.data);
+    return width <= context->width && height <= context->height && width >= static_cast<int>(held->minCoded.width) &&
+           height >= static_cast<int>(held->minCoded.height);
+}
+
 int VideoDecoder::readVideoPacket() {
     for (;;) {
         const int err = av_read_frame(m_format, m_packet);
@@ -823,6 +903,7 @@ void VideoDecoder::failDecode(const char* what, int err) {
 
 std::optional<DecodedFrame> VideoDecoder::next() {
     m_device.assertGpuThread("VideoDecoder::next");
+    releaseRetiredCodec();
     releaseIdleFramesContexts();
     for (;;) {
         // What the format callback decided during the last ffmpeg call comes before what that
@@ -860,6 +941,9 @@ std::optional<DecodedFrame> VideoDecoder::next() {
                 throw WallpaperContentError("VideoDecoder: " + m_file +
                                             " ended before software decoding reached the pictures already returned");
             }
+            // A play-once caller may not call again, which would hold a decoder retired near the end until close.
+            releaseRetiredCodec();
+            releaseIdleFramesContexts();
             return std::nullopt;
         }
         if (isDamagedPacket(err)) continue;

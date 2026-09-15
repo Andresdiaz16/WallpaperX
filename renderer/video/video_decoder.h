@@ -40,7 +40,8 @@ struct FrameColour {
 // One decoded picture, held until destroyed: an image on the device when the hardware decoded
 // it, planes in host memory when software did. Both carry the coded extent -- what the codec
 // rounds the picture up to -- and the visible rectangle inside it, so a converter asks the
-// same questions of either.
+// same questions of either. A device picture sits at its image's origin, and the image can be
+// larger: AV1 keeps its images across a change to a smaller size.
 //
 // GPU thread only, destruction included: the destructor may have to ask the Device whether the
 // GPU has finished reading the image, and that is asked nowhere else. Must be destroyed before
@@ -121,18 +122,23 @@ private:
 // A refusal and a fault are told apart deliberately rather than by ffmpeg's own fallback,
 // which retries in software after any failure. The device is asked whether it accepts the
 // stream -- codec, profile, bit depth, coded size, the image it would decode into -- and a no
-// selects software. When ffmpeg's hardware path fails after that yes, which it can for reasons
-// of its own, the device is asked whether it still answers: one that does not is a GpuFailure,
-// one that does means decoding continues in software, as next() describes.
+// selects software. So does a picture its images cannot hold or smaller than the device decodes,
+// checked before it is decoded; DecodedFrame says why the two can differ. When
+// ffmpeg's hardware path fails after the device's yes, which it can for reasons of its own, the
+// device is asked whether it still answers: one that does not is a GpuFailure, one that does
+// means decoding continues in software, as next() describes.
 //
 // The decoder ffmpeg is asked for is the one that can use this device, which for AV1 is a
 // hardware-only shim, and it is opened single-threaded so ffmpeg never touches a queue off
 // the GPU thread. Neither suits software, so a refusal reopens the stream on ffmpeg's default
 // decoder with its default threads.
 //
-// Frames handed out may outlive this decoder but not the Device. A stream that changes size or
-// format mid-stream leaves an image pool no picture uses; next() frees it once this renderer's
-// last read of it has finished, and never waits for that. Destroying this decoder frees the
+// Frames handed out may outlive this decoder but not the Device. A size or format change
+// mid-stream leaves an image pool no picture uses, and a switch to software leaves the hardware
+// decoder it replaces; next() frees each once this renderer's last read of it has finished, and
+// never waits for those reads. Freeing that decoder does wait on ffmpeg's own decode work, as the
+// destructor below does, which hangs only on a decode queue stalled without the device being lost.
+// Destroying this decoder frees the
 // rest once no frame is out, and ffmpeg waits without bound there twice over: on each image's
 // semaphore, which covers this renderer's reads of it, and on its own decode work. The Device's
 // bounded wait guards only the first -- a read batch of this renderer's that has not finished
@@ -203,10 +209,14 @@ private:
     static AVPixelFormat chooseFormat(AVCodecContext* codec, const AVPixelFormat* offered);
     AVPixelFormat choose(AVCodecContext* codec, const AVPixelFormat* offered);
     bool attachHardwareFrames(AVCodecContext* codec);
+    static int allocatePicture(AVCodecContext* codec, AVFrame* frame, int flags);
+    bool holds(const AVBufferRef& frames, int width, int height) const;
     void releaseIdleFramesContexts() noexcept;
+    void releaseRetiredCodec() noexcept;
     void openContainer();
     void openDecoder();
     void closeDecoder() noexcept;
+    void retireDecoder() noexcept;
     void closeAll() noexcept;
     void reopenInSoftware();
     int64_t streamStart() const;
@@ -238,11 +248,21 @@ private:
     // this reference the last one destroys the semaphore under that wait.
     struct HeldFrames {
         AVBufferRef* ref;
+        // The smallest picture the device decodes under the profile these images were made for.
+        VkExtent2D minCoded;
         // The last batch that could read its images, taken once this reference is the only one.
         std::optional<Device::SubmitTicket> lastReader;
     };
     std::vector<HeldFrames> m_framesContexts;
+    // A hardware codec given up for software, freed once its last reader has completed: freeing it
+    // waits on ffmpeg's decode batches, which can be ordered after this renderer's reads of their images.
+    struct RetiredCodec {
+        AVCodecContext* codec;
+        Device::SubmitTicket lastReader;
+    };
+    std::optional<RetiredCodec> m_retiredCodec;
     PFN_vkGetPhysicalDeviceVideoFormatPropertiesKHR m_videoFormatProperties = nullptr;
+    PFN_vkGetPhysicalDeviceVideoCapabilitiesKHR m_videoCapabilities = nullptr;
     int m_stream = -1;
     // What a software restart resumes after, since the stream was opened or restarted: how many
     // pictures next() has returned; the last one's timestamp for as long as every one returned had a

@@ -62,6 +62,11 @@ inline int counterFromBgra(const std::vector<unsigned char>& pixels, uint32_t wi
 struct CounterReference {
     std::vector<int> ids;  // per picture, in output order; -1 where unreadable
     std::vector<uint32_t> widths;  // each distinct picture width, in order of first appearance
+    struct Size {
+        int width;
+        int height;
+    };
+    std::vector<Size> sizes;  // per picture, in output order, with the stream's cropping applied
     int bidirectional = 0;  // pictures coded as B
     int untimestamped = 0;
     int nonIncreasing = 0;  // timestamped pictures not above the timestamped picture before
@@ -135,6 +140,7 @@ inline std::optional<CounterReference> decodeCounterReference(const std::string&
                     return static_cast<int>(frame->data[0][static_cast<size_t>(y) * frame->linesize[0] + x]);
                 },
                 125, 50));
+            reference.sizes.push_back({width, height});
             if (std::find(reference.widths.begin(), reference.widths.end(), static_cast<uint32_t>(width)) ==
                 reference.widths.end()) {
                 reference.widths.push_back(static_cast<uint32_t>(width));
