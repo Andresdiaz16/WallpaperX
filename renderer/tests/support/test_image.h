@@ -38,6 +38,16 @@ inline void writePngOrThrow(const std::string& path, int width, int height,
 
 }  // namespace detail
 
+// Tightly packed RGBA rows, top row first -- the order stb_image decodes them in.
+inline std::string writeRgbaPng(const std::string& path, int width, int height,
+                                const std::vector<unsigned char>& rgba) {
+    if (rgba.size() != static_cast<size_t>(width) * height * 4) {
+        throw std::invalid_argument("test_image: pixel buffer does not match " + path);
+    }
+    detail::writePngOrThrow(path, width, height, rgba);
+    return path;
+}
+
 // A flat RGBA image. Returns the path it wrote, so a caller can name the file and use it
 // in one expression.
 inline std::string writeSolidPng(const std::string& path, int width, int height,

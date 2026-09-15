@@ -2,6 +2,8 @@
 
 #include "static_renderer.h"
 
+#include "cover_crop.h"
+
 #include "../vulkan/offscreen.h"
 
 #include "../vulkan/descriptor_buffer.h"
@@ -16,6 +18,7 @@
 
 #include <array>
 #include <cerrno>
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <memory>
@@ -29,6 +32,16 @@ struct Vertex {
     float pos[2];
     float uv[2];
 };
+
+// Mirrors the push_constant blocks: the texture region in fullscreen.vert, then the heap index
+// fullscreen_heap.frag reads. The other tiers' fragment shader ignores the index.
+struct Push {
+    float uvOrigin[2];
+    float uvExtent[2];
+    uint32_t textureIndex;
+};
+static_assert(offsetof(Push, uvOrigin) == 0 && offsetof(Push, uvExtent) == 8 && offsetof(Push, textureIndex) == 16 &&
+              sizeof(Push) <= kPushDataBytes);
 }
 
 StaticRenderer::StaticRenderer(Device& device, VkRenderPass renderPass, const std::string& imagePath, const std::string& shaderDir)
@@ -61,13 +74,11 @@ void StaticRenderer::cleanup() {
     // how a wedge reaches the daemon's health report from here. No batch to name: nothing
     // records which render last drew with this pipeline, so any pending one may still be.
     const bool idle = m_device.safeToFree(
-        "a wallpaper's texture, that texture's view and sampler, its pipeline and pipeline "
-        "layout, and its vertex buffer");
+        "a wallpaper's texture, that texture's view and sampler, its pipeline, and its vertex "
+        "buffer");
     if (idle) {
         if (m_pipeline) vkDestroyPipeline(device, m_pipeline, nullptr);
-        if (m_pipelineLayout) vkDestroyPipelineLayout(device, m_pipelineLayout, nullptr);
         m_pipeline = VK_NULL_HANDLE;
-        m_pipelineLayout = VK_NULL_HANDLE;
         m_device.memory().destroyBuffer(m_vertexBuffer);
     }
 
@@ -260,6 +271,7 @@ void StaticRenderer::loadAndUploadTexture(const std::string& imagePath) {
     imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
     m_texture = m_device.memory().createImage(imageInfo, "static-renderer-texture");
+    m_textureExtent = {imageInfo.extent.width, imageInfo.extent.height};
 
     m_device.immediateSubmit([&](VkCommandBuffer cmd) {
         const VkImageMemoryBarrier toTransferDst =
@@ -418,24 +430,11 @@ void StaticRenderer::createPipeline(VkRenderPass renderPass, const std::string& 
         flags2Info.flags = VK_PIPELINE_CREATE_2_DESCRIPTOR_HEAP_BIT_EXT;
         pipelineInfo.pNext = &flags2Info;
         pipelineInfo.layout = VK_NULL_HANDLE;
-    } else {
-        VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
-        if (auto* classic = dynamic_cast<ClassicDescriptorAllocator*>(&m_device.descriptorAllocator())) {
-            setLayout = classic->setLayout();
-        } else if (auto* buffer = dynamic_cast<DescriptorBufferAllocator*>(&m_device.descriptorAllocator())) {
-            setLayout = buffer->setLayout();
-            pipelineInfo.flags = VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
-        }
-
-        VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-        layoutInfo.setLayoutCount = 1;
-        layoutInfo.pSetLayouts = &setLayout;
-
-        if (const VkResult r = vkCreatePipelineLayout(m_device.device(), &layoutInfo, nullptr, &m_pipelineLayout);
-            r != VK_SUCCESS) {
-            throwVkFailure("StaticRenderer: vkCreatePipelineLayout", r);
-        }
-        pipelineInfo.layout = m_pipelineLayout;
+    } else if (auto* classic = dynamic_cast<ClassicDescriptorAllocator*>(&m_device.descriptorAllocator())) {
+        pipelineInfo.layout = classic->pipelineLayout();
+    } else if (auto* buffer = dynamic_cast<DescriptorBufferAllocator*>(&m_device.descriptorAllocator())) {
+        pipelineInfo.layout = buffer->pipelineLayout();
+        pipelineInfo.flags = VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
     }
 
     VkResult result = vkCreateGraphicsPipelines(m_device.device(), VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipeline);
@@ -472,9 +471,16 @@ VkImageLayout StaticRenderer::record(VkCommandBuffer cmd, const OffscreenTarget&
 
     m_device.descriptorAllocator().bind(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
 
-    if (m_heapAllocator) {
-        m_heapAllocator->pushData(cmd, 0, &m_descriptorHandle.index, sizeof(uint32_t));
-    }
+    // Per record, not per renderer: one renderer may draw monitors of different shapes.
+    const Crop crop = coverCrop(m_textureExtent.width, m_textureExtent.height, width, height);
+    const auto textureWidth = static_cast<float>(m_textureExtent.width);
+    const auto textureHeight = static_cast<float>(m_textureExtent.height);
+    const Push push{
+        {static_cast<float>(crop.x0) / textureWidth, static_cast<float>(crop.y0) / textureHeight},
+        {static_cast<float>(crop.x1 - crop.x0) / textureWidth, static_cast<float>(crop.y1 - crop.y0) / textureHeight},
+        m_descriptorHandle.index,
+    };
+    m_device.descriptorAllocator().pushData(cmd, 0, &push, sizeof(push));
 
     VkDeviceSize offset = 0;
     vkCmdBindVertexBuffers(cmd, 0, 1, &m_vertexBuffer.buffer, &offset);

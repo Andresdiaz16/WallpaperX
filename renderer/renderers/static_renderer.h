@@ -36,13 +36,13 @@ private:
     DescriptorHeapAllocator* m_heapAllocator = nullptr;
 
     AllocatedImage m_texture;
+    VkExtent2D m_textureExtent{};
     VkImageView m_textureView = VK_NULL_HANDLE;
     VkSampler m_sampler = VK_NULL_HANDLE;
 
     AllocatedBuffer m_vertexBuffer;
 
     VkRenderPass m_renderPass = VK_NULL_HANDLE;
-    VkPipelineLayout m_pipelineLayout = VK_NULL_HANDLE;
     VkPipeline m_pipeline = VK_NULL_HANDLE;
 
     DescriptorHandle m_descriptorHandle;

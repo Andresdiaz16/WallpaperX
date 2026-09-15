@@ -2,6 +2,8 @@
 
 #include "video_renderer.h"
 
+#include "cover_crop.h"
+
 #include "../vulkan/device.h"
 #include "../vulkan/format_features.h"
 #include "../vulkan/gpu_fault.h"
@@ -9,7 +11,6 @@
 #include "../vulkan/memory_export.h"
 #include "../vulkan/offscreen.h"
 
-#include <algorithm>
 #include <array>
 #include <stdexcept>
 #include <string>
@@ -61,32 +62,6 @@ uint32_t maxImageDimension2D(VkPhysicalDevice physicalDevice) {
     VkPhysicalDeviceProperties properties{};
     vkGetPhysicalDeviceProperties(physicalDevice, &properties);
     return properties.limits.maxImageDimension2D;
-}
-
-struct Crop {
-    int32_t x0, y0, x1, y1;
-};
-
-// The centred region of a frame with the target's aspect ratio. Products rather than divided
-// ratios so the comparison is exact; the region is never larger than the frame and never
-// empty, whatever the two shapes are. Both extents are within maxImageDimension2D, so the
-// narrowing to VkOffset3D's int32_t cannot wrap.
-Crop coverCrop(uint32_t frameWidth, uint32_t frameHeight, uint32_t targetWidth, uint32_t targetHeight) {
-    const uint64_t frameWide = static_cast<uint64_t>(frameWidth) * targetHeight;
-    const uint64_t targetWide = static_cast<uint64_t>(targetWidth) * frameHeight;
-
-    uint64_t width = frameWidth;
-    uint64_t height = frameHeight;
-    if (frameWide > targetWide) {
-        width = std::max<uint64_t>(1, static_cast<uint64_t>(frameHeight) * targetWidth / targetHeight);
-    } else if (frameWide < targetWide) {
-        height = std::max<uint64_t>(1, static_cast<uint64_t>(frameWidth) * targetHeight / targetWidth);
-    }
-
-    const uint64_t x0 = (frameWidth - width) / 2;
-    const uint64_t y0 = (frameHeight - height) / 2;
-    return {static_cast<int32_t>(x0), static_cast<int32_t>(y0), static_cast<int32_t>(x0 + width),
-            static_cast<int32_t>(y0 + height)};
 }
 
 void requireShowable(const VideoFrame& frame) {

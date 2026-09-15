@@ -60,6 +60,8 @@ ClassicDescriptorAllocator::ClassicDescriptorAllocator(Device& device)
         VkPipelineLayoutCreateInfo pipelineLayoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         pipelineLayoutInfo.setLayoutCount = 1;
         pipelineLayoutInfo.pSetLayouts = &m_setLayout;
+        pipelineLayoutInfo.pushConstantRangeCount = 1;
+        pipelineLayoutInfo.pPushConstantRanges = &kPushConstantRange;
         if (const VkResult r = vkCreatePipelineLayout(vk, &pipelineLayoutInfo, nullptr, &m_pipelineLayout);
             r != VK_SUCCESS) {
             throwVkFailure("ClassicDescriptorAllocator: vkCreatePipelineLayout", r);
@@ -130,6 +132,11 @@ DescriptorHandle ClassicDescriptorAllocator::allocateUniform(VkBuffer buffer, Vk
 void ClassicDescriptorAllocator::bind(VkCommandBuffer cmd, VkPipelineBindPoint bindPoint) {
     vkCmdBindDescriptorSets(cmd, bindPoint, m_pipelineLayout, 0, 1, &m_set, 0, nullptr);
     m_setMayBeInFlight = true;
+}
+
+void ClassicDescriptorAllocator::pushData(VkCommandBuffer cmd, uint32_t offset, const void* data, size_t size) {
+    vkCmdPushConstants(cmd, m_pipelineLayout, kPushConstantRange.stageFlags, offset, static_cast<uint32_t>(size),
+                       data);
 }
 
 void ClassicDescriptorAllocator::free(DescriptorHandle handle) {

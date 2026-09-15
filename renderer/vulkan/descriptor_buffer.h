@@ -21,10 +21,14 @@ public:
     DescriptorHandle allocate(VkImageView view, VkSampler sampler) override;
     DescriptorHandle allocateUniform(VkBuffer buffer, VkDeviceSize size) override;
     void bind(VkCommandBuffer cmd, VkPipelineBindPoint bindPoint) override;
+    void pushData(VkCommandBuffer cmd, uint32_t offset, const void* data, size_t size) override;
     void free(DescriptorHandle handle) override;
     DescriptorTier tier() const override { return DescriptorTier::Buffer; }
 
-    VkDescriptorSetLayout setLayout() const { return m_setLayout; }
+    // The layout every pipeline drawing against this buffer must be created with: bind() sets
+    // offsets through it, and those only stay bound for a layout with identical push-constant
+    // ranges.
+    VkPipelineLayout pipelineLayout() const { return m_pipelineLayout; }
 
 private:
     static constexpr uint32_t kImageBinding = 0;

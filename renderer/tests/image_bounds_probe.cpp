@@ -737,10 +737,10 @@ uint64_t checkInstrumentSeesTheDecoder(const std::string& oversizePath) {
 //       being written never enters RSS, so an RSS check reports "no growth" for exactly
 //       the decode-first case it exists to catch. The request is what is unavoidable:
 //       nothing can decode into memory it never asked for.
-// CONTROL: static_renderer.cpp's `peakBytes > kMaxPeakDecodeBytes` throw disabled -> three
-//       reds here -- "the oversize header is refused by the header gate, before the
-//       decode", "nothing pixel-sized is allocated on the way to the rejection" (printed
-//       "21 allocation requests, the largest 976.56 MiB"), and "the rejection names the
+// CONTROL: renderer/renderers/static_renderer.cpp's `peakBytes > kMaxPeakDecodeBytes` throw
+//       disabled -> three reds here -- "the oversize header is refused by the header gate,
+//       before the decode", "nothing pixel-sized is allocated on the way to the rejection"
+//       (printed "16 allocation requests, the largest 976.56 MiB"), and "the rejection names the
 //       declared dimensions". Note what stayed GREEN in that same run: "an image over the
 //       decoded-size budget is rejected" -- the verdict-only assertion, passing for a
 //       renderer that had just spent 976 MiB. Reverted, re-measured green at 0.02 MiB.

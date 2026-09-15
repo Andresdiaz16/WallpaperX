@@ -829,7 +829,18 @@ set_tests_properties(target_ring_probe PROPERTIES RESOURCE_LOCK target_ring_prob
 # resource so ctest never runs them concurrently (e.g. under `ctest -jN`),
 # which would otherwise risk one process reading a half-written PNG from
 # the other.
-set_tests_properties(static_renderer_probe PROPERTIES RESOURCE_LOCK static_renderer_probe_test_image)
+#
+# SKIP_RETURN_CODE 77 because a descriptor tier can be absent on a given driver: the probe walks
+# all three in one process, and a tier it could not put in the state its phases grade exits 77 with
+# a printed reason. Without this, that run exits 0 and a tier nothing was drawn on is
+# indistinguishable from one that graded the crop.
+set_tests_properties(static_renderer_probe PROPERTIES
+                     RESOURCE_LOCK static_renderer_probe_test_image SKIP_RETURN_CODE 77)
+
+# descriptor_allocator_probe grades the heap tier in four phases and skips them, with a printed
+# reason, on a driver that has no heap tier -- so the same 77 applies. Without it those skipped
+# phases exit 0 beside the phases that did run, and the entry reads as having graded the heap tier.
+set_tests_properties(descriptor_allocator_probe PROPERTIES SKIP_RETURN_CODE 77)
 
 # image_bounds_probe writes bounds_*.png under the same WALLPAPERX_TEST_IMAGE_DIR and,
 # like the others, is one binary registered twice -- so its two entries share a lock of
@@ -938,7 +949,11 @@ if(WALLPAPERX_LAVAPIPE_ICD)
             ENVIRONMENT "VK_ICD_FILENAMES=${WALLPAPERX_LAVAPIPE_ICD};WALLPAPERX_ALLOW_NO_HEAP_TIER=1"
             LABELS "lavapipe"
     )
-    set_tests_properties(static_renderer_probe_lavapipe PROPERTIES RESOURCE_LOCK static_renderer_probe_test_image)
+    # 77 here is the expected outcome wherever this driver has no heap tier: see the non-lavapipe
+    # entry. Both entries need it, or the skip reads as a failure.
+    set_tests_properties(static_renderer_probe_lavapipe PROPERTIES
+                         RESOURCE_LOCK static_renderer_probe_test_image SKIP_RETURN_CODE 77)
+    set_tests_properties(descriptor_allocator_probe_lavapipe PROPERTIES SKIP_RETURN_CODE 77)
     set_tests_properties(image_bounds_probe_lavapipe PROPERTIES
                          RESOURCE_LOCK image_bounds_probe_test_image SKIP_RETURN_CODE 77)
     set_tests_properties(descriptor_inflight_heap_lavapipe descriptor_inflight_buffer_lavapipe

@@ -31,9 +31,8 @@ public:
     DescriptorHandle allocateUniform(VkBuffer buffer, VkDeviceSize size) override;
     void bind(VkCommandBuffer cmd, VkPipelineBindPoint bindPoint) override;
     void free(DescriptorHandle handle) override;
+    void pushData(VkCommandBuffer cmd, uint32_t offset, const void* data, size_t size) override;
     DescriptorTier tier() const override { return DescriptorTier::Heap; }
-
-    void pushData(VkCommandBuffer cmd, uint32_t offset, const void* data, size_t size);
 
 private:
     void loadFunctions();

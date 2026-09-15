@@ -49,6 +49,8 @@ DescriptorBufferAllocator::DescriptorBufferAllocator(Device& device)
         VkPipelineLayoutCreateInfo pipelineLayoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         pipelineLayoutInfo.setLayoutCount = 1;
         pipelineLayoutInfo.pSetLayouts = &m_setLayout;
+        pipelineLayoutInfo.pushConstantRangeCount = 1;
+        pipelineLayoutInfo.pPushConstantRanges = &kPushConstantRange;
         if (const VkResult r = vkCreatePipelineLayout(m_device, &pipelineLayoutInfo, nullptr, &m_pipelineLayout);
             r != VK_SUCCESS) {
             throwVkFailure("DescriptorBufferAllocator: vkCreatePipelineLayout", r);
@@ -157,6 +159,11 @@ void DescriptorBufferAllocator::bind(VkCommandBuffer cmd, VkPipelineBindPoint bi
     const uint32_t bufferIndex = 0;
     const VkDeviceSize offset = 0;
     m_pfnCmdSetOffsets(cmd, bindPoint, m_pipelineLayout, 0, 1, &bufferIndex, &offset);
+}
+
+void DescriptorBufferAllocator::pushData(VkCommandBuffer cmd, uint32_t offset, const void* data, size_t size) {
+    vkCmdPushConstants(cmd, m_pipelineLayout, kPushConstantRange.stageFlags, offset, static_cast<uint32_t>(size),
+                       data);
 }
 
 void DescriptorBufferAllocator::free(DescriptorHandle handle) {

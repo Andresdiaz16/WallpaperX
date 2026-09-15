@@ -20,8 +20,21 @@ namespace {
 // is how the two probes stop agreeing.
 using wallpaperx::testing::TestResource;
 
+// ctest reads 77 as a skip (SKIP_RETURN_CODE on both entries in renderer/CMakeLists.txt). Four
+// heap phases skipped for want of a heap tier must not exit 0 beside the tiers that did run: that
+// is a phase nothing exercised reading as a graded one.
+//
+// CONTROL: heapTierGuard in support/descriptor_probe_support.h forced to report no heap tier, with
+// WALLPAPERX_ALLOW_NO_HEAP_TIER=1 -> the four heap phases printed "skipped", then "NOT VERIFIED",
+// exit 77 on both ICDs; with the g_notVerified return in main() deleted, the same run exited 0 with
+// those phases silently ungraded. Both reverted.
+constexpr int kNotVerifiedExitCode = 77;
+bool g_notVerified = false;
+
 std::optional<bool> heapTierGuard(wallpaperx::Device& device, const char* label) {
-    return wallpaperx::testing::heapTierGuard(device, "descriptor_allocator_probe", label);
+    std::optional<bool> result = wallpaperx::testing::heapTierGuard(device, "descriptor_allocator_probe", label);
+    if (result && *result) g_notVerified = true;
+    return result;
 }
 
 bool testTierRejectsDoubleAllocate(const char* forceTier) {
@@ -364,5 +377,13 @@ int main() {
     ok &= testHeapTierUniformSlotsDoNotCollideWithImageSlots();
     ok &= testHeapTierRejectsDoubleFree();
     ok &= testHeapTierExhaustion();
-    return ok ? 0 : 1;
+    // Failures first: a run that is both broken and inconclusive must report broken.
+    if (!ok) return 1;
+    if (g_notVerified) {
+        std::cout << "descriptor_allocator_probe: NOT VERIFIED -- the heap phases were skipped, reported to ctest "
+                     "as a skip, not a pass"
+                  << std::endl;
+        return kNotVerifiedExitCode;
+    }
+    return 0;
 }

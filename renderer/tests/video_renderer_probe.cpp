@@ -35,7 +35,9 @@
 #include "vulkan/offscreen.h"
 
 #include "support/check.h"
+#include "support/cover_expectation.h"
 #include "support/gpu_readback.h"
+#include "support/lent_frame.h"
 #include "support/validation_grade.h"
 
 #include <dlfcn.h>
@@ -65,6 +67,8 @@ using wallpaperx::VideoFrame;
 using wallpaperx::VideoRenderer;
 using wallpaperx::VideoSource;
 using wallpaperx::testing::check;
+using wallpaperx::testing::CropRect;
+using wallpaperx::testing::expectedCover;
 using wallpaperx::testing::fail;
 
 constexpr int kNotVerifiedExitCode = 77;
@@ -127,12 +131,6 @@ std::string layoutName(VkImageLayout layout) {
 // The lent frame.
 // ------------------------------------------------------------------------- //
 
-constexpr VkFormat kFrameFormat = VK_FORMAT_B8G8R8A8_UNORM;
-// SAMPLED is not needed by the blit; it is what makes SHADER_READ_ONLY_OPTIMAL a legal
-// layout to declare, which one of the layout cases below does. TRANSFER_DST is how the
-// ramp gets in.
-constexpr VkImageUsageFlags kFrameUsage =
-    VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
 constexpr unsigned char kConstantBlue = 128;
 
 unsigned char ramp(uint32_t coordinate, uint32_t extent) {
@@ -143,141 +141,30 @@ unsigned char ramp(uint32_t coordinate, uint32_t extent) {
 // A frame whose pixels name their own position: red rises with x, green with y, blue is a
 // constant every pixel carries. Owned here and lent to the renderer, which is the ownership
 // split VideoFrame documents -- the renderer allocates nothing and frees nothing.
-class RampFrame {
+std::vector<unsigned char> rampPixels(uint32_t width, uint32_t height) {
+    std::vector<unsigned char> bgra(static_cast<size_t>(width) * height * 4);
+    for (uint32_t y = 0; y < height; ++y) {
+        for (uint32_t x = 0; x < width; ++x) {
+            unsigned char* pixel = &bgra[(static_cast<size_t>(y) * width + x) * 4];
+            pixel[0] = kConstantBlue;
+            pixel[1] = ramp(y, height);
+            pixel[2] = ramp(x, width);
+            pixel[3] = 255;
+        }
+    }
+    return bgra;
+}
+
+class RampFrame : public wallpaperx::testing::LentFrame {
 public:
     RampFrame(Device& device, uint32_t width, uint32_t height, VkImageLayout declaredLayout)
-        : m_device(device), m_layout(declaredLayout) {
-        m_source.format = kFrameFormat;
-        m_source.tiling = VK_IMAGE_TILING_OPTIMAL;
-        m_source.width = width;
-        m_source.height = height;
-        m_source.usage = kFrameUsage;
-
-        VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-        info.imageType = VK_IMAGE_TYPE_2D;
-        info.format = kFrameFormat;
-        info.extent = {width, height, 1};
-        info.mipLevels = 1;
-        info.arrayLayers = 1;
-        info.samples = VK_SAMPLE_COUNT_1_BIT;
-        info.tiling = VK_IMAGE_TILING_OPTIMAL;
-        info.usage = kFrameUsage;
-        info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-        info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        m_image = m_device.memory().createImage(info, "video-probe-frame");
-
-        upload();
-    }
-
-    RampFrame(const RampFrame&) = delete;
-    RampFrame& operator=(const RampFrame&) = delete;
-
-    // safeToFree(), not waitForSubmissions(): a batch that reads this image may still be in
-    // flight, and the wait throws on a wedged GPU -- from a destructor that is std::terminate
-    // and the probe's verdict is lost. safeToFree() answers false instead, having already
-    // reported the leak.
-    ~RampFrame() {
-        if (m_image.image == VK_NULL_HANDLE) return;
-        if (!m_device.safeToFree("the borrowed video frame")) return;
-        m_device.memory().destroyImage(m_image);
-    }
-
-    VideoFrame frame() const {
-        VideoFrame frame;
-        frame.source = m_source;
-        frame.image = m_image.image;
-        frame.layout = m_layout;
-        return frame;
-    }
-
-    VkImage image() const { return m_image.image; }
-    uint32_t width() const { return m_source.width; }
-    uint32_t height() const { return m_source.height; }
-    VkImageLayout declaredLayout() const { return m_layout; }
-
-private:
-    void upload() {
-        const VkDeviceSize bytes = static_cast<VkDeviceSize>(m_source.width) * m_source.height * 4;
-        AllocatedBuffer staging = m_device.memory().createBuffer(bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                                                                 HostAccess::Write, "video-probe-upload");
-        struct Guard {
-            Device& device;
-            AllocatedBuffer& buffer;
-            ~Guard() { device.memory().destroyBuffer(buffer); }
-        } guard{m_device, staging};
-
-        auto* pixels = static_cast<unsigned char*>(staging.mapped);
-        for (uint32_t y = 0; y < m_source.height; ++y) {
-            for (uint32_t x = 0; x < m_source.width; ++x) {
-                unsigned char* pixel = pixels + (static_cast<size_t>(y) * m_source.width + x) * 4;
-                pixel[0] = kConstantBlue;                 // B
-                pixel[1] = ramp(y, m_source.height);      // G
-                pixel[2] = ramp(x, m_source.width);       // R
-                pixel[3] = 255;                           // A
-            }
-        }
-        m_device.memory().flushForHostWrite(staging);
-
-        m_device.immediateSubmit([&](VkCommandBuffer cmd) {
-            VkImageMemoryBarrier toDst{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-            toDst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-            toDst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-            toDst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-            toDst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            toDst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            toDst.image = m_image.image;
-            toDst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,
-                                 nullptr, 0, nullptr, 1, &toDst);
-
-            VkBufferImageCopy region{};
-            region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-            region.imageExtent = {m_source.width, m_source.height, 1};
-            vkCmdCopyBufferToImage(cmd, staging.buffer, m_image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
-                                   &region);
-
-            VkImageMemoryBarrier toDeclared = toDst;
-            toDeclared.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-            toDeclared.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
-            toDeclared.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-            toDeclared.newLayout = m_layout;
-            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0,
-                                 nullptr, 0, nullptr, 1, &toDeclared);
-        });
-    }
-
-    Device& m_device;
-    VideoSource m_source;
-    AllocatedImage m_image;
-    VkImageLayout m_layout;
+        : LentFrame(device, width, height, declaredLayout, rampPixels(width, height), "video-probe-frame") {}
 };
 
 // ------------------------------------------------------------------------- //
 // Where the pixels on the monitor came from.
 // ------------------------------------------------------------------------- //
 
-struct CropRect {
-    double x0 = 0, y0 = 0, width = 0, height = 0;
-};
-
-// The region of the frame that "scaled to cover, cropped centrally" names, stated in real
-// arithmetic. Deliberately NOT the integer-product form the renderer uses: a copy of the
-// implementation would agree with it however both were wrong. Rounding differences between
-// the two are under a pixel and the tolerances below swallow them; the errors this has to
-// separate -- a stretch, a corner-anchored crop, a letterbox -- are tens of pixels.
-CropRect expectedCover(uint32_t frameWidth, uint32_t frameHeight, uint32_t targetWidth, uint32_t targetHeight) {
-    const double frameAspect = static_cast<double>(frameWidth) / frameHeight;
-    const double targetAspect = static_cast<double>(targetWidth) / targetHeight;
-
-    double width = frameWidth;
-    double height = frameHeight;
-    if (frameAspect > targetAspect) {
-        width = std::max(1.0, frameHeight * targetAspect);
-    } else if (frameAspect < targetAspect) {
-        height = std::max(1.0, frameWidth / targetAspect);
-    }
-    return {(frameWidth - width) / 2.0, (frameHeight - height) / 2.0, width, height};
-}
 
 constexpr int kSampleAxisPoints = 5;
 constexpr int kSamplesPerCase = kSampleAxisPoints * kSampleAxisPoints;
@@ -394,17 +281,18 @@ void runGeometryChecks(Device& device, OffscreenTargetManager& targets) {
     //       monitor and taller than it take opposite arms, an exact aspect takes neither, and
     //       512x2 on an 8x64 monitor is the case whose computed crop width is zero before the
     //       clamp.
-    // CONTROL: three, all in coverCrop (renderer/renderers/video_renderer.cpp) unless said
-    //       otherwise, all reverted. (a) `if (frameWide > targetWide)` -> `if (false)`, so a
-    //       frame wider than the monitor is squeezed: "FAIL: a frame wider than the monitor is
-    //       cropped left and right, not squeezed / 5 of 25 sampled pixels came from the right
-    //       column (worst miss 63.5 px, tolerance 4.0)", and the taller-than-monitor case
-    //       stayed green -- the two arms are separable. (b) `const uint64_t x0 = (frameWidth -
-    //       width) / 2;` and its y twin -> `= 0`, an anchored crop rather than a centred one:
-    //       four cases red, each naming the axis it was cropped on (worst miss 64.5 px). (c)
-    //       the blit's `dstOffsets[1]` in VideoRenderer::record halved, so the frame occupies a
-    //       quarter of the monitor: every case red on both the geometry and the "came from the
-    //       frame rather than from a border" check beside it.
+    // CONTROL: three, all reverted. (a) and (b) are in coverCrop, which
+    //       renderer/renderers/cover_crop.h shares with the still-image renderer. (a) `if
+    //       (sourceWide > targetWide)` -> `if (false)`, so a frame wider than the monitor is
+    //       squeezed: "FAIL: a frame wider than the monitor is cropped left and right, not
+    //       squeezed / 5 of 25 sampled pixels came from the right column (worst miss 63.5 px,
+    //       tolerance 4.0)", the sliver case (also wider than its monitor) red too, and the
+    //       taller-than-monitor case green -- the two arms are separable. (b) `const uint64_t x0
+    //       = (sourceWidth - width) / 2;` and its y twin -> `= 0`, an anchored crop: four cases
+    //       red, each naming the axis it was cropped on (worst miss 64.5 px). (c) the blit's
+    //       `dstOffsets[1]` in VideoRenderer::record (renderer/renderers/video_renderer.cpp)
+    //       halved, so the frame occupies a quarter of the monitor: all five cases red on both
+    //       the geometry and the "came from the frame rather than from a border" check beside it.
     // COVERAGE-ASSERT: g_coverCasesGraded is asserted below, and each case asserts that all
     //       25 of its sample points were actually read, so a case that silently stopped
     //       comparing fails rather than passing on the samples it reached. Both were observed
@@ -452,10 +340,10 @@ void runGeometryChecks(Device& device, OffscreenTargetManager& targets) {
         //       column wide, so every destination pixel must come from column 255 give or take
         //       the tolerance. The y half is weak here by construction -- the frame is two rows
         //       tall, less than the tolerance -- and is graded by the three cases above.
-        // CONTROL: `std::max<uint64_t>(1, ...)` in coverCrop
-        //       (renderer/renderers/video_renderer.cpp) changed to `std::max<uint64_t>(64,
-        //       ...)`, a wrong clamp -> this case red alone, "0 of 25 sampled pixels came from
-        //       the right column (worst miss 28.6 px, tolerance 2.6)". Reverted.
+        // CONTROL: the wider-than-monitor arm's `std::max<uint64_t>(1, ...)` in coverCrop
+        //       (renderer/renderers/cover_crop.h) changed to `std::max<uint64_t>(64, ...)`, a
+        //       wrong clamp -> this case red alone, "0 of 25 sampled pixels came from the right
+        //       column (worst miss 28.6 px, tolerance 2.6)". Reverted.
         //
         //       WHAT THIS DOES NOT GRADE, measured rather than assumed: deleting the clamp
         //       outright -- so the crop really is zero pixels wide -- leaves the whole probe
@@ -694,7 +582,8 @@ void runRefusalChecks(Device& device, OffscreenTargetManager& targets) {
     // CONTROL: `show(first);` in the VideoRenderer constructor
     //       (renderer/renderers/video_renderer.cpp) replaced by `m_frame = first;`, a
     //       constructor that adopts without checking -> "FAIL: a default-constructed frame
-    //       cannot build a renderer / it was accepted" as the run's only failure. Reverted.
+    //       cannot build a renderer / it was accepted", and the default-valued-declaration check
+    //       below it, which an unchecking constructor also lets through; nothing else. Reverted.
     //       Note that removing any *single* guard inside show() leaves this green: a
     //       default-constructed frame is refused by the null image, by the undefined layout and
     //       by the zero extent independently, so only "the constructor does not check at all"
@@ -771,12 +660,14 @@ void runRefusalChecks(Device& device, OffscreenTargetManager& targets) {
     //         * the extent guard in requireBlittable -> `if (false)` -> zero extent and
     //           over-limit. The default-valued case stayed green: the usage guard catches it.
     //         * the usage guard -> `if (false)` -> the missing TRANSFER_SRC case.
-    //         * `if (!isUnormColour(source.format))` -> `if (false)` -> the sRGB case only; NV12
-    //           stayed green because the format-feature query below it also refuses NV12.
-    //           Disabling that query as well reddens NV12 too.
+    //         * `if (!isUnormColour(source.format))` -> `if (false)` -> the two cases declaring
+    //           sRGB, and the previously-shown-frame check, since the second of them also lies
+    //           about its extent. NV12 stayed green because the format-feature query below it
+    //           also refuses NV12; disabling that query as well reddens NV12 too.
     //         * the tiling guard -> `if (false)` -> the DRM-modifier case.
-    //         * requireBlittable made to return immediately -> nine red lines, every case in
-    //           this table that is not a layout or a null handle.
+    //         * requireBlittable made to return immediately -> ten red lines: all eight cases in
+    //           this table that are not a layout or a null handle, the default-valued first
+    //           frame above, and the previously-shown-frame check.
     //       All in renderer/renderers/video_renderer.cpp.
     std::vector<Case> cases;
     cases.push_back({"a multi-planar Y'CbCr frame (NV12) is refused", Expected::ContentError, true,

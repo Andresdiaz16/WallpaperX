@@ -5,8 +5,9 @@
 layout(descriptor_heap) uniform sampler heapSampler[];
 layout(descriptor_heap) uniform texture2D heapTexture2D[];
 
+// Follows fullscreen.vert's block, which the two stages share.
 layout(push_constant) uniform PushData {
-    uint index;
+    layout(offset = 16) uint index;
 } pushData;
 
 layout(location = 0) in vec2 inUV;
