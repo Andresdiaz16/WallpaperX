@@ -47,6 +47,7 @@
 #include "tests/client/daemon_client.h"
 #include "tests/client/http_probe.h"
 #include "tests/client/scratch_dir.h"
+#include "tests/manager_output.h"
 #include "tests/test_report.h"
 
 #include <httplib.h>
@@ -105,6 +106,7 @@ using wallpaperx::testing::getStatusOrExplain;
 using wallpaperx::testing::HeldPort;
 using wallpaperx::testing::HttpReply;
 using wallpaperx::testing::makeClient;
+using wallpaperx::testing::nameScreen;
 using wallpaperx::testing::Poller;
 using wallpaperx::testing::setWallpaper;
 using wallpaperx::testing::StatusReply;
@@ -2378,13 +2380,13 @@ void runHealthStateChecks(const std::string& bluePath, const std::string& videoP
                 //       frontend displaying a failure that no longer exists.
                 // CONTROL: both `lastError.clear()` calls removed from
                 //       wallpaper_manager.cpp -- the one in requestWallpaper and the one in
-                //       renderPending's commit -- i.e. a failure that never clears -> "FAIL:
+                //       renderPassLocked's commit -- i.e. a failure that never clears -> "FAIL:
                 //       a later successful render clears the monitor's failed state" with
                 //       "  monitor 0 after a good render: failed", and "FAIL: the recovered
                 //       monitor's detail is empty, not the failure it no longer has".
                 //       Removing either alone leaves the check green, since the other still
                 //       clears it; that is a fact about the daemon, not a weakness here.
-                //       Reverted.
+                //       Re-observed 2026-09-14. Reverted.
                 daemon.manager().requestWallpaper("static", bluePath, 0);
                 daemon.manager().renderPending(0);
                 const HttpReply recovered = daemon.health();
@@ -2461,7 +2463,7 @@ void runHealthStateChecks(const std::string& bluePath, const std::string& videoP
             //       pass every assertion above it.
             // CONTROL: three, all reverted. (a) `daemonFault = true;` deleted from both
             //       `catch (const std::exception&)` arms in wallpaper_manager.cpp's
-            //       renderPending -> exactly three red: "a render that failed inside the
+            //       renderPassLocked (re-observed 2026-09-14) -> exactly three red: "a render that failed inside the
             //       daemon is recorded as the daemon's own fault", "after a render that
             //       failed inside the daemon, /health reports the verdict as fail", and "the
             //       failing wallpapers check says the failure was inside the daemon and
@@ -3832,9 +3834,9 @@ void runOutputParamChecks(WallpaperManager& manager, httplib::Client& cli, const
     try {
         manager.requestWallpaper("static", namedPath, kMonitorNamedSet);
         manager.requestWallpaper("static", otherPath, kMonitorNamedOther);
-        manager.setMonitorOutput(kMonitorNamedSet, "DP-1");
-        manager.setMonitorOutput(kMonitorNamedOther, "DP-2");
-        manager.setMonitorOutput(kMonitorNamedUnset, "HDMI-A-2");
+        nameScreen(manager, kMonitorNamedSet, "DP-1");
+        nameScreen(manager, kMonitorNamedOther, "DP-2");
+        nameScreen(manager, kMonitorNamedUnset, "HDMI-A-2");
     } catch (const wallpaperx::InvalidRequest& e) {
         // The code under test refusing input it is required to accept is a defect, not a host
         // condition: reported through check() so the run exits 1 rather than 77. Without this
@@ -4194,7 +4196,7 @@ void runOutputParamChecks(WallpaperManager& manager, httplib::Client& cli, const
     //       S10.8 alone, with every other check in the phase still graded and green.
     bool hostileBound = true;
     try {
-        manager.setMonitorOutput(kMonitorNamedHostile, hostileName);
+        nameScreen(manager, kMonitorNamedHostile, hostileName);
     } catch (const std::exception& e) {
         notVerified("S10.8's /config clause (a connector name is escaped wherever it is displayed)",
                     std::string("the hostile connector name could not be recorded: ") + e.what());
@@ -4984,7 +4986,7 @@ void runGpuLockChecks(sdbus::IProxy& proxy, WallpaperManager& manager, FrameRead
     // A name of its own, distinct from the connector-name phase's, so binding it cannot
     // disturb that phase's "a name resolves to its own monitor" checks.
     try {
-        manager.setMonitorOutput(kMonitorGpuLock, "DP-LOCK");
+        nameScreen(manager, kMonitorGpuLock, "DP-LOCK");
     } catch (const std::exception& e) {
         notVerified("S7.12 (a poll never waits on a render)",
                     std::string("the connector name the poller asks by could not be recorded: ") + e.what());

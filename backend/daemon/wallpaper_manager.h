@@ -34,6 +34,12 @@ struct InvalidRequest : std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
+// A screen size reported under a connector name no monitor answers to. Its own type because the
+// cure is elsewhere: the name has to be bound first.
+struct UnknownOutput : InvalidRequest {
+    using InvalidRequest::InvalidRequest;
+};
+
 // What a monitor was last asked to display, and what came of it. `generation` is monotonic
 // per monitor and never resets, so a consumer can tell a fresh frame from a repeat; `hasFrame`
 // is separate because a failed render clears the flag without rewinding the counter.
@@ -44,6 +50,11 @@ struct MonitorStatus {
     uint32_t height = 0;
     uint64_t generation = 0;
     bool hasFrame = false;
+
+    // What the next render draws at: the size this monitor's screen reported, or the configured
+    // default until one has.
+    OutputSize targetSize;
+    bool targetSizeReported = false;
 
     // Why the most recent request produced no frame, or empty if it produced one or is still
     // rendering. The only channel a failure has: SetWallpaper replies before the render runs.
@@ -245,9 +256,8 @@ public:
     static constexpr size_t kMaxHoldersPerMonitor = 4;
 
     struct Config {
-        // Placeholder geometry: no source of real monitor dimensions exists until the app
-        // supplies them via KScreen (Step 15). Tests override it to keep software-rasterised
-        // runs fast.
+        // What a monitor is drawn at until its screen reports a size through setOutputSize().
+        // Tests override it to keep software-rasterised runs fast.
         uint32_t width = 1920;
         uint32_t height = 1080;
 
@@ -289,7 +299,19 @@ public:
     // reach the config file: the binding stands for this run either way, and only the write
     // makes it outlive a restart. Idempotent; a call that changes nothing already on disk does
     // not write, since the write parks the calling thread.
-    void setMonitorOutput(int monitorId, const std::string& outputName);
+    //
+    // A name carries its screen's reported size, so binding one can change what two monitors are
+    // drawn at. Those are recorded as owed a render and put in `redraw` before anything can throw;
+    // the caller posts them on success and on a failed write alike, since the binding stands.
+    void setMonitorOutput(int monitorId, const std::string& outputName, std::vector<int>& redraw);
+
+    // Records the size the screen named `outputName` is drawn at. The monitor whose drawing size
+    // that changes is recorded as owed a render and put in `redraw` before anything can throw; the
+    // caller posts it on success and failure alike, since the size stands either way. Throws
+    // InvalidRequest for a name or size the shared validators reject, and UnknownOutput for a name
+    // no monitor answers to. Idempotent. The write is queued, not waited on -- a size lost to a
+    // failed write costs one redraw after a restart, and a stalled disk must not delay this one.
+    void setOutputSize(const std::string& outputName, uint32_t width, uint32_t height, std::vector<int>& redraw);
 
     // Records what the consumer named by `client` says it can import, and returns the monitors
     // to re-post so their images are rebuilt against it. GPU-free, like requestWallpaper: the
@@ -362,10 +384,10 @@ public:
     // Silent about a claim it does not hold: a consumer releasing twice, or releasing one
     // already dropped for it, is not making an error. Throws InvalidRequest for a bad id.
     //
-    // `announce`, when given, receives the monitors that owe no render and so will announce
-    // nothing of their own -- the freed image has to be published some other way, or a consumer
-    // refused for want of one never learns it may ask again. The two are disjoint: a monitor
-    // either owes a render or has its committed frame re-announced.
+    // `announce`, when given, receives the monitors holding a frame a consumer can still read --
+    // the freed image has to be published, or a consumer refused for want of one never learns it
+    // may ask again. A monitor can be in both: a redraw at a new size is owed while the frame it
+    // replaces is still served.
     std::vector<int> releaseBuffer(const std::string& client, int monitorId, uint64_t bufferId,
                                    std::vector<FrameAvailable>* announce = nullptr);
 
@@ -490,15 +512,48 @@ private:
     // still starts and reports a clean error. Called with m_gpuMutex held.
     void ensureGpu();
 
-    // Both called with m_gpuMutex held, and both drop the monitor's holds when they change
-    // which images exist: a claim on an image that has been freed names an id nothing will
-    // ever hand out again.
-    void ensureTargets(int monitorId);
+    // Both called with m_gpuMutex held, and both drop the monitor's holds and frame when they
+    // change which images exist: a claim on an image that has been freed names an id nothing
+    // will ever hand out again.
+    // ensureTargets() answers whether it replaced the images.
+    bool ensureTargets(int monitorId, OutputSize size);
     void releaseTarget(int monitorId);
 
-    // Drops every claim on a monitor whose images have just been freed or replaced. Takes
+    // Whether this monitor already has images at `size`, which ensureTargets() then reuses.
+    // Caller must hold m_gpuMutex.
+    bool targetsFit(int monitorId, OutputSize size) const;
+
+    // One attempt at renderPending()'s work. `superseded` means a newer request overtook it before
+    // it committed. `rebuilt` is set when this attempt replaced the images. Caller must hold
+    // m_gpuMutex.
+    struct RenderPass {
+        RenderOutcome outcome;
+        bool superseded = false;
+    };
+    RenderPass renderPassLocked(int monitorId, bool& rebuilt);
+
+    // Drops every claim on a monitor whose images have just been freed or replaced, and the
+    // frame they held: hasFrame promises an export that the images it names still exist. Takes
     // m_stateMutex itself, so the caller must hold only m_gpuMutex.
-    void forgetHolds(int monitorId);
+    void forgetImages(int monitorId);
+
+    // The size the screen bound to this monitor reported, if it has. Caller must hold
+    // m_stateMutex.
+    std::optional<OutputSize> reportedSizeLocked(int monitorId) const;
+
+    // What this monitor is drawn at: the reported size, else the configured default. Caller
+    // must hold m_stateMutex.
+    OutputSize targetSizeLocked(int monitorId) const;
+
+    // Re-requests a monitor whose drawing size is no longer `before`, appending it to `toRender`.
+    // Bumping requestSeq is what keeps a render already under way at the old size from
+    // committing. Cannot throw once `toRender` has room for one more. Caller must hold
+    // m_stateMutex.
+    void redrawIfResizedLocked(int monitorId, OutputSize before, std::vector<int>& toRender);
+
+    // Drops remembered sizes of names no monitor answers to, until no more than kMaxMonitors are
+    // held. Caller must hold m_stateMutex.
+    void pruneOutputSizesLocked();
 
     // Both of a hand-over's descriptors, or neither and a throw with the GPU health recorded.
     // Caller must hold m_gpuMutex, which is what keeps `target` alive across the export.
@@ -521,10 +576,10 @@ private:
     // in: two consumers may hold the same image, and both claims are real.
     static std::vector<uint64_t> flattenHolds(const std::vector<BufferHold>& holds);
 
-    // What an image coming free on `monitorId` is worth: appends to `toRender` or to `announce`,
-    // never both. Caller must hold m_stateMutex.
-    static void reportFreedImageLocked(int monitorId, const MonitorState& state, std::vector<int>& toRender,
-                                       std::vector<FrameAvailable>* announce);
+    // What an image coming free on `monitorId` is worth: a render if one is owed, an announcement
+    // if a readable frame exists. Caller must hold m_stateMutex.
+    void reportFreedImageLocked(int monitorId, const MonitorState& state, std::vector<int>& toRender,
+                                std::vector<FrameAvailable>* announce) const;
 
     // Reads the config on a thread this can walk away from. Linux gives no way to bound a
     // filesystem call -- a hard network mount is uninterruptible by design -- so the only
@@ -614,6 +669,11 @@ private:
     // Connector name -> monitor id, and the only authority on which is which. Guarded by
     // m_stateMutex.
     std::map<std::string, int> m_outputs;
+
+    // Connector name -> the size that screen last reported. Kept apart from m_outputs so a size
+    // outlives its name being unbound: the plugin that sent it cannot tell the name was unbound
+    // and bound again, so it never sends it twice. Guarded by m_stateMutex.
+    std::map<std::string, OutputSize> m_outputSizes;
 
     // What each consumer reported it can import, keyed by its DBus unique name, and the
     // intersection currently in force. Per-consumer because the daemon must satisfy all of

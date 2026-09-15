@@ -5,10 +5,18 @@
 #include "config_store.h"
 
 #include <map>
+#include <optional>
 #include <string>
 #include <vector>
 
 namespace wallpaperx {
+
+// A bound connector name as the file records it: the monitor it answers to, and the size its
+// screen last reported.
+struct OutputBinding {
+    int monitorId = 0;
+    std::optional<OutputSize> size;
+};
 
 // What the persistence side needs to know about live monitor state, and all it needs. Passed
 // as a value rather than read from the manager's fields: which rows the file will hold is
@@ -17,8 +25,8 @@ struct LiveWallpapers {
     // One per monitor actually holding a wallpaper.
     std::vector<PersistedWallpaper> rows;
 
-    // Connector name -> monitor id, and the only authority on which is which.
-    std::map<std::string, int> outputs;
+    // Connector name -> binding, and the only authority on which is which.
+    std::map<std::string, OutputBinding> outputs;
 
     // Whether a live monitor holds a wallpaper for this id, which is what decides that a kept
     // row for the same id will not survive the next save.

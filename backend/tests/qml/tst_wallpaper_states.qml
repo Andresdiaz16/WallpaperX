@@ -53,12 +53,13 @@ TestCase {
     }
 
     // A stand-in for the renderer module, which this harness has no import path for. It carries
-    // the two properties main.qml exchanges with the loaded item and nothing else -- every
-    // binding that decides WHETHER to load it stays main.qml's own.
+    // the properties main.qml exchanges with the loaded item and nothing else -- every binding
+    // that decides WHETHER to load it stays main.qml's own.
     Component {
         id: standInRenderer
         Item {
             property int monitorId: -1
+            property string output: ""
             property string unavailableReason: ""
             // The real item reports this only once a frame is on screen. The stand-in draws
             // nothing, so a check that wants the backdrop hidden must set it.
@@ -916,6 +917,33 @@ TestCase {
         // The fragment comes from the case table, which is the one place it is spelled.
         verify(item.describe().indexOf(suite.unreachableFragment) >= 0,
                "and the message names the daemon being gone, not the previous cause");
+    }
+
+    // GOAL: S13.107 -- the renderer main.qml loads is handed the connector name its monitor id was
+    //       resolved from, and a screen renamed afterwards hands the loaded renderer the new name, so
+    //       the size the renderer reports is filed under the screen it is drawn on.
+    // WHY-THIS-SHAPE: read off the stand-in, the only renderer this harness can load. The rename is made
+    //       after the renderer loaded, and "set" does not depend on the name, so the second half reaches
+    //       the rename handler rather than a fresh onLoaded.
+    // CONTROL: `item.output = root.connector;` deleted from the Loader's onLoaded in main.qml
+    //       (backend/kde/kpackage/contents/ui/main.qml) -> "the renderer is told the connector name its
+    //       monitor id belongs to" red, 'Actual (): Expected (): DP-3'. Reverted.
+    // CONTROL: the `onConnectorChanged` handler deleted from main.qml -> only "a renamed screen's new
+    //       connector name reaches the loaded renderer" red, 'Actual (): DP-3 Expected (): DP-9'. Reverted.
+    function test_the_renderer_is_told_its_connector_name() {
+        const item = loadPlugin(suite.namedScreen);
+        const surface = childNamed(item, "wallpaperxSurface");
+        verify(surface !== null, "the plugin has a surface");
+        surface.sourceComponent = standInRenderer;
+
+        item.apply(200, '{"output":"DP-3","known":true,"path":"/w.png","monitor_id":0}');
+        compare(surface.status, Loader.Ready, "the stand-in renderer loaded, which is what lets this check fail");
+        compare(surface.item.output, suite.namedScreen, "the renderer is told the connector name its monitor id belongs to");
+
+        item.connectorOverride = "DP-9";
+        compare(item.screenState, "set", "renaming the screen leaves it drawing");
+        verify(surface.item !== null, "the renderer is still loaded after the rename");
+        compare(surface.item.output, "DP-9", "a renamed screen's new connector name reaches the loaded renderer");
     }
 
     // The one configuration where main.qml hides the backdrop: a stand-in renderer loaded on a

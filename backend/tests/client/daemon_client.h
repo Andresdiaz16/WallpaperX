@@ -317,6 +317,16 @@ inline void setMonitorOutput(sdbus::IProxy& proxy, int32_t monitorId, const std:
         .withArguments(monitorId, outputName);
 }
 
+// Reports the pixel size the screen named `outputName` is drawn at, as the KDE plugin does. Shared
+// for setMonitorOutput's reason: the argument order is a wire fact.
+inline void setOutputSize(sdbus::IProxy& proxy, const std::string& outputName, uint32_t width, uint32_t height,
+                          std::chrono::microseconds timeout = {}) {
+    proxy.callMethod("SetOutputSize")
+        .onInterface(DbusService::kInterface)
+        .withTimeout(timeout)
+        .withArguments(outputName, width, height);
+}
+
 // Reports what the frame consumer can import, as the plugin's render thread does.
 //
 // Here rather than in one test file for the same reason as setMonitorOutput above: the

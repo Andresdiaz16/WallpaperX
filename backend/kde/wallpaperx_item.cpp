@@ -64,6 +64,15 @@ constexpr const char* kErrorNoFreeImage = "io.wallpaperx.Daemon.Error.NoFreeImag
 // on its own once an image comes free.
 constexpr int kRefusedRetryMs = 2000;
 
+// A screen size reported before the daemon knows the screen's name. Ordinary while the app has
+// not named it, and answered by the next report once it has.
+constexpr const char* kErrorUnknownOutput = "io.wallpaperx.Daemon.Error.UnknownOutput";
+constexpr const char* kErrorRenderFailed = "io.wallpaperx.Daemon.Error.RenderFailed";
+
+// Long enough to cover a login's burst of layout and scale changes, short enough that a rotation
+// is redrawn before anyone looks for it.
+constexpr int kSizeReportSettleMs = 250;
+
 }  // namespace
 
 namespace {
@@ -400,6 +409,8 @@ bool WallpaperXItem::supersedesShown(Arriving generation, Held shown) {
 
 WallpaperXItem::WallpaperXItem(QQuickItem* parent) : QQuickItem(parent) {
     setFlag(ItemHasContents, true);
+    m_sizeReportTimer.setSingleShot(true);
+    connect(&m_sizeReportTimer, &QTimer::timeout, this, &WallpaperXItem::reportSize);
     connectToDaemon();
 }
 
@@ -410,11 +421,69 @@ void WallpaperXItem::setMonitorId(int monitorId) {
     m_monitorId = monitorId;
 
     forgetGenerations();
+    m_sizeReported.reset();
+    scheduleSizeReport();
 
     emit monitorIdChanged();
     // A screen that has just been identified may already have a frame waiting; without this the
     // desktop stays blank until the next time the wallpaper happens to change.
     if (m_monitorId >= 0) fetchFrame(0);
+}
+
+void WallpaperXItem::setOutput(const QString& output) {
+    if (m_output == output) return;
+    m_output = output;
+    emit outputChanged();
+    scheduleSizeReport();
+}
+
+void WallpaperXItem::scheduleSizeReport() { m_sizeReportTimer.start(kSizeReportSettleMs); }
+
+// Measured on this item, not on its QScreen: the item is what the frame is stretched over, and on
+// Wayland a fractional scale belongs to the window while QScreen carries the output's integer one.
+void WallpaperXItem::reportSize() {
+    const QQuickWindow* host = window();
+    if (m_output.isEmpty() || host == nullptr) return;
+    const qreal ratio = host->effectiveDevicePixelRatio();
+    const SizeReport report{m_output, QSize(qRound(width() * ratio), qRound(height() * ratio))};
+    // Not laid out yet. The geometry change that lays it out reports.
+    if (report.pixels.isEmpty() || m_sizeReported == report) return;
+
+    QDBusConnection bus = QDBusConnection::sessionBus();
+    if (!bus.isConnected()) return;
+    QDBusMessage request = QDBusMessage::createMethodCall(QString::fromUtf8(kService), QString::fromUtf8(kPath),
+                                                          QString::fromUtf8(kInterface),
+                                                          QStringLiteral("SetOutputSize"));
+    request.setArguments({report.output, static_cast<quint32>(report.pixels.width()),
+                          static_cast<quint32>(report.pixels.height())});
+    m_sizeReported = report;
+
+    auto* watcher = new QDBusPendingCallWatcher(bus.asyncCall(request), this);
+    connect(watcher, &QDBusPendingCallWatcher::finished, this, [this, report](QDBusPendingCallWatcher* done) {
+        done->deleteLater();
+        // Nothing to undo after a success, or once a newer report has replaced this one.
+        if (!done->isError() || !(m_sizeReported == report)) return;
+        m_sizeReported.reset();
+
+        const QString name = done->error().name();
+        // The daemon's arrival reports again, through the owner watcher.
+        if (name == QLatin1String("org.freedesktop.DBus.Error.ServiceUnknown")) return;
+        // Ordinary until the app names the screen, so not logged. This item exists only while
+        // /config says the name is bound, so its retries end with it.
+        const bool unnamed = name == QLatin1String(kErrorUnknownOutput);
+        // Only what a resend can fix: an unnamed screen, a save that could not be queued, a daemon
+        // too busy to answer. Anything else stands until the daemon or the screen changes, and
+        // both of those report again on their own.
+        const bool transient = unnamed || name == QLatin1String(kErrorRenderFailed) ||
+                               name == QLatin1String("org.freedesktop.DBus.Error.NoReply") ||
+                               name == QLatin1String("org.freedesktop.DBus.Error.Timeout");
+        if (!unnamed) {
+            std::fprintf(stderr, "wallpaperx: the daemon refused this screen's size -- %s\n",
+                         sanitizeForLog(done->error().message().toStdString()).c_str());
+        }
+        // A trigger already pending goes sooner.
+        if (transient && !m_sizeReportTimer.isActive()) m_sizeReportTimer.start(kRefusedRetryMs);
+    });
 }
 
 // Every generation mark at once. Generations belong to one monitor and one daemon instance, so a
@@ -524,10 +593,12 @@ void WallpaperXItem::connectToDaemon() {
                 // Before anything else, and on departures too: a claim outlives the daemon that
                 // granted it, and the next daemon starts its buffer ids over from one.
                 noteDaemonOwner(newOwner);
+                m_sizeReported.reset();
                 if (newOwner.isEmpty()) {
                     setFetchReason(tr("WallpaperX is not running."));
                     return;
                 }
+                scheduleSizeReport();
                 // Gated: an unconditional retry would add a duplicate match rule per restart,
                 // which is one of the things that makes the subscription fail in the first place.
                 if (!m_subscribed) m_subscribed = subscribeToFrameReady();
@@ -1067,8 +1138,18 @@ void WallpaperXItem::retryWhileNothingIsShown() {
 // a fetch for this screen is usually already out and forcing would ask for the same frame twice.
 void WallpaperXItem::itemChange(ItemChange change, const ItemChangeData& value) {
     QQuickItem::itemChange(change, value);
+    if (change == ItemDevicePixelRatioHasChanged) {
+        scheduleSizeReport();
+        return;
+    }
     if (change != ItemSceneChange || value.window == nullptr) return;
     ensureFrameRequested();
+    scheduleSizeReport();
+}
+
+void WallpaperXItem::geometryChange(const QRectF& newGeometry, const QRectF& oldGeometry) {
+    QQuickItem::geometryChange(newGeometry, oldGeometry);
+    if (newGeometry.size() != oldGeometry.size()) scheduleSizeReport();
 }
 
 // The imported handles are the scene graph's to free -- Qt's own exemption for resources its

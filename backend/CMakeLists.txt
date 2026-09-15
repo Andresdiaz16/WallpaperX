@@ -918,6 +918,24 @@ if(DBUS_RUN_SESSION)
             RESOURCE_LOCK wallpaperx_bus_tests
             SKIP_RETURN_CODE 77)
 
+        # The same item, driven by a stub that records SetOutputSize. The binary configures the
+        # offscreen platform itself with two screens at different scales, which is the only way to
+        # make a scale change headless, so it needs no GL and no display.
+        add_executable(wallpaperx-item-size-report-test tests/item_size_report_test.cpp)
+        target_link_libraries(wallpaperx-item-size-report-test PRIVATE
+            Qt6::Core Qt6::DBus Qt6::Gui Qt6::Qml Qt6::Quick)
+        target_include_directories(wallpaperx-item-size-report-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        target_compile_definitions(wallpaperx-item-size-report-test PRIVATE
+            WALLPAPERX_QML_MODULE_PATH="${CMAKE_CURRENT_BINARY_DIR}/qml")
+        add_dependencies(wallpaperx-item-size-report-test wallpaperxplugin)
+        add_test(NAME item_size_report
+                 COMMAND ${DBUS_RUN_SESSION} -- $<TARGET_FILE:wallpaperx-item-size-report-test>)
+        set_tests_properties(item_size_report PROPERTIES
+            ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QT_NO_XDG_DESKTOP_PORTAL=1"
+            LABELS "novulkan"
+            RESOURCE_LOCK wallpaperx_bus_tests
+            SKIP_RETURN_CODE 77)
+
         # The same item, driven by a stub that serves a frame the importer ACCEPTS -- a real
         # Vulkan export -- so that what the scene graph does with the imported GL objects when it
         # drops them is observable. Needs Vulkan as well as OpenGL, and needs both to resolve to

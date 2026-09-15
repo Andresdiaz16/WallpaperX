@@ -1541,10 +1541,11 @@ void checkConcurrentClients(sdbus::IProxy& proxy, FrameReadyLog& signals, const 
     //       would be gone by the time a single reading at the end was taken. Non-zero at ANY
     //       reading is the violation, which makes it independent of the interleaving -- unlike
     //       an assertion that some particular number of deferrals did or did not occur.
-    // CONTROL: `if (deferred)` in WallpaperManager::renderPending (backend/daemon/
+    // CONTROL: `if (deferred)` in WallpaperManager::renderPassLocked (backend/daemon/
     //       wallpaper_manager.cpp) changed to `if (true)`, so every render defers -> "FAIL: no
     //       render was ever deferred for want of a free image, which the producer's reserve is
-    //       what prevents", printing "21 of 22 readings reported a deferred render". Reverted.
+    //       what prevents", printing "21 of 22 readings reported a deferred render", beside the
+    //       checks that need any render to complete. Re-observed 2026-09-14. Reverted.
     //       Deleting exportCurrentFrame()'s reserve does NOT redden this: measured, that run
     //       produced no deferral on any storm monitor at all, because whether the storm's clients
     //       come to hold every image of one monitor is a scheduling outcome. That is the reason
@@ -4331,12 +4332,11 @@ void checkOutputRestart(NameWatcher& names, const std::string& validationEnv, co
     //       that never bound them at all would spend the timeout and then be graded on
     //       whatever the last sample happened to hold. TWO screens with two names, because
     //       one cannot distinguish a restored map from a map with a single entry in it.
-    // CONTROL: the whole `if (nameValid && entry.monitorId < kMaxMonitors &&
-    //       bindOutputLocked(entry.monitorId, entry.output) == BindResult::Displaced)`
-    //       statement in WallpaperManager::restoreSaved()
+    // CONTROL: the whole `if (bindOutputLocked(entry.monitorId, entry.output) ==
+    //       BindResult::Displaced) ++displacedNames;` statement in WallpaperManager::restoreSaved()
     //       (backend/daemon/wallpaper_manager.cpp) deleted -- the bind is a side effect of
     //       the CONDITION, so removing only the `++displacedNames;` body disables nothing
-    //       and leaves every check here green. With the statement gone: "FAIL: both
+    //       and leaves every check here green. Re-observed 2026-09-14. With the statement gone: "FAIL: both
     //       connector names resolve to their own monitors in a daemon that was told
     //       nothing", printing "'DP-3' -> -1 (expected 18), 'HDMI-A-1' -> -1 (expected 19)"
     //       and the config file it read them out of, plus the four /config lines below. The

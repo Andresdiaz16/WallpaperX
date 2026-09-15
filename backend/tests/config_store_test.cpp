@@ -28,6 +28,7 @@
 #include "daemon/wallpaper_manager.h"
 #include "tests/client/blocking_config_write.h"
 #include "tests/client/scratch_dir.h"
+#include "tests/manager_output.h"
 #include "tests/test_report.h"
 
 #include <nlohmann/json.hpp>
@@ -74,6 +75,7 @@ using wallpaperx::sanitizeForLog;
 using wallpaperx::testing::BlockingWrite;
 using wallpaperx::testing::blockingWriteFixtureWorks;
 using wallpaperx::testing::isRegularFile;
+using wallpaperx::testing::nameScreen;
 using wallpaperx::testing::ScratchDir;
 using wallpaperx::WallpaperManager;
 
@@ -1228,7 +1230,7 @@ void runNonUtf8Checks() {
     //       kept is in the file", printing "monitor 0 is not in the file at all" beside a detail
     //       still reading "(1 wallpapers dropped: ...; any screen name on those rows was kept)".
     //       Observed 2026-08-18, reverted. Two checks above it go red from the same edit.
-    manager.setMonitorOutput(0, "DP-PROMISED");
+    nameScreen(manager, 0, "DP-PROMISED");
     const std::string namedDetail = manager.snapshot().health.persistence.detail;
     std::string promisedWhy;
     const std::map<int, RowInFile> promisedRows = rowsInFile(managerConfig.configFile, promisedWhy);
@@ -3547,7 +3549,9 @@ void runOutputRestoreChecks() {
     //       backend/daemon/wallpaper_manager.cpp -> "FAIL: two config rows claiming one
     //       connector name are reported as a loss", printing the persistence detail without
     //       the clause, while the resolution checks stayed green -- which is what separates
-    //       "not reported" from "not resolved". Reverted.
+    //       "not reported" from "not resolved". Sixteen checks elsewhere go red with it, every
+    //       preserved-copy and repair-write check whose fixture's only repair is a displaced name.
+    //       Re-observed 2026-09-14. Reverted.
     check(snap.outputs.count("DP-DUP") == 1 && snap.outputs.at("DP-DUP") == 4,
           "two config rows claiming one connector name leave the last one holding it");
     int namesOnThree = 0;
@@ -3641,15 +3645,21 @@ void runOutputRestoreChecks() {
     //       wallpaper and its connector name on one row" with "5 rows for 4 monitor ids",
     //       "FAIL: a monitor's wallpaper and its connector name are written as one row" with
     //       "6 rows for 5 monitor ids", and the two merged-row checks, neither read finding the
-    //       name on the row that holds the wallpaper. Re-observed 2026-08-19. Reverted.
+    //       name on the row that holds the wallpaper, with four kept-row and repair-write checks
+    //       red beside them. Re-observed 2026-09-14, after the wait below was made to require the
+    //       start's own write: waiting on row 1 alone was satisfied by the fixture, and the first
+    //       check then read the fixture's five rows and passed under this mutation. Reverted.
     // CONTROL, for the first read being of the START's write and not of the fixture this phase
     //       wrote: rowsInFile()'s raw-row count returned one too high -> "FAIL: the restore's
     //       own write puts a monitor's wallpaper and its connector name on one row", printing
     //       "5 rows for 4 monitor ids (read back); ids: 1 2 4 5" -- four ids, where the fixture
     //       above has five. Observed 2026-08-15. Reverted.
     const std::string presentPath = present.string();
+    // For the START's write: the fixture already has DP-1 beside its wallpaper, and only the repair
+    // takes DP-DUP off monitor 3, so a wait on row 1 alone can be satisfied by the fixture itself.
     waitForRows(file, [&presentPath](const std::map<int, RowInFile>& rows) {
-        return rows.count(1) == 1 && rows.at(1).output == "DP-1" && rows.at(1).path == presentPath;
+        const bool repaired = rows.count(3) == 0 || rows.at(3).output != "DP-DUP";
+        return repaired && rows.count(1) == 1 && rows.at(1).output == "DP-1" && rows.at(1).path == presentPath;
     });
     std::string repairWhy;
     std::size_t repairRowCount = 0;
@@ -3698,9 +3708,10 @@ void runOutputRestoreChecks() {
     //       deleted -> three FAILs: "a rebinding is written to the file, not just held in
     //       memory", "the merged row carries both the wallpaper and the connector name", and
     //       "a screen that has only been named keeps a row of its own across a save" -- no
-    //       output key on any row. Thirteen more go red with them, every check in the binary
-    //       that reads a name back off the disk. Re-observed 2026-08-19. Reverted.
-    manager.setMonitorOutput(7, "DP-1");
+    //       output key on any row. Sixteen more go red with them, every check in the binary
+    //       that reads a name back off the disk, the screen-size file checks among them.
+    //       Re-observed 2026-09-14. Reverted.
+    nameScreen(manager, 7, "DP-1");
     waitForRows(file, [](const std::map<int, RowInFile>& rows) {
         return rows.count(7) == 1 && rows.at(7).output == "DP-1";
     });
@@ -4571,7 +4582,7 @@ void runStrictOwnershipChecks() {
         void (*drive)(WallpaperManager&);
     };
     static constexpr Touch kTouches[] = {
-        {"naming the screen", [](WallpaperManager& m) { m.setMonitorOutput(0, "DP-KEPT"); }},
+        {"naming the screen", [](WallpaperManager& m) { nameScreen(m, 0, "DP-KEPT"); }},
         {"asking it to render what has not been set", [](WallpaperManager& m) { m.renderPending(0); }},
         {"asking it for a frame", [](WallpaperManager& m) { m.exportCurrentFrame(0); }},
     };
@@ -4683,7 +4694,7 @@ void runKeptNameTakenOverAtRuntimeChecks() {
     //       "FAIL: the name the report says was taken over really did leave the carried row",
     //       printing "ids on disk: 0 100" with both rows carrying the name -- two monitors
     //       answering to one screen at the next start.
-    manager.setMonitorOutput(0, "DP-CARRIED");
+    nameScreen(manager, 0, "DP-CARRIED");
     const std::string detail = manager.snapshot().health.persistence.detail;
 
     const std::optional<int> takenOver = clauseCountOrSkip(detail, takenClause, kGoals);
@@ -4826,7 +4837,7 @@ void runRepeatedRuntimeLossesAreBoundedChecks() {
         manager.requestWallpaper("static", paths->wallpapers[0].string(), i);
     }
     for (int i = 0; i < kEach; ++i) {
-        manager.setMonitorOutput(kEach + i, "DP-CARRIED-" + std::to_string(i));
+        nameScreen(manager, kEach + i, "DP-CARRIED-" + std::to_string(i));
     }
 
     // Read once, after both bursts: every assertion below is about the same report, which is
@@ -5606,7 +5617,7 @@ void runPreservedRowChecks() {
         return;
     }
 
-    manager.setMonitorOutput(claimingMonitor, claimedName);
+    nameScreen(manager, claimingMonitor, claimedName);
     const WallpaperManager::Snapshot afterClaim = manager.snapshot();
     const std::optional<int> keptNamesAfter = keptNameCount(afterClaim.health.persistence.detail);
     const bool claimBound = afterClaim.outputs.count(claimedName) == 1 &&
@@ -5720,7 +5731,8 @@ void runIdempotentRenameChecks() {
     // CONTROL: the `== BindResult::Unchanged` early return deleted from
     //       WallpaperManager::setMonitorOutput (backend/daemon/wallpaper_manager.cpp) ->
     //       "FAIL: naming a screen the name it already has does not write the config at all",
-    //       printing "2 write(s) landed for 1 change". Observed 2026-08-14. Reverted.
+    //       printing "2 write(s) landed for 1 change". Observed 2026-08-14, re-observed 2026-09-14.
+    //       Reverted.
     // COVERAGE-ASSERT: a count that never moves is what a dead interposition and a daemon that
     //       never saves both produce, so the first call is asserted to write exactly once and
     //       a later call that DOES change the binding is asserted to write again -- an early
@@ -5736,7 +5748,7 @@ void runIdempotentRenameChecks() {
         });
     };
 
-    manager.setMonitorOutput(3, "DP-A");
+    nameScreen(manager, 3, "DP-A");
     const unsigned afterFirst = renamesCounted();
     if (!waitForOutput(file, 3, "DP-A")) {
         check(false, "naming a screen writes that name into the config file");
@@ -5807,14 +5819,14 @@ void runIdempotentRenameChecks() {
     }
     check(afterFirst == 1, "naming a screen a name it did not have writes the config exactly once");
 
-    manager.setMonitorOutput(3, "DP-A");
+    nameScreen(manager, 3, "DP-A");
     const unsigned afterRepeat = renamesCounted();
     check(afterRepeat == afterFirst, "naming a screen the name it already has does not write the config at all");
     if (afterRepeat != afterFirst) {
         std::fprintf(stderr, "  %u write(s) landed for %u change\n", afterRepeat, afterFirst);
     }
 
-    manager.setMonitorOutput(3, "DP-B");
+    nameScreen(manager, 3, "DP-B");
     const unsigned afterChange = renamesCounted();
     if (!waitForOutput(file, 3, "DP-B")) {
         check(false, "naming a screen a different name writes that name into the config file");
@@ -5893,7 +5905,7 @@ void runIdempotentRenameChecks() {
     //       before it; the config file is empty or absent; monitor 3 output '(no row)'", and
     //       "FAIL: the persistence health recovers once a retried write lands". Eight red in all;
     //       the other six are the agreement cluster below, which grades the same shortcut.
-    //       Re-observed 2026-08-18. Reverted.
+    //       Re-observed 2026-09-14, and the whole-return control below with it. Reverted.
     // CONTROL, for the last check of this phase: the whole `== BindResult::Unchanged` early
     //       return deleted from the same function, so every call writes -> "FAIL: once the
     //       retry has landed, re-asserting the same name writes nothing again", printing "3
@@ -5911,7 +5923,7 @@ void runIdempotentRenameChecks() {
     // every check under it.
     const auto name = [&blocked](int monitorId, const std::string& outputName) {
         try {
-            blocked.setMonitorOutput(monitorId, outputName);
+            nameScreen(blocked, monitorId, outputName);
         } catch (const std::exception& e) {
             return std::string(e.what());
         } catch (...) {
@@ -6847,7 +6859,7 @@ void runNameAnswersForItsOwnWriteChecks() {
 
     std::string threw;
     try {
-        manager.setMonitorOutput(1, "DP-OK");
+        nameScreen(manager, 1, "DP-OK");
     } catch (const std::exception& e) {
         threw = e.what();
     } catch (...) {
@@ -6992,7 +7004,7 @@ FileAnswers askEveryChannel(WallpaperManager& manager, const std::filesystem::pa
     out.healthOk = manager.snapshot().health.persistence.status == wallpaperx::HealthStatus::Ok;
     countRenamesOnto(file);
     try {
-        manager.setMonitorOutput(monitorId, outputName);
+        nameScreen(manager, monitorId, outputName);
     } catch (const std::exception& e) {
         out.threw = e.what();
     } catch (...) {
@@ -7110,7 +7122,7 @@ void runOneAnswerAboutTheFileChecks() {
         // that thread must be able to keep the manager alive rather than be left holding a
         // destroyed one.
         auto manager = std::make_shared<WallpaperManager>(config);
-        manager->setMonitorOutput(3, "DP-A");
+        nameScreen(*manager, 3, "DP-A");
         if (!waitForRows(file, [](const std::map<int, RowInFile>& rows) {
                 return rows.count(3) == 1 && rows.at(3).output == "DP-A";
             })) {
@@ -7224,7 +7236,7 @@ void runOneAnswerAboutTheFileChecks() {
             refused.restoreSaved();
             refused.preserveUnreadableConfig();
             try {
-                refused.setMonitorOutput(4, "DP-B");
+                nameScreen(refused, 4, "DP-B");
             } catch (const std::exception&) {  // NOLINT(bugprone-empty-catch) -- graded below
             }
             compare(askEveryChannel(refused, refusedFile, 4, "DP-B"), /*expectedOnDisk=*/false,
@@ -7272,7 +7284,7 @@ void runRefusedNameRetryChecks() {
 
     const auto name = [&manager](int monitorId, const std::string& outputName) {
         try {
-            manager.setMonitorOutput(monitorId, outputName);
+            nameScreen(manager, monitorId, outputName);
         } catch (const std::exception& e) {
             return std::string(e.what());
         } catch (...) {
@@ -8027,7 +8039,7 @@ void runNoWriterThreadChecks() {
     // that already agreed with it and this would grade nothing.
     const auto name = [&manager](int monitorId, const std::string& outputName) {
         try {
-            manager.setMonitorOutput(monitorId, outputName);
+            nameScreen(manager, monitorId, outputName);
         } catch (const std::exception& e) {
             return std::string(e.what());
         } catch (...) {
@@ -8626,6 +8638,563 @@ void runLatestSnapshotWinsChecks() {
 
 }  // namespace
 
+// ---------------------------------------------------------------------------- //
+// A screen's reported size (S13.95-S13.99, S13.105): kept beside its connector name, restored at a
+// start, and moved with the name rather than with the monitor. Read from the redraw lists the manager
+// returns and from snapshot(), never from a render: nothing here has a GPU.
+// ---------------------------------------------------------------------------- //
+
+// One row's connector name and size as the file holds them, parsed here for rowsInFile()'s reason.
+struct SizeInFile {
+    std::string output;
+    bool hasSize = false;
+    nlohmann::json size;
+};
+
+std::map<int, SizeInFile> sizesInFile(const std::filesystem::path& file) {
+    std::map<int, SizeInFile> rows;
+    const nlohmann::json root = nlohmann::json::parse(readFile(file), nullptr, false);
+    if (root.is_discarded() || !root.is_object() || !root.contains("monitors") || !root["monitors"].is_array()) {
+        return rows;
+    }
+    for (const nlohmann::json& entry : root["monitors"]) {
+        if (!entry.is_object() || !entry.contains("monitor_id") || !entry["monitor_id"].is_number_integer()) continue;
+        SizeInFile row;
+        if (entry.contains("output") && entry["output"].is_string()) row.output = entry["output"].get<std::string>();
+        row.hasSize = entry.contains("output_size");
+        if (row.hasSize) row.size = entry["output_size"];
+        rows[entry["monitor_id"].get<int>()] = std::move(row);
+    }
+    return rows;
+}
+
+bool rowSized(const std::map<int, SizeInFile>& rows, int monitorId, const std::string& output, int width, int height) {
+    const auto it = rows.find(monitorId);
+    return it != rows.end() && it->second.output == output && it->second.hasSize &&
+           it->second.size == nlohmann::json{{"width", width}, {"height", height}};
+}
+
+bool rowUnsized(const std::map<int, SizeInFile>& rows, int monitorId, const std::string& output) {
+    const auto it = rows.find(monitorId);
+    return it != rows.end() && it->second.output == output && !it->second.hasSize;
+}
+
+std::string describeSizes(const std::map<int, SizeInFile>& rows) {
+    std::string out;
+    for (const auto& [id, row] : rows) {
+        out += (out.empty() ? "" : "; ") + std::to_string(id) + " output=\"" + row.output +
+               "\" size=" + (row.hasSize ? row.size.dump() : "(none)");
+    }
+    return out.empty() ? "(no rows)" : out;
+}
+
+// Polls for the file to hold what `landed` wants, for waitForRows()'s reason. False means it never did.
+bool waitForSizes(const std::filesystem::path& file, const std::function<bool(const std::map<int, SizeInFile>&)>& landed) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    for (;;) {
+        if (landed(sizesInFile(file))) return true;
+        if (std::chrono::steady_clock::now() >= deadline) {
+            std::fprintf(stderr, "  the file never reached the expected rows; it holds: %s\n",
+                         describeSizes(sizesInFile(file)).c_str());
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+}
+
+// Whether snapshot() says `monitorId` is drawn at width x height, from a reported size or the default.
+// Prints what it is drawn at when not.
+bool targetIs(const WallpaperManager& manager, int monitorId, uint32_t width, uint32_t height, bool reported) {
+    const WallpaperManager::Snapshot snap = manager.snapshot();
+    const auto it = snap.monitors.find(monitorId);
+    const bool is = it != snap.monitors.end() && it->second.targetSize == wallpaperx::OutputSize{width, height} &&
+                    it->second.targetSizeReported == reported;
+    if (!is) {
+        const std::string actual = it == snap.monitors.end()
+                                       ? std::string("(no such monitor)")
+                                       : std::to_string(it->second.targetSize.width) + "x" +
+                                             std::to_string(it->second.targetSize.height) +
+                                             (it->second.targetSizeReported ? " (reported)" : " (default)");
+        std::fprintf(stderr, "  monitor %d is drawn at %s, want %ux%u (%s)\n", monitorId, actual.c_str(), width, height,
+                     reported ? "reported" : "default");
+    }
+    return is;
+}
+
+// What setOutputSize threw: empty when it returned.
+std::string refusalOf(WallpaperManager& manager, const std::string& name, uint32_t width, uint32_t height,
+                      std::vector<int>& redraw) {
+    try {
+        manager.setOutputSize(name, width, height, redraw);
+    } catch (const wallpaperx::UnknownOutput&) {
+        return "UnknownOutput";
+    } catch (const wallpaperx::InvalidRequest&) {
+        return "InvalidRequest";
+    } catch (const std::exception& e) {
+        return std::string("an unexpected exception: ") + e.what();
+    }
+    return {};
+}
+
+std::string idList(std::vector<int> ids) {
+    std::sort(ids.begin(), ids.end());
+    std::string out;
+    for (const int id : ids) out += (out.empty() ? "" : " ") + std::to_string(id);
+    return out.empty() ? "(none)" : out;
+}
+
+void runOutputSizeFieldChecks() {
+    constexpr const char* kGoals = "S13.97's storage half (a screen's size is written beside its connector name only)";
+    const ScratchDir scratch("outputsizefield");
+    if (!scratch.ok()) {
+        notVerified(kGoals, "a scratch directory could not be created");
+        return;
+    }
+    const std::filesystem::path file = scratch.path() / "wallpaperx" / "config.json";
+    const ConfigStore store(file);
+
+    PersistedWallpaper named{0, "static", "/tmp/zero.png", "DP-1"};
+    named.outputSize = wallpaperx::OutputSize{2560, 1440};
+    PersistedWallpaper nameless{1, "static", "/tmp/one.png", ""};
+    nameless.outputSize = wallpaperx::OutputSize{1920, 1080};
+    const PersistedWallpaper unsized{2, "", "", "DP-2"};
+    const SaveResult saved = store.save({named, nameless, unsized});
+    check(saved.error.empty(), "rows carrying screen sizes are saved");
+
+    // GOAL: S13.97 -- a size is written as {width, height} beside the connector name it describes, and
+    //       not on a row with no name, where it would describe no screen.
+    // WHY-THIS-SHAPE: the file is parsed here rather than read back through load(), for rowsInFile()'s
+    //       reason; load() is graded on its own below.
+    // CONTROL: the `if (entry.outputSize)` write moved out of the `if (nameOk && !entry.output.empty())`
+    //       block in ConfigStore::save() (backend/daemon/config_store.cpp) -> "FAIL: a size is written
+    //       beside its connector name, and nowhere else", printing row 1 with a size and no name.
+    //       Reverted.
+    const std::map<int, SizeInFile> rows = sizesInFile(file);
+    const bool written = rowSized(rows, 0, "DP-1", 2560, 1440) && rows.count(1) == 1 && !rows.at(1).hasSize &&
+                         rowUnsized(rows, 2, "DP-2");
+    check(written, "a size is written beside its connector name, and nowhere else");
+    if (!written) std::fprintf(stderr, "  file: %s\n", describeSizes(rows).c_str());
+
+    // CONTROL: `if (element.contains(kKeyOutputSize)) entry.outputSize = ...` deleted from
+    //       ConfigStore::load() (backend/daemon/config_store.cpp) -> "FAIL: a written size is read
+    //       back, and a row without one reads as having none", and four red in the phases below that
+    //       restore a size: the usable sizes, the dropped-size count, the start's rewrite, and the
+    //       restart. Reverted.
+    const LoadResult loaded = store.load();
+    std::map<int, PersistedWallpaper> byId;
+    for (const PersistedWallpaper& entry : loaded.entries) byId[entry.monitorId] = entry;
+    check(byId.count(0) == 1 && byId[0].outputSize == std::optional<wallpaperx::OutputSize>(wallpaperx::OutputSize{2560, 1440}) &&
+              byId.count(2) == 1 && !byId[2].outputSize.has_value(),
+          "a written size is read back, and a row without one reads as having none");
+}
+
+void runOutputSizeRestoreChecks() {
+    constexpr const char* kGoals = "S13.97's restore half and S13.98 (a saved size is in force at a start, and an "
+                                   "unusable one costs its row nothing else)";
+    const ScratchDir scratch("outputsizerestore");
+    const std::optional<PhasePaths> paths = preparePhase(scratch, kGoals, 1);
+    if (!paths) return;
+    const ScopedEnv stateHome("XDG_STATE_HOME", stateHomeOf(scratch).string());
+    const std::filesystem::path& file = paths->config;
+    const std::string wallpaper = paths->wallpapers[0].string();
+
+    struct Row {
+        int id;
+        const char* size;
+        bool usable;
+        uint32_t width;
+        uint32_t height;
+    };
+    // Two usable sizes, the second at the per-axis limit, and seven that are not: not an object, a zero
+    // side, a side past 8192, a negative side, a missing side, a string, and a number past int range.
+    const std::vector<Row> fixture{
+        {1, R"({"width":2560,"height":1440})", true, 2560, 1440},
+        {2, R"("big")", false, 0, 0},
+        {3, R"({"width":0,"height":1080})", false, 0, 0},
+        {4, R"({"width":8193,"height":100})", false, 0, 0},
+        {5, R"({"width":-5,"height":10})", false, 0, 0},
+        {6, R"({"width":1920})", false, 0, 0},
+        {7, R"({"width":"1920","height":1080})", false, 0, 0},
+        {8, R"({"width":99999999999,"height":10})", false, 0, 0},
+        {9, R"({"width":8192,"height":8192})", true, 8192, 8192},
+    };
+    constexpr int kUnusable = 7;
+    std::string config = "{\"version\":1,\"monitors\":[";
+    for (const Row& row : fixture) {
+        if (row.id != fixture.front().id) config += ",";
+        config += "{\"monitor_id\":" + std::to_string(row.id) + ",\"type\":\"static\",\"path\":" +
+                  nlohmann::json(wallpaper).dump() + ",\"output\":\"DP-" + std::to_string(row.id) +
+                  "\",\"output_size\":" + row.size + "}";
+    }
+    config += "]}";
+    if (!writeFile(file, config)) {
+        notVerified(kGoals, "the config file this phase reads could not be written");
+        return;
+    }
+
+    WallpaperManager::Config managerConfig;
+    managerConfig.configFile = file;
+    WallpaperManager manager(managerConfig);
+    const std::vector<int> restored = manager.restoreSaved();
+    manager.preserveUnreadableConfig();
+    manager.writeRepairedConfig();
+
+    // GOAL: S13.98 -- an output_size that is malformed or out of range costs only the size: every row's
+    //       wallpaper, path and connector name come back, and its monitor is drawn at the default.
+    // WHY-THIS-SHAPE: seven different unusable shapes, each on its own row beside an intact wallpaper
+    //       and name, so a reader that rejected the ROW for any one of them loses a named monitor here
+    //       rather than going unnoticed; and two usable rows, one at the 8192 limit, so a range check
+    //       that also refused good sizes is red too.
+    // CONTROL: `if (element.contains(kKeyOutputSize) && !element.at(kKeyOutputSize).is_object()) {
+    //       ++result.malformedEntries; continue; }` added to ConfigStore::load()
+    //       (backend/daemon/config_store.cpp) -> "FAIL: every row with an unusable size still restores
+    //       its wallpaper, path and connector name", posted "1 3 4 5 6 7 8 9", and with row 2 gone the
+    //       default-size, count and rewrite checks below red too. Reverted.
+    // CONTROL: `sizeValid` in WallpaperManager::restoreSaved() (backend/daemon/wallpaper_manager.cpp)
+    //       reduced to `entry.outputSize.has_value()` -> "FAIL: an unusable size leaves its monitor at the
+    //       default size", with monitors 2-8 drawn at 0x0 or 8193x100, and the count and rewrite checks
+    //       below red, since nothing was dropped. Reverted.
+    std::vector<int> expectedIds;
+    for (const Row& row : fixture) expectedIds.push_back(row.id);
+    const WallpaperManager::Snapshot snap = manager.snapshot();
+    bool rowsIntact = restored == expectedIds;
+    for (const Row& row : fixture) {
+        const auto it = snap.monitors.find(row.id);
+        const std::string name = "DP-" + std::to_string(row.id);
+        if (it == snap.monitors.end() || it->second.type != "static" || it->second.path != wallpaper ||
+            snap.outputs.count(name) != 1 || snap.outputs.at(name) != row.id) {
+            rowsIntact = false;
+            std::fprintf(stderr, "  monitor %d did not come back with its wallpaper and the name %s\n", row.id,
+                         name.c_str());
+        }
+    }
+    check(rowsIntact, "every row with an unusable size still restores its wallpaper, path and connector name");
+    if (restored != expectedIds) std::fprintf(stderr, "  posted: %s\n", idList(restored).c_str());
+
+    bool defaultsHeld = true;
+    bool usableHeld = true;
+    for (const Row& row : fixture) {
+        if (row.usable) {
+            usableHeld = targetIs(manager, row.id, row.width, row.height, true) && usableHeld;
+        } else {
+            defaultsHeld = targetIs(manager, row.id, 1920, 1080, false) && defaultsHeld;
+        }
+    }
+    check(defaultsHeld, "an unusable size leaves its monitor at the default size");
+    // GOAL: S13.97's restore half -- a size saved beside a name is in force from the start, before any
+    //       screen reports.
+    // CONTROL: `if (sizeValid) m_outputSizes.insert_or_assign(entry.output, *entry.outputSize);` deleted
+    //       from WallpaperManager::restoreSaved() (backend/daemon/wallpaper_manager.cpp) -> "FAIL: a usable
+    //       saved size, including one at the limit, is in force at the start", monitors 1 and 9 at
+    //       1920x1080 (default), with the rewrite check below and the runtime phase's restart red too.
+    //       Reverted.
+    check(usableHeld, "a usable saved size, including one at the limit, is in force at the start");
+
+    // GOAL: S13.98's report -- the dropped sizes are counted in the persistence detail, and the start
+    //       rewrites the file without them while keeping the usable ones.
+    // WHY-THIS-SHAPE: the count is compared as a number through clauseCountOrSkip(), whose own comment
+    //       gives the reason a substring match is not enough. The rewrite is waited for because the
+    //       start's repair is queued, not waited on.
+    // CONTROL: `++rejectedSizes;` deleted from WallpaperManager::restoreSaved()
+    //       (backend/daemon/wallpaper_manager.cpp) -> "FAIL: the dropped sizes are counted in the
+    //       persistence report" printing 0, and "FAIL: the start rewrites the file without the unusable
+    //       sizes", since nothing else in this fixture asks for a repair. Reverted.
+    const std::optional<int> dropped =
+        clauseCountOrSkip(snap.health.persistence.detail, " screen sizes dropped, unusable", kGoals);
+    if (dropped.has_value()) {
+        check(*dropped == kUnusable, "the dropped sizes are counted in the persistence report");
+        if (*dropped != kUnusable) {
+            std::fprintf(stderr, "  counted %d, want %d, in: %s\n", *dropped, kUnusable,
+                         snap.health.persistence.detail.c_str());
+        }
+    }
+    const bool rewritten = waitForSizes(file, [&fixture](const std::map<int, SizeInFile>& rows) {
+        for (const Row& row : fixture) {
+            const std::string name = "DP-" + std::to_string(row.id);
+            const bool ok = row.usable ? rowSized(rows, row.id, name, static_cast<int>(row.width), static_cast<int>(row.height))
+                                       : rowUnsized(rows, row.id, name);
+            if (!ok) return false;
+        }
+        return true;
+    });
+    check(rewritten, "the start rewrites the file without the unusable sizes, keeping the names and the usable sizes");
+}
+
+void runOutputSizeRuntimeChecks() {
+    constexpr const char* kGoals = "S13.95, S13.96, S13.97 and S13.99 at the manager level (what a refused size leaves, "
+                                   "what a new size is owed, what is written, and what moves with a name)";
+    const ScratchDir scratch("outputsizeruntime");
+    const std::optional<PhasePaths> paths = preparePhase(scratch, kGoals, 1);
+    if (!paths) return;
+    const ScopedEnv stateHome("XDG_STATE_HOME", stateHomeOf(scratch).string());
+    const std::filesystem::path& file = paths->config;
+    const std::string wallpaper = paths->wallpapers[0].string();
+    // Config's default size, written out so a change to it cannot move both sides of these checks.
+    constexpr uint32_t kDefaultWidth = 1920;
+    constexpr uint32_t kDefaultHeight = 1080;
+
+    WallpaperManager::Config managerConfig;
+    managerConfig.configFile = file;
+    {
+        WallpaperManager manager(managerConfig);
+        manager.requestWallpaper("static", wallpaper, 3);
+        manager.requestWallpaper("static", wallpaper, 4);
+        nameScreen(manager, 3, "DP-A");
+        // A name on a monitor with no wallpaper: a size for it has nothing to redraw.
+        nameScreen(manager, 6, "DP-IDLE");
+
+        // GOAL: S13.95 at the manager -- zero, a side past 8192, and an unusable name are refused as
+        //       InvalidRequest, a name no monitor answers to as UnknownOutput; none schedules a redraw,
+        //       none changes what its monitor is drawn at, and a size refused for an unbound name is not
+        //       kept for when the name is bound. 8192 itself is accepted.
+        // WHY-THIS-SHAPE: the last clause binds the refused name afterwards and reads the monitor it
+        //       lands on. A refusal that stored the size first and threw second answers every error
+        //       check above it correctly; only a later binding can see what it left.
+        // CONTROL: the size and the UnknownOutput test swapped in WallpaperManager::setOutputSize
+        //       (backend/daemon/wallpaper_manager.cpp) so `m_outputSizes.insert_or_assign` runs before the
+        //       bound-name lookup throws -> "FAIL: a size refused for a name no monitor answered to is not
+        //       kept for when one does", monitor 4 at 2560x1440 (reported), and the two later checks that
+        //       expect monitor 4 at the default. Reverted.
+        // CONTROL: `size.width > kMaxOutputDimension` in outputSizeError (backend/daemon/config_store.h)
+        //       made `>=` -> "FAIL: a size at the 8192 limit is accepted" alone in this phase, and in the
+        //       restore phase the limit row, the dropped-size count and the rewrite red beside it. Reverted.
+        // CONTROL: the `outputSizeError` throw deleted from WallpaperManager::setOutputSize -> the four
+        //       size refusals red ("was accepted"), "FAIL: a refused size schedules no redraw", and "FAIL:
+        //       a refused size leaves its monitor at the default size". Reverted.
+        struct Refusal {
+            const char* what;
+            std::string name;
+            uint32_t width;
+            uint32_t height;
+            const char* expected;
+        };
+        const std::vector<Refusal> refusals{
+            {"a zero width", "DP-A", 0, 1080, "InvalidRequest"},
+            {"a zero height", "DP-A", 1920, 0, "InvalidRequest"},
+            {"a width past 8192", "DP-A", 8193, 1080, "InvalidRequest"},
+            {"a height past 8192", "DP-A", 1920, 8193, "InvalidRequest"},
+            {"an empty name", "", 1920, 1080, "InvalidRequest"},
+            {"a name past the cap", std::string(wallpaperx::kMaxOutputNameBytes + 1, 'D'), 1920, 1080, "InvalidRequest"},
+            {"a name no monitor answers to", "DP-NOBODY", 2560, 1440, "UnknownOutput"},
+        };
+        size_t refusedRedraws = 0;
+        for (const Refusal& refusal : refusals) {
+            std::vector<int> redraw;
+            const std::string threw = refusalOf(manager, refusal.name, refusal.width, refusal.height, redraw);
+            check(threw == refusal.expected,
+                  ("a size with " + std::string(refusal.what) + " is refused as " + refusal.expected).c_str());
+            if (threw != refusal.expected) {
+                std::fprintf(stderr, "  %s\n", threw.empty() ? "it was accepted" : ("it threw " + threw).c_str());
+            }
+            refusedRedraws += redraw.size();
+        }
+        check(refusedRedraws == 0, "a refused size schedules no redraw");
+        check(targetIs(manager, 3, kDefaultWidth, kDefaultHeight, false), "a refused size leaves its monitor at the default size");
+        std::vector<int> atLimit;
+        check(refusalOf(manager, "DP-IDLE", 8192, 8192, atLimit).empty() && atLimit.empty(),
+              "a size at the 8192 limit is accepted, and redraws nothing on a monitor with no wallpaper");
+        const std::vector<int> boundLater = nameScreen(manager, 4, "DP-NOBODY");
+        check(boundLater.empty() && targetIs(manager, 4, kDefaultWidth, kDefaultHeight, false),
+              "a size refused for a name no monitor answered to is not kept for when one does");
+
+        // GOAL: S13.96 at the manager -- a new size owes exactly the monitor its name is bound to a
+        //       redraw, at that size; a report that leaves the drawing size where it was owes nothing.
+        // WHY-THIS-SHAPE: the no-change case reports the default size explicitly on a monitor drawn at
+        //       the default, so the size map does change and the source flips to "reported" -- a repeat
+        //       of an identical report would be stopped by the idempotent early return before the
+        //       comparison this is about is ever reached.
+        // CONTROL: `redrawIfResizedLocked(bound->second, before, redraw);` deleted from
+        //       WallpaperManager::setOutputSize (backend/daemon/wallpaper_manager.cpp) -> "FAIL: a new size
+        //       redraws the monitor its name is bound to, and only that one", printing "(none)", and the
+        //       allocation phase's check red with it. Reverted.
+        // CONTROL: `if (targetSizeLocked(monitorId) == before) return;` deleted from
+        //       WallpaperManager::redrawIfResizedLocked -> "FAIL: a report of the size a monitor is already
+        //       drawn at schedules nothing", printing "4", plus the two other checks that expect no redraw
+        //       without a size change: binding the refused name, and the same-size move. Reverted.
+        std::vector<int> resized;
+        const std::string sizedA = refusalOf(manager, "DP-A", 2560, 1440, resized);
+        check(sizedA.empty() && resized == std::vector<int>{3},
+              "a new size redraws the monitor its name is bound to, and only that one");
+        if (resized != std::vector<int>{3}) std::fprintf(stderr, "  redraw: %s\n", idList(resized).c_str());
+        check(targetIs(manager, 3, 2560, 1440, true), "that monitor is now drawn at the reported size");
+        check(targetIs(manager, 4, kDefaultWidth, kDefaultHeight, false),
+              "a monitor whose screen has reported nothing stays at the default size");
+        std::vector<int> unchanged;
+        const std::string sizedDefault = refusalOf(manager, "DP-NOBODY", kDefaultWidth, kDefaultHeight, unchanged);
+        check(sizedDefault.empty() && unchanged.empty(), "a report of the size a monitor is already drawn at schedules nothing");
+        if (!unchanged.empty()) std::fprintf(stderr, "  redraw: %s\n", idList(unchanged).c_str());
+        check(targetIs(manager, 4, kDefaultWidth, kDefaultHeight, true), "and that monitor's size is now the reported one");
+
+        // GOAL: S13.97 -- an accepted size reaches the file beside its name.
+        // CONTROL: `row[kKeyOutputSize] = ...` deleted from ConfigStore::save()
+        //       (backend/daemon/config_store.cpp) -> "FAIL: an accepted size is written beside its name",
+        //       with the file holding row 3 as output="DP-A" size=(none), and red with it: the storage
+        //       phase's two checks, the restore phase's rewrite, this phase's rebound-size row, and a skip
+        //       for the restart, whose input never reached the file. Reverted.
+        check(waitForSizes(file, [](const auto& rows) { return rowSized(rows, 3, "DP-A", 2560, 1440); }),
+              "an accepted size is written beside its name");
+
+        // GOAL: S13.99 -- a size belongs to its NAME: unbinding the name drops its monitor to the default
+        //       and writes no size for the name that replaced it; binding it again restores the size with
+        //       no new report; moving it to another monitor redraws exactly the monitors whose size changed.
+        // WHY-THIS-SHAPE: the replacement name is one that never reported, so a manager keeping sizes per
+        //       monitor instead of per name is visible in both memory and the file. The last move is
+        //       chosen to change NEITHER monitor's size, so "redraws both" cannot pass for a manager that
+        //       redraws every monitor a move touches.
+        //       Another screen reports while the name is unbound, because the size map is pruned only when
+        //       a size is recorded: with no report in between, a prune that dropped every unbound size
+        //       would stay green here.
+        // CONTROL: pruneOutputSizesLocked's limit (backend/daemon/wallpaper_manager.cpp) set to 0 -> "FAIL:
+        //       binding a sized name again restores its size without a new report", "FAIL: and the restored
+        //       size is written again beside it" and "FAIL: moving a sized name to another monitor redraws
+        //       both, each at its new size". Without the unrelated report the same mutation stayed green.
+        //       Reverted.
+        // CONTROL: `if (leaving != monitorId) redrawIfResizedLocked(leaving, sizeLeaving, redraw);` deleted
+        //       from WallpaperManager::setMonitorOutput -> "FAIL: moving a sized name to another monitor
+        //       redraws both, each at its new size", printing "4", and dbus_service_test's wire twin red
+        //       beside it. Re-observed 2026-09-15. Reverted.
+        // CONTROL: the monitor's released name's size copied to the new name in the release loop of
+        //       WallpaperManager::bindOutputLocked, i.e. a size that follows the monitor -> "FAIL: unbinding
+        //       a sized name drops its monitor to the default size, and redraws it" printing "(none)",
+        //       "FAIL: the name that replaced it is written without a size" with row 3 as DP-B at 2560x1440,
+        //       and the rebind and move checks after them. Reverted.
+        // CONTROL: `m_outputSizes.erase(it->first);` added to that release loop, i.e. a size that dies
+        //       with its binding -> "FAIL: binding a sized name again restores its size without a new
+        //       report", its file row, and both move checks. Reverted.
+        const std::vector<int> renamed = nameScreen(manager, 3, "DP-B");
+        check(renamed == std::vector<int>{3} && targetIs(manager, 3, kDefaultWidth, kDefaultHeight, false),
+              "unbinding a sized name drops its monitor to the default size, and redraws it");
+        if (renamed != std::vector<int>{3}) std::fprintf(stderr, "  redraw: %s\n", idList(renamed).c_str());
+        check(waitForSizes(file,
+                           [](const std::map<int, SizeInFile>& rows) {
+                               for (const auto& [id, row] : rows) {
+                                   if (row.output == "DP-A") return false;
+                               }
+                               return rowUnsized(rows, 3, "DP-B");
+                           }),
+              "the name that replaced it is written without a size, and the unbound name is written nowhere");
+
+        // Another screen reports while DP-A is unbound, which is when the size map is pruned.
+        std::vector<int> unrelated;
+        check(refusalOf(manager, "DP-IDLE", 1024, 768, unrelated).empty() && unrelated.empty(),
+              "a size for another screen is accepted while the sized name is unbound");
+
+        const std::vector<int> rebound = nameScreen(manager, 3, "DP-A");
+        check(rebound == std::vector<int>{3} && targetIs(manager, 3, 2560, 1440, true),
+              "binding a sized name again restores its size without a new report");
+        check(waitForSizes(file, [](const auto& rows) { return rowSized(rows, 3, "DP-A", 2560, 1440); }),
+              "and the restored size is written again beside it");
+
+        std::vector<int> moved = nameScreen(manager, 4, "DP-A");
+        std::sort(moved.begin(), moved.end());
+        const bool bothRedrawn = moved == std::vector<int>({3, 4}) &&
+                                 targetIs(manager, 3, kDefaultWidth, kDefaultHeight, false) &&
+                                 targetIs(manager, 4, 2560, 1440, true);
+        check(bothRedrawn, "moving a sized name to another monitor redraws both, each at its new size");
+        if (moved != std::vector<int>({3, 4})) std::fprintf(stderr, "  redraw: %s\n", idList(moved).c_str());
+
+        // DP-NOBODY reported the default size, and monitor 3 is drawn at the default: nothing changes.
+        const std::vector<int> sameSize = nameScreen(manager, 3, "DP-NOBODY");
+        check(sameSize.empty() && targetIs(manager, 3, kDefaultWidth, kDefaultHeight, true),
+              "moving a name whose size is what its new monitor is already drawn at redraws nothing");
+        if (!sameSize.empty()) std::fprintf(stderr, "  redraw: %s\n", idList(sameSize).c_str());
+
+        if (!waitForSizes(file, [](const auto& rows) { return rowSized(rows, 4, "DP-A", 2560, 1440); })) {
+            notVerified("S13.97's restart clause", "the size the restart below reads never reached the file");
+            return;
+        }
+    }
+
+    // GOAL: S13.97 -- the next start draws the monitor at the size saved with its name, before any report.
+    // CONTROL: `if (sizeValid) m_outputSizes.insert_or_assign(entry.output, *entry.outputSize);` deleted
+    //       from WallpaperManager::restoreSaved() (backend/daemon/wallpaper_manager.cpp) -> "FAIL: after a
+    //       restart the monitor is drawn at the size saved with its name", monitor 4 at 1920x1080
+    //       (default). Reverted.
+    WallpaperManager restarted(managerConfig);
+    restarted.restoreSaved();
+    check(targetIs(restarted, 4, 2560, 1440, true), "after a restart the monitor is drawn at the size saved with its name");
+}
+
+void runOutputSizeAllocationFailureChecks() {
+    constexpr const char* kGoals = "S13.105's manager half (a size stored before an allocation failed is still reported "
+                                   "as owing its monitor a redraw)";
+#if !WALLPAPERX_ALLOCATION_INSTRUMENT
+    notVerified(kGoals, "this build replaces no allocator, so no allocation inside setOutputSize can be made to fail -- "
+                        "the instrument is compiled out under a sanitizer, whose runtime owns operator new");
+#else
+    const ScratchDir scratch("outputsizealloc");
+    const std::optional<PhasePaths> paths = preparePhase(scratch, kGoals, 1);
+    if (!paths) return;
+    const ScopedEnv stateHome("XDG_STATE_HOME", stateHomeOf(scratch).string());
+
+    WallpaperManager::Config config;
+    config.configFile = paths->config;
+    WallpaperManager manager(config);
+    manager.requestWallpaper("static", paths->wallpapers[0].string(), 3);
+    nameScreen(manager, 3, "DP-A");
+
+    // GOAL: S13.105's manager half -- whenever setOutputSize throws after it stored the new size, the
+    //       redraw list it was handed already names the monitor, so the caller's catch can still post it.
+    // WHY-THIS-SHAPE: every allocation the call makes is faulted in turn, each against a size the monitor
+    //       has never had, for runWriterAllocationFailureChecks()' reason: which allocation belongs to
+    //       which step is the library's business. What is graded is an implication over every fault --
+    //       stored implies listed -- rather than the outcome at one chosen allocation.
+    // CONTROL: `redraw.reserve(redraw.size() + 1);` deleted from WallpaperManager::setOutputSize
+    //       (backend/daemon/wallpaper_manager.cpp), so the push inside redrawIfResizedLocked allocates
+    //       after the size is stored -> "FAIL: a size stored before an allocation failed is still listed
+    //       as owing its monitor a redraw", printing the allocation it failed at. Reverted.
+    // COVERAGE-ASSERT: the sweep must have faulted at least one allocation AFTER the size was stored, or
+    //       the implication was only ever tested on calls that failed before storing anything.
+    g_allocProbeArmed.store(true, std::memory_order_relaxed);
+    struct DisarmProbe {
+        ~DisarmProbe() {
+            t_failAfter = -1;
+            g_allocProbeArmed.store(false, std::memory_order_relaxed);
+        }
+    } disarmProbe;
+    struct ArmedFor {
+        explicit ArmedFor(long long n) { t_failAfter = n; }
+        ~ArmedFor() { t_failAfter = -1; }
+    };
+
+    constexpr long long kSweep = 400;
+    long long injections = 0;
+    long long faultedAfterStoring = 0;
+    std::string firstUnlisted;
+    for (long long n = 0; n < kSweep; ++n) {
+        const auto width = static_cast<uint32_t>(1000 + n);
+        std::vector<int> redraw;
+        std::string threw;
+        t_injected = false;
+        try {
+            ArmedFor armed(n);
+            manager.setOutputSize("DP-A", width, 700, redraw);
+        } catch (const std::exception& e) {
+            threw = e.what();
+        }
+        // Past the last allocation the call makes: every later n would fault nothing either.
+        if (!t_injected) break;
+        ++injections;
+        const WallpaperManager::Snapshot snap = manager.snapshot();
+        const auto it = snap.monitors.find(3);
+        const bool stored = it != snap.monitors.end() && it->second.targetSize == wallpaperx::OutputSize{width, 700};
+        if (!stored) continue;
+        if (!threw.empty()) ++faultedAfterStoring;
+        if (std::find(redraw.begin(), redraw.end(), 3) == redraw.end() && firstUnlisted.empty()) {
+            firstUnlisted = "allocation " + std::to_string(n) + " stored " + std::to_string(width) + "x700 and " +
+                            (threw.empty() ? "returned" : "threw " + threw) + " with the redraw list " + idList(redraw);
+        }
+    }
+    check(firstUnlisted.empty(), "a size stored before an allocation failed is still listed as owing its monitor a redraw");
+    if (!firstUnlisted.empty()) std::fprintf(stderr, "  %s\n", firstUnlisted.c_str());
+    check(injections > 0 && faultedAfterStoring > 0,
+          "the sweep faulted at least one allocation after the size was stored");
+    std::printf("config_store_test: setOutputSize faulted at %lld allocation(s), %lld of them after the size was "
+                "stored\n",
+                injections, faultedAfterStoring);
+#endif
+}
+
 int main() {
     wallpaperx::testing::g_testName = "config_store_test";
 
@@ -8760,6 +9329,10 @@ int main() {
         {"a writer thread that could not be allocated", runWriterAllocationFailureChecks},
         {"the wait a save is given", runSaveVisibleOnReturnChecks},
         {"the snapshot that wins a stall", runLatestSnapshotWinsChecks},
+        {"a screen's size as a stored field", runOutputSizeFieldChecks},
+        {"a screen's size read back at startup", runOutputSizeRestoreChecks},
+        {"what a reported size changes, and what moves with its name", runOutputSizeRuntimeChecks},
+        {"an allocation failure after a size was stored", runOutputSizeAllocationFailureChecks},
     };
     for (const Phase& phase : kPhases) {
         try {

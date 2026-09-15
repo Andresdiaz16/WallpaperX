@@ -32,6 +32,9 @@ constexpr const char* kErrorUnsupported = "io.wallpaperx.Daemon.Error.Unsupporte
 constexpr const char* kErrorNoFreeImage = "io.wallpaperx.Daemon.Error.NoFreeImage";
 constexpr const char* kErrorShuttingDown = "io.wallpaperx.Daemon.Error.ShuttingDown";
 constexpr const char* kErrorBusy = "io.wallpaperx.Daemon.Error.Busy";
+// A size for a screen no monitor answers to. Not InvalidArgs: nothing in the call was wrong, and
+// the same call succeeds once SetMonitorOutput has named the screen.
+constexpr const char* kErrorUnknownOutput = "io.wallpaperx.Daemon.Error.UnknownOutput";
 constexpr const char* kErrorInvalidArgs = "org.freedesktop.DBus.Error.InvalidArgs";
 
 }  // namespace
@@ -144,6 +147,11 @@ void DbusService::registerVTable() {
                     setMonitorOutput(monitorId, outputName);
                 })
                 .withInputParamNames("monitor_id", "output_name"),
+            sdbus::registerMethod("SetOutputSize")
+                .implementedAs([this](const std::string& outputName, uint32_t width, uint32_t height) {
+                    setOutputSize(outputName, width, height);
+                })
+                .withInputParamNames("output_name", "width", "height"),
             sdbus::registerMethod("GetStatus").implementedAs([this]() { return getStatus(); }).withOutputParamNames("status"),
             // frame_generation rides along with the monitor id. A bare FrameReady(monitor)
             // was unambiguous only while rendering was synchronous; now that several
@@ -246,13 +254,16 @@ void DbusService::setMonitorOutput(int32_t monitorId, const std::string& outputN
                 sanitizeForLog(outputName).c_str());
     std::fflush(stdout);
 
+    std::vector<int> redraw;
     try {
-        m_manager.setMonitorOutput(monitorId, outputName);
+        m_manager.setMonitorOutput(monitorId, outputName, redraw);
     } catch (const InvalidRequest& e) {
         std::fprintf(stderr, "wallpaperx-daemon: SetMonitorOutput rejected (monitor=%d): %s\n",
                      monitorId, e.what());
         throw sdbus::Error(sdbus::Error::Name{kErrorInvalidArgs}, e.what());
     } catch (const std::exception& e) {
+        // The binding stands although the write failed, so the redraws it owes are still owed.
+        for (const int id : redraw) m_worker.post(id);
         // As SetWallpaper does: the save behind this can throw on a machine out of threads
         // or memory, and letting that escape the callback tells the client nothing.
         std::fprintf(stderr, "wallpaperx-daemon: SetMonitorOutput failed (monitor=%d): %s\n",
@@ -260,8 +271,32 @@ void DbusService::setMonitorOutput(int32_t monitorId, const std::string& outputN
         throw sdbus::Error(sdbus::Error::Name{kErrorRenderFailed}, e.what());
     }
 
-    // No m_worker.post(): naming a screen changes nothing about what it draws, so there is
-    // no render to schedule and no target to release.
+    // A name carries its screen's size, so moving one can change what a monitor is drawn at.
+    for (const int id : redraw) m_worker.post(id);
+}
+
+void DbusService::setOutputSize(const std::string& outputName, uint32_t width, uint32_t height) {
+    std::printf("wallpaperx-daemon: SetOutputSize(output=%s, width=%u, height=%u)\n",
+                sanitizeForLog(outputName).c_str(), width, height);
+    std::fflush(stdout);
+
+    std::vector<int> redraw;
+    try {
+        m_manager.setOutputSize(outputName, width, height, redraw);
+    } catch (const UnknownOutput& e) {
+        std::fprintf(stderr, "wallpaperx-daemon: SetOutputSize rejected: %s\n", e.what());
+        throw sdbus::Error(sdbus::Error::Name{kErrorUnknownOutput}, e.what());
+    } catch (const InvalidRequest& e) {
+        std::fprintf(stderr, "wallpaperx-daemon: SetOutputSize rejected: %s\n", e.what());
+        throw sdbus::Error(sdbus::Error::Name{kErrorInvalidArgs}, e.what());
+    } catch (const std::exception& e) {
+        // The size stands although its save could not be queued, so the redraw it owes is still owed.
+        for (const int id : redraw) m_worker.post(id);
+        std::fprintf(stderr, "wallpaperx-daemon: SetOutputSize failed: %s\n", e.what());
+        throw sdbus::Error(sdbus::Error::Name{kErrorRenderFailed}, e.what());
+    }
+
+    for (const int id : redraw) m_worker.post(id);
 }
 
 void DbusService::releaseBuffer(const std::string& client, int32_t monitorId, uint64_t bufferId) {
@@ -448,6 +483,11 @@ std::string DbusService::getStatus() {
             entry["width"] = monitor.width;
             entry["height"] = monitor.height;
         }
+        // What the next render draws at, and whether a screen reported it. Always emitted: a
+        // monitor drawn at the default size looks healthy in every other field.
+        entry["target_width"] = monitor.targetSize.width;
+        entry["target_height"] = monitor.targetSize.height;
+        entry["target_size_source"] = monitor.targetSizeReported ? "reported" : "default";
         // Present only when the last request failed. Since SetWallpaper now replies
         // before the render is attempted, this is the only place a render failure is
         // reported at all -- a client that gets a successful reply and then no

@@ -433,9 +433,10 @@ int main() {
         // GOAL: a stale record on a row this build cannot render is removed by its pass, not
         //       left for a future build that CAN render that type to refuse a wallpaper the
         //       row no longer holds.
-        // CONTROL: in backend/daemon/wallpaper_manager.cpp, the removeCrashRecord() call in
-        //       renderPending()'s unsupported-type branch deleted -> "FAIL: a stale record on
-        //       an unrenderable row is removed by its pass". Reverted.
+        // CONTROL: in backend/daemon/wallpaper_manager.cpp, the removeCrashRecord() call in the
+        //       unsupported-type branch of WallpaperManager::renderPassLocked deleted -> "FAIL: a
+        //       stale record on an unrenderable row is removed by its pass". Re-observed 2026-09-14.
+        //       Reverted.
         check(!recordOnDisk(stateDir, kUnsupportedMonitor),
               "a stale record on an unrenderable row is removed by its pass");
 
@@ -468,9 +469,11 @@ int main() {
         //       before the pass is run. Without that, a build that simply stopped re-posting
         //       would pass every check below while the check proved nothing about the refusal
         //       -- the pass it grades would never have happened.
-        // CONTROL: in backend/daemon/wallpaper_manager.cpp, renderPending()'s quarantined
-        //       branch deleted -> "FAIL: an import-modifier report does not decode a refused
-        //       wallpaper" and "FAIL: the record survives an import-modifier report". Reverted.
+        // CONTROL: in backend/daemon/wallpaper_manager.cpp, the quarantined branch of
+        //       WallpaperManager::renderPassLocked deleted -> "FAIL: an import-modifier report does
+        //       not decode a refused wallpaper", "FAIL: the record survives an import-modifier
+        //       report", and the two checks after them that the monitor is still refused and that a
+        //       departing consumer re-posts it. Re-observed 2026-09-14. Reverted.
         {
             // Taken from the daemon's own answer rather than written as a fourcc here: a
             // report for any other format is refused outright, so a hardcoded constant would

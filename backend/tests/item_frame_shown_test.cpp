@@ -377,7 +377,8 @@ bool runFrameShownChecks() {
         //       otherwise make this whole phase a no-op graded as a pass. CONTROL: the trailing
         //       `if (m_monitorId >= 0) fetchFrame(0);` deleted from WallpaperXItem::setMonitorId in
         //       backend/kde/wallpaperx_item.cpp -> "FAIL: the item asks the daemon again for the
-        //       screen it was moved to", that check alone. Observed 2026-08-23. Reverted.
+        //       screen it was moved to", plus the harness line saying the refused fetch that check
+        //       would have produced was never reported. Re-observed 2026-09-14. Reverted.
         const int requestsBeforeIdChange = stub.requests();
         check(item->property("monitorId").toInt() == kFirstMonitor, "the item starts on the monitor id the QML set");
         item->setProperty("monitorId", kSecondMonitor);

@@ -60,6 +60,12 @@ void requireValidMonitorId(int monitorId) {
     }
 }
 
+void requireValidOutputName(const std::string& outputName) {
+    if (const std::string why = outputNameError(outputName); !why.empty()) {
+        throw InvalidRequest(why + ": " + sanitizeForLog(outputName));
+    }
+}
+
 std::string resolveShaderDir(const std::string& configured) {
     std::string dir = configured;
     if (dir.empty()) {
@@ -212,7 +218,12 @@ LiveWallpapers WallpaperManager::liveWallpapers() const {
     for (const auto& [monitorId, state] : m_monitors) {
         live.rows.push_back(PersistedWallpaper{monitorId, state.type, state.path, {}});
     }
-    live.outputs = m_outputs;
+    for (const auto& [name, monitorId] : m_outputs) {
+        const auto size = m_outputSizes.find(name);
+        live.outputs.emplace(name, OutputBinding{monitorId, size == m_outputSizes.end()
+                                                                ? std::nullopt
+                                                                : std::optional<OutputSize>(size->second)});
+    }
     return live;
 }
 
@@ -332,30 +343,78 @@ void WallpaperManager::ensureGpu() {
     std::fflush(stdout);
 }
 
-void WallpaperManager::ensureTargets(int monitorId) {
+bool WallpaperManager::targetsFit(int monitorId, OutputSize size) const {
     // Keyed on the dimensions, not on mere existence: create() replaces and waits for idle, so
-    // reuse is worth it, and when real monitor geometry arrives this will not go on quietly
-    // rendering at the old resolution.
-    const bool reusable = m_targets->has(monitorId) && m_targets->get(monitorId).width == m_config.width &&
-                          m_targets->get(monitorId).height == m_config.height;
-    if (reusable) return;
+    // reuse is worth it, and a screen that reported a new size is not drawn at the old one.
+    return m_targets->has(monitorId) && m_targets->get(monitorId).width == size.width &&
+           m_targets->get(monitorId).height == size.height;
+}
 
-    m_targets->create(monitorId, m_config.width, m_config.height, kTargetDepth);
-    forgetHolds(monitorId);
+bool WallpaperManager::ensureTargets(int monitorId, OutputSize size) {
+    if (targetsFit(monitorId, size)) return false;
+
+    m_targets->create(monitorId, size.width, size.height, kTargetDepth);
+    forgetImages(monitorId);
+    return true;
 }
 
 void WallpaperManager::releaseTarget(int monitorId) {
     if (m_targets && m_targets->has(monitorId)) {
         m_targets->destroy(monitorId);
-        forgetHolds(monitorId);
+        forgetImages(monitorId);
     }
 }
 
 // Takes m_stateMutex itself, so its callers hold m_gpuMutex and not m_stateMutex.
-void WallpaperManager::forgetHolds(int monitorId) {
+void WallpaperManager::forgetImages(int monitorId) {
     std::lock_guard<std::mutex> stateLock(m_stateMutex);
     auto it = m_monitors.find(monitorId);
-    if (it != m_monitors.end()) it->second.holds.clear();
+    if (it == m_monitors.end()) return;
+    it->second.holds.clear();
+    it->second.hasFrame = false;
+}
+
+std::optional<OutputSize> WallpaperManager::reportedSizeLocked(int monitorId) const {
+    // A scan, not an index: bindOutputLocked() gives each monitor at most one name, so this
+    // holds no more entries than there are monitors.
+    for (const auto& [name, boundId] : m_outputs) {
+        if (boundId != monitorId) continue;
+        const auto size = m_outputSizes.find(name);
+        if (size == m_outputSizes.end()) return std::nullopt;
+        return size->second;
+    }
+    return std::nullopt;
+}
+
+// Bound names number at most kMaxMonitors, so past that there is always an unbound one to drop.
+// Which goes does not matter at any real connector count; the bound is against a client cycling
+// through names.
+void WallpaperManager::pruneOutputSizesLocked() {
+    const auto limit = static_cast<std::size_t>(kMaxMonitors);
+    for (auto it = m_outputSizes.begin(); it != m_outputSizes.end() && m_outputSizes.size() > limit;) {
+        if (m_outputs.count(it->first) != 0) {
+            ++it;
+            continue;
+        }
+        it = m_outputSizes.erase(it);
+    }
+}
+
+OutputSize WallpaperManager::targetSizeLocked(int monitorId) const {
+    return reportedSizeLocked(monitorId).value_or(OutputSize{m_config.width, m_config.height});
+}
+
+void WallpaperManager::redrawIfResizedLocked(int monitorId, OutputSize before, std::vector<int>& toRender) {
+    if (targetSizeLocked(monitorId) == before) return;
+    auto it = m_monitors.find(monitorId);
+    // A quarantined request is never drawn, so a pass for it would draw nothing.
+    if (it == m_monitors.end() || !isRenderableType(it->second.type) || it->second.quarantined) return;
+    // Recorded before the bump, so a render owed is never lost to an allocation failure.
+    toRender.push_back(monitorId);
+    // The frame stays until the pass that redraws it rebuilds the images; renderPending() does not
+    // let a pass overtaken after that leave the monitor without one. A pass that fails is reported
+    // like any failed render.
+    ++it->second.requestSeq;
 }
 
 std::vector<uint64_t> WallpaperManager::flattenHolds(const std::vector<BufferHold>& holds) {
@@ -409,12 +468,13 @@ bool WallpaperManager::dropHoldLocked(MonitorState& state, const std::string& cl
 // otherwise a repeat of the announcement, so a consumer refused for want of a free image hears
 // that the ring has moved. Caller must hold m_stateMutex.
 void WallpaperManager::reportFreedImageLocked(int monitorId, const MonitorState& state, std::vector<int>& toRender,
-                                              std::vector<FrameAvailable>* announce) {
-    if (state.requestSeq != state.servicedSeq) {
-        toRender.push_back(monitorId);
-        return;
+                                              std::vector<FrameAvailable>* announce) const {
+    // Independent: a redraw at a new size is owed while the frame it replaces is still served, and
+    // that frame is what a refused consumer can take now.
+    if (state.requestSeq != state.servicedSeq) toRender.push_back(monitorId);
+    if (announce != nullptr && frameStillReadableLocked(state)) {
+        announce->push_back(FrameAvailable{monitorId, state.generation});
     }
-    if (announce != nullptr && state.hasFrame) announce->push_back(FrameAvailable{monitorId, state.generation});
 }
 
 std::vector<int> WallpaperManager::releaseBuffer(const std::string& client, int monitorId, uint64_t bufferId,
@@ -678,15 +738,20 @@ void WallpaperManager::requestWallpaper(const std::string& type, const std::stri
     persist(toPersist);
 }
 
-void WallpaperManager::setMonitorOutput(int monitorId, const std::string& outputName) {
+void WallpaperManager::setMonitorOutput(int monitorId, const std::string& outputName, std::vector<int>& redraw) {
     requireValidMonitorId(monitorId);
-    if (const std::string why = outputNameError(outputName); !why.empty()) {
-        throw InvalidRequest(why + ": " + sanitizeForLog(outputName));
-    }
+    requireValidOutputName(outputName);
 
     std::vector<PersistedWallpaper> toPersist;
     {
         std::lock_guard<std::mutex> stateLock(m_stateMutex);
+        // At most two monitors change size: this one, and the one the name leaves.
+        const auto previous = m_outputs.find(outputName);
+        const int leaving = previous != m_outputs.end() ? previous->second : monitorId;
+        const OutputSize sizeHere = targetSizeLocked(monitorId);
+        const OutputSize sizeLeaving = targetSizeLocked(leaving);
+        redraw.reserve(redraw.size() + 2);
+
         // Idempotent is advertised, so a client may re-assert every name on each screen
         // change; persist() parks this thread -- the bus event loop -- on the write. Skipped
         // only when the file is known to hold what the map holds: any other answer, including a
@@ -695,6 +760,9 @@ void WallpaperManager::setMonitorOutput(int monitorId, const std::string& output
         if (bound == BindResult::Unchanged && m_writer.outcome().onDisk()) {
             return;
         }
+
+        redrawIfResizedLocked(monitorId, sizeHere, redraw);
+        if (leaving != monitorId) redrawIfResizedLocked(leaving, sizeLeaving, redraw);
 
         // A name carried for a build with more monitors is taken over by this one, and the save
         // below drops it. Erased and reported here for the reason its wallpaper sibling above
@@ -706,6 +774,7 @@ void WallpaperManager::setMonitorOutput(int monitorId, const std::string& output
                 [&outputName](const PersistedWallpaper& row) { return row.output == outputName; });
             if (kept != m_kept.carried().end() && !kept->output.empty()) {
                 kept->output.clear();
+                kept->outputSize.reset();
                 m_kept.countTakenOverName();
             }
         }
@@ -722,6 +791,36 @@ void WallpaperManager::setMonitorOutput(int monitorId, const std::string& output
         throw std::runtime_error(whyNot.empty() ? "the screen name did not reach the config file"
                                                 : whyNot);
     }
+}
+
+void WallpaperManager::setOutputSize(const std::string& outputName, uint32_t width, uint32_t height,
+                                     std::vector<int>& redraw) {
+    requireValidOutputName(outputName);
+    const OutputSize size{width, height};
+    if (const std::string why = outputSizeError(size); !why.empty()) throw InvalidRequest(why);
+
+    std::vector<PersistedWallpaper> toPersist;
+    {
+        std::lock_guard<std::mutex> stateLock(m_stateMutex);
+        const auto bound = m_outputs.find(outputName);
+        if (bound == m_outputs.end()) {
+            throw UnknownOutput("no monitor answers to output " + sanitizeForLog(outputName) +
+                                "; it must be named with SetMonitorOutput first");
+        }
+        // The same rule as re-asserting a name: an unchanged report writes only while the file
+        // is not known to hold it.
+        const auto known = m_outputSizes.find(outputName);
+        if (known != m_outputSizes.end() && known->second == size && m_writer.outcome().onDisk()) return;
+
+        redraw.reserve(redraw.size() + 1);
+        const OutputSize before = targetSizeLocked(bound->second);
+        m_outputSizes.insert_or_assign(outputName, size);
+        pruneOutputSizesLocked();
+        redrawIfResizedLocked(bound->second, before, redraw);
+        toPersist = m_kept.rowsToWrite(liveWallpapers());
+    }
+
+    queuePersist(toPersist);
 }
 
 WallpaperManager::BindResult WallpaperManager::bindOutputLocked(int monitorId,
@@ -869,6 +968,7 @@ std::vector<int> WallpaperManager::restoreSaved() {
     // entry it came from may restore perfectly well without it.
     int displacedNames = 0;
     int rejectedNames = 0;
+    int rejectedSizes = 0;
     int duplicateIds = 0;
 
     // Screen name -> the kept row that claimed it last, in file order. The sweep at the end
@@ -900,6 +1000,7 @@ std::vector<int> WallpaperManager::restoreSaved() {
         const bool nameValid = !entry.output.empty() && outputNameError(entry.output).empty();
         const bool nameTravels = nameValid && entry.monitorId >= kMaxMonitors;
         if (!entry.output.empty() && !nameValid && !nameTravels) ++rejectedNames;
+        const bool sizeValid = entry.outputSize && outputSizeError(*entry.outputSize).empty();
 
         // Dropped, not kept: a kept entry is only ever superseded by a live monitor
         // claiming its id, and a negative id can never be one -- so keeping it means
@@ -915,12 +1016,16 @@ std::vector<int> WallpaperManager::restoreSaved() {
             continue;
         }
 
+        // Counted only beside a name that survives: a size lost with its name is that name's loss.
+        if (nameValid && entry.outputSize && !sizeValid) ++rejectedSizes;
+
         // Independent halves of a row: this one is restored even when the other cannot be.
         // Last-wins -- file order carries no meaning. What matters is that the loss is
         // reported, not left as two monitors quietly answering to one screen.
-        if (nameValid && entry.monitorId < kMaxMonitors &&
-            bindOutputLocked(entry.monitorId, entry.output) == BindResult::Displaced) {
-            ++displacedNames;
+        if (nameValid && entry.monitorId < kMaxMonitors) {
+            if (bindOutputLocked(entry.monitorId, entry.output) == BindResult::Displaced) ++displacedNames;
+            // A row without one does not erase a size an earlier row gave the same screen.
+            if (sizeValid) m_outputSizes.insert_or_assign(entry.output, *entry.outputSize);
         }
 
         // A row with no wallpaper stops here rather than falling into the arm below, whose
@@ -951,6 +1056,7 @@ std::vector<int> WallpaperManager::restoreSaved() {
                 PersistedWallpaper keep = entry;
                 if (heldLive && KeptRows::dropWallpaper(keep)) ++duplicateIds;
                 if (!nameTravels) keep.output.clear();
+                if (!nameTravels || !sizeValid) keep.outputSize.reset();
                 // Nothing left to carry. Kept, it would ride every save for the life of the
                 // install and come back as a wallpaper that did not return.
                 if (keep.type.empty() && keep.path.empty() && keep.output.empty()) continue;
@@ -971,7 +1077,9 @@ std::vector<int> WallpaperManager::restoreSaved() {
                 // The name counter, not the row counter: what was lost here is a screen's
                 // name, and duplicateIds counts wallpapers.
                 if (!held.output.empty() && held.output != entry.output) ++displacedNames;
+                if (held.output != entry.output) held.outputSize.reset();
                 held.output = entry.output;
+                if (sizeValid) held.outputSize = entry.outputSize;
                 keptNameOwner[entry.output] = entry.monitorId;
             }
             continue;
@@ -1029,9 +1137,13 @@ std::vector<int> WallpaperManager::restoreSaved() {
         if (m_outputs.count(kept.output) != 0 || owner == keptNameOwner.end() ||
             owner->second != kept.monitorId) {
             kept.output.clear();
+            kept.outputSize.reset();
             ++displacedNames;
         }
     }
+
+    // Later rows can unbind names an earlier row sized, and the file holds thousands of rows.
+    pruneOutputSizesLocked();
 
     if (displacedNames > 0) {
         // Same correction as the entry counter below: a name this build could bind displaces a
@@ -1043,6 +1155,11 @@ std::vector<int> WallpaperManager::restoreSaved() {
     if (rejectedNames > 0) {
         m_kept.note(std::to_string(rejectedNames) +
                            " screen names dropped, unusable; those screens must be named again");
+    }
+    if (rejectedSizes > 0) {
+        m_kept.note(std::to_string(rejectedSizes) +
+                    " screen sizes dropped, unusable; those screens are drawn at the default size "
+                    "until they report again");
     }
     if (duplicateIds > 0) {
         // Not "the last entry won": three collisions feed this counter and one is resolved by
@@ -1058,7 +1175,8 @@ std::vector<int> WallpaperManager::restoreSaved() {
     // malformed, so nothing would tell the user those wallpapers did not come back.
     // Recomposed from the raw path rather than appended to the recorded detail, which is
     // already sanitized and would be escaped a second time.
-    repaired = displacedNames > 0 || rejectedNames > 0 || duplicateIds > 0 || m_kept.anyDropped();
+    repaired = displacedNames > 0 || rejectedNames > 0 || rejectedSizes > 0 || duplicateIds > 0 ||
+               m_kept.anyDropped();
     if ((!m_kept.carried().empty() || repaired) && m_health.persistence.status == HealthStatus::Ok) {
         recordHealthLocked(&DaemonHealth::persistence, HealthStatus::Ok,
                            keptDetail(m_store.file().string()));
@@ -1071,11 +1189,29 @@ std::vector<int> WallpaperManager::restoreSaved() {
 }
 
 RenderOutcome WallpaperManager::renderPending(int monitorId) {
+    // Bounds how long a stream of size changes, each landing mid-draw, can hold the worker. Past it
+    // the monitor goes without a frame until the newest request's own post runs.
+    constexpr int kAttemptsAfterRebuild = 3;
+
     std::lock_guard<std::mutex> gpuLock(m_gpuMutex);
+    bool rebuilt = false;
+    for (int attempt = 0;; ++attempt) {
+        const RenderPass pass = renderPassLocked(monitorId, rebuilt);
+        // An attempt overtaken after the images were replaced has already thrown away the frame.
+        // So the newer request is drawn now, still under the GPU lock, before any export can see
+        // the gap -- rather than after whatever else is queued ahead of its own post.
+        if (!pass.superseded || !rebuilt || attempt + 1 >= kAttemptsAfterRebuild) return pass.outcome;
+    }
+}
+
+WallpaperManager::RenderPass WallpaperManager::renderPassLocked(int monitorId, bool& rebuilt) {
 
     std::string type;
     std::string path;
     uint64_t seq = 0;
+    // Read with the sequence number: every change to it bumps that number, so a commit that finds
+    // the sequence unmoved was drawn at the size still in force.
+    OutputSize size;
     {
         std::lock_guard<std::mutex> stateLock(m_stateMutex);
         auto it = m_monitors.find(monitorId);
@@ -1099,6 +1235,7 @@ RenderOutcome WallpaperManager::renderPending(int monitorId) {
         type = it->second.type;
         path = it->second.path;
         seq = it->second.requestSeq;
+        size = targetSizeLocked(monitorId);
     }
 
     if (!isRenderableType(type)) {
@@ -1131,29 +1268,29 @@ RenderOutcome WallpaperManager::renderPending(int monitorId) {
     std::optional<StaticRenderer> renderer;
     const OffscreenTarget* target = nullptr;
 
-    // On disk from just before the decode to just after the submit -- the span in which the
-    // file's content is what runs -- so a start after a fatal signal in it refuses this
-    // wallpaper. Not around ensureGpu(): a driver that dies creating the device would be
-    // blamed on whichever picture happened to be first.
+    // On disk across the decode and across the submit -- the spans in which the file's content
+    // is what runs -- so a start after a fatal signal in either refuses this wallpaper. Not
+    // around ensureGpu() or the images: a driver that dies creating those would be blamed on
+    // whichever picture happened to be first.
     std::optional<ApplyingRecord> applying;
     try {
         ensureGpu();
         // Before the target is acquired, so a set reported since the last render rebuilds the
         // image rather than being applied to one already allocated against the old one.
         applyImportModifiersLocked();
-        ensureTargets(monitorId);
 
-        // Chosen before the image is decoded, so a pass that cannot draw anywhere costs
-        // nothing. Nothing can claim an image between here and the submit: hand-overs happen
-        // in exportCurrentFrame, which runs on this same worker thread, and a release only
-        // ever frees one.
-        {
+        // A pass that cannot draw anywhere is refused before the decode, so it costs nothing.
+        // Only images that are kept can all be held: a rebuild clears every hold.
+        if (targetsFit(monitorId, size)) {
             std::lock_guard<std::mutex> stateLock(m_stateMutex);
-            target = m_targets->nextUnheld(monitorId, heldBuffersLocked(monitorId));
+            deferred = m_targets->nextUnheld(monitorId, heldBuffersLocked(monitorId)) == nullptr;
         }
-        if (target == nullptr) {
-            deferred = true;
-        } else {
+
+        if (!deferred) {
+            // Decoded before the images are rebuilt, so a redraw at a new size goes without a frame
+            // for the draw only, not for the decode. The render pass belongs to the manager, not to
+            // this monitor's images, and the draw takes its extent from the target.
+            //
             // Not retained past this call. A static wallpaper renders once, so keeping the
             // texture, pipeline and descriptor alive per monitor would hold VRAM for
             // something nothing re-renders. render() does not wait, so what keeps this from
@@ -1162,6 +1299,20 @@ RenderOutcome WallpaperManager::renderPending(int monitorId) {
             // Step 13's video renderer does need to persist and will live in MonitorState.
             applying.emplace(m_config.stateDir, monitorId, type, path);
             renderer.emplace(*m_device, m_targets->renderPass(), path, m_resolvedShaderDir);
+            // Off disk while the images are made, for ensureGpu()'s reason: their size is the
+            // screen's, and a driver dying on it is not this picture's doing.
+            applying.reset();
+
+            if (ensureTargets(monitorId, size)) rebuilt = true;
+
+            // Nothing can claim an image between here and the submit: a hand-over needs
+            // m_gpuMutex, which this pass holds, and a release only ever frees one.
+            {
+                std::lock_guard<std::mutex> stateLock(m_stateMutex);
+                target = m_targets->nextUnheld(monitorId, heldBuffersLocked(monitorId));
+            }
+            deferred = target == nullptr;
+            if (!deferred) applying.emplace(m_config.stateDir, monitorId, type, path);
         }
     } catch (const GpuFailure& e) {
         // Caught before std::exception, which it derives from. The GPU going wrong rather
@@ -1194,7 +1345,7 @@ RenderOutcome WallpaperManager::renderPending(int monitorId) {
         {
             std::lock_guard<std::mutex> stateLock(m_stateMutex);
             auto it = m_monitors.find(monitorId);
-            if (it == m_monitors.end() || it->second.requestSeq != seq) return {};
+            if (it == m_monitors.end() || it->second.requestSeq != seq) return RenderPass{{}, true};
             refusals = ++it->second.deferredRenders;
         }
         // Once per episode. A producer drawing at display rate would otherwise write a line
@@ -1221,10 +1372,11 @@ RenderOutcome WallpaperManager::renderPending(int monitorId) {
         std::lock_guard<std::mutex> stateLock(m_stateMutex);
         auto it = m_monitors.find(monitorId);
         if (it == m_monitors.end() || it->second.requestSeq != seq) {
-            // Superseded. Nothing has been submitted, so the image still holds exactly
-            // what the consumer was last told about. Leave servicedSeq alone so the
-            // newer request's own pass is not mistaken for one already done.
-            return {};
+            // Superseded. Nothing has been submitted, so kept images still hold exactly what the
+            // consumer was last told about; replaced ones hold nothing, and renderPending() draws
+            // the newer request at once. Leave servicedSeq alone so the newer request's own pass
+            // is not mistaken for one already done.
+            return RenderPass{{}, true};
         }
 
         if (error.empty()) {
@@ -1255,11 +1407,14 @@ RenderOutcome WallpaperManager::renderPending(int monitorId) {
             // truncation keeps the head, so reversing that message would cut stb's reason.
             it->second.lastError = sanitizeForLog(error, 1024, LogFraming::Bare);
             it->second.lastErrorIsDaemonFault = daemonFault;
+            // Here, not only in releaseTarget() below: that runs after this lock is dropped, and a
+            // reader in between would see a frame beside the error that says there is none.
+            it->second.hasFrame = false;
         } else {
             ++it->second.generation;
             it->second.hasFrame = true;
-            it->second.width = m_config.width;
-            it->second.height = m_config.height;
+            it->second.width = target->width;
+            it->second.height = target->height;
             it->second.frameModifier = target->drmModifier;
             // Cleared here rather than relying on requestWallpaper having cleared it. A
             // successful commit is what makes "this monitor has a frame" true, and the
@@ -1292,7 +1447,7 @@ RenderOutcome WallpaperManager::renderPending(int monitorId) {
         return {};
     }
 
-    return RenderOutcome{committed, generation};
+    return RenderPass{RenderOutcome{committed, generation}, false};
 }
 
 FrameHandle WallpaperManager::exportHandle(const OffscreenTarget& target) {
@@ -1453,6 +1608,8 @@ WallpaperManager::Snapshot WallpaperManager::snapshot() const {
             entry.width = state.width;
             entry.height = state.height;
         }
+        entry.targetSize = targetSizeLocked(monitorId);
+        entry.targetSizeReported = reportedSizeLocked(monitorId).has_value();
         out.monitors.emplace(monitorId, std::move(entry));
     }
     out.outputs = m_outputs;

@@ -53,14 +53,16 @@ std::vector<PersistedWallpaper> KeptRows::rowsToWrite(const LiveWallpapers& live
         if (monitorId < m_maxMonitors || live.outputs.count(row.output) != 0 ||
             !written.insert(row.output).second) {
             row.output.clear();
+            row.outputSize.reset();
         }
     }
-    for (const auto& [name, monitorId] : live.outputs) {
-        PersistedWallpaper& row = rows[monitorId];
+    for (const auto& [name, binding] : live.outputs) {
+        PersistedWallpaper& row = rows[binding.monitorId];
         // Explicit: operator[] default-constructs monitorId 0 for a named, wallpaper-less
         // screen.
-        row.monitorId = monitorId;
+        row.monitorId = binding.monitorId;
         row.output = name;
+        row.outputSize = binding.size;
     }
 
     std::vector<PersistedWallpaper> entries;

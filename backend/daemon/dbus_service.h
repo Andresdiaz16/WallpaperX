@@ -53,6 +53,10 @@ private:
     // not survive a restart, and the client may re-assert it later.
     void setMonitorOutput(int32_t monitorId, const std::string& outputName);
 
+    // Records the pixel size the screen named `outputName` is drawn at, and posts its monitor
+    // when that changes. Accepted means recorded, not saved: see WallpaperManager::setOutputSize.
+    void setOutputSize(const std::string& outputName, uint32_t width, uint32_t height);
+
     void emitFrameReady(int monitorId, uint64_t generation);
 
     // Announces frames that already exist, after an image came free. Same signal as a new

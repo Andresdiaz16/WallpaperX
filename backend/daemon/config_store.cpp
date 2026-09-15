@@ -36,6 +36,9 @@ constexpr const char* kKeyMonitorId = "monitor_id";
 constexpr const char* kKeyType = "type";
 constexpr const char* kKeyPath = "path";
 constexpr const char* kKeyOutput = "output";
+constexpr const char* kKeyOutputSize = "output_size";
+constexpr const char* kKeyWidth = "width";
+constexpr const char* kKeyHeight = "height";
 
 // load() returns from a dozen places; this is what keeps the descriptor from leaking out
 // of any of them.
@@ -99,6 +102,19 @@ bool readInt(const nlohmann::json& field, int& out) {
 bool readMonitorId(const nlohmann::json& object, int& out) {
     if (!object.contains(kKeyMonitorId)) return false;
     return readInt(object.at(kKeyMonitorId), out);
+}
+
+// Anything unreadable comes back 0x0, which the manager's range check refuses and reports. A size
+// is a measurement the screen sends again, so it never costs the row it rides on.
+OutputSize readOutputSize(const nlohmann::json& field) {
+    int width = 0;
+    int height = 0;
+    if (!field.is_object() || !field.contains(kKeyWidth) || !field.contains(kKeyHeight) ||
+        !readInt(field.at(kKeyWidth), width) || !readInt(field.at(kKeyHeight), height) || width < 0 ||
+        height < 0) {
+        return {};
+    }
+    return OutputSize{static_cast<std::uint32_t>(width), static_cast<std::uint32_t>(height)};
 }
 
 }  // namespace
@@ -239,6 +255,7 @@ LoadResult ConfigStore::load() const {
                 ++result.malformedEntries;
                 continue;
             }
+            if (element.contains(kKeyOutputSize)) entry.outputSize = readOutputSize(element.at(kKeyOutputSize));
             result.entries.push_back(std::move(entry));
         }
     } catch (const std::exception& e) {
@@ -285,7 +302,13 @@ SaveResult ConfigStore::save(const std::vector<PersistedWallpaper>& entries) con
                                {kKeyPath, wallpaperOk ? entry.path : ""}};
             // Only when there is one: a config for an install that never named a screen
             // stays byte-identical to what a build without this field writes.
-            if (nameOk && !entry.output.empty()) row[kKeyOutput] = entry.output;
+            if (nameOk && !entry.output.empty()) {
+                row[kKeyOutput] = entry.output;
+                if (entry.outputSize) {
+                    row[kKeyOutputSize] = {{kKeyWidth, entry.outputSize->width},
+                                           {kKeyHeight, entry.outputSize->height}};
+                }
+            }
             monitors.push_back(std::move(row));
         }
         const nlohmann::json root{{kKeyVersion, kSchemaVersion}, {kKeyMonitors, std::move(monitors)}};

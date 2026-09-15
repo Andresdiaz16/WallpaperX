@@ -241,6 +241,9 @@ WallpaperItem {
             item.monitorId = root.monitorId;
             root.rendererReason = item.unavailableReason;
             root.rendererDrawing = item.frameShown;
+            // The name monitorId was resolved from, so the size the renderer reports is filed
+            // under the same screen.
+            item.output = root.connector;
         }
         // State from an item that is going away would otherwise outlive it.
         onStatusChanged: {
@@ -257,6 +260,9 @@ WallpaperItem {
             target: root
             function onMonitorIdChanged() {
                 if (surface.item !== null) surface.item.monitorId = root.monitorId;
+            }
+            function onConnectorChanged() {
+                if (surface.item !== null) surface.item.output = root.connector;
             }
         }
 

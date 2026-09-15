@@ -6,7 +6,9 @@
 #include "frame_import.h"
 
 #include <QQuickItem>
+#include <QSize>
 #include <QString>
+#include <QTimer>
 #include <QtGlobal>
 #include <QtQml/qqmlregistration.h>
 
@@ -41,6 +43,9 @@ class WallpaperXItem : public QQuickItem {
     // permanently unlintable.
     QML_NAMED_ELEMENT(WallpaperXRenderer)
     Q_PROPERTY(int monitorId READ monitorId WRITE setMonitorId NOTIFY monitorIdChanged)
+    // The connector name main.qml resolved monitorId from. This item's pixel size is reported to
+    // the daemon under it; empty reports nothing.
+    Q_PROPERTY(QString output READ output WRITE setOutput NOTIFY outputChanged)
     // Why nothing is being drawn, when nothing is. Empty while the wallpaper is showing, so QML
     // can fall back to the message states main.qml already derives rather than inventing its own.
     Q_PROPERTY(QString unavailableReason READ unavailableReason NOTIFY unavailableReasonChanged)
@@ -91,11 +96,15 @@ public:
     int monitorId() const { return m_monitorId; }
     void setMonitorId(int monitorId);
 
+    QString output() const { return m_output; }
+    void setOutput(const QString& output);
+
     QString unavailableReason() const { return m_unavailableReason; }
     bool frameShown() const { return m_frameShown; }
 
 signals:
     void monitorIdChanged();
+    void outputChanged();
     void unavailableReasonChanged();
     void frameShownChanged();
 
@@ -103,6 +112,7 @@ protected:
     QSGNode* updatePaintNode(QSGNode* old, UpdatePaintNodeData* data) override;
     void releaseResources() override;
     void itemChange(ItemChange change, const ItemChangeData& value) override;
+    void geometryChange(const QRectF& newGeometry, const QRectF& oldGeometry) override;
 
 private slots:
     // FrameReady(monitor_id, frame_generation) from the daemon, on the GUI thread.
@@ -167,7 +177,25 @@ private:
     void setRenderReason(const QString& reason);  // render thread
     void publishReason();                         // GUI thread
 
+    // What SetOutputSize was last told. GUI thread.
+    struct SizeReport {
+        QString output;
+        QSize pixels;
+        bool operator==(const SizeReport&) const = default;
+    };
+    // Restarts the settle timer; reportSize() runs when the triggers stop. GUI thread.
+    void scheduleSizeReport();
+    void reportSize();
+
     int m_monitorId = -1;
+    QString m_output;  // GUI thread only
+    // Settles the size before it is reported: a login lays the item out, exposes the window and
+    // applies its scale in quick succession, and every intermediate size costs the daemon a redraw.
+    QTimer m_sizeReportTimer;
+    // The last report sent and not refused, so an unchanged size is not sent again. Forgotten
+    // wherever the daemon may have lost it: a restart, or a monitor change, which can mean the
+    // name was unbound and bound again in between. GUI thread only.
+    std::optional<SizeReport> m_sizeReported;
     // The newest generation this item has fetched, so a signal for a frame already in hand
     // costs nothing. GUI thread only, like everything else the fetch path touches.
     quint64 m_fetchedGeneration = 0;

@@ -40,6 +40,7 @@
 #include "support/validation_grade.h"
 #include "tests/client/daemon_client.h"
 #include "tests/client/scratch_dir.h"
+#include "tests/manager_output.h"
 #include "tests/test_report.h"
 
 #include <sdbus-c++/sdbus-c++.h>
@@ -71,10 +72,90 @@
 #include <utility>
 #include <vector>
 
+#include <dlfcn.h>
 #include <fcntl.h>
+#include <sys/inotify.h>
 #include <unistd.h>
 
 using wallpaperx::DbusService;
+
+// Where the resize barrier phase holds or fails the render thread from inside the daemon's own work: the
+// framebuffer creation that finishes every rebuilt image, and the unlink that removes a crash record.
+// Defined in this executable, so the daemon's calls resolve here; unarmed, each costs the real call one
+// atomic load.
+class CallGate {
+public:
+    enum class Mode { Hold, Fail };
+
+    // `path`, when given, limits the gate to calls naming that path.
+    void arm(Mode mode, std::string path = {}) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_mode = mode;
+        m_path = std::move(path);
+        m_fired = false;
+        m_released = false;
+        m_armed.store(true);
+    }
+
+    // In the hooked call; true when that call must fail. A held call waits at most a minute, so a
+    // phase that never releases costs a minute rather than the run.
+    bool enter(const char* path = nullptr) {
+        if (!m_armed.load()) return false;
+        std::unique_lock<std::mutex> lock(m_mutex);
+        if (!m_armed.load() || (!m_path.empty() && (path == nullptr || m_path != path))) return false;
+        m_armed.store(false);
+        m_fired = true;
+        m_changed.notify_all();
+        if (m_mode == Mode::Fail) return true;
+        m_changed.wait_for(lock, std::chrono::seconds(60), [this] { return m_released; });
+        return false;
+    }
+
+    bool waitFired(std::chrono::seconds limit) {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        return m_changed.wait_for(lock, limit, [this] { return m_fired; });
+    }
+
+    // Lets a held call go, and disarms a gate whose call never came.
+    void release() {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_armed.store(false);
+        m_released = true;
+        m_changed.notify_all();
+    }
+
+private:
+    std::atomic<bool> m_armed{false};
+    std::mutex m_mutex;
+    std::condition_variable m_changed;
+    Mode m_mode = Mode::Hold;
+    std::string m_path;
+    bool m_fired = false;
+    bool m_released = false;
+};
+
+CallGate g_framebufferGate;
+CallGate g_unlinkGate;
+
+extern "C" int unlink(const char* path) {
+    using Fn = int (*)(const char*);
+    static const Fn real = reinterpret_cast<Fn>(::dlsym(RTLD_NEXT, "unlink"));
+    if (real == nullptr) {
+        errno = ENOSYS;
+        return -1;
+    }
+    g_unlinkGate.enter(path);
+    return real(path);
+}
+
+extern "C" VkResult vkCreateFramebuffer(VkDevice device, const VkFramebufferCreateInfo* info,
+                                       const VkAllocationCallbacks* allocator, VkFramebuffer* framebuffer) {
+    using Fn = VkResult (*)(VkDevice, const VkFramebufferCreateInfo*, const VkAllocationCallbacks*, VkFramebuffer*);
+    static const Fn real = reinterpret_cast<Fn>(::dlsym(RTLD_NEXT, "vkCreateFramebuffer"));
+    if (real == nullptr) return VK_ERROR_INITIALIZATION_FAILED;
+    if (g_framebufferGate.enter()) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    return real(device, info, allocator, framebuffer);
+}
 
 namespace {
 
@@ -724,6 +805,11 @@ void runHostChecks(sdbus::IProxy& proxy, const std::string& imagePath, const Che
         //       exception instead of this line.
         {"method", "SetImportModifiers", ArgList{{"in", "u:drm_format"}, {"in", "at:modifiers"}}},
         {"method", "SetMonitorOutput", ArgList{{"in", "i:monitor_id"}, {"in", "s:output_name"}}},
+        // CONTROL: the second name in `.withInputParamNames("output_name", "width", "height")` on
+        //       SetOutputSize in DbusService::registerVTable (backend/daemon/dbus_service.cpp) changed to
+        //       "w" -> "FAIL: wire signature of method SetOutputSize is unchanged", printing `u:width(in)`
+        //       against `u:w(in)`. Reverted.
+        {"method", "SetOutputSize", ArgList{{"in", "s:output_name"}, {"in", "u:width"}, {"in", "u:height"}}},
         {"method", "GetStatus", ArgList{{"out", "s:status"}}},
         // A signal's args carry no direction attribute, hence the empty first field.
         {"signal", "FrameReady", ArgList{{"", "i:monitor_id"}, {"", "t:frame_generation"}}},
@@ -842,9 +928,10 @@ void runOutputNameChecks(sdbus::IProxy& proxy, const Check& check) {
     // handler is main's catch-all above every later phase, so one refusal here turns "a named
     // check failed" into "the render and coalescing phases never ran".
     // CONTROL: `if (outputName == "DP-MOVE") throw std::runtime_error(...)` added to
-    //       WallpaperManager::setMonitorOutput (backend/daemon/wallpaper_manager.cpp) -> four
+    //       WallpaperManager::setMonitorOutput (backend/daemon/wallpaper_manager.cpp) -> five
     //       named FAIL lines from "naming monitor A 'DP-MOVE' is accepted" onward, and the
-    //       render phase still ran ("SetWallpaper replied in 0 ms, FrameReady at 164 ms").
+    //       render phase still ran ("SetWallpaper replied in 0 ms, FrameReady at 146 ms").
+    //       Re-observed 2026-09-14.
     //       Reverting only that one call to a bare one, mutation still in place: a single
     //       "FAIL: unexpected exception: [io.wallpaperx.Daemon.Error.RenderFailed]", no render
     //       phase, and the Vulkan oracle reporting that no device was ever created. Both
@@ -893,7 +980,8 @@ void runOutputNameChecks(sdbus::IProxy& proxy, const Check& check) {
     //       ..." printing "monitor 17 answers to (none)", and the cross-monitor check. This
     //       is the mutation the "DP-KEEP" pair was added for -- recording a bad id costs
     //       monitor 17 the name it held.
-    //       (c) the `outputNameError` check deleted from setMonitorOutput -> four red: "FAIL:
+    //       (c) the `requireValidOutputName(outputName);` check deleted from setMonitorOutput
+    //       (re-observed 2026-09-14) -> four red: "FAIL:
     //       an empty connector name is rejected as InvalidArgs", "FAIL: an oversized connector
     //       name is rejected as InvalidArgs", "FAIL: a refused connector name neither binds to
     //       the monitor it targeted nor disturbs the name it already answered to" printing the
@@ -2465,11 +2553,14 @@ void runImportModifierChecks(const wallpaperx::WallpaperManager::Config& config,
     //       snapshot().hasFrame instead would grade the same bit one layer earlier but
     //       would not show that the reply is the *right* one; NotRendered is asserted
     //       here precisely because that is the answer a consumer can act on.
-    // CONTROL: `state.hasFrame = false;` deleted from
-    //       WallpaperManager::applyImportModifiersLocked (backend/daemon/
-    //       wallpaper_manager.cpp) -- the defect commit 5fb5072 fixed. Observed red on
-    //       both ICDs with the exception text quoted below; every other check in this
-    //       binary stayed green.
+    // CONTROL: it now takes two mutations, both in backend/daemon/wallpaper_manager.cpp, because
+    //       two clears enforce it: `it->second.hasFrame = false;` in
+    //       WallpaperManager::applyImportModifiersLocked (the defect commit 5fb5072 fixed) AND the
+    //       same line in WallpaperManager::forgetImages, which the images' release there also
+    //       reaches. The first alone left every check green on Lavapipe, re-observed 2026-09-14.
+    //       Both together -> this check red on Lavapipe with "the export threw: monitor 21 is marked
+    //       as rendered but has no offscreen target", and "a later report re-posts a monitor the
+    //       previous one left without a frame" beside it. Re-observed 2026-09-15. Reverted.
     bool threw = false;
     std::string threwWhat;
     Exported pending;
@@ -3951,7 +4042,9 @@ void runBufferHoldChecks(const wallpaperx::WallpaperManager::Config& config, con
     // CONTROL: the `announce->push_back(...)` line in
     //       WallpaperManager::reportFreedImageLocked (backend/daemon/wallpaper_manager.cpp)
     //       deleted -> "FAIL: releasing an image re-announces the monitor's committed frame",
-    //       printing 0 announcements. Reverted.
+    //       printing 0 announcements, with the other checks that wait on an announcement red beside
+    //       it (the departure, the wire re-announcement, the resize-release phase). Re-observed
+    //       2026-09-14. Reverted.
     const uint64_t committed = monitorStatus(manager, kMonitorHoldRing).generation;
     {
         std::vector<wallpaperx::FrameAvailable> announced;
@@ -4654,8 +4747,9 @@ void runBufferReleaseWireChecks(const wallpaperx::WallpaperManager::Config& conf
     //       WallpaperManager::forgetHeldBuffers (backend/daemon/wallpaper_manager.cpp) passed
     //       as `nullptr`, so a departure drops claims but publishes nothing -> "FAIL: a
     //       consumer leaving the bus re-announces the monitor's committed frame", printing
-    //       "generation 5 was never announced a second time after the consumer left", while
-    //       the ring check below stayed green. Reverted.
+    //       "generation 7 was never announced a second time after the consumer left", and the
+    //       manager-tier "a departure announces the monitor's committed frame", while the ring check
+    //       below stayed green. Re-observed 2026-09-14. Reverted.
     // CONTROL, the other leg: that same `std::erase_if` replaced by a `std::count_if` that
     //       reports the monitor without dropping the claim -> "FAIL: the departed consumer's
     //       images are really back in the ring", printing the NoFreeImage the surviving
@@ -5173,6 +5267,693 @@ void runCoalescingChecks(sdbus::IProxy& proxy, FrameReadyLog& signals, const std
     }
 }
 
+// --------------------------------------------------------------------------- //
+// A screen's reported size (S13.94-S13.97, S13.99-S13.101, S13.103, S13.104): what a monitor is
+// drawn at, what a change of it redraws, and what a redraw at a new size may and may not leave
+// observable. Each phase brings its own manager, so the ids below repeat numbers used above.
+// --------------------------------------------------------------------------- //
+
+// Not the Config size (64x48), not square, and different from each other, so a swapped axis, a
+// default taken for a report, or the old size taken for the new one all read differently.
+constexpr uint32_t kReportedWidth = 40;
+constexpr uint32_t kReportedHeight = 30;
+constexpr uint32_t kResizedWidth = 50;
+constexpr uint32_t kResizedHeight = 20;
+
+constexpr int32_t kMonitorSized = 0;
+constexpr int32_t kMonitorUnsized = 1;
+constexpr int32_t kMonitorSizeBarrier = 2;
+constexpr int32_t kMonitorSizeLostFile = 3;
+constexpr int32_t kMonitorSizeIdle = 4;
+
+void runOutputSizeWireChecks(const wallpaperx::WallpaperManager::Config& config, const std::string& imagePath,
+                             const Check& check) {
+    using wallpaperx::testing::setMonitorOutput;
+    using wallpaperx::testing::setOutputSize;
+
+    PhaseDeviceGrade grade("the output-size wire phase", check);
+    wallpaperx::testing::FrameReadyLog signals;
+    wallpaperx::WallpaperManager manager(config);
+    CaptureGradeOnExit captureGrade{grade, manager};
+
+    auto serviceConn = sdbus::createSessionBusConnection();
+    DbusService service(*serviceConn, manager);
+    serviceConn->enterEventLoopAsync();
+    auto proxy = sdbus::createProxy(sdbus::ServiceName{serviceConn->getUniqueName()},
+                                    sdbus::ObjectPath{DbusService::kObjectPath});
+    proxy->uponSignal("FrameReady")
+        .onInterface(DbusService::kInterface)
+        .call([&signals](int32_t monitorId, uint64_t generation) { signals.record(monitorId, generation); });
+
+    const char* kGoals = "S13.94, S13.95, S13.96, S13.99 and S13.100's lost-file clause over the wire";
+    constexpr const char* kInvalidArgs = "org.freedesktop.DBus.Error.InvalidArgs";
+    constexpr const char* kUnknownOutput = "io.wallpaperx.Daemon.Error.UnknownOutput";
+
+    // The size of the frame GetFrameFd hands over, released again at once so this consumer never
+    // reaches its cap. `error` is the refusal's name when there is no frame.
+    struct Served {
+        bool ok = false;
+        uint32_t width = 0;
+        uint32_t height = 0;
+        std::string error;
+    };
+    const auto served = [&proxy](int32_t monitorId) {
+        Served out;
+        try {
+            const wallpaperx::testing::Frame frame = wallpaperx::testing::getFrameFd(*proxy, monitorId);
+            wallpaperx::testing::releaseBuffer(*proxy, monitorId, frame.bufferId);
+            out = Served{true, frame.width, frame.height, {}};
+        } catch (const sdbus::Error& e) {
+            out.error = e.getName();
+        }
+        return out;
+    };
+    const auto describeServed = [](const Served& s) {
+        return s.ok ? std::to_string(s.width) + "x" + std::to_string(s.height) : "no frame (" + s.error + ")";
+    };
+
+    // Every render posted before this one has run by the time its FrameReady arrives: one FIFO worker.
+    uint64_t barrierGeneration = 0;
+    const auto settle = [&]() {
+        if (!errorNameFrom([&] { setWallpaper(*proxy, "static", imagePath, kMonitorSizeBarrier); }).empty()) return false;
+        return signals.wait(kMonitorSizeBarrier, ++barrierGeneration);
+    };
+
+    const std::string bindError = errorNameFrom([&] { setMonitorOutput(*proxy, kMonitorSized, "DP-SIZED"); });
+    const std::string sizeError =
+        errorNameFrom([&] { setOutputSize(*proxy, "DP-SIZED", kReportedWidth, kReportedHeight); });
+    check(bindError.empty() && sizeError.empty(), "a named screen's size is accepted before its monitor has a wallpaper");
+    if (!bindError.empty() || !sizeError.empty()) {
+        std::fprintf(stderr, "  SetMonitorOutput answered '%s', SetOutputSize '%s'\n", bindError.c_str(), sizeError.c_str());
+        return;
+    }
+
+    setWallpaper(*proxy, "static", imagePath, kMonitorUnsized);
+    if (!signals.wait(kMonitorUnsized, 1)) {
+        grade.expectNoDevice();
+        wallpaperx::testing::notVerified(kGoals, "the daemon drew no frame at the default size on this host, so no size "
+                                                 "could be compared with it");
+        return;
+    }
+    setWallpaper(*proxy, "static", imagePath, kMonitorSized);
+    const bool sizedDrawn = signals.wait(kMonitorSized, 1);
+    check(sizedDrawn, "a monitor whose screen reported a size is drawn at all");
+    if (!sizedDrawn) return;
+
+    // GOAL: S13.94 -- a monitor whose connector name has a reported size is drawn at that size, one with
+    //       none at Config's default, and GetStatus's target fields and target_size_source say which.
+    // WHY-THIS-SHAPE: the size is read from the frame GetFrameFd hands over, which is the extent the
+    //       images were created at, as well as from GetStatus -- a status that reported the target
+    //       while the images stayed at the default would satisfy the status half alone.
+    // CONTROL: WallpaperManager::targetSizeLocked (backend/daemon/wallpaper_manager.cpp) made to return
+    //       the Config size always -> "FAIL: a monitor whose screen reported a size is drawn at that
+    //       size" printing 64x48, the GetStatus line for it red, and nearly every later size check in this
+    //       file red with them, since no size can take effect. Reverted.
+    // CONTROL: the `"reported" : "default"` operands swapped in DbusService::getStatus
+    //       (backend/daemon/dbus_service.cpp) -> both GetStatus lines red and "after the refusals both
+    //       monitors are drawn at what they were before them", which reads the same field; both frame
+    //       lines green. Reverted.
+    const Served sized = served(kMonitorSized);
+    const Served unsized = served(kMonitorUnsized);
+    check(sized.ok && sized.width == kReportedWidth && sized.height == kReportedHeight,
+          "a monitor whose screen reported a size is drawn at that size");
+    check(unsized.ok && unsized.width == config.width && unsized.height == config.height,
+          "a monitor whose screen reported nothing is drawn at the configured default");
+    if (!sized.ok || sized.width != kReportedWidth || !unsized.ok || unsized.width != config.width) {
+        std::fprintf(stderr, "  sized monitor served %s, unsized monitor served %s\n", describeServed(sized).c_str(),
+                     describeServed(unsized).c_str());
+    }
+    const auto statusSays = [&proxy](int32_t monitorId, uint32_t width, uint32_t height, const char* source) {
+        const StatusReply status = getStatusOrExplain(*proxy);
+        const nlohmann::json* entry = wallpaperStatus(status, std::to_string(monitorId));
+        const bool says = entry != nullptr && entry->value("target_width", uint32_t{0}) == width &&
+                          entry->value("target_height", uint32_t{0}) == height &&
+                          entry->value("target_size_source", std::string()) == source;
+        if (!says) {
+            std::fprintf(stderr, "  GetStatus for monitor %d: %s\n", monitorId,
+                         entry != nullptr ? entry->dump().c_str() : "(no entry)");
+        }
+        return says;
+    };
+    check(statusSays(kMonitorSized, kReportedWidth, kReportedHeight, "reported"),
+          "GetStatus says the sized monitor is drawn at its reported size, and that a screen reported it");
+    check(statusSays(kMonitorUnsized, config.width, config.height, "default"),
+          "GetStatus says the unsized monitor is drawn at the default size, and that nothing reported one");
+
+    // GOAL: S13.95 over the wire -- zero or a side past 8192 and an unusable name answer InvalidArgs, a
+    //       name no monitor answers to UnknownOutput; 8192 is accepted; none of them draws anything or
+    //       changes a target, and a size refused for an unbound name does not come with the name later.
+    // WHY-THIS-SHAPE: "draws nothing" is read after a barrier render, never after a wait: an absent signal
+    //       is only evidence once a later render on the same FIFO worker has been announced. It is read as
+    //       "no FrameReady for the next generation", not as a signal count: releasing the image served()
+    //       fetched re-announces the frame it frees, which is a FrameReady with no redraw behind it.
+    // CONTROL: the `catch (const UnknownOutput& e)` arm deleted from DbusService::setOutputSize
+    //       (backend/daemon/dbus_service.cpp), so it falls into the InvalidRequest arm -> "FAIL: a size
+    //       for a name no monitor answers to is refused as io.wallpaperx.Daemon.Error.UnknownOutput",
+    //       printing InvalidArgs, and nothing else in the phase. Reverted.
+    struct WireRefusal {
+        const char* what;
+        std::string name;
+        uint32_t width;
+        uint32_t height;
+        const char* error;
+    };
+    const std::vector<WireRefusal> refusals{
+        {"a zero width", "DP-SIZED", 0, kReportedHeight, kInvalidArgs},
+        {"a zero height", "DP-SIZED", kReportedWidth, 0, kInvalidArgs},
+        {"a width past 8192", "DP-SIZED", 8193, kReportedHeight, kInvalidArgs},
+        {"a height past 8192", "DP-SIZED", kReportedWidth, 8193, kInvalidArgs},
+        {"an empty name", "", kReportedWidth, kReportedHeight, kInvalidArgs},
+        {"a name past the cap", std::string(wallpaperx::kMaxOutputNameBytes + 1, 'D'), kReportedWidth,
+         kReportedHeight, kInvalidArgs},
+        {"a name no monitor answers to", "DP-NOBODY", kResizedWidth, kResizedHeight, kUnknownOutput},
+    };
+    for (const WireRefusal& refusal : refusals) {
+        const std::string got = errorNameFrom([&] { setOutputSize(*proxy, refusal.name, refusal.width, refusal.height); });
+        check(got == refusal.error,
+              ("a size for " + std::string(refusal.what) + " is refused as " + refusal.error).c_str());
+        if (got != refusal.error) std::fprintf(stderr, "  it answered '%s'\n", got.c_str());
+    }
+    check(errorNameFrom([&] { setMonitorOutput(*proxy, kMonitorSizeIdle, "DP-IDLE"); }).empty() &&
+              errorNameFrom([&] { setOutputSize(*proxy, "DP-IDLE", 8192, 8192); }).empty(),
+          "a size of 8192 on each side is accepted");
+    check(errorNameFrom([&] { setMonitorOutput(*proxy, kMonitorUnsized, "DP-NOBODY"); }).empty(),
+          "the name a size was refused for can be bound afterwards");
+    if (!settle()) {
+        check(false, "the barrier render after the refusals is announced");
+        return;
+    }
+    check(signals.countOf(kMonitorSized, 2) == 0 && signals.countOf(kMonitorUnsized, 2) == 0,
+          "no refused size, and no binding of the name one was refused for, draws anything");
+    check(statusSays(kMonitorSized, kReportedWidth, kReportedHeight, "reported") &&
+              statusSays(kMonitorUnsized, config.width, config.height, "default"),
+          "after the refusals both monitors are drawn at what they were before them");
+
+    // GOAL: S13.96 over the wire -- a new size redraws its monitor, announced, at the new size; the same
+    //       size reported again draws nothing.
+    // CONTROL: the last `for (const int id : redraw) m_worker.post(id);` in DbusService::setOutputSize
+    //       (backend/daemon/dbus_service.cpp) deleted -> "FAIL: a new size redraws its monitor, announced
+    //       with FrameReady" after the signal timeout and "FAIL: the redraw is at the new size" printing
+    //       40x30, with the three lost-file checks below red since their redraw never runs. Reverted.
+    // CONTROL: for the repeat, it takes two mutations, since two mechanisms each stop it: the idempotent
+    //       early return in WallpaperManager::setOutputSize AND the `== before` return in
+    //       redrawIfResizedLocked both deleted (backend/daemon/wallpaper_manager.cpp) -> "FAIL: the same
+    //       size reported again draws nothing". Either alone leaves it green, measured both ways; the
+    //       `== before` deletion alone reddens the refusal block's "no ... binding of the name one was
+    //       refused for, draws anything", whose bind changes no size. Reverted.
+    check(errorNameFrom([&] { setOutputSize(*proxy, "DP-SIZED", kResizedWidth, kResizedHeight); }).empty(),
+          "a new size for a bound name is accepted");
+    const bool redrawn = signals.wait(kMonitorSized, 2);
+    check(redrawn, "a new size redraws its monitor, announced with FrameReady");
+    const Served resized = served(kMonitorSized);
+    check(resized.ok && resized.width == kResizedWidth && resized.height == kResizedHeight,
+          "the redraw is at the new size");
+    if (!resized.ok || resized.width != kResizedWidth) {
+        std::fprintf(stderr, "  served %s\n", describeServed(resized).c_str());
+    }
+    check(errorNameFrom([&] { setOutputSize(*proxy, "DP-SIZED", kResizedWidth, kResizedHeight); }).empty(),
+          "the same size reported again is accepted");
+    if (!settle()) {
+        check(false, "the barrier render after the repeated size is announced");
+        return;
+    }
+    check(signals.countOf(kMonitorSized, 3) == 0, "the same size reported again draws nothing");
+
+    // GOAL: S13.99 over the wire -- moving a sized name to another monitor redraws both, each at its new
+    //       size.
+    // CONTROL: the success path's `for (const int id : redraw) m_worker.post(id);` in
+    //       DbusService::setMonitorOutput (backend/daemon/dbus_service.cpp) deleted -> "FAIL: moving a
+    //       sized name to another monitor redraws both of them" after the signal timeout. Reverted.
+    check(errorNameFrom([&] { setMonitorOutput(*proxy, kMonitorUnsized, "DP-SIZED"); }).empty(),
+          "a sized name can be moved to another monitor");
+    const bool leftRedrawn = signals.wait(kMonitorSized, 3);
+    const bool joinedRedrawn = signals.wait(kMonitorUnsized, 2);
+    check(leftRedrawn && joinedRedrawn, "moving a sized name to another monitor redraws both of them");
+    if (leftRedrawn && joinedRedrawn) {
+        const Served left = served(kMonitorSized);
+        const Served joined = served(kMonitorUnsized);
+        check(left.ok && left.width == config.width && left.height == config.height && joined.ok &&
+                  joined.width == kResizedWidth && joined.height == kResizedHeight,
+              "the monitor the name left is drawn at the default, and the one it joined at the name's size");
+        if (!left.ok || left.width != config.width || !joined.ok || joined.width != kResizedWidth) {
+            std::fprintf(stderr, "  left %s, joined %s\n", describeServed(left).c_str(), describeServed(joined).c_str());
+        }
+    }
+
+    // GOAL: S13.100's lost-file clause -- a resize redraw of a wallpaper whose file was deleted since it
+    //       was drawn clears the frame and reports last_error and RenderFailed like any failed render,
+    //       and is not retried.
+    // WHY-THIS-SHAPE: read after a barrier render, when the failed pass has certainly finished -- polling
+    //       for last_error could also catch the pass between recording the error and releasing the
+    //       images, which the barrier phase below grades on its own.
+    // CONTROL: it takes two mutations, both in WallpaperManager::renderPassLocked
+    //       (backend/daemon/wallpaper_manager.cpp), because two things clear the frame: the
+    //       `it->second.hasFrame = false;` in the commit block's error arm AND `releaseTarget(monitorId);`
+    //       in the error tail. Either alone leaves this green, measured 2026-09-15. Both together -> "FAIL:
+    //       and clears the frame rather than keep the old one" and "FAIL: and GetFrameFd answers
+    //       RenderFailed", serving the old 64x48 frame, with the barrier phase's creation-failure pair and
+    //       never-both pair red the same way. Reverted. Whether a failed monitor's images are released
+    //       at all is not graded here, since the frame is withdrawn without it.
+    const std::string lostPath = testAssetDir() + "/dbus_test_size_lost.png";
+    {
+        std::error_code ec;
+        std::filesystem::copy_file(imagePath, lostPath, std::filesystem::copy_options::overwrite_existing, ec);
+        if (ec) {
+            wallpaperx::testing::notVerified("S13.100's lost-file clause", "the wallpaper copy it deletes could not be made: " + ec.message());
+            return;
+        }
+    }
+    check(errorNameFrom([&] { setMonitorOutput(*proxy, kMonitorSizeLostFile, "DP-LOST"); }).empty() &&
+              errorNameFrom([&] { setWallpaper(*proxy, "static", lostPath, kMonitorSizeLostFile); }).empty() &&
+              signals.wait(kMonitorSizeLostFile, 1),
+          "the wallpaper whose file is then deleted is drawn first");
+    {
+        std::error_code ec;
+        std::filesystem::remove(lostPath, ec);
+    }
+    check(errorNameFrom([&] { setOutputSize(*proxy, "DP-LOST", kReportedWidth, kReportedHeight); }).empty(),
+          "a size for the monitor whose file is gone is accepted");
+    if (!settle()) {
+        check(false, "the barrier render after the failed redraw is announced");
+        return;
+    }
+    const StatusReply lostStatus = getStatusOrExplain(*proxy);
+    const nlohmann::json* lostEntry = wallpaperStatus(lostStatus, std::to_string(kMonitorSizeLostFile));
+    check(lostEntry != nullptr && lostEntry->contains("last_error"),
+          "a resize redraw of a wallpaper whose file is gone reports last_error");
+    check(lostEntry != nullptr && !lostEntry->value("has_frame", true), "and clears the frame rather than keep the old one");
+    const Served lostServed = served(kMonitorSizeLostFile);
+    check(!lostServed.ok && lostServed.error == kErrRenderFailed, "and GetFrameFd answers RenderFailed");
+    if (lostServed.ok || lostServed.error != kErrRenderFailed) {
+        std::fprintf(stderr, "  served %s\n", describeServed(lostServed).c_str());
+    }
+    if (!settle()) {
+        check(false, "the second barrier render after the failed redraw is announced");
+        return;
+    }
+    check(signals.countOf(kMonitorSizeLostFile, 2) == 0 &&
+              wallpaperStatus(getStatusOrExplain(*proxy), std::to_string(kMonitorSizeLostFile)) != nullptr,
+          "and the failed redraw is not retried");
+}
+
+// GOAL: S13.97's render half -- the first render after a restart is at the size saved with the screen's
+//       name, before any screen reports.
+// WHY-THIS-SHAPE: two managers on one config file, the second never told a size; the extent is read
+//       from the committed frame and from the export. The daemon_system tier restarts a real process,
+//       but what is at stake here is only which size restoreSaved() hands the first render.
+// CONTROL: `if (sizeValid) m_outputSizes.insert_or_assign(entry.output, *entry.outputSize);` deleted from
+//       WallpaperManager::restoreSaved() (backend/daemon/wallpaper_manager.cpp) -> "FAIL: the first render
+//       after a restart is at the size saved with the screen's name", printing 64x48. Reverted.
+void runOutputSizeRestartRenderChecks(const wallpaperx::WallpaperManager::Config& config, const std::string& imagePath,
+                                      const Check& check) {
+    const char* kGoal = "S13.97's render half (the first render after a restart uses the saved size)";
+    const wallpaperx::testing::ScratchDir scratch("sizerestart");
+    if (!scratch.ok()) {
+        wallpaperx::testing::notVerified(kGoal, "a scratch directory could not be created");
+        return;
+    }
+    wallpaperx::WallpaperManager::Config saving = config;
+    saving.configFile = scratch.path() / "wallpaperx" / "config.json";
+    {
+        wallpaperx::WallpaperManager first(saving);
+        wallpaperx::testing::nameScreen(first, kMonitorSized, "DP-SAVED");
+        first.requestWallpaper("static", imagePath, kMonitorSized);
+        std::vector<int> redraw;
+        first.setOutputSize("DP-SAVED", kReportedWidth, kReportedHeight, redraw);
+
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        bool saved = false;
+        while (!saved && std::chrono::steady_clock::now() < deadline) {
+            std::ifstream in(saving.configFile);
+            const nlohmann::json root = nlohmann::json::parse(in, nullptr, false);
+            if (!root.is_discarded() && root.is_object() && root.contains("monitors") && root["monitors"].is_array()) {
+                for (const nlohmann::json& row : root["monitors"]) {
+                    if (row.is_object() && row.value("output", std::string()) == "DP-SAVED" && row.contains("output_size") &&
+                        row["output_size"] == nlohmann::json{{"width", kReportedWidth}, {"height", kReportedHeight}}) {
+                        saved = true;
+                    }
+                }
+            }
+            if (!saved) std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        check(saved, "the size reached the config file before the restart");
+        if (!saved) return;
+    }
+
+    PhaseDeviceGrade grade("the output-size restart phase", check);
+    wallpaperx::WallpaperManager second(saving);
+    CaptureGradeOnExit captureGrade{grade, second};
+    const std::vector<int> restored = second.restoreSaved();
+    check(restored == std::vector<int>{kMonitorSized}, "the restart restores the sized monitor's wallpaper");
+    if (!second.renderPending(kMonitorSized).rendered) {
+        const wallpaperx::MonitorStatus failed = monitorStatus(second, kMonitorSized);
+        check(false, "the restored wallpaper renders");
+        std::fprintf(stderr, "  last_error: %s\n", failed.lastError.c_str());
+        return;
+    }
+    const wallpaperx::MonitorStatus drawn = monitorStatus(second, kMonitorSized);
+    uint32_t exportedWidth = 0;
+    uint32_t exportedHeight = 0;
+    wallpaperx::FrameExport exported = second.exportCurrentFrame(kMonitorSized, "");
+    if (exported.handle) {
+        exportedWidth = exported.handle->frame.width;
+        exportedHeight = exported.handle->frame.height;
+        if (exported.handle->frame.fd >= 0) close(exported.handle->frame.fd);
+        if (exported.handle->acquireFd >= 0) close(exported.handle->acquireFd);
+    }
+    const bool atSaved = drawn.width == kReportedWidth && drawn.height == kReportedHeight &&
+                         exportedWidth == kReportedWidth && exportedHeight == kReportedHeight;
+    check(atSaved, "the first render after a restart is at the size saved with the screen's name");
+    if (!atSaved) {
+        std::fprintf(stderr, "  committed %ux%u, exported %ux%u\n", drawn.width, drawn.height, exportedWidth,
+                     exportedHeight);
+    }
+}
+
+// GOAL: S13.104 -- an image released on a monitor that both owes a redraw and has a frame a consumer
+//       can import queues the render AND announces the frame: the redraw at the new size is owed while
+//       the old frame is still what a refused consumer can take.
+// WHY-THIS-SHAPE: driven on the manager, on this thread, so the release's two answers are read directly
+//       rather than inferred from which FrameReady arrives -- a re-announced generation and the
+//       redraw's new one are both FrameReady on the wire.
+// CONTROL: WallpaperManager::reportFreedImageLocked (backend/daemon/wallpaper_manager.cpp) put back to
+//       `if (state.requestSeq != state.servicedSeq) { toRender.push_back(monitorId); return; }` before the
+//       announcement, which is the code before this change -> "FAIL: and announces the frame it still
+//       holds". Reverted.
+void runResizeReleaseChecks(const wallpaperx::WallpaperManager::Config& config, const std::string& imagePath,
+                            const Check& check) {
+    const char* kGoal = "S13.104 (a release on a monitor owing a redraw queues it and announces the frame)";
+    PhaseDeviceGrade grade("the resize-release phase", check);
+    wallpaperx::WallpaperManager manager(config);
+    CaptureGradeOnExit captureGrade{grade, manager};
+    const std::string alice = ":test.resize.alice";
+
+    wallpaperx::testing::nameScreen(manager, kMonitorSized, "DP-HOLD");
+    if (!renderOnce(manager, kMonitorSized, imagePath)) {
+        grade.expectNoDevice();
+        wallpaperx::testing::notVerified(kGoal, "the first render on this host produced no frame to hold");
+        return;
+    }
+    const uint64_t held = fetchFrame(manager, kMonitorSized, alice);
+    if (held == 0) {
+        wallpaperx::testing::notVerified(kGoal, "the monitor committed a frame but could not export it");
+        return;
+    }
+    std::vector<int> redraw;
+    manager.setOutputSize("DP-HOLD", kReportedWidth, kReportedHeight, redraw);
+    const wallpaperx::MonitorStatus owing = monitorStatus(manager, kMonitorSized);
+    const bool bothTrue = redraw == std::vector<int>{kMonitorSized} && owing.hasFrame && owing.renderOutstanding;
+    check(bothTrue, "a new size on a monitor with a frame owes a redraw and keeps the frame until it runs");
+    if (!bothTrue) return;
+
+    std::vector<wallpaperx::FrameAvailable> announce;
+    const std::vector<int> toRender = manager.releaseBuffer(alice, kMonitorSized, held, &announce);
+    check(toRender == std::vector<int>{kMonitorSized}, "releasing an image on a monitor that owes a redraw queues the render");
+    const bool announced = std::any_of(announce.begin(), announce.end(), [&owing](const wallpaperx::FrameAvailable& a) {
+        return a.monitorId == kMonitorSized && a.generation == owing.generation;
+    });
+    check(announced, "and announces the frame it still holds, so a consumer refused for want of an image can take it");
+    check(manager.renderPending(kMonitorSized).rendered && monitorStatus(manager, kMonitorSized).width == kReportedWidth,
+          "and the queued render then draws at the new size");
+}
+
+// Counts IN_CREATE events for one file name waiting on an inotify descriptor, without blocking.
+int creationsOf(int inotifyFd, const std::string& name) {
+    int count = 0;
+    std::array<char, 4096> buffer{};
+    for (;;) {
+        const ssize_t n = ::read(inotifyFd, buffer.data(), buffer.size());
+        if (n <= 0) return count;
+        for (ssize_t at = 0; at < n;) {
+            const auto* event = reinterpret_cast<const inotify_event*>(buffer.data() + at);
+            if ((event->mask & IN_CREATE) != 0 && event->len > 0 && name == event->name) ++count;
+            at += static_cast<ssize_t>(sizeof(inotify_event) + event->len);
+        }
+    }
+}
+
+void runResizeBarrierChecks(const wallpaperx::WallpaperManager::Config& config, const std::string& imagePath,
+                            const Check& check) {
+    using wallpaperx::RenderWorker;
+    const char* kGoals = "S13.100's creation-failure and never-both clauses, S13.101 and S13.103 (a resize pass held "
+                         "and failed from inside its own image rebuild)";
+    constexpr int32_t kMonitorRecord = 0;
+    constexpr int32_t kMonitorOvertaken = 1;
+    constexpr int32_t kMonitorCreateFails = 2;
+    constexpr int32_t kMonitorFileGone = 3;
+    constexpr auto kGateLimit = std::chrono::seconds(30);
+
+    const wallpaperx::testing::ScratchDir state("resizestate");
+    if (!state.ok()) {
+        wallpaperx::testing::notVerified(kGoals, "no scratch state directory could be created");
+        return;
+    }
+    PhaseDeviceGrade grade("the resize barrier phase", check);
+    wallpaperx::testing::FrameReadyLog signals;
+    wallpaperx::WallpaperManager::Config withRecords = config;
+    withRecords.stateDir = state.path();
+    wallpaperx::WallpaperManager manager(withRecords);
+    CaptureGradeOnExit captureGrade{grade, manager};
+    RenderWorker worker(manager, [&signals](int monitorId, uint64_t generation) { signals.record(monitorId, generation); });
+    // Before the worker is destroyed, on every exit: a gate left armed or holding would park it.
+    struct Unblock {
+        RenderWorker& worker;
+        ~Unblock() {
+            g_framebufferGate.release();
+            g_unlinkGate.release();
+            worker.stop();
+        }
+    } unblock{worker};
+
+    const auto firstFrame = [&](int32_t monitorId, const std::string& name, const std::string& path) {
+        wallpaperx::testing::nameScreen(manager, monitorId, name);
+        manager.requestWallpaper("static", path, monitorId);
+        worker.post(monitorId);
+        return signals.wait(monitorId, 1);
+    };
+    // What DbusService::setOutputSize does, minus the bus.
+    const auto resize = [&](const std::string& name, uint32_t width, uint32_t height) {
+        std::vector<int> redraw;
+        manager.setOutputSize(name, width, height, redraw);
+        for (const int id : redraw) worker.post(id);
+    };
+    struct Exported {
+        bool served = false;
+        uint32_t width = 0;
+        uint32_t height = 0;
+        wallpaperx::NoFrameReason reason = wallpaperx::NoFrameReason::NeverRequested;
+        std::string error;
+    };
+    // An export on the worker, which owns the Device, behind whatever is already queued there.
+    const auto exportOnWorker = [&worker, &manager](int32_t monitorId) {
+        auto answer = std::make_shared<std::promise<Exported>>();
+        std::future<Exported> future = answer->get_future();
+        worker.postTask([answer, &manager, monitorId](RenderWorker::TaskState taskState) {
+            Exported out;
+            if (taskState != RenderWorker::TaskState::Run) {
+                out.error = "the worker did not run the export";
+            } else {
+                try {
+                    wallpaperx::FrameExport e = manager.exportCurrentFrame(monitorId, "");
+                    if (e.handle) {
+                        out.served = true;
+                        out.width = e.handle->frame.width;
+                        out.height = e.handle->frame.height;
+                        if (e.handle->frame.fd >= 0) close(e.handle->frame.fd);
+                        if (e.handle->acquireFd >= 0) close(e.handle->acquireFd);
+                    } else {
+                        out.reason = e.reason;
+                    }
+                } catch (const std::exception& ex) {
+                    out.error = ex.what();
+                }
+            }
+            answer->set_value(std::move(out));
+        });
+        return future;
+    };
+    const auto describeExport = [](const Exported& e) {
+        if (e.served) return std::to_string(e.width) + "x" + std::to_string(e.height);
+        if (!e.error.empty()) return "an exception: " + e.error;
+        return "no frame, reason " + std::to_string(static_cast<int>(e.reason));
+    };
+    // True once everything queued on the worker before this call has run.
+    const auto drained = [&worker]() {
+        auto done = std::make_shared<std::promise<void>>();
+        std::future<void> future = done->get_future();
+        worker.postTask([done](RenderWorker::TaskState) { done->set_value(); });
+        return future.wait_for(std::chrono::seconds(60)) == std::future_status::ready;
+    };
+
+    const int watch = ::inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    struct CloseWatch {
+        int fd;
+        ~CloseWatch() {
+            if (fd >= 0) ::close(fd);
+        }
+    } closeWatch{watch};
+    // Deletions too, though only creations are counted: the kernel merges two identical unread events in
+    // a row, so a watch on creations alone reports a record created, removed and created again as one.
+    const bool watching = watch >= 0 && ::inotify_add_watch(watch, state.path().c_str(), IN_CREATE | IN_DELETE) >= 0;
+
+    if (!firstFrame(kMonitorRecord, "DP-RECORD", imagePath)) {
+        grade.expectNoDevice();
+        wallpaperx::testing::notVerified(kGoals, "the first render on this host produced no frame to resize");
+        return;
+    }
+
+    // GOAL: S13.103 -- while the render thread creates a monitor's images at a new size, no crash record
+    //       naming its wallpaper is on disk, so a driver dying on the size is not blamed on the picture.
+    // WHY-THIS-SHAPE: the render thread is held inside the very call that finishes an image, and the
+    //       record is looked for while it is held -- a check before or after the pass cannot see the
+    //       span at all.
+    // CONTROL: `applying.reset();` before `ensureTargets` in WallpaperManager::renderPassLocked
+    //       (backend/daemon/wallpaper_manager.cpp) deleted -> "FAIL: no crash record naming the wallpaper
+    //       is on disk while its images are created at the new size". Reverted.
+    // COVERAGE-ASSERT: the same pass is required to have created the monitor's record at least twice --
+    //       around the decode and around the draw -- so its absence at the hold is not a record this
+    //       manager never writes.
+    if (watching) creationsOf(watch, wallpaperx::crashRecordPath(state.path(), kMonitorRecord).filename().string());
+    g_framebufferGate.arm(CallGate::Mode::Hold);
+    resize("DP-RECORD", kReportedWidth, kReportedHeight);
+    const bool rebuilding = g_framebufferGate.waitFired(kGateLimit);
+    check(rebuilding, "a new size makes the render thread create the monitor's images again");
+    if (rebuilding) {
+        std::error_code ec;
+        const bool onDisk = std::filesystem::exists(wallpaperx::crashRecordPath(state.path(), kMonitorRecord), ec);
+        check(!ec && !onDisk, "no crash record naming the wallpaper is on disk while its images are created at the new size");
+    }
+    g_framebufferGate.release();
+    check(signals.wait(kMonitorRecord, 2), "that redraw commits once image creation is let go");
+    if (!watching) {
+        wallpaperx::testing::notVerified("S13.103's coverage assertion", "inotify could not watch the state directory");
+    } else {
+        const int creations =
+            creationsOf(watch, wallpaperx::crashRecordPath(state.path(), kMonitorRecord).filename().string());
+        check(creations >= 2, "the resize pass wrote its crash record around the decode and the draw, so the absence "
+                              "above was not a record never written");
+        if (creations < 2) std::fprintf(stderr, "  the record was created %d time(s)\n", creations);
+    }
+
+    // GOAL: S13.101 -- a resize pass overtaken by a newer size after it replaced the images never leaves
+    //       the monitor without a frame: an export queued behind it gets a frame, the old or the new, and
+    //       never NotRendered.
+    // WHY-THIS-SHAPE: the newer size lands while the first pass is held inside image creation, and the
+    //       export is queued between that pass and the newer size's own post -- the one order in which
+    //       the export runs before anything but the overtaken pass could draw.
+    // CONTROL: WallpaperManager::renderPending's attempt loop (backend/daemon/wallpaper_manager.cpp)
+    //       reduced to `return renderPassLocked(monitorId, rebuilt).outcome;` -> "FAIL: an export racing a
+    //       resize pass overtaken mid-rebuild gets the old or the new frame, never none", printing
+    //       "no frame, reason 1" (NotRendered). Reverted.
+    if (!firstFrame(kMonitorOvertaken, "DP-RACE", imagePath)) {
+        check(false, "the monitor the overtaken pass is about is drawn first");
+        return;
+    }
+    g_framebufferGate.arm(CallGate::Mode::Hold);
+    resize("DP-RACE", kReportedWidth, kReportedHeight);
+    const bool raceHeld = g_framebufferGate.waitFired(kGateLimit);
+    check(raceHeld, "the pass to be overtaken is held inside its image rebuild");
+    if (raceHeld) {
+        std::future<Exported> racing = exportOnWorker(kMonitorOvertaken);
+        resize("DP-RACE", kResizedWidth, kResizedHeight);
+        g_framebufferGate.release();
+        const bool answered = racing.wait_for(std::chrono::seconds(60)) == std::future_status::ready;
+        check(answered, "the export queued behind the overtaken pass is answered");
+        if (answered) {
+            const Exported got = racing.get();
+            const bool framed = got.served && ((got.width == kResizedWidth && got.height == kResizedHeight) ||
+                                               (got.width == config.width && got.height == config.height));
+            check(framed, "an export racing a resize pass overtaken mid-rebuild gets the old or the new frame, never none");
+            if (!framed) std::fprintf(stderr, "  the export got %s\n", describeExport(got).c_str());
+        }
+    }
+    g_framebufferGate.release();
+
+    // GOAL: S13.100's creation-failure clause -- a resize redraw whose image creation fails clears the frame
+    //       and reports last_error and RenderFailed like any failed render, and is not retried.
+    // WHY-THIS-SHAPE: the failure is injected into the real creation call for exactly one call, so the
+    //       daemon takes its own GpuFailure path; the state is read after the worker has drained.
+    // CONTROL: it takes two mutations, both in backend/daemon/wallpaper_manager.cpp, because two clears
+    //       withdraw the frame: `it->second.hasFrame = false;` in WallpaperManager::forgetImages AND the same
+    //       line in the commit block's error arm of WallpaperManager::renderPassLocked. The forgetImages one
+    //       alone left every check green on both ICDs, measured 2026-09-15. Both together -> "FAIL: and has
+    //       no frame, rather than keep the old one" and "FAIL: and an export answers RenderFailed", the
+    //       export throwing "marked as rendered but has no offscreen target", with the lost-file pair
+    //       (served as ExportFailed) and the never-both pair red beside them. Reverted.
+    if (!firstFrame(kMonitorCreateFails, "DP-NOIMAGE", imagePath)) {
+        check(false, "the monitor whose image creation will fail is drawn first");
+        return;
+    }
+    g_framebufferGate.arm(CallGate::Mode::Fail);
+    resize("DP-NOIMAGE", kReportedWidth, kReportedHeight);
+    const bool failedInside = g_framebufferGate.waitFired(kGateLimit);
+    check(failedInside, "the image creation for the new size was reached, and failed");
+    if (failedInside && drained()) {
+        const wallpaperx::MonitorStatus after = monitorStatus(manager, kMonitorCreateFails);
+        check(!after.lastError.empty(), "a resize redraw whose image creation fails reports last_error");
+        check(!after.hasFrame, "and has no frame, rather than keep the old one");
+        std::future<Exported> answer = exportOnWorker(kMonitorCreateFails);
+        const bool exportAnswered = answer.wait_for(std::chrono::seconds(60)) == std::future_status::ready;
+        const Exported got = exportAnswered ? answer.get() : Exported{};
+        const bool refused = exportAnswered && !got.served && got.error.empty() &&
+                             got.reason == wallpaperx::NoFrameReason::RenderFailed;
+        check(refused, "and an export answers RenderFailed");
+        if (!refused) std::fprintf(stderr, "  the export got %s\n", exportAnswered ? describeExport(got).c_str() : "(no answer)");
+        const bool quiet = drained() && monitorStatus(manager, kMonitorCreateFails).generation == after.generation &&
+                           !monitorStatus(manager, kMonitorCreateFails).renderOutstanding;
+        check(quiet, "and nothing retries it");
+    }
+    g_framebufferGate.release();
+
+    // GOAL: S13.100's never-both clause -- a failed resize redraw is never observable with a frame beside
+    //       its error, not even between recording the error and releasing the images.
+    // WHY-THIS-SHAPE: the render thread is held at the unlink of the pass's own crash record, which runs
+    //       after the error is committed and before the images are released -- a read after the pass
+    //       has finished cannot see that span at all. snapshot() is what GetStatus reads, and is read
+    //       here from a thread the render is not waiting on.
+    // CONTROL: `it->second.hasFrame = false;` deleted from the error arm of the commit block in
+    //       WallpaperManager::renderPassLocked (backend/daemon/wallpaper_manager.cpp) -> "FAIL: a failed
+    //       resize redraw is never observable with a frame beside its error", printing "has_frame is true
+    //       beside last_error: StaticRenderer: cannot open image (No such file or directory)"; the check
+    //       after it stays green, since releaseTarget() still clears the flag. Reverted.
+    const std::filesystem::path gonePath = state.path() / "gone.png";
+    {
+        std::error_code ec;
+        std::filesystem::copy_file(imagePath, gonePath, std::filesystem::copy_options::overwrite_existing, ec);
+        if (ec) {
+            wallpaperx::testing::notVerified("S13.100's never-both clause",
+                                             "the wallpaper copy it deletes could not be made: " + ec.message());
+            return;
+        }
+    }
+    if (!firstFrame(kMonitorFileGone, "DP-GONE", gonePath.string())) {
+        check(false, "the monitor whose file will be deleted is drawn first");
+        return;
+    }
+    {
+        std::error_code ec;
+        std::filesystem::remove(gonePath, ec);
+    }
+    g_unlinkGate.arm(CallGate::Mode::Hold, wallpaperx::crashRecordPath(state.path(), kMonitorFileGone).string());
+    resize("DP-GONE", kReportedWidth, kReportedHeight);
+    const bool atRemoval = g_unlinkGate.waitFired(kGateLimit);
+    check(atRemoval, "the failed redraw reaches the removal of its crash record");
+    if (atRemoval) {
+        const wallpaperx::MonitorStatus during = monitorStatus(manager, kMonitorFileGone);
+        // COVERAGE-ASSERT: the error must already be recorded when the thread is held, or "no frame
+        //       beside an error" would be true of a read that came before the error existed.
+        check(!during.lastError.empty(), "the failed redraw's error is already recorded when it is held");
+        const bool both = during.hasFrame && !during.lastError.empty();
+        check(!both, "a failed resize redraw is never observable with a frame beside its error");
+        if (both) std::fprintf(stderr, "  has_frame is true beside last_error: %s\n", during.lastError.c_str());
+    }
+    g_unlinkGate.release();
+    if (drained()) {
+        const wallpaperx::MonitorStatus after = monitorStatus(manager, kMonitorFileGone);
+        check(!after.lastError.empty() && !after.hasFrame, "once it has finished, the failed redraw has an error and no frame");
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -5322,6 +6103,14 @@ int main() {
         // entirely over the bus. Placed after the phase above for reading order only -- it
         // shares no state with it.
         runBufferReleaseWireChecks(config, imagePath, check);
+
+        // A screen's reported size. Each brings its own manager: the first over the bus, the next two
+        // on this thread, and the last with a render worker and no bus, so this thread can look while
+        // the worker is held inside its own image creation.
+        runOutputSizeWireChecks(config, imagePath, check);
+        runOutputSizeRestartRenderChecks(config, imagePath, check);
+        runResizeReleaseChecks(config, imagePath, check);
+        runResizeBarrierChecks(config, imagePath, check);
 
         // Its own manager and Device, scoped inside the call so both are torn down
         // before the validation warning count is read below.

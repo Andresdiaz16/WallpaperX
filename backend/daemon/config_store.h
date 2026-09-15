@@ -7,11 +7,20 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
 
 namespace wallpaperx {
+
+// A screen's size in device pixels as its desktop draws it, rotation and scaling applied.
+struct OutputSize {
+    uint32_t width = 0;
+    uint32_t height = 0;
+
+    bool operator==(const OutputSize&) const = default;
+};
 
 // One monitor's wallpaper as it survives a restart; nothing about the current run is kept.
 // `output` is the connector name -- "DP-3" -- and may ride on a row with no type or path: a
@@ -22,6 +31,10 @@ struct PersistedWallpaper {
     std::string type;
     std::string path;
     std::string output;
+
+    // What `output`'s screen last reported. A fact about that name, so it is written only
+    // beside it.
+    std::optional<OutputSize> outputSize;
 };
 
 // Not a fit -- real names run under a dozen bytes -- but a finite bound on a string a
@@ -41,6 +54,23 @@ inline std::string outputNameError(std::string_view name) {
     // dump() throws on invalid UTF-8, so a name that reached the file and could not be
     // written would cost the user every other entry in it.
     if (!isValidUtf8(name)) return "output name is not valid UTF-8";
+    return {};
+}
+
+// Per axis. Above every shipping panel, and the Vulkan Roadmap 2022 floor for a 2D image, so a
+// size accepted here is one the render device can create rather than a GPU failure recorded
+// against the daemon on a peer's say-so.
+constexpr uint32_t kMaxOutputDimension = 8192;
+
+// Why a reported screen size is unusable, or empty when it is fine. Shared by
+// WallpaperManager::setOutputSize and WallpaperManager::restoreSaved, like outputNameError.
+inline std::string outputSizeError(const OutputSize& size) {
+    if (size.width == 0 || size.height == 0 || size.width > kMaxOutputDimension ||
+        size.height > kMaxOutputDimension) {
+        return "output size must be 1 to " + std::to_string(kMaxOutputDimension) +
+               " pixels on each side, got " + std::to_string(size.width) + "x" +
+               std::to_string(size.height);
+    }
     return {};
 }
 
