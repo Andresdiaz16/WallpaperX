@@ -55,6 +55,16 @@ public:
     // throw this pipeline is not usable.
     bool renderNext(OffscreenTargetManager& targets, const OffscreenTarget& target);
 
+    // The two halves of that call, for a caller that must decide between them whether this picture
+    // may be shown at all: decodeNext() touches no target, so a caller holding a picture may still
+    // abandon it, and draw() is one blit.
+    //
+    // decodeNext() answers as renderNext() does and throws as it does. draw() shows the picture
+    // decodeNext() last converted, throws std::logic_error when there is none, and otherwise throws
+    // as renderNext() does.
+    bool decodeNext();
+    void draw(OffscreenTargetManager& targets, const OffscreenTarget& target);
+
 private:
     // Built and replaced together, so the renderer never outlives the image it shows.
     struct Stage {

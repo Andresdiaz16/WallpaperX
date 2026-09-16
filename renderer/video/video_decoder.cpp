@@ -362,13 +362,34 @@ bool VideoDecoder::deviceHealthy() {
     }
 }
 
+// The same question as deviceHealthy(), from a destructor. Anything the probe throws is an
+// unhealthy answer: the alternative is entering ffmpeg's unbounded wait from a noexcept path.
+bool VideoDecoder::decodeWorkCanDrain() noexcept {
+    try {
+        return deviceHealthy();
+    } catch (...) {
+        return false;
+    }
+}
+
 // Freeing the codec and the frames contexts frees their image pools once no frame is out, and
-// ffmpeg waits without bound on every image's semaphore first. Those are what own the pools, so
-// they are all that is leaked; the scratch objects and a software codec hold no GPU work. Nor does
-// a hardware codec with no context held: ffmpeg's Vulkan decoder references its frames context.
+// ffmpeg waits without bound on every image's semaphore first, then on its own decode work. Those
+// are what own the pools, so they are all that is leaked; the scratch objects and a software codec
+// hold no GPU work. Nor does a hardware codec with no context held: ffmpeg's Vulkan decoder
+// references its frames context.
+//
+// A bounded question in front of each wait, and either answering no leaks instead: this runs on
+// the daemon's one GPU thread with its lock held, so a hang here stops every monitor's frames.
 void VideoDecoder::closeDecoder() noexcept {
     av_frame_free(&m_frame);
-    if (!m_framesContexts.empty() && !m_device.safeToFree("the video decoder's images")) {
+    // ffmpeg's Vulkan decoder references the frames context it decodes into, so a hardware codec
+    // with none held has no decode work to wait on and must not be made to pay the probe: a
+    // decoder refused before it decoded anything tears down touching the GPU not at all.
+    const bool decodeWorkHeld =
+        !m_framesContexts.empty() &&
+        ((m_codec != nullptr && m_codec->hw_device_ctx != nullptr) || m_retiredCodec.has_value());
+    if ((!m_framesContexts.empty() && !m_device.safeToFree("the video decoder's images")) ||
+        (decodeWorkHeld && !decodeWorkCanDrain())) {
         if (m_codec != nullptr && m_codec->hw_device_ctx != nullptr) m_codec = nullptr;
         m_retiredCodec.reset();
         m_framesContexts.clear();
@@ -476,7 +497,14 @@ void VideoDecoder::openDecoder() {
     m_codec->flags |= AV_CODEC_FLAG_COPY_OPAQUE;
 
     if (hardware) {
-        attachDevice();
+        if (!attachDevice()) {
+            // Never software on this context: it was opened for the device -- single-threaded, and
+            // for AV1 a decoder with no software output of its own. attachDevice() settled the
+            // path, so this opens again on ffmpeg's default decoder.
+            avcodec_free_context(&m_codec);
+            openDecoder();
+            return;
+        }
         m_codec->get_buffer2 = &VideoDecoder::allocatePicture;
     }
 
@@ -637,7 +665,7 @@ void VideoDecoder::recordLanding() {
     seeked->landing = atOrBefore && (keyframe || !first) ? Landing::NothingPast : Landing::Unproven;
 }
 
-void VideoDecoder::attachDevice() {
+bool VideoDecoder::attachDevice() {
     BufferRef ref{av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_VULKAN)};
     if (ref.ref == nullptr) throwOutOfMemory("VideoDecoder");
     auto* context = reinterpret_cast<AVHWDeviceContext*>(ref.ref->data);
@@ -658,25 +686,42 @@ void VideoDecoder::attachDevice() {
 
     // ffmpeg never destroys a device it was given, so the Device outlives this context whatever
     // order they are freed in.
+    // Each refusal below is this ffmpeg and this driver declining, not the GPU failing, so the
+    // device is asked which it is -- the same question every refusal during decoding asks.
     if (const int err = av_hwdevice_ctx_init(ref.ref); err < 0) {
         if (err == AVERROR(ENOMEM)) throwOutOfMemory("VideoDecoder");
-        throw GpuFailure("VideoDecoder: ffmpeg cannot decode on " + m_device.info().gpuName + ": " +
-                         avErrorString(err));
+        if (!deviceHealthy()) {
+            throw GpuFailure("VideoDecoder: ffmpeg cannot decode on " + m_device.info().gpuName + " (" +
+                             avErrorString(err) + ") and the device no longer answers");
+        }
+        m_path = Path::SoftwareRefused;
+        return false;
     }
 
     m_videoFormatProperties = reinterpret_cast<PFN_vkGetPhysicalDeviceVideoFormatPropertiesKHR>(
         vkGetInstanceProcAddr(m_device.instance(), "vkGetPhysicalDeviceVideoFormatPropertiesKHR"));
     if (m_videoFormatProperties == nullptr) {
-        throw GpuFailure("VideoDecoder: " + m_device.info().gpuName +
-                         " enables VK_KHR_video_queue but has no vkGetPhysicalDeviceVideoFormatPropertiesKHR");
+        if (!deviceHealthy()) {
+            throw GpuFailure("VideoDecoder: " + m_device.info().gpuName +
+                             " enables VK_KHR_video_queue but has no "
+                             "vkGetPhysicalDeviceVideoFormatPropertiesKHR, and no longer answers");
+        }
+        m_path = Path::SoftwareRefused;
+        return false;
     }
     m_videoCapabilities = reinterpret_cast<PFN_vkGetPhysicalDeviceVideoCapabilitiesKHR>(
         vkGetInstanceProcAddr(m_device.instance(), "vkGetPhysicalDeviceVideoCapabilitiesKHR"));
     if (m_videoCapabilities == nullptr) {
-        throw GpuFailure("VideoDecoder: " + m_device.info().gpuName +
-                         " enables VK_KHR_video_queue but has no vkGetPhysicalDeviceVideoCapabilitiesKHR");
+        if (!deviceHealthy()) {
+            throw GpuFailure("VideoDecoder: " + m_device.info().gpuName +
+                             " enables VK_KHR_video_queue but has no vkGetPhysicalDeviceVideoCapabilitiesKHR, "
+                             "and no longer answers");
+        }
+        m_path = Path::SoftwareRefused;
+        return false;
     }
     m_codec->hw_device_ctx = ref.release();
+    return true;
 }
 
 // Asks the device whether it decodes this stream, through the query ffmpeg's own setup makes --

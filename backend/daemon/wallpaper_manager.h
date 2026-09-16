@@ -143,9 +143,18 @@ struct FrameHandle {
     int acquireFd = -1;
 };
 
-// The single answer to "can this build draw this type", so the render dispatch, the
-// GetFrameFd reason and the GetStatus field cannot drift apart.
-inline bool isRenderableType(const std::string& type) { return type == "static"; }
+// What a type is drawn with. The single answer to "can this build draw this type" too: a
+// renderable type is exactly one that names a drawer, so the render dispatch, the GetFrameFd
+// reason and the GetStatus field cannot drift apart.
+enum class Drawable { Still, Clip };
+
+inline std::optional<Drawable> drawableType(const std::string& type) {
+    if (type == "static") return Drawable::Still;
+    if (type == "video") return Drawable::Clip;
+    return std::nullopt;
+}
+
+inline bool isRenderableType(const std::string& type) { return drawableType(type).has_value(); }
 
 // The path a client may act on: the bytes as stored, or nothing when they are not valid
 // UTF-8 and so cannot be carried by JSON at all. Published beside the escaped `path`, which
@@ -160,7 +169,7 @@ enum class NoFrameReason {
     NotRendered,     // a request is recorded but no frame has committed -- still queued
                      // or still rendering. Temporary by definition: retrying is correct.
     RenderFailed,    // the last render was attempted and failed; lastError says why
-    Unsupported,     // the recorded type (video, shader) cannot be rendered by this build,
+    Unsupported,     // the recorded type (shader) cannot be rendered by this build,
                      // so no amount of waiting or retrying will produce a frame
     NoFreeImage,     // there IS a frame, but no image may be handed over: it would leave the
                      // producer nowhere to draw, or this consumer already holds its fill.
@@ -290,8 +299,8 @@ public:
 
     // Records a request; GPU-free. Throws InvalidRequest for a malformed one, and everything
     // that can only fail on the GPU fails later in renderPending(). The caller must then post
-    // the monitor to the render worker, non-static types included -- those still need their
-    // target released.
+    // the monitor to the render worker, types this build cannot draw included -- those still
+    // need their target released.
     void requestWallpaper(const std::string& type, const std::string& path, int monitorId);
 
     // Records the connector name a monitor is known by -- "DP-3". Throws InvalidRequest for a

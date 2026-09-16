@@ -4365,8 +4365,8 @@ void runCrossContainerDuplicateChecks() {
 
         // "hologram" is a type no build here knows, so its row is KEPT for a newer build rather
         // than applied -- which is what puts the two rows in different containers. A `video` row
-        // would not: this build knows that type and merely cannot draw it, so both rows would
-        // take the same arm and the collision the goal is about never arises.
+        // would not: this build knows that type and applies it, so both rows would take the same
+        // arm and the collision the goal is about never arises.
         nlohmann::json monitors = nlohmann::json::array();
         const nlohmann::json keptRow = configRow(3, "hologram", "/newer-build.holo", "");
         const nlohmann::json liveRow = configRow(3, "static", wallpaper.string(), "");

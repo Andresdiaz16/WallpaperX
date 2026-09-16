@@ -554,6 +554,67 @@ target_compile_definitions(wallpaperx-daemon-system-test PRIVATE
 # timeout thirty seconds later.
 add_dependencies(wallpaperx-daemon-system-test wallpaperx-daemon)
 
+# --------------------------------------------------------------------------- #
+# Step 13 Stage E1: a video wallpaper drawn by the daemon
+# --------------------------------------------------------------------------- #
+#
+# Its own binary rather than another phase of dbus_service_test, for one reason. On this GPU
+# ffmpeg's Vulkan decoder raises VUID-VkVideoBeginCodingInfoKHR-flags-07244 on every decode, so
+# any process that draws a video stops being able to grade "zero validation warnings" the way
+# that file does. This binary excuses that one message id -- by id, through the validation
+# layer's own filter, announced on every run -- and keeping it separate leaves dbus_service_test's
+# oracle exactly as strict as it was.
+set(WALLPAPERX_BACKEND_VIDEO_ASSET_DIR ${CMAKE_CURRENT_BINARY_DIR}/video_assets)
+find_program(WALLPAPERX_FFMPEG_EXECUTABLE ffmpeg)
+if(WALLPAPERX_FFMPEG_EXECUTABLE)
+    file(MAKE_DIRECTORY ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR})
+    # Four vertical bands over 320x120, drawn against a 64x48 monitor. Covering that monitor
+    # crops to the middle half, so a correct draw shows green then yellow and no red or blue at
+    # all: a stretch, a letterbox, an off-centre crop and a mirrored draw each put a band where
+    # the check does not expect one. Tagged with setparams rather than -color_*, which libx264
+    # drops silently -- the same trap renderer/CMakeLists.txt records for its own fixtures.
+    add_custom_command(
+        OUTPUT ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_bands.mp4
+        COMMAND ${WALLPAPERX_FFMPEG_EXECUTABLE} -y -v error
+                -f lavfi -i color=c=black:size=320x240:rate=10:duration=1
+                -vf "drawbox=x=0:y=0:w=320:h=60:color=0xFF0000@1:t=fill,drawbox=x=0:y=60:w=320:h=60:color=0x00FF00@1:t=fill,drawbox=x=0:y=120:w=320:h=60:color=0xFFFF00@1:t=fill,drawbox=x=0:y=180:w=320:h=60:color=0x0000FF@1:t=fill,format=yuv420p,setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv"
+                -c:v libx264 -profile:v baseline -g 5 -pix_fmt yuv420p
+                ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_bands.mp4
+        COMMENT "Generating video wallpaper fixture wallpaper_bands.mp4"
+        VERBATIM
+    )
+    add_custom_target(wallpaperx-backend-video-fixtures
+                      DEPENDS ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_bands.mp4)
+else()
+    message(STATUS "  ffmpeg CLI: not found -- the video wallpaper fixture is not generated, and "
+                   "video_wallpaper will report itself to ctest as a skip rather than a pass")
+endif()
+
+add_executable(wallpaperx-video-wallpaper-test tests/video_wallpaper_test.cpp)
+target_link_libraries(wallpaperx-video-wallpaper-test PRIVATE wallpaperx-daemon-lib)
+# renderer/tests for the shared probe scaffolding: the frame mapper, the cover-crop
+# expectation, the PNG fixture writer and the validation grade.
+target_include_directories(wallpaperx-video-wallpaper-test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../renderer/tests)
+# Its own asset directory, not the one dbus_service_test and http_server_test share: this
+# entry holds no lock with them, and a directory-scoped fixture written by one while another
+# reads it is how a parallel ctest turns into a failure that looks like a defect.
+target_compile_definitions(wallpaperx-video-wallpaper-test PRIVATE
+    WALLPAPERX_TEST_IMAGE_DIR="${CMAKE_CURRENT_BINARY_DIR}/video_test_assets"
+    WALLPAPERX_VIDEO_ASSET_DIR="${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}")
+if(WALLPAPERX_FFMPEG_EXECUTABLE)
+    add_dependencies(wallpaperx-video-wallpaper-test wallpaperx-backend-video-fixtures)
+endif()
+
+# The HTTP tier reads the same clip, for the one thing only it can answer: what /health says about a
+# monitor showing a video. Attached here rather than at that target's own definition because the
+# fixture directory is not known until this point in the file.
+target_compile_definitions(wallpaperx-http-server-test PRIVATE
+    WALLPAPERX_VIDEO_ASSET_DIR="${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}")
+if(WALLPAPERX_FFMPEG_EXECUTABLE)
+    add_dependencies(wallpaperx-http-server-test wallpaperx-backend-video-fixtures)
+endif()
+
 # These targets have no Q_OBJECT / Qt usage; AUTOMOC is on globally via
 # qt_standard_project_setup(), so turn it off here to skip a pointless moc step.
 if(WALLPAPERX_BUILD_KDE_PLUGIN)
@@ -561,6 +622,7 @@ if(WALLPAPERX_BUILD_KDE_PLUGIN)
                           wallpaperx-daemon-system-test wallpaperx-http-server-test
                           wallpaperx-log-escape-test wallpaperx-config-store-test
                           wallpaperx-kpackage-metadata-test wallpaperx-qml-lint-test
+                          wallpaperx-video-wallpaper-test
         PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
 endif()
 
@@ -824,6 +886,33 @@ if(DBUS_RUN_SESSION)
                  COMMAND ${DBUS_RUN_SESSION} -- $<TARGET_FILE:wallpaperx-daemon-system-test>)
         set_tests_properties(daemon_system_lavapipe PROPERTIES
             ENVIRONMENT "VK_ICD_FILENAMES=${WALLPAPERX_LAVAPIPE_ICD}"
+            LABELS "lavapipe"
+            RESOURCE_LOCK wallpaperx_bus_tests
+            SKIP_RETURN_CODE 77)
+    endif()
+
+    # Step 13 Stage E1: a `video` wallpaper drawn end to end. Private bus and the shared
+    # RESOURCE_LOCK for the same reasons the entries above carry them -- it renders, and it
+    # requests the same well-known name. SKIP_RETURN_CODE because two things it needs can be
+    # absent: the ffmpeg command line that generates its fixture, and a host whose Vulkan
+    # stack comes up at all; neither may read as a pass.
+    add_test(NAME video_wallpaper
+             COMMAND ${DBUS_RUN_SESSION} -- $<TARGET_FILE:wallpaperx-video-wallpaper-test>)
+    set_tests_properties(video_wallpaper PROPERTIES
+        ENVIRONMENT "WALLPAPERX_FORCE_TIER="
+        RESOURCE_LOCK wallpaperx_bus_tests
+        SKIP_RETURN_CODE 77)
+
+    # The lavapipe twin earns its place on pixels, not on driver coverage: this GPU exports
+    # OPAQUE_FD, which no client can map, so the check that the picture is cover-cropped is
+    # answerable only where the export is a LINEAR dma_buf. The default entry still grades
+    # everything else and says out loud that it skipped the pixels. It is also a software
+    # decode, which is the other half of the decoder this daemon may be handed.
+    if(WALLPAPERX_LAVAPIPE_ICD)
+        add_test(NAME video_wallpaper_lavapipe
+                 COMMAND ${DBUS_RUN_SESSION} -- $<TARGET_FILE:wallpaperx-video-wallpaper-test>)
+        set_tests_properties(video_wallpaper_lavapipe PROPERTIES
+            ENVIRONMENT "VK_ICD_FILENAMES=${WALLPAPERX_LAVAPIPE_ICD};WALLPAPERX_FORCE_TIER="
             LABELS "lavapipe"
             RESOURCE_LOCK wallpaperx_bus_tests
             SKIP_RETURN_CODE 77)

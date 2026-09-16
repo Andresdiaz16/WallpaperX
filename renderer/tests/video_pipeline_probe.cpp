@@ -581,9 +581,12 @@ void runSequenceChecks(Device& device, const std::string& label, bool onDevice) 
     //       decode that never touches VideoDecoder. A blit submitted first shows the previous picture
     //       (black on the first), which only a per-call identity sees; a frame count cannot. Reading
     //       back adds a wait after the call, never inside it, so the order graded is the pipeline's.
-    // CONTROL: each reverted. renderer/video/video_pipeline.cpp renderNext() rendering before converting:
-    //       every fixture red on both paths and both drivers, "call 1 showed -1 where 0 was due; 0 shown
-    //       more than once, 1 never shown, 1 unreadable". renderer/video/video_decoder.cpp admit()
+    // CONTROL: each reverted. The convert now lives in renderer/video/video_pipeline.cpp decodeNext() and
+    //       the blit in draw(), so "rendering before converting" is renderNext() calling draw() first.
+    //       Re-run there 2026-09-15: all four fixtures red on the host path, "the pipeline threw after 0
+    //       pictures: VideoPipeline::draw: no picture has been decoded" -- the split turned what used to
+    //       show a stale picture into a throw, which is why this text no longer says "call 1 showed -1".
+    //       renderer/video/video_decoder.cpp admit()
     //       dropping, outside a resume, a picture whose timestamp is not above the last returned:
     //       counter_jump.ts "60 pictures shown against 120", counter_repeat.mkv "30 pictures shown
     //       against 60"; the rising and untimestamped fixtures stayed green.
@@ -978,10 +981,12 @@ void runShapeChecks(Device& device, const std::string& label) {
     // WHY-THIS-SHAPE: a counter drawn at both sizes and read back after every call. Black reads as
     //       unreadable, so "never black" needs no separate check. This entry is the software path; the
     //       hardware path is the shape-device entry's, S13.80 onwards.
-    // CONTROL: renderer/video/video_pipeline.cpp renderNext(), each reverted, both drivers. The stage
-    //       built only for the first picture: "the pipeline threw after 30 pictures: FrameConverter: the
-    //       frame's picture differs". Rendering before converting: "2 never shown, 2 unreadable" -- black
-    //       on the first call and again at the size change.
+    // CONTROL: renderer/video/video_pipeline.cpp, each reverted. The stage build moved to decodeNext();
+    //       built only for the first picture there, re-observed on this entry 2026-09-15: "the pipeline
+    //       threw after 30 pictures: FrameConverter: the frame's picture differs from the one this
+    //       converter was built for". The rendering-before-converting mutation is now renderNext()
+    //       drawing before it decodes, which throws on the FIRST call rather than showing black; that was
+    //       re-observed on the sequence entry, not re-run here.
     // COVERAGE-ASSERT: the independent decode shows two picture widths -- red with a single-size stream
     //       substituted, "the resize fixture does not change size".
     if (reference->widths.size() != 2) {
@@ -1385,8 +1390,12 @@ void runShapeDeviceFixture(Device& device, const std::string& label, const SizeC
     //       failed-parameters refusal throwing WallpaperContentError: the declined HEVC alone, "the pipeline
     //       threw after 28 pictures" and "raised WallpaperContentError"; the AV1 declines, made in
     //       allocatePicture(), stayed green.
-    //       renderer/video/video_pipeline.cpp renderNext() rendering before converting, reverted: all nine,
-    //       "call 1 showed -1 where 0 was due; 0 shown more than once, 3 never shown, 3 unreadable".
+    //       renderer/video/video_pipeline.cpp's rendering-before-converting mutation is now renderNext()
+    //       calling draw() before decodeNext(); since the split, draw() with nothing decoded throws
+    //       instead of showing a stale picture, so the recorded "call 1 showed -1" no longer describes it.
+    //       Re-observed 2026-09-15 on the software sequence entry ("the pipeline threw after 0 pictures:
+    //       VideoPipeline::draw: no picture has been decoded"); these forked per-fixture device runs were
+    //       not repeated for it.
     // CONTROL (S13.88): renderer/video/video_decoder.cpp holds(), each reverted. Without its minimum-size
     //       test: counter_tiny.obu "no picture at the declined size was decoded in software" and "20 Vulkan
     //       validation warning(s)", VUID-VkVideoBeginCodingInfoKHR-pPictureResource-07243 and
@@ -2270,15 +2279,18 @@ void runSteadyChecks(Device& device, const std::string& label, bool onDevice) {
     if (!haveAsset(file, label)) return;
 
     // GOAL: S13.67 -- once its stage exists, a call creates no Vulkan object and waits on nothing.
-    // WHY-THIS-SHAPE: counted at this executable's Vulkan symbols during renderNext() alone. The
+    // WHY-THIS-SHAPE: counted at this executable's Vulkan symbols during renderNext() alone -- which since
+    //       the split is decodeNext() and draw() together, so both halves are inside the count. The
     //       queue is drained before each counted call, so a wait inside it is the pipeline's and not
     //       one a slow GPU forced: FrameConverter's host path waits when two uploads are still in
     //       flight, and counting across an undrained queue would grade the scheduler. The first calls
     //       are left out because the Device's fence and command buffer pool grows to its most batches.
-    // CONTROL: renderer/video/video_pipeline.cpp renderNext(), each reverted, on the device path, the
-    //       host path and Lavapipe. Device::waitForSubmissions() after the render: "318 steady calls made
-    //       vkWaitForFences x318" on all three (fewer where nothing is pending). The stage rebuilt on every
-    //       call: "vkCreateImage x954, vkCreateImageView x1272, ..." on the device path.
+    // CONTROL: renderer/video/video_pipeline.cpp, each reverted. Both mutations moved with the split and
+    //       were re-run at their new homes 2026-09-15, on the host path; the device and Lavapipe runs were
+    //       not repeated this round. Device::waitForSubmissions() after the render, now in draw(): "318
+    //       steady calls made vkWaitForFences x318". The stage rebuilt on every call, now in decodeNext():
+    //       "318 steady calls made vkCreateImage x1272, vkCreateImageView x1272, vkCreateBuffer x636,
+    //       vkCreateSampler x318, ... vkWaitForFences x317".
     // COVERAGE-ASSERT: the first call, which builds the stage, must be seen creating and waiting -- red
     //       with counting never switched on, "the first call was seen making none" -- and 300 calls
     //       counted, red on the 20-picture fixture, "only 17 calls counted".
@@ -3018,6 +3030,147 @@ void runLoopFileChecks(Device& device, const std::string& label) {
 }
 
 // ------------------------------------------------------------------------- //
+// The two halves the daemon drives: decode, then draw
+// ------------------------------------------------------------------------- //
+
+void runHalvesChecks(Device& device, const std::string& label, bool onDevice) {
+    if (onDevice ? !hardwareDecoderPresent(device, label) : !videoExtensionsHidden(device, label)) return;
+    const char* const file = "counter_short.mp4";
+    const std::optional<CounterReference> reference = counterReference(label, file);
+    if (!reference) return;
+    if (reference->ids.size() < 3) {
+        fail("the halves fixture has fewer than three pictures, so the target cannot be watched across a decode");
+        return;
+    }
+
+    // GOAL: S13.120 -- the sequence the daemon uses. decodeNext() then draw() shows the picture that
+    //       decodeNext() decoded; decodeNext() on its own writes to NO target, so a caller that decides
+    //       not to show the picture leaves what is on screen untouched; draw() before anything has been
+    //       decoded throws std::logic_error rather than drawing whatever the target held; and
+    //       renderNext() is still exactly the two composed.
+    // WHY-THIS-SHAPE: what is watched across the lone decode is whether the target is PUBLISHED, not
+    //       what its pixels hold. Reading the pixels is the obvious version and it cannot be written:
+    //       the readback reclaims the published frame, and a target may be reclaimed once per render,
+    //       so a second read with no draw between throws rather than answering. Publication is the
+    //       property anyway -- only render() publishes, so a decodeNext() that drew anywhere would leave
+    //       the target published, and one that did not cannot. renderNext() is run over the same fixture
+    //       in a pipeline of its own and its sequence compared, rather than trusting that it delegates:
+    //       "composed of the two" is a claim about output, not about code.
+    // CONTROL: renderer/video/video_pipeline.cpp, each reverted -- observed below. The untouched-target
+    //       check has no production mutation that expresses it: decodeNext() takes no target and so
+    //       cannot be made to draw into one. Its control is in this harness -- renderNext() substituted
+    //       for that one decodeNext() call, which publishes and reddens it -- and that is recorded here
+    //       rather than left to look like an unreddened check.
+    // COVERAGE-ASSERT: the picture drawn after the lone decode is asserted to be the NEXT one, so a
+    //       readback that had stopped distinguishing pictures (which would make the sequence checks
+    //       trivially true) fails here instead of passing there.
+    std::string threw;
+    bool drawBeforeDecodeThrew = false;
+    std::string otherThrow;
+    bool decodedFirst = false;
+    bool decodedSecond = false;
+    bool publishedAfterLoneDecode = true;
+    bool publishedAfterDraw = false;
+    int afterFirstDraw = -2;
+    int afterSecondDraw = -2;
+    std::vector<int> halves;
+    std::vector<int> composed;
+    try {
+        OffscreenTargetManager targets(device);
+        const OffscreenTarget& target = targets.create(1, kTargetWidth, kTargetHeight);
+        const auto shown = [&] {
+            return wallpaperx::testing::counterFromBgra(
+                wallpaperx::testing::reclaimAndReadback(device, targets, target), target.width, target.height);
+        };
+        {
+            VideoPipeline pipeline(device, asset(file), kShaderDir, VideoPipeline::Playback::Once);
+            try {
+                pipeline.draw(targets, target);
+            } catch (const std::logic_error&) {
+                drawBeforeDecodeThrew = true;
+            } catch (const std::exception& e) {
+                otherThrow = e.what();
+            }
+
+            decodedFirst = pipeline.decodeNext();
+            if (decodedFirst) {
+                pipeline.draw(targets, target);
+                afterFirstDraw = shown();
+                halves.push_back(afterFirstDraw);
+
+                // Decoded and converted, deliberately not drawn: what the daemon does for a pass it may
+                // still abandon. shown() above reclaimed the frame the draw published, so the target is
+                // unpublished here and only a draw can publish it again.
+                decodedSecond = pipeline.decodeNext();
+                if (decodedSecond) {
+                    publishedAfterLoneDecode = target.published();
+                    pipeline.draw(targets, target);
+                    publishedAfterDraw = target.published();
+                    afterSecondDraw = shown();
+                    halves.push_back(afterSecondDraw);
+                    while (pipeline.decodeNext()) {
+                        pipeline.draw(targets, target);
+                        halves.push_back(shown());
+                    }
+                }
+            }
+        }
+        {
+            VideoPipeline composedPipeline(device, asset(file), kShaderDir, VideoPipeline::Playback::Once);
+            while (composedPipeline.renderNext(targets, target)) composed.push_back(shown());
+        }
+    } catch (const std::exception& e) {
+        threw = e.what();
+    }
+    if (!threw.empty()) {
+        std::fprintf(stderr, "FAIL: %s: %s: the two-halves run threw: %s\n", label.c_str(), file, threw.c_str());
+        fail("driving the pipeline through decodeNext() and draw() threw");
+        return;
+    }
+    if (!decodedFirst) {
+        std::fprintf(stderr, "FAIL: %s: %s: decodeNext() returned no picture at all\n", label.c_str(), file);
+        fail("the halves run decoded nothing, so nothing below was exercised");
+        return;
+    }
+
+    check(drawBeforeDecodeThrew, "draw() before any picture has been decoded throws std::logic_error");
+    if (!drawBeforeDecodeThrew) {
+        std::fprintf(stderr, "  it threw %s instead\n", otherThrow.empty() ? "nothing" : otherThrow.c_str());
+    }
+    if (!decodedSecond) {
+        std::fprintf(stderr, "FAIL: %s: %s: only one picture was decoded, so the lone decode was never made\n",
+                     label.c_str(), file);
+        fail("the halves run never reached a decode with no draw after it");
+        return;
+    }
+    check(!publishedAfterLoneDecode, "decodeNext() publishes no frame: it writes to no target at all");
+    // The other half of that claim, and what keeps it from being true of a decode that did nothing:
+    // the very next draw does publish.
+    check(publishedAfterDraw, "and the draw that follows it does publish one");
+    const bool thenShown = afterSecondDraw == reference->ids[1];
+    check(thenShown, "and the draw that follows shows the picture that decode had decoded");
+    if (!thenShown) {
+        std::fprintf(stderr, "  the draw after it showed %d where picture %d was due\n", afterSecondDraw,
+                     reference->ids[1]);
+    }
+    const bool everyPicture = halves == reference->ids;
+    check(everyPicture, "decodeNext() then draw() shows every picture once, in order");
+    if (!everyPicture) {
+        std::fprintf(stderr, "  %zu pictures shown against %zu\n", halves.size(), reference->ids.size());
+    }
+    const bool sameAsComposed = composed == halves;
+    check(sameAsComposed, "renderNext() shows exactly what the two halves show, in the same order");
+    if (!sameAsComposed) {
+        std::fprintf(stderr, "  renderNext() showed %zu pictures, the halves %zu\n", composed.size(), halves.size());
+    }
+    if (everyPicture && sameAsComposed) {
+        std::printf("%s: %s: %zu pictures through decodeNext()+draw() and the same %zu through renderNext(); the "
+                    "target held picture %d across a decode\n",
+                    label.c_str(), file, halves.size(), composed.size(), afterFirstDraw);
+    }
+}
+
+// ------------------------------------------------------------------------- //
 // Playing once, and a looping stream with nothing to show
 // ------------------------------------------------------------------------- //
 
@@ -3082,8 +3235,10 @@ void runPlayOnceChecks(Device& device, const std::string& label) {
     // WHY-THIS-SHAPE: every packet is refused as damaged, which the decoder skips, so the stream ends
     //       with nothing shown. What is graded is that no seek or open follows: returning false is not
     //       enough, since a restarted empty stream returns false too.
-    // CONTROL: renderer/video/video_pipeline.cpp renderNext() restarting without a stage, reverted: "first
-    //       call decoded 0 picture(s), seeks to -2048".
+    // CONTROL: the restart moved to renderer/video/video_pipeline.cpp decodeNext(); with its `&& m_stage`
+    //       dropped there, re-observed 2026-09-15: "a looping pipeline that has shown nothing started its
+    //       stream again instead of reporting the end", printing "first call decoded 0 picture(s), seeks
+    //       to -2048". Reverted.
     // COVERAGE-ASSERT: packets were refused -- red with the refusal never switched on.
     g_packetsRefused = 0;
     LoopPlan plan;
@@ -3713,7 +3868,8 @@ int main(int argc, char** argv) {
         "sequence-device",   "sequence-host", "resume-timestamps", "resume-no-timestamps", "resume-late-seek",
         "resume-end",        "resume-seek-failure", "resume-drop-count", "shape", "shape-device",
         "steady-device",     "steady-host",   "loop-device",       "loop-host",  "loop-cost-device",
-        "loop-cost-host",    "loop-resume",   "release-device",    "retire-device"};
+        "loop-cost-host",    "loop-resume",   "release-device",    "retire-device",
+        "halves-device",     "halves-host"};
     if (std::find(modes.begin(), modes.end(), mode) == modes.end()) {
         std::fprintf(stderr, "usage: %s <mode>, one of:", argv[0]);
         for (const std::string& m : modes) std::fprintf(stderr, " %s", m.c_str());
@@ -3774,7 +3930,7 @@ int main(int argc, char** argv) {
     }
 
     return runGraded(label, mode == "sequence-host" || mode == "shape" || mode == "steady-host" || mode == "loop-host" ||
-                                mode == "loop-cost-host",
+                                mode == "loop-cost-host" || mode == "halves-host",
                      [&](Device& device) {
                          if (mode == "sequence-device") runSequenceChecks(device, label, /*onDevice=*/true);
                          if (mode == "sequence-host") runSequenceChecks(device, label, /*onDevice=*/false);
@@ -3785,6 +3941,8 @@ int main(int argc, char** argv) {
                          if (mode == "resume-seek-failure") runSeekFailureChecks(device, label);
                          if (mode == "resume-drop-count") runDropCountChecks(device, label);
                          if (mode == "shape") runShapeChecks(device, label);
+                         if (mode == "halves-device") runHalvesChecks(device, label, /*onDevice=*/true);
+                         if (mode == "halves-host") runHalvesChecks(device, label, /*onDevice=*/false);
                          if (mode == "steady-device") runSteadyChecks(device, label, /*onDevice=*/true);
                          if (mode == "steady-host") runSteadyChecks(device, label, /*onDevice=*/false);
                          if (mode == "loop-host") {

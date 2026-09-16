@@ -71,8 +71,10 @@ constexpr int kCrashedMonitor = 0;      // a stamped record naming exactly what 
 constexpr int kMovedOnMonitor = 1;      // a record naming a wallpaper this row no longer holds
 constexpr int kKilledMonitor = 2;       // a record with no signal: the process was killed
 constexpr int kOtherTypeMonitor = 3;    // a record naming another type for the same path
-constexpr int kUnsupportedMonitor = 4;  // a video row -- this build renders no video -- and a
+constexpr int kUnsupportedMonitor = 4;  // a shader row -- this build renders no shader -- and a
                                         // stale record beside it
+constexpr int kVideoMonitor = 5;        // a video row -- a type this build DOES draw since Step 13
+                                        // Stage E1 -- with a record naming exactly what it is set to
 
 // Small: every render here is a software rasteriser on some hosts, and nothing grades pixels.
 constexpr uint32_t kWidth = 64;
@@ -207,14 +209,19 @@ int main() {
     const std::filesystem::path stateDir = root / "state" / "wallpaperx";
     const std::filesystem::path configFile = root / "config" / "wallpaperx" / "config.json";
 
-    std::string crashedImage, movedOnImage, killedImage, otherTypeImage, videoRow, notAnImage;
+    std::string crashedImage, movedOnImage, killedImage, otherTypeImage, shaderRow, videoRow, notAnImage;
     try {
         crashedImage = wallpaperx::testing::writeGradientPng((root / "crashed.png").string(), 16, 16);
         movedOnImage = wallpaperx::testing::writeGradientPng((root / "moved-on.png").string(), 16, 16);
         killedImage = wallpaperx::testing::writeGradientPng((root / "killed.png").string(), 16, 16);
         otherTypeImage = wallpaperx::testing::writeGradientPng((root / "other-type.png").string(), 16, 16);
-        videoRow = (root / "clip.mp4").string();
-        writeText(videoRow, "not really a video, and this build renders none");
+        shaderRow = (root / "unrenderable.frag").string();
+        writeText(shaderRow, "not really a shader, and this build renders none");
+        // Deliberately not a real video. A refused row is never opened, so its bytes are never
+        // read -- and if the refusal ever stopped working, the daemon would open this file, which
+        // is exactly what the watch below reports.
+        videoRow = (root / "quarantined.mp4").string();
+        writeText(videoRow, "not really a video; a refused row never gets as far as opening it");
         notAnImage = (root / "text.png").string();
         writeText(notAnImage, "this is not a PNG");
     } catch (const std::exception& e) {
@@ -227,7 +234,8 @@ int main() {
                               {kMovedOnMonitor, "static", movedOnImage},
                               {kKilledMonitor, "static", killedImage},
                               {kOtherTypeMonitor, "static", otherTypeImage},
-                              {kUnsupportedMonitor, "video", videoRow},
+                              {kUnsupportedMonitor, "shader", shaderRow},
+                              {kVideoMonitor, "video", videoRow},
                           }));
 
     plantRecord(stateDir, kCrashedMonitor, "static", crashedImage, SIGSEGV);
@@ -235,7 +243,8 @@ int main() {
                 SIGSEGV);
     plantRecord(stateDir, kKilledMonitor, "static", killedImage, std::nullopt);
     plantRecord(stateDir, kOtherTypeMonitor, "video", otherTypeImage, SIGSEGV);
-    plantRecord(stateDir, kUnsupportedMonitor, "video", (root / "another-clip.mp4").string(), SIGSEGV);
+    plantRecord(stateDir, kUnsupportedMonitor, "shader", (root / "another.frag").string(), SIGSEGV);
+    plantRecord(stateDir, kVideoMonitor, "video", videoRow, SIGSEGV);
 
     WallpaperManager::Config config;
     config.configFile = configFile;
@@ -246,7 +255,7 @@ int main() {
     try {
         WallpaperManager manager(config);
         const std::vector<int> restored = manager.restoreSaved();
-        check(restored.size() == 5, "every saved monitor is posted for a pass, refused or not");
+        check(restored.size() == 6, "every saved monitor is posted for a pass, refused or not");
 
         // ------------------------------------------------------------------ //
         // What the restore decided, before anything renders
@@ -317,6 +326,19 @@ int main() {
             const std::optional<wallpaperx::MonitorStatus> otherType = monitor(snap, kOtherTypeMonitor);
             check(otherType.has_value() && otherType->lastError.empty() && otherType->renderOutstanding,
                   "a monitor whose record names another type for the same file is applied as normal");
+
+            // The refusal is about the record, not about the type: a `video` row matching its record is
+            // refused on the same three counts the static row above is. See the quarantine-clause block
+            // further down for the control and for why the file's bytes do not matter.
+            const std::optional<wallpaperx::MonitorStatus> video = monitor(snap, kVideoMonitor);
+            check(video.has_value() && !video->lastError.empty(),
+                  "a video row whose record matches its wallpaper is refused with a reason");
+            if (video.has_value()) {
+                check(video->lastError.find("SIGSEGV") != std::string::npos,
+                      "the video row's refusal names the signal the last run died of");
+                check(!video->hasFrame && !video->renderOutstanding,
+                      "and it has no frame and owes no render, exactly as the static row does");
+            }
         }
 
         // ------------------------------------------------------------------ //
@@ -325,6 +347,7 @@ int main() {
 
         OpenWatch crashedWatch(crashedImage);
         OpenWatch movedOnWatch(movedOnImage);
+        OpenWatch videoWatch(videoRow);
         if (!crashedWatch.ok() || !movedOnWatch.ok()) {
             notVerified("S13.13 and S13.15 (the not-decoded half)",
                         "inotify could not watch the fixture images on this host, so whether a file was "
@@ -382,6 +405,29 @@ int main() {
                              refusedOpens, controlOpens);
             }
 
+            // GOAL: S13.119's quarantine clause -- a `video` row whose record matches is refused at the
+            //       next start exactly as a static one is, and is never opened. Only falsifiable since
+            //       Step 13 Stage E1: before it, `video` was a type this build could not draw, so the
+            //       row was skipped for a reason that had nothing to do with the crash record.
+            // WHY-THIS-SHAPE: an open of the file, not a status field, for the reason above OpenWatch --
+            //       a build that reported the refusal and decoded anyway is the crash loop this exists to
+            //       stop, and it reports identically. The file is deliberately not a real video: a refused
+            //       row is never opened, so its bytes are never read, and a quarantine that stopped working
+            //       would open it, which is what this counts.
+            // CONTROL: in backend/daemon/wallpaper_manager.cpp, restoreSaved()'s `state.quarantined = crash
+            //       && ...` replaced with `= false` -> "FAIL: a video row whose record matches it is never
+            //       opened either", beside the static row's own failures. Observed 2026-09-15. Reverted.
+            if (videoWatch.ok()) {
+                const int videoOpens = videoWatch.drain();
+                check(videoOpens == 0, "a video row whose record matches it is never opened either");
+                if (videoOpens != 0) {
+                    std::fprintf(stderr, "  the refused video row was opened %d time(s)\n", videoOpens);
+                }
+            } else {
+                notVerified("S13.119's quarantine clause (the not-opened half)",
+                            "inotify could not watch the video row on this host");
+            }
+
             // The instrument, proved on the very file the check above reads. Runs whether or
             // not a GPU is present, so a run that could not render still says whether its
             // silence meant anything.
@@ -435,8 +481,8 @@ int main() {
         //       row no longer holds.
         // CONTROL: in backend/daemon/wallpaper_manager.cpp, the removeCrashRecord() call in the
         //       unsupported-type branch of WallpaperManager::renderPassLocked deleted -> "FAIL: a
-        //       stale record on an unrenderable row is removed by its pass". Re-observed 2026-09-14.
-        //       Reverted.
+        //       stale record on an unrenderable row is removed by its pass". Re-observed
+        //       2026-09-15 with the row a `shader`, red on both ICD entries. Reverted.
         check(!recordOnDisk(stateDir, kUnsupportedMonitor),
               "a stale record on an unrenderable row is removed by its pass");
 

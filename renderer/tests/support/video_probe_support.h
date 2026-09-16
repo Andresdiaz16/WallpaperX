@@ -8,6 +8,7 @@
 // excused, so there is one definition.
 
 #include "check.h"
+#include "decoder_message_id.h"
 #include "validation_grade.h"
 #include "vulkan/device.h"
 
@@ -24,10 +25,9 @@
 
 namespace wallpaperx::testing {
 
-// ffmpeg's Vulkan decoder binds one reference slot per DPB picture where this driver's profile
-// wants a single layered image. Reproducible with the stock `ffmpeg -hwaccel vulkan` command
-// line, so it is a defect in a dependency. Named exactly, so any other complaint still fails.
-inline constexpr const char* kExcusedDecoderMessageId = "VUID-VkVideoBeginCodingInfoKHR-flags-07244";
+// kExcusedDecoderMessageId -- the one message excused here, and why -- is support/decoder_message_id.h,
+// shared with backend/tests/video_wallpaper_test.cpp, which excuses the same id through the
+// validation layer's own filter.
 
 // A Device's validation messages graded with that one id excused, on a messenger of this
 // oracle's own. attach() right after the Device is built, detach() before it is destroyed,

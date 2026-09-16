@@ -224,8 +224,8 @@ void DbusService::setWallpaper(const std::string& type, const std::string& path,
         throw sdbus::Error(sdbus::Error::Name{kErrorRenderFailed}, e.what());
     }
 
-    // Posted for every accepted type, not just "static": video and shader requests still
-    // need their monitor's target released, and that is GPU work, so it belongs on the
+    // Posted for every accepted type, drawable or not: a type this build cannot render still
+    // needs its monitor's target released, and that is GPU work, so it belongs on the
     // worker rather than in this handler.
     m_worker.post(monitorId);
 }

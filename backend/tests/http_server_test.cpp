@@ -1786,7 +1786,88 @@ void runGpuFailureChecks(const std::string& bluePath, const WallpaperManager::Co
 // ---------------------------------------------------------------------------- //
 // Phase 2b -- the states /health has to be able to tell apart.
 // ---------------------------------------------------------------------------- //
-void runHealthStateChecks(const std::string& bluePath, const std::string& videoPath, const std::string& junkPath,
+// The clip backend/CMakeLists.txt generates for the video tier. A build with no ffmpeg command line
+// generates nothing, and the phase below reports a named skip rather than a pass.
+std::string videoClipPath() { return std::string(WALLPAPERX_VIDEO_ASSET_DIR) + "/wallpaper_bands.mp4"; }
+
+// ---------------------------------------------------------------------------- //
+// A monitor showing a video is not a monitor this build cannot render
+// ---------------------------------------------------------------------------- //
+//
+// GOAL: S13.122 -- /health does not call a `video` monitor unrenderable. Its per-monitor state is
+//       `showing` and the wallpapers check reads ok, exactly as for a still image. False for a
+//       build whose health classifier still treats video as a type it cannot draw -- which is what
+//       every build before Step 13 Stage E1 did, and which would paint a working wallpaper as a
+//       fault on any frontend reading /health.
+// WHY-THIS-SHAPE: a daemon of its own, with no config file and no state directory, because this
+//       records a monitor and renders it -- doing that on the run's shared manager would change
+//       what every later check in this file reads. The render is driven through the manager rather
+//       than over the bus so no worker is needed and the Device stays on this thread. `showing` is
+//       asserted rather than "not unsupported": the latter is equally true of a monitor reported as
+//       failed, which is the other way this could go wrong.
+// CONTROL: drawableType() in backend/daemon/wallpaper_manager.h with its `video` arm removed, which is
+//       the daemon one commit before Stage E1 -> "FAIL: a monitor set to a video is not reported as a
+//       type this build cannot render", printing /health's own body with monitor 0 in state
+//       "unsupported" and the detail "monitor 0 is set to a 'video' wallpaper, which this build cannot
+//       render". Observed 2026-09-15. Reverted. That mutation also leaves the monitor frameless, which
+//       is why the unsupported test above runs BEFORE the frameless skip -- ordered the other way, this
+//       control produced a skip instead of a failure.
+void runVideoHealthChecks(const Check& check) {
+    const char* kGoal = "S13.122 (/health does not call a video monitor unrenderable)";
+    const std::string clip = videoClipPath();
+    if (!std::filesystem::exists(clip)) {
+        notVerified(kGoal, "the video fixture " + clip + " was not generated, so nothing here can draw one");
+        return;
+    }
+    WallpaperManager::Config config;
+    config.width = kTargetWidth;
+    config.height = kTargetHeight;
+    IsolatedDaemon daemon(config);
+    if (!daemon.ready()) {
+        notVerified(kGoal, daemon.reason());
+        return;
+    }
+    daemon.manager().requestWallpaper("video", clip, 0);
+    daemon.manager().renderPending(0);
+
+    const WallpaperManager::Snapshot snap = daemon.manager().snapshot();
+    const auto it = snap.monitors.find(0);
+    if (it == snap.monitors.end()) {
+        check(false, "the video request was recorded on the video-health daemon");
+        return;
+    }
+    const HttpReply health = daemon.health();
+    if (!health.ok()) {
+        check(false, "the video daemon answered /health with a parseable 200");
+        return;
+    }
+    const std::string state = monitorState(health.json, 0);
+    // Read before the frameless case is excused, and it is what keeps the excuse from swallowing the
+    // defect: a build that cannot draw video has no frame here EITHER, so "no frame, so skip" would
+    // turn the very state this goal forbids into a silent skip. `unsupported` is the daemon's own
+    // answer about the type, so it separates "this build refuses video" from "this host could not
+    // render", which is the only case X.3 says to abstain on.
+    if (state == "unsupported") {
+        check(false, "a monitor set to a video is not reported as a type this build cannot render");
+        std::fprintf(stderr, "  /health calls monitor 0 unsupported; body: %s\n", health.body.c_str());
+        return;
+    }
+    if (!it->second.hasFrame) {
+        notVerified(kGoal, "the video did not render on this host: " +
+                               (it->second.lastError.empty() ? "no error was recorded" : it->second.lastError));
+        return;
+    }
+    check(state == "showing", "a monitor showing a video is reported as showing, not as unsupported");
+    check(healthCheckStatus(health.json, "wallpapers") == "ok",
+          "and the wallpapers check reads ok with a video on screen");
+    if (state != "showing") {
+        std::fprintf(stderr, "  monitor 0 reads '%s'; body: %s\n", state.c_str(), health.body.c_str());
+    }
+    std::printf("http_server_test: a video wallpaper -> monitor 0 reads '%s'\n", state.c_str());
+    std::fflush(stdout);
+}
+
+void runHealthStateChecks(const std::string& bluePath, const std::string& shaderPath, const std::string& junkPath,
                           const Check& check) {
     WallpaperManager::Config base;
     base.width = kTargetWidth;
@@ -1992,14 +2073,14 @@ void runHealthStateChecks(const std::string& bluePath, const std::string& videoP
             // renderPending returns early for a type this build cannot draw, before
             // ensureGpu, so this scenario needs no working Vulkan -- which is the point of
             // it being separate from the after-device phase that also covers the rule.
-            daemon.manager().requestWallpaper("video", videoPath, 0);
+            daemon.manager().requestWallpaper("shader", shaderPath, 0);
             daemon.manager().renderPending(0);
 
             const WallpaperManager::Snapshot snap = daemon.manager().snapshot();
             const auto it = snap.monitors.find(0);
             const HttpReply health = daemon.health();
             if (it == snap.monitors.end()) {
-                check(false, "the video request was recorded on the unsupported-type daemon");
+                check(false, "the shader request was recorded on the unsupported-type daemon");
             } else if (!health.ok()) {
                 check(false, "the unsupported-type daemon answered /health with a parseable 200");
             } else {
@@ -2040,7 +2121,7 @@ void runHealthStateChecks(const std::string& bluePath, const std::string& videoP
                 //       pending". All reverted.
                 // COVERAGE-ASSERT: the monitor is asserted to carry no lastError, so this
                 //       scenario cannot silently become a second copy of scenario (c) -- a
-                //       future requestWallpaper that recorded an error for `video` would
+                //       future requestWallpaper that recorded an error for `shader` would
                 //       otherwise leave this grading the failed-render path instead.
                 check(it->second.lastError.empty(),
                       "an unrenderable type leaves no error on the monitor, so `unsupported` cannot come from one");
@@ -4268,7 +4349,7 @@ void runOutputParamChecks(WallpaperManager& manager, httplib::Client& cli, const
 // Phase 4 -- /config cannot report a torn view of one monitor.
 // ---------------------------------------------------------------------------- //
 void runTornReadChecks(WallpaperManager& manager, httplib::Client& cli, const std::string& staticPath,
-                       const std::string& videoPath, const Check& check) {
+                       const std::string& shaderPath, const Check& check) {
     // GOAL: S7.3 -- /config and GetStatus cannot disagree about a monitor, which is
     //       false if either reads the same state through separate lock acquisitions that
     //       another writer can commit between. This half establishes the *reader* side:
@@ -4279,7 +4360,7 @@ void runTornReadChecks(WallpaperManager& manager, httplib::Client& cli, const st
     //       happen to agree, and cannot see a torn read at all. So a writer thread flips
     //       one monitor between two states that differ in BOTH fields, and every response
     //       is classified: a response is valid only if it is wholly one state or wholly
-    //       the other. ("static", videoPath) is unreachable under any interleaving of a
+    //       the other. ("static", shaderPath) is unreachable under any interleaving of a
     //       correct implementation, because requestWallpaper writes both fields under one
     //       m_stateMutex acquisition -- so this is an invariant, not a claim about
     //       scheduling (X.2). The writer drives WallpaperManager directly rather than
@@ -4288,8 +4369,10 @@ void runTornReadChecks(WallpaperManager& manager, httplib::Client& cli, const st
     //           const auto typeSnap = m_manager.snapshot();   // type read from this one
     //           const auto pathSnap = m_manager.snapshot();   // path read from this one
     //       -> "FAIL: no /config response ever mixes the type of one request with the
-    //       path of another" with "280 of 400 responses were torn, e.g. type=video
-    //       path=.../http_blue.png". Reverted.
+    //       path of another". Re-observed 2026-09-15 with the writer's second state a
+    //       `shader`: 15 of 400 responses torn on NVIDIA ("type=static
+    //       path=.../http_unrenderable.frag") and 8 of 400 on Lavapipe ("type=shader
+    //       path=.../http_blue.png"). Reverted.
     // COVERAGE-ASSERT: the two counters below. If the writer never ran, or the flip was
     //       too slow to overlap the reads, every response is one state and the check
     //       would be vacuously green -- so both states must actually be observed, and the
@@ -4313,7 +4396,7 @@ void runTornReadChecks(WallpaperManager& manager, httplib::Client& cli, const st
             try {
                 while (!stop.stop_requested()) {
                     manager.requestWallpaper("static", staticPath, kMonitorTorn);
-                    manager.requestWallpaper("video", videoPath, kMonitorTorn);
+                    manager.requestWallpaper("shader", shaderPath, kMonitorTorn);
                 }
             } catch (const std::exception& e) {
                 writerError = e.what();
@@ -4325,7 +4408,7 @@ void runTornReadChecks(WallpaperManager& manager, httplib::Client& cli, const st
         });
 
         int sawStatic = 0;
-        int sawVideo = 0;
+        int sawShader = 0;
         int torn = 0;
         int answered = 0;
         std::string firstTorn;
@@ -4338,8 +4421,8 @@ void runTornReadChecks(WallpaperManager& manager, httplib::Client& cli, const st
             const std::string reported = res.json.value("path", std::string());
             if (type == "static" && reported == staticPath) {
                 ++sawStatic;
-            } else if (type == "video" && reported == videoPath) {
-                ++sawVideo;
+            } else if (type == "shader" && reported == shaderPath) {
+                ++sawShader;
             } else {
                 ++torn;
                 if (firstTorn.empty()) firstTorn = "type=" + type + " path=" + reported;
@@ -4356,10 +4439,10 @@ void runTornReadChecks(WallpaperManager& manager, httplib::Client& cli, const st
             std::fprintf(stderr, "  %d of %d responses were torn, e.g. %s\n", torn, answered, firstTorn.c_str());
         }
         check(answered >= kReads / 2, "at least half the torn-read probes got a parseable 200");
-        check(sawStatic > 0 && sawVideo > 0,
+        check(sawStatic > 0 && sawShader > 0,
               "both of the writer's states were actually observed, so the torn-read check had something to tear");
-        std::printf("http_server_test: torn-read phase: %d responses, %d static, %d video, %d torn\n", answered,
-                    sawStatic, sawVideo, torn);
+        std::printf("http_server_test: torn-read phase: %d responses, %d static, %d shader, %d torn\n", answered,
+                    sawStatic, sawShader, torn);
         std::fflush(stdout);
     }
 }
@@ -4617,7 +4700,7 @@ void runHealthAfterDeviceChecks(httplib::Client& cli, sdbus::IProxy& proxy, Wall
     // WHY-THIS-SHAPE: the expected set of monitors is derived from the GetStatus reply taken
     //       alongside, not written as a literal, and compared as an exact set. What this
     //       manager holds by now is the sum of every phase above -- a rendered monitor, one
-    //       the torn-read writer left on a `video`, one only ever recorded -- so a
+    //       the torn-read writer left on a `shader`, one only ever recorded -- so a
     //       hand-written expectation would have to be re-derived whenever a phase above
     //       touches an id, and the version written on that day is the one that agrees with
     //       whatever /health happened to answer. Deriving it also makes the two channels
@@ -5510,7 +5593,7 @@ int main() {
 
     try {
         const std::string bluePath = writeSolidImage("http_blue.png", 0, 0, 255);
-        const std::string videoPath = writeSolidImage("http_video.mp4", 255, 0, 0);
+        const std::string shaderPath = writeSolidImage("http_unrenderable.frag", 255, 0, 0);
         const std::string hostilePath = writeHostileNamedImage();
         const std::string junkPath = writeUndecodableFile("http_not_an_image.png");
         // Two more distinct files, so the connector-name phase can tell "this screen's
@@ -5579,7 +5662,11 @@ int main() {
             // Runs on managers of its own, so it neither needs nor disturbs the state
             // above -- and so it can be reached on a host with no Vulkan at all, where the
             // main render below never happens.
-            runHealthStateChecks(bluePath, videoPath, junkPath, check);
+            runHealthStateChecks(bluePath, shaderPath, junkPath, check);
+
+            // Its own daemon, like the phase above, and placed beside it because it is the same
+            // question asked of a type this build draws.
+            runVideoHealthChecks(check);
 
             // Recorded through the manager rather than through SetWallpaper, so no render
             // is queued and the "before any device" state above survives into this phase.
@@ -5590,7 +5677,7 @@ int main() {
             // adds monitors and connector names without queueing a render.
             runOutputParamChecks(manager, cli, bluePath, namedPath, namedOtherPath, check);
 
-            runTornReadChecks(manager, cli, bluePath, videoPath, check);
+            runTornReadChecks(manager, cli, bluePath, shaderPath, check);
 
             // First render of the run. Everything after it needs a Device to exist.
             setWallpaper(*proxy, "static", hostilePath, kMonitorAgree);

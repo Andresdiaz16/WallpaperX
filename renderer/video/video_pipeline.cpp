@@ -5,6 +5,8 @@
 #include "../vulkan/device.h"
 #include "../vulkan/offscreen.h"
 
+#include <stdexcept>
+
 namespace wallpaperx {
 
 VideoPipeline::Stage::Stage(Device& device, const DecodedFrame& first, const std::string& shaderDir)
@@ -15,7 +17,16 @@ VideoPipeline::VideoPipeline(Device& device, const std::string& file, const std:
     : m_device(device), m_shaderDir(shaderDir), m_playback(playback), m_decoder(device, file) {}
 
 bool VideoPipeline::renderNext(OffscreenTargetManager& targets, const OffscreenTarget& target) {
+    // Asserted here as well as in the two halves: the abort has to name the entry point the
+    // caller used, not the one it delegates to.
     m_device.assertGpuThread("VideoPipeline::renderNext");
+    if (!decodeNext()) return false;
+    draw(targets, target);
+    return true;
+}
+
+bool VideoPipeline::decodeNext() {
+    m_device.assertGpuThread("VideoPipeline::decodeNext");
     std::optional<DecodedFrame> frame = m_decoder.next();
     // No stage means nothing was ever shown, and a stream with nothing to show must not spin here.
     if (!frame && m_playback == Playback::Loop && m_stage) {
@@ -31,8 +42,15 @@ bool VideoPipeline::renderNext(OffscreenTargetManager& targets, const OffscreenT
         m_stage = std::make_unique<Stage>(m_device, *frame, m_shaderDir);
     }
     static_cast<void>(m_stage->converter.convert(*frame));
-    targets.render(m_stage->renderer, target);
     return true;
+}
+
+void VideoPipeline::draw(OffscreenTargetManager& targets, const OffscreenTarget& target) {
+    m_device.assertGpuThread("VideoPipeline::draw");
+    // A stage exists exactly once a picture has been converted into it, so this is the one state
+    // that has nothing to show.
+    if (!m_stage) throw std::logic_error("VideoPipeline::draw: no picture has been decoded");
+    targets.render(m_stage->renderer, target);
 }
 
 }

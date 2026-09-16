@@ -136,15 +136,19 @@ private:
 // Frames handed out may outlive this decoder but not the Device. A size or format change
 // mid-stream leaves an image pool no picture uses, and a switch to software leaves the hardware
 // decoder it replaces; next() frees each once this renderer's last read of it has finished, and
-// never waits for those reads. Freeing that decoder does wait on ffmpeg's own decode work, as the
-// destructor below does, which hangs only on a decode queue stalled without the device being lost.
-// Destroying this decoder frees the
-// rest once no frame is out, and ffmpeg waits without bound there twice over: on each image's
-// semaphore, which covers this renderer's reads of it, and on its own decode work. The Device's
-// bounded wait guards only the first -- a read batch of this renderer's that has not finished
-// makes the destructor leak the codec context and every pool rather than wait. The second has
-// no guard here: a device that is declared lost returns from ffmpeg's waits with an error, but
-// one that merely stops does not, and that destructor hangs inside ffmpeg.
+// never waits for those reads. That free still enters ffmpeg's unbounded wait on its own decode
+// work, which a device that stalls without being declared lost never returns from -- unguarded,
+// because the only bounded question here is itself a wait and the playback path may make none.
+//
+// Destroying this decoder frees the rest once no frame is out, where ffmpeg waits without bound
+// twice over: on each image's semaphore, which covers this renderer's reads of it, and on its own
+// decode work. Neither is entered blind -- the Device answers the first, and an empty batch
+// through it answers the second before a hardware codec holding decode images is freed -- and
+// either answering no makes the destructor leak the codec context and every pool rather than
+// wait. What that buys is a device already gone when nothing of this renderer's was left pending,
+// which is where the first question answers yes without asking the GPU anything. It does not
+// cover a decode queue wedged while the rest of the device still answers: the probe goes through
+// the graphics queue, so it comes back yes and ffmpeg's wait is entered anyway.
 class VideoDecoder {
 public:
     // Where frames come from. The software states say why hardware was not used.
@@ -162,7 +166,9 @@ public:
     // Opens `file` and readies the decoder; the path is decided when the first frame is decoded,
     // since the stream's own headers are what the device is asked about. Throws
     // WallpaperContentError for a file that cannot be opened or has no decodable video stream,
-    // GpuFailure when ffmpeg cannot adopt this device, and std::runtime_error when out of memory.
+    // GpuFailure when ffmpeg cannot adopt this device and the device has stopped answering, and
+    // std::runtime_error when out of memory. A device that still answers selects software instead:
+    // ffmpeg failing to adopt it is a property of that pairing, not a fault.
     VideoDecoder(Device& device, const std::string& file);
     ~VideoDecoder();
 
@@ -227,8 +233,13 @@ private:
     bool admit(int64_t timestamp, std::optional<uint64_t> packet);
     void recordReturned(int64_t timestamp, std::optional<uint64_t> packet);
     void recordLanding();
-    void attachDevice();
+    // True means decode on the device. False means the path was decided as software, because
+    // ffmpeg cannot decode on a device that still answers.
+    bool attachDevice();
     bool deviceHealthy();
+    // deviceHealthy() from a path that cannot throw, where any answer but a clean yes has to keep
+    // ffmpeg's unbounded free from being entered.
+    bool decodeWorkCanDrain() noexcept;
     int readVideoPacket();
     void numberPacket();
     void failDecode(const char* what, int err);

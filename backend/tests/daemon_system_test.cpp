@@ -1053,7 +1053,7 @@ void checkFirstFrameUnderStatusLoad(sdbus::IProxy& proxy, FrameReadyLog& signals
 // catch. What does separate them:
 //
 //   - The cost of *issuing* a request that will render, against the cost of issuing one
-//     that will not. See the S6.9 block below for why the comparison is against a `video`
+//     that will not. See the S6.9 block below for why the comparison is against a `shader`
 //     burst rather than against the render drain.
 //
 // The GetStatus/GetFrameFd ordering is *printed and not asserted*, which is worth
@@ -1111,10 +1111,10 @@ void checkResponsivenessUnderLoad(sdbus::IProxy& proxy, FrameReadyLog& signals, 
     // file of constant size. Without it the file would grow entry by entry underneath the
     // measurement and part of the difference being measured would be that.
     for (int i = 0; i < loadCount; ++i) {
-        setWallpaper(proxy, "video", bluePath, kMonitorLoadBase + i);
+        setWallpaper(proxy, "shader", bluePath, kMonitorLoadBase + i);
     }
 
-    // GOAL: the premise the S6.9 assertion below rests on -- that a `video` request is
+    // GOAL: the premise the S6.9 assertion below rests on -- that a `shader` request is
     //       recorded and then NOT rendered. If it ever renders, the two bursts stop
     //       differing and the assertion measures nothing while staying green.
     // WHY-THIS-SHAPE: asked of the daemon over the wire rather than asserted in the test,
@@ -1122,28 +1122,31 @@ void checkResponsivenessUnderLoad(sdbus::IProxy& proxy, FrameReadyLog& signals, 
     //       the absence of a FrameReady -- cannot distinguish "never renders" from "has not
     //       rendered yet", and would have to spend a timeout to say so. `unsupported` is
     //       the daemon's own published answer and shares isRenderableType() with the
-    //       render path, so the two cannot disagree.
-    // CONTROL: isRenderableType() changed to `type == "static" || type == "video"` ->
-    //       "FAIL: the video burst is recorded as a wallpaper this build does not render",
-    //       with "0/16 monitors report unsupported" beside it. The ratio on that run read
-    //       1.00 -- two rendering bursts compared against each other, the vacuous green
-    //       this converts into a red. Reverted.
-    const StatusReply videoStatus = getStatusOrExplain(proxy);
+    //       render path, so the two cannot disagree. The inert type is `shader`, not
+    //       `video`: Step 13 makes video a type the daemon draws, and this burst has to
+    //       stay one that draws nothing or the comparison below loses its control side.
+    // CONTROL: isRenderableType() (backend/daemon/wallpaper_manager.h) changed to
+    //       `type == "static" || type == "shader"` -> "FAIL: the shader burst is recorded as
+    //       a wallpaper this build does not render", with "0/16 monitors report unsupported"
+    //       beside it, on both ICD entries. The ratio on those runs read 0.99 and 0.93 --
+    //       two rendering bursts compared against each other, the vacuous green this
+    //       converts into a red. Observed 2026-09-15. Reverted.
+    const StatusReply inertStatus = getStatusOrExplain(proxy);
     int unsupportedSeen = 0;
     for (int i = 0; i < loadCount; ++i) {
-        const nlohmann::json* entry = wallpaperStatus(videoStatus, std::to_string(kMonitorLoadBase + i));
+        const nlohmann::json* entry = wallpaperStatus(inertStatus, std::to_string(kMonitorLoadBase + i));
         if (entry != nullptr && entry->value("unsupported", false)) ++unsupportedSeen;
     }
-    const bool videoIsInert = unsupportedSeen == loadCount;
-    if (!videoIsInert) {
-        // Says which of the two ways this failed: the daemon renders video now, or the
+    const bool inertBurstIsInert = unsupportedSeen == loadCount;
+    if (!inertBurstIsInert) {
+        // Says which of the two ways this failed: the daemon renders shaders now, or the
         // reply that would have said so never arrived (getStatusOrExplain has printed the
         // reason for that case immediately above).
         std::fprintf(stderr, "  %d/%d monitors report unsupported%s\n", unsupportedSeen, loadCount,
-                     videoStatus.ok() ? "" : " -- and GetStatus did not answer, see above");
+                     inertStatus.ok() ? "" : " -- and GetStatus did not answer, see above");
     }
-    check(videoIsInert, "the video burst is recorded as a wallpaper this build does not render "
-                        "(the S6.9 comparison below is meaningless otherwise)");
+    check(inertBurstIsInert, "the shader burst is recorded as a wallpaper this build does not render "
+                             "(the S6.9 comparison below is meaningless otherwise)");
 
     // The control burst. Same monitors as the renderable burst below, so the config save
     // each call performs writes an identically sized file.
@@ -1154,10 +1157,10 @@ void checkResponsivenessUnderLoad(sdbus::IProxy& proxy, FrameReadyLog& signals, 
     // of each pair comes out ~3x the other. Which one is a coin flip per run (a tsan run
     // read 3.47 and the next 0.31, the second with the INERT call dearer), so the number
     // stops being about the wallpaper type at all. X.2 forbids asserting on that.
-    std::vector<Clock::duration> videoSamples;
-    videoSamples.reserve(static_cast<size_t>(loadCount));
+    std::vector<Clock::duration> inertSamples;
+    inertSamples.reserve(static_cast<size_t>(loadCount));
     for (int i = 0; i < loadCount; ++i) {
-        videoSamples.push_back(timeSetWallpaper(proxy, "video", bluePath, kMonitorLoadBase + i));
+        inertSamples.push_back(timeSetWallpaper(proxy, "shader", bluePath, kMonitorLoadBase + i));
     }
 
     std::vector<Clock::duration> staticSamples;
@@ -1218,25 +1221,25 @@ void checkResponsivenessUnderLoad(sdbus::IProxy& proxy, FrameReadyLog& signals, 
                 "the Device's thread pinning is what makes a GPU-touching handler fatal)\n",
                 statusDoneAt < frameDoneAt ? "overtook" : "did not overtake");
 
-    const double videoFloor = minMillis(videoSamples);
+    const double inertFloor = minMillis(inertSamples);
     const double staticFloor = minMillis(staticSamples);
-    const double ratio = videoFloor > 0 ? staticFloor / videoFloor : 0.0;
+    const double ratio = inertFloor > 0 ? staticFloor / inertFloor : 0.0;
     // The sample count is printed rather than asserted: both bursts are the same
     // unconditional loop over one clamped counter, so no state of the daemon, the host or
     // the GPU can make them differ -- an assertion on it could only be reddened by editing
     // the clamp three lines away, which is a check that cannot fail dressed as a guard.
     std::printf("daemon_system_test: cheapest SetWallpaper cost %.3f ms for a request that renders vs %.3f ms for one "
                 "that does not (ratio %.2f, bound %.1f) over %zu and %zu samples; medians %.3f and %.3f\n",
-                staticFloor, videoFloor, ratio, kIssueCostRatioBound, staticSamples.size(), videoSamples.size(),
-                medianMillis(staticSamples), medianMillis(videoSamples));
+                staticFloor, inertFloor, ratio, kIssueCostRatioBound, staticSamples.size(), inertSamples.size(),
+                medianMillis(staticSamples), medianMillis(inertSamples));
 
     // The comparison means something only if exactly one of the two bursts rendered. Not a
     // silent pass either way: both premises are asserted above, so a run that lands here is
     // already red and the reason is already printed against the right component.
-    if (!round1Ok || !videoIsInert) {
+    if (!round1Ok || !inertBurstIsInert) {
         std::printf("daemon_system_test: the S6.9 issue-cost comparison is abandoned -- %s, so the two bursts do "
                     "not differ in the way the comparison assumes.\n",
-                    round1Ok ? "the video burst was not inert" : "the static burst never drained");
+                    round1Ok ? "the shader burst was not inert" : "the static burst never drained");
         return;
     }
 
@@ -1249,7 +1252,7 @@ void checkResponsivenessUnderLoad(sdbus::IProxy& proxy, FrameReadyLog& signals, 
     //       while the handler is instrumented daemon code, so the two sides scale by
     //       different factors: the tsan tier read 0.2932 then 0.9375 against a 0.25 bound
     //       on a daemon that is not defective, and 0.9375 is what the defect itself scores.
-    //       The `video` burst is the same handler, the same validation, the same requestSeq
+    //       The `shader` burst is the same handler, the same validation, the same requestSeq
     //       bookkeeping and the same config save, differing only in isRenderableType() --
     //       so sanitizer distortion and host GPU speed appear on both sides and cancel.
     //       The cheapest call of each burst, not the median or the total: the renderable
@@ -1267,9 +1270,10 @@ void checkResponsivenessUnderLoad(sdbus::IProxy& proxy, FrameReadyLog& signals, 
     //       thread pinning from aborting first, so the daemon survives to be measured;
     //       emitFrameReady had to be detached for the same run, because a worker blocking
     //       on the connection lock while the handler waits on the worker is a deadlock, not
-    //       a slow reply. Observed: NVIDIA 1.725 ms vs 0.144 ms, ratio 11.96; lavapipe
-    //       2.983 vs 0.151, ratio 19.71; tsan+lavapipe 4.143 vs 0.778, ratio 5.33 -- FAIL
-    //       in all three. Reverted.
+    //       a slow reply. Re-observed 2026-09-15 against the `shader` control burst: NVIDIA
+    //       2.159 ms vs 0.040 ms, ratio 53.90; lavapipe 5.343 vs 0.038, ratio 138.88 --
+    //       FAIL on both, against a bound of 2.0. (The sanitizer tier was not re-run this
+    //       round.) Reverted.
     //
     // What this deliberately does NOT cover: the handler's absolute cost. The config save
     // runs on both sides, so it cancels -- ConfigStore::save given a 5 ms sleep, some 500x
@@ -1281,11 +1285,11 @@ void checkResponsivenessUnderLoad(sdbus::IProxy& proxy, FrameReadyLog& signals, 
     //
     // A validity gate, not part of the assertion: a cheapest call measured at 0 ms means this
     // host's clock cannot resolve a round trip, and a ratio computed from it grades nothing.
-    // Folded into the check -- which is what `videoFloor > 0 &&` used to do -- it printed
+    // Folded into the check -- which is what `inertFloor > 0 &&` used to do -- it printed
     // "ratio 1.00" beside a FAIL accusing the daemon of rendering inline. The gate cannot
     // hide the defect it is next to: a handler that rendered inline has no zero-cost call to
     // offer, since every one of these monitors is a distinct, fresh render.
-    if (videoFloor <= 0.0 || staticFloor <= 0.0) {
+    if (inertFloor <= 0.0 || staticFloor <= 0.0) {
         notVerified("S6.9 (SetWallpaper does not render inline)",
                     "the cheapest call in a burst measured 0 ms, so this host's clock cannot resolve a SetWallpaper "
                     "round trip and no ratio from this run means anything");
@@ -5678,8 +5682,9 @@ void checkFileSizeLimit(NameWatcher& names, const std::string& validationEnv, co
     //       ignored the first SetWallpaper under a `LimitFSIZE=` unit killed the daemon
     //       outright, with a core dump, no log line and no clean shutdown -- after the
     //       client's call had already returned success. Every monitor goes blank at once.
-    // WHY-THIS-SHAPE: the wallpaper is a `video`, which requestWallpaper records and
-    //       persists but renderPending refuses before touching the GPU. A `static` would
+    // WHY-THIS-SHAPE: the wallpaper is a `shader`, which requestWallpaper records and
+    //       persists but renderPending refuses before touching the GPU -- and which stays
+    //       undrawable after Step 13 makes `video` renderable. A `static` would
     //       create a Vulkan device under the same 1-byte file limit, and a driver that
     //       writes a shader cache would then die for a reason that has nothing to do with
     //       the config -- a failure this phase would report against the daemon. The limit is
@@ -5688,7 +5693,8 @@ void checkFileSizeLimit(NameWatcher& names, const std::string& validationEnv, co
     // CONTROL: `std::signal(SIGXFSZ, SIG_IGN)` disabled in backend/daemon/main.cpp -> four FAILs: the
     //       SetWallpaper call itself (the daemon dies mid-reply), "a config write that
     //       exceeds the file-size limit does not kill the daemon", and both shutdown checks,
-    //       printing "  exited normally 0, timed out 0, signal 25". Reverted.
+    //       printing "  exited normally 0, timed out 0, signal 25". Re-observed 2026-09-15
+    //       with the wallpaper a `shader`, same four lines. Reverted.
     SpawnedDaemon daemon({validationEnv, configHome.env()}, SpawnedDaemon::Stdout::Captured, {}, 1);
     if (!names.waitFor(true)) {
         if (!reportedStartupFault(daemon, kGoals)) {
@@ -5701,7 +5707,7 @@ void checkFileSizeLimit(NameWatcher& names, const std::string& validationEnv, co
         sdbus::createProxy(sdbus::ServiceName{DbusService::kBusName}, sdbus::ObjectPath{DbusService::kObjectPath});
     std::string setError;
     try {
-        setWallpaper(*proxy, "video", bluePath, kMonitorFileLimit);
+        setWallpaper(*proxy, "shader", bluePath, kMonitorFileLimit);
     } catch (const std::exception& e) {
         setError = e.what();
     }
@@ -5797,14 +5803,14 @@ void checkStalledConfigWrite(NameWatcher& names, const std::string& validationEn
     // somewhere out of sight. It also gives S8.32 a last-good save to hide, which is the
     // wrong answer that goal names.
     //
-    // `video`, not `static`, throughout: requestWallpaper records and persists it and
+    // `shader`, not `static`, throughout: requestWallpaper records and persists it and
     // renderPending refuses it before touching the GPU, so nothing here creates a Vulkan
     // device. What is being measured is a handler's latency, and a driver's first-use cost
     // inside the same call would swamp it -- and would make this phase unanswerable on a host
     // with no working ICD, for a question that has nothing to do with the GPU.
     std::string baselineError;
     try {
-        setWallpaper(*proxy, "video", bluePath, kMonitorStalledFirst);
+        setWallpaper(*proxy, "shader", bluePath, kMonitorStalledFirst);
     } catch (const std::exception& e) {
         baselineError = e.what();
     }
@@ -5838,15 +5844,16 @@ void checkStalledConfigWrite(NameWatcher& names, const std::string& validationEn
     // CONTROL: `m_store.save(entries);` added at the top of WallpaperManager::persist(), i.e.
     //       the write put back on the bus thread -> "FAIL: the daemon answers a SetWallpaper
     //       whose config write has stopped coming back", printing
-    //       "org.freedesktop.DBus.Error.Timeout: Connection timed out (after 15075 ms)", and
-    //       six more: the deadline check here, both GetStatus checks, the second-save check,
-    //       the stall-report check ("persistence reads (absent)") and both shutdown checks
-    //       ("exit code 1", the watchdog line present). That is the state this whole change
-    //       exists to prevent, reproduced end to end. Reverted.
+    //       "org.freedesktop.DBus.Error.Timeout: Connection timed out (after 15018 ms)", and
+    //       seven more: the deadline check here, both GetStatus checks, the second-save check,
+    //       the stall-report check ("persistence reads (absent)") and both shutdown checks --
+    //       eight FAIL lines in all. That is the state this whole change
+    //       exists to prevent, reproduced end to end. Re-observed 2026-09-15 with this
+    //       phase's wallpapers `shader` rather than `video`. Reverted.
     const auto firstStart = Clock::now();
     std::string stalledError;
     try {
-        setWallpaper(*proxy, "video", bluePath, kMonitorStalledSecond, std::chrono::seconds(15));
+        setWallpaper(*proxy, "shader", bluePath, kMonitorStalledSecond, std::chrono::seconds(15));
     } catch (const sdbus::Error& e) {
         stalledError = e.getName() + ": " + e.getMessage();
     } catch (const std::exception& e) {
@@ -5918,7 +5925,7 @@ void checkStalledConfigWrite(NameWatcher& names, const std::string& validationEn
     const auto secondStart = Clock::now();
     std::string secondError;
     try {
-        setWallpaper(*proxy, "video", bluePath, kMonitorStalledFirst, std::chrono::seconds(15));
+        setWallpaper(*proxy, "shader", bluePath, kMonitorStalledFirst, std::chrono::seconds(15));
     } catch (const std::exception& e) {
         secondError = e.what();
     }
