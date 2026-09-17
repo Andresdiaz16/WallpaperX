@@ -949,10 +949,11 @@ void runOutputNameChecks(sdbus::IProxy& proxy, const Check& check) {
     //       cross-monitor check, with every InvalidArgs line still green.
     //       (e) destroys-nothing for the ID family, which is what the "DP-KEEP" pair adds:
     //       bindOutputLocked's `find`/`erase` displacement block hoisted into
-    //       setMonitorOutput ABOVE `requireValidMonitorId` -> exactly two red, "FAIL: a
+    //       setMonitorOutput ABOVE `requireValidMonitorId` -> two red in this phase, "FAIL: a
     //       refused connector name neither binds ..." printing "monitor 17 answers to
     //       (none)" and the cross-monitor check at the end of the phase, with all four
-    //       InvalidArgs lines green. With the "DP-KEEP" pair deleted and that mutation still
+    //       InvalidArgs lines green; a later phase's "moving a sized name to another monitor
+    //       redraws both of them" goes red beside them (re-observed 2026-09-16). With the "DP-KEEP" pair deleted and that mutation still
     //       in place the run reported "all checks passed" -- measured -- which is the gap
     //       the pair closes. A sixth, `name.size() > kMaxOutputNameBytes` in config_store.h
     //       weakened to `>=`, belongs to the at-cap pair below and is recorded there.
@@ -1660,12 +1661,14 @@ void runRenderChecks(sdbus::IProxy& proxy, FrameReadyLog& signals, const std::st
     check(signals.wait(kMonitorBarrier, 1), "FrameReady arrives for the barrier request");
 
     // CONTROL: two parts, and either alone leaves this green -- which is worth stating,
-    //       because the obvious single mutation does not test it. Making isRenderableType()
-    //       (backend/daemon/wallpaper_manager.h) accept `shader` is not enough: the file this
-    //       phase records is undecodable, so a renderable shader still fails its render and
-    //       still announces nothing. With the recorded path ALSO swapped for the decodable
-    //       test image the monitor renders -> "FAIL: a shader request emits no FrameReady",
-    //       beside seven other unrenderable-state failures. Observed 2026-09-15, both reverted.
+    //       because the obvious single mutation does not test it. Making drawableType()
+    //       (backend/daemon/wallpaper_manager.h) map `shader` to a still is not enough: the file
+    //       this phase records is undecodable, so a drawable shader still fails its render and
+    //       still announces nothing. With the recorded path ALSO swapped for the decodable test
+    //       image the monitor renders -> "FAIL: a shader request emits no FrameReady", beside six
+    //       other unrenderable-state failures (seven on Lavapipe). Re-observed 2026-09-16, both
+    //       reverted. Mutating isRenderableType() instead no longer reaches this check at all: the
+    //       render pass asks drawableType(), so the shader is never drawn.
     check(signals.countFor(kMonitorUnrenderable) == 0, "a shader request emits no FrameReady");
     // Still 1: the good render above, and nothing for the corrupt one that followed.
     check(signals.countFor(kMonitorCorrupt) == 1, "a render that fails emits no FrameReady");
@@ -2018,8 +2021,13 @@ void runImportModifierWireChecks(sdbus::IProxy& proxy, FrameReadyLog& signals, c
     //       the others; the empty case matters most, because an empty stored set reads
     //       identically to "nobody has reported yet" and would silently restore the
     //       unnegotiated behaviour rather than being refused.
-    // CONTROL: each clause disabled in turn in WallpaperManager::setImportModifiers
-    //       (backend/daemon/wallpaper_manager.cpp); see the report for the observed lines.
+    // CONTROL: each clause of WallpaperManager::setImportModifiers
+    //       (backend/daemon/wallpaper_manager.cpp) disabled in turn, on both driver entries,
+    //       2026-09-16, all reverted. The format test -> the format line alone. The length cap ->
+    //       the length line and nine later checks built on it. The empty-set test alone leaves
+    //       everything GREEN: an empty report also shares no layout, and the empty-intersection
+    //       refusal answers InvalidArgs for it. With that refusal disabled too -> "FAIL: an empty
+    //       modifier report is refused as InvalidArgs rather than stored" and seven more.
     check(errorNameFrom([&] { setImportModifiers(proxy, exportedFormat ^ 0xFFu, reported); }) ==
               "org.freedesktop.DBus.Error.InvalidArgs",
           "a modifier report for a format this daemon does not export is refused as InvalidArgs");
@@ -2077,7 +2085,8 @@ void runImportModifierWireChecks(sdbus::IProxy& proxy, FrameReadyLog& signals, c
     //       wallpaper_manager.cpp) -- the pre-2026-08-30 "every renderable monitor is
     //       re-posted" behaviour. Observed red on both ICDs, this check reporting
     //       "monitor 22 announced 2 frames; expected exactly 1", together with the serve
-    //       check below and the two manager-tier checks; 4 failures in all. Reverted.
+    //       check below and the two manager-tier checks; 4 failures on NVIDIA, 5 on Lavapipe
+    //       (the undone-condemnation check too). Re-observed 2026-09-16. Reverted.
     std::vector<uint64_t> keep{kUnavailableModifierA};
     if (!opaqueExport) keep.push_back(committed);
     setImportModifiers(proxy, exportedFormat, keep);
@@ -2129,11 +2138,14 @@ void runImportModifierWireChecks(sdbus::IProxy& proxy, FrameReadyLog& signals, c
     //       cannot be graded as either.
     // CONTROL: two, both on backend/daemon/wallpaper_manager.cpp, because the two endings
     //       fail to different defects. `it->second.frameModifier = target->drmModifier;`
-    //       deleted from WallpaperManager::renderPending leaves every frame looking
+    //       deleted from WallpaperManager::renderPassLocked leaves every frame looking
     //       layout-less, so nothing is ever condemned -> the settled-state check goes red on
-    //       Lavapipe (7 failures in that run). `state.hasFrame = false` deleted from
-    //       applyImportModifiersLocked -- the defect 5fb5072 fixed -> the withdrawal check
-    //       goes red (4 failures). Both reverted.
+    //       Lavapipe (10 failures in that run, re-observed 2026-09-16). The withdrawal check is
+    //       defended by three clears of hasFrame -- applyImportModifiersLocked() (the defect
+    //       5fb5072 fixed), forgetImages(), and the commit block's error arm -- and deleting the
+    //       first alone, or the first two, leaves it green. All three deleted -> "FAIL: a report
+    //       that excludes the committed frame's layout withdraws that frame" among 10 failures on
+    //       Lavapipe, re-observed 2026-09-16. All reverted.
     // LINEAR is offered unless the committed layout already IS linear, so that on a driver
     // with more than one usable layout the report leaves something to rebuild into and the
     // rebuild is graded rather than skipped. A set of purely unallocatable layouts would make
@@ -2312,8 +2324,9 @@ void runModifierWithdrawalRenderChecks(sdbus::IProxy& proxy, FrameReadyLog& sign
     //       changed to `adoptImportModifiersLocked(...); return {};`, and separately the
     //       `for (...) m_worker.post(monitorId);` loop deleted from
     //       DbusService::watchClientExits (backend/daemon/dbus_service.cpp). Observed red on
-    //       the NVIDIA host: the first mutation reddens this and the manager-tier check (2
-    //       failures), the second reddens this one alone. Both printed the monitor's stale
+    //       the NVIDIA host: the first mutation reddens this, the manager-tier check and "a
+    //       reporting consumer leaving the bus is announced to the others" (3 failures on both
+    //       drivers, re-observed 2026-09-16), the second reddens this one alone. Both printed the monitor's stale
     //       decode error, so no render had run. Both reverted.
     leaver.reset();
     const bool rendered = signals.wait(kMonitorWithdrawRender, 1);
@@ -2467,10 +2480,11 @@ void runImportModifierChecks(const wallpaperx::WallpaperManager::Config& config,
     //       falsifies an earlier phase of this binary first.
     // CONTROL: `if (stillReadable) continue;` disabled in
     //       WallpaperManager::adoptImportModifiersLocked -> the re-post check goes red (4
-    //       failures across this binary on both ICDs). Separately, `monitorIds` in
+    //       failures across this binary on NVIDIA, 5 on Lavapipe). Separately, `monitorIds` in
     //       WallpaperManager::applyImportModifiersLocked restored to every entry of
     //       m_monitors -> the survivor check goes red, with the wire tier's serve check (2
-    //       failures). Both in backend/daemon/wallpaper_manager.cpp; both reverted.
+    //       failures on NVIDIA; on Lavapipe the undone-condemnation check makes 3). Both in
+    //       backend/daemon/wallpaper_manager.cpp; both re-observed 2026-09-16 and reverted.
     std::vector<uint64_t> keep{kUnavailableModifierA};
     if (!opaqueExport) keep.push_back(committed);
     const std::vector<int> keepRender = manager.setImportModifiers(kConsumerName, exportedFormat, keep).toRender;
@@ -2502,10 +2516,10 @@ void runImportModifierChecks(const wallpaperx::WallpaperManager::Config& config,
     //       exists because the report condemns several monitors and the worker services them
     //       one at a time; a single-monitor form cannot express it.
     // CONTROL: `it->second.frameModifier = target->drmModifier;` deleted from
-    //       WallpaperManager::renderPending (backend/daemon/wallpaper_manager.cpp), which
+    //       WallpaperManager::renderPassLocked (backend/daemon/wallpaper_manager.cpp), which
     //       leaves every committed frame looking layout-less so no report can exclude it.
-    //       Observed red on Lavapipe -- this check plus six more, including the NotRendered
-    //       window and both recovery checks. Reverted.
+    //       Observed red on Lavapipe -- this check plus nine more, including the NotRendered
+    //       window and both recovery checks; re-observed 2026-09-16. Reverted.
     // LINEAR unless the committed layout already is linear: on a driver with a second usable
     // layout that leaves something to rebuild into, so the rebuild is graded rather than
     // reported as unreachable. A set of purely unallocatable layouts grades strictly less.
@@ -2688,8 +2702,10 @@ void runImportModifierChecks(const wallpaperx::WallpaperManager::Config& config,
     //       chose DRM format modifier 0, which the frame consumer did not report as importable"
     //       -- the reused image. Reverted. The "not asked to re-render" check just above has a
     //       control of its own: deleting the SECOND isRenderableType test, the one guarding the
-    //       requestSeq bump, reddens it alone -- as does making isRenderableType() accept the
-    //       `shader` this phase now records, observed 2026-09-15 and reverted.
+    //       requestSeq bump, reddens it on Lavapipe, beside "a report that changes the layouts in
+    //       force but condemns no monitor is still reported as a change" on both drivers
+    //       (re-observed 2026-09-16) -- as does making drawableType() map the `shader` this phase
+    //       records to a still. Reverted.
     manager.requestWallpaper("static", imagePath, kMonitorModifiersUnrenderable);
     const wallpaperx::RenderOutcome unrenderableFirst = manager.renderPending(kMonitorModifiersUnrenderable);
     if (!unrenderableFirst.rendered) {
@@ -2823,7 +2839,8 @@ void runImportModifierClientChecks(const wallpaperx::WallpaperManager::Config& c
     // CONTROL: the `if (m_importModifiers == modifiers) return {};` early-out disabled in
     //       WallpaperManager::adoptImportModifiersLocked (backend/daemon/
     //       wallpaper_manager.cpp). Observed red on both ICDs, with the two other
-    //       unchanged-set checks in this phase; 3 failures. Reverted.
+    //       unchanged-set checks in this phase and four "changes nothing" checks elsewhere; 7
+    //       failures, re-observed 2026-09-16. Reverted.
     check(!report(consumerA, {m1, m2}).changed, "an identical report from the same consumer changes nothing");
 
     // GOAL: S6.52 -- what a consumer reports is a SET. The same layouts sent in a different
@@ -2870,7 +2887,8 @@ void runImportModifierClientChecks(const wallpaperx::WallpaperManager::Config& c
     // CONTROL: the intersection in WallpaperManager::setImportModifiers (backend/daemon/
     //       wallpaper_manager.cpp) replaced by the caller's own list -- the last-report-wins
     //       rule. Observed red on both ICDs: both refusal probes above, the exact-set probe,
-    //       and four more across this phase and the wire tier; 7 failures. Reverted.
+    //       and six more across this phase and the wire tier; 9 failures, re-observed
+    //       2026-09-16. Reverted.
     check(report(consumerB, {m2, m3}).changed, "a second consumer's report narrows what is in force");
     check(report(consumerC, {m3}).refused,
           "a layout only one consumer reported is refused as another consumer's whole set");
@@ -2894,7 +2912,8 @@ void runImportModifierClientChecks(const wallpaperx::WallpaperManager::Config& c
     // CONTROL: the two `m_importModifiersByClient` restore lines disabled in the empty-
     //       intersection branch of WallpaperManager::setImportModifiers (backend/daemon/
     //       wallpaper_manager.cpp). Observed red on both ICDs: both rollback checks here,
-    //       the exact-set probe above, and both S6.50 probes below; 5 failures. Reverted.
+    //       the exact-set probe above, both S6.50 probes below, and three more across the
+    //       departure and wire phases; 8 failures, re-observed 2026-09-16. Reverted.
     check(!exact.refused, "a refused report leaves a consumer that had no earlier entry unregistered");
     check(report(consumerA, {m1}).refused, "a report that would leave no shared layout is refused");
     const Report afterRollback = report(consumerF, {m1, m2});
@@ -2911,8 +2930,9 @@ void runImportModifierClientChecks(const wallpaperx::WallpaperManager::Config& c
     //       unconstrained rather than "whatever the last one said".
     // CONTROL: `m_importModifiersByClient.erase(client)` replaced by a `count()` test in
     //       WallpaperManager::forgetImportModifiers (backend/daemon/wallpaper_manager.cpp),
-    //       so nothing is ever forgotten. Observed red on both ICDs: both checks here and the
-    //       wire tier's departure check; 3 failures. Reverted.
+    //       so nothing is ever forgotten. Observed red on both ICDs: both checks here, the
+    //       wire tier's departure check, and four more that depend on a departure widening the
+    //       set; 7 failures, re-observed 2026-09-16. Reverted.
     manager.forgetImportModifiers(consumerA);
     manager.forgetImportModifiers(consumerE);
     manager.forgetImportModifiers(consumerF);
@@ -2959,8 +2979,10 @@ void runImportModifierClientChecks(const wallpaperx::WallpaperManager::Config& c
     //       reddens the S6.50 checks instead and is not a control for this.
     // CONTROL: the last line of WallpaperManager::forgetImportModifiers (backend/daemon/
     //       wallpaper_manager.cpp) changed to `adoptImportModifiersLocked(...); return {};` --
-    //       the set still widens, nothing is scheduled. Observed red on the NVIDIA host, with
-    //       the wire tier's departure check and no S6.50 check; 2 failures. Reverted.
+    //       the set still widens, nothing is scheduled. Observed red on both drivers, with
+    //       the wire tier's departure check and "a reporting consumer leaving the bus is
+    //       announced to the others", and no S6.50 check; 3 failures, re-observed 2026-09-16.
+    //       Reverted.
     manager.forgetImportModifiers(consumerI);
     const std::vector<int> unblocked = manager.forgetImportModifiers(consumerH).toRender;
     check(std::find(unblocked.begin(), unblocked.end(), kMonitorModifiersIdle) != unblocked.end(),
@@ -3070,7 +3092,9 @@ void runImportModifierClientWireChecks(const wallpaperx::WallpaperManager::Confi
     //       form stayed green and this one goes red.
     // CONTROL: `m_importModifiersByClient.clear();` added after the erase in
     //       WallpaperManager::forgetImportModifiers (backend/daemon/wallpaper_manager.cpp).
-    //       Observed red on the NVIDIA host, and the only failure in that run. Reverted.
+    //       Observed red on both drivers, beside "a departure hands back the frameless monitor
+    //       its set was blocking, not just a wider set"; 2 failures, re-observed 2026-09-16.
+    //       Reverted.
     auto consumerLast = sdbus::createProxy(daemonName, objectPath);
     check(errorNameFrom([&] { setImportModifiers(*consumerLast, exportedFormat, setLast); }) ==
               "org.freedesktop.DBus.Error.InvalidArgs",
@@ -3182,9 +3206,9 @@ void runImportModifierAnnouncementChecks(const wallpaperx::WallpaperManager::Con
         //       has no monitor to condemn; 2 failures. The condemning check below stayed GREEN,
         //       which is what makes this property separable from "a change is announced at all".
         //       Reverted.
-        //       Re-observed 2026-09-15, after this phase's monitor moved to `shader`:
-        //       isRenderableType() made to accept `shader` reddens this check too, since the
-        //       one monitor becomes renderable and the change then condemns it. Reverted.
+        //       Re-observed 2026-09-16, after this phase's monitor moved to `shader`:
+        //       drawableType() made to map `shader` to a still reddens this check too, since
+        //       the one monitor becomes renderable and the change then condemns it. Reverted.
         const wallpaperx::ImportModifierUpdate condemnsNothing =
             bookkeeping.setImportModifiers(consumer, exportedFormat, {kUnavailableModifierA, kUnavailableModifierB});
         check(condemnsNothing.changed && condemnsNothing.toRender.empty(),
@@ -3218,7 +3242,8 @@ void runImportModifierAnnouncementChecks(const wallpaperx::WallpaperManager::Con
         // CONTROL: `toRender.push_back(id);` deleted from the loop in
         //       WallpaperManager::adoptImportModifiersLocked (backend/daemon/
         //       wallpaper_manager.cpp). Observed red here, with four pre-existing checks that
-        //       read the same list; 5 failures. Reverted.
+        //       read the same list; 5 failures on NVIDIA, 9 on Lavapipe where the dma_buf
+        //       withdrawal phase reads it too. Re-observed 2026-09-16. Reverted.
         bookkeeping.requestWallpaper("static", imagePath, kMonitorAnnounceCondemned);
         const wallpaperx::ImportModifierUpdate condemns =
             bookkeeping.setImportModifiers(consumer, exportedFormat, {kUnavailableModifierA});
@@ -3882,9 +3907,10 @@ void runBufferHoldChecks(const wallpaperx::WallpaperManager::Config& config, con
     //       2, 0", and the phase stops there so no reserve check below is reported as
     //       established. Reverted.
     // CONTROL, the other direction: that same constant raised to 3, which deepens the ring to
-    //       seven -> this line stays GREEN, correctly, and the refusal check below goes red
-    //       alone, printing "the third consumer was handed image 5". That is the right
-    //       attribution: the premise held and the daemon's behaviour is what changed. Reverted.
+    //       seven -> this line stays GREEN, correctly, and the refusal check below goes red,
+    //       printing "the third consumer was handed image 5", with the four later checks that
+    //       depend on that refusal (re-observed 2026-09-16). That is the right attribution: the
+    //       premise held and the daemon's behaviour is what changed. Reverted.
     const bool ringFilled = reserveRender && ringIds.size() == static_cast<size_t>(2 * kExpectedHeldPerClient) &&
                             allDistinct(ringIds);
     check(ringFilled, "two consumers hold four of the monitor's five images, so exactly one is free");
@@ -3998,9 +4024,9 @@ void runBufferHoldChecks(const wallpaperx::WallpaperManager::Config& config, con
     //       (backend/daemon/wallpaper_manager.cpp), which releaseBuffer calls, replaced by
     //       `true`, so any caller matches the first holder -> "FAIL: one consumer cannot
     //       release an image another consumer
-    //       holds", printing "it freed something and announced monitor 0 generation 4", and
-    //       downstream the departure check, whose consumer had already had its claim taken.
-    //       Reverted.
+    //       holds", printing "it freed something and announced monitor 0 generation 6", and
+    //       downstream "the ring is down to its reserve again before the departure", whose
+    //       consumer had already had its claim taken. Re-observed 2026-09-16. Reverted.
     {
         std::vector<wallpaperx::FrameAvailable> announced;
         const std::vector<int> byTheWrongClient = manager.releaseBuffer(bob, kMonitorHoldRing, secondId, &announced);
@@ -4687,9 +4713,10 @@ void runBufferReleaseWireChecks(const wallpaperx::WallpaperManager::Config& conf
     //       `std::count(...)` that reports
     //       the claim without removing it -> "FAIL: the consumer that was refused is served
     //       once an image has come free", printing "it was answered
-    //       'io.wallpaperx.Daemon.Error.NoFreeImage' instead", and the only red line in the
-    //       run -- the re-announcement check above stayed green, which is the measurement
-    //       showing announcing and freeing are two facts and not one. Reverted.
+    //       'io.wallpaperx.Daemon.Error.NoFreeImage' instead", beside only the manager-tier
+    //       check of the same fact (re-observed 2026-09-16) -- the re-announcement check above
+    //       stayed green, which is the measurement showing announcing and freeing are two facts
+    //       and not one. Reverted.
     const std::string servedName =
         wallpaperx::testing::errorNameFrom([&carol] { wallpaperx::testing::getFrameFd(*carol, kMonitorReleaseWire); });
     check(servedName.empty(), "the consumer that was refused is served once an image has come free");

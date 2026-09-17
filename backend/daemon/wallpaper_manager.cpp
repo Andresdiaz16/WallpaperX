@@ -26,7 +26,6 @@
 #include <stdexcept>
 #include <thread>
 #include <utility>
-#include <variant>
 
 #include <unistd.h>
 
@@ -245,6 +244,10 @@ WallpaperManager::~WallpaperManager() {
     if (m_device) {
         m_device->adoptGpuThread();
     }
+
+    // Sessions are freed by member destruction, with no crash record: one left by a stop main's
+    // teardown alarm abandoned would refuse a wallpaper that drew. That alarm is all that bounds
+    // this teardown, which can enter ffmpeg's unbounded wait.
 }
 
 const char* toString(HealthStatus status) {
@@ -713,6 +716,9 @@ void WallpaperManager::requestWallpaper(const std::string& type, const std::stri
         state.type = type;
         state.path = path;
         ++state.requestSeq;
+        // Bumped even when type and path are what this monitor already held: the same path can
+        // name different bytes, and a decode session opened on the old ones must not be reused.
+        ++state.wallpaperSeq;
         state.lastError.clear();
         state.quarantined = false;
 
@@ -1104,6 +1110,7 @@ std::vector<int> WallpaperManager::restoreSaved() {
         state.type = entry.type;
         state.path = entry.path;
         ++state.requestSeq;
+        ++state.wallpaperSeq;
         state.lastError.clear();
         state.hasFrame = false;
 
@@ -1190,6 +1197,67 @@ std::vector<int> WallpaperManager::restoreSaved() {
     return monitorIds;
 }
 
+void WallpaperManager::closeVideoSessionLocked(int monitorId) {
+    auto it = m_videoSessions.find(monitorId);
+    if (it == m_videoSessions.end()) return;
+
+    VideoSession session = std::move(it->second);
+    m_videoSessions.erase(it);
+
+    // Best-effort where the teardown is not: writing the record allocates, and a record that
+    // cannot be written must not leave a decoder open.
+    std::optional<ApplyingRecord> applying;
+    try {
+        applying.emplace(m_config.stateDir, monitorId, "video", session.path);
+    } catch (const std::exception&) {
+    }
+    session.pipeline.reset();
+}
+
+void WallpaperManager::dropStaleVideoSessionLocked(int monitorId, std::optional<Drawable> kind,
+                                                   uint64_t wallpaperSeq) {
+    const auto it = m_videoSessions.find(monitorId);
+    if (it == m_videoSessions.end()) return;
+    if (kind == Drawable::Clip && it->second.wallpaperSeq == wallpaperSeq) return;
+    closeVideoSessionLocked(monitorId);
+}
+
+static_assert(WallpaperManager::kMaxVideoSessions > 0, "the monitor being drawn needs a session of its own");
+
+VideoPipeline& WallpaperManager::videoSessionLocked(int monitorId, const std::string& path, uint64_t wallpaperSeq) {
+    if (const auto it = m_videoSessions.find(monitorId); it != m_videoSessions.end()) {
+        it->second.lastUsed = ++m_videoSessionUse;
+        return *it->second.pipeline;
+    }
+
+    // Evicted before the record below is taken, not after: a teardown names the file it frees, and
+    // the handler has one slot, so a record for this monitor would silence the evicted one's.
+    while (m_videoSessions.size() >= kMaxVideoSessions) {
+        const auto oldest =
+            std::min_element(m_videoSessions.begin(), m_videoSessions.end(),
+                             [](const auto& a, const auto& b) { return a.second.lastUsed < b.second.lastUsed; });
+        closeVideoSessionLocked(oldest->first);
+    }
+
+    // On disk across the open and the first decode -- the spans in which the file's content is
+    // what runs -- and declared before the pipeline, so a session that fails half-built is torn
+    // down while the record still names it.
+    const ApplyingRecord applying(m_config.stateDir, monitorId, "video", path);
+    auto pipeline =
+        std::make_unique<VideoPipeline>(*m_device, path, m_resolvedShaderDir, VideoPipeline::Playback::Once);
+    // The picture every pass for this wallpaper draws until a clock exists to ask for another. A
+    // file with none cannot be drawn at a later pass either, so this fails now.
+    if (!pipeline->decodeNext()) {
+        throw WallpaperContentError("no picture could be decoded from " + path);
+    }
+
+    const auto entry =
+        m_videoSessions
+            .insert_or_assign(monitorId, VideoSession{wallpaperSeq, ++m_videoSessionUse, path, std::move(pipeline)})
+            .first;
+    return *entry->second.pipeline;
+}
+
 RenderOutcome WallpaperManager::renderPending(int monitorId) {
     // Bounds how long a stream of size changes, each landing mid-draw, can hold the worker. Past it
     // the monitor goes without a frame until the newest request's own post runs.
@@ -1211,6 +1279,9 @@ WallpaperManager::RenderPass WallpaperManager::renderPassLocked(int monitorId, b
     std::string type;
     std::string path;
     uint64_t seq = 0;
+    // Which wallpaper this pass is for, as against which render: a re-post for a new size shares
+    // the wallpaper of the pass before it and so shares its decode session.
+    uint64_t wallpaperSeq = 0;
     // Read with the sequence number: every change to it bumps that number, so a commit that finds
     // the sequence unmoved was drawn at the size still in force.
     OutputSize size;
@@ -1237,10 +1308,12 @@ WallpaperManager::RenderPass WallpaperManager::renderPassLocked(int monitorId, b
         type = it->second.type;
         path = it->second.path;
         seq = it->second.requestSeq;
+        wallpaperSeq = it->second.wallpaperSeq;
         size = targetSizeLocked(monitorId);
     }
 
     const std::optional<Drawable> kind = drawableType(type);
+    dropStaleVideoSessionLocked(monitorId, kind, wallpaperSeq);
     if (!kind) {
         // Recorded only; nothing here draws a shader yet. Release the target --
         // nothing will read it again, and holding a full-size image per monitor for a
@@ -1268,19 +1341,20 @@ WallpaperManager::RenderPass WallpaperManager::renderPassLocked(int monitorId, b
     std::string error;
     bool daemonFault = false;
     bool deferred = false;
-    // On disk across the decode, the submit and the drawer's own teardown -- the spans in which
-    // the file's content is what runs -- so a start after a fatal signal in any of them refuses
-    // this wallpaper. Not around ensureGpu() or the images: a driver that dies creating those
-    // would be blamed on whichever picture happened to be first.
+    // On disk while a still's renderer is built, and from the choice of target through the submit
+    // and the teardowns after it -- the spans in which the file's content is what runs -- so a
+    // start after a fatal signal in any of them refuses this wallpaper. A video's open and first
+    // decode carry videoSessionLocked()'s own record. Not around ensureGpu() or the images: a
+    // driver that dies creating those would be blamed on whichever picture happened to be first,
+    // so a pass failing there frees its renderer with no record on disk.
     //
-    // Declared before the drawer so every exit destroys the drawer while this record is still on
-    // disk: tearing a decode session down re-enters ffmpeg and the driver.
+    // Declared before the renderer so a return that skips the teardown below still frees it first.
     std::optional<ApplyingRecord> applying;
 
-    // One drawer per pass, and the type picks which. Neither is default-constructible, so the
-    // empty arm is both how this is declared before the type is branched on and how the failure
-    // exit below destroys it early.
-    std::variant<std::monostate, StaticRenderer, VideoPipeline> drawer;
+    // What draws, one per type. The still's renderer is this pass's own; a video's session
+    // outlives the pass, and this only points at the one m_videoSessions holds.
+    std::optional<StaticRenderer> still;
+    VideoPipeline* clip = nullptr;
     const OffscreenTarget* target = nullptr;
     try {
         ensureGpu();
@@ -1296,32 +1370,24 @@ WallpaperManager::RenderPass WallpaperManager::renderPassLocked(int monitorId, b
         }
 
         if (!deferred) {
-            // Decoded before the images are rebuilt, so a redraw at a new size goes without a frame
-            // for the draw only, not for the decode. The render pass belongs to the manager, not to
-            // this monitor's images, and the draw takes its extent from the target.
+            // Whatever is drawn is ready before the images are rebuilt, so a redraw at a new size
+            // goes without a frame for the draw only, not for the decode or the upload. The render
+            // pass belongs to the manager, not to this monitor's images, and the draw takes its
+            // extent from the target.
             //
-            // Neither drawer is retained past this call. A static wallpaper renders once, and a
-            // video shows only its first picture until a per-monitor session with a clock drives
-            // it, so keeping either per monitor would hold VRAM -- a texture and a pipeline, or a
-            // decoder's image pool and its hardware decode session -- for something nothing
-            // re-renders. render() does not wait, so what keeps a drawer from being destroyed out
-            // from under the GPU is its own destructor: the still waits for the device to go idle,
-            // the video asks it a bounded question and leaks rather than wait.
-            applying.emplace(m_config.stateDir, monitorId, type, path);
+            // The still's renderer is not retained past this call: a texture and a pipeline per
+            // monitor for something nothing re-renders. render() does not wait, so what keeps it
+            // from being destroyed out from under the GPU is its own destructor, which waits for
+            // the device to go idle.
             if (*kind == Drawable::Still) {
-                drawer.emplace<StaticRenderer>(*m_device, m_targets->renderPass(), path, m_resolvedShaderDir);
+                applying.emplace(m_config.stateDir, monitorId, type, path);
+                still.emplace(*m_device, m_targets->renderPass(), path, m_resolvedShaderDir);
+                // Off disk while the images are made, for ensureGpu()'s reason: their size is the
+                // screen's, and a driver dying on it is not this picture's doing.
+                applying.reset();
             } else {
-                VideoPipeline& clip = drawer.emplace<VideoPipeline>(*m_device, path, m_resolvedShaderDir,
-                                                                    VideoPipeline::Playback::Once);
-                // Decoded here rather than at the draw, for the reason above: the picture lands in
-                // the pipeline's own image, so a rebuild costs this monitor the blit, not the decode.
-                if (!clip.decodeNext()) {
-                    throw WallpaperContentError("no picture could be decoded from " + path);
-                }
+                clip = &videoSessionLocked(monitorId, path, wallpaperSeq);
             }
-            // Off disk while the images are made, for ensureGpu()'s reason: their size is the
-            // screen's, and a driver dying on it is not this picture's doing.
-            applying.reset();
 
             if (ensureTargets(monitorId, size)) rebuilt = true;
 
@@ -1379,6 +1445,12 @@ WallpaperManager::RenderPass WallpaperManager::renderPassLocked(int monitorId, b
         return {};
     }
 
+    // Here, not only after the commit block, which an overtaken pass returns from inside: the newer
+    // pass must not draw on a device this failure may have lost. Without a record, because a
+    // session exists here only once its open and first decode succeeded, so what failed was the
+    // GPU or the daemon, not the file.
+    if (!error.empty()) m_videoSessions.erase(monitorId);
+
     bool committed = false;
     uint64_t generation = 0;
     {
@@ -1402,12 +1474,12 @@ WallpaperManager::RenderPass WallpaperManager::renderPassLocked(int monitorId, b
 
         if (error.empty()) {
             try {
-                // An arm is always set here: every path that leaves the variant empty sets
+                // One of the two is always set here: every path that leaves both unset sets
                 // `error`, which the guard above excludes.
                 if (*kind == Drawable::Still) {
-                    m_targets->render(std::get<StaticRenderer>(drawer), *target);
+                    m_targets->render(*still, *target);
                 } else {
-                    std::get<VideoPipeline>(drawer).draw(*m_targets, *target);
+                    clip->draw(*m_targets, *target);
                 }
             } catch (const GpuFailure& e) {
                 error = e.what();
@@ -1462,10 +1534,11 @@ WallpaperManager::RenderPass WallpaperManager::renderPassLocked(int monitorId, b
                                m_gpuStatus.name + " (" + m_gpuStatus.descriptorTier + ")");
         }
     }
-    // Both outside the state lock: a teardown that re-enters ffmpeg, and an unlink on a stalled
-    // filesystem, must not hold up GetStatus. The drawer goes first, so a fatal fault tearing a
-    // decode session down is still attributed to the file being applied.
-    drawer.emplace<std::monostate>();
+    // Both outside the state lock: freeing a texture waits for the GPU, and an unlink on a stalled
+    // filesystem must not hold up GetStatus. Both teardowns run before the record comes off disk.
+    still.reset();
+    // A draw that threw leaves its pipeline unusable, and the record on disk names its file.
+    if (!error.empty()) closeVideoSessionLocked(monitorId);
     applying.reset();
 
     if (!error.empty()) {

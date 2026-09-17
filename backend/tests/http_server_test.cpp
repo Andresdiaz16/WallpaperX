@@ -3102,9 +3102,10 @@ void runGpuFailureChecks(const std::string& bluePath, const WallpaperManager::Co
     //       wallpaper_manager.cpp put back to `m_health.gpu.status = HealthStatus::Ok;`
     //       -> "FAIL: a recovered GPU carries the detail ensureGpu writes, not the text of
     //       the failure it recovered from" with "  gpu after recovery: ok
-    //       (Device::immediateSubmit: vkQueueSubmit failed) (expected NVIDIA GeForce RTX
-    //       3080 Ti (Heap))". The status check above it stayed green, which is the point:
-    //       the two are not one assertion written twice. Reverted.
+    //       (Device::submit: vkQueueSubmit failed with VK_ERROR_DEVICE_LOST) (expected NVIDIA
+    //       GeForce RTX 3080 Ti (Heap))", re-observed 2026-09-16. The status check above it
+    //       stayed green, which is the point: the two are not one assertion written twice.
+    //       Reverted.
     // COVERAGE-ASSERT: the expected string is required to be non-trivial before it is
     //       compared. On a manager reporting no GPU name it would be " ()", and an
     //       equality check against that establishes nothing.

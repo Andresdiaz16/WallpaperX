@@ -27,6 +27,7 @@ namespace wallpaperx {
 class Device;
 class OffscreenTargetManager;
 struct OffscreenTarget;
+class VideoPipeline;
 
 // A request that was malformed rather than one that failed to render. Its own type so the
 // DBus layer can answer with InvalidArgs instead of a generic failure.
@@ -264,6 +265,13 @@ public:
     // is the price of not evicting a holder to make room for the fifth.
     static constexpr size_t kMaxHoldersPerMonitor = 4;
 
+    // Video wallpapers holding an open decode session at once: a budget for the video memory idle
+    // decoders hold, not a hardware session limit. Monitor ids are the client's to choose and each
+    // session holds a decoder and its picture pool, so kMaxMonitors is not a usable bound. A
+    // desktop with more video screens than this evicts the least recently drawn session, and every
+    // re-post of an evicted screen reopens its file and decodes again.
+    static constexpr size_t kMaxVideoSessions = 4;
+
     struct Config {
         // What a monitor is drawn at until its screen reports a size through setOutputSize().
         // Tests override it to keep software-rasterised runs fast.
@@ -476,6 +484,13 @@ private:
         // a second pass would burn a generation and re-announce a frame already imported.
         uint64_t servicedSeq = 0;
 
+        // Counts the times this monitor was given a wallpaper, where requestSeq counts renders
+        // owed: a resize or an import-modifier report bumps that one and leaves this alone. What
+        // a retained decode session belongs to, since it may survive a re-post but never a new
+        // wallpaper -- and comparing paths instead would call a file rewritten in place the same
+        // wallpaper, leaving a decoder open on bytes that are gone.
+        uint64_t wallpaperSeq = 0;
+
         uint64_t generation = 0;
         bool hasFrame = false;
         std::string lastError;
@@ -540,6 +555,26 @@ private:
         bool superseded = false;
     };
     RenderPass renderPassLocked(int monitorId, bool& rebuilt);
+
+    // The three entries to a monitor's retained decode session, all on the GPU thread with
+    // m_gpuMutex held. A teardown re-enters ffmpeg and the driver on behalf of the file that
+    // session opened, so it puts a crash record naming that file on disk -- unless the caller
+    // already holds one, which happens only where the two name the same file and that record then
+    // stands. The only other teardowns write none: a pass that failed on the GPU, and destruction.
+    void closeVideoSessionLocked(int monitorId);
+
+    // Keeps the session only if a pass for this wallpaper would draw with it. Called before the
+    // branches that draw or release a target, so no type and no failure leaves a decoder and its
+    // picture pool open for a file nothing shows.
+    void dropStaleVideoSessionLocked(int monitorId, std::optional<Drawable> kind, uint64_t wallpaperSeq);
+
+    // The session to draw this monitor's video with, opened and decoded into when it has none for
+    // this wallpaper -- so a re-post costs the blit of the picture already held. Never advances a
+    // session that exists: what shows the next picture is the clock, which does not exist yet.
+    // ensureGpu() and this pass's dropStaleVideoSessionLocked() must have run: a session found here
+    // is reused without asking which wallpaper it was opened for. Throws what VideoPipeline's
+    // constructor and decodeNext() throw, retaining nothing when it does.
+    VideoPipeline& videoSessionLocked(int monitorId, const std::string& path, uint64_t wallpaperSeq);
 
     // Drops every claim on a monitor whose images have just been freed or replaced, and the
     // frame they held: hasFrame promises an export that the images it names still exist. Takes
@@ -669,6 +704,33 @@ private:
     std::unique_ptr<Device> m_device;
     std::unique_ptr<OffscreenTargetManager> m_targets;
     std::string m_resolvedShaderDir;
+
+    // One monitor's open video file: the decoder, its picture pool and the converted picture last
+    // shown. Held so a re-post -- a screen reporting its size, a consumer reporting its layouts --
+    // draws that picture again instead of rebuilding a decode session for it. A resize keeps it:
+    // nothing in a session is sized to the target, since the blit that shows the picture scales to
+    // whatever extent it is given.
+    //
+    // Guarded by m_gpuMutex and not m_stateMutex, which is why it cannot live in MonitorState: a
+    // pipeline is GPU-thread-only, destruction included, while MonitorState is read by bus
+    // handlers. Declared after the Device and the targets so it is destroyed before them, which is
+    // also what frees the pipelines at shutdown -- on the thread ~WallpaperManager adopts, and
+    // before the Device they were built on. Holds at most kMaxVideoSessions entries.
+    struct VideoSession {
+        uint64_t wallpaperSeq = 0;
+        // Which draw this session was last wanted for, against m_videoSessionUse. Eviction picks
+        // the smallest.
+        uint64_t lastUsed = 0;
+        // The file this pipeline opened, which its teardown is attributed to. Not a copy of the
+        // monitor's path: that names what the monitor has been asked for since.
+        std::string path;
+        std::unique_ptr<VideoPipeline> pipeline;
+    };
+    std::map<int, VideoSession> m_videoSessions;
+
+    // Counts draws that wanted a session, so the least recently wanted one can be told from the
+    // rest. Guarded by m_gpuMutex with the map it orders.
+    uint64_t m_videoSessionUse = 0;
 
     // Guarded by m_stateMutex. m_gpuStatus is a copy of what the Device reported,
     // published once at initialisation, so status() can answer without touching the

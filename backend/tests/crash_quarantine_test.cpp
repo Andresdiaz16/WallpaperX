@@ -270,9 +270,10 @@ int main() {
         //       assertion, then decode the file on the first pass -- the crash loop, with a
         //       message on top of it.
         // CONTROL: in backend/daemon/wallpaper_manager.cpp, restoreSaved()'s
-        //       `state.quarantined = crash && ...` replaced with `= false` -> 16 FAIL lines,
+        //       `state.quarantined = crash && ...` replaced with `= false` -> 20 FAIL lines,
         //       from "a monitor whose record matches its wallpaper is refused with a reason"
-        //       through "the refused wallpaper is never opened, let alone decoded". Reverted.
+        //       through "a consumer leaving the bus re-posts the refused monitor too", the video
+        //       row's four among them. Re-observed 2026-09-16. Reverted.
         {
             const WallpaperManager::Snapshot snap = manager.snapshot();
             const std::optional<wallpaperx::MonitorStatus> crashed = monitor(snap, kCrashedMonitor);
@@ -382,11 +383,12 @@ int main() {
         // CONTROL: two lines of backend/daemon/wallpaper_manager.cpp, because either one alone
         //       still stops the decode and neither is dead: restoreSaved()'s
         //       `state.servicedSeq = state.requestSeq` (which makes the first pass a no-op for
-        //       a request nothing owes) and renderPending()'s `if (it->second.quarantined)`
+        //       a request nothing owes) and renderPassLocked()'s `if (it->second.quarantined)`
         //       early return (which is what stops a RE-POSTED refusal, and goes red on its own
         //       in the import-modifier checks below). With both removed: "FAIL: the refused
         //       wallpaper is never opened, let alone decoded -- the refused file was opened 1
-        //       time(s); the rendered one 1", 11 FAIL lines in all. Both reverted.
+        //       time(s); the rendered one 1", 13 FAIL lines in all, the video row's two among
+        //       them. Re-observed 2026-09-16. Both reverted.
         if (crashedWatch.ok() && movedOnWatch.ok()) {
             const int refusedOpens = crashedWatch.drain();
             const int controlOpens = movedOnWatch.drain();
@@ -454,9 +456,10 @@ int main() {
             // CONTROL: in backend/daemon/wallpaper_manager.cpp, `removeCrashRecord(m_config.stateDir,
             //       entry.monitorId)` added to restoreSaved()'s quarantine branch -> "FAIL: the
             //       record stays on disk, so a second restart refuses too" and the unstamped one
-            //       beside it. Reverted. (The same call added to renderPending()'s quarantined
-            //       branch instead reddens only the two re-post checks further down, because the
-            //       first pass returns earlier -- at the already-serviced test.)
+            //       beside it, with the two re-post record checks further down. (The same call added
+            //       to renderPassLocked()'s quarantined branch instead reddens only those two re-post
+            //       checks, because the first pass returns earlier -- at the already-serviced test.)
+            //       Both re-observed 2026-09-16. Reverted.
             check(recordOnDisk(stateDir, kCrashedMonitor),
                   "the record stays on disk, so a second restart refuses too");
             check(recordOnDisk(stateDir, kKilledMonitor),

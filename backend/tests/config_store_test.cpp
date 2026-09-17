@@ -1385,9 +1385,9 @@ void runRestoreChecks() {
     //       (4d10655) the repair write WAS synchronous, and the guard deletion alone reddened
     //       this check, which is what the previous annotation recorded. It now goes green --
     //       measured, five runs -- because the queued write has not reached the file when the
-    //       read below happens. The synchronous half alone reddens only "the startup repair
-    //       does not park the daemon on the config write", never these two. Observed
-    //       2026-08-19. Both reverted. This check therefore cannot see an asynchronous repair
+    //       read below happens. The synchronous half alone reddens "the startup repair does not
+    //       park the daemon on the config write" and "a write that has only just been handed over
+    //       reports pending, ...", never these two. Re-observed 2026-09-16. Both reverted. This check therefore cannot see an asynchronous repair
     //       write; the daemon_system twin, which samples across a process restart, can, and is
     //       what really carries the rule.
     // COVERAGE-ASSERT: the byte comparison is only evidence of this rule while the fixture
@@ -1520,7 +1520,7 @@ void runUnreadableConfigChecks() {
     //       The health status is asserted alongside because a preserved file nobody is told
     //       about reads to the user as a config that silently emptied itself.
     // CONTROL: the `std::filesystem::rename(source, kept, ec)` call deleted from putBytes()
-    //       (backend/daemon/wallpaper_manager.cpp), so the placement reports success without
+    //       (backend/daemon/config_preserve.cpp), so the placement reports success without
     //       writing anything -> "FAIL: a config that could not be read is kept as
     //       config.json.bad" and "FAIL: the preserved copy is byte-identical to the file the
     //       daemon could not read", printing "no .../config.json.bad exists; copies anywhere:
@@ -2343,10 +2343,14 @@ void runRepairCopyChecks() {
     // WHY-THIS-SHAPE, second half: sampled between preserveUnreadableConfig() and
     //       writeRepairedConfig() so it is that call's own record being graded, not one the
     //       rewrite left behind.
-    // CONTROL: the `m_repairCopied ? HealthStatus::Ok : HealthStatus::Fail` in
-    //       WallpaperManager::preserveUnreadableConfig() (backend/daemon/wallpaper_manager.cpp)
-    //       forced back to a bare `HealthStatus::Ok`, which is the code before this fix -> "FAIL:
-    //       a copy that could not be taken is reported as failed persistence, not as ok".
+    // CONTROL: it takes two, both in backend/daemon/wallpaper_manager.cpp: the
+    //       `m_repairCopied ? HealthStatus::Ok : HealthStatus::Fail` in
+    //       WallpaperManager::preserveUnreadableConfig() forced back to a bare `HealthStatus::Ok`,
+    //       which is the code before this fix, AND the `if (m_preserveFailed)` status line in
+    //       applyPersistOutcomeLocked()'s NeverAsked arm deleted -> "FAIL: a copy that could not be
+    //       taken is reported as failed persistence, not as ok", printing "persistence: ok", with
+    //       the alarm-escape phase's check beside it. The forced Ok alone leaves this green: the
+    //       sticky flag still reports the loss. Re-observed 2026-09-16. Reverted.
     manager.preserveUnreadableConfig();
     const WallpaperManager::Snapshot afterCopy = manager.snapshot();
     const bool copyFailedLoudly = afterCopy.health.persistence.status == wallpaperx::HealthStatus::Fail &&
@@ -2452,11 +2456,11 @@ void runRepairCopyChecks() {
     // stuck at Fail from the first line of the constructor.
     // CONTROL: `m_preserveFailed` initialised to `true` in wallpaper_manager.h -> "FAIL: a run
     // whose copy WAS taken reports persistence ok, so the alarm above is not permanent", printing
-    // "persistence reads fail", and four more across three other phases -- "an entry this build
-    // cannot apply is reported without failing the persistence check", "the persistence health
-    // recovers once a retried write lands" and "persistence reports itself working again once a
-    // save has landed". A daemon whose persistence can never read ok is caught in several
-    // independent places, which is the point of asking here as well.
+    // "persistence reads fail", and seven more across other phases, among them "an entry this
+    // build cannot apply is reported without failing the persistence check", "the persistence
+    // health recovers once a retried write lands" and "persistence reports itself working again
+    // once a save has landed" (re-observed 2026-09-16). A daemon whose persistence can never read
+    // ok is caught in several independent places, which is the point of asking here as well.
     std::error_code freeEc;
     std::filesystem::remove(firstBesideName, freeEc);
     if (freeEc) {
@@ -2515,7 +2519,7 @@ void runPreservationWithoutHomeChecks() {
     //       that kept a copy and still refused to save would satisfy a check on the copy alone,
     //       and that is the whole cost of the defect.
     // CONTROL: the config file's own directory removed from preserveConfig()'s candidate list
-    //       in backend/daemon/wallpaper_manager.cpp, which is the code before this fix -> "FAIL:
+    //       in backend/daemon/config_preserve.cpp, which is the code before this fix -> "FAIL:
     //       with no state directory the config is kept beside the config file", printing "copies:
     //       (none)", "FAIL: the config that could not be read is not left where the daemon reads
     //       it", and "FAIL: a wallpaper set after the copy was kept is persisted", printing "ids
@@ -3585,10 +3589,11 @@ void runOutputRestoreChecks() {
     //       accepted and bound -> "FAIL: an unusable connector name is not bound" and "FAIL: an
     //       unusable connector name in the config is reported as dropped", the persistence
     //       detail carrying no dropped-name clause at all. The narrower mutation of only
-    //       suppressing `++rejectedNames` reddens the reporting check alone -- it never binds
-    //       the name -- so it does not control the first of the two. Re-observed 2026-08-16,
-    //       now with six further checks in other phases red beside them, since carrying a name
-    //       for a bigger build is gated on the same predicate. Reverted.
+    //       suppressing `++rejectedNames` reddens the reporting check and two other reporting
+    //       checks, never the binding one -- it never binds the name -- so it does not control
+    //       the first of the two. Both re-observed 2026-09-16,
+    //       now with eight further checks in other phases red beside them, since carrying a
+    //       name for a bigger build is gated on the same predicate. Reverted.
     check(snap.outputs.count(oversized) == 0, "an unusable connector name is not bound");
     check(snap.monitors.count(5) == 1 && snap.monitors.at(5).path == other.string(),
           "the wallpaper on a row whose connector name was refused is restored anyway");
@@ -3611,12 +3616,14 @@ void runOutputRestoreChecks() {
     //       carries these rows and reports them as "screen names ... kept", leaving a check
     //       that looks only for "entries this build cannot apply" green. The property is that
     //       the row is not carried AT ALL, so neither clause may name it.
-    // CONTROL: the `if (entry.type.empty() && entry.path.empty() && !nameTravels)` guard in
-    //       WallpaperManager::restoreSaved() (backend/daemon/wallpaper_manager.cpp) disabled ->
-    //       "FAIL: a screen named with no wallpaper is reported as neither a kept entry nor a
-    //       kept name", printing a persistence detail containing "3 screen names this build's
-    //       monitor limit excludes, kept". Observed 2026-08-14. Reverted. Measured 2026-08-13:
-    //       the single-clause form of this check stayed GREEN under that same mutation.
+    // CONTROL: NONE CURRENT. Disabling the `if (entry.type.empty() && entry.path.empty() &&
+    //       !nameTravels)` guard in WallpaperManager::restoreSaved()
+    //       (backend/daemon/wallpaper_manager.cpp) reddened this on 2026-08-14; re-run 2026-09-16
+    //       it stays GREEN, because later code drops the same rows. Also disabling the kept-row
+    //       arm's `if (!nameTravels) keep.output.clear();` and the `live.outputs.count(...) == 0`
+    //       term in KeptRows::detail() (backend/daemon/kept_rows.cpp) still left it green, which
+    //       points at the end-of-restore name reconciliation as a fourth defence (not run). The
+    //       check stands, but nothing has been seen to redden it since those defences landed.
     const bool noFalseLoss =
         snap.health.persistence.detail.find("entries this build cannot apply") == std::string::npos &&
         snap.health.persistence.detail.find("screen names this build's monitor limit excludes") ==
@@ -4399,8 +4406,10 @@ void runCrossContainerDuplicateChecks() {
         //       clearing removed from the kept-row arm -> the "row this build can apply comes
         //       first" case red on "a monitor claimed across both containers reports the
         //       wallpaper it lost", printing 0 losses, and on "the repair leaves one row for that
-        //       monitor", printing "2 rows for 1 monitor id". (b) the `keptIndex.find` erase
-        //       removed from the applicable-row arm -> the other case red the same way.
+        //       monitor", printing "2 rows for 1 monitor id". (b) the
+        //       `KeptRows::dropWallpaper(held)` clearing under the applicable-row arm's
+        //       `keptIndex.find` disabled -> the other case red the same way. Both re-observed
+        //       2026-09-16.
         WallpaperManager::Config config;
         config.configFile = file;
         WallpaperManager manager(config);
@@ -4572,7 +4581,7 @@ void runStrictOwnershipChecks() {
     //       (a) exists to fail before. It must be THAT copy: the manager kept a second,
     //       map-lookup form, WallpaperManager::liveHolds(), and loosening it instead leaves (b)
     //       green -- it is reached only from restoreSaved(), which runs before any placeholder
-    //       can exist. Established by running both, 2026-08-19.
+    //       can exist. Established by running both, 2026-08-19; all three re-observed 2026-09-16.
     // COVERAGE-ASSERT: three calls are asserted to have been driven, against a literal three.
     //       CONTROL: the render entry deleted from the table, which is what dropping an awkward
     //       call looks like -> "FAIL: all three calls this phase means to drive were driven",
@@ -4685,7 +4694,7 @@ void runKeptNameTakenOverAtRuntimeChecks() {
     //       taken", printing "the report counts 0" beside a detail that still promises the row's
     //       wallpaper back. Reverted. The other two checks here are each defended TWICE in
     //       production, so that one mutation cannot redden them, and each needed the second
-    //       defence removed as well -- both re-observed 2026-08-19, both reverted:
+    //       defence removed as well -- all three re-observed 2026-09-16, all reverted:
     //       the promise check with `live.outputs.count(entry.output) == 0` dropped from
     //       KeptRows::detail()'s keptNames test -> "FAIL: the report stops promising back a
     //       screen name a client has taken", printing "1 still promised";
@@ -5046,8 +5055,8 @@ void runPreservedRowChecks() {
     //       later row's wallpaper in the file", printing "monitor 41 holds '/first.png'", and
     //       "FAIL: every kept row a later row really overwrote is reported as a loss, and no
     //       other" with no such clause in the detail at all, nothing having been overwritten.
-    //       Nine more went red with them, the merge being what every other check here rests on.
-    //       Re-observed 2026-08-19. Reverted.
+    //       Eight more went red with them, the merge being what every other check here rests on.
+    //       Re-observed 2026-09-16. Reverted.
     // COVERAGE-ASSERT: the expected number of losses is the length of the collision list
     //       below, so adding a colliding pair to the fixture without it being reported fails
     //       rather than quietly leaving the count alone.
@@ -6146,8 +6155,8 @@ void runStartupRepairChecks() {
     //       on disk before any client call", printing "monitor 1 holds type '' path '' output
     //       'DP-4'; ids on disk: 1 40", and "FAIL: a second start with no client acting has
     //       nothing left to repair", printing a second-start detail carrying "2 screen names
-    //       displaced by another entry" again. Twenty more go red with them, every check in the
-    //       binary that reads a startup repair back. Re-observed 2026-08-19. Reverted.
+    //       displaced by another entry" again. Twenty-two more go red with them, every check in
+    //       the binary that reads a startup repair back. Re-observed 2026-09-16. Reverted.
     const bool repairOnDisk = afterFirstStart.count(1) == 1 && afterFirstStart.at(1).path == present.string() &&
                               afterFirstStart.at(1).output == "DP-4";
     check(repairOnDisk, "the repair a start performs is on disk before any client call");
