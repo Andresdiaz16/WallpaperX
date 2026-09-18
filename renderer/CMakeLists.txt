@@ -763,7 +763,7 @@ set_tests_properties(frame_converter_shader_read PROPERTIES LABELS "novulkan")
 set(WALLPAPERX_PIPELINE_MODES sequence-device sequence-host resume-timestamps resume-no-timestamps
     resume-late-seek resume-end resume-seek-failure resume-drop-count shape shape-device steady-device
     steady-host loop-device loop-host loop-cost-device loop-cost-host loop-resume release-device retire-device
-    halves-device halves-host)
+    halves-device halves-host timing-device timing-host)
 foreach(MODE ${WALLPAPERX_PIPELINE_MODES})
     string(REPLACE "-" "_" MODE_NAME "${MODE}")
     add_test(NAME video_pipeline_${MODE_NAME} COMMAND wallpaperx-video-pipeline-probe ${MODE})
@@ -998,7 +998,7 @@ if(WALLPAPERX_LAVAPIPE_ICD)
                          PROPERTIES ENVIRONMENT "VK_ICD_FILENAMES=${WALLPAPERX_LAVAPIPE_ICD}"
                                     LABELS "lavapipe" SKIP_RETURN_CODE 77)
     # The pipeline's entries that need no hardware decoder.
-    foreach(MODE sequence-host shape steady-host loop-host loop-cost-host halves-host)
+    foreach(MODE sequence-host shape steady-host loop-host loop-cost-host halves-host timing-host)
         string(REPLACE "-" "_" MODE_NAME "${MODE}")
         add_test(NAME video_pipeline_${MODE_NAME}_lavapipe COMMAND wallpaperx-video-pipeline-probe ${MODE})
         set_tests_properties(video_pipeline_${MODE_NAME}_lavapipe

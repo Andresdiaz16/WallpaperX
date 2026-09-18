@@ -4002,10 +4002,11 @@ void runBufferHoldChecks(const wallpaperx::WallpaperManager::Config& config, con
         //       somewhere would not separate the two reset rules, and those rules are the whole
         //       difference between the two counters.
         // CONTROL: `it->second.refusedHandovers = 0;` moved out of
-        //       WallpaperManager::exportCurrentFrame and into the commit path beside
-        //       `state.deferredRenders = 0;` in WallpaperManager::renderPending (backend/daemon/
-        //       wallpaper_manager.cpp) -> "FAIL: and a commit does not clear it -- only a served
-        //       hand-over does", printing 0. Reverted.
+        //       WallpaperManager::exportCurrentFrame and into commitFrameLocked(), beside
+        //       `state.deferredRenders = 0;` (backend/daemon/wallpaper_manager.cpp) -> "FAIL: and a
+        //       commit does not clear it -- only a served hand-over does", printing "the monitor
+        //       reports 0 refused hand-over(s) after a commit that reset nothing". Observed
+        //       2026-09-18; the commit path used to be inline in renderPending(). Reverted.
         check(after.refusedHandovers == 1, "and a commit does not clear it -- only a served hand-over does");
         if (after.refusedHandovers != 1) {
             std::fprintf(stderr, "  the monitor reports %u refused hand-over(s) after a commit that reset nothing\n",
@@ -5856,7 +5857,7 @@ void runResizeBarrierChecks(const wallpaperx::WallpaperManager::Config& config, 
     // CONTROL: WallpaperManager::renderPending's attempt loop (backend/daemon/wallpaper_manager.cpp)
     //       reduced to `return renderPassLocked(monitorId, rebuilt).outcome;` -> "FAIL: an export racing a
     //       resize pass overtaken mid-rebuild gets the old or the new frame, never none", printing
-    //       "no frame, reason 1" (NotRendered). Reverted.
+    //       "no frame, reason 1" (NotRendered). Re-observed 2026-09-18. Reverted.
     if (!firstFrame(kMonitorOvertaken, "DP-RACE", imagePath)) {
         check(false, "the monitor the overtaken pass is about is drawn first");
         return;

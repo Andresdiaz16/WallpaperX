@@ -24,6 +24,15 @@ struct WallpaperContentError : std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
+// A host or device resource that ran out, which isResourceExhaustion() below names. Its own type
+// because a caller may be able to free something and ask again -- the daemon frees an idle video
+// decode session and retries the open -- and because matching that on message text is what the
+// two types above exist to avoid. Deliberately not a GpuFailure: a shortage is not evidence
+// about the driver.
+struct ResourceExhausted : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
 // "VK_ERROR_DEVICE_LOST", or the raw number for a code this build does not name. Only for
 // diagnostics: an operator reads the daemon's last_error, and an integer there names nothing.
 std::string vkResultName(VkResult result);

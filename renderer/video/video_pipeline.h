@@ -6,6 +6,7 @@
 #include "frame_converter.h"
 #include "video_decoder.h"
 
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -65,6 +66,18 @@ public:
     bool decodeNext();
     void draw(OffscreenTargetManager& targets, const OffscreenTarget& target);
 
+    // When the picture draw() shows belongs on screen, as the decoder reported it. What paces the
+    // pictures is the caller's; this only says where each one falls.
+    struct PictureTiming {
+        std::optional<std::chrono::nanoseconds> presentation;
+        std::optional<std::chrono::nanoseconds> duration;
+        // The first picture this pipeline showed, or the first after a loop: its presentation
+        // time says nothing about its distance from the picture before it.
+        bool startsPass = false;
+    };
+    // Throws std::logic_error before the first picture.
+    PictureTiming timing() const;
+
 private:
     // Built and replaced together, so the renderer never outlives the image it shows.
     struct Stage {
@@ -79,6 +92,8 @@ private:
     VideoDecoder m_decoder;
     // Null until the first picture.
     std::unique_ptr<Stage> m_stage;
+    // The converted picture's; meaningful once m_stage exists.
+    PictureTiming m_timing;
 };
 
 }

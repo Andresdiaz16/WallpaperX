@@ -23,24 +23,26 @@
 namespace {
 
 using wallpaperx::GpuFailure;
+using wallpaperx::ResourceExhausted;
 using wallpaperx::WallpaperContentError;
 using wallpaperx::testing::check;
 
-// What the classifier is required to decide. `ResourceLimit` means the daemon's plain
-// std::exception arm catches it and the GPU's recorded health is left alone; `DriverFault`
-// means the GpuFailure arm catches it and the health is latched to failed.
+// What the classifier is required to decide. `ResourceLimit` means the GPU's recorded health
+// is left alone AND the caller is told it may be able to free something and ask again;
+// `DriverFault` means the GpuFailure arm catches it and the health is latched to failed.
 enum class Verdict { ResourceLimit, DriverFault };
 
 // What it actually did. Folded into a value rather than asserted inside the catch blocks so
 // that "threw nothing at all" has a name of its own -- inside a catch block that outcome is
 // simply the absence of an assertion, which is indistinguishable from a pass.
-enum class Observed { Nothing, GpuFault, ContentError, PlainRuntimeError, ForeignException };
+enum class Observed { Nothing, GpuFault, ContentError, Exhausted, PlainRuntimeError, ForeignException };
 
 const char* describe(Observed o) {
     switch (o) {
         case Observed::Nothing: return "returned without throwing";
         case Observed::GpuFault: return "GpuFailure";
         case Observed::ContentError: return "WallpaperContentError";
+        case Observed::Exhausted: return "ResourceExhausted";
         case Observed::PlainRuntimeError: return "std::runtime_error";
         case Observed::ForeignException: return "some other std::exception";
     }
@@ -62,6 +64,12 @@ Observed classify(VkResult result, std::string* message) {
     } catch (const WallpaperContentError& e) {
         *message = e.what();
         return Observed::ContentError;
+    } catch (const ResourceExhausted& e) {
+        // Before std::runtime_error, which it derives from. Its own arm because the daemon
+        // now acts on it: an open that raises it frees an idle video decode session and
+        // tries once more, which a plain runtime_error does not get.
+        *message = e.what();
+        return Observed::Exhausted;
     } catch (const std::runtime_error& e) {
         *message = e.what();
         return Observed::PlainRuntimeError;
@@ -128,17 +136,18 @@ const std::vector<Case> kCases = {
 //       broken GPU. The table is swept rather than sampled because the property is "these
 //       seven and nothing else", which a sample cannot express.
 // CONTROL: the `isResourceExhaustion(result)` branch deleted from throwVkFailure in
-//       renderer/vulkan/gpu_fault.cpp, so every failure becomes a GpuFailure -- with that
-//       mutation in place the other 55 backend entries all stayed green, which is why this
-//       file exists -> seven reds here, "FAIL: VK_ERROR_OUT_OF_HOST_MEMORY (the
-//       host is out of memory) is a resource limit, so it must not be raised as GpuFailure
-//       -- got GpuFailure" and one per remaining limit code, exit 1. Reverted. Second
-//       control, aimed the other way: `case VK_ERROR_DEVICE_LOST:` added to
-//       isResourceExhaustion -> "FAIL: VK_ERROR_DEVICE_LOST (the device stopped working) is
-//       the driver going wrong, so it must be raised as GpuFailure -- got
-//       std::runtime_error". Reverted. Third, for the two message checks: the `context +`
-//       dropped from the message throwVkFailure builds -> 26 reds, "FAIL: ... message names
-//       the calling context". Reverted.
+//       renderer/vulkan/gpu_fault.cpp, so every failure becomes a GpuFailure -> seven reds
+//       here, "FAIL: VK_ERROR_OUT_OF_HOST_MEMORY (the host is out of memory) is a resource
+//       limit, so it must be raised as ResourceExhausted -- got GpuFailure" and one per
+//       remaining limit code, exit 1. Reverted. Second, aimed the other way:
+//       `case VK_ERROR_DEVICE_LOST:` added to isResourceExhaustion -> "FAIL:
+//       VK_ERROR_DEVICE_LOST (the device stopped working) is the driver going wrong, so it
+//       must be raised as GpuFailure -- got ResourceExhausted". Reverted. Third, for the
+//       TYPE rather than the arm: that branch made to throw a plain std::runtime_error, which
+//       is what it threw before the daemon learnt to retry an exhausted open -> the same
+//       seven reds, "got std::runtime_error". Reverted. Fourth, for the two message checks:
+//       the `context +` dropped from the message throwVkFailure builds -> 26 reds, "FAIL: ...
+//       message names the calling context". Reverted. All four observed 2026-09-18.
 // COVERAGE-ASSERT: g_classified is asserted against the table size in main(). It guards a
 //       harness defect only -- a loop that stops early, or a table emptied by an edit -- and
 //       no production change can redden it; the per-case checks are what production breaks.
@@ -150,8 +159,12 @@ void testClassification() {
         const std::string prefix = named + " (" + c.why + ") ";
 
         if (c.expected == Verdict::ResourceLimit) {
-            check(observed == Observed::PlainRuntimeError,
-                  prefix + "is a resource limit, so it must not be raised as GpuFailure -- got " +
+            // ResourceExhausted specifically, not "anything but GpuFailure": a caller that can
+            // free something asks again on this type alone, so a limit raised as a plain
+            // runtime_error would leave the GPU's health correctly alone and still refuse a
+            // wallpaper the machine has room for.
+            check(observed == Observed::Exhausted,
+                  prefix + "is a resource limit, so it must be raised as ResourceExhausted -- got " +
                       describe(observed));
         } else {
             check(observed == Observed::GpuFault,

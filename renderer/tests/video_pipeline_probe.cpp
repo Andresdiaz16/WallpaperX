@@ -3030,6 +3030,142 @@ void runLoopFileChecks(Device& device, const std::string& label) {
 }
 
 // ------------------------------------------------------------------------- //
+// Where each picture falls on the stream's own timeline
+// ------------------------------------------------------------------------- //
+
+void runTimingChecks(Device& device, const std::string& label, bool onDevice) {
+    if (onDevice ? !hardwareDecoderPresent(device, label) : !videoExtensionsHidden(device, label)) return;
+    const char* const file = "counter_short.mp4";
+    // The fixture's own recipe in renderer/CMakeLists.txt: twenty pictures at ten a second. Stated
+    // here so a recipe that changed without this changing fails a check rather than grading a
+    // different file.
+    constexpr std::chrono::nanoseconds kInterval{100'000'000};
+    constexpr size_t kPictures = 20;
+    constexpr size_t kTimingPasses = 2;
+
+    // GOAL: S13.145 -- every picture says where it belongs on the stream's own timeline: a
+    //       presentation time that advances by the file's interval from one picture to the next, its
+    //       own duration, and -- for the first picture of the file and the first after a loop -- a
+    //       mark saying the picture before it was not its predecessor. False for timings read off the
+    //       wrong time base (a presentation time in stream ticks rather than nanoseconds is off by
+    //       four orders of magnitude here), for a pipeline that reports the first picture's timing for
+    //       every picture, and for a loop boundary that is not marked -- which is the case that
+    //       matters, because the difference across it is the whole file's length backwards.
+    // WHY-THIS-SHAPE: two full passes, so the boundary is inside the run and the mark can be asserted
+    //       to be true EXACTLY twice. Asserting "the boundary is marked" alone would also hold for a
+    //       pipeline that marks every picture, which would make a caller restart its schedule on every
+    //       frame. The timings are compared against the fixture's own recipe rather than against each
+    //       other alone: a pipeline reporting a constant would satisfy "consecutive differences are
+    //       equal" perfectly.
+    // CONTROL: renderer/video/video_pipeline.cpp, decodeNext()'s `startsPass = true;` after the
+    //       restart deleted -> "FAIL: the first picture after a loop is marked as starting a pass",
+    //       printing "1 mark(s), where 2 were due", and the spacing check with it ("-1900000000 ns at
+    //       20" -- the whole file backwards, which is what the mark exists to keep a caller from
+    //       using). renderer/video/video_decoder.cpp, next()'s `frame.m_presentation` given
+    //       AVRational{1, 1} as its base -> "FAIL: each picture is due one file interval after the one
+    //       before it", printing "38 of 38 steps are not 100000000 ns; first: 1024000000000 ns at 1".
+    //       Both observed 2026-09-18; reverted.
+    // COVERAGE-ASSERT: the number of pictures decoded and the number of successive pairs actually
+    //       compared are both asserted, so a run that decoded two pictures cannot report the same
+    //       verdict as one that decoded forty.
+    struct Shown {
+        std::optional<std::chrono::nanoseconds> presentation;
+        std::optional<std::chrono::nanoseconds> duration;
+        bool startsPass = false;
+    };
+    std::vector<Shown> shown;
+    std::string threw;
+    bool timingBeforeDecodeThrew = false;
+    std::string otherThrow;
+    try {
+        VideoPipeline pipeline(device, asset(file), kShaderDir, VideoPipeline::Playback::Loop);
+        try {
+            static_cast<void>(pipeline.timing());
+        } catch (const std::logic_error&) {
+            timingBeforeDecodeThrew = true;
+        } catch (const std::exception& e) {
+            otherThrow = e.what();
+        }
+        for (size_t i = 0; i < kTimingPasses * kPictures && pipeline.decodeNext(); ++i) {
+            const VideoPipeline::PictureTiming timing = pipeline.timing();
+            shown.push_back(Shown{timing.presentation, timing.duration, timing.startsPass});
+        }
+    } catch (const std::exception& e) {
+        threw = e.what();
+    }
+    if (!threw.empty()) {
+        std::fprintf(stderr, "FAIL: %s: %s: the timing run threw: %s\n", label.c_str(), file, threw.c_str());
+        fail("decoding the fixture to read its timings threw");
+        return;
+    }
+    check(timingBeforeDecodeThrew, "timing() before any picture has been decoded throws std::logic_error");
+    if (!timingBeforeDecodeThrew) {
+        std::fprintf(stderr, "  it threw %s instead\n", otherThrow.empty() ? "nothing" : otherThrow.c_str());
+    }
+    if (shown.size() != kTimingPasses * kPictures) {
+        std::fprintf(stderr, "FAIL: %s: %s: %zu picture(s) decoded, where %zu were planned\n", label.c_str(), file,
+                     shown.size(), kTimingPasses * kPictures);
+        fail("the fixture did not yield the two passes this check grades, so nothing below was exercised");
+        return;
+    }
+
+    size_t withoutTiming = 0;
+    size_t wrongDuration = 0;
+    for (const Shown& s : shown) {
+        if (!s.presentation || !s.duration) ++withoutTiming;
+        else if (*s.duration != kInterval) ++wrongDuration;
+    }
+    check(withoutTiming == 0, "every picture of a file that carries timestamps reports a presentation time and a "
+                              "duration");
+    if (withoutTiming != 0) std::fprintf(stderr, "  %zu of %zu carried neither\n", withoutTiming, shown.size());
+    check(wrongDuration == 0, "and the duration each reports is the file's own picture interval");
+    if (wrongDuration != 0) std::fprintf(stderr, "  %zu of %zu report another\n", wrongDuration, shown.size());
+
+    size_t compared = 0;
+    size_t wrongStep = 0;
+    std::string firstWrong;
+    for (size_t i = 1; i < shown.size(); ++i) {
+        // The boundary is excluded on purpose: the picture after it restarts the file, so the step
+        // across it is the whole file backwards -- which is exactly what startsPass exists to say.
+        if (shown[i].startsPass || !shown[i].presentation || !shown[i - 1].presentation) continue;
+        ++compared;
+        if (*shown[i].presentation - *shown[i - 1].presentation == kInterval) continue;
+        ++wrongStep;
+        if (firstWrong.empty()) {
+            firstWrong = std::to_string((*shown[i].presentation - *shown[i - 1].presentation).count()) + " ns at " +
+                         std::to_string(i);
+        }
+    }
+    check(compared == kTimingPasses * (kPictures - 1), "enough successive pictures were compared to grade their spacing");
+    if (compared != kTimingPasses * (kPictures - 1)) {
+        std::fprintf(stderr, "  %zu pair(s) compared, where %zu were due\n", compared, kTimingPasses * (kPictures - 1));
+    }
+    check(wrongStep == 0, "each picture is due one file interval after the one before it");
+    if (wrongStep != 0) {
+        std::fprintf(stderr, "  %zu of %zu steps are not %lld ns; first: %s\n", wrongStep, compared,
+                     static_cast<long long>(kInterval.count()), firstWrong.c_str());
+    }
+
+    size_t marks = 0;
+    bool boundaryMarked = false;
+    for (size_t i = 0; i < shown.size(); ++i) {
+        if (!shown[i].startsPass) continue;
+        ++marks;
+        if (i == kPictures) boundaryMarked = true;
+        if (i != 0 && i != kPictures) {
+            std::fprintf(stderr, "  picture %zu is marked as starting a pass, and it does not\n", i);
+        }
+    }
+    check(boundaryMarked, "the first picture after a loop is marked as starting a pass");
+    check(marks == kTimingPasses, "and nothing else is: the mark is on the file's first picture and the loop's, only");
+    if (marks != kTimingPasses) std::fprintf(stderr, "  %zu mark(s), where %zu were due\n", marks, kTimingPasses);
+    if (marks == kTimingPasses && boundaryMarked && wrongStep == 0 && withoutTiming == 0) {
+        std::printf("%s: %s: %zu pictures over %zu passes, %lld ns apart, each carrying its own duration\n",
+                    label.c_str(), file, shown.size(), kTimingPasses, static_cast<long long>(kInterval.count()));
+    }
+}
+
+// ------------------------------------------------------------------------- //
 // The two halves the daemon drives: decode, then draw
 // ------------------------------------------------------------------------- //
 
@@ -3869,7 +4005,7 @@ int main(int argc, char** argv) {
         "resume-end",        "resume-seek-failure", "resume-drop-count", "shape", "shape-device",
         "steady-device",     "steady-host",   "loop-device",       "loop-host",  "loop-cost-device",
         "loop-cost-host",    "loop-resume",   "release-device",    "retire-device",
-        "halves-device",     "halves-host"};
+        "halves-device",     "halves-host",   "timing-device",     "timing-host"};
     if (std::find(modes.begin(), modes.end(), mode) == modes.end()) {
         std::fprintf(stderr, "usage: %s <mode>, one of:", argv[0]);
         for (const std::string& m : modes) std::fprintf(stderr, " %s", m.c_str());
@@ -3930,7 +4066,7 @@ int main(int argc, char** argv) {
     }
 
     return runGraded(label, mode == "sequence-host" || mode == "shape" || mode == "steady-host" || mode == "loop-host" ||
-                                mode == "loop-cost-host" || mode == "halves-host",
+                                mode == "loop-cost-host" || mode == "halves-host" || mode == "timing-host",
                      [&](Device& device) {
                          if (mode == "sequence-device") runSequenceChecks(device, label, /*onDevice=*/true);
                          if (mode == "sequence-host") runSequenceChecks(device, label, /*onDevice=*/false);
@@ -3943,6 +4079,8 @@ int main(int argc, char** argv) {
                          if (mode == "shape") runShapeChecks(device, label);
                          if (mode == "halves-device") runHalvesChecks(device, label, /*onDevice=*/true);
                          if (mode == "halves-host") runHalvesChecks(device, label, /*onDevice=*/false);
+                         if (mode == "timing-device") runTimingChecks(device, label, /*onDevice=*/true);
+                         if (mode == "timing-host") runTimingChecks(device, label, /*onDevice=*/false);
                          if (mode == "steady-device") runSteadyChecks(device, label, /*onDevice=*/true);
                          if (mode == "steady-host") runSteadyChecks(device, label, /*onDevice=*/false);
                          if (mode == "loop-host") {

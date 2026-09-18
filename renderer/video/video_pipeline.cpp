@@ -28,10 +28,12 @@ bool VideoPipeline::renderNext(OffscreenTargetManager& targets, const OffscreenT
 bool VideoPipeline::decodeNext() {
     m_device.assertGpuThread("VideoPipeline::decodeNext");
     std::optional<DecodedFrame> frame = m_decoder.next();
+    bool startsPass = !m_stage;
     // No stage means nothing was ever shown, and a stream with nothing to show must not spin here.
     if (!frame && m_playback == Playback::Loop && m_stage) {
         m_decoder.restart();
         frame = m_decoder.next();
+        startsPass = true;
     }
     if (!frame) return false;
 
@@ -42,7 +44,13 @@ bool VideoPipeline::decodeNext() {
         m_stage = std::make_unique<Stage>(m_device, *frame, m_shaderDir);
     }
     static_cast<void>(m_stage->converter.convert(*frame));
+    m_timing = PictureTiming{frame->presentationTime(), frame->duration(), startsPass};
     return true;
+}
+
+VideoPipeline::PictureTiming VideoPipeline::timing() const {
+    if (!m_stage) throw std::logic_error("VideoPipeline::timing: no picture has been decoded");
+    return m_timing;
 }
 
 void VideoPipeline::draw(OffscreenTargetManager& targets, const OffscreenTarget& target) {

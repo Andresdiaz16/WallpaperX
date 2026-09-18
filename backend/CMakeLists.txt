@@ -583,8 +583,25 @@ if(WALLPAPERX_FFMPEG_EXECUTABLE)
         COMMENT "Generating video wallpaper fixture wallpaper_bands.mp4"
         VERBATIM
     )
+    # The same bands in a file that holds exactly one picture. A session opened on it parks after
+    # its first picture and decodes no more, which is what lets the phases that count opens and
+    # decodes inside one render pass attribute every count to that pass: with a file that keeps
+    # playing, the clock decodes on the same thread between the counter reset and the read, and no
+    # counter can say which of the two did it. Also the fixture for "a one-picture video is shown
+    # once and never decoded again".
+    add_custom_command(
+        OUTPUT ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_one_picture.mp4
+        COMMAND ${WALLPAPERX_FFMPEG_EXECUTABLE} -y -v error
+                -f lavfi -i color=c=black:size=320x240:rate=10:duration=1
+                -vf "drawbox=x=0:y=0:w=320:h=60:color=0xFF0000@1:t=fill,drawbox=x=0:y=60:w=320:h=60:color=0x00FF00@1:t=fill,drawbox=x=0:y=120:w=320:h=60:color=0xFFFF00@1:t=fill,drawbox=x=0:y=180:w=320:h=60:color=0x0000FF@1:t=fill,format=yuv420p,setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv"
+                -frames:v 1 -c:v libx264 -profile:v baseline -g 5 -pix_fmt yuv420p
+                ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_one_picture.mp4
+        COMMENT "Generating video wallpaper fixture wallpaper_one_picture.mp4"
+        VERBATIM
+    )
     add_custom_target(wallpaperx-backend-video-fixtures
-                      DEPENDS ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_bands.mp4)
+                      DEPENDS ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_bands.mp4
+                              ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_one_picture.mp4)
 else()
     message(STATUS "  ffmpeg CLI: not found -- the video wallpaper fixture is not generated, and "
                    "video_wallpaper will report itself to ctest as a skip rather than a pass")

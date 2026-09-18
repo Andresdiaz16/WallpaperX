@@ -9,6 +9,7 @@ extern "C" {
 }
 
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <exception>
 #include <functional>
@@ -69,6 +70,14 @@ public:
     VkRect2D visible() const;
     const FrameColour& colour() const { return m_colour; }
 
+    // When this picture is shown, on the stream's own timeline, whose origin is arbitrary: only
+    // differences between pictures of one stream mean anything. Empty when the stream carries no
+    // timestamp for it.
+    std::optional<std::chrono::nanoseconds> presentationTime() const { return m_presentation; }
+    // How long it is shown: its own duration, else the stream's nominal frame interval. Empty
+    // when neither is known.
+    std::optional<std::chrono::nanoseconds> duration() const { return m_duration; }
+
     struct DeviceImage {
         VkImage image = VK_NULL_HANDLE;
         // A multi-planar format; the converter copies its planes out through plane aspects.
@@ -112,6 +121,8 @@ private:
     Device* m_device = nullptr;
     AVFrame* m_frame = nullptr;
     FrameColour m_colour;
+    std::optional<std::chrono::nanoseconds> m_presentation;
+    std::optional<std::chrono::nanoseconds> m_duration;
 };
 
 // Demuxes one file and decodes its video stream on this GPU's hardware decoder when the device

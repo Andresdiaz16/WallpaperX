@@ -54,7 +54,7 @@ std::string vkResultName(VkResult result) {
 void throwVkFailure(const std::string& context, VkResult result) {
     const std::string message = context + " failed with " + vkResultName(result);
     if (isResourceExhaustion(result)) {
-        throw std::runtime_error(message + " -- a resource limit, not the graphics driver");
+        throw ResourceExhausted(message + " -- a resource limit, not the graphics driver");
     }
     throw GpuFailure(message);
 }

@@ -2,11 +2,13 @@
 
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <condition_variable>
 #include <deque>
 #include <functional>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <thread>
 
@@ -20,10 +22,16 @@ class WallpaperManager;
 // One FIFO for renders and tasks, holding monitor ids rather than requests: ordering is
 // arrival order, and a client dragging through a wallpaper list coalesces to one render per
 // monitor. The manager makes each pass idempotent, covering dequeue-to-read.
+//
+// The video clock runs here too, as a round of WallpaperManager::advanceVideo() after every job
+// and whenever the manager's next due time comes. So one job at most runs between two rounds and
+// one round between two jobs: a hand-over waits for at most one round of pictures, and a picture
+// for at most one job.
 class RenderWorker {
 public:
-    // Called on the worker thread after a render that produced a frame, so it must be safe off
-    // the DBus event loop -- emitting a signal is, per sdbus-c++'s IObject contract.
+    // Called on the worker thread after each committed frame, a video's pictures included, so it
+    // must be safe off the DBus event loop -- emitting a signal is, per sdbus-c++'s IObject
+    // contract.
     using FrameReadyFn = std::function<void(int monitorId, uint64_t generation)>;
 
     // Why a task is being invoked: to do its work, or to answer that it never will. Every task
@@ -67,6 +75,14 @@ private:
     };
 
     void run();
+    void runJob(Job& job);
+
+    // Rounds that have thrown in a row, so an episode is logged once and retried more slowly the
+    // longer it lasts. Worker thread only.
+    unsigned m_clockFailures = 0;
+    // One clock round and its announcements. Returns when the next is due, or nothing while no
+    // video plays.
+    std::optional<std::chrono::steady_clock::time_point> runClock();
 
     WallpaperManager& m_manager;
     FrameReadyFn m_onFrameReady;

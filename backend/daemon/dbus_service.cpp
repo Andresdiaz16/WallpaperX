@@ -348,11 +348,14 @@ void DbusService::completeGetFrameFd(FrameFdCall call, int32_t monitorId, std::s
         if (exported.reason == NoFrameReason::NoFreeImage) {
             // Logged where the served hand-overs are logged: a wallpaper that stops changing for
             // one consumer while the daemon keeps rendering is otherwise invisible. Named,
-            // because which of two consumers was refused is the whole diagnosis.
-            std::printf("wallpaperx-daemon: GetFrameFd(monitor=%d) refused for %s -- no image may be handed over "
-                        "until one is released\n",
-                        monitorId, sanitizeForLog(client).c_str());
-            std::fflush(stdout);
+            // because which of two consumers was refused is the whole diagnosis. Once per episode:
+            // a consumer refused while a video plays is refused again for every picture.
+            if (exported.firstRefusal) {
+                std::printf("wallpaperx-daemon: GetFrameFd(monitor=%d) refused for %s -- no image may be handed over "
+                            "until one is released\n",
+                            monitorId, sanitizeForLog(client).c_str());
+                std::fflush(stdout);
+            }
             call.returnError(sdbus::Error(sdbus::Error::Name{kErrorNoFreeImage},
                                           "monitor " + std::to_string(monitorId) +
                                               " has no image to hand over -- one must stay free for the next "
@@ -407,11 +410,13 @@ void DbusService::completeGetFrameFd(FrameFdCall call, int32_t monitorId, std::s
     // silent log as a failure.
     // Whether an acquire went with it, for the same reason: a frame handed over unsynchronised is
     // read without the queue-family acquire, and nothing downstream of here says so.
-    std::printf("wallpaperx-daemon: GetFrameFd(monitor=%d) served generation %llu as %s, %s\n", monitorId,
-                static_cast<unsigned long long>(exported.handle->generation),
-                frame.type == ExportedFrame::HandleType::DmaBuf ? "dma_buf" : "opaque fd",
-                syncFds.empty() ? "unsynchronised" : "with an acquire semaphore");
-    std::fflush(stdout);
+    if (!exported.handle->routine) {
+        std::printf("wallpaperx-daemon: GetFrameFd(monitor=%d) served generation %llu as %s, %s\n", monitorId,
+                    static_cast<unsigned long long>(exported.handle->generation),
+                    frame.type == ExportedFrame::HandleType::DmaBuf ? "dma_buf" : "opaque fd",
+                    syncFds.empty() ? "unsynchronised" : "with an acquire semaphore");
+        std::fflush(stdout);
+    }
 
     call.returnResults(fd, frame.width, frame.height, frame.memorySize,
                        frame.type == ExportedFrame::HandleType::DmaBuf ? 1 : 0,

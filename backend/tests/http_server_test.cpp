@@ -3027,12 +3027,14 @@ void runGpuFailureChecks(const std::string& bluePath, const WallpaperManager::Co
     //       is ever reached, and the pre-existing catch around ensureGpu/emplace records
     //       gpu=fail identically. Both variants then print the same body, and the catch
     //       this scenario exists for never runs.
-    // CONTROL: the `catch (const GpuFailure& e)` added around `m_targets->render(...)` in
-    //       wallpaper_manager.cpp deleted, so the failure falls through to the plain
-    //       std::exception arm -> "FAIL: a GPU that fails a submit after the device was
-    //       created reads fail, not ok" and "FAIL: the gpu detail names the driver call
-    //       that failed", with gpu reading {ok, "NVIDIA GeForce RTX 3080 Ti (Heap)"}
-    //       while every render had failed. Reverted.
+    // CONTROL: in backend/daemon/wallpaper_manager.cpp, the `if (failure.gpuFault)
+    //       recordHealthLocked(...)` line disabled in renderPassLocked()'s commit-block catch, so
+    //       the driver fault is recorded like any other failure -> "FAIL: a GPU that fails a submit
+    //       after the device was created reads fail, not ok" and "FAIL: the gpu detail names the
+    //       driver call that failed", printing "after failing submit 2 of 2: gpu ok (NVIDIA GeForce
+    //       RTX 3080 Ti (Heap))" while every render had failed. Observed 2026-09-18. Reverted.
+    //       (The three separate catch arms this control used to name were folded into
+    //       classifyFailure() by Stage E3; the line above is where that decision now lands.)
     // COVERAGE-ASSERT: `injected == 1` is the load-bearing one -- if dispatch ever moves to
     //       volk or vkGetDeviceProcAddr the interposer is bypassed, and without it the
     //       phase would inject nothing and grade a successful render. `observed ==
@@ -4666,13 +4668,14 @@ void runHealthAfterDeviceChecks(httplib::Client& cli, sdbus::IProxy& proxy, Wall
     //       believe. Nothing here asserts a tier *name*: NVIDIA resolves Heap, Lavapipe
     //       Buffer and WALLPAPERX_FORCE_TIER=classic makes it Classic, so a literal would
     //       be a check on the host.
-    // CONTROL: the GPU is recorded ok in TWO places -- ensureGpu, and renderPending's
+    // CONTROL: the GPU is recorded ok in TWO places -- ensureGpu, and renderPassLocked's
     //       commit under the lock it already holds -- so deleting either alone leaves this
     //       green, and that was observed before it was written down: with only ensureGpu's
     //       record removed, gpu still read ok here (the commit had set it) and only the
     //       detail check below went red. Both removed together -> "FAIL: /health reports
-    //       the GPU as ok once a device exists" with "GetStatus: initialized=true
-    //       /health: gpu=pending". The mutation moves only the gpu line: this manager's
+    //       the GPU as ok once a device exists", with three more in this file. Re-observed
+    //       2026-09-18, after Stage E3 moved the commit out of renderPending() into
+    //       renderPassLocked(). The mutation moves only the gpu line: this manager's
     //       verdict is `pending` either way -- it has renders outstanding, and a gpu check
     //       that falls back to `pending` aggregates to the same word. The shaders half is separate:
     //       `recordHealth(&DaemonHealth::shaders, HealthStatus::Ok, ...)` deleted ->

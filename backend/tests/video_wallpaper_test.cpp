@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-// Step 13 Stages E1 and E2: the daemon draws a `video` wallpaper's first picture, and keeps one
-// decode session per monitor rather than building one inside every render pass.
+// Step 13 Stages E1, E2 and E3: the daemon draws a `video` wallpaper's first picture, keeps one
+// decode session per monitor rather than building one inside every render pass, and plays it.
 //
 // Each phase has a manager of its own, because they need the manager in three different shapes --
 // with a bus, with a render worker and no bus, and with neither -- and the Device pins itself to
@@ -12,11 +12,27 @@
 //   a worker, no bus    a resize decodes nothing, a new wallpaper decodes before the rebuild, and
 //                       an overtaken pass leaves the published frame reachable (S13.117, S13.118)
 //   a worker, no bus    the crash record covers the decode and a session's teardown (S13.119)
-//   no bus, no worker   which passes reuse, reopen, evict and drop a session (S13.123-S13.126,
-//                       S13.132)
+//   no bus, no worker   which passes reuse and drop a session, the eight-session ceiling and what
+//                       it refuses (S13.123-S13.126, S13.132)
 //   a worker, no bus    what a failed pass does with its session, and which teardowns are under a
-//                       record (S13.127-S13.130)
+//                       record (S13.127-S13.130, S13.138)
 //   a worker, no bus    shutdown frees sessions with no record, and the next start draws (S13.131)
+//   a worker, no bus    the clock: rate, order, looping, pausing for a render, a still beside it
+//                       (S13.133, S13.134, S13.137, S13.143)
+//   a worker, no bus    a one-picture file is shown once and parks (S13.135)
+//   no bus, no worker   a hand-over and a refusal are announced once per consumer (S13.144)
+//   no bus, no worker   an open that runs out of memory frees an idle session and retries once
+//                       (S13.139)
+//   a worker, no bus    playback that keeps failing is reopened three times and then settles
+//                       (S13.140)
+//   a worker, no bus    a played picture does not clear GPU health, and a GPU fault during
+//                       playback is never retried (S13.141, S13.142)
+//
+// TWO FIXTURES, AND THE SECOND IS LOAD-BEARING. wallpaper_bands.mp4 holds ten pictures and plays;
+// wallpaper_one_picture.mp4 holds one, and a session opened on it parks after its first picture and
+// is never decoded from again. Every phase that counts what ONE RENDER PASS opened or decoded uses
+// the parked fixture, because the clock runs on the same thread between a counter reset and the
+// read, and no counter can say which of the two sent a packet.
 //
 // WHICH FILES ARE OPEN is read from ffmpeg's own I/O entry points, hooked below: a session holds
 // its file open for exactly its lifetime, so the set of open wallpaper files is the set of
@@ -111,10 +127,22 @@ namespace {
 // video is the frame converter's, built during the first decode -- not the monitor's images.
 CallGate g_framebufferGate;      // the framebuffer that finishes a rebuilt image of the armed size
 CallGate g_framebufferFailGate;  // the same call, failed; checked after the hold, so both can apply
+CallGate g_framebufferLostGate;  // the same call, failed as the DEVICE itself: a GPU fault, not a shortage
 CallGate g_decodeGate;           // a packet handed to the decoder: the span the picture is decoded in
 CallGate g_freeCodecGate;        // the decoder's codec context being freed: a session's teardown
 CallGate g_submitFailGate;       // a queue submission, failed
 CallGate g_closeFileGate;        // a wallpaper file being closed, by path: the end of a session
+
+// Queue submissions to be failed as VK_ERROR_DEVICE_LOST -- which the daemon sorts as the GPU's
+// own fault, where the shortage g_submitFailGate injects is sorted as a resource running out. The
+// difference is the whole of "a GPU fault never retries", so the two cannot share a gate.
+std::atomic<int> g_submitDeviceLost{0};
+
+// Image creations to be failed as VK_ERROR_OUT_OF_DEVICE_MEMORY. Only the daemon's own: ffmpeg
+// reaches Vulkan through a function table it fetched from the loader, which no definition here can
+// interpose, so an armed count is spent on the picture converter's image inside the decode that
+// opens a session -- which is the shortage the retry-once path exists for.
+std::atomic<int> g_failImageCreates{0};
 
 // Packets sent to the wallpaper's decoder since the last reset. What makes "the decode happened
 // before the images were rebuilt" an observation rather than an inference.
@@ -191,6 +219,56 @@ FileLedger g_files;
 // control for S13.117 first produced.
 bool isDecodersContext(const AVCodecContext* context) { return context != nullptr && context->opaque != nullptr; }
 
+// Fails every picture a decoder is asked for AFTER the first one it delivered, for as long as it is
+// armed. Not a CallGate: a gate fires once, and what the bounded retry is about is a file that
+// fails again after every reopen -- one failure would establish nothing about the bound.
+//
+// Keyed on the codec context and on how many pictures that context has already delivered, because
+// the open and the clock decode through the same call: the open must SUCCEED for a reopen to be a
+// reopen, and it is the picture after it -- the clock's -- that must fail. Counting per context is
+// what separates them without the test having to know how many packets a driver needs for a
+// picture, which differs between the hardware and software decoders.
+class PlaybackFailure {
+public:
+    void arm() { m_armed.store(true); }
+    void disarm() { m_armed.store(false); }
+
+    bool shouldFail(const AVCodecContext* context) {
+        if (!m_armed.load()) return false;
+        std::lock_guard<std::mutex> lock(m_mutex);
+        const auto it = m_delivered.find(context);
+        if (it == m_delivered.end() || it->second == 0) return false;
+        ++m_injected;
+        return true;
+    }
+
+    void delivered(const AVCodecContext* context) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        ++m_delivered[context];
+    }
+
+    // A freed context must not leave its count behind: ffmpeg reuses the address, and a reopened
+    // decoder inheriting "has already delivered one" would have its FIRST picture failed, which is
+    // an open that fails rather than playback that fails.
+    void forget(const AVCodecContext* context) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_delivered.erase(context);
+    }
+
+    int injected() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_injected;
+    }
+
+private:
+    std::atomic<bool> m_armed{false};
+    mutable std::mutex m_mutex;
+    std::map<const AVCodecContext*, int> m_delivered;
+    int m_injected = 0;
+};
+
+PlaybackFailure g_playbackFailure;
+
 }  // namespace
 
 extern "C" VkResult vkCreateFramebuffer(VkDevice device, const VkFramebufferCreateInfo* info,
@@ -202,7 +280,19 @@ extern "C" VkResult vkCreateFramebuffer(VkDevice device, const VkFramebufferCrea
     if (info != nullptr) std::snprintf(extent, sizeof(extent), "%ux%u", info->width, info->height);
     if (g_framebufferGate.enter(extent)) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
     if (g_framebufferFailGate.enter(extent)) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    if (g_framebufferLostGate.enter(extent)) return VK_ERROR_DEVICE_LOST;
     return real(device, info, allocator, framebuffer);
+}
+
+extern "C" VkResult vkCreateImage(VkDevice device, const VkImageCreateInfo* info,
+                                  const VkAllocationCallbacks* allocator, VkImage* image) {
+    using Fn = VkResult (*)(VkDevice, const VkImageCreateInfo*, const VkAllocationCallbacks*, VkImage*);
+    static const Fn real = reinterpret_cast<Fn>(::dlsym(RTLD_NEXT, "vkCreateImage"));
+    if (real == nullptr) return VK_ERROR_INITIALIZATION_FAILED;
+    for (int armed = g_failImageCreates.load(); armed > 0;) {
+        if (g_failImageCreates.compare_exchange_weak(armed, armed - 1)) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    }
+    return real(device, info, allocator, image);
 }
 
 static std::string extentOf(uint32_t width, uint32_t height) {
@@ -215,6 +305,9 @@ extern "C" VkResult vkQueueSubmit(VkQueue queue, uint32_t count, const VkSubmitI
     static const Fn real = reinterpret_cast<Fn>(::dlsym(RTLD_NEXT, "vkQueueSubmit"));
     if (real == nullptr) return VK_ERROR_INITIALIZATION_FAILED;
     if (g_submitFailGate.enter()) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    for (int armed = g_submitDeviceLost.load(); armed > 0;) {
+        if (g_submitDeviceLost.compare_exchange_weak(armed, armed - 1)) return VK_ERROR_DEVICE_LOST;
+    }
     return real(queue, count, infos, fence);
 }
 
@@ -261,9 +354,22 @@ extern "C" void avcodec_free_context(AVCodecContext** context) {
     // during construction and never see a session's teardown at all.
     if (context != nullptr && isDecodersContext(*context)) {
         g_codecFrees.fetch_add(1, std::memory_order_relaxed);
+        g_playbackFailure.forget(*context);
         g_freeCodecGate.enter();
     }
     real(context);
+}
+
+extern "C" int avcodec_receive_frame(AVCodecContext* context, AVFrame* frame) {
+    using Fn = int (*)(AVCodecContext*, AVFrame*);
+    static const Fn real = reinterpret_cast<Fn>(::dlsym(RTLD_NEXT, "avcodec_receive_frame"));
+    if (real == nullptr) return -1;
+    // EIO, not AVERROR_INVALIDDATA: the decoder treats a damaged packet as something to skip past,
+    // which is a picture lost rather than playback failing, and skipping is not what this injects.
+    if (isDecodersContext(context) && g_playbackFailure.shouldFail(context)) return AVERROR(EIO);
+    const int result = real(context, frame);
+    if (result == 0 && isDecodersContext(context)) g_playbackFailure.delivered(context);
+    return result;
 }
 
 namespace {
@@ -324,6 +430,16 @@ const Band* bandAtRow(double sourceRow) {
 std::string testAssetDir() { return std::string(WALLPAPERX_TEST_IMAGE_DIR); }
 std::string clipPath() { return std::string(WALLPAPERX_VIDEO_ASSET_DIR) + "/wallpaper_bands.mp4"; }
 
+// The same bands in a file holding exactly one picture. The clock parks a session opened on it
+// after that picture and never decodes from it again, so on the render worker's thread the pass
+// under test is the only thing that can open a file or send a packet while a phase is counting.
+std::string onePicturePath() { return std::string(WALLPAPERX_VIDEO_ASSET_DIR) + "/wallpaper_one_picture.mp4"; }
+
+// How many pictures each fixture holds, as backend/CMakeLists.txt generates them. Stated here so a
+// recipe that changed without this changing is a failed check rather than a check grading a
+// different file.
+constexpr int kClipPictures = 10;
+
 // A file that exists, is a regular file and is readable, and is not a video. SetWallpaper applies
 // the readable-regular-file check to every known type, so a path that was never created is
 // rejected on the reply and never reaches the failed-render state S13.116 is about.
@@ -333,6 +449,18 @@ std::string writeUndecodable(const std::string& name) {
     std::ofstream out(path, std::ios::binary | std::ios::trunc);
     out << "this is not a video, and never was";
     return path;
+}
+
+// Runs an empty task on the render worker and waits for it. The worker runs one clock round after
+// every job, so a drain that returns means: the queue was emptied, and at least one clock round has
+// finished since the job before this task. That is the barrier every count-inside-a-pass check
+// below is opened with -- a sleep would be an assertion on the scheduler, and there is no state the
+// test can read that says "the clock is between rounds".
+bool drainWorker(RenderWorker& worker) {
+    auto done = std::make_shared<std::promise<void>>();
+    std::future<void> future = done->get_future();
+    worker.postTask([done](RenderWorker::TaskState) { done->set_value(); });
+    return future.wait_for(std::chrono::seconds(60)) == std::future_status::ready;
 }
 
 std::optional<wallpaperx::MonitorStatus> monitorStatus(const WallpaperManager& manager, int monitorId) {
@@ -788,11 +916,14 @@ void runResizeChecks(const WallpaperManager::Config& config, const std::string& 
         }
     } unblock{worker};
 
+    // Waits for the frame AND for the clock round that follows it, which is the round that parks a
+    // one-picture session. After this returns, nothing but a render pass can open a file or send a
+    // packet -- which is what every "opens and decodes nothing" count below rests on.
     const auto firstFrame = [&](int monitorId, const std::string& name) {
         wallpaperx::testing::nameScreen(manager, monitorId, name);
         manager.requestWallpaper("video", clip, monitorId);
         worker.post(monitorId);
-        return signals.wait(monitorId, 1);
+        return signals.wait(monitorId, 1) && drainWorker(worker);
     };
     const auto resize = [&](const std::string& name, uint32_t width, uint32_t height) {
         std::vector<int> redraw;
@@ -840,11 +971,17 @@ void runResizeChecks(const WallpaperManager::Config& config, const std::string& 
     //       alone is also true of a pass that rebuilds first and decodes after. The render thread is
     //       held inside the creation of a framebuffer of the new size, which only the monitor's
     //       rebuilt images have, so the gate firing proves this pass really rebuilt.
+    //       THE FIXTURE IS THE ONE-PICTURE FILE ON PURPOSE. The obvious alternative -- the ten-picture
+    //       clip these checks used before the clock existed -- cannot be counted: the clock decodes
+    //       from a playing session on this same thread between the counter reset and the read, so a
+    //       non-zero count no longer says the pass did it. A file whose session parks leaves the pass
+    //       as the only possible opener or decoder, and firstFrame() above waits for the round that
+    //       parks it.
     // CONTROL: in backend/daemon/wallpaper_manager.cpp, dropStaleVideoSessionLocked()'s keep-it
     //       `return` disabled (`&& false`), so every pass reopens its file -> "FAIL: a resize of a
     //       monitor with a resident session opens and decodes nothing", printing "1 open(s), 1
-    //       packet(s) by the rebuild; 1 open(s), 1 packet(s) by the commit" (11 packets on Lavapipe).
-    //       Observed 2026-09-16 on both driver entries. Reverted.
+    //       packet(s) by the rebuild; 1 open(s), 1 packet(s) by the commit". Observed 2026-09-18.
+    //       Reverted.
     // COVERAGE-ASSERT: the gate is asserted to have fired, so "nothing was decoded" is never
     //       concluded from a rebuild that never happened.
     g_decodeCalls.store(0);
@@ -896,6 +1033,9 @@ void runResizeChecks(const WallpaperManager::Config& config, const std::string& 
     }
     g_framebufferGate.release();
     check(signals.wait(kMonitorOrder, 3), "and that redraw commits once the rebuild is let go");
+    // This monitor's session is new, so the round that parks it has still to run; the counters
+    // below must not carry its decode.
+    check(drainWorker(worker), "the worker keeps serving after the reopened session's first frame");
 
     // GOAL: S13.118 -- a video pass overtaken by a newer request after it replaced the monitor's
     //       images never leaves that monitor without a frame: an export queued behind it is
@@ -908,7 +1048,7 @@ void runResizeChecks(const WallpaperManager::Config& config, const std::string& 
     // CONTROL: WallpaperManager::renderPending's attempt loop (backend/daemon/wallpaper_manager.cpp)
     //       reduced to a single pass -> "FAIL: an export racing an overtaken video pass gets a frame,
     //       never none", printing "the export got no frame, reason 1" (NotRendered -- the answer this
-    //       goal forbids). Observed 2026-09-15. Reverted.
+    //       goal forbids). Re-observed 2026-09-18. Reverted.
     if (!firstFrame(kMonitorRace, "DP-RACE")) {
         check(false, "the monitor the overtaken video pass is about is drawn first");
         return;
@@ -935,12 +1075,13 @@ void runResizeChecks(const WallpaperManager::Config& config, const std::string& 
         //       draw with the session already resident: no file opened, nothing decoded.
         // WHY-THIS-SHAPE: waits for generation 2, which only the retry inside the overtaken
         //       renderPending() call can commit -- the newer size's own post finds its request
-        //       serviced -- so the counters cover exactly the overtaken pass and its retry.
+        //       serviced -- so the counters cover exactly the overtaken pass and its retry. The
+        //       one-picture fixture again: a playing session would decode on this thread inside the
+        //       same window and no counter could say which of the two did it.
         // CONTROL: in backend/daemon/wallpaper_manager.cpp, `m_videoSessions.erase(monitorId);` added
         //       before the superseded `return RenderPass{{}, true};` in the commit block -> "FAIL: the
-        //       retry after an overtaken rebuild opens and decodes nothing", printing "1 open(s), 1
-        //       packet(s) across the overtaken pass and its retry" (11 packets on Lavapipe).
-        //       Observed 2026-09-16 on both driver entries. Reverted.
+        //       retry after an overtaken rebuild opens and decodes nothing", printing "1 open(s), 3
+        //       packet(s) across the overtaken pass and its retry". Observed 2026-09-18. Reverted.
         const bool retried = signals.wait(kMonitorRace, 2);
         check(retried, "the retry after the overtaken rebuild commits");
         if (retried) {
@@ -1047,7 +1188,11 @@ void runCrashRecordSpanChecks(const WallpaperManager::Config& base, const std::s
     // CONTROL: in backend/daemon/wallpaper_manager.cpp, the `applying.emplace(...)` line deleted from
     //       closeVideoSessionLocked() -> "FAIL: a record naming the video is on disk while a replaced
     //       session's decoder is torn down", printing "the record on disk: none", beside the two
-    //       S13.130 checks. Observed 2026-09-16 on both driver entries. Reverted.
+    //       S13.130 checks. Observed 2026-09-18. Reverted.
+    // The clock round that parks this phase's one-picture session runs after the job that drew it,
+    // and it decodes; the gate below must not be armed while that round is still to come, or the
+    // teardown it catches could be the decoder's rather than the replaced session's.
+    check(drainWorker(worker), "the worker answers a task before the replaced session is torn down");
     g_codecFrees.store(0);
     g_freeCodecGate.arm(CallGate::Mode::Hold);
     manager.requestWallpaper("video", clip, kMonitorRecord);
@@ -1146,8 +1291,11 @@ void gradeServedPicture(WallpaperManager& manager, int monitorId, const char* go
                      " sampled rows show the wrong band; first: " + verdict.firstWrong);
 }
 
-constexpr int kSessionMonitors[] = {10, 11, 12, 13, 14};
-constexpr int kMonitorStillOnly = 15;
+// One more than the session ceiling, so the last of them is a session the daemon has no room for.
+constexpr int kSessionMonitors[] = {10, 11, 12, 13, 14, 15, 16, 17, 18};
+static_assert(std::size(kSessionMonitors) == WallpaperManager::kMaxVideoSessions + 1,
+              "the ceiling checks need exactly one monitor past the ceiling");
+constexpr int kMonitorStillOnly = 19;
 constexpr const char* kConsumer = ":1.42";
 // A layout no driver allocates: what a report excluding the committed one is made of.
 constexpr uint64_t kUnallocatableModifier = 0x0f00000000000001ull;
@@ -1292,79 +1440,119 @@ void runSessionChecks(const WallpaperManager::Config& config, const std::vector<
     reportUnless(g_files.live().count(clips[0]) == 1, "and one session for that monitor remains",
                  "open: " + describeFiles(g_files.live()));
 
-    // GOAL: S13.126 -- at most four sessions are resident; the fifth evicts the least recently drawn
-    //       -- not the least recently opened -- and the evicted monitor's next pass reopens its file
-    //       and draws the video correctly.
+    // GOAL: S13.126, restated for the clock -- eight sessions is the ceiling, and a ninth video
+    //       asked for while all eight monitors are showing theirs is REFUSED: nothing is opened,
+    //       nothing is closed, and no monitor that is showing a video loses it. False for the E2
+    //       behaviour this replaces, which evicted the least recently drawn session whatever it was
+    //       doing -- on a desktop with nine video screens that froze one of them for another's sake.
     // WHY-THIS-SHAPE: every monitor plays a different copy of the fixture, so the set of open files
-    //       says which monitors hold a session. Monitor 10 is opened first and redrawn after 11-13
-    //       are opened, so least-recently-opened (10) and least-recently-drawn (11) differ.
-    // CONTROL: (a) kMaxVideoSessions set to 5 in backend/daemon/wallpaper_manager.h -> "FAIL: a fifth
-    //       session leaves four resident", printing all five files open, and three more. (b)
-    //       `it->second.lastUsed = ++m_videoSessionUse;` deleted from videoSessionLocked()'s reuse
-    //       branch in backend/daemon/wallpaper_manager.cpp -> "FAIL: the fifth session evicts the least
-    //       recently drawn monitor's, not the first opened", printing video_session_0.mp4 gone. Both
-    //       observed 2026-09-16 on both driver entries; reverted.
-    // COVERAGE-ASSERT: each of the four opens is asserted to have happened, so "four are resident"
-    //       is never read off a phase in which some never opened.
+    //       says which monitors hold a session. This phase runs no render worker, so every monitor
+    //       that has been rendered here is settled -- a frame of its own wallpaper and no render
+    //       owed -- which is exactly the state the daemon calls "playing". The simpler shape, asking
+    //       for the ninth on a daemon with a worker running, cannot establish "no playing session is
+    //       taken": which session is least recently used would then depend on which clock rounds had
+    //       run.
+    // CONTROL: in backend/daemon/wallpaper_manager.cpp, the `if (playingSeqLocked(...)) continue;`
+    //       skip deleted from evictIdleVideoSessionLocked(), which is the Stage E2 behaviour ->
+    //       "FAIL: a ninth video wallpaper asked for while all eight play opens nothing and commits
+    //       nothing", printing "committed, 1 open(s), 1 close(s), 1 packet(s)", and five more.
+    //       Raising kMaxVideoSessions cannot be used as the control: the static_assert above stops
+    //       the build, which is the point of tying the monitor count to the constant. Observed
+    //       2026-09-18. Reverted.
+    // COVERAGE-ASSERT: each of the eight opens is asserted to have happened, so "eight are resident"
+    //       is never read off a phase in which some never opened; and the monitor list is tied to
+    //       kMaxVideoSessions by the static_assert above, so a ceiling that moved without this
+    //       moving is a failed build rather than a check grading some other number.
+    const int refused = kSessionMonitors[std::size(kSessionMonitors) - 1];
     {
         int opened = 0;
-        for (int i = 1; i <= 3; ++i) {
+        for (size_t i = 1; i + 1 < std::size(kSessionMonitors); ++i) {
             manager.requestWallpaper("video", clips[i], kSessionMonitors[i]);
             const PassCost cost = renderCounted(manager, kSessionMonitors[i]);
             if (cost.outcome.rendered && cost.opens == 1 && cost.closes == 0) ++opened;
             else std::fprintf(stderr, "  monitor %d: %s\n", kSessionMonitors[i], describe(cost).c_str());
         }
-        check(opened == 3, "three more video monitors each open a session and close none");
-        reportUnless(g_files.live().size() == 4, "four video monitors hold four sessions",
-                     "open: " + describeFiles(g_files.live()));
+        check(opened == static_cast<int>(WallpaperManager::kMaxVideoSessions) - 1,
+              "seven more video monitors each open a session and close none");
+        reportUnless(g_files.live().size() == WallpaperManager::kMaxVideoSessions,
+                     "eight video monitors hold eight sessions", "open: " + describeFiles(g_files.live()));
 
-        resize(v0, kResizedAgainWidth, kResizedAgainHeight);
-        const PassCost touched = renderCounted(manager, v0);
-        reportUnless(touched.outcome.rendered && touched.opens == 0,
-                     "the first-opened monitor is redrawn from its session", describe(touched));
+        const std::multiset<std::string> beforeNinth = g_files.live();
+        manager.requestWallpaper("video", clips[std::size(kSessionMonitors) - 1], refused);
+        const PassCost ninth = renderCounted(manager, refused);
+        reportUnless(!ninth.outcome.rendered && ninth.opens == 0 && ninth.closes == 0,
+                     "a ninth video wallpaper asked for while all eight play opens nothing and commits nothing",
+                     describe(ninth));
+        reportUnless(g_files.live() == beforeNinth, "and no monitor that is showing a video loses its session",
+                     "before: " + describeFiles(beforeNinth) + "; after: " + describeFiles(g_files.live()));
 
-        manager.requestWallpaper("video", clips[4], kSessionMonitors[4]);
-        const PassCost fifth = renderCounted(manager, kSessionMonitors[4]);
-        reportUnless(fifth.outcome.rendered && fifth.opens == 1, "a fifth video monitor opens a session and commits",
-                     describe(fifth));
-        const std::multiset<std::string> afterFifth = g_files.live();
-        reportUnless(afterFifth.size() == 4, "a fifth session leaves four resident", "open: " + describeFiles(afterFifth));
-        reportUnless(g_files.closes(clips[1]) == 1 && afterFifth.count(clips[1]) == 0 && afterFifth.count(clips[0]) == 1,
-                     "the fifth session evicts the least recently drawn monitor's, not the first opened",
-                     "open: " + describeFiles(afterFifth));
+        // GOAL: the refusal is the daemon's, and it says what the limit is. False for a refusal
+        //       reported as the file's fault, which sends the user to replace a file that is fine,
+        //       and false for one whose message does not name the limit that caused it.
+        // CONTROL: in classifyFailure() (backend/daemon/wallpaper_manager.cpp), the ResourceExhausted
+        //       arm's `daemonFault` set to false -> "FAIL: the refusal is recorded as the daemon's
+        //       fault, not the file's". Changing the thrown text in videoSessionLocked() to drop the
+        //       count reddens the naming clause instead. Observed 2026-09-18. Reverted.
+        const std::optional<wallpaperx::MonitorStatus> status = monitorStatus(manager, refused);
+        const std::string error = status ? status->lastError : std::string();
+        reportUnless(error.find("at most " + std::to_string(WallpaperManager::kMaxVideoSessions) + " videos") !=
+                         std::string::npos,
+                     "the refused monitor's error names the session limit that caused it", "last_error: " + error);
+        reportUnless(status.has_value() && status->lastErrorIsDaemonFault,
+                     "the refusal is recorded as the daemon's fault, not the file's",
+                     status ? "daemon fault: no" : "the monitor has no status");
+        reportUnless(manager.exportCurrentFrame(refused).reason == wallpaperx::NoFrameReason::RenderFailed,
+                     "and a frame request for it answers RenderFailed", "a different no-frame reason");
 
+        // GOAL: room IS made by closing a session whose monitor is not playing -- here one that owes
+        //       a render because its screen reported a new size -- and the sessions that are playing
+        //       are left alone. False for a ceiling that refuses whatever is resident, which would
+        //       strand the ninth wallpaper for as long as eight entries existed.
+        // WHY-THIS-SHAPE: the idle session is made idle by setOutputSize alone, which owes a render
+        //       without changing the wallpaper: it isolates "owes a render" as the reason, where
+        //       setting a new wallpaper would also have moved the session's wallpaper key.
+        // CONTROL: in backend/daemon/wallpaper_manager.cpp, playingSeqLocked()'s
+        //       `it->second.requestSeq != it->second.servicedSeq` clause deleted, so a monitor owing a
+        //       render still counts as playing -> "FAIL: with one monitor owing a render, the ninth
+        //       video opens a session and commits", printing "did not commit, 0 open(s), 0 close(s),
+        //       0 packet(s)". Observed 2026-09-18. Reverted.
         reportUnless(resize(kSessionMonitors[1], kResizedWidth, kResizedHeight),
-                     "a new size is owed to the evicted monitor", "setOutputSize did not name it");
-        const PassCost reopened = renderCounted(manager, kSessionMonitors[1]);
-        reportUnless(reopened.outcome.rendered && g_files.opens(clips[1]) == 1 && reopened.decodes > 0,
-                     "the evicted monitor's next pass reopens its file, decodes and commits", describe(reopened));
-        reportUnless(g_files.closes(clips[2]) == 1 && g_files.live().size() == 4,
-                     "and evicts the next least recently drawn in its place", "open: " + describeFiles(g_files.live()));
-        gradeServedPicture(manager, kSessionMonitors[1], "S13.126's picture after eviction",
-                           "the evicted monitor's redraw shows its video, cover-cropped");
+                     "a new size is owed to the monitor whose session is to be freed",
+                     "setOutputSize did not name it for a redraw");
+        manager.requestWallpaper("video", clips[std::size(kSessionMonitors) - 1], refused);
+        const PassCost ninthAgain = renderCounted(manager, refused);
+        reportUnless(ninthAgain.outcome.rendered && ninthAgain.opens == 1 && ninthAgain.closes == 1,
+                     "with one monitor owing a render, the ninth video opens a session and commits",
+                     describe(ninthAgain));
+        const std::multiset<std::string> afterNinth = g_files.live();
+        reportUnless(afterNinth.count(clips[1]) == 0 && afterNinth.count(clips[0]) == 1 &&
+                         afterNinth.size() == WallpaperManager::kMaxVideoSessions,
+                     "the session closed for it is the one whose monitor owes a render, not a playing monitor's",
+                     "open: " + describeFiles(afterNinth));
+        gradeServedPicture(manager, refused, "S13.126's picture past the ceiling",
+                           "the ninth monitor's frame shows its video, cover-cropped");
     }
 
     // GOAL: S13.132 -- a still wallpaper's passes neither open, close nor evict a video session:
-    //       with four resident, a still set and resized on another monitor leaves exactly the same
-    //       files open and still commits.
-    // WHY-THIS-SHAPE: run while the cap is full, so a still pass that counted against it, or that
-    //       cleared sessions it does not own, changes the open set.
+    //       with the ceiling reached, a still set and resized on another monitor leaves exactly the
+    //       same files open and still commits.
+    // WHY-THIS-SHAPE: run while the ceiling is reached, so a still pass that counted against it, or
+    //       that cleared sessions it does not own, changes the open set.
     // CONTROL: dropStaleVideoSessionLocked() in backend/daemon/wallpaper_manager.cpp given a first
     //       line that closes every session when `kind` is not a video -> "FAIL: setting a still beside
-    //       four video sessions commits and opens or closes no video", printing "4 close(s)", and "FAIL:
-    //       the four video sessions are all still resident". Observed 2026-09-16 on both driver
-    //       entries. Reverted.
+    //       eight video sessions commits and opens or closes no video", printing "8 close(s)", and
+    //       "FAIL: the video sessions are all still resident". Observed 2026-09-18. Reverted.
     {
         const std::multiset<std::string> resident = g_files.live();
         manager.requestWallpaper("static", still, kMonitorStillOnly);
         const PassCost set = renderCounted(manager, kMonitorStillOnly);
         reportUnless(set.outcome.rendered && set.opens == 0 && set.closes == 0,
-                     "setting a still beside four video sessions commits and opens or closes no video", describe(set));
+                     "setting a still beside eight video sessions commits and opens or closes no video", describe(set));
         resize(kMonitorStillOnly, kResizedWidth, kResizedHeight);
         const PassCost moved = renderCounted(manager, kMonitorStillOnly);
         reportUnless(moved.outcome.rendered && moved.opens == 0 && moved.closes == 0,
                      "resizing that still commits and opens or closes no video", describe(moved));
-        reportUnless(g_files.live() == resident, "the four video sessions are all still resident",
+        reportUnless(g_files.live() == resident, "the video sessions are all still resident",
                      "before: " + describeFiles(resident) + "; after: " + describeFiles(g_files.live()));
     }
 
@@ -1454,13 +1642,6 @@ bool restartGraded(const RestartVerdict& verdict) {
     return verdict.graded;
 }
 
-bool drainWorker(RenderWorker& worker) {
-    auto done = std::make_shared<std::promise<void>>();
-    std::future<void> future = done->get_future();
-    worker.postTask([done](RenderWorker::TaskState) { done->set_value(); });
-    return future.wait_for(std::chrono::seconds(60)) == std::future_status::ready;
-}
-
 std::string describeRecord(const std::optional<wallpaperx::CrashRecord>& record) {
     return record ? "type '" + record->type + "' path '" + record->path + "'" : "none";
 }
@@ -1470,8 +1651,12 @@ std::string describeRecord(const std::optional<wallpaperx::CrashRecord>& record)
 struct WorkerUnblock {
     RenderWorker& worker;
     ~WorkerUnblock() {
+        g_playbackFailure.disarm();
+        g_failImageCreates.store(0);
+        g_submitDeviceLost.store(0);
         g_framebufferGate.release();
         g_framebufferFailGate.release();
+        g_framebufferLostGate.release();
         g_submitFailGate.release();
         g_closeFileGate.release();
         g_freeCodecGate.release();
@@ -1506,11 +1691,15 @@ void runFailedPassChecks(const WallpaperManager::Config& base, const std::vector
                         [&signals](int monitorId, uint64_t generation) { signals.record(monitorId, generation); });
     WorkerUnblock unblock{worker};
 
+    // The drain matters as much as the frame: this phase's clips hold one picture each, and the
+    // clock round that parks a session runs after the job that drew it. Until that round has run,
+    // the session is still playing and the clock would reach the gates armed below -- the submit
+    // this phase fails to fail a DRAW would be spent on the clock's own instead.
     const auto show = [&](int id, const std::string& path) {
         wallpaperx::testing::nameScreen(manager, id, screenOf(id));
         manager.requestWallpaper("video", path, id);
         worker.post(id);
-        return signals.wait(id, 1);
+        return signals.wait(id, 1) && drainWorker(worker);
     };
     const auto resize = [&](int id, uint32_t width, uint32_t height) {
         std::vector<int> redraw;
@@ -1667,6 +1856,18 @@ void runFailedPassChecks(const WallpaperManager::Config& base, const std::vector
     g_closeFileGate.release();
     g_submitFailGate.release();
     check(drainWorker(worker), "the pass whose draw failed finishes once its teardown is let go");
+    // GOAL: the failure this monitor reports is the one its own draw hit -- the queue submission --
+    //       and not some later failure of the daemon's, so an operator reading last_error is pointed
+    //       at what actually went wrong.
+    // WHY-THIS-SHAPE: this phase's clips hold one picture each and show() drains the round that parks
+    //       them, so the single injected submission failure is spent on THIS pass's draw. With a
+    //       playing clip it was spent on a picture of the video clock instead, the clock's retry then
+    //       re-rendered the monitor successfully, and the successful render cleared last_error -- the
+    //       check read an empty string and could no longer fail for the reason it names.
+    // CONTROL: in backend/daemon/wallpaper_manager.cpp, recordFailureLocked() made to record a fixed
+    //       string instead of `error` -> "FAIL: the failure the monitor reports is the draw's own
+    //       submission", printing "last_error: a failure this monitor did not have". Observed
+    //       2026-09-18. Reverted.
     {
         const std::optional<wallpaperx::MonitorStatus> status = monitorStatus(manager, kMonitorDrawFault);
         const std::string error = status ? status->lastError : std::string();
@@ -1702,7 +1903,9 @@ void runFailedPassChecks(const WallpaperManager::Config& base, const std::vector
     check(signals.wait(kMonitorReplaced, 2), "and the still then commits");
 }
 
-constexpr int kEvictionMonitors[] = {24, 25, 26, 27, 28};
+constexpr int kEvictionMonitors[] = {20, 21, 22, 23, 24, 25, 26, 27, 28};
+static_assert(std::size(kEvictionMonitors) == WallpaperManager::kMaxVideoSessions + 1,
+              "the eviction check needs one monitor past the ceiling");
 
 // S13.130's eviction half, on a manager of its own so which session is least recently drawn
 // depends on nothing but this function.
@@ -1724,7 +1927,7 @@ void runEvictionRecordCheck(const WallpaperManager::Config& base, const std::vec
                         [&signals](int monitorId, uint64_t generation) { signals.record(monitorId, generation); });
     WorkerUnblock unblock{worker};
 
-    const auto post = [&](int i) {
+    const auto post = [&](size_t i) {
         wallpaperx::testing::nameScreen(manager, kEvictionMonitors[i], screenOf(kEvictionMonitors[i]));
         manager.requestWallpaper("video", clips[i], kEvictionMonitors[i]);
         worker.post(kEvictionMonitors[i]);
@@ -1735,29 +1938,39 @@ void runEvictionRecordCheck(const WallpaperManager::Config& base, const std::vec
         notVerified(kGoal, "the first video render on this host produced no frame");
         return;
     }
-    for (int i = 1; i <= 3; ++i) {
+    for (size_t i = 1; i + 1 < std::size(kEvictionMonitors); ++i) {
         post(i);
         if (!signals.wait(kEvictionMonitors[i], 1)) {
-            check(false, "four video monitors are drawn before the fifth");
+            check(false, "eight video monitors are drawn before the ninth");
             return;
         }
     }
+    // Every session here is opened on the one-picture fixture, so after this drain each has been
+    // parked by a clock round: none of them is playing, all of them are free to close, and the
+    // choice below is the least recently drawn of eight equals rather than a race between whichever
+    // rounds happened to have run.
+    if (!drainWorker(worker)) {
+        check(false, "the render worker answers a task once the eight sessions are open");
+        return;
+    }
 
-    // GOAL: S13.130, eviction -- the least recently drawn session, evicted to make room for a
-    //       fifth, is torn down with a record on disk naming the EVICTED monitor and its file.
+    // GOAL: S13.130, eviction -- the session closed to make room for one past the ceiling is torn
+    //       down with a record on disk naming the EVICTED monitor and its file. Restated for the
+    //       clock only in which session is chosen: it is the least recently drawn session that is
+    //       not playing, and a file holding a single picture is not playing, because it has nothing
+    //       left to show.
     // WHY-THIS-SHAPE: the thread is held as the evicted file is closed, and the evicted monitor's
     //       record is read -- not the drawing monitor's. The crash handler has one slot, so a record
     //       for the monitor being drawn, taken first, would leave the eviction's unwritten.
     // CONTROL: (a) in videoSessionLocked() (backend/daemon/wallpaper_manager.cpp), a copy of the
-    //       `const ApplyingRecord applying(...)` line added above the eviction loop -> "FAIL: a record
-    //       naming the evicted monitor's video is on disk while its session is torn down", printing
-    //       "the evicted monitor's record: none". (b) the `applying.emplace(...)` line deleted from
-    //       closeVideoSessionLocked() -> the same line. Both observed 2026-09-16 on both driver
-    //       entries; reverted.
+    //       `applying.emplace(...)` line added above the eviction loop -> "FAIL: a record naming the
+    //       evicted monitor's video is on disk while its session is torn down", printing "the evicted
+    //       monitor's record: none". (b) the `applying.emplace(...)` line deleted from
+    //       closeVideoSessionLocked() -> the same line. Both observed 2026-09-18; reverted.
     g_closeFileGate.arm(CallGate::Mode::Hold, clips[0]);
-    post(4);
+    post(std::size(kEvictionMonitors) - 1);
     const bool evicting = g_closeFileGate.waitFired(kGateLimit);
-    check(evicting, "drawing a fifth video monitor tears the least recently drawn session down");
+    check(evicting, "a video monitor past the ceiling tears the least recently drawn parked session down");
     if (evicting) {
         const std::optional<wallpaperx::CrashRecord> record =
             wallpaperx::readCrashRecord(config.stateDir, kEvictionMonitors[0]);
@@ -1766,7 +1979,8 @@ void runEvictionRecordCheck(const WallpaperManager::Config& base, const std::vec
                      "the evicted monitor's record: " + describeRecord(record));
     }
     g_closeFileGate.release();
-    check(signals.wait(kEvictionMonitors[4], 1), "and the fifth monitor then commits");
+    check(signals.wait(kEvictionMonitors[std::size(kEvictionMonitors) - 1], 1),
+          "and the monitor past the ceiling then commits");
 }
 
 constexpr int kMonitorShutdown = 29;
@@ -1873,6 +2087,800 @@ void runShutdownChecks(const WallpaperManager::Config& base, const std::string& 
     if (status && !status->lastError.empty()) grade.expectNoDevice();
 }
 
+// --------------------------------------------------------------------------- //
+// Stage E3: the video clock
+// --------------------------------------------------------------------------- //
+
+// Every FrameReady the worker announced, in order and with the moment it arrived. FrameReadyLog
+// answers "did generation N arrive"; the clock's checks need the sequence itself -- that each
+// generation was announced once, that the next is exactly one higher, and how long a run of them
+// took -- and none of those is a question about one generation.
+class PictureLog {
+public:
+    struct Event {
+        int monitorId = 0;
+        uint64_t generation = 0;
+        Clock::time_point at;
+    };
+
+    void record(int monitorId, uint64_t generation) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_events.push_back(Event{monitorId, generation, Clock::now()});
+    }
+
+    std::vector<Event> forMonitor(int monitorId) const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        std::vector<Event> out;
+        for (const Event& e : m_events) {
+            if (e.monitorId == monitorId) out.push_back(e);
+        }
+        return out;
+    }
+
+private:
+    mutable std::mutex m_mutex;
+    std::vector<Event> m_events;
+};
+
+// Waits for a condition the daemon reaches on its own, with a deadline that is reported rather than
+// fallen through. Every use below is a state a correct daemon reaches in well under a second; the
+// limit is there so a daemon that never reaches it fails a named check instead of hanging.
+bool settlesWithin(std::chrono::seconds limit, const std::function<bool()>& reached) {
+    const Clock::time_point deadline = Clock::now() + limit;
+    while (Clock::now() < deadline) {
+        if (reached()) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return reached();
+}
+
+// Parks the render worker inside a task of this test's until the returned handle is dropped. The
+// barrier every "nothing moved" reading below needs: the worker is the only thread that shows a
+// picture, so while it is held here the generation a status read returns is provably the last one
+// committed, and a request recorded during the hold provably precedes every later round.
+class HeldWorker {
+public:
+    explicit HeldWorker(RenderWorker& worker) {
+        auto entered = std::make_shared<std::promise<void>>();
+        std::future<void> arrived = entered->get_future();
+        std::shared_future<void> gate = m_release->get_future().share();
+        worker.postTask([entered, gate](RenderWorker::TaskState state) {
+            entered->set_value();
+            // Never wait when the worker is answering a task it will not run: stop() is waiting for
+            // this thread, and waiting back is a deadlock that costs the run its diagnostics.
+            if (state == RenderWorker::TaskState::Run) gate.wait();
+        });
+        m_held = arrived.wait_for(std::chrono::seconds(30)) == std::future_status::ready;
+    }
+    HeldWorker(const HeldWorker&) = delete;
+    HeldWorker& operator=(const HeldWorker&) = delete;
+    ~HeldWorker() { m_release->set_value(); }
+
+    bool held() const { return m_held; }
+
+private:
+    std::shared_ptr<std::promise<void>> m_release = std::make_shared<std::promise<void>>();
+    bool m_held = false;
+};
+
+// Monitor ids start again at 0 in each of the phases below, and may: every one builds a manager of
+// its own, and a manager refuses an id at or past kMaxMonitors (32), which the earlier phases have
+// nearly used up between them.
+constexpr int kMonitorPlay = 0;
+constexpr int kMonitorPlayStill = 1;
+
+// How many pictures the rate and order checks grade. Two and a half passes of the ten-picture
+// fixture, so the loop is crossed twice inside the graded run.
+constexpr uint64_t kGradedPictures = 25;
+// The generation the rate is measured from: past the first pictures, whose spacing carries the
+// cost of opening the file.
+constexpr uint64_t kRateFrom = 5;
+
+void runClockChecks(const WallpaperManager::Config& config, const std::string& clip, const std::string& still) {
+    const char* kGoals = "S13.133-S13.134, S13.137 and S13.143 (a video plays at the file's rate and in order, "
+                         "loops, pauses while a render is owed, and leaves a still alone)";
+    PhaseGrade grade("the clock phase");
+    FrameReadyLog signals;
+    PictureLog pictures;
+    WallpaperManager manager(config);
+    CaptureGradeOnExit captureGrade{grade, manager};
+    RenderWorker worker(manager, [&signals, &pictures](int monitorId, uint64_t generation) {
+        signals.record(monitorId, generation);
+        pictures.record(monitorId, generation);
+    });
+    WorkerUnblock unblock{worker};
+
+    wallpaperx::testing::nameScreen(manager, kMonitorPlay, screenOf(kMonitorPlay));
+    manager.requestWallpaper("video", clip, kMonitorPlay);
+    worker.post(kMonitorPlay);
+    if (!signals.wait(kMonitorPlay, 1)) {
+        grade.expectNoDevice();
+        notVerified(kGoals, "the first video render on this host produced no frame");
+        return;
+    }
+    g_files.resetCounts();
+
+    // GOAL: S13.133 -- a video wallpaper keeps committing pictures with nobody asking, one
+    //       generation per picture, each announced exactly once and each exactly one past the last:
+    //       none repeated, none skipped. And S13.134 -- it keeps going past the file's last picture,
+    //       from the session it already has. False for a daemon that shows one picture and stops
+    //       (what Stage E2 did), for one that drops pictures to catch up, and for one that plays the
+    //       file once and stalls at its end.
+    // WHY-THIS-SHAPE: the wait is for an exact generation, so reaching it is what makes the run
+    //       gradeable -- and a run that does not reach it returns instead of measuring, because a
+    //       stalled clock must not be graded as a slow one. The order is read from the announcements
+    //       rather than from GetStatus, which carries only the newest generation and so cannot say
+    //       whether the one before it was ever announced.
+    // CONTROL: in backend/daemon/wallpaper_manager.cpp, advanceSessionLocked()'s
+    //       `round.shown.push_back(...)` deleted -> "FAIL: a video wallpaper keeps committing
+    //       pictures without anyone asking", after the 30-second signal limit. Committing the same
+    //       generation twice -- `--it->second.generation;` after commitFrameLocked() -- reddens the
+    //       ordering check instead. Observed 2026-09-18. Reverted.
+    // COVERAGE-ASSERT: the number of successive pairs actually compared is asserted, so a future
+    //       edit that leaves the loop with two announcements to look at fails instead of going quiet.
+    const bool reached = signals.wait(kMonitorPlay, kGradedPictures);
+    check(reached, "a video wallpaper keeps committing pictures without anyone asking");
+    if (!reached) {
+        notVerified(kGoals, "the video did not reach generation " + std::to_string(kGradedPictures) +
+                                " on this host, so there is no run of pictures to grade");
+        return;
+    }
+    {
+        const std::vector<PictureLog::Event> shown = pictures.forMonitor(kMonitorPlay);
+        size_t compared = 0;
+        size_t outOfOrder = 0;
+        std::string firstWrong;
+        for (size_t i = 1; i < shown.size(); ++i) {
+            ++compared;
+            if (shown[i].generation == shown[i - 1].generation + 1) continue;
+            ++outOfOrder;
+            if (firstWrong.empty()) {
+                firstWrong = std::to_string(shown[i - 1].generation) + " then " + std::to_string(shown[i].generation);
+            }
+        }
+        check(compared + 1 >= kGradedPictures, "enough successive pictures were compared to grade their order");
+        reportUnless(outOfOrder == 0,
+                     "every picture is announced once and is the next generation -- none repeated, none skipped",
+                     std::to_string(outOfOrder) + " of " + std::to_string(compared) +
+                         " successive pairs are not consecutive; first: " + firstWrong);
+
+        // GOAL: S13.133's rate -- the pictures are paced by the file's own timestamps, not drawn as
+        //       fast as the GPU allows and not at some fixed rate of the daemon's.
+        // WHY-THIS-SHAPE: INHERENTLY TEMPORAL -- pacing is a claim about time and nothing else can
+        //       stand in for it. Kept stable by measuring across a fixed NUMBER of pictures rather
+        //       than counting pictures in a fixed time, and by bounds wide enough (half the file's
+        //       rate to four times it) that a loaded machine cannot cross them: at ten pictures a
+        //       second the twenty graded intervals are 2.0 s, and the check admits 1.0 s to 8.0 s.
+        //       The lower bound is what catches a clock that ignores the file and free-runs, which
+        //       would finish the same twenty in the time twenty draws take.
+        // CONTROL: in backend/daemon/wallpaper_manager.cpp, gapBetween() made to return
+        //       kMinPictureInterval always -> "FAIL: the pictures are paced by the file's own rate",
+        //       printing a measured span of about 0.08 s. Observed 2026-09-18. Reverted.
+        const auto at = [&shown](uint64_t generation) -> std::optional<Clock::time_point> {
+            for (const PictureLog::Event& e : shown) {
+                if (e.generation == generation) return e.at;
+            }
+            return std::nullopt;
+        };
+        const std::optional<Clock::time_point> from = at(kRateFrom);
+        const std::optional<Clock::time_point> to = at(kGradedPictures);
+        if (!from || !to) {
+            notVerified("S13.133's rate", "the graded generations were not both announced, so no span can be measured");
+        } else {
+            const double seconds = std::chrono::duration<double>(*to - *from).count();
+            const double nominal = static_cast<double>(kGradedPictures - kRateFrom) / kClipPictures;
+            reportUnless(seconds >= nominal / 2 && seconds <= nominal * 4, "the pictures are paced by the file's own rate",
+                         std::to_string(kGradedPictures - kRateFrom) + " pictures took " + std::to_string(seconds) +
+                             " s, where the file's own rate makes them " + std::to_string(nominal) + " s");
+            std::printf("video_wallpaper_test: %llu pictures took %.3f s (the file's rate makes them %.3f s)\n",
+                        static_cast<unsigned long long>(kGradedPictures - kRateFrom), seconds, nominal);
+            std::fflush(stdout);
+        }
+
+        // GOAL: S13.134 -- the video starts the file again from the session it already has, rather
+        //       than stopping at its last picture or opening the file a second time.
+        // CONTROL: in backend/daemon/wallpaper_manager.cpp, videoSessionLocked() given
+        //       VideoPipeline::Playback::Once -> "FAIL: and starts it again without reopening the
+        //       file", printing 2 opens since the first frame; the picture COUNT stays above ten even
+        //       then, because the failure at the file's end posts a render that reopens and goes on,
+        //       which is why the reopen count is asserted beside it. Observed 2026-09-18. Reverted.
+        reportUnless(shown.size() > kClipPictures,
+                     "the video plays past the last picture in the file instead of stopping at it",
+                     std::to_string(shown.size()) + " picture(s) from a file holding " +
+                         std::to_string(kClipPictures));
+        reportUnless(g_files.totalOpens() == 0, "and starts it again without reopening the file",
+                     std::to_string(g_files.totalOpens()) + " open(s) since the first frame");
+    }
+
+    // GOAL: S13.137 -- a monitor plays only while it is settled. A screen reporting a new size owes
+    //       that monitor a render, and until that render has run NO picture is shown; once it has,
+    //       the pictures start again. False for a clock that keeps drawing this session's pictures
+    //       into a monitor whose images are about to be rebuilt for a different size.
+    // WHY-THIS-SHAPE: the worker is parked inside a task of this test's while the new size is
+    //       recorded, so the count read either side of that moment is provably not a count taken
+    //       mid-round. The simpler shape -- record the size and compare counts -- cannot tell a
+    //       picture the clock committed before the size was recorded from one it committed after,
+    //       and that is exactly the distinction the goal is about. The quiet window is a second,
+    //       ten of this file's picture intervals; a correct daemon shows nothing in it however long
+    //       it is, so the length buys strength and cannot buy flakiness.
+    // CONTROL: in backend/daemon/wallpaper_manager.cpp, playingSeqLocked()'s
+    //       `it->second.requestSeq != it->second.servicedSeq` clause deleted -> "FAIL: no picture is
+    //       shown while the monitor owes a render", printing about ten pictures shown in the quiet
+    //       second. Observed 2026-09-18. Reverted.
+    std::vector<int> owed;
+    uint64_t pausedAt = 0;
+    {
+        const HeldWorker hold(worker);
+        check(hold.held(), "the render worker can be parked between pictures");
+        if (!hold.held()) {
+            notVerified(kGoals, "the render worker could not be parked, so nothing can be read at a known moment");
+            return;
+        }
+        manager.setOutputSize(screenOf(kMonitorPlay), kResizedWidth, kResizedHeight, owed);
+        pausedAt = signals.countFor(kMonitorPlay);
+    }
+    reportUnless(contains(owed, kMonitorPlay), "a new size leaves the playing monitor owing a render",
+                 "setOutputSize did not name it for a redraw");
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+    reportUnless(signals.countFor(kMonitorPlay) == pausedAt, "no picture is shown while the monitor owes a render",
+                 std::to_string(signals.countFor(kMonitorPlay) - pausedAt) + " picture(s) were shown in a quiet second");
+
+    for (const int id : owed) worker.post(id);
+    const bool resumed = signals.waitAtLeast(kMonitorPlay, pausedAt + 3);
+    reportUnless(resumed, "and the pictures start again once that render has run",
+                 "no third picture arrived after the redraw");
+    if (!resumed) return;
+
+    // GOAL: S13.143 -- a still wallpaper is untouched while a video plays beside it: it commits when
+    //       it is asked to and never again, and its frame stays exportable. False for a clock whose
+    //       rounds announce or redraw monitors that hold no video.
+    // WHY-THIS-SHAPE: the still's announcements are counted across a window in which the video is
+    //       provably busy -- the video's own count is asserted to have grown -- so "the still did not
+    //       move" cannot be read off a window in which nothing moved at all.
+    // CONTROL: in backend/daemon/render_worker.cpp, runClock() made to announce each picture for the
+    //       NEXT monitor id as well as its own -> "FAIL: a still wallpaper beside a playing video is
+    //       left exactly as it was drawn", printing "37 announcements for a still drawn once". Moving
+    //       the announcement to the neighbour instead of duplicating it cannot be used: the video's
+    //       own announcements stop, so the phase abandons before this check is reached. Observed
+    //       2026-09-18. Reverted.
+    // COVERAGE-ASSERT: the video's own picture count over the same window is asserted to have grown
+    //       by at least five, so the still's steadiness is never read off a stalled daemon.
+    wallpaperx::testing::nameScreen(manager, kMonitorPlayStill, screenOf(kMonitorPlayStill));
+    manager.requestWallpaper("static", still, kMonitorPlayStill);
+    worker.post(kMonitorPlayStill);
+    if (!signals.wait(kMonitorPlayStill, 1)) {
+        check(false, "the still wallpaper beside the video commits");
+        return;
+    }
+    const size_t videoBefore = signals.countFor(kMonitorPlay);
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+    const size_t videoAfter = signals.countFor(kMonitorPlay);
+    reportUnless(videoAfter >= videoBefore + 5, "the video kept playing across the window the still is judged in",
+                 std::to_string(videoAfter - videoBefore) + " picture(s) in a second");
+    reportUnless(signals.countFor(kMonitorPlayStill) == 1,
+                 "a still wallpaper beside a playing video is left exactly as it was drawn",
+                 std::to_string(signals.countFor(kMonitorPlayStill)) + " announcements for a still drawn once");
+    const std::optional<wallpaperx::MonitorStatus> stillStatus = monitorStatus(manager, kMonitorPlayStill);
+    reportUnless(stillStatus && stillStatus->hasFrame && stillStatus->lastError.empty(),
+                 "and it still holds its frame with no error",
+                 stillStatus ? "last_error: " + stillStatus->lastError : std::string("no status"));
+}
+
+constexpr int kMonitorParked = 0;
+
+void runOnePictureChecks(const WallpaperManager::Config& config, const std::string& onePicture) {
+    const char* kGoals = "S13.135 (a file holding one picture is shown once and decoded no further, and a resize "
+                         "still redraws it)";
+    PhaseGrade grade("the one-picture phase");
+    FrameReadyLog signals;
+    WallpaperManager manager(config);
+    CaptureGradeOnExit captureGrade{grade, manager};
+    RenderWorker worker(manager,
+                        [&signals](int monitorId, uint64_t generation) { signals.record(monitorId, generation); });
+    WorkerUnblock unblock{worker};
+
+    wallpaperx::testing::nameScreen(manager, kMonitorParked, screenOf(kMonitorParked));
+    manager.requestWallpaper("video", onePicture, kMonitorParked);
+    worker.post(kMonitorParked);
+    if (!signals.wait(kMonitorParked, 1) || !drainWorker(worker)) {
+        grade.expectNoDevice();
+        notVerified(kGoals, "the one-picture video produced no frame on this host");
+        return;
+    }
+
+    // GOAL: S13.135 -- a video file that yields exactly one picture is shown once and then left
+    //       alone: nothing is decoded from it again, no further generation is announced, and the
+    //       monitor keeps the frame it was given. False for a clock that asks such a file for its
+    //       next picture for ever, which gets the same picture back after every restart and
+    //       announces it as new -- a still image redrawn tens of times a second.
+    // WHY-THIS-SHAPE: the drain above is what makes the counters mean something. The round that
+    //       parks the session runs after the job that drew it, and it decodes once -- that is how
+    //       the daemon learns the file has nothing after the first picture. Resetting the counters
+    //       before that round had run would count its decode as a failure to park. INHERENTLY
+    //       TEMPORAL in one direction only: nothing happening can only be observed by waiting, and a
+    //       correct daemon does nothing here however long the window is.
+    // CONTROL: in backend/daemon/wallpaper_manager.cpp, advanceSessionLocked()'s
+    //       `session.clock = Session::OnePicture{};` replaced by falling through to the Waiting line
+    //       below it -> "FAIL: a video file holding one picture is never decoded again", printing
+    //       packets in the quiet second, and "FAIL: and its one picture is announced once, not once
+    //       per round". Observed 2026-09-18. Reverted.
+    g_decodeCalls.store(0);
+    g_files.resetCounts();
+    const size_t announced = signals.countFor(kMonitorParked);
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+    reportUnless(g_decodeCalls.load() == 0, "a video file holding one picture is never decoded again",
+                 std::to_string(g_decodeCalls.load()) + " packet(s) in a quiet second");
+    reportUnless(signals.countFor(kMonitorParked) == announced,
+                 "and its one picture is announced once, not once per round",
+                 std::to_string(signals.countFor(kMonitorParked) - announced) + " further announcement(s)");
+    reportUnless(g_files.totalOpens() == 0 && g_files.totalCloses() == 0, "and its file is neither reopened nor closed",
+                 std::to_string(g_files.totalOpens()) + " open(s), " + std::to_string(g_files.totalCloses()) +
+                     " close(s)");
+    const std::optional<wallpaperx::MonitorStatus> status = monitorStatus(manager, kMonitorParked);
+    reportUnless(status && status->hasFrame && status->lastError.empty(), "and the monitor still holds its frame",
+                 status ? "last_error: " + status->lastError : std::string("no status"));
+
+    // GOAL: S13.135's second half -- a parked session is still a session: a screen reporting a new
+    //       size redraws that monitor from the picture the session holds, opening no file and
+    //       decoding nothing. False for a daemon that frees a session it will never advance again,
+    //       which would make every resize of a one-picture video reopen and decode it.
+    // CONTROL: in backend/daemon/wallpaper_manager.cpp, dropStaleVideoSessionLocked()'s keep-it
+    //       `return` disabled (`&& false`) -> "FAIL: a resize of a parked one-picture video redraws
+    //       it from the session, opening and decoding nothing", printing "1 open(s), 1 packet(s)".
+    //       Observed 2026-09-18. Reverted.
+    g_decodeCalls.store(0);
+    g_files.resetCounts();
+    std::vector<int> owed;
+    manager.setOutputSize(screenOf(kMonitorParked), kResizedWidth, kResizedHeight, owed);
+    for (const int id : owed) worker.post(id);
+    const bool redrawn = signals.wait(kMonitorParked, 2);
+    check(redrawn, "a new size redraws the parked one-picture video");
+    if (redrawn) {
+        reportUnless(g_files.totalOpens() == 0 && g_decodeCalls.load() == 0,
+                     "a resize of a parked one-picture video redraws it from the session, opening and decoding nothing",
+                     std::to_string(g_files.totalOpens()) + " open(s), " + std::to_string(g_decodeCalls.load()) +
+                         " packet(s)");
+    }
+}
+
+constexpr int kMonitorHandover = 0;
+
+void runHandoverLogChecks(const WallpaperManager::Config& config, const std::string& clip) {
+    const char* kGoals = "S13.144 (a hand-over of a playing video is announced once per consumer, and so is a "
+                         "refusal)";
+    PhaseGrade grade("the hand-over phase");
+    WallpaperManager manager(config);
+    CaptureGradeOnExit captureGrade{grade, manager};
+
+    wallpaperx::testing::nameScreen(manager, kMonitorHandover, screenOf(kMonitorHandover));
+    manager.requestWallpaper("video", clip, kMonitorHandover);
+    if (!manager.renderPending(kMonitorHandover).rendered) {
+        grade.expectNoDevice();
+        notVerified(kGoals, "the video render on this host produced no frame to hand over");
+        return;
+    }
+
+    // Closed at the end, not at each export: the refusals below are produced by consumers HOLDING
+    // their images, which is the state a refusal exists for.
+    std::vector<int> open;
+    struct CloseAll {
+        std::vector<int>& fds;
+        ~CloseAll() {
+            for (const int fd : fds) {
+                if (fd >= 0) close(fd);
+            }
+        }
+    } closeAll{open};
+    const auto take = [&](const std::string& consumer) {
+        wallpaperx::FrameExport e = manager.exportCurrentFrame(kMonitorHandover, consumer);
+        if (e.handle) {
+            open.push_back(e.handle->frame.fd);
+            open.push_back(e.handle->acquireFd);
+        }
+        return e;
+    };
+
+    // GOAL: S13.144's first half -- a consumer this monitor's video has already served is marked
+    //       routine, so the daemon logs one line when a consumer starts reading and not one per
+    //       picture; a consumer it has NOT served is not, whatever the other consumers did. False
+    //       for a per-monitor mark, where one consumer starting to read silences the next one's
+    //       first hand-over entirely -- and which of two consumers is being served is the diagnosis
+    //       the line exists to carry.
+    // WHY-THIS-SHAPE: two consumers, because "once per consumer" and "once per monitor" agree on one.
+    //       The mark is read off the manager rather than off the daemon's stdout: what dbus_service
+    //       prints is one branch on exactly this flag, and capturing a process's stdout to grade a
+    //       branch makes every other diagnostic in the phase disappear with it.
+    // CONTROL: in backend/daemon/wallpaper_manager.cpp, exportCurrentFrame()'s `served.push_back`
+    //       moved above the `std::find` that sets `handle.routine` -> "FAIL: the first hand-over to a
+    //       consumer is not routine, so it is logged". Setting `handle.routine = false` outright
+    //       reddens the second clause instead. Observed 2026-09-18. Reverted.
+    const wallpaperx::FrameExport firstA = take(":1.301");
+    const wallpaperx::FrameExport againA = take(":1.301");
+    const wallpaperx::FrameExport firstB = take(":1.302");
+    if (!firstA.handle || !againA.handle || !firstB.handle) {
+        notVerified(kGoals, "the three hand-overs this check needs were not all served");
+        return;
+    }
+    check(!firstA.handle->routine, "the first hand-over to a consumer is not routine, so it is logged");
+    check(againA.handle->routine, "the next hand-over to the same consumer is routine, so it is not logged again");
+    check(!firstB.handle->routine, "and a second consumer's first hand-over is its own line, not silenced by the first");
+
+    // GOAL: S13.144's second half -- a refusal is reported once per consumer per episode: the same
+    //       consumer refused again is not reported again, and a different consumer being refused is.
+    //       False for a per-monitor flag, which would report only whichever consumer was refused
+    //       first and leave a second consumer's starvation invisible.
+    // WHY-THIS-SHAPE: consumers are added until the daemon refuses one, rather than a fixed number
+    //       being assumed: how many images a monitor's ring holds is the driver's business, and a
+    //       count written here would silently stop reaching the refusal on a driver that allocates
+    //       one more. The loop's own success is asserted.
+    // CONTROL: in backend/daemon/wallpaper_manager.cpp, exportCurrentFrame()'s `out.firstRefusal =
+    //       ...` replaced with `out.firstRefusal = true;` -> "FAIL: the same consumer refused again
+    //       is not reported again". Replacing it with `false` reddens the other two clauses.
+    //       Observed 2026-09-18. Reverted.
+    std::string starved;
+    for (int i = 0; i < 16 && starved.empty(); ++i) {
+        const std::string consumer = ":1.4" + std::to_string(i);
+        const wallpaperx::FrameExport e = take(consumer);
+        if (e.handle) continue;
+        if (e.reason != wallpaperx::NoFrameReason::NoFreeImage) break;
+        starved = consumer;
+        check(e.firstRefusal, "the first refusal of a consumer is reported");
+    }
+    if (starved.empty()) {
+        notVerified("S13.144's refusal half", "no consumer could be refused an image on this host");
+        return;
+    }
+    const wallpaperx::FrameExport refusedAgain = manager.exportCurrentFrame(kMonitorHandover, starved);
+    check(refusedAgain.reason == wallpaperx::NoFrameReason::NoFreeImage && !refusedAgain.firstRefusal,
+          "the same consumer refused again is not reported again");
+    const wallpaperx::FrameExport refusedOther = manager.exportCurrentFrame(kMonitorHandover, ":1.499");
+    check(refusedOther.reason == wallpaperx::NoFrameReason::NoFreeImage && refusedOther.firstRefusal,
+          "but a different consumer being refused is reported in its own right");
+}
+
+constexpr int kMemoryMonitors[] = {0, 1, 2, 3, 4, 5};
+
+void runMemoryRetryChecks(const WallpaperManager::Config& config, const std::vector<std::string>& clips) {
+    const char* kGoals = "S13.139 (an open that runs out of memory frees an idle session and tries once more)";
+    PhaseGrade grade("the memory-retry phase");
+    WallpaperManager manager(config);
+    CaptureGradeOnExit captureGrade{grade, manager};
+    struct Disarm {
+        ~Disarm() { g_failImageCreates.store(0); }
+    } disarm;
+
+    const auto draw = [&](size_t i) {
+        wallpaperx::testing::nameScreen(manager, kMemoryMonitors[i], screenOf(kMemoryMonitors[i]));
+        manager.requestWallpaper("video", clips[i], kMemoryMonitors[i]);
+        return renderCounted(manager, kMemoryMonitors[i]);
+    };
+    if (!draw(0).outcome.rendered) {
+        grade.expectNoDevice();
+        notVerified(kGoals, "the first video render on this host produced no frame");
+        return;
+    }
+    reportUnless(draw(1).outcome.rendered && draw(2).outcome.rendered && draw(3).outcome.rendered,
+                 "four video monitors are drawn first", "one of the four did not commit");
+    // THREE sessions to free, not two. The bound below is "the retry is tried once": telling a
+    // daemon that stops after one retry from one that keeps freeing sessions needs a third idle
+    // session for the third attempt to take -- with only two, both behave identically and the check
+    // could not fail. This phase runs no render worker, so a monitor is idle exactly while it owes a
+    // render, and setOutputSize owes one without changing the wallpaper.
+    std::vector<int> owed;
+    for (size_t i = 1; i <= 3; ++i) {
+        manager.setOutputSize(screenOf(kMemoryMonitors[i]), kResizedWidth, kResizedHeight, owed);
+    }
+    reportUnless(owed.size() == 3, "three of them are left owing a render, so their sessions are free to close",
+                 "setOutputSize named " + std::to_string(owed.size()) + " monitor(s)");
+
+    // GOAL: S13.139 -- what the card can hold is settled by trying. An open that runs out of memory
+    //       closes a session nothing is showing and opens again, and that second attempt commits.
+    //       False for a daemon that reports the shortage to the user, which would refuse a wallpaper
+    //       the machine has room for as soon as another screen's decoder had taken the last of it.
+    // WHY-THIS-SHAPE: the shortage is injected into the daemon's own image creation, which on this
+    //       path is the picture converter's image inside the decode that opens the session. The
+    //       signature graded is that the FILE WAS OPENED TWICE: "it committed" alone is also true of
+    //       an attempt that never ran out, and the injection being spent is asserted separately.
+    // CONTROL: in backend/daemon/wallpaper_manager.cpp, videoSessionLocked()'s retry condition
+    //       `!classifyFailure().exhausted` replaced by `true`, so no shortage is ever retried ->
+    //       "FAIL: an open that runs out of memory frees an idle session and commits on the retry",
+    //       printing "did not commit, 1 open(s), 1 close(s)". Observed 2026-09-18. Reverted.
+    // COVERAGE-ASSERT: the armed shortage is asserted to have been spent, so a run where the
+    //       injection never landed fails instead of grading an ordinary open.
+    g_failImageCreates.store(1);
+    const PassCost retried = draw(4);
+    check(g_failImageCreates.load() == 0, "the injected memory shortage was spent on the daemon's own image");
+    reportUnless(retried.outcome.rendered && retried.opens == 2,
+                 "an open that runs out of memory frees an idle session and commits on the retry", describe(retried));
+    const std::multiset<std::string> afterRetry = g_files.live();
+    reportUnless(afterRetry.count(clips[1]) == 0 && afterRetry.count(clips[0]) == 1,
+                 "what it freed is a session whose monitor owes a render, not one that is showing its video",
+                 "open: " + describeFiles(afterRetry));
+
+    // GOAL: S13.139's bound -- the retry is tried ONCE. A second shortage in a row is reported, not
+    //       answered by freeing session after session. False for a loop that keeps evicting while
+    //       anything is idle, which turns one bad allocation into every other screen going dark.
+    // WHY-THIS-SHAPE: the count graded is OPENS of the new file -- two, the attempt and its one
+    //       retry -- rather than closes, which also carry each failed attempt tearing its own
+    //       half-built pipeline down and so say nothing about how many sessions were freed. How many
+    //       were freed is asserted separately, by name. THREE idle sessions are set up above for this
+    //       one check: with two, a daemon that retries once and a daemon that retries for ever both
+    //       run out of sessions on the same attempt and produce the same counts, so the check could
+    //       not have failed at all.
+    // CONTROL: in backend/daemon/wallpaper_manager.cpp, the `retried ||` term deleted from
+    //       videoSessionLocked()'s retry condition -> "FAIL: a second shortage in a row is reported
+    //       rather than answered by freeing another session", printing "committed, 3 open(s), 4
+    //       close(s), 3 packet(s), 0 shortage(s) left unspent". Observed 2026-09-18. Reverted.
+    // COVERAGE-ASSERT: the shortages left unspent are printed beside the failure, so a run where
+    //       only one of the two landed is visible rather than graded as a bound that held.
+    g_failImageCreates.store(2);
+    const PassCost twice = draw(5);
+    reportUnless(!twice.outcome.rendered && twice.opens == 2,
+                 "a second shortage in a row is reported rather than answered by freeing another session",
+                 describe(twice) + ", " + std::to_string(g_failImageCreates.load()) + " shortage(s) left unspent");
+    reportUnless(g_files.closes(clips[2]) == 1 && g_files.closes(clips[3]) == 0 &&
+                     g_files.live().count(clips[0]) == 1 && g_files.live().count(clips[4]) == 1,
+                 "exactly one session was freed for it, and neither of the two that are showing a video",
+                 "open: " + describeFiles(g_files.live()));
+    const std::optional<wallpaperx::MonitorStatus> status = monitorStatus(manager, kMemoryMonitors[5]);
+    reportUnless(status && status->lastErrorIsDaemonFault && !status->lastError.empty(),
+                 "and the monitor records it as the daemon's own failure, not the file's",
+                 status ? "last_error: " + status->lastError : std::string("no status"));
+}
+
+constexpr int kMonitorRetry = 0;
+
+// The end state a spent retry budget leaves: no frame, an error standing, and no render owed, so
+// nothing will run again until the user acts.
+bool settledOnFailure(const WallpaperManager& manager, int monitorId) {
+    const std::optional<wallpaperx::MonitorStatus> status = monitorStatus(manager, monitorId);
+    return status && !status->hasFrame && !status->lastError.empty() && !status->renderOutstanding;
+}
+
+void runPlaybackRetryChecks(const WallpaperManager::Config& config, const std::vector<std::string>& clips) {
+    const char* kGoals = "S13.140 (playback that keeps failing is reopened three times and then left alone; a "
+                         "picture shown restores the budget; a new wallpaper starts fresh)";
+    PhaseGrade grade("the playback-retry phase");
+    FrameReadyLog signals;
+    WallpaperManager manager(config);
+    CaptureGradeOnExit captureGrade{grade, manager};
+    RenderWorker worker(manager,
+                        [&signals](int monitorId, uint64_t generation) { signals.record(monitorId, generation); });
+    WorkerUnblock unblock{worker};
+
+    const auto play = [&](const std::string& path) {
+        manager.requestWallpaper("video", path, kMonitorRetry);
+        worker.post(kMonitorRetry);
+        const std::optional<wallpaperx::MonitorStatus> before = monitorStatus(manager, kMonitorRetry);
+        const uint64_t next = (before ? before->generation : 0) + 1;
+        return signals.waitAtLeast(kMonitorRetry, next);
+    };
+    wallpaperx::testing::nameScreen(manager, kMonitorRetry, screenOf(kMonitorRetry));
+    if (!play(clips[0])) {
+        grade.expectNoDevice();
+        notVerified(kGoals, "the first video render on this host produced no frame");
+        return;
+    }
+
+    // GOAL: S13.140 -- playback that fails again after every reopen is retried three times and then
+    //       left alone: the file is opened exactly kPlaybackRetries more times, the monitor ends with
+    //       no frame and its error standing, a frame request answers RenderFailed, and no render is
+    //       owed, so nothing reopens it until the user sets a wallpaper again. False for an unbounded
+    //       retry, which reopens a decoder tens of times a second for ever.
+    // WHY-THIS-SHAPE: the injected failure is the picture AFTER the one a decoder delivered, so each
+    //       reopen SUCCEEDS and fails again on its first clock picture -- which is the only shape
+    //       that reaches the bound at all. A failure that also broke the open would end the chain
+    //       after one try and the check would pass over a daemon with no bound whatsoever. The count
+    //       graded is opens, not failures: an open is what the bound is spending.
+    // CONTROL: in backend/daemon/wallpaper_manager.cpp, the `spent < kPlaybackRetries` term deleted
+    //       from advanceSessionLocked()'s retry condition -> "FAIL: playback that keeps failing is
+    //       reopened three times and then left alone", printing opens climbing past three, then the
+    //       settle deadline. Observed 2026-09-18. Reverted.
+    // COVERAGE-ASSERT: the number of failures actually injected is asserted to be at least one per
+    //       reopen plus the one that spent the budget, so a run where the injection stopped landing
+    //       fails instead of grading a daemon that simply never failed.
+    g_files.resetCounts();
+    const int injectedBefore = g_playbackFailure.injected();
+    g_playbackFailure.arm();
+    const bool settled = settlesWithin(std::chrono::seconds(30),
+                                       [&manager] { return settledOnFailure(manager, kMonitorRetry); });
+    g_playbackFailure.disarm();
+    check(settled, "a video whose playback keeps failing stops on its own rather than reopening for ever");
+    if (!settled) {
+        notVerified(kGoals, "the monitor never settled after its playback was made to fail");
+        return;
+    }
+    const int reopens = g_files.opens(clips[0]);
+    reportUnless(reopens == static_cast<int>(WallpaperManager::kPlaybackRetries),
+                 "playback that keeps failing is reopened three times and then left alone",
+                 std::to_string(reopens) + " reopen(s) of the file");
+    reportUnless(g_playbackFailure.injected() - injectedBefore >= reopens + 1,
+                 "every one of those reopens was answered by another injected failure",
+                 std::to_string(g_playbackFailure.injected() - injectedBefore) + " failure(s) for " +
+                     std::to_string(reopens) + " reopen(s)");
+    reportUnless(manager.exportCurrentFrame(kMonitorRetry).reason == wallpaperx::NoFrameReason::RenderFailed,
+                 "and a frame request for that monitor answers RenderFailed", "a different no-frame reason");
+    {
+        const std::optional<wallpaperx::MonitorStatus> status = monitorStatus(manager, kMonitorRetry);
+        // What /health reads to name a monitor in its wallpapers check: an error recorded with no
+        // render outstanding. The wording of that check is graded in http_server_test.
+        reportUnless(status && !status->lastError.empty() && !status->renderOutstanding,
+                     "the monitor is left with its error standing and no render owed, which is what /health names",
+                     status ? "last_error: " + status->lastError : std::string("no status"));
+        std::printf("video_wallpaper_test: a spent playback budget leaves -- %s\n",
+                    status ? status->lastError.c_str() : "no status");
+        std::fflush(stdout);
+    }
+    const int quietOpens = g_files.opens(clips[0]);
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    reportUnless(g_files.opens(clips[0]) == quietOpens, "and nothing reopens it afterwards",
+                 std::to_string(g_files.opens(clips[0]) - quietOpens) + " further open(s) in a quiet half second");
+
+    // GOAL: S13.140's second clause -- a NEW wallpaper starts with a full budget, and a picture shown
+    //       since the last failure restores it. So a file that hiccups once an hour keeps recovering
+    //       instead of spending a retry it never gets back. False for a count kept per monitor and
+    //       never reset, which would leave a screen that failed three times in its first hour unable
+    //       to recover for the rest of the session.
+    // WHY-THIS-SHAPE: the budget spent before the video is allowed to play again is MEASURED rather
+    //       than assumed to be one: disarming the injection cannot stop a failure already in flight,
+    //       so how many were spent first is a race. What is asserted is the difference -- that the
+    //       full three are available AFTER a picture is shown, whatever was spent before it -- and
+    //       that at least one and fewer than three had been spent, so the restoration is not being
+    //       read off a budget that was never touched.
+    // CONTROL: in backend/daemon/wallpaper_manager.cpp, `playbackBudgetLocked(it->second) = 0;`
+    //       deleted from advanceSessionLocked()'s commit -> "FAIL: a picture shown since the last
+    //       failure restores the whole retry budget", printing 2 reopens where 3 were owed. Observed
+    //       2026-09-18. Reverted.
+    if (!play(clips[1])) {
+        check(false, "a new video wallpaper on that monitor draws again after the budget was spent");
+        return;
+    }
+    g_files.resetCounts();
+    g_playbackFailure.arm();
+    const bool failedOnce = settlesWithin(std::chrono::seconds(30),
+                                          [&clips] { return g_files.opens(clips[1]) >= 1; });
+    g_playbackFailure.disarm();
+    check(failedOnce, "the new wallpaper's playback fails and is reopened, so the budget is partly spent");
+    if (!failedOnce) return;
+
+    // Let it play again: a committed clock picture is what restores the budget.
+    const std::optional<wallpaperx::MonitorStatus> playing = monitorStatus(manager, kMonitorRetry);
+    const uint64_t resumedBy = (playing ? playing->generation : 0) + 5;
+    if (!signals.waitAtLeast(kMonitorRetry, resumedBy)) {
+        check(false, "the reopened wallpaper plays again once the injected failure is withdrawn");
+        return;
+    }
+    const int spentFirst = g_files.opens(clips[1]);
+    reportUnless(spentFirst >= 1 && spentFirst < static_cast<int>(WallpaperManager::kPlaybackRetries),
+                 "part of the budget -- not all of it -- was spent before the video played again",
+                 std::to_string(spentFirst) + " reopen(s) spent");
+
+    g_playbackFailure.arm();
+    const bool settledAgain = settlesWithin(std::chrono::seconds(30),
+                                            [&manager] { return settledOnFailure(manager, kMonitorRetry); });
+    g_playbackFailure.disarm();
+    check(settledAgain, "the wallpaper settles again once its restored budget is spent");
+    if (!settledAgain) return;
+    reportUnless(g_files.opens(clips[1]) == spentFirst + static_cast<int>(WallpaperManager::kPlaybackRetries),
+                 "a picture shown since the last failure restores the whole retry budget",
+                 std::to_string(g_files.opens(clips[1]) - spentFirst) + " reopen(s) after the picture, where " +
+                     std::to_string(WallpaperManager::kPlaybackRetries) + " were owed");
+}
+
+constexpr int kMonitorFaulting = 0;
+constexpr int kMonitorFaultStill = 1;
+// A size nothing else in this phase draws at, so the injected device fault lands on this monitor's
+// rebuild and not on a picture of the video playing beside it.
+constexpr uint32_t kFaultWidth = 72;
+constexpr uint32_t kFaultHeight = 36;
+
+void runGpuFaultChecks(const WallpaperManager::Config& config, const std::vector<std::string>& clips,
+                       const std::string& still) {
+    const char* kGoals = "S13.141 (a video's pictures do not clear recorded GPU health) and S13.142 (a GPU fault "
+                         "during playback is never retried)";
+    PhaseGrade grade("the gpu-fault phase");
+    FrameReadyLog signals;
+    WallpaperManager manager(config);
+    CaptureGradeOnExit captureGrade{grade, manager};
+    RenderWorker worker(manager,
+                        [&signals](int monitorId, uint64_t generation) { signals.record(monitorId, generation); });
+    WorkerUnblock unblock{worker};
+
+    wallpaperx::testing::nameScreen(manager, kMonitorFaulting, screenOf(kMonitorFaulting));
+    manager.requestWallpaper("video", clips[0], kMonitorFaulting);
+    worker.post(kMonitorFaulting);
+    wallpaperx::testing::nameScreen(manager, kMonitorFaultStill, screenOf(kMonitorFaultStill));
+    manager.requestWallpaper("static", still, kMonitorFaultStill);
+    worker.post(kMonitorFaultStill);
+    if (!signals.wait(kMonitorFaulting, 1) || !signals.wait(kMonitorFaultStill, 1)) {
+        grade.expectNoDevice();
+        notVerified(kGoals, "the video and the still did not both draw on this host");
+        return;
+    }
+
+    // GOAL: S13.141 -- GPU health recorded as failed is cleared by a render somebody asked for, and
+    //       NOT by the pictures a video goes on showing. False for a daemon that clears it on every
+    //       commit: a video playing on one screen would wipe a fault recorded for another before an
+    //       operator or a watchdog could read it, and /health would report a broken device as ok.
+    // WHY-THIS-SHAPE: the fault is injected into a framebuffer of a size only the still monitor's
+    //       rebuild asks for, because the video beside it is submitting several times a second and an
+    //       unfiltered injection would be spent on one of its pictures instead. The video is then
+    //       asserted to have kept playing across the window in which health is re-read, so "still
+    //       failed" is never read off a daemon that had stopped committing anything.
+    // CONTROL: in backend/daemon/wallpaper_manager.cpp, the recordHealthLocked(gpu, Ok, ...) call
+    //       moved from renderPassLocked()'s commit into commitFrameLocked(), which the clock also
+    //       calls -> "FAIL: the pictures a video keeps showing do not clear a recorded GPU fault",
+    //       printing gpu health ok. Observed 2026-09-18. Reverted.
+    // COVERAGE-ASSERT: the recorded fault is asserted before the window as well as after it, so the
+    //       check cannot pass because nothing was ever recorded.
+    g_framebufferLostGate.arm(CallGate::Mode::Fail, extentOf(kFaultWidth, kFaultHeight));
+    std::vector<int> owed;
+    manager.setOutputSize(screenOf(kMonitorFaultStill), kFaultWidth, kFaultHeight, owed);
+    for (const int id : owed) worker.post(id);
+    const bool faulted = settlesWithin(std::chrono::seconds(30), [&manager] {
+        return manager.snapshot().health.gpu.status == wallpaperx::HealthStatus::Fail;
+    });
+    g_framebufferLostGate.release();
+    check(faulted, "a render that loses the device records GPU health as failed");
+    if (!faulted) {
+        notVerified(kGoals, "no GPU fault could be recorded on this host, so there is nothing to keep recorded");
+        return;
+    }
+    const size_t playedBefore = signals.countFor(kMonitorFaulting);
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+    const size_t playedAfter = signals.countFor(kMonitorFaulting);
+    reportUnless(playedAfter >= playedBefore + 5, "the video kept playing across the window health is judged in",
+                 std::to_string(playedAfter - playedBefore) + " picture(s) in a second");
+    reportUnless(manager.snapshot().health.gpu.status == wallpaperx::HealthStatus::Fail,
+                 "the pictures a video keeps showing do not clear a recorded GPU fault",
+                 "gpu health: " + manager.snapshot().health.gpu.detail);
+
+    // The other half of the same rule: a render somebody asked for does clear it.
+    manager.requestWallpaper("static", still, kMonitorFaultStill);
+    worker.post(kMonitorFaultStill);
+    const bool cleared = signals.waitAtLeast(kMonitorFaultStill, 2) &&
+                         settlesWithin(std::chrono::seconds(10), [&manager] {
+                             return manager.snapshot().health.gpu.status == wallpaperx::HealthStatus::Ok;
+                         });
+    reportUnless(cleared, "a render somebody asked for does clear it",
+                 "gpu health: " + manager.snapshot().health.gpu.detail);
+
+    // GOAL: S13.142 -- a GPU fault during playback is never retried: the session is dropped, the
+    //       fault is recorded, and the file is NOT reopened, because rendering again on a device that
+    //       has just stopped answering is worse than stopping. False for a retry that treats every
+    //       playback failure alike, which would reopen a decoder against a lost device three more
+    //       times before giving up.
+    // WHY-THIS-SHAPE: the injection is a lost device on the next queue submission, armed while the
+    //       only thing submitting is the clock -- no job is posted and no other monitor is playing,
+    //       so the submission it lands on is a picture's. The count graded is reopens of this
+    //       monitor's own copy of the fixture, which only the retry path could produce.
+    // CONTROL: in backend/daemon/wallpaper_manager.cpp, the `!failure.gpuFault` term deleted from
+    //       advanceSessionLocked()'s retry condition -> "FAIL: a GPU fault during playback never
+    //       reopens the file", printing "1 reopen(s) after the fault", with the two clauses after it.
+    //       Observed 2026-09-18. Reverted.
+    // COVERAGE-ASSERT: the injected fault is asserted to have been spent before anything is read, so
+    //       "no reopen" cannot be read off an injection that never fired.
+    g_files.resetCounts();
+    g_submitDeviceLost.store(1);
+    const bool injected = settlesWithin(std::chrono::seconds(30), [] { return g_submitDeviceLost.load() == 0; });
+    check(injected, "the injected device loss was spent on a picture's submission");
+    if (!injected) {
+        notVerified("S13.142", "nothing submitted a picture, so no device loss could be injected into one");
+        return;
+    }
+    // The reopen is read after a quiet window rather than after waiting for the monitor to settle:
+    // a daemon that DOES retry a GPU fault never settles, so a settle-first shape would spend its
+    // deadline on the check above and leave the reopen count -- the property -- ungraded.
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    reportUnless(g_files.opens(clips[0]) == 0, "a GPU fault during playback never reopens the file",
+                 std::to_string(g_files.opens(clips[0])) + " reopen(s) after the fault");
+    reportUnless(manager.snapshot().health.gpu.status == wallpaperx::HealthStatus::Fail,
+                 "and the fault is recorded against the GPU", "gpu health: " + manager.snapshot().health.gpu.detail);
+    reportUnless(settledOnFailure(manager, kMonitorFaulting),
+                 "and the monitor is left with no frame and the failure standing",
+                 "the monitor did not settle on the failure");
+}
+
 }  // namespace
 
 int main() {
@@ -1906,10 +2914,11 @@ int main() {
     std::fflush(stdout);
 
     const std::string clip = clipPath();
-    if (!std::filesystem::exists(clip)) {
+    const std::string onePicture = onePicturePath();
+    if (!std::filesystem::exists(clip) || !std::filesystem::exists(onePicture)) {
         notVerified("every goal in this file",
-                    "the video fixture " + clip +
-                        " was not generated, which means this build found no ffmpeg command line");
+                    "the video fixtures " + clip + " and " + onePicture +
+                        " were not both generated, which means this build found no ffmpeg command line");
         return wallpaperx::testing::reportNotVerifiedOrPassed();
     }
 
@@ -1918,11 +2927,17 @@ int main() {
         const std::string still = wallpaperx::testing::writeGradientPng(testAssetDir() + "/video_test_still.png", 32, 32);
         const std::string junk = writeUndecodable("video_test_not_a_clip.mp4");
         // Copies, one per monitor the session phases draw, so the set of open files names which
-        // monitors hold a session.
+        // monitors hold a session. Nine of each, one more than the session ceiling, so a phase can
+        // ask for a session past it. The parked copies hold a single picture: on the render
+        // worker's thread they leave the pass under test as the only thing that can open a file or
+        // send a packet while a phase counts (see runResizeChecks).
         std::vector<std::string> clips;
-        for (int i = 0; i < 5; ++i) {
+        std::vector<std::string> parked;
+        for (int i = 0; i < 9; ++i) {
             clips.push_back(testAssetDir() + "/video_session_" + std::to_string(i) + ".mp4");
             std::filesystem::copy_file(clip, clips.back(), std::filesystem::copy_options::overwrite_existing);
+            parked.push_back(testAssetDir() + "/video_parked_" + std::to_string(i) + ".mp4");
+            std::filesystem::copy_file(onePicture, parked.back(), std::filesystem::copy_options::overwrite_existing);
         }
         // A type this build records and cannot draw; requestWallpaper wants a readable file.
         const std::string shaderRow = writeUndecodable("video_test_undrawable.frag");
@@ -1953,12 +2968,18 @@ int main() {
         }
 
         runUndecodableChecks(config, junk);
-        runResizeChecks(config, clip);
-        runCrashRecordSpanChecks(config, clip);
+        runResizeChecks(config, onePicture);
+        runCrashRecordSpanChecks(config, onePicture);
         runSessionChecks(config, clips, still, shaderRow);
-        runFailedPassChecks(config, clips, still);
-        runEvictionRecordCheck(config, clips);
-        runShutdownChecks(config, clips[0]);
+        runFailedPassChecks(config, parked, still);
+        runEvictionRecordCheck(config, parked);
+        runShutdownChecks(config, parked[0]);
+        runClockChecks(config, clip, still);
+        runOnePictureChecks(config, onePicture);
+        runHandoverLogChecks(config, clip);
+        runMemoryRetryChecks(config, clips);
+        runPlaybackRetryChecks(config, clips);
+        runGpuFaultChecks(config, clips, still);
     } catch (const std::exception& e) {
         // Without this an escaping sdbus::Error -- what a host with no session bus produces --
         // would abort the process, so ctest would report an opaque SIGABRT instead of the named

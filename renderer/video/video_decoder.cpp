@@ -38,7 +38,7 @@ std::string avErrorString(int err) {
 }
 
 [[noreturn]] void throwOutOfMemory(const std::string& context) {
-    throw std::runtime_error(context + ": out of memory");
+    throw ResourceExhausted(context + ": out of memory");
 }
 
 // An ffmpeg error that is not the GPU's: memory, or the file.
@@ -196,6 +196,20 @@ private:
 // the decode reports it, and neither is retried -- the packet is gone, so a retry would spin.
 bool isDamagedPacket(int err) { return err == AVERROR_INVALIDDATA; }
 
+// `value` in `base` units -- pkt_timebase, which is the stream's -- or nothing for an unset one.
+std::optional<std::chrono::nanoseconds> inNanoseconds(int64_t value, AVRational base) {
+    if (value == AV_NOPTS_VALUE || base.num <= 0 || base.den <= 0) return std::nullopt;
+    return std::chrono::nanoseconds(av_rescale_q(value, base, AVRational{1, 1'000'000'000}));
+}
+
+// One frame at the rate the container declares, else the rate ffmpeg guessed while probing.
+std::optional<std::chrono::nanoseconds> nominalInterval(const AVStream& stream) {
+    for (const AVRational rate : {stream.avg_frame_rate, stream.r_frame_rate}) {
+        if (rate.num > 0 && rate.den > 0) return inNanoseconds(1, av_inv_q(rate));
+    }
+    return std::nullopt;
+}
+
 // What VideoDecoder::readVideoPacket() numbered the packet a frame was decoded from; ffmpeg
 // carries it in `opaque`, where 0 is no number.
 std::optional<uint64_t> packetNumber(const AVFrame& frame) {
@@ -237,7 +251,11 @@ DecodedFrame::DecodedFrame(Device& device, AVFrame* frame) : m_device(&device), 
 DecodedFrame::~DecodedFrame() { release(); }
 
 DecodedFrame::DecodedFrame(DecodedFrame&& other) noexcept
-    : m_device(other.m_device), m_frame(std::exchange(other.m_frame, nullptr)), m_colour(other.m_colour) {}
+    : m_device(other.m_device),
+      m_frame(std::exchange(other.m_frame, nullptr)),
+      m_colour(other.m_colour),
+      m_presentation(other.m_presentation),
+      m_duration(other.m_duration) {}
 
 DecodedFrame& DecodedFrame::operator=(DecodedFrame&& other) noexcept {
     if (this != &other) {
@@ -245,6 +263,8 @@ DecodedFrame& DecodedFrame::operator=(DecodedFrame&& other) noexcept {
         m_device = other.m_device;
         m_frame = std::exchange(other.m_frame, nullptr);
         m_colour = other.m_colour;
+        m_presentation = other.m_presentation;
+        m_duration = other.m_duration;
     }
     return *this;
 }
@@ -839,7 +859,7 @@ AVPixelFormat VideoDecoder::chooseFormat(AVCodecContext* codec, const AVPixelFor
     try {
         return self->choose(codec, offered);
     } catch (const std::bad_alloc&) {
-        self->m_parkedFailure = std::make_exception_ptr(std::runtime_error("VideoDecoder: out of memory"));
+        self->m_parkedFailure = std::make_exception_ptr(ResourceExhausted("VideoDecoder: out of memory"));
     } catch (...) {
         self->m_parkedFailure = std::current_exception();
     }
@@ -970,6 +990,10 @@ std::optional<DecodedFrame> VideoDecoder::next() {
             if (out == nullptr) throwOutOfMemory("VideoDecoder");
             av_frame_move_ref(out, m_frame);
             DecodedFrame frame(m_device, out);
+            const AVStream& stream = *m_format->streams[m_stream];
+            frame.m_presentation = inNanoseconds(timestamp, stream.time_base);
+            frame.m_duration = out->duration > 0 ? inNanoseconds(out->duration, stream.time_base)
+                                                 : nominalInterval(stream);
             recordReturned(timestamp, packet);
             return frame;
         }
