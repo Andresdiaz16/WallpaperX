@@ -51,6 +51,15 @@ void RenderWorker::post(int monitorId) {
     m_wake.notify_one();
 }
 
+void RenderWorker::wake() {
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_stop) return;
+        m_wakeClock = true;
+    }
+    m_wake.notify_one();
+}
+
 void RenderWorker::postTask(Task task) {
     TaskState refused = TaskState::Run;
     {
@@ -82,7 +91,7 @@ void RenderWorker::run() {
         bool haveJob = false;
         {
             std::unique_lock<std::mutex> lock(m_mutex);
-            const auto ready = [this] { return m_stop || !m_queue.empty(); };
+            const auto ready = [this] { return m_stop || m_wakeClock || !m_queue.empty(); };
             if (clockDue) {
                 m_wake.wait_until(lock, *clockDue, ready);
             } else {
@@ -93,6 +102,10 @@ void RenderWorker::run() {
             // see -- the daemon is going away -- and rendering it would only delay
             // shutdown by a full GPU submit per entry. stop() answers the tasks left behind.
             if (m_stop) return;
+
+            // Taken whatever woke this: the round below runs on every pass, so a wake that is
+            // still set afterwards would spin.
+            m_wakeClock = false;
 
             if (!m_queue.empty()) {
                 job = std::move(m_queue.front());

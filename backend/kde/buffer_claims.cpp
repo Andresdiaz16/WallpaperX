@@ -50,6 +50,33 @@ void BufferClaims::daemonReplaced() {
     m_entries.clear();
 }
 
+void ClaimSet::add(const BufferClaims::Claim& claim) {
+    if (!claim.held()) return;
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_claims.push_back(claim);
+}
+
+bool ClaimSet::remove(const BufferClaims::Claim& claim) {
+    if (!claim.held()) return false;
+    std::lock_guard<std::mutex> lock(m_mutex);
+    // The owner is not part of the identity: it is where a release is addressed, and the same
+    // image can be claimed once before this process has learned the daemon's unique name and
+    // again after.
+    const auto held = std::find_if(m_claims.begin(), m_claims.end(), [&claim](const BufferClaims::Claim& mine) {
+        return mine.daemon == claim.daemon && mine.monitorId == claim.monitorId && mine.bufferId == claim.bufferId;
+    });
+    if (held == m_claims.end()) return false;
+    m_claims.erase(held);
+    return true;
+}
+
+std::vector<BufferClaims::Claim> ClaimSet::removeAll() {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    std::vector<BufferClaims::Claim> held;
+    held.swap(m_claims);
+    return held;
+}
+
 BufferClaims& BufferClaims::instance() {
     static BufferClaims* claims = new BufferClaims();
     return *claims;

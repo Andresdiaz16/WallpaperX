@@ -435,6 +435,12 @@ std::string clipPath() { return std::string(WALLPAPERX_VIDEO_ASSET_DIR) + "/wall
 // under test is the only thing that can open a file or send a packet while a phase is counting.
 std::string onePicturePath() { return std::string(WALLPAPERX_VIDEO_ASSET_DIR) + "/wallpaper_one_picture.mp4"; }
 
+// The same bands again at one picture every four seconds, which is longer than the daemon's own
+// unwatched interval. The only fixture that can tell "the wait runs from the oldest uncollected
+// picture" apart from "the wait runs from the last hand-over": at ten pictures a second the two
+// rules agree.
+std::string slowClipPath() { return std::string(WALLPAPERX_VIDEO_ASSET_DIR) + "/wallpaper_slow.mp4"; }
+
 // How many pictures each fixture holds, as backend/CMakeLists.txt generates them. Stated here so a
 // recipe that changed without this changing is a failed check rather than a check grading a
 // different file.
@@ -1174,21 +1180,28 @@ void runCrashRecordSpanChecks(const WallpaperManager::Config& base, const std::s
         return;
     }
 
-    // GOAL: S13.119's second half -- a session dropped because its monitor was given a wallpaper
-    //       again, the same file included, is torn down with a record on disk naming the type
-    //       `video` and the file that session opened. Tearing a decoder down re-enters ffmpeg and
-    //       the driver, so a fatal fault there has to refuse that file at the next start, exactly
-    //       as one during the decode does. False for a drop that frees the session with no record.
-    // WHY-THIS-SHAPE: the thread is held inside the decoder's codec context being freed, inside
+    // GOAL: S13.119's second half, RESTATED for Stage E4 -- a session dropped because its monitor
+    //       was given a wallpaper again writes NO crash record while its decoder is torn down. What
+    //       a record is for is the span in which the FILE'S CONTENT runs: its open, its first decode
+    //       and its draw, which all keep theirs. A teardown is past all three, and Stage E4 frees a
+    //       session five seconds after any screen goes dark -- so a record here would refuse a
+    //       wallpaper that has been playing for hours because the machine lost power during a lock.
+    //       False for the Stage E3 behaviour, which wrote one.
+    // WHY-THIS-SHAPE: an absent record is only evidence beside a demonstration that one can be
+    //       present, so this reads the same state directory and the same monitor that the decode
+    //       half above has just proved a record IS written for. Without that pairing the check would
+    //       pass for a build whose crash records had stopped working entirely.
+    //       The thread is held inside the decoder's codec context being freed, inside
     //       ~VideoPipeline. The same path is requested again on purpose: a new wallpaper with the
     //       same path must still drop the session (S13.124), and the first decoder free in that pass
     //       is that drop, since it runs before the new session is opened. The count of frees is
-    //       printed so a run where that stopped being true is visible. The record's contents are read
-    //       too: a record naming the wrong type would refuse nothing.
-    // CONTROL: in backend/daemon/wallpaper_manager.cpp, the `applying.emplace(...)` line deleted from
-    //       closeVideoSessionLocked() -> "FAIL: a record naming the video is on disk while a replaced
-    //       session's decoder is torn down", printing "the record on disk: none", beside the two
-    //       S13.130 checks. Observed 2026-09-18. Reverted.
+    //       printed so a run where that stopped being true is visible.
+    // CONTROL: in backend/daemon/wallpaper_manager.cpp, closeVideoSessionLocked() given back the
+    //       Stage E3 record -- `std::optional<ApplyingRecord> applying; try {
+    //       applying.emplace(m_config.stateDir, monitorId, "video", session.path); } catch (const
+    //       std::exception&) {}` before `session.pipeline.reset();` -> "FAIL: no crash record is on
+    //       disk while a replaced session's decoder is torn down", printing "the record on disk:
+    //       video <the clip>". Observed 2026-09-20. Reverted.
     // The clock round that parks this phase's one-picture session runs after the job that drew it,
     // and it decodes; the gate below must not be armed while that round is still to come, or the
     // teardown it catches could be the decoder's rather than the replaced session's.
@@ -1201,11 +1214,9 @@ void runCrashRecordSpanChecks(const WallpaperManager::Config& base, const std::s
     check(tearingDown, "the render thread reaches the teardown of the replaced session's decoder");
     if (tearingDown) {
         const std::optional<wallpaperx::CrashRecord> record = wallpaperx::readCrashRecord(state.path(), kMonitorRecord);
-        const bool names = record.has_value() && record->type == "video" && record->path == clip;
-        check(names, "a record naming the video is on disk while a replaced session's decoder is torn down");
-        if (!names) {
-            std::fprintf(stderr, "  the record on disk: %s\n",
-                         record ? (record->type + " " + record->path).c_str() : "none");
+        check(!record.has_value(), "no crash record is on disk while a replaced session's decoder is torn down");
+        if (record.has_value()) {
+            std::fprintf(stderr, "  the record on disk: %s %s\n", record->type.c_str(), record->path.c_str());
         }
         std::printf("video_wallpaper_test: %d codec context(s) freed by the time the teardown was reached\n",
                     g_codecFrees.load());
@@ -1452,10 +1463,12 @@ void runSessionChecks(const WallpaperManager::Config& config, const std::vector<
     //       for the ninth on a daemon with a worker running, cannot establish "no playing session is
     //       taken": which session is least recently used would then depend on which clock rounds had
     //       run.
-    // CONTROL: in backend/daemon/wallpaper_manager.cpp, the `if (playingSeqLocked(...)) continue;`
-    //       skip deleted from evictIdleVideoSessionLocked(), which is the Stage E2 behaviour ->
-    //       "FAIL: a ninth video wallpaper asked for while all eight play opens nothing and commits
-    //       nothing", printing "committed, 1 open(s), 1 close(s), 1 packet(s)", and five more.
+    // CONTROL: in backend/daemon/wallpaper_manager.cpp, the "skip a session whose monitor is
+    //       showing its own current picture" line deleted from evictIdleVideoSessionLocked() --
+    //       Stage E4 spells it `if (currentSeqLocked(...) && screenDrawnLocked(monitorId))
+    //       continue;`, where Stage E2 had no skip at all -> "FAIL: a ninth video wallpaper asked
+    //       for while all eight play opens nothing and commits nothing", and eleven more across
+    //       this phase and the eviction-narrowing one. Re-run under the E4 spelling 2026-09-20.
     //       Raising kMaxVideoSessions cannot be used as the control: the static_assert above stops
     //       the build, which is the point of tying the monitor count to the constant. Observed
     //       2026-09-18. Reverted.
@@ -1875,15 +1888,20 @@ void runFailedPassChecks(const WallpaperManager::Config& base, const std::vector
                      "the failure the monitor reports is the draw's own submission", "last_error: " + error);
     }
 
-    // GOAL: S13.130, a replaced video -- a session dropped because its monitor was given a still is
-    //       torn down under a record naming the video that session opened, not the still now asked
-    //       for.
-    // WHY-THIS-SHAPE: a different file and type on purpose: S13.119's same-path form cannot tell a
-    //       record naming the session's file from one naming the monitor's new request.
-    // CONTROL: the `applying.emplace(...)` line deleted from closeVideoSessionLocked() in
-    //       backend/daemon/wallpaper_manager.cpp -> "FAIL: a record naming the replaced video, not the
-    //       still, is on disk while its session is torn down", printing "the record on disk: none".
-    //       Observed 2026-09-16 on both driver entries. Reverted.
+    // GOAL: S13.130, a replaced video, RESTATED for Stage E4 -- a session dropped because its
+    //       monitor was given a still is torn down with NO record on disk: neither the video that
+    //       session opened nor the still now asked for. The still's own record is taken later in the
+    //       pass, around the span its file is actually read in; a record around this teardown would
+    //       blame the next start on a file that had already played.
+    // WHY-THIS-SHAPE: a different file and type on purpose -- with the same path, "no record" and
+    //       "a record naming the new request" cannot be told apart. The absence is read in the same
+    //       state directory where the draw-fault check above has just required a record to be
+    //       PRESENT, so a build whose crash records stopped being written altogether fails there
+    //       rather than passing here.
+    // CONTROL: closeVideoSessionLocked() in backend/daemon/wallpaper_manager.cpp given back the
+    //       Stage E3 record (see the same control in runCrashRecordSpanChecks) -> "FAIL: no record
+    //       is on disk while a replaced video's session is torn down for a still", printing the
+    //       video's own path. Observed 2026-09-20. Reverted.
     if (!show(kMonitorReplaced, clips[3])) {
         check(false, "the monitor whose video is replaced is drawn first");
         return;
@@ -1895,8 +1913,7 @@ void runFailedPassChecks(const WallpaperManager::Config& base, const std::vector
     check(replacing, "giving a video monitor a still tears its session down");
     if (replacing) {
         const std::optional<wallpaperx::CrashRecord> record = wallpaperx::readCrashRecord(config.stateDir, kMonitorReplaced);
-        reportUnless(record && record->type == "video" && record->path == clips[3],
-                     "a record naming the replaced video, not the still, is on disk while its session is torn down",
+        reportUnless(!record.has_value(), "no record is on disk while a replaced video's session is torn down for a still",
                      "the record on disk: " + describeRecord(record));
     }
     g_closeFileGate.release();
@@ -1954,33 +1971,58 @@ void runEvictionRecordCheck(const WallpaperManager::Config& base, const std::vec
         return;
     }
 
-    // GOAL: S13.130, eviction -- the session closed to make room for one past the ceiling is torn
-    //       down with a record on disk naming the EVICTED monitor and its file. Restated for the
-    //       clock only in which session is chosen: it is the least recently drawn session that is
-    //       not playing, and a file holding a single picture is not playing, because it has nothing
-    //       left to show.
-    // WHY-THIS-SHAPE: the thread is held as the evicted file is closed, and the evicted monitor's
-    //       record is read -- not the drawing monitor's. The crash handler has one slot, so a record
-    //       for the monitor being drawn, taken first, would leave the eviction's unwritten.
-    // CONTROL: (a) in videoSessionLocked() (backend/daemon/wallpaper_manager.cpp), a copy of the
-    //       `applying.emplace(...)` line added above the eviction loop -> "FAIL: a record naming the
-    //       evicted monitor's video is on disk while its session is torn down", printing "the evicted
-    //       monitor's record: none". (b) the `applying.emplace(...)` line deleted from
-    //       closeVideoSessionLocked() -> the same line. Both observed 2026-09-18; reverted.
+    // GOAL: S13.130, eviction, RESTATED for Stage E4 -- the session closed to make room for one past
+    //       the ceiling is torn down with NO record on disk at all: not the evicted monitor's, whose
+    //       file has already opened, decoded and drawn, and not the monitor being opened either,
+    //       whose own record is taken only once the eviction is over. The second half is the
+    //       ordering that keeps a death inside another file's teardown from being blamed on this
+    //       one. Which session is chosen is unchanged: the least recently drawn that is not
+    //       playing, and a file holding a single picture is not playing.
+    // WHY-THIS-SHAPE: an absent record says nothing on its own, so the same phase, the same state
+    //       directory and the same monitor are then held inside the NEW file's first decode and a
+    //       record IS required to be there naming it. The two readings are what make each other
+    //       mean something: a build that had stopped writing records anywhere passes the first and
+    //       fails the second.
+    // CONTROL: (a) closeVideoSessionLocked() in backend/daemon/wallpaper_manager.cpp given back the
+    //       Stage E3 record -> "FAIL: nothing names the evicted monitor while its session is torn
+    //       down", printing the evicted clip. (b) in videoSessionLocked(), a copy of the
+    //       `applying.emplace(m_config.stateDir, monitorId, "video", path);` line added above the
+    //       eviction loop -> "FAIL: and nothing names the monitor being opened either, whose own
+    //       record is taken after the eviction". (c) for the positive half, that same
+    //       `applying.emplace(...)` line deleted from inside the retry loop -> "FAIL: and a record
+    //       naming the new file IS on disk once its own open and first decode are running".
+    //       All three observed 2026-09-20; reverted.
     g_closeFileGate.arm(CallGate::Mode::Hold, clips[0]);
-    post(std::size(kEvictionMonitors) - 1);
+    const size_t ninth = std::size(kEvictionMonitors) - 1;
+    post(ninth);
     const bool evicting = g_closeFileGate.waitFired(kGateLimit);
     check(evicting, "a video monitor past the ceiling tears the least recently drawn parked session down");
     if (evicting) {
-        const std::optional<wallpaperx::CrashRecord> record =
+        const std::optional<wallpaperx::CrashRecord> evicted =
             wallpaperx::readCrashRecord(config.stateDir, kEvictionMonitors[0]);
-        reportUnless(record && record->type == "video" && record->path == clips[0],
-                     "a record naming the evicted monitor's video is on disk while its session is torn down",
-                     "the evicted monitor's record: " + describeRecord(record));
+        reportUnless(!evicted.has_value(), "nothing names the evicted monitor while its session is torn down",
+                     "the evicted monitor's record: " + describeRecord(evicted));
+        const std::optional<wallpaperx::CrashRecord> opening =
+            wallpaperx::readCrashRecord(config.stateDir, kEvictionMonitors[ninth]);
+        reportUnless(!opening.has_value(),
+                     "and nothing names the monitor being opened either, whose own record is taken after the eviction",
+                     "the opening monitor's record: " + describeRecord(opening));
     }
+    // Armed before the close is let go, so the hold lands on the new file's own first decode and
+    // not on a later round's: the pass continues straight from the teardown into the open.
+    g_decodeGate.arm(CallGate::Mode::Hold);
     g_closeFileGate.release();
-    check(signals.wait(kEvictionMonitors[std::size(kEvictionMonitors) - 1], 1),
-          "and the monitor past the ceiling then commits");
+    const bool decodingNew = g_decodeGate.waitFired(kGateLimit);
+    check(decodingNew, "the pass past the ceiling goes on to decode the file it opened");
+    if (decodingNew) {
+        const std::optional<wallpaperx::CrashRecord> opening =
+            wallpaperx::readCrashRecord(config.stateDir, kEvictionMonitors[ninth]);
+        reportUnless(opening && opening->type == "video" && opening->path == clips[ninth],
+                     "and a record naming the new file IS on disk once its own open and first decode are running",
+                     "the opening monitor's record: " + describeRecord(opening));
+    }
+    g_decodeGate.release();
+    check(signals.wait(kEvictionMonitors[ninth], 1), "and the monitor past the ceiling then commits");
 }
 
 constexpr int kMonitorShutdown = 29;
@@ -2163,6 +2205,163 @@ private:
     bool m_held = false;
 };
 
+// What one hand-over did. Asked for ON THE WORKER'S THREAD wherever a phase has a worker, which is
+// forced rather than tidy: Device aborts the process on a GPU call from any thread but the one that
+// owns it, and exporting a frame is a GPU call. It is also what the daemon does -- getFrameFd posts
+// the export as a task and answers from the worker.
+struct Handover {
+    bool answered = false;  // the task ran at all, rather than being refused by a stopping worker
+    bool served = false;
+    uint64_t bufferId = 0;
+    uint64_t generation = 0;
+    wallpaperx::NoFrameReason reason = wallpaperx::NoFrameReason::NeverRequested;
+    bool firstRefusal = false;
+    std::string threw;
+};
+
+std::string describe(const Handover& h) {
+    if (!h.answered) return "the worker never ran the export task";
+    if (!h.threw.empty()) return "the export threw: " + h.threw;
+    if (h.served) return "served image " + std::to_string(h.bufferId) + " at generation " + std::to_string(h.generation);
+    return "refused (" + std::to_string(static_cast<int>(h.reason)) + ")";
+}
+
+// `keep` decides whether the image is given straight back. A consumer that keeps what it is handed
+// is the state a refusal exists for, and it is also the state that must stop a video: those are
+// two of the goals below, so the choice cannot be wired one way here.
+Handover handOver(WallpaperManager& manager, RenderWorker& worker, int monitorId, const std::string& client,
+                  bool keep = false) {
+    auto done = std::make_shared<std::promise<Handover>>();
+    std::future<Handover> answer = done->get_future();
+    worker.postTask([&manager, monitorId, client, keep, done](RenderWorker::TaskState state) {
+        Handover out;
+        if (state != RenderWorker::TaskState::Run) {
+            done->set_value(out);
+            return;
+        }
+        out.answered = true;
+        try {
+            const wallpaperx::FrameExport e = manager.exportCurrentFrame(monitorId, client);
+            out.reason = e.reason;
+            out.firstRefusal = e.firstRefusal;
+            if (e.handle) {
+                out.served = true;
+                out.bufferId = e.handle->frame.bufferId;
+                out.generation = e.handle->generation;
+                if (e.handle->frame.fd >= 0) close(e.handle->frame.fd);
+                if (e.handle->acquireFd >= 0) close(e.handle->acquireFd);
+                if (!keep) manager.releaseBuffer(client, monitorId, out.bufferId);
+            }
+        } catch (const std::exception& ex) {
+            out.threw = ex.what();
+        }
+        done->set_value(out);
+    });
+    // Reported, never fallen through: a hand-over that never came back must not be graded as a
+    // refusal, which is what a default-constructed Handover would look like without `answered`.
+    if (answer.wait_for(std::chrono::seconds(60)) != std::future_status::ready) return Handover{};
+    return answer.get();
+}
+
+// A consumer of one monitor's pictures: it asks for a hand-over when one is ANNOUNCED, and gives
+// the image straight back.
+//
+// ONLY ON AN ANNOUNCEMENT, never on a timer, and that is the whole reason this class exists rather
+// than a loop. The daemon decides a monitor has stopped being collected from by how long its
+// OLDEST uncollected picture has been waiting; the obvious wrong rule -- how long since the last
+// hand-over -- is satisfied by a consumer that polls faster than the file's own rate, so a polling
+// consumer could not tell the two apart. The KDE plugin fetches on FrameReady, which is this.
+//
+// The hand-over is posted as a task rather than made here: announcements arrive on the worker's own
+// thread, inside its loop, and that thread is the only one that may touch the GPU.
+class Collector {
+public:
+    Collector(WallpaperManager& manager, int monitorId, std::string client)
+        : m_manager(manager), m_monitorId(monitorId), m_client(std::move(client)) {}
+
+    // Separate from the constructor because the worker's frame callback has to name this object,
+    // so this is built first -- and it must be destroyed after worker.stop(), which is what
+    // guarantees no task is still running with a pointer to it.
+    void attach(RenderWorker& worker) { m_worker = &worker; }
+
+    void announced(int monitorId, uint64_t) {
+        if (monitorId != m_monitorId || m_worker == nullptr) return;
+        // One fetch outstanding at a time, as the plugin keeps: without it a burst of
+        // announcements would queue a task each and the worker's task slots are finite.
+        if (m_inFlight.exchange(true)) return;
+        m_worker->postTask([this](RenderWorker::TaskState state) {
+            if (state == RenderWorker::TaskState::Run) collectOnce();
+            m_inFlight.store(false);
+        });
+    }
+
+    int served() const { return m_served.load(); }
+    int refused() const { return m_refused.load(); }
+    std::string threw() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_threw;
+    }
+    std::string describe() const {
+        return std::to_string(served()) + " collected, " + std::to_string(refused()) + " refused" +
+               (threw().empty() ? std::string() : ", threw: " + threw());
+    }
+
+private:
+    void collectOnce() {
+        try {
+            const wallpaperx::FrameExport e = m_manager.exportCurrentFrame(m_monitorId, m_client);
+            if (!e.handle) {
+                m_refused.fetch_add(1);
+                return;
+            }
+            const uint64_t bufferId = e.handle->frame.bufferId;
+            if (e.handle->frame.fd >= 0) close(e.handle->frame.fd);
+            if (e.handle->acquireFd >= 0) close(e.handle->acquireFd);
+            m_manager.releaseBuffer(m_client, m_monitorId, bufferId);
+            m_served.fetch_add(1);
+        } catch (const std::exception& ex) {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (m_threw.empty()) m_threw = ex.what();
+        }
+    }
+
+    WallpaperManager& m_manager;
+    RenderWorker* m_worker = nullptr;
+    int m_monitorId;
+    std::string m_client;
+    std::atomic<bool> m_inFlight{false};
+    std::atomic<int> m_served{0};
+    std::atomic<int> m_refused{0};
+    mutable std::mutex m_mutex;
+    std::string m_threw;
+};
+
+// Waits until this monitor has been quiet for `quiet`, and reports how many pictures it had by
+// then. False means it never went quiet inside `limit` -- which every caller must branch on: a
+// video that never stops is exactly what these phases are looking for, and treating a timeout as
+// "it stopped" would make the whole off switch unfalsifiable.
+bool quiesced(const FrameReadyLog& signals, int monitorId, std::chrono::milliseconds quiet,
+              std::chrono::seconds limit, size_t& finalCount) {
+    const Clock::time_point deadline = Clock::now() + limit;
+    size_t last = signals.countFor(monitorId);
+    Clock::time_point lastChange = Clock::now();
+    while (Clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        const size_t now = signals.countFor(monitorId);
+        if (now != last) {
+            last = now;
+            lastChange = Clock::now();
+            continue;
+        }
+        if (Clock::now() - lastChange >= quiet) {
+            finalCount = last;
+            return true;
+        }
+    }
+    finalCount = signals.countFor(monitorId);
+    return false;
+}
+
 // Monitor ids start again at 0 in each of the phases below, and may: every one builds a manager of
 // its own, and a manager refuses an id at or past kMaxMonitors (32), which the earlier phases have
 // nearly used up between them.
@@ -2184,10 +2383,15 @@ void runClockChecks(const WallpaperManager::Config& config, const std::string& c
     PictureLog pictures;
     WallpaperManager manager(config);
     CaptureGradeOnExit captureGrade{grade, manager};
-    RenderWorker worker(manager, [&signals, &pictures](int monitorId, uint64_t generation) {
+    // Declared before the worker so it is destroyed after WorkerUnblock has stopped it: a task
+    // still running with a pointer to a dead collector is a use-after-free in the harness.
+    Collector collector(manager, kMonitorPlay, ":1.700");
+    RenderWorker worker(manager, [&signals, &pictures, &collector](int monitorId, uint64_t generation) {
         signals.record(monitorId, generation);
         pictures.record(monitorId, generation);
+        collector.announced(monitorId, generation);
     });
+    collector.attach(worker);
     WorkerUnblock unblock{worker};
 
     wallpaperx::testing::nameScreen(manager, kMonitorPlay, screenOf(kMonitorPlay));
@@ -2200,31 +2404,48 @@ void runClockChecks(const WallpaperManager::Config& config, const std::string& c
     }
     g_files.resetCounts();
 
-    // GOAL: S13.133 -- a video wallpaper keeps committing pictures with nobody asking, one
-    //       generation per picture, each announced exactly once and each exactly one past the last:
-    //       none repeated, none skipped. And S13.134 -- it keeps going past the file's last picture,
-    //       from the session it already has. False for a daemon that shows one picture and stops
-    //       (what Stage E2 did), for one that drops pictures to catch up, and for one that plays the
-    //       file once and stalls at its end.
-    // WHY-THIS-SHAPE: the wait is for an exact generation, so reaching it is what makes the run
-    //       gradeable -- and a run that does not reach it returns instead of measuring, because a
-    //       stalled clock must not be graded as a slow one. The order is read from the announcements
-    //       rather than from GetStatus, which carries only the newest generation and so cannot say
-    //       whether the one before it was ever announced.
+    // GOAL: S13.133, RESTATED for Stage E4 -- a video wallpaper keeps committing pictures FOR A
+    //       CONSUMER THAT KEEPS COLLECTING THEM, one generation per picture, each announced exactly
+    //       once and each exactly one past the last: none repeated, none skipped. And S13.134 -- it
+    //       keeps going past the file's last picture, from the session it already has. False for a
+    //       daemon that shows one picture and stops (what Stage E2 did), for one that drops pictures
+    //       to catch up, for one that plays the file once and stalls at its end -- and now for one
+    //       whose off switch stops a video somebody is watching.
+    //
+    //       The Stage E3 wording, "with nobody asking", is exactly what Stage E4 reverses: a video
+    //       no consumer collects from now stops within a couple of seconds. That direction is graded
+    //       in runWatchChecks below; what is left here is that collection keeps it running.
+    // WHY-THIS-SHAPE: the consumer fetches only when a picture is ANNOUNCED, which is what the KDE
+    //       plugin does. A consumer polling on a timer would satisfy the wrong rule as well -- "how
+    //       long since the last hand-over" -- and so could not grade the one the daemon has.
+    //       The wait is for an exact generation, so reaching it is what makes the run gradeable, and
+    //       a run that does not reach it returns instead of measuring: a stalled clock must not be
+    //       graded as a slow one. The order is read from the announcements rather than from
+    //       GetStatus, which carries only the newest generation and so cannot say whether the one
+    //       before it was ever announced.
     // CONTROL: in backend/daemon/wallpaper_manager.cpp, advanceSessionLocked()'s
     //       `round.shown.push_back(...)` deleted -> "FAIL: a video wallpaper keeps committing
-    //       pictures without anyone asking", after the 30-second signal limit. Committing the same
-    //       generation twice -- `--it->second.generation;` after commitFrameLocked() -- reddens the
-    //       ordering check instead. Observed 2026-09-18. Reverted.
-    // COVERAGE-ASSERT: the number of successive pairs actually compared is asserted, so a future
-    //       edit that leaves the loop with two announcements to look at fails instead of going quiet.
+    //       pictures for a consumer that collects them", after the 30-second signal limit.
+    //       Committing the same generation twice -- `--it->second.generation;` after
+    //       commitFrameLocked() -- reddens the ordering check instead. Observed 2026-09-18,
+    //       re-observed under this wording 2026-09-20. Reverted.
+    // COVERAGE-ASSERT: the consumer is required to have collected most of the run, so a daemon that
+    //       ignored `watched` altogether -- and would keep playing for a consumer that had stopped
+    //       -- cannot be reported as having been graded against a collecting one. And the number of
+    //       successive pairs actually compared is asserted, so a future edit that leaves the loop
+    //       with two announcements to look at fails instead of going quiet.
     const bool reached = signals.wait(kMonitorPlay, kGradedPictures);
-    check(reached, "a video wallpaper keeps committing pictures without anyone asking");
+    check(reached, "a video wallpaper keeps committing pictures for a consumer that collects them");
     if (!reached) {
+        std::fprintf(stderr, "  the consumer: %s\n", collector.describe().c_str());
         notVerified(kGoals, "the video did not reach generation " + std::to_string(kGradedPictures) +
                                 " on this host, so there is no run of pictures to grade");
         return;
     }
+    reportUnless(collector.threw().empty(), "the consumer's hand-overs did not throw", collector.threw());
+    reportUnless(static_cast<uint64_t>(collector.served()) * 2 >= kGradedPictures,
+                 "the consumer collected most of the pictures, so the run is graded against a watched monitor",
+                 collector.describe());
     {
         const std::vector<PictureLog::Event> shown = pictures.forMonitor(kMonitorPlay);
         size_t compared = 0;
@@ -2400,10 +2621,13 @@ void runOnePictureChecks(const WallpaperManager::Config& config, const std::stri
     //       TEMPORAL in one direction only: nothing happening can only be observed by waiting, and a
     //       correct daemon does nothing here however long the window is.
     // CONTROL: in backend/daemon/wallpaper_manager.cpp, advanceSessionLocked()'s
-    //       `session.clock = Session::OnePicture{};` replaced by falling through to the Waiting line
-    //       below it -> "FAIL: a video file holding one picture is never decoded again", printing
-    //       packets in the quiet second, and "FAIL: and its one picture is announced once, not once
-    //       per round". Observed 2026-09-18. Reverted.
+    //       `if (before.startsPass && after.startsPass)` -- the branch that records the file as
+    //       parked -- disabled, so the round falls through to the Waiting line below it -> "FAIL: a
+    //       video file holding one picture is never decoded again", printing 20 packets in the quiet
+    //       second, and "FAIL: and its one picture is announced once, not once per round", printing
+    //       10 further announcements, with the overtaken-rebuild count in the resize phase red
+    //       beside them. Rewritten for Stage E4, which moved the fact from a clock variant onto the
+    //       monitor; observed 2026-09-20. Reverted.
     g_decodeCalls.store(0);
     g_files.resetCounts();
     const size_t announced = signals.countFor(kMonitorParked);
@@ -2441,9 +2665,999 @@ void runOnePictureChecks(const WallpaperManager::Config& config, const std::stri
                      std::to_string(g_files.totalOpens()) + " open(s), " + std::to_string(g_decodeCalls.load()) +
                          " packet(s)");
     }
+
+    // GOAL: S13.160 -- a one-picture video releases its decoder too. Its session is kept for a
+    //       while after it parks, which is what the resize above redraws from, and then freed on
+    //       the same terms as any stopped video's: the file is closed and the picture pool goes,
+    //       while the monitor keeps the picture on screen. False for a daemon that parks a session
+    //       for ever -- a decoder and a picture pool per screen, held for the life of the process
+    //       for a wallpaper that is a still image in all but name -- and false for one that frees
+    //       it so fast the resize above has to reopen the file.
+    // WHY-THIS-SHAPE: INHERENTLY TEMPORAL, and kept stable by waiting for the CLOSE rather than by
+    //       sleeping for a fixed span and looking: the wait has a deadline well past the release
+    //       interval and a failure branch, so a session that is never freed fails this named check
+    //       instead of being timed. The file is asserted to be still open first -- read right after
+    //       the resize, inside the interval -- so "it was closed" cannot be satisfied by a daemon
+    //       that had already closed it before the resize, which the resize check above would then
+    //       be grading against a reopen.
+    // CONTROL: in backend/daemon/wallpaper_manager.cpp, advanceSessionLocked()'s stopped branch
+    //       reduced to `if (!session.idleSince) session.idleSince = now; return std::nullopt;`, so
+    //       nothing is ever freed -> "FAIL: a parked one-picture video's decoder and file are
+    //       released once it has been idle", printing the fixture still open after the wait.
+    //       Observed 2026-09-20. Reverted.
+    //       NOT graded here: whether the park branch SCHEDULES that release. Making it return
+    //       nothing leaves this check green, because the resize above posts a job and the round
+    //       that follows any job starts the countdown anyway. runParkedReleaseChecks below is the
+    //       phase that can fail on it -- one monitor and nothing else ever posted.
+    {
+        const std::multiset<std::string> openNow = g_files.live();
+        reportUnless(openNow.count(onePicture) == 1,
+                     "the parked one-picture video still holds its file open just after the resize",
+                     "open files: " + describeFiles(openNow));
+        g_files.resetCounts();
+        const bool released = settlesWithin(std::chrono::seconds(20), [&] { return g_files.closes(onePicture) >= 1; });
+        reportUnless(released, "a parked one-picture video's decoder and file are released once it has been idle",
+                     "open files after the wait: " + describeFiles(g_files.live()));
+        const std::optional<wallpaperx::MonitorStatus> after = monitorStatus(manager, kMonitorParked);
+        reportUnless(after && after->hasFrame, "and the picture it drew stays on the screen through the release",
+                     after ? "has_frame: false" : std::string("no status"));
+    }
+}
+
+// --------------------------------------------------------------------------- //
+// Stage E4: the off switch
+// --------------------------------------------------------------------------- //
+
+constexpr int kMonitorWatch = 0;
+
+// How long the "nothing moved" windows below are. One second is ten of this file's picture
+// intervals, so a daemon that had not stopped would show about ten pictures in it; a correct one
+// shows none however long the window is, so the length buys strength and cannot buy flakiness.
+constexpr auto kQuietWindow = std::chrono::seconds(1);
+
+// How long a run of pictures may take before it counts as "did not stop promptly". The daemon's
+// own interval is two seconds and this file shows ten pictures a second, so a correct stop lands
+// near 2.0-2.3 s; six is three times that, far past any scheduling hiccup, and still nowhere near
+// a daemon that never stops.
+constexpr auto kStopBy = std::chrono::seconds(6);
+
+void runOffSwitchChecks(const WallpaperManager::Config& config, const std::string& clip) {
+    const char* kGoals = "S13.146-S13.148 (a video nobody collects stops and keeps its picture, its decoder is "
+                         "released after that, and a hand-over starts it again)";
+    PhaseGrade grade("the off-switch phase");
+    FrameReadyLog signals;
+    PictureLog pictures;
+    WallpaperManager manager(config);
+    CaptureGradeOnExit captureGrade{grade, manager};
+    RenderWorker worker(manager, [&signals, &pictures](int monitorId, uint64_t generation) {
+        signals.record(monitorId, generation);
+        pictures.record(monitorId, generation);
+    });
+    WorkerUnblock unblock{worker};
+
+    wallpaperx::testing::nameScreen(manager, kMonitorWatch, screenOf(kMonitorWatch));
+    manager.requestWallpaper("video", clip, kMonitorWatch);
+    worker.post(kMonitorWatch);
+    if (!signals.wait(kMonitorWatch, 1)) {
+        grade.expectNoDevice();
+        notVerified(kGoals, "the video render on this host produced no frame, so there was nothing to stop");
+        return;
+    }
+
+    // GOAL: S13.146 -- a video whose pictures NOTHING COLLECTS stops within about two seconds and
+    //       keeps its last picture on the screen. False for Stage E3's clock, which decoded and
+    //       committed for ever whether or not any consumer was reading -- a locked screen, or a
+    //       desktop whose plugin had gone, cost a decode and a GPU pass per picture for as long as
+    //       the daemon ran. Also false for a daemon that stops by clearing the frame, which would
+    //       blank the screen instead of freezing it.
+    // WHY-THIS-SHAPE: "it stopped" is read as a QUIESCENCE with a deadline and a failure branch --
+    //       the count has to stop changing for a full second -- and never as a timeout falling
+    //       through into arithmetic. A wait for an exact generation cannot be used in either
+    //       direction here: how many pictures fit in the daemon's own interval is not a number this
+    //       file may pin, and waiting for one that will never arrive is how a stall gets graded as
+    //       a slow drain. The span the pictures took is asserted separately, which is what makes
+    //       this "stopped promptly" rather than merely "stopped eventually".
+    // CONTROL: in backend/daemon/wallpaper_manager.cpp, playingSeqLocked() made to return `current`
+    //       without consulting watchedLocked() -- the Stage E3 predicate -> "FAIL: a video no
+    //       consumer is collecting from stops on its own", printing 251 pictures still arriving
+    //       after 25 s, and the visibility phase's own stop line red beside it. Observed
+    //       2026-09-20. Reverted.
+    // COVERAGE-ASSERT: the number of pictures shown before the stop is asserted to be more than
+    //       one, so a daemon that never played at all -- or one that stopped before its second
+    //       picture, which would make every later check here read off a video that never ran --
+    //       fails instead of being reported as having stopped correctly.
+    size_t stoppedAt = 0;
+    const bool stopped = quiesced(signals, kMonitorWatch, kQuietWindow, std::chrono::seconds(25), stoppedAt);
+    check(stopped, "a video no consumer is collecting from stops on its own");
+    if (!stopped) {
+        std::fprintf(stderr, "  it was still announcing pictures after 25 s; %zu shown\n", stoppedAt);
+        notVerified(kGoals, "the video never stopped, so nothing below could be read against a stopped one");
+        return;
+    }
+    check(stoppedAt > 1, "and it had played more than one picture before it stopped");
+    {
+        const std::vector<PictureLog::Event> shown = pictures.forMonitor(kMonitorWatch);
+        if (shown.size() < 2) {
+            notVerified(kGoals, "fewer than two pictures were ever announced, so no span can be measured");
+            return;
+        }
+        const auto span = shown.back().at - shown.front().at;
+        std::printf("video_wallpaper_test: the unwatched video ran for %.3f s (%zu pictures)\n",
+                    std::chrono::duration<double>(span).count(), shown.size());
+        std::fflush(stdout);
+        reportUnless(span <= kStopBy, "and it stopped within a few seconds of its first picture, not eventually",
+                     std::to_string(std::chrono::duration<double>(span).count()) + " s of pictures");
+    }
+    const uint64_t frozenAt = static_cast<uint64_t>(stoppedAt);
+    {
+        const std::optional<wallpaperx::MonitorStatus> status = monitorStatus(manager, kMonitorWatch);
+        reportUnless(status && status->hasFrame && status->generation == frozenAt && status->lastError.empty(),
+                     "the stopped monitor keeps the last picture it drew, with no error",
+                     status ? "has_frame " + std::string(status->hasFrame ? "true" : "false") + ", generation " +
+                                  std::to_string(status->generation) + " against " + std::to_string(frozenAt) +
+                                  ", last_error: " + status->lastError
+                            : std::string("no status"));
+        // GOAL: and GetStatus says WHY it stopped, in the two facts the daemon decided from. A
+        //       stopped wallpaper reads identically in every other field, so without these an
+        //       operator cannot tell a video that was switched off from one that is broken.
+        // CONTROL: in backend/daemon/wallpaper_manager.cpp, snapshot()'s
+        //       `entry.watched = watchedLocked(monitorId, state);` replaced by `entry.watched =
+        //       true;` -> "FAIL: and it says the monitor is no longer watched, which is why".
+        //       Observed 2026-09-20. Reverted.
+        reportUnless(status && !status->watched, "and it says the monitor is no longer watched, which is why",
+                     status ? "watched: true" : std::string("no status"));
+        reportUnless(status && status->screenVisible,
+                     "while the screen itself is still reported as being drawn, so the reason is not confused",
+                     status ? "screen_visible: false" : std::string("no status"));
+    }
+
+    // GOAL: S13.147 -- a session that has been stopped for a few seconds is closed: its file is
+    //       released and its decoder and picture pool go with it. Not at once, which is the other
+    //       half: the interval is what keeps a menu, a notification or a window animation from
+    //       costing the file a reopen. The monitor keeps its picture throughout, so nothing on the
+    //       screen changes. False for a daemon that holds a decoder per screen for the life of the
+    //       process, and false for one that frees it the moment playback stops.
+    // WHY-THIS-SHAPE: the file is read from ffmpeg's own I/O entry points, which is the only thing
+    //       that can answer whether a session is resident: a stopped monitor reports the same frame
+    //       whether its decoder was kept or freed. The "still open" reading comes first and is what
+    //       makes the release meaningful -- without it a daemon that had already closed the file
+    //       before the video stopped would pass.
+    // CONTROL: in backend/daemon/wallpaper_manager.cpp, advanceSessionLocked()'s stopped branch
+    //       made to `return std::nullopt;` before the release -- so nothing is ever freed -> "FAIL:
+    //       a video stopped for a few seconds has its file and decoder released", printing the clip
+    //       still open, together with the one-picture phase's release line and the reopen line
+    //       below. Making it release immediately (`const SteadyTime releaseAt = *session.
+    //       idleSince;`) reddens "the stopped video still holds its file open a second after
+    //       stopping" -- and a dozen other checks in this file with it, since a session freed the
+    //       moment it stops breaks every reuse and resize property Stage E2 established. Both
+    //       observed 2026-09-20. Reverted.
+    {
+        const std::multiset<std::string> openNow = g_files.live();
+        reportUnless(openNow.count(clip) == 1, "the stopped video still holds its file open a second after stopping",
+                     "open files: " + describeFiles(openNow));
+    }
+    g_files.resetCounts();
+    const bool releasedSession = settlesWithin(std::chrono::seconds(20), [&] { return g_files.closes(clip) >= 1; });
+    check(releasedSession, "a video stopped for a few seconds has its file and decoder released");
+    if (!releasedSession) {
+        std::fprintf(stderr, "  open files after the wait: %s\n", describeFiles(g_files.live()).c_str());
+    }
+    {
+        const std::optional<wallpaperx::MonitorStatus> status = monitorStatus(manager, kMonitorWatch);
+        reportUnless(status && status->hasFrame && status->generation == frozenAt,
+                     "and the picture stays on the screen across the release, so there is no blank",
+                     status ? "has_frame " + std::string(status->hasFrame ? "true" : "false") + ", generation " +
+                                  std::to_string(status->generation)
+                            : std::string("no status"));
+    }
+
+    // GOAL: S13.148 -- a hand-over to a named consumer starts a stopped video again, and a video
+    //       whose session was released opens its file afresh to do it. That fresh open is what
+    //       makes a resumed video play from the file's beginning: nothing of the old session
+    //       survives it, and a VideoPipeline is constructed at the file's first picture (which
+    //       renderer/tests/video_pipeline_timing_* grades for S13.145). False for a daemon that
+    //       leaves a stopped video stopped -- a desktop that comes back to a frozen wallpaper for
+    //       ever -- and false for one that needs a render to be posted before it will reopen,
+    //       since nothing posts one: the monitor's request is already serviced.
+    // WHY-THIS-SHAPE: nothing but the hand-over is done. No render is posted and no size reported,
+    //       so the pictures that follow can only have come from the daemon deciding for itself that
+    //       the monitor is watched again. The reopen is counted from a reset taken before the
+    //       hand-over, so a file opened during the release above is not credited to it.
+    // CONTROL: in backend/daemon/wallpaper_manager.cpp, the `if (!client.empty())
+    //       noteHandoverServed(monitorId);` line deleted from exportCurrentFrame() -> "FAIL: a
+    //       hand-over to a named consumer starts a stopped video again", after the 30-second signal
+    //       limit. Deleting the reopen loop body in reopenVideosLocked() -- `if (!owed) continue;`
+    //       changed to `continue;` -- reddens the same line for the other half, since the monitor
+    //       becomes watched with no session to play from. Both observed 2026-09-20. Reverted.
+    g_files.resetCounts();
+    const Handover resume = handOver(manager, worker, kMonitorWatch, ":1.801");
+    check(resume.served, "the stopped video's last picture can still be handed over");
+    if (!resume.served) {
+        std::fprintf(stderr, "  %s\n", describe(resume).c_str());
+        notVerified(kGoals, "no hand-over was served, so nothing could have restarted the video");
+        return;
+    }
+    const bool restarted = signals.waitAtLeast(kMonitorWatch, frozenAt + 1);
+    check(restarted, "a hand-over to a named consumer starts a stopped video again");
+    if (restarted) {
+        reportUnless(g_files.opens(clip) == 1,
+                     "and a video whose session was released opens its file again to do it, from the beginning",
+                     std::to_string(g_files.opens(clip)) + " open(s) of the clip since the hand-over");
+    }
+}
+
+constexpr int kMonitorParkedIdle = 0;
+
+// S13.160's other half, on a manager whose ONE monitor is posted once and never touched again.
+//
+// That isolation is the check. A one-picture video parks in the middle of a clock round, and if
+// that round asks for nothing further the render worker has no deadline to wake on: it sleeps
+// until something else is posted, and the decoder and picture pool stay held for the life of the
+// daemon. Every other phase in this file posts something sooner or later -- a resize, another
+// monitor -- and a round runs after any job, so the countdown starts whatever the park branch
+// returned. Only a phase that posts nothing can tell the two apart.
+void runParkedReleaseChecks(const WallpaperManager::Config& config, const std::string& onePicture) {
+    const char* kGoal = "S13.160's scheduling half (a one-picture video that parks asks for the round that frees "
+                        "its decoder, with nothing else posted)";
+    PhaseGrade grade("the parked-release phase");
+    FrameReadyLog signals;
+    WallpaperManager manager(config);
+    CaptureGradeOnExit captureGrade{grade, manager};
+    RenderWorker worker(manager,
+                        [&signals](int monitorId, uint64_t generation) { signals.record(monitorId, generation); });
+    WorkerUnblock unblock{worker};
+
+    wallpaperx::testing::nameScreen(manager, kMonitorParkedIdle, screenOf(kMonitorParkedIdle));
+    manager.requestWallpaper("video", onePicture, kMonitorParkedIdle);
+    worker.post(kMonitorParkedIdle);
+    if (!signals.wait(kMonitorParkedIdle, 1)) {
+        grade.expectNoDevice();
+        notVerified(kGoal, "the one-picture video produced no frame on this host");
+        return;
+    }
+
+    // GOAL: a one-picture video that parks releases its decoder on its own, without anything else
+    //       being asked of the daemon. False for a clock that parks by scheduling nothing: the
+    //       worker then has no deadline to wake on, and a screen showing a one-picture video holds
+    //       a decoder and a picture pool until the user next changes something -- which on a
+    //       desktop is for the rest of the session.
+    // WHY-THIS-SHAPE: nothing is posted, drained or resized after the first render, and that is the
+    //       whole check. A drain would post a task, and the round that follows any job starts the
+    //       countdown regardless -- which is exactly why the one-picture phase above cannot grade
+    //       this. INHERENTLY TEMPORAL in one direction: the wait has a deadline well past the
+    //       release interval and a failure branch, so a decoder that is never freed fails a named
+    //       check rather than being timed.
+    // CONTROL: in backend/daemon/wallpaper_manager.cpp, advanceSessionLocked()'s park branch made
+    //       to `return std::nullopt;` instead of `return now;` -- the Stage E3 shape -> "FAIL: a
+    //       one-picture video releases its decoder with nothing else asked of the daemon",
+    //       printing the fixture still open after 20 s. Observed 2026-09-20. Reverted.
+    g_files.resetCounts();
+    const bool released = settlesWithin(std::chrono::seconds(20), [&] { return g_files.closes(onePicture) >= 1; });
+    check(released, "a one-picture video releases its decoder with nothing else asked of the daemon");
+    if (!released) {
+        std::fprintf(stderr, "  open files after the wait: %s\n", describeFiles(g_files.live()).c_str());
+    }
+    const std::optional<wallpaperx::MonitorStatus> after = monitorStatus(manager, kMonitorParkedIdle);
+    reportUnless(after && after->hasFrame, "and its picture stays on the screen",
+                 after ? "has_frame: false" : std::string("no status"));
+}
+
+constexpr int32_t kMonitorVisible = 0;
+
+// Over the bus, because the resume is a chain and only the whole chain is the property: the method
+// records the answer, the manager decides the monitor is watchable again, and the worker is WOKEN
+// so a round runs at once. A manager-level phase would have to call wake() itself and would then
+// be grading the daemon's own plumbing with a stand-in for the part most likely to be missing --
+// measured on Stage E3, where a manager change that nothing woke the worker for took effect only
+// when something else happened to be posted.
+// The newest generation this monitor has been announced at, which over the bus is NOT the number
+// of announcements: releasing an image re-announces the frame it frees, so a consumer that
+// collects and releases produces a FrameReady per release with no new picture behind it. Counting
+// those made the first draft of this phase report five thousand pictures for a stopped video.
+uint64_t latestGeneration(const PictureLog& pictures, int monitorId) {
+    uint64_t newest = 0;
+    for (const PictureLog::Event& e : pictures.forMonitor(monitorId)) newest = std::max(newest, e.generation);
+    return newest;
+}
+
+// Waits until no NEW picture has been announced for `quiet`. quiesced() above cannot be used over
+// the bus for the reason latestGeneration() states: a release re-announces the frame it frees, so
+// the number of announcements grows without a picture behind it. False means it never went quiet
+// inside `limit`, which every caller must branch on.
+bool quiescedByGeneration(const PictureLog& pictures, int monitorId, std::chrono::milliseconds quiet,
+                          std::chrono::seconds limit) {
+    uint64_t last = latestGeneration(pictures, monitorId);
+    Clock::time_point lastChange = Clock::now();
+    const Clock::time_point deadline = Clock::now() + limit;
+    while (Clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        const uint64_t now = latestGeneration(pictures, monitorId);
+        if (now != last) {
+            last = now;
+            lastChange = Clock::now();
+            continue;
+        }
+        if (Clock::now() - lastChange >= quiet) return true;
+    }
+    return false;
+}
+
+void runVisibilityChecks(sdbus::IProxy& proxy, const PictureLog& pictures, const std::string& clip) {
+    using wallpaperx::testing::setMonitorOutput;
+    using wallpaperx::testing::setOutputVisible;
+    const char* kGoals = "S13.154-S13.157 (a collecting consumer keeps a video playing, a covered screen's video stops "
+                         "the screen coming back starts it again)";
+    const std::string screen = "DP-VIS";
+
+    setMonitorOutput(proxy, kMonitorVisible, screen);
+    setWallpaper(proxy, "video", clip, kMonitorVisible);
+    if (!settlesWithin(std::chrono::seconds(30), [&] { return latestGeneration(pictures, kMonitorVisible) > 0; })) {
+        notVerified(kGoals, "the video render on this host produced no frame, so there was nothing to cover");
+        return;
+    }
+    const auto statusOf = [&proxy]() -> nlohmann::json {
+        const StatusReply status = getStatusOrExplain(proxy);
+        const nlohmann::json* entry = wallpaperStatus(status, std::to_string(kMonitorVisible));
+        return entry != nullptr ? *entry : nlohmann::json::object();
+    };
+
+    // Collects every announced picture and gives it straight back -- which is what the KDE plugin
+    // does -- while watching for the monitor to go quiet. One loop rather than a collector thread
+    // because both halves go through the same proxy, and the pair is inseparable anyway: "it
+    // stopped" is only attributable to the screen report if something was still collecting when it
+    // stopped.
+    struct Watched {
+        bool quiet = false;      // no NEW picture for the whole quiet window
+        uint64_t newest = 0;     // the newest generation announced by the end
+        int collected = 0;       // hand-overs served to this consumer inside the window
+    };
+    const auto collectUntilQuiet = [&proxy, &pictures](std::chrono::milliseconds quiet, std::chrono::seconds limit) {
+        Watched out;
+        out.newest = latestGeneration(pictures, kMonitorVisible);
+        Clock::time_point lastChange = Clock::now();
+        const Clock::time_point deadline = Clock::now() + limit;
+        while (Clock::now() < deadline) {
+            const uint64_t now = latestGeneration(pictures, kMonitorVisible);
+            if (now != out.newest) {
+                out.newest = now;
+                lastChange = Clock::now();
+                try {
+                    const wallpaperx::testing::Frame frame = getFrameFd(proxy, kMonitorVisible);
+                    wallpaperx::testing::releaseBuffer(proxy, kMonitorVisible, frame.bufferId);
+                    ++out.collected;
+                } catch (const sdbus::Error&) {
+                    // A refusal is an ordinary answer and says nothing about these goals.
+                }
+                continue;
+            }
+            if (Clock::now() - lastChange >= quiet) {
+                out.quiet = true;
+                return out;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        return out;
+    };
+
+    // GOAL: S13.154 -- a consumer that keeps collecting keeps the video playing. This is the
+    //       starting state everything below is measured against, and it is a claim in its own
+    //       right: the off switch must not stop a wallpaper somebody is watching.
+    // CONTROL: in backend/daemon/wallpaper_manager.cpp, noteHandoverServed() made to set
+    //       `uncollectedSince = now` instead of resetting it -- the obvious wrong rule, "how long
+    //       since the last hand-over" -> the video still plays here, because this file's pictures
+    //       are a tenth of a second apart; it is runSlowPictureChecks that reddens on that
+    //       mutation. Deleting the `if (!client.empty()) noteHandoverServed(monitorId);` line
+    //       instead -> "FAIL: a video whose pictures are being collected keeps playing". Observed
+    //       2026-09-20. Reverted.
+    const Watched whilePlaying = collectUntilQuiet(kQuietWindow, std::chrono::seconds(10));
+    check(!whilePlaying.quiet && whilePlaying.collected > 0,
+          "a video whose pictures are being collected keeps playing");
+    if (whilePlaying.quiet || whilePlaying.collected == 0) {
+        std::fprintf(stderr, "  it reached generation %llu, %d collected; the video was not playing for a "
+                             "collecting consumer, so covering the screen would establish nothing\n",
+                     static_cast<unsigned long long>(whilePlaying.newest), whilePlaying.collected);
+        notVerified(kGoals, "the video was not playing for a collecting consumer before the screen was covered");
+        return;
+    }
+
+    // GOAL: S13.155 -- a screen that reports it is NOT BEING DRAWN stops its video on the next
+    //       round, whatever any consumer is doing, and GetStatus says so. This is the half the
+    //       daemon cannot work out for itself: a lock screen, a fullscreen window or another
+    //       session leaves every other fact about the monitor unchanged. False for a daemon that
+    //       only counts hand-overs, which would keep decoding at full rate for a desktop whose
+    //       plugin is dutifully fetching frames nobody can see.
+    // WHY-THIS-SHAPE: the consumer goes on collecting through the whole stop, so "it stopped" is
+    //       attributable to the report and to nothing else -- the check above has just shown that
+    //       the same loop keeps this video running. The stop is read as a quiescence with a
+    //       deadline and a failure branch, never as a wait that expires.
+    // CONTROL: in backend/daemon/wallpaper_manager.cpp, screenDrawnLocked() made to `return true;`
+    //       -> "FAIL: a screen that says it is not being drawn stops its video", after the 25 s
+    //       quiescence limit. Observed 2026-09-20. Reverted.
+    // COVERAGE-ASSERT: the check above is the guard -- the same loop, in the same phase, is
+    //       required to have kept this video running for ten seconds first. Nothing is asserted
+    //       about hand-overs INSIDE the stopping window, and deliberately: a correct daemon stops
+    //       within a round, so there may be no further picture to collect, and requiring one would
+    //       make the check fail for the daemon behaving exactly as the goal says.
+    setOutputVisible(proxy, screen, false);
+    const Watched whileCovering = collectUntilQuiet(kQuietWindow, std::chrono::seconds(25));
+    check(whileCovering.quiet, "a screen that says it is not being drawn stops its video");
+    const uint64_t stoppedAt = whileCovering.newest;
+    if (!whileCovering.quiet) {
+        std::fprintf(stderr, "  it was still announcing pictures 25 s after the screen reported itself dark\n");
+        notVerified(kGoals, "the covered screen's video never stopped, so nothing below has a starting state");
+        return;
+    }
+    {
+        const nlohmann::json entry = statusOf();
+        check(entry.value("has_frame", false), "and the monitor keeps the picture it stopped on");
+        check(!entry.value("screen_visible", true), "and GetStatus reports the screen as not being drawn");
+        check(!entry.value("watched", true), "and the monitor as no longer watched");
+    }
+
+    // GOAL: S13.156 -- a covered screen cannot be restarted by FETCHING. Collection is only half of
+    //       what makes a monitor watched; a consumer that goes on asking for frames -- which the
+    //       plugin does, because a screen that is merely occluded still has an item asking -- must
+    //       not be able to override what the screen itself said. False for a daemon whose only
+    //       evidence is the hand-over: the decoder would run for the whole time a screen was
+    //       locked, which is the cost this stage exists to remove.
+    // WHY-THIS-SHAPE: the hand-overs are asserted to have been SERVED, so "nothing restarted"
+    //       cannot be satisfied by a fetch that failed for an unrelated reason. The window is a
+    //       second, ten of this file's picture intervals; a correct daemon shows nothing in it
+    //       however long it is.
+    // CONTROL: in backend/daemon/wallpaper_manager.cpp, noteHandoverServed() given a loop that
+    //       also erases this monitor's screen from m_outputsNotDrawn -- "the hand-over is evidence
+    //       the screen is being drawn", which is the shape this check exists to forbid -> "FAIL: a
+    //       covered screen's video is not restarted by a consumer that keeps fetching", printing
+    //       11 new pictures across 20 served hand-overs. Observed 2026-09-20. Reverted.
+    //       Deleting watchedLocked()'s `if (!screenDrawnLocked(monitorId)) return false;` is NOT a
+    //       usable control here: the video then never stops, so the phase abandons at the check
+    //       above and this line is never reached.
+    int servedWhileCovered = 0;
+    const Clock::time_point coveredUntil = Clock::now() + kQuietWindow;
+    while (Clock::now() < coveredUntil) {
+        try {
+            const wallpaperx::testing::Frame frame = getFrameFd(proxy, kMonitorVisible);
+            wallpaperx::testing::releaseBuffer(proxy, kMonitorVisible, frame.bufferId);
+            ++servedWhileCovered;
+        } catch (const sdbus::Error&) {
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    check(servedWhileCovered > 0, "a covered screen still serves the picture it stopped on");
+    {
+        const uint64_t afterFetching = latestGeneration(pictures, kMonitorVisible);
+        reportUnless(afterFetching == stoppedAt,
+                     "a covered screen's video is not restarted by a consumer that keeps fetching",
+                     std::to_string(afterFetching - stoppedAt) + " new picture(s) across " +
+                         std::to_string(servedWhileCovered) + " served hand-over(s)");
+    }
+
+    // GOAL: S13.157 -- the screen reporting that it is being drawn again starts the video, with
+    //       nothing else asked for: no render posted, no size reported, no fetch first. The report
+    //       is the only event, so the daemon has to credit the monitor with having been seen, run a
+    //       round at once, and -- since the session has been freed by then -- open the file again.
+    //       False for a daemon that records the answer and waits for something else to happen: the
+    //       wallpaper would start moving whenever the user next changed something, which on a
+    //       desktop reads as never.
+    // WHY-THIS-SHAPE: THE STATE THE RESUME IS DRIVEN FROM IS THE WHOLE CHECK, and each half of it
+    //       was measured to be necessary:
+    //         * the last picture must be UNCOLLECTED and stale, so the monitor is genuinely
+    //           unwatched when the report arrives. Driven by uncovering, letting the video publish
+    //           pictures that this phase does not fetch, and waiting for it to stop on its own.
+    //           With the screen re-covered straight after the fetching window above -- where every
+    //           picture HAD been collected, leaving nothing outstanding -- the monitor reads as
+    //           watched already and deleting the covered-to-drawn credit leaves this green.
+    //         * the session must already be RELEASED, so the worker has no deadline of its own
+    //           left. While a session is open the worker wakes at the release whether or not
+    //           anything woke it, and deleting the wake leaves this green too.
+    //       Both were observed green before the drive was built this way.
+    //       The wait is for a generation past the one it stopped on, which nothing already
+    //       announced can satisfy.
+    // CONTROL: in backend/daemon/dbus_service.cpp, the `m_worker.wake();` line deleted from
+    //       setOutputVisible() -> "FAIL: a screen reporting that it is drawn again starts its video,
+    //       with nothing else asked for", after the 30 s limit. In
+    //       backend/daemon/wallpaper_manager.cpp, the `if (!visible || wasDrawn) return;` guard in
+    //       setOutputVisible() changed to `return;` -- so the covered-to-drawn edge credits nothing
+    //       -- reddens the same line. Both observed 2026-09-20. Reverted.
+    // COVERAGE-ASSERT: both preconditions are asserted rather than assumed -- the monitor is
+    //       required to read as unwatched with its screen drawn, and the session is required to
+    //       have been closed. A run that reached neither could not fail this check.
+    setOutputVisible(proxy, screen, true);
+    const bool playedAgain = settlesWithin(std::chrono::seconds(30),
+                                           [&] { return latestGeneration(pictures, kMonitorVisible) > stoppedAt; });
+    check(playedAgain, "the screen coming back starts the video while its session is still open");
+    if (!playedAgain) {
+        notVerified(kGoals, "the video never played again after the screen came back, so the stale-and-released "
+                            "state the resume check needs could not be built");
+        return;
+    }
+    // Nothing is fetched from here on, so the pictures it published pile up uncollected and the
+    // monitor goes stale -- which is what a locked screen leaves behind.
+    const bool stoppedUncollected =
+        quiescedByGeneration(pictures, kMonitorVisible, kQuietWindow, std::chrono::seconds(25));
+    check(stoppedUncollected, "and stops again once nothing is collecting from it");
+    const uint64_t staleAt = latestGeneration(pictures, kMonitorVisible);
+    {
+        const nlohmann::json entry = statusOf();
+        check(entry.value("screen_visible", false) && !entry.value("watched", true),
+              "leaving a drawn screen whose newest picture nobody has taken");
+    }
+    setOutputVisible(proxy, screen, false);
+    g_files.resetCounts();
+    const bool sessionReleased =
+        settlesWithin(std::chrono::seconds(20), [&clip] { return g_files.closes(clip) >= 1; });
+    check(sessionReleased, "covering it again releases the session, leaving the worker nothing to wake for");
+    if (!stoppedUncollected || !sessionReleased) {
+        std::fprintf(stderr, "  open files after the wait: %s\n", describeFiles(g_files.live()).c_str());
+        notVerified(kGoals, "the stale-and-released state was not reached, so the resume below could not fail");
+        return;
+    }
+    setOutputVisible(proxy, screen, true);
+    const bool resumed = settlesWithin(std::chrono::seconds(30),
+                                       [&] { return latestGeneration(pictures, kMonitorVisible) > staleAt; });
+    check(resumed, "a screen reporting that it is drawn again starts its video, with nothing else asked for");
+    if (!resumed) {
+        std::fprintf(stderr, "  it stayed at generation %llu after the screen said it was being drawn again\n",
+                     static_cast<unsigned long long>(latestGeneration(pictures, kMonitorVisible)));
+    }
+    check(statusOf().value("screen_visible", false), "and GetStatus reports the screen as drawn again");
+}
+
+constexpr int kMonitorEvidence = 0;
+constexpr int kMonitorRebound = 1;
+
+// The evidence rules, on a manager with NO render worker: every one of these is a question about
+// what the daemon counts as "something is collecting", which is pure state, and without a worker
+// this thread owns the GPU and every hand-over is made where it can be read at a known moment.
+void runWatchEvidenceChecks(const WallpaperManager::Config& config, const std::string& clip,
+                            const std::string& still) {
+    const char* kGoals = "S13.149-S13.152 (what counts as a monitor being collected from, and what does not)";
+    PhaseGrade grade("the watch-evidence phase");
+    WallpaperManager manager(config);
+    CaptureGradeOnExit captureGrade{grade, manager};
+
+    wallpaperx::testing::nameScreen(manager, kMonitorEvidence, screenOf(kMonitorEvidence));
+    manager.requestWallpaper("video", clip, kMonitorEvidence);
+    if (!manager.renderPending(kMonitorEvidence).rendered) {
+        grade.expectNoDevice();
+        notVerified(kGoals, "the video render on this host produced no frame to collect");
+        return;
+    }
+    const auto watched = [&manager](int monitorId) {
+        const std::optional<wallpaperx::MonitorStatus> status = monitorStatus(manager, monitorId);
+        return status && status->watched;
+    };
+
+    // Publishes another picture, which is the only thing that starts the wait again: the daemon
+    // stamps at a commit and clears on collection, so after a hand-over there is nothing
+    // outstanding and the monitor counts as watched until something new is published. Asking for
+    // the same wallpaper again is what re-commits WITHOUT rebuilding the images -- a size change
+    // would rebuild them, and that clears every consumer's hold, which is the state half of the
+    // checks below are about.
+    const auto republish = [&manager, &clip]() {
+        manager.requestWallpaper("video", clip, kMonitorEvidence);
+        return manager.renderPending(kMonitorEvidence).rendered;
+    };
+    // Republishes and waits for the monitor to go stale again, so the rule under test is asked in
+    // a known state. False is reported by the caller rather than fallen through: a rule read off a
+    // monitor that was already watched would be unfalsifiable.
+    const auto rearmStale = [&]() {
+        if (!republish()) return false;
+        return settlesWithin(std::chrono::seconds(20), [&] { return !watched(kMonitorEvidence); });
+    };
+
+    // Images held open for the whole phase: a consumer that gives nothing back is the state the
+    // refusals below need, and it is also the state the evidence rules are about.
+    std::vector<int> open;
+    struct CloseAll {
+        std::vector<int>& fds;
+        ~CloseAll() {
+            for (const int fd : fds) {
+                if (fd >= 0) close(fd);
+            }
+        }
+    } closeAll{open};
+    const auto takeAndKeep = [&](const std::string& consumer) {
+        wallpaperx::FrameExport e = manager.exportCurrentFrame(kMonitorEvidence, consumer);
+        if (e.handle) {
+            open.push_back(e.handle->frame.fd);
+            open.push_back(e.handle->acquireFd);
+        }
+        return e;
+    };
+
+    // GOAL: S13.149 -- a monitor whose published picture nothing has collected for the daemon's own
+    //       interval stops counting as watched, and a SERVED hand-over to a named consumer makes it
+    //       watched again. This is the state every other rule below is a qualification of.
+    // WHY-THIS-SHAPE: `watched` is read out of the manager's own snapshot rather than inferred from
+    //       pictures appearing, because that is one fact and the picture rate is several -- a video
+    //       that stopped for a want of a session, or because a render was owed, would look the same
+    //       from outside. This phase has no render worker at all, so nothing is racing the reading.
+    //       INHERENTLY TEMPORAL: "has not been collected for two seconds" cannot be observed
+    //       without waiting, and the wait is bounded and one-directional -- the flag only ever goes
+    //       the wrong way early, never late.
+    // CONTROL: in backend/daemon/wallpaper_manager.cpp, watchedLocked() made to `return true;`
+    //       before the uncollected test -> "FAIL: a monitor nothing has collected from for the
+    //       daemon's own interval stops counting as watched". Observed 2026-09-20. Reverted.
+    check(watched(kMonitorEvidence), "a monitor is watched at the moment its picture is published");
+    const bool wentUnwatched =
+        settlesWithin(std::chrono::seconds(20), [&] { return !watched(kMonitorEvidence); });
+    check(wentUnwatched, "a monitor nothing has collected from for the daemon's own interval stops counting as "
+                         "watched");
+    if (!wentUnwatched) {
+        notVerified(kGoals, "the monitor never stopped counting as watched, so none of the rules below has a "
+                            "starting state");
+        return;
+    }
+
+    // GOAL: S13.150 -- a hand-over with NO bus name behind it is not collection. A diagnostic poll
+    //       -- the daemon's own tooling, a status reader -- takes an image nobody can be charged
+    //       with holding, so counting it would let a `busctl` call keep a screen's video decoding
+    //       for nobody.
+    // WHY-THIS-SHAPE: the unnamed hand-over is asserted to have been SERVED first, so "it did not
+    //       count" cannot be satisfied by an export that failed for some other reason. The named
+    //       one that follows is what proves the same call in the same state DOES count, which is
+    //       the only way to tell "unnamed is ignored" from "nothing at all clears this".
+    // CONTROL: in backend/daemon/wallpaper_manager.cpp, the `if (!client.empty())` guard on
+    //       noteHandoverServed() in exportCurrentFrame() dropped -> "FAIL: a hand-over with no bus
+    //       name behind it does not count as collection". Observed 2026-09-20. Reverted.
+    {
+        wallpaperx::FrameExport anonymous = manager.exportCurrentFrame(kMonitorEvidence);
+        check(anonymous.handle.has_value(), "an unnamed poll is served the monitor's picture");
+        if (anonymous.handle) {
+            const uint64_t bufferId = anonymous.handle->frame.bufferId;
+            if (anonymous.handle->frame.fd >= 0) close(anonymous.handle->frame.fd);
+            if (anonymous.handle->acquireFd >= 0) close(anonymous.handle->acquireFd);
+            check(!watched(kMonitorEvidence), "a hand-over with no bus name behind it does not count as collection");
+            manager.releaseBuffer(std::string(), kMonitorEvidence, bufferId);
+        }
+    }
+    {
+        wallpaperx::FrameExport named = manager.exportCurrentFrame(kMonitorEvidence, ":1.900");
+        check(named.handle.has_value(), "and a named consumer is served the same picture");
+        if (named.handle) {
+            const uint64_t bufferId = named.handle->frame.bufferId;
+            if (named.handle->frame.fd >= 0) close(named.handle->frame.fd);
+            if (named.handle->acquireFd >= 0) close(named.handle->acquireFd);
+            check(watched(kMonitorEvidence), "which does count: a served hand-over to a named consumer is collection");
+            manager.releaseBuffer(":1.900", kMonitorEvidence, bufferId);
+        }
+    }
+
+    // GOAL: S13.151 -- a REFUSAL tells the two kinds of consumer apart. One refused while holding
+    //       none of this monitor's images is asking for a picture the daemon had none to give; that
+    //       is the daemon's own back-pressure, so it counts as collecting and the video it would
+    //       otherwise stop keeps playing for it. One refused while holding images is the opposite:
+    //       those are the images it has not given back, which is exactly the state the off switch
+    //       exists to catch. False either way round -- counting every refusal keeps a frozen screen
+    //       decoding at display rate, counting none stops a video for a consumer the daemon itself
+    //       is starving.
+    // WHY-THIS-SHAPE: consumers are added until the daemon refuses one rather than a fixed number
+    //       being assumed: how many images a monitor's ring holds is the driver's business. The
+    //       holder's refusal is driven with a consumer that has been SERVED and kept its images, so
+    //       the two arms differ in exactly the fact under test and in nothing else.
+    // COVERAGE-ASSERT: the loop's own success is asserted -- a run where no consumer could be
+    //       refused reports that rather than grading two arms it never reached.
+    // The holder arm's consumer, taken to its own cap ACROSS PUBLISHED PICTURES. Asking twice for
+    // the same picture hands the same image back and the hold does not grow -- measured, and it is
+    // why a plain loop of hand-overs leaves a consumer holding one image and being served for ever.
+    // A consumer at its cap is refused whatever the ring has free, which is what keeps this arm
+    // drivable without saturating the ring: the daemon has to be able to publish another picture
+    // between the arms, and a ring with nothing free would leave it deferring instead.
+    const std::string holder = ":1.910";
+    bool holderAtItsCap = false;
+    for (int i = 0; i < 8 && !holderAtItsCap; ++i) {
+        const wallpaperx::FrameExport e = takeAndKeep(holder);
+        if (!e.handle) {
+            holderAtItsCap = e.reason == wallpaperx::NoFrameReason::NoFreeImage;
+            break;
+        }
+        if (!republish()) break;
+    }
+    // Then further consumers, each asked once for the picture that is up, until one is refused
+    // holding nothing. Bounded rather than counted out: how many consumers a monitor will record
+    // and how deep its ring is are the daemon's and the driver's business, not this file's.
+    std::string starvedEmptyHanded;
+    for (int i = 1; i < 16 && starvedEmptyHanded.empty(); ++i) {
+        const std::string consumer = ":1.91" + std::to_string(i);
+        const wallpaperx::FrameExport e = takeAndKeep(consumer);
+        if (e.handle) continue;
+        if (e.reason != wallpaperx::NoFrameReason::NoFreeImage) break;
+        starvedEmptyHanded = consumer;
+    }
+    check(holderAtItsCap, "a consumer can be taken to the point where the daemon refuses it while it holds images");
+    if (starvedEmptyHanded.empty() || !holderAtItsCap) {
+        notVerified("S13.151", "no consumer could be refused an image on this host while another held one, so the "
+                               "two kinds of refusal could not be told apart");
+    } else {
+        // CONTROL: in backend/daemon/wallpaper_manager.cpp, the `std::none_of(...)` guard in
+        //       exportCurrentFrame()'s refusal block dropped, so every refusal resets
+        //       uncollectedSince -> "FAIL: and a consumer refused while holding this monitor's
+        //       images does not count as collecting". Replacing the whole block with nothing --
+        //       no refusal ever counts -> "FAIL: a consumer refused while holding none of this
+        //       monitor's images counts as collecting". Both observed 2026-09-20. Reverted.
+        const bool unwatchedAgain = rearmStale();
+        check(unwatchedAgain, "the monitor goes unwatched again with its images out and nothing collecting");
+        if (unwatchedAgain) {
+            const wallpaperx::FrameExport emptyHanded =
+                manager.exportCurrentFrame(kMonitorEvidence, starvedEmptyHanded);
+            check(emptyHanded.reason == wallpaperx::NoFrameReason::NoFreeImage && !emptyHanded.handle,
+                  "a consumer holding nothing is refused, which is the state this rule is about");
+            check(watched(kMonitorEvidence),
+                  "a consumer refused while holding none of this monitor's images counts as collecting");
+
+            const bool unwatchedOnceMore = rearmStale();
+            check(unwatchedOnceMore, "and the monitor goes unwatched again after it");
+            if (unwatchedOnceMore) {
+                const wallpaperx::FrameExport byHolder = manager.exportCurrentFrame(kMonitorEvidence, holder);
+                if (byHolder.handle) {
+                    std::fprintf(stderr, "  %s was SERVED image %llu; holders now:", holder.c_str(),
+                                 static_cast<unsigned long long>(byHolder.handle->frame.bufferId));
+                    const std::optional<wallpaperx::MonitorStatus> s = monitorStatus(manager, kMonitorEvidence);
+                    if (s) {
+                        for (const wallpaperx::BufferHold& h : s->holds) {
+                            std::fprintf(stderr, " %s(%zu)", h.client.c_str(), h.buffers.size());
+                        }
+                    }
+                    std::fprintf(stderr, "\n");
+                }
+                check(byHolder.reason == wallpaperx::NoFrameReason::NoFreeImage && !byHolder.handle,
+                      "the consumer holding its fill is refused too");
+                check(!watched(kMonitorEvidence),
+                      "and a consumer refused while holding this monitor's images does not count as collecting");
+            }
+        }
+    }
+
+    // GOAL: S13.152 -- a video's FIRST PICTURE after a wallpaper change is never declared unwatched
+    //       by the previous wallpaper's staleness. The wait is anchored to the oldest uncollected
+    //       picture, and a monitor whose frame was thrown away has had nothing to collect since --
+    //       so the wait has to start again at the new wallpaper's first picture. False for a daemon
+    //       that keeps the old stamp: a screen whose video had been ignored for a minute would get
+    //       one picture of its new wallpaper and stop, and on the user's desktop that reads as a
+    //       video that refuses to play.
+    // WHY-THIS-SHAPE: driven from a monitor that is PROVABLY stale -- the check above has just
+    //       established it is unwatched -- so the new wallpaper's first picture is committed into
+    //       exactly the state the defect needs. Reading `watched` straight after the render, with
+    //       no worker running, means nothing can have collected in between.
+    // CONTROL: in backend/daemon/wallpaper_manager.cpp, commitFrameLocked()'s
+    //       `if (!hadFrame || !state.uncollectedSince)` narrowed to `if (!state.uncollectedSince)`
+    //       -> "FAIL: a video's first picture after a wallpaper change starts the wait again".
+    //       Observed 2026-09-20. Reverted.
+    {
+        const bool stale = rearmStale();
+        check(stale, "the monitor is stale before its wallpaper is changed");
+        if (stale) {
+            manager.requestWallpaper("video", clip, kMonitorEvidence);
+            const bool drew = manager.renderPending(kMonitorEvidence).rendered;
+            check(drew, "the new wallpaper's first picture commits");
+            if (drew) {
+                check(watched(kMonitorEvidence),
+                      "a video's first picture after a wallpaper change starts the wait again");
+            }
+        }
+    }
+
+    // GOAL: S13.153 -- a screen name rebound to another monitor does not carry its old not-drawn
+    //       verdict. A report is filed under the NAME, because a screen can be named before a
+    //       wallpaper is chosen for it; but no consumer has said anything about the monitor taking
+    //       the name over, and an unreported screen is taken to be drawn. False for a daemon that
+    //       leaves the verdict behind: a monitor that inherited a dark screen's name would have its
+    //       video stopped with nothing able to correct it, because the plugin only sends a report
+    //       when its own answer changes.
+    // WHY-THIS-SHAPE: read through screenVisible on the monitor that took the name over, which is
+    //       the whole claim; reading it on the monitor that lost the name would be satisfied by a
+    //       daemon that simply forgot both. The still is there so the new monitor has a status
+    //       entry to read at all -- GetStatus lists wallpapers.
+    // CONTROL: in backend/daemon/wallpaper_manager.cpp, the
+    //       `m_outputsNotDrawn.erase(existing->first);` line deleted from bindOutputLocked() ->
+    //       "FAIL: a screen name rebound to another monitor does not carry its old not-drawn
+    //       verdict", printing screen_visible false. Observed 2026-09-20. Reverted.
+    {
+        const std::string name = screenOf(kMonitorEvidence);
+        manager.setOutputVisible(name, false);
+        const std::optional<wallpaperx::MonitorStatus> covered = monitorStatus(manager, kMonitorEvidence);
+        check(covered && !covered->screenVisible, "a screen that says it is not being drawn is recorded as such");
+        manager.requestWallpaper("static", still, kMonitorRebound);
+        (void)manager.renderPending(kMonitorRebound);
+        wallpaperx::testing::nameScreen(manager, kMonitorRebound, name);
+        const std::optional<wallpaperx::MonitorStatus> rebound = monitorStatus(manager, kMonitorRebound);
+        reportUnless(rebound && rebound->screenVisible,
+                     "a screen name rebound to another monitor does not carry its old not-drawn verdict",
+                     rebound ? "screen_visible: false" : std::string("no status for the monitor that took the name"));
+    }
+}
+
+constexpr int kMonitorSlow = 0;
+
+// How many of the slow fixture's pictures this phase waits for. Three, so the four-second gap is
+// crossed twice.
+constexpr uint64_t kSlowPictures = 3;
+
+void runSlowPictureChecks(const WallpaperManager::Config& config, const std::string& slow) {
+    const char* kGoal = "S13.158 (a consumer that keeps collecting keeps a video playing however far apart the "
+                        "file's pictures are)";
+    PhaseGrade grade("the slow-picture phase");
+    FrameReadyLog signals;
+    PictureLog pictures;
+    WallpaperManager manager(config);
+    CaptureGradeOnExit captureGrade{grade, manager};
+    Collector collector(manager, kMonitorSlow, ":1.750");
+    RenderWorker worker(manager, [&signals, &pictures, &collector](int monitorId, uint64_t generation) {
+        signals.record(monitorId, generation);
+        pictures.record(monitorId, generation);
+        collector.announced(monitorId, generation);
+    });
+    collector.attach(worker);
+    WorkerUnblock unblock{worker};
+
+    wallpaperx::testing::nameScreen(manager, kMonitorSlow, screenOf(kMonitorSlow));
+    manager.requestWallpaper("video", slow, kMonitorSlow);
+    worker.post(kMonitorSlow);
+    if (!signals.wait(kMonitorSlow, 1)) {
+        grade.expectNoDevice();
+        notVerified(kGoal, "the slow video produced no first picture on this host");
+        return;
+    }
+
+    // GOAL: S13.158 -- a video whose pictures are FARTHER APART than the daemon's own unwatched
+    //       interval keeps playing for a consumer that collects every one of them. This is the case
+    //       that froze on the user's desktop: with four seconds between pictures and a two-second
+    //       interval, a rule measured from the last hand-over declares its own consumer gone in the
+    //       gap and the wallpaper shows one picture and stops. The rule that survives it measures
+    //       from the OLDEST picture nobody has collected -- and there is none, because the consumer
+    //       took the last one.
+    // WHY-THIS-SHAPE: a fixture whose pictures are four seconds apart is the whole check; every
+    //       other video fixture here runs at ten pictures a second, where the right rule and the
+    //       wrong one agree and no arrangement of consumers can tell them apart. The consumer
+    //       fetches only on an announcement, which is what the plugin does -- a consumer polling
+    //       faster than the interval would keep the wrong rule satisfied too.
+    // CONTROL: in backend/daemon/wallpaper_manager.cpp, noteHandoverServed() made to set
+    //       `it->second.uncollectedSince = std::chrono::steady_clock::now();` instead of resetting
+    //       it -- which is the rule measured from the last hand-over -> "FAIL: a video whose
+    //       pictures are four seconds apart keeps playing for a consumer that collects them", after
+    //       the signal limit, with the picture count stuck at one. The same mutation leaves every
+    //       other phase in this file green. Observed 2026-09-20. Reverted.
+    // COVERAGE-ASSERT: the span the graded pictures took is asserted to be at least twice the
+    //       daemon's own unwatched interval, so a fixture regenerated at a fast rate -- which would
+    //       make this check agree with the wrong rule and stop being able to fail -- fails here
+    //       instead.
+    const bool kept = signals.wait(kMonitorSlow, kSlowPictures);
+    check(kept, "a video whose pictures are four seconds apart keeps playing for a consumer that collects them");
+    if (!kept) {
+        std::fprintf(stderr, "  it reached generation %llu; the consumer: %s\n",
+                     static_cast<unsigned long long>(latestGeneration(pictures, kMonitorSlow)),
+                     collector.describe().c_str());
+        notVerified(kGoal, "the slow video never reached its third picture, so no span could be measured");
+        return;
+    }
+    reportUnless(collector.threw().empty(), "the consumer's hand-overs did not throw", collector.threw());
+    reportUnless(collector.served() > 0, "and the consumer really was collecting them", collector.describe());
+    {
+        const std::vector<PictureLog::Event> shown = pictures.forMonitor(kMonitorSlow);
+        std::optional<Clock::time_point> first;
+        std::optional<Clock::time_point> third;
+        for (const PictureLog::Event& e : shown) {
+            if (e.generation == 1) first = e.at;
+            if (e.generation == kSlowPictures) third = e.at;
+        }
+        if (!first || !third) {
+            notVerified(kGoal, "the first and third pictures were not both announced, so no span can be measured");
+        } else {
+            const double seconds = std::chrono::duration<double>(*third - *first).count();
+            std::printf("video_wallpaper_test: the slow fixture's first %llu pictures took %.3f s\n",
+                        static_cast<unsigned long long>(kSlowPictures), seconds);
+            std::fflush(stdout);
+            reportUnless(seconds >= 2 * std::chrono::duration<double>(WallpaperManager::kUnwatchedAfter).count(),
+                         "and the gaps it crossed really are longer than the daemon's unwatched interval",
+                         std::to_string(seconds) + " s for " + std::to_string(kSlowPictures) +
+                             " pictures, which is not long enough for this check to be able to fail");
+        }
+    }
+}
+
+constexpr int kEvictionWatchMonitors[] = {0, 1, 2, 3, 4, 5, 6, 7, 8};
+static_assert(std::size(kEvictionWatchMonitors) == WallpaperManager::kMaxVideoSessions + 1,
+              "this phase needs exactly one monitor past the session ceiling");
+
+// S13.159, on a manager with NO render worker: the clock never runs here, so every session stays
+// exactly as the pass that opened it left it and which one eviction picks depends on nothing but
+// this function.
+void runEvictionWatchChecks(const WallpaperManager::Config& config, const std::vector<std::string>& clips) {
+    const char* kGoal = "S13.159 (eviction asks current-and-drawn, not watched: a screen merely behind on fetching "
+                        "keeps its session, a covered one does not)";
+    PhaseGrade grade("the eviction-narrowing phase");
+    WallpaperManager manager(config);
+    CaptureGradeOnExit captureGrade{grade, manager};
+
+    for (size_t i = 0; i + 1 < std::size(kEvictionWatchMonitors); ++i) {
+        wallpaperx::testing::nameScreen(manager, kEvictionWatchMonitors[i], screenOf(kEvictionWatchMonitors[i]));
+        manager.requestWallpaper("video", clips[i], kEvictionWatchMonitors[i]);
+        if (!manager.renderPending(kEvictionWatchMonitors[i]).rendered) {
+            if (i == 0) grade.expectNoDevice();
+            notVerified(kGoal, "only " + std::to_string(i) + " of the " +
+                                   std::to_string(WallpaperManager::kMaxVideoSessions) +
+                                   " videos this phase needs could be drawn on this host");
+            return;
+        }
+    }
+
+    // GOAL: S13.159 -- the question eviction asks is NARROWER than the clock's. A screen whose
+    //       consumer has merely not fetched for a couple of seconds is still showing a current
+    //       picture, and must not lose its decoder to another screen: the moment anything collects
+    //       from it again it would have to reopen the file and start the video over. A screen that
+    //       has SAID it is not being drawn is evidence rather than a guess, and is taken at once.
+    //       False for a daemon that evicts whatever the clock has stopped -- every screen a user
+    //       is not actively fetching from becomes a spare slot, so setting a ninth video steals a
+    //       decoder from a screen that is visibly playing.
+    // WHY-THIS-SHAPE: the eight monitors are deliberately left uncollected past the daemon's own
+    //       interval before the ninth is asked for, and that staleness is ASSERTED through
+    //       GetStatus's `watched` -- otherwise "the ninth was refused" would be equally true of a
+    //       run where the interval had not elapsed and nothing was stale at all. The two
+    //       directions are then driven from the same eight sessions, so the only thing that differs
+    //       between "refused" and "evicted" is the screen report.
+    // CONTROL: in backend/daemon/wallpaper_manager.cpp, evictIdleVideoSessionLocked()'s
+    //       `if (currentSeqLocked(...) && screenDrawnLocked(monitorId)) continue;` changed back to
+    //       `if (playingSeqLocked(monitorId, session.wallpaperSeq)) continue;` -- the clock's own
+    //       test -> "FAIL: a ninth video is refused while every screen is showing a current
+    //       picture", because a stale-but-drawn session is evicted instead. Observed 2026-09-20.
+    //       Reverted.
+    // COVERAGE-ASSERT: every one of the eight is required to read as unwatched before the ninth is
+    //       asked for, so a run that had not gone stale cannot report the refusal as evidence that
+    //       eviction ignores staleness.
+    size_t stale = 0;
+    const bool allStale = settlesWithin(std::chrono::seconds(20), [&] {
+        stale = 0;
+        for (size_t i = 0; i + 1 < std::size(kEvictionWatchMonitors); ++i) {
+            const std::optional<wallpaperx::MonitorStatus> s = monitorStatus(manager, kEvictionWatchMonitors[i]);
+            if (s && !s->watched && s->screenVisible && s->hasFrame) ++stale;
+        }
+        return stale + 1 == std::size(kEvictionWatchMonitors);
+    });
+    check(allStale, "every one of the eight screens is showing a current picture that nothing is collecting");
+    if (!allStale) {
+        std::fprintf(stderr, "  %zu of %zu reached that state\n", stale, std::size(kEvictionWatchMonitors) - 1);
+        notVerified(kGoal, "the eight sessions never reached the stale-but-drawn state the two directions differ in");
+        return;
+    }
+
+    const size_t ninth = std::size(kEvictionWatchMonitors) - 1;
+    wallpaperx::testing::nameScreen(manager, kEvictionWatchMonitors[ninth], screenOf(kEvictionWatchMonitors[ninth]));
+    manager.requestWallpaper("video", clips[ninth], kEvictionWatchMonitors[ninth]);
+    g_files.resetCounts();
+    const bool refused = !manager.renderPending(kEvictionWatchMonitors[ninth]).rendered;
+    check(refused, "a ninth video is refused while every screen is showing a current picture");
+    {
+        const std::optional<wallpaperx::MonitorStatus> ninthStatus =
+            monitorStatus(manager, kEvictionWatchMonitors[ninth]);
+        reportUnless(ninthStatus && ninthStatus->lastError.find("at most") != std::string::npos &&
+                         ninthStatus->lastErrorIsDaemonFault,
+                     "and it is refused with the daemon's own limit named, not the file's fault",
+                     ninthStatus ? "last_error: " + ninthStatus->lastError : std::string("no status"));
+        reportUnless(g_files.totalCloses() == 0, "and no screen loses the session it is showing from",
+                     std::to_string(g_files.totalCloses()) + " session(s) closed by the refused request");
+    }
+
+    // The other direction, from the same eight sessions: one screen says it is not being drawn, and
+    // that one is taken at once.
+    // CONTROL: in backend/daemon/wallpaper_manager.cpp, the `&& screenDrawnLocked(monitorId)` term
+    //       deleted from evictIdleVideoSessionLocked() -> "FAIL: a screen that says it is not being
+    //       drawn gives its session up for the ninth video", because nothing is then evictable and
+    //       the ninth is refused again. Observed 2026-09-20. Reverted.
+    manager.setOutputVisible(screenOf(kEvictionWatchMonitors[2]), false);
+    // Asked for again, not merely re-rendered: a pass that failed marks the request serviced, so
+    // renderPending() on its own would answer "nothing to do" and this check would read a no-op.
+    manager.requestWallpaper("video", clips[ninth], kEvictionWatchMonitors[ninth]);
+    g_files.resetCounts();
+    const bool drewNinth = manager.renderPending(kEvictionWatchMonitors[ninth]).rendered;
+    check(drewNinth, "a screen that says it is not being drawn gives its session up for the ninth video");
+    reportUnless(g_files.closes(clips[2]) == 1, "and it is the covered screen's own file that is closed",
+                 "closed " + std::to_string(g_files.totalCloses()) + " file(s), " +
+                     std::to_string(g_files.closes(clips[2])) + " of them the covered screen's");
 }
 
 constexpr int kMonitorHandover = 0;
+constexpr int kMonitorHandoverCycle = 1;
 
 void runHandoverLogChecks(const WallpaperManager::Config& config, const std::string& clip) {
     const char* kGoals = "S13.144 (a hand-over of a playing video is announced once per consumer, and so is a "
@@ -2536,6 +3750,87 @@ void runHandoverLogChecks(const WallpaperManager::Config& config, const std::str
     const wallpaperx::FrameExport refusedOther = manager.exportCurrentFrame(kMonitorHandover, ":1.499");
     check(refusedOther.reason == wallpaperx::NoFrameReason::NoFreeImage && refusedOther.firstRefusal,
           "but a different consumer being refused is reported in its own right");
+
+    // GOAL: S13.144's refusal half, RESTATED for Stage E4 -- the line is rate-limited per consumer,
+    //       NOT re-armed by a hand-over. A consumer holding its fill of a playing video is served
+    //       and refused alternately, many times a second: under the Stage E3 rule, where being
+    //       served ended the episode, that is a log line per picture for as long as the video
+    //       plays. False for a daemon that re-arms on a hand-over, and false for one that reports
+    //       nothing at all, which the checks above already cover.
+    // WHY-THIS-SHAPE: driven by taking ONE consumer to its own cap across published pictures, which
+    //       is the only way to make the same consumer be refused, then served, then refused again:
+    //       a consumer asked twice for one picture is handed the same image back, so the second ask
+    //       is neither a new hand-over nor a refusal. Every other shape either cannot refuse the
+    //       consumer a second time or cannot serve it in between.
+    // CONTROL: in backend/daemon/wallpaper_manager.cpp, the Stage E3 line
+    //       `std::erase_if(it->second.refusalsReported, [&client](const MonitorState::RefusalReport&
+    //       r) { return r.client == client; });` added back after `it->second.refusedHandovers = 0;`
+    //       in exportCurrentFrame() -> "FAIL: a consumer served in between is not reported again
+    //       when it is refused once more". Observed 2026-09-20. Reverted.
+    // COVERAGE-ASSERT: the drive asserts each of its three states -- refused, then served, then
+    //       refused -- so a run that never reached one of them fails there rather than reporting
+    //       the rate limit as established.
+    // A monitor of its own, because the checks above deliberately leave this one's ring fully spoken
+    // for: publishing another picture needs an image nobody holds, and that is exactly what the
+    // starvation above removed.
+    {
+        const std::string cycling = ":1.480";
+        wallpaperx::testing::nameScreen(manager, kMonitorHandoverCycle, screenOf(kMonitorHandoverCycle));
+        const auto republish = [&manager, &clip]() {
+            manager.requestWallpaper("video", clip, kMonitorHandoverCycle);
+            return manager.renderPending(kMonitorHandoverCycle).rendered;
+        };
+        const auto take = [&](const std::string& consumer) {
+            wallpaperx::FrameExport e = manager.exportCurrentFrame(kMonitorHandoverCycle, consumer);
+            if (e.handle) {
+                open.push_back(e.handle->frame.fd);
+                open.push_back(e.handle->acquireFd);
+            }
+            return e;
+        };
+        bool atCap = false;
+        bool firstRefusalReported = false;
+        uint64_t lastHeld = 0;
+        const bool firstPicture = republish();
+        check(firstPicture, "the second monitor's video draws its first picture");
+        for (int i = 0; firstPicture && i < 8 && !atCap; ++i) {
+            const wallpaperx::FrameExport e = take(cycling);
+            if (!e.handle) {
+                atCap = e.reason == wallpaperx::NoFrameReason::NoFreeImage;
+                // The loop's own refusal IS this consumer's first, so it is read here rather than
+                // asked for again: a second call would be the one being rate-limited.
+                firstRefusalReported = e.firstRefusal;
+                break;
+            }
+            lastHeld = e.handle->frame.bufferId;
+            if (!republish()) break;
+        }
+        check(atCap && lastHeld != 0, "a consumer can be taken to the point where it is refused while holding images");
+        if (atCap && lastHeld != 0) {
+            check(firstRefusalReported, "its first refusal is reported");
+            manager.releaseBuffer(cycling, kMonitorHandoverCycle, lastHeld);
+            const bool republished = republish();
+            check(republished, "another picture is published for it to be served again");
+            const wallpaperx::FrameExport servedAgain =
+                republished ? manager.exportCurrentFrame(kMonitorHandoverCycle, cycling) : wallpaperx::FrameExport{};
+            check(servedAgain.handle.has_value(), "and it is served again after giving an image back");
+            if (servedAgain.handle) {
+                open.push_back(servedAgain.handle->frame.fd);
+                open.push_back(servedAgain.handle->acquireFd);
+                const bool ready = republish();
+                check(ready, "and one more picture is published, so it can be refused once more");
+                if (ready) {
+                    const wallpaperx::FrameExport refusedAfterService =
+                        manager.exportCurrentFrame(kMonitorHandoverCycle, cycling);
+                    check(refusedAfterService.reason == wallpaperx::NoFrameReason::NoFreeImage &&
+                              !refusedAfterService.handle,
+                          "and refused once more after it");
+                    check(!refusedAfterService.firstRefusal,
+                          "a consumer served in between is not reported again when it is refused once more");
+                }
+            }
+        }
+    }
 }
 
 constexpr int kMemoryMonitors[] = {0, 1, 2, 3, 4, 5};
@@ -2915,6 +4210,7 @@ int main() {
 
     const std::string clip = clipPath();
     const std::string onePicture = onePicturePath();
+    const std::string slow = slowClipPath();
     if (!std::filesystem::exists(clip) || !std::filesystem::exists(onePicture)) {
         notVerified("every goal in this file",
                     "the video fixtures " + clip + " and " + onePicture +
@@ -2976,6 +4272,40 @@ int main() {
         runShutdownChecks(config, parked[0]);
         runClockChecks(config, clip, still);
         runOnePictureChecks(config, onePicture);
+        runParkedReleaseChecks(config, onePicture);
+        runOffSwitchChecks(config, clip);
+        runWatchEvidenceChecks(config, clip, still);
+
+        // A bus of its own, and a second phase that owns the daemon's well-known name: the
+        // visibility goals are about the whole chain -- the method, the manager, and the worker
+        // being woken -- and a manager-level phase would have to stand in for the last of those.
+        {
+            PhaseGrade grade("the visibility phase");
+            PictureLog pictures;
+            WallpaperManager manager(config);
+            CaptureGradeOnExit captureGrade{grade, manager};
+
+            auto serviceConn = sdbus::createSessionBusConnection(sdbus::ServiceName{DbusService::kBusName});
+            DbusService service(*serviceConn, manager);
+            serviceConn->enterEventLoopAsync();
+            auto proxy = sdbus::createProxy(sdbus::ServiceName{DbusService::kBusName},
+                                            sdbus::ObjectPath{DbusService::kObjectPath});
+            proxy->uponSignal("FrameReady")
+                .onInterface(DbusService::kInterface)
+                .call([&pictures](int32_t monitorId, uint64_t generation) { pictures.record(monitorId, generation); });
+
+            runVisibilityChecks(*proxy, pictures, clip);
+        }
+
+        runEvictionWatchChecks(config, clips);
+        if (std::filesystem::exists(slow)) {
+            runSlowPictureChecks(config, slow);
+        } else {
+            notVerified("S13.158", "the slow-picture fixture " + slow +
+                                       " was not generated, so the case that froze on a real desktop -- a video "
+                                       "whose pictures are farther apart than the daemon's unwatched interval -- "
+                                       "was not exercised at all");
+        }
         runHandoverLogChecks(config, clip);
         runMemoryRetryChecks(config, clips);
         runPlaybackRetryChecks(config, clips);

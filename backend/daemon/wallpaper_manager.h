@@ -17,6 +17,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -40,6 +41,14 @@ struct InvalidRequest : std::runtime_error {
 // cure is elsewhere: the name has to be bound first.
 struct UnknownOutput : InvalidRequest {
     using InvalidRequest::InvalidRequest;
+};
+
+// One consumer's claim on a monitor's images: the buffer ids it has been handed and has not
+// given back, oldest first. A holder disappears when its last claim ends, so a monitor's list is
+// exactly the consumers currently reading it.
+struct BufferHold {
+    std::string client;  // DBus unique name
+    std::vector<uint64_t> buffers;
 };
 
 // What a monitor was last asked to display, and what came of it. `generation` is monotonic
@@ -80,6 +89,17 @@ struct MonitorStatus {
     // while no consumer can fetch, which reads from every other field like a desktop that is
     // keeping up.
     uint32_t refusedHandovers = 0;
+
+    // Who is reading this monitor's images. Published because a count of refusals says a
+    // hand-over was declined but not who is holding what it wanted, and an image is only ever
+    // given back by its holder -- so this is the whole diagnosis of a frozen screen.
+    std::vector<BufferHold> holds;
+
+    // What this monitor's screen last reported about being drawn, and whether anything is
+    // collecting its pictures. A video advances only while `watched`, so these two are the
+    // answer to "why has this wallpaper stopped moving".
+    bool screenVisible = true;
+    bool watched = false;
 };
 
 // True once a config read has been abandoned mid-call. That thread is still blocked in the
@@ -195,10 +215,10 @@ struct FrameExport {
     NoFrameReason reason = NoFrameReason::NeverRequested;
     std::string lastError;
 
-    // The first refusal of THIS consumer since it was last served, and so the one worth a log line:
-    // a consumer refused at display rate is refused for every picture until it gives an image back.
-    // Per consumer, not per monitor: one consumer being served must not re-arm another's line, and
-    // a second consumer being refused is its own diagnosis. Meaningful only for NoFreeImage.
+    // Whether this refusal is worth a log line: the first for THIS consumer, or the first in a
+    // while. Per consumer, not per monitor, because a second consumer being refused is its own
+    // diagnosis. Rate-limited rather than armed by a hand-over, because a consumer holding its fill
+    // is served and refused alternately while a video plays. Meaningful only for NoFreeImage.
     bool firstRefusal = false;
 };
 
@@ -218,8 +238,10 @@ struct FrameAvailable {
 };
 
 // What one round of the video clock did: the pictures it committed, each to be announced like a
-// render's frame, the monitors whose playback failed and are owed a render again, and when it next
-// has work. No `nextDue` means no video is playing, and only a render can start one.
+// render's frame, the monitors owed a render again -- playback failed, or the session their
+// pictures need was freed while nobody was looking -- and when it next has work. `nextDue` covers
+// a session waiting to be freed as well as a picture waiting to be shown; no `nextDue` means
+// neither is pending, and only a render or a wake can start one.
 struct ClockRound {
     struct Shown {
         int monitorId = 0;
@@ -307,6 +329,32 @@ public:
     // and with nothing free to close the new wallpaper is refused and says so.
     static constexpr size_t kMaxVideoSessions = 8;
 
+    // How long a published picture may sit uncollected before the monitor stops counting as
+    // watched. Measured from the announcement, never from wall time: a consumer can only collect
+    // what has been announced, so "time since the last hand-over" would be the file's own frame
+    // interval and a video with pictures seconds apart would call its own consumer gone.
+    //
+    // Two seconds is far past any scheduling hiccup on the consumer's side and short enough that a
+    // desktop that has gone stops the decoder almost at once. A monitor wrongly called unwatched
+    // costs one paused picture: the next hand-over starts it again.
+    static constexpr std::chrono::seconds kUnwatchedAfter{2};
+
+    // How long a decode session stays open after its monitor stops playing. Stopping already ends
+    // the cost of playing, so what this trades is the video memory a decoder and its picture pool
+    // hold against the cost of coming back, which is not only a file open, a stream probe and one
+    // decode: a reopened file starts at its first picture, so a video that resumes after this plays
+    // from the beginning rather than carrying on. The last picture stays on screen throughout.
+    //
+    // Five seconds is past every transient -- a menu, a notification, a window animation, a screen
+    // redrawn at a new size -- and far below the absences whose memory is worth having back: a
+    // locked screen, a fullscreen window, a session switched away.
+    static constexpr std::chrono::seconds kIdleSessionRelease{5};
+
+    // How often one consumer's refusal on one monitor is worth a line. A consumer that holds its
+    // fill of a playing video is refused for every picture it does not release in time, so this is
+    // the difference between one line and sixty a second.
+    static constexpr std::chrono::seconds kRefusalLogInterval{60};
+
     // Times the clock reopens one wallpaper after playback fails without a picture having been
     // shown in between. Three, because one retry can be lost to a fault that was genuinely
     // momentary, while three failures with nothing shown between them is a file that cannot get
@@ -373,6 +421,16 @@ public:
     // no monitor answers to. Idempotent. The write is queued, not waited on -- a size lost to a
     // failed write costs one redraw after a restart, and a stalled disk must not delay this one.
     void setOutputSize(const std::string& outputName, uint32_t width, uint32_t height, std::vector<int>& redraw);
+
+    // Records whether the screen named `outputName` is actually being drawn -- its desktop is not
+    // behind a lock screen, a fullscreen window or another session. The daemon can see none of
+    // that for itself, so a screen that never reports is taken to be drawn and behaves as it
+    // always has. A video on a screen that is not drawn stops on the next round and keeps its last
+    // picture; nothing a consumer does starts it again while that stands, so the caller wakes the
+    // render worker whatever the answer. Throws InvalidRequest for a name the shared validator
+    // rejects and UnknownOutput for one no monitor answers to. Idempotent: only the change from
+    // covered to drawn credits the monitor with having been seen.
+    void setOutputVisible(const std::string& outputName, bool visible);
 
     // Records what the consumer named by `client` says it can import, and returns the monitors
     // to re-post so their images are rebuilt against it. GPU-free, like requestWallpaper: the
@@ -505,14 +563,6 @@ public:
     bool validationLayerActive() const;
 
 private:
-    // One consumer's claim on a monitor's images: the buffer ids it has been handed and has
-    // not given back, oldest first. A holder disappears when its last claim ends, so the list
-    // is exactly the consumers currently reading this monitor.
-    struct BufferHold {
-        std::string client;  // DBus unique name
-        std::vector<uint64_t> buffers;
-    };
-
     // What withHandover() decided. One value with three states rather than a flag beside a
     // maybe-filled list: `holds` is meaningless unless the hand-over was allowed, and only
     // Granted may be undone -- an image the client already held is one it is still reading.
@@ -583,11 +633,32 @@ private:
         // that keeps committing while this climbs is one whose images are not coming back.
         uint32_t refusedHandovers = 0;
 
-        // The consumers whose refusal has been reported since each was last served, at most
-        // kMaxHoldersPerMonitor of them so peer-chosen names cannot size this. Kept beside the
-        // count rather than derived from it: the count is one number for the monitor, and which
-        // consumer was refused is what the report is about.
-        std::vector<std::string> refusalsReported;
+        // When each consumer's refusal was last reported, at most kMaxHoldersPerMonitor of them so
+        // peer-chosen names cannot size this. Kept beside the count rather than derived from it:
+        // the count is one number for the monitor, and which consumer was refused is what the
+        // report is about.
+        struct RefusalReport {
+            std::string client;
+            std::chrono::steady_clock::time_point at;
+        };
+        std::vector<RefusalReport> refusalsReported;
+
+        // When this monitor published a picture that nothing has collected since, or nothing while
+        // its newest picture is in a consumer's hands. The evidence that something is looking, and
+        // deliberately anchored to the OLDEST uncollected picture: "time since the last hand-over"
+        // is the file's own frame interval, which the scheduler lets reach kMaxPictureInterval, so
+        // a slow video would have declared its own consumer gone between two pictures.
+        //
+        // A refusal does not clear it: a consumer that has stopped giving images back asks at
+        // display rate and is refused every time, so counting a refusal as collection would keep a
+        // frozen screen decoding at display rate.
+        std::optional<std::chrono::steady_clock::time_point> uncollectedSince;
+
+        // The wallpaper whose file held a single picture: it is on screen and there is nothing
+        // after it, so no clock advances it and no session is opened to play it. Keyed by
+        // wallpaperSeq for playbackRetriesFor's reason, and held here rather than on the session
+        // because the session is freed while the fact stays true.
+        uint64_t parkedWallpaperSeq = 0;
 
         // Reopens the clock has spent on `playbackRetriesFor`, against kPlaybackRetries. Keyed by
         // the wallpaper rather than reset when one arrives: a count whose key names a wallpaper
@@ -657,10 +728,10 @@ private:
         int monitorId, std::chrono::steady_clock::time_point now, ClockRound& round);
 
     // The three entries to a monitor's retained decode session, all on the GPU thread with
-    // m_gpuMutex held. A teardown re-enters ffmpeg and the driver on behalf of the file that
-    // session opened, so it puts a crash record naming that file on disk -- unless the caller
-    // already holds one, which happens only where the two name the same file and that record then
-    // stands. The only other teardowns write none: a pass that failed on the GPU, and destruction.
+    // m_gpuMutex held. A teardown re-enters ffmpeg and the driver, and writes no crash record for
+    // it: the file has already opened, decoded and drawn by then, and a session is released
+    // whenever a screen goes dark, so a record here would refuse a working wallpaper after a death
+    // in a teardown its content did not cause. A caller that already holds one keeps it.
     void closeVideoSessionLocked(int monitorId);
 
     // Keeps the session only if a pass for this wallpaper would draw with it. Called before the
@@ -668,12 +739,36 @@ private:
     // picture pool open for a file nothing shows.
     void dropStaleVideoSessionLocked(int monitorId, std::optional<Drawable> kind, uint64_t wallpaperSeq);
 
-    // The request whose committed frame this session's pictures continue, or nothing when the
-    // session has no picture left to show or the monitor is not showing its pictures: no frame, a
-    // render owed, or another wallpaper since. The clock advances exactly the sessions this answers
-    // for, and eviction frees only the others -- one predicate, so "playing" cannot come to mean
-    // two things. Caller must hold m_stateMutex.
-    std::optional<uint64_t> playingSeqLocked(int monitorId, const VideoSession& session) const;
+    // The request whose committed frame a video of `wallpaperSeq` still shows, or nothing when it
+    // shows something else: no frame, a render owed, another wallpaper since, or a file with one
+    // picture. Caller must hold m_stateMutex.
+    std::optional<uint64_t> currentSeqLocked(int monitorId, uint64_t wallpaperSeq) const;
+
+    // The same, and watched: what the clock advances, what the idle release frees, and what decides
+    // a session is worth reopening. Eviction deliberately asks the narrower pair instead --
+    // currentSeqLocked() and screenDrawnLocked() -- because a consumer that has not fetched for a
+    // moment must not cost its screen the decoder it is visibly playing. Caller must hold
+    // m_stateMutex.
+    std::optional<uint64_t> playingSeqLocked(int monitorId, uint64_t wallpaperSeq) const;
+
+    // Whether anything can see this monitor: its screen is being drawn and nothing it published is
+    // sitting uncollected. Reads the clock itself, so no caller can ask with a stale one. Caller
+    // must hold m_stateMutex.
+    bool watchedLocked(int monitorId, const MonitorState& state) const;
+
+    // Whether the screen bound to this monitor is being drawn, which is true of one that has never
+    // said otherwise. Caller must hold m_stateMutex.
+    bool screenDrawnLocked(int monitorId) const;
+
+    // Records that a hand-over collected this monitor's newest picture, which is what makes it
+    // watched. Takes m_stateMutex itself.
+    void noteHandoverServed(int monitorId);
+
+    // Posts the videos that would be playing if they had a decode session: one whose session was
+    // freed while nobody was looking, and -- only when this round freed one, so a failure cannot
+    // spin -- one that never got a session because every slot was taken. Caller must hold
+    // m_gpuMutex and not m_stateMutex.
+    void reopenVideosLocked(std::chrono::steady_clock::time_point now, bool freedSession, ClockRound& round);
 
     // Closes the least recently drawn session whose monitor is not playing, to make room for
     // another. False when every open session is playing, which is the only case a caller cannot
@@ -707,9 +802,9 @@ private:
     // m_stateMutex.
     void redrawIfResizedLocked(int monitorId, OutputSize before, std::vector<int>& toRender);
 
-    // Drops remembered sizes of names no monitor answers to, until no more than kMaxMonitors are
+    // Drops what names no monitor answers to reported, until no more than kMaxMonitors of each are
     // held. Caller must hold m_stateMutex.
-    void pruneOutputSizesLocked();
+    void pruneOutputReportsLocked();
 
     // Both of a hand-over's descriptors, or neither and a throw with the GPU health recorded.
     // Caller must hold m_gpuMutex, which is what keeps `target` alive across the export.
@@ -839,10 +934,8 @@ private:
         std::unique_ptr<VideoPipeline> pipeline;
 
         // The held picture: the first, never drawn; the one on screen, which was due at `due` and
-        // whose successor is decoded next; that successor, waiting for `due`; or the only picture
-        // the file has, which is shown once and never asked for again -- a one-picture video costs
-        // what a still costs. A pass drawing a waiting picture shows it early and leaves the
-        // schedule where it was.
+        // whose successor is decoded next; or that successor, waiting for `due`. A pass drawing a
+        // waiting picture shows it early and leaves the schedule where it was.
         struct Undrawn {};
         struct OnScreen {
             std::chrono::steady_clock::time_point due;
@@ -850,8 +943,12 @@ private:
         struct Waiting {
             std::chrono::steady_clock::time_point due;
         };
-        struct OnePicture {};
-        std::variant<Undrawn, OnScreen, Waiting, OnePicture> clock;
+        std::variant<Undrawn, OnScreen, Waiting> clock;
+
+        // When the clock first found this session's monitor not playing, or nothing while it is.
+        // The whole off switch: a video nobody can see stops at once and keeps its picture, and
+        // this is what says how long it has been stopped, whatever stopped it.
+        std::optional<std::chrono::steady_clock::time_point> idleSince;
 
         // The consumers this session has handed a picture to, most recent last and at most
         // kMaxHoldersPerMonitor of them, so the log records a consumer starting to read rather
@@ -878,6 +975,13 @@ private:
     // outlives its name being unbound: the plugin that sent it cannot tell the name was unbound
     // and bound again, so it never sends it twice. Guarded by m_stateMutex.
     std::map<std::string, OutputSize> m_outputSizes;
+
+    // The screens that reported they are not being drawn -- behind a lock screen, a fullscreen
+    // window, or a session switched away. By name for the same reason a size is, and not on the
+    // monitor: a screen can be named before a wallpaper is chosen for it, and a report dropped
+    // there would be answered with success and never sent again. Absent means drawn, which is what
+    // a screen that has never reported is taken to be. Guarded by m_stateMutex.
+    std::set<std::string> m_outputsNotDrawn;
 
     // What each consumer reported it can import, keyed by its DBus unique name, and the
     // intersection currently in force. Per-consumer because the daemon must satisfy all of

@@ -1078,12 +1078,23 @@ TestCase {
     // WHY-THIS-SHAPE: the drive carries a monitor_id, which is what makes the Loader ACTIVE -- and
     //       activation is the whole point. suite.goodReply has no id, so a drive using it leaves
     //       `active` false, the module load never attempted, and every assertion below satisfied
-    //       by a Loader that is simply switched off. This harness has no com.wallpaperx on its
-    //       import path, so an active Loader genuinely reaches Loader.Error here.
-    // COVERAGE: no control is run for this one. Making the module loadable here would need the
-    //       built plugin on the harness's import path, at which point the check stops testing
-    //       what it is for. The two states an inactive Loader cannot fake -- active, and Error --
-    //       are asserted instead.
+    //       by a Loader that is simply switched off.
+    //
+    //       Whether com.wallpaperx loads is MADE FALSE by this harness rather than assumed absent
+    //       (qml_states_test.cpp rewrites its qmldir URL to one that does not exist). It used to be
+    //       absent by accident, because a test binary's import path does not include the module it
+    //       is built beside -- and the moment the plugin was installed system-wide for a live
+    //       desktop test the import succeeded and this case failed against a correct build. A check
+    //       that reads differently depending on what is installed grades the machine.
+    // CONTROL: the `if (surface.status === Loader.Error)` block deleted from describe() in
+    //       backend/kde/kpackage/contents/ui/main.qml, so it falls through to the "will draw" line
+    //       -> "FAIL!: the plugin does not claim it will draw when the module could not be loaded"
+    //       and "FAIL!: the message names the module as the cause", that case alone. Observed
+    //       2026-09-20. Reverted.
+    // COVERAGE-ASSERT: the interceptor is asserted to have rewritten at least one candidate qmldir
+    //       URL, so a run in which it silently stopped matching cannot report Loader.Error as
+    //       evidence of anything -- on a machine with no module installed the state would look
+    //       identical.
     function test_a_missing_renderer_module_leaves_the_message_working() {
         const item = drivenPlugin({
             connector: suite.namedScreen,
@@ -1092,6 +1103,8 @@ TestCase {
         const surface = childNamed(item, "wallpaperxSurface");
         verify(surface !== null, "the plugin has a surface");
         verify(surface.active, "the Loader actually tried to load the renderer module");
+        verify(moduleBlock.blocked() > 0,
+               "this harness made com.wallpaperx unloadable, rather than hoping it was absent");
         compare(surface.status, Loader.Error,
                 "the module cannot be loaded on this harness, which is the state being graded");
         // Content, not length: every possible string has a length, so the old check could not

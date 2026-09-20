@@ -59,6 +59,13 @@ public:
     // negative, which is how a task is told from a render. Non-blocking.
     void post(int monitorId);
 
+    // Runs a clock round now, without queuing any work. What a change that only the manager can
+    // act on -- a screen saying it is being drawn again -- reaches the worker by: playback is
+    // resumed by the round, and the worker's next wake-up is only recomputed after a job or a
+    // round, so without this a video stopped while nobody was looking would stay stopped until
+    // something else happened to be posted. Non-blocking.
+    void wake();
+
     // Queues arbitrary GPU work -- an export, replying from the worker thread. Never coalesced,
     // since each task carries its own reply. Non-blocking; a task refused because the worker is
     // stopping or already full is answered inline on the calling thread.
@@ -92,6 +99,10 @@ private:
     std::deque<Job> m_queue;
     std::set<int> m_queuedRenders;  // membership test for the coalescing above
     size_t m_queuedTasks = 0;
+    // A wake() that has not been taken yet. In the wait predicate rather than a bare notify:
+    // wait_until with a predicate loops until the predicate holds, so a notify alone is spurious
+    // and the worker goes straight back to sleep until its own deadline.
+    bool m_wakeClock = false;
     bool m_stop = false;
     std::once_flag m_joined;
 

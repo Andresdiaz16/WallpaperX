@@ -132,6 +132,113 @@ void runDaemonLifetimeChecks() {
     check(claims.giveBack(fromNewDaemon), "and the successor's own claim on that image is still there to release");
 }
 
+// ClaimSet, the per-reader half added for Stage E4: which claims ONE reader of the daemon's
+// images is holding right now, so each is given back exactly once by whichever comes first -- the
+// import ending, or the reader stopping showing the image at all.
+//
+// Graded here rather than through the plugin item, and that is a finding rather than a
+// convenience. The state the retirement exists for -- a texture dying AFTER its item has been
+// handed the same image again -- could not be reached through a real item under
+// QQuickRenderControl: by the time the old texture is destroyed the item's own bookkeeping has
+// emptied the set again, so the two shapes are indistinguishable from outside the plugin.
+// Measured, with the retirement removed: item_offscreen_hidden stayed green, and the claim set
+// was empty at the teardown in both builds. What is left is the decision itself, which is a
+// pure, Qt-free property of this class and of the one line in the item that uses it.
+void runClaimSetChecks() {
+    BufferClaims& ledger = freshLedger();
+
+    // GOAL: a set gives back what it holds, once each, and reports whether it still held it. The
+    //       answer is what the two release paths branch on: an import ending and an item leaving
+    //       the screen can both reach the same claim, and whichever is second must send nothing.
+    //       False for a set that answers true twice -- which is a second ReleaseBuffer for an
+    //       image the first one already freed, and on a ring that reuses ids that is an
+    //       invitation to draw into memory still being read.
+    // CONTROL: `m_claims.erase(held);` deleted from ClaimSet::remove (backend/kde/
+    //       buffer_claims.cpp) -> "FAIL: and a second attempt on the same claim reports nothing
+    //       to give back". Observed 2026-09-20. Reverted.
+    {
+        wallpaperx::ClaimSet set;
+        const BufferClaims::Claim one = ledger.take(1, 11);
+        set.add(one);
+        check(set.remove(one), "a claim the set holds is reported as still held when it is removed");
+        check(!set.remove(one), "and a second attempt on the same claim reports nothing to give back");
+    }
+
+    // GOAL: two live imports of one image are two claims, and the set hands both back. The plugin
+    //       re-imports the image it is already showing whenever the scene changes, so this is the
+    //       ordinary steady state -- and the ledger above counts imports, so a set that collapsed
+    //       duplicates would leave that count one too high for ever and the image would never be
+    //       released at all.
+    // CONTROL: `m_claims.push_back(claim);` in ClaimSet::add (backend/kde/buffer_claims.cpp)
+    //       guarded by "only if not already present" -> "FAIL: two live imports of one image are
+    //       two claims, and emptying the set returns both". Observed 2026-09-20. Reverted.
+    {
+        wallpaperx::ClaimSet set;
+        const BufferClaims::Claim first = ledger.take(1, 12);
+        const BufferClaims::Claim second = ledger.take(1, 12);
+        set.add(first);
+        set.add(second);
+        check(set.removeAll().size() == 2, "two live imports of one image are two claims, and emptying the set "
+                                           "returns both");
+        check(set.removeAll().empty(), "and the set is empty afterwards");
+        (void)ledger.giveBack(first);
+        (void)ledger.giveBack(second);
+    }
+
+    // GOAL: the owner is not part of what identifies a claim. The same image can be claimed once
+    //       before this process has learned the daemon's unique bus name and again after, and a
+    //       set that matched on the owner would refuse to give the first one back -- leaving that
+    //       image out of the monitor's ring for the life of the session.
+    // CONTROL: `mine.daemon == claim.daemon && mine.monitorId == ...` in ClaimSet::remove
+    //       (backend/kde/buffer_claims.cpp) given `&& mine.owner == claim.owner` -> "FAIL: a
+    //       claim is matched by the image it names, not by which bus name granted it". Observed
+    //       2026-09-20. Reverted.
+    {
+        wallpaperx::ClaimSet set;
+        BufferClaims::Claim unnamed = ledger.take(1, 13);
+        BufferClaims::Claim named = unnamed;
+        named.owner = ":1.77";
+        set.add(unnamed);
+        check(set.remove(named), "a claim is matched by the image it names, not by which bus name granted it");
+        (void)ledger.giveBack(unnamed);
+    }
+
+    // GOAL: a holder that kept a reference to a RETIRED set cannot give back a claim registered
+    //       in the set that replaced it. This is the whole reason the item exchanges its set for
+    //       a fresh one when it leaves the screen instead of just emptying the one it has: a ring
+    //       slot hands the same buffer id out again, so a stale holder's claim is value-identical
+    //       to the one the item is showing now, and a set that had merely been emptied would
+    //       match it and free an image being displayed.
+    // WHY-THIS-SHAPE: the two claims are deliberately made value-identical -- same daemon, same
+    //       monitor, same buffer id -- because that is the only case in which the two shapes
+    //       differ. With different ids a stale holder finds nothing in either shape, and the
+    //       check would be green for a set that was never retired at all.
+    // CONTROL: the retirement is one line in the ITEM, not in this class, so the control is the
+    //       harness's own: `wallpaperx::ClaimSet replacement;` below replaced by a reference to
+    //       `retired`, which is what an item that emptied its set instead of exchanging it would
+    //       produce -> "FAIL: a holder of the retired set cannot give back a claim the new set
+    //       holds" and "and the new set still holds it". Observed 2026-09-20. Reverted.
+    //       NOT COVERED, and stated because it is the part a reviewer will look for: that
+    //       WallpaperXItem::releaseHeldImages actually performs the exchange is not graded
+    //       anywhere. Removing it leaves item_offscreen_hidden green, for the reason stated at
+    //       the top of this function.
+    {
+        wallpaperx::ClaimSet retired;
+        wallpaperx::ClaimSet replacement;
+        const BufferClaims::Claim beforeHide = ledger.take(1, 14);
+        retired.add(beforeHide);
+        check(retired.removeAll().size() == 1, "the set the item leaves behind gives back what it was holding");
+
+        // The same image handed out again, after the hide: a fresh claim with identical contents.
+        const BufferClaims::Claim afterShow = ledger.take(1, 14);
+        replacement.add(afterShow);
+        check(!retired.remove(beforeHide), "a holder of the retired set cannot give back a claim the new set holds");
+        check(replacement.remove(afterShow), "and the new set still holds it");
+        (void)ledger.giveBack(beforeHide);
+        (void)ledger.giveBack(afterShow);
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -140,6 +247,7 @@ int main() {
     runCountingChecks();
     runKeyingChecks();
     runDaemonLifetimeChecks();
+    runClaimSetChecks();
 
     // Left empty for anything else in this process, though nothing else runs here. The ledger
     // is a never-destroyed singleton by design, so a phase that walked away from its entries

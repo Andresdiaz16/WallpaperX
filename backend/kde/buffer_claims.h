@@ -77,4 +77,34 @@ private:
     std::vector<Entry> m_entries;
 };
 
+// The claims one reader of the daemon's images is holding right now, so each is given back
+// exactly once -- by whichever comes first: the import that took it ending, or the reader
+// stopping showing the image at all.
+//
+// Both are needed, and neither covers the other. An import ends when the scene graph destroys
+// the texture, which is the only moment the image is provably finished with -- but a desktop
+// that hides a wallpaper rather than destroying it may never destroy that texture, and the
+// daemon keys a hold on the process, not on the item, so those images stay out of the ring for
+// the session and every later hand-over is refused. Held in one place rather than in the
+// destructors that would each do it, because two of them releasing the same claim would give
+// back an image a second reader still holds.
+//
+// Free of Qt, like the ledger above: it decides only what may be released, never how.
+class ClaimSet {
+public:
+    void add(const BufferClaims::Claim& claim);
+
+    // Removes one and reports whether it was still here. False means something else has already
+    // given it back, and the caller must not.
+    bool remove(const BufferClaims::Claim& claim);
+
+    // Every claim still here, emptied. Duplicates are kept: two live imports of one image are two
+    // claims, and the ledger counts them.
+    std::vector<BufferClaims::Claim> removeAll();
+
+private:
+    std::mutex m_mutex;
+    std::vector<BufferClaims::Claim> m_claims;
+};
+
 }  // namespace wallpaperx

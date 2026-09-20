@@ -22,10 +22,14 @@
 // with opposite expectations: read in separate runs, a wait that was silently too short would
 // make the second pass and only the first fail, and the pair would still look like coverage.
 //
-// No scene graph and no window: the item is never parented into one. That is deliberate rather
-// than a shortcut -- joining a scene makes the item ask again by itself, which would be
-// indistinguishable from the timer this file is about -- and it also means the run needs no
-// OpenGL and skips on nothing but a missing bus.
+// A WINDOW WITH NO SCENE GRAPH RUNNING, which is an exact requirement of this file and not a
+// convenience. The item fetches only while it is on the screen -- in a window and visible -- so an
+// item parented into nothing never reaches the bus at all and every check here would grade a
+// silence the plugin is right to keep. The window is a QQuickRenderControl one that is never
+// initialised and never rendered into, so joining it costs exactly ONE fetch (the in-flight latch
+// coalesces the scene-change re-ask into the visibility one) and nothing afterwards can produce a
+// request but the retry timer this file is about. No OpenGL is needed and the run skips on nothing
+// but a missing bus.
 
 #include "tests/test_report.h"
 
@@ -40,6 +44,8 @@
 #include <QQmlEngine>
 #include <QQmlError>
 #include <QQuickItem>
+#include <QQuickRenderControl>
+#include <QQuickWindow>
 #include <QString>
 #include <QUrl>
 #include <QVariant>
@@ -136,10 +142,11 @@ Item {
 )");
 }
 
-// One item, standing on its own with no window. Returned rather than built inline so each phase
-// gets a fresh one: the retry timer belongs to the item, and a phase reusing the previous
-// phase's item would be reading a timer armed under the other answer.
-std::unique_ptr<QObject> makeItem(QQmlEngine& engine, const char* fileName) {
+// One item, parented into `window` so that it counts as on the screen and therefore fetches at
+// all. Returned rather than built inline so each phase gets a fresh one: the retry timer belongs
+// to the item, and a phase reusing the previous phase's item would be reading a timer armed under
+// the other answer.
+std::unique_ptr<QObject> makeItem(QQmlEngine& engine, QQuickWindow& window, const char* fileName) {
     QQmlComponent component(&engine);
     component.setData(qmlSource().toUtf8(),
                       QUrl::fromLocalFile(QCoreApplication::applicationDirPath() + QLatin1Char('/') +
@@ -149,7 +156,14 @@ std::unique_ptr<QObject> makeItem(QQmlEngine& engine, const char* fileName) {
         for (const QQmlError& error : component.errors()) {
             std::fprintf(stderr, "  qml: %s\n", qPrintable(error.toString()));
         }
+        return root;
     }
+    auto* rootItem = qobject_cast<QQuickItem*>(root.get());
+    if (rootItem == nullptr) {
+        wallpaperx::testing::harnessFailure("the QML root is not a QQuickItem, so it could not be put in a window");
+        return {};
+    }
+    rootItem->setParentItem(window.contentItem());
     return root;
 }
 
@@ -175,6 +189,14 @@ int main(int argc, char** argv) {
     QQmlEngine engine;
     engine.addImportPath(QString::fromUtf8(WALLPAPERX_QML_MODULE_PATH));
 
+    // A window the items live in, so that they count as being on the screen and fetch at all. Under
+    // a render control that is never initialised, so no scene-graph pass ever runs: the item asks
+    // for one on every hand-over and the answer must stay "nothing was drawn", or it would be
+    // driving its paint watch instead of its retry timer.
+    QQuickRenderControl control;
+    QQuickWindow window(&control);
+    window.setGeometry(0, 0, 64, 64);
+
     // How many times the item asked while it was being refused, carried out of the first phase so
     // the second phase's "it did not ask again" can be read against a number that is known to be
     // reachable. Without it the second phase's span could be too short and nobody would know.
@@ -184,7 +206,7 @@ int main(int argc, char** argv) {
     // NoFreeImage, with nothing on screen.
     // ---------------------------------------------------------------- //
     {
-        std::unique_ptr<QObject> root = makeItem(engine, "item_refusal_retry_refused.qml");
+        std::unique_ptr<QObject> root = makeItem(engine, window, "item_refusal_retry_refused.qml");
         // The module and the type are the plugin's own, so a load failure here is production's,
         // not this harness's -- and every check below is gated on it.
         // CONTROL: the import path replaced with a nonexistent directory -> `qml: ... module
@@ -226,16 +248,26 @@ int main(int argc, char** argv) {
         //       announcement of a freed image is sent when a consumer RELEASES one, and the
         //       consumer holding the ring is by definition one that has stopped releasing.
         //       Without this the screen stays on the backdrop until the user sets a wallpaper.
-        // WHY-THIS-SHAPE: no FrameReady is ever sent on this bus and the item is never put into a
-        //       scene, so the only thing that can produce a second request is the item's own
-        //       timer. The obvious shape -- send a FrameReady and check it re-fetches -- grades
-        //       the announcement path, which already has coverage, and would pass for a plugin
-        //       with no timer at all.
+        // WHY-THIS-SHAPE: no FrameReady is ever sent on this bus, and the window the item lives in
+        //       never runs a scene-graph pass, so nothing but the item's own timer can produce a
+        //       second request. The obvious shape -- send a FrameReady and check it re-fetches --
+        //       grades the announcement path, which already has coverage, and would pass for a
+        //       plugin with no timer at all.
+        // COVERAGE-ASSERT: the count at the moment the refusal was published is asserted to be
+        //       exactly one, so a harness that made the item ask repeatedly on its own -- by
+        //       rendering the scene, or by joining and leaving the window -- fails here rather
+        //       than crediting those asks to the timer.
         // CONTROL: `retryWhileNothingIsShown();` deleted from the NoFreeImage branch of
         //       WallpaperXItem::takeFrameReply (backend/kde/wallpaperx_item.cpp) -> "FAIL: and it
         //       asks again on its own, with nothing having told it to", printing that it stayed
         //       at 1 request. Reverted.
         const int askedWhenReported = stub.requests();
+        check(askedWhenReported == 1, "joining the window cost exactly one fetch, so a second is the timer's");
+        if (askedWhenReported != 1) {
+            std::fprintf(stderr, "  the item had asked %d time(s) before the retry window opened; something other "
+                                 "than the timer is driving it and this phase cannot attribute the next ask\n",
+                         askedWhenReported);
+        }
         const bool askedAgain = pumpUntil([&] { return stub.requests() > askedWhenReported; }, kRetryWindowMs);
         check(askedAgain, "and it asks again on its own, with nothing having told it to");
         if (!askedAgain) {
@@ -260,7 +292,7 @@ int main(int argc, char** argv) {
         // dispatches incoming messages while one is outstanding. Measured -- taken afterwards,
         // this count already included the request and the check below read zero.
         const int askedBefore = stub.requests();
-        std::unique_ptr<QObject> root = makeItem(engine, "item_refusal_retry_noframe.qml");
+        std::unique_ptr<QObject> root = makeItem(engine, window, "item_refusal_retry_noframe.qml");
         if (root == nullptr) {
             wallpaperx::testing::harnessFailure("the plugin's QML type instantiated once and then would not again");
             return wallpaperx::testing::reportNotVerifiedOrPassed();

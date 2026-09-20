@@ -599,9 +599,26 @@ if(WALLPAPERX_FFMPEG_EXECUTABLE)
         COMMENT "Generating video wallpaper fixture wallpaper_one_picture.mp4"
         VERBATIM
     )
+    # The same bands again, at one picture every four seconds. The gap is the point: it is longer
+    # than the interval after which the daemon decides nothing is collecting a monitor's pictures,
+    # so a daemon that measured that interval from the last HAND-OVER -- rather than from the oldest
+    # picture nobody has taken -- would call its own consumer gone between two pictures of this file
+    # and freeze it. Every other fixture here plays ten pictures a second, where the two rules agree.
+    # Three pictures, so the check crosses the gap twice without the entry taking a minute.
+    add_custom_command(
+        OUTPUT ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_slow.mp4
+        COMMAND ${WALLPAPERX_FFMPEG_EXECUTABLE} -y -v error
+                -f lavfi -i color=c=black:size=320x240:rate=1/4:duration=12
+                -vf "drawbox=x=0:y=0:w=320:h=60:color=0xFF0000@1:t=fill,drawbox=x=0:y=60:w=320:h=60:color=0x00FF00@1:t=fill,drawbox=x=0:y=120:w=320:h=60:color=0xFFFF00@1:t=fill,drawbox=x=0:y=180:w=320:h=60:color=0x0000FF@1:t=fill,format=yuv420p,setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv"
+                -c:v libx264 -profile:v baseline -g 1 -pix_fmt yuv420p -r 1/4
+                ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_slow.mp4
+        COMMENT "Generating video wallpaper fixture wallpaper_slow.mp4"
+        VERBATIM
+    )
     add_custom_target(wallpaperx-backend-video-fixtures
                       DEPENDS ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_bands.mp4
-                              ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_one_picture.mp4)
+                              ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_one_picture.mp4
+                              ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_slow.mp4)
 else()
     message(STATUS "  ffmpeg CLI: not found -- the video wallpaper fixture is not generated, and "
                    "video_wallpaper will report itself to ctest as a skip rather than a pass")
@@ -963,10 +980,10 @@ if(DBUS_RUN_SESSION)
             RESOURCE_LOCK wallpaperx_bus_tests
             SKIP_RETURN_CODE 77)
 
-        # The same item again, driven by a stub that only ever REFUSES. No scene graph and no
-        # window: the item is never parented into one, because joining a scene makes it ask again
-        # by itself and that is exactly what this entry has to tell apart from the retry timer.
-        # So the offscreen platform is fine here where the entries above cannot use it.
+        # The same item again, driven by a stub that only ever REFUSES. It lives in a window --
+        # an item that is not on the screen does not fetch at all -- but under a render control
+        # that is never initialised, so no scene-graph pass ever runs and no GL is needed. That is
+        # why the offscreen platform is fine here where the entries above cannot use it.
         add_executable(wallpaperx-item-refusal-retry-test tests/item_refusal_retry_test.cpp)
         target_link_libraries(wallpaperx-item-refusal-retry-test PRIVATE
             Qt6::Core Qt6::DBus Qt6::Gui Qt6::Qml Qt6::Quick)
@@ -1133,6 +1150,33 @@ if(DBUS_RUN_SESSION)
                          COMMAND ${DBUS_RUN_SESSION} --
                                  $<TARGET_FILE:wallpaperx-item-release-ledger-test> ${release_phase})
                 set_tests_properties(item_release_${release_phase} PROPERTIES
+                    ENVIRONMENT "QT_QPA_PLATFORM=wayland\;xcb\;offscreen;QT_NO_XDG_DESKTOP_PORTAL=1"
+                    RESOURCE_LOCK wallpaperx_bus_tests
+                    SKIP_RETURN_CODE 77)
+            endforeach()
+
+            # The same scene once more, for what the item does when it STOPS BEING ON THE SCREEN
+            # and for what it tells the daemon when the desktop stops drawing what it hands over.
+            # Two entries from one binary, each naming its phase, for item_release_ledger's reason:
+            # the plugin's release ledger and its record of which daemon it is talking to are
+            # process-wide singletons with no reset.
+            add_executable(wallpaperx-item-offscreen-test tests/item_offscreen_test.cpp)
+            target_link_libraries(wallpaperx-item-offscreen-test PRIVATE
+                wallpaperx-renderer wallpaperx-frame-import
+                Qt6::Core Qt6::DBus Qt6::Gui Qt6::Qml Qt6::Quick Qt6::QuickPrivate
+                PkgConfig::EGL OpenGL::GL)
+            target_include_directories(wallpaperx-item-offscreen-test PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../renderer/tests)
+            target_compile_definitions(wallpaperx-item-offscreen-test PRIVATE
+                WALLPAPERX_QML_MODULE_PATH="${CMAKE_CURRENT_BINARY_DIR}/qml"
+                WALLPAPERX_SHADER_DIR="${WALLPAPERX_SHADER_OUTPUT_DIR}"
+                WALLPAPERX_TEST_IMAGE_DIR="${WALLPAPERX_ITEM_ASSET_DIR}")
+            add_dependencies(wallpaperx-item-offscreen-test wallpaperxplugin wallpaperx-shaders)
+            foreach(offscreen_phase hidden painted)
+                add_test(NAME item_offscreen_${offscreen_phase}
+                         COMMAND ${DBUS_RUN_SESSION} --
+                                 $<TARGET_FILE:wallpaperx-item-offscreen-test> ${offscreen_phase})
+                set_tests_properties(item_offscreen_${offscreen_phase} PROPERTIES
                     ENVIRONMENT "QT_QPA_PLATFORM=wayland\;xcb\;offscreen;QT_NO_XDG_DESKTOP_PORTAL=1"
                     RESOURCE_LOCK wallpaperx_bus_tests
                     SKIP_RETURN_CODE 77)

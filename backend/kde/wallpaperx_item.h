@@ -12,6 +12,8 @@
 #include <QtGlobal>
 #include <QtQml/qqmlregistration.h>
 
+#include <atomic>
+#include <memory>
 #include <mutex>
 #include <optional>
 
@@ -135,6 +137,9 @@ private:
         FrameImport::Request request;
         quint64 generation = 0;
         BufferClaims::Claim claim;
+        // Where the claim is registered, so dropping this frame gives the image back only if the
+        // item has not already done so on its way off the screen.
+        std::shared_ptr<ClaimSet> claims;
 
         PendingFrame() = default;
         ~PendingFrame();
@@ -149,7 +154,9 @@ private:
     bool subscribeToFrameReady();
     // Installs the ImportModifiersChanged match rule. False when the bus refused it.
     bool subscribeToImportModifiersChanged();
-    // Drops every generation mark together. See the definition for why they go as a set.
+    // Drops every generation mark and the frame they describe. See the definition for why they go
+    // as a set. discardHeldFrame() is the same without publishing, for the paths that must not.
+    void discardHeldFrame();
     void forgetGenerations();
     void fetchFrame(quint64 generation);
     // Asks only when this item neither holds a reply nor has a request out. The scene-change
@@ -187,6 +194,29 @@ private:
     void scheduleSizeReport();
     void reportSize();
 
+    // Recomputes whether this item is on the screen at all -- in a window and visible -- and acts
+    // on the change. See the definition for what leaving costs. GUI thread.
+    void updateOnScreen();
+
+    // Gives back every image this item still holds, and drops the frame it had not yet imported.
+    // Does not wait for the reads to finish; see the definition. GUI thread, and the destructor.
+    void releaseHeldImages();
+
+    // Stops presenting the image releaseHeldImages() gave back, by asking the next scene graph pass
+    // to destroy the node. GUI thread, and never from the destructor: it publishes to QML.
+    void dropShownFrame();
+
+    // Starts the watch that answers whether the desktop is drawing what this item hands it, if it
+    // is not already running. Armed wherever the daemon answers a fetch, served or refused -- a
+    // covered screen produces refusals, since a scene graph that has stopped running frees no
+    // image to be handed the next one. Once it finds no passes it keeps itself going.
+    void armPaintWatch();
+    void checkPainting();
+
+    // Tells the daemon whether this screen's wallpaper can be seen, when the answer changes.
+    // GUI thread.
+    void reportVisible();
+
     int m_monitorId = -1;
     QString m_output;  // GUI thread only
     // Settles the size before it is reported: a login lays the item out, exposes the window and
@@ -196,6 +226,35 @@ private:
     // wherever the daemon may have lost it: a restart, or a monitor change, which can mean the
     // name was unbound and bound again in between. GUI thread only.
     std::optional<SizeReport> m_sizeReported;
+
+    // Whether this item is in a window and visible, which is Qt's answer, and whether the scene
+    // graph is actually painting it, which is the compositor's -- Qt goes on calling an occluded
+    // window's item visible. What the daemon is told is the two together: a wallpaper nobody can
+    // see is one it need not keep decoding. GUI thread only.
+    bool m_onScreen = false;
+    bool m_painting = true;
+    // The last answer the daemon accepted, so an unchanged one is not sent again. Empty wherever
+    // the daemon may have lost it, as the size report is.
+    std::optional<bool> m_visibleReported;
+    QTimer m_paintWatch;
+    quint64 m_paintMark = 0;   // the count when the watch was last armed
+    // One window has ended with no pass and another has been asked for. A single empty window is
+    // equally consistent with a pass that was merely late, and acting on it stalls a video the
+    // user is watching.
+    bool m_paintUnconfirmed = false;
+    // How long the next probe waits, doubling while the screen stays dark. Reset whenever the watch
+    // is armed afresh, so a short absence is still noticed within kPaintProbeMs of coming back.
+    int m_probeMs = 250;
+    // Passes the scene graph has run for this item. Written by the render thread and read by the
+    // GUI thread, which is the whole point: it is the one fact that says whether what this item
+    // hands over is being put on the screen.
+    std::atomic<quint64> m_paintCount{0};
+
+    // The claims this item's imports hold. Shared with the textures built from them, which the
+    // scene graph destroys on the render thread and after this item is gone. Replaced, never
+    // reused, when the item leaves the screen: a holder left over from before then finds its own
+    // set empty rather than a claim on the same ring slot taken since.
+    std::shared_ptr<ClaimSet> m_claims = std::make_shared<ClaimSet>();
     // The newest generation this item has fetched, so a signal for a frame already in hand
     // costs nothing. GUI thread only, like everything else the fetch path touches.
     quint64 m_fetchedGeneration = 0;
@@ -227,6 +286,9 @@ private:
     // anything (a daemon restart, a monitor change) while the node keeps drawing what it has.
     // Cleared where the node dies, not where generations are invalidated.
     bool m_nodeHasFrame = false;  // guarded by m_importedMutex
+    // The node is showing an image this item no longer holds a claim on, so the next pass must
+    // destroy it. Only the render thread can, which is why this is a request and not a call.
+    bool m_dropNode = false;  // guarded by m_importedMutex
     // Bumped every time the marks are invalidated, so the render thread can tell whether the
     // shown generation it read is still the one it is about to write back to.
     quint64 m_generationEpoch = 0;  // guarded by m_importedMutex

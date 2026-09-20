@@ -27,10 +27,12 @@
 
 #include <QCoreApplication>
 #include <QObject>
+#include <QQmlAbstractUrlInterceptor>
 #include <QQmlContext>
 #include <QQmlEngine>
 #include <QString>
 #include <QTranslator>
+#include <QUrl>
 
 #include <httplib.h>
 
@@ -269,6 +271,38 @@ private:
     bool m_installed = false;
 };
 
+// Makes `com.wallpaperx` unloadable in this process, whatever is installed on the machine.
+//
+// Three of the cases below rest on the renderer module NOT loading -- the one that grades what
+// main.qml does when the Loader reaches Loader.Error, and two that read the backdrop while the
+// Loader is not Ready. That used to be true by accident, because a test binary's import path does
+// not include the module it is built beside. It stopped being true the moment the plugin was
+// installed system-wide for a live desktop test: Qt searches /usr/lib/qt6/qml, the import
+// succeeded, and the Loader.Error case failed with "Actual 1, Expected 3" on a build whose
+// behaviour was correct. A check whose verdict depends on what is installed on the developer's
+// machine grades the machine.
+//
+// Rewriting the qmldir URL is what makes it deterministic in the direction the cases need. The
+// obvious alternative -- trimming /usr/lib/qt6/qml out of the engine's import path -- cannot be
+// used: QtQuick, QtTest and the Plasma modules all live there, so the whole file would stop
+// loading.
+class BlockRendererModule : public QObject, public QQmlAbstractUrlInterceptor {
+    Q_OBJECT
+public:
+    QUrl intercept(const QUrl& path, DataType type) override {
+        if (type != QmldirFile || !path.toString().contains(QLatin1String("com/wallpaperx"))) return path;
+        ++m_blocked;
+        return QUrl::fromLocalFile(QStringLiteral("/nonexistent/wallpaperx-module-blocked-by-this-test/qmldir"));
+    }
+
+    // Read by the Loader.Error case: a run where no candidate qmldir was ever rewritten is one
+    // where this class did nothing, and its verdict would be about the machine again.
+    Q_INVOKABLE int blocked() const { return m_blocked; }
+
+private:
+    int m_blocked = 0;
+};
+
 class Setup : public QObject {
     Q_OBJECT
 
@@ -284,9 +318,11 @@ public slots:
     }
 
     void qmlEngineAvailable(QQmlEngine* engine) {
+        engine->addUrlInterceptor(&m_blockRenderer);
         engine->rootContext()->setContextProperty(QStringLiteral("stubDaemon"), &m_stub);
         m_translation.setEngine(engine);
         engine->rootContext()->setContextProperty(QStringLiteral("translationProbe"), &m_translation);
+        engine->rootContext()->setContextProperty(QStringLiteral("moduleBlock"), &m_blockRenderer);
     }
 
     // Belt and braces: a case that failed between installing and removing would otherwise leave
@@ -299,6 +335,7 @@ public slots:
 private:
     StubDaemon m_stub;
     TranslationProbe m_translation;
+    BlockRendererModule m_blockRenderer;
 };
 
 }  // namespace

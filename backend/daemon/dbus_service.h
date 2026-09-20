@@ -57,6 +57,12 @@ private:
     // when that changes. Accepted means recorded, not saved: see WallpaperManager::setOutputSize.
     void setOutputSize(const std::string& outputName, uint32_t width, uint32_t height);
 
+    // Records whether the screen named `outputName` is being drawn at all -- not behind a lock
+    // screen, a fullscreen window or another session. The daemon cannot see any of that, and a
+    // video whose screen is not drawn stops until this says otherwise, so the worker is woken
+    // either way: it is what recomputes what plays.
+    void setOutputVisible(const std::string& outputName, bool visible);
+
     void emitFrameReady(int monitorId, uint64_t generation);
 
     // Announces frames that already exist, after an image came free. Same signal as a new

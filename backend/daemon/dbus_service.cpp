@@ -152,6 +152,11 @@ void DbusService::registerVTable() {
                     setOutputSize(outputName, width, height);
                 })
                 .withInputParamNames("output_name", "width", "height"),
+            sdbus::registerMethod("SetOutputVisible")
+                .implementedAs([this](const std::string& outputName, bool visible) {
+                    setOutputVisible(outputName, visible);
+                })
+                .withInputParamNames("output_name", "visible"),
             sdbus::registerMethod("GetStatus").implementedAs([this]() { return getStatus(); }).withOutputParamNames("status"),
             // frame_generation rides along with the monitor id. A bare FrameReady(monitor)
             // was unambiguous only while rendering was synchronous; now that several
@@ -297,6 +302,27 @@ void DbusService::setOutputSize(const std::string& outputName, uint32_t width, u
     }
 
     for (const int id : redraw) m_worker.post(id);
+}
+
+void DbusService::setOutputVisible(const std::string& outputName, bool visible) {
+    std::printf("wallpaperx-daemon: SetOutputVisible(output=%s, visible=%s)\n", sanitizeForLog(outputName).c_str(),
+                visible ? "true" : "false");
+    std::fflush(stdout);
+
+    try {
+        m_manager.setOutputVisible(outputName, visible);
+    } catch (const UnknownOutput& e) {
+        std::fprintf(stderr, "wallpaperx-daemon: SetOutputVisible rejected: %s\n", e.what());
+        throw sdbus::Error(sdbus::Error::Name{kErrorUnknownOutput}, e.what());
+    } catch (const InvalidRequest& e) {
+        std::fprintf(stderr, "wallpaperx-daemon: SetOutputVisible rejected: %s\n", e.what());
+        throw sdbus::Error(sdbus::Error::Name{kErrorInvalidArgs}, e.what());
+    }
+
+    // What resumes a video stopped because nothing could see it. No render is posted: the monitor
+    // still holds the picture it stopped on, and the clock round this wake runs is what decides
+    // whether anything has to be drawn or reopened.
+    m_worker.wake();
 }
 
 void DbusService::releaseBuffer(const std::string& client, int32_t monitorId, uint64_t bufferId) {
@@ -513,6 +539,22 @@ std::string DbusService::getStatus() {
         // Why a consumer sees no new frame while this monitor keeps committing them: its images
         // are not coming back. Always emitted, like the count above, which cannot report this.
         entry["refused_handovers"] = monitor.refusedHandovers;
+        // Who is holding which image. The count above says a hand-over was refused; only this says
+        // by whom it is being kept, which is the whole diagnosis of a screen that has stopped --
+        // an image is given back by its holder or by that holder leaving the bus, and by nothing
+        // else. Names are bus-assigned but escaped like every other string that came from outside
+        // this process.
+        nlohmann::json holders = nlohmann::json::array();
+        for (const BufferHold& hold : monitor.holds) {
+            holders.push_back({{"client", sanitizeForLog(hold.client, 256, LogFraming::Bare)},
+                               {"buffers", hold.buffers}});
+        }
+        entry["holders"] = std::move(holders);
+        // Why a video has stopped moving, in the two facts it is decided from: what the screen
+        // last said about being drawn, and whether anything has taken a picture off this monitor
+        // recently. A stopped wallpaper reads identically in every other field.
+        entry["screen_visible"] = monitor.screenVisible;
+        entry["watched"] = monitor.watched;
         wallpapers[std::to_string(monitorId)] = std::move(entry);
     }
     status["wallpapers"] = wallpapers;

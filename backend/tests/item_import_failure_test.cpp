@@ -304,10 +304,12 @@ int main(int argc, char** argv) {
         // WHY-THIS-SHAPE: bounded, with an explicit failure branch, and everything below is gated
         //       on it. Falling through on the timeout would let a never-fetching item be graded on
         //       whatever state it was left in.
-        // CONTROL: `if (m_monitorId < 0) return;` widened to `< 1000` in
+        // CONTROL: `if (m_monitorId < 0 || !m_onScreen) return;` widened to `m_monitorId < 1000` in
         //       WallpaperXItem::fetchFrame in backend/kde/wallpaperx_item.cpp
         //       -> "FAIL: the item asked the stub daemon for a frame", after 5s, and the checks
-        //       below did not run. Observed 2026-08-21. Reverted.
+        //       below did not run. Observed 2026-08-21; re-run 2026-09-20 under the Stage E4
+        //       spelling of that guard, which now also tests whether the item is on the screen.
+        //       Reverted.
         const bool asked = pumpUntil([&stub] { return stub.requests() > 0; }, 5000);
         check(asked, "the item asked the stub daemon for a frame");
         // A stub that could not build its reply is this file's fault, not the plugin's, and is

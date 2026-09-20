@@ -73,6 +73,19 @@ constexpr const char* kErrorRenderFailed = "io.wallpaperx.Daemon.Error.RenderFai
 // is redrawn before anyone looks for it.
 constexpr int kSizeReportSettleMs = 250;
 
+// How long after handing the scene graph a frame this item waits before deciding the desktop is
+// not drawing it. A pass normally follows within one display frame; a second is far past any sync
+// that ran long, and it is what a wallpaper costs after a screen locks before it stops.
+constexpr int kPaintDeadlineMs = 1000;
+
+// How soon an item that believes it is not being drawn asks for a pass to find out whether it is
+// again: the delay before a wallpaper starts moving after the screen comes back.
+constexpr int kPaintProbeMs = 250;
+
+// Where the doubling stops. A screen can stay dark for hours, and this is the wake-up rate that
+// costs; two seconds is the longest a wallpaper should take to start moving again once it is back.
+constexpr int kPaintProbeMaxMs = 2000;
+
 }  // namespace
 
 namespace {
@@ -367,17 +380,26 @@ void releaseClaimWhenReadsFinish(const BufferClaims::Claim& claim) noexcept {
     }
 }
 
+// A frame that was never imported, so nothing is reading it and the release needs no fence.
+// Silent when the item has already given this image back on its way off the screen.
+void releaseUnimported(const std::shared_ptr<ClaimSet>& claims, const BufferClaims::Claim& claim) noexcept {
+    if (claims && claims->remove(claim)) releaseClaim(claim);
+}
+
 }  // namespace
 
 WallpaperXItem::PendingFrame::~PendingFrame() {
     closeDescriptors(request);
-    releaseClaim(claim);
+    releaseUnimported(claims, claim);
 }
 
 // Moved, not copied. Request holds a std::vector, so copying it can throw -- and a throw out of
 // a noexcept function is std::terminate, here inside plasmashell.
 WallpaperXItem::PendingFrame::PendingFrame(PendingFrame&& other) noexcept
-    : request(std::move(other.request)), generation(other.generation), claim(other.claim) {
+    : request(std::move(other.request)),
+      generation(other.generation),
+      claim(other.claim),
+      claims(std::move(other.claims)) {
     disownDescriptors(other.request);
     other.claim = {};
 }
@@ -385,10 +407,11 @@ WallpaperXItem::PendingFrame::PendingFrame(PendingFrame&& other) noexcept
 WallpaperXItem::PendingFrame& WallpaperXItem::PendingFrame::operator=(PendingFrame&& other) noexcept {
     if (this != &other) {
         closeDescriptors(request);
-        releaseClaim(claim);
+        releaseUnimported(claims, claim);
         request = std::move(other.request);
         generation = other.generation;
         claim = other.claim;
+        claims = std::move(other.claims);
         disownDescriptors(other.request);
         other.claim = {};
     }
@@ -411,14 +434,22 @@ WallpaperXItem::WallpaperXItem(QQuickItem* parent) : QQuickItem(parent) {
     setFlag(ItemHasContents, true);
     m_sizeReportTimer.setSingleShot(true);
     connect(&m_sizeReportTimer, &QTimer::timeout, this, &WallpaperXItem::reportSize);
+    m_paintWatch.setSingleShot(true);
+    connect(&m_paintWatch, &QTimer::timeout, this, &WallpaperXItem::checkPainting);
     connectToDaemon();
 }
 
-WallpaperXItem::~WallpaperXItem() = default;
+// A QML item can be destroyed while still parented and visible, and nothing else would ever tell
+// the daemon what it was holding.
+WallpaperXItem::~WallpaperXItem() { releaseHeldImages(); }
 
 void WallpaperXItem::setMonitorId(int monitorId) {
     if (m_monitorId == monitorId) return;
     m_monitorId = monitorId;
+
+    // QML sets this once the item is in the scene, so it is also the last point at which a scene
+    // change this item never heard about would still leave it fetching nothing for ever.
+    updateOnScreen();
 
     forgetGenerations();
     m_sizeReported.reset();
@@ -433,11 +464,164 @@ void WallpaperXItem::setMonitorId(int monitorId) {
 void WallpaperXItem::setOutput(const QString& output) {
     if (m_output == output) return;
     m_output = output;
+    // Both reports are filed under the screen's name, so neither says anything about the new one.
+    m_sizeReported.reset();
+    m_visibleReported.reset();
     emit outputChanged();
     scheduleSizeReport();
 }
 
 void WallpaperXItem::scheduleSizeReport() { m_sizeReportTimer.start(kSizeReportSettleMs); }
+
+void WallpaperXItem::releaseHeldImages() {
+    // The frame in hand goes with the claims, and before them: an image the daemon has been told
+    // is free must not be left importable by the next pass. The one teardown both this and a
+    // monitor change use, so the marks they invalidate cannot drift apart.
+    discardHeldFrame();
+
+    // Retired, not emptied: a claim is matched by which image it names, and ring slots hand the
+    // same id out again, so a texture that dies after this must not find a claim taken since and
+    // give back an image being displayed. Holders keep a reference to the set they were added to,
+    // and this one will never be added to again.
+    const std::shared_ptr<ClaimSet> retired = std::exchange(m_claims, std::make_shared<ClaimSet>());
+
+    // Unfenced: this runs on the GUI thread with no graphics context, and the fence would be
+    // placed by a pass that may never run for this item again. The cost is that the daemon may
+    // redraw an image whose last queued read has not retired.
+    for (const BufferClaims::Claim& claim : retired->removeAll()) releaseClaim(claim);
+}
+
+// The node is a live reader of an image the daemon now counts as free, so showing it again would
+// sample memory the next picture is being drawn into -- and only a scene graph pass, with the
+// context current, can free the texture that holds it.
+void WallpaperXItem::dropShownFrame() {
+    {
+        std::lock_guard<std::mutex> lock(m_importedMutex);
+        m_shownGeneration = 0;
+        m_nodeHasFrame = false;
+        m_dropNode = true;
+    }
+    publishReason();
+    update();
+}
+
+// Qt's answer to whether this item is on the screen. An item that is not has nothing to show and
+// nothing to hold: it gives its images back, since the daemon keys a hold on this process and
+// cannot tell that the item holding it is gone, so images it stops showing would stay out of the
+// monitor's ring for the session and every later hand-over would be refused.
+void WallpaperXItem::updateOnScreen() {
+    const bool onScreen = window() != nullptr && isVisible();
+    if (onScreen == m_onScreen) return;
+    m_onScreen = onScreen;
+
+    if (!m_onScreen) {
+        m_paintWatch.stop();
+        releaseHeldImages();
+        dropShownFrame();
+        reportVisible();
+        return;
+    }
+    // Assumed to be painted until a frame handed over proves otherwise, so a wallpaper resumes
+    // without waiting out an interval. The fetch is forced: the item gave up what it was showing
+    // on the way out, and the daemon may have announced nothing meanwhile.
+    m_painting = true;
+    m_paintUnconfirmed = false;
+    reportVisible();
+    fetchFrame(0);
+    // Not left to the dirty mark set on the way out: a window teardown between the two would drop
+    // it, and nothing else asks for the pass that frees the node.
+    update();
+}
+
+void WallpaperXItem::armPaintWatch() {
+    if (m_paintWatch.isActive()) return;
+    m_paintMark = m_paintCount.load(std::memory_order_relaxed);
+    m_paintUnconfirmed = false;
+    m_probeMs = kPaintProbeMs;
+    m_paintWatch.start(m_painting ? kPaintDeadlineMs : m_probeMs);
+    // What the deadline measures is a pass this item asked for. Without this, a stretch with no new
+    // frame -- an item being refused images, which is exactly what a dark screen produces -- reads
+    // as a desktop that has stopped drawing, and the daemon is told to stop a video the user is
+    // watching.
+    update();
+}
+
+// Whether the desktop drew anything this item handed it since the watch was armed. The only
+// signal there is for a screen that is locked, covered by a fullscreen window or belongs to
+// another session: the compositor stops asking for frames, so the scene graph stops running, and
+// nothing else in this process is told why.
+void WallpaperXItem::checkPainting() {
+    const quint64 painted = m_paintCount.load(std::memory_order_relaxed);
+    const bool drew = painted != m_paintMark;
+    m_paintMark = painted;
+
+    // One empty window is not evidence: a visible desktop can miss a pass for a second during a
+    // reconfigure or a mode change, and telling the daemon then costs a visible freeze and, past
+    // the idle release, the video's place in the file. So the first empty window only asks for
+    // another pass; the answer stands when the window this code explicitly requested is empty too.
+    if (drew) {
+        m_painting = true;
+        m_paintUnconfirmed = false;
+    } else if (m_painting && !m_paintUnconfirmed) {
+        m_paintUnconfirmed = true;
+    } else {
+        m_painting = false;
+    }
+
+    reportVisible();
+    if (!m_onScreen) return;
+    // Nothing left to watch until the next hand-over arms it again.
+    if (m_painting && !m_paintUnconfirmed) return;
+
+    // Asking for a pass is what makes the next check mean something, and it is free exactly while
+    // this holds: a window the compositor is not driving does not render. Backed off all the same,
+    // since that is an assumption about the compositor and a screen can stay dark all night.
+    update();
+    m_paintWatch.start(m_probeMs);
+    m_probeMs = std::min(m_probeMs * 2, kPaintProbeMaxMs);
+}
+
+void WallpaperXItem::reportVisible() {
+    const bool visible = m_onScreen && m_painting;
+    if (m_output.isEmpty() || m_visibleReported == visible) return;
+
+    QDBusConnection bus = QDBusConnection::sessionBus();
+    if (!bus.isConnected()) {
+        // The watch is what asks again, and nothing else would: a screen whose report never landed
+        // gets no pictures, and no pictures means no hand-over to arm it.
+        armPaintWatch();
+        return;
+    }
+    QDBusMessage request = QDBusMessage::createMethodCall(QString::fromUtf8(kService), QString::fromUtf8(kPath),
+                                                          QString::fromUtf8(kInterface),
+                                                          QStringLiteral("SetOutputVisible"));
+    request.setArguments({m_output, visible});
+    m_visibleReported = visible;
+
+    auto* watcher = new QDBusPendingCallWatcher(bus.asyncCall(request), this);
+    connect(watcher, &QDBusPendingCallWatcher::finished, this, [this, visible](QDBusPendingCallWatcher* done) {
+        done->deleteLater();
+        // Nothing to undo after a success, or once a newer answer has replaced this one.
+        if (!done->isError() || m_visibleReported != visible) return;
+        m_visibleReported.reset();
+        const QString name = done->error().name();
+        if (name == QLatin1String(kErrorUnknownOutput)) {
+            // The size report's success is what says the daemon can place this screen, and it is
+            // not sent again while the size has not changed -- so the retry it already has for an
+            // unnamed screen is re-opened here rather than left suppressed.
+            m_sizeReported.reset();
+            if (!m_sizeReportTimer.isActive()) m_sizeReportTimer.start(kRefusedRetryMs);
+            return;
+        }
+        // No daemon: its arrival reports again, through the owner watcher.
+        if (name == QLatin1String("org.freedesktop.DBus.Error.ServiceUnknown")) return;
+        std::fprintf(stderr, "wallpaperx: the daemon refused this screen's visibility -- %s\n",
+                     sanitizeForLog(done->error().message().toStdString()).c_str());
+        // Anything else -- a busy daemon, a timeout -- has no other retry: the watch recomputes the
+        // answer and sends it again, and stops once one is accepted.
+        armPaintWatch();
+    });
+}
 
 // Measured on this item, not on its QScreen: the item is what the frame is stretched over, and on
 // Wayland a fractional scale belongs to the window while QScreen carries the output's integer one.
@@ -461,8 +645,15 @@ void WallpaperXItem::reportSize() {
     auto* watcher = new QDBusPendingCallWatcher(bus.asyncCall(request), this);
     connect(watcher, &QDBusPendingCallWatcher::finished, this, [this, report](QDBusPendingCallWatcher* done) {
         done->deleteLater();
-        // Nothing to undo after a success, or once a newer report has replaced this one.
-        if (!done->isError() || !(m_sizeReported == report)) return;
+        if (!done->isError()) {
+            // The daemon answers to this screen by name now, which is what a visibility report
+            // needs and the only thing that says when it has one -- so this is where a report the
+            // daemon could not place is sent again.
+            reportVisible();
+            return;
+        }
+        // Nothing to undo once a newer report has replaced this one.
+        if (!(m_sizeReported == report)) return;
         m_sizeReported.reset();
 
         const QString name = done->error().name();
@@ -486,10 +677,11 @@ void WallpaperXItem::reportSize() {
     });
 }
 
-// Every generation mark at once. Generations belong to one monitor and one daemon instance, so a
-// change of either invalidates all of them -- resetting some and not the rest is what made a
-// restarted daemon's frames read as older than the screen.
-void WallpaperXItem::forgetGenerations() {
+// Every generation mark at once, and the frame they describe. Generations belong to one monitor
+// and one daemon instance, so a change of either invalidates all of them -- resetting some and not
+// the rest is what made a restarted daemon's frames read as older than the screen. The epoch bump
+// is what makes a pass that is importing right now discard its write-back.
+void WallpaperXItem::discardHeldFrame() {
     m_fetchedGeneration = 0;
     m_retriedGeneration = 0;
     // Destroyed outside the lock: giving its claim back reaches the bus, and m_pendingMutex is
@@ -505,6 +697,10 @@ void WallpaperXItem::forgetGenerations() {
         m_shownGeneration = 0;
         ++m_generationEpoch;
     }
+}
+
+void WallpaperXItem::forgetGenerations() {
+    discardHeldFrame();
     publishReason();
 }
 
@@ -594,6 +790,9 @@ void WallpaperXItem::connectToDaemon() {
                 // granted it, and the next daemon starts its buffer ids over from one.
                 noteDaemonOwner(newOwner);
                 m_sizeReported.reset();
+                // A new daemon takes every screen to be drawn until it is told otherwise, and one
+                // that has gone remembers nothing.
+                m_visibleReported.reset();
                 if (newOwner.isEmpty()) {
                     setFetchReason(tr("WallpaperX is not running."));
                     return;
@@ -628,7 +827,9 @@ void WallpaperXItem::ensureFrameRequested() {
 }
 
 void WallpaperXItem::fetchFrame(quint64 generation) {
-    if (m_monitorId < 0) return;
+    // Nothing to do with a frame while this item is not on the screen, and every one fetched would
+    // take an image out of the daemon's ring for a wallpaper nobody is looking at.
+    if (m_monitorId < 0 || !m_onScreen) return;
 
     // Already have this frame, or a newer one. Asking is not free: a bus round trip, an export
     // by the daemon, a dup() here. A signal for a frame already fetched is ordinary.
@@ -837,6 +1038,11 @@ void WallpaperXItem::takeFrameReply(int monitorId, const QDBusMessage& call) {
         // the announcement it would otherwise wait for is sent when some consumer releases an
         // image -- which a consumer that has stopped releasing never does.
         if (name == QLatin1String(kErrorNoFreeImage)) {
+            // A refusal is a hand-over the daemon answered, so it says as much about whether the
+            // desktop is drawing as a served one does -- and it is what this item gets once the
+            // screen goes dark, because a scene graph that has stopped running never destroys a
+            // texture and so never frees an image to be handed the next one.
+            armPaintWatch();
             if (m_frameShown) {
                 setFetchReason(QString());
             } else {
@@ -868,6 +1074,14 @@ void WallpaperXItem::takeFrameReply(int monitorId, const QDBusMessage& call) {
     // the claim is what makes that automatic.
     frame.request.bufferId = grantedBufferId(call);
     frame.claim = BufferClaims::instance().take(monitorId, frame.request.bufferId, g_daemonOwner.toStdString());
+    // Registered before anything else can fail, for the same reason the claim is taken first: from
+    // here the set is what owes this image back, whichever path drops it.
+    frame.claims = m_claims;
+    m_claims->add(frame.claim);
+
+    // Left the screen while the request was out. The hold the daemon recorded is given straight
+    // back by `frame` going out of scope, since nothing else ends it.
+    if (!m_onScreen) return;
 
     frame.request.fd = ::dup(args.at(0).value<QDBusUnixFileDescriptor>().fileDescriptor());
     frame.request.width = args.at(1).toUInt();
@@ -948,15 +1162,38 @@ void WallpaperXItem::takeFrameReply(int monitorId, const QDBusMessage& call) {
     superseded.reset();
     setFetchReason(QString());
     update();
+    // A hand-over is what makes "is this desktop drawing what I give it" a question with an answer.
+    armPaintWatch();
 }
 
 QSGNode* WallpaperXItem::updatePaintNode(QSGNode* old, UpdatePaintNodeData*) {
     auto* node = static_cast<QSGSimpleTextureNode*>(old);
 
+    // An image this item has given back must stop being presented, and only a pass with the context
+    // current can free the texture that holds it. Taken before the window checks, so a pass that
+    // returns early does not leave the request standing for the next one to act on late.
+    bool dropNode = false;
+    {
+        std::lock_guard<std::mutex> lock(m_importedMutex);
+        dropNode = std::exchange(m_dropNode, false);
+        // Cleared here too: a pass that was already importing when the drop was asked for writes
+        // "a node is drawing" back afterwards, and this is the pass that makes that untrue.
+        if (dropNode) {
+            m_shownGeneration = 0;
+            m_nodeHasFrame = false;
+        }
+    }
+    if (dropNode) {
+        delete node;
+        node = nullptr;
+        // The render thread must not emit, so the published reason is recomputed on the item's own.
+        QMetaObject::invokeMethod(this, [this] { publishReason(); }, Qt::QueuedConnection);
+    }
+
     // No window or no interface is transient -- a reparent in progress -- so nothing is reported
     // and nothing is torn down; the next sync pass has one.
     QQuickWindow* host = window();
-    if (host == nullptr || host->rendererInterface() == nullptr) return old;
+    if (host == nullptr || host->rendererInterface() == nullptr) return node;
 
     // The scene graph can be running on Vulkan, Metal, D3D or software, and this import path is
     // OpenGL only. Checked every pass rather than once, because the window can change.
@@ -976,6 +1213,11 @@ QSGNode* WallpaperXItem::updatePaintNode(QSGNode* old, UpdatePaintNodeData*) {
         }
         return nullptr;
     }
+
+    // Counted past the backend check, and only there: what the GUI thread is waiting on is a pass
+    // this item could have presented in, and on a scene graph that cannot import at all every
+    // forced pass would otherwise read as a desktop drawing the wallpaper it can never show.
+    m_paintCount.fetch_add(1, std::memory_order_relaxed);
 
     // The epoch is read BEFORE the frame is claimed, not after. forgetGenerations() clears
     // m_pending and bumps the epoch under two separate locks, in that order, so an epoch read
@@ -1083,9 +1325,12 @@ QSGNode* WallpaperXItem::updatePaintNode(QSGNode* old, UpdatePaintNodeData*) {
             // daemon first invites it to draw into memory this process is still reading.
             QObject::connect(
                 texture, &QObject::destroyed, texture,
-                [imported, claim = std::exchange(incoming->claim, BufferClaims::Claim{})] {
+                [imported, claims = incoming->claims, claim = std::exchange(incoming->claim, BufferClaims::Claim{})] {
                     FrameImport::release(imported);
-                    releaseClaimWhenReadsFinish(claim);
+                    // Silent if the item gave this image back on its way off the screen: it is the
+                    // same claim, and releasing it twice would free an image a second reader of
+                    // this process still holds.
+                    if (claims && claims->remove(claim)) releaseClaimWhenReadsFinish(claim);
                 },
                 Qt::DirectConnection);
             // Destroys the texture it replaces, which is what runs the handler above for the
@@ -1142,7 +1387,13 @@ void WallpaperXItem::itemChange(ItemChange change, const ItemChangeData& value) 
         scheduleSizeReport();
         return;
     }
-    if (change != ItemSceneChange || value.window == nullptr) return;
+    if (change == ItemVisibleHasChanged) {
+        updateOnScreen();
+        return;
+    }
+    if (change != ItemSceneChange) return;
+    updateOnScreen();
+    if (value.window == nullptr) return;
     ensureFrameRequested();
     scheduleSizeReport();
 }

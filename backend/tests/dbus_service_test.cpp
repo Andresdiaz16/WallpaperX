@@ -764,6 +764,14 @@ void runHostChecks(sdbus::IProxy& proxy, const std::string& imagePath, const Che
         //       "w" -> "FAIL: wire signature of method SetOutputSize is unchanged", printing `u:width(in)`
         //       against `u:w(in)`. Reverted.
         {"method", "SetOutputSize", ArgList{{"in", "s:output_name"}, {"in", "u:width"}, {"in", "u:height"}}},
+        // A boolean and not, say, a reason string: the daemon acts on one bit -- a screen that is
+        // being drawn or one that is not -- and why it is dark is the desktop's business.
+        // CONTROL: the second name in `.withInputParamNames("output_name", "visible")` on
+        //       SetOutputVisible in DbusService::registerVTable (backend/daemon/dbus_service.cpp)
+        //       changed to "shown" -> "FAIL: wire signature of method SetOutputVisible is
+        //       unchanged", printing expected `b:visible(in)` against actual `b:shown(in)`.
+        //       Observed 2026-09-20. Reverted.
+        {"method", "SetOutputVisible", ArgList{{"in", "s:output_name"}, {"in", "b:visible"}}},
         {"method", "GetStatus", ArgList{{"out", "s:status"}}},
         // A signal's args carry no direction attribute, hence the empty first field.
         {"signal", "FrameReady", ArgList{{"", "i:monitor_id"}, {"", "t:frame_generation"}}},
@@ -5303,6 +5311,7 @@ void runOutputSizeWireChecks(const wallpaperx::WallpaperManager::Config& config,
                              const Check& check) {
     using wallpaperx::testing::setMonitorOutput;
     using wallpaperx::testing::setOutputSize;
+    using wallpaperx::testing::setOutputVisible;
 
     PhaseDeviceGrade grade("the output-size wire phase", check);
     wallpaperx::testing::FrameReadyLog signals;
@@ -5567,6 +5576,60 @@ void runOutputSizeWireChecks(const wallpaperx::WallpaperManager::Config& config,
     check(signals.countOf(kMonitorSizeLostFile, 2) == 0 &&
               wallpaperStatus(getStatusOrExplain(*proxy), std::to_string(kMonitorSizeLostFile)) != nullptr,
           "and the failed redraw is not retried");
+
+    // GOAL: S13.161 over the wire -- SetOutputVisible takes the same name discipline as SetOutputSize
+    //       (an unusable name is InvalidArgs, a name no monitor answers to is UnknownOutput), a bound
+    //       name is accepted either way round, and GetStatus's `screen_visible` reports back what was
+    //       last said about that screen. False for a daemon that accepts a name it cannot place --
+    //       which would leave the desktop believing it had reported a dark screen that nothing acted
+    //       on -- and false for one whose status cannot say why a wallpaper stopped moving.
+    // WHY-THIS-SHAPE: the report is read back out of GetStatus rather than only checked for "no error",
+    //       because an accepted call that recorded nothing answers identically. The pair false-then-true
+    //       is asserted in both directions on one screen, so a status field wired to a constant fails
+    //       on one of the two.
+    // CONTROL: the `catch (const UnknownOutput& e)` arm deleted from DbusService::setOutputVisible
+    //       (backend/daemon/dbus_service.cpp), so it falls into the InvalidRequest arm -> "FAIL: a
+    //       visibility report for a name no monitor answers to is refused as
+    //       io.wallpaperx.Daemon.Error.UnknownOutput", printing InvalidArgs. Observed 2026-09-20.
+    //       Reverted.
+    // CONTROL: `entry["screen_visible"] = monitor.screenVisible;` in DbusService::getStatus
+    //       (backend/daemon/dbus_service.cpp) replaced by `entry["screen_visible"] = true;` -> "FAIL:
+    //       GetStatus reports the screen as not drawn once its desktop says so". Observed 2026-09-20.
+    //       Reverted.
+    const std::vector<std::pair<const char*, std::string>> visibilityRefusals{
+        {"an empty name", ""},
+        {"a name past the cap", std::string(wallpaperx::kMaxOutputNameBytes + 1, 'D')},
+    };
+    for (const auto& [what, name] : visibilityRefusals) {
+        const std::string got = errorNameFrom([&] { setOutputVisible(*proxy, name, false); });
+        check(got == kInvalidArgs,
+              ("a visibility report for " + std::string(what) + " is refused as InvalidArgs").c_str());
+        if (got != kInvalidArgs) std::fprintf(stderr, "  it answered '%s'\n", got.c_str());
+    }
+    {
+        const std::string got = errorNameFrom([&] { setOutputVisible(*proxy, "DP-NOSUCHSCREEN", false); });
+        check(got == kUnknownOutput,
+              "a visibility report for a name no monitor answers to is refused as "
+              "io.wallpaperx.Daemon.Error.UnknownOutput");
+        if (got != kUnknownOutput) std::fprintf(stderr, "  it answered '%s'\n", got.c_str());
+    }
+    const auto screenVisibleSays = [&proxy](int32_t monitorId) {
+        const StatusReply status = getStatusOrExplain(*proxy);
+        const nlohmann::json* entry = wallpaperStatus(status, std::to_string(monitorId));
+        if (entry == nullptr) return std::string("(no entry: ") + status.error() + status.json().dump() + ")";
+        if (!entry->contains("screen_visible")) return std::string("(no screen_visible field: ") + entry->dump() + ")";
+        return std::string(entry->value("screen_visible", true) ? "true" : "false");
+    };
+    // DP-LOST, whose monitor has a wallpaper: GetStatus lists the wallpapers, so a screen named on a
+    //       monitor nothing was ever set on has no entry to read the field out of.
+    check(errorNameFrom([&] { setOutputVisible(*proxy, "DP-LOST", false); }).empty(),
+          "a bound screen reporting that it is not being drawn is accepted");
+    const std::string saidNotDrawn = screenVisibleSays(kMonitorSizeLostFile);
+    check(saidNotDrawn == "false", "GetStatus reports the screen as not drawn once its desktop says so");
+    if (saidNotDrawn != "false") std::fprintf(stderr, "  screen_visible read back as %s\n", saidNotDrawn.c_str());
+    check(errorNameFrom([&] { setOutputVisible(*proxy, "DP-LOST", true); }).empty(),
+          "and the same screen reporting that it is being drawn again is accepted");
+    check(screenVisibleSays(kMonitorSizeLostFile) == "true", "and GetStatus reports it as drawn again");
 }
 
 // GOAL: S13.97's render half -- the first render after a restart is at the size saved with the screen's

@@ -327,6 +327,17 @@ inline void setOutputSize(sdbus::IProxy& proxy, const std::string& outputName, u
         .withArguments(outputName, width, height);
 }
 
+// Reports whether the screen named `outputName` is being drawn at all, as the KDE plugin's paint
+// watch does. Shared for setOutputSize's reason: which argument is the name and which the answer
+// is a wire fact, and a private copy would go on compiling if the two were ever swapped.
+inline void setOutputVisible(sdbus::IProxy& proxy, const std::string& outputName, bool visible,
+                             std::chrono::microseconds timeout = {}) {
+    proxy.callMethod("SetOutputVisible")
+        .onInterface(DbusService::kInterface)
+        .withTimeout(timeout)
+        .withArguments(outputName, visible);
+}
+
 // Reports what the frame consumer can import, as the plugin's render thread does.
 //
 // Here rather than in one test file for the same reason as setMonitorOutput above: the

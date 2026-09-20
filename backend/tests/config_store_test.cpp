@@ -9053,7 +9053,7 @@ void runOutputSizeRuntimeChecks() {
         //       Another screen reports while the name is unbound, because the size map is pruned only when
         //       a size is recorded: with no report in between, a prune that dropped every unbound size
         //       would stay green here.
-        // CONTROL: pruneOutputSizesLocked's limit (backend/daemon/wallpaper_manager.cpp) set to 0 -> "FAIL:
+        // CONTROL: pruneOutputReportsLocked's limit (backend/daemon/wallpaper_manager.cpp) set to 0 -> "FAIL:
         //       binding a sized name again restores its size without a new report", "FAIL: and the restored
         //       size is written again beside it" and "FAIL: moving a sized name to another monitor redraws
         //       both, each at its new size". Without the unrelated report the same mutation stayed green.
