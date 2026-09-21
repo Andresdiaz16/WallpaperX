@@ -125,12 +125,25 @@ std::chrono::nanoseconds gapBetween(const PictureTiming& before, const PictureTi
     return ownInterval(before);
 }
 
+WallpaperManager::Config withCheckedTiming(WallpaperManager::Config config) {
+    const auto check = [](std::chrono::steady_clock::duration value, const char* name) {
+        if (value <= std::chrono::steady_clock::duration::zero() || value > WallpaperManager::kMaxTiming) {
+            throw std::invalid_argument(std::string("WallpaperManager::Config::") + name +
+                                        " must be positive and at most kMaxTiming");
+        }
+    };
+    check(config.unwatchedAfter, "unwatchedAfter");
+    check(config.idleSessionRelease, "idleSessionRelease");
+    check(config.refusalLogInterval, "refusalLogInterval");
+    return config;
+}
+
 }  // namespace
 
 bool configLoadAbandoned() { return g_loadAbandoned.load(std::memory_order_acquire); }
 
 WallpaperManager::WallpaperManager(Config config)
-    : m_config(std::move(config)), m_store(m_config.configFile), m_writer(m_store) {
+    : m_config(withCheckedTiming(std::move(config))), m_store(m_config.configFile), m_writer(m_store) {
     if (!m_store.enabled()) {
         // Ok, not Fail: this feeds a worst-wins aggregate, so Fail would make every daemon
         // that never opted in report itself broken.
@@ -913,7 +926,7 @@ void WallpaperManager::setOutputVisible(const std::string& outputName, bool visi
         credit.generation = generation;
         return;
     }
-    credit = MonitorState::ResumeCredit{credit.at ? std::max(now, *credit.at + kUnwatchedAfter) : now, generation};
+    credit = MonitorState::ResumeCredit{credit.at ? std::max(now, *credit.at + m_config.unwatchedAfter) : now, generation};
 }
 
 WallpaperManager::BindResult WallpaperManager::bindOutputLocked(int monitorId,
@@ -1298,7 +1311,7 @@ void WallpaperManager::closeVideoSessionLocked(int monitorId) {
     // No crash record, for the reason ~WallpaperManager writes none: this frees a decoder for a
     // file that has already opened, decoded and drawn, and a session is now released whenever a
     // screen goes dark, so a record here would refuse a working wallpaper after any power cut in
-    // the five seconds that follow a lock. What the record is for is the file's content running --
+    // the idle release that follows a lock. What the record is for is the file's content running --
     // the open and first decode, and the draw -- and those keep theirs.
     session.pipeline.reset();
 }
@@ -1335,7 +1348,7 @@ bool WallpaperManager::watchedLocked(int monitorId, const MonitorState& state) c
     const SteadyTime now = std::chrono::steady_clock::now();
     if (resumeCreditStands(state) && now >= *state.resumeCredit.at) return true;
     if (!state.uncollectedSince) return true;
-    return now - *state.uncollectedSince < kUnwatchedAfter;
+    return now - *state.uncollectedSince < m_config.unwatchedAfter;
 }
 
 std::optional<uint64_t> WallpaperManager::currentSeqLocked(int monitorId, uint64_t wallpaperSeq) const {
@@ -1554,7 +1567,7 @@ void WallpaperManager::reopenVideosLocked(SteadyTime now, bool freedSession, Clo
 
     std::lock_guard<std::mutex> stateLock(m_stateMutex);
     // A resume credit that has not come due yet is a round owed at that moment. Nothing else would
-    // wake the worker then -- what it knows about is a release five seconds out, or nothing at all
+    // wake the worker then -- what it knows about is an idle session's release, or nothing at all
     // -- and the screen that said it was being drawn again would wait that long for its picture.
     for (const auto& [monitorId, state] : m_monitors) {
         const MonitorState::ResumeCredit& credit = state.resumeCredit;
@@ -1621,7 +1634,7 @@ std::optional<SteadyTime> WallpaperManager::advanceSessionLocked(int monitorId, 
         // interval as any other: it draws no picture again, but a resize still redraws that picture
         // from it rather than reopening the file.
         if (!session.idleSince) session.idleSince = now;
-        const SteadyTime releaseAt = *session.idleSince + kIdleSessionRelease;
+        const SteadyTime releaseAt = *session.idleSince + m_config.idleSessionRelease;
         if (now < releaseAt) return releaseAt;
         closeVideoSessionLocked(monitorId);
         return std::nullopt;
@@ -2017,12 +2030,12 @@ FrameHandle WallpaperManager::exportHandle(const OffscreenTarget& target) {
 }
 
 bool WallpaperManager::reportConsumer(std::vector<ConsumerReport>& reports, const std::string& client, Repeat repeat,
-                                      SteadyTime now) {
+                                      SteadyTime now, std::chrono::steady_clock::duration interval) {
     const auto seen = std::find_if(reports.begin(), reports.end(),
                                    [&client](const ConsumerReport& report) { return report.client == client; });
     if (seen != reports.end()) {
         seen->heard = now;
-        if (repeat == Repeat::Once || now - seen->logged < kRefusalLogInterval) return false;
+        if (repeat == Repeat::Once || now - seen->logged < interval) return false;
         seen->logged = now;
         return true;
     }
@@ -2036,7 +2049,7 @@ bool WallpaperManager::reportConsumer(std::vector<ConsumerReport>& reports, cons
     const auto quietest =
         std::min_element(reports.begin(), reports.end(),
                          [](const ConsumerReport& a, const ConsumerReport& b) { return a.heard < b.heard; });
-    if (now - quietest->heard < kRefusalLogInterval) return false;
+    if (now - quietest->heard < interval) return false;
     *quietest = ConsumerReport{client, now, now};
     return true;
 }
@@ -2118,7 +2131,7 @@ FrameExport WallpaperManager::exportCurrentFrame(int monitorId, const std::strin
                 // Periodic: a consumer stuck being refused is worth saying again, unlike one that
                 // is reading normally.
                 out.firstRefusal = reportConsumer(it->second.refusalsReported, client, Repeat::Periodic,
-                                                  std::chrono::steady_clock::now());
+                                                  std::chrono::steady_clock::now(), m_config.refusalLogInterval);
                 // A consumer refused while holding none of this monitor's images is asking for a
                 // picture the daemon had none to give -- its own back-pressure -- so it counts as
                 // collecting, and the video it would otherwise stop keeps playing for it. A
@@ -2170,7 +2183,8 @@ FrameExport WallpaperManager::exportCurrentFrame(int monitorId, const std::strin
     if (!client.empty() && m_videoSessions.count(monitorId) != 0) {
         std::lock_guard<std::mutex> stateLock(m_stateMutex);
         if (const auto it = m_monitors.find(monitorId); it != m_monitors.end()) {
-            handle.routine = !reportConsumer(it->second.served, client, Repeat::Once, std::chrono::steady_clock::now());
+            handle.routine = !reportConsumer(it->second.served, client, Repeat::Once, std::chrono::steady_clock::now(),
+                                             m_config.refusalLogInterval);
         }
     }
     out.handle = std::move(handle);

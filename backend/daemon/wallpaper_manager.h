@@ -365,6 +365,9 @@ public:
     // the budget, so a video that hiccups once an hour keeps recovering.
     static constexpr uint32_t kPlaybackRetries = 3;
 
+    // The longest a Config may set any of the three waits above to.
+    static constexpr std::chrono::hours kMaxTiming{24};
+
     struct Config {
         // What a monitor is drawn at until its screen reports a size through setOutputSize().
         // Tests override it to keep software-rasterised runs fast.
@@ -390,6 +393,15 @@ public:
         // defaultStateDir(), so a test that says nothing about state cannot leave a record
         // in the developer's own directory for the real daemon's next start to honour.
         std::filesystem::path stateDir;
+
+        // The waits above, overridable so a test can run them in milliseconds; the constants are
+        // what production gets. Each must be positive and at most kMaxTiming, or the constructor
+        // throws std::invalid_argument: zero would make a monitor unwatched the moment it publishes
+        // and lift the once-per-interval limit on resume credits. The ceiling is a sanity bound far
+        // below the ~292 years at which adding one to now() would overflow; some bound is needed.
+        std::chrono::steady_clock::duration unwatchedAfter = kUnwatchedAfter;
+        std::chrono::steady_clock::duration idleSessionRelease = kIdleSessionRelease;
+        std::chrono::steady_clock::duration refusalLogInterval = kRefusalLogInterval;
     };
 
     explicit WallpaperManager(Config config);
@@ -587,7 +599,7 @@ private:
     // consumers are remembered, so peer-chosen bus names cannot size the list, and one that cannot
     // be given a slot is reported not at all -- which is what bounds the log when more consumers
     // than slots take turns on one monitor. Every call keeps the caller's slot, and a slot goes to
-    // a newcomer only once its holder has been silent for kRefusalLogInterval or has left the bus.
+    // a newcomer only once its holder has been silent for `interval` or has left the bus.
     // The cost is deliberate: while four consumers keep reading one monitor, a fifth is never
     // named, which is one missing line rather than a stream of false ones.
     //
@@ -596,7 +608,8 @@ private:
     // starting to read is a single event. The caller's lock is whichever one guards `reports`.
     enum class Repeat { Periodic, Once };
     static bool reportConsumer(std::vector<ConsumerReport>& reports, const std::string& client, Repeat repeat,
-                               std::chrono::steady_clock::time_point now);
+                               std::chrono::steady_clock::time_point now,
+                               std::chrono::steady_clock::duration interval);
 
     struct MonitorState {
         std::string type;
@@ -685,7 +698,7 @@ private:
         // stopped video would wait for a hand-over that only a picture can prompt -- but the report
         // is a peer's word, so it is worth one picture and no more: it lapses as soon as this
         // monitor publishes one, and whether the consumer then takes that picture is what says
-        // whether playback goes on. It takes effect at most once per kUnwatchedAfter, since the
+        // whether playback goes on. It takes effect at most once per unwatchedAfter, since the
         // report is free to send; without that, a client that collects nothing would keep a decoder
         // running at the file's full rate by saying hidden and then shown again.
         //

@@ -480,8 +480,8 @@ std::string clipPath() { return std::string(WALLPAPERX_VIDEO_ASSET_DIR) + "/wall
 // under test is the only thing that can open a file or send a packet while a phase is counting.
 std::string onePicturePath() { return std::string(WALLPAPERX_VIDEO_ASSET_DIR) + "/wallpaper_one_picture.mp4"; }
 
-// The same bands again at one picture every four seconds, which is longer than the daemon's own
-// unwatched interval. The only fixture that can tell "the wait runs from the oldest uncollected
+// The same bands again at one picture every two seconds, well over twice the unwatched interval
+// this file's daemon runs with. The only fixture that can tell "the wait runs from the oldest uncollected
 // picture" apart from "the wait runs from the last hand-over": at ten pictures a second the two
 // rules agree.
 std::string slowClipPath() { return std::string(WALLPAPERX_VIDEO_ASSET_DIR) + "/wallpaper_slow.mp4"; }
@@ -578,9 +578,15 @@ public:
                          m_label.c_str());
         }
         check(failures == 0, ("video_wallpaper_test: " + m_label + "'s own device passed its validation grade").c_str());
+        // Printed, never asserted: how long each phase takes is what says where this entry's run
+        // time goes, and a run that fails intermittently under load needs it to say which phase.
+        std::printf("video_wallpaper_test: %s took %.2f s\n", m_label.c_str(),
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - m_started).count());
+        std::fflush(stdout);
     }
 
 private:
+    std::chrono::steady_clock::time_point m_started = std::chrono::steady_clock::now();
     std::string m_label;
     std::shared_ptr<const std::atomic<int>> m_counter;
     bool m_layerActive = false;
@@ -2740,8 +2746,10 @@ void runOnePictureChecks(const WallpaperManager::Config& config, const std::stri
     //       parks the session runs after the job that drew it, and it decodes once -- that is how
     //       the daemon learns the file has nothing after the first picture. Resetting the counters
     //       before that round had run would count its decode as a failure to park. INHERENTLY
-    //       TEMPORAL in one direction only: nothing happening can only be observed by waiting, and a
-    //       correct daemon does nothing here however long the window is.
+    //       TEMPORAL in one direction only: nothing happening can only be observed by waiting. The
+    //       window is half the phase's idleSessionRelease, because that is where "however long" ends
+    //       -- the parked session is released one idle interval after it parks, and that release is a
+    //       close this window would count.
     // CONTROL: in backend/daemon/wallpaper_manager.cpp, advanceSessionLocked()'s
     //       `if (before.startsPass && after.startsPass)` -- the branch that records the file as
     //       parked -- disabled, so the round falls through to the Waiting line below it -> "FAIL: a
@@ -2753,9 +2761,9 @@ void runOnePictureChecks(const WallpaperManager::Config& config, const std::stri
     g_decodeCalls.store(0);
     g_files.resetCounts();
     const size_t announced = signals.countFor(kMonitorParked);
-    std::this_thread::sleep_for(std::chrono::seconds(1));
+    std::this_thread::sleep_for(config.idleSessionRelease / 2);
     reportUnless(g_decodeCalls.load() == 0, "a video file holding one picture is never decoded again",
-                 std::to_string(g_decodeCalls.load()) + " packet(s) in a quiet second");
+                 std::to_string(g_decodeCalls.load()) + " packet(s) in a quiet window");
     reportUnless(signals.countFor(kMonitorParked) == announced,
                  "and its one picture is announced once, not once per round",
                  std::to_string(signals.countFor(kMonitorParked) - announced) + " further announcement(s)");
@@ -2832,16 +2840,18 @@ void runOnePictureChecks(const WallpaperManager::Config& config, const std::stri
 
 constexpr int kMonitorWatch = 0;
 
-// How long the "nothing moved" windows below are. One second is ten of this file's picture
-// intervals, so a daemon that had not stopped would show about ten pictures in it; a correct one
-// shows none however long the window is, so the length buys strength and cannot buy flakiness.
-constexpr auto kQuietWindow = std::chrono::seconds(1);
+// How long the "nothing moved" windows below are: six of this file's picture intervals, so a
+// daemon that had not stopped shows about six pictures in one. It cuts both ways, which is what
+// bounds it below: the same window also decides that a video still PLAYING has not stopped, so a
+// playing video must never go this long without a picture -- and a 10-a-second clip on the software
+// driver under a parallel run has never been seen to pause for more than a small fraction of it.
+constexpr auto kQuietWindow = std::chrono::milliseconds(600);
 
-// How long a run of pictures may take before it counts as "did not stop promptly". The daemon's
-// own interval is two seconds and this file shows ten pictures a second, so a correct stop lands
-// near 2.0-2.3 s; six is three times that, far past any scheduling hiccup, and still nowhere near
-// a daemon that never stops.
-constexpr auto kStopBy = std::chrono::seconds(6);
+// How long a run of pictures may take before it counts as "did not stop promptly": three of the
+// daemon's own unwatched intervals, read from the config the phase was built with. A correct stop
+// lands about one interval after the first uncollected picture; three is far past a scheduling
+// hiccup and nowhere near a daemon that never stops.
+std::chrono::steady_clock::duration stopBy(const WallpaperManager::Config& config) { return 3 * config.unwatchedAfter; }
 
 void runOffSwitchChecks(const WallpaperManager::Config& config, const std::string& clip) {
     const char* kGoals = "S13.146-S13.148 (a video nobody collects stops and keeps its picture, its decoder is "
@@ -2907,7 +2917,7 @@ void runOffSwitchChecks(const WallpaperManager::Config& config, const std::strin
         std::printf("video_wallpaper_test: the unwatched video ran for %.3f s (%zu pictures)\n",
                     std::chrono::duration<double>(span).count(), shown.size());
         std::fflush(stdout);
-        reportUnless(span <= kStopBy, "and it stopped within a few seconds of its first picture, not eventually",
+        reportUnless(span <= stopBy(config), "and it stopped within a few seconds of its first picture, not eventually",
                      std::to_string(std::chrono::duration<double>(span).count()) + " s of pictures");
     }
     const uint64_t frozenAt = static_cast<uint64_t>(stoppedAt);
@@ -2949,20 +2959,53 @@ void runOffSwitchChecks(const WallpaperManager::Config& config, const std::strin
     //       a video stopped for a few seconds has its file and decoder released", printing the clip
     //       still open, together with the one-picture phase's release line and the reopen line
     //       below. Making it release immediately (`const SteadyTime releaseAt = *session.
-    //       idleSince;`) reddens "the stopped video still holds its file open a second after
-    //       stopping" -- and a dozen other checks in this file with it, since a session freed the
-    //       moment it stops breaks every reuse and resize property Stage E2 established. Both
-    //       observed 2026-09-20. Reverted.
+    //       idleSince;`) reddens "the stopped video still holds its file open just after stopping"
+    //       -- and a dozen other checks in this file with it, since a session freed the moment it
+    //       stops breaks every reuse and resize property Stage E2 established. Both observed
+    //       2026-09-20. Reverted.
     {
         const std::multiset<std::string> openNow = g_files.live();
-        reportUnless(openNow.count(clip) == 1, "the stopped video still holds its file open a second after stopping",
+        reportUnless(openNow.count(clip) == 1, "the stopped video still holds its file open just after stopping",
                      "open files: " + describeFiles(openNow));
     }
     g_files.resetCounts();
     const bool releasedSession = settlesWithin(std::chrono::seconds(20), [&] { return g_files.closes(clip) >= 1; });
+    const Clock::time_point releasedAt = Clock::now();
     check(releasedSession, "a video stopped for a few seconds has its file and decoder released");
     if (!releasedSession) {
         std::fprintf(stderr, "  open files after the wait: %s\n", describeFiles(g_files.live()).c_str());
+    }
+
+    // GOAL: S13.147's length -- the release comes the CONFIGURED idleSessionRelease after the
+    //       video stopped, not at some other interval. Nothing else in this file reads that setting,
+    //       so without this a daemon that ignored it, and released at its compiled-in five seconds
+    //       or at once, would satisfy every check above.
+    // WHY-THIS-SHAPE: measured from the FIRST picture, which nothing here ever collects: the video
+    //       stops once that picture has waited unwatchedAfter, and is released idleSessionRelease
+    //       after that, so the close is due at their sum. The lower bound is the sum less a margin
+    //       for the poll; the upper bound allows a second and a half of late waking. Both bounds read
+    //       the phase's own config.
+    // CONTROL: backend/daemon/wallpaper_manager.cpp, the release computed from kIdleSessionRelease
+    //       instead of m_config.idleSessionRelease -> "FAIL: the stopped video is released after the
+    //       configured idle interval, not sooner or later", released 5.816 s after its first picture
+    //       where 2.750 s was due. Reverted.
+    if (releasedSession) {
+        const std::vector<PictureLog::Event> shown = pictures.forMonitor(kMonitorWatch);
+        if (shown.empty()) {
+            notVerified("S13.147's length", "no picture was ever announced, so there is nothing to measure from");
+        } else {
+            const double seconds = std::chrono::duration<double>(releasedAt - shown.front().at).count();
+            const double due =
+                std::chrono::duration<double>(config.unwatchedAfter + config.idleSessionRelease).count();
+            std::printf("video_wallpaper_test: the uncollected video's session was released %.3f s after its first "
+                        "picture (due at %.3f s)\n",
+                        seconds, due);
+            std::fflush(stdout);
+            reportUnless(seconds >= due - 0.1 && seconds <= due + 1.5,
+                         "the stopped video is released after the configured idle interval, not sooner or later",
+                         std::to_string(seconds) + " s after its first picture, where " + std::to_string(due) +
+                             " s is due");
+        }
     }
     {
         const std::optional<wallpaperx::MonitorStatus> status = monitorStatus(manager, kMonitorWatch);
@@ -3104,7 +3147,10 @@ bool quiescedByGeneration(const PictureLog& pictures, int monitorId, std::chrono
     return false;
 }
 
-void runVisibilityChecks(sdbus::IProxy& proxy, const PictureLog& pictures, const std::string& clip) {
+// `config` is the one the phase's manager was built with: every wait and bound below reads the
+// daemon's intervals from it.
+void runVisibilityChecks(sdbus::IProxy& proxy, const PictureLog& pictures, const std::string& clip,
+                         const WallpaperManager::Config& config) {
     using wallpaperx::testing::setMonitorOutput;
     using wallpaperx::testing::setOutputVisible;
     const char* kGoals = "S13.154-S13.157 (a collecting consumer keeps a video playing, a covered screen's video stops "
@@ -3171,7 +3217,9 @@ void runVisibilityChecks(sdbus::IProxy& proxy, const PictureLog& pictures, const
     //       mutation. Deleting the `if (!client.empty()) noteHandoverServed(monitorId);` line
     //       instead -> "FAIL: a video whose pictures are being collected keeps playing". Observed
     //       2026-09-20. Reverted.
-    const Watched whilePlaying = collectUntilQuiet(kQuietWindow, std::chrono::seconds(10));
+    // Three seconds: four of the phase's unwatched intervals, which is what a daemon applying the
+    // wrong rule would need to stop a video its consumer is collecting from.
+    const Watched whilePlaying = collectUntilQuiet(kQuietWindow, std::chrono::seconds(3));
     check(!whilePlaying.quiet && whilePlaying.collected > 0,
           "a video whose pictures are being collected keeps playing");
     if (whilePlaying.quiet || whilePlaying.collected == 0) {
@@ -3196,7 +3244,7 @@ void runVisibilityChecks(sdbus::IProxy& proxy, const PictureLog& pictures, const
     //       -> "FAIL: a screen that says it is not being drawn stops its video", after the 25 s
     //       quiescence limit. Observed 2026-09-20. Reverted.
     // COVERAGE-ASSERT: the check above is the guard -- the same loop, in the same phase, is
-    //       required to have kept this video running for ten seconds first. Nothing is asserted
+    //       required to have kept this video running for three seconds first. Nothing is asserted
     //       about hand-overs INSIDE the stopping window, and deliberately: a correct daemon stops
     //       within a round, so there may be no further picture to collect, and requiring one would
     //       make the check fail for the daemon behaving exactly as the goal says.
@@ -3223,14 +3271,15 @@ void runVisibilityChecks(sdbus::IProxy& proxy, const PictureLog& pictures, const
     //       evidence is the hand-over: the decoder would run for the whole time a screen was
     //       locked, which is the cost this stage exists to remove.
     // WHY-THIS-SHAPE: the hand-overs are asserted to have been SERVED, so "nothing restarted"
-    //       cannot be satisfied by a fetch that failed for an unrelated reason. The window is a
-    //       second, ten of this file's picture intervals; a correct daemon shows nothing in it
+    //       cannot be satisfied by a fetch that failed for an unrelated reason. The window is
+    //       kQuietWindow, six of this file's picture intervals; a correct daemon shows nothing in it
     //       however long it is.
     // CONTROL: in backend/daemon/wallpaper_manager.cpp, noteHandoverServed() given a loop that
     //       also erases this monitor's screen from m_outputsNotDrawn -- "the hand-over is evidence
     //       the screen is being drawn", which is the shape this check exists to forbid -> "FAIL: a
     //       covered screen's video is not restarted by a consumer that keeps fetching", printing
-    //       11 new pictures across 20 served hand-overs. Observed 2026-09-20. Reverted.
+    //       7 new pictures across 12 served hand-overs in the 600 ms window. Observed 2026-09-21.
+    //       Reverted.
     //       Deleting watchedLocked()'s `if (!screenDrawnLocked(monitorId)) return false;` is NOT a
     //       usable control here: the video then never stops, so the phase abandons at the check
     //       above and this line is never reached.
@@ -3331,22 +3380,23 @@ void runVisibilityChecks(sdbus::IProxy& proxy, const PictureLog& pictures, const
     //       hidden->shown pair cleared the "nothing has collected this" stamp outright, so 0.7 bus
     //       calls a second kept a 60 fps video decoding for a consumer collecting nothing (measured
     //       by the QA pass: 1269 pictures in 21 s).
-    // WHY-THIS-SHAPE: a count of pictures against a bound COMPUTED from the daemon's own
-    //       kUnwatchedAfter, not a rate and not a hand-written number. The credit is worth one
-    //       picture and is granted at most once per that interval, so the most this window can
-    //       legitimately produce is one per interval plus one already in flight -- while the defect
-    //       produces one per picture of the file, which here is sixty a second. The two differ by
-    //       nearly two orders of magnitude, so no amount of machine load can move a correct daemon
-    //       across the bound, and a change to kUnwatchedAfter moves the bound with it rather than
-    //       stranding a literal.
+    // WHY-THIS-SHAPE: a count of pictures against a bound COMPUTED from the unwatchedAfter this
+    //       phase's manager was built with, not a rate and not a hand-written number. The credit is
+    //       worth one picture and is granted at most once per that interval, so the most this window
+    //       can legitimately produce is one per interval plus one already in flight -- while the
+    //       defect produces one per picture of the file, ten a second here. With the phase's 750 ms
+    //       interval that is about 5 against 39, doubled into an allowance of 13, so machine load
+    //       cannot move a correct daemon across it. Edges come every quarter interval, so each
+    //       credit is reported again several times before it comes due -- which is the situation the
+    //       re-dating half below is about, and at one edge per interval that half could not fail.
     //       Nothing is fetched anywhere in the window -- that is the whole point, since a fetch is
     //       the evidence being forged -- and the starting generation is read after the monitor has
     //       been quiesced, so pictures the resume above was still publishing are not charged here.
     // CONTROL: in backend/daemon/wallpaper_manager.cpp, setOutputVisible()'s credit replaced by the
     //       pre-fix line `it->second.uncollectedSince.reset();` -> "FAIL: saying a screen is hidden
     //       and then shown again does not keep its video playing for a consumer that collects
-    //       nothing", printing "+123 picture(s) over 24 edges, where 15 is the most the one-picture
-    //       credit allows" against 6 when the fix is in. Reverted.
+    //       nothing", printing "40 picture(s) over 20 edges, where 13 is the most the one-picture
+    //       credit allows" against 5-6 with the fix. Reverted.
     // COVERAGE-ASSERT: the number of edges actually driven is asserted, so a loop that stopped
     //       early -- which would make "few pictures appeared" true for the wrong reason -- fails
     //       here instead of reading as a bound that held.
@@ -3360,8 +3410,8 @@ void runVisibilityChecks(sdbus::IProxy& proxy, const PictureLog& pictures, const
         }
         const uint64_t forgeFrom = latestGeneration(pictures, kMonitorVisible);
 
-        constexpr auto kEdgeEvery = std::chrono::milliseconds(500);
-        constexpr int kEdges = 24;
+        const auto edgeEvery = config.unwatchedAfter / 4;
+        constexpr int kEdges = 20;
         int edgesDriven = 0;
         const Clock::time_point forgeStart = Clock::now();
         for (int i = 0; i < kEdges; ++i) {
@@ -3369,16 +3419,15 @@ void runVisibilityChecks(sdbus::IProxy& proxy, const PictureLog& pictures, const
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
             setOutputVisible(proxy, screen, true);
             ++edgesDriven;
-            std::this_thread::sleep_for(kEdgeEvery);
+            std::this_thread::sleep_for(edgeEvery);
         }
         const auto forgeSpan = Clock::now() - forgeStart;
         const uint64_t forged = latestGeneration(pictures, kMonitorVisible) - forgeFrom;
 
-        // One credit per kUnwatchedAfter, each worth one picture, plus one for a round already
+        // One credit per unwatchedAfter, each worth one picture, plus one for a round already
         // under way when the window opened. Doubled, so a correct daemon has room and the defect
-        // -- which is a picture per FILE interval, two orders of magnitude more -- still cannot fit.
-        const uint64_t allowed =
-            2 * (static_cast<uint64_t>(forgeSpan / WallpaperManager::kUnwatchedAfter) + 1) + 1;
+        // -- a picture per FILE interval -- still cannot fit.
+        const uint64_t allowed = 2 * (static_cast<uint64_t>(forgeSpan / config.unwatchedAfter) + 1) + 1;
         std::printf("video_wallpaper_test: %d forged hidden->shown edges over %.1f s, nothing collected: "
                     "+%llu picture(s), against an allowance of %llu\n",
                     edgesDriven, std::chrono::duration<double>(forgeSpan).count(),
@@ -3393,19 +3442,18 @@ void runVisibilityChecks(sdbus::IProxy& proxy, const PictureLog& pictures, const
 
         // GOAL: S13.178 -- a credit reported again before it is spent is DATED FORWARD, not pushed
         //       out by every report: a screen that keeps saying hidden-then-shown still gets its
-        //       picture about once per kUnwatchedAfter, not one picture and then none. False for a
-        //       rule that re-dates a pending credit on each report -- reports every half second
-        //       then push it two seconds further away each time, and it never comes due.
+        //       picture about once per unwatchedAfter, not one picture and then none. False for a
+        //       rule that re-dates a pending credit on each report -- reports every quarter interval
+        //       then push it a whole interval further away each time, and it never comes due.
         // WHY-THIS-SHAPE: the same window the upper bound above is read from, so the two bounds
         //       are about one behaviour and cannot both be met by different ones. The floor is HALF
         //       what the interval allows, so a slow machine cannot cross it; the defect gives one.
         // CONTROL: backend/daemon/wallpaper_manager.cpp, setOutputVisible()'s early return for a
-        //       pending or unspent credit deleted, so every report re-dates it -> "FAIL: a screen
-        //       that keeps reporting it is drawn again goes on getting a picture about once per
-        //       interval", printing "+0 picture(s), where at least 3 were due over 12.2 s" against
-        //       +6 with the fix; the genuine-resume line below went red with it, its credit pushed
-        //       out of reach by the reports before it. Reverted.
-        const uint64_t expectedAtLeast = static_cast<uint64_t>(forgeSpan / WallpaperManager::kUnwatchedAfter) / 2;
+        //       pending or unspent credit deleted, so every report re-dates it -> "FAIL: a screen that
+        //       keeps reporting it is drawn again goes on getting a picture about once per interval",
+        //       printing "+1 picture(s), where at least 2 were due over 3.96 s"; the genuine-resume
+        //       line below went red with it, its credit pushed out of reach. Reverted.
+        const uint64_t expectedAtLeast = static_cast<uint64_t>(forgeSpan / config.unwatchedAfter) / 2;
         reportUnless(expectedAtLeast >= 2 && forged >= expectedAtLeast,
                      "a screen that keeps reporting it is drawn again goes on getting a picture about once per "
                      "interval, rather than one picture and then none",
@@ -3426,20 +3474,21 @@ void runVisibilityChecks(sdbus::IProxy& proxy, const PictureLog& pictures, const
         //       collected goes on playing", printing "0 picture(s), 0 collected", with S13.157's
         //       own resume line red above it. The forged half stays green at +0, which is why both
         //       halves are needed. Reverted.
-        // A credit is granted at most once per kUnwatchedAfter, and the forged loop above left one
-        // half a second old. Waiting past the interval is what makes the edge below a grantable
-        // one, so this half grades the feature rather than the rate limit the half above grades.
-        std::this_thread::sleep_for(2 * WallpaperManager::kUnwatchedAfter);
+        // A credit is granted at most once per unwatchedAfter, and the forged loop above left one
+        // a fraction of an interval old. Waiting past the interval is what makes the edge below a
+        // grantable one, so this half grades the feature rather than the rate limit above.
+        std::this_thread::sleep_for(2 * config.unwatchedAfter);
         const uint64_t genuineFrom = latestGeneration(pictures, kMonitorVisible);
         setOutputVisible(proxy, screen, false);
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
         setOutputVisible(proxy, screen, true);
         const Clock::time_point genuineStart = Clock::now();
-        const Watched genuine = collectUntilQuiet(kQuietWindow, std::chrono::seconds(12));
+        // Three seconds of collecting: about 30 pictures from a playing video, against the 11 a
+        // forged edge could be worth over the same span.
+        const Watched genuine = collectUntilQuiet(kQuietWindow, std::chrono::seconds(3));
         const auto genuineSpan = Clock::now() - genuineStart;
         const uint64_t played = latestGeneration(pictures, kMonitorVisible) - genuineFrom;
-        const uint64_t forgedAllowance =
-            2 * (static_cast<uint64_t>(genuineSpan / WallpaperManager::kUnwatchedAfter) + 1) + 1;
+        const uint64_t forgedAllowance = 2 * (static_cast<uint64_t>(genuineSpan / config.unwatchedAfter) + 1) + 1;
         std::printf("video_wallpaper_test: the same edge with a consumer collecting: +%llu picture(s) over %.1f s, "
                     "%d collected\n",
                     static_cast<unsigned long long>(played), std::chrono::duration<double>(genuineSpan).count(),
@@ -3720,7 +3769,7 @@ void runWatchEvidenceChecks(const WallpaperManager::Config& config, const std::s
 
 constexpr int kMonitorSlow = 0;
 
-// How many of the slow fixture's pictures this phase waits for. Three, so the four-second gap is
+// How many of the slow fixture's pictures this phase waits for. Three, so the two-second gap is
 // crossed twice.
 constexpr uint64_t kSlowPictures = 3;
 
@@ -3752,28 +3801,28 @@ void runSlowPictureChecks(const WallpaperManager::Config& config, const std::str
 
     // GOAL: S13.158 -- a video whose pictures are FARTHER APART than the daemon's own unwatched
     //       interval keeps playing for a consumer that collects every one of them. This is the case
-    //       that froze on the user's desktop: with four seconds between pictures and a two-second
-    //       interval, a rule measured from the last hand-over declares its own consumer gone in the
-    //       gap and the wallpaper shows one picture and stops. The rule that survives it measures
-    //       from the OLDEST picture nobody has collected -- and there is none, because the consumer
-    //       took the last one.
-    // WHY-THIS-SHAPE: a fixture whose pictures are four seconds apart is the whole check; every
-    //       other video fixture here runs at ten pictures a second, where the right rule and the
-    //       wrong one agree and no arrangement of consumers can tell them apart. The consumer
-    //       fetches only on an announcement, which is what the plugin does -- a consumer polling
-    //       faster than the interval would keep the wrong rule satisfied too.
+    //       that froze on the user's desktop: with pictures farther apart than the interval, a rule
+    //       measured from the last hand-over declares its own consumer gone in the gap and the
+    //       wallpaper shows one picture and stops. The rule that survives it measures from the
+    //       OLDEST picture nobody has collected -- and there is none, because the consumer took the
+    //       last one.
+    // WHY-THIS-SHAPE: a fixture whose pictures are two seconds apart -- more than twice the
+    //       phase's 750 ms unwatchedAfter -- is the whole check; every other video fixture here runs
+    //       at ten pictures a second, where the right rule and the wrong one agree and no
+    //       arrangement of consumers can tell them apart. The consumer fetches only on an
+    //       announcement, which is what the plugin does -- a consumer polling faster than the
+    //       interval would keep the wrong rule satisfied too.
     // CONTROL: in backend/daemon/wallpaper_manager.cpp, noteHandoverServed() made to set
     //       `it->second.uncollectedSince = std::chrono::steady_clock::now();` instead of resetting
-    //       it -- which is the rule measured from the last hand-over -> "FAIL: a video whose
-    //       pictures are four seconds apart keeps playing for a consumer that collects them", after
-    //       the signal limit, with the picture count stuck at one. The same mutation leaves every
-    //       other phase in this file green. Observed 2026-09-20. Reverted.
+    //       it -- which is the rule measured from the last hand-over -> "FAIL: a video whose pictures
+    //       are farther apart than the unwatched interval keeps playing for a consumer that collects
+    //       them", with the picture count stuck at one. Reverted.
     // COVERAGE-ASSERT: the span the graded pictures took is asserted to be at least twice the
-    //       daemon's own unwatched interval, so a fixture regenerated at a fast rate -- which would
-    //       make this check agree with the wrong rule and stop being able to fail -- fails here
-    //       instead.
+    //       phase's own unwatchedAfter, so a fixture regenerated at a fast rate -- which would make
+    //       this check agree with the wrong rule and stop being able to fail -- fails here instead.
     const bool kept = signals.wait(kMonitorSlow, kSlowPictures);
-    check(kept, "a video whose pictures are four seconds apart keeps playing for a consumer that collects them");
+    check(kept, "a video whose pictures are farther apart than the unwatched interval keeps playing for a consumer "
+                "that collects them");
     if (!kept) {
         std::fprintf(stderr, "  it reached generation %llu; the consumer: %s\n",
                      static_cast<unsigned long long>(latestGeneration(pictures, kMonitorSlow)),
@@ -3798,7 +3847,7 @@ void runSlowPictureChecks(const WallpaperManager::Config& config, const std::str
             std::printf("video_wallpaper_test: the slow fixture's first %llu pictures took %.3f s\n",
                         static_cast<unsigned long long>(kSlowPictures), seconds);
             std::fflush(stdout);
-            reportUnless(seconds >= 2 * std::chrono::duration<double>(WallpaperManager::kUnwatchedAfter).count(),
+            reportUnless(seconds >= 2 * std::chrono::duration<double>(config.unwatchedAfter).count(),
                          "and the gaps it crossed really are longer than the daemon's unwatched interval",
                          std::to_string(seconds) + " s for " + std::to_string(kSlowPictures) +
                              " pictures, which is not long enough for this check to be able to fail");
@@ -4304,7 +4353,9 @@ void runResumeCreditChecks(const WallpaperManager::Config& config, const std::st
     //       reverted. Its `drawableType(state.type) == Drawable::Clip` term deleted -> red on the
     //       still only, "watched true at once, true an interval later". Its `parkedWallpaperSeq !=
     //       wallpaperSeq` term deleted -> red on the one-picture video only, "watched true at once".
-    std::this_thread::sleep_for(WallpaperManager::kUnwatchedAfter + std::chrono::milliseconds(500));
+    // Half an interval past the phase's unwatchedAfter, so the uncollected picture is provably stale.
+    const auto pastInterval = config.unwatchedAfter + config.unwatchedAfter / 2;
+    std::this_thread::sleep_for(pastInterval);
     for (const auto& [id, what] : {std::pair<int, const char*>{kMonitorCreditStill, "a still wallpaper"},
                                    std::pair<int, const char*>{kMonitorCreditOnePicture, "a one-picture video"}}) {
         const bool before = watched(id);
@@ -4314,7 +4365,7 @@ void runResumeCreditChecks(const WallpaperManager::Config& config, const std::st
         if (before) continue;
         edge(id);
         const bool atOnce = watched(id);
-        std::this_thread::sleep_for(WallpaperManager::kUnwatchedAfter + std::chrono::milliseconds(500));
+        std::this_thread::sleep_for(pastInterval);
         const bool later = watched(id);
         std::printf("video_wallpaper_test: %s after its screen came back: watched %s at once, %s an interval "
                     "later\n",
@@ -4333,22 +4384,23 @@ void runResumeCreditChecks(const WallpaperManager::Config& config, const std::st
     //       when that clears, the video starts. False for a credit that lapses after an interval:
     //       nothing else would ever start that video, because the screen, already drawn, sends no
     //       further report.
-    // WHY-THIS-SHAPE: the delay is made by HOLDING THE WORKER for longer than kUnwatchedAfter,
-    //       which stands in for the full slot table and the failed GPU the QA drivers used: all
+    // WHY-THIS-SHAPE: the delay is made by HOLDING THE WORKER for twice the phase's unwatchedAfter
+    //       -- a whole interval past any deadline a credit could be given -- which stands in for the
+    //       full slot table and the failed GPU the QA drivers used: all
     //       three are "nothing may open the file yet", and a held worker is the one of them this
     //       file can hold for a known time. The session is RELEASED first, so the picture that
     //       follows needs a reopen and can only come from the credit -- a resident session would
     //       leave the clock able to draw on its own. The wait for that picture is for a generation
     //       past the one it stopped on, which nothing already announced can satisfy.
     // CONTROL: backend/daemon/wallpaper_manager.cpp, watchedLocked()'s credit test given a
-    //       deadline -- `&& now - *state.resumeCredit.at < kUnwatchedAfter` -> "FAIL: a screen that
-    //       came back while nothing could open its video still gets its picture once something can",
-    //       after the signal limit. Reverted.
+    //       deadline -- `&& now - *state.resumeCredit.at < m_config.unwatchedAfter` -> "FAIL: a
+    //       screen that came back while nothing could open its video still gets its picture once
+    //       something can", after the signal limit. Reverted.
     // COVERAGE-ASSERT: the release is asserted before the edge, and so is the worker being held.
     {
-        // "No longer open" rather than "a close since now": the release is due about seven seconds
-        // after the first picture, which the still and one-picture checks above can already have
-        // outlived -- measured, a wait for a fresh close then timed out on a session long gone.
+        // "No longer open" rather than "a close since now": the release is due unwatchedAfter plus
+        // idleSessionRelease after the first picture, which the still and one-picture checks above
+        // can already have outlived -- measured, a wait for a fresh close then timed out.
         const bool released = settlesWithin(std::chrono::seconds(20), [&clip] { return g_files.live().count(clip) == 0; });
         check(released, "the uncollected video's session is released, so resuming it needs a reopen");
         if (!released) {
@@ -4361,7 +4413,7 @@ void runResumeCreditChecks(const WallpaperManager::Config& config, const std::st
             check(hold.held(), "the render worker can be held across the credit's interval");
             if (!hold.held()) return;
             edge(kMonitorCreditDelayed);
-            std::this_thread::sleep_for(WallpaperManager::kUnwatchedAfter + std::chrono::seconds(1));
+            std::this_thread::sleep_for(2 * config.unwatchedAfter);
         }
         const bool resumed = signals.waitAtLeast(kMonitorCreditDelayed, stoppedAt + 1);
         check(resumed, "a screen that came back while nothing could open its video still gets its picture once "
@@ -4608,7 +4660,8 @@ void runCapBudgetChecks(const WallpaperManager::Config& config, const std::strin
     //       116.88 (fastest window 116.91) against 119.99 with the fix. Reverted.
     // COVERAGE-ASSERT: the number of windows compared is asserted.
     constexpr uint64_t kWindow = 120;
-    constexpr uint64_t kPictures = 600;
+    // Three seconds of pictures: 240 one-second windows, which is plenty for a median.
+    constexpr uint64_t kPictures = 360;
     const bool reached = signals.wait(kMonitorClamp, kPictures + 5);
     if (!reached) {
         notVerified(kGoal, "the 120 a second video did not reach its graded picture on this host, so no window can be "
@@ -4934,7 +4987,7 @@ void runHandoverLogChecks(const WallpaperManager::Config& config, const std::str
     //       which opens a NEW session whose served list is empty -- measured, that reports all four
     //       slot-holders once per round and grades the session churn instead of the policy.
     // CONTROL: in backend/daemon/wallpaper_manager.cpp, reportConsumer()'s full-list branch made to
-    //       evict unconditionally -- the `if (now - quietest->heard < kRefusalLogInterval) return
+    //       evict unconditionally -- the `if (now - quietest->heard < interval) return
     //       false;` line deleted -> all three checks red, printing "240 report(s) across 240
     //       hand-over(s): :1.90=40, :1.91=40, ... :1.95=40" against 4 reports with the fix in.
     //       That is the QA finding's cliff exactly: one line per hand-over. Observed 2026-09-21.
@@ -5015,26 +5068,26 @@ void runHandoverLogChecks(const WallpaperManager::Config& config, const std::str
             };
 
             // GOAL: S13.179 -- a consumer that STILL READS keeps its slot past the interval: it is
-            //       not reported again every minute, and a newcomer does not take its slot from it.
+            //       not reported again every interval, and a newcomer does not take its slot from it.
             //       What frees a slot is its holder going quiet for a whole interval, not the time
             //       since its line was written. False for a list that ages a slot by when it was
-            //       LOGGED: every minute the holders look stale, a slotless reader evicts one, and the
-            //       evicted one is reported again on its next picture -- a line per reader per
-            //       minute, for as long as they read.
-            // WHY-THIS-SHAPE: INHERENTLY A WAIT PAST kRefusalLogInterval, a whole minute, because the
-            //       interval is a compile-time constant of the daemon and nothing else can make a slot
-            //       old. The holders keep reading through it -- one hand-over each every few seconds
-            //       -- and a slotless consumer asks once the minute has passed, which is the moment a
-            //       logged-age rule gives its slot away. The holders are then asked again, because the
-            //       defect shows as THEIR re-report as much as as the newcomer's.
+            //       LOGGED: every interval the holders look stale, a slotless reader evicts one, and
+            //       the evicted one is reported again on its next picture -- in production a line per
+            //       reader per minute, for as long as they read.
+            // WHY-THIS-SHAPE: INHERENTLY A WAIT PAST the phase's refusalLogInterval (5 s here, a
+            //       minute in production), because nothing else can make a slot old. The holders keep
+            //       reading through it -- one hand-over each every fifth of an interval, so each is
+            //       always heard well within one -- and a slotless consumer asks once the interval has
+            //       passed, which is the moment a logged-age rule gives its slot away. The holders are
+            //       then asked again, because the defect shows as THEIR re-report as much as the
+            //       newcomer's.
             // CONTROL: backend/daemon/wallpaper_manager.cpp, reportConsumer()'s eviction measured on
             //       `logged` instead of `heard` (both the min_element comparison and the age test) ->
-            //       "FAIL: a consumer that keeps reading keeps its slot past the interval", printing
-            //       "3 holder(s) reported again; the newcomer was reported", against 0 and silent with
-            //       the fix. Reverted.
+            //       "FAIL: a consumer that keeps reading keeps its slot past the interval", printing "3
+            //       holder(s) reported again; the newcomer was reported". Reverted.
             {
-                const Clock::time_point until = Clock::now() + WallpaperManager::kRefusalLogInterval +
-                                                std::chrono::seconds(2);
+                const auto readEvery = config.refusalLogInterval / 5;
+                const Clock::time_point until = Clock::now() + config.refusalLogInterval + readEvery;
                 int heldReads = 0;
                 bool holderReportedDuringWait = false;
                 while (Clock::now() < until) {
@@ -5043,7 +5096,7 @@ void runHandoverLogChecks(const WallpaperManager::Config& config, const std::str
                         if (r) ++heldReads;
                         if (r && *r) holderReportedDuringWait = true;
                     }
-                    std::this_thread::sleep_for(std::chrono::seconds(3));
+                    std::this_thread::sleep_for(readEvery);
                 }
                 const std::optional<bool> newcomer = reportedNow(names[WallpaperManager::kMaxHoldersPerMonitor]);
                 int holdersReportedAfter = 0;
@@ -5051,13 +5104,13 @@ void runHandoverLogChecks(const WallpaperManager::Config& config, const std::str
                     const std::optional<bool> r = reportedNow(names[i]);
                     if (r && *r) ++holdersReportedAfter;
                 }
-                std::printf("video_wallpaper_test: after %d reads over a minute by the %zu slot holders, a slotless "
+                std::printf("video_wallpaper_test: after %d reads over an interval by the %zu slot holders, a slotless "
                             "consumer was %s and %d holder(s) were reported again\n",
                             heldReads, WallpaperManager::kMaxHoldersPerMonitor,
                             newcomer ? (*newcomer ? "REPORTED" : "silent") : "not served", holdersReportedAfter);
                 std::fflush(stdout);
                 reportUnless(heldReads > 0 && newcomer.has_value(),
-                             "the slot holders and the newcomer were all served, so the minute was really read through",
+                             "the slot holders and the newcomer were all served, so the interval was really read through",
                              std::to_string(heldReads) + " holder read(s)");
                 reportUnless(!holderReportedDuringWait && holdersReportedAfter == 0 && newcomer && !*newcomer,
                              "a consumer that keeps reading keeps its slot past the interval: it is not reported "
@@ -5067,7 +5120,7 @@ void runHandoverLogChecks(const WallpaperManager::Config& config, const std::str
             }
 
             // GOAL: S13.180 -- a consumer that LEAVES THE BUS frees its slot at once, so the next
-            //       consumer is named on its first picture rather than a minute later. And the
+            //       consumer is named on its first picture rather than an interval later. And the
             //       departure is handled on the calling thread alone: nothing about it is owed to the
             //       render worker for a consumer that held no image.
             // WHY-THIS-SHAPE: the newcomer is one that was just refused a slot by the check above, so
@@ -5191,12 +5244,23 @@ bool settledOnFailure(const WallpaperManager& manager, int monitorId) {
     return status && !status->hasFrame && !status->lastError.empty() && !status->renderOutstanding;
 }
 
+// For a phase whose subject is not watching at all but which needs its video to keep playing with no
+// consumer: an unwatched interval longer than any phase runs. Without it such a phase leans on the
+// grace period before an uncollected video stops -- two seconds in production, far less here -- and
+// passes only if it finishes inside that, which a loaded machine does not promise.
+WallpaperManager::Config playsUnwatched(const WallpaperManager::Config& base) {
+    WallpaperManager::Config config = base;
+    config.unwatchedAfter = std::chrono::hours(1);
+    return config;
+}
+
 void runPlaybackRetryChecks(const WallpaperManager::Config& config, const std::vector<std::string>& clips) {
     const char* kGoals = "S13.140 (playback that keeps failing is reopened three times and then left alone; a "
                          "picture shown restores the budget; a new wallpaper starts fresh)";
     PhaseGrade grade("the playback-retry phase");
     FrameReadyLog signals;
-    WallpaperManager manager(config);
+    // Its reopens happen only while the video counts as watched, and nothing here collects from it.
+    WallpaperManager manager(playsUnwatched(config));
     CaptureGradeOnExit captureGrade{grade, manager};
     RenderWorker worker(manager,
                         [&signals](int monitorId, uint64_t generation) { signals.record(monitorId, generation); });
@@ -5334,7 +5398,10 @@ void runGpuFaultChecks(const WallpaperManager::Config& config, const std::vector
                          "during playback is never retried)";
     PhaseGrade grade("the gpu-fault phase");
     FrameReadyLog signals;
-    WallpaperManager manager(config);
+    // Both halves need the video to go on submitting pictures with nothing collecting them: S13.141
+    // reads health across a window it asserts the video kept playing in, and S13.142 injects its
+    // fault into a picture's submission.
+    WallpaperManager manager(playsUnwatched(config));
     CaptureGradeOnExit captureGrade{grade, manager};
     RenderWorker worker(manager,
                         [&signals](int monitorId, uint64_t generation) { signals.record(monitorId, generation); });
@@ -5519,6 +5586,18 @@ int main() {
         // The GPU-side oracle for everything the render and export path does, with exactly one
         // message id excused above.
         config.enableValidation = !validationWaived();
+        // The daemon's three waits, shortened so this entry runs in seconds. Every sleep and bound
+        // below reads these from the config its phase was built with -- never the production
+        // constants -- or a short wait and a long bound drift apart unnoticed.
+        //   unwatchedAfter 750 ms: seven and a half of the clip's picture intervals, and far above
+        //     the tens of milliseconds a hand-over takes on the software driver under a parallel run.
+        //   idleSessionRelease 2 s: the production ratio to unwatchedAfter (5 s to 2 s) kept, so a
+        //     stopped session is still resident when the phases read it before its release.
+        //   refusalLogInterval 5 s: a refuse-serve-refuse cycle of several renders must fit inside
+        //     one interval even on a loaded machine.
+        config.unwatchedAfter = std::chrono::milliseconds(750);
+        config.idleSessionRelease = std::chrono::seconds(2);
+        config.refusalLogInterval = std::chrono::seconds(5);
 
         {
             PhaseGrade grade("the bus phase");
@@ -5584,7 +5663,7 @@ int main() {
                 .onInterface(DbusService::kInterface)
                 .call([&pictures](int32_t monitorId, uint64_t generation) { pictures.record(monitorId, generation); });
 
-            runVisibilityChecks(*proxy, pictures, clip);
+            runVisibilityChecks(*proxy, pictures, clip, config);
         }
 
         runEvictionWatchChecks(config, clips);

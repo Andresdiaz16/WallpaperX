@@ -599,8 +599,10 @@ if(WALLPAPERX_FFMPEG_EXECUTABLE)
         COMMENT "Generating video wallpaper fixture wallpaper_one_picture.mp4"
         VERBATIM
     )
-    # The same bands again, at one picture every four seconds. The gap is the point: it is longer
-    # than the interval after which the daemon decides nothing is collecting a monitor's pictures,
+    # The same bands again, at one picture every two seconds. The gap is the point: it is longer --
+    # by more than twice -- than the interval after which video_wallpaper_test's daemon decides
+    # nothing is collecting a monitor's pictures (750 ms there; production's two seconds is not what
+    # that test runs with),
     # so a daemon that measured that interval from the last HAND-OVER -- rather than from the oldest
     # picture nobody has taken -- would call its own consumer gone between two pictures of this file
     # and freeze it. Every other fixture here plays ten pictures a second, where the two rules agree.
@@ -608,9 +610,9 @@ if(WALLPAPERX_FFMPEG_EXECUTABLE)
     add_custom_command(
         OUTPUT ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_slow.mp4
         COMMAND ${WALLPAPERX_FFMPEG_EXECUTABLE} -y -v error
-                -f lavfi -i color=c=black:size=320x240:rate=1/4:duration=12
+                -f lavfi -i color=c=black:size=320x240:rate=1/2:duration=6
                 -vf "drawbox=x=0:y=0:w=320:h=60:color=0xFF0000@1:t=fill,drawbox=x=0:y=60:w=320:h=60:color=0x00FF00@1:t=fill,drawbox=x=0:y=120:w=320:h=60:color=0xFFFF00@1:t=fill,drawbox=x=0:y=180:w=320:h=60:color=0x0000FF@1:t=fill,format=yuv420p,setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv"
-                -c:v libx264 -profile:v baseline -g 1 -pix_fmt yuv420p -r 1/4
+                -c:v libx264 -profile:v baseline -g 1 -pix_fmt yuv420p -r 1/2
                 ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_slow.mp4
         COMMENT "Generating video wallpaper fixture wallpaper_slow.mp4"
         VERBATIM
