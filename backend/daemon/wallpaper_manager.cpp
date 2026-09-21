@@ -9,6 +9,7 @@
 #include "renderers/static_renderer.h"
 #include "video/video_pipeline.h"
 #include "vulkan/device.h"
+#include "wallpaper_file.h"
 #include "vulkan/offscreen.h"
 #include "vulkan/tier_selection.h"
 
@@ -93,10 +94,16 @@ std::string resolveShaderDir(const std::string& configured) {
 using SteadyTime = std::chrono::steady_clock::time_point;
 using PictureTiming = VideoPipeline::PictureTiming;
 
-// Bounds on the time between two pictures. The floor keeps a file claiming an absurd rate from
-// occupying the GPU thread; the ceiling reads a longer gap in the timestamps as a discontinuity
-// rather than a pause, so a timestamp jump cannot freeze a wallpaper.
-constexpr std::chrono::nanoseconds kMinPictureInterval = std::chrono::milliseconds(4);
+// Bounds on the time between two pictures. The floor is a budget, not a display fact: 120 pictures
+// a second per monitor on the one thread that also answers every monitor's frame request. It is
+// fixed because no screen's refresh rate ever reaches this daemon -- the plugin reports a size and
+// nothing else -- and it is held between the times successive pictures are due, not imposed on
+// each gap in the file: timestamps rounded to whole milliseconds put a 120 a second file at 8, 8,
+// 9 ms, and raising every 8 without lowering the 9 plays it slow. The cost is real: a file authored
+// above 120 on a 144, 165 or 240 Hz screen is played slower than its author meant. The ceiling reads a
+// longer gap in the timestamps as a discontinuity rather than a pause, so a timestamp jump cannot
+// freeze a wallpaper.
+constexpr std::chrono::nanoseconds kMinPictureInterval{1'000'000'000 / 120};
 constexpr std::chrono::nanoseconds kMaxPictureInterval = std::chrono::seconds(5);
 // For a picture neither the file nor its stream gives a duration.
 constexpr std::chrono::nanoseconds kFallbackPictureInterval{1'000'000'000 / 30};
@@ -106,15 +113,14 @@ std::chrono::nanoseconds ownInterval(const PictureTiming& picture) {
     return std::clamp(*picture.duration, kMinPictureInterval, kMaxPictureInterval);
 }
 
-// How long after `before` its successor `after` is due: their timestamps' difference where that is
-// usable, else `before`'s own duration -- which is what a loop's first picture, a timestamp going
-// backwards or one jumping past the ceiling get.
+// How long after `before` its successor `after` is due on the file's own timeline: their
+// timestamps' difference where that is usable, else `before`'s own duration -- which is what a
+// loop's first picture, a timestamp going backwards or one jumping past the ceiling get. Not
+// floored: the floor is applied against when the previous picture was drawn.
 std::chrono::nanoseconds gapBetween(const PictureTiming& before, const PictureTiming& after) {
     if (!after.startsPass && before.presentation && after.presentation) {
         const std::chrono::nanoseconds gap = *after.presentation - *before.presentation;
-        if (gap > std::chrono::nanoseconds::zero() && gap <= kMaxPictureInterval) {
-            return std::max(gap, kMinPictureInterval);
-        }
+        if (gap > std::chrono::nanoseconds::zero() && gap <= kMaxPictureInterval) return gap;
     }
     return ownInterval(before);
 }
@@ -541,10 +547,11 @@ std::vector<int> WallpaperManager::forgetHeldBuffers(const std::string& client, 
 
     std::lock_guard<std::mutex> stateLock(m_stateMutex);
     for (auto& [monitorId, state] : m_monitors) {
-        // Whether or not it held anything: a consumer that left is one whose refusal episode is
-        // over, and the name would otherwise sit in the list until the ring is rebuilt.
-        std::erase_if(state.refusalsReported,
-                      [&client](const MonitorState::RefusalReport& report) { return report.client == client; });
+        // Whether or not it held anything: a consumer that left is neither refused nor reading, and
+        // its name would otherwise hold a slot the next consumer needs to be named by.
+        const auto departed = [&client](const ConsumerReport& report) { return report.client == client; };
+        std::erase_if(state.refusalsReported, departed);
+        std::erase_if(state.served, departed);
         const size_t before = state.holds.size();
         std::erase_if(state.holds, [&client](const BufferHold& hold) { return hold.client == client; });
         if (state.holds.size() == before) continue;
@@ -893,13 +900,20 @@ void WallpaperManager::setOutputVisible(const std::string& outputName, bool visi
     }
     pruneOutputReportsLocked();
 
-    // A screen coming back counts as having collected what it missed, which is what lets a video
-    // start again before any consumer has had a chance to fetch: otherwise it would wait for a
-    // hand-over that only a picture can prompt. On the change only -- re-asserting it would let a
-    // client forge the evidence that something is collecting and keep a video decoding for nobody.
+    // See MonitorState::ResumeCredit. A report while a credit is pending or unspent leaves it at its
+    // own time -- moving it would let reports in quick succession push it out of reach -- and only
+    // takes the current generation, so a picture published meanwhile does not cancel it.
     if (!visible || wasDrawn) return;
     const auto it = m_monitors.find(bound->second);
-    if (it != m_monitors.end()) it->second.uncollectedSince.reset();
+    if (it == m_monitors.end()) return;
+    MonitorState::ResumeCredit& credit = it->second.resumeCredit;
+    const SteadyTime now = std::chrono::steady_clock::now();
+    const uint64_t generation = it->second.generation;
+    if (credit.at && (*credit.at > now || credit.generation == generation)) {
+        credit.generation = generation;
+        return;
+    }
+    credit = MonitorState::ResumeCredit{credit.at ? std::max(now, *credit.at + kUnwatchedAfter) : now, generation};
 }
 
 WallpaperManager::BindResult WallpaperManager::bindOutputLocked(int monitorId,
@@ -1308,13 +1322,20 @@ bool WallpaperManager::screenDrawnLocked(int monitorId) const {
     return true;
 }
 
+bool WallpaperManager::resumeCreditStands(const MonitorState& state) {
+    return state.resumeCredit.at && state.resumeCredit.generation == state.generation && state.hasFrame &&
+           drawableType(state.type) == Drawable::Clip && state.parkedWallpaperSeq != state.wallpaperSeq;
+}
+
 bool WallpaperManager::watchedLocked(int monitorId, const MonitorState& state) const {
     if (!screenDrawnLocked(monitorId)) return false;
     // The clock is read here and not passed in: a round samples its time before it decodes, and a
     // caller asking after a decode would be answering with a reading the decode has already
     // outlived.
+    const SteadyTime now = std::chrono::steady_clock::now();
+    if (resumeCreditStands(state) && now >= *state.resumeCredit.at) return true;
     if (!state.uncollectedSince) return true;
-    return std::chrono::steady_clock::now() - *state.uncollectedSince < kUnwatchedAfter;
+    return now - *state.uncollectedSince < kUnwatchedAfter;
 }
 
 std::optional<uint64_t> WallpaperManager::currentSeqLocked(int monitorId, uint64_t wallpaperSeq) const {
@@ -1395,7 +1416,7 @@ WallpaperManager::VideoSession& WallpaperManager::videoSessionLocked(int monitor
                                                        VideoPipeline::Playback::Loop);
             // A file with no picture cannot be drawn at a later pass either, so this fails now.
             if (!pipeline->decodeNext()) {
-                throw WallpaperContentError("no picture could be decoded from " + path);
+                throw WallpaperContentError(describeRejection("VideoPipeline", "no picture could be decoded", path));
             }
             break;
         } catch (const std::exception&) {
@@ -1412,6 +1433,12 @@ WallpaperManager::VideoSession& WallpaperManager::videoSessionLocked(int monitor
         m_videoSessions
             .insert_or_assign(monitorId, VideoSession{wallpaperSeq, ++m_videoSessionUse, path, std::move(pipeline), {}})
             .first;
+    {
+        // A new session's readers are all new to it. This is the only place a session is made, so
+        // the only reset that list needs; between sessions nothing reads it.
+        std::lock_guard<std::mutex> stateLock(m_stateMutex);
+        if (const auto it = m_monitors.find(monitorId); it != m_monitors.end()) it->second.served.clear();
+    }
     return entry->second;
 }
 
@@ -1419,12 +1446,12 @@ void WallpaperManager::markShown(VideoSession& session, SteadyTime now) {
     using Session = VideoSession;
     // Terminal for the schedule: what is on screen is what the session holds.
     if (std::holds_alternative<Session::OnScreen>(session.clock)) return;
-    SteadyTime due = now;
+    Session::OnScreen shown{now, now};
     if (const auto* waiting = std::get_if<Session::Waiting>(&session.clock);
-        waiting != nullptr && now - waiting->due <= ownInterval(session.pipeline->timing())) {
-        due = waiting->due;
+        waiting != nullptr && now - waiting->timeline <= ownInterval(session.pipeline->timing())) {
+        shown = Session::OnScreen{waiting->timeline, waiting->due};
     }
-    session.clock = Session::OnScreen{due};
+    session.clock = shown;
 }
 
 uint64_t WallpaperManager::commitFrameLocked(MonitorState& state, const OffscreenTarget& target) {
@@ -1526,6 +1553,15 @@ void WallpaperManager::reopenVideosLocked(SteadyTime now, bool freedSession, Clo
     size_t free = kMaxVideoSessions - m_videoSessions.size();
 
     std::lock_guard<std::mutex> stateLock(m_stateMutex);
+    // A resume credit that has not come due yet is a round owed at that moment. Nothing else would
+    // wake the worker then -- what it knows about is a release five seconds out, or nothing at all
+    // -- and the screen that said it was being drawn again would wait that long for its picture.
+    for (const auto& [monitorId, state] : m_monitors) {
+        const MonitorState::ResumeCredit& credit = state.resumeCredit;
+        if (!resumeCreditStands(state) || now >= *credit.at) continue;
+        if (!round.nextDue || *credit.at < *round.nextDue) round.nextDue = credit.at;
+    }
+
     // Nothing is reopened on a device that has just stopped answering: the rule advanceSessionLocked's
     // failure path states, and the recorded health is what carries it across the round boundary. A
     // render somebody asked for still clears it, which is how the daemon finds out the device is back.
@@ -1597,11 +1633,11 @@ std::optional<SteadyTime> WallpaperManager::advanceSessionLocked(int monitorId, 
         if (const auto* onScreen = std::get_if<Session::OnScreen>(&session.clock)) {
             // No crash record: this runs for as long as the wallpaper is shown, and the handler's
             // single slot cannot name every playing file at once.
-            const SteadyTime shownDue = onScreen->due;
+            const Session::OnScreen shown = *onScreen;
             const PictureTiming before = session.pipeline->timing();
             if (!session.pipeline->decodeNext()) {
-                throw WallpaperContentError("no picture could be decoded from " + session.path +
-                                            " when it started again");
+                throw WallpaperContentError(
+                    describeRejection("VideoPipeline", "no picture could be decoded when it started again", session.path));
             }
             const PictureTiming after = session.pipeline->timing();
             if (before.startsPass && after.startsPass) {
@@ -1623,7 +1659,8 @@ std::optional<SteadyTime> WallpaperManager::advanceSessionLocked(int monitorId, 
                 }
                 return now;
             }
-            session.clock = Session::Waiting{shownDue + gapBetween(before, after)};
+            const SteadyTime timeline = shown.timeline + gapBetween(before, after);
+            session.clock = Session::Waiting{std::max(timeline, shown.due + kMinPictureInterval), timeline};
         }
         if (const auto* waiting = std::get_if<Session::Waiting>(&session.clock); waiting != nullptr && waiting->due > now) {
             return waiting->due;
@@ -1979,6 +2016,31 @@ FrameHandle WallpaperManager::exportHandle(const OffscreenTarget& target) {
     return handle;
 }
 
+bool WallpaperManager::reportConsumer(std::vector<ConsumerReport>& reports, const std::string& client, Repeat repeat,
+                                      SteadyTime now) {
+    const auto seen = std::find_if(reports.begin(), reports.end(),
+                                   [&client](const ConsumerReport& report) { return report.client == client; });
+    if (seen != reports.end()) {
+        seen->heard = now;
+        if (repeat == Repeat::Once || now - seen->logged < kRefusalLogInterval) return false;
+        seen->logged = now;
+        return true;
+    }
+    if (reports.size() < kMaxHoldersPerMonitor) {
+        reports.push_back(ConsumerReport{client, now, now});
+        return true;
+    }
+    // Nothing is said for a consumer that cannot be recorded: reporting one would be a line for
+    // every one of its hand-overs, which is what more consumers than slots taking turns on one
+    // monitor produces. A slot whose holder has gone quiet for a whole interval goes to it instead.
+    const auto quietest =
+        std::min_element(reports.begin(), reports.end(),
+                         [](const ConsumerReport& a, const ConsumerReport& b) { return a.heard < b.heard; });
+    if (now - quietest->heard < kRefusalLogInterval) return false;
+    *quietest = ConsumerReport{client, now, now};
+    return true;
+}
+
 FrameExport WallpaperManager::exportCurrentFrame(int monitorId, const std::string& client) {
     requireValidMonitorId(monitorId);
 
@@ -2053,35 +2115,10 @@ FrameExport WallpaperManager::exportCurrentFrame(int monitorId, const std::strin
             if (next.outcome == Handover::Outcome::Refused ||
                 m_targets->nextUnheld(monitorId, flattenHolds(next.holds)) == nullptr) {
                 ++it->second.refusedHandovers;
-                // Once per consumer per interval. The list is capped so a client inventing names
-                // cannot size it, and a full one gives up the slot of whichever consumer has been
-                // quiet longest -- quiet for a whole interval, so a consumer being refused now can
-                // never be displaced by one that has stopped. Without that, four consumers refused
-                // once early would hold every slot for the life of their bus names and the fifth,
-                // the one actually stuck, could never be named.
-                const SteadyTime now = std::chrono::steady_clock::now();
-                std::vector<MonitorState::RefusalReport>& reported = it->second.refusalsReported;
-                const auto seen = std::find_if(reported.begin(), reported.end(),
-                                               [&client](const MonitorState::RefusalReport& report) {
-                                                   return report.client == client;
-                                               });
-                if (seen != reported.end()) {
-                    out.firstRefusal = now - seen->at >= kRefusalLogInterval;
-                    if (out.firstRefusal) seen->at = now;
-                } else if (reported.size() < kMaxHoldersPerMonitor) {
-                    out.firstRefusal = true;
-                    reported.push_back(MonitorState::RefusalReport{client, now});
-                } else {
-                    const auto quietest = std::min_element(
-                        reported.begin(), reported.end(),
-                        [](const MonitorState::RefusalReport& a, const MonitorState::RefusalReport& b) {
-                            return a.at < b.at;
-                        });
-                    if (now - quietest->at >= kRefusalLogInterval) {
-                        out.firstRefusal = true;
-                        *quietest = MonitorState::RefusalReport{client, now};
-                    }
-                }
+                // Periodic: a consumer stuck being refused is worth saying again, unlike one that
+                // is reading normally.
+                out.firstRefusal = reportConsumer(it->second.refusalsReported, client, Repeat::Periodic,
+                                                  std::chrono::steady_clock::now());
                 // A consumer refused while holding none of this monitor's images is asking for a
                 // picture the daemon had none to give -- its own back-pressure -- so it counts as
                 // collecting, and the video it would otherwise stop keeps playing for it. A
@@ -2124,21 +2161,16 @@ FrameExport WallpaperManager::exportCurrentFrame(int monitorId, const std::strin
     if (!client.empty()) noteHandoverServed(monitorId);
 
     handle.generation = generation;
-    // Under this call's own m_gpuMutex, taken at the top and held throughout, which is what makes
-    // touching a session here safe while the clock erases them: only the pictures, never the
-    // pipeline, so no GPU work and no thread affinity is involved.
+    // Only for a monitor with a video session, which this call's m_gpuMutex makes safe to look up;
+    // `served` itself is monitor state, taken under m_stateMutex inside it in the documented order.
     //
-    // Recorded on the session rather than derived from the holds: a consumer that gives its image
+    // Recorded per consumer rather than derived from the holds: a consumer that gives its image
     // back before asking for the next one holds none at this moment and is reading all the same,
     // which made every picture of a playing video log a line.
-    if (const auto session = m_videoSessions.find(monitorId); !client.empty() && session != m_videoSessions.end()) {
-        std::vector<std::string>& served = session->second.served;
-        handle.routine = std::find(served.begin(), served.end(), client) != served.end();
-        if (!handle.routine) {
-            served.push_back(client);
-            // Bounded by the consumers a monitor can hold at once; the oldest goes, and would be
-            // reported again if it came back.
-            if (served.size() > kMaxHoldersPerMonitor) served.erase(served.begin());
+    if (!client.empty() && m_videoSessions.count(monitorId) != 0) {
+        std::lock_guard<std::mutex> stateLock(m_stateMutex);
+        if (const auto it = m_monitors.find(monitorId); it != m_monitors.end()) {
+            handle.routine = !reportConsumer(it->second.served, client, Repeat::Once, std::chrono::steady_clock::now());
         }
     }
     out.handle = std::move(handle);

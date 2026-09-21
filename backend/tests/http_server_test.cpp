@@ -126,7 +126,7 @@ using wallpaperx::testing::wallpaperStatus;
 // This is NOT the test-only hook in a production file that X.6 forbids. Nothing is added
 // to, or compiled differently in, renderer/ or backend/daemon/ -- the fault lives
 // entirely in the test binary, which is the same technique renderer/tests/
-// image_bounds_probe.cpp uses on malloc and fopen.
+// image_bounds_probe.cpp uses on malloc and open.
 //
 // The plan is thread_local rather than global, so no other thread in this process can
 // see it: the manager's HTTP serving thread, the DBus dispatch thread and any render
@@ -384,7 +384,7 @@ private:
 // Replacing ::operator new is the standard-sanctioned way to interpose on allocation.
 // Nothing in backend/daemon or renderer/ changes, so this is not the test-only hook in a
 // production file that X.6 forbids -- it is the technique this file already uses on
-// vkQueueSubmit and renderer/tests/image_bounds_probe.cpp uses on malloc and fopen.
+// vkQueueSubmit and renderer/tests/image_bounds_probe.cpp uses on malloc and open.
 // operator delete is replaced alongside it so every pointer this binary hands out is a
 // malloc/free pair; a lone operator new would leave malloc'd memory to be freed through
 // the default delete's bookkeeping.

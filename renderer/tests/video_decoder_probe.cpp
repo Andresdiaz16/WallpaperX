@@ -44,10 +44,16 @@ extern "C" {
 }
 
 #include <dlfcn.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <atomic>
+#include <chrono>
 #include <climits>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -675,6 +681,137 @@ void runClassifierChecks(Device& device, bool deviceStops) {
 // S13.42 / S13.43 -- damaged packets, and whose fault a bad file is
 // ------------------------------------------------------------------------- //
 
+// Attaches a writer to each of `fifos` if the calling thread is still inside the guarded work after
+// a deadline, and again every half second until that work ends -- which is what releases an open
+// parked on a pipe nobody writes to. The decoder cannot be built on a thread of its own (a Device
+// pins itself to its creating thread and a failed construction unwinds through it), so a watchdog
+// that frees the main thread is the only way a regression here reds instead of hanging the probe.
+class PipeRescuer {
+public:
+    explicit PipeRescuer(std::vector<std::string> fifos) : m_fifos(std::move(fifos)) {
+        m_thread = std::thread([this] {
+            std::unique_lock<std::mutex> lock(m_mutex);
+            if (m_changed.wait_for(lock, std::chrono::seconds(10), [this] { return m_done; })) return;
+            m_rescued = true;
+            while (!m_done) {
+                for (const std::string& fifo : m_fifos) {
+                    const int writer = ::open(fifo.c_str(), O_WRONLY | O_CLOEXEC | O_NONBLOCK);
+                    if (writer >= 0) ::close(writer);
+                }
+                m_changed.wait_for(lock, std::chrono::milliseconds(500), [this] { return m_done; });
+            }
+        });
+    }
+    ~PipeRescuer() { finish(); }
+    PipeRescuer(const PipeRescuer&) = delete;
+    PipeRescuer& operator=(const PipeRescuer&) = delete;
+
+    // True when the guarded work had to be released from a parked open.
+    bool finish() {
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_done = true;
+        }
+        m_changed.notify_all();
+        if (m_thread.joinable()) m_thread.join();
+        return m_rescued;
+    }
+
+private:
+    std::vector<std::string> m_fifos;
+    std::mutex m_mutex;
+    std::condition_variable m_changed;
+    bool m_done = false;
+    bool m_rescued = false;
+    std::thread m_thread;
+};
+
+// GOAL: S13.177 -- a wallpaper whose CONTENT names further files is refused at once, as the file's
+//       fault, and never makes ffmpeg open anything by itself: an ffconcat script and an HLS playlist
+//       each listing a named pipe with no writer. Before this fix such a container wedged the
+//       decoding thread exactly as a pipe given as the wallpaper itself did, because ffmpeg opened
+//       the listed file by path on that thread -- a path the daemon never checked.
+// WHY-THIS-SHAPE: three containers, because the refusal has two halves and they cover different
+//       ways in. A demuxer that opens a file for its own context goes through the context's io_open
+//       hook; one that opens a whole CONTAINER of its own -- the concat demuxer does -- builds a
+//       fresh context that inherits the protocol list and nothing else. A third script lists an
+//       ordinary video rather than a pipe: it must be refused too (nothing may be opened by path)
+//       and it can never park, so it grades the refusal without the watchdog ever mattering.
+//       "Refused" is not enough on its own -- a parked open that the watchdog released also ends in
+//       an error -- so the rescue flag is what fails the park, and the rescue is what lets that
+//       failure be printed instead of hanging the run.
+// CONTROL: renderer/video/video_decoder.cpp, three runs, all reverted.
+//       (1) `protocol_whitelist` not set, io_open kept -> both ffconcat cases red: the pipe one
+//       "parked the decoding thread in an open until a writer appeared", released by the watchdog
+//       and printed; the ordinary one "was opened". The HLS case stayed GREEN -- io_open refused
+//       its segment on its own.
+//       (2) io_open not set, list kept -> all three green: ffmpeg's default open applies the
+//       context's protocol list, so the list alone refuses every case here.
+//       (3) both removed -> all three red, the HLS one printing ffmpeg's "Opening '.../segment.ts'
+//       for reading" before parking, which is what shows its segment open is really reached.
+//       So the protocol list is load-bearing on its own; io_open is a working second defence for
+//       the HLS path (run 1) but no case this probe can build needs it alone (run 2).
+// COVERAGE-ASSERT: the count of cases graded is asserted against a literal.
+void runMultiFileChecks(Device& device, const ScratchDir& scratch) {
+    const std::string pipe = scratch.file("listed.pipe");
+    const std::string segment = scratch.file("segment.ts");
+    const std::string ordinary = scratch.file("listed-ordinary.mp4");
+    const std::string concatPipe = scratch.file("concat-pipe.mp4");
+    const std::string hlsPipe = scratch.file("playlist.m3u8");
+    const std::string concatOrdinary = scratch.file("concat-ordinary.mp4");
+    std::error_code ec;
+    std::filesystem::copy_file(asset("h264_crop.mp4"), ordinary, ec);
+    if (ec || ::mkfifo(pipe.c_str(), 0600) != 0 || ::mkfifo(segment.c_str(), 0600) != 0) {
+        fail("video_decoder_probe (content): could not make the pipes and copies the multi-file cases list, so "
+             "none was exercised");
+        return;
+    }
+    {
+        std::ofstream(concatPipe) << "ffconcat version 1.0\nfile listed.pipe\n";
+        std::ofstream(hlsPipe) << "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n#EXTINF:1.0,\nsegment.ts\n"
+                                  "#EXT-X-ENDLIST\n";
+        std::ofstream(concatOrdinary) << "ffconcat version 1.0\nfile listed-ordinary.mp4\n";
+    }
+
+    const std::pair<const char*, const std::string*> cases[] = {
+        {"an ffconcat script listing a named pipe", &concatPipe},
+        {"an HLS playlist whose segment is a named pipe", &hlsPipe},
+        {"an ffconcat script listing an ordinary video", &concatOrdinary},
+    };
+    constexpr int kCases = 3;
+    check(static_cast<int>(sizeof(cases) / sizeof(cases[0])) == kCases,
+          "the multi-file case list no longer has the three entries this check is written for");
+
+    int graded = 0;
+    for (const auto& [what, path] : cases) {
+        std::string said;
+        bool asContent = false;
+        bool opened = false;
+        bool rescued = false;
+        {
+            PipeRescuer rescuer({pipe, segment});
+            try {
+                VideoDecoder decoder(device, *path);
+                opened = true;
+            } catch (const WallpaperContentError& e) {
+                asContent = true;
+                said = e.what();
+            } catch (const std::exception& e) {
+                said = e.what();
+            }
+            rescued = rescuer.finish();
+        }
+        std::printf("video_decoder_probe (content): %s -> %s%s\n", what,
+                    opened ? "OPENED" : said.c_str(), rescued ? " [released from a parked open by the watchdog]" : "");
+        check(!rescued, std::string(what) + " parked the decoding thread in an open until a writer appeared");
+        check(!opened, std::string(what) + " was opened, so ffmpeg reached a file by a path nobody checked");
+        check(asContent && said.find(*path) != std::string::npos,
+              std::string(what) + " was not refused as a content error naming the wallpaper (said: " + said + ")");
+        ++graded;
+    }
+    check(graded == kCases, "every multi-file case ran (" + std::to_string(graded) + " of 3)");
+}
+
 void runContentChecks(Device& device) {
     if (!haveAssets({"h264_raw.h264", "audio_only.m4a"})) {
         g_notVerified = true;
@@ -690,8 +827,9 @@ void runContentChecks(Device& device) {
     //       and not GpuFailure, which the daemon turns into a permanently unhealthy state over a
     //       file the user could simply replace.
     // CONTROL: renderer/video/video_decoder.cpp, two, because two different sites raise these,
-    //       both reverted. (1) throwAvFailure() raising GpuFailure: red for the missing file and
-    //       the non-container, and the coverage count with them. (2) openContainer()'s explicit
+    //       both reverted. (1) throwFileFailure() raising GpuFailure: red for the missing file and
+    //       the non-container, and the coverage count with them; the multi-file cases in
+    //       runMultiFileChecks go red with it. Observed 2026-09-21. (2) openContainer()'s explicit
     //       `throw WallpaperContentError(... " has no video stream")` changed to GpuFailure: red
     //       for the audio-only file. Neither alone covers all three.
     struct BadFile {
@@ -730,6 +868,107 @@ void runContentChecks(Device& device) {
     check(static_cast<int>(bad.size()) == kUnusableFiles,
           "the list of unusable files no longer has the three entries this check is written for");
     check(refusedAsContent == kUnusableFiles, "not every unusable file was refused as a content error");
+
+    // GOAL: S13.182 -- every refusal that names a wallpaper file is worded `VideoDecoder: reason:
+    //       path`, reason first and the path last. The daemon keeps only the head of a recorded
+    //       error, so a path placed ahead of the reason is all that survives a long one and the
+    //       only account of the failure a client gets is lost.
+    // WHY-THIS-SHAPE: three failures raised at three different sites -- the open, ffmpeg's own
+    //       container error, and the decoder's explicit "no video stream" -- because the property is
+    //       that every site goes through one helper, and one site graded says nothing about the
+    //       others. That a long path really does lose a path-first reason is graded at the daemon.
+    // CONTROL: renderer/video/video_decoder.cpp, the "no video stream" throw put back to the
+    //       pre-helper `"VideoDecoder: " + m_file + " has no video stream"` -> "FAIL: a container
+    //       with no video stream: the refusal is not worded `VideoDecoder: reason: path`" and the
+    //       count "2 of 3". Reverted.
+    {
+        const std::pair<const char*, std::string> sites[] = {
+            {"a file that does not exist", missing},
+            {"a file that is not a container", notAVideo},
+            {"a container with no video stream", asset("audio_only.m4a")},
+        };
+        int wellWorded = 0;
+        for (const auto& [what, path] : sites) {
+            std::string said;
+            try {
+                VideoDecoder decoder(device, path);
+            } catch (const std::exception& e) {
+                said = e.what();
+            }
+            const std::string tail = ": " + path;
+            const bool pathLast = said.size() > tail.size() && said.compare(said.size() - tail.size(), tail.size(), tail) == 0;
+            const bool componentFirst = said.rfind("VideoDecoder: ", 0) == 0;
+            // The reason is what sits between the two, and there must be one.
+            const bool hasReason = pathLast && componentFirst && said.size() > tail.size() + 14;
+            check(pathLast && componentFirst && hasReason,
+                  std::string(what) + ": the refusal is not worded `VideoDecoder: reason: path` (said: " + said + ")");
+            if (pathLast && componentFirst && hasReason) ++wellWorded;
+        }
+        check(wellWorded == 3, "every decoder refusal graded here names its path last (" + std::to_string(wellWorded) +
+                                   " of 3)");
+    }
+
+    // GOAL: S13.169, the video half -- a wallpaper path that is not a regular file is refused BY
+    //       THE VIDEO DECODER, naming the path, rather than handed to ffmpeg. That a path like
+    //       this is refused at all belongs to openWallpaperFile and is graded in
+    //       wallpaper_file_probe; what is graded here is that VideoDecoder goes through that door
+    //       -- it builds its own AVIOContext precisely so ffmpeg is never given the path, and if
+    //       that ever regressed to avio_open2 this is what would say so.
+    // WHY-THIS-SHAPE: the refusal's WORDING is what is asserted, not merely that
+    //       WallpaperContentError came out. Without the fix both of these still raise
+    //       WallpaperContentError -- ffmpeg reports "Invalid data found" for the device and EISDIR
+    //       for the directory, and both are classed as the file's fault -- so "it threw the right
+    //       type" is green either way and grades nothing.
+    //       A named pipe is deliberately NOT among the kinds, though it is what the finding was
+    //       about: with the refusal removed the open returns and the decoder then blocks in
+    //       read(2) on the empty pipe for ever, so a pipe case makes this probe HANG under its own
+    //       control instead of reddening -- measured in image_bounds_probe, whose run had to be
+    //       killed. The pipe is graded in wallpaper_file_probe, on a thread with a deadline.
+    // CONTROL: renderer/wallpaper_file.cpp, `if (!S_ISREG(info.st_mode))` -> `if (false)` -> three
+    //       FAILs: "a directory was not refused as not-a-regular-file (said: VideoDecoder: cannot
+    //       open ...: Is a directory)", the same for /dev/null saying "Invalid data found when
+    //       processing input", and the count "0 of 2". Both messages are WallpaperContentError,
+    //       which is why the wording and not the type is what is asserted. Reverted, green.
+    // COVERAGE-ASSERT: kIrregularKinds is a literal against the list's own length.
+    {
+        const std::string videoDirectory = scratch.file("a-directory.mp4");
+        std::error_code dirEc;
+        std::filesystem::create_directory(videoDirectory, dirEc);
+        if (dirEc) {
+            fail("video_decoder_probe (content): could not make a directory to offer the decoder, so "
+                 "the not-a-regular-file cases were not exercised");
+        } else {
+            const std::string charDevice = "/dev/null";
+            const std::pair<const char*, const std::string*> kinds[] = {
+                {"a directory", &videoDirectory},
+                {"a character device", &charDevice},
+            };
+            constexpr int kIrregularKinds = 2;
+            check(static_cast<int>(sizeof(kinds) / sizeof(kinds[0])) == kIrregularKinds,
+                  "the decoder's irregular-path list no longer has the two entries this check is written for");
+
+            int refusedByKind = 0;
+            for (const auto& [what, path] : kinds) {
+                std::string said;
+                try {
+                    VideoDecoder decoder(device, *path);
+                    said = "it was opened without complaint";
+                } catch (const std::exception& e) {
+                    said = e.what();
+                }
+                std::printf("video_decoder_probe (content): the decoder given %s: %s\n", what, said.c_str());
+                const bool named = said.find("is not a regular file") != std::string::npos &&
+                                   said.find(*path) != std::string::npos;
+                check(named, std::string(what) + " was not refused as not-a-regular-file (said: " + said + ")");
+                if (named) ++refusedByKind;
+            }
+            check(refusedByKind == kIrregularKinds,
+                  "every irregular path was refused by the decoder (" + std::to_string(refusedByKind) + " of " +
+                      std::to_string(kIrregularKinds) + ")");
+        }
+    }
+
+    runMultiFileChecks(device, scratch);
 
     // GOAL: S13.42 -- a real file with damaged payload does not kill the wallpaper. End to end:
     //       it decodes to fewer pictures than the same file undamaged, and to more than none.

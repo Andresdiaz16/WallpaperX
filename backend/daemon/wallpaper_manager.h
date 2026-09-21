@@ -352,7 +352,8 @@ public:
 
     // How often one consumer's refusal on one monitor is worth a line. A consumer that holds its
     // fill of a playing video is refused for every picture it does not release in time, so this is
-    // the difference between one line and sixty a second.
+    // the difference between one line and sixty a second. It is also how long a consumer must have
+    // been quiet before another may take its slot in reportConsumer().
     static constexpr std::chrono::seconds kRefusalLogInterval{60};
 
     // Times the clock reopens one wallpaper after playback fails without a picture having been
@@ -573,6 +574,30 @@ private:
         Outcome outcome = Outcome::Refused;
     };
 
+    // One consumer of one monitor, as both the refusal log and the hand-over log remember it. Two
+    // times, because a slot is asked two different things: whether its holder is still there, and
+    // whether a line about it is due again.
+    struct ConsumerReport {
+        std::string client;
+        std::chrono::steady_clock::time_point heard;
+        std::chrono::steady_clock::time_point logged;
+    };
+
+    // Whether `client` is worth a line now, recording it if so. At most kMaxHoldersPerMonitor
+    // consumers are remembered, so peer-chosen bus names cannot size the list, and one that cannot
+    // be given a slot is reported not at all -- which is what bounds the log when more consumers
+    // than slots take turns on one monitor. Every call keeps the caller's slot, and a slot goes to
+    // a newcomer only once its holder has been silent for kRefusalLogInterval or has left the bus.
+    // The cost is deliberate: while four consumers keep reading one monitor, a fifth is never
+    // named, which is one missing line rather than a stream of false ones.
+    //
+    // Periodic reports a consumer that already holds a slot again once per interval: a refusal
+    // still happening is still worth saying. Once reports it only when it takes a slot, since
+    // starting to read is a single event. The caller's lock is whichever one guards `reports`.
+    enum class Repeat { Periodic, Once };
+    static bool reportConsumer(std::vector<ConsumerReport>& reports, const std::string& client, Repeat repeat,
+                               std::chrono::steady_clock::time_point now);
+
     struct MonitorState {
         std::string type;
         std::string path;
@@ -633,15 +658,17 @@ private:
         // that keeps committing while this climbs is one whose images are not coming back.
         uint32_t refusedHandovers = 0;
 
-        // When each consumer's refusal was last reported, at most kMaxHoldersPerMonitor of them so
-        // peer-chosen names cannot size this. Kept beside the count rather than derived from it:
-        // the count is one number for the monitor, and which consumer was refused is what the
-        // report is about.
-        struct RefusalReport {
-            std::string client;
-            std::chrono::steady_clock::time_point at;
-        };
-        std::vector<RefusalReport> refusalsReported;
+        // When each consumer's refusal was last reported. Kept beside the count rather than derived
+        // from it: the count is one number for the monitor, and which consumer was refused is what
+        // the report is about.
+        std::vector<ConsumerReport> refusalsReported;
+
+        // The consumers this monitor's current video session has handed a picture to, so the log
+        // records a consumer starting to read rather than every picture it takes; a single name
+        // would not do, since two readers would each find the other there. About the session, and
+        // emptied when one opens. Kept here and not on the session so a consumer leaving the bus
+        // can be forgotten under this lock alone: the bus thread must never wait on m_gpuMutex.
+        std::vector<ConsumerReport> served;
 
         // When this monitor published a picture that nothing has collected since, or nothing while
         // its newest picture is in a consumer's hands. The evidence that something is looking, and
@@ -653,6 +680,28 @@ private:
         // display rate and is refused every time, so counting a refusal as collection would keep a
         // frozen screen decoding at display rate.
         std::optional<std::chrono::steady_clock::time_point> uncollectedSince;
+
+        // What a screen reporting it is being drawn again buys. It has to buy something, or a
+        // stopped video would wait for a hand-over that only a picture can prompt -- but the report
+        // is a peer's word, so it is worth one picture and no more: it lapses as soon as this
+        // monitor publishes one, and whether the consumer then takes that picture is what says
+        // whether playback goes on. It takes effect at most once per kUnwatchedAfter, since the
+        // report is free to send; without that, a client that collects nothing would keep a decoder
+        // running at the file's full rate by saying hidden and then shown again.
+        //
+        // It carries no deadline of its own: only a picture can spend it, and a monitor waiting on
+        // a GPU that has just failed or on a decode session slot may take longer than any deadline
+        // to publish one -- after which no further report would come, the screen already being
+        // drawn. What bounds it instead is resumeCreditStands(): it counts only while this monitor
+        // holds a video that can still publish that picture.
+        struct ResumeCredit {
+            // When it comes due. Never earlier than the report that granted it, and later than that
+            // when the report landed inside the interval since the last one.
+            std::optional<std::chrono::steady_clock::time_point> at;
+            // This monitor's generation when it was granted; any picture since has spent it.
+            uint64_t generation = 0;
+        };
+        ResumeCredit resumeCredit;
 
         // The wallpaper whose file held a single picture: it is on screen and there is nothing
         // after it, so no clock advances it and no session is opened to play it. Keyed by
@@ -755,6 +804,12 @@ private:
     // sitting uncollected. Reads the clock itself, so no caller can ask with a stale one. Caller
     // must hold m_stateMutex.
     bool watchedLocked(int monitorId, const MonitorState& state) const;
+
+    // Whether this monitor's resume credit is unspent and could still be spent: it holds a frame of
+    // a video that has more than one picture. Anything else -- a still, a one-picture file, a
+    // failed render -- will never publish the picture that spends it, and would read as watched
+    // for ever. Caller must hold m_stateMutex.
+    static bool resumeCreditStands(const MonitorState& state);
 
     // Whether the screen bound to this monitor is being drawn, which is true of one that has never
     // said otherwise. Caller must hold m_stateMutex.
@@ -933,15 +988,21 @@ private:
         std::string path;
         std::unique_ptr<VideoPipeline> pipeline;
 
-        // The held picture: the first, never drawn; the one on screen, which was due at `due` and
-        // whose successor is decoded next; or that successor, waiting for `due`. A pass drawing a
-        // waiting picture shows it early and leaves the schedule where it was.
+        // The held picture: the first, never drawn; the one on screen, whose successor is decoded
+        // next; or that successor, waiting for `due`. `timeline` is a picture's place on the file's
+        // own schedule, which the next is timed from; `due` is when it may be drawn, which the cap
+        // holds at least kMinPictureInterval after the previous picture's `due` but which never
+        // moves the schedule. Measured from `due` and not from the draw, so wake-up latency is not
+        // charged to the next picture. A pass drawing a waiting picture shows it early and leaves
+        // the schedule where it was.
         struct Undrawn {};
         struct OnScreen {
+            std::chrono::steady_clock::time_point timeline;
             std::chrono::steady_clock::time_point due;
         };
         struct Waiting {
             std::chrono::steady_clock::time_point due;
+            std::chrono::steady_clock::time_point timeline;
         };
         std::variant<Undrawn, OnScreen, Waiting> clock;
 
@@ -949,12 +1010,6 @@ private:
         // The whole off switch: a video nobody can see stops at once and keeps its picture, and
         // this is what says how long it has been stopped, whatever stopped it.
         std::optional<std::chrono::steady_clock::time_point> idleSince;
-
-        // The consumers this session has handed a picture to, most recent last and at most
-        // kMaxHoldersPerMonitor of them, so the log records a consumer starting to read rather
-        // than every picture it takes. A single name would not do: two consumers reading one
-        // monitor would each find the other there and log every picture.
-        std::vector<std::string> served;
     };
     std::map<int, VideoSession> m_videoSessions;
 

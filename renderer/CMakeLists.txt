@@ -71,6 +71,7 @@ find_file(WALLPAPERX_LAVAPIPE_ICD
 
 add_library(wallpaperx-renderer STATIC
     renderer.cpp
+    wallpaper_file.cpp
     vulkan/gpu_fault.cpp
     vulkan/device.cpp
     vulkan/memory.cpp
@@ -548,6 +549,14 @@ else()
                    "video_decoder_probe entries will report a skip")
 endif()
 
+# The one door every wallpaper file is opened through, asked with no Vulkan anywhere: which kinds of
+# path are refused, that a refusal leaks no descriptor, and that a pipe nobody writes to does not
+# park the caller. No Device, which is the point twice over: it runs on a host with no GPU (the
+# defect it grades is a kernel wait, not a GPU one), and the parking case needs a worker thread with
+# a deadline, which a Device's thread affinity would forbid.
+add_executable(wallpaperx-wallpaper-file-probe tests/wallpaper_file_probe.cpp)
+target_link_libraries(wallpaperx-wallpaper-file-probe PRIVATE wallpaperx-renderer)
+
 # The ffmpeg bridge: every path state, the refusal-versus-fault classifier, and the frame's
 # semaphore protocol. Interposes av_hwframe_ctx_init, vkQueueSubmit and
 # vkEnumerateDeviceExtensionProperties -- the first two so a failure that no available file can
@@ -620,6 +629,11 @@ add_test(NAME tier_selection COMMAND wallpaperx-tier-selection-test)
 add_test(NAME memory_export COMMAND wallpaperx-memory-export-test)
 add_test(NAME gpu_fault COMMAND wallpaperx-gpu-fault-test)
 
+# SKIP_RETURN_CODE because a host that cannot make a temporary directory has no FIFO, directory or
+# symlink to offer openWallpaperFile, and an inconclusive run must not read as a verified one.
+add_test(NAME wallpaper_file_probe COMMAND wallpaperx-wallpaper-file-probe)
+set_tests_properties(wallpaper_file_probe PROPERTIES SKIP_RETURN_CODE 77)
+
 # The two-argument externalMemoryHandleType() caches WALLPAPERX_FORCE_HANDLE_TYPE in a
 # function-local static, so one process can only ever observe one value of it. Three
 # processes, three environments -- a single binary looping over setenv would test the
@@ -642,6 +656,7 @@ set_tests_properties(handle_type_env_default PROPERTIES ENVIRONMENT "WALLPAPERX_
 # unexercised under the sanitizer -- while the run still reported green.
 set_tests_properties(tier_selection memory_export gpu_fault
                      handle_type_env_default handle_type_env_opaque handle_type_env_dmabuf
+                     wallpaper_file_probe
                      PROPERTIES LABELS "novulkan")
 
 add_test(NAME device_probe COMMAND wallpaperx-device-probe)

@@ -615,10 +615,56 @@ if(WALLPAPERX_FFMPEG_EXECUTABLE)
         COMMENT "Generating video wallpaper fixture wallpaper_slow.mp4"
         VERBATIM
     )
+    # A file that declares a rate no screen can show: 240 pictures timed at 1000 a second. The
+    # daemon's floor on the gap between pictures caps it at 120 a second, so this plays in full and
+    # slower than its author meant. Without a floor near what a display can do, a file like this one
+    # -- and wallpapers are exactly the thing this project plans to take from a workshop -- drives
+    # the single GPU thread at whatever rate it asks for, which the QA pass measured as 688 renders
+    # a second and a twelvefold rise in every other client's frame-fetch latency.
+    add_custom_command(
+        OUTPUT ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_fast.mp4
+        COMMAND ${WALLPAPERX_FFMPEG_EXECUTABLE} -y -v error
+                -f lavfi -i color=c=black:size=320x240:rate=1000:duration=0.24
+                -vf "drawbox=x=0:y=0:w=320:h=120:color=0xFF0000@1:t=fill,drawbox=x=0:y=120:w=320:h=120:color=0x00FF00@1:t=fill,format=yuv420p,setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv"
+                -c:v libx264 -profile:v baseline -g 30 -pix_fmt yuv420p -r 1000
+                ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_fast.mp4
+        COMMENT "Generating video wallpaper fixture wallpaper_fast.mp4"
+        VERBATIM
+    )
+    # The other end of the same clamp: three pictures eight seconds apart, which is past the
+    # five-second ceiling on one picture's interval. A gap that long is read as a discontinuity
+    # rather than a pause, so the wallpaper advances after five seconds instead of eight -- which is
+    # what keeps a timestamp jump from freezing a wallpaper for as long as the jump says.
+    add_custom_command(
+        OUTPUT ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_gap.mp4
+        COMMAND ${WALLPAPERX_FFMPEG_EXECUTABLE} -y -v error
+                -f lavfi -i color=c=black:size=320x240:rate=1/8:duration=24
+                -vf "drawbox=x=0:y=0:w=320:h=120:color=0xFF0000@1:t=fill,drawbox=x=0:y=120:w=320:h=120:color=0x00FF00@1:t=fill,format=yuv420p,setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv"
+                -c:v libx264 -profile:v baseline -g 1 -pix_fmt yuv420p -r 1/8
+                ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_gap.mp4
+        COMMENT "Generating video wallpaper fixture wallpaper_gap.mp4"
+        VERBATIM
+    )
+    # A 120 a second file whose container rounds timestamps to whole milliseconds -- Matroska does
+    # -- so its gaps read 8, 9, 8 ms. The floor held on each gap alone raises every 8 to 8.33 and
+    # leaves the 9, and plays the file at 116 a second; held between due times it plays at 120.
+    add_custom_command(
+        OUTPUT ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_rate120_ms.mkv
+        COMMAND ${WALLPAPERX_FFMPEG_EXECUTABLE} -y -v error
+                -f lavfi -i color=c=black:size=320x240:rate=120:duration=3
+                -vf "drawbox=x=0:y=0:w=320:h=120:color=0xFF0000@1:t=fill,format=yuv420p,setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv"
+                -c:v libx264 -profile:v baseline -g 30 -pix_fmt yuv420p
+                ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_rate120_ms.mkv
+        COMMENT "Generating video wallpaper fixture wallpaper_rate120_ms.mkv"
+        VERBATIM
+    )
     add_custom_target(wallpaperx-backend-video-fixtures
                       DEPENDS ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_bands.mp4
                               ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_one_picture.mp4
-                              ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_slow.mp4)
+                              ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_slow.mp4
+                              ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_fast.mp4
+                              ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_gap.mp4
+                              ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_rate120_ms.mkv)
 else()
     message(STATUS "  ffmpeg CLI: not found -- the video wallpaper fixture is not generated, and "
                    "video_wallpaper will report itself to ctest as a skip rather than a pass")

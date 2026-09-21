@@ -12,9 +12,12 @@
 #include "../vulkan/device.h"
 #include "../vulkan/image_barrier.h"
 #include "../vulkan/shader_module.h"
+#include "../wallpaper_file.h"
 
 #define STB_IMAGE_IMPLEMENTATION
 #include <stb_image.h>
+
+#include <unistd.h>
 
 #include <array>
 #include <cerrno>
@@ -145,12 +148,7 @@ std::string stbFailureReason() {
     return reason != nullptr ? std::string(reason) : std::string("no reason reported");
 }
 
-// Diagnosis first, path last: these become MonitorState::lastError, which sanitizeForLog
-// truncates from the tail at 1024 bytes. Path-first let a long path cut off stb's reason --
-// the only account of a render failure a client ever gets.
-std::string describeRejection(const std::string& what, const std::string& imagePath) {
-    return "StaticRenderer: " + what + ": " + imagePath;
-}
+constexpr const char* kComponent = "StaticRenderer";
 
 struct FileCloser {
     void operator()(FILE* f) const noexcept { std::fclose(f); }
@@ -189,10 +187,17 @@ void StaticRenderer::loadAndUploadTexture(const std::string& imagePath) {
     // Probes and decode share one open: reopening by path lets a swapped file be charged
     // the wrong peak factor. Safe without a rewind because both _from_file probes
     // ftell/fseek around their work (stb_image.h:7701, :7722).
-    FilePtr probe(std::fopen(imagePath.c_str(), "rb"));
+    //
+    // Through openWallpaperFile() rather than fopen: a render happens whenever a screen reports a
+    // new size, long after the path was checked, and opening what is a named pipe by then parks
+    // this thread -- the one GPU thread -- for good.
+    const int fd = openWallpaperFile(imagePath, kComponent);
+    FilePtr probe(fd < 0 ? nullptr : ::fdopen(fd, "rb"));
     if (!probe) {
+        const int why = errno;
+        if (fd >= 0) ::close(fd);
         throw WallpaperContentError(
-            describeRejection(std::string("cannot open image (") + std::strerror(errno) + ")", imagePath));
+            describeRejection(kComponent, std::string("cannot open image (") + std::strerror(why) + ")", imagePath));
     }
 
     int probeWidth = 0;
@@ -203,10 +208,11 @@ void StaticRenderer::loadAndUploadTexture(const std::string& imagePath) {
 
     if (!headerRead) {
         throw WallpaperContentError(
-            describeRejection("not a decodable image (" + stbFailureReason() + ")", imagePath));
+            describeRejection(kComponent, "not a decodable image (" + stbFailureReason() + ")", imagePath));
     }
     if (probeWidth <= 0 || probeHeight <= 0) {
         throw WallpaperContentError(describeRejection(
+            kComponent,
             "image reports non-positive dimensions (" + std::to_string(probeWidth) + "x" +
                 std::to_string(probeHeight) + ")",
             imagePath));
@@ -220,6 +226,7 @@ void StaticRenderer::loadAndUploadTexture(const std::string& imagePath) {
     const uint64_t peakBytes = outputBytes * (sixteenBit ? kPeakFactor16Bit : kPeakFactor8Bit);
     if (peakBytes > kMaxPeakDecodeBytes) {
         throw WallpaperContentError(describeRejection(
+            kComponent,
             "estimated peak " + std::to_string(peakBytes / (1024 * 1024)) + " MiB to decode " +
                 std::to_string(probeWidth) + "x" + std::to_string(probeHeight) + " (" +
                 std::to_string(probeChannels) + " channels, " + (sixteenBit ? "16" : "8") +
@@ -234,13 +241,14 @@ void StaticRenderer::loadAndUploadTexture(const std::string& imagePath) {
     PixelsPtr pixels(stbi_load_from_file(probe.get(), &imageWidth, &imageHeight, &channels, STBI_rgb_alpha));
     if (!pixels) {
         throw WallpaperContentError(
-            describeRejection("failed to load image (" + stbFailureReason() + ")", imagePath));
+            describeRejection(kComponent, "failed to load image (" + stbFailureReason() + ")", imagePath));
     }
 
     // Guards stb's two parsers disagreeing with each other, not a swap -- the shared open
     // above rules that out.
     if (imageWidth != probeWidth || imageHeight != probeHeight) {
         throw WallpaperContentError(describeRejection(
+            kComponent,
             "decoded to " + std::to_string(imageWidth) + "x" + std::to_string(imageHeight) +
                 " but its header reported " + std::to_string(probeWidth) + "x" +
                 std::to_string(probeHeight) + " -- header and decoder disagree",

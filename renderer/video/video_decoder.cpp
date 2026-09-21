@@ -6,6 +6,7 @@
 
 #include "../vulkan/format_features.h"
 #include "../vulkan/gpu_fault.h"
+#include "../wallpaper_file.h"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -17,10 +18,15 @@ extern "C" {
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_vulkan.h>
 #include <libavutil/mathematics.h>
+#include <libavutil/mem.h>
 #include <libavutil/pixdesc.h>
 }
 
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include <algorithm>
+#include <cerrno>
 #include <iterator>
 #include <new>
 #include <stdexcept>
@@ -41,10 +47,20 @@ std::string avErrorString(int err) {
     throw ResourceExhausted(context + ": out of memory");
 }
 
-// An ffmpeg error that is not the GPU's: memory, or the file.
-[[noreturn]] void throwAvFailure(const std::string& context, int err) {
-    if (err == AVERROR(ENOMEM)) throwOutOfMemory(context);
-    throw WallpaperContentError(context + ": " + avErrorString(err));
+// ffmpeg's own default for a file it opens, and what its probes are sized against.
+constexpr int kIoBufferSize = 32768;
+
+// A protocol list that names no protocol there is, which is how ffmpeg is told to open nothing:
+// an empty list means "unrestricted" to it, so the refusal has to be spelt as a name that matches
+// none.
+constexpr const char* kNoProtocols = "none";
+
+constexpr const char* kComponent = "VideoDecoder";
+
+// An ffmpeg error that is not the GPU's: memory, or the file, which it names.
+[[noreturn]] void throwFileFailure(const std::string& reason, int err, const std::string& file) {
+    if (err == AVERROR(ENOMEM)) throwOutOfMemory(kComponent);
+    throw WallpaperContentError(describeRejection(kComponent, reason + " (" + avErrorString(err) + ")", file));
 }
 
 struct BufferRef {
@@ -368,7 +384,7 @@ void VideoDecoder::closeAll() noexcept {
     closeDecoder();
     av_packet_free(&m_packet);
     avformat_close_input(&m_format);
-    avio_closep(&m_io);
+    closeFile();
 }
 
 // The one bounded question this renderer can ask of the GPU: an empty batch through the
@@ -456,29 +472,97 @@ void VideoDecoder::releaseIdleFramesContexts() noexcept {
     });
 }
 
+int VideoDecoder::readFile(void* opaque, uint8_t* buffer, int size) {
+    const int fd = static_cast<VideoDecoder*>(opaque)->m_fd;
+    ssize_t got = 0;
+    do {
+        got = ::read(fd, buffer, static_cast<size_t>(size));
+    } while (got < 0 && errno == EINTR);
+    if (got < 0) return AVERROR(errno);
+    return got == 0 ? AVERROR_EOF : static_cast<int>(got);
+}
+
+int VideoDecoder::refuseOpen(AVFormatContext*, AVIOContext**, const char*, int, AVDictionary**) {
+    return AVERROR(EACCES);
+}
+
+int64_t VideoDecoder::seekFile(void* opaque, int64_t offset, int whence) {
+    const int fd = static_cast<VideoDecoder*>(opaque)->m_fd;
+    // Asked for the file's length rather than for a position; AVSEEK_FORCE is advice about how
+    // dear a seek is, which costs a regular file nothing.
+    if ((whence & ~AVSEEK_FORCE) == AVSEEK_SIZE) {
+        struct stat info{};
+        if (::fstat(fd, &info) != 0) return AVERROR(errno);
+        return info.st_size;
+    }
+    const off_t at = ::lseek(fd, static_cast<off_t>(offset), whence & ~AVSEEK_FORCE);
+    return at == static_cast<off_t>(-1) ? AVERROR(errno) : at;
+}
+
+void VideoDecoder::openFile() {
+    m_fd = openWallpaperFile(m_file, kComponent);
+    if (m_fd < 0) {
+        // Taken before the message is built: building one allocates, an allocator may leave errno
+        // changed behind it, and a reason that reads as out of memory would send the daemon off
+        // freeing another monitor's decoder to retry this open.
+        const int why = errno;
+        throwFileFailure("cannot open the wallpaper", AVERROR(why), m_file);
+    }
+
+    auto* buffer = static_cast<unsigned char*>(av_malloc(kIoBufferSize));
+    if (buffer == nullptr) throwOutOfMemory("VideoDecoder");
+    m_io = avio_alloc_context(buffer, kIoBufferSize, /*write_flag=*/0, this, &VideoDecoder::readFile, nullptr,
+                              &VideoDecoder::seekFile);
+    if (m_io == nullptr) {
+        av_free(buffer);
+        throwOutOfMemory("VideoDecoder");
+    }
+}
+
+// The I/O context before the file it reads.
+void VideoDecoder::closeFile() noexcept {
+    if (m_io != nullptr) av_freep(&m_io->buffer);
+    avio_context_free(&m_io);
+    if (m_fd >= 0) {
+        ::close(m_fd);
+        m_fd = -1;
+    }
+}
+
 // The first call opens the file; a later one reads it again from its start.
 void VideoDecoder::openContainer() {
     if (m_io == nullptr) {
-        if (const int err = avio_open2(&m_io, m_file.c_str(), AVIO_FLAG_READ, nullptr, nullptr); err < 0) {
-            throwAvFailure("VideoDecoder: cannot open " + m_file, err);
-        }
+        openFile();
     } else if (const int64_t err = avio_seek(m_io, 0, SEEK_SET); err < 0) {
-        throwAvFailure("VideoDecoder: cannot return to the start of " + m_file, static_cast<int>(err));
+        throwFileFailure("cannot return to the start of the wallpaper", static_cast<int>(err), m_file);
     }
     m_format = avformat_alloc_context();
     if (m_format == nullptr) throwOutOfMemory("VideoDecoder");
     m_format->pb = m_io;
     m_format->flags |= AVFMT_FLAG_CUSTOM_IO;
+    // A container whose content names further files -- a playlist, a concat script, an image
+    // sequence, a QuickTime external data reference -- has them opened on this thread, by a path
+    // this decoder never checked, so a pipe among them parks the thread exactly as the wallpaper's
+    // own path would. Both refusals earn their place: io_open is the hook a demuxer uses to open a
+    // file for this context, while one that opens a container of its own -- a concat script does --
+    // builds a fresh context that inherits the protocol list and nothing else. Nothing here needs a
+    // protocol; the bytes come from the descriptor. Such a container fails to play, which is the
+    // intended loss.
+    m_format->io_open = &VideoDecoder::refuseOpen;
+    m_format->protocol_whitelist = av_strdup(kNoProtocols);
+    if (m_format->protocol_whitelist == nullptr) throwOutOfMemory("VideoDecoder");
     // Frees the context on failure, never a caller's I/O context.
     if (const int err = avformat_open_input(&m_format, m_file.c_str(), nullptr, nullptr); err < 0) {
-        throwAvFailure("VideoDecoder: cannot open " + m_file, err);
+        throwFileFailure("cannot open the wallpaper", err, m_file);
     }
     if (const int err = avformat_find_stream_info(m_format, nullptr); err < 0) {
-        throwAvFailure("VideoDecoder: cannot read the streams of " + m_file, err);
+        throwFileFailure("cannot read the wallpaper's streams", err, m_file);
     }
     const int stream = av_find_best_stream(m_format, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
-    if (stream == AVERROR_STREAM_NOT_FOUND) throw WallpaperContentError("VideoDecoder: " + m_file + " has no video stream");
-    if (stream < 0) throwAvFailure("VideoDecoder: cannot pick a video stream in " + m_file, stream);
+    if (stream == AVERROR_STREAM_NOT_FOUND) {
+        throw WallpaperContentError(describeRejection(kComponent, "the wallpaper has no video stream", m_file));
+    }
+    if (stream < 0) throwFileFailure("cannot pick a video stream", stream, m_file);
     m_stream = stream;
 }
 
@@ -497,12 +581,12 @@ void VideoDecoder::openDecoder() {
     if (m_path == Path::Undecided && codec == nullptr) m_path = Path::SoftwareCodec;
     const bool hardware = m_path == Path::Undecided;
     if (!hardware) codec = avcodec_find_decoder(id);
-    if (codec == nullptr) throw WallpaperContentError("VideoDecoder: no decoder for the video in " + m_file);
+    if (codec == nullptr) throw WallpaperContentError(describeRejection(kComponent, "no decoder for the video", m_file));
 
     m_codec = avcodec_alloc_context3(codec);
     if (m_codec == nullptr) throwOutOfMemory("VideoDecoder");
     if (const int err = avcodec_parameters_to_context(m_codec, stream.codecpar); err < 0) {
-        throwAvFailure("VideoDecoder: cannot configure the decoder for " + m_file, err);
+        throwFileFailure("cannot configure the decoder", err, m_file);
     }
     m_codec->pkt_timebase = stream.time_base;
     m_codec->opaque = this;
@@ -529,7 +613,7 @@ void VideoDecoder::openDecoder() {
     }
 
     if (const int err = avcodec_open2(m_codec, codec, nullptr); err < 0) {
-        throwAvFailure("VideoDecoder: cannot open the decoder for " + m_file, err);
+        throwFileFailure("cannot open the decoder", err, m_file);
     }
 
     m_frame = av_frame_alloc();
@@ -881,7 +965,8 @@ AVPixelFormat VideoDecoder::choose(AVCodecContext* codec, const AVPixelFormat* o
 
     if (codec->hw_device_ctx == nullptr) {
         if (software == AV_PIX_FMT_NONE) {
-            throw WallpaperContentError("VideoDecoder: " + m_file + " decodes to no format software can hold");
+            throw WallpaperContentError(
+                describeRejection(kComponent, "the wallpaper decodes to no format software can hold", m_file));
         }
         return software;
     }
@@ -895,8 +980,10 @@ AVPixelFormat VideoDecoder::choose(AVCodecContext* codec, const AVPixelFormat* o
         // ffmpeg's own decoder setup failed after the device's yes, and it says nothing of why.
         m_awaitingHardwareSetup = false;
         if (!deviceHealthy()) {
-            throw GpuFailure("VideoDecoder: " + m_device.info().gpuName + " accepted " + m_file +
-                             " and no longer answers after its hardware decoder failed to initialise");
+            throw GpuFailure(describeRejection(kComponent,
+                                               m_device.info().gpuName + " accepted the wallpaper and no longer answers "
+                                                                         "after its hardware decoder failed to initialise",
+                                               m_file));
         }
         m_path = Path::SoftwareRefused;
     } else {
@@ -955,15 +1042,18 @@ void VideoDecoder::numberPacket() {
 // device that still answers, having arranged for the stream to be decoded in software instead.
 void VideoDecoder::failDecode(const char* what, int err) {
     if (m_parkedFailure) std::rethrow_exception(std::exchange(m_parkedFailure, nullptr));
-    const std::string context = std::string("VideoDecoder: ") + what + " on " + m_file;
+    const std::string failed = std::string(what) + " failed";
     const bool hardware = m_awaitingHardwareSetup || m_path == Path::Hardware;
     if (err == AVERROR_EXTERNAL && hardware) {
-        if (!deviceHealthy()) throw GpuFailure(context + ": the hardware decoder failed and the device no longer answers");
+        if (!deviceHealthy()) {
+            throw GpuFailure(describeRejection(
+                kComponent, failed + ": the hardware decoder failed and the device no longer answers", m_file));
+        }
         m_path = Path::SoftwareRefused;
         m_reopenInSoftware = true;
         return;
     }
-    throwAvFailure(context, err);
+    throwFileFailure(failed, err, m_file);
 }
 
 std::optional<DecodedFrame> VideoDecoder::next() {
@@ -1007,8 +1097,9 @@ std::optional<DecodedFrame> VideoDecoder::next() {
                 continue;
             }
             if (std::holds_alternative<DropCount>(m_resume)) {
-                throw WallpaperContentError("VideoDecoder: " + m_file +
-                                            " ended before software decoding reached the pictures already returned");
+                throw WallpaperContentError(describeRejection(
+                    kComponent, "the wallpaper ended before software decoding reached the pictures already returned",
+                    m_file));
             }
             // A play-once caller may not call again, which would hold a decoder retired near the end until close.
             releaseRetiredCodec();
@@ -1030,7 +1121,7 @@ std::optional<DecodedFrame> VideoDecoder::next() {
             if (err == AVERROR_EOF) {
                 m_flushed = true;
             } else if (err < 0) {
-                throwAvFailure("VideoDecoder: reading " + m_file, err);
+                throwFileFailure("cannot read the wallpaper", err, m_file);
             } else {
                 recordLanding();
             }

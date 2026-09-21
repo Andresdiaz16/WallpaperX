@@ -17,9 +17,12 @@
 // this executable. stb_image is compiled into the renderer's static library with the
 // default STBI_MALLOC (= malloc), so its pixel-buffer allocation is a call into this
 // file's symbol -- which means the request is observable without a single test-only line
-// in any production file (X.6). fopen is interposed the same way, to count the opens the
+// in any production file (X.6). open(2) is interposed the same way, to count the opens the
 // decode path makes and to redirect a chosen one of them, which is how the bytes the
-// decoder actually consumed are identified.
+// decoder actually consumed are identified. open and not fopen: the still path reaches its
+// file through openWallpaperFile(), which opens the descriptor and hands it to fdopen, so
+// fopen is never called with the image's path and an fopen counter reads zero for every
+// load -- a counter that cannot see the thing it counts.
 //
 // Requests, and not peak RSS, for a reason that was measured rather than assumed: with
 // the header gate disabled, the rejected load asked for 976 MiB and this probe's VmHWM
@@ -44,10 +47,15 @@
 #include <stb_image.h>
 
 #include <dlfcn.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <cstdarg>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -85,7 +93,7 @@
 // __has_feature(leak_sanitizer) there (verified with a preprocessor probe), so the
 // fallback covers LSan too.
 //
-// The fopen interposer sits under the same switch. It has no sanitizer conflict of its
+// The open(2) interposer sits under the same switch. It has no sanitizer conflict of its
 // own, but every check that uses it also needs the allocation instrument, and main()
 // returns 77 before any of them run when this is 0 -- one switch, no second story.
 #ifndef WALLPAPERX_ALLOCATION_INSTRUMENT
@@ -213,7 +221,7 @@ struct Window {
 // replacement to a two-open implementation as well, so both shapes pass and the check goes
 // green on exactly what it exists to refuse. Capping at one is what splits them.
 struct FileSwapPlan {
-    const char* watchedPath = nullptr;      // the exact string production passes to fopen
+    const char* watchedPath = nullptr;      // the exact string production passes to open(2)
     const char* replacementPath = nullptr;  // what to open instead
     int redirectFromOpen = 0;               // 1-based index of the first open to redirect; 0 = observe only
     int redirectMaxCount = 0;               // cap on redirects performed; 0 = no cap
@@ -273,22 +281,36 @@ void* realloc(void* ptr, size_t size) {
     return p;
 }
 
-// fopen has no __libc_ alias, so this one does need dlsym -- which is safe here in a way
+// open has no __libc_ alias, so this one does need dlsym -- which is safe here in a way
 // it would not be inside malloc: dlsym allocates, but it does not open files, so there is
 // no recursion to bootstrap around. Resolution is idempotent, so the relaxed racing store
 // can only ever write the same value twice.
 //
 // Unarmed, this is one relaxed load and a tail call. It has to be: the Vulkan loader and
 // the ICD open files on threads this probe does not own.
-FILE* fopen(const char* path, const char* mode) {
-    static std::atomic<void*> realFopen{nullptr};
-    void* real = realFopen.load(std::memory_order_relaxed);
+//
+// The mode argument is forwarded unconditionally. Reading a va_arg for an open that was
+// called with two arguments is undefined only if the value is used, and it is not: the
+// real open ignores its third argument unless O_CREAT or O_TMPFILE is set, and the
+// production call this watches passes neither. Forwarding it blindly is what keeps this
+// one interposer correct for every other opener in the process.
+int open(const char* path, int flags, ...) {
+    static std::atomic<void*> realOpen{nullptr};
+    void* real = realOpen.load(std::memory_order_relaxed);
     if (real == nullptr) {
-        real = dlsym(RTLD_NEXT, "fopen");
-        realFopen.store(real, std::memory_order_relaxed);
+        real = dlsym(RTLD_NEXT, "open");
+        realOpen.store(real, std::memory_order_relaxed);
     }
-    auto* realFn = reinterpret_cast<FILE* (*)(const char*, const char*)>(real);
-    if (realFn == nullptr) return nullptr;  // unresolvable libc; every open fails loudly
+    auto* realFn = reinterpret_cast<int (*)(const char*, int, mode_t)>(real);
+    if (realFn == nullptr) return -1;  // unresolvable libc; every open fails loudly
+
+    mode_t mode = 0;
+    if ((flags & (O_CREAT | O_TMPFILE)) != 0) {
+        va_list args;
+        va_start(args, flags);
+        mode = static_cast<mode_t>(va_arg(args, unsigned int));
+        va_end(args);
+    }
 
     if (g_swapPlansArmed.load(std::memory_order_relaxed) != 0 && g_swapPlan != nullptr &&
         path != nullptr && g_swapPlan->watchedPath != nullptr &&
@@ -300,10 +322,10 @@ FILE* fopen(const char* path, const char* mode) {
             g_swapPlan->redirectMaxCount == 0 || g_swapPlan->redirects < g_swapPlan->redirectMaxCount;
         if (inRange && underCap) {
             ++g_swapPlan->redirects;
-            return realFn(g_swapPlan->replacementPath, mode);
+            return realFn(g_swapPlan->replacementPath, flags, mode);
         }
     }
-    return realFn(path, mode);
+    return realFn(path, flags, mode);
 }
 
 }  // extern "C"
@@ -434,7 +456,8 @@ size_t vmHighWaterKb() {
 // fallback, so a reworded message fails loudly instead of quietly reclassifying.
 enum class Gate {
     None,                   // did not throw at all
-    CannotOpen,             // fopen() of the image failed
+    CannotOpen,             // opening the image failed, reported with the OS's reason
+    NotARegularFile,        // it opened, and the descriptor says it is a pipe, a directory, a device
     NotDecodable,           // the header probe refused the file
     NonPositiveDimensions,  // header parsed, w or h <= 0
     HeaderPeakBudget,       // the pre-decode peak estimate exceeded the budget
@@ -450,6 +473,7 @@ const char* gateName(Gate gate) {
     switch (gate) {
         case Gate::None: return "no rejection";
         case Gate::CannotOpen: return "cannot-open";
+        case Gate::NotARegularFile: return "not-a-regular-file";
         case Gate::NotDecodable: return "not-a-decodable-image";
         case Gate::NonPositiveDimensions: return "non-positive-dimensions";
         case Gate::HeaderPeakBudget: return "header peak-budget gate";
@@ -465,6 +489,7 @@ Gate classifyRejection(bool threw, const std::string& message) {
     if (message.find("estimated peak") != std::string::npos) return Gate::HeaderPeakBudget;
     if (message.find("header and decoder disagree") != std::string::npos) return Gate::PostLoadMismatch;
     if (message.find("failed to load image") != std::string::npos) return Gate::DecodeFailed;
+    if (message.find("is not a regular file") != std::string::npos) return Gate::NotARegularFile;
     if (message.find("cannot open image") != std::string::npos) return Gate::CannotOpen;
     if (message.find("not a decodable image") != std::string::npos) return Gate::NotDecodable;
     if (message.find("non-positive dimensions") != std::string::npos) return Gate::NonPositiveDimensions;
@@ -947,7 +972,7 @@ struct SwapResult {
     int redirects = 0;
 };
 
-// One load with the fopen interposer armed. `redirectFromOpen` is 1-based, 0 = observe
+// One load with the open(2) interposer armed. `redirectFromOpen` is 1-based, 0 = observe
 // only; `redirectMaxCount` caps the redirects performed, 0 = no cap. The two watched sizes
 // go to the allocation window, so the caller can ask which image stb allocated for.
 SwapResult loadWithRedirect(wallpaperx::Device& device, VkRenderPass renderPass,
@@ -970,17 +995,24 @@ SwapResult loadWithRedirect(wallpaperx::Device& device, VkRenderPass renderPass,
     return result;
 }
 
-// GOAL: S4.11 -- the header verdict binds the bytes that are actually decoded. Probes and
-//       decode read the image through ONE open, so the bytes the budget verdict was
-//       computed on cannot be replaced before they are decoded. False at 2 (a decode that
-//       reopens by path) or 3 (probes via stbi_info(path)/stbi_is_16_bit(path)).
+// GOAL: S4.11 and S13.172 -- the header verdict binds the bytes that are actually decoded.
+//       Probes and decode read the image through ONE open of the path, so the bytes the
+//       budget verdict was computed on cannot be replaced before they are decoded. False at
+//       2 (a decode that reopens by path) or 3 (probes via stbi_info(path)/stbi_is_16_bit).
 // WHY-THIS-SHAPE: exactly 1, not "at most 2". Every open after the first admits a 16-bit
 //       file of identical geometry in place of the 8-bit one that was charged, and the
 //       post-decode guard compares dimensions -- which such a substitute matches -- so that
 //       axis is undetectable there. Measured on a load that SUCCEEDS: on a rejected one, a
-//       count of 1 could mean it gave up before the second.
-// CONTROL: production's `stbi_load_from_file(probe.get(), ...)` -> `stbi_load(imagePath
-//       .c_str(), ...)` gives "(2 opens of the image, expected 1)". Reverted, green at 1.
+//       count of 1 could mean it gave up before the second. Counted at open(2) rather than
+//       at fopen because openWallpaperFile() is what production calls; an fopen counter
+//       sees nothing at all now, which reads as zero opens rather than as a broken oracle.
+// CONTROL: in renderer/renderers/static_renderer.cpp, the decode given a second descriptor
+//       from the same path -- `openWallpaperFile(imagePath, ...)` + fdopen feeding
+//       stbi_load_from_file -> "(2 opens of the image, expected 1)", 11 FAILs across this
+//       check and the three interposition phases. Reverted, green at 1.
+//       `stbi_load(imagePath.c_str(), ...)` is NOT usable as the mutation any more: stb
+//       reaches the file through fopen, whose internal open is not this file's symbol, so
+//       that shape counts 1 here and the check would pass on the defect it exists to catch.
 // COVERAGE-ASSERT: the load must have constructed -- controlled by pointing this at a
 //       nonexistent path, which still counts 1 open and reddens only that assert.
 void checkDecodePathOpensTheImageOnce(wallpaperx::Device& device, VkRenderPass renderPass,
@@ -1019,10 +1051,11 @@ struct RedirectPhase {
     int expectRedirects;
 };
 
-// GOAL: S4.11 -- the header verdict binds the bytes that are actually decoded, from the
-//       other side: the single open feeds BOTH the header probes and the decoder, so stb
-//       decodes the bytes the verdict was computed on. False for anything that reaches the
-//       file a second time, including by open(2), which the open counter cannot see.
+// GOAL: S4.11 and S13.172 -- the header verdict binds the bytes that are actually decoded,
+//       from the other side: the single open feeds BOTH the header probes and the decoder,
+//       so stb decodes the bytes the verdict was computed on, and a path swapped after the
+//       descriptor exists cannot be loaded. False for anything that reaches the file a
+//       second time by name.
 // WHY-THIS-SHAPE: the oracle is which image stb ALLOCATED for, watching the replacement's
 //       size present and the original's absent. "It constructed" would instead lean on
 //       production's post-decode dimension guard, and go green if that guard were deleted.
@@ -1030,12 +1063,14 @@ struct RedirectPhase {
 //       replacement on both opens and passes identically -- measured, see CONTROL (b).
 //       Phase 1 (identical copy) is the attribution control; phase 3 arms the old swap at
 //       open 2 and requires it to deliver nothing.
-// CONTROL: (a) production reverted to `stbi_load(imagePath.c_str(), ...)` -> 10 FAILs here,
-//       four on the differently-sized phase ("...(1044995 bytes): NO", "...(264453 bytes):
-//       it did", "saw: header-vs-decoder disagreement", "exactly 1 open (saw 2)") and five
-//       on the old-swap phase, "0 redirects expected, saw 1" among them. Phase 1 reddened
-//       only on the open count, as designed. (b) (a) re-run with redirectMaxCount=0 -> the
-//       differently-sized phase's three substantive checks all went GREEN. Both reverted.
+// CONTROL: (a) in renderer/renderers/static_renderer.cpp, the decode given a second
+//       descriptor from the same path (openWallpaperFile + fdopen feeding
+//       stbi_load_from_file) -> 10 FAILs here, four on the differently-sized phase
+//       ("...(1044995 bytes): NO", "...(264453 bytes): it did", "saw: header-vs-decoder
+//       disagreement", "exactly 1 open (saw 2)") and five on the old-swap phase, "0
+//       redirects expected, saw 1" among them. Phase 1 reddened only on the open count, as
+//       designed. (b) (a) re-run with redirectMaxCount=0 -> the differently-sized phase's
+//       three substantive checks all went GREEN. Both reverted, re-measured 2026-09-20.
 // COVERAGE-ASSERT: per-phase open and redirect counts, plus phasesRun == kPhaseCount.
 //       Controlled: `p.redirectFromOpen` -> 99 gives "1 redirects expected, saw 0"; an
 //       `if (phasesRun == 1) break;` gives "every interposition phase ran (1 of 3)"; and
@@ -1113,14 +1148,16 @@ void checkOneOpenFeedsProbeAndDecode(wallpaperx::Device& device, VkRenderPass re
 //       is skipped with a printed reason when the process can read a mode-000 file anyway
 //       (running as root, which is normal in a container) rather than failing -- an
 //       inconclusive case must not print as a defect in the renderer.
-// CONTROL: the message on static_renderer.cpp's fopen-failure path changed back to the
-//       pre-rework wording, `describeRejection("not a decodable image (can't fopen)", ...)`
+// CONTROL: the message on static_renderer.cpp's open-failure path changed back to the
+//       pre-rework wording, `describeRejection(kComponent, "not a decodable image (can't
+//       fopen)", imagePath)`
 //       -> exactly 4 FAILs, "a missing file is reported as unopenable, not as undecodable
 //       (saw: not-a-decodable-image)" and its strerror half, for both errnos, and nothing
 //       else red. That precise mutation was chosen over the blunter one (pointing the open
 //       at /dev/null so it can never fail), which reddens 33 checks across the whole file
 //       and would not show that THIS check is what distinguishes the two attributions.
-//       Reverted, re-measured green.
+//       Reverted, re-measured green. Re-run 2026-09-20 after the open moved from fopen to
+//       openWallpaperFile(): the same four reds, unchanged.
 void checkUnopenableFileIsAttributed(wallpaperx::Device& device, VkRenderPass renderPass,
                                      const std::string& dir) {
     const std::string missingPath = dir + "/bounds_no_such_file.png";
@@ -1152,12 +1189,12 @@ void checkUnopenableFileIsAttributed(wallpaperx::Device& device, VkRenderPass re
         }
     } restore{deniedPath};
 
-    FILE* canStillRead = std::fopen(deniedPath.c_str(), "rb");
-    if (canStillRead != nullptr) {
-        std::fclose(canStillRead);
+    const int canStillRead = ::open(deniedPath.c_str(), O_RDONLY | O_CLOEXEC);
+    if (canStillRead >= 0) {
+        ::close(canStillRead);
         std::printf("image_bounds_probe: SKIPPED the permission-denied case -- this process can read "
-                    "a mode-000 file (running as root?), so there is no way to make fopen fail with "
-                    "EACCES here. The missing-file case above still ran.\n");
+                    "a mode-000 file (running as root?), so there is no way to make the open fail "
+                    "with EACCES here. The missing-file case above still ran.\n");
         return;
     }
 
@@ -1169,6 +1206,76 @@ void checkUnopenableFileIsAttributed(wallpaperx::Device& device, VkRenderPass re
               gateName(denied.gate) + ")");
     check(denied.message.find(std::strerror(EACCES)) != std::string::npos,
           "the unopenable-file message carries the OS reason for a permission failure");
+}
+
+// GOAL: S13.169, the still half -- a wallpaper path that is not a regular file is refused BY THE
+//       STILL RENDERER, as a content error naming the path. The property that a path like this is
+//       refused at all belongs to openWallpaperFile and is graded in wallpaper_file_probe; what is
+//       graded here is that StaticRenderer's load actually goes through that door, which is the
+//       only thing that makes the still path safe. It matters on its own because the still path is
+//       the EASIER one to reach: repointing a symlink and reporting a new screen size forces a
+//       redraw at once, with no wait for a video to stop.
+// WHY-THIS-SHAPE: a directory and a character device, and NOT a named pipe, which is the kind the
+//       finding was written about. Two reasons, and the second was measured here rather than
+//       reasoned about. (1) A Device pins itself to its creating thread and StaticRenderer's
+//       failure path unwinds through code that calls into it, so this renderer cannot be built on
+//       a worker thread -- and a worker thread is the only place a call that never returns can be
+//       survived. (2) A pipe cannot be offered safely even with a writer attached: with the
+//       refusal removed, the open returns and stb then blocks in read(2) on the empty pipe for
+//       ever, so the CONTROL for a pipe case hangs this probe instead of reddening it -- observed,
+//       the run had to be killed at 300 s. A directory fails its first read with EISDIR and
+//       /dev/null returns end-of-file at once, so both kinds terminate under the mutation and
+//       report. The pipe is graded in wallpaper_file_probe, on a thread with a deadline.
+//       The gate is named rather than "it threw": both kinds also throw without the refusal, as
+//       "not a decodable image", and that is exactly the pre-fix behaviour this tells apart.
+// CONTROL: renderer/wallpaper_file.cpp, `if (!S_ISREG(info.st_mode))` -> `if (false)` -> exactly
+//       two FAILs, "a directory is refused as not-a-regular-file (saw: not-a-decodable-image)" and
+//       the same for the character device, both printing "not a decodable image (unknown image
+//       type)". Reverted, green.
+// COVERAGE-ASSERT: kIrregularKinds is a literal against the list's own length, so deleting a case
+//       reddens the count rather than shrinking what was graded.
+void checkIrregularPathsAreRefusedByTheStillPath(wallpaperx::Device& device, VkRenderPass renderPass,
+                                                 const std::string& dir) {
+    const std::string directory = dir + "/bounds_dir.png";
+    const std::string charDevice = "/dev/null";
+
+    std::error_code ec;
+    std::filesystem::remove_all(directory, ec);
+    std::filesystem::create_directory(directory, ec);
+    if (ec) {
+        wallpaperx::testing::fail(
+            "image_bounds_probe: could not make a directory to offer the still renderer, so the "
+            "not-a-regular-file cases were not exercised");
+        return;
+    }
+
+    struct Kind {
+        const char* what;
+        const std::string* path;
+    };
+    const Kind kinds[] = {{"a directory", &directory}, {"a character device", &charDevice}};
+    constexpr int kIrregularKinds = 2;
+    check(static_cast<int>(sizeof(kinds) / sizeof(kinds[0])) == kIrregularKinds,
+          "the still renderer's irregular-path list no longer has the two entries this check is "
+          "written for");
+
+    int graded = 0;
+    for (const Kind& kind : kinds) {
+        const Attempt attempt = attemptLoad(device, renderPass, *kind.path);
+        std::printf("image_bounds_probe: the still renderer given %s: %s -- %s\n", kind.what,
+                    gateName(attempt.gate), attempt.message.c_str());
+        check(!attempt.constructed, std::string("the still renderer loaded ") + kind.what);
+        check(attempt.gate == Gate::NotARegularFile,
+              std::string(kind.what) + " is refused as not-a-regular-file (saw: " + gateName(attempt.gate) + ")");
+        check(attempt.message.find(*kind.path) != std::string::npos,
+              std::string(kind.what) + ": the refusal does not name the path it is about");
+        ++graded;
+    }
+    check(graded == kIrregularKinds,
+          "every irregular path was offered to the still renderer (" + std::to_string(graded) + " of " +
+              std::to_string(kIrregularKinds) + ")");
+
+    std::filesystem::remove_all(directory, ec);
 }
 
 }  // namespace
@@ -1218,6 +1325,7 @@ int main() {
                 checkOneOpenFeedsProbeAndDecode(device, targets.renderPass(), swapSmallPath,
                                                 swapCopyPath, swapGrownPath);
                 checkUnopenableFileIsAttributed(device, targets.renderPass(), dir);
+                checkIrregularPathsAreRefusedByTheStillPath(device, targets.renderPass(), dir);
             } catch (const std::exception& e) {
                 // A host with no usable ICD lands here. Reported as a failure of this
                 // probe's setup, with the reason, rather than as a silent pass.

@@ -2273,6 +2273,30 @@ void runReleaseChecks(Device& device, const std::string& label) {
 // What a steady picture costs
 // ------------------------------------------------------------------------- //
 
+// Whether a wait made through this executable's vkWaitForFences is counted -- the proof that "no
+// waits" is a measurement. Made by the probe itself, on a fence created already signalled, because
+// the pipeline's own first call cannot prove it: the Device polls a fence before waiting on it, so
+// it calls vkWaitForFences only if the GPU has not finished yet, and on Lavapipe under load it
+// sometimes has -- a first call making no wait is legitimate, and requiring one failed the loop
+// entry intermittently under a parallel ctest run.
+// CONTROL: the `++g_vulkanCalls[k_vkWaitForFences]` line deleted from this file's vkWaitForFences ->
+//       "FAIL: a wait made through this probe's vkWaitForFences is counted ..." on both the loop and
+//       the steady entry, where the first-call wait test it replaces would also have gone red, but
+//       only by the scheduler's leave. Restored.
+bool waitCounterIsWired(Device& device) {
+    VkFenceCreateInfo info{};
+    info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    info.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+    VkFence fence = VK_NULL_HANDLE;
+    if (vkCreateFence(device.device(), &info, nullptr, &fence) != VK_SUCCESS) return false;
+    g_vulkanCalls.fill(0);
+    g_countVulkan = true;
+    const VkResult waited = vkWaitForFences(device.device(), 1, &fence, VK_TRUE, 0);
+    g_countVulkan = false;
+    vkDestroyFence(device.device(), fence, nullptr);
+    return waited == VK_SUCCESS && g_vulkanCalls[k_vkWaitForFences] == 1;
+}
+
 void runSteadyChecks(Device& device, const std::string& label, bool onDevice) {
     if (onDevice ? !hardwareDecoderPresent(device, label) : !videoExtensionsHidden(device, label)) return;
     const char* const file = "counter_long.mp4";
@@ -2291,9 +2315,12 @@ void runSteadyChecks(Device& device, const std::string& label, bool onDevice) {
     //       steady calls made vkWaitForFences x318". The stage rebuilt on every call, now in decodeNext():
     //       "318 steady calls made vkCreateImage x1272, vkCreateImageView x1272, vkCreateBuffer x636,
     //       vkCreateSampler x318, ... vkWaitForFences x317".
-    // COVERAGE-ASSERT: the first call, which builds the stage, must be seen creating and waiting -- red
-    //       with counting never switched on, "the first call was seen making none" -- and 300 calls
-    //       counted, red on the 20-picture fixture, "only 17 calls counted".
+    // COVERAGE-ASSERT: the first call, which builds the stage, must be seen creating -- red with
+    //       counting never switched on, "the first call was seen making none" -- and the wait counter
+    //       proven wired by waitCounterIsWired(); and 300 calls counted, red on the 20-picture fixture,
+    //       "only 17 calls counted". The first call is NOT required to wait: it waits only if the GPU
+    //       is still busy when asked, and requiring it failed the Lavapipe loop entry intermittently
+    //       under a parallel ctest run.
     constexpr int kUncountedCalls = 3;
     constexpr int kMinCountedCalls = 300;
     VulkanTally first;
@@ -2348,7 +2375,9 @@ void runSteadyChecks(Device& device, const std::string& label, bool onDevice) {
         g_notVerified = true;
         return;
     }
-    if (first.creations() == 0 || first.waits() == 0) {
+    check(waitCounterIsWired(device), "a wait made through this probe's vkWaitForFences is counted, so a steady "
+                                      "count of no waits is a measurement");
+    if (first.creations() == 0) {
         std::fprintf(stderr, "FAIL: %s: the first call was seen making %s\n", label.c_str(), first.describe().c_str());
         fail("the Vulkan interposers did not see the stage being built, so a count of zero would mean nothing");
         return;
@@ -2682,10 +2711,15 @@ void runLoopChecks(Device& device, const std::string& label, bool onDevice) {
     //       x1". The wait placed before the render stayed green: nothing is pending, no Vulkan call is made.
     // COVERAGE-ASSERT: the calls made and read back match the plan -- red with every seventh skipped, "60
     //       calls made and 51 read back" -- and the first call is seen building the stage, red with
-    //       counting off, "the first call was seen making none". The list's length and counter_bf2.mkv's
-    //       missing decode timestamp are asserted, red with six expected and with the MP4 claimed instead.
+    //       counting off, "the first call was seen making none". That the WAIT counter is wired is
+    //       proven by waitCounterIsWired(), not by the first call waiting: whether it waits depends on
+    //       whether the GPU finished first, which is the scheduler's to decide. The list's length and
+    //       counter_bf2.mkv's missing decode timestamp are asserted, red with six expected and with the
+    //       MP4 claimed instead.
     check(std::size(kLoopFixtures) == kLoopFixtureCount,
           "the loop fixture list no longer has the seven entries this check is written for");
+    check(waitCounterIsWired(device), "a wait made through this probe's vkWaitForFences is counted, so a boundary "
+                                      "count of no waits is a measurement");
     for (const LoopFixture& fixture : kLoopFixtures) {
         const std::optional<CounterReference> reference = counterReference(label, fixture.file);
         if (!reference) continue;
@@ -2712,7 +2746,7 @@ void runLoopChecks(Device& device, const std::string& label, bool onDevice) {
         if (poolsGraded && run.threw.empty()) {
             good = gradePools(label, what, run.calls.size(), kPasses * reference->widths.size()) && good;
         }
-        if (!run.calls.empty() && (run.calls[0].vulkan.creations() == 0 || run.calls[0].vulkan.waits() == 0)) {
+        if (!run.calls.empty() && run.calls[0].vulkan.creations() == 0) {
             std::fprintf(stderr, "FAIL: %s: %s: the first call was seen making %s\n", label.c_str(), what.c_str(),
                          run.calls[0].vulkan.describe().c_str());
             fail("the Vulkan interposers did not see the stage being built, so a boundary count of zero would mean "
@@ -2941,9 +2975,12 @@ void runLoopFileChecks(Device& device, const std::string& label) {
     // WHY-THIS-SHAPE: every seek fails from the change on, because a seek that lands never reopens and
     //       would leave the path unread. The other video's counter starts at 1000, so a picture read
     //       from it by path cannot be mistaken for the original's.
-    // CONTROL: renderer/video/video_decoder.cpp openContainer() opening the path at every open, reverted:
-    //       deletion "threw during call 21: VideoDecoder: cannot open .../deleted.mp4: No such file or
-    //       directory"; rename "call 21 (pass 2, picture 0 of it) showed 1000 where 0 was due".
+    // CONTROL: renderer/video/video_decoder.cpp openContainer()'s `if (m_io == nullptr)` made `if (true)`
+    //       with a closeFile() before the openFile(), so the PATH is opened again at every container
+    //       open rather than the descriptor being reused, reverted: deletion "threw during call 21:
+    //       VideoDecoder: cannot open .../deleted.mp4: No such file or directory"; rename "call 21
+    //       (pass 2, picture 0 of it) showed 1000 where 0 was due". Re-measured 2026-09-20, after the
+    //       decoder stopped calling avio_open2 and started opening the descriptor itself.
     // COVERAGE-ASSERT: each boundary opens the container once -- red with the seek failures not applied --
     //       and the two videos share no counter, red with the original as its own replacement.
     for (int id : otherReference->ids) {

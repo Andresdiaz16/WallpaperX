@@ -20,6 +20,7 @@ extern "C" {
 
 struct AVBufferRef;
 struct AVCodecContext;
+struct AVDictionary;
 struct AVFormatContext;
 struct AVFrame;
 struct AVIOContext;
@@ -231,6 +232,15 @@ private:
     void releaseIdleFramesContexts() noexcept;
     void releaseRetiredCodec() noexcept;
     void openContainer();
+    // Opens the file through openWallpaperFile() and the I/O context every container reads it
+    // through. ffmpeg is given the path only as a hint to probing and as text in its messages.
+    void openFile();
+    void closeFile() noexcept;
+    static int readFile(void* opaque, uint8_t* buffer, int size);
+    static int64_t seekFile(void* opaque, int64_t offset, int whence);
+    // The io_open hook: refuses every open ffmpeg would make of its own accord; openContainer()
+    // says why.
+    static int refuseOpen(AVFormatContext*, AVIOContext**, const char*, int, AVDictionary**);
     void openDecoder();
     void closeDecoder() noexcept;
     void retireDecoder() noexcept;
@@ -257,8 +267,10 @@ private:
 
     Device& m_device;
     std::string m_file;
-    // The file, opened once. Every container reads through it and closing one leaves it open, so a
-    // reopened container reads the same file after its path is deleted or renamed over.
+    // The file, opened once, and the I/O context that reads it. Every container reads through them
+    // and closing one leaves them open, so a reopened container reads the same file after its path
+    // is deleted or renamed over.
+    int m_fd = -1;
     AVIOContext* m_io = nullptr;
     AVFormatContext* m_format = nullptr;
     AVCodecContext* m_codec = nullptr;
