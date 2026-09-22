@@ -179,8 +179,9 @@ public:
     // since the stream's own headers are what the device is asked about. Throws
     // WallpaperContentError for a file that cannot be opened or has no decodable video stream,
     // GpuFailure when ffmpeg cannot adopt this device and the device has stopped answering, and
-    // std::runtime_error when out of memory. A device that still answers selects software instead:
-    // ffmpeg failing to adopt it is a property of that pairing, not a fault.
+    // ResourceExhausted when out of memory or file descriptors. A device that still answers
+    // selects software instead: ffmpeg failing to adopt it is a property of that pairing, not a
+    // fault.
     VideoDecoder(Device& device, const std::string& file);
     ~VideoDecoder();
 

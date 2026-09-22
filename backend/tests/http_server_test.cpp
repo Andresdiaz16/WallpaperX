@@ -2248,13 +2248,15 @@ void runHealthStateChecks(const std::string& bluePath, const std::string& shader
                     //       "not fail". `pending` would also be wrong here and is what a build
                     //       that refused the wallpaper but still owed a render would report.
                     // CONTROL: two, one per half, both in backend/daemon/wallpaper_manager.cpp.
-                    //       `state.lastErrorIsDaemonFault = false` in restoreSaved()'s
-                    //       quarantine branch changed to `= true` -> "FAIL: a refused wallpaper
-                    //       does not make the daemon itself unhealthy", printing `aggregate:
-                    //       fail; wallpapers: 1 of 1 monitors failed inside the daemon`. And
-                    //       `state.quarantined = ...` replaced with `= false` -> "FAIL: /health
-                    //       reports a monitor whose wallpaper was refused as failed" and the
-                    //       detail check beside it. Both reverted.
+                    //       `state.lastErrorFault = Fault::File;` in restoreSaved()'s refuse
+                    //       lambda changed to `Fault::Daemon` -> "FAIL: a refused wallpaper is the
+                    //       wallpaper's problem: the wallpapers check stays ok" and "FAIL: a
+                    //       refused wallpaper does not make the daemon itself unhealthy", printing
+                    //       `aggregate: fail; wallpapers: 1 of 1 monitors failed inside the
+                    //       daemon`. And the crash-record match before `refuse(...)` made `if
+                    //       (false)` -> "FAIL: /health reports a monitor whose wallpaper was
+                    //       refused as failed" and the detail check beside it. Both re-observed
+                    //       2026-09-21 on the NVIDIA entry. Reverted.
                     check(monitorState(health.json, 0) == "failed",
                           "/health reports a monitor whose wallpaper was refused as failed");
                     check(monitorDetail(health.json, 0).find("SIGSEGV") != std::string::npos,

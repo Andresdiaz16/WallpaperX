@@ -10,6 +10,7 @@
 #include "../vulkan/descriptor_classic.h"
 #include "../vulkan/descriptor_heap.h"
 #include "../vulkan/device.h"
+#include "../vulkan/gpu_fault.h"
 #include "../vulkan/image_barrier.h"
 #include "../vulkan/shader_module.h"
 #include "../wallpaper_file.h"
@@ -192,12 +193,16 @@ void StaticRenderer::loadAndUploadTexture(const std::string& imagePath) {
     // new size, long after the path was checked, and opening what is a named pipe by then parks
     // this thread -- the one GPU thread -- for good.
     const int fd = openWallpaperFile(imagePath, kComponent);
-    FilePtr probe(fd < 0 ? nullptr : ::fdopen(fd, "rb"));
-    if (!probe) {
+    if (fd < 0) {
         const int why = errno;
-        if (fd >= 0) ::close(fd);
         throw WallpaperContentError(
             describeRejection(kComponent, std::string("cannot open image (") + std::strerror(why) + ")", imagePath));
+    }
+    // fdopen fails only for want of memory to build the stream, which is not the image's doing.
+    FilePtr probe(::fdopen(fd, "rb"));
+    if (!probe) {
+        ::close(fd);
+        throw ResourceExhausted(describeRejection(kComponent, "out of memory opening the image", imagePath));
     }
 
     int probeWidth = 0;

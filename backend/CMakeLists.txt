@@ -697,6 +697,23 @@ if(WALLPAPERX_FFMPEG_EXECUTABLE)
     add_dependencies(wallpaperx-http-server-test wallpaperx-backend-video-fixtures)
 endif()
 
+# Step 13 Stage E5's shutdown watchdog needs a stop that genuinely cannot finish, in the real daemon:
+# a library preloaded into it that parks the manager's teardown inside a decoder free. Test-only --
+# nothing shipped links it, and it does nothing unless the test sets its variable.
+add_library(wallpaperx-test-wedge-shim SHARED tests/wedge_shim.cpp)
+# ffmpeg's headers only: the shim tells the daemon's own decoder context from the ones ffmpeg opens
+# while probing a file, which is a field of AVCodecContext. It calls through dlsym, never by link.
+pkg_check_modules(WALLPAPERX_SHIM_LIBAV REQUIRED IMPORTED_TARGET libavcodec libavutil)
+target_link_libraries(wallpaperx-test-wedge-shim PRIVATE ${CMAKE_DL_LIBS} PkgConfig::WALLPAPERX_SHIM_LIBAV)
+set_target_properties(wallpaperx-test-wedge-shim PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+target_compile_definitions(wallpaperx-daemon-system-test PRIVATE
+    WALLPAPERX_VIDEO_ASSET_DIR="${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}"
+    WALLPAPERX_WEDGE_SHIM="$<TARGET_FILE:wallpaperx-test-wedge-shim>")
+add_dependencies(wallpaperx-daemon-system-test wallpaperx-test-wedge-shim)
+if(WALLPAPERX_FFMPEG_EXECUTABLE)
+    add_dependencies(wallpaperx-daemon-system-test wallpaperx-backend-video-fixtures)
+endif()
+
 # These targets have no Q_OBJECT / Qt usage; AUTOMOC is on globally via
 # qt_standard_project_setup(), so turn it off here to skip a pointless moc step.
 if(WALLPAPERX_BUILD_KDE_PLUGIN)

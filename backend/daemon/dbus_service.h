@@ -35,8 +35,13 @@ public:
     DbusService(sdbus::IConnection& connection, WallpaperManager& manager);
     ~DbusService();
 
-    // Call once, before the event loop.
+    // Applies the saved wallpapers without drawing them. Call once, before the event loop.
     void restoreSaved();
+
+    // Posts the renders restoreSaved() held back. Call once, after
+    // WallpaperManager::recordStartingVideos(): a video that crashes the render thread before the
+    // playing record is open names nothing, and the restart loop that record exists to stop goes on.
+    void renderRestored();
 
 private:
     void registerVTable();
@@ -116,6 +121,9 @@ private:
     std::unique_ptr<sdbus::IObject> m_object;
     std::unique_ptr<sdbus::IProxy> m_busWatch;
     RenderWorker m_worker;
+
+    // What restoreSaved() applied, until renderRestored() posts it. Main thread, before the loop.
+    std::vector<int> m_restored;
 };
 
 }

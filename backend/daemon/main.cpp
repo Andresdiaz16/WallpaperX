@@ -22,10 +22,9 @@
 #include <unistd.h>
 
 namespace {
-// Budgets the whole stop -- signal to process gone, not just teardown -- so work still
-// running when the signal lands spends it too. Far above a normal shutdown of a few hundred
-// milliseconds, so it fires only for a stop that is stuck rather than slow.
-constexpr std::chrono::seconds kTeardownDeadline{5};
+// Budgets the whole stop -- signal to process gone -- so work running when the signal lands
+// spends it too. Must exceed the config writer's 2 s deadline.
+constexpr std::chrono::seconds kTeardownDeadline{3};
 
 std::atomic<bool>* g_wakingForShutdown = nullptr;
 
@@ -102,7 +101,6 @@ int main() {
                                  "a wallpaper that crashes the daemon will be applied again on restart\n");
         }
 
-        // Connected without claiming the name yet -- see the request below.
         auto connection = sdbus::createSessionBusConnection();
 
         // sigwait on its own thread, not a handler: leaveEventLoop() takes locks and is not
@@ -122,8 +120,7 @@ int main() {
         } teardown;
 
         // Declared beside the objects whose destructors can block, so the watchdog is armed at
-        // the top of the unwind rather than after them -- the alarm used to be armed in
-        // ~ShutdownWatch, which runs last.
+        // the top of the unwind rather than after them.
         bool teardownArmed = false;
         struct ArmTeardown {
             bool& armed;
@@ -228,8 +225,7 @@ int main() {
                 (void)ignored;
             }
             // Nonzero: teardown was abandoned, and a supervisor reading only the status
-            // should not be told this was a clean stop. Wallpaper choices are written when
-            // they are set, so nothing durable is lost.
+            // should not be told this was a clean stop.
             std::_Exit(1);
         }), wakingForShutdown, teardown, teardownArmed};
 
@@ -242,8 +238,7 @@ int main() {
         // out of requestName() below, where the server further down does not exist yet.
         ArmTeardown armBeforeService{teardownArmed};
 
-        // Before the name is claimed: this is what fills the monitor map. Skipped after a
-        // stop -- it starts the first render, and that is GPU work for a process leaving.
+        // Before the name is claimed: this is what fills the monitor map.
         if (!shutdownRequested.load(std::memory_order_acquire)) service.restoreSaved();
 
         // Claimed last, so the name on the bus means the daemon can answer: object registered,
@@ -255,14 +250,13 @@ int main() {
             // Only now: this moves the user's config aside, and until the name is held this
             // process does not know it is the daemon.
             manager.preserveUnreadableConfig();
-            // After the copy aside: the repair rewrites config.json from live state, and the
-            // copy preserves the bytes it destroys. Nothing enforces the order -- reversed, the
-            // copy is taken of bytes the repair has already replaced.
+            // After the copy aside, which preserves the bytes this rewrite replaces.
             manager.writeRepairedConfig();
+            // Only now, for the same reason: it replaces the record the running daemon keeps.
+            manager.recordStartingVideos();
+            service.renderRestored();
         }
 
-        // Unconditional, this claimed the name was held on a start a signal cut short before
-        // requesting it -- the opposite of what someone reading the journal needs.
         if (shutdownRequested.load(std::memory_order_acquire)) {
             std::printf("wallpaperx-daemon: stopped before claiming %s\n",
                         wallpaperx::DbusService::kBusName);
@@ -300,6 +294,8 @@ int main() {
         if (enter) {
             connection->enterEventLoop();  // returns once leaveEventLoop() is called
         }
+        // Before any teardown the deadline could cut short: this stop is orderly whatever follows.
+        manager.endPlayingRecord();
 
         // Destroyed in reverse declaration order: HTTP, then the service (stopping the
         // render worker), then the manager (GPU teardown + leak report), the shutdown

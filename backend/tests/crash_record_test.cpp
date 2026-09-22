@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 // The on-disk half of the crash-loop breaker: the record the render thread keeps while a
-// wallpaper is being applied, and what the fatal-signal handler does to it.
+// wallpaper is being applied, the playing record that names the video a death happened in, and
+// what the fatal-signal handler does to each.
 //
 // Everything that involves a signal runs in a forked child, for one reason: a check that gets
 // it wrong takes the process down instead of reporting, and a dead harness prints no
@@ -17,6 +18,8 @@
 #include "support/forked_child.h"
 #include "tests/client/scratch_dir.h"
 #include "tests/test_report.h"
+
+#include <nlohmann/json.hpp>
 
 #include <cerrno>
 #include <chrono>
@@ -586,6 +589,309 @@ void runOnDiskChecks() {
     // check go red, and one that cannot fail is worse than the gap it hides.
 }
 
+// ---------------------------------------------------------------------------- //
+// The playing record: which video a death names (Step 13 Stage E5)
+// ---------------------------------------------------------------------------- //
+
+void check(bool condition, const std::string& what) { wallpaperx::testing::check(condition, what.c_str()); }
+
+constexpr int kPlayingMonitor = 2;
+constexpr const char* kPlayingPath = "/videos/the-one-that-crashes.mp4";
+constexpr int kOtherPlayingMonitor = 6;
+constexpr const char* kOtherPlayingPath = "/videos/a-good-one.mp4";
+
+enum class PlayingMode {
+    FaultNamed,       // a memory fault on the thread whose guard names a video
+    FaultElsewhere,   // the guard is live on one thread, the fault lands on another
+    FaultAfterGuard,  // the guard has been destroyed; the same thread then faults
+    FaultAfterEnd,    // the guard is live but the record was ended (an orderly stop began)
+    KilledNamed,      // SIGKILL while the guard is live: no handler runs
+};
+
+[[noreturn]] void runPlayingChildBody(PlayingMode mode, const std::filesystem::path& dir, int readyFd) {
+    installFatalSignalHandlers();
+    wallpaperx::PlayingRecord record(dir);
+    record.start({{kPlayingMonitor, kPlayingPath, 1}, {kOtherPlayingMonitor, kOtherPlayingPath, 0}});
+    std::error_code ec;
+    if (!std::filesystem::exists(wallpaperx::playingRecordPath(dir), ec)) _exit(kChildRecordFailedExit);
+    const std::string line = wallpaperx::playingBlameLine(kPlayingMonitor, kPlayingPath);
+
+    std::promise<void> guardLive;
+    std::future<void> live = guardLive.get_future();
+    std::thread worker([&] {
+        switch (mode) {
+            case PlayingMode::FaultNamed: {
+                const wallpaperx::PlayingBlame blame(line);
+                faultNow();
+            }
+            case PlayingMode::FaultAfterGuard: {
+                { const wallpaperx::PlayingBlame blame(line); }
+                faultNow();
+            }
+            case PlayingMode::FaultAfterEnd: {
+                const wallpaperx::PlayingBlame blame(line);
+                record.end();
+                faultNow();
+            }
+            case PlayingMode::FaultElsewhere:
+            case PlayingMode::KilledNamed: {
+                const wallpaperx::PlayingBlame blame(line);
+                guardLive.set_value();
+                sleepForever();
+            }
+        }
+    });
+    if (mode == PlayingMode::FaultElsewhere || mode == PlayingMode::KilledNamed) {
+        live.wait();
+        if (mode == PlayingMode::FaultElsewhere) faultNow();
+        const char byte = 'r';
+        const ssize_t ignored = ::write(readyFd, &byte, 1);
+        (void)ignored;
+    }
+    sleepForever();
+}
+
+// A forked child in `mode`, reaped. `ok` is false when the harness could not reach the state being
+// graded, for runChild()'s reason.
+ChildResult runPlayingChild(PlayingMode mode, const std::filesystem::path& dir, bool& ok) {
+    ok = false;
+    ChildResult out;
+    int ready[2] = {-1, -1};
+    if (::pipe2(ready, O_CLOEXEC) != 0) {
+        harnessFailure("could not create the readiness pipe for a playing-record child");
+        return out;
+    }
+    const pid_t parentBeforeFork = ::getpid();
+    const pid_t pid = ::fork();
+    if (pid < 0) {
+        ::close(ready[0]);
+        ::close(ready[1]);
+        harnessFailure("fork failed");
+        return out;
+    }
+    if (pid == 0) {
+        ::close(ready[0]);
+        if (!wallpaperx::testing::armAgainstParentDeath(parentBeforeFork)) {
+            _exit(wallpaperx::testing::kChildArmFailedExit);
+        }
+        wallpaperx::testing::suppressCoreDump();
+        runPlayingChildBody(mode, dir, ready[1]);
+    }
+    ::close(ready[1]);
+    bool killedOnCue = true;
+    if (mode == PlayingMode::KilledNamed) {
+        struct pollfd waitOn {
+            ready[0], POLLIN, 0
+        };
+        if (::poll(&waitOn, 1, static_cast<int>(kChildTimeout.count()) * 1000) <= 0) {
+            harnessFailure("a playing-record child never reported its guard live, so nothing was killed while it was");
+            killedOnCue = false;
+        }
+        ::kill(pid, SIGKILL);
+    }
+    out.reaped = waitForExit(pid, out.status);
+    if (!out.reaped) {
+        ::kill(pid, SIGKILL);
+        int discarded = 0;
+        waitForExit(pid, discarded);
+        harnessFailure("a playing-record child did not exit within the harness's bound");
+    }
+    ::close(ready[0]);
+    if (out.reaped && WIFEXITED(out.status)) {
+        if (const char* fault = wallpaperx::testing::forkPreambleFault(WEXITSTATUS(out.status)); fault != nullptr) {
+            harnessFailure(fault);
+            return out;
+        }
+        if (WEXITSTATUS(out.status) == kChildRecordFailedExit) {
+            harnessFailure("a playing-record child could not put its record on disk, so its outcome grades nothing");
+            return out;
+        }
+    }
+    ok = out.reaped && killedOnCue;
+    return out;
+}
+
+std::string describeDied(const std::optional<wallpaperx::PlayingHistory>& history) {
+    if (!history) return "no readable record";
+    if (!history->died) return "names no video";
+    return "names monitor " + std::to_string(history->died->monitorId) + " '" + history->died->path + "'";
+}
+
+// GOAL: S13.184, at the record -- a fatal signal on the thread whose guard names a video writes that
+//       video (its monitor and path) and the signal into the playing record, beside the counts the
+//       run started with, and the process still dies of the signal. False if the record names
+//       nothing (the crash loop goes on), or names it without the signal.
+// WHY-THIS-SHAPE: a real store to a PROT_NONE page on the guarded thread, for runStampedChecks'
+//       reason; and the counts are read back too, because the handler appends to the file the
+//       counts live in and a write at the wrong offset would destroy them.
+// CONTROL: in backend/daemon/crash_record.cpp, the `::write(playingFd, blame->data(), ...)` in
+//       onFatalSignal() deleted -> "FAIL: a fault on the thread working on a video names that video
+//       in the playing record", printing "the record names no video", and "FAIL: and the signal
+//       that killed it" (a signal is read only beside a name); the replacement check below then
+//       reports a harness fault, having no named death to replace. Observed 2026-09-21; reverted.
+void runPlayingBlameChecks() {
+    ScratchDir scratch("playingnamed");
+    if (!scratch.ok()) {
+        notVerified("S13.184 (at the record)", "no scratch state directory could be created");
+        return;
+    }
+    bool ok = false;
+    const ChildResult result = runPlayingChild(PlayingMode::FaultNamed, scratch.path(), ok);
+    if (!ok) return;
+    if (kDeathSignalObservable) {
+        check(diedOf(result, SIGSEGV), "a fault on the thread working on a video still ends the process with SIGSEGV");
+    }
+    const std::optional<wallpaperx::PlayingHistory> history = wallpaperx::readPlayingRecord(scratch.path());
+    const bool named = history && history->died && history->died->monitorId == kPlayingMonitor &&
+                       history->died->path == kPlayingPath;
+    check(named, "a fault on the thread working on a video names that video in the playing record");
+    if (!named) std::fprintf(stderr, "  the record %s\n", describeDied(history).c_str());
+    check(history && history->signal && *history->signal == SIGSEGV, "and the signal that killed it");
+    const bool countsKept = history && history->videos.size() == 2 && history->videos[0].monitorId == kPlayingMonitor &&
+                            history->videos[0].deaths == 1 && history->videos[1].monitorId == kOtherPlayingMonitor;
+    check(countsKept, "and the counts the run started with are still read back beside it");
+}
+
+// GOAL: S13.184's other half, at the record -- a death that is not the named video's names
+//       nothing: a fault on another thread while the guard is live, a fault on the same thread
+//       after its guard has gone (nothing was being worked on), a fault after the record was ended
+//       (an orderly stop had begun), and SIGKILL, which runs no handler at all. False if any of
+//       them names the video, since each would then count a death against a file that did not
+//       cause it.
+// WHY-THIS-SHAPE: four children, each one change away from runPlayingBlameChecks' child, which is
+//       the positive reading that proves a name CAN be written in this directory layout. The kill
+//       is sent once the child says its guard is live, over a pipe, for runKilledChecks' reason.
+// CONTROL: in backend/daemon/crash_record.cpp, (a) the `::gettid() == g_blameTid.load(...)` term
+//       deleted from onFatalSignal() -> "FAIL: a fault on another thread while a video is being
+//       worked on names nothing", printing "names monitor 2"; (b) `g_blame.store(nullptr, ...)`
+//       and the restore of m_previous deleted from ~PlayingBlame -> "FAIL: a fault after the guard
+//       has gone names nothing"; (c) PlayingRecord::end() made a no-op -> "FAIL: a fault after the
+//       record was ended names nothing"; (d) PlayingBlame's constructor made to write `line` into
+//       the record at once, as a record-per-picture design would -> "FAIL: SIGKILL while a video is
+//       being worked on names nothing" and the three cases above with it. Each of (a)-(c) reddened
+//       its own case alone. All observed 2026-09-21; reverted.
+void runPlayingNamesNothingChecks() {
+    struct Case {
+        PlayingMode mode;
+        const char* what;
+        int signal;
+    };
+    const Case cases[] = {
+        {PlayingMode::FaultElsewhere, "a fault on another thread while a video is being worked on names nothing",
+         SIGSEGV},
+        {PlayingMode::FaultAfterGuard, "a fault after the guard has gone names nothing", SIGSEGV},
+        {PlayingMode::FaultAfterEnd, "a fault after the record was ended names nothing", SIGSEGV},
+        {PlayingMode::KilledNamed, "SIGKILL while a video is being worked on names nothing", SIGKILL},
+    };
+    for (const Case& c : cases) {
+        ScratchDir scratch("playingnothing");
+        if (!scratch.ok()) {
+            notVerified("S13.184 (a death that names nothing)", "no scratch state directory could be created");
+            return;
+        }
+        bool ok = false;
+        const ChildResult result = runPlayingChild(c.mode, scratch.path(), ok);
+        if (!ok) continue;
+        if (kDeathSignalObservable || c.signal == SIGKILL) {
+            check(diedOf(result, c.signal), std::string(c.what) + " -- the child died of the expected signal");
+        }
+        const std::optional<wallpaperx::PlayingHistory> history = wallpaperx::readPlayingRecord(scratch.path());
+        check(history.has_value(), std::string(c.what) + " -- the record itself is still readable");
+        const bool nothing = history && !history->died && !history->signal;
+        check(nothing, c.what);
+        if (!nothing) std::fprintf(stderr, "  the record %s\n", describeDied(history).c_str());
+    }
+}
+
+// GOAL: the playing record's own rules. start() replaces whatever the last run left, blame and
+//       all, so one death is never counted twice; clear() zeroes a monitor's count for the next
+//       read and a clear written by another run is ignored; a monitor the run did not count
+//       writes no clear; and only one record per process can start, so a second instance of the
+//       daemon cannot overwrite the running one's.
+// WHY-THIS-SHAPE: the record replaced is one a real death left (runPlayingChild), not a planted
+//       file, so "the blame is gone" is read against a blame line the handler wrote. The
+//       other-run case plants a clear line on purpose: no correct run writes one naming a
+//       different run, and that is exactly the leftover the run id exists to ignore.
+// CONTROL: in backend/daemon/crash_record.cpp, (a) createRecordFile()'s O_TRUNC made O_APPEND, so
+//       a new record lands after the old one -> "FAIL: a new run's record replaces the last run's,
+//       blame and all", printing "names monitor 2", beside the cleared-count check. Removing O_TRUNC
+//       alone is NOT a control: the shorter new line leaves old bytes ahead of the blame line, the
+//       reader then finds no blame, and the check stays green. (b) the `!line.starts_with(run)` term
+//       deleted from readCleared() -> "FAIL: a clear written by another run is ignored"; (c) the
+//       compare-exchange in PlayingRecord::start() replaced by a plain store -> "FAIL: a second
+//       record in the process writes nothing while the first is live"; (d) clear()'s
+//       `m_counted.count(monitorId) == 0` return deleted -> "FAIL: a monitor the run did not count
+//       writes no clear"; (e) clear()'s writeAll deleted -> "FAIL: a cleared monitor carries no count
+//       at the next read". All observed 2026-09-21; reverted.
+void runPlayingRecordRules() {
+    ScratchDir scratch("playingrules");
+    if (!scratch.ok()) {
+        notVerified("the playing record's own rules", "no scratch state directory could be created");
+        return;
+    }
+    const std::filesystem::path dir = scratch.path();
+    bool ok = false;
+    runPlayingChild(PlayingMode::FaultNamed, dir, ok);
+    if (!ok) return;
+    const std::optional<wallpaperx::PlayingHistory> died = wallpaperx::readPlayingRecord(dir);
+    if (!died || !died->died) {
+        harnessFailure("the dying child left no named death to be replaced, so the replacement check grades nothing");
+        return;
+    }
+    try {
+        {
+            wallpaperx::PlayingRecord record(dir);
+            record.start({{kOtherPlayingMonitor, kOtherPlayingPath, 1}});
+            const std::optional<wallpaperx::PlayingHistory> fresh = wallpaperx::readPlayingRecord(dir);
+            check(fresh && !fresh->died && fresh->videos.size() == 1 && fresh->videos[0].monitorId == kOtherPlayingMonitor,
+                  "a new run's record replaces the last run's, blame and all");
+            if (fresh && fresh->died) std::fprintf(stderr, "  the record %s\n", describeDied(fresh).c_str());
+
+            record.clear(kPlayingMonitor);  // not counted by this run
+            std::error_code ec;
+            check(!std::filesystem::exists(dir / "playing-cleared", ec), "a monitor the run did not count writes no clear");
+
+            record.clear(kOtherPlayingMonitor);
+            const std::optional<wallpaperx::PlayingHistory> cleared = wallpaperx::readPlayingRecord(dir);
+            check(cleared && cleared->videos.empty(), "a cleared monitor carries no count at the next read");
+
+            ScratchDir second("playingsecond");
+            wallpaperx::PlayingRecord other(second.path());
+            other.start({{kPlayingMonitor, kPlayingPath, 1}});
+            check(!std::filesystem::exists(wallpaperx::playingRecordPath(second.path()), ec),
+                  "a second record in the process writes nothing while the first is live");
+        }
+        {
+            wallpaperx::PlayingRecord record(dir);
+            record.start({{kPlayingMonitor, kPlayingPath, 1}, {kOtherPlayingMonitor, kOtherPlayingPath, 1}});
+        }
+        // Another run's id of the same shape as this one's -- the same length, one digit different
+        // -- so the line is rejected for naming another run and not for being malformed.
+        std::string run;
+        {
+            std::ifstream in(wallpaperx::playingRecordPath(dir));
+            std::string first;
+            std::getline(in, first);
+            const nlohmann::json root = nlohmann::json::parse(first, nullptr, false);
+            if (root.is_object() && root.contains("run") && root["run"].is_string()) run = root["run"].get<std::string>();
+        }
+        if (run.empty()) {
+            harnessFailure("the playing record names no run, so a clear from another run cannot be planted");
+            return;
+        }
+        std::string otherRun = run;
+        otherRun.back() = otherRun.back() == '0' ? '1' : '0';
+        writeText(dir / "playing-cleared", otherRun + " " + std::to_string(kPlayingMonitor) + "\n");
+        const std::optional<wallpaperx::PlayingHistory> foreign = wallpaperx::readPlayingRecord(dir);
+        check(foreign && foreign->videos.size() == 2, "a clear written by another run is ignored");
+        writeText(dir / "playing-cleared", run + " " + std::to_string(kPlayingMonitor) + "\n");
+        const std::optional<wallpaperx::PlayingHistory> own = wallpaperx::readPlayingRecord(dir);
+        check(own && own->videos.size() == 1, "while the same line naming this run's own id does clear it");
+    } catch (const std::exception& e) {
+        check(false, std::string("the playing record threw: ") + e.what());
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -609,6 +915,9 @@ int main() {
         runCleanExitChecks();
         runChainingChecks();
         runOnDiskChecks();
+        runPlayingBlameChecks();
+        runPlayingNamesNothingChecks();
+        runPlayingRecordRules();
     } catch (const std::exception& e) {
         harnessFailure(std::string("the run ended in an unhandled exception: ") + e.what());
     }

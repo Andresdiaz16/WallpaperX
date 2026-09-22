@@ -233,9 +233,11 @@ WallpaperItem {
         // Named so a check can find it without depending on declaration order.
         objectName: "wallpaperxSurface"
         anchors.fill: parent
-        // Only once there is something to draw AND a screen to ask about. Without the id test
-        // the renderer would poll for frames belonging to no monitor.
-        active: root.screenState === "set" && root.monitorId >= 0
+        // As soon as the daemon knows the screen, wallpaper or not: the renderer is what reports
+        // the screen's size, and one loaded only once a wallpaper is set lets the first one be
+        // drawn at the default size and then again. Until a frame is shown the backdrop stays
+        // over it. Without the id test the renderer would ask for frames belonging to no monitor.
+        active: (root.screenState === "set" || root.screenState === "unset") && root.monitorId >= 0
         source: "WallpaperSurface.qml"
         onLoaded: {
             item.monitorId = root.monitorId;

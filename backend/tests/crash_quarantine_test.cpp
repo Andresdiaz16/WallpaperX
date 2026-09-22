@@ -2,7 +2,8 @@
 
 // The refusal half of the crash-loop breaker: what a start does when it finds, in the state
 // directory, a record saying the last run died applying one of the wallpapers it is about to
-// apply.
+// apply -- or deaths named against a video that was playing (runPlaybackDeathChecks, whose deaths
+// are real: children of this binary, re-executed, that die with the playing record open).
 //
 // Driven through WallpaperManager directly -- restoreSaved(), renderPending(),
 // exportCurrentFrame() -- rather than over the bus, for the reason http_server_test's
@@ -32,25 +33,31 @@
 
 #include "support/test_image.h"
 #include "tests/client/scratch_dir.h"
+#include "tests/self_exec.h"
 #include "tests/test_report.h"
 
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <csignal>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <optional>
 #include <string>
 #include <system_error>
+#include <thread>
 #include <vector>
 
 #include <fcntl.h>
 #include <sys/inotify.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 using wallpaperx::CrashRecord;
@@ -185,9 +192,375 @@ std::optional<wallpaperx::MonitorStatus> monitor(const WallpaperManager::Snapsho
     return it->second;
 }
 
+void check(bool condition, const std::string& what) { wallpaperx::testing::check(condition, what.c_str()); }
+
+// ---------------------------------------------------------------------------- //
+// Deaths while a video plays (Step 13 Stage E5): the counts a start carries
+// ---------------------------------------------------------------------------- //
+
+// Monitors of their own, past the ones above.
+constexpr int kBadVideoMonitor = 10;   // the video every named death here names
+constexpr int kGoodVideoMonitor = 11;  // another video, never named
+constexpr int kSameFileMonitor = 12;   // the bad video's own file, on another monitor
+
+// A child of this binary that builds a manager as the daemon's start does -- restoreSaved(), then
+// recordStartingVideos() -- and then ends as `action` says. Re-executed rather than forked: the
+// manager starts threads, and a death on one of them is the point.
+//
+//   die <monitor> <path>      a memory fault on a thread whose guard names that video
+//   die-unnamed <monitor> <path>  the same thread faults after its guard has gone
+//   killed <monitor> <path>   the guard is live when the parent sends SIGKILL
+//   orderly                   endPlayingRecord() and an ordinary exit
+constexpr const char* kPlayingChildFlag = "--playing-child";
+constexpr int kPlayingChildSetupFailed = 121;
+
+[[noreturn]] void faultNow() {
+    void* page = ::mmap(nullptr, 4096, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (page == MAP_FAILED) _exit(kPlayingChildSetupFailed);
+    *static_cast<volatile char*>(page) = 1;
+    _exit(kPlayingChildSetupFailed);
+}
+
+[[noreturn]] void runPlayingChild(int argc, char** argv) {
+    wallpaperx::testing::suppressCoreDump();
+    wallpaperx::installFatalSignalHandlers();
+    if (argc < 5) _exit(kPlayingChildSetupFailed);
+    const std::string action = argv[4];
+    WallpaperManager::Config config;
+    config.configFile = argv[2];
+    config.stateDir = argv[3];
+    try {
+        auto manager = std::make_unique<WallpaperManager>(config);
+        manager->restoreSaved();
+        manager->recordStartingVideos();
+        if (action == "orderly") {
+            manager->endPlayingRecord();
+            manager.reset();
+            std::_Exit(0);
+        }
+        if (argc < 7) _exit(kPlayingChildSetupFailed);
+        const std::string line = wallpaperx::playingBlameLine(std::atoi(argv[5]), argv[6]);
+        std::thread worker([&] {
+            if (action == "die") {
+                const wallpaperx::PlayingBlame blame(line);
+                faultNow();
+            }
+            if (action == "die-unnamed") {
+                { const wallpaperx::PlayingBlame blame(line); }
+                faultNow();
+            }
+            if (action == "killed") {
+                const wallpaperx::PlayingBlame blame(line);
+                wallpaperx::testing::reportSelfExecReady();
+                for (;;) std::this_thread::sleep_for(std::chrono::seconds(1));
+            }
+            _exit(kPlayingChildSetupFailed);
+        });
+        worker.join();
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "crash_quarantine_test child: %s\n", e.what());
+    }
+    _exit(kPlayingChildSetupFailed);
+}
+
+// Runs one child and says whether it ended the way its action is meant to, reporting a harness
+// fault -- never a verdict on the daemon -- when it did not.
+bool playingChild(const std::filesystem::path& configFile, const std::filesystem::path& stateDir,
+                  const std::vector<std::string>& action) {
+    std::vector<std::string> args{kPlayingChildFlag, configFile.string(), stateDir.string()};
+    args.insert(args.end(), action.begin(), action.end());
+    const bool killed = action.front() == "killed";
+    const wallpaperx::testing::SelfExecResult r = wallpaperx::testing::runSelf(args, std::chrono::seconds(30), killed);
+    const bool expected = action.front() == "orderly" ? r.exitedWith(0) : r.diedOf(killed ? SIGKILL : SIGSEGV);
+    if (!r.fault.empty() || !expected) {
+        harnessFailure("a '" + action.front() + "' child did not end as staged (" +
+                       (r.fault.empty() ? r.how() : r.fault) + "), so what it left grades nothing");
+        return false;
+    }
+    return true;
+}
+
+// What a start decides for each monitor, read without changing anything on disk: restoreSaved() only
+// reads the playing record; recordStartingVideos() is what would replace it.
+struct StartVerdict {
+    bool graded = false;
+    std::optional<wallpaperx::MonitorStatus> bad, good, sameFile;
+    std::vector<int> posted;
+};
+
+StartVerdict startNow(const std::filesystem::path& configFile, const std::filesystem::path& stateDir) {
+    StartVerdict v;
+    try {
+        WallpaperManager::Config config;
+        config.configFile = configFile;
+        config.stateDir = stateDir;
+        WallpaperManager manager(config);
+        v.posted = manager.restoreSaved();
+        const WallpaperManager::Snapshot snap = manager.snapshot();
+        v.bad = monitor(snap, kBadVideoMonitor);
+        v.good = monitor(snap, kGoodVideoMonitor);
+        v.sameFile = monitor(snap, kSameFileMonitor);
+        v.graded = v.bad && v.good && v.sameFile;
+    } catch (const std::exception& e) {
+        harnessFailure(std::string("a start from the state under test threw: ") + e.what());
+    }
+    if (!v.graded) harnessFailure("a start from the state under test did not restore the three video monitors");
+    return v;
+}
+
+bool refused(const std::optional<wallpaperx::MonitorStatus>& s) {
+    return s && !s->lastError.empty() && !s->renderOutstanding;
+}
+bool applied(const std::optional<wallpaperx::MonitorStatus>& s) {
+    return s && s->lastError.empty() && s->renderOutstanding;
+}
+std::string describeStatus(const std::optional<wallpaperx::MonitorStatus>& s) {
+    if (!s) return "not restored";
+    return s->lastError.empty() ? (s->renderOutstanding ? "applied, render owed" : "applied, nothing owed")
+                                : "refused: " + s->lastError;
+}
+
+int countFor(const std::filesystem::path& stateDir, int monitorId) {
+    const std::optional<wallpaperx::PlayingHistory> h = wallpaperx::readPlayingRecord(stateDir);
+    if (!h) return -1;
+    for (const wallpaperx::PlayingVideo& v : h->videos) {
+        if (v.monitorId == monitorId) return v.deaths;
+    }
+    return 0;
+}
+
+// An in-process start that runs as the daemon's does -- restoreSaved(), recordStartingVideos() --
+// then `then` on the manager, then an orderly stop.
+template <typename Then>
+bool runStart(const std::filesystem::path& configFile, const std::filesystem::path& stateDir, Then&& then) {
+    try {
+        WallpaperManager::Config config;
+        config.configFile = configFile;
+        config.stateDir = stateDir;
+        WallpaperManager manager(config);
+        manager.restoreSaved();
+        manager.recordStartingVideos();
+        then(manager);
+        manager.endPlayingRecord();
+        return true;
+    } catch (const std::exception& e) {
+        harnessFailure(std::string("an in-process start threw: ") + e.what());
+        return false;
+    }
+}
+
+void runPlaybackDeathChecks(const std::filesystem::path& root) {
+    const char* kGoals = "S13.184-S13.188 (deaths named against a video, and what the next start does with them)";
+    const std::filesystem::path configFile = root / "playing-config" / "config.json";
+    const std::filesystem::path stateDir = root / "playing-state";
+    const std::string badVideo = (root / "crashes-while-playing.mp4").string();
+    const std::string goodVideo = (root / "plays-fine.mp4").string();
+    writeText(badVideo, "not a video; nothing here decodes it");
+    writeText(goodVideo, "not a video either");
+    writeText(configFile, configJson({
+                              {kBadVideoMonitor, "video", badVideo},
+                              {kGoodVideoMonitor, "video", goodVideo},
+                              {kSameFileMonitor, "video", badVideo},
+                          }));
+    const auto die = [&](const char* how) {
+        return playingChild(configFile, stateDir, {how, std::to_string(kBadVideoMonitor), badVideo});
+    };
+
+    // GOAL: S13.185's first clause -- ONE death named against a video refuses nothing at the next
+    //       start: one crash that merely landed there (a driver fault while drawing it) must never
+    //       cost a working wallpaper. The death is recorded, so the count is not simply unwritten.
+    // CONTROL: in backend/daemon/wallpaper_manager.cpp, restoreSaved()'s `deaths >= kPlaybackDeaths`
+    //       made `deaths >= 1` -> "FAIL: one death named against a video refuses nothing at the next
+    //       start", printing the refusal, and the after-reset check below. Observed 2026-09-21;
+    //       reverted.
+    if (!die("die")) return;
+    {
+        const std::optional<wallpaperx::PlayingHistory> h = wallpaperx::readPlayingRecord(stateDir);
+        check(h && h->died && h->died->monitorId == kBadVideoMonitor && h->died->path == badVideo,
+              "the death is named against the video it happened in (the harness's premise)");
+        const StartVerdict v = startNow(configFile, stateDir);
+        if (!v.graded) return;
+        check(applied(v.bad), "one death named against a video refuses nothing at the next start (" +
+                                  describeStatus(v.bad) + ")");
+    }
+
+    // GOAL: S13.187 -- the count SURVIVES an orderly stop, and a death that names no video changes
+    //       no count: after one named death, an orderly run, a crash on the render thread after it
+    //       stopped working on the video, and a SIGKILL, the video still carries exactly one death.
+    //       False for the rule this replaced, where a normal stop cleared every count (a bad video
+    //       was then refused only until the next login), and for any rule that counts a death that
+    //       names nothing (power loss, the watchdog, another screen's crash).
+    // WHY-THIS-SHAPE: the count is read from the record each start writes, and then graded through
+    //       its consequence: one more named death must refuse the video, which it does only if the
+    //       first survived all three -- and only if none of them added one, since two would already
+    //       have refused it at the check above.
+    // CONTROL: (a) in backend/daemon/wallpaper_manager.cpp, endPlayingRecord() made to also remove
+    //       playingRecordPath(m_config.stateDir) -> "FAIL: the count survives an orderly stop (-1)"
+    //       and nine more down the chain, "a video named by two deaths is refused" among them; (b) in
+    //       backend/daemon/crash_record.cpp, ~PlayingBlame's withdrawal deleted -> "FAIL: a crash
+    //       after the render thread stopped working on the video counts for nobody (2)" and "FAIL:
+    //       SIGKILL counts for nobody (2)"; (c) PlayingBlame's constructor writing its line into the
+    //       record at once -> the same two. All observed 2026-09-21; reverted.
+    if (!playingChild(configFile, stateDir, {"orderly"})) return;
+    const int afterOrderly = countFor(stateDir, kBadVideoMonitor);
+    check(afterOrderly == 1, "the count survives an orderly stop (" + std::to_string(afterOrderly) + ")");
+    if (!die("die-unnamed")) return;
+    if (!playingChild(configFile, stateDir, {"orderly"})) return;
+    const int afterUnnamed = countFor(stateDir, kBadVideoMonitor);
+    check(afterUnnamed == 1, "a crash after the render thread stopped working on the video counts for nobody (" +
+                                 std::to_string(afterUnnamed) + ")");
+    if (!die("killed")) return;
+    if (!playingChild(configFile, stateDir, {"orderly"})) return;
+    const int afterKilled = countFor(stateDir, kBadVideoMonitor);
+    check(afterKilled == 1, "SIGKILL counts for nobody (" + std::to_string(afterKilled) + ")");
+
+    // GOAL: S13.185 -- a video named by TWO deaths since it was last set is refused at the next
+    //       start, with a reason saying the daemon crashed with that signal while playing it, that it
+    //       is the 2nd time, and to set it again to retry; nothing is owed for it and it is never
+    //       opened. Another video is not refused, and the same FILE on another monitor carries no
+    //       count: a death names a monitor and a path.
+    // WHY-THIS-SHAPE: whether the refused file is opened is watched with inotify, for OpenWatch's
+    //       reason, across a pass an import-modifier report posts: a plain renderPending() on a
+    //       refused monitor returns at "already serviced" before the refusal is consulted, and with
+    //       it the check stayed green with the refusal's quarantine deleted.
+    // CONTROL: in backend/daemon/wallpaper_manager.cpp, (a) `if (diedHere) ++deaths;` deleted ->
+    //       "FAIL: a video named by two deaths is refused at the next start" among nine; (b) the
+    //       `played->died->monitorId == monitorId &&` term deleted -> exactly "FAIL: the same file on
+    //       another monitor carries no count (refused: ...)"; (c) `state.quarantined = true;` deleted
+    //       from restoreSaved()'s refuse lambda -> "FAIL: a refused video is never opened, even by a
+    //       re-post that looks like new work", beside S13.15's four. In
+    //       backend/daemon/crash_record.cpp, (d) "; set it again to retry" dropped from
+    //       describePlaybackDeaths() -> exactly "FAIL: the refusal says it is the 2nd time ... and how
+    //       to retry". All observed 2026-09-21; reverted.
+    if (!die("die")) return;
+    {
+        const StartVerdict v = startNow(configFile, stateDir);
+        if (!v.graded) return;
+        check(refused(v.bad), "a video named by two deaths is refused at the next start (" + describeStatus(v.bad) + ")");
+        const std::string reason = v.bad ? v.bad->lastError : std::string();
+        check(reason.find("crashed with SIGSEGV while playing this video") != std::string::npos &&
+                  reason.find("the 2nd time") != std::string::npos &&
+                  reason.find("set it again to retry") != std::string::npos,
+              "the refusal says it is the 2nd time the daemon crashed with SIGSEGV while playing it, and how to retry "
+              "(" + reason + ")");
+        check(applied(v.good), "another video is not refused (" + describeStatus(v.good) + ")");
+        check(applied(v.sameFile), "the same file on another monitor carries no count (" + describeStatus(v.sameFile) + ")");
+        check(std::find(v.posted.begin(), v.posted.end(), kGoodVideoMonitor) != v.posted.end(),
+              "and the start posts the other video's render");
+    }
+    {
+        OpenWatch watch(badVideo);
+        try {
+            WallpaperManager::Config config;
+            config.configFile = configFile;
+            config.stateDir = stateDir;
+            WallpaperManager manager(config);
+            manager.restoreSaved();
+            // A re-post that bumps the request, as the plugin's report at every login does: a
+            // refused monitor owes nothing, so a plain renderPending() would return before the
+            // refusal is ever consulted.
+            const wallpaperx::ImportModifierUpdate update = manager.setImportModifiers(
+                ":1.9", wallpaperx::drmFourccForVkFormat(wallpaperx::OffscreenTargetManager::kFormat), {0});
+            check(std::find(update.toRender.begin(), update.toRender.end(), kBadVideoMonitor) != update.toRender.end(),
+                  "an import-modifier report re-posts the refused video, so the pass below really runs");
+            for (const int id : update.toRender) {
+                if (id == kBadVideoMonitor) manager.renderPending(id);
+            }
+        } catch (const std::exception& e) {
+            harnessFailure(std::string("the refused video's pass threw: ") + e.what());
+        }
+        if (watch.ok()) {
+            check(watch.drain() == 0, "a refused video is never opened, even by a re-post that looks like new work");
+            { const std::ifstream probe(badVideo, std::ios::binary); }
+            check(watch.drain() >= 1, "the watch that says so does see an open when there is one");
+        } else {
+            notVerified("S13.185's not-opened clause", "inotify could not watch the refused video");
+        }
+    }
+
+    // GOAL: S13.186 -- the refusal persists across orderly restarts until the video is set again:
+    //       a refused video is carried at the cap, two, so the start after the refusal refuses it too.
+    //       And a count is capped at two on disk however high the record read says it is.
+    // CONTROL: in backend/daemon/wallpaper_manager.cpp, restoreSaved()'s playing loop: (a) the carry
+    //       made `if (deaths > 0 && deaths < kPlaybackDeaths)`, so a refused video is not carried ->
+    //       "FAIL: a refused video is carried at two (0)", "... still refused after an orderly
+    //       restart", "a count is capped at two (0)" and "a request for another monitor resets
+    //       nothing"; (b) the READ cap, `std::min(video.deaths, kPlaybackDeaths)` -> `video.deaths` ->
+    //       exactly "FAIL: a record carrying seven deaths is read as two", printing "the 7th time";
+    //       (c) both caps removed -> that and "FAIL: a count is capped at two (7)". The write cap
+    //       alone is not singly load-bearing: after the read cap a count reaches three only for a
+    //       refused video, which cannot die. Observed 2026-09-21; reverted.
+    if (!runStart(configFile, stateDir, [](WallpaperManager&) {})) return;
+    check(countFor(stateDir, kBadVideoMonitor) == 2, "a refused video is carried at two (" +
+                                                         std::to_string(countFor(stateDir, kBadVideoMonitor)) + ")");
+    {
+        const StartVerdict v = startNow(configFile, stateDir);
+        if (!v.graded) return;
+        check(refused(v.bad), "a refused video is still refused after an orderly restart (" + describeStatus(v.bad) + ")");
+    }
+    {
+        const ScratchDir capped("playingcap");
+        if (capped.ok()) {
+            {
+                wallpaperx::PlayingRecord record(capped.path());
+                record.start({{kBadVideoMonitor, badVideo, 7}});
+            }
+            const StartVerdict v = startNow(configFile, capped.path());
+            if (!v.graded) return;
+            check(refused(v.bad) && v.bad->lastError.find("the 2nd time") != std::string::npos,
+                  "a record carrying seven deaths is read as two (" + describeStatus(v.bad) + ")");
+            if (!runStart(configFile, capped.path(), [](WallpaperManager&) {})) return;
+            check(countFor(capped.path(), kBadVideoMonitor) == 2,
+                  "a count is capped at two (" + std::to_string(countFor(capped.path(), kBadVideoMonitor)) + ")");
+        }
+    }
+
+    // GOAL: S13.188 -- setting a wallpaper again resets that monitor's count to ZERO from the next
+    //       start: the refusal is gone, and one more named death refuses nothing, where the rule this
+    //       replaced ("carried one short of refusal") refused it again. A request for ANOTHER monitor
+    //       resets nothing.
+    // WHY-THIS-SHAPE: the reset is graded by a death after it, because "not refused" alone is also
+    //       what a reset to one short would show. The other monitor's request comes first, in a run of
+    //       its own, so a reset that cleared every monitor goes red before the real one runs.
+    // CONTROL: in backend/daemon/wallpaper_manager.cpp, (a) `m_playing.clear(monitorId);` deleted from
+    //       requestWallpaper() -> "FAIL: setting the video again clears its refusal at the next
+    //       start" and "FAIL: after being set again, one more named death refuses nothing", printing
+    //       "the 3rd time"; (b) that line replaced by a loop clearing every monitor id -> exactly
+    //       "FAIL: a request for another monitor resets nothing". Observed 2026-09-21; reverted.
+    if (!runStart(configFile, stateDir, [&](WallpaperManager& m) {
+            m.requestWallpaper("video", goodVideo, kGoodVideoMonitor);
+        })) {
+        return;
+    }
+    {
+        const StartVerdict v = startNow(configFile, stateDir);
+        if (!v.graded) return;
+        check(refused(v.bad), "a request for another monitor resets nothing (" + describeStatus(v.bad) + ")");
+    }
+    if (!runStart(configFile, stateDir, [&](WallpaperManager& m) {
+            m.requestWallpaper("video", badVideo, kBadVideoMonitor);
+        })) {
+        return;
+    }
+    {
+        const StartVerdict v = startNow(configFile, stateDir);
+        if (!v.graded) return;
+        check(applied(v.bad), "setting the video again clears its refusal at the next start (" + describeStatus(v.bad) + ")");
+    }
+    if (!die("die")) return;
+    {
+        const StartVerdict v = startNow(configFile, stateDir);
+        if (!v.graded) return;
+        check(applied(v.bad), "after being set again, one more named death refuses nothing: the count went to zero (" +
+                                  describeStatus(v.bad) + ")");
+    }
+    (void)kGoals;
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc > 1 && std::strcmp(argv[1], kPlayingChildFlag) == 0) runPlayingChild(argc, argv);
     wallpaperx::testing::g_testName = "crash_quarantine_test";
 
     // One epilogue for every exit, including the early ones. A `return 1` at a setup failure
@@ -613,6 +986,9 @@ int main() {
         //       "FAIL: a completed render leaves no record for the next start to refuse", and
         //       the two clean-failure checks after it: 5 in all. Reverted.
         manager.requestWallpaper("static", crashedImage, kCrashedMonitor);
+        // The request opens the file itself to check it can be read (S13.195); that open is not the
+        // render's, and counted here it would satisfy "the retry actually opens the file" alone.
+        if (crashedWatch.ok()) crashedWatch.drain();
         {
             const std::optional<wallpaperx::MonitorStatus> crashed = monitor(manager.snapshot(), kCrashedMonitor);
             check(crashed.has_value() && crashed->lastError.empty(), "an explicit request clears the refusal");
@@ -650,6 +1026,12 @@ int main() {
         }
     } catch (const std::exception& e) {
         harnessFailure(std::string("the run ended in an unhandled exception: ") + e.what());
+    }
+
+    try {
+        runPlaybackDeathChecks(root);
+    } catch (const std::exception& e) {
+        harnessFailure(std::string("the playback-death checks ended in an unhandled exception: ") + e.what());
     }
 
     return finish();

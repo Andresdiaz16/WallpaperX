@@ -81,24 +81,21 @@
 using wallpaperx::DbusService;
 
 // Where the resize barrier phase holds or fails the render thread from inside the daemon's own work: the
-// framebuffer creation that finishes every rebuilt image, and the unlink that removes a crash record.
-// Defined in this executable, so the daemon's calls resolve here; unarmed, each costs the real call one
-// atomic load. The gate itself is tests/client/call_gate.h, shared with video_wallpaper_test, which
+// framebuffer creation that finishes every rebuilt image, and the framebuffer destruction that releases
+// them. Defined in this executable, so the daemon's calls resolve here; unarmed, each costs the real call
+// one atomic load. The gate itself is tests/client/call_gate.h, shared with video_wallpaper_test, which
 // holds the render thread inside a decode and inside a decoder's teardown.
 using wallpaperx::testing::CallGate;
 
 CallGate g_framebufferGate;
-CallGate g_unlinkGate;
+CallGate g_destroyFramebufferGate;  // a monitor's images being released: held there, never failed
 
-extern "C" int unlink(const char* path) {
-    using Fn = int (*)(const char*);
-    static const Fn real = reinterpret_cast<Fn>(::dlsym(RTLD_NEXT, "unlink"));
-    if (real == nullptr) {
-        errno = ENOSYS;
-        return -1;
-    }
-    g_unlinkGate.enter(path);
-    return real(path);
+extern "C" void vkDestroyFramebuffer(VkDevice device, VkFramebuffer framebuffer, const VkAllocationCallbacks* allocator) {
+    using Fn = void (*)(VkDevice, VkFramebuffer, const VkAllocationCallbacks*);
+    static const Fn real = reinterpret_cast<Fn>(::dlsym(RTLD_NEXT, "vkDestroyFramebuffer"));
+    if (real == nullptr) return;
+    g_destroyFramebufferGate.enter();
+    real(device, framebuffer, allocator);
 }
 
 extern "C" VkResult vkCreateFramebuffer(VkDevice device, const VkFramebufferCreateInfo* info,
@@ -5796,7 +5793,7 @@ void runResizeBarrierChecks(const wallpaperx::WallpaperManager::Config& config, 
         RenderWorker& worker;
         ~Unblock() {
             g_framebufferGate.release();
-            g_unlinkGate.release();
+            g_destroyFramebufferGate.release();
             worker.stop();
         }
     } unblock{worker};
@@ -5883,9 +5880,12 @@ void runResizeBarrierChecks(const wallpaperx::WallpaperManager::Config& config, 
     // WHY-THIS-SHAPE: the render thread is held inside the very call that finishes an image, and the
     //       record is looked for while it is held -- a check before or after the pass cannot see the
     //       span at all.
-    // CONTROL: `applying.reset();` before `ensureTargets` in WallpaperManager::renderPassLocked
-    //       (backend/daemon/wallpaper_manager.cpp) deleted -> "FAIL: no crash record naming the wallpaper
-    //       is on disk while its images are created at the new size". Reverted.
+    // CONTROL: in WallpaperManager::renderPassLocked (backend/daemon/wallpaper_manager.cpp), the still's
+    //       build given the pass's own record instead of the attempt's -- the retryAfterEvictionLocked()
+    //       call replaced by `applying.emplace(m_config.stateDir, monitorId, type, path);
+    //       still.emplace(...);`, so the record spans ensureTargets() -> exactly "FAIL: no crash record
+    //       naming the wallpaper is on disk while its images are created at the new size". Observed
+    //       2026-09-21 on the NVIDIA entry. Reverted.
     // COVERAGE-ASSERT: the same pass is required to have created the monitor's record at least twice --
     //       around the decode and around the draw -- so its absence at the hold is not a record this
     //       manager never writes.
@@ -5983,15 +5983,19 @@ void runResizeBarrierChecks(const wallpaperx::WallpaperManager::Config& config, 
 
     // GOAL: S13.100's never-both clause -- a failed resize redraw is never observable with a frame beside
     //       its error, not even between recording the error and releasing the images.
-    // WHY-THIS-SHAPE: the render thread is held at the unlink of the pass's own crash record, which runs
-    //       after the error is committed and before the images are released -- a read after the pass
-    //       has finished cannot see that span at all. snapshot() is what GetStatus reads, and is read
-    //       here from a thread the render is not waiting on.
-    // CONTROL: `it->second.hasFrame = false;` deleted from the error arm of the commit block in
-    //       WallpaperManager::renderPassLocked (backend/daemon/wallpaper_manager.cpp) -> "FAIL: a failed
-    //       resize redraw is never observable with a frame beside its error", printing "has_frame is true
-    //       beside last_error: StaticRenderer: cannot open image (No such file or directory)"; the check
-    //       after it stays green, since releaseTarget() still clears the flag. Reverted.
+    // WHY-THIS-SHAPE: the render thread is held as the monitor's images are released -- the first
+    //       framebuffer destroyed in the pass, inside releaseTarget(), which runs after the error is
+    //       committed and before forgetImages() clears the flag a second time -- so only the clear made
+    //       with the error can be what the read sees. A read after the pass cannot see that span. The
+    //       hold used to be the unlink of the pass's crash record; since Step 13 Stage E5 a still that
+    //       fails to open has no record left by then (the build attempt's own is removed as it unwinds,
+    //       before the error exists), and a hold there reads a state with no error yet.
+    // CONTROL: `state.hasFrame = false;` deleted from WallpaperManager::recordFailureLocked
+    //       (backend/daemon/wallpaper_manager.cpp) -> "FAIL: a failed resize redraw is never observable
+    //       with a frame beside its error", printing "has_frame is true beside last_error:
+    //       StaticRenderer: cannot open image (No such file or directory)"; the check after it stays
+    //       green, since releaseTarget() still clears the flag. Observed 2026-09-21 on the NVIDIA
+    //       entry. Reverted.
     const std::filesystem::path gonePath = state.path() / "gone.png";
     {
         std::error_code ec;
@@ -6010,10 +6014,10 @@ void runResizeBarrierChecks(const wallpaperx::WallpaperManager::Config& config, 
         std::error_code ec;
         std::filesystem::remove(gonePath, ec);
     }
-    g_unlinkGate.arm(CallGate::Mode::Hold, wallpaperx::crashRecordPath(state.path(), kMonitorFileGone).string());
+    g_destroyFramebufferGate.arm(CallGate::Mode::Hold);
     resize("DP-GONE", kReportedWidth, kReportedHeight);
-    const bool atRemoval = g_unlinkGate.waitFired(kGateLimit);
-    check(atRemoval, "the failed redraw reaches the removal of its crash record");
+    const bool atRemoval = g_destroyFramebufferGate.waitFired(kGateLimit);
+    check(atRemoval, "the failed redraw reaches the release of the monitor's images");
     if (atRemoval) {
         const wallpaperx::MonitorStatus during = monitorStatus(manager, kMonitorFileGone);
         // COVERAGE-ASSERT: the error must already be recorded when the thread is held, or "no frame
@@ -6023,7 +6027,7 @@ void runResizeBarrierChecks(const wallpaperx::WallpaperManager::Config& config, 
         check(!both, "a failed resize redraw is never observable with a frame beside its error");
         if (both) std::fprintf(stderr, "  has_frame is true beside last_error: %s\n", during.lastError.c_str());
     }
-    g_unlinkGate.release();
+    g_destroyFramebufferGate.release();
     if (drained()) {
         const wallpaperx::MonitorStatus after = monitorStatus(manager, kMonitorFileGone);
         check(!after.lastError.empty() && !after.hasFrame, "once it has finished, the failed redraw has an error and no frame");

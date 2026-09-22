@@ -4,6 +4,7 @@
 
 #include "config_store.h"
 #include "config_writer.h"
+#include "crash_record.h"
 #include "kept_rows.h"
 #include "log_escape.h"
 #include "vulkan/frame_export.h"
@@ -365,7 +366,26 @@ public:
     // the budget, so a video that hiccups once an hour keeps recovering.
     static constexpr uint32_t kPlaybackRetries = 3;
 
-    // The longest a Config may set any of the three waits above to.
+    // Reopens after the daemon ran short, each of which first evicts an idle session if there is
+    // one. More than kPlaybackRetries because a real shortage clears as other screens release
+    // theirs; bounded because a file whose own demand exceeds the device is reported as a shortage
+    // every time.
+    static constexpr uint32_t kShortageRetries = 10;
+
+    // Fatal signals caught while the render thread was working on one video's content -- decoding
+    // or drawing it, or freeing it after its own failure -- before the next start refuses it.
+    // Counted across every stop, never for a death that names no video, and cleared when the video
+    // is set again or has played kCleanPlayAfter. Two, so one crash that merely landed there -- a
+    // driver fault while drawing it -- never costs a working wallpaper, while a file that kills
+    // every run it plays in is stopped on the third start.
+    static constexpr int kPlaybackDeaths = 2;
+
+    // Pictures shown for this long clear a video's death count: a file that crashes at some picture
+    // reaches it within one loop, and wallpaper loops are seconds to a few minutes. Measured in
+    // pictures delivered, not time since it was set, so a video nobody watched earns nothing.
+    static constexpr std::chrono::minutes kCleanPlayAfter{10};
+
+    // The longest a Config may set any of the waits above to.
     static constexpr std::chrono::hours kMaxTiming{24};
 
     struct Config {
@@ -387,11 +407,12 @@ public:
         // about config cannot read or overwrite the developer's own.
         std::filesystem::path configFile;
 
-        // Where the record of the wallpaper being applied lives, so a start after a crash
-        // can refuse the one the last run did not survive. Empty disables that refusal, and
-        // is the default for the same reason configFile's is: production opts in via
-        // defaultStateDir(), so a test that says nothing about state cannot leave a record
-        // in the developer's own directory for the real daemon's next start to honour.
+        // Where the records of the wallpaper being applied and of the videos a run started with
+        // live, so a start after a crash can refuse what the last runs did not survive. Empty
+        // disables that refusal, and is the default for the same reason configFile's is:
+        // production opts in via defaultStateDir(), so a test that says nothing about state
+        // cannot leave a record in the developer's own directory for the real daemon's next
+        // start to honour.
         std::filesystem::path stateDir;
 
         // The waits above, overridable so a test can run them in milliseconds; the constants are
@@ -402,6 +423,7 @@ public:
         std::chrono::steady_clock::duration unwatchedAfter = kUnwatchedAfter;
         std::chrono::steady_clock::duration idleSessionRelease = kIdleSessionRelease;
         std::chrono::steady_clock::duration refusalLogInterval = kRefusalLogInterval;
+        std::chrono::steady_clock::duration cleanPlayAfter = kCleanPlayAfter;
     };
 
     explicit WallpaperManager(Config config);
@@ -484,6 +506,16 @@ public:
     // and has no event loop yet, and the writer reports a failed write on stderr itself. Call
     // once, after preserveUnreadableConfig(), which copies the bytes this rewrite replaces.
     void writeRepairedConfig();
+
+    // Replaces the playing record the last run left with the counts restoreSaved() carried forward,
+    // and holds it open until this manager is destroyed. Call once, after restoreSaved() and after
+    // the bus name is held: it overwrites state a running daemon owns.
+    void recordStartingVideos();
+
+    // Stops counting deaths, because an orderly stop has begun; the counts stay. Call as the stop
+    // starts, not at the end of teardown, which the stop deadline may cut short. Idempotent;
+    // destruction does it too.
+    void endPlayingRecord();
 
     // Renders the monitor's current request, on the render worker's thread and never the DBus
     // one. rendered=true only when the frame is still the one that was asked for: a request
@@ -611,6 +643,10 @@ private:
                                std::chrono::steady_clock::time_point now,
                                std::chrono::steady_clock::duration interval);
 
+    // Who answers for a failure: the file, the daemon, or the daemon for want of a resource that
+    // closing a session can give back -- memory, a decoder, a descriptor.
+    enum class Fault { File, Daemon, Shortage };
+
     struct MonitorState {
         std::string type;
         std::string path;
@@ -634,12 +670,13 @@ private:
         uint64_t generation = 0;
         bool hasFrame = false;
         std::string lastError;
-        bool lastErrorIsDaemonFault = false;
+        Fault lastErrorFault = Fault::File;  // meaningless while lastError is empty
 
-        // The saved request was not applied because the last run died applying it, and no pass
-        // may decode it -- a re-post for any other reason must not either. Set only by
-        // restoreSaved(), cleared only by requestWallpaper(): a client asking for this
-        // wallpaper again is a different statement from a config being restored.
+        // The saved request was not applied because the last run died applying it, or because
+        // kPlaybackDeaths deaths were caught while playing it, and no pass may decode it -- a
+        // re-post for any other reason must not either. Set only by restoreSaved(), cleared only
+        // by requestWallpaper(): a client asking for this wallpaper again is a different statement
+        // from a config being restored.
         bool quarantined = false;
 
         // Copied from the target at commit time, so status() can report the frame's size
@@ -718,16 +755,36 @@ private:
 
         // The wallpaper whose file held a single picture: it is on screen and there is nothing
         // after it, so no clock advances it and no session is opened to play it. Keyed by
-        // wallpaperSeq for playbackRetriesFor's reason, and held here rather than on the session
+        // wallpaperSeq for ReopenBudget's reason, and held here rather than on the session
         // because the session is freed while the fact stays true.
         uint64_t parkedWallpaperSeq = 0;
 
-        // Reopens the clock has spent on `playbackRetriesFor`, against kPlaybackRetries. Keyed by
-        // the wallpaper rather than reset when one arrives: a count whose key names a wallpaper
-        // this monitor no longer holds has nothing to say about the one it does, so no caller has
-        // to remember to clear it.
-        uint64_t playbackRetriesFor = 0;
-        uint32_t playbackRetries = 0;
+        // Reopens the clock has spent on the wallpaper `forSeq` names. Keyed by the wallpaper
+        // rather than reset when one arrives: a count whose key names a wallpaper this monitor no
+        // longer holds has nothing to say about the one it does, so no caller has to remember to
+        // clear it.
+        struct ReopenBudget {
+            uint64_t forSeq = 0;
+            uint32_t failures = 0;   // against kPlaybackRetries
+            uint32_t shortages = 0;  // against kShortageRetries, and never the file's
+
+            // Spends one reopen after `failure` from the allowance it belongs to; false once spent.
+            bool spend(Fault failure);
+        };
+        ReopenBudget reopens;
+
+        // How long the wallpaper `forSeq` names has played in this run: the gaps between consecutive
+        // clock pictures, each drawn on time. `lastShown` is dropped whenever play stops -- the
+        // screen reported hidden, the clock finding it not playing, a failure, a new session -- so
+        // no stop, however short, adds anything. `cleared` once it reached Config::cleanPlayAfter
+        // and its death count was cleared.
+        struct CleanPlay {
+            uint64_t forSeq = 0;
+            std::chrono::steady_clock::duration played{};
+            std::optional<std::chrono::steady_clock::time_point> lastShown;
+            bool cleared = false;
+        };
+        CleanPlay cleanPlay;
     };
 
     // Creates the Device and target manager on first use, so a machine with no working Vulkan
@@ -759,7 +816,7 @@ private:
     // Publishes the frame just drawn into `target`, returning its generation, or records why a
     // render or a picture produced none. Caller must hold m_stateMutex.
     uint64_t commitFrameLocked(MonitorState& state, const OffscreenTarget& target);
-    static void recordFailureLocked(MonitorState& state, const std::string& error, bool daemonFault);
+    static void recordFailureLocked(MonitorState& state, const std::string& error, Fault fault);
 
     // What a failed render or picture was: the message, and who answers for it. Built by
     // rethrowing, so every site sorts the same three kinds the same way rather than carrying its
@@ -771,17 +828,24 @@ private:
         bool gpuFault = false;
         // A host or device resource ran out: freeing something may make the same work possible.
         bool exhausted = false;
+
+        Fault fault() const { return exhausted ? Fault::Shortage : daemonFault ? Fault::Daemon : Fault::File; }
     };
     static RenderFailure classifyFailure();
 
     // The reopens this monitor's current wallpaper has spent, zeroed if the count was another
     // wallpaper's. Caller must hold m_stateMutex.
-    static uint32_t& playbackBudgetLocked(MonitorState& state);
+    static MonitorState::ReopenBudget& playbackBudgetLocked(MonitorState& state);
 
     // Records that the held picture was just drawn. One drawn later than its own interval -- a
     // stall, not jitter -- restarts the schedule from `now`, so a long stall is not followed by
     // pictures shown back to back.
     static void markShown(VideoSession& session, std::chrono::steady_clock::time_point now);
+
+    // Credits `state`'s wallpaper with the play since its last clock picture, for the picture shown at
+    // `now` -- nothing when that one was not `onTime`. True exactly once per wallpaper, when that play
+    // first reaches Config::cleanPlayAfter. Caller must hold m_stateMutex.
+    bool creditCleanPlayLocked(MonitorState& state, std::chrono::steady_clock::time_point now, bool onTime) const;
 
     // advanceVideo() for one session: when it next needs a round, or nothing while its monitor is
     // not playing. Appends to `round` what it showed and what it left owed. Caller must hold
@@ -790,11 +854,15 @@ private:
         int monitorId, std::chrono::steady_clock::time_point now, ClockRound& round);
 
     // The three entries to a monitor's retained decode session, all on the GPU thread with
-    // m_gpuMutex held. A teardown re-enters ffmpeg and the driver, and writes no crash record for
-    // it: the file has already opened, decoded and drawn by then, and a session is released
-    // whenever a screen goes dark, so a record here would refuse a working wallpaper after a death
-    // in a teardown its content did not cause. A caller that already holds one keeps it.
+    // m_gpuMutex held. A routine teardown -- a screen gone dark, an eviction, a wallpaper replaced --
+    // re-enters ffmpeg and the driver but blames nothing: it is not the file's content running, so
+    // a death in it must not refuse a working wallpaper. A caller that holds a record keeps it.
     void closeVideoSessionLocked(int monitorId);
+
+    // The same after `failure` broke the session, named to the fatal-signal handler only when the
+    // failure was the file's: freeing a pipeline on a device that has just failed can itself crash
+    // the driver, and that death says nothing about the video.
+    void closeFailedVideoSessionLocked(int monitorId, Fault failure);
 
     // Keeps the session only if a pass for this wallpaper would draw with it. Called before the
     // branches that draw or release a target, so no type and no failure leaves a decoder and its
@@ -842,6 +910,13 @@ private:
     // another. False when every open session is playing, which is the only case a caller cannot
     // resolve. Caller must hold m_gpuMutex and not m_stateMutex.
     bool evictIdleVideoSessionLocked();
+
+    // Runs `attempt`, and when it fails for want of something a closed session gives back -- memory,
+    // a decoder, the file descriptor its video holds -- closes an idle one and runs it once more.
+    // What the second attempt throws, or the first when nothing could be closed, propagates. Caller
+    // must hold m_gpuMutex and not m_stateMutex.
+    template <typename Attempt>
+    void retryAfterEvictionLocked(Attempt&& attempt);
 
     // The session to draw this monitor's video with, opened and decoded into when it has none for
     // this wallpaper -- so a re-post costs the blit of the picture already held. Never advances a
@@ -956,6 +1031,11 @@ private:
     // The repair restoreSaved() computed, until writeRepairedConfig() takes it out.
     std::optional<std::vector<PersistedWallpaper>> m_repair;
 
+    // The counts restoreSaved() carried forward, until recordStartingVideos() puts them on disk.
+    // Written and read before the event loop starts.
+    std::vector<PlayingVideo> m_startingVideos;
+    PlayingRecord m_playing;
+
     // A copy of the pre-repair file exists. Written by preserveUnreadableConfig(), read by
     // writeRepairedConfig(); both run before the event loop.
     bool m_repairCopied = false;
@@ -999,6 +1079,9 @@ private:
         // The file this pipeline opened, which its teardown is attributed to. Not a copy of the
         // monitor's path: that names what the monitor has been asked for since.
         std::string path;
+        // What names this session to the fatal-signal handler while it is being worked on. On the
+        // heap so its bytes stay put when the session is moved: the handler holds their address.
+        std::unique_ptr<const std::string> blame;
         std::unique_ptr<VideoPipeline> pipeline;
 
         // The held picture: the first, never drawn; the one on screen, whose successor is decoded

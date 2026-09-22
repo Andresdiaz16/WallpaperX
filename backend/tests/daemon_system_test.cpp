@@ -2305,105 +2305,58 @@ void checkBusLoss(const Check& check) {
 }
 
 // ---------------------------------------------------------------------------- //
-// A daemon whose teardown STICKS, and the two things that end one.
+// A daemon whose teardown STICKS, and the three things that end one.
 //
-// Both phases below need a stop that does not finish, and nothing in this suite produced
-// one: every fixture here is refused early or bounded by a deadline of its own. What is
-// used instead is the render worker. ~DbusService joins it, so a render that never returns
-// is a join that never returns -- and a wallpaper file whose open blocks forever is a FIFO.
+// All three phases below need a stop that does not finish, and nothing this suite can ask the
+// daemon for produces one: every fixture here is refused early or bounded by a deadline of its
+// own. The wedge is therefore made from outside the daemon's code, by preloading
+// tests/wedge_shim.cpp into it: with WALLPAPERX_TEST_WEDGE_FREE=1 a decoder freed on the MAIN
+// thread never returns, and the only place the daemon frees one there is ~WallpaperManager --
+// the teardown, after ~DbusService has joined the render worker. So a daemon that has drawn a
+// video stops normally right up to the point these phases are about, and then stops dead.
 //
-// requestWallpaper() refuses a FIFO outright (is_regular_file), and correctly: the check
-// runs on the bus thread, and the render runs later on the worker. So the fixture points
-// the request at a SYMLINK to a real image and re-points that symlink at a FIFO in between.
-// That is a race, and it is treated as one: each attempt is verified, a lost attempt is
-// retried, and a host where none lands reports the phase unexercised rather than passing.
+// What this replaced, and why: the wedge used to be the render worker, blocked on opening a FIFO
+// that a symlink was re-pointed at between the request and the render. Since 09d905b the render's
+// own open refuses a FIFO, so that race could never be won again and both phases reported
+// themselves unexercised on every run -- green suites with nothing behind them.
 // ---------------------------------------------------------------------------- //
 
-// Whether the daemon's render worker is provably stuck: a wallpaper set on `witnessMonitor`
-// after the wedge never produces a frame. The worker is one FIFO thread, so a monitor
-// queued behind a wedged render cannot be serviced -- which is a much stronger signal than
-// the wedged monitor's own silence, since that is also what a render that merely failed
-// looks like.
-bool workerIsWedged(sdbus::IProxy& proxy, const std::string& goodImage, int witnessMonitor,
-                    std::chrono::milliseconds patience) {
-    try {
-        setWallpaper(proxy, "static", goodImage, witnessMonitor, std::chrono::seconds(10));
-    } catch (const std::exception&) {
-        return false;
-    }
-    const std::string id = std::to_string(witnessMonitor);
-    const auto deadline = Clock::now() + patience;
-    while (Clock::now() < deadline) {
-        const StatusReply status = getStatus(proxy, std::chrono::seconds(10));
-        const nlohmann::json* entry = wallpaperStatus(status, id);
-        // A frame means the worker got through, so nothing is wedged.
-        if (entry != nullptr && entry->value("has_frame", false)) return false;
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    }
-    // No frame for the whole patience, and the sanity render before the wedge proved this
-    // daemon renders, so the worker is not coming back.
-    return true;
+// The environment a daemon whose stop must stick is started with: the wedge library preloaded and
+// armed, and a HOME, cache and config/state of its own so nothing it writes touches the
+// developer's. SpawnedDaemon adds scratch XDG directories when none are given; `home` is named
+// here anyway, since a daemon inheriting the developer's HOME would put its shader cache there.
+std::vector<std::string> wedgedDaemonEnv(const std::string& validationEnv, const std::string& busAddress,
+                                         const std::filesystem::path& home) {
+    std::error_code ec;
+    std::filesystem::create_directories(home / "cache", ec);
+    return {validationEnv,
+            "DBUS_SESSION_BUS_ADDRESS=" + busAddress,
+            "HOME=" + home.string(),
+            "XDG_CACHE_HOME=" + (home / "cache").string(),
+            std::string("LD_PRELOAD=") + WALLPAPERX_WEDGE_SHIM,
+            "WALLPAPERX_TEST_WEDGE_FREE=1"};
 }
 
-// Wedges the worker, or returns false having said why in `why`. `link` is re-pointed
-// between the request and the render; `fifo` is what it ends up naming.
-bool wedgeRenderWorker(sdbus::IProxy& proxy, const std::string& goodImage, const std::filesystem::path& link,
-                       const std::filesystem::path& fifo, std::string& why) {
-    // The sanity render first: without it, "no frame appeared" below is equally consistent
-    // with a host whose daemon cannot render at all, and the phases would grade an unwind
-    // that was never wedged.
-    constexpr int kSanityMonitor = 20;
+// Gives the daemon a video to play, so its teardown has a decoder to free -- which the preloaded
+// wedge then never returns from. False with `why` set when this host cannot get that far.
+bool primeTeardownWedge(sdbus::IProxy& proxy, const std::string& clip, std::string& why) {
+    constexpr int kWedgeMonitor = 0;
     try {
-        setWallpaper(proxy, "static", goodImage, kSanityMonitor, std::chrono::seconds(10));
+        setWallpaper(proxy, "video", clip, kWedgeMonitor, std::chrono::seconds(10));
     } catch (const std::exception& e) {
-        why = std::string("the daemon refused the wallpaper this phase needs as a baseline: ") + e.what();
+        why = std::string("the daemon refused the video this phase wedges its teardown with: ") + e.what();
         return false;
     }
-    bool rendered = false;
-    const auto sanityDeadline = Clock::now() + std::chrono::seconds(15);
-    while (!rendered && Clock::now() < sanityDeadline) {
+    // A frame, not just an accepted request: the decoder exists only once the video has opened,
+    // and it is the decoder's free that the wedge holds.
+    const auto deadline = Clock::now() + std::chrono::seconds(20);
+    while (Clock::now() < deadline) {
         const StatusReply status = getStatus(proxy, std::chrono::seconds(10));
-        const nlohmann::json* entry = wallpaperStatus(status, std::to_string(kSanityMonitor));
-        rendered = entry != nullptr && entry->value("has_frame", false);
-        if (!rendered) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        const nlohmann::json* entry = wallpaperStatus(status, std::to_string(kWedgeMonitor));
+        if (entry != nullptr && entry->value("has_frame", false)) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
-    if (!rendered) {
-        why = "this daemon never produced a frame for an ordinary wallpaper, so a render cannot be wedged on this "
-              "host and nothing below would be measuring a stuck teardown";
-        return false;
-    }
-
-    // Each attempt gets monitor ids of its own: a re-used id coalesces with the request
-    // still outstanding on it, so a second attempt would queue nothing at all.
-    constexpr int kAttempts = 12;
-    for (int attempt = 0; attempt < kAttempts; ++attempt) {
-        const int wedgeMonitor = 1 + attempt * 2;
-        const int witnessMonitor = 2 + attempt * 2;
-        std::error_code ec;
-        std::filesystem::remove(link, ec);
-        std::filesystem::create_symlink(goodImage, link, ec);
-        if (ec) {
-            why = "a symlink could not be created at " + link.string() + ": " + ec.message();
-            return false;
-        }
-        try {
-            setWallpaper(proxy, "static", link.string(), wedgeMonitor, std::chrono::seconds(10));
-        } catch (const std::exception&) {
-            // The daemon saw the FIFO at validation -- the previous attempt's link, or this
-            // one re-pointed too early. Not a defect, just a lost race.
-            continue;
-        }
-        // The whole fixture, in two calls: the request is accepted against a real file and
-        // the render opens whatever this now names.
-        std::filesystem::remove(link, ec);
-        std::filesystem::create_symlink(fifo, link, ec);
-        if (ec) continue;
-
-        if (workerIsWedged(proxy, goodImage, witnessMonitor, std::chrono::milliseconds(2500))) return true;
-    }
-    why = "the render never landed on the fifo in " + std::to_string(kAttempts) +
-          " attempts -- this host services a render faster than the harness can re-point a symlink, so no stuck "
-          "teardown could be staged";
+    why = "this daemon never drew the video, so it holds no decoder and its teardown cannot be wedged on this host";
     return false;
 }
 
@@ -2414,7 +2367,7 @@ bool wedgeRenderWorker(sdbus::IProxy& proxy, const std::string& goodImage, const
 //       stop` on that machine ends in SIGKILL after the unit's own timeout.
 // WHY-THIS-SHAPE: driven on the CONNECTION-LOSS path, not on a signal, and that is the whole
 //       reason the phase exists separately. On a signal the sigwait watcher is already
-//       running a deadline of its own and ends the process at five seconds whatever the
+//       running a deadline of its own and ends the process at kTeardownDeadline whatever the
 //       guards do, so a signal-driven version of this check is green with them deleted --
 //       measured, and it is why the obvious shape was rejected. With the bus destroyed
 //       instead, no signal is ever received, the watcher is still parked in sigwait, and the
@@ -2423,31 +2376,30 @@ bool wedgeRenderWorker(sdbus::IProxy& proxy, const std::string& goodImage, const
 //       SIGKILL after their own wait and report a code either way, so a code-only check
 //       grades a process that never exited as one that exited for the right reason.
 // CONTROL: both `ArmTeardown` guards (armBeforeService and armBeforeHttp) deleted from
-//       backend/daemon/main.cpp, i.e. the arming left to ~ShutdownWatch as it was before the
-//       fix -> "FAIL: a daemon whose teardown blocks still ends, rather than having to be
-//       killed", printing "it was still running 32.8 s after its bus was destroyed, with its
-//       render worker wedged; nothing armed the watchdog" -- the process had to be SIGKILLed
-//       at the harness timeout, and the whole binary went from 21 s to 46 s. One red in the
-//       run, no skips. The escalation phase below stayed GREEN under it, which is the
-//       separation the two phases exist for: the second signal does not need the alarm.
-//       Observed 2026-08-19. Reverted.
-// COVERAGE-ASSERT: the wedge is verified before the bus is killed -- a wallpaper set after it
-//       must produce no frame, on a daemon that has already been seen to render one -- and a
-//       run that could not wedge the worker reports NOT VERIFIED. Without that, a daemon
+//       backend/daemon/main.cpp, i.e. the arming left to ~ShutdownWatch, which the wedged
+//       ~WallpaperManager is never reached past -> "FAIL: a daemon whose teardown blocks still
+//       ends, rather than having to be killed", printing "it was still running 30.0 s after its
+//       bus was destroyed, with its teardown wedged; nothing armed the watchdog" -- the process
+//       had to be SIGKILLed at the harness timeout. The escalation phase below stayed GREEN under
+//       it, which is the separation the two phases exist for: the second signal does not need the
+//       alarm. First observed 2026-08-19 with the FIFO wedge; re-observed 2026-09-22 on the
+//       NVIDIA entry with the preloaded one. Reverted.
+// COVERAGE-ASSERT: the wedge is verified before the verdict is read -- the daemon must have drawn
+//       the video whose decoder the preloaded library holds, and its own line must be in the
+//       output -- and a run that could not stage it reports NOT VERIFIED. Without that, a daemon
 //       whose teardown was never stuck exits promptly and this phase reads green having
 //       graded an ordinary shutdown.
-void checkStuckTeardownIsBounded(const std::string& validationEnv, const std::string& bluePath, const Check& check) {
+void checkStuckTeardownIsBounded(const std::string& validationEnv, const std::string& clip, const Check& check) {
     constexpr const char* kGoal = "S8.20's watchdog clause (a teardown that blocks is ended by the alarm the unwind "
                                   "arms at its top, not left to a destructor that is never reached)";
+    std::error_code ec;
+    if (!std::filesystem::exists(clip, ec)) {
+        notVerified(kGoal, "the video fixture " + clip + " was not generated, so no teardown frees a decoder");
+        return;
+    }
     ScratchDir work("stuckteardown");
     if (!work.ok()) {
         notVerified(kGoal, "a scratch directory could not be created");
-        return;
-    }
-    const std::filesystem::path link = work.path() / "wallpaper-link.png";
-    const std::filesystem::path fifo = work.path() / "wallpaper.fifo";
-    if (::mkfifo(fifo.c_str(), 0644) != 0) {
-        notVerified(kGoal, "a fifo could not be created, so no render can be made to block on this host");
         return;
     }
 
@@ -2461,7 +2413,7 @@ void checkStuckTeardownIsBounded(const std::string& validationEnv, const std::st
         return;
     }
 
-    SpawnedDaemon daemon({validationEnv, std::string("DBUS_SESSION_BUS_ADDRESS=") + bus.address()});
+    SpawnedDaemon daemon(wedgedDaemonEnv(validationEnv, bus.address(), work.path()));
     if (!daemon.waitForOutput(std::string("serving ") + DbusService::kBusName, std::chrono::seconds(30))) {
         if (reportedStartupFault(daemon, kGoal)) return;
         notVerified(kGoal, "the daemon for this phase never reached the bus");
@@ -2477,7 +2429,7 @@ void checkStuckTeardownIsBounded(const std::string& validationEnv, const std::st
         auto proxy = sdbus::createProxy(*connection, sdbus::ServiceName{DbusService::kBusName},
                                         sdbus::ObjectPath{DbusService::kObjectPath});
         std::string why;
-        if (!wedgeRenderWorker(*proxy, bluePath, link, fifo, why)) {
+        if (!primeTeardownWedge(*proxy, clip, why)) {
             notVerified(kGoal, why);
             return;
         }
@@ -2492,9 +2444,13 @@ void checkStuckTeardownIsBounded(const std::string& validationEnv, const std::st
     const double elapsedMs = millis(Clock::now() - killedAt);
     const std::string output = daemon.output();
 
+    if (output.find("wedge_shim: holding") == std::string::npos) {
+        notVerified(kGoal, "the stop never reached the wedged decoder free, so this daemon's teardown was not stuck");
+        return;
+    }
     check(!daemon.timedOut(), "a daemon whose teardown blocks still ends, rather than having to be killed");
     if (daemon.timedOut()) {
-        std::fprintf(stderr, "  it was still running %.1f s after its bus was destroyed, with its render worker "
+        std::fprintf(stderr, "  it was still running %.1f s after its bus was destroyed, with its teardown "
                              "wedged; nothing armed the watchdog\n",
                      elapsedMs / 1000.0);
         return;
@@ -2509,7 +2465,7 @@ void checkStuckTeardownIsBounded(const std::string& validationEnv, const std::st
                      daemon.exitedNormally() ? "exited normally" : "was terminated by a signal", exitCode,
                      daemon.termSignal(), elapsedMs / 1000.0);
     }
-    std::printf("daemon_system_test: a daemon with a wedged render worker was ended %.1f s after its bus was "
+    std::printf("daemon_system_test: a daemon with a wedged teardown was ended %.1f s after its bus was "
                 "destroyed\n",
                 elapsedMs / 1000.0);
 }
@@ -2518,42 +2474,44 @@ void checkStuckTeardownIsBounded(const std::string& validationEnv, const std::st
 //       False if the second signal does nothing: the user who pressed Ctrl-C twice waits out
 //       the full teardown deadline, and a supervisor's escalation lands on a process that
 //       cannot answer it.
-// WHY-THIS-SHAPE: the same wedged worker as the phase above, because a second signal only
+// WHY-THIS-SHAPE: the same wedged teardown as the phase above, because a second signal only
 //       has anything to end if the first stop is stuck -- on an ordinary stop the process is
 //       gone before a second signal can be sent, and a check written that way would be
 //       grading a race. BOTH the message and the elapsed time are asserted: without the
-//       handler the process still exits, at the five-second deadline, so an exit-code check
+//       handler the process still exits, at the teardown deadline, so an exit-code check
 //       alone is green under the control. The absence of the deadline's own line is asserted
 //       for the same reason -- it is what the daemon prints when nothing shortened the stop.
 // CONTROL: the sigaction/pthread_sigmask block that installs forceExitOnSecondSignal deleted
 //       from the watcher in backend/daemon/main.cpp -> two red. "FAIL: the daemon says that a
 //       second signal is what ended it", printing "it left with exit code -1, signal 14, and
 //       said none of it"; and "FAIL: the second signal ends the daemon promptly rather than at
-//       the deadline", printing "the daemon took 3884 ms to go after the second signal,
-//       against a 5000 ms teardown deadline". The second signal simply stayed pending -- it is
-//       blocked in every thread and the watcher has left its sigwait -- so the process died on
-//       the unwind's own SIGALRM instead.
+//       the deadline". The second signal simply stays pending -- it is blocked in every thread
+//       and the watcher has left its sigwait -- so the process dies on the unwind's own SIGALRM
+//       instead.
 //       Note which check did NOT fire: "the stop ends on the second signal rather than on the
 //       teardown deadline" stayed green, because the alarm beat the watcher's deadline and
 //       "shutdown blocked" was never printed. That is exactly why the message and the elapsed
 //       time are asserted as well; the absence check alone would have been green here.
-//       Observed 2026-08-19. Reverted.
-// COVERAGE-ASSERT: the wedge is verified before the first signal, exactly as above, and a run
-//       that could not stage it reports NOT VERIFIED rather than grading a stop that was
-//       never stuck.
-void checkSecondSignalEndsAStuckStop(const std::string& validationEnv, const std::string& bluePath,
+//       First observed 2026-08-19 with the FIFO wedge, printing "3884 ms ... against a 5000 ms
+//       teardown deadline"; re-observed 2026-09-22 on the NVIDIA entry with the preloaded wedge,
+//       printing "it left with exit code -1, signal 14, and said none of it" and "a wedged stop
+//       ended 1832 ms after the second SIGTERM" -- the three-second deadline measured from the
+//       first signal. Reverted.
+// COVERAGE-ASSERT: the wedge is verified before the verdict is read -- the video must have drawn
+//       and the wedge's own line must be in the output -- and a run that could not stage it
+//       reports NOT VERIFIED rather than grading a stop that was never stuck.
+void checkSecondSignalEndsAStuckStop(const std::string& validationEnv, const std::string& clip,
                                      const Check& check) {
     constexpr const char* kGoal = "S8.20's escalation clause (a second shutdown signal ends a stop that is stuck, "
                                   "rather than leaving the user to wait out the teardown deadline)";
+    std::error_code ec;
+    if (!std::filesystem::exists(clip, ec)) {
+        notVerified(kGoal, "the video fixture " + clip + " was not generated, so no teardown frees a decoder");
+        return;
+    }
     ScratchDir work("secondsignal");
     if (!work.ok()) {
         notVerified(kGoal, "a scratch directory could not be created");
-        return;
-    }
-    const std::filesystem::path link = work.path() / "wallpaper-link.png";
-    const std::filesystem::path fifo = work.path() / "wallpaper.fifo";
-    if (::mkfifo(fifo.c_str(), 0644) != 0) {
-        notVerified(kGoal, "a fifo could not be created, so no render can be made to block on this host");
         return;
     }
 
@@ -2567,7 +2525,7 @@ void checkSecondSignalEndsAStuckStop(const std::string& validationEnv, const std
         return;
     }
 
-    SpawnedDaemon daemon({validationEnv, std::string("DBUS_SESSION_BUS_ADDRESS=") + bus.address()});
+    SpawnedDaemon daemon(wedgedDaemonEnv(validationEnv, bus.address(), work.path()));
     if (!daemon.waitForOutput(std::string("serving ") + DbusService::kBusName, std::chrono::seconds(30))) {
         if (reportedStartupFault(daemon, kGoal)) return;
         notVerified(kGoal, "the daemon for this phase never reached the bus");
@@ -2580,7 +2538,7 @@ void checkSecondSignalEndsAStuckStop(const std::string& validationEnv, const std
         auto proxy = sdbus::createProxy(*connection, sdbus::ServiceName{DbusService::kBusName},
                                         sdbus::ObjectPath{DbusService::kObjectPath});
         std::string why;
-        if (!wedgeRenderWorker(*proxy, bluePath, link, fifo, why)) {
+        if (!primeTeardownWedge(*proxy, clip, why)) {
             notVerified(kGoal, why);
             return;
         }
@@ -2588,7 +2546,7 @@ void checkSecondSignalEndsAStuckStop(const std::string& validationEnv, const std
 
     ::kill(daemon.pid(), SIGTERM);
     // Long enough for the watcher to have printed, installed the handler and unblocked these
-    // signals, and far short of the five-second deadline the control has to fall back on.
+    // signals, and well short of the three-second deadline the control has to fall back on.
     // A shorter wait would make the second signal race the handler's installation, which is
     // the daemon's setup rather than the behaviour being graded.
     std::this_thread::sleep_for(std::chrono::milliseconds(1200));
@@ -2598,6 +2556,11 @@ void checkSecondSignalEndsAStuckStop(const std::string& validationEnv, const std
     const double afterSecondMs = millis(Clock::now() - secondSignal);
     const std::string output = daemon.output();
 
+    if (output.find("wedge_shim: holding") == std::string::npos) {
+        notVerified(kGoal, "the first stop never reached the wedged decoder free, so there was no stuck stop for the "
+                           "second signal to end");
+        return;
+    }
     check(!daemon.timedOut(), "a daemon asked twice to stop does not have to be killed");
     if (daemon.timedOut()) {
         std::fprintf(stderr, "  it was still running %.1f s after the second signal\n", afterSecondMs / 1000.0);
@@ -2613,16 +2576,256 @@ void checkSecondSignalEndsAStuckStop(const std::string& validationEnv, const std
     // watcher's own deadline. Its presence here means the second signal changed nothing.
     const bool notTheDeadline = output.find("shutdown blocked") == std::string::npos;
     check(notTheDeadline, "the stop ends on the second signal rather than on the teardown deadline");
-    // A quarter of the deadline: the handler runs in the signal itself, so anything near
-    // five seconds is the deadline having fired, and a relative bound would accept it.
+    // Under the 1.8 s the three-second deadline has left when the second signal lands: the
+    // handler runs in the signal itself, so anything near that is the deadline having fired, and
+    // a relative bound would accept it.
     const bool prompt = afterSecondMs < 1250;
     check(prompt, "the second signal ends the daemon promptly rather than at the deadline");
     if (!prompt) {
-        std::fprintf(stderr, "  the daemon took %.0f ms to go after the second signal, against a 5000 ms teardown "
-                             "deadline\n",
+        std::fprintf(stderr, "  the daemon took %.0f ms to go after the second signal, against a 3000 ms teardown "
+                             "deadline from the first\n",
                      afterSecondMs);
     }
     std::printf("daemon_system_test: a wedged stop ended %.0f ms after the second SIGTERM\n", afterSecondMs);
+}
+
+// Every regular file under `dir`, by path relative to it, with its bytes. What "wrote nothing" is
+// read against: a new file, a removed one or a changed byte all show as a difference.
+std::map<std::string, std::string> fileTree(const std::filesystem::path& dir) {
+    std::map<std::string, std::string> files;
+    std::error_code ec;
+    for (auto it = std::filesystem::recursive_directory_iterator(dir, ec);
+         !ec && it != std::filesystem::recursive_directory_iterator(); it.increment(ec)) {
+        if (!it->is_regular_file(ec)) continue;
+        std::ifstream in(it->path(), std::ios::binary);
+        files[std::filesystem::relative(it->path(), dir, ec).string()] =
+            std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    }
+    return files;
+}
+
+std::string describeTreeChange(const std::map<std::string, std::string>& before,
+                               const std::map<std::string, std::string>& after) {
+    std::string out;
+    for (const auto& [name, bytes] : after) {
+        const auto was = before.find(name);
+        if (was == before.end()) out += " added " + name + ";";
+        else if (was->second != bytes) out += " changed " + name + ";";
+    }
+    for (const auto& [name, bytes] : before) {
+        if (after.count(name) == 0) out += " removed " + name + ";";
+    }
+    return out.empty() ? " nothing" : out;
+}
+
+// GOAL: S13.191 -- a stop that cannot finish ends the process at the three-second deadline, not
+//       at five and not never, and the path that ends it writes NOTHING to disk: the config and the
+//       state directory (crash records, the playing record) are byte for byte what they were when
+//       the stop began. False for the five-second deadline this replaced, and for any stop that
+//       leaves a record behind when it is cut short -- which the next start would read as a death.
+// WHY-THIS-SHAPE: the stop is wedged for real, in the manager's own teardown, by a library
+//       preloaded into the daemon (tests/wedge_shim.cpp) that never returns from the decoder free on
+//       the main thread -- the one place a stop frees a video. The render-worker wedge the S8.20
+//       phases above use can no longer be staged: the FIFO it relies on is refused at the open since
+//       09d905b. The elapsed time is bounded on both sides: below by the wedge's own line, which
+//       proves the stop was stuck rather than quick, and above at 4.5 s, which a five-second
+//       deadline cannot meet. The directories are compared whole, so no particular file has to be
+//       predicted.
+// CONTROL: (a) in backend/daemon/main.cpp, `kTeardownDeadline{3}` -> `{5}` -> "FAIL: a stop wedged
+//       in the manager's teardown ends at the three-second deadline", printing about 5.0 s; (b) in
+//       backend/daemon/wallpaper_manager.cpp, ~WallpaperManager given a loop that frees each video
+//       session under an ApplyingRecord naming its file -- the Stage E2 shutdown record -> "FAIL: a
+//       stop the deadline ended wrote nothing", printing "added wallpaperx/applying-0.json". Both
+//       observed 2026-09-21 on the NVIDIA entry. Reverted.
+// COVERAGE-ASSERT: the wedge's own line must be in the daemon's output, and the video must have
+//       drawn first; otherwise the phase reports NOT VERIFIED rather than grading an ordinary stop.
+void checkWatchdogEndsAStuckStopWritingNothing(const std::string& validationEnv, const Check& check) {
+    constexpr const char* kGoal = "S13.191 (a stop not finished in 3 s ends the process, and writes nothing)";
+    const std::string clip = std::string(WALLPAPERX_VIDEO_ASSET_DIR) + "/wallpaper_bands.mp4";
+    std::error_code ec;
+    if (!std::filesystem::exists(clip, ec)) {
+        notVerified(kGoal, "the video fixture " + clip + " was not generated, so no teardown frees a decoder");
+        return;
+    }
+    ScratchDir home("watchdoghome");
+    if (!home.ok()) {
+        notVerified(kGoal, "a scratch HOME could not be created");
+        return;
+    }
+    const std::filesystem::path configHome = home.path() / "config";
+    const std::filesystem::path stateHome = home.path() / "state";
+    std::filesystem::create_directories(configHome, ec);
+    std::filesystem::create_directories(stateHome, ec);
+    std::filesystem::create_directories(home.path() / "cache", ec);
+
+    NestedBus bus;
+    if (!bus.ok()) {
+        if (const char* fault = bus.preambleFault()) {
+            phaseSetupFault(kGoal, fault);
+            return;
+        }
+        notVerified(kGoal, bus.reason());
+        return;
+    }
+    SpawnedDaemon daemon({validationEnv, std::string("DBUS_SESSION_BUS_ADDRESS=") + bus.address(),
+                          "HOME=" + home.path().string(), "XDG_CONFIG_HOME=" + configHome.string(),
+                          "XDG_STATE_HOME=" + stateHome.string(), "XDG_CACHE_HOME=" + (home.path() / "cache").string(),
+                          std::string("LD_PRELOAD=") + WALLPAPERX_WEDGE_SHIM, "WALLPAPERX_TEST_WEDGE_FREE=1"});
+    if (!daemon.waitForOutput(std::string("serving ") + DbusService::kBusName, std::chrono::seconds(30))) {
+        if (reportedStartupFault(daemon, kGoal)) return;
+        notVerified(kGoal, "the daemon for this phase never reached the bus");
+        return;
+    }
+    bool drew = false;
+    {
+        auto connection = sdbus::createSessionBusConnectionWithAddress(bus.address());
+        connection->enterEventLoopAsync();
+        auto proxy = sdbus::createProxy(*connection, sdbus::ServiceName{DbusService::kBusName},
+                                        sdbus::ObjectPath{DbusService::kObjectPath});
+        try {
+            setWallpaper(*proxy, "video", clip, 0, std::chrono::seconds(10));
+            const auto deadline = Clock::now() + std::chrono::seconds(20);
+            while (!drew && Clock::now() < deadline) {
+                const StatusReply status = getStatus(*proxy, std::chrono::seconds(10));
+                const nlohmann::json* entry = wallpaperStatus(status, "0");
+                drew = entry != nullptr && entry->value("has_frame", false);
+                if (!drew) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "  the video could not be set: %s\n", e.what());
+        }
+    }
+    const std::map<std::string, std::string> configBefore = fileTree(configHome);
+    const std::map<std::string, std::string> stateBefore = fileTree(stateHome);
+
+    const auto signalledAt = Clock::now();
+    const int exitCode = daemon.shutdown(SIGTERM);
+    const double elapsed = millis(Clock::now() - signalledAt) / 1000.0;
+    const std::string output = daemon.output();
+    if (!drew || output.find("wedge_shim: holding") == std::string::npos) {
+        notVerified(kGoal, drew ? "the stop never reached the wedged decoder free, so it was not stuck"
+                                : "the daemon drew no video on this host, so its stop frees no decoder");
+        return;
+    }
+    check(!daemon.timedOut(), "a stop wedged in the manager's teardown still ends, rather than having to be killed");
+    const bool onTime = elapsed >= 2.5 && elapsed < 4.5;
+    check(onTime, "a stop wedged in the manager's teardown ends at the three-second deadline");
+    if (!onTime) std::fprintf(stderr, "  it ended %.1f s after SIGTERM\n", elapsed);
+    const bool forced = output.find("stopped cleanly") == std::string::npos &&
+                        (exitCode == 1 || (!daemon.exitedNormally() && daemon.termSignal() == SIGALRM));
+    check(forced, "and it is the deadline that ended it, not a clean stop");
+    if (!forced) {
+        std::fprintf(stderr, "  exit code %d, signal %d\n", exitCode, daemon.termSignal());
+    }
+    const std::string configChange = describeTreeChange(configBefore, fileTree(configHome));
+    const std::string stateChange = describeTreeChange(stateBefore, fileTree(stateHome));
+    const bool untouched = configChange == " nothing" && stateChange == " nothing";
+    check(untouched, "a stop the deadline ended wrote nothing: the config and the state directory are unchanged");
+    if (!untouched) {
+        std::fprintf(stderr, "  config:%s state:%s\n", configChange.c_str(), stateChange.c_str());
+    }
+    std::printf("daemon_system_test: a stop wedged in the manager's teardown ended %.1f s after SIGTERM, %zu state "
+                "file(s) compared\n",
+                elapsed, stateBefore.size());
+}
+
+// GOAL: S13.197 -- a restored video's renders are posted only after the playing record is open, so
+//       a death while the render thread works on that video NAMES it. False for the order reversed:
+//       the first crash of a restart loop would name nobody, no strike would be counted, and the
+//       loop the record exists to break would go on -- restart, play, crash, restart.
+// WHY-THIS-SHAPE: the window between the two calls is microseconds, so nothing outside the process
+//       can land in it unaided. The preloaded library widens it -- creating playing.json takes three
+//       seconds -- and then faults on the render thread at the first picture asked of the daemon's
+//       own decoder after it delivered one, which is the clock's work and never the video's open
+//       (the span the applying record covers). Keyed that way rather than on a packet number: a
+//       fixed count landed inside the open on the software decoder, which needs more packets for a
+//       first picture, and the record then named nothing for a reason that was the harness's.
+//       Both halves are the harness's, not the daemon's: production is unchanged and the daemon is
+//       the shipped binary.
+// CONTROL: in backend/daemon/main.cpp, `service.renderRestored();` moved above
+//       `manager.recordStartingVideos();` -> "FAIL: a death in a restored video's playback names
+//       that video", printing "there is no readable playing record", and "FAIL: and the signal it
+//       died of" -- the renders start while the record is still being created, so the handler has
+//       no descriptor to write to and the file the next start reads is never written. Observed
+//       2026-09-22 on the NVIDIA entry. Reverted.
+// COVERAGE-ASSERT: the daemon must have died of the staged fault, and the fault's own line must be
+//       in its output; a run where it did not reports NOT VERIFIED rather than grading a record
+//       nothing wrote to.
+void checkTheRestoredVideoIsPostedAfterTheRecordOpens(const std::string& validationEnv, const std::string& clip,
+                                                      const Check& check) {
+    constexpr const char* kGoal = "S13.197 (a restored video's renders are posted after the playing record is open, "
+                                  "so a death in its playback names it)";
+    constexpr int kMonitor = 0;
+    std::error_code ec;
+    if (!std::filesystem::exists(clip, ec)) {
+        notVerified(kGoal, "the video fixture " + clip + " was not generated, so no restored video can play");
+        return;
+    }
+    ScratchDir home("restoreorder");
+    if (!home.ok()) {
+        notVerified(kGoal, "a scratch HOME could not be created");
+        return;
+    }
+    const std::filesystem::path configHome = home.path() / "config";
+    const std::filesystem::path stateHome = home.path() / "state";
+    std::filesystem::create_directories(configHome / "wallpaperx", ec);
+    std::filesystem::create_directories(stateHome, ec);
+    {
+        // The saved choice this daemon restores, written as the daemon writes it.
+        nlohmann::json monitors = nlohmann::json::array();
+        monitors.push_back({{"monitor_id", kMonitor}, {"type", "video"}, {"path", clip}});
+        std::ofstream out(configHome / "wallpaperx" / "config.json", std::ios::trunc);
+        out << nlohmann::json{{"version", 1}, {"monitors", std::move(monitors)}}.dump();
+        if (!out) {
+            notVerified(kGoal, "the saved wallpaper could not be written");
+            return;
+        }
+    }
+
+    NestedBus bus;
+    if (!bus.ok()) {
+        if (const char* fault = bus.preambleFault()) {
+            phaseSetupFault(kGoal, fault);
+            return;
+        }
+        notVerified(kGoal, bus.reason());
+        return;
+    }
+    std::vector<std::string> env = wedgedDaemonEnv(validationEnv, bus.address(), home.path());
+    env.erase(std::remove(env.begin(), env.end(), std::string("WALLPAPERX_TEST_WEDGE_FREE=1")), env.end());
+    env.push_back("XDG_CONFIG_HOME=" + configHome.string());
+    env.push_back("XDG_STATE_HOME=" + stateHome.string());
+    env.push_back("WALLPAPERX_TEST_DELAY_PLAYING_OPEN_MS=3000");
+    env.push_back("WALLPAPERX_TEST_CRASH_IN_PLAYBACK=1");
+
+    SpawnedDaemon daemon(env);
+    const int exitCode = daemon.waitForExit();
+    const std::string output = daemon.output();
+    const bool faulted = output.find("wedge_shim: faulting") != std::string::npos;
+    const bool diedOfTheFault = faulted && !daemon.timedOut() && !daemon.exitedNormally() &&
+                                daemon.termSignal() == SIGSEGV;
+    if (!diedOfTheFault) {
+        notVerified(kGoal, faulted ? "the daemon did not die of the staged fault (exit code " +
+                                         std::to_string(exitCode) + ", signal " +
+                                         std::to_string(daemon.termSignal()) + ")"
+                                   : "the staged fault never fired: this host never decoded the restored video");
+        return;
+    }
+    const std::optional<wallpaperx::PlayingHistory> history = wallpaperx::readPlayingRecord(stateHome / "wallpaperx");
+    const bool named = history && history->died && history->died->monitorId == kMonitor && history->died->path == clip;
+    check(named, "a death in a restored video's playback names that video");
+    if (!named) {
+        std::fprintf(stderr, "  %s\n", !history            ? "there is no readable playing record"
+                                       : !history->died    ? "the record names no video"
+                                                           : ("the record names monitor " +
+                                                              std::to_string(history->died->monitorId) + " '" +
+                                                              history->died->path + "'")
+                                                                 .c_str());
+    }
+    check(history && history->signal == SIGSEGV, "and the signal it died of");
+    std::printf("daemon_system_test: a restored video's playback was faulted at its second picture, and the record "
+                "%s\n",
+                named ? "named it" : "did not");
 }
 
 // Used by both phases below: phase 10 asks the daemon what it thinks of its config port
@@ -3839,7 +4042,12 @@ void checkConfigRestart(NameWatcher& names, const std::string& validationEnv, co
     //       wallpaper set before the restart is on that monitor after it, with no client
     //       asking" and "the restored wallpaper renders in the new process without any
     //       client asking", and including this phase's two S8.11 lines and the
-    //       unreadable-restore phase's three. Reverted.
+    //       unreadable-restore phase's three. Reverted. The restore and its render are separate
+    //       calls since Step 13 Stage E5: `service.renderRestored();` deleted from
+    //       backend/daemon/main.cpp -> "FAIL: the restored wallpaper renders in the new process
+    //       without any client asking", the two S8.11 lines and "a restored monitor whose file is
+    //       missing says why it is blank", the state check staying green. Observed 2026-09-21 on
+    //       the NVIDIA entry. Reverted.
     const StatusReply afterRestart = getStatusOrExplain(*proxy);
     const nlohmann::json* entry = wallpaperStatus(afterRestart, std::to_string(kMonitorRestore));
     check(entry != nullptr,
@@ -5241,7 +5449,7 @@ void checkStoppableOnAnyConfigFile(NameWatcher& names, const std::string& valida
     //       reaches the bus at all -- the phase's GetStatus and detail checks are skipped
     //       rather than red, and the FAILs land on the two that do not depend on the name.
     //       What stayed GREEN under (b) is worth as much: the daemon still exited without
-    //       being killed, because backend/daemon/main.cpp's five-second teardown deadline fires and ends the
+    //       being killed, because backend/daemon/main.cpp's teardown deadline (kTeardownDeadline) fires and ends the
     //       process -- and it is that deadline, not a clean stop, that the exit code 1 above
     //       comes from. So stoppability here rests on three independent mechanisms -- the type
     //       and size guards, the load deadline, and that watchdog -- and no single-mutation
@@ -5564,7 +5772,7 @@ void checkShutdownDuringStartup(NameWatcher& names, const std::string& validatio
     //       against the current binary -> "FAIL: a daemon signalled before its event loop
     //       began exits 0" ("exit code 1") and "FAIL: ... still runs its destructor chain".
     //       Note the signature has MOVED since that mutation was first run: the daemon is no
-    //       longer SIGKILLed after the reap timeout but ends itself at the five-second
+    //       longer SIGKILLed after the reap timeout but ends itself at the
     //       teardown deadline with exit 1, so "exits without having to be killed" stays green
     //       and the exit code carries the failure. The same mutation still reddens the SIGINT
     //       and SIGHUP phases, which signal as soon as the name appears and so land in this
@@ -6005,7 +6213,7 @@ void checkStalledConfigWrite(NameWatcher& names, const std::string& validationEn
     //       being graded; releasing it first would grade an ordinary shutdown. The absence of
     //       the watchdog's line is asserted beside the exit code, because the watchdog also
     //       ends the process -- so an exit-code check alone would pass for a daemon that had
-    //       to be forced out five seconds late.
+    //       to be forced out at the teardown deadline.
     // CONTROL: `.detach()` in ConfigWriter::startLocked() (backend/daemon/config_writer.cpp)
     //       replaced by storing the thread in the writer and joining it in ~ConfigWriter ->
     //       "FAIL: a daemon with a config write it can never finish still exits 0 on SIGTERM"
@@ -6318,7 +6526,7 @@ int main() {
 
             // GOAL: the busiest daemon this suite runs -- a device created, wallpapers set,
             //       a hundred concurrent calls behind it -- still finishes teardown inside
-            //       main.cpp's five-second budget, so it leaves through main() rather than
+            //       main.cpp's three-second budget, so it leaves through main() rather than
             //       through the watchdog's _Exit. False if the daemon starts taking the
             //       forced path routinely: teardown would then be abandoned every stop, and
             //       "stopped cleanly" above would go with it.
@@ -6339,7 +6547,8 @@ int main() {
             //       the forced path -> "FAIL: the daemon leaves through main() rather than
             //       through the teardown watchdog", "FAIL: the daemon exits 0 on SIGTERM"
             //       ("exit code 1") and "FAIL: the daemon runs its destructor chain on the way
-            //       out". Reverted.
+            //       out", with every other phase's exit-0 check beside them. Re-observed
+            //       2026-09-21 on the NVIDIA entry. Reverted.
             const bool leftThroughMain = daemonOutput.find("shutdown blocked") == std::string::npos;
             check(leftThroughMain, "the daemon leaves through main() rather than through the teardown watchdog");
             check(names.waitFor(false), "the bus name is released once the daemon exits");
@@ -6445,8 +6654,11 @@ int main() {
         // Last of the daemon-spawning phases, and on buses of their own: each wedges a render
         // worker on purpose, so the daemon it leaves behind cannot be stopped cleanly and must
         // not be holding the name any phase above still needs.
-        checkStuckTeardownIsBounded(validationEnv, bluePath, check);
-        checkSecondSignalEndsAStuckStop(validationEnv, bluePath, check);
+        const std::string wedgeClip = std::string(WALLPAPERX_VIDEO_ASSET_DIR) + "/wallpaper_bands.mp4";
+        checkStuckTeardownIsBounded(validationEnv, wedgeClip, check);
+        checkSecondSignalEndsAStuckStop(validationEnv, wedgeClip, check);
+        checkWatchdogEndsAStuckStopWritingNothing(validationEnv, check);
+        checkTheRestoredVideoIsPostedAfterTheRecordOpens(validationEnv, wedgeClip, check);
 
         // Every Frame's UnixFd closes at scope exit, and the daemon is gone, so this
         // process must be back where it started. A descriptor leaked per GetFrameFd is

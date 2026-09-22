@@ -27,6 +27,13 @@
 //                       (S13.140)
 //   a worker, no bus    a played picture does not clear GPU health, and a GPU fault during
 //                       playback is never retried (S13.141, S13.142)
+//   a worker, no bus    running short is the daemon's fault, with a reopen budget of its own
+//                       (S13.193)
+//   no bus, no worker   picking a wallpaper opens it, with the draw's filesystem checks (S13.195)
+//   a worker, no bus    a video's death count is cleared by play, not by time (S13.189)
+//   children            which death a video answers for: this binary re-executed as a daemon-like
+//                       start that dies of a real fault on its render thread (S13.184, S13.185,
+//                       S13.190)
 //
 // TWO FIXTURES, AND THE SECOND IS LOAD-BEARING. wallpaper_bands.mp4 holds ten pictures and plays;
 // wallpaper_one_picture.mp4 holds one, and a session opened on it parks after its first picture and
@@ -81,6 +88,7 @@
 #include "tests/client/daemon_client.h"
 #include "tests/client/scratch_dir.h"
 #include "tests/manager_output.h"
+#include "tests/self_exec.h"
 #include "tests/test_report.h"
 
 #include <sdbus-c++/sdbus-c++.h>
@@ -104,12 +112,15 @@
 #include <set>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 #include <cstdarg>
+#include <limits>
 
 #include <dlfcn.h>
 #include <fcntl.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -264,16 +275,41 @@ bool isDecodersContext(const AVCodecContext* context) { return context != nullpt
 // picture, which differs between the hardware and software decoders.
 class PlaybackFailure {
 public:
-    void arm() { m_armed.store(true); }
+    // `fileFaults` of the failures are EIO -- the file's fault -- and every one after them ENOMEM,
+    // which the decoder reports as the daemon running short.
+    void arm(int fileFaults = std::numeric_limits<int>::max()) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_fileFaultsLeft = fileFaults;
+        m_armed.store(true);
+    }
     void disarm() { m_armed.store(false); }
 
-    bool shouldFail(const AVCodecContext* context) {
-        if (!m_armed.load()) return false;
+    // The error to fail this picture with, or 0 to let it through.
+    int failureFor(const AVCodecContext* context) {
+        if (!m_armed.load()) return 0;
         std::lock_guard<std::mutex> lock(m_mutex);
         const auto it = m_delivered.find(context);
-        if (it == m_delivered.end() || it->second == 0) return false;
+        if (it == m_delivered.end() || it->second == 0) return 0;
         ++m_injected;
-        return true;
+        if (m_fileFaultsLeft > 0) {
+            --m_fileFaultsLeft;
+            // EIO, not AVERROR_INVALIDDATA: the decoder treats a damaged packet as something to skip
+            // past, which is a picture lost rather than playback failing.
+            return AVERROR(EIO);
+        }
+        ++m_shortagesInjected;
+        return AVERROR(ENOMEM);
+    }
+
+    bool hasDelivered(const AVCodecContext* context) const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        const auto it = m_delivered.find(context);
+        return it != m_delivered.end() && it->second > 0;
+    }
+
+    int shortagesInjected() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_shortagesInjected;
     }
 
     void delivered(const AVCodecContext* context) {
@@ -299,9 +335,116 @@ private:
     mutable std::mutex m_mutex;
     std::map<const AVCodecContext*, int> m_delivered;
     int m_injected = 0;
+    int m_fileFaultsLeft = 0;
+    int m_shortagesInjected = 0;
 };
 
 PlaybackFailure g_playbackFailure;
+
+// Opens of one path made to fail with a chosen errno, `count` times -- EMFILE for the daemon running
+// out of descriptors (S13.193), EACCES for a file stat() calls readable that cannot be opened
+// (S13.195).
+class OpenFailure {
+public:
+    void arm(const std::string& path, int error, int count) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_path = path;
+        m_error = error;
+        m_left = count;
+        m_armed.store(count > 0);
+    }
+    void disarm() {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_left = 0;
+        m_armed.store(false);
+    }
+    // The errno to fail this open with, or 0.
+    int failureFor(const char* path) {
+        if (!m_armed.load(std::memory_order_relaxed) || path == nullptr) return 0;
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_left <= 0 || m_path != path) return 0;
+        if (--m_left == 0) m_armed.store(false);
+        ++m_spent;
+        return m_error;
+    }
+    int spent() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_spent;
+    }
+    int left() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_left;
+    }
+
+private:
+    std::atomic<bool> m_armed{false};
+    mutable std::mutex m_mutex;
+    std::string m_path;
+    int m_error = 0;
+    int m_left = 0;
+    int m_spent = 0;
+};
+
+OpenFailure g_openFailure;
+
+// A mount table read in place of /proc/self/mountinfo while set: how a phase puts a wallpaper on a
+// network filesystem without mounting one (S13.194, S13.195). Empty is the machine's own.
+std::mutex g_mountTableMutex;
+std::string g_mountTable;
+std::atomic<bool> g_mountTableSet{false};
+
+// Which wallpaper file each decoder context reads, so a death can be staged on one video's work
+// and not another's. Learned at the context's first packet from the last wallpaper file opened on
+// that thread: a decoder opens its file and then decodes from it on the same thread, with no other
+// wallpaper opened in between.
+thread_local std::string t_lastWallpaperOpened;
+std::mutex g_contextFilesMutex;
+std::map<const AVCodecContext*, std::string> g_contextFiles;
+
+std::string fileOfContext(const AVCodecContext* context) {
+    std::lock_guard<std::mutex> lock(g_contextFilesMutex);
+    const auto it = g_contextFiles.find(context);
+    return it == g_contextFiles.end() ? std::string() : it->second;
+}
+
+// The death a --blame-child stages: a real memory fault on the render thread, in the decoder's work
+// on one file. Decode: a packet sent for that file's next picture, after its first was delivered --
+// the clock's work, never the open's. Free: that file's decoder being freed -- a session's teardown.
+//
+// Only on the render worker's thread, whose id the child records: a free on any other thread is the
+// manager's own destruction as the child unwinds -- a stop, not the teardown being staged -- and a
+// death there would be graded as the staged one.
+enum class CrashOn { Nothing, Decode, Free };
+std::atomic<CrashOn> g_crashOn{CrashOn::Nothing};
+std::atomic<pid_t> g_crashThread{0};
+std::mutex g_crashPathMutex;
+std::string g_crashPath;
+
+void armCrash(CrashOn on, const std::string& path) {
+    {
+        std::lock_guard<std::mutex> lock(g_crashPathMutex);
+        g_crashPath = path;
+    }
+    g_crashOn.store(on);
+}
+
+bool crashDueFor(CrashOn on, const AVCodecContext* context) {
+    if (g_crashOn.load() != on || ::gettid() != g_crashThread.load()) return false;
+    std::string target;
+    {
+        std::lock_guard<std::mutex> lock(g_crashPathMutex);
+        target = g_crashPath;
+    }
+    return !target.empty() && fileOfContext(context) == target;
+}
+
+// A store to a page mapped PROT_NONE: a genuine SIGSEGV on the calling thread, for
+// crash_record_test's reason (a raise() would be a signal the thread sent itself).
+[[noreturn]] void faultNow() {
+    void* page = ::mmap(nullptr, 4096, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (page != MAP_FAILED) *static_cast<volatile char*>(page) = 1;
+    std::_Exit(120);
+}
 
 }  // namespace
 
@@ -364,8 +507,21 @@ extern "C" int open(const char* path, int flags, ...) {
         mode = static_cast<mode_t>(va_arg(args, unsigned int));
         va_end(args);
     }
+    if (const int error = g_openFailure.failureFor(path); error != 0) {
+        errno = error;
+        return -1;
+    }
+    if (g_mountTableSet.load(std::memory_order_relaxed) && path != nullptr &&
+        std::strcmp(path, "/proc/self/mountinfo") == 0) {
+        std::string table;
+        {
+            std::lock_guard<std::mutex> lock(g_mountTableMutex);
+            table = g_mountTable;
+        }
+        if (!table.empty()) return real(table.c_str(), flags, mode);
+    }
     const int fd = real(path, flags, mode);
-    if (fd >= 0) g_files.opened(fd, path);
+    if (fd >= 0 && g_files.opened(fd, path)) t_lastWallpaperOpened = path;
     return fd;
 }
 
@@ -384,6 +540,11 @@ extern "C" int avcodec_send_packet(AVCodecContext* context, const AVPacket* pack
     static const Fn real = reinterpret_cast<Fn>(::dlsym(RTLD_NEXT, "avcodec_send_packet"));
     if (real == nullptr) return -1;
     if (isDecodersContext(context)) {
+        {
+            std::lock_guard<std::mutex> lock(g_contextFilesMutex);
+            g_contextFiles.try_emplace(context, t_lastWallpaperOpened);
+        }
+        if (crashDueFor(CrashOn::Decode, context) && g_playbackFailure.hasDelivered(context)) faultNow();
         g_decodeCalls.fetch_add(1, std::memory_order_relaxed);
         g_decodeGate.enter();
     }
@@ -398,8 +559,13 @@ extern "C" void avcodec_free_context(AVCodecContext** context) {
     // being built, so a gate that fired on the first free of any context would hold the thread
     // during construction and never see a session's teardown at all.
     if (context != nullptr && isDecodersContext(*context)) {
+        if (crashDueFor(CrashOn::Free, *context)) faultNow();
         g_codecFrees.fetch_add(1, std::memory_order_relaxed);
         g_playbackFailure.forget(*context);
+        {
+            std::lock_guard<std::mutex> lock(g_contextFilesMutex);
+            g_contextFiles.erase(*context);
+        }
         g_freeCodecGate.enter();
     }
     real(context);
@@ -409,9 +575,9 @@ extern "C" int avcodec_receive_frame(AVCodecContext* context, AVFrame* frame) {
     using Fn = int (*)(AVCodecContext*, AVFrame*);
     static const Fn real = reinterpret_cast<Fn>(::dlsym(RTLD_NEXT, "avcodec_receive_frame"));
     if (real == nullptr) return -1;
-    // EIO, not AVERROR_INVALIDDATA: the decoder treats a damaged packet as something to skip past,
-    // which is a picture lost rather than playback failing, and skipping is not what this injects.
-    if (isDecodersContext(context) && g_playbackFailure.shouldFail(context)) return AVERROR(EIO);
+    if (isDecodersContext(context)) {
+        if (const int failure = g_playbackFailure.failureFor(context); failure != 0) return failure;
+    }
     const int result = real(context, frame);
     if (result == 0 && isDecodersContext(context)) g_playbackFailure.delivered(context);
     return result;
@@ -1279,9 +1445,10 @@ void runCrashRecordSpanChecks(const WallpaperManager::Config& base, const std::s
     //       "it was there afterwards" is not available as evidence. The record's contents are read
     //       too, not just its existence: a record naming the wrong type would refuse nothing.
     // CONTROL: in backend/daemon/wallpaper_manager.cpp, the `const ApplyingRecord applying(...)` line
-    //       deleted from videoSessionLocked() -> "FAIL: a crash record is on disk while the video is
-    //       being decoded", and no other line. Observed 2026-09-16 on both driver
-    //       entries. Reverted.
+    //       deleted from videoSessionLocked()'s attempt -> "FAIL: a crash record is on disk while the
+    //       video is being decoded", and the eviction phase's positive reading ("and a record naming
+    //       the new file IS on disk ..."), nothing else. Re-observed 2026-09-21 on the NVIDIA entry.
+    //       Reverted.
     g_decodeGate.arm(CallGate::Mode::Hold);
     wallpaperx::testing::nameScreen(manager, kMonitorRecord, "DP-REC");
     manager.requestWallpaper("video", clip, kMonitorRecord);
@@ -1858,16 +2025,15 @@ void runFailedPassChecks(const WallpaperManager::Config& base, const std::vector
     //       next pass reopens the file rather than drawing with the dropped session.
     // WHY-THIS-SHAPE: the thread is held as the session's file is closed, the end of its teardown,
     //       and a start is built from the state copied at that instant -- the consequence, not just
-    //       the file. S13.129 below grades the same copy going the other way, so this "not refused"
-    //       cannot be the copy failing to refuse anything.
-    // CONTROL: in backend/daemon/wallpaper_manager.cpp, renderPassLocked()'s
-    //       `if (!error.empty()) m_videoSessions.erase(monitorId);` replaced with
-    //       `if (!error.empty()) closeVideoSessionLocked(monitorId);` -- the record-writing close the
-    //       last review found -> "FAIL: no crash record is on disk while a session is torn down for a
-    //       fault that is not the file's", printing the record naming video_session_0.mp4, and "FAIL: a
-    //       start after dying in that teardown applies the video instead of refusing it". Deleting that
-    //       line instead reddens the same two, through the close after the commit block. Both observed
-    //       2026-09-16 on both driver entries. Reverted.
+    //       the file. The draw-fault section below builds the same copy while a record IS on disk and
+    //       requires it to refuse, so this "not refused" cannot be the copy failing to refuse anything.
+    // CONTROL: in backend/daemon/wallpaper_manager.cpp, closeFailedVideoSessionLocked() made to free
+    //       a non-file failure's pipeline inside a scoped `ApplyingRecord` naming the session's file
+    //       -- a record-writing close, which the Stage E2 review found here -> "FAIL: no crash record
+    //       is on disk while a session is torn down for a fault that is not the file's", printing the
+    //       record naming video_parked_0.mp4, and "FAIL: a start after dying in that teardown applies
+    //       the video instead of refusing it", beside the restated S13.129 pair below (the same close).
+    //       Observed 2026-09-21 on the NVIDIA entry. Reverted.
     // COVERAGE-ASSERT: the injected failure is asserted to have fired, so the teardown seen is the
     //       one that failure caused.
     g_framebufferFailGate.arm(CallGate::Mode::Fail, extentOf(kResizedWidth, kResizedHeight));
@@ -1913,23 +2079,24 @@ void runFailedPassChecks(const WallpaperManager::Config& base, const std::vector
     // WHY-THIS-SHAPE: the render thread is held inside the image rebuild of a pass that has just
     //       opened a new wallpaper's session, the rebuild is armed to fail when let go, and the newer
     //       size lands while it is held -- so the failure and the overtaking are both certain, in
-    //       that order, with no timing involved.
-    // CONTROL: `if (!error.empty()) m_videoSessions.erase(monitorId);` deleted from renderPassLocked()
-    //       in backend/daemon/wallpaper_manager.cpp -> "FAIL: a failed, overtaken pass leaves no
-    //       session: the newer pass opens its own", printing "0 open(s), 0 close(s) after the failure".
-    //       Observed 2026-09-16 on both driver entries, after the gates were filtered by size: before
-    //       that, the same mutation stayed green, because the hold landed in the frame converter
-    //       during the open and the pass failed before any session existed. Reverted.
+    //       that order, with no timing involved. The open count is reset AFTER requestWallpaper():
+    //       the request opens the file itself to check it can be read (S13.195), and that open,
+    //       counted, would make "the pass opened its session" read two where the pass opened one.
+    // CONTROL: in backend/daemon/wallpaper_manager.cpp, renderPassLocked()'s first
+    //       `if (!error.empty()) closeFailedVideoSessionLocked(monitorId, fault);` -- the one before
+    //       the commit block -- deleted -> "FAIL: a failed, overtaken pass leaves no session: the
+    //       newer pass opens its own", printing "0 open(s), 0 close(s) after the failure", alone.
+    //       Observed 2026-09-21 on the NVIDIA entry. Reverted.
     // COVERAGE-ASSERT: the held pass is asserted to have opened the session, and the injected
     //       failure to have fired.
     if (!show(kMonitorOvertaken, clips[0])) {
         check(false, "the monitor the overtaken failing pass is about is drawn first");
         return;
     }
-    g_files.resetCounts();
     g_framebufferGate.arm(CallGate::Mode::Hold, extentOf(kResizedWidth, kResizedHeight));
     g_framebufferFailGate.arm(CallGate::Mode::Fail, extentOf(kResizedWidth, kResizedHeight));
     manager.requestWallpaper("video", clips[1], kMonitorOvertaken);
+    g_files.resetCounts();
     resize(kMonitorOvertaken, kResizedWidth, kResizedHeight);
     const bool heldFailing = g_framebufferGate.waitFired(kGateLimit);
     check(heldFailing, "the pass to be overtaken is held inside its image rebuild");
@@ -1952,49 +2119,90 @@ void runFailedPassChecks(const WallpaperManager::Config& base, const std::vector
     g_framebufferGate.release();
     g_framebufferFailGate.release();
 
-    // GOAL: S13.129 -- a draw that throws inside the commit block tears the session down while a
-    //       record naming that file is on disk, so a death in that teardown refuses the video at the
-    //       next start.
-    // WHY-THIS-SHAPE: the size changes and changes back before the one post, so the pass neither
-    //       rebuilds nor decodes and the draw's submission is its only one -- failing the next
-    //       submission fails the draw. The reported error is read to confirm that.
-    // CONTROL: in backend/daemon/wallpaper_manager.cpp, renderPassLocked()'s
-    //       `if (!error.empty()) closeVideoSessionLocked(monitorId);` replaced with
-    //       `if (!error.empty()) m_videoSessions.erase(monitorId);` placed after `applying.reset();`
-    //       -> "FAIL: a record naming the video is on disk while the session whose draw failed is torn
-    //       down", printing "the record on disk: none", and "FAIL: a start after dying in that teardown
-    //       refuses the video". Deleting the close outright -> "FAIL: a draw that fails tears the
-    //       monitor's session down", after the gate's 30-second limit. Both observed 2026-09-16 on both
-    //       driver entries. Reverted. Deleting the record from closeVideoSessionLocked() leaves this
-    //       green, correctly: the pass's own record names the same file.
     if (!show(kMonitorDrawFault, clips[2])) {
         check(false, "the monitor whose draw is failed is drawn first");
         return;
     }
-    {
+    // Changes size and back before the one post, so the pass neither rebuilds nor decodes and the
+    // draw's submission is its only one.
+    const auto repostWithoutRebuild = [&] {
         std::vector<int> notPosted;
         manager.setOutputSize(screenOf(kMonitorDrawFault), kResizedWidth, kResizedHeight, notPosted);
         manager.setOutputSize(screenOf(kMonitorDrawFault), kTargetWidth, kTargetHeight, notPosted);
+        worker.post(kMonitorDrawFault);
+    };
+
+    // The positive reading the absences in this phase are measured against: while a video's DRAW
+    // runs -- the file's content being shown -- a record naming it is on disk. Without it, a build
+    // whose records had stopped being written at all would pass every "no record" check here.
+    // CONTROL: in backend/daemon/wallpaper_manager.cpp, renderPassLocked()'s
+    //       `if (!deferred) applying.emplace(m_config.stateDir, monitorId, type, path);` deleted ->
+    //       "FAIL: a record naming the video is on disk while its draw is submitted", printing "none",
+    //       and "FAIL: a start from the state copied while that record is on disk refuses the video".
+    //       Observed 2026-09-21 on the NVIDIA entry. Reverted.
+    g_submitFailGate.arm(CallGate::Mode::Hold);
+    repostWithoutRebuild();
+    const bool drawing = g_submitFailGate.waitFired(kGateLimit);
+    check(drawing, "a re-post of a parked video reaches its draw's submission");
+    if (drawing) {
+        const std::optional<wallpaperx::CrashRecord> record = wallpaperx::readCrashRecord(config.stateDir, kMonitorDrawFault);
+        reportUnless(record && record->type == "video" && record->path == clips[2],
+                     "a record naming the video is on disk while its draw is submitted",
+                     "the record on disk: " + describeRecord(record));
+        // And the copied-state start, which S13.127 above and the restated S13.129 below read as "not
+        // refused", does refuse when there is a record to refuse on.
+        const RestartVerdict restart = startAfterDeathNow(config, kMonitorDrawFault);
+        if (restartGraded(restart)) {
+            check(restart.refused, "a start from the state copied while that record is on disk refuses the video");
+        }
     }
+    g_submitFailGate.release();
+    check(signals.wait(kMonitorDrawFault, 2) && drainWorker(worker), "and that draw commits once it is let go");
+
+    // GOAL: S13.129, RESTATED for Stage E5 -- a draw that fails for a reason that is NOT the file's
+    //       (here the device running out of memory at the submit, which the daemon sorts as its own
+    //       shortage) frees the session with NO record naming the video on disk, so a death in that
+    //       teardown does not refuse the video at the next start; the monitor reports the failure as
+    //       the daemon's. The old rule (a record kept across the teardown) predated the split between
+    //       the file's faults and the daemon's, and would refuse a working video after a driver
+    //       crash freeing a pipeline on a device that had just failed.
+    // WHY-THIS-SHAPE: the thread is held as the session's file is closed -- the end of its teardown
+    //       -- and a start is built from the state copied at that instant, for S13.127's reason. The
+    //       record reading just above, in the same directory for the same monitor, is what makes
+    //       this absence evidence.
+    // CONTROL: in backend/daemon/wallpaper_manager.cpp, renderPassLocked()'s
+    //       `if (!error.empty() && fault != Fault::File) applying.reset();` deleted, so the pass's
+    //       record stays on disk through the teardown -> "FAIL: no record naming the video is on disk
+    //       while a session whose draw failed for the daemon's reason is torn down", printing the
+    //       record naming video_parked_2.mp4, and "FAIL: a start after dying in that teardown applies
+    //       the video", printing the "killed while applying" refusal; nothing else. Observed 2026-09-21
+    //       on the NVIDIA entry. Reverted.
     g_submitFailGate.arm(CallGate::Mode::Fail);
     g_closeFileGate.arm(CallGate::Mode::Hold, clips[2]);
-    worker.post(kMonitorDrawFault);
+    repostWithoutRebuild();
     const bool closingAfterDraw = g_closeFileGate.waitFired(kGateLimit);
     check(closingAfterDraw, "a draw that fails tears the monitor's session down");
     if (closingAfterDraw) {
         const std::optional<wallpaperx::CrashRecord> record =
             wallpaperx::readCrashRecord(config.stateDir, kMonitorDrawFault);
-        reportUnless(record && record->type == "video" && record->path == clips[2],
-                     "a record naming the video is on disk while the session whose draw failed is torn down",
+        reportUnless(!record.has_value(),
+                     "no record naming the video is on disk while a session whose draw failed for the daemon's "
+                     "reason is torn down",
                      "the record on disk: " + describeRecord(record));
         const RestartVerdict restart = startAfterDeathNow(config, kMonitorDrawFault);
         if (restartGraded(restart)) {
-            check(restart.refused, "a start after dying in that teardown refuses the video");
+            reportUnless(!restart.refused, "a start after dying in that teardown applies the video",
+                         "the start refused it: " + restart.lastError);
         }
     }
     g_closeFileGate.release();
     g_submitFailGate.release();
     check(drainWorker(worker), "the pass whose draw failed finishes once its teardown is let go");
+    {
+        const std::optional<wallpaperx::MonitorStatus> status = monitorStatus(manager, kMonitorDrawFault);
+        check(status && status->lastErrorIsDaemonFault, "and the failed draw is reported as the daemon's failure, not "
+                                                        "the file's");
+    }
     // GOAL: the failure this monitor reports is the one its own draw hit -- the queue submission --
     //       and not some later failure of the daemon's, so an operator reading last_error is pointed
     //       at what actually went wrong.
@@ -2111,13 +2319,16 @@ void runEvictionRecordCheck(const WallpaperManager::Config& base, const std::vec
     //       fails the second.
     // CONTROL: (a) closeVideoSessionLocked() in backend/daemon/wallpaper_manager.cpp given back the
     //       Stage E3 record -> "FAIL: nothing names the evicted monitor while its session is torn
-    //       down", printing the evicted clip. (b) in videoSessionLocked(), a copy of the
-    //       `applying.emplace(m_config.stateDir, monitorId, "video", path);` line added above the
-    //       eviction loop -> "FAIL: and nothing names the monitor being opened either, whose own
-    //       record is taken after the eviction". (c) for the positive half, that same
-    //       `applying.emplace(...)` line deleted from inside the retry loop -> "FAIL: and a record
-    //       naming the new file IS on disk once its own open and first decode are running".
-    //       All three observed 2026-09-20; reverted.
+    //       down", printing the evicted clip. (b) in videoSessionLocked(), an `ApplyingRecord` naming
+    //       the new file declared above the ceiling's eviction loop -> "FAIL: and nothing names the
+    //       monitor being opened either, whose own record is taken after the eviction", printing
+    //       video_parked_8.mp4 -- declared below that loop instead, it reddens only the shortage-path
+    //       eviction in runPlaybackBlameChecks, since the ceiling's eviction runs first. (c) for the
+    //       positive half, the `const ApplyingRecord applying(...)` line deleted from the open's
+    //       attempt -> "FAIL: and a record naming the new file IS on disk once its own open and first
+    //       decode are running". (a) observed 2026-09-20, re-observed 2026-09-21 with the
+    //       applying-record control in runPlaybackBlameChecks; (b) and (c) re-observed 2026-09-21 on
+    //       the NVIDIA entry; reverted.
     g_closeFileGate.arm(CallGate::Mode::Hold, clips[0]);
     const size_t ninth = std::size(kEvictionMonitors) - 1;
     post(ninth);
@@ -5188,10 +5399,12 @@ void runMemoryRetryChecks(const WallpaperManager::Config& config, const std::vec
     //       path is the picture converter's image inside the decode that opens the session. The
     //       signature graded is that the FILE WAS OPENED TWICE: "it committed" alone is also true of
     //       an attempt that never ran out, and the injection being spent is asserted separately.
-    // CONTROL: in backend/daemon/wallpaper_manager.cpp, videoSessionLocked()'s retry condition
+    // CONTROL: in backend/daemon/wallpaper_manager.cpp, retryAfterEvictionLocked()'s condition
     //       `!classifyFailure().exhausted` replaced by `true`, so no shortage is ever retried ->
     //       "FAIL: an open that runs out of memory frees an idle session and commits on the retry",
-    //       printing "did not commit, 1 open(s), 1 close(s)". Observed 2026-09-18. Reverted.
+    //       printing "did not commit, 1 open(s), 1 close(s), 1 packet(s)", and the three checks after
+    //       it; the eviction staging in runPlaybackBlameChecks then reports its death never came.
+    //       Re-observed 2026-09-21 on the NVIDIA entry. Reverted.
     // COVERAGE-ASSERT: the armed shortage is asserted to have been spent, so a run where the
     //       injection never landed fails instead of grading an ordinary open.
     g_failImageCreates.store(1);
@@ -5215,9 +5428,10 @@ void runMemoryRetryChecks(const WallpaperManager::Config& config, const std::vec
     //       run out of sessions on the same attempt and produce the same counts, so the check could
     //       not have failed at all.
     // CONTROL: in backend/daemon/wallpaper_manager.cpp, the `retried ||` term deleted from
-    //       videoSessionLocked()'s retry condition -> "FAIL: a second shortage in a row is reported
+    //       retryAfterEvictionLocked()'s condition -> "FAIL: a second shortage in a row is reported
     //       rather than answered by freeing another session", printing "committed, 3 open(s), 4
-    //       close(s), 3 packet(s), 0 shortage(s) left unspent". Observed 2026-09-18. Reverted.
+    //       close(s), 3 packet(s), 0 shortage(s) left unspent", and the two checks after it.
+    //       Re-observed 2026-09-21 on the NVIDIA entry. Reverted.
     // COVERAGE-ASSERT: the shortages left unspent are printed beside the failure, so a run where
     //       only one of the two landed is visible rather than graded as a bound that held.
     g_failImageCreates.store(2);
@@ -5290,10 +5504,19 @@ void runPlaybackRetryChecks(const WallpaperManager::Config& config, const std::v
     //       that reaches the bound at all. A failure that also broke the open would end the chain
     //       after one try and the check would pass over a daemon with no bound whatsoever. The count
     //       graded is opens, not failures: an open is what the bound is spending.
-    // CONTROL: in backend/daemon/wallpaper_manager.cpp, the `spent < kPlaybackRetries` term deleted
-    //       from advanceSessionLocked()'s retry condition -> "FAIL: playback that keeps failing is
-    //       reopened three times and then left alone", printing opens climbing past three, then the
-    //       settle deadline. Observed 2026-09-18. Reverted.
+    // CONTROL: in backend/daemon/wallpaper_manager.cpp, MonitorState::ReopenBudget::spend()'s limit
+    //       made to apply to shortages only (`if (shortage && spent >= kShortageRetries)`), leaving
+    //       the file's reopens unbounded -> "FAIL: a video whose playback keeps failing stops on its
+    //       own rather than reopening for ever" after the 30-second settle bound, and this phase
+    //       reported not verified. Re-observed 2026-09-21 on the NVIDIA entry. Reverted.
+    // GOAL: S13.192 -- a video that fails for good shows nothing and its error: its last picture is
+    //       not held. The same settled state -- no frame, the error standing, a frame request
+    //       answering RenderFailed -- is what is read below.
+    // CONTROL: in backend/daemon/wallpaper_manager.cpp, both `state.hasFrame = false;` in
+    //       recordFailureLocked() and `if (failed) releaseTarget(monitorId);` in advanceSessionLocked()
+    //       deleted, so a failed video keeps its last picture -> "FAIL: a video whose playback keeps
+    //       failing stops on its own ...", S13.142's "and the monitor is left with no frame", and the
+    //       shortage phase's settle checks. Observed 2026-09-21 on the NVIDIA entry. Reverted.
     // COVERAGE-ASSERT: the number of failures actually injected is asserted to be at least one per
     //       reopen plus the one that spent the budget, so a run where the injection stopped landing
     //       fails instead of grading a daemon that simply never failed.
@@ -5345,10 +5568,11 @@ void runPlaybackRetryChecks(const WallpaperManager::Config& config, const std::v
     //       full three are available AFTER a picture is shown, whatever was spent before it -- and
     //       that at least one and fewer than three had been spent, so the restoration is not being
     //       read off a budget that was never touched.
-    // CONTROL: in backend/daemon/wallpaper_manager.cpp, `playbackBudgetLocked(it->second) = 0;`
-    //       deleted from advanceSessionLocked()'s commit -> "FAIL: a picture shown since the last
-    //       failure restores the whole retry budget", printing 2 reopens where 3 were owed. Observed
-    //       2026-09-18. Reverted.
+    // CONTROL: in backend/daemon/wallpaper_manager.cpp, `playbackBudgetLocked(it->second) =
+    //       {it->second.wallpaperSeq};` deleted from advanceSessionLocked()'s commit -> exactly "FAIL:
+    //       a picture shown since the last failure restores the whole retry budget", printing "2
+    //       reopen(s) after the picture, where 3 were owed". Re-observed 2026-09-21 on the NVIDIA
+    //       entry. Reverted.
     if (!play(clips[1])) {
         check(false, "a new video wallpaper on that monitor draws again after the budget was spent");
         return;
@@ -5502,9 +5726,720 @@ void runGpuFaultChecks(const WallpaperManager::Config& config, const std::vector
                  "the monitor did not settle on the failure");
 }
 
+// --------------------------------------------------------------------------- //
+// Stage E5: which death a video answers for, its count, and the daemon's own shortages
+// --------------------------------------------------------------------------- //
+
+void check(bool condition, const std::string& what) { wallpaperx::testing::check(condition, what.c_str()); }
+
+// A config file as the daemon writes it, for a child or a start to restore from.
+void writeConfig(const std::filesystem::path& file, const std::vector<std::tuple<int, std::string, std::string>>& rows) {
+    nlohmann::json monitors = nlohmann::json::array();
+    for (const auto& [id, type, path] : rows) monitors.push_back({{"monitor_id", id}, {"type", type}, {"path", path}});
+    std::filesystem::create_directories(file.parent_path());
+    std::ofstream(file, std::ios::trunc) << nlohmann::json{{"version", 1}, {"monitors", std::move(monitors)}}.dump();
+}
+
+// A child of this binary that starts as the daemon does -- restoreSaved(), recordStartingVideos(),
+// then every restored monitor posted to a render worker -- and dies of a real memory fault on the
+// render thread at the point `scenario` stages. The parent reads what the death left.
+//
+//   decode        in the clock's decode of <path>'s next picture (its first was delivered)
+//   replace       in freeing <path>'s decoder after its monitor was given the video <extra>
+//   still         the same, given the still <extra>: the stale-session drop
+//   idle          the same, when the idle release frees it (short waits, nothing collecting)
+//   evict         the same, when an open of <extra> for monitor <extraMonitor> runs out of
+//                 descriptors and frees <path>'s session, hidden, to try again
+//   file-failure  the same, after the clock's next picture fails as the file's fault
+//   gpu-failure   the same, after the clock's draw loses the device
+constexpr const char* kBlameChildFlag = "--blame-child";
+constexpr int kBlameChildNeverDied = 3;
+constexpr int kBlameChildSetupFailed = 4;
+
+[[noreturn]] void runBlameChild(int argc, char** argv) {
+    wallpaperx::testing::suppressCoreDump();
+    wallpaperx::installFatalSignalHandlers();
+    if (argc < 7) std::_Exit(kBlameChildSetupFailed);
+    const std::string scenario = argv[4];
+    const int monitorId = std::atoi(argv[5]);
+    const std::string path = argv[6];
+    const std::string extra = argc > 7 ? argv[7] : "";
+    const int extraMonitor = argc > 8 ? std::atoi(argv[8]) : -1;
+
+    WallpaperManager::Config config;
+    config.width = kTargetWidth;
+    config.height = kTargetHeight;
+    config.configFile = argv[2];
+    config.stateDir = argv[3];
+    config.unwatchedAfter = std::chrono::hours(1);
+    config.idleSessionRelease = std::chrono::hours(1);
+    if (scenario == "idle") {
+        config.unwatchedAfter = std::chrono::milliseconds(300);
+        config.idleSessionRelease = std::chrono::milliseconds(300);
+    }
+    g_files.watch(path);
+    if (!extra.empty()) g_files.watch(extra);
+    try {
+        WallpaperManager manager(config);
+        const std::vector<int> restored = manager.restoreSaved();
+        manager.recordStartingVideos();
+        FrameReadyLog signals;
+        RenderWorker worker(manager, [&signals](int id, uint64_t generation) { signals.record(id, generation); });
+        {
+            std::promise<void> known;
+            std::future<void> recorded = known.get_future();
+            worker.postTask([&known](RenderWorker::TaskState) {
+                g_crashThread.store(::gettid());
+                known.set_value();
+            });
+            if (recorded.wait_for(std::chrono::seconds(30)) != std::future_status::ready) {
+                std::_Exit(kBlameChildSetupFailed);
+            }
+        }
+        for (const int id : restored) worker.post(id);
+        if (scenario == "decode") {
+            armCrash(CrashOn::Decode, path);
+        } else {
+            if (!signals.wait(monitorId, 1)) std::_Exit(kBlameChildSetupFailed);
+            armCrash(CrashOn::Free, path);
+            if (scenario == "replace" || scenario == "still") {
+                manager.requestWallpaper(scenario == "replace" ? "video" : "static", extra, monitorId);
+                worker.post(monitorId);
+            } else if (scenario == "evict") {
+                wallpaperx::testing::nameScreen(manager, monitorId, "DP-BLAME");
+                manager.setOutputVisible("DP-BLAME", false);
+                // Two: the request's own open is a shortage it accepts, the render's is the one
+                // that frees a session to try again.
+                g_openFailure.arm(extra, EMFILE, 2);
+                manager.requestWallpaper("video", extra, extraMonitor);
+                worker.post(extraMonitor);
+            } else if (scenario == "file-failure") {
+                g_playbackFailure.arm();
+            } else if (scenario == "gpu-failure") {
+                g_submitDeviceLost.store(1);
+            } else if (scenario != "idle") {
+                std::_Exit(kBlameChildSetupFailed);
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::seconds(30));
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "video_wallpaper_test blame child: %s\n", e.what());
+        std::_Exit(kBlameChildSetupFailed);
+    }
+    std::_Exit(kBlameChildNeverDied);
+}
+
+// What one staged death left behind. `died` is set only when the child really died of SIGSEGV;
+// anything else is reported here, as a harness fault or as a death that never came.
+struct StagedDeath {
+    bool died = false;
+    std::optional<wallpaperx::PlayingHistory> playing;
+};
+
+StagedDeath stageDeath(const char* goal, const std::filesystem::path& configFile, const std::filesystem::path& stateDir,
+                       const std::vector<std::string>& scenario) {
+    std::vector<std::string> args{kBlameChildFlag, configFile.string(), stateDir.string()};
+    args.insert(args.end(), scenario.begin(), scenario.end());
+    const wallpaperx::testing::SelfExecResult r = wallpaperx::testing::runSelf(args, std::chrono::seconds(90));
+    StagedDeath out;
+    if (!r.fault.empty() || !r.reaped) {
+        wallpaperx::testing::harnessFailure("a '" + scenario.front() + "' child " +
+                                            (r.fault.empty() ? r.how() : r.fault));
+        return out;
+    }
+    if (r.exitedWith(kBlameChildNeverDied)) {
+        notVerified(goal, "the '" + scenario.front() + "' child never reached the point its death was staged at");
+        return out;
+    }
+    if (!r.diedOf(SIGSEGV)) {
+        wallpaperx::testing::harnessFailure("a '" + scenario.front() + "' child " + r.how() +
+                                            " rather than dying of the staged fault");
+        return out;
+    }
+    out.died = true;
+    out.playing = wallpaperx::readPlayingRecord(stateDir);
+    return out;
+}
+
+std::string describeDeath(const StagedDeath& d) {
+    if (!d.playing) return "no readable playing record";
+    if (!d.playing->died) return "the record names no video";
+    return "the record names monitor " + std::to_string(d.playing->died->monitorId) + " '" + d.playing->died->path +
+           "'";
+}
+
+constexpr int kMonitorBlamed = 0;
+constexpr int kMonitorBystander = 1;
+
+// S13.184 and S13.190 through a real render thread, and S13.185's consequence.
+void runPlaybackBlameChecks(const WallpaperManager::Config& base, const std::vector<std::string>& clips,
+                            const std::string& still, const std::string& onePicture) {
+    const char* kGoals = "S13.184, S13.185 and S13.190 (which death a video answers for, through the real render thread)";
+    const wallpaperx::testing::ScratchDir scratch("videoblame");
+    if (!scratch.ok()) {
+        notVerified(kGoals, "no scratch directory could be created");
+        return;
+    }
+    const std::string& blamed = clips[0];
+    const std::string& bystander = clips[1];
+
+    // GOAL: S13.184 through the daemon's own render thread -- a fatal signal while the clock is
+    //       decoding one video's next picture names THAT video, its monitor and path, and not the
+    //       other video playing beside it. False if the render thread holds no name while it works
+    //       on a video -- the crash loop the record exists to stop goes on -- or holds the wrong one.
+    // WHY-THIS-SHAPE: a child of this binary that starts as the daemon does and dies of a real
+    //       memory fault inside the decoder call, staged on the one file's context after its first
+    //       picture, so the death is the clock's and never the open's (which the applying record
+    //       covers). Two videos play, so a record naming the wrong one is told apart from the right.
+    //       The fault fires only on the render worker's thread: without that, a child unwinding after
+    //       a failed setup died in ~WallpaperManager's teardown and was graded as the staged death.
+    // CONTROL: in backend/daemon/wallpaper_manager.cpp, `const PlayingBlame working(*session.blame);`
+    //       deleted from advanceSessionLocked() -> "FAIL: a death in the clock's decode of one video
+    //       names that video", printing "the record names no video", "FAIL: after two deaths in its
+    //       playback, the next start refuses that video, saying so" and "FAIL: and the refused file
+    //       is never opened". Observed 2026-09-21 on the NVIDIA entry. Reverted.
+    {
+        const std::filesystem::path configFile = scratch.path() / "decode" / "config.json";
+        const std::filesystem::path stateDir = scratch.path() / "decode" / "state";
+        writeConfig(configFile, {{kMonitorBlamed, "video", blamed}, {kMonitorBystander, "video", bystander}});
+        const StagedDeath first =
+            stageDeath("S13.184", configFile, stateDir, {"decode", std::to_string(kMonitorBlamed), blamed});
+        if (!first.died) return;
+        const bool named = first.playing && first.playing->died && first.playing->died->monitorId == kMonitorBlamed &&
+                           first.playing->died->path == blamed && first.playing->signal == SIGSEGV;
+        reportUnless(named, "a death in the clock's decode of one video names that video", describeDeath(first));
+
+        // GOAL: S13.185 end to end -- after a second such death the next start refuses that video with
+        //       the reason and leaves the other one playing: it is drawn, and it goes on to show more
+        //       pictures, while the refused file is never opened.
+        // WHY-THIS-SHAPE: the start is this process's own manager on the state the two children left,
+        //       with a worker, so "still plays" is pictures committed rather than a status field.
+        // CONTROL: the same deletion as above -> "FAIL: after two deaths in its playback, the next
+        //       start refuses that video, saying so" and "FAIL: and the refused file is never opened";
+        //       the bystander still played. Observed 2026-09-21 on the NVIDIA entry. Reverted.
+        const StagedDeath second =
+            stageDeath("S13.185", configFile, stateDir, {"decode", std::to_string(kMonitorBlamed), blamed});
+        if (!second.died) return;
+        WallpaperManager::Config config = playsUnwatched(base);
+        config.configFile = configFile;
+        config.stateDir = stateDir;
+        PhaseGrade grade("the start after two deaths");
+        WallpaperManager manager(config);
+        CaptureGradeOnExit captureGrade{grade, manager};
+        g_files.resetCounts();
+        const std::vector<int> restored = manager.restoreSaved();
+        FrameReadyLog signals;
+        RenderWorker worker(manager, [&signals](int id, uint64_t g) { signals.record(id, g); });
+        WorkerUnblock unblock{worker};
+        for (const int id : restored) worker.post(id);
+        const std::optional<wallpaperx::MonitorStatus> refusedStatus = monitorStatus(manager, kMonitorBlamed);
+        reportUnless(refusedStatus && !refusedStatus->lastError.empty() && !refusedStatus->renderOutstanding &&
+                         refusedStatus->lastError.find("while playing this video, the 2nd time") != std::string::npos,
+                     "after two deaths in its playback, the next start refuses that video, saying so",
+                     refusedStatus ? "last_error: " + refusedStatus->lastError : std::string("no status"));
+        const bool plays = signals.wait(kMonitorBystander, 1) && signals.waitAtLeast(kMonitorBystander, 3);
+        check(plays, "while the other video is drawn and keeps playing");
+        reportUnless(drainWorker(worker) && g_files.opens(blamed) == 0, "and the refused file is never opened",
+                     std::to_string(g_files.opens(blamed)) + " open(s)");
+    }
+
+    // GOAL: S13.190 -- a teardown that is not a failure blames nothing. A death while freeing a
+    //       video's decoder because its monitor was given another video, because it was given a still
+    //       (the stale-session drop), because nothing could see it (the idle release), or because
+    //       another monitor's open ran short and evicted it, names NO video -- and leaves no applying
+    //       record either. A driver crash during two ordinary screen locks would otherwise refuse a
+    //       good video.
+    // WHY-THIS-SHAPE: the same child, dying inside the free of the one file's decoder, reached four
+    //       ways. The positive reading that makes each absence evidence is the file-failure case
+    //       below, the same death in the same free, which IS named.
+    // CONTROL: in backend/daemon/wallpaper_manager.cpp, closeVideoSessionLocked() made to free the
+    //       pipeline under `const PlayingBlame freeing(*session.blame);`, as closeFailedVideoSessionLocked()
+    //       does for the file's own failure -> "FAIL: a death freeing a video's decoder when its
+    //       monitor is given another video names nothing" and the same for a still, the idle release
+    //       and an eviction, each printing the record naming video_session_0.mp4. The applying-record
+    //       half: the same function made to free under an `ApplyingRecord` naming the file -> the four
+    //       "-- and leaves no applying record either" lines, beside S13.119's and S13.130's. Both
+    //       observed 2026-09-21 on the NVIDIA entry. Reverted.
+    struct Teardown {
+        const char* scenario;
+        const char* what;
+        std::string extra;
+        int extraMonitor;
+    };
+    const Teardown routine[] = {
+        {"replace", "a death freeing a video's decoder when its monitor is given another video names nothing",
+         clips[2], -1},
+        {"still", "a death freeing a video's decoder when its monitor is given a still names nothing", still, -1},
+        {"idle", "a death freeing a video's decoder in the idle release names nothing", "", -1},
+        {"evict", "a death freeing a video's decoder evicted for another monitor's short open names nothing",
+         clips[3], kMonitorBystander},
+    };
+    int graded = 0;
+    for (const Teardown& t : routine) {
+        const std::filesystem::path dir = scratch.path() / t.scenario;
+        writeConfig(dir / "config.json", {{kMonitorBlamed, "video", blamed}});
+        std::vector<std::string> scenario{t.scenario, std::to_string(kMonitorBlamed), blamed};
+        if (!t.extra.empty()) scenario.push_back(t.extra);
+        if (t.extraMonitor >= 0) scenario.push_back(std::to_string(t.extraMonitor));
+        const StagedDeath death = stageDeath("S13.190", dir / "config.json", dir / "state", scenario);
+        if (!death.died) continue;
+        ++graded;
+        reportUnless(death.playing && !death.playing->died, t.what, describeDeath(death));
+        const bool noRecord = !wallpaperx::readCrashRecord(dir / "state", kMonitorBlamed) &&
+                              (t.extraMonitor < 0 || !wallpaperx::readCrashRecord(dir / "state", t.extraMonitor));
+        check(noRecord, std::string(t.what) + " -- and leaves no applying record either");
+    }
+    std::printf("video_wallpaper_test: %d of 4 routine teardowns were reached and died as staged\n", graded);
+
+    // GOAL: S13.190's failure half -- the teardown after a failure names the video only when the
+    //       FILE failed: a death freeing it after its own picture failed to decode names it, and a
+    //       death freeing it after the device was lost at its draw names nothing (the S13.129
+    //       restatement, for the clock's path).
+    // CONTROL: in backend/daemon/wallpaper_manager.cpp, closeFailedVideoSessionLocked(): (a)
+    //       `const PlayingBlame freeing(*session.blame);` deleted -> "FAIL: a death freeing a video's
+    //       decoder after its own picture failed names that video", printing "the record names no
+    //       video"; (b) `if (failure != Fault::File) return;` deleted -> "FAIL: a death freeing a
+    //       video's decoder after the device was lost names nothing", printing the record naming
+    //       video_session_0.mp4. Each alone; observed 2026-09-21 on the NVIDIA entry. Reverted.
+    {
+        const std::filesystem::path dir = scratch.path() / "file-failure";
+        writeConfig(dir / "config.json", {{kMonitorBlamed, "video", blamed}});
+        const StagedDeath death =
+            stageDeath("S13.190", dir / "config.json", dir / "state", {"file-failure", std::to_string(kMonitorBlamed), blamed});
+        if (death.died) {
+            reportUnless(death.playing && death.playing->died && death.playing->died->path == blamed,
+                         "a death freeing a video's decoder after its own picture failed names that video",
+                         describeDeath(death));
+        }
+    }
+    {
+        const std::filesystem::path dir = scratch.path() / "gpu-failure";
+        writeConfig(dir / "config.json", {{kMonitorBlamed, "video", blamed}});
+        const StagedDeath death =
+            stageDeath("S13.190", dir / "config.json", dir / "state", {"gpu-failure", std::to_string(kMonitorBlamed), blamed});
+        if (death.died) {
+            reportUnless(death.playing && !death.playing->died,
+                         "a death freeing a video's decoder after the device was lost names nothing",
+                         describeDeath(death));
+        }
+    }
+    (void)onePicture;
+}
+
+constexpr int kMonitorClean = 0;
+
+// S13.189: the count a video carries is cleared by play, and only by play. Run twice, once per hide
+// length; `gradeClear` asks for the clearing half as well, which consumes the count.
+//
+// GOAL: S13.189's second clause -- time with nothing shown does not count toward clearing, however
+//       SHORT the stop is. A screen hidden for three seconds -- well inside the five seconds the
+//       rule before the fix tolerated between two pictures -- adds nothing, so two visible stretches
+//       that together fall short of cleanPlayAfter leave the count standing; the same for a
+//       six-second hide, across which the idle release also frees the session. False for a clock
+//       credited by wall time (every hide would count), and false for one credited whenever two
+//       pictures are within five seconds of each other -- under which the three-second hide counts
+//       and the six-second one does not, which is why both are driven.
+// WHY-THIS-SHAPE: two runs of the same drive, each with a state directory and a manager of its own,
+//       because the clearing half consumes the count. The visible stretches are timed by this
+//       thread, and a run whose visible time reached cleanPlayAfter reports NOT VERIFIED rather than
+//       reading a clear as a defect. The three-second case is the one this suite could not fail
+//       before: under the old rule that hide was credited as play, measured on unmodified production
+//       at the time.
+// CONTROL: in backend/daemon/wallpaper_manager.cpp, the three `cleanPlay.lastShown.reset()` drops
+//       this drive crosses deleted -- setOutputVisible()'s, videoSessionLocked()'s (the session is
+//       released and reopened inside both hides) and advanceSessionLocked()'s stopped branch -> both
+//       "FAIL: a 6 s hide is not counted as play" and "FAIL: a 3 s hide is not counted as play",
+//       each printing "the count is 0". The same three deleted AND creditCleanPlayLocked()'s
+//       `onTime` term replaced by the rule before the fix, `now - *play.lastShown <=
+//       kMaxPictureInterval` -> the 3 s run red and the 6 s run GREEN, which is exactly the defect
+//       the short hide was added for. Measured and NOT usable as controls: deleting
+//       setOutputVisible()'s drop alone leaves both green (the clock's stopped branch drops the
+//       anchor a moment later), and the `onTime` term alone defends neither hide -- a session
+//       reopened after the release draws its first picture on time. Observed 2026-09-22 on the
+//       NVIDIA entry. Reverted.
+// COVERAGE-ASSERT: the session is required to have been released during the hide, so the "released"
+//       part of the goal is exercised rather than assumed, and the count is read once before the
+//       hide so the run is known to have started carrying one.
+void runCleanPlayHideChecks(const WallpaperManager::Config& base, const std::string& clip,
+                            std::chrono::seconds hide, bool gradeClear) {
+    const std::string what = "a " + std::to_string(hide.count()) + " s hide";
+    const char* kGoal = "S13.189 (a video's death count is cleared by play, and only by play)";
+    const wallpaperx::testing::ScratchDir scratch("videoclean");
+    if (!scratch.ok()) {
+        notVerified(kGoal, "no scratch directory could be created");
+        return;
+    }
+    WallpaperManager::Config config = base;
+    config.configFile = scratch.path() / "config.json";
+    config.stateDir = scratch.path() / "state";
+    // Three seconds: above the two visible stretches below with a second to spare, and far below the
+    // six-second hide between them, so which of the two rules is in force decides the answer.
+    config.cleanPlayAfter = std::chrono::seconds(3);
+    writeConfig(config.configFile, {{kMonitorClean, "video", clip}});
+    {
+        // One death carried in, written by the daemon's own record, as a start after it would carry it.
+        wallpaperx::PlayingRecord record(config.stateDir);
+        record.start({{kMonitorClean, clip, 1}});
+    }
+    const auto countNow = [&]() {
+        const std::optional<wallpaperx::PlayingHistory> h = wallpaperx::readPlayingRecord(config.stateDir);
+        if (!h) return -1;
+        for (const wallpaperx::PlayingVideo& v : h->videos) {
+            if (v.monitorId == kMonitorClean) return v.deaths;
+        }
+        return 0;
+    };
+
+    PhaseGrade grade("the clean-play phase");
+    FrameReadyLog signals;
+    WallpaperManager manager(config);
+    CaptureGradeOnExit captureGrade{grade, manager};
+    Collector collector(manager, kMonitorClean, ":1.clean");
+    RenderWorker worker(manager, [&](int id, uint64_t g) {
+        signals.record(id, g);
+        collector.announced(id, g);
+    });
+    collector.attach(worker);
+    WorkerUnblock unblock{worker};
+    const std::vector<int> restored = manager.restoreSaved();
+    manager.recordStartingVideos();
+    check(countNow() == 1, "the video starts this run carrying one death (the harness's premise)");
+    const std::string screen = "DP-CLEAN";
+    wallpaperx::testing::nameScreen(manager, kMonitorClean, screen);
+    for (const int id : restored) worker.post(id);
+    if (!signals.wait(kMonitorClean, 1)) {
+        grade.expectNoDevice();
+        notVerified(kGoal, "the video did not draw on this host");
+        return;
+    }
+
+    const Clock::time_point firstShown = Clock::now();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+    manager.setOutputVisible(screen, false);
+    const double visibleBefore = std::chrono::duration<double>(Clock::now() - firstShown).count();
+    g_files.resetCounts();
+    std::this_thread::sleep_for(hide);
+    const int releasedDuringHide = g_files.closes(clip);
+    const Clock::time_point shownAgain = Clock::now();
+    manager.setOutputVisible(screen, true);
+    worker.wake();
+    const size_t before = signals.countFor(kMonitorClean);
+    const bool resumed = settlesWithin(std::chrono::seconds(10),
+                                       [&] { return signals.countFor(kMonitorClean) >= before + 2; });
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    const int afterHide = countNow();
+    const double visibleAfter = std::chrono::duration<double>(Clock::now() - shownAgain).count();
+    check(resumed, what + ": the video plays again when the screen is shown");
+    check(releasedDuringHide >= 1,
+          what + ": the session was released during it, so a release is inside what is graded");
+    if (visibleBefore + visibleAfter >= 3.0) {
+        // A loaded host that took long to resume showed enough for the count to clear honestly.
+        const std::string clause = "S13.189's hidden-time clause (" + what + ")";
+        notVerified(clause.c_str(), "the visible stretches took " + std::to_string(visibleBefore + visibleAfter) +
+                                        " s, not less than cleanPlayAfter, so a clear proves nothing");
+    } else {
+        const std::string says = what + " is not counted as play";
+        reportUnless(afterHide == 1, says.c_str(), "the count is " + std::to_string(afterHide));
+    }
+    if (!gradeClear) return;
+
+    // GOAL: S13.189 -- a video that goes on playing normally for cleanPlayAfter has its count
+    //       cleared, from the next start on. False for a count that stands for ever: two unrelated
+    //       driver crashes months apart would then refuse a working video.
+    // WHY-THIS-SHAPE: read through readPlayingRecord(), which is what the next start reads, with a
+    //       bound of cleanPlayAfter plus the longest picture interval and a margin, reported rather
+    //       than waited out.
+    // CONTROL: in backend/daemon/wallpaper_manager.cpp, `if (playedClean) m_playing.clear(monitorId);`
+    //       deleted from advanceSessionLocked() -> "FAIL: a video that plays normally for cleanPlayAfter
+    //       has its count cleared", printing "the count is still 1, 138 collected, 0 refused". Observed
+    //       2026-09-21 on the NVIDIA entry. Reverted.
+    const bool cleared = settlesWithin(std::chrono::seconds(12), [&] { return countNow() == 0; });
+    reportUnless(cleared, "a video that plays normally for cleanPlayAfter has its count cleared",
+                 "the count is still " + std::to_string(countNow()) + ", " + collector.describe());
+}
+
+constexpr int kMonitorShort = 0;
+
+// S13.193 at the manager: a shortage is the daemon's, has a budget of its own, and a request made
+// during one is accepted.
+void runShortageChecks(const WallpaperManager::Config& base, const std::vector<std::string>& clips) {
+    const char* kGoals = "S13.193 (running out of descriptors or memory is the daemon's fault, with a budget of its own)";
+    PhaseGrade grade("the shortage phase");
+    FrameReadyLog signals;
+    WallpaperManager manager(playsUnwatched(base));
+    CaptureGradeOnExit captureGrade{grade, manager};
+    RenderWorker worker(manager, [&signals](int id, uint64_t g) { signals.record(id, g); });
+    WorkerUnblock unblock{worker};
+    struct Disarm {
+        ~Disarm() { g_openFailure.disarm(); }
+    } disarm;
+    wallpaperx::testing::nameScreen(manager, kMonitorShort, screenOf(kMonitorShort));
+
+    // GOAL: S13.193's request clause -- a wallpaper asked for while the daemon has run out of file
+    //       descriptors is ACCEPTED: the shortage is the daemon's, gives no verdict on the file, and
+    //       the render's own open checks again. False for a request that refuses a working file
+    //       because the daemon was short at that instant.
+    // CONTROL: in backend/daemon/wallpaper_manager.cpp, requestWallpaper()'s
+    //       `catch (const ResourceExhausted&) {}` made to rethrow as InvalidRequest -> "FAIL: a
+    //       wallpaper asked for while the daemon is out of descriptors is accepted", printing
+    //       "refused: WallpaperManager: the daemon has run out of file descriptors", and the eviction
+    //       staging in runPlaybackBlameChecks reports a harness fault, since it goes through the same
+    //       request. Observed 2026-09-21 on the NVIDIA entry. Reverted.
+    g_openFailure.arm(clips[4], EMFILE, 1);
+    std::string refusal;
+    try {
+        manager.requestWallpaper("video", clips[4], kMonitorShort);
+    } catch (const std::exception& e) {
+        refusal = e.what();
+    }
+    check(g_openFailure.left() == 0, "the injected shortage was spent on the request's own open");
+    reportUnless(refusal.empty(), "a wallpaper asked for while the daemon is out of descriptors is accepted",
+                 "refused: " + refusal);
+    if (!refusal.empty()) {
+        // Set it without a shortage, so the render clause below still has a wallpaper to run.
+        g_openFailure.disarm();
+        manager.requestWallpaper("video", clips[4], kMonitorShort);
+    }
+
+    // GOAL: S13.193's render clause -- a render whose open runs out of descriptors records a failure
+    //       that is the DAEMON's (not the file's), saying so, with no frame.
+    // CONTROL: in renderer/wallpaper_file.cpp, openWallpaper()'s `if (isShortage(failed))
+    //       throwShortage(...)` after the open deleted, so EMFILE is the open's own answer -> "FAIL: a
+    //       render whose open runs out of descriptors is the daemon's failure, not the file's",
+    //       printing "VideoDecoder: cannot open the wallpaper (Too many open files) ... (the file's)",
+    //       beside the request clause above and the eviction staging's harness fault (both reach the
+    //       same open). Observed 2026-09-21 on the NVIDIA entry. Reverted.
+    g_openFailure.arm(clips[4], EMFILE, 1);
+    worker.post(kMonitorShort);
+    const bool settled = settlesWithin(std::chrono::seconds(30), [&] {
+        const std::optional<wallpaperx::MonitorStatus> s = monitorStatus(manager, kMonitorShort);
+        return s && !s->renderOutstanding && !s->lastError.empty();
+    });
+    {
+        const std::optional<wallpaperx::MonitorStatus> s = monitorStatus(manager, kMonitorShort);
+        check(settled && g_openFailure.left() == 0, "the render's open ran out of descriptors (the harness's premise)");
+        reportUnless(s && s->lastErrorIsDaemonFault && !s->hasFrame &&
+                         s->lastError.find("run out of file descriptors") != std::string::npos,
+                     "a render whose open runs out of descriptors is the daemon's failure, not the file's",
+                     s ? "last_error: " + s->lastError + (s->lastErrorIsDaemonFault ? " (daemon's)" : " (the file's)")
+                       : std::string("no status"));
+    }
+
+    const auto play = [&](const std::string& path) {
+        manager.requestWallpaper("video", path, kMonitorShort);
+        worker.post(kMonitorShort);
+        const std::optional<wallpaperx::MonitorStatus> now = monitorStatus(manager, kMonitorShort);
+        return signals.waitAtLeast(kMonitorShort, (now ? now->generation : 0) + 1);
+    };
+    if (!play(clips[5])) {
+        grade.expectNoDevice();
+        notVerified(kGoals, "the video did not draw on this host");
+        return;
+    }
+
+    // GOAL: S13.193's budget -- playback that keeps failing because the daemon runs short is reopened
+    //       kShortageRetries (10) times, not the file's kPlaybackRetries (3), and the monitor settles
+    //       on a failure that is the daemon's. False for a shortage spending the file's budget, which
+    //       is what gave up on a good file after three tries while another screen held the memory.
+    // WHY-THIS-SHAPE: the injected failure is the picture after each reopen's first, for S13.140's
+    //       reason -- each reopen succeeds and fails again -- and it is ENOMEM, which the decoder
+    //       reports as a shortage. The count graded is opens of this file.
+    // CONTROL: in backend/daemon/wallpaper_manager.cpp, ReopenBudget::spend()'s
+    //       `kShortageRetries` replaced by `kPlaybackRetries` -> "FAIL: playback that keeps running
+    //       short is reopened kShortageRetries times", printing "3 reopen(s)", and the separation
+    //       check below printing "5 reopen(s)". Observed 2026-09-21 on the NVIDIA entry. Reverted.
+    // COVERAGE-ASSERT: at least one shortage per reopen, plus the one that spent the budget, is
+    //       asserted to have been injected.
+    g_files.resetCounts();
+    const int shortagesBefore = g_playbackFailure.shortagesInjected();
+    g_playbackFailure.arm(0);
+    const bool spent = settlesWithin(std::chrono::seconds(60), [&] { return settledOnFailure(manager, kMonitorShort); });
+    g_playbackFailure.disarm();
+    check(spent, "playback that keeps running short stops on its own");
+    const int reopens = g_files.opens(clips[5]);
+    reportUnless(reopens == static_cast<int>(WallpaperManager::kShortageRetries),
+                 "playback that keeps running short is reopened kShortageRetries times",
+                 std::to_string(reopens) + " reopen(s)");
+    check(g_playbackFailure.shortagesInjected() - shortagesBefore >= reopens + 1,
+          "every one of those reopens was answered by another injected shortage");
+    {
+        const std::optional<wallpaperx::MonitorStatus> s = monitorStatus(manager, kMonitorShort);
+        check(s && s->lastErrorIsDaemonFault, "and the monitor settles on a failure that is the daemon's");
+    }
+
+    // GOAL: S13.193's separation -- the two budgets are separate: two failures that are the file's,
+    //       then shortages, reopen the file 2 + 10 times. False for one shared budget of either size
+    //       (10 or 3 in total).
+    // CONTROL: in backend/daemon/wallpaper_manager.cpp, ReopenBudget::spend()'s
+    //       `uint32_t& spent = shortage ? shortages : failures;` made `uint32_t& spent = failures;` ->
+    //       exactly "FAIL: the file's failures and the daemon's shortages spend separate budgets",
+    //       printing "10 reopen(s)". Observed 2026-09-21 on the NVIDIA entry. Reverted.
+    if (!play(clips[6])) {
+        check(false, "a new video draws on the monitor after the shortage budget was spent");
+        return;
+    }
+    g_files.resetCounts();
+    g_playbackFailure.arm(2);
+    const bool spentBoth = settlesWithin(std::chrono::seconds(60), [&] { return settledOnFailure(manager, kMonitorShort); });
+    g_playbackFailure.disarm();
+    check(spentBoth, "playback that fails twice as the file's fault and then runs short stops on its own");
+    reportUnless(g_files.opens(clips[6]) == 2 + static_cast<int>(WallpaperManager::kShortageRetries),
+                 "the file's failures and the daemon's shortages spend separate budgets",
+                 std::to_string(g_files.opens(clips[6])) + " reopen(s)");
+}
+
+constexpr int kMonitorAsked = 0;
+
+// A mount table that puts `dir` on a filesystem of type `type`, for the open hook to serve.
+std::string writeFakeMountTable(const std::filesystem::path& file, const std::string& dir, const std::string& type) {
+    std::ofstream out(file, std::ios::trunc);
+    out << "1 0 0:1 / / rw - ext4 /dev/root rw\n2 1 0:999 / " << dir << " rw - " << type << " share rw\n";
+    return out ? file.string() : std::string();
+}
+
+struct MountTableOverride {
+    explicit MountTableOverride(const std::string& table) {
+        std::lock_guard<std::mutex> lock(g_mountTableMutex);
+        g_mountTable = table;
+        g_mountTableSet.store(true);
+    }
+    ~MountTableOverride() {
+        g_mountTableSet.store(false);
+        std::lock_guard<std::mutex> lock(g_mountTableMutex);
+        g_mountTable.clear();
+    }
+};
+
+// S13.195: picking a wallpaper opens it, with the checks the draw uses.
+void runOpenAtRequestChecks(const WallpaperManager::Config& config, const std::string& still) {
+    const char* kGoals = "S13.195 (picking a wallpaper opens the file on the spot, with the draw's checks)";
+    const wallpaperx::testing::ScratchDir scratch("videoasked");
+    if (!scratch.ok()) {
+        notVerified(kGoals, "no scratch directory could be created");
+        return;
+    }
+    std::error_code ec;
+    const std::filesystem::path shareDir = std::filesystem::canonical(scratch.path(), ec) / "share";
+    std::filesystem::create_directories(shareDir, ec);
+    const std::string onShare = (shareDir / "still.png").string();
+    std::filesystem::copy_file(still, onShare, std::filesystem::copy_options::overwrite_existing, ec);
+    const std::string denied = (scratch.path() / "denied.png").string();
+    std::filesystem::copy_file(still, denied, std::filesystem::copy_options::overwrite_existing, ec);
+    if (ec) {
+        notVerified(kGoals, "the fixture copies could not be made: " + ec.message());
+        return;
+    }
+    g_files.watch(onShare);
+    g_files.watch(denied);
+
+    PhaseGrade grade("the open-at-request phase");
+    WallpaperManager manager(config);
+    CaptureGradeOnExit captureGrade{grade, manager};
+    wallpaperx::testing::nameScreen(manager, kMonitorAsked, screenOf(kMonitorAsked));
+    struct Disarm {
+        ~Disarm() { g_openFailure.disarm(); }
+    } disarm;
+    const auto ask = [&](const std::string& type, const std::string& path) -> std::string {
+        try {
+            manager.requestWallpaper(type, path, kMonitorAsked);
+            return {};
+        } catch (const wallpaperx::InvalidRequest& e) {
+            return e.what();
+        } catch (const std::exception& e) {
+            return std::string("(not InvalidRequest) ") + e.what();
+        }
+    };
+
+    // GOAL: S13.195 -- the request OPENS the file, on the calling thread, and closes it again: an
+    //       unreadable file is refused at the request rather than accepted and then failing. And a
+    //       file that stat() calls readable but whose open is refused is refused -- which a stat-only
+    //       check cannot tell.
+    // WHY-THIS-SHAPE: the open is observed at the kernel call, and the refused open is injected at
+    //       the same call with access(2) still answering yes, so the only thing that can refuse it is
+    //       an open. No render runs before these readings.
+    // CONTROL: in backend/daemon/wallpaper_manager.cpp, requestWallpaper()'s openWallpaper() block
+    //       replaced by the check it superseded (`!std::filesystem::is_regular_file(path, ec) ||
+    //       ::access(path.c_str(), R_OK) != 0` -> refused) -> "FAIL: a wallpaper request opens the
+    //       file and closes it again" ("0 open(s), 0 close(s)") and "FAIL: a file whose open is refused
+    //       is refused at the request, though stat calls it readable" ("accepted"), with the two
+    //       filesystem refusals below and the shortage phase's "the injected shortage was spent on the
+    //       request's own open". Observed 2026-09-21 on the NVIDIA entry. Reverted.
+    g_files.resetCounts();
+    const std::string accepted = ask("static", denied);
+    reportUnless(accepted.empty() && g_files.opens(denied) == 1 && g_files.closes(denied) == 1,
+                 "a wallpaper request opens the file and closes it again",
+                 std::to_string(g_files.opens(denied)) + " open(s), " + std::to_string(g_files.closes(denied)) +
+                     " close(s)" + (accepted.empty() ? "" : ", refused: " + accepted));
+    check(::access(denied.c_str(), R_OK) == 0, "the file below is readable as far as access(2) can tell (the premise)");
+    g_openFailure.arm(denied, EACCES, 1);
+    const std::string refusal = ask("static", denied);
+    reportUnless(!refusal.empty() && refusal.rfind("(not", 0) != 0 && refusal.find("not a readable file") != std::string::npos,
+                 "a file whose open is refused is refused at the request, though stat calls it readable",
+                 refusal.empty() ? std::string("accepted") : refusal);
+
+    // GOAL: S13.195 with S13.194 -- a file on a network filesystem, or on a FUSE one not on the
+    //       allow-list, is refused at the request with the reason; one on an allow-listed FUSE
+    //       filesystem is accepted. And because the check runs on EVERY open, a wallpaper accepted
+    //       from a local directory is refused at a later render once that directory is a network
+    //       mount, as the file's own failure.
+    // WHY-THIS-SHAPE: the mount table is substituted at the open hook, the same substitution
+    //       wallpaper_file_probe grades exhaustively; here what is graded is that the daemon's request
+    //       and its render both consult it.
+    // CONTROL: in renderer/wallpaper_file.cpp, openWallpaper()'s leading refusedFilesystemOf() block
+    //       deleted -> "FAIL: a wallpaper on a network filesystem is refused at the request", the FUSE
+    //       one, and "FAIL: a wallpaper whose directory has since become a network mount is refused
+    //       at its next render", printing an empty last_error (the still redrew); the fake mounts
+    //       carry a device no file has, so the check after the open cannot stand in. Observed
+    //       2026-09-21 on the NVIDIA entry. Reverted.
+    const std::string nfsTable = writeFakeMountTable(scratch.path() / "mountinfo-nfs", shareDir.string(), "nfs4");
+    const std::string sshTable = writeFakeMountTable(scratch.path() / "mountinfo-ssh", shareDir.string(), "fuse.sshfs");
+    const std::string ntfsTable = writeFakeMountTable(scratch.path() / "mountinfo-ntfs", shareDir.string(), "fuse.ntfs-3g");
+    {
+        const MountTableOverride table(nfsTable);
+        const std::string r = ask("static", onShare);
+        reportUnless(r.find("network filesystem (nfs4)") != std::string::npos && r.rfind("(not", 0) != 0,
+                     "a wallpaper on a network filesystem is refused at the request, saying so",
+                     r.empty() ? std::string("accepted") : r);
+    }
+    {
+        const MountTableOverride table(sshTable);
+        const std::string r = ask("static", onShare);
+        reportUnless(r.find("FUSE filesystem (fuse.sshfs)") != std::string::npos,
+                     "a wallpaper on a FUSE filesystem not on the allow-list is refused at the request, saying so",
+                     r.empty() ? std::string("accepted") : r);
+    }
+    {
+        const MountTableOverride table(ntfsTable);
+        const std::string r = ask("static", onShare);
+        reportUnless(r.empty(), "a wallpaper on an allow-listed FUSE filesystem is accepted", "refused: " + r);
+    }
+    const std::string local = ask("static", onShare);
+    const wallpaperx::RenderOutcome drawn = manager.renderPending(kMonitorAsked);
+    if (!local.empty() || !drawn.rendered) {
+        grade.expectNoDevice();
+        notVerified("S13.195's later-open clause", "the local wallpaper did not draw on this host: " + local);
+        return;
+    }
+    {
+        const MountTableOverride table(nfsTable);
+        std::vector<int> owed;
+        manager.setOutputSize(screenOf(kMonitorAsked), kResizedWidth, kResizedHeight, owed);
+        check(std::find(owed.begin(), owed.end(), kMonitorAsked) != owed.end(),
+              "a new size owes the still a render, which opens its file again");
+        manager.renderPending(kMonitorAsked);
+    }
+    const std::optional<wallpaperx::MonitorStatus> s = monitorStatus(manager, kMonitorAsked);
+    reportUnless(s && !s->hasFrame && !s->lastErrorIsDaemonFault &&
+                     s->lastError.find("network filesystem (nfs4)") != std::string::npos,
+                 "a wallpaper whose directory has since become a network mount is refused at its next render, "
+                 "as the file's failure",
+                 s ? "last_error: " + s->lastError : std::string("no status"));
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc > 1 && std::strcmp(argv[1], kBlameChildFlag) == 0) runBlameChild(argc, argv);
     wallpaperx::testing::g_testName = "video_wallpaper_test";
 
     const wallpaperx::testing::ScratchStateHome stateHome;
@@ -5696,6 +6631,13 @@ int main() {
         runMemoryRetryChecks(config, clips);
         runPlaybackRetryChecks(config, clips);
         runGpuFaultChecks(config, clips, still);
+        runShortageChecks(config, clips);
+        runOpenAtRequestChecks(config, still);
+        // Two hides: one past the five seconds the rule before the fix tolerated between pictures,
+        // one well inside it. The second consumes nothing, so the clearing half rides on the first.
+        runCleanPlayHideChecks(config, clip, std::chrono::seconds(6), /*gradeClear=*/true);
+        runCleanPlayHideChecks(config, clip, std::chrono::seconds(3), /*gradeClear=*/false);
+        runPlaybackBlameChecks(config, clips, still, onePicture);
     } catch (const std::exception& e) {
         // Without this an escaping sdbus::Error -- what a host with no session bus produces --
         // would abort the process, so ctest would report an opaque SIGABRT instead of the named

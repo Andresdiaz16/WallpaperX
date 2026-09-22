@@ -817,8 +817,9 @@ TestCase {
     }
 
     // GOAL: S12.6 -- whatever the renderer is doing, a screen that cannot show a wallpaper still
-    //       shows its message. The renderer is opaque and fills the item, so a build that
-    //       activates it in a non-"set" state covers the only thing the user had to read.
+    //       shows its message, and a screen with no monitor id loads no renderer at all. The
+    //       rows here carry no monitor id; "unset" WITH one loads the renderer under its message
+    //       by design (S13.196), graded in its own test below.
     // WHY-THIS-SHAPE: driven across ALL the causes rather than one, because each reaches the
     //       Loader's condition by a different route -- no name, no answer, a refusal, an
     //       unreadable reply -- and a condition testing only `reply !== null` would pass four of
@@ -864,6 +865,42 @@ TestCase {
         const surface = childNamed(item, "wallpaperxSurface");
         verify(surface !== null, "the plugin has a surface");
         verify(!surface.active, "the renderer stays inactive without a monitor id");
+    }
+
+    // GOAL: S13.196, S12.6's "unset" case with a monitor id -- a screen the daemon knows, with no
+    //       wallpaper chosen yet, already loads the renderer (which is what reports the screen's
+    //       size), told its monitor id and connector name, so the first wallpaper is drawn at the
+    //       screen's real size; and the desktop stays legible meanwhile: the "no wallpaper chosen"
+    //       message stays visible over the renderer until a frame is shown. False for the rule this
+    //       replaced (the renderer loaded only once a wallpaper was set), and for a renderer that
+    //       covers the message while it has nothing to draw.
+    // WHY-THIS-SHAPE: driven with the monitor id present -- the unset row in causeCases() carries
+    //       none, and without an id nothing loads either way. The stand-in renderer is what lets
+    //       "loaded" and "told its screen" be read at all on this harness; `active` is main.qml's own.
+    // CONTROL: in backend/kde/kpackage/contents/ui/main.qml, the Loader's `active` put back to
+    //       `root.screenState === "set" && root.monitorId >= 0` -> "FAIL!: 'a known screen with no
+    //       wallpaper loads the renderer, so its size is reported before the first wallpaper'
+    //       returned FALSE", that check alone. And the backdrop's `visible` binding replaced by
+    //       `!surface.active` -> "'the message stays over the renderer until a frame is shown'
+    //       returned FALSE", beside four older checks that read the same binding. Observed
+    //       2026-09-21. Reverted.
+    function test_a_known_screen_with_no_wallpaper_loads_the_renderer_under_its_message() {
+        const item = loadPlugin(suite.namedScreen);
+        const surface = childNamed(item, "wallpaperxSurface");
+        const backdrop = childNamed(item, "wallpaperxBackdrop");
+        verify(surface !== null && backdrop !== null, "the plugin has a surface and a backdrop");
+        surface.sourceComponent = standInRenderer;
+
+        item.apply(200, '{"output":"DP-3","known":true,"path":"","monitor_id":2}');
+        compare(item.screenState, "unset", "the reply is a known screen with no wallpaper");
+        compare(item.monitorId, 2, "and it carries the monitor id");
+        verify(surface.active,
+               "a known screen with no wallpaper loads the renderer, so its size is reported before the first wallpaper");
+        compare(surface.status, Loader.Ready, "the stand-in renderer loaded, which is what lets this check fail");
+        compare(surface.item.monitorId, 2, "the renderer is told which monitor it is");
+        compare(surface.item.output, suite.namedScreen, "and the connector name its size is filed under");
+        verify(backdrop.visible, "the message stays over the renderer until a frame is shown");
+        verify(item.describe().indexOf("No wallpaper chosen") >= 0, "and it is the no-wallpaper message");
     }
 
     // GOAL: S12.1/S12.6 -- once a wallpaper is actually being drawn, the message stops covering

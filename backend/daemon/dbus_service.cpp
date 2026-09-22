@@ -174,10 +174,11 @@ void DbusService::registerVTable() {
         .forInterface(std::string(kInterface));
 }
 
-void DbusService::restoreSaved() {
-    for (const int monitorId : m_manager.restoreSaved()) {
-        m_worker.post(monitorId);
-    }
+void DbusService::restoreSaved() { m_restored = m_manager.restoreSaved(); }
+
+void DbusService::renderRestored() {
+    for (const int monitorId : m_restored) m_worker.post(monitorId);
+    m_restored.clear();
 }
 
 void DbusService::applyImportModifierUpdate(const ImportModifierUpdate& update) {
