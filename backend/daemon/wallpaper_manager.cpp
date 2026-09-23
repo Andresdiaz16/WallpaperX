@@ -338,9 +338,8 @@ void WallpaperManager::recordHealthLocked(HealthCheck DaemonHealth::*which, Heal
     (m_health.*which).detail = sanitizeForLog(detail, 1024, LogFraming::Bare);
 }
 
-void WallpaperManager::recordConfigServer(bool listening, const std::string& error) {
-    recordHealth(&DaemonHealth::configServer, listening ? HealthStatus::Ok : HealthStatus::Fail,
-                 listening ? "listening" : error);
+void WallpaperManager::recordConfigServer(bool listening, const std::string& detail) {
+    recordHealth(&DaemonHealth::configServer, listening ? HealthStatus::Ok : HealthStatus::Fail, detail);
 }
 
 void WallpaperManager::recordConfigServerShutdown(const std::string& detail) {

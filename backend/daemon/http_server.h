@@ -34,6 +34,9 @@ public:
     // A second instance for one manager DOES throw std::logic_error -- it would stamp its own
     // bind result over the first's, including a failure over a server that is serving. That is
     // a programming error rather than an environment one, hence the difference.
+    //
+    // `port` 0 binds whatever port the kernel chooses; port() then returns it, and the health
+    // detail and the startup line name it.
     HttpServer(WallpaperManager& manager, int port = kDefaultPort);
 
     // Stops and joins on every path; a joinable thread destroyed mid-unwind is std::terminate.
@@ -58,6 +61,9 @@ private:
 
         Registration(const Registration&) = delete;
         Registration& operator=(const Registration&) = delete;
+
+        // The port actually bound, which differs from the one asked for when that was 0.
+        void bound(int port) { m_port = port; }
 
     private:
         WallpaperManager& m_manager;

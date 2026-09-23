@@ -570,8 +570,9 @@ private:
     friend class HttpServer;
 
     // Called from HttpServer's constructor with the bind result, from its serving thread
-    // if the accept loop later dies, and from its registration on the way out.
-    void recordConfigServer(bool listening, const std::string& error);
+    // if the accept loop later dies, and from its registration on the way out. `detail` names
+    // the port bound, or why none is.
+    void recordConfigServer(bool listening, const std::string& detail);
 
     // Retracts a live record on the way out, and only that. A bind failure or a dead accept
     // loop already named its own cause, and that diagnosis is the only place a port conflict

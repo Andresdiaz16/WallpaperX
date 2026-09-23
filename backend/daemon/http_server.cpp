@@ -173,9 +173,16 @@ HttpServer::HttpServer(WallpaperManager& manager, int port)
 
     registerRoutes();
 
-    if (!m_server->bind_to_port(kLoopbackHost, m_port)) {
-        const std::string bindError = std::string("could not bind ") + kLoopbackHost + ":" +
-                                      std::to_string(m_port) + " (is another process using it?)";
+    // Port 0 is the kernel's choice, and m_port becomes what it chose: a caller cannot connect to a
+    // port it cannot learn, so the number is published below wherever the configured one would be.
+    const int bound = m_port == 0 ? m_server->bind_to_any_port(kLoopbackHost)
+                                  : (m_server->bind_to_port(kLoopbackHost, m_port) ? m_port : -1);
+    if (bound < 0) {
+        // No reason given: httplib's failure paths log, close and free before returning, and some
+        // never set errno at all, so what errno holds here is not the bind's answer.
+        const std::string bindError =
+            m_port == 0 ? std::string("could not bind any port on ") + kLoopbackHost
+                        : std::string("could not bind ") + kLoopbackHost + ":" + std::to_string(m_port);
         std::fprintf(stderr,
                      "wallpaperx-daemon: %s -- the KDE plugin will not be able to read config; "
                      "DBus and rendering are unaffected\n",
@@ -184,9 +191,12 @@ HttpServer::HttpServer(WallpaperManager& manager, int port)
         return;
     }
 
+    m_port = bound;
+    m_registration.bound(bound);
+
     // Recorded here, not by the caller: the serving thread below is the only other writer,
     // and starting it after this write is what orders the two.
-    m_manager.recordConfigServer(true, {});
+    m_manager.recordConfigServer(true, std::string("listening on ") + kLoopbackHost + ":" + std::to_string(bound));
 
     m_thread = std::thread([this] {
         // false only when httplib hit an accept error outside EMFILE/EINTR/EAGAIN and

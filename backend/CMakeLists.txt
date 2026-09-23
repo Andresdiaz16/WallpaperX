@@ -1254,10 +1254,14 @@ if(DBUS_RUN_SESSION)
                 WALLPAPERX_TEST_IMAGE_DIR="${WALLPAPERX_ITEM_ASSET_DIR}")
             add_dependencies(wallpaperx-item-import-cache-test wallpaperxplugin wallpaperx-shaders)
             foreach(cache_phase counts single pixels no-acquire handover handover-reset handover-modifier
-                                stale-daemon stale-monitor offscreen)
+                                stale-daemon stale-monitor offscreen publish not-opengl)
                 set(cache_environment "QT_QPA_PLATFORM=wayland\;xcb\;offscreen;QT_NO_XDG_DESKTOP_PORTAL=1")
                 if(cache_phase STREQUAL "handover-modifier")
                     set(cache_environment "${cache_environment};WALLPAPERX_FORCE_HANDLE_TYPE=dmabuf")
+                endif()
+                # A real window, so never on a real desktop's platform.
+                if(cache_phase STREQUAL "not-opengl")
+                    set(cache_environment "QT_QPA_PLATFORM=offscreen;QT_NO_XDG_DESKTOP_PORTAL=1")
                 endif()
                 add_test(NAME item_cache_${cache_phase}
                          COMMAND ${DBUS_RUN_SESSION} -- $<TARGET_FILE:wallpaperx-item-import-cache-test> ${cache_phase})

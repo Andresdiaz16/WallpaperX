@@ -429,10 +429,14 @@ bool runFrameShownChecks() {
         //       check passes against the exact build that shipped the defect. The item is asserted
         //       to be CLAIMING a frame on the line before, or this check would pass by having had
         //       nothing to withdraw.
-        // CONTROL: the `publishReason();` call at the end of WallpaperXItem::releaseResources() in
-        //       backend/kde/wallpaperx_item.cpp deleted -- the shape that shipped -> "FAIL: the
-        //       plugin stops claiming a frame is on screen once the scene graph takes its
-        //       resources away", that check alone. Observed 2026-08-23. Reverted.
+        // CONTROL: in backend/kde/wallpaperx_item.cpp, the `publishReason();` at the end of
+        //       WallpaperXItem::releaseResources() AND the one in dropShownFrame() both deleted ->
+        //       "FAIL: the plugin stops claiming a frame is on screen once the scene graph takes
+        //       its resources away", that check alone. Either deleted alone leaves it green: the
+        //       detach also takes the item off the screen, and both paths publish. Qt calls
+        //       releaseResources() only on this detach (window.releaseResources() and a scene-graph
+        //       invalidate do not), so its publish is graded nowhere on its own. Observed
+        //       2026-09-23. Reverted.
         const bool claimedBeforeRelease = claimsFrameShown(item);
         check(claimedBeforeRelease, "the plugin is still claiming a frame immediately before the release");
         if (!claimedBeforeRelease) {

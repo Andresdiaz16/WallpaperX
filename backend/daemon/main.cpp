@@ -8,6 +8,7 @@
 #include <sdbus-c++/sdbus-c++.h>
 
 #include <atomic>
+#include <charconv>
 #include <chrono>
 #include <condition_variable>
 #include <csignal>
@@ -16,6 +17,9 @@
 #include <cstring>
 #include <exception>
 #include <mutex>
+#include <optional>
+#include <string_view>
+#include <system_error>
 #include <thread>
 
 #include <pthread.h>
@@ -47,9 +51,60 @@ void armTeardown(bool& armed) {
     armed = true;
     ::alarm(static_cast<unsigned>(kTeardownDeadline.count()));
 }
+
+constexpr char kUsage[] =
+    "usage: wallpaperx-daemon [--config-port <port>]\n"
+    "  --config-port <port>  serve the loopback config server on <port> instead of %d; 0 lets\n"
+    "                        the kernel choose and the daemon reports what it bound. For tests:\n"
+    "                        the desktop plugin only ever asks %d.\n";
+
+struct Options {
+    int configPort = wallpaperx::HttpServer::kDefaultPort;
+};
+
+// Strict: an option this daemon does not know is refused, never ignored, so a mistyped one cannot
+// start a daemon that silently does something else.
+std::optional<Options> parseArguments(int argc, char** argv, bool& help) {
+    Options options;
+    bool portGiven = false;
+    for (int i = 1; i < argc; ++i) {
+        const std::string_view arg = argv[i];
+        if (arg == "--help" || arg == "-h") {
+            help = true;
+            return options;
+        }
+        if (arg != "--config-port") {
+            std::fprintf(stderr, "wallpaperx-daemon: unknown argument '%s'\n", argv[i]);
+            return std::nullopt;
+        }
+        if (portGiven || i + 1 >= argc) {
+            std::fprintf(stderr, "wallpaperx-daemon: --config-port takes one port, given once\n");
+            return std::nullopt;
+        }
+        const std::string_view value = argv[++i];
+        int port = -1;
+        const auto [end, ec] = std::from_chars(value.data(), value.data() + value.size(), port);
+        if (ec != std::errc() || end != value.data() + value.size() || port < 0 || port > 65535) {
+            std::fprintf(stderr, "wallpaperx-daemon: --config-port needs a port from 0 to 65535, got '%s'\n",
+                         argv[i]);
+            return std::nullopt;
+        }
+        options.configPort = port;
+        portGiven = true;
+    }
+    return options;
+}
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    bool help = false;
+    const std::optional<Options> options = parseArguments(argc, argv, help);
+    if (!options || help) {
+        std::fprintf(help ? stdout : stderr, kUsage, wallpaperx::HttpServer::kDefaultPort,
+                     wallpaperx::HttpServer::kDefaultPort);
+        return help ? 0 : 2;
+    }
+
     // Blocked before any thread exists, since a thread inherits the mask of its creator
     // and both the render worker and the sd-bus loop start below. The sigwait thread is
     // then the only place these are handled.
@@ -276,7 +331,7 @@ int main() {
 
         // Declared after the service so it is destroyed first: its handlers call
         // manager.snapshot(), so HTTP has to stop before anything it reads is torn down.
-        wallpaperx::HttpServer httpServer(manager);
+        wallpaperx::HttpServer httpServer(manager, options->configPort);
         // Destroyed first of everything here, so the ordinary stop is bounded from its own top.
         ArmTeardown armBeforeHttp{teardownArmed};
 

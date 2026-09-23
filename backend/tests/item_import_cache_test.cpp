@@ -25,6 +25,8 @@
 //   stale-daemon       a daemon that leaves takes its imports with it, not the picture (S13.204)
 //   stale-monitor      so does a monitor the item stops showing (S13.204)
 //   offscreen          off the screen every import goes, and coming back imports again (S13.205)
+//   publish            a picture that changes nothing emits nothing and posts one call (S13.212)
+//   not-opengl         a scene graph that is not OpenGL is told why nothing is shown (S13.213)
 //
 // Like the other importing item tests, this reports NOT VERIFIED when this host cannot pair a GL
 // context with the Vulkan device that produced the export: an opaque fd is importable only by the
@@ -43,6 +45,7 @@
 #include <QDBusConnection>
 #include <QDBusMessage>
 #include <QElapsedTimer>
+#include <QEvent>
 #include <QEventLoop>
 #include <QGuiApplication>
 #include <QOpenGLContext>
@@ -70,6 +73,7 @@
 #include <memory>
 #include <set>
 #include <string>
+#include <typeinfo>
 #include <vector>
 
 namespace {
@@ -105,6 +109,8 @@ enum class Phase {
     StaleDaemon,
     StaleMonitor,
     Offscreen,
+    Publish,
+    NotOpenGl,
 };
 
 struct PhaseName {
@@ -126,6 +132,9 @@ constexpr PhaseName kPhases[] = {
     {Phase::StaleDaemon, "stale-daemon", "S13.204 (a departed daemon's imports are freed; its picture stays)"},
     {Phase::StaleMonitor, "stale-monitor", "S13.204 (a left monitor's imports are freed; its picture stays)"},
     {Phase::Offscreen, "offscreen", "S13.205 (off the screen every import goes; coming back imports again)"},
+    {Phase::Publish, "publish",
+     "S13.212 (a picture that changes nothing emits nothing and posts one call to the item's thread)"},
+    {Phase::NotOpenGl, "not-opengl", "S13.213 (a desktop not running on OpenGL is told why nothing is shown)"},
 };
 
 // The words the item blanks with once a hand-over has failed for too long. Restated rather than
@@ -154,17 +163,22 @@ import QtQuick
 import com.wallpaperx
 
 Item {
+    id: root
     width: 68
     height: 36
     property Item rendererItem: renderer
     property string publishedReason: renderer.unavailableReason
     property var boundImports: renderer.importCount
     property var boundReused: renderer.reusedImportCount
+    property int reasonSignals: 0
+    property int frameShownSignals: 0
 
     WallpaperXRenderer {
         id: renderer
         anchors.fill: parent
         monitorId: 0
+        onUnavailableReasonChanged: root.reasonSignals++
+        onFrameShownChanged: root.frameShownSignals++
     }
 }
 )");
@@ -294,6 +308,25 @@ private:
     std::vector<QMetaObject::Connection> m_connections;
 };
 
+// Counts the queued calls delivered to one object, split by who posted them. QtDBus delivers a bus
+// signal to its receiver as a MetaCall event of its own class, so FrameReady arrives through the
+// same door as the item's own queued lambdas; telling them apart by class is what lets the item's
+// posts be counted at all.
+class MetaCallCounter : public QObject {
+public:
+    bool eventFilter(QObject*, QEvent* event) override {
+        if (event->type() == QEvent::MetaCall) {
+            const std::string kind = typeid(*event).name();
+            ++(kind.find("QDBus") != std::string::npos ? busDeliveries : ownPosts);
+            ++byKind[kind];
+        }
+        return false;
+    }
+    int ownPosts = 0;
+    int busDeliveries = 0;
+    std::map<std::string, int> byKind;
+};
+
 // Draws round the ring until every one of its images has been on the screen, watching each
 // texture. Returns false, having reported why, when the ring was never covered.
 bool importWholeRing(Scene& scene, ExportingStub& stub, QDBusConnection& bus, TextureWatch& watch, size_t ringSize) {
@@ -314,6 +347,65 @@ bool importWholeRing(Scene& scene, ExportingStub& stub, QDBusConnection& bus, Te
                                             "is graded were never all made");
         return false;
     }
+    return true;
+}
+
+// The not-opengl phase. A plain window, not the render control every other phase uses: Qt's render
+// control cannot host a software scene graph (measured -- initialize() leaves it without one). The
+// entry runs on the offscreen platform, so nothing is shown on a real desktop.
+bool runNotOpenGl(ExportingStub& stub, const char* kGoal) {
+    QQuickWindow window;
+    window.setGeometry(0, 0, static_cast<int>(kWidth), static_cast<int>(kHeight));
+    QQmlEngine engine;
+    engine.addImportPath(QString::fromUtf8(WALLPAPERX_QML_MODULE_PATH));
+    QQmlComponent component(&engine);
+    component.setData(cacheQmlSource().toUtf8(), QUrl::fromLocalFile(QCoreApplication::applicationDirPath() +
+                                                                      QStringLiteral("/item_import_cache.qml")));
+    std::unique_ptr<QObject> root(component.create());
+    auto* rootItem = qobject_cast<QQuickItem*>(root.get());
+    if (rootItem == nullptr) {
+        for (const QQmlError& error : component.errors()) std::fprintf(stderr, "  qml: %s\n", qPrintable(error.toString()));
+        check(false, "the com.wallpaperx module loads and WallpaperXRenderer instantiates");
+        return true;
+    }
+    auto* item = qobject_cast<QQuickItem*>(root->property("rendererItem").value<QObject*>());
+    if (item == nullptr) {
+        wallpaperx::testing::harnessFailure("the root object exposed no rendererItem");
+        return true;
+    }
+    rootItem->setParentItem(window.contentItem());
+    window.show();
+    const bool exposed = pumpUntil([&] { return window.rendererInterface() != nullptr && window.isExposed(); }, 5000);
+    if (!exposed || window.rendererInterface()->graphicsApi() != QSGRendererInterface::Software) {
+        notVerified(kGoal, std::string("no software scene graph came up under the ") +
+                               QGuiApplication::platformName().toStdString() + " platform");
+        return true;
+    }
+
+    // GOAL: S13.213's non-OpenGL path -- on a desktop whose scene graph is not OpenGL, the item says
+    //       why it shows nothing. False if the reason set on that path never reaches QML. (No frame
+    //       is claimed and no node exists is asserted beside it, but nothing here could draw one, so
+    //       that half has no control of its own.)
+    // WHY-THIS-SHAPE: the stub serves real frames so the daemon side has nothing to say: an
+    //       unreachable daemon's reason outranks the render side's and would satisfy "some reason
+    //       appeared" by itself. Hence equality with the exact words, and a served request
+    //       required. The wait is bounded; expiry leaves the reason empty and fails.
+    // CONTROL: the `setRenderReason(tr("This desktop is not running on OpenGL..."))` in
+    //       WallpaperXItem::updatePaintNode (backend/kde/wallpaperx_item.cpp) deleted -> "FAIL: a
+    //       desktop not running on OpenGL is told so", printing "reason [], frame shown: no".
+    //       Observed 2026-09-23. Reverted.
+    const QString kNotOpenGl =
+        QStringLiteral("This desktop is not running on OpenGL, which WallpaperX needs to show a frame.");
+    auto reason = [&] { return root->property("publishedReason").toString(); };
+    const bool reported = pumpUntil([&] { return stub.served() >= 1 && !reason().isEmpty(); }, 5000);
+    pumpFor(100);
+    check(stub.served() >= 1,
+          "the item fetched a frame from the stub daemon (" + std::to_string(stub.served()) + " served)");
+    check(reported && reason() == kNotOpenGl && !claimsFrameShown(item) && itemPaintNode(item) == nullptr,
+          "a desktop not running on OpenGL is told so (reason [" + reason().toStdString() +
+              "], frame shown: " + (claimsFrameShown(item) ? "yes" : "no") + ")");
+    root.reset();
+    pumpFor(50);
     return true;
 }
 
@@ -362,6 +454,8 @@ bool runPhase(const PhaseName& which) {
                                    bus.lastError().message().toStdString());
             return true;
         }
+
+        if (phase == Phase::NotOpenGl) return runNotOpenGl(stub, kGoal);
 
         Scene scene;
         scene.window.setGeometry(0, 0, static_cast<int>(kWidth), static_cast<int>(kHeight));
@@ -1051,6 +1145,87 @@ bool runPhase(const PhaseName& which) {
                           std::to_string(scene.reused() - reused0) + " reuse(s))");
                 return true;
             }
+
+            case Phase::Publish: {
+                // The item is showing its first picture cleanly by now; everything below is measured
+                // from that settled state.
+                if (!claimsFrameShown(scene.item) || !scene.reason().isEmpty()) {
+                    wallpaperx::testing::harnessFailure("the item was not showing its first picture cleanly, so a "
+                                                        "picture that changes nothing could not be driven");
+                    return true;
+                }
+                MetaCallCounter counter;
+                scene.item->installEventFilter(&counter);
+                const int reasonSignals0 = scene.root->property("reasonSignals").toInt();
+                const int shownSignals0 = scene.root->property("frameShownSignals").toInt();
+                const quint64 pictures0 = scene.pictures();
+                constexpr int kDrive = 12;
+                for (int step = 0; step < kDrive; ++step) {
+                    if (!drawNext(scene, stub, bus)) {
+                        check(false, "the item draws each picture it is served");
+                        scene.item->removeEventFilter(&counter);
+                        return true;
+                    }
+                }
+                const int drawn = static_cast<int>(scene.pictures() - pictures0);
+                // Every post a pass makes is queued by the time drawNext returns; the pump lets them
+                // all land, and the extra 200 ms lets a surplus land too rather than be missed.
+                pumpUntil([&] { return counter.ownPosts >= drawn; }, 2000);
+                pumpFor(200);
+                scene.item->removeEventFilter(&counter);
+                std::string kinds;
+                for (const auto& [kind, count] : counter.byKind) kinds += " " + std::to_string(count) + " x " + kind;
+
+                // GOAL: S13.212 -- a drawn picture that changes nothing emits nothing: with the item
+                //       already showing a picture and no reason standing, a dozen more pictures fire
+                //       neither unavailableReasonChanged nor frameShownChanged.
+                // WHY-THIS-SHAPE: counted by a QML handler on each signal, the reader the signals are
+                //       for. The two properties' VALUES alone cannot fail here: they are the same
+                //       before and after, whether or not a redundant emit fired in between.
+                // CONTROL: in WallpaperXItem::publishReason (backend/kde/wallpaperx_item.cpp), `if
+                //       (m_unavailableReason == settled) return;` deleted -> "FAIL: a picture that
+                //       changes nothing emits no reason or frameShown change", printing "24 reason,
+                //       0 frameShown" -- two per picture, the fetch reply's publish and the draw's. And
+                //       the `if (m_frameShown != shown)` guard made unconditional -> the same line,
+                //       "0 reason, 24 frameShown". Observed 2026-09-23 on the NVIDIA entry. Reverted.
+                const int reasonSignals = scene.root->property("reasonSignals").toInt() - reasonSignals0;
+                const int shownSignals = scene.root->property("frameShownSignals").toInt() - shownSignals0;
+                check(reasonSignals == 0 && shownSignals == 0,
+                      "a picture that changes nothing emits no reason or frameShown change (" +
+                          std::to_string(reasonSignals) + " reason, " + std::to_string(shownSignals) +
+                          " frameShown, over " + std::to_string(drawn) + " picture(s))");
+
+                // GOAL: S13.212's cost half -- a drawn picture posts ONE queued call to the item's
+                //       thread, the one that announces the counts and publishes; not a second hop for
+                //       a reason that has not changed.
+                // WHY-THIS-SHAPE: counted at the item's own event queue with a filter, because the
+                //       cost is the posting, not any visible effect -- a redundant publish of an
+                //       unchanged reason changes nothing a reader can see. FrameReady reaches the
+                //       item as a MetaCall event too, of QtDBus's own class, and is counted apart.
+                // CONTROL: `setRenderReason(QString());` restored after the per-picture
+                //       invokeMethod in WallpaperXItem::updatePaintNode (backend/kde/wallpaperx_item.cpp)
+                //       -- the shape before this change -> "FAIL: each picture drawn posts one call to
+                //       the item's thread", printing "24 post(s) for 12 picture(s)". Observed
+                //       2026-09-23 on the NVIDIA entry. Reverted.
+                // COVERAGE-ASSERT: the bus deliveries must number the pictures announced, so a QtDBus
+                //       whose event class no longer matches cannot silently move FrameReady into the
+                //       item's own count, or out of it. Its control is in this file, standing in for
+                //       such a Qt: the classifier's "QDBus" made "QDBusRenamed" -> this check red with
+                //       "0 for 12", and the post count red beside it with 24. Reverted.
+                check(drawn == kDrive, "the drive drew every picture it announced (" + std::to_string(drawn) + " of " +
+                                           std::to_string(kDrive) + ")");
+                check(counter.busDeliveries == kDrive,
+                      "every FrameReady reached the item as a bus delivery, told apart from its own posts (" +
+                          std::to_string(counter.busDeliveries) + " for " + std::to_string(kDrive) + ";" + kinds + ")");
+                check(counter.ownPosts == drawn, "each picture drawn posts one call to the item's thread (" +
+                                                     std::to_string(counter.ownPosts) + " post(s) for " +
+                                                     std::to_string(drawn) + " picture(s);" + kinds + ")");
+                return true;
+            }
+
+            case Phase::NotOpenGl:
+                // Graded above, before any import is waited for: there is none on this scene graph.
+                return true;
         }
         return true;
     });
@@ -1061,13 +1236,16 @@ bool runPhase(const PhaseName& which) {
 int main(int argc, char** argv) {
     wallpaperx::testing::g_testName = "item_import_cache_test";
     wallpaperx::testing::registerFrameReplyTypes();
-    QQuickWindow::setGraphicsApi(QSGRendererInterface::OpenGL);
     QGuiApplication app(argc, argv);
 
     const PhaseName* which = nullptr;
     for (const PhaseName& candidate : kPhases) {
         if (argc > 1 && std::strcmp(argv[1], candidate.name) == 0) which = &candidate;
     }
+    // Before any window exists, which is all setGraphicsApi requires.
+    QQuickWindow::setGraphicsApi(which != nullptr && which->phase == Phase::NotOpenGl
+                                     ? QSGRendererInterface::Software
+                                     : QSGRendererInterface::OpenGL);
     if (which == nullptr) {
         wallpaperx::testing::harnessFailure("no known phase was named on the command line");
         (void)wallpaperx::testing::reportHarnessFaults("in this test file, not in the plugin");

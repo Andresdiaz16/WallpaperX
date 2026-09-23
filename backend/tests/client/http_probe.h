@@ -87,7 +87,7 @@ inline ConnectResult tryConnect(const std::string& ip, int port, int timeoutMs) 
 
 // A listening socket the test owns, so the port it holds is genuinely taken. Both tiers
 // need one: the in-process tier holds an ephemeral port to make an HttpServer's bind fail,
-// the system tier holds the shipped 18462 before the daemon binary is started.
+// the system tier holds a port before telling the daemon binary to serve on it.
 class HeldPort {
 public:
     HeldPort() = default;

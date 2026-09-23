@@ -78,6 +78,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -2891,13 +2892,30 @@ std::string bindFailureMarker(int port) {
 }
 
 // The daemon's bind-SUCCESS wording, duplicated for the same reason the failure wording is.
-// This one has no live DBus counterpart to cross-check against: the success path's health
-// detail is the fixed word "listening" (WallpaperManager::recordConfigServer), not the
-// printf's wording. What guards it is the FAIL arm in awaitConfigServerBind below.
+// Guarded by the FAIL arm in awaitConfigServerBind below, and cross-checked against the live
+// GetStatus detail -- which names the bound port too -- by the port-0 phase.
 std::string bindSuccessMarker(int port) {
     return std::string("config server on http://") + wallpaperx::HttpServer::kLoopbackHost + ":" +
            std::to_string(port);
 }
+
+// The success detail GetStatus's config_server carries, duplicated for the same reason.
+std::string listeningDetail(int port) {
+    return std::string("listening on ") + wallpaperx::HttpServer::kLoopbackHost + ":" + std::to_string(port);
+}
+
+// A loopback port nothing holds at this instant, for a daemon told to serve on it: the kernel
+// picks it and it is let go at once, so these phases never compete with a developer's own daemon
+// on 18462. What is left is a race with the whole machine for that one ephemeral port in the
+// milliseconds before the daemon binds it, and losing it is a bind failure awaitConfigServerBind
+// reports as a skip, never as a verdict on the daemon. -1 when no port could be had at all.
+int unusedLoopbackPort() {
+    wallpaperx::testing::HeldPort probe;
+    if (!probe.open(INADDR_LOOPBACK, 0)) return -1;
+    return probe.port();
+}
+
+std::vector<std::string> configPortArgs(int port) { return {"--config-port", std::to_string(port)}; }
 
 // GOAL: X.3 in both of its directions, for every phase whose checks need the spawned daemon
 //       to be the process listening on `port`. A daemon that reworded its bind-success line
@@ -2910,7 +2928,7 @@ std::string bindSuccessMarker(int port) {
 //       inlining its own wait-and-classify -- is what this replaces, and the cost of it is
 //       measurable: a copy that drops the drain re-wait accuses production of rewording a
 //       log line the daemon did print, and a copy that drops the bind-failure cross-check
-//       files a daemon that died mid-phase as another process holding 18462. The arm order
+//       files a daemon that died mid-phase as another process holding its port. The arm order
 //       is the substance: each positive signal (the daemon printed the failure line; the
 //       process is gone; the daemon says ok) is consulted before anything is concluded from
 //       an absence, because "no bind line in the buffer" is equally true of all of them.
@@ -2922,14 +2940,17 @@ std::string bindSuccessMarker(int port) {
 //       from an event loop it enters after the HttpServer constructor has printed, so an
 //       "ok" verdict proves the printf already ran -- and it expires into the same FAIL, so
 //       it can never turn a real rewording into a pass (X.1).
-// CONTROL: six, all reverted, each reported by both calling phases. (a) the success printf
+// CONTROL: six, all reverted. (a) to (e) were observed from the connector-name and HTTP
+//       lifecycle phases, before the default-port phase became a third caller; (a), (b) and
+//       (f) were re-observed 2026-09-23, (c) to (e) were not re-run. (a) the success printf
 //       in backend/daemon/http_server.cpp reworded to "config server listening on
 //       http://%s:%d" -> "FAIL: the bind-success wording the connector-name phase waits for
-//       is still the daemon's" and the same for the HTTP lifecycle phase. (b)
-//       `wallpaperx::HttpServer httpServer(manager);` commented out in
+//       is still the daemon's" and the same for the HTTP lifecycle phase, each printing the
+//       port the daemon reports it is listening on. (b)
+//       `wallpaperx::HttpServer httpServer(manager, options->configPort);` commented out in
 //       backend/daemon/main.cpp -> "NOT VERIFIED -- ... the daemon printed neither the
-//       bind-success nor the bind-failure line for port 18462; the daemon reports
-//       config_server pending", and no FAIL from either phase. (c) that construction replaced
+//       bind-success nor the bind-failure line for port <its port>; the daemon reports
+//       config_server pending", from all three callers, and no FAIL from any. (c) that construction replaced
 //       in backend/daemon/main.cpp by a detached thread that `std::_Exit(7)`s two seconds in,
 //       which is a daemon that quit of its own accord mid-phase -> "FAIL: the daemon of the
 //       connector-name phase is still running when its config port is asked about" and the
@@ -2943,15 +2964,16 @@ std::string bindSuccessMarker(int port) {
 //       a lost capture pipe -> "HARNESS FAULT -- the connector-name phase could not be set up:
 //       the daemon's output pipe failed while it was still running", from both phases; with
 //       the StillRunning arm removed the same build printed (c)'s two FAIL lines against a
-//       daemon that was running the whole time. (f) an unrelated process made to hold port
-//       18462 -> the port-conflict skip carrying the daemon's own detail, "port 18462 is held
-//       by another process on this machine (a real wallpaperx-daemon?) ...; the daemon reports
-//       config_server fail / could not bind 127.0.0.1:18462 (is another process using it?)",
-//       and with bindFailureMarker additionally made to match nothing the daemon prints, the
-//       neutral skip with the same detail appended -- where restoring the dropped
-//       `|| reportStatus == "fail"` disjunct claimed the phantom holding process instead.
-//       Timing, same port-conflict run: 17.7 s with the two-marker wait above, 37.4 s with the
-//       single-marker wait it replaced.
+//       daemon that was running the whole time. (f) an unrelated process (a bare listening
+//       socket) made to hold port 18462 -> from the default-port phase, the only caller left
+//       on that port, the port-conflict skip carrying the daemon's own detail: "port 18462 is
+//       held by another process on this machine (a real wallpaperx-daemon?), so the spawned
+//       daemon could not bind it; the daemon reports config_server fail / could not bind
+//       127.0.0.1:18462". Its two older halves were not re-run: with bindFailureMarker
+//       additionally made to match nothing the daemon prints, the neutral skip with the same
+//       detail appended -- where restoring the dropped `|| reportStatus == "fail"` disjunct
+//       claimed the phantom holding process instead; and the timing, 17.7 s with the
+//       two-marker wait above against 37.4 s with the single-marker wait it replaced.
 bool awaitConfigServerBind(const SpawnedDaemon& daemon, int port, const char* goals, const char* phase,
                            const Check& check) {
     const std::string bindOk = bindSuccessMarker(port);
@@ -3071,25 +3093,193 @@ std::string joinNames(const std::vector<std::string>& names) {
 }
 
 // ---------------------------------------------------------------------------- //
-// Phase 10 -- the HTTP config server, in the shipped binary, on the shipped port.
+// Phase 10 -- the HTTP config server, in the shipped binary.
 // ---------------------------------------------------------------------------- //
 //
 // Everything else about http_server.cpp is checked in process, on an ephemeral port
-// (http_server_test). Three things are only observable from out here:
+// (http_server_test). What is only observable from out here: the command line that picks
+// the port, main.cpp wiring the server up at all, nothing left listening after the process
+// exits (S7.8), and a poll landing during shutdown not reading state being torn down (S7.11,
+// which lives in main.cpp's declaration order).
 //
-//   1. main.cpp wires it up at all, on 18462, with no port argument to help it.
-//   2. Nothing is left listening after the process exits (S7.8). In process the port
-//      always closes, because the process that opened it is the one asserting.
-//   3. A poll landing during shutdown cannot read state being torn down (S7.11). That
-//      ordering lives in main.cpp's declaration order -- the HttpServer is declared last
-//      so it is destroyed first -- and an in-process test cannot exercise a main() it
-//      never runs.
-//
-// The port is the one thing this phase cannot choose, so it never assumes it: if the
-// spawned daemon could not bind 18462 (a developer's real daemon is running, most
-// likely), the phase says so and is reported as a skip. Reading a bind failure as a
-// defect here is exactly the "port conflict wearing a defect's clothes" this suite must
-// not do.
+// Every phase but one runs its daemon on a port it picked (--config-port), so a developer's
+// own daemon on 18462 costs them nothing. The one that does not is the default-port phase,
+// which exists to grade that default, and which still skips when 18462 is taken.
+
+void awaitNameRelease(NameWatcher& names, const char* nextUp);
+
+// The words every refusal of the command line ends with, restated from main.cpp's usage text.
+constexpr const char* kUsageLine = "usage: wallpaperx-daemon [--config-port <port>]";
+
+// GOAL: S13.207 -- the daemon's command line is strict. Each refusal (an unknown option, the
+//       `--config-port=<n>` form, a missing value, the option twice, a non-number, a number
+//       outside 0-65535) exits 2 before doing anything, naming what was wrong and printing
+//       the usage; --help and -h print the usage and exit 0. False if any of them starts a
+//       daemon, exits with another code, or refuses without saying why.
+// WHY-THIS-SHAPE: the real binary, because main() is the only parser and nothing in process
+//       can call it. "Started nothing" is read from the bus name never being taken, not from
+//       the exit alone: a parser that ignored an argument would start a daemon that runs
+//       until signalled, and this waits five seconds for an exit before calling that out.
+//       The reason is matched per case, not just the usage line, because every refusal
+//       prints the same usage and a parser that refused everything would satisfy that.
+// CONTROL: each in parseArguments (backend/daemon/main.cpp), each reverted.
+//       (a) `portGiven ||` deleted -> "FAIL: --config-port 5 --config-port 6 is refused",
+//       printing "exit -1 (still running after 5 s, took the bus name: yes)". (b) `|| port >
+//       65535` deleted -> "FAIL: --config-port 65536 is refused", printing "exit -1 ...".
+//       (c) `end != value.data() + value.size() ||` deleted -> "FAIL: --config-port 1x is
+//       refused". (d) the unknown-argument branch made to `continue` -> "FAIL: --bogus is
+//       refused" and "FAIL: --config-port=5 is refused". Observed 2026-09-23.
+void checkCommandLine(NameWatcher& names, const std::string& validationEnv, const Check& check) {
+    struct Case {
+        std::vector<std::string> args;
+        const char* reason;  // what the refusal must say, beside the usage line
+    };
+    const Case kRefused[] = {
+        {{"--bogus"}, "unknown argument '--bogus'"},
+        {{"--config-port=5"}, "unknown argument '--config-port=5'"},
+        {{"--config-port"}, "--config-port takes one port, given once"},
+        {{"--config-port", "5", "--config-port", "6"}, "--config-port takes one port, given once"},
+        {{"--config-port", "abc"}, "--config-port needs a port from 0 to 65535, got 'abc'"},
+        {{"--config-port", "1x"}, "--config-port needs a port from 0 to 65535, got '1x'"},
+        {{"--config-port", "-1"}, "--config-port needs a port from 0 to 65535, got '-1'"},
+        {{"--config-port", "65536"}, "--config-port needs a port from 0 to 65535, got '65536'"},
+        {{"--config-port", ""}, "--config-port needs a port from 0 to 65535, got ''"},
+    };
+    const auto run = [&](const std::vector<std::string>& args, int& exitCode, std::string& output, bool& tookName) {
+        // Counted, not asked: a daemon that took the name and let it go again before the
+        // question would read as never having had it.
+        const uint64_t eventsBefore = names.events();
+        SpawnedDaemon daemon({validationEnv}, SpawnedDaemon::Stdout::Captured, {}, 0, args);
+        const auto deadline = Clock::now() + std::chrono::seconds(5);
+        while (!daemon.exited() && Clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        const bool ranOn = !daemon.exited();
+        exitCode = ranOn ? daemon.shutdown(SIGTERM) : daemon.waitForExit();
+        if (ranOn) exitCode = -1;
+        output = daemon.output();
+        // The name signal travels the bus while the exit travels the process table; a short
+        // wait lets a claim that happened reach the counter before it is read.
+        names.waitForEventsPast(eventsBefore, std::chrono::milliseconds(200));
+        tookName = names.events() != eventsBefore;
+        if (tookName) awaitNameRelease(names, "the next command-line case");
+        return ranOn;
+    };
+    std::string joined;
+    for (const Case& c : kRefused) {
+        joined.clear();
+        for (const std::string& a : c.args) joined += (joined.empty() ? "" : " ") + a;
+        int exitCode = 0;
+        std::string output;
+        bool tookName = false;
+        const bool ranOn = run(c.args, exitCode, output, tookName);
+        const bool refused = !ranOn && !tookName && exitCode == 2 && output.find(c.reason) != std::string::npos &&
+                             output.find(kUsageLine) != std::string::npos;
+        check(refused, (joined + " is refused").c_str());
+        if (!refused) {
+            std::fprintf(stderr, "  exit %d (%s, took the bus name: %s)\n  output: %s\n", exitCode,
+                         ranOn ? "still running after 5 s" : "exited", tookName ? "yes" : "no", output.c_str());
+        }
+    }
+    for (const char* help : {"--help", "-h"}) {
+        int exitCode = 0;
+        std::string output;
+        bool tookName = false;
+        const bool ranOn = run({help}, exitCode, output, tookName);
+        const bool shown = !ranOn && !tookName && exitCode == 0 && output.find(kUsageLine) != std::string::npos;
+        check(shown, (std::string(help) + " prints the usage and exits 0").c_str());
+        if (!shown) std::fprintf(stderr, "  exit %d, output: %s\n", exitCode, output.c_str());
+    }
+}
+
+// GOAL: S13.208 -- a daemon given no port serves on 18462, the one the desktop plugin asks.
+//       False if the default moved, or a daemon started bare served nowhere.
+// WHY-THIS-SHAPE: the one phase left on the shipped port, on purpose: every other phase picks
+//       its own, and without this nothing would notice the default changing. It skips when
+//       18462 is taken -- the developer's own daemon, usually -- through the same classifier
+//       as the others, so a port conflict is never read as a defect. The port is written out,
+//       not taken from HttpServer::kDefaultPort, since the claim is about the number main.qml
+//       has in it.
+// CONTROL: `int configPort = wallpaperx::HttpServer::kDefaultPort;` in backend/daemon/main.cpp
+//       made `18463`, with 18462 free -> "FAIL: a daemon given no port serves on 18462",
+//       printing "config_server ok / listening on 127.0.0.1:18463", and "FAIL: a daemon given
+//       no port answers /health on 18462". With 18462 held by another process and no mutation,
+//       the phase is NOT VERIFIED through awaitConfigServerBind's port-conflict arm. Both
+//       observed 2026-09-23. Reverted.
+void checkDefaultConfigPort(NameWatcher& names, const std::string& validationEnv, const Check& check) {
+    constexpr int kShippedPort = 18462;
+    constexpr const char* kGoal = "S13.208 (a daemon given no port serves on 18462)";
+    SpawnedDaemon daemon({validationEnv});
+    if (!names.waitFor(true)) {
+        if (!reportedStartupFault(daemon, kGoal)) notVerified(kGoal, "the daemon never acquired the bus name");
+        return;
+    }
+    // Asked first, because the detail names the port whatever it is: a daemon that bound some
+    // other port reads as exactly that, not as a log line that went missing. Anything but ok
+    // goes to the shared classifier, where 18462 being held is a skip.
+    std::string detail;
+    std::string why;
+    const std::string status = askConfigServerStatus(detail, why);
+    if (status == "ok") {
+        check(detail == listeningDetail(kShippedPort), "a daemon given no port serves on 18462");
+        if (detail != listeningDetail(kShippedPort)) std::fprintf(stderr, "  config_server ok / %s\n", detail.c_str());
+        httplib::Client cli = wallpaperx::testing::makeClient(kShippedPort);
+        check(wallpaperx::testing::get(cli, "/health").ok(), "a daemon given no port answers /health on 18462");
+    } else {
+        (void)awaitConfigServerBind(daemon, kShippedPort, kGoal, "the default-port phase", check);
+    }
+    daemon.shutdown(SIGTERM);
+    awaitNameRelease(names, "the port-0 phase");
+}
+
+// GOAL: S13.209 -- `--config-port 0` lets the kernel choose, and the daemon names the port it
+//       got in the startup line and in GetStatus's config_server detail, the two agreeing, and
+//       /health answers on it. False if either names 0, or they disagree, or nothing listens.
+// WHY-THIS-SHAPE: the port is read from the startup line and then required of the other two,
+//       so the check is on agreement with a port nobody chose in advance -- the only kind a
+//       test on a shared machine can name. The detail is compared whole, which is also what
+//       keeps listeningDetail() honest as the other phases' duplicate of the daemon's wording.
+// CONTROL: in HttpServer's constructor (backend/daemon/http_server.cpp), the success record made
+//       to name `m_port` and moved above `m_port = bound;`, so it names the port asked for ->
+//       "FAIL: GetStatus names the port the startup line does", alone, printing "startup line
+//       port 44623; config_server ok, detail [listening on 127.0.0.1:0]". And the startup printf
+//       made to print 0 -> "FAIL: a daemon told port 0 names the port it bound in its startup
+//       line" ("bound 0"), beside the two bind-success-wording failures of the phases that wait
+//       for that line. Observed 2026-09-23. Both reverted.
+void checkChosenConfigPort(NameWatcher& names, const std::string& validationEnv, const Check& check) {
+    constexpr const char* kGoal = "S13.209 (port 0 is the kernel's choice, and the daemon names it)";
+    SpawnedDaemon daemon({validationEnv}, SpawnedDaemon::Stdout::Captured, {}, 0, configPortArgs(0));
+    if (!names.waitFor(true)) {
+        if (!reportedStartupFault(daemon, kGoal)) notVerified(kGoal, "the daemon never acquired the bus name");
+        return;
+    }
+    const std::string prefix = bindSuccessMarker(0).substr(0, bindSuccessMarker(0).size() - 1);
+    const bool printed = daemon.waitForOutput(prefix, std::chrono::seconds(10));
+    int bound = -1;
+    if (printed) {
+        const std::string output = daemon.output();
+        const size_t at = output.find(prefix) + prefix.size();
+        size_t end = at;
+        while (end < output.size() && std::isdigit(static_cast<unsigned char>(output[end]))) ++end;
+        if (end > at && end - at <= 5) bound = std::stoi(output.substr(at, end - at));
+    }
+    check(printed && bound > 0, "a daemon told port 0 names the port it bound in its startup line");
+    if (!printed || bound <= 0) {
+        std::fprintf(stderr, "  bound %d; output: %s\n", bound, daemon.output().c_str());
+    } else {
+        std::string detail;
+        std::string why;
+        const std::string status = askConfigServerStatus(detail, why);
+        check(status == "ok" && detail == listeningDetail(bound), "GetStatus names the port the startup line does");
+        if (status != "ok" || detail != listeningDetail(bound)) {
+            std::fprintf(stderr, "  startup line port %d; config_server %s, detail [%s]%s\n", bound, status.c_str(),
+                         detail.c_str(), why.empty() ? "" : (" -- " + why).c_str());
+        }
+        httplib::Client cli = wallpaperx::testing::makeClient(bound);
+        check(wallpaperx::testing::get(cli, "/health").ok(), "/health answers on the port the daemon named");
+    }
+    daemon.shutdown(SIGTERM);
+    awaitNameRelease(names, "the HTTP lifecycle phase");
+}
+
 void checkHttpLifecycle(NameWatcher& names, const std::string& bluePath, const std::string& validationEnv,
                         const Check& check) {
     using wallpaperx::testing::ConnectResult;
@@ -3098,10 +3288,15 @@ void checkHttpLifecycle(NameWatcher& names, const std::string& bluePath, const s
     using wallpaperx::testing::Poller;
     using wallpaperx::testing::tryConnect;
 
-    constexpr int kPort = wallpaperx::HttpServer::kDefaultPort;
     constexpr int32_t kMonitorHttp = 26;
 
-    SpawnedDaemon daemon({validationEnv});
+    const int kPort = unusedLoopbackPort();
+    if (kPort < 0) {
+        notVerified("S7.8/S7.11 (the HTTP server's process lifecycle)",
+                    "no free loopback port could be found for this phase's daemon");
+        return;
+    }
+    SpawnedDaemon daemon({validationEnv}, SpawnedDaemon::Stdout::Captured, {}, 0, configPortArgs(kPort));
     if (!names.waitFor(true)) {
         if (reportedStartupFault(daemon, "S7.8/S7.11 (the HTTP server's process lifecycle)")) return;
         notVerified("S7.8/S7.11 (the HTTP server's process lifecycle)",
@@ -3109,7 +3304,7 @@ void checkHttpLifecycle(NameWatcher& names, const std::string& bluePath, const s
         return;
     }
 
-    // Whether this daemon is the process on 18462 decides whether this phase can run at all,
+    // Whether this daemon is the process on its port decides whether this phase can run at all,
     // and the four outcomes are told apart in awaitConfigServerBind -- one classifier shared
     // with the connector-name phase, so the two cannot drift into disagreeing about which
     // outcome is the daemon's fault and which is the machine's.
@@ -3119,7 +3314,7 @@ void checkHttpLifecycle(NameWatcher& names, const std::string& bluePath, const s
         return;
     }
 
-    // GOAL: S7.10/S7.10b end to end -- /health on 127.0.0.1:18462, asked of the real
+    // GOAL: S7.10/S7.10b end to end -- /health on the daemon's config port, asked of the real
     //       binary by a process that is not it. A daemon that has just started has not
     //       touched its shader directory or created a device, so `shaders` and `gpu` read
     //       `pending` in their own entries while the aggregate, which counts failures only,
@@ -3133,11 +3328,12 @@ void checkHttpLifecycle(NameWatcher& names, const std::string& bluePath, const s
     //       asserts the names and the pending set beside the aggregate, and no details.
     //       The pending set is asserted rather than `status == "ok"` alone because alone it
     //       is vacuous: a daemon that reported everything `ok` from birth satisfies it.
-    // CONTROL: the `wallpaperx::HttpServer httpServer(manager);` line removed from
-    //       backend/daemon/main.cpp -> this phase reports NOT VERIFIED ("the daemon printed neither the
-    //       bind-success nor the bind-failure line for port 18462; the daemon reports
-    //       config_server pending") rather than spending a FAIL on the daemon; the run's
-    //       failures for that mutation all come from phase 11, which grades it directly.
+    // CONTROL: the `wallpaperx::HttpServer httpServer(manager, options->configPort);` line
+    //       removed from backend/daemon/main.cpp -> this phase reports NOT VERIFIED ("the daemon
+    //       printed neither the bind-success nor the bind-failure line for port 42729; the
+    //       daemon reports config_server pending") rather than spending a FAIL on the daemon;
+    //       the run's failures for that mutation come from the port-0 phase and phase 11, which
+    //       grade it directly. Observed 2026-09-23.
     //       For the body itself, two: the `else if (check->status ==
     //       HealthStatus::Pending && overall != HealthStatus::Fail)` arm restored in
     //       http_server.cpp's aggregation -> "FAIL: the real daemon reports ok overall
@@ -3152,7 +3348,7 @@ void checkHttpLifecycle(NameWatcher& names, const std::string& bluePath, const s
     //       with two checks in it. All reverted.
     httplib::Client cli = wallpaperx::testing::makeClient(kPort);
     const HttpReply fresh = wallpaperx::testing::get(cli, "/health");
-    check(fresh.ok(), "the real daemon answers GET /health on 127.0.0.1:18462");
+    check(fresh.ok(), "the real daemon answers GET /health on its config port");
     if (fresh.ok()) {
         const nlohmann::json* checks = healthChecks(fresh.json);
         const bool named = checks != nullptr && checks->contains("shaders") && checks->contains("gpu") &&
@@ -3170,8 +3366,7 @@ void checkHttpLifecycle(NameWatcher& names, const std::string& bluePath, const s
             std::fprintf(stderr, "  pending checks: %s; aggregate: %s\n  fresh /health: %s\n",
                          joinNames(untried).c_str(), aggregate.c_str(), fresh.body.c_str());
         }
-        std::printf("daemon_system_test: /health on the shipped port before any wallpaper: %s\n",
-                    fresh.body.c_str());
+        std::printf("daemon_system_test: /health on port %d before any wallpaper: %s\n", kPort, fresh.body.c_str());
         std::fflush(stdout);
     }
 
@@ -3316,7 +3511,7 @@ void checkHttpLifecycle(NameWatcher& names, const std::string& bluePath, const s
     // until the process is gone, so a still-open socket here is a socket the exited
     // process left behind, not one it is still using.
     const ConnectResult afterExit = tryConnect("127.0.0.1", kPort, 1000);
-    check(afterExit == ConnectResult::Refused, "nothing is listening on 18462 once the daemon has exited");
+    check(afterExit == ConnectResult::Refused, "nothing is listening on the config port once the daemon has exited");
     if (afterExit != ConnectResult::Refused) {
         std::fprintf(stderr, "  connect to 127.0.0.1:%d %s (expected refused)\n", kPort, describe(afterExit));
     }
@@ -3328,8 +3523,8 @@ void checkHttpLifecycle(NameWatcher& names, const std::string& bluePath, const s
 //
 // Both directions run against the real binary, because main.cpp is the only place the
 // bind result is ever handed to the manager. The failing direction needs a process holding
-// 18462 before the daemon starts, which an in-process test cannot arrange for a main() it
-// never runs.
+// the daemon's port before the daemon starts, which an in-process test cannot arrange for a
+// main() it never runs.
 
 // Who holds the listening socket on 127.0.0.1:`port`. Read from /proc, deliberately: the
 // whole question is whether the daemon's own report about that port can be trusted, so the
@@ -3420,9 +3615,12 @@ void awaitNameRelease(NameWatcher& names, const char* nextUp) {
 
 // Direction 1: the port is free, so the daemon is the process listening on it.
 void checkConfigServerOwnsPort(NameWatcher& names, const std::string& validationEnv, const Check& check) {
-    constexpr int kPort = wallpaperx::HttpServer::kDefaultPort;
-
-    SpawnedDaemon daemon({validationEnv});
+    const int kPort = unusedLoopbackPort();
+    if (kPort < 0) {
+        notVerified("S7.14 (the ok direction)", "no free loopback port could be found for this phase's daemon");
+        return;
+    }
+    SpawnedDaemon daemon({validationEnv}, SpawnedDaemon::Stdout::Captured, {}, 0, configPortArgs(kPort));
     if (!names.waitFor(true)) {
         if (reportedStartupFault(daemon, "S7.14 (the ok direction)")) return;
         notVerified("S7.14 (the ok direction)", "the daemon for this phase never acquired the bus name");
@@ -3441,7 +3639,7 @@ void checkConfigServerOwnsPort(NameWatcher& names, const std::string& validation
     }
 
     // GOAL: S7.14's ok direction -- config_server reads ok exactly when this daemon is the
-    //       process listening on 18462, not merely whenever the daemon is up.
+    //       process listening on the port it was told, not merely whenever the daemon is up.
     // WHY-THIS-SHAPE: /proc is asked who holds the socket, rather than the test believing
     //       the daemon or believing that a free port stayed free. Asserting only
     //       `status == "ok"` here passes for a hardcoded string and for a daemon that
@@ -3451,14 +3649,19 @@ void checkConfigServerOwnsPort(NameWatcher& names, const std::string& validation
     //       event loop -- so a reply having come back is proof the decision is made, and
     //       nothing answers GetStatus before then. The bus name, which is taken earlier,
     //       is not that proof.
-    // CONTROL: three. (a) backend/daemon/main.cpp's HttpServer constructed on kDefaultPort + 1, its
-    //       constructor still recording the bind -> "FAIL: config_server reads ok exactly
-    //       when this daemon is the process holding 18462" with "  config_server: ok /
-    //       listening, but 127.0.0.1:18462 is held by nobody". (b) the `status
-    //       ["config_server"] = ...` line deleted from DbusService::getStatus -> "FAIL:
-    //       GetStatus carries a config_server object". (c) recordConfigServer's "listening"
-    //       detail replaced with "" -> "FAIL: the config_server report carries a detail, not
-    //       a bare status". All reverted.
+    // CONTROL: three. (a) backend/daemon/main.cpp's HttpServer constructed on
+    //       `options->configPort + 1`, its constructor still recording the bind -> "FAIL:
+    //       config_server reads ok exactly when this daemon is the process holding its port"
+    //       and "FAIL: the config_server report names the port it is listening on", printing
+    //       "config_server: ok / listening on 127.0.0.1:44250, but 127.0.0.1:44249 is held by
+    //       nobody" (every other port phase red beside them). (b) the `status["config_server"]
+    //       = ...` line deleted from DbusService::getStatus -> "FAIL: GetStatus carries a
+    //       config_server object" -- not re-run 2026-09-23, dbus_service.cpp unchanged. (c) in
+    //       HttpServer's constructor (backend/daemon/http_server.cpp), the success
+    //       recordConfigServer's detail made empty -> "FAIL: the config_server report names the
+    //       port it is listening on", printing "config_server: ok / (empty), but
+    //       127.0.0.1:36193 is held by the spawned daemon". (a) and (c) observed 2026-09-23.
+    //       All reverted.
     std::string why;
     const Listener who = whoListens(kPort, daemon.pid(), why);
     const nlohmann::json* report = configServerReport(status);
@@ -3481,9 +3684,10 @@ void checkConfigServerOwnsPort(NameWatcher& names, const std::string& validation
         check(report != nullptr, "GetStatus carries a config_server object");
         if (report != nullptr) {
             check((reportStatus == "ok") == (who == Listener::Daemon),
-                  "config_server reads ok exactly when this daemon is the process holding 18462");
-            check(!reportDetail.empty(), "the config_server report carries a detail, not a bare status");
-            if ((reportStatus == "ok") != (who == Listener::Daemon) || reportDetail.empty()) {
+                  "config_server reads ok exactly when this daemon is the process holding its port");
+            const bool namesPort = reportStatus != "ok" || reportDetail == listeningDetail(kPort);
+            check(!reportDetail.empty() && namesPort, "the config_server report names the port it is listening on");
+            if ((reportStatus == "ok") != (who == Listener::Daemon) || reportDetail.empty() || !namesPort) {
                 std::fprintf(stderr, "  config_server: %s / %s, but 127.0.0.1:%d is held by %s\n",
                              reportStatus.c_str(), reportDetail.empty() ? "(empty)" : reportDetail.c_str(), kPort,
                              describeListener(who));
@@ -3533,19 +3737,20 @@ void checkConfigServerOwnsPort(NameWatcher& names, const std::string& validation
 // would answer the question with the thing being questioned.
 void checkConfigServerLostPort(NameWatcher& names, const std::string& bluePath, const std::string& validationEnv,
                                bool hostRendered, const Check& check) {
-    constexpr int kPort = wallpaperx::HttpServer::kDefaultPort;
-
-    // The conflict is created here rather than hoped for, and the decision to skip is taken
-    // on THIS process's bind() -- never on config_server, the field under test. A gate that
-    // read the field would turn a daemon reporting the wrong thing into a green skip.
+    // The conflict is created here rather than hoped for: this test holds a port the kernel
+    // chose and tells the daemon to serve on it, so the conflict is certain whatever else the
+    // machine runs. The decision to skip is taken on THIS process's bind() -- never on
+    // config_server, the field under test. A gate that read the field would turn a daemon
+    // reporting the wrong thing into a green skip.
     wallpaperx::testing::HeldPort impostor;
-    if (!impostor.open(INADDR_LOOPBACK, kPort)) {
-        notVerified("S7.14 (the fail direction)", "this test could not take port " + std::to_string(kPort) +
-                                                      " itself, so the port conflict could not be created");
+    if (!impostor.open(INADDR_LOOPBACK, 0)) {
+        notVerified("S7.14 (the fail direction)",
+                    "this test could not take a loopback port itself, so the port conflict could not be created");
         return;
     }
+    const int kPort = impostor.port();
 
-    SpawnedDaemon daemon({validationEnv});
+    SpawnedDaemon daemon({validationEnv}, SpawnedDaemon::Stdout::Captured, {}, 0, configPortArgs(kPort));
     if (!names.waitFor(true)) {
         // Before the bind-failure branch below, which grades a daemon that reached its bind
         // attempt: a child that never execed printed nothing, so that branch would fall
@@ -3587,10 +3792,9 @@ void checkConfigServerLostPort(NameWatcher& names, const std::string& bluePath, 
     // SO_REUSEPORT -- so a daemon found listening here means the phase graded a daemon that
     // got the port after all, and every "fail" assertion under it would be nonsense.
     // Sampled after the GetStatus reply, which is proof main() is past its bind attempt.
-    // CONTROL: SOCK_CLOEXEC dropped from HeldPort, so the forked daemon inherits this
-    //       socket -> "FAIL: the port conflict is real: the daemon is not the process
-    //       listening on 18462". That was a live bug in the first draft, not a hypothetical.
-    //       Restored.
+    // CONTROL: SOCK_CLOEXEC dropped from HeldPort (backend/tests/client/http_probe.h), so the
+    //       forked daemon inherits this socket -> "FAIL: the port conflict is real: the daemon
+    //       is not the process listening on its port", alone. Observed 2026-09-23. Restored.
     std::string listenerWhy;
     const Listener who = whoListens(kPort, daemon.pid(), listenerWhy);
     if (who == Listener::Unknown) {
@@ -3599,7 +3803,7 @@ void checkConfigServerLostPort(NameWatcher& names, const std::string& bluePath, 
                     kPort, listenerWhy.c_str());
     } else {
         check(who != Listener::Daemon,
-              "the port conflict is real: the daemon is not the process listening on 18462");
+              "the port conflict is real: the daemon is not the process listening on its port");
     }
 
     // GOAL: S7.14's substantive half -- a daemon that lost its config port says so on DBus,
@@ -3610,22 +3814,19 @@ void checkConfigServerLostPort(NameWatcher& names, const std::string& bluePath, 
     //       is itself the evidence the daemon is alive. The alternative -- reading the
     //       daemon's stderr line -- says only that it printed something on the way past,
     //       which is the state this goal exists to improve on.
-    // CONTROL: three, all in HttpServer's constructor. (a) the bind-failure branch's
+    // CONTROL: three, all in HttpServer's constructor (backend/daemon/http_server.cpp),
+    //       observed 2026-09-23. (a) the bind-failure branch's
     //       `m_manager.recordConfigServer(false, bindError)` deleted -> "FAIL: a daemon
-    //       that could not bind its config port reports config_server fail" and "FAIL: the
-    //       failed bind report names the port it could not take", with "  config_server:
-    //       pending / (empty), while 127.0.0.1:18462 is held by some other process". The
-    //       success-path record next to it is the wrong line to cut: deleting that one
-    //       instead leaves both checks green and reddens only the ok direction above.
-    //       (b) bindError reworded so the host:port moves into parentheses -> the
-    //       wording check below red, the fail one and the names-the-port one both still
-    //       green (that rewording keeps "127.0.0.1:18462" inside the detail).
-    //       (c) the bind branch's
-    //       `return` replaced with `throw std::runtime_error(bindError)` -> "FAIL: a
-    //       daemon that could not bind its config port still answers GetStatus", plus the
-    //       two shutdown checks below; which DBus error comes back depends on whether the
-    //       daemon dies before or after its name request, NoReply and ServiceUnknown both
-    //       observed. All reverted.
+    //       that could not bind its config port reports config_server fail", "FAIL: the
+    //       failed bind report names the port it could not take" and the wording check below,
+    //       with "  config_server: pending / (empty), while 127.0.0.1:44655 is held by some
+    //       other process". (b) bindError made "could not bind (127.0.0.1:<port>)" -> the
+    //       wording check below red alone; the fail one and the names-the-port one stay green,
+    //       since the host:port is still inside the detail. (c) the bind branch's `return`
+    //       replaced with `throw std::runtime_error(bindError)` -> "FAIL: a daemon that could
+    //       not bind its config port still answers GetStatus" (ServiceUnknown this run;
+    //       NoReply has been seen too, depending on whether the daemon dies before or after
+    //       its name request), plus the two shutdown checks below. All reverted.
     check(status.ok(), "a daemon that could not bind its config port still answers GetStatus");
     if (!status.ok()) {
         std::fprintf(stderr, "  %s\n", status.error().c_str());
@@ -3657,15 +3858,14 @@ void checkConfigServerLostPort(NameWatcher& names, const std::string& bluePath, 
         //       Matching the daemon's stderr instead would be circular -- it is exactly the
         //       text whose stability is in question, and both sides would move together. The
         //       existing names-the-port check above does not cover this: it looks for
-        //       "127.0.0.1:18462", which survives any rewording around it.
-        // CONTROL: bindError reworded to "the config port could not be bound (" +
-        //       kLoopbackHost + ":" ... in http_server.cpp -> "FAIL: the bind-failure
-        //       wording this file matches on in the daemon's stderr is still the daemon's"
-        //       with '  bindFailureMarker(18462) = "could not bind 127.0.0.1:18462", but
-        //       the daemon reports "the config port could not be bound (127.0.0.1:18462)
-        //       (is another process using it?)"', and it was the run's only failure -- the
-        //       names-the-port check above stayed green, since the rewording kept the
-        //       host:port inside it. Reverted.
+        //       "127.0.0.1:<port>", which survives any rewording around it.
+        // CONTROL: bindError in HttpServer's constructor (backend/daemon/http_server.cpp)
+        //       made "could not bind (" + kLoopbackHost + ":" + port + ")" -> "FAIL: the
+        //       bind-failure wording this file matches on in the daemon's stderr is still the
+        //       daemon's" with '  bindFailureMarker(35871) = "could not bind 127.0.0.1:35871",
+        //       but the daemon reports "could not bind (127.0.0.1:35871)"', and it was the
+        //       run's only failure -- the names-the-port check above stayed green, since the
+        //       rewording kept the host:port inside it. Observed 2026-09-23. Reverted.
         const std::string marker = bindFailureMarker(kPort);
         check(reportDetail.find(marker) != std::string::npos,
               "the bind-failure wording this file matches on in the daemon's stderr is still the daemon's");
@@ -3673,6 +3873,18 @@ void checkConfigServerLostPort(NameWatcher& names, const std::string& bluePath, 
             std::fprintf(stderr, "  bindFailureMarker(%d) = \"%s\", but the daemon reports \"%s\"\n", kPort,
                          marker.c_str(), reportDetail.c_str());
         }
+
+        // GOAL: S13.211 -- the failure names the port and guesses no cause. The daemon cannot
+        //       know why a bind failed (httplib does not keep errno), so a guess such as "is
+        //       another process using it?" misleads whenever the real cause is anything else.
+        // WHY-THIS-SHAPE: equality, where the check above is a substring match on purpose, so
+        //       that it survives a rewording around the marker. Only equality notices text
+        //       added after it.
+        // CONTROL: " (is another process using it?)" appended to bindError in HttpServer's
+        //       constructor (backend/daemon/http_server.cpp) -> "FAIL: the failed bind report
+        //       guesses no cause", alone. Observed 2026-09-23. Reverted.
+        check(reportDetail == marker, "the failed bind report guesses no cause");
+        if (reportDetail != marker) std::fprintf(stderr, "  the daemon reports \"%s\"\n", reportDetail.c_str());
 
         if (reportStatus != "fail" || reportDetail.find(hostPort) == std::string::npos) {
             std::fprintf(stderr, "  config_server: %s / %s, while %s is held by %s\n",
@@ -3727,7 +3939,7 @@ void checkConfigServerLostPort(NameWatcher& names, const std::string& bluePath, 
     // CONTROL: control (c) above -- a throwing bind branch -> "FAIL: a daemon that could not
     //       bind its config port still exits 0 on SIGTERM" and "FAIL: ... still runs its
     //       destructor chain", the daemon having printed "fatal: could not bind
-    //       127.0.0.1:18462 ..." and never "stopped cleanly". Reverted.
+    //       127.0.0.1:45719" and never "stopped cleanly". Observed 2026-09-23. Reverted.
     const int exitCode = daemon.shutdown(SIGTERM);
     const std::string output = daemon.output();
     if (output.find("Sanitizer: reported") != std::string::npos) {
@@ -3843,19 +4055,19 @@ bool filesUnder(const std::filesystem::path& dir, std::vector<std::string>& foun
     return true;
 }
 
-// The daemon's /health body, when the daemon is the process serving 18462. Returns false
-// with a reason otherwise -- a developer's own daemon holding the port is a skip, not a
-// finding, and this phase has a GetStatus-based answer for that case that does not need
-// the port at all.
-bool fetchHealth(const StatusReply& status, nlohmann::json& out, std::string& why, const Check& check) {
+// The daemon's /health body, asked on `port`, the one it was told to serve on. Returns false
+// with a reason when the daemon says it is not serving there -- losing a race for the port is
+// a skip, not a finding, and this phase has a GetStatus-based answer for that case that does
+// not need the port at all.
+bool fetchHealth(const StatusReply& status, int port, nlohmann::json& out, std::string& why, const Check& check) {
     const nlohmann::json* report = configServerReport(status);
     const std::string reportStatus = report ? report->value("status", std::string()) : std::string();
     if (reportStatus != "ok") {
         why = "the daemon reports config_server " + (reportStatus.empty() ? std::string("(absent)") : reportStatus) +
-              ", so port " + std::to_string(wallpaperx::HttpServer::kDefaultPort) + " is not its own to answer on";
+              ", so port " + std::to_string(port) + " is not its own to answer on";
         return false;
     }
-    httplib::Client cli = wallpaperx::testing::makeClient(wallpaperx::HttpServer::kDefaultPort);
+    httplib::Client cli = wallpaperx::testing::makeClient(port);
     const wallpaperx::testing::HttpReply reply = wallpaperx::testing::get(cli, "/health");
     if (!reply.ok()) {
         // Not a skip: the daemon just said it owns that port, so a /health that will not
@@ -3902,7 +4114,14 @@ void checkConfigRestart(NameWatcher& names, const std::string& validationEnv, co
 
     bool firstRendered = false;
     {
-        SpawnedDaemon first({validationEnv, configHome.env()});
+        // A port of its own, so the /health half runs whoever holds 18462.
+        const int firstPort = unusedLoopbackPort();
+        if (firstPort < 0) {
+            notVerified(kGoals, "no free loopback port could be found for this phase's daemon");
+            return;
+        }
+        SpawnedDaemon first({validationEnv, configHome.env()}, SpawnedDaemon::Stdout::Captured, {}, 0,
+                            configPortArgs(firstPort));
         if (!names.waitFor(true)) {
             if (!reportedStartupFault(first, kGoals)) {
                 notVerified(kGoals, "the first daemon of this phase never acquired the bus name");
@@ -3926,7 +4145,7 @@ void checkConfigRestart(NameWatcher& names, const std::string& validationEnv, co
         //       seconds ago, so "no config file" is a fact rather than an assumption, and
         //       asked before this phase's own SetWallpaper. gpu.initialized on GetStatus is
         //       asserted unconditionally; the `pending` wording is asserted only when the
-        //       daemon owns port 18462, because a developer's own daemon on that port is a
+        //       daemon owns the port it was told, because losing a race for that port is a
         //       skip and not a finding.
         // CONTROL: this block moved below the SetWallpaper and the FrameReady wait, so the
         //       same daemon is asked once a device provably exists -> "FAIL: a daemon with
@@ -3942,7 +4161,7 @@ void checkConfigRestart(NameWatcher& names, const std::string& validationEnv, co
                   "a daemon with no config file has created no GPU device at startup");
             nlohmann::json health;
             std::string why;
-            if (!fetchHealth(beforeAnything, health, why, check)) {
+            if (!fetchHealth(beforeAnything, firstPort, health, why, check)) {
                 if (!why.empty()) notVerified("S8.11's /health half", why);
             } else {
                 check(healthCheckStatusOf(health, "gpu") == "pending",
@@ -4019,7 +4238,13 @@ void checkConfigRestart(NameWatcher& names, const std::string& validationEnv, co
 
     // The restart. No client call of any kind against this daemon before the assertions:
     // that is the property.
-    SpawnedDaemon second({validationEnv, configHome.env()});
+    const int secondPort = unusedLoopbackPort();
+    if (secondPort < 0) {
+        notVerified(kGoals, "no free loopback port could be found for the restarted daemon");
+        return;
+    }
+    SpawnedDaemon second({validationEnv, configHome.env()}, SpawnedDaemon::Stdout::Captured, {}, 0,
+                         configPortArgs(secondPort));
     if (!names.waitFor(true)) {
         if (!reportedStartupFault(second, kGoals)) {
             notVerified(kGoals, "the restarted daemon never acquired the bus name");
@@ -4090,7 +4315,7 @@ void checkConfigRestart(NameWatcher& names, const std::string& validationEnv, co
                   "a daemon that restored a wallpaper has resolved its GPU with no client involved");
             nlohmann::json health;
             std::string healthWhy;
-            if (!fetchHealth(afterRender, health, healthWhy, check)) {
+            if (!fetchHealth(afterRender, secondPort, health, healthWhy, check)) {
                 if (!healthWhy.empty()) notVerified("S8.11's /health half after a restore", healthWhy);
             } else {
                 const std::string gpu = healthCheckStatusOf(health, "gpu");
@@ -4303,7 +4528,8 @@ void checkOutputRestart(NameWatcher& names, const std::string& validationEnv, co
     using wallpaperx::testing::HttpReply;
     using wallpaperx::testing::setMonitorOutput;
 
-    constexpr int kPort = wallpaperx::HttpServer::kDefaultPort;
+    // The restarted daemon's port, picked now so a failure to find one skips before anything runs.
+    const int kPort = unusedLoopbackPort();
     // This phase drives a daemon and an XDG_CONFIG_HOME of its own, so these ids are only
     // ever compared against its own -- the rule the id table at the top of this file sets
     // out for a phase that does not share a daemon with any other.
@@ -4318,6 +4544,10 @@ void checkOutputRestart(NameWatcher& names, const std::string& validationEnv, co
     ScratchDir configHome("outputrestart");
     if (!configHome.ok()) {
         notVerified(kGoals, "a scratch XDG_CONFIG_HOME could not be created under the temp directory");
+        return;
+    }
+    if (kPort < 0) {
+        notVerified(kGoals, "no free loopback port could be found for the restarted daemon");
         return;
     }
 
@@ -4516,7 +4746,8 @@ void checkOutputRestart(NameWatcher& names, const std::string& validationEnv, co
     // The restart. No client call of any kind against this daemon before the assertions --
     // no SetMonitorOutput, no SetWallpaper -- because the reads below are the whole point:
     // a check that named the screens again would establish nothing about the file.
-    SpawnedDaemon second({validationEnv, configHome.env()});
+    SpawnedDaemon second({validationEnv, configHome.env()}, SpawnedDaemon::Stdout::Captured, {}, 0,
+                         configPortArgs(kPort));
     if (!names.waitFor(true)) {
         if (!reportedStartupFault(second, kGoals)) {
             notVerified(kGoals, "the restarted daemon never acquired the bus name");
@@ -4583,8 +4814,8 @@ void checkOutputRestart(NameWatcher& names, const std::string& validationEnv, co
         }
     }
 
-    // Whether this daemon is the process on 18462 decides whether the HTTP half can run at
-    // all: a developer's own daemon holding the port is a skip, a restarted daemon killed by
+    // Whether this daemon is the process on its port decides whether the HTTP half can run at
+    // all: losing a race for the port is a skip, a restarted daemon killed by
     // the machine is a skip, a restarted daemon that quit of its own accord is a FAIL, and a
     // drifted log literal is a FAIL. They are told apart in awaitConfigServerBind, shared
     // with the HTTP lifecycle phase so the two cannot drift.
@@ -5715,9 +5946,16 @@ void checkShutdownDuringStartup(NameWatcher& names, const std::string& validatio
 
     constexpr const char* kGoal =
         "S8.20 (a shutdown signal that arrives before the event loop starts still stops the daemon)";
-    constexpr int kPort = wallpaperx::HttpServer::kDefaultPort;
     constexpr int kAttempts = 12;
     constexpr std::size_t kConfigBytes = 1000000;
+    // The port whose refused connect says "not yet serving", so it must be one only this
+    // phase's daemon would ever bind: a daemon of the developer's on 18462 answers connects
+    // from a loop of its own and would hide every window.
+    const int kPort = unusedLoopbackPort();
+    if (kPort < 0) {
+        notVerified(kGoal, "no free loopback port could be found for this phase's daemon");
+        return;
+    }
 
     ScratchDir configHome("earlyterm");
     if (!configHome.ok()) {
@@ -5733,7 +5971,7 @@ void checkShutdownDuringStartup(NameWatcher& names, const std::string& validatio
 
     // GOAL: S8.20 -- a SIGTERM delivered after the daemon owns the bus name but before it enters its
     //       event loop still terminates it, cleanly and through main(). False if such a
-    //       daemon runs on holding io.wallpaperx.Daemon and port 18462 after being told to
+    //       daemon runs on holding io.wallpaperx.Daemon and its config port after being told to
     //       stop -- the user's `systemctl stop` returns, the name stays taken, and the next
     //       start fails with FileExists.
     // WHY-THIS-SHAPE: it asserts the OUTCOME, not the mechanism, and deliberately makes no
@@ -5743,7 +5981,7 @@ void checkShutdownDuringStartup(NameWatcher& names, const std::string& validatio
     //       what saves it" would therefore be a false claim, and one written to go red when
     //       the guard is deleted cannot exist.
     //       The window is entered by force rather than by luck. SIGSTOP freezes the daemon
-    //       where it stands; a connect() to 18462 is then answered by the KERNEL, so it
+    //       where it stands; a connect() to its port is then answered by the KERNEL, so it
     //       still discriminates on a process that cannot run -- refused means the HttpServer
     //       constructor has not completed, and that constructor runs before
     //       enterEventLoop(). Only then is SIGTERM queued and SIGCONT sent. The obvious
@@ -5779,7 +6017,7 @@ void checkShutdownDuringStartup(NameWatcher& names, const std::string& validatio
     //       window by accident; the SIGTERM phase, which does work first, stayed green.
     // COVERAGE-ASSERT: an attempt counts only when the connect said refused while the
     //       daemon was stopped. If no attempt in six lands in the window -- another process
-    //       holds 18462, or this host starts the daemon faster than the harness can freeze
+    //       took the port, or this host starts the daemon faster than the harness can freeze
     //       it -- the phase reports NOT VERIFIED and grades nothing, rather than passing on
     //       shutdowns that all happened from inside the loop.
     int inWindow = 0;
@@ -5796,7 +6034,8 @@ void checkShutdownDuringStartup(NameWatcher& names, const std::string& validatio
                                         ("config.json.bad" + (n == 0 ? std::string() : "." + std::to_string(n))),
                                     removeEc);
         }
-        SpawnedDaemon daemon({validationEnv, configHome.env(), configHome.stateEnv()});
+        SpawnedDaemon daemon({validationEnv, configHome.env(), configHome.stateEnv()}, SpawnedDaemon::Stdout::Captured,
+                             {}, 0, configPortArgs(kPort));
         if (!names.waitFor(true)) {
             if (reportedStartupFault(daemon, kGoal)) return;
             notVerified(kGoal, "the daemon for this phase never acquired the bus name");
@@ -5830,7 +6069,7 @@ void checkShutdownDuringStartup(NameWatcher& names, const std::string& validatio
         const std::string output = daemon.output();
 
         // The refused connect is evidence only for a daemon that was going to bind that
-        // port. One that could not bind it at all -- another process holds 18462 -- answers
+        // port. One that could not bind it at all -- another process took it -- answers
         // refused from inside its event loop just as it does before reaching it, which would
         // let this phase grade an ordinary shutdown and report it as a startup-window one.
         if (output.find(bindFailureMarker(kPort)) != std::string::npos) {
@@ -6156,8 +6395,7 @@ void checkStalledConfigWrite(NameWatcher& names, const std::string& validationEn
     //       write off the bus thread bought -- so a stale ok is the only thing an operator
     //       would ever see while nothing has reached the disk since the mount died.
     // WHY-THIS-SHAPE: read over the bus rather than from /health, so it does not depend on
-    //       this daemon owning port 18462 -- a developer's own daemon on that port would turn
-    //       this into a skip. Polled to a deadline with a failure branch, and the verdict is
+    //       this daemon owning a port at all. Polled to a deadline with a failure branch, and the verdict is
     //       the LAST observation: the stall becomes reportable at almost the same instant the
     //       first caller is released, so a single reply taken here would land on either side
     //       of that by luck. Both the status and the wording are asserted, because a `fail`
@@ -6318,7 +6556,7 @@ int main() {
     //       through does not skip it.
     //       A change is attributed before it is graded: only a new file holding one of this
     //       run's own paths is this suite's doing. The developer's own daemon is tolerated
-    //       elsewhere in this file (it holding port 18462 is a skip, not a finding) and it
+    //       elsewhere in this file (the default-port phase skips on it) and it
     //       rewrites this file on every SetWallpaper, so an unattributable change is reported
     //       as a guard that could not conclude -- still red, through the harness channel --
     //       rather than as this suite having clobbered a real config.
@@ -6608,12 +6846,14 @@ int main() {
         // after the phases above have released the name, and before the descriptor
         // accounting below -- its httplib clients close their sockets on destruction,
         // which that accounting would otherwise report as a leak in this process.
+        // The command line and the port it picks, each spawning daemons of their own.
+        checkCommandLine(names, validationEnv, check);
+        checkDefaultConfigPort(names, validationEnv, check);
+        checkChosenConfigPort(names, validationEnv, check);
         checkHttpLifecycle(names, bluePath, validationEnv, check);
 
-        // S7.14, both directions. After checkHttpLifecycle rather than beside it: that
-        // phase asserts nothing is listening on 18462 once its daemon has gone, and the
-        // second of these deliberately puts a socket of this test's own there. Before
-        // the descriptor accounting, since both hold sockets that close at scope exit.
+        // S7.14, both directions. Before the descriptor accounting, since both hold sockets
+        // that close at scope exit.
         checkConfigServerOwnsPort(names, validationEnv, check);
         // signals is this run's whole FrameReady history, from the daemons of the
         // phases above: a non-empty one is proof this host can render, which is what
@@ -6788,8 +7028,8 @@ int main() {
                          after.file.string().c_str(), realConfig.existed ? "held something else" : "did not exist");
         } else {
             // It changed while this run was in flight but holds none of this run's paths.
-            // This suite already tolerates the developer's own daemon running (fetchHealth
-            // treats it holding port 18462 as a skip), and that daemon rewrites the config on
+            // This suite already tolerates the developer's own daemon running (the
+            // default-port phase skips on it), and that daemon rewrites the config on
             // every SetWallpaper -- so blaming the suite here would send the reader hunting
             // for a leak in SpawnedDaemon that is not there. Still red, through the harness
             // channel, because the guard could not conclude.

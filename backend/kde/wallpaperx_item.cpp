@@ -1439,7 +1439,6 @@ QSGNode* WallpaperXItem::updatePaintNode(QSGNode* old, UpdatePaintNodeData*) {
     // The scene graph can be running on Vulkan, Metal, D3D or software, and this import path is
     // OpenGL only. Checked every pass rather than once, because the window can change.
     if (host->rendererInterface()->graphicsApi() != QSGRendererInterface::OpenGL) {
-        setRenderReason(tr("This desktop is not running on OpenGL, which WallpaperX needs to show a frame."));
         // The release runs, and must. Reaching here means no OpenGL context is current, so its
         // glDeleteTextures and glDeleteMemoryObjectsEXT are silent no-ops -- but the GL context
         // that owned those names is gone and took them with it. Its eglDestroyImageKHR is the
@@ -1452,6 +1451,8 @@ QSGNode* WallpaperXItem::updatePaintNode(QSGNode* old, UpdatePaintNodeData*) {
             m_shownGeneration = 0;
             m_nodeHasFrame = false;
         }
+        // After the frame is gone, so the publish it posts reads both facts settled.
+        setRenderReason(tr("This desktop is not running on OpenGL, which WallpaperX needs to show a frame."));
         return nullptr;
     }
 
@@ -1574,7 +1575,6 @@ QSGNode* WallpaperXItem::updatePaintNode(QSGNode* old, UpdatePaintNodeData*) {
                 withdrawImportModifier(incoming->request.drmFormat, incoming->request.drmModifier);
             }
             if (!stillDrawing) {
-                setRenderReason(tr("WallpaperX produced a frame this desktop could not import."));
                 // The node goes too, and with it every import it held: keeping one would leave the
                 // desktop showing a frame while the item reports it is drawing nothing, and a
                 // layout the failure has just renegotiated makes those imports worthless anyway.
@@ -1585,6 +1585,8 @@ QSGNode* WallpaperXItem::updatePaintNode(QSGNode* old, UpdatePaintNodeData*) {
                     m_shownGeneration = 0;
                     m_nodeHasFrame = false;
                 }
+                // After the frame is gone, so the publish it posts reads both facts settled.
+                setRenderReason(tr("WallpaperX produced a frame this desktop could not import."));
             }
             // Asked for once more. A still wallpaper sends no further FrameReady, so without this
             // a transient failure is permanent. The whole decision runs on the item's own thread,
@@ -1630,21 +1632,22 @@ QSGNode* WallpaperXItem::updatePaintNode(QSGNode* old, UpdatePaintNodeData*) {
                 // Not epoch-guarded, unlike the mark above: this says a node is drawing, which is
                 // true whatever the epoch did while the import ran.
                 m_nodeHasFrame = true;
+                m_renderReason.clear();
             }
             // What a drawn picture owes this item's own thread. The retry mark is cleared so
             // "retried once" means once per failure, not once per session: the same generation can
             // be re-fetched later (a window change re-asks) and must be allowed its retry again if
-            // that import fails too. The counts are announced here rather than from a hop of their
-            // own, which would be a second queued event per video frame; the render thread may not
-            // emit at all.
+            // that import fails too. The counts and the reason are published here rather than from
+            // hops of their own, which would be more queued events per video frame; the render
+            // thread may not emit at all.
             QMetaObject::invokeMethod(
                 this,
                 [this] {
                     m_retriedGeneration = 0;
                     emit importCountsChanged();
+                    publishReason();
                 },
                 Qt::QueuedConnection);
-            setRenderReason(QString());
         }
     }
 

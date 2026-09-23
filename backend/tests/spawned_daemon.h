@@ -66,10 +66,11 @@ public:
     // to ask what a daemon with no usable HOME writes into its own working directory,
     // since this process's own is the build tree. A non-zero `fileSizeLimit` is an
     // RLIMIT_FSIZE applied to the child, which is how a config write can be made to fail
-    // the way a systemd unit's LimitFSIZE= makes it fail on a user's machine.
+    // the way a systemd unit's LimitFSIZE= makes it fail on a user's machine. `args` follow
+    // the binary on its command line.
     explicit SpawnedDaemon(const std::vector<std::string>& extraEnvIn = {},
                            Stdout stdoutMode = Stdout::Captured, const std::string& workingDir = {},
-                           rlim_t fileSizeLimit = 0) {
+                           rlim_t fileSizeLimit = 0, const std::vector<std::string>& args = {}) {
         // The daemon persists wallpapers under $XDG_CONFIG_HOME. Unset, it would read and
         // rewrite the developer's own config -- restoring test wallpapers into their
         // desktop, and carrying one test's 28 monitors into the next. A fresh directory
@@ -134,7 +135,11 @@ public:
         envp.push_back(nullptr);
 
         std::string binary = WALLPAPERX_DAEMON_BINARY;
-        char* argv[] = {binary.data(), nullptr};
+        std::vector<std::string> argStorage = args;
+        std::vector<char*> argvList{binary.data()};
+        for (std::string& arg : argStorage) argvList.push_back(arg.data());
+        argvList.push_back(nullptr);
+        char** argv = argvList.data();
 
         const pid_t parentBeforeFork = getpid();
         m_pid = fork();
