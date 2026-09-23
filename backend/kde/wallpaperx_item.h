@@ -31,8 +31,17 @@ namespace wallpaperx {
 //     fetch happens while QML is still building this item, where the nested event loop such a
 //     call needs never runs -- measured, it never returned and the item drew nothing;
 //   * the render thread imports that fd into GL inside updatePaintNode(), because that is the
-//     only place a GL context is current. Freeing is the scene graph's: the node owns its
-//     texture, and destroying it releases the import on that same thread.
+//     only place a GL context is current. Freeing is the scene graph's: the node owns the
+//     imports, and destroying it releases them on that same thread.
+//
+// The daemon cycles a ring of images and hands the same few back over and over, so an import is
+// kept and looked up by which image it is, and a picture drawn into an image already imported
+// costs only the daemon's acquire and a change of which texture the node samples. Only for a
+// picture that brings that acquire: waiting on it is the one thing that tells the driver the
+// memory holds something else now, so a picture arriving without one is imported afresh.
+//
+// What is NOT cached is the claim: the daemon must not draw into the image being sampled, so every
+// picture's hold is given back as soon as the node stops sampling it.
 //
 // m_pendingMutex guards the handover between the first two and the third. Every GL object lives
 // and dies on the render thread.
@@ -55,6 +64,14 @@ class WallpaperXItem : public QQuickItem {
     // unavailableReason does not mean this: it is also empty before the first frame arrives,
     // which is a window where the desktop shows neither a wallpaper nor a message.
     Q_PROPERTY(bool frameShown READ frameShown NOTIFY frameShownChanged)
+    // Properties rather than plain accessors because the only readers outside this process load
+    // the item through its QML module and have no other way to ask. One change signal for both:
+    // a picture moves exactly one of them, and the announcement rides the hop to this thread that
+    // every drawn picture already makes -- a second signal would be a second queued event per
+    // video frame. Without a NOTIFY a QML binding on either would be read once and then frozen,
+    // which is the one reading this exists for.
+    Q_PROPERTY(quint64 importCount READ importCount NOTIFY importCountsChanged)
+    Q_PROPERTY(quint64 reusedImportCount READ reusedImportCount NOTIFY importCountsChanged)
 
 public:
     explicit WallpaperXItem(QQuickItem* parent = nullptr);
@@ -104,11 +121,21 @@ public:
     QString unavailableReason() const { return m_unavailableReason; }
     bool frameShown() const { return m_frameShown; }
 
+    // How many pictures this item drew through an import it had to make, and how many through one
+    // it already held. Both count drawn pictures and nothing else, so their sum is what reached
+    // the screen: a picture that failed counts in neither. Written by the render thread and read
+    // from any; nothing in this item reads them. They are the only way to tell an import per
+    // picture from an import per image -- both draw the same wallpaper, and one does it at the
+    // video's frame rate.
+    quint64 importCount() const { return m_importCount.load(std::memory_order_relaxed); }
+    quint64 reusedImportCount() const { return m_reusedImportCount.load(std::memory_order_relaxed); }
+
 signals:
     void monitorIdChanged();
     void outputChanged();
     void unavailableReasonChanged();
     void frameShownChanged();
+    void importCountsChanged();
 
 protected:
     QSGNode* updatePaintNode(QSGNode* old, UpdatePaintNodeData* data) override;
@@ -132,7 +159,7 @@ private:
     //
     // It owns the daemon's claim on the image the same way, and for the same reason: the daemon
     // records the hold when it answers GetFrameFd, so every path that drops the frame without
-    // importing it owes a release. A successful import moves the claim on to the texture.
+    // importing it owes a release. A picture that reaches the screen moves the claim to the node.
     struct PendingFrame {
         FrameImport::Request request;
         quint64 generation = 0;
@@ -250,10 +277,19 @@ private:
     // hands over is being put on the screen.
     std::atomic<quint64> m_paintCount{0};
 
-    // The claims this item's imports hold. Shared with the textures built from them, which the
-    // scene graph destroys on the render thread and after this item is gone. Replaced, never
-    // reused, when the item leaves the screen: a holder left over from before then finds its own
-    // set empty rather than a claim on the same ring slot taken since.
+    // Render thread, read by whoever asks. See importCount().
+    std::atomic<quint64> m_importCount{0};
+    std::atomic<quint64> m_reusedImportCount{0};
+    // Hand-overs that failed since a picture last reached the screen. What separates a blip, which
+    // must not take a wallpaper off the screen, from a producer hand-over that has stopped working,
+    // which has to say so. On the item rather than on the node, so a node rebuilt for an unrelated
+    // reason does not restart the run. Render thread only, like everything in updatePaintNode.
+    int m_handOversFailed = 0;
+
+    // The claims on the pictures this item has been handed. Shared with the node, which the scene
+    // graph destroys on the render thread and after this item is gone. Replaced, never reused,
+    // when the item leaves the screen: a holder left over from before then finds its own set empty
+    // rather than a claim on the same ring slot taken since.
     std::shared_ptr<ClaimSet> m_claims = std::make_shared<ClaimSet>();
     // The newest generation this item has fetched, so a signal for a frame already in hand
     // costs nothing. GUI thread only, like everything else the fetch path touches.
@@ -286,9 +322,19 @@ private:
     // anything (a daemon restart, a monitor change) while the node keeps drawing what it has.
     // Cleared where the node dies, not where generations are invalidated.
     bool m_nodeHasFrame = false;  // guarded by m_importedMutex
-    // The node is showing an image this item no longer holds a claim on, so the next pass must
-    // destroy it. Only the render thread can, which is why this is a request and not a call.
-    bool m_dropNode = false;  // guarded by m_importedMutex
+    // What the next pass owes the node. Only the render thread may touch GL, so the GUI thread
+    // asks and the pass does it; two things it can ask for, one value so they cannot both be
+    // pending and disagree.
+    //
+    //   ForgetStaleImports  the marks these imports were fetched against stopped meaning anything
+    //                       -- a daemon replaced, a monitor changed -- so none of them can be
+    //                       handed over again. The picture on the screen stays: it is still a
+    //                       picture, and blanking the desktop until a replacement daemon produces
+    //                       one costs more than the memory does.
+    //   Destroy             the image being shown has been given back, so it must stop being
+    //                       sampled at all. Outranks the other, whichever was asked for first.
+    enum class NodeRequest { None, ForgetStaleImports, Destroy };
+    NodeRequest m_nodeRequest = NodeRequest::None;  // guarded by m_importedMutex
     // Bumped every time the marks are invalidated, so the render thread can tell whether the
     // shown generation it read is still the one it is about to write back to.
     quint64 m_generationEpoch = 0;  // guarded by m_importedMutex

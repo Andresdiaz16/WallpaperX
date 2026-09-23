@@ -15,9 +15,10 @@
 //     backend tier cannot do this: a CPU mapping of an exported frame needs DMA_BUF with a
 //     LINEAR layout, and the project's target GPU exports opaque file descriptors.
 //
-// Depth 3 here is this probe's own fixture, not the daemon's WallpaperManager::kTargetDepth
-// -- a renderer probe may not include a backend header. That the *daemon* asks for more than
-// one image is graded at the backend tier, where changing kTargetDepth to 1 turns it red.
+// Depth 3 here is this probe's own fixture, not the daemon's wallpaperx::kTargetDepth
+// (backend/daemon/ring_depth.h) -- a renderer probe may not include a backend header. That the
+// *daemon* keeps its ring deep enough is graded at the backend tier, in dbus_service_test's
+// buffer-hold phase.
 
 #include "vulkan/device.h"
 #include "vulkan/offscreen.h"

@@ -3,6 +3,7 @@
 #include "wallpaperx_item.h"
 
 #include "daemon/log_escape.h"
+#include "daemon/ring_depth.h"
 
 #include <QCoreApplication>
 #include <QDBusArgument>
@@ -386,6 +387,233 @@ void releaseUnimported(const std::shared_ptr<ClaimSet>& claims, const BufferClai
     if (claims && claims->remove(claim)) releaseClaim(claim);
 }
 
+// Which of the daemon's images an import describes.
+//
+// The buffer id carries it: the daemon numbers images from a counter it never resets, so within
+// one of its lifetimes an id is one image, and a ring it rebuilds gets fresh ids. Across lifetimes
+// it is not enough -- ids start from one again -- which is what `daemon` answers, the same count
+// the release ledger keys on. The shape rides along so an image that does not match the import
+// held for it is imported again rather than drawn at the wrong size or layout.
+struct ImportKey {
+    uint64_t daemon = 0;
+    int monitorId = -1;
+    uint64_t bufferId = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint64_t memorySize = 0;
+    uint32_t drmFormat = 0;
+    uint64_t drmModifier = 0;
+    FrameImport::HandleType handleType = FrameImport::HandleType::OpaqueFd;
+
+    bool operator==(const ImportKey&) const = default;
+
+    // A reply that granted no image names none, and two of those would be the same key without
+    // being the same memory.
+    bool identifies() const { return bufferId != 0; }
+
+    // Whether `other` names an image of the same ring: every field but which image it is. Written
+    // against the whole key rather than field by field, so a field added above is covered here
+    // without being remembered.
+    bool sameRingAs(const ImportKey& other) const {
+        ImportKey mine = *this;
+        mine.bufferId = other.bufferId;
+        return mine == other;
+    }
+};
+
+ImportKey importKeyFor(const BufferClaims::Claim& claim, const FrameImport::Request& request) {
+    return ImportKey{claim.daemon,       claim.monitorId,     claim.bufferId,
+                     request.width,      request.height,      request.memorySize,
+                     request.drmFormat,  request.drmModifier, request.handleType};
+}
+
+// Imports one item keeps: the daemon's own ring depth, shared rather than restated, because a
+// cache shallower than the ring is refilled every time the ring comes round and nothing says so.
+constexpr std::size_t kMaxImports = kTargetDepth;
+
+// Hand-overs that may fail in a row before the desktop stops showing the last picture that worked
+// and says why. An eighth of a second of video: past any blip, and short enough that a wallpaper
+// stuck on one picture explains itself rather than looking healthy for the rest of the session.
+constexpr int kToleratedHandOverFailures = 8;
+
+// Whether this picture carries the producer's hand-over. Without one nothing tells the driver that
+// the memory behind an import it already has holds a different picture now, so a kept import must
+// not be drawn for it -- see the header's note on what a reuse costs.
+bool carriesHandOver(const FrameImport::Request& request) {
+    return std::any_of(request.syncFds.begin(), request.syncFds.end(), [](int syncFd) { return syncFd >= 0; });
+}
+
+// What stopped a picture reaching the screen. Named rather than read back out of the error text,
+// because the three differ in what may be concluded from them: only the first says anything about
+// the layout the daemon chose, and only the last leaves the previous picture still being drawn.
+enum class Stopped {
+    Nothing,
+    Layout,    // the driver would not describe this memory
+    Wrapping,  // it did, and the scene graph would not take the texture
+    HandOver,  // the memory is imported; the producer's acquire could not be performed
+};
+
+// What the item hands the scene graph: the picture on the screen, the imports it can switch
+// between without describing memory to the driver again, and the daemon's hold on the image it is
+// sampling now.
+//
+// All of it is the render thread's, the destructor included -- the scene graph destroys its nodes
+// there with a context current, which the GL frees need and the item's own destructor, on the GUI
+// thread, cannot offer. It is also why the imports are kept here: an item leaving the screen asks
+// for its node to be destroyed, so "holds nothing importable" and "has no node" are one fact.
+class FrameNode : public QSGSimpleTextureNode {
+public:
+    // One image described to the driver once, with the scene graph's wrapper around it. The two
+    // die together, so neither can outlive the other.
+    class Import {
+    public:
+        Import(const ImportKey& image, const FrameImport::Result& result, QSGTexture* wrapper)
+            : m_key(image), m_imported(result), m_texture(wrapper) {}
+        ~Import() { free(); }
+        Import(Import&& other) noexcept
+            : m_key(other.m_key),
+              m_imported(std::move(other.m_imported)),
+              m_texture(std::exchange(other.m_texture, nullptr)) {}
+        Import& operator=(Import&& other) noexcept {
+            if (this != &other) {
+                free();
+                m_key = other.m_key;
+                m_imported = std::move(other.m_imported);
+                m_texture = std::exchange(other.m_texture, nullptr);
+            }
+            return *this;
+        }
+        Import(const Import&) = delete;
+        Import& operator=(const Import&) = delete;
+
+        const ImportKey& key() const { return m_key; }
+        QSGTexture* texture() const { return m_texture; }
+        // The GL name the daemon's acquire must be waited on against.
+        unsigned int name() const { return m_imported.texture; }
+
+    private:
+        // The import goes before the wrapper, never after: from outside this plugin the scene
+        // graph's texture destruction is the moment the import's fate can be observed, and
+        // freeing afterwards would leave the GL objects alive past the only handle to them.
+        //
+        // A null wrapper means this was moved from, and then the import went with it.
+        void free() {
+            if (m_texture == nullptr) return;
+            FrameImport::release(m_imported);
+            delete m_texture;
+            m_texture = nullptr;
+        }
+
+        ImportKey m_key;
+        FrameImport::Result m_imported;
+        QSGTexture* m_texture = nullptr;
+    };
+
+    FrameNode() {
+        // An import outlives the picture it was made for, so the node must not free what it is
+        // handed; m_imports is what owns every texture this node is ever given.
+        setOwnsTexture(false);
+        setFiltering(QSGTexture::Linear);
+    }
+
+    ~FrameNode() override {
+        m_imports.clear();
+        // Silent when the item gave this image back on its way off the screen: the same claim
+        // released twice would free an image another reader in this process still holds.
+        if (m_claims && m_claims->remove(m_claim)) releaseClaimWhenReadsFinish(m_claim);
+    }
+
+    // The import held for this image, or null. Reading only: present() is what moves the node.
+    const Import* held(const ImportKey& key) const {
+        if (!key.identifies()) return nullptr;
+        const auto it = std::find_if(m_imports.begin(), m_imports.end(),
+                                     [&key](const Import& import) { return import.key() == key; });
+        return it == m_imports.end() ? nullptr : &*it;
+    }
+
+    // Takes over a fresh import of `key`, at the front, where present() will find it. Trimmed
+    // straight away, because a picture whose hand-over then fails is never presented and the bound
+    // would otherwise be enforced only by the pictures that succeed.
+    void adopt(const ImportKey& key, const FrameImport::Result& imported, QSGTexture* texture) {
+        m_imports.emplace(m_imports.begin(), key, imported, texture);
+        forgetUnusable();
+    }
+
+    // Draws the import held for `key` and takes the daemon's hold on the picture in it.
+    //
+    // The hold it replaces is given back here rather than when its import is freed: the import
+    // stays for the next picture drawn into the same image, and a hold kept that long would leave
+    // the daemon with nowhere to draw. This is the first moment nothing of this item's still
+    // samples the previous picture -- the commands that did were issued by earlier passes, which
+    // is what the fence inside the release covers.
+    void present(const ImportKey& key, const std::shared_ptr<ClaimSet>& claims,
+                 const BufferClaims::Claim& claim) {
+        const auto shown = std::find_if(m_imports.begin(), m_imports.end(),
+                                        [&key](const Import& import) { return import.key() == key; });
+        if (shown == m_imports.end()) {
+            // The caller has just imported this key or found it here, so there is no such pass.
+            // Were there one, nothing would be sampling this picture and the daemon would never
+            // hear about the hold its caller has already given up -- so it hears about it now.
+            releaseUnimported(claims, claim);
+            return;
+        }
+        std::rotate(m_imports.begin(), shown, shown + 1);
+        setTexture(m_imports.front().texture());
+        markDirty(QSGNode::DirtyMaterial);
+
+        const std::shared_ptr<ClaimSet> previousClaims = std::exchange(m_claims, claims);
+        const BufferClaims::Claim previous = std::exchange(m_claim, claim);
+        if (previousClaims && previousClaims->remove(previous)) releaseClaimWhenReadsFinish(previous);
+
+        forgetUnusable();
+    }
+
+    // Every import but the one on the screen. What the item asks for when the marks its frames were
+    // fetched against stop meaning anything: no later hand-over can name any of these, and the one
+    // being drawn is kept only because taking a picture off the desktop costs more than it does.
+    //
+    // The one path that frees imports without a picture arriving -- and the cases that need it, a
+    // daemon that exited and a monitor this item left, are exactly the ones where none ever will.
+    void forgetAllButDrawn() {
+        std::erase_if(m_imports, [this](const Import& import) { return !isDrawn(import); });
+    }
+
+private:
+    // Whether the node is sampling this import. Asked, never inferred from position: an import
+    // taken in for a picture whose hand-over then failed sits at the front without being drawn,
+    // and freeing what the node points at is a use-after-free inside the scene graph.
+    bool isDrawn(const Import& import) const { return import.texture() == texture(); }
+
+    // Drops every import that is neither on the screen, nor the one just taken in, nor one a later
+    // hand-over could still name -- an image of the ring being drawn from, meaning same daemon
+    // lifetime, same monitor, same size and layout.
+    //
+    // A daemon that has exited and a monitor this item no longer shows are the cases that matter:
+    // their imports pin memory nothing will hand over again, and left to the count alone they
+    // drain one per picture, which for a still wallpaper is never. A second entry under the front's
+    // own key goes for another reason: two entries one lookup cannot tell apart is a state this
+    // must not be left in. The count is the backstop for a ring rebuilt with everything but the
+    // ids the same, and is walked from the least recently drawn.
+    void forgetUnusable() {
+        const ImportKey current = m_imports.front().key();
+        for (std::size_t at = m_imports.size(); at > 1; --at) {
+            const std::size_t index = at - 1;
+            const Import& import = m_imports[index];
+            if (isDrawn(import)) continue;
+            const bool nameable = import.key() != current && import.key().sameRingAs(current);
+            if (nameable && index < kMaxImports) continue;
+            m_imports.erase(m_imports.begin() + static_cast<std::ptrdiff_t>(index));
+        }
+    }
+
+    // Most recently sampled first.
+    std::vector<Import> m_imports;
+    // The hold on the picture the node is sampling, and the set that says whether it is still this
+    // node's to give back.
+    std::shared_ptr<ClaimSet> m_claims;
+    BufferClaims::Claim m_claim;
+};
+
 }  // namespace
 
 WallpaperXItem::PendingFrame::~PendingFrame() {
@@ -499,7 +727,7 @@ void WallpaperXItem::dropShownFrame() {
         std::lock_guard<std::mutex> lock(m_importedMutex);
         m_shownGeneration = 0;
         m_nodeHasFrame = false;
-        m_dropNode = true;
+        m_nodeRequest = NodeRequest::Destroy;
     }
     publishReason();
     update();
@@ -696,12 +924,20 @@ void WallpaperXItem::discardHeldFrame() {
         std::lock_guard<std::mutex> lock(m_importedMutex);
         m_shownGeneration = 0;
         ++m_generationEpoch;
+        // The imports go with the marks: what invalidates a generation is a daemon or a monitor
+        // change, and neither will ever hand over those images again. Only the render thread can
+        // free them. Never a downgrade -- an image already given back must still stop being shown.
+        if (m_nodeRequest == NodeRequest::None) m_nodeRequest = NodeRequest::ForgetStaleImports;
     }
 }
 
 void WallpaperXItem::forgetGenerations() {
     discardHeldFrame();
     publishReason();
+    // The request above is only a request; without a pass, an item whose daemon never comes back
+    // keeps a dead one's ring imported for the session. Not in discardHeldFrame(), which the
+    // destructor reaches through releaseHeldImages().
+    update();
 }
 
 // The two producers write their own fact and never the published string, because a queued clear
@@ -793,6 +1029,11 @@ void WallpaperXItem::connectToDaemon() {
                 // A new daemon takes every screen to be drawn until it is told otherwise, and one
                 // that has gone remembers nothing.
                 m_visibleReported.reset();
+                // On departures too, and before the return below: a daemon numbers its images from
+                // scratch, so every mark this item holds is meaningless either way -- and one that
+                // never comes back is the case where no later frame would clear them or the
+                // imports they describe.
+                forgetGenerations();
                 if (newOwner.isEmpty()) {
                     setFetchReason(tr("WallpaperX is not running."));
                     return;
@@ -802,8 +1043,6 @@ void WallpaperXItem::connectToDaemon() {
                 // which is one of the things that makes the subscription fail in the first place.
                 if (!m_subscribed) m_subscribed = subscribeToFrameReady();
                 g_modifiersReported.store(false);
-                // A restarted daemon numbers from scratch, so every mark is meaningless now.
-                forgetGenerations();
                 fetchFrame(0);
             });
     // After the watcher, so an owner change between the two is reported by it rather than lost:
@@ -1167,27 +1406,29 @@ void WallpaperXItem::takeFrameReply(int monitorId, const QDBusMessage& call) {
 }
 
 QSGNode* WallpaperXItem::updatePaintNode(QSGNode* old, UpdatePaintNodeData*) {
-    auto* node = static_cast<QSGSimpleTextureNode*>(old);
+    auto* node = static_cast<FrameNode*>(old);
 
-    // An image this item has given back must stop being presented, and only a pass with the context
-    // current can free the texture that holds it. Taken before the window checks, so a pass that
-    // returns early does not leave the request standing for the next one to act on late.
-    bool dropNode = false;
+    // What the GUI thread has asked of the node, and the only place it can be done: freeing a
+    // texture or an import needs the context this pass has. Taken before the window checks, so a
+    // pass that returns early does not leave the request standing for the next one to act on late.
+    NodeRequest request = NodeRequest::None;
     {
         std::lock_guard<std::mutex> lock(m_importedMutex);
-        dropNode = std::exchange(m_dropNode, false);
+        request = std::exchange(m_nodeRequest, NodeRequest::None);
         // Cleared here too: a pass that was already importing when the drop was asked for writes
         // "a node is drawing" back afterwards, and this is the pass that makes that untrue.
-        if (dropNode) {
+        if (request == NodeRequest::Destroy) {
             m_shownGeneration = 0;
             m_nodeHasFrame = false;
         }
     }
-    if (dropNode) {
+    if (request == NodeRequest::Destroy) {
         delete node;
         node = nullptr;
         // The render thread must not emit, so the published reason is recomputed on the item's own.
         QMetaObject::invokeMethod(this, [this] { publishReason(); }, Qt::QueuedConnection);
+    } else if (request == NodeRequest::ForgetStaleImports && node != nullptr) {
+        node->forgetAllButDrawn();
     }
 
     // No window or no interface is transient -- a reparent in progress -- so nothing is reported
@@ -1250,38 +1491,100 @@ QSGNode* WallpaperXItem::updatePaintNode(QSGNode* old, UpdatePaintNodeData*) {
             reportImportModifiersOnce(incoming->request.drmFormat);
         }
         dropUnwaitableSync(incoming->request);
-        const FrameImport::Result imported = FrameImport::import(incoming->request);
-        // Null means nothing took ownership of the import, so it is freed by hand here.
-        QSGTexture* texture =
-            imported.texture == 0
-                ? nullptr
-                // No alpha flag: every fourcc the daemon can export is an X variant, so the alpha
-                // bytes are undefined and the scene graph must not blend against them.
-                : QNativeInterface::QSGOpenGLTexture::fromNative(
-                      imported.texture, host,
-                      QSize(static_cast<int>(incoming->request.width), static_cast<int>(incoming->request.height)),
-                      {});
-        if (texture == nullptr) {
-            // A texture name with no error is not the importer's refusal: the import succeeded and
-            // the scene graph would not wrap it, which carries no reason of its own.
-            reportImportFailure(imported.texture == 0
-                                    ? imported.error
-                                    : std::string("the scene graph would not wrap the imported texture"));
-            if (imported.texture != 0) FrameImport::release(imported);
-            // A failed import outranks what EGL said it could take: this modifier demonstrably
-            // does not work here, so stop the daemon choosing it again.
-            if (incoming->request.handleType == FrameImport::HandleType::DmaBuf) {
+
+        const ImportKey key = importKeyFor(incoming->claim, incoming->request);
+        // An import is drawn again only for a picture that brings the producer's hand-over: waiting
+        // on it is the one thing that tells the driver the memory holds something else now, and
+        // neither extension promises anything without it. A picture arriving without one is
+        // described to the driver afresh, as every picture was before imports were kept.
+        const FrameNode::Import* reused =
+            node != nullptr && carriesHandOver(incoming->request) ? node->held(key) : nullptr;
+
+        Stopped stopped = Stopped::Nothing;
+        std::string failure;
+        unsigned int importedTexture = 0;  // the GL name this picture's hand-over is waited on against
+        if (reused != nullptr) {
+            // The memory descriptor goes unused: the import it would produce is the one held.
+            if (incoming->request.fd >= 0) ::close(incoming->request.fd);
+            incoming->request.fd = -1;
+            importedTexture = reused->name();
+        } else {
+            // import() is handed no hand-over to perform, which is what makes its failure
+            // readable: doing both halves it answers one error for two questions, and only one of
+            // them is a verdict on the layout. Put back on the line after -- ~PendingFrame is what
+            // closes them, and nothing between the two throws.
+            std::vector<int> handOver;
+            handOver.swap(incoming->request.syncFds);
+            const FrameImport::Result memory = FrameImport::import(incoming->request);
+            handOver.swap(incoming->request.syncFds);
+
+            // Null means nothing took ownership of the import, so it is freed by hand below.
+            // No alpha flag: every fourcc the daemon can export is an X variant, so the alpha
+            // bytes are undefined and the scene graph must not blend against them.
+            QSGTexture* texture =
+                memory.texture == 0
+                    ? nullptr
+                    : QNativeInterface::QSGOpenGLTexture::fromNative(
+                          memory.texture, host,
+                          QSize(static_cast<int>(incoming->request.width), static_cast<int>(incoming->request.height)),
+                          {});
+            if (memory.texture == 0) {
+                stopped = Stopped::Layout;
+                failure = memory.error;
+            } else if (texture == nullptr) {
+                // The import succeeded and the scene graph would not take it, which is Qt's answer
+                // and not the driver's, and carries no reason of its own.
+                stopped = Stopped::Wrapping;
+                failure = "the scene graph would not wrap the imported texture";
+                FrameImport::release(memory);
+            } else {
+                // Built only now: a node handed back without a texture is a null dereference
+                // inside the scene graph.
+                if (node == nullptr) node = new FrameNode();
+                node->adopt(key, memory, texture);
+                importedTexture = memory.texture;
+            }
+        }
+
+        // The hand-over, per picture, whichever way its memory got here.
+        if (stopped == Stopped::Nothing && !FrameImport::acquire(incoming->request, importedTexture, &failure)) {
+            stopped = Stopped::HandOver;
+            ++m_handOversFailed;
+        }
+
+        // A picture that could not be handed over leaves the node drawing the last one that was, so
+        // the item neither blanks nor says it is drawing nothing -- this file's rule elsewhere is
+        // that a frame on screen outranks a message about a fetch that failed. Its imports stay
+        // with it: every one is still good.
+        //
+        // Bounded, because that tolerance is for a blip. A hand-over that has stopped working
+        // altogether would otherwise freeze the wallpaper on one picture while the item went on
+        // reporting that it is drawing normally, which is the one state nothing else here can tell
+        // the user about.
+        const bool stillDrawing = stopped == Stopped::HandOver && m_handOversFailed <= kToleratedHandOverFailures &&
+                                  node != nullptr && node->texture() != nullptr;
+
+        if (stopped != Stopped::Nothing) {
+            reportImportFailure(failure);
+            // Only a refusal to describe the memory is evidence about the layout. A hand-over that
+            // could not be performed says nothing about it -- the wait is the same whichever
+            // modifier the frame arrived in -- and withdrawing on one would take a layout this
+            // driver demonstrably imports out of the daemon's hands for the session.
+            if (stopped == Stopped::Layout && incoming->request.handleType == FrameImport::HandleType::DmaBuf) {
                 withdrawImportModifier(incoming->request.drmFormat, incoming->request.drmModifier);
             }
-            setRenderReason(tr("WallpaperX produced a frame this desktop could not import."));
-            // The node goes too: keeping one would leave the desktop showing a frame while the
-            // item reports it is drawing nothing.
-            delete node;
-            node = nullptr;
-            {
-                std::lock_guard<std::mutex> lock(m_importedMutex);
-                m_shownGeneration = 0;
-                m_nodeHasFrame = false;
+            if (!stillDrawing) {
+                setRenderReason(tr("WallpaperX produced a frame this desktop could not import."));
+                // The node goes too, and with it every import it held: keeping one would leave the
+                // desktop showing a frame while the item reports it is drawing nothing, and a
+                // layout the failure has just renegotiated makes those imports worthless anyway.
+                delete node;
+                node = nullptr;
+                {
+                    std::lock_guard<std::mutex> lock(m_importedMutex);
+                    m_shownGeneration = 0;
+                    m_nodeHasFrame = false;
+                }
             }
             // Asked for once more. A still wallpaper sends no further FrameReady, so without this
             // a transient failure is permanent. The whole decision runs on the item's own thread,
@@ -1305,38 +1608,18 @@ QSGNode* WallpaperXItem::updatePaintNode(QSGNode* old, UpdatePaintNodeData*) {
                 },
                 Qt::QueuedConnection);
         } else {
-            // Built only now: a node handed back without a texture is a null dereference inside
-            // the scene graph.
-            if (node == nullptr) {
-                node = new QSGSimpleTextureNode();
-                // Load-bearing for the release below: the node destroying its texture is what
-                // frees the import.
-                node->setOwnsTexture(true);
-                node->setFiltering(QSGTexture::Linear);
-            }
-            // Tied to the texture rather than scheduled as a render job: a NoStage job posted
-            // against an unexposed window is dropped without running, and by then this is the
-            // only reference left. Node teardown and setTexture both run on the render thread
-            // with the context current, which release needs.
-            //
-            // The claim travels with the texture, since the texture is what is reading the
-            // image -- and it outlives this item. Given back only after the GL objects are gone
-            // AND the GPU has run the commands that sampled them, never before: telling the
-            // daemon first invites it to draw into memory this process is still reading.
-            QObject::connect(
-                texture, &QObject::destroyed, texture,
-                [imported, claims = incoming->claims, claim = std::exchange(incoming->claim, BufferClaims::Claim{})] {
-                    FrameImport::release(imported);
-                    // Silent if the item gave this image back on its way off the screen: it is the
-                    // same claim, and releasing it twice would free an image a second reader of
-                    // this process still holds.
-                    if (claims && claims->remove(claim)) releaseClaimWhenReadsFinish(claim);
-                },
-                Qt::DirectConnection);
-            // Destroys the texture it replaces, which is what runs the handler above for the
-            // previous frame and gives that image back.
-            node->setTexture(texture);
-            node->markDirty(QSGNode::DirtyMaterial);
+            // Both counted at the one event they describe -- a picture drawn -- so their sum is
+            // what this item put on the screen and the split is how much of it needed an import of
+            // its own. Counted at the top of either branch they would count attempts, and no
+            // relation between them would be assertable.
+            (reused == nullptr ? m_importCount : m_reusedImportCount).fetch_add(1, std::memory_order_relaxed);
+            // The run of failed hand-overs is over: this is the picture that proves it.
+            m_handOversFailed = 0;
+            // The claim goes to the node, which is what samples the image, and is taken out of the
+            // frame so ~PendingFrame does not give back an image about to be drawn. The node holds
+            // it only until the next picture is sampled -- the import it belongs to is kept, the
+            // daemon's permission to draw is not.
+            node->present(key, incoming->claims, std::exchange(incoming->claim, BufferClaims::Claim{}));
             {
                 std::lock_guard<std::mutex> lock(m_importedMutex);
                 // Only if nothing invalidated the marks while the import ran. The lock cannot be
@@ -1348,12 +1631,18 @@ QSGNode* WallpaperXItem::updatePaintNode(QSGNode* old, UpdatePaintNodeData*) {
                 // true whatever the epoch did while the import ran.
                 m_nodeHasFrame = true;
             }
-            // Cleared so "retried once" means once per failure, not once per session: the same
-            // generation can be re-fetched later (a window change re-asks) and must be allowed
-            // its retry again if that import fails too.
+            // What a drawn picture owes this item's own thread. The retry mark is cleared so
+            // "retried once" means once per failure, not once per session: the same generation can
+            // be re-fetched later (a window change re-asks) and must be allowed its retry again if
+            // that import fails too. The counts are announced here rather than from a hop of their
+            // own, which would be a second queued event per video frame; the render thread may not
+            // emit at all.
             QMetaObject::invokeMethod(
                 this,
-                [this] { m_retriedGeneration = 0; },
+                [this] {
+                    m_retriedGeneration = 0;
+                    emit importCountsChanged();
+                },
                 Qt::QueuedConnection);
             setRenderReason(QString());
         }

@@ -353,14 +353,12 @@ int main(int argc, char** argv) {
             //       change on any pass where the item defers its update, and its failure branch
             //       would be indistinguishable from a real empty reason. The loop cannot pass by
             //       timing out: expiry leaves `reasonAppeared` false, which fails the check.
-            // CONTROL: on the texture == 0 branch of WallpaperXItem::updatePaintNode in
-            //       backend/kde/wallpaperx_item.cpp, the `setRenderReason(tr("WallpaperX
-            //       produced a frame this desktop could not import."))` call replaced with
+            // CONTROL: in the `if (!stillDrawing)` block of WallpaperXItem::updatePaintNode's
+            //       failure branch (backend/kde/wallpaperx_item.cpp), `setRenderReason(tr("WallpaperX
+            //       produced a frame this desktop could not import."))` replaced with
             //       `setRenderReason(QString())` -> "FAIL: a failed import publishes a non-empty
             //       unavailableReason, readable from QML" plus the next check, printing
-            //       "published reason was: []", after the full 5s. Re-run 2026-09-06: the branch
-            //       no longer calls setUnavailableReason, which the earlier annotation named and
-            //       which no longer exists. Reverted.
+            //       "published reason was: []", after the full 5s. Observed 2026-09-22. Reverted.
             // COVERAGE-ASSERT: the check above -- reason empty before this loop -- and this one
             //       together pin the transition to a sync pass. A count of passes was tried and
             //       dropped: it cannot fail, since the loop increments it beside the very call it
@@ -381,12 +379,11 @@ int main(int argc, char** argv) {
             //       and this test exists to distinguish exactly those. The stub sending a sync
             //       descriptor is what makes it grade S12.11 as well; without one the reply never
             //       enters the branch that reads the field.
-            // CONTROL: the texture == 0 branch of WallpaperXItem::updatePaintNode in
-            //       backend/kde/wallpaperx_item.cpp made to publish the could-not-take-hold-of
+            // CONTROL: the `if (!stillDrawing)` block of WallpaperXItem::updatePaintNode's failure
+            //       branch (backend/kde/wallpaperx_item.cpp) made to publish the could-not-take-hold-of
             //       message instead -> "FAIL: the published reason is the one for an import that
-            //       failed", alone, and the diagnostic below named the wrong string. Re-run
-            //       2026-08-31 -- the sync-fd message this control used to name no longer exists
-            //       in production. Reverted.
+            //       failed", alone, printing "published reason was: [WallpaperX sent a frame this
+            //       plugin could not take hold of.]". Observed 2026-09-22. Reverted.
             // CONTROL (S12.11): the pre-fix refusal restored in WallpaperXItem::takeFrameReply
             //       (backend/kde/wallpaperx_item.cpp) -- `setFetchReason(...must be waited on...)`
             //       and return, for a non-empty sync_fds -> "FAIL: the published reason is the

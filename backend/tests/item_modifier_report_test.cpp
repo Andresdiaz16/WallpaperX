@@ -421,6 +421,12 @@ int main(int argc, char** argv) {
                 //       Observed red, the only failure in that run: "no further call reached the
                 //       stub across 200 served frame(s); the plugin has nothing left to withdraw
                 //       from". Reverted.
+                // CONTROL (S13.202, a refused memory import still withdraws): the withdrawal in
+                //       WallpaperXItem::updatePaintNode (backend/kde/wallpaperx_item.cpp) made
+                //       unreachable, `if (false && stopped == Stopped::Layout && ...)` -> this check
+                //       red with the same line; the only red across item_modifier_report and
+                //       item_modifier_retry, which does not depend on the withdrawal. Observed
+                //       2026-09-22. Reverted.
                 const quint64 servedLayout = expected.front();
                 stub.serveModifier(servedLayout);
                 const size_t beforeWithdrawals = stub.reports().size();

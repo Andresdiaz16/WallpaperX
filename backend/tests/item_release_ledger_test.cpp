@@ -15,10 +15,10 @@
 // plugin. Phases sharing a process would carry each other's state, and the daemon-restart phase
 // in particular has to be the first owner change this process ever sees.
 //
-//   repeat-import  -- one release per image, not per import. The plugin re-imports the image it
-//                     is already showing whenever the scene changes, so one image is genuinely
-//                     imported twice at once and the daemon may only be told when the last of
-//                     those imports is gone.
+//   repeat-import  -- one release per image, not per hand-over. The daemon hands the image the
+//                     item is already showing over again as its ring cycles, so the item briefly
+//                     holds two claims on one image, and the daemon may only be told when the last
+//                     of those claims is gone.
 //   dropped-frame  -- a frame fetched and then dropped without ever being imported is released.
 //                     The daemon recorded the hold when it answered, so every path that walks
 //                     away from a reply owes it a release.
@@ -87,7 +87,7 @@ enum class Phase { RepeatImport, DroppedFrame, InFlightMonitorChange, DaemonRest
 const char* goalFor(Phase phase) {
     switch (phase) {
         case Phase::RepeatImport:
-            return "S12.15 (the daemon is told once per image, when the LAST live import of it is gone)";
+            return "S12.15 and S13.201 (the daemon is told once per image, when the LAST live claim on it is gone)";
         case Phase::DroppedFrame:
             return "S12.16 (a frame fetched and dropped without being imported is still released)";
         case Phase::InFlightMonitorChange:
@@ -443,11 +443,11 @@ bool runPhase(Phase phase) {
         // would leave those counts describing a different state.
         check(stub.releases().empty(), "nothing has been released while the item is showing the frame");
 
-        // Whether the scene graph has destroyed that first texture, watched rather than inferred
-        // from the item's texture pointer changing. Two reasons: setTexture() DELETES the one it
-        // replaces, so comparing pointers afterwards reads freed memory and the allocator is free
-        // to hand the same address back -- measured, and a genuine re-import read as no change at
-        // all. And it is the destruction, not the replacement, that the release hangs off.
+        // Whether that first texture has been destroyed, watched rather than inferred from the
+        // item's texture pointer changing: once destroyed, its address is the allocator's to hand
+        // straight back, so comparing pointers afterwards can read a new import as no change at all.
+        // The daemon-restart phase reads it: the node drops the imports of a daemon that has gone,
+        // which is when this texture goes.
         //
         // Scoped to the window, which outlives every local here, so a texture reaped during the
         // window's own teardown cannot write through a dead stack frame.
@@ -462,31 +462,31 @@ bool runPhase(Phase phase) {
             Qt::DirectConnection);
 
         if (phase == Phase::RepeatImport) {
-            // GOAL: the daemon is told once per IMAGE, not once per import. A newer generation can
-            //       arrive in the image the item is already showing -- the daemon's ring cycles,
-            //       so it hands the same buffer id back every few frames -- and the item then has
-            //       two imports of one image live at once; releasing on the first teardown hands
-            //       the daemon an image the older texture is still sampling from. This phase
-            //       drives that state with its own FrameReady rather than waiting for a scene
-            //       re-entry, which no longer re-asks: the item's scene-change path now goes
-            //       through ensureFrameRequested(), which is silent when it already holds a reply.
-            // WHY-THIS-SHAPE: the negative check comes first and is what carries the property.
-            //       "One release at the end" alone is equally true of a plugin that releases on
-            //       the FIRST teardown and sends nothing on the second -- which is exactly what a
-            //       claim held as a flag rather than a count does. Only asking, after the first
-            //       texture is gone and before the second is, whether anything was sent can tell
-            //       those apart.
+            // GOAL: S12.15, restated by Stage F (S13.201) -- the daemon is told once per IMAGE, when
+            //       the LAST claim on it goes, not once per hand-over. A newer generation can arrive
+            //       in the image the item is already showing -- the daemon's ring cycles, so it hands
+            //       the same buffer id back every few frames -- and between that reply being taken
+            //       and the node moving on to it, the item holds two live claims on one image. The
+            //       older one is given back as the node switches; releasing then would hand the
+            //       daemon an image the node is about to sample.
+            // WHY-THIS-SHAPE: the state is now two live CLAIMS, not two live imports: imports are
+            //       kept per image since Stage F, so a second hand-over of the same image is drawn
+            //       through the import already held and there are never two imports of it. The
+            //       negative check comes first and is what carries the property: "one release at the
+            //       end" alone is equally true of a plugin that releases on the FIRST give-back and
+            //       sends nothing on the second -- which is what a claim held as a flag rather than a
+            //       count does. Only asking, after the older claim has been given back and before the
+            //       newer one is, whether anything was sent can tell those apart.
             // CONTROL: `++entry->imports;` in BufferClaims::take (backend/kde/buffer_claims.cpp)
-            //       replaced by a bare `;`, so a repeat import records nothing -> "FAIL: nothing
-            //       is released while a second import of that image is still live", printing "it
-            //       released monitor 0 image 1 with an import still live", "FAIL: and it is
-            //       released once, not once per import" printing 2 releases, and the settle
-            //       premise above red as well -- a superseded reply releases early there for the
-            //       same reason. Reverted.
-            // COVERAGE-ASSERT: the first texture is required to have been DESTROYED and a second
-            //       frame served, so a run in which the item never re-imported -- and therefore
-            //       never built the two-live-imports state -- fails here instead of reporting the
-            //       release accounting as established.
+            //       replaced by a bare `;`, so a repeat claim records nothing -> "FAIL: nothing is
+            //       released while a second claim on that image is still live", printing "it
+            //       released monitor 0 image 1 with a claim still live". Observed 2026-09-22 on the
+            //       NVIDIA entry. Reverted.
+            // COVERAGE-ASSERT: the second picture is required to have been drawn through the
+            //       import kept for that image, and a second reply served, so a run that never put
+            //       two claims on one image fails here instead of reporting the accounting as
+            //       established.
+            const quint64 reusedBefore = scene.item->property("reusedImportCount").toULongLong();
             QDBusMessage ready = QDBusMessage::createSignal(QString::fromUtf8(kPath), QString::fromUtf8(kInterface),
                                                             QStringLiteral("FrameReady"));
             // One past the newest generation the item has read, so it is worth fetching. Counted
@@ -495,19 +495,18 @@ bool runPhase(Phase phase) {
             ready.setArguments({kFirstMonitor, static_cast<qulonglong>(servedAtSettle + 1)});
             bus.send(ready);
 
-            const bool reimported = pumpUntil(
-                [&scene, &firstTextureDestroyed] {
+            const bool drawnAgain = pumpUntil(
+                [&scene, reusedBefore] {
                     scene.renderPass();
-                    return firstTextureDestroyed && itemTexture(scene.item) != nullptr;
+                    return scene.item->property("reusedImportCount").toULongLong() > reusedBefore;
                 },
                 5000);
-            check(reimported, "the item re-imported the image it was already showing, replacing its texture");
-            if (!reimported) {
-                std::fprintf(stderr, "  the stub served %d frame(s) and the item asked %d time(s), first texture "
-                                     "destroyed: %s, a texture is present: %s, the item reports [%s]; the "
-                                     "two-live-imports state was never built\n",
-                             stub.served(), stub.requests(), firstTextureDestroyed ? "yes" : "no",
-                             itemTexture(scene.item) != nullptr ? "yes" : "no",
+            check(drawnAgain, "the image the item was already showing is handed over again and drawn through the "
+                              "import kept for it");
+            if (!drawnAgain) {
+                std::fprintf(stderr, "  the stub served %d frame(s) and the item asked %d time(s), the item reports "
+                                     "[%s]; the two-live-claims state was never built\n",
+                             stub.served(), stub.requests(),
                              scene.root->property("publishedReason").toString().toStdString().c_str());
                 scene.root.reset();
                 scene.renderPass();
@@ -515,36 +514,34 @@ bool runPhase(Phase phase) {
                 return true;
             }
             check(stub.served() > servedAtSettle,
-                  "the stub served the same image again, which is what makes two imports of it live");
+                  "the stub served the same image again, which is what puts two claims on it");
 
-            // The first texture was destroyed by the replacement above. Nothing may have been
-            // sent: the second import of that image is still live.
+            // The older claim was given back as the node moved to the new picture. Nothing may
+            // have been sent: the newer claim on that image is still live.
             pumpFor(300);
-            check(stub.releases().empty(), "nothing is released while a second import of that image is still live");
+            check(stub.releases().empty(), "nothing is released while a second claim on that image is still live");
             if (!stub.releases().empty()) {
-                std::fprintf(stderr, "  it released monitor %d image %llu with an import still live\n",
+                std::fprintf(stderr, "  it released monitor %d image %llu with a claim still live\n",
                              stub.releases().front().monitorId,
                              static_cast<unsigned long long>(stub.releases().front().bufferId));
             }
 
-            // GOAL: and exactly one release when the last import goes.
-            // CONTROL: `releaseClaimWhenReadsFinish(claim);` deleted from the
-            //       QSGTexture::destroyed lambda in WallpaperXItem::updatePaintNode
-            //       (backend/kde/wallpaperx_item.cpp) -> "FAIL: the last import going is what
-            //       releases the image", printing "0 release(s) for one image imported twice".
-            //       Reverted.
-            // CONTROL: `releaseClaim(claim);` deleted from
-            //       WallpaperXItem::PendingFrame::~PendingFrame (backend/kde/wallpaperx_item.cpp)
-            //       -> the same line red, for the other reason: the claim a superseded reply
-            //       never gives back leaves the count one too high forever, so the last texture
-            //       teardown decrements to one instead of nought and says nothing. Reverted.
+            // GOAL: and exactly one release when the last claim goes.
+            // CONTROL: in WallpaperXItem::releaseHeldImages (backend/kde/wallpaperx_item.cpp), the
+            //       retired set's `releaseClaim(claim);` made `(void)claim;` -> "FAIL: the last claim
+            //       going is what releases the image", printing "0 release(s) for one image handed
+            //       over twice". The item's own teardown is what gives the last claim back: it
+            //       retires the set first, so the node's destructor finds nothing to release, and
+            //       emptying ~FrameNode's release instead leaves this green (the node's release is
+            //       graded in item_cache_handover, where a failure destroys the node and not the
+            //       item). Both observed 2026-09-22 on the NVIDIA entry. Reverted.
             scene.root.reset();
             scene.renderPass();
             const bool released = pumpUntil([&stub] { return !stub.releases().empty(); }, 2000);
-            check(released, "the last import going is what releases the image");
-            check(stub.releases().size() <= 1, "and it is released once, not once per import");
+            check(released, "the last claim going is what releases the image");
+            check(stub.releases().size() <= 1, "and it is released once, not once per hand-over");
             if (stub.releases().size() != 1) {
-                std::fprintf(stderr, "  %zu release(s) for one image imported twice\n", stub.releases().size());
+                std::fprintf(stderr, "  %zu release(s) for one image handed over twice\n", stub.releases().size());
             }
             scene.control.invalidate();
             return true;
@@ -616,8 +613,8 @@ bool runPhase(Phase phase) {
             return true;
         }
 
-        // Replacing the texture destroyed the first one, which is where the previous daemon's
-        // claim lived. Nothing may have been sent to the successor.
+        // Drawing the successor's picture let go of the one before it, whose claim the previous
+        // daemon granted. Nothing may have been sent to the successor.
         pumpFor(300);
         check(successor.releases().empty(),
               "the claim the previous daemon granted is not released against its successor");

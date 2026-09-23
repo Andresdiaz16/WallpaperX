@@ -9,10 +9,11 @@
 // the texture is the opposite failure and is a use-after-free inside plasmashell. Neither shows
 // up as a wrong pixel, so nothing in the pixel-comparing probes can see either one.
 //
-// The whole check rests on one production decision: the release is attached to
-// QSGTexture::destroyed with Qt::DirectConnection, and the QSGSimpleTextureNode owns its texture.
-// A direct connection runs on whichever thread emits, so this file attaches a SECOND handler to
-// the same signal and asks, from outside, what was true at that instant.
+// The whole check rests on one production decision: the node the item hands the scene graph owns
+// the imports, and each import frees its GL objects and THEN deletes the scene-graph texture
+// wrapped round them. So the texture's destroyed signal, handled directly, fires on whichever
+// thread the node was destroyed on, just after the free -- and this file asks, from outside, what
+// was true at that instant.
 //
 // The THREAD half of that sentence is printed rather than asserted, and the annotation at the
 // print says why: QQuickRenderControl runs the scene graph on the thread that calls sync(), so
@@ -279,17 +280,20 @@ bool runReleaseChecks() {
         //       exposes none. Which arm this host ran is printed instead, so a reader knows what
         //       was demonstrated. `imported` is the existing bounded pump: it cannot pass by
         //       expiring, since expiry leaves it false and the branch below reports.
-        // CONTROL (S12.13): `return false;` at the top of FrameImport::acquire in
-        //       backend/kde/frame_import.cpp -> "FAIL: the item imported the frame the daemon
-        //       served", with the run printing that this context CAN wait and that the stub sent
-        //       one acquire descriptor. Observed 2026-08-31. Reverted.
+        // CONTROL (S12.13): `return false;` at the top of the public FrameImport::acquire in
+        //       backend/kde/frame_import.cpp -- the hand-over the item performs itself since Stage F
+        //       -> "FAIL: the item imported the frame the daemon served", with the run printing that
+        //       this context CAN wait and that the stub sent one acquire descriptor. The same at
+        //       the top of FrameImport::waitOnSyncFds (the private wait, which carried the name
+        //       `acquire` before Stage F) -> the same line red. Both re-observed 2026-09-22 on the
+        //       NVIDIA entry. Reverted.
         // CONTROL (S12.14): two stacked, the first to reach the state and the second to violate
         //       the property. FrameImport::supportsSync in backend/kde/frame_import.cpp forced to
         //       return false puts this host on the cannot-wait arm -- the run printed CANNOT and
         //       stayed GREEN, which is the property holding. dropUnwaitableSync in
         //       backend/kde/wallpaperx_item.cpp then made an immediate `return;` on top of that ->
-        //       "FAIL: the item imported the frame the daemon served". Observed 2026-08-31. Both
-        //       reverted.
+        //       "FAIL: the item imported the frame the daemon served". Re-observed 2026-09-22 on the
+        //       NVIDIA entry. Both reverted.
         // COVERAGE-ASSERT: the number of acquire descriptors the stub actually sent is asserted,
         //       against the driver's own answer to whether it can export one. Without it, a stub
         //       that stopped sending one leaves both arms of this claim about a reply that carries
@@ -390,10 +394,10 @@ bool runReleaseChecks() {
         //       read as "already freed" and fail for the wrong reason. The obvious simpler form,
         //       a single query after one sync, cannot distinguish "still alive" from "not yet
         //       reached the code that would free it".
-        // CONTROL: `FrameImport::release(imported);` added immediately after `node->setTexture(
-        //       texture);` in WallpaperXItem::updatePaintNode, backend/kde/wallpaperx_item.cpp
-        //       -> "FAIL: the imported GL texture stays alive while the item is showing the
-        //       frame", printing "0 of 6 passes found it live". Observed 2026-08-22. Reverted.
+        // CONTROL: `FrameImport::release(imported);` added at the end of FrameNode::adopt in
+        //       backend/kde/wallpaperx_item.cpp -- the import freed as the node takes it -> "FAIL:
+        //       the imported GL texture stays alive while the item is showing the frame", printing
+        //       "0 of 6 passes found it live". Re-observed 2026-09-22 on the NVIDIA entry. Reverted.
         // COVERAGE-ASSERT: the pass count is asserted, and the control for it is the reason it is
         //       here rather than a comment. With the loop bound forced to zero -- a stand-in for
         //       any future edit that stops entering it -- the liveness check itself stayed GREEN,
@@ -413,18 +417,18 @@ bool runReleaseChecks() {
         if (passesLive != passesRun) {
             std::fprintf(stderr, "  %d of %d passes found it live\n", passesLive, passesRun);
         }
-        // The barrier the destruction phase below rests on, and it is checked rather than assumed
-        // for a concrete reason: node->setTexture() destroys the texture it replaces, so a second
-        // served frame would delete the object this file is about to attach a handler to. That is
-        // a dangling pointer in the harness -- measured, by removing the stub's one-frame guard:
-        // the run died without printing its own summary, which is the one thing a harness must
-        // never do. Both facts are reported, then the phase is abandoned.
-        // CONTROL: the stub's `if (m_served > 0)` refusal disabled, and a FrameReady signal sent
+        // The barrier the destruction phase below rests on, checked rather than assumed: a second
+        // served frame can move the node to another texture and free this one, which would leave
+        // the handler below attached to a dead object -- a dangling pointer in the harness, and a
+        // run that dies without printing its own summary. Both facts are reported, then the phase
+        // is abandoned.
+        // CONTROL: the stub's exhausted-sequence refusal disabled, and a FrameReady signal sent
         //       from this file after the texture was captured -> both checks red, "the item kept
         //       the same scene-graph texture across the liveness passes" and "the stub served
         //       exactly one frame, so no second import replaced the texture", and the phase
-        //       abandoned instead of dereferencing the replaced texture. Observed 2026-08-22.
-        //       Both reverted.
+        //       abandoned instead of dereferencing the replaced texture. Observed 2026-08-22,
+        //       before imports were kept; not re-run since -- it mutates this harness, not the
+        //       plugin.
         const bool sameTexture = itemTexture(item) == texture;
         check(sameTexture, "the item kept the same scene-graph texture across the liveness passes");
         check(stub.served() == 1, "the stub served exactly one frame, so no second import replaced the texture");
@@ -437,26 +441,18 @@ bool runReleaseChecks() {
 
         // GOAL: S12.4's core -- when the scene graph destroys the imported texture, the release
         //       has ALREADY run, on that thread, with that thread's GL context current.
-        // WHY-THIS-SHAPE: a second handler on the same QSGTexture::destroyed signal, attached
-        //       AFTER the plugin's, because Qt activates direct slots in connection order -- so
-        //       this one observes the state the plugin's release left behind. That ordering is
-        //       load-bearing: reversed, glIsTexture would still report the name live and this
-        //       would fail for the wrong reason. The obvious simpler form -- check the name after
-        //       the frame that tears the node down -- cannot tell "freed by the texture's own
-        //       destruction" from "freed later by anything at all", and it is exactly the "later,
-        //       somewhere else" shapes (a queued connection, a free from releaseResources on the
-        //       GUI thread) that this goal exists to exclude.
-        // CONTROL: Qt::DirectConnection changed to Qt::QueuedConnection on the
-        //       QSGTexture::destroyed connection in WallpaperXItem::updatePaintNode,
-        //       backend/kde/wallpaperx_item.cpp -> "FAIL: the import was already released by the
-        //       time the scene graph's texture destruction returned", printing "GL name 1 was
-        //       still a live GL texture after the scene graph destroyed the QSGTexture that owned
-        //       it", and no other check red. Observed 2026-08-22. Reverted.
-        // CONTROL, the pre-fix shape: that connection removed entirely, the FrameImport::Result
-        //       stored on the item instead, and FrameImport::release() called from
-        //       WallpaperXItem::releaseResources() in backend/kde/wallpaperx_item.cpp -- freeing
-        //       on the GUI thread, which is what shipped before -> the same check red with the
-        //       same diagnostic. Observed 2026-08-22. Reverted.
+        // WHY-THIS-SHAPE: a handler on the scene-graph texture's destroyed signal, direct, because
+        //       the plugin frees each import and THEN deletes the texture wrapped round it (in the
+        //       node's import, backend/kde/wallpaperx_item.cpp) -- so at that instant this handler
+        //       sees what the free left behind. The obvious simpler form -- check the name after the
+        //       frame that tears the node down -- cannot tell "freed with the texture" from "freed
+        //       later by anything at all", and "later, somewhere else" is what this goal excludes.
+        // CONTROL: in FrameNode::Import::free() (backend/kde/wallpaperx_item.cpp), `delete
+        //       m_texture;` moved above `FrameImport::release(m_imported);` -> "FAIL: the import was
+        //       already released by the time the scene graph's texture destruction returned",
+        //       printing "GL name 1 was still a live GL texture after the scene graph destroyed the
+        //       QSGTexture that owned it", and no other check red. Observed 2026-09-22 on the NVIDIA
+        //       entry. Reverted.
         DestroyObservation seen;
         // Disconnected on every exit, and declared AFTER `seen` so it runs BEFORE `seen` dies.
         // The connection is scoped to `window`, which is declared earlier and so outlives these
@@ -494,12 +490,12 @@ bool runReleaseChecks() {
         //       about WHEN and WHERE, and all of it is vacuous if the texture simply outlives the
         //       item -- which is a whole screen's worth of GPU memory leaked per unplugged
         //       monitor, silently.
-        // CONTROL: `node->setOwnsTexture(true);` changed to `false` in
-        //       WallpaperXItem::updatePaintNode, backend/kde/wallpaperx_item.cpp -> "FAIL: the
-        //       scene graph destroyed the imported texture when the item went away", printing
+        // CONTROL: FrameNode::Import's destructor emptied (`~Import() {}`) in
+        //       backend/kde/wallpaperx_item.cpp, so no import is ever freed -> "FAIL: the scene
+        //       graph destroyed the imported texture when the item went away", printing
         //       "QSGTexture::destroyed never fired, so nothing could have released the import".
-        //       The checks below did not run, which is why they sit inside the else. Observed
-        //       2026-08-22. Reverted.
+        //       The checks below did not run, which is why they sit inside the else. Re-observed
+        //       2026-09-22 on the NVIDIA entry. Reverted.
         const bool destroyed = seen.count > 0;
         check(destroyed, "the scene graph destroyed the imported texture when the item went away");
         if (!destroyed) {
@@ -516,14 +512,15 @@ bool runReleaseChecks() {
             //       it answered for. The assertion takes the two that no windowing system can
             //       defeat, plus the harness's own record of whether a render pass was open; the
             //       EGL one is printed beside them rather than asserted.
-            // CONTROL: the pre-fix shape one level up -- `node->setOwnsTexture(false)`, the
-            //       QSGTexture stored on the item, and `delete`d from
-            //       WallpaperXItem::releaseResources() in backend/kde/wallpaperx_item.cpp, so the
-            //       item frees it on the GUI thread as the item is torn down -> "FAIL: the
-            //       imported texture was destroyed inside a render pass, with a GL context
-            //       current", printing "in a render pass: no, Qt context current: no, EGL context
-            //       current: no, driver answered: no", and the check below correctly reported
-            //       that it could not answer rather than passing. Observed 2026-08-22. Reverted.
+            // CONTROL: none that reaches this line alone any more. It went red on 2026-08-22 when
+            //       the item held the texture and freed it from releaseResources() on the GUI thread;
+            //       since Stage F the item holds no pointer to its node or imports, so the only way
+            //       for a free to leave the render pass is to be deferred -- and ~FrameNode's imports
+            //       handed to a queued call on the application object (backend/kde/wallpaperx_item.cpp)
+            //       reddens the destruction check above first, "QSGTexture::destroyed never fired",
+            //       because this test reads before the event loop runs again. Observed 2026-09-22 on
+            //       the NVIDIA entry. Reverted. This line stays as the witness of WHERE a destruction
+            //       that does happen ran.
             check(seen.insideRenderPass && seen.qtContextCurrent && seen.glAnswered,
                   "the imported texture was destroyed inside a render pass, with a GL context current");
 
@@ -578,10 +575,12 @@ bool runReleaseChecks() {
         //       The buffer id is compared, not just the count: a release naming the wrong image
         //       is worse than none, since it invites the daemon to draw into one this process
         //       may still be sampling.
-        // CONTROL: `releaseClaimWhenReadsFinish(claim);` deleted from the QSGTexture::destroyed
-        //       lambda in WallpaperXItem::updatePaintNode (backend/kde/wallpaperx_item.cpp) ->
-        //       "FAIL: the plugin told the daemon it had let the image go", printing "0
-        //       release(s) arrived in two seconds after the texture was destroyed". Reverted.
+        // CONTROL: in WallpaperXItem::releaseHeldImages (backend/kde/wallpaperx_item.cpp), the
+        //       retired set's `releaseClaim(claim);` made `(void)claim;` -> "FAIL: the plugin told
+        //       the daemon it had let the image go", printing "0 release(s) arrived in two seconds
+        //       after the texture was destroyed". The item going away is what gives its image back;
+        //       ~FrameNode's own release finds the claim already retired, and emptying it leaves
+        //       this green. Both observed 2026-09-22 on the NVIDIA entry. Reverted.
         // CONTROL, for the id: `request.setArguments({monitorId, bufferId});` in
         //       sendReleaseBuffer (backend/kde/wallpaperx_item.cpp) changed to `bufferId + 1`
         //       -> "FAIL: and named the monitor and the image it had been given", printing "it

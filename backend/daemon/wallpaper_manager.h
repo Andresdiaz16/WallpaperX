@@ -7,6 +7,9 @@
 #include "crash_record.h"
 #include "kept_rows.h"
 #include "log_escape.h"
+// kTargetDepth and the two numbers behind it: separate because the KDE plugin sizes its import
+// cache against them and cannot include this header.
+#include "ring_depth.h"
 #include "vulkan/frame_export.h"
 
 #include <cstdint>
@@ -289,27 +292,6 @@ public:
     // this is far above any real driver and exists only to keep a client from sizing daemon
     // state.
     static constexpr size_t kMaxImportModifiers = 512;
-
-    // How many of a monitor's images one consumer may hold at once. Two, because a consumer
-    // that has fetched a new frame goes on sampling the old one until the new one is on screen.
-    //
-    // A third hand-over is REFUSED, not made room for: the daemon has no evidence the consumer
-    // has stopped reading its oldest image, and drawing into one it is still sampling is the
-    // tearing this ring exists to prevent. What the cap buys is the depth below -- without a
-    // per-consumer bound, no depth guarantees a second consumer anything.
-    static constexpr size_t kMaxHeldPerClient = 2;
-
-    // Consumers a monitor is sized for. Two: the desktop, and one auxiliary reader -- a
-    // screenshot tool, a settings preview, a debugging fetch over busctl.
-    static constexpr size_t kFullConsumers = 2;
-
-    // Images per monitor: the producer's reserve, plus a full hold for each consumer sized for.
-    // Nothing is ever taken back, so a consumer that fetches its fill and goes quiet keeps those
-    // images for the life of the daemon; at depth three that one consumer left the desktop
-    // refused forever, with no release coming to announce that it may ask again. A third silent
-    // consumer cannot be survived at any depth for the same reason, which is where the
-    // arithmetic stops paying: each one costs ~8 MB per monitor at 1080p.
-    static constexpr uint32_t kTargetDepth = 1 + static_cast<uint32_t>(kFullConsumers * kMaxHeldPerClient);
 
     // How many consumers may hold images on one monitor. Bounds what peers can make the daemon
     // remember; a further one is refused like any other hand-over. Unlike the reserve it can

@@ -473,7 +473,7 @@ void FrameImport::waitForReadsToFinish() {
 // no token meaning "whatever Vulkan last used", so the two sides naming the same layout is the
 // whole of the agreement -- and nothing checks it: an ownership transfer's halves are invisible
 // to the validation layers.
-bool FrameImport::acquire(Request& request, unsigned int texture, std::string& error) {
+bool FrameImport::waitOnSyncFds(Request& request, unsigned int texture, std::string& error) {
     const SemaphoreApi& api = semaphoreApi();
 
     for (int& syncFd : request.syncFds) {
@@ -687,7 +687,7 @@ FrameImport::Result FrameImport::import(Request& request) {
 
     if (mustAcquire) {
         std::string error;
-        if (!acquire(request, out.texture, error)) {
+        if (!waitOnSyncFds(request, out.texture, error)) {
             // The texture is sound but was never acquired, and handing it back would sample memory
             // whose ownership transfer is half done -- exactly what this exists to prevent.
             release(out);
@@ -697,6 +697,27 @@ FrameImport::Result FrameImport::import(Request& request) {
         }
     }
     return out;
+}
+
+bool FrameImport::acquire(Request& request, unsigned int texture, std::string* whyNot) {
+    const bool mustAcquire = std::any_of(request.syncFds.begin(), request.syncFds.end(),
+                                         [](int syncFd) { return syncFd >= 0; });
+    if (!mustAcquire) return true;
+    if (texture == 0) {
+        if (whyNot != nullptr) *whyNot = "there is no texture to acquire the frame against";
+        return false;
+    }
+    if (!supportsSync(whyNot)) return false;
+
+    // As import() does: a stale error from earlier in this context would otherwise be attributed
+    // to whichever call below is checked next.
+    while (glGetError() != GL_NO_ERROR) {
+    }
+
+    std::string error;
+    if (waitOnSyncFds(request, texture, error)) return true;
+    if (whyNot != nullptr) *whyNot = std::move(error);
+    return false;
 }
 
 FrameImport::Result FrameImport::importOpaqueFd(Request& request) {

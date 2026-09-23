@@ -260,13 +260,13 @@ constexpr int32_t kMonitorHoldLimit = 3;
 constexpr int32_t kMonitorReleaseWire = 0;
 
 // How many images a monitor is expected to hold, written out rather than taken from
-// WallpaperManager::kTargetDepth. Comparing the daemon against its own constant would make
+// wallpaperx::kTargetDepth (backend/daemon/ring_depth.h). Comparing the daemon against its own constant would make
 // "the ring is five deep" unfalsifiable: a change to kTargetDepth would move both sides of
 // the comparison at once and the checks built on it would stay green for any depth at all.
 constexpr int kExpectedRingDepth = 5;
 
 // The same, for how many images one consumer may hold before a further hand-over is refused,
-// and deliberately not WallpaperManager::kMaxHeldPerClient for the same reason.
+// and deliberately not wallpaperx::kMaxHeldPerClient for the same reason.
 constexpr int kExpectedHeldPerClient = 2;
 
 // The same again, for how many consumers may hold images on one monitor before a further one is
@@ -3871,13 +3871,13 @@ void runBufferHoldChecks(const wallpaperx::WallpaperManager::Config& config, con
     //       then return nothing and 0 differs from firstId. Which image the pixels actually
     //       landed in is established at the renderer tier by target_ring_probe, whose readback
     //       works on the opaque-fd GPU where a CPU mapping of the exported frame cannot.
-    // CONTROL: WallpaperManager::kTargetDepth (backend/daemon/wallpaper_manager.h) set to 1 ->
-    //       "FAIL: a render commits while a consumer holds the monitor's first image" and
-    //       "FAIL: that render drew into a different image from the one the consumer holds",
-    //       with the ids printed as 1, 0, 0. Observed with this phase temporarily moved to the
-    //       front of main(): at depth 1 the SHARED manager's only image is held by its own
-    //       consumer, so the render phase above throws before this one would be reached. Both
-    //       reverted.
+    // CONTROL: wallpaperx::kTargetDepth (backend/daemon/ring_depth.h) set to 2, with this phase
+    //       temporarily moved to the front of main() (in place, an earlier shared-manager phase
+    //       throws NoFreeImage first) -> "FAIL: that render drew into a different image from the
+    //       one the consumer holds", ids printed as 1, 0, 0: the second hand-over is refused as
+    //       the reserve. The "it commits" half stayed green, and depth 1 no longer reaches either
+    //       line -- the first hand-over is refused and the phase reports NOT VERIFIED. So no ring
+    //       depth reddens "it commits"; nothing else was tried. Observed 2026-09-22. Reverted.
     const bool secondCommitted = renderOnce(manager, kMonitorHoldRing, imagePath);
     check(secondCommitted, "a render commits while a consumer holds the monitor's first image");
     const uint64_t secondId = secondCommitted ? fetchFrame(manager, kMonitorHoldRing, alice) : 0;
@@ -3906,15 +3906,15 @@ void runBufferHoldChecks(const wallpaperx::WallpaperManager::Config& config, con
     // consumers are not holding four, the reserve is under no pressure, and the refusal below
     // would be grading a monitor with slack in it. Asserted before the refusal is read, so a run
     // that never built the state cannot report the refusal as established.
-    // CONTROL: WallpaperManager::kFullConsumers (backend/daemon/wallpaper_manager.h) lowered to
-    //       1, which shrinks the derived depth to three -> "FAIL: two consumers hold four of the
+    // CONTROL: wallpaperx::kFullConsumers (backend/daemon/ring_depth.h) lowered to 1, which
+    //       shrinks the derived depth to three -> "FAIL: two consumers hold four of the
     //       monitor's five images, so exactly one is free", printing "the ids handed out were 1,
     //       2, 0", and the phase stops there so no reserve check below is reported as
-    //       established. Reverted.
+    //       established. Re-observed 2026-09-22. Reverted.
     // CONTROL, the other direction: that same constant raised to 3, which deepens the ring to
     //       seven -> this line stays GREEN, correctly, and the refusal check below goes red,
     //       printing "the third consumer was handed image 5", with the four later checks that
-    //       depend on that refusal (re-observed 2026-09-16). That is the right attribution: the
+    //       depend on that refusal (re-observed 2026-09-22). That is the right attribution: the
     //       premise held and the daemon's behaviour is what changed. Reverted.
     const bool ringFilled = reserveRender && ringIds.size() == static_cast<size_t>(2 * kExpectedHeldPerClient) &&
                             allDistinct(ringIds);
@@ -4386,10 +4386,10 @@ void runBufferHoldChecks(const wallpaperx::WallpaperManager::Config& config, con
     //       above, not a claim of its own. The only production change that makes it false is a
     //       ring too shallow for one consumer's cap plus the reserve, and that reddens the ring
     //       premise earlier in this phase, which abandons before this line. Measured twice:
-    //       WallpaperManager::kFullConsumers lowered to 1 and, separately,
-    //       WallpaperManager::kTargetDepth set to `1 + kMaxHeldPerClient` (both backend/daemon/
-    //       wallpaper_manager.h) each produced "FAIL: two consumers hold four of the monitor's
-    //       five images, so exactly one is free" and nothing below it. Both reverted.
+    //       wallpaperx::kFullConsumers lowered to 1 and, separately, wallpaperx::kTargetDepth
+    //       set to `1 + kMaxHeldPerClient` (both backend/daemon/ring_depth.h) each produced
+    //       "FAIL: two consumers hold four of the monitor's five images, so exactly one is
+    //       free" and nothing below it. Re-observed 2026-09-22. Both reverted.
     const Handover byAnother = fetchHandover(manager, kMonitorHoldNeverReleases, bob);
     check(byAnother.served(), "and the monitor still had images free, so it was the cap that refused and not the "
                               "ring");
@@ -4524,10 +4524,11 @@ void runBufferReleaseWireChecks(const wallpaperx::WallpaperManager::Config& conf
         //       reaches main's catch-all, which prints "unexpected exception: [...NoFreeImage]"
         //       naming neither the phase nor which hand-over, and abandons every phase after
         //       this one (the worker-coalescing checks are graded nowhere else).
-        // CONTROL: kTargetDepth in backend/daemon/wallpaper_manager.h reduced by one, dropping
-        //       the reserve -> "FAIL: the ring hands out every image but the producer's reserve",
-        //       printing "hand-over 4 of 4 was refused with 'io.wallpaperx.Daemon.Error.
-        //       NoFreeImage'", and the phases after this one still ran. Reverted.
+        // CONTROL: wallpaperx::kTargetDepth in backend/daemon/ring_depth.h reduced by one,
+        //       dropping the reserve -> "FAIL: the ring hands out every image but the producer's
+        //       reserve", printing "hand-over 4 of 4 was refused with 'io.wallpaperx.Daemon.Error.
+        //       NoFreeImage'", and the phases after this one still ran. Re-observed 2026-09-22.
+        //       Reverted.
         wallpaperx::testing::Frame frame;
         try {
             frame = wallpaperx::testing::getFrameFd(taker, kMonitorReleaseWire);

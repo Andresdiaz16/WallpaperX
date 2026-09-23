@@ -96,8 +96,9 @@ if(NOT EXISTS "${HTTPLIB_INCLUDE_DIR}/httplib.h")
     )
 endif()
 
-# daemon/log_escape.h, header-only. A target rather than a bare include path because the
-# plugin needs it too: it logs text that arrived over the bus, exactly as the daemon does.
+# daemon/log_escape.h and daemon/ring_depth.h, header-only. A target rather than a bare
+# include path because the plugin needs both: it logs text that arrived over the bus exactly
+# as the daemon does, and it sizes its import cache against the daemon's ring depth.
 add_library(wallpaperx-log-escape INTERFACE)
 target_include_directories(wallpaperx-log-escape INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})
 
@@ -1237,6 +1238,35 @@ if(DBUS_RUN_SESSION)
                 WALLPAPERX_SHADER_DIR="${WALLPAPERX_SHADER_OUTPUT_DIR}"
                 WALLPAPERX_TEST_IMAGE_DIR="${WALLPAPERX_ITEM_ASSET_DIR}")
             add_dependencies(wallpaperx-item-offscreen-test wallpaperxplugin wallpaperx-shaders)
+            # Step 13 Stage F: what the item keeps imported, and that keeping it changes nothing it
+            # draws or tells the daemon. One entry per phase, for item_release_ledger's reason. The
+            # modifier phase forces a dma_buf export, the only kind with a layout to withdraw.
+            add_executable(wallpaperx-item-import-cache-test tests/item_import_cache_test.cpp)
+            target_link_libraries(wallpaperx-item-import-cache-test PRIVATE
+                wallpaperx-renderer wallpaperx-frame-import wallpaperx-log-escape
+                Qt6::Core Qt6::DBus Qt6::Gui Qt6::Qml Qt6::Quick Qt6::QuickPrivate
+                PkgConfig::EGL OpenGL::GL)
+            target_include_directories(wallpaperx-item-import-cache-test PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../renderer/tests)
+            target_compile_definitions(wallpaperx-item-import-cache-test PRIVATE
+                WALLPAPERX_QML_MODULE_PATH="${CMAKE_CURRENT_BINARY_DIR}/qml"
+                WALLPAPERX_SHADER_DIR="${WALLPAPERX_SHADER_OUTPUT_DIR}"
+                WALLPAPERX_TEST_IMAGE_DIR="${WALLPAPERX_ITEM_ASSET_DIR}")
+            add_dependencies(wallpaperx-item-import-cache-test wallpaperxplugin wallpaperx-shaders)
+            foreach(cache_phase counts single pixels no-acquire handover handover-reset handover-modifier
+                                stale-daemon stale-monitor offscreen)
+                set(cache_environment "QT_QPA_PLATFORM=wayland\;xcb\;offscreen;QT_NO_XDG_DESKTOP_PORTAL=1")
+                if(cache_phase STREQUAL "handover-modifier")
+                    set(cache_environment "${cache_environment};WALLPAPERX_FORCE_HANDLE_TYPE=dmabuf")
+                endif()
+                add_test(NAME item_cache_${cache_phase}
+                         COMMAND ${DBUS_RUN_SESSION} -- $<TARGET_FILE:wallpaperx-item-import-cache-test> ${cache_phase})
+                set_tests_properties(item_cache_${cache_phase} PROPERTIES
+                    ENVIRONMENT "${cache_environment}"
+                    RESOURCE_LOCK wallpaperx_bus_tests
+                    SKIP_RETURN_CODE 77)
+            endforeach()
+
             foreach(offscreen_phase hidden painted)
                 add_test(NAME item_offscreen_${offscreen_phase}
                          COMMAND ${DBUS_RUN_SESSION} --

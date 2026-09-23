@@ -131,6 +131,14 @@ public:
     // sampled before its ownership transfer completed, which shows as tearing nothing explains.
     static Result import(Request& request);
 
+    // The hand-over half of import(), against a texture import() already produced, consuming
+    // `request.syncFds`. For a caller that keeps an import and is handed the same image again: the
+    // memory is described to the driver once, but each frame drawn into it carries its own
+    // acquire and is unsafe to sample until that has been waited on.
+    //
+    // Refuses a wait this context cannot perform, exactly as import() does.
+    static bool acquire(Request& request, unsigned int texture, std::string* whyNot = nullptr);
+
 private:
     // The dma_buf half of import(), through EGLImage. Separate because the two paths share
     // nothing but their result: one hands the fd to GL, the other describes it to EGL.
@@ -145,7 +153,7 @@ private:
 
     // Waits on every descriptor in `request.syncFds` against `texture`, consuming them. The
     // acquire both paths need, so it runs after either has produced a texture.
-    static bool acquire(Request& request, unsigned int texture, std::string& error);
+    static bool waitOnSyncFds(Request& request, unsigned int texture, std::string& error);
 
 public:
     // Frees what import() returned. The GL half must run on the thread whose context created

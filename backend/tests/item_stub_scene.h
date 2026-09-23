@@ -21,6 +21,7 @@
 #include "vulkan/offscreen.h"
 
 #include <QCoreApplication>
+#include <QDBusArgument>
 #include <QDBusConnection>
 #include <QDBusMessage>
 #include <QDBusVirtualObject>
@@ -33,12 +34,15 @@
 
 #include <EGL/egl.h>
 #include <GL/gl.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 #include <array>
 #include <cstdint>
 #include <exception>
 #include <functional>
+#include <iterator>
+#include <map>
 #include <optional>
 #include <string>
 #include <utility>
@@ -77,6 +81,17 @@ inline void publishOneFrame(wallpaperx::Device& device, wallpaperx::OffscreenTar
                             const wallpaperx::OffscreenTarget& target, const char* fixtureName) {
     const std::string imagePath =
         wallpaperx::testing::writeGradientPng(std::string(WALLPAPERX_TEST_IMAGE_DIR) + "/" + fixtureName, 16, 16);
+    wallpaperx::StaticRenderer renderer(device, targets.renderPass(), imagePath, WALLPAPERX_SHADER_DIR);
+    targets.render(renderer, target);
+}
+
+// The same, drawing one flat colour: a picture a readback can name at a glance, so a check can
+// tell which of several pictures an import is showing.
+inline void publishSolidFrame(wallpaperx::Device& device, wallpaperx::OffscreenTargetManager& targets,
+                              const wallpaperx::OffscreenTarget& target, const std::string& fixtureName,
+                              std::array<unsigned char, 4> rgba) {
+    const std::string imagePath =
+        wallpaperx::testing::writeSolidPng(std::string(WALLPAPERX_TEST_IMAGE_DIR) + "/" + fixtureName, 16, 16, rgba);
     wallpaperx::StaticRenderer renderer(device, targets.renderPass(), imagePath, WALLPAPERX_SHADER_DIR);
     targets.render(renderer, target);
 }
@@ -137,6 +152,40 @@ public:
     void holdNextReply() { m_holdNext = true; }
     bool replyIsHeld() const { return m_heldConnection.has_value(); }
 
+    // Serves the sequence round and round instead of refusing once it runs out: a daemon's ring,
+    // handing the same few images back in turn for as long as it is asked.
+    void rotate() { m_rotate = true; }
+
+    // Serves `target` for the next request only, whatever the sequence says, for a check that needs
+    // one particular image to come round next.
+    void serveNext(const wallpaperx::OffscreenTarget* target) { m_serveNext = target; }
+
+    // Holds the reply to the request that would be served as number `number` (counting from one),
+    // as holdNextReply() does. Decided here, as the request arrives, rather than armed by the test
+    // after it has seen the previous one served: the item asks again on its own after a failed
+    // picture, and a hold armed from outside races that request.
+    void holdServeNumber(int number) { m_holdAtServe = number; }
+
+    // What goes beside the memory descriptor on every further reply, in place of the daemon's
+    // acquire. `None` is what a driver that cannot export one sends; `Unusable` is a descriptor the
+    // importer cannot wait on -- a memfd, which is no semaphore -- so the picture's memory imports
+    // and its hand-over fails, the one way a hand-over failure can be staged from outside the item.
+    enum class Acquire { Real, None, Unusable };
+    void sendAcquire(Acquire mode) { m_acquireFrom = {{1, mode}}; }
+    // The same, from the reply served as number `serveNumber` on (counting from one), leaving the
+    // replies before it as they were scheduled. Decided per reply as it is built, for
+    // holdServeNumber()'s reason: the item's own re-asks do not wait for the test.
+    void sendAcquireFrom(int serveNumber, Acquire mode) { m_acquireFrom[serveNumber] = mode; }
+
+    // Every SetImportModifiers the item sent, answered with success as the daemon answers one it
+    // accepts. The only view there is of a withdrawal: the plugin withdraws a layout by reporting
+    // its list again without it.
+    struct ModifierReport {
+        quint32 drmFormat = 0;
+        std::vector<quint64> modifiers;
+    };
+    const std::vector<ModifierReport>& modifierReports() const { return m_modifierReports; }
+
     // Sends it. False when there is none, which a caller must branch on: a phase that thinks it
     // released a reply and did not would grade the item against a request still outstanding.
     bool sendHeldReply() {
@@ -160,6 +209,23 @@ public:
             }
             return connection.send(message.createReply());
         }
+        if (message.member() == QLatin1String("SetImportModifiers")) {
+            const QList<QVariant> args = message.arguments();
+            ModifierReport report;
+            if (args.size() >= 2) {
+                report.drmFormat = args.at(0).toUInt();
+                const QDBusArgument list = args.at(1).value<QDBusArgument>();
+                list.beginArray();
+                while (!list.atEnd()) {
+                    quint64 modifier = 0;
+                    list >> modifier;
+                    report.modifiers.push_back(modifier);
+                }
+                list.endArray();
+            }
+            m_modifierReports.push_back(std::move(report));
+            return connection.send(message.createReply());
+        }
         if (message.member() != QLatin1String("GetFrameFd")) return false;
         // Counted before anything here can go wrong, so "the item asked" and "the stub answered"
         // stay separate verdicts.
@@ -168,12 +234,14 @@ public:
             return connection.send(message.createErrorReply(
                 m_refuseWith, QStringLiteral("this stub was told to refuse every further hand-over")));
         }
-        if (m_served >= static_cast<int>(m_sequence.size())) {
+        if (!m_rotate && m_served >= static_cast<int>(m_sequence.size())) {
             return connection.send(
                 message.createErrorReply(QStringLiteral("io.wallpaperx.Error.NoFrame"),
                                          QStringLiteral("this stub's frame sequence is exhausted")));
         }
-        const wallpaperx::OffscreenTarget& served = *m_sequence[static_cast<size_t>(m_served)];
+        const wallpaperx::OffscreenTarget& served =
+            m_serveNext != nullptr ? *std::exchange(m_serveNext, nullptr)
+                                   : *m_sequence[static_cast<size_t>(m_served) % m_sequence.size()];
 
         wallpaperx::ExportedFrame frame;
         try {
@@ -202,16 +270,30 @@ public:
         // that is exactly what the daemon does, and a caller can then tell "this host has no
         // acquire" from "the plugin lost it".
         QList<QDBusUnixFileDescriptor> syncFds;
-        try {
-            const int acquireFd = wallpaperx::exportFrameAcquireFd(m_device, served);
-            if (acquireFd >= 0) {
-                syncFds.append(QDBusUnixFileDescriptor(acquireFd));
-                ::close(acquireFd);
-            }
-        } catch (const std::exception& e) {
-            m_acquireError = e.what();
+        // Numbered as this reply will be once it is counted below.
+        Acquire acquireMode = Acquire::Real;
+        if (auto it = m_acquireFrom.upper_bound(m_served + 1); it != m_acquireFrom.begin()) {
+            acquireMode = std::prev(it)->second;
         }
-        m_acquireFdsSent += static_cast<int>(syncFds.size());
+        if (acquireMode == Acquire::Real) {
+            try {
+                const int acquireFd = wallpaperx::exportFrameAcquireFd(m_device, served);
+                if (acquireFd >= 0) {
+                    syncFds.append(QDBusUnixFileDescriptor(acquireFd));
+                    ::close(acquireFd);
+                }
+            } catch (const std::exception& e) {
+                m_acquireError = e.what();
+            }
+        } else if (acquireMode == Acquire::Unusable) {
+            const int notASemaphore = ::memfd_create("wallpaperx-stub-not-a-semaphore", MFD_CLOEXEC);
+            if (notASemaphore >= 0) {
+                syncFds.append(QDBusUnixFileDescriptor(notASemaphore));
+                ::close(notASemaphore);
+                ++m_unusableAcquiresSent;
+            }
+        }
+        if (acquireMode == Acquire::Real) m_acquireFdsSent += static_cast<int>(syncFds.size());
 
         QList<FramePlane> planes;
         for (const wallpaperx::ExportedFramePlane& plane : frame.planes) {
@@ -219,6 +301,7 @@ public:
         }
 
         m_handleType = frame.type == wallpaperx::ExportedFrame::HandleType::DmaBuf ? 1 : 0;
+        m_lastModifier = frame.modifier;
         ++m_served;
         // One generation per frame served, starting at 1. The item ignores a FrameReady naming a
         // generation it already holds, so a stub that answered 1 for every frame could never be
@@ -232,8 +315,9 @@ public:
                              QByteArray(reinterpret_cast<const char*>(frame.deviceUuid.data()),
                                         static_cast<qsizetype>(frame.deviceUuid.size())),
                              m_bufferIdOverride != 0 ? m_bufferIdOverride : frame.bufferId, syncFds));
-        if (m_holdNext) {
+        if (m_holdNext || m_served == m_holdAtServe) {
             m_holdNext = false;
+            if (m_served == m_holdAtServe) m_holdAtServe = -1;
             m_heldReply = reply;
             m_heldConnection = connection;
             return true;  // handled: the caller must not be given Qt's unknown-method error
@@ -244,6 +328,8 @@ public:
     int requests() const { return m_requests; }
     int served() const { return m_served; }
     int handleType() const { return m_handleType; }
+    // The DRM format modifier of the last frame served: the layout a withdrawal would name.
+    quint64 lastModifier() const { return m_lastModifier; }
     const std::string& exportError() const { return m_exportError; }
 
     // What the plugin released, in the order it said so. Empty is a real answer, and the checks
@@ -258,8 +344,17 @@ public:
     // the plugin into a claim about nothing.
     int acquireFdsSent() const { return m_acquireFdsSent; }
     const std::string& acquireError() const { return m_acquireError; }
+    // How many replies went out with an acquire the importer cannot wait on.
+    int unusableAcquiresSent() const { return m_unusableAcquiresSent; }
 
 private:
+    bool m_rotate = false;
+    const wallpaperx::OffscreenTarget* m_serveNext = nullptr;
+    quint64 m_lastModifier = 0;
+    int m_holdAtServe = -1;
+    std::map<int, Acquire> m_acquireFrom;
+    int m_unusableAcquiresSent = 0;
+    std::vector<ModifierReport> m_modifierReports;
     wallpaperx::Device& m_device;
     std::vector<const wallpaperx::OffscreenTarget*> m_sequence;
     quint64 m_bufferIdOverride = 0;
