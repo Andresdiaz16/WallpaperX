@@ -58,6 +58,7 @@
 #include "tests/client/daemon_client.h"
 #include "tests/client/http_probe.h"
 #include "tests/client/scratch_dir.h"
+#include "tests/name_watcher.h"
 #include "tests/spawned_daemon.h"
 #include "tests/test_report.h"
 
@@ -120,10 +121,12 @@ using wallpaperx::testing::getFrameFd;
 using wallpaperx::testing::getStatus;
 using wallpaperx::testing::execChildOrDie;
 using wallpaperx::testing::getStatusOrExplain;
+using wallpaperx::testing::NameWatcher;
 using wallpaperx::testing::openFdCount;
 using wallpaperx::testing::ScratchDir;
 using wallpaperx::testing::SpawnedDaemon;
 using wallpaperx::testing::setWallpaper;
+using wallpaperx::testing::sanitizerReportedIn;
 using wallpaperx::testing::StatusReply;
 using wallpaperx::testing::wallpaperStatus;
 
@@ -570,118 +573,6 @@ private:
     std::string m_reason;
     // A string literal from forkPreambleFault(), so no ownership to manage.
     const char* m_preambleFault = nullptr;
-};
-
-// Watches org.freedesktop.DBus for the daemon's name appearing and disappearing.
-//
-// Subscribed before the daemon is spawned, so there is no window in which the name
-// could be acquired unobserved -- which is what makes this a signal wait rather than a
-// poll loop with a sleep in it.
-class NameWatcher {
-public:
-    NameWatcher()
-        : m_proxy(sdbus::createProxy(sdbus::ServiceName{"org.freedesktop.DBus"},
-                                     sdbus::ObjectPath{"/org/freedesktop/DBus"})) {
-        m_proxy->uponSignal("NameOwnerChanged")
-            .onInterface("org.freedesktop.DBus")
-            .call([this](const std::string& name, const std::string& oldOwner, const std::string& newOwner) {
-                if (name != DbusService::kBusName) return;
-                {
-                    std::lock_guard<std::mutex> lock(m_mutex);
-                    ++m_events;
-                }
-                (void)oldOwner;
-                (void)newOwner;
-                m_changed.notify_all();
-            });
-    }
-
-    // True if the daemon currently holds the name, asked of the bus itself.
-    bool ownedNow() {
-        bool has = false;
-        m_proxy->callMethod("NameHasOwner")
-            .onInterface("org.freedesktop.DBus")
-            .withArguments(std::string(DbusService::kBusName))
-            .storeResultsTo(has);
-        return has;
-    }
-
-    // How many NameOwnerChanged events for this name have arrived. The only evidence OUTSIDE
-    // the daemon's own log that the name was ever claimed, which is what a phase grading that
-    // log needs -- it cannot use the log as its own witness. A counter rather than a cached
-    // ownership bool, for the reason waitFor's comment below gives.
-    uint64_t events() const {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        return m_events;
-    }
-
-    // Waits, to a deadline, for that counter to move off `from`. False means it did not, which
-    // for a daemon that has already exited means the name was never taken and never released.
-    bool waitForEventsPast(uint64_t from, std::chrono::milliseconds patience) {
-        std::unique_lock<std::mutex> lock(m_mutex);
-        return m_changed.wait_for(lock, patience, [&] { return m_events != from; });
-    }
-
-    // Waits until the name is (or is not) owned. Returns false on timeout.
-    //
-    // Deliberately not "cache a bool in the signal handler and wait on it". Two attempts
-    // at that were both wrong and in opposite directions: caching only in the handler
-    // left the flag holding the *previous* daemon's value after an early return, so a
-    // later wait was satisfied before the next daemon existed; writing the bus's answer
-    // back into the flag then let a NameOwnerChanged delivered between the reply and the
-    // lock be overwritten, losing the very transition being waited for.
-    //
-    // The signal carries no state here at all -- it only bumps a counter, which cannot be
-    // lost or clobbered. Ownership itself is always read from the bus, which is the one
-    // authority that cannot go stale. Snapshotting the counter *before* asking means any
-    // transition racing the query bumps it and wakes the wait, so nothing is missed.
-    bool waitFor(bool owned) {
-        const auto deadline = std::chrono::steady_clock::now() + kProcessTimeout;
-        while (true) {
-            uint64_t seen = 0;
-            {
-                std::lock_guard<std::mutex> lock(m_mutex);
-                seen = m_events;
-            }
-            if (ownedNow() == owned) return true;
-
-            std::unique_lock<std::mutex> lock(m_mutex);
-            if (!m_changed.wait_until(lock, deadline, [&] { return m_events != seen; })) return false;
-        }
-    }
-
-private:
-    // GOAL: X.4 -- no test aborts or corrupts memory instead of reporting.
-    // WHY-THIS-SHAPE: m_proxy is declared *last*, which reads backwards next to the
-    //       constructor that initialises it first, and it has to be. Members are
-    //       destroyed in reverse declaration order, and the signal callback registered
-    //       on the proxy touches m_mutex, m_events and m_changed. With the proxy
-    //       declared first it was destroyed last, so a NameOwnerChanged arriving during
-    //       teardown ran notify_all() on an already-destroyed condition_variable.
-    //       ThreadSanitizer caught it on a real run: "data race ...
-    //       std::condition_variable::~condition_variable()" with the previous access
-    //       inside NameWatcher's own lambda. Declaring the proxy last makes it the
-    //       first thing destroyed, and sdbus unregisters the handler there.
-    // CONTROL: none that reproduces, and saying so is the point. Putting the
-    //       declaration back above m_mutex and running daemon_system_lavapipe six times
-    //       under the TSan tier produced zero ThreadSanitizer reports -- the racy layout
-    //       is silent here on demand. An earlier version of this comment claimed the
-    //       opposite ("six runs ... each reported the race twice"); that figure did not
-    //       hold up and is withdrawn. The race needs a NameOwnerChanged still in flight
-    //       at the instant the watcher is destroyed, and this test's shutdown almost
-    //       never produces that window; the one time TSan did catch it was on an
-    //       unrelated run whose timing happened to hit it.
-    //       So this ordering is justified by the language rule rather than by a
-    //       control: members are destroyed in reverse declaration order, and the
-    //       callback registered on m_proxy touches all three members below it. That is
-    //       checkable by reading it and does not depend on a scheduler. Do not read the
-    //       silence above as evidence the ordering is optional -- an unreproducible race
-    //       is still a race, and a control that cannot make this go red means this
-    //       comment is a claim about C++ semantics, not an observation.
-    mutable std::mutex m_mutex;
-    std::condition_variable m_changed;
-    uint64_t m_events = 0;
-    std::unique_ptr<sdbus::IProxy> m_proxy;
 };
 
 // Whether VK_LAYER_KHRONOS_validation can be loaded on this host. Asked through the
@@ -1851,7 +1742,8 @@ SignalMasks readSignalMasks(pid_t pid, const std::vector<pid_t>& tids) {
 //       daemon.
 // CONTROL: `sigaddset(&shutdownSignals, SIGHUP)` deleted from backend/daemon/main.cpp -> "FAIL: the
 //       daemon exits through main() on SIGHUP rather than being killed by it (terminated
-//       by signal 1)", plus the exit-0, signal-name and stopped-cleanly checks. Reverted.
+//       by signal 1)", plus the exit-0, signal-name and stopped-cleanly checks. Re-observed
+//       2026-09-24 via control_run.sh, those four lines only. Reverted.
 void checkHangupShutdown(NameWatcher& names, const Check& check) {
     SpawnedDaemon hungUp;
     const bool cameUp = names.waitFor(true);
@@ -1876,7 +1768,7 @@ void checkHangupShutdown(NameWatcher& names, const Check& check) {
     // Same shape as the SIGTERM and SIGINT blocks: under a sanitizer the exit code is the
     // sanitizer's, so the question stops being about the shutdown path and is reported as
     // that rather than as an accusation against main.cpp.
-    if (output.find("Sanitizer: reported") != std::string::npos) {
+    if (sanitizerReportedIn(output)) {
         check(false, "the SIGHUP daemon's sanitizer reported no warnings (its exit code is the sanitizer's "
                      "here, so the SIGHUP exit-code check cannot run)");
     } else {
@@ -2066,9 +1958,11 @@ void checkClosedStdout(NameWatcher& names, const std::string& bluePath, const st
         }
     }
 
-    // The shutdown path writes to the broken stdout too ("... received, shutting down",
-    // "stopped cleanly", plus the flush at exit), so this is a second, independent EPIPE
-    // -- and the last chance for one to turn a clean exit into 141.
+    // The shutdown path writes to the broken stdout too ("... received, shutting down" through
+    // the daemon's own descriptor for that pipe, then "stopped cleanly" and the flush at exit),
+    // so this is a second, independent EPIPE -- and the last chance for one to turn a clean exit
+    // into 141. CONTROL: backend/daemon/main.cpp's StopLog::print made to abort on EPIPE, via
+    // control_run.sh 2026-09-24, reverted -> the two exit lines below red, signal 6.
     const int exitCode = deaf.shutdown(SIGTERM);
     check(deaf.exitedNormally(), "a daemon whose stdout is closed still exits through main() on SIGTERM");
     if (!deaf.exitedNormally()) {
@@ -2078,7 +1972,7 @@ void checkClosedStdout(NameWatcher& names, const std::string& bluePath, const st
     // Its stdout is broken by construction, so "stopped cleanly" cannot be looked for
     // here: the exit code is the only evidence left, which is exactly the position an
     // operator is in when this happens for real.
-    if (deaf.output().find("Sanitizer: reported") != std::string::npos) {
+    if (deaf.sanitizerReported()) {
         check(false, "the closed-stdout daemon's sanitizer reported no warnings (its exit code is the "
                      "sanitizer's here, so the exit-code check cannot run)");
     } else {
@@ -2222,7 +2116,7 @@ void checkBusLoss(const Check& check) {
         std::fprintf(stderr, "  terminated by signal %d%s\n", orphan.termSignal(),
                      orphan.timedOut() ? " (it had to be killed after the timeout)" : "");
     }
-    if (output.find("Sanitizer: reported") != std::string::npos) {
+    if (sanitizerReportedIn(output)) {
         check(false, "the orphaned daemon's sanitizer reported no warnings (its exit code is the sanitizer's "
                      "here, so the connection-loss exit-code check cannot run)");
     } else {
@@ -2286,11 +2180,14 @@ void checkBusLoss(const Check& check) {
     //       reworded message in main.cpp turns those red instead of leaving this one
     //       vacuously green.
     //
-    // CONTROL: backend/daemon/main.cpp's `wakingForShutdown` early return deleted from the watcher -- i.e.
-    //       the code as it was before this fix. Re-run 2026-08-06: the orphan printed
-    //       "wallpaperx-daemon: Terminated received, shutting down" ahead of its ENOTCONN
-    //       fatal line, and this was the ONLY failure in the run -- "FAIL: the daemon does
-    //       not report a signal it was never sent when its bus connection drops". Reverted.
+    // CONTROL: in backend/daemon/main.cpp, via control_run.sh, 2026-09-24, reverted. The watcher
+    //       made to print its "received" line for every signal it takes, straight after sigwait,
+    //       so ~ShutdownWatch's own wake is reported as a signal -> this line red, alone.
+    //       The watcher's `if (teardown.finished) return;` deleted no longer reaches this line:
+    //       ~ShutdownWatch's wake is then taken for an outside SIGUSR1 and ignored, join() never
+    //       returns, and the alarm kills the daemon (signal 14) before main's fatal line -> 8 FAILs
+    //       (this phase's three exit and fatal-line checks, the second-instance phase's four, and
+    //       another phase's duplicate instance), with this check printed as not graded.
     // CONTROL (the gate): the same bare-thread mutation, run against this shape on
     //       2026-08-06, printed "the fabricated-signal check is not graded -- the orphan
     //       never reached main's exception handler ..." and 3 FAILs, where before the gate
@@ -2384,7 +2281,8 @@ bool primeTeardownWedge(sdbus::IProxy& proxy, const std::string& clip, std::stri
 //       had to be SIGKILLed at the harness timeout. The escalation phase below stayed GREEN under
 //       it, which is the separation the two phases exist for: the second signal does not need the
 //       alarm. First observed 2026-08-19 with the FIFO wedge; re-observed 2026-09-22 on the
-//       NVIDIA entry with the preloaded one. Reverted.
+//       NVIDIA entry with the preloaded one, and 2026-09-24 via control_run.sh after the alarm
+//       gained a handler of its own (that line alone red). Reverted.
 // COVERAGE-ASSERT: the wedge is verified before the verdict is read -- the daemon must have drawn
 //       the video whose decoder the preloaded library holds, and its own line must be in the
 //       output -- and a run that could not stage it reports NOT VERIFIED. Without that, a daemon
@@ -2482,8 +2380,10 @@ void checkStuckTeardownIsBounded(const std::string& validationEnv, const std::st
 //       handler the process still exits, at the teardown deadline, so an exit-code check
 //       alone is green under the control. The absence of the deadline's own line is asserted
 //       for the same reason -- it is what the daemon prints when nothing shortened the stop.
-// CONTROL: the sigaction/pthread_sigmask block that installs forceExitOnSecondSignal deleted
-//       from the watcher in backend/daemon/main.cpp -> two red. "FAIL: the daemon says that a
+// CONTROL: the sigaction/pthread_sigmask block that installs forceExitOnSecondSignal (inside the
+//       watcher's second `if (outside)`) deleted from backend/daemon/main.cpp -> two red,
+//       re-observed 2026-09-24 via control_run.sh after the switch to StopLog, with the same
+//       output (a wedged stop ended 1840 ms after the second SIGTERM). "FAIL: the daemon says that a
 //       second signal is what ended it", printing "it left with exit code -1, signal 14, and
 //       said none of it"; and "FAIL: the second signal ends the daemon promptly rather than at
 //       the deadline". The second signal simply stays pending -- it is blocked in every thread
@@ -2637,7 +2537,8 @@ std::string describeTreeChange(const std::map<std::string, std::string>& before,
 //       backend/daemon/wallpaper_manager.cpp, ~WallpaperManager given a loop that frees each video
 //       session under an ApplyingRecord naming its file -- the Stage E2 shutdown record -> "FAIL: a
 //       stop the deadline ended wrote nothing", printing "added wallpaperx/applying-0.json". Both
-//       observed 2026-09-21 on the NVIDIA entry. Reverted.
+//       observed 2026-09-21 on the NVIDIA entry; (a) re-observed 2026-09-24 via control_run.sh,
+//       that line alone red. Reverted.
 // COVERAGE-ASSERT: the wedge's own line must be in the daemon's output, and the video must have
 //       drawn first; otherwise the phase reports NOT VERIFIED rather than grading an ordinary stop.
 void checkWatchdogEndsAStuckStopWritingNothing(const std::string& validationEnv, const Check& check) {
@@ -3495,7 +3396,7 @@ void checkHttpLifecycle(NameWatcher& names, const std::string& bluePath, const s
         std::fprintf(stderr, "  %d of %d answered polls were not a parseable 200\n", malformed, answered);
     }
 
-    if (output.find("Sanitizer: reported") != std::string::npos) {
+    if (sanitizerReportedIn(output)) {
         // Same shape as the SIGTERM and SIGINT phases: a sanitized build replaces the
         // exit code, so the exit-code question stops being about the shutdown path.
         check(false, "the HTTP-lifecycle daemon's sanitizer reported no warnings (its exit code is the "
@@ -3943,7 +3844,7 @@ void checkConfigServerLostPort(NameWatcher& names, const std::string& bluePath, 
     //       127.0.0.1:45719" and never "stopped cleanly". Observed 2026-09-23. Reverted.
     const int exitCode = daemon.shutdown(SIGTERM);
     const std::string output = daemon.output();
-    if (output.find("Sanitizer: reported") != std::string::npos) {
+    if (sanitizerReportedIn(output)) {
         // Same shape as every other exit-code site here: a sanitized build replaces the
         // exit code, so this stops being a question about the shutdown path.
         check(false, "the port-conflict daemon's sanitizer reported no warnings (its exit code is the sanitizer's "
@@ -4264,11 +4165,13 @@ void checkConfigRestart(NameWatcher& names, const std::string& validationEnv, co
     //       before the restarted daemon is spawned, so no startup render can be emitted
     //       unobserved -- subscribing after the name appears would not do, since the daemon
     //       owns its name before it queues that render.
-    // CONTROL: `service.restoreSaved();` deleted from backend/daemon/main.cpp -> seven FAILs, led by "the
-    //       wallpaper set before the restart is on that monitor after it, with no client
+    // CONTROL: `service.restoreSaved();` disabled in backend/daemon/main.cpp -> sixteen FAILs, led by
+    //       "the wallpaper set before the restart is on that monitor after it, with no client
     //       asking" and "the restored wallpaper renders in the new process without any
-    //       client asking", and including this phase's two S8.11 lines and the
-    //       unreadable-restore phase's three. Reverted. The restore and its render are separate
+    //       client asking", and including this phase's two S8.11 lines and the restore lines of
+    //       the crash-refusal, connector-name and unreadable-config phases. Re-observed 2026-09-24
+    //       on the NVIDIA entry, and again after the stop reason moved into g_stopReason (the
+    //       same sixteen, via control_run.sh). Reverted. The restore and its render are separate
     //       calls since Step 13 Stage E5: `service.renderRestored();` deleted from
     //       backend/daemon/main.cpp -> "FAIL: the restored wallpaper renders in the new process
     //       without any client asking", the two S8.11 lines and "a restored monitor whose file is
@@ -5043,7 +4946,7 @@ void checkStartsOnAnyConfig(NameWatcher& names, const std::string& validationEnv
 
         const int exitCode = daemon.shutdown(SIGTERM);
         const std::string output = daemon.output();
-        const bool sanitizerReported = output.find("Sanitizer: reported") != std::string::npos;
+        const bool sanitizerReported = sanitizerReportedIn(output);
         // exitedNormally() is the half that sees an abort: a process killed by SIGABRT and
         // one that timed out both report exit code -1, so a check written on the code alone
         // cannot tell a crash from a clean refusal. It is asserted unconditionally.
@@ -5784,7 +5687,7 @@ void checkStoppableOnAnyConfigFile(NameWatcher& names, const std::string& valida
                          static_cast<int>(daemon.exitedNormally()), static_cast<int>(daemon.timedOut()),
                          daemon.termSignal());
         }
-        if (daemon.output().find("Sanitizer: reported") != std::string::npos) {
+        if (daemon.sanitizerReported()) {
             check(false, (std::string("with ") + c.what +
                           " at config.json, the daemon's sanitizer reported no warnings (its exit code is the "
                           "sanitizer's here, so the exit-code check cannot run)")
@@ -5849,14 +5752,10 @@ std::string validEntriesNearCap(std::size_t targetBytes) {
 //       The delays sweep rather than sit at one value because the ONE outcome that establishes
 //       nothing -- the signal arriving before main() has blocked it, which kills the process
 //       outright -- is the one a fixed short delay would produce every time on a fast host.
-// CONTROL: the `if (shutdownRequested...)` arm around the startup message in
-//       backend/daemon/main.cpp collapsed back to the unconditional
-//       `printf("... serving %s at %s")` -> "FAIL: a start stopped before the bus name was
-//       requested does not announce that name", twice, printing "the name was never taken, but
-//       the daemon announced it was serving it" -- once per attempt that landed in the window,
-//       and nothing else red. The run's own tally line was unchanged: "of 6 pre-claim attempts,
-//       2 stopped before the name, 1 after it, and 3 before the signal could be blocked".
-//       Observed 2026-08-19. Reverted.
+// CONTROL: the `if (!claimed)` arm around the startup message in backend/daemon/main.cpp
+//       collapsed to the unconditional `printf("... serving %s at %s")` -> "FAIL: a start
+//       stopped before the bus name was requested does not announce that name", and nothing
+//       else red. Observed 2026-09-24. Reverted.
 // COVERAGE-ASSERT: the number of attempts that actually landed BEFORE the name was claimed is
 //       asserted to be non-zero. Without it a host that starts the daemon faster than this
 //       harness can signal it would grade only ordinary starts and report the goal as met on
@@ -5975,12 +5874,10 @@ void checkShutdownDuringStartup(NameWatcher& names, const std::string& validatio
     //       daemon runs on holding io.wallpaperx.Daemon and its config port after being told to
     //       stop -- the user's `systemctl stop` returns, the name stays taken, and the next
     //       start fails with FileExists.
-    // WHY-THIS-SHAPE: it asserts the OUTCOME, not the mechanism, and deliberately makes no
-    //       claim about main.cpp's `shutdownRequested` guard. Measured: with that guard
-    //       removed the daemon still exits cleanly, because sdbus-c++ latches a
-    //       leaveEventLoop() issued before the loop starts. A check written as "the guard is
-    //       what saves it" would therefore be a false claim, and one written to go red when
-    //       the guard is deleted cannot exist.
+    // WHY-THIS-SHAPE: it asserts the OUTCOME, not the mechanism. What saves such a daemon is
+    //       main.cpp's loop gate: the watcher records the stop under the gate's mutex and calls
+    //       leaveEventLoop() only for a loop already entered, so main must see the recorded stop
+    //       and not enter the loop at all.
     //       The window is entered by force rather than by luck. SIGSTOP freezes the daemon
     //       where it stands; a connect() to its port is then answered by the KERNEL, so it
     //       still discriminates on a process that cannot run -- refused means the HttpServer
@@ -6000,22 +5897,15 @@ void checkShutdownDuringStartup(NameWatcher& names, const std::string& validatio
     //       (mean 1.8) -- and with the phase as it stood before this change, attempts 1-6
     //       (mean 2.75), which is a 7% chance of no attempt landing at all and the goal
     //       silently going unexercised.
-    // CONTROL: two, both reverted. (a) the guard alone deleted, so main enters the loop
-    //       whatever the watcher recorded -> still green, four runs out of four, each with
-    //       the freeze confirmed: that is the latch, measured here rather than taken on
-    //       trust, and it is why this phase claims nothing about the guard. Run before the
-    //       reordering that moved preserveUnreadableConfig() after requestName(), and left
-    //       standing because it says the guard is not load-bearing, which nothing since has
-    //       touched. (b) the guard deleted AND the latch removed with it -- the watcher
-    //       calling leaveEventLoop() only when a flag says the loop is running -- re-run
-    //       against the current binary -> "FAIL: a daemon signalled before its event loop
-    //       began exits 0" ("exit code 1") and "FAIL: ... still runs its destructor chain".
-    //       Note the signature has MOVED since that mutation was first run: the daemon is no
-    //       longer SIGKILLed after the reap timeout but ends itself at the
-    //       teardown deadline with exit 1, so "exits without having to be killed" stays green
-    //       and the exit code carries the failure. The same mutation still reddens the SIGINT
-    //       and SIGHUP phases, which signal as soon as the name appears and so land in this
-    //       window by accident; the SIGTERM phase, which does work first, stayed green.
+    // CONTROL: the gate's check deleted in backend/daemon/main.cpp -- `enter =
+    //       g_stopReason.load() == StopReason::None` made `enter = true`, so main enters the loop
+    //       whatever the watcher recorded -> "FAIL: a daemon signalled before its event loop began
+    //       exits 0" and "FAIL: ... still runs its destructor chain"; "exits without having to be
+    //       killed" stays green, since the teardown deadline ends it with exit 1. The same break
+    //       reddens the SIGINT and SIGHUP phases' exit and destructor lines, which signal as soon
+    //       as the name appears and land in this window by accident, and the config-repair phase's
+    //       exit; the SIGTERM phase, which does work first, stays green. Re-observed 2026-09-24 via
+    //       control_run.sh, those seven lines. Reverted.
     // COVERAGE-ASSERT: an attempt counts only when the connect said refused while the
     //       daemon was stopped. If no attempt in six lands in the window -- another process
     //       took the port, or this host starts the daemon faster than the harness can freeze
@@ -6087,7 +5977,7 @@ void checkShutdownDuringStartup(NameWatcher& names, const std::string& validatio
                          static_cast<int>(daemon.exitedNormally()), static_cast<int>(daemon.timedOut()),
                          daemon.termSignal());
         }
-        if (output.find("Sanitizer: reported") != std::string::npos) {
+        if (sanitizerReportedIn(output)) {
             check(false, "the startup-shutdown daemon's sanitizer reported no warnings (its exit code is the "
                          "sanitizer's here, so the exit-code check cannot run)");
         } else {
@@ -6188,7 +6078,7 @@ void checkFileSizeLimit(NameWatcher& names, const std::string& validationEnv, co
                      static_cast<int>(daemon.exitedNormally()), static_cast<int>(daemon.timedOut()),
                      daemon.termSignal());
     }
-    if (daemon.output().find("Sanitizer: reported") != std::string::npos) {
+    if (daemon.sanitizerReported()) {
         check(false, "the file-size-limit daemon's sanitizer reported no warnings (its exit code is the sanitizer's "
                      "here, so the exit-code check cannot run)");
     } else {
@@ -6476,7 +6366,7 @@ void checkStalledConfigWrite(NameWatcher& names, const std::string& validationEn
                      static_cast<int>(daemon.exitedNormally()), static_cast<int>(daemon.timedOut()),
                      daemon.termSignal());
     }
-    if (output.find("Sanitizer: reported") != std::string::npos) {
+    if (sanitizerReportedIn(output)) {
         check(false, "the stalled-write daemon's sanitizer reported no warnings (its exit code is the sanitizer's "
                      "here, so the exit-code check cannot run)");
     } else {
@@ -6492,6 +6382,14 @@ void checkStalledConfigWrite(NameWatcher& names, const std::string& validationEn
 
 int main() {
     wallpaperx::testing::g_testName = "daemon_system_test";
+
+    // S14.9, graded in name_watcher.h. First, before the scratch-directory probe and the config
+    // witness, so a refused run spawns nothing and touches no file; one guard rather than a check
+    // per phase, since every phase's name wait is satisfied by a foreign owner.
+    // CONTROL: the call below deleted, a scratch daemon owning the name -> the phases ran against
+    //       it, printing FAILs about a daemon they never started, until `timeout 45` stopped the
+    //       run. Observed 2026-09-24, inside dbus-run-session. Reverted.
+    if (const std::optional<int> refused = wallpaperx::testing::refuseUnlessPrivateBus()) return *refused;
 
     // Wrapped in a Check rather than called directly because every phase below takes one:
     // the std::function is what lets a phase be handed the grader without this file's
@@ -6511,7 +6409,7 @@ int main() {
 
     // GOAL: X.3 -- a host that cannot supply a temporary directory makes this run report,
     //       not abort, and does not have the missing directory recorded against the daemon.
-    //       False if `TMPDIR=/nonexistent ./wallpaperx-daemon-system-test` dies on SIGABRT,
+    //       False if the binary run with `TMPDIR=/nonexistent` dies on SIGABRT,
     //       or exits with a FAIL line, or exits 0.
     // WHY-THIS-SHAPE: a positive probe of the host, taken before anything is spawned, rather
     //       than classifying what main()'s catch-all caught. Routing that catch-all to the
@@ -6523,7 +6421,8 @@ int main() {
     //       tier (config_store_test) already answers this same host state with 77, and one of
     //       the two reporting the machine's missing /tmp as red would have the two tiers
     //       disagree about whose fault it is.
-    // CONTROL: run as `TMPDIR=/nonexistent/nowhere ./wallpaperx-daemon-system-test`. Before
+    // CONTROL: run as `dbus-run-session -- env TMPDIR=/nonexistent/nowhere
+    //       ./wallpaperx-daemon-system-test` (the bus guard above refuses a bare run). Before
     //       this branch: "FAIL: unexpected exception: scratch XDG_CONFIG_HOME could not be
     //       created", then "terminate called ... temp_directory_path" from harnessTempPrefix()
     //       in the isolation guard below, and exit 134 with the rest of the report lost.
@@ -6598,7 +6497,6 @@ int main() {
         // Subscribed before anything is spawned, so the name's appearance cannot be
         // missed between the fork and the subscription.
         NameWatcher names;
-        check(!names.ownedNow(), "the bus name is free before the daemon starts (the session bus is private)");
 
         const size_t fdsBefore = openFdCount();
 
@@ -6708,11 +6606,13 @@ int main() {
                 //       plausible future regression. The error name is what pins the
                 //       reason, and it is the name a caller of
                 //       createSessionBusConnection() would branch on.
-                // CONTROL: backend/daemon/main.cpp patched to throw before requesting the name
-                //       (`throw std::runtime_error("no")` above createSessionBusConnection)
-                //       -> "FAIL: the second instance is refused with
-                //       org.freedesktop.DBus.Error.FileExists", while the pre-existing
-                //       "says why it exited" check stayed green. Reverted.
+                // CONTROL: in backend/daemon/main.cpp, a failed requestName rethrown as
+                //       `std::runtime_error("no")`, so a second instance still dies with a
+                //       fatal line but for no stated reason -> "FAIL: the second instance is
+                //       refused with org.freedesktop.DBus.Error.FileExists", alone: "says why it
+                //       exited" stayed green. Observed 2026-09-24 via control_run.sh. Reverted.
+                //       (A throw before the bus connection no longer reaches this check: the
+                //       first instance dies too, and the run timed out at 600 s.)
                 check(secondOutput.find("org.freedesktop.DBus.Error.FileExists") != std::string::npos,
                       "the second instance is refused with org.freedesktop.DBus.Error.FileExists");
             }
@@ -6751,7 +6651,22 @@ int main() {
             // about the shutdown path. Reported as what it actually is instead: a
             // non-zero exit that reads "the shutdown path is broken" would send the next
             // reader to main.cpp, which is not where the problem is.
-            const bool sanitizerReported = daemonOutput.find("Sanitizer: reported") != std::string::npos;
+            const bool sanitizerReported = sanitizerReportedIn(daemonOutput);
+            // GOAL: S14.2 -- a signal stop still exits 0 now that a lost device exits 75, so the
+            //       service manager's Restart=on-failure does not bring back a daemon a user stopped.
+            //       And the signal the daemon wakes its own signal thread with is not a stop
+            //       signal, so the wake never lands in the second-signal handler a stop arms.
+            // CONTROL: in backend/daemon/main.cpp, via control_run.sh, all observed 2026-09-24 on
+            //       NVIDIA, reverted. main's final status set on `!= StopReason::None` instead of
+            //       `== StopReason::DeviceLost` -> this line, the SIGINT and SIGHUP exit-0 lines and
+            //       every other phase's exit-0 and destructor-chain lines red (30 FAILs).
+            //       Re-observed 2026-09-24 after the watcher began ignoring a wake it has no reason
+            //       for: ~ShutdownWatch's wake sent as SIGTERM instead of kWakeSignal -> 18 FAILs of
+            //       the same kind, this line first: the wake lands in the handler the stop armed and
+            //       exits 1. kWakeSignal itself made SIGTERM -> the user's SIGTERM is then a wake
+            //       with no reason recorded and is ignored, so every SIGTERM stop hangs: 28 FAILs,
+            //       this line and the other exit-0 and destructor-chain lines, before ctest's 600 s
+            //       timeout ended the run.
             if (sanitizerReported) {
                 check(false, "the daemon's sanitizer reported no warnings (its exit code is the sanitizer's here, so "
                              "the SIGTERM exit-code check cannot run)");
@@ -6787,7 +6702,9 @@ int main() {
             //       through the teardown watchdog", "FAIL: the daemon exits 0 on SIGTERM"
             //       ("exit code 1") and "FAIL: the daemon runs its destructor chain on the way
             //       out", with every other phase's exit-0 check beside them. Re-observed
-            //       2026-09-21 on the NVIDIA entry. Reverted.
+            //       2026-09-24 via control_run.sh (35 FAILs): a zero deadline is also alarm(0),
+            //       which arms nothing, so the wedged connection-loss phase's "still ends" line
+            //       goes red with them. Reverted.
             const bool leftThroughMain = daemonOutput.find("shutdown blocked") == std::string::npos;
             check(leftThroughMain, "the daemon leaves through main() rather than through the teardown watchdog");
             check(names.waitFor(false), "the bus name is released once the daemon exits");
@@ -6819,7 +6736,7 @@ int main() {
                 // bare `if (no sanitizer report)` made the assertion vanish with no FAIL, no
                 // print and no change in the count, so a sanitized run looked like it had
                 // verified SIGINT when it had verified nothing.
-                if (interruptOutput.find("Sanitizer: reported") != std::string::npos) {
+                if (sanitizerReportedIn(interruptOutput)) {
                     check(false, "the SIGINT daemon's sanitizer reported no warnings (its exit code is the "
                                  "sanitizer's here, so the SIGINT exit-code check cannot run)");
                 } else {

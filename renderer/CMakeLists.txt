@@ -283,6 +283,12 @@ target_link_libraries(wallpaperx-descriptor-inflight-probe PRIVATE wallpaperx-re
 add_executable(wallpaperx-video-renderer-probe tests/video_renderer_probe.cpp)
 target_link_libraries(wallpaperx-video-renderer-probe PRIVATE wallpaperx-renderer)
 
+# Which queue and fence results latch Device::lost(). Interposes vkQueueSubmit,
+# vkWaitForFences and vkGetFenceStatus to hand the Device a scripted result, since no driver
+# loses a device on demand. No shaders and no fixture.
+add_executable(wallpaperx-device-lost-probe tests/device_lost_probe.cpp)
+target_link_libraries(wallpaperx-device-lost-probe PRIVATE wallpaperx-renderer)
+
 # --------------------------------------------------------------------------- #
 # Video fixtures for the decoder probe
 # --------------------------------------------------------------------------- #
@@ -695,6 +701,9 @@ add_test(NAME target_ring_probe COMMAND wallpaperx-target-ring-probe)
 # that measurement was made where it was not, or mark a working renderer unverified.
 add_test(NAME video_renderer_probe COMMAND wallpaperx-video-renderer-probe render)
 add_test(NAME video_modifier_filter_probe COMMAND wallpaperx-video-renderer-probe modifiers)
+# 77 when the host has no Vulkan device at all.
+add_test(NAME device_lost_probe COMMAND wallpaperx-device-lost-probe)
+set_tests_properties(device_lost_probe PROPERTIES SKIP_RETURN_CODE 77)
 
 # Six entries, one binary, because they answer different questions on different configurations.
 # `enabled` is registered three times so the feature chain is walked once per descriptor tier:
@@ -912,6 +921,7 @@ if(WALLPAPERX_LAVAPIPE_ICD)
     add_test(NAME target_ring_probe_lavapipe COMMAND wallpaperx-target-ring-probe)
     add_test(NAME video_renderer_probe_lavapipe COMMAND wallpaperx-video-renderer-probe render)
     add_test(NAME video_modifier_filter_probe_lavapipe COMMAND wallpaperx-video-renderer-probe modifiers)
+    add_test(NAME device_lost_probe_lavapipe COMMAND wallpaperx-device-lost-probe)
     # The software driver is where "a device with no hardware decoder reports none and still
     # builds, submits and tears down" is actually answered -- the real GPU cannot show it. The
     # other three entries grade properties that hold on any driver and are registered here so CI,
@@ -949,6 +959,7 @@ if(WALLPAPERX_LAVAPIPE_ICD)
         target_ring_probe_lavapipe
         video_renderer_probe_lavapipe
         video_modifier_filter_probe_lavapipe
+        device_lost_probe_lavapipe
         device_video_enabled_lavapipe
         device_video_decode_lavapipe
         device_video_waits_lavapipe

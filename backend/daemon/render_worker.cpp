@@ -11,8 +11,11 @@
 
 namespace wallpaperx {
 
-RenderWorker::RenderWorker(WallpaperManager& manager, FrameReadyFn onFrameReady)
-    : m_manager(manager), m_onFrameReady(std::move(onFrameReady)), m_thread([this] { run(); }) {}
+RenderWorker::RenderWorker(WallpaperManager& manager, FrameReadyFn onFrameReady, DeviceLostFn onDeviceLost)
+    : m_manager(manager),
+      m_onFrameReady(std::move(onFrameReady)),
+      m_onDeviceLost(std::move(onDeviceLost)),
+      m_thread([this] { run(); }) {}
 
 RenderWorker::~RenderWorker() { stop(); }
 
@@ -129,8 +132,22 @@ void RenderWorker::run() {
         }
 
         if (haveJob) runJob(job);
+        if (stopForLostDevice()) return;
         clockDue = runClock();
+        if (stopForLostDevice()) return;
     }
+}
+
+bool RenderWorker::stopForLostDevice() {
+    if (!m_onDeviceLost || !m_manager.deviceLost()) return false;
+    // Before the owner hears of it, so nothing posted in response is run. stop() answers what is
+    // already queued.
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_stop = true;
+    }
+    m_onDeviceLost();
+    return true;
 }
 
 std::optional<std::chrono::steady_clock::time_point> RenderWorker::runClock() {

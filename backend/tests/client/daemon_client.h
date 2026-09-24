@@ -36,6 +36,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -198,6 +199,18 @@ private:
     std::vector<std::pair<int32_t, uint64_t>> m_events;
 };
 
+// A proxy on the session bus with `log` subscribed to FrameReady. Call it BEFORE spawning the
+// daemon: a restored wallpaper renders on the daemon's own initiative, and a subscription made
+// after the name appears can miss it. `log` must outlive the proxy.
+inline std::unique_ptr<sdbus::IProxy> subscribeFrameReady(FrameReadyLog& log) {
+    auto proxy =
+        sdbus::createProxy(sdbus::ServiceName{DbusService::kBusName}, sdbus::ObjectPath{DbusService::kObjectPath});
+    proxy->uponSignal("FrameReady")
+        .onInterface(DbusService::kInterface)
+        .call([&log](int32_t monitorId, uint64_t generation) { log.record(monitorId, generation); });
+    return proxy;
+}
+
 // Everything GetFrameFd hands back, in one place, so the assertions read as claims
 // about the frame rather than as tuple indices.
 struct Frame {
@@ -262,6 +275,20 @@ inline void setWallpaper(sdbus::IProxy& proxy, const std::string& type, const st
         .onInterface(DbusService::kInterface)
         .withTimeout(timeout)
         .withArguments(type, path, monitorId);
+}
+
+// The same call for a phase that only needs the wallpaper set: false, with the error printed,
+// instead of a throw that would unwind past every later phase into main's catch-all. The caller
+// grades the false.
+[[nodiscard]] inline bool trySetWallpaper(sdbus::IProxy& proxy, const std::string& type, const std::string& path,
+                                          int32_t monitorId, std::chrono::microseconds timeout = {}) {
+    try {
+        setWallpaper(proxy, type, path, monitorId, timeout);
+        return true;
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "  SetWallpaper(%s, monitor %d) failed: %s\n", type.c_str(), monitorId, e.what());
+        return false;
+    }
 }
 
 // The answer to GetStatus, or the reason there is none.

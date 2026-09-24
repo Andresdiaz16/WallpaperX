@@ -37,6 +37,34 @@ using Clock = std::chrono::steady_clock;
 // How long a daemon gets to exit before it is considered wedged.
 constexpr auto kProcessTimeout = std::chrono::seconds(30);
 
+// This process's environment with `extraEnv` ("KEY=VALUE") added, each replacing any inherited
+// entry for its key. Call before fork(): it allocates, which a forked child of a threaded
+// process must not.
+inline std::vector<std::string> mergedEnvironment(const std::vector<std::string>& extraEnv) {
+    std::vector<std::string> env;
+    for (char** e = environ; *e != nullptr; ++e) {
+        const std::string entry(*e);
+        const size_t eq = entry.find('=');
+        const std::string key = eq == std::string::npos ? entry : entry.substr(0, eq);
+        bool overridden = false;
+        for (const std::string& extra : extraEnv) {
+            if (extra.rfind(key + "=", 0) == 0) overridden = true;
+        }
+        if (!overridden) env.push_back(entry);
+    }
+    env.insert(env.end(), extraEnv.begin(), extraEnv.end());
+    return env;
+}
+
+// True when a daemon's captured output holds a sanitizer's report. It then exits with the
+// sanitizer's status (66 for ThreadSanitizer), so an exit-status check would grade the sanitizer,
+// not the path it was written for; callers grade the report instead. The one place this rule lives.
+// CONTROL: by hand 2026-09-24, reverted: made to return true -> daemon_system's 24 sanitizer-
+//       attribution lines, from all twelve of its call sites, and no other FAIL.
+inline bool sanitizerReportedIn(std::string_view output) {
+    return output.find("Sanitizer: reported") != std::string_view::npos;
+}
+
 // ---------------------------------------------------------------------------- //
 // The daemon under test, as a child process.
 // ---------------------------------------------------------------------------- //
@@ -116,18 +144,7 @@ public:
         // the child could deadlock on a lock some other thread held at the instant of
         // the fork. Assembling the environment here and handing it to execve() sidesteps
         // that entirely.
-        std::vector<std::string> env;
-        for (char** e = environ; *e != nullptr; ++e) {
-            const std::string entry(*e);
-            const size_t eq = entry.find('=');
-            const std::string key = eq == std::string::npos ? entry : entry.substr(0, eq);
-            bool overridden = false;
-            for (const std::string& extra : extraEnv) {
-                if (extra.rfind(key + "=", 0) == 0) overridden = true;
-            }
-            if (!overridden) env.push_back(entry);
-        }
-        env.insert(env.end(), extraEnv.begin(), extraEnv.end());
+        std::vector<std::string> env = mergedEnvironment(extraEnv);
 
         std::vector<char*> envp;
         envp.reserve(env.size() + 1);
@@ -348,6 +365,9 @@ public:
         return reap();
     }
 
+    // sanitizerReportedIn() on this daemon's output. Meaningful only after exit.
+    bool sanitizerReported() const { return sanitizerReportedIn(output()); }
+
     // Everything the daemon has written so far. Complete only after it has exited: the
     // reader thread is still draining the pipe until then, so any assertion about the
     // daemon's output belongs after a shutdown()/waitForExit().
@@ -432,11 +452,32 @@ public:
         }
     }
 
+    // Stops draining the capture pipe for good, so it can be filled and the daemon's stderr made
+    // a reader that stopped reading. Returns once the reader thread has read for the last time;
+    // false if it did not confirm within 2 s. Output written after this is never captured, and
+    // exited() stays false until shutdown()/waitForExit() reaps the process.
+    bool holdCapture() {
+        m_holdCapture.store(true, std::memory_order_release);
+        std::unique_lock<std::mutex> lock(m_mutex);
+        return m_holdChanged.wait_for(lock, std::chrono::seconds(2), [this] { return m_captureHeld; });
+    }
+
 private:
     void readLoop() {
         char buf[4096];
         std::string pending;
         while (true) {
+            if (m_holdCapture.load(std::memory_order_acquire)) {
+                {
+                    std::lock_guard<std::mutex> lock(m_mutex);
+                    m_captureHeld = true;
+                }
+                m_holdChanged.notify_all();
+                while (!m_stopReader.load(std::memory_order_acquire)) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                }
+                break;
+            }
             // Polled rather than blocked in read(): a child that forks something inheriting this
             // pipe leaves it open after the daemon exits, and a blocking read would then never
             // return and the join below would hang instead of reporting.
@@ -540,7 +581,10 @@ private:
     std::atomic<bool> m_readerDone{false};
     std::atomic<bool> m_stopReader{false};
     std::atomic<bool> m_readFailed{false};
+    std::atomic<bool> m_holdCapture{false};
     mutable std::mutex m_mutex;
+    std::condition_variable m_holdChanged;
+    bool m_captureHeld = false;  // under m_mutex
     std::string m_output;
 };
 

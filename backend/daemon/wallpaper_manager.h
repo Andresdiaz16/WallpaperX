@@ -536,6 +536,11 @@ public:
     // render's do, and stop that video.
     ClockRound advanceVideo(std::chrono::steady_clock::time_point now);
 
+    // Whether the device this manager built has been lost. Permanent: the device is built once
+    // and never rebuilt, so every later render fails. False before one exists -- a device that
+    // could not be created is retried by the next render. Render worker thread.
+    bool deviceLost() const;
+
     // Exports the monitor's most recent frame as a fresh fd. An empty handle means nothing was
     // handed over, with `reason` saying which state that is; a thrown exception means the
     // export itself went wrong.

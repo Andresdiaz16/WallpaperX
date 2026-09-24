@@ -31,8 +31,9 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#ifndef WALLPAPERX_DEFAULT_SHADER_DIR
-#error "WALLPAPERX_DEFAULT_SHADER_DIR must be defined by the build -- see backend/CMakeLists.txt"
+#if !defined(WALLPAPERX_DEFAULT_SHADER_DIR) || !defined(WALLPAPERX_BUILD_RUNTIME_DIR) || \
+    !defined(WALLPAPERX_INSTALLED_SHADER_DIR_FROM_BINDIR)
+#error "the shader directory defaults must be defined by the build -- see backend/CMakeLists.txt"
 #endif
 
 namespace wallpaperx {
@@ -69,21 +70,32 @@ void requireValidOutputName(const std::string& outputName) {
     }
 }
 
+// The build tree's shaders for an executable still in the build tree; otherwise the installed ones,
+// where the install put them relative to the executable. Decided by where the executable is rather
+// than by which directory exists, so neither can quietly load the other's shaders.
+std::string defaultShaderDir() {
+    std::error_code ec;
+    const std::filesystem::path exe = std::filesystem::read_symlink("/proc/self/exe", ec);
+    if (ec) return WALLPAPERX_DEFAULT_SHADER_DIR;
+    const std::filesystem::path exeDir = exe.parent_path();
+    // False, not an error, once the build tree is gone -- which is the usual state of an install.
+    if (std::filesystem::equivalent(exeDir, WALLPAPERX_BUILD_RUNTIME_DIR, ec)) return WALLPAPERX_DEFAULT_SHADER_DIR;
+    return (exeDir / WALLPAPERX_INSTALLED_SHADER_DIR_FROM_BINDIR).lexically_normal().string();
+}
+
 std::string resolveShaderDir(const std::string& configured) {
     std::string dir = configured;
     if (dir.empty()) {
         if (const char* env = std::getenv("WALLPAPERX_SHADER_DIR"); env != nullptr && *env != '\0') {
             dir = env;
         } else {
-            dir = WALLPAPERX_DEFAULT_SHADER_DIR;
+            dir = defaultShaderDir();
         }
     }
 
-    // Checked once, here, rather than left to the first shader open. The build-time
-    // default points into the build tree, so this is the failure a user hits when the
-    // daemon is run from an install prefix that has no shaders -- it deserves a message
-    // that names the directory and the override, not a bare "failed to open" on some
-    // .spv path.
+    // Checked once, here, rather than left to the first shader open: a missing directory
+    // deserves a message that names it and the override, not a bare "failed to open" on
+    // some .spv path.
     std::error_code ec;
     if (!std::filesystem::is_directory(dir, ec)) {
         throw std::runtime_error("WallpaperManager: shader directory '" + dir +
@@ -412,6 +424,11 @@ void WallpaperManager::ensureGpu() {
                 m_device->info().gpuName.c_str(), toString(m_device->info().vendor),
                 toString(m_device->descriptorTier()));
     std::fflush(stdout);
+}
+
+bool WallpaperManager::deviceLost() const {
+    std::lock_guard<std::mutex> gpuLock(m_gpuMutex);
+    return m_device && m_device->lost();
 }
 
 bool WallpaperManager::targetsFit(int monitorId, OutputSize size) const {

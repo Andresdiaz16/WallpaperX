@@ -31,8 +31,9 @@ public:
     static constexpr const char* kObjectPath = "/io/wallpaperx/Daemon";
     static constexpr const char* kInterface = "io.wallpaperx.Daemon";
 
-    // `manager` must outlive this object.
-    DbusService(sdbus::IConnection& connection, WallpaperManager& manager);
+    // `manager` must outlive this object. `onDeviceLost` is the render worker's; see there.
+    DbusService(sdbus::IConnection& connection, WallpaperManager& manager,
+                RenderWorker::DeviceLostFn onDeviceLost = {});
     ~DbusService();
 
     // Applies the saved wallpapers without drawing them. Call once, before the event loop.

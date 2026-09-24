@@ -797,7 +797,7 @@ Device::SubmitTicket Device::submit(const std::function<void(VkCommandBuffer)>& 
     submitInfo.signalSemaphoreCount = static_cast<uint32_t>(signals.size());
     submitInfo.pSignalSemaphores = signals.empty() ? nullptr : signals.data();
 
-    if (const VkResult r = vkQueueSubmit(m_graphicsQueue, 1, &submitInfo, fence); r != VK_SUCCESS) {
+    if (const VkResult r = observe(vkQueueSubmit(m_graphicsQueue, 1, &submitInfo, fence)); r != VK_SUCCESS) {
         throwVkFailure("Device::submit: vkQueueSubmit", r);
     }
 
@@ -866,7 +866,7 @@ bool Device::drainForTeardown() noexcept {
         const uint32_t count = static_cast<uint32_t>(std::min(m_pending.size(), fences.size()));
         for (uint32_t i = 0; i < count; ++i) fences[i] = m_pending[i].fence;
 
-        const VkResult r = vkWaitForFences(m_device, count, fences.data(), VK_TRUE, kSubmitTimeoutNs);
+        const VkResult r = observe(vkWaitForFences(m_device, count, fences.data(), VK_TRUE, kSubmitTimeoutNs));
         // A lost device abandons its work rather than finishing it, so no wait will ever say
         // otherwise and its objects are the application's to destroy -- which is the only way
         // a lost device can be torn down at all.
@@ -898,6 +898,16 @@ bool Device::safeToFree(const char* whatIsLeaked, std::optional<SubmitTicket> re
     std::fprintf(stderr, "Device: the GPU has not finished the work that reads %s, so it is leaked rather than freed\n",
                  whatIsLeaked);
     return false;
+}
+
+bool Device::lost() const {
+    assertGpuThread("Device::lost");
+    return m_lost;
+}
+
+VkResult Device::observe(VkResult result) noexcept {
+    if (result == VK_ERROR_DEVICE_LOST) m_lost = true;
+    return result;
 }
 
 Device::SubmitTicket Device::lastSubmission() const {
@@ -939,7 +949,7 @@ bool Device::isPending(uint64_t serial) const {
 }
 
 void Device::waitFences(const VkFence* fences, uint32_t count, const char* what) {
-    const VkResult r = vkWaitForFences(m_device, count, fences, VK_TRUE, kSubmitTimeoutNs);
+    const VkResult r = observe(vkWaitForFences(m_device, count, fences, VK_TRUE, kSubmitTimeoutNs));
     if (r == VK_SUCCESS) return;
 
     if (r == VK_TIMEOUT) {
@@ -953,7 +963,7 @@ void Device::waitFences(const VkFence* fences, uint32_t count, const char* what)
         // long ago throw for someone else's stall.
         for (Pending& batch : m_pending) {
             if (std::find(fences, fences + count, batch.fence) == fences + count) continue;
-            if (vkGetFenceStatus(m_device, batch.fence) != VK_SUCCESS) batch.waitOutcome = VK_TIMEOUT;
+            if (observe(vkGetFenceStatus(m_device, batch.fence)) != VK_SUCCESS) batch.waitOutcome = VK_TIMEOUT;
         }
         throw GpuFailure(std::string(what) + ": the GPU did not finish a submitted batch within " +
                          std::to_string(kSubmitTimeout.count()) + " seconds");
@@ -977,7 +987,7 @@ void Device::retireCompleted() noexcept {
         // VK_NOT_READY is still running. VK_ERROR_DEVICE_LOST is neither: the batch stays
         // pending forever, because after a loss nothing says whether the driver is done with
         // these two objects, and only teardown -- which waits for idle first -- frees them.
-        if (vkGetFenceStatus(m_device, batch.fence) != VK_SUCCESS) {
+        if (observe(vkGetFenceStatus(m_device, batch.fence)) != VK_SUCCESS) {
             m_pending[kept++] = batch;
             continue;
         }

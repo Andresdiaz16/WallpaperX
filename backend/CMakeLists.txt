@@ -237,12 +237,23 @@ target_link_libraries(wallpaperx-daemon-lib PUBLIC
     ${LIBZIP_LIBRARIES}
 )
 
-# Where StaticRenderer looks for compiled SPIR-V when nothing overrides it. Points
-# into the build tree, which is right for running from a build and wrong for an
-# install -- $WALLPAPERX_SHADER_DIR covers the gap until packaging (Step 14) gives
-# the shaders a real installed location.
+include(GNUInstallDirs)
+set(WALLPAPERX_INSTALL_SHADER_DIR "${CMAKE_INSTALL_DATADIR}/wallpaperx/shaders")
+# Relative to the executable, so the daemon finds its shaders under whatever prefix it was
+# installed to. The install below refuses a prefix under which this path no longer holds.
+cmake_path(ABSOLUTE_PATH CMAKE_INSTALL_BINDIR BASE_DIRECTORY "${CMAKE_INSTALL_PREFIX}" NORMALIZE
+           OUTPUT_VARIABLE _wx_configured_bindir)
+cmake_path(ABSOLUTE_PATH WALLPAPERX_INSTALL_SHADER_DIR BASE_DIRECTORY "${CMAKE_INSTALL_PREFIX}" NORMALIZE
+           OUTPUT_VARIABLE _wx_configured_shader_dir)
+file(RELATIVE_PATH WALLPAPERX_SHADER_DIR_FROM_BINDIR "${_wx_configured_bindir}" "${_wx_configured_shader_dir}")
+
+# Where StaticRenderer looks for compiled SPIR-V when nothing overrides it: the build tree's
+# shaders for an executable that is in the build tree, and the installed ones, found relative to
+# the executable, for any other.
 target_compile_definitions(wallpaperx-daemon-lib PRIVATE
     WALLPAPERX_DEFAULT_SHADER_DIR="${WALLPAPERX_SHADER_OUTPUT_DIR}"
+    WALLPAPERX_BUILD_RUNTIME_DIR="$<TARGET_FILE_DIR:wallpaperx-daemon>"
+    WALLPAPERX_INSTALLED_SHADER_DIR_FROM_BINDIR="${WALLPAPERX_SHADER_DIR_FROM_BINDIR}"
     # /health reports this. Taken from project(... VERSION) rather than written into the
     # source, so the string a user quotes in a bug report cannot be a version the build
     # stopped being. http_server.cpp #errors if it is missing rather than defaulting.
@@ -257,6 +268,78 @@ add_dependencies(wallpaperx-daemon-lib wallpaperx-shaders)
 # Qt is reserved for the separate WallpaperX KDE plugin .so below.
 add_executable(wallpaperx-daemon daemon/main.cpp)
 target_link_libraries(wallpaperx-daemon PRIVATE wallpaperx-daemon-lib)
+
+# `cmake --install <build> --prefix ~/.local --component daemon` yields a runnable daemon.
+
+# share/, not lib/: systemd --user searches $XDG_DATA_HOME/systemd/user, so a ~/.local prefix
+# works as /usr does, and ~/.config/systemd/user stays the user's own place to override it.
+set(WALLPAPERX_SYSTEMD_USER_UNIT_DIR "${CMAKE_INSTALL_DATADIR}/systemd/user"
+    CACHE STRING "Where the systemd user unit is installed, relative to the prefix or absolute")
+# Before anything is copied, so a refused install leaves nothing behind. The unit is generated
+# here, not at configure time, because ExecStart names the binary under the prefix the install
+# actually uses; and written straight to its destination, since the build tree may not be the
+# installing user's to write.
+install(CODE "
+    set(_wx_bindir \"${CMAKE_INSTALL_BINDIR}\")
+    set(_wx_shader_dir \"${WALLPAPERX_INSTALL_SHADER_DIR}\")
+    set(_wx_shader_dir_from_bindir \"${WALLPAPERX_SHADER_DIR_FROM_BINDIR}\")
+    set(_wx_unit_dir \"${WALLPAPERX_SYSTEMD_USER_UNIT_DIR}\")
+    set(_wx_unit_template \"${CMAKE_CURRENT_SOURCE_DIR}/packaging/wallpaperx-daemon.service.in\")
+" COMPONENT daemon)
+install(CODE [[
+    cmake_path(ABSOLUTE_PATH _wx_bindir BASE_DIRECTORY "${CMAKE_INSTALL_PREFIX}" NORMALIZE
+               OUTPUT_VARIABLE _wx_bin)
+    cmake_path(ABSOLUTE_PATH _wx_shader_dir BASE_DIRECTORY "${CMAKE_INSTALL_PREFIX}" NORMALIZE
+               OUTPUT_VARIABLE _wx_shaders)
+    # The path is compiled into the daemon. An absolute bin or data directory does not move with
+    # a prefix given now, while the other one does.
+    file(RELATIVE_PATH _wx_from_bin "${_wx_bin}" "${_wx_shaders}")
+    if(NOT _wx_from_bin STREQUAL _wx_shader_dir_from_bindir)
+        message(FATAL_ERROR "this prefix puts the shaders at ${_wx_shaders}, but the daemon installed "
+                            "to ${_wx_bin} was built to look in ${_wx_shader_dir_from_bindir} from "
+                            "there. Install with the configured prefix, or configure with "
+                            "CMAKE_INSTALL_BINDIR and CMAKE_INSTALL_DATADIR both relative.")
+    endif()
+
+    set(_wx_exe "${_wx_bin}/wallpaperx-daemon")
+    # systemd refuses these in an executable path however they are escaped ("Executable path
+    # contains special characters"), so the unit could never load.
+    set(_wx_refused 34 39 92 127)
+    foreach(_wx_code RANGE 1 31)
+        list(APPEND _wx_refused ${_wx_code})
+    endforeach()
+    foreach(_wx_code IN LISTS _wx_refused)
+        string(ASCII ${_wx_code} _wx_char)
+        string(FIND "${_wx_exe}" "${_wx_char}" _wx_at)
+        if(NOT _wx_at EQUAL -1)
+            message(FATAL_ERROR "systemd cannot run an executable whose path contains a quote, a "
+                                "backslash or a control character: ${_wx_exe}")
+        endif()
+    endforeach()
+    # Anything else is quoted, with % doubled (specifiers are expanded inside quotes too) and
+    # the ":" prefix, which stops $ in the path being taken for a variable in argv[0].
+    if(_wx_exe MATCHES "^[A-Za-z0-9/._+,:=@~-]+$")
+        set(WALLPAPERX_DAEMON_EXEC_START "${_wx_exe}")
+    else()
+        string(REPLACE "%" "%%" _wx_exe "${_wx_exe}")
+        set(WALLPAPERX_DAEMON_EXEC_START ":\"${_wx_exe}\"")
+    endif()
+    file(READ "${_wx_unit_template}" _wx_unit_text)
+    string(CONFIGURE "${_wx_unit_text}" _wx_unit_text @ONLY)
+
+    # What install(FILES) would do: written under DESTDIR, recorded in the manifest without it,
+    # 0644 whatever the umask.
+    cmake_path(ABSOLUTE_PATH _wx_unit_dir BASE_DIRECTORY "${CMAKE_INSTALL_PREFIX}" NORMALIZE)
+    set(_wx_unit "${_wx_unit_dir}/wallpaperx-daemon.service")
+    set(_wx_staged_unit "$ENV{DESTDIR}${_wx_unit}")
+    message(STATUS "Installing: ${_wx_staged_unit}")
+    file(WRITE "${_wx_staged_unit}" "${_wx_unit_text}")
+    file(CHMOD "${_wx_staged_unit}" PERMISSIONS OWNER_READ OWNER_WRITE GROUP_READ WORLD_READ)
+    list(APPEND CMAKE_INSTALL_MANIFEST_FILES "${_wx_unit}")
+]] COMPONENT daemon)
+install(TARGETS wallpaperx-daemon RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT daemon)
+install(DIRECTORY ${WALLPAPERX_SHADER_OUTPUT_DIR}/ DESTINATION ${WALLPAPERX_INSTALL_SHADER_DIR}
+        COMPONENT daemon FILES_MATCHING PATTERN "*.spv")
 
 # --------------------------------------------------------------------------- #
 # Tests
@@ -369,6 +452,14 @@ target_link_libraries(wallpaperx-crash-quarantine-test PRIVATE wallpaperx-daemon
 target_include_directories(wallpaperx-crash-quarantine-test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../renderer/tests)
 set_target_properties(wallpaperx-crash-quarantine-test PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+
+# RenderWorker's stop for a lost device, in process: interposes vkQueueSubmit to lose the device
+# and count what is submitted after the worker reports it.
+add_executable(wallpaperx-device-loss-worker-test tests/device_loss_worker_test.cpp)
+target_link_libraries(wallpaperx-device-loss-worker-test PRIVATE wallpaperx-daemon-lib)
+target_include_directories(wallpaperx-device-loss-worker-test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../renderer/tests)
+set_target_properties(wallpaperx-device-loss-worker-test PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
 
 # Step 9's Plasma wallpaper package (kde/kpackage), checked as text: that its metadata
 # parses, declares the structure Plasma looks for, and agrees with the install rule below
@@ -714,8 +805,60 @@ target_compile_definitions(wallpaperx-daemon-system-test PRIVATE
     WALLPAPERX_VIDEO_ASSET_DIR="${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}"
     WALLPAPERX_WEDGE_SHIM="$<TARGET_FILE:wallpaperx-test-wedge-shim>")
 add_dependencies(wallpaperx-daemon-system-test wallpaperx-test-wedge-shim)
+
+# The device-loss exit needs a lost device in the real daemon, and hanging a real GPU takes
+# the desktop with it: a library preloaded into it that fails the daemon's queue submissions as
+# VK_ERROR_DEVICE_LOST once a trigger file exists. Test-only, like the wedge shim; Vulkan's headers
+# only, since it reaches the loader through dlsym.
+add_library(wallpaperx-test-device-lost-shim SHARED tests/device_lost_shim.cpp)
+# Found again here: the renderer's find_package() is scoped to its own directory.
+find_package(Vulkan REQUIRED)
+target_link_libraries(wallpaperx-test-device-lost-shim PRIVATE ${CMAKE_DL_LIBS} Vulkan::Headers)
+target_include_directories(wallpaperx-test-device-lost-shim PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../renderer/tests)
+set_target_properties(wallpaperx-test-device-lost-shim PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+
+# The real daemon losing its device, exiting 75, and being started again on the same HOME.
+add_executable(wallpaperx-device-loss-restart-test tests/device_loss_restart_test.cpp)
+target_link_libraries(wallpaperx-device-loss-restart-test PRIVATE wallpaperx-daemon-lib)
+target_include_directories(wallpaperx-device-loss-restart-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../renderer/tests)
+set_target_properties(wallpaperx-device-loss-restart-test PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+target_compile_definitions(wallpaperx-device-loss-restart-test PRIVATE
+    WALLPAPERX_DAEMON_BINARY="$<TARGET_FILE:wallpaperx-daemon>"
+    WALLPAPERX_DEVICE_LOST_SHIM="$<TARGET_FILE:wallpaperx-test-device-lost-shim>"
+    WALLPAPERX_WEDGE_SHIM="$<TARGET_FILE:wallpaperx-test-wedge-shim>"
+    WALLPAPERX_VIDEO_ASSET_DIR="${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}")
+add_dependencies(wallpaperx-device-loss-restart-test wallpaperx-daemon wallpaperx-test-device-lost-shim
+                 wallpaperx-test-wedge-shim)
+
+# The install: runs `cmake --install` on this build tree into scratch prefixes and starts the copy.
+find_program(SYSTEMD_ANALYZE_EXECUTABLE systemd-analyze)
+if(NOT SYSTEMD_ANALYZE_EXECUTABLE)
+    set(SYSTEMD_ANALYZE_EXECUTABLE "")
+endif()
+add_executable(wallpaperx-daemon-install-test tests/daemon_install_test.cpp)
+target_link_libraries(wallpaperx-daemon-install-test PRIVATE wallpaperx-daemon-lib)
+target_include_directories(wallpaperx-daemon-install-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../renderer/tests)
+set_target_properties(wallpaperx-daemon-install-test PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+target_compile_definitions(wallpaperx-daemon-install-test PRIVATE
+    WALLPAPERX_CMAKE_COMMAND="${CMAKE_COMMAND}"
+    WALLPAPERX_BUILD_DIR="${CMAKE_BINARY_DIR}"
+    WALLPAPERX_SHADER_OUTPUT_DIR="${WALLPAPERX_SHADER_OUTPUT_DIR}"
+    # The layout this tree installs, so an overridden one is not graded as a broken install.
+    WALLPAPERX_TEST_UNIT_DIR="${WALLPAPERX_SYSTEMD_USER_UNIT_DIR}"
+    WALLPAPERX_TEST_BINDIR="${CMAKE_INSTALL_BINDIR}"
+    WALLPAPERX_TEST_SHADER_DIR="${WALLPAPERX_INSTALL_SHADER_DIR}"
+    WALLPAPERX_SYSTEMD_ANALYZE="${SYSTEMD_ANALYZE_EXECUTABLE}"
+    WALLPAPERX_VIDEO_ASSET_DIR="${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}"
+    # For a scratch configure of this project, which must succeed on whatever host built this one.
+    WALLPAPERX_BACKEND_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+    WALLPAPERX_CMAKE_GENERATOR="${CMAKE_GENERATOR}"
+    WALLPAPERX_BUILD_KDE_PLUGIN_SETTING="${WALLPAPERX_BUILD_KDE_PLUGIN}")
+add_dependencies(wallpaperx-daemon-install-test wallpaperx-daemon)
+
 if(WALLPAPERX_FFMPEG_EXECUTABLE)
     add_dependencies(wallpaperx-daemon-system-test wallpaperx-backend-video-fixtures)
+    add_dependencies(wallpaperx-device-loss-restart-test wallpaperx-backend-video-fixtures)
+    add_dependencies(wallpaperx-daemon-install-test wallpaperx-backend-video-fixtures)
 endif()
 
 # These targets have no Q_OBJECT / Qt usage; AUTOMOC is on globally via
@@ -792,6 +935,18 @@ set_tests_properties(crash_quarantine PROPERTIES SKIP_RETURN_CODE 77)
 if(WALLPAPERX_LAVAPIPE_ICD)
     add_test(NAME crash_quarantine_lavapipe COMMAND $<TARGET_FILE:wallpaperx-crash-quarantine-test>)
     set_tests_properties(crash_quarantine_lavapipe PROPERTIES
+        ENVIRONMENT "VK_ICD_FILENAMES=${WALLPAPERX_LAVAPIPE_ICD}"
+        LABELS "lavapipe"
+        SKIP_RETURN_CODE 77)
+endif()
+
+# Registered as crash_quarantine is, for the same reasons: a device, a scratch directory of its
+# own, and no timing measured.
+add_test(NAME device_loss_worker COMMAND $<TARGET_FILE:wallpaperx-device-loss-worker-test>)
+set_tests_properties(device_loss_worker PROPERTIES SKIP_RETURN_CODE 77)
+if(WALLPAPERX_LAVAPIPE_ICD)
+    add_test(NAME device_loss_worker_lavapipe COMMAND $<TARGET_FILE:wallpaperx-device-loss-worker-test>)
+    set_tests_properties(device_loss_worker_lavapipe PROPERTIES
         ENVIRONMENT "VK_ICD_FILENAMES=${WALLPAPERX_LAVAPIPE_ICD}"
         LABELS "lavapipe"
         SKIP_RETURN_CODE 77)
@@ -995,6 +1150,39 @@ if(DBUS_RUN_SESSION)
         add_test(NAME daemon_system_lavapipe
                  COMMAND ${DBUS_RUN_SESSION} -- $<TARGET_FILE:wallpaperx-daemon-system-test>)
         set_tests_properties(daemon_system_lavapipe PROPERTIES
+            ENVIRONMENT "VK_ICD_FILENAMES=${WALLPAPERX_LAVAPIPE_ICD}"
+            LABELS "lavapipe"
+            RESOURCE_LOCK wallpaperx_bus_tests
+            SKIP_RETURN_CODE 77)
+    endif()
+
+    # Device loss, exit 75, and the restart that brings the wallpapers back. Private bus
+    # and the shared lock for daemon_system's reasons; the binary also refuses any other bus.
+    add_test(NAME device_loss_restart
+             COMMAND ${DBUS_RUN_SESSION} -- $<TARGET_FILE:wallpaperx-device-loss-restart-test>)
+    set_tests_properties(device_loss_restart PROPERTIES RESOURCE_LOCK wallpaperx_bus_tests
+                         SKIP_RETURN_CODE 77)
+    if(WALLPAPERX_LAVAPIPE_ICD)
+        add_test(NAME device_loss_restart_lavapipe
+                 COMMAND ${DBUS_RUN_SESSION} -- $<TARGET_FILE:wallpaperx-device-loss-restart-test>)
+        set_tests_properties(device_loss_restart_lavapipe PROPERTIES
+            ENVIRONMENT "VK_ICD_FILENAMES=${WALLPAPERX_LAVAPIPE_ICD}"
+            LABELS "lavapipe"
+            RESOURCE_LOCK wallpaperx_bus_tests
+            SKIP_RETURN_CODE 77)
+    endif()
+
+    # Private bus and the shared lock for daemon_system's reasons: it starts the installed daemon.
+    # The lock also keeps the two entries apart, since every install rewrites this tree's
+    # install_manifest_daemon.txt and the test reads it back. The Lavapipe entry is what puts the
+    # install and unit checks, which need no GPU, in continuous integration.
+    add_test(NAME daemon_install
+             COMMAND ${DBUS_RUN_SESSION} -- $<TARGET_FILE:wallpaperx-daemon-install-test>)
+    set_tests_properties(daemon_install PROPERTIES RESOURCE_LOCK wallpaperx_bus_tests SKIP_RETURN_CODE 77)
+    if(WALLPAPERX_LAVAPIPE_ICD)
+        add_test(NAME daemon_install_lavapipe
+                 COMMAND ${DBUS_RUN_SESSION} -- $<TARGET_FILE:wallpaperx-daemon-install-test>)
+        set_tests_properties(daemon_install_lavapipe PROPERTIES
             ENVIRONMENT "VK_ICD_FILENAMES=${WALLPAPERX_LAVAPIPE_ICD}"
             LABELS "lavapipe"
             RESOURCE_LOCK wallpaperx_bus_tests

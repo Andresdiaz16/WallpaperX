@@ -259,6 +259,11 @@ public:
     [[nodiscard]] bool safeToFree(const char* whatIsLeaked,
                                   std::optional<SubmitTicket> reader = std::nullopt) noexcept;
 
+    // Whether a queue submission or a fence query on this Device has returned
+    // VK_ERROR_DEVICE_LOST. Permanent once true, as the loss is: nothing this Device submits can
+    // run again. Object creation still succeeds on a lost device, so no creation call is asked.
+    bool lost() const;
+
     // Names the most recent batch submitted, or nothing at all when there has been none.
     // What a caller records when it stops using something the GPU may be reading: no batch
     // submitted after this point can reach it, so this is the last one that could.
@@ -303,6 +308,10 @@ private:
     // Never cleared: the handle is unreachable by then, so a GPU that later catches up does
     // not make it destroyable again.
     void abandon() noexcept { m_abandoned = true; }
+
+    // Passes `result` through, latching lost() on VK_ERROR_DEVICE_LOST. Every queue and fence
+    // result goes through it.
+    VkResult observe(VkResult result) noexcept;
 
     void createInstance(bool enableValidation);
     void selectPhysicalDevice();
@@ -418,6 +427,9 @@ private:
     // abandon(); destroying the device or the VMA allocator around an orphan is a validation
     // error and a hard abort respectively, so teardown leaks instead once this is set.
     bool m_abandoned = false;
+
+    // Written only by observe().
+    bool m_lost = false;
 };
 
 }

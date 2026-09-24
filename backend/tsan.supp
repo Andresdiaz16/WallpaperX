@@ -73,6 +73,14 @@ race:libgallium
 called_from_lib:libvulkan_radeon.so
 called_from_lib:libvulkan_intel.so
 
+# ffmpeg's frame threads order their copies, fills and frees with C11 atomics, which the
+# uninstrumented library hides, so its own memcpy/memset/malloc/free on decoder state read as
+# races. Verified against an ffmpeg built with the sanitizer: none of those reports appear.
+# A race between two of this project's threads stays visible (a planted one is still reported);
+# what is lost is a race between our code and one of those ffmpeg calls on the same memory.
+called_from_lib:libavcodec.so
+called_from_lib:libavutil.so
+
 # sd-bus runs the connection's event loop; its internal reference counting is
 # uninstrumented and shows up on every signal emission from the render thread.
 called_from_lib:libsystemd.so

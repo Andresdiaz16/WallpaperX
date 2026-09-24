@@ -66,6 +66,7 @@
 
 #include "support/check.h"
 #include "support/descriptor_probe_support.h"
+#include "support/real_entry_point.h"
 #include "support/validation_grade.h"
 
 #include <dlfcn.h>
@@ -81,6 +82,7 @@
 #include <unordered_map>
 
 using wallpaperx::testing::check;
+using wallpaperx::testing::realEntryPoint;
 
 namespace {
 
@@ -134,15 +136,7 @@ Batch batchState(VkDevice device, const BatchRef& ref) {
     return vkGetFenceStatus(device, ref.fence) == VK_SUCCESS ? Batch::Finished : Batch::Pending;
 }
 
-template <class Fn>
-Fn realEntryPoint(const char* name) {
-    auto* fn = reinterpret_cast<Fn>(dlsym(RTLD_NEXT, name));
-    if (fn == nullptr) {
-        std::fprintf(stderr, "descriptor_inflight_probe: cannot resolve the real %s\n", name);
-        std::abort();
-    }
-    return fn;
-}
+constexpr const char* kProbe = "descriptor_inflight_probe";
 
 // A buffer tied to a scope. Every phase here has a throwing path, and a buffer freed only on
 // the success path leaks an allocation that VMA turns into a fatal teardown assert -- which
@@ -683,7 +677,7 @@ extern "C" VkResult vkWaitForFences(VkDevice device, uint32_t fenceCount, const 
         ++g_fenceWaits;
     }
     using Fn = VkResult (*)(VkDevice, uint32_t, const VkFence*, VkBool32, uint64_t);
-    static const Fn real = realEntryPoint<Fn>("vkWaitForFences");
+    static const Fn real = realEntryPoint<Fn>(kProbe, "vkWaitForFences");
     return real(device, fenceCount, pFences, waitAll, timeout);
 }
 
@@ -693,7 +687,7 @@ extern "C" VkResult vkQueueSubmit(VkQueue queue, uint32_t submitCount, const VkS
         g_lastSubmitFence = fence;
     }
     using Fn = VkResult (*)(VkQueue, uint32_t, const VkSubmitInfo*, VkFence);
-    static const Fn real = realEntryPoint<Fn>("vkQueueSubmit");
+    static const Fn real = realEntryPoint<Fn>(kProbe, "vkQueueSubmit");
     return real(queue, submitCount, pSubmits, fence);
 }
 
@@ -703,7 +697,7 @@ extern "C" VkResult vkResetFences(VkDevice device, uint32_t fenceCount, const Vk
         for (uint32_t i = 0; i < fenceCount; ++i) ++g_fenceResets[pFences[i]];
     }
     using Fn = VkResult (*)(VkDevice, uint32_t, const VkFence*);
-    static const Fn real = realEntryPoint<Fn>("vkResetFences");
+    static const Fn real = realEntryPoint<Fn>(kProbe, "vkResetFences");
     return real(device, fenceCount, pFences);
 }
 

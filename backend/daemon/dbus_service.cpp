@@ -40,10 +40,12 @@ constexpr const char* kErrorInvalidArgs = "org.freedesktop.DBus.Error.InvalidArg
 
 }  // namespace
 
-DbusService::DbusService(sdbus::IConnection& connection, WallpaperManager& manager)
+DbusService::DbusService(sdbus::IConnection& connection, WallpaperManager& manager,
+                         RenderWorker::DeviceLostFn onDeviceLost)
     : m_manager(manager),
       m_object(sdbus::createObject(connection, sdbus::ObjectPath{kObjectPath})),
-      m_worker(manager, [this](int monitorId, uint64_t generation) { emitFrameReady(monitorId, generation); }) {
+      m_worker(manager, [this](int monitorId, uint64_t generation) { emitFrameReady(monitorId, generation); },
+               std::move(onDeviceLost)) {
     // The worker starts idle -- it can only do anything once a handler posts to it, and
     // no handler can be dispatched until the vtable below is registered.
     registerVTable();

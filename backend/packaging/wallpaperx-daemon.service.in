@@ -1,0 +1,27 @@
+[Unit]
+Description=WallpaperX wallpaper daemon
+After=graphical-session.target
+PartOf=graphical-session.target
+# systemd's default, 5 starts in 10 s, is never reached with RestartSec=3, so it would never give up.
+# Ten starts in two minutes leave room for the daemon's own crash-loop breaker -- one death refuses
+# a still wallpaper that killed it, two a video -- to settle with several monitors each holding a
+# file that kills it, while a daemon that dies at every start is given up on in well under a minute.
+StartLimitIntervalSec=120
+StartLimitBurst=10
+
+[Service]
+# exec rather than dbus: nothing orders after this unit, and Type=dbus would tie the unit to
+# whoever owns the bus name -- terminating it when the name drops, and taking another instance
+# already holding the name as this one being up.
+Type=exec
+ExecStart=@WALLPAPERX_DAEMON_EXEC_START@
+# Load-bearing: brings the daemon back from every exit it did not choose -- a crash, the bus
+# dropping its connection, and status 75, which it exits with when the GPU device is lost.
+# A stop (SIGTERM, SIGINT, SIGHUP) exits 0 and is not restarted.
+Restart=on-failure
+RestartSec=3
+# Above the daemon's own 3 s deadline, which ends a stop even when its teardown is stuck.
+TimeoutStopSec=10
+
+[Install]
+WantedBy=graphical-session.target
