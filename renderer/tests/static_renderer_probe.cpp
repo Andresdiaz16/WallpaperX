@@ -305,7 +305,7 @@ void gradeCover(Device& device, OffscreenTargetManager& targets, StaticRenderer&
     }
     check(report.fromImage == expected, "every monitor pixel came from the image rather than a border, for: " + what);
 
-    // GOAL: the image is not mirrored or flipped -- its left and top edges land on the monitor's
+    // GOAL: S13.110 -- the image is not mirrored or flipped -- its left and top edges land on the monitor's
     //       left and top.
     // WHY-THIS-SHAPE: read off the same ramps rather than separate stripe markers: the ramp is a
     //       marker at every column and row, so a stripe fixture would add nothing the geometry
@@ -329,7 +329,7 @@ void gradeCover(Device& device, OffscreenTargetManager& targets, StaticRenderer&
 void runCoverCases(Device& device, const std::string& tier) {
     OffscreenTargetManager targets(device);
 
-    // GOAL: an image whose aspect differs from the monitor's is uniformly scaled to cover it,
+    // GOAL: S13.108 -- an image whose aspect differs from the monitor's is uniformly scaled to cover it,
     //       centred, the overflow cropped -- never stretched, letterboxed or anchored at a corner --
     //       and one whose aspect matches is shown whole.
     // WHY-THIS-SHAPE: every monitor pixel is compared against a recovered image coordinate, not a
@@ -359,7 +359,7 @@ void runCoverCases(Device& device, const std::string& tier) {
         gradeCover(device, targets, renderer, 1, 128, 64, 96, 96,
                    tier + ": an image wider than the monitor is cropped left and right, not squeezed");
 
-        // GOAL: the crop is decided per target. One renderer drawing monitors of three shapes crops
+        // GOAL: S13.109 -- the crop is decided per target. One renderer drawing monitors of three shapes crops
         //       each for its own shape.
         // WHY-THIS-SHAPE: the same renderer as above on purpose -- a fresh renderer per shape would
         //       pass for one that computed the crop once and kept it. 192x36 makes the 2:1 image
@@ -445,7 +445,7 @@ void gradeAgreement(Device& device, OffscreenTargetManager& targets, int monitor
     check(interior > 0 && edge > 0 && interior + edge == static_cast<size_t>(targetWidth) * targetHeight,
           "every monitor pixel was compared, inside the crop and at its edge, for: " + what);
 
-    // GOAL: the still-image and video renderers keep the same region of the same image on the same
+    // GOAL: S13.111 -- the still-image and video renderers keep the same region of the same image on the same
     //       monitor.
     // WHY-THIS-SHAPE: compared pixel for pixel against the video renderer, not against the cover
     //       rule, because the property is agreement, and the video probe's own geometry check
@@ -504,7 +504,7 @@ void runAgreementCases(Device& device, const std::string& tier) {
 
 constexpr int kCasesPerTier = 8;
 
-// GOAL: every tier draws the cropped image with zero validation messages, and each tier is really
+// GOAL: S13.112 -- every tier draws the cropped image with zero validation messages, and each tier is really
 //       the one named.
 // WHY-THIS-SHAPE: one Device per tier, each graded on its own, because the tiers build different
 //       pipeline layouts and a message on one must name that tier. Heap cannot be forced -- it is

@@ -2203,7 +2203,7 @@ void runFailedPassChecks(const WallpaperManager::Config& base, const std::vector
         check(status && status->lastErrorIsDaemonFault, "and the failed draw is reported as the daemon's failure, not "
                                                         "the file's");
     }
-    // GOAL: the failure this monitor reports is the one its own draw hit -- the queue submission --
+    // GOAL: S13.138 -- the failure this monitor reports is the one its own draw hit -- the queue submission --
     //       and not some later failure of the daemon's, so an operator reading last_error is pointed
     //       at what actually went wrong.
     // WHY-THIS-SHAPE: this phase's clips hold one picture each and show() drains the round that parks
@@ -3885,7 +3885,8 @@ void runWatchEvidenceChecks(const WallpaperManager::Config& config, const std::s
         //       uncollectedSince -> "FAIL: and a consumer refused while holding this monitor's
         //       images does not count as collecting". Replacing the whole block with nothing --
         //       no refusal ever counts -> "FAIL: a consumer refused while holding none of this
-        //       monitor's images counts as collecting". Both observed 2026-09-20. Reverted.
+        //       monitor's images counts as collecting". Both observed 2026-09-20. Reverted. The first
+        //       re-run 2026-09-23 on the NVIDIA entry: this arm is reached there, and went red.
         const bool unwatchedAgain = rearmStale();
         check(unwatchedAgain, "the monitor goes unwatched again with its images out and nothing collecting");
         if (unwatchedAgain) {

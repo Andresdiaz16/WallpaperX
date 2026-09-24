@@ -6294,7 +6294,10 @@ void runAcquireTimelineWireChecks(const wallpaperx::WallpaperManager::Config& co
     //       `!AcquireTimeline::supported(*m_device)` made `true` -> "FAIL: a GPU that can export a
     //       timeline gives the first consumer one (refused with
     //       'io.wallpaperx.Daemon.Error.Unsupported')". Observed 2026-09-23 on the NVIDIA entry.
-    //       Reverted. The Unsupported direction runs only where the driver cannot export one.
+    //       Reverted. The Unsupported direction runs only where the driver cannot export one: the same
+    //       line made `false` -> "FAIL: a GPU that cannot export a timeline is answered Unsupported
+    //       (answered 'io.wallpaperx.Daemon.Error.ExportFailed')" on dbus_service_lavapipe and
+    //       dbus_service_classic_lavapipe, observed 2026-09-23. Reverted.
     sdbus::UnixFd aliceTimeline;
     std::string refusal;
     try {

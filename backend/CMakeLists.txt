@@ -747,6 +747,13 @@ add_test(NAME log_escape COMMAND $<TARGET_FILE:wallpaperx-log-escape-test>)
 # driver, no filesystem. `novulkan` because the sanitizer block below selects by label and an
 # unlabelled entry is disabled there.
 add_test(NAME buffer_claims COMMAND $<TARGET_FILE:wallpaperx-buffer-claims-test>)
+
+# Reads the linked daemon binary for calls that copy a decoded picture into system memory (S13.9).
+# Opens no driver, hence `novulkan`.
+add_test(NAME no_host_readback
+         COMMAND ${CMAKE_COMMAND} -DBINARY=$<TARGET_FILE:wallpaperx-daemon>
+                 -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/no_host_readback.cmake)
+set_tests_properties(no_host_readback PROPERTIES LABELS "novulkan")
 set_tests_properties(buffer_claims PROPERTIES LABELS "novulkan"
                      SKIP_RETURN_CODE 77)
 # `novulkan`, for the same reason the five renderer entries carry it: the TSan block below

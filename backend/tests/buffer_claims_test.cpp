@@ -147,7 +147,7 @@ void runDaemonLifetimeChecks() {
 void runClaimSetChecks() {
     BufferClaims& ledger = freshLedger();
 
-    // GOAL: a set gives back what it holds, once each, and reports whether it still held it. The
+    // GOAL: S13.168 -- a set gives back what it holds, once each, and reports whether it still held it. The
     //       answer is what the two release paths branch on: an import ending and an item leaving
     //       the screen can both reach the same claim, and whichever is second must send nothing.
     //       False for a set that answers true twice -- which is a second ReleaseBuffer for an
@@ -164,7 +164,7 @@ void runClaimSetChecks() {
         check(!set.remove(one), "and a second attempt on the same claim reports nothing to give back");
     }
 
-    // GOAL: two live imports of one image are two claims, and the set hands both back. The plugin
+    // GOAL: S13.168 -- two live imports of one image are two claims, and the set hands both back. The plugin
     //       re-imports the image it is already showing whenever the scene changes, so this is the
     //       ordinary steady state -- and the ledger above counts imports, so a set that collapsed
     //       duplicates would leave that count one too high for ever and the image would never be
@@ -185,7 +185,7 @@ void runClaimSetChecks() {
         (void)ledger.giveBack(second);
     }
 
-    // GOAL: the owner is not part of what identifies a claim. The same image can be claimed once
+    // GOAL: S13.168 -- the owner is not part of what identifies a claim. The same image can be claimed once
     //       before this process has learned the daemon's unique bus name and again after, and a
     //       set that matched on the owner would refuse to give the first one back -- leaving that
     //       image out of the monitor's ring for the life of the session.
@@ -203,7 +203,7 @@ void runClaimSetChecks() {
         (void)ledger.giveBack(unnamed);
     }
 
-    // GOAL: a holder that kept a reference to a RETIRED set cannot give back a claim registered
+    // GOAL: S13.168 -- a holder that kept a reference to a RETIRED set cannot give back a claim registered
     //       in the set that replaced it. This is the whole reason the item exchanges its set for
     //       a fresh one when it leaves the screen instead of just emptying the one it has: a ring
     //       slot hands the same buffer id out again, so a stale holder's claim is value-identical

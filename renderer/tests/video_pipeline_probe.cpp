@@ -2027,6 +2027,112 @@ void runStalledTeardownChecks(Device& device, const std::string& label, const Si
     }
 }
 
+void runUnansweredProbeTeardownChecks(Device& device, const std::string& label) {
+    if (!hardwareDecoderPresent(device, label)) return;
+    const char* const file = "counter_resize.h264";
+    if (!haveAsset(file, label)) return;
+    const std::string what = std::string(file) + ", torn down on the hardware with the device not answering";
+
+    // GOAL: S13.121 -- tearing down a hardware decoder that holds decode images, with every renderer batch
+    //       finished, first asks the device a bounded question, and when that goes unanswered leaks the codec
+    //       and its image pools rather than entering ffmpeg's unbounded wait on its own decode work.
+    // WHY-THIS-SHAPE: every batch is drained before teardown, so safeToFree() says yes and cannot short-circuit
+    //       to the leak on its own -- the stalled-teardown check (S13.91) reaches the leak that way, which is why
+    //       it never grades this branch. Only the probe's own submission is held and its wait told VK_TIMEOUT,
+    //       the answer a stopped GPU gives, so the branch runs without waiting out the Device's bound.
+    // CONTROL: renderer/video/video_decoder.cpp closeDecoder() without `(decodeWorkHeld && !decodeWorkCanDrain())`,
+    //       reverted: "0 unanswered probe(s) at teardown, not 1". The probe made and its answer ignored, reverted:
+    //       "the hardware codec was freed at teardown" and "pool 1 of 1 was freed at teardown". NVIDIA only.
+    // COVERAGE-ASSERT: every call before teardown returned a device picture, the codec and a pool were alive when
+    //       teardown began, and exactly one wait was refused -- the probe's, since nothing else was held.
+    std::string threw;
+    bool devicePictures = true;
+    bool aliveAtTeardown = false;
+    bool drained = false;
+    bool stillStalled = false;
+    try {
+        RetireHarness harness(device, asset(file));
+        for (int i = 0; i < 3; ++i) {
+            const DirectCall call = harness.call();
+            devicePictures = devicePictures && call.returned && call.onDevice;
+        }
+        device.waitForSubmissions();
+        drained = device.hasCompleted(device.lastSubmission());
+        const CodecRecord* hardware = RetireHarness::hardwareCodec();
+        aliveAtTeardown = hardware != nullptr && !hardware->freed && !g_pools.empty() && !g_pools.front().freed;
+        g_holdNextSubmission = true;
+        g_stallHeld = true;
+        static_cast<void>(harness.destroy());
+        g_holdNextSubmission = false;
+        // The next teardown on a GPU that never answered, as the daemon's would be. Without it the probe's batch
+        // retires below and the Device, never told of the leak, destroys itself under the leaked codec's objects:
+        // VUID-vkDestroyDevice-device-05137 at teardown, a production defect recorded under S13.121, not graded.
+        stillStalled = !device.safeToFree("what the unanswered-probe teardown leaked");
+        g_stallHeld = false;
+    } catch (const std::exception& e) {
+        g_stallHeld = false;
+        g_holdNextSubmission = false;
+        threw = e.what();
+    }
+    // Lets the Device retire the probe's batch, so the entry's closing wait does not report it as a stall. It
+    // was submitted a moment ago, so it is polled to completion first: that wait refuses a stamped batch.
+    g_heldFences.clear();
+    const auto retireBy = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!device.hasCompleted(device.lastSubmission()) && std::chrono::steady_clock::now() < retireBy) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (!device.hasCompleted(device.lastSubmission())) {
+        std::fprintf(stderr, "FAIL: %s: %s: the probe's empty batch had not completed 5 s after the hold was let go\n",
+                     label.c_str(), what.c_str());
+        fail("the harness could not retire the batch it held, so nothing after it in this child can be trusted");
+        return;
+    }
+    if (!threw.empty()) {
+        std::fprintf(stderr, "FAIL: %s: %s: threw: %s\n", label.c_str(), what.c_str(), threw.c_str());
+        fail("the unanswered-probe teardown run threw");
+        return;
+    }
+    if (!devicePictures) {
+        std::printf("%s: %s: this device did not decode every picture of the run on the hardware -- not answerable\n",
+                    label.c_str(), what.c_str());
+        g_notVerified = true;
+        return;
+    }
+    const CodecRecord* hardware = RetireHarness::hardwareCodec();
+    std::printf("%s: %s: %d unanswered probe(s); hardware codec %s; %zu pool(s)\n", label.c_str(), what.c_str(),
+                g_stalledWaits, codecFate(hardware).c_str(), g_pools.size());
+    if (!drained || !aliveAtTeardown) {
+        std::fprintf(stderr, "FAIL: %s: %s: renderer batches %s before teardown; codec and pool %s alive at it\n",
+                     label.c_str(), what.c_str(), drained ? "finished" : "still running",
+                     aliveAtTeardown ? "were" : "were not");
+        fail("teardown was not reached with a live hardware codec and every renderer batch finished");
+        return;
+    }
+    if (g_stalledWaits != 1) {
+        std::fprintf(stderr, "FAIL: %s: %s: %d unanswered probe(s) at teardown, not 1\n", label.c_str(), what.c_str(),
+                     g_stalledWaits);
+        fail("a teardown holding decode images did not ask the device a bounded question before freeing them");
+        return;
+    }
+    if (!stillStalled) {
+        std::fprintf(stderr, "FAIL: %s: %s: the Device saw no stalled batch after the unanswered probe\n",
+                     label.c_str(), what.c_str());
+        fail("the harness's stall did not outlive the teardown it was meant to stall");
+        return;
+    }
+    if (hardware->freed) {
+        std::fprintf(stderr, "FAIL: %s: %s: the hardware codec was %s\n", label.c_str(), what.c_str(),
+                     codecFate(hardware).c_str());
+        fail("a hardware codec was freed after the device did not answer, entering ffmpeg's unbounded wait");
+    }
+    for (size_t i = 0; i < g_pools.size(); ++i) {
+        if (!g_pools[i].freed || g_pools[i].freedDuring != kDestroying) continue;
+        std::fprintf(stderr, "FAIL: %s: %s: pool %zu of %zu was freed at teardown\n", label.c_str(), what.c_str(), i + 1,
+                     g_pools.size());
+        fail("an image pool was freed after the device did not answer");
+    }
+}
+
 void runRefusedTeardownChecks(Device& device, const std::string& label) {
     if (!hardwareDecoderPresent(device, label)) return;
     const char* const file = "counter_sg_30.hevc";
@@ -4080,6 +4186,8 @@ int main(int argc, char** argv) {
             }
             cases.emplace_back("counter_sg_30.hevc, refused before decoding",
                                [label](Device& device) { runRefusedTeardownChecks(device, label); });
+            cases.emplace_back("counter_resize.h264, device not answering at teardown",
+                               [label](Device& device) { runUnansweredProbeTeardownChecks(device, label); });
         } else if (mode == "loop-device") {
             cases.emplace_back("every loop fixture", [label](Device& device) {
                 runLoopChecks(device, label, /*onDevice=*/true);

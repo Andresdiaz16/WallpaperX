@@ -2923,7 +2923,8 @@ std::vector<std::string> configPortArgs(int port) { return {"--config-port", std
 //       that quit of its own accord must arrive as a named failure; a daemon the machine
 //       killed must arrive as a skip, never as a verdict on the daemon; and a port genuinely
 //       held by another process must arrive as a skip, asserted only where the daemon's own
-//       bind-failure line says so.
+//       bind-failure line says so. Control (f) below is also S13.210's evidence: with 18462
+//       held, only the default-port phase noticed.
 // WHY-THIS-SHAPE: one function, not a copy per phase. The obvious alternative -- each phase
 //       inlining its own wait-and-classify -- is what this replaces, and the cost of it is
 //       measurable: a copy that drops the drain re-wait accuses production of rewording a

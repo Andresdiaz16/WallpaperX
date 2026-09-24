@@ -586,8 +586,9 @@ bool runPhase(Phase phase) {
         // CONTROL: in backend/kde/wallpaperx_item.cpp, the `dropShownFrame();` call deleted from
         //       updateOnScreen()'s off-screen branch -> "FAIL: and it stops claiming a frame is on
         //       the screen" and "FAIL: and the next pass destroys the node that was drawing it".
-        //       Deleting only the `m_dropNode = true;` line inside dropShownFrame() reddens the
-        //       node line alone. Both observed 2026-09-20. Reverted.
+        //       Deleting only the `m_nodeRequest = NodeRequest::Destroy;` line inside
+        //       dropShownFrame() reddens the node line, and the later "and says a frame is on the
+        //       screen again", in item_offscreen_hidden. Both re-run 2026-09-23. Reverted.
         check(!claimsFrameShown(scene.item), "and it stops claiming a frame is on the screen");
         scene.renderPass();
         check(itemPaintNode(scene.item) == nullptr, "and the next pass destroys the node that was drawing it");

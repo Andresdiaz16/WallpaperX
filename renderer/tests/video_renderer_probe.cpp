@@ -269,7 +269,7 @@ void gradeCover(Device& device, OffscreenTargetManager& targets, VideoRenderer& 
 // ------------------------------------------------------------------------- //
 
 void runGeometryChecks(Device& device, OffscreenTargetManager& targets) {
-    // GOAL: a frame whose aspect differs from the monitor's is scaled to cover and cropped
+    // GOAL: S13.20, S13.22 -- a frame whose aspect differs from the monitor's is scaled to cover and cropped
     //       centrally -- never stretched to fit, never letterboxed, never cropped from a
     //       corner -- and a crop the arithmetic would round to nothing keeps one pixel
     //       instead of collapsing to an empty blit region.
@@ -304,7 +304,7 @@ void runGeometryChecks(Device& device, OffscreenTargetManager& targets) {
         gradeCover(device, targets, renderer, wide, /*monitorId=*/1, 64, 64,
                    "a frame wider than the monitor is cropped left and right, not squeezed");
 
-        // GOAL: the crop is decided per target, not once per frame or per renderer. The same
+        // GOAL: S13.21 -- the crop is decided per target, not once per frame or per renderer. The same
         //       renderer showing the same frame on a monitor of a different shape crops on the
         //       other axis.
         // WHY-THIS-SHAPE: reuses the renderer above deliberately. A version that built a second
@@ -333,7 +333,7 @@ void runGeometryChecks(Device& device, OffscreenTargetManager& targets) {
                    "a frame with the monitor's own aspect is shown whole");
     }
     {
-        // GOAL: at a ratio whose crop rounds to zero, the monitor still shows the middle column
+        // GOAL: S13.22 -- at a ratio whose crop rounds to zero, the monitor still shows the middle column
         //       of the frame and the render is legal.
         // WHY-THIS-SHAPE: 512x2 on an 8x64 monitor makes the computed crop width 2*8/64 = 0
         //       before std::max clamps it to 1. The x half carries the verdict: the crop is one
@@ -382,7 +382,7 @@ void runFrameRestoreChecks(Device& device, OffscreenTargetManager& targets) {
         const std::vector<RecordedBarrier> onFrame = barriersFor(frame.image());
         ++layoutsExamined;
 
-        // GOAL: a render transitions the borrowed frame to a blit source and back to the layout
+        // GOAL: S13.23 -- a render transitions the borrowed frame to a blit source and back to the layout
         //       its owner declared, so the owner's own record of that image never drifts and the
         //       same frame can be shown again.
         // WHY-THIS-SHAPE: the barriers are read by interposing vkCmdPipelineBarrier, because
@@ -425,7 +425,7 @@ void runFrameRestoreChecks(Device& device, OffscreenTargetManager& targets) {
                   "the frame stays with the graphics queue -- the renderer transfers no ownership of it");
         }
 
-        // GOAL: showing one frame twice is legal and produces the same picture both times.
+        // GOAL: S13.24 -- showing one frame twice is legal and produces the same picture both times.
         // WHY-THIS-SHAPE: two monitors rather than one, because reading a target back reclaims
         //       it. Stated as a check even though the pair above is the stronger oracle: this is
         //       the property a caller depends on (a decoder holds a frame across several display
@@ -475,7 +475,7 @@ void runTargetLayoutChecks(Device& device, OffscreenTargetManager& targets) {
     targets.render(renderer, target);
     stopBarrierRecording();
 
-    // GOAL: a video render leaves the target in TRANSFER_DST_OPTIMAL and says so. What the
+    // GOAL: S13.25 -- a video render leaves the target in TRANSFER_DST_OPTIMAL and says so. What the
     //       target records as released is what the next acquire names, so a consumer's
     //       hand-back reverses the hand-over it was paired with.
     // WHY-THIS-SHAPE: this is why IRenderer::record() returns a layout at all. Asserting the
@@ -577,7 +577,7 @@ void runRefusalChecks(Device& device, OffscreenTargetManager& targets) {
     vkGetPhysicalDeviceProperties(device.physicalDevice(), &properties);
     const uint32_t limit = properties.limits.maxImageDimension2D;
 
-    // GOAL: the constructor validates the frame it is handed. A wholly default-constructed
+    // GOAL: S13.28 -- the constructor validates the frame it is handed. A wholly default-constructed
     //       VideoFrame -- the value a caller gets for free -- does not build a renderer.
     // CONTROL: `show(first);` in the VideoRenderer constructor
     //       (renderer/renderers/video_renderer.cpp) replaced by `m_frame = first;`, a
@@ -594,7 +594,7 @@ void runRefusalChecks(Device& device, OffscreenTargetManager& targets) {
     RampFrame good(device, 128, 128, VK_IMAGE_LAYOUT_GENERAL);
     VideoRenderer renderer(device, good.frame());
 
-    // GOAL: the first frame is checked even when its declaration is the default-constructed
+    // GOAL: S13.28 -- the first frame is checked even when its declaration is the default-constructed
     //       one -- the value a caller gets for free from `VideoSource{}`.
     // WHY-THIS-SHAPE: this is the case the marker has to get right, and the only one. A real
     //       image and a valid layout carry it past requireShowable, so what refuses it is the
@@ -646,7 +646,7 @@ void runRefusalChecks(Device& device, OffscreenTargetManager& targets) {
         return frame;
     };
 
-    // GOAL: each of these declarations is refused rather than blitted, and refused with the type
+    // GOAL: S13.26 -- each of these declarations is refused rather than blitted, and refused with the type
     //       that names whose problem it is -- WallpaperContentError for content this device
     //       cannot take verbatim, std::invalid_argument for a declaration wrong on its face.
     // WHY-THIS-SHAPE: refuses() grades the exception type and not merely that something was
@@ -714,7 +714,7 @@ void runRefusalChecks(Device& device, OffscreenTargetManager& targets) {
         ++examined;
         refuses(testCase.what, testCase.expected, [&] { renderer.show(testCase.frame); });
 
-        // GOAL: a refused frame leaves the previously shown one on the monitor -- the refusal
+        // GOAL: S13.27 -- a refused frame leaves the previously shown one on the monitor -- the refusal
         //       costs the picture nothing.
         // WHY-THIS-SHAPE: rendered and compared after each refusal rather than once at the end,
         //       so a leak is attributed to the case that leaked. Four of the eleven cases are
@@ -877,7 +877,7 @@ void runModifierFilterChecks(Device& device) {
     check(everyUsableIsListed, "every usable modifier appears in the driver's modifier report");
     if (!everyUsableIsListed) return;
 
-    // GOAL: usableDrmModifiers() drops exactly those modifiers whose own tiling features lack
+    // GOAL: S13.29 -- usableDrmModifiers() drops exactly those modifiers whose own tiling features lack
     //       the caller's required ones -- so requiring a feature no modifier advertises leaves
     //       none, and requiring one only some advertise drops precisely the others.
     // WHY-THIS-SHAPE: a check that asked for VK_FORMAT_FEATURE_BLIT_DST_BIT (what production
@@ -965,7 +965,7 @@ void runModifierFilterChecks(Device& device) {
         return;
     }
 
-    // GOAL: the requirement reaches image creation. A dma_buf image whose required tiling
+    // GOAL: S13.30 -- the requirement reaches image creation. A dma_buf image whose required tiling
     //       features no modifier satisfies is refused, rather than created with a layout the
     //       blit it exists for cannot target.
     // WHY-THIS-SHAPE: graded through createExportableImage rather than only through the free
@@ -1027,7 +1027,7 @@ void runModifierFilterChecks(Device& device) {
     check(createdWithProductionFeatures,
           "a dma_buf image is still created for the tiling features an offscreen target asks for");
 
-    // GOAL: the opaque-fd path does not consult the requirement, as its documentation says --
+    // GOAL: S13.31 -- the opaque-fd path does not consult the requirement, as its documentation says --
     //       there is no modifier list there, and the caller can query the tiling it chose.
     // WHY-THIS-SHAPE: the same impossible feature that refuses the dma_buf path above. Without
     //       this, moving the filter above the handle-type branch -- the obvious "simplification"
