@@ -58,6 +58,11 @@ public:
         // and have the import refused: reading without the acquire is undefined but works, and is
         // the fallback.
         std::vector<int> syncFds;
+
+        // The other form of the same hand-over: the acquire_value of GetFrameFd, a value to wait
+        // for on the consumer's acquire timeline. Nonzero only when syncFds is empty -- the daemon
+        // sends one or the other. Which timeline it is a value on is the caller's to know.
+        uint64_t timelineValue = 0;
     };
 
     struct Result {
@@ -137,7 +142,37 @@ public:
     // acquire and is unsafe to sample until that has been waited on.
     //
     // Refuses a wait this context cannot perform, exactly as import() does.
-    static bool acquire(Request& request, unsigned int texture, std::string* whyNot = nullptr);
+    //
+    // `importRefused`, when given, is set true only when the driver refused glImportSemaphoreFdEXT
+    // itself -- on NVIDIA the one failure after which no semaphore import in this context succeeds
+    // again. Every other failure leaves it false.
+    static bool acquire(Request& request, unsigned int texture, std::string* whyNot = nullptr,
+                        bool* importRefused = nullptr);
+
+    // Whether this context can wait on a Vulkan timeline semaphore: supportsSync() plus
+    // GL_NV_timeline_semaphore. Mesa has the first and not the second, and keeps the binary path.
+    static bool supportsTimeline(std::string* whyNot = nullptr);
+
+    // A timeline semaphore imported into one context, once, and waited on for many pictures. 0 is
+    // "none". Freed by release() with the same context current.
+    struct Timeline {
+        unsigned int semaphore = 0;
+    };
+
+    // Imports the timeline `fd` names. Borrows `fd`: the import is made from a duplicate, so the
+    // caller's descriptor is its own either way. Worth doing as rarely as possible -- measured on
+    // NVIDIA, once one semaphore import fails in a context, every later one there fails too.
+    // `importRefused` as for acquire().
+    static Timeline importTimeline(int fd, std::string* whyNot = nullptr, bool* importRefused = nullptr);
+
+    // The per-picture half of the timeline path: waits for `value` against `texture`, carrying the
+    // same acquire and layout as the binary wait. `value` must already have been reached. This
+    // context cannot read the payload to check, and a wait for a value it never reaches stalls
+    // every later command in the context -- which is why the daemon only hands out reached values.
+    static bool acquire(const Timeline& timeline, uint64_t value, unsigned int texture,
+                        std::string* whyNot = nullptr);
+
+    static void release(const Timeline& timeline);
 
 private:
     // The dma_buf half of import(), through EGLImage. Separate because the two paths share
@@ -153,7 +188,8 @@ private:
 
     // Waits on every descriptor in `request.syncFds` against `texture`, consuming them. The
     // acquire both paths need, so it runs after either has produced a texture.
-    static bool waitOnSyncFds(Request& request, unsigned int texture, std::string& error);
+    static bool waitOnSyncFds(Request& request, unsigned int texture, std::string& error,
+                              bool* importRefused = nullptr);
 
 public:
     // Frees what import() returned. The GL half must run on the thread whose context created

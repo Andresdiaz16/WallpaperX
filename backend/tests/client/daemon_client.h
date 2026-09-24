@@ -226,6 +226,32 @@ inline Frame getFrameFd(sdbus::IProxy& proxy, int32_t monitorId) {
     return frame;
 }
 
+// GetFrameFdOnTimeline's reply: GetFrameFd's twelve fields in the same order, then acquire_value.
+// Shared for the reason Frame is: which field is where is a wire fact both tiers must read alike.
+struct TimelineFrame {
+    Frame frame;
+    uint64_t acquireValue = 0;
+};
+
+inline TimelineFrame getFrameFdOnTimeline(sdbus::IProxy& proxy, int32_t monitorId) {
+    TimelineFrame out;
+    Frame& frame = out.frame;
+    proxy.callMethod("GetFrameFdOnTimeline")
+        .onInterface(DbusService::kInterface)
+        .withArguments(monitorId)
+        .storeResultsTo(frame.fd, frame.width, frame.height, frame.memorySize, frame.handleType, frame.syncFds,
+                        frame.generation, frame.drmFormat, frame.drmModifier, frame.planes, frame.deviceUuid,
+                        frame.bufferId, out.acquireValue);
+    return out;
+}
+
+// The caller's acquire timeline, as a descriptor the caller owns.
+inline sdbus::UnixFd getAcquireTimeline(sdbus::IProxy& proxy) {
+    sdbus::UnixFd timeline;
+    proxy.callMethod("GetAcquireTimeline").onInterface(DbusService::kInterface).storeResultsTo(timeline);
+    return timeline;
+}
+
 // `timeout` is the method-call timeout. Zero, the default, means the bus's own (25 s) and is
 // what every caller wants but one: a phase asking the question OF a daemon that may be wedged
 // inside the handler passes a short one, so that daemon produces a failed check in seconds

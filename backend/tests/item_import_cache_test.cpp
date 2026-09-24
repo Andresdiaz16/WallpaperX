@@ -36,6 +36,8 @@
 #include "kde/frame_import.h"
 #include "support/validation_grade.h"
 #include "tests/gl_import_harness.h"
+#include "tests/gl_semaphore_fault.h"
+#include "tests/item_render_scene.h"
 #include "tests/item_stub_scene.h"
 #include "tests/test_report.h"
 #include "vulkan/device.h"
@@ -78,8 +80,11 @@
 
 namespace {
 
+using wallpaperx::testing::announce;
+using wallpaperx::testing::cacheQmlSource;
 using wallpaperx::testing::check;
 using wallpaperx::testing::claimsFrameShown;
+using wallpaperx::testing::drawNext;
 using wallpaperx::testing::ExportingStub;
 using wallpaperx::testing::glDeviceUuid;
 using wallpaperx::testing::itemPaintNode;
@@ -91,9 +96,14 @@ using wallpaperx::testing::kPath;
 using wallpaperx::testing::kSecondMonitor;
 using wallpaperx::testing::kService;
 using wallpaperx::testing::kWidth;
+using wallpaperx::testing::nativeName;
+using wallpaperx::testing::nearestColour;
 using wallpaperx::testing::notVerified;
 using wallpaperx::testing::publishSolidFrame;
+using wallpaperx::testing::pumpFor;
 using wallpaperx::testing::pumpUntil;
+using wallpaperx::testing::Scene;
+using wallpaperx::testing::settleQuiet;
 using wallpaperx::testing::vulkanDeviceUuid;
 
 void check(bool condition, const std::string& what) { wallpaperx::testing::check(condition, what.c_str()); }
@@ -148,136 +158,6 @@ constexpr const char* kCouldNotImport = "WallpaperX produced a frame this deskto
 constexpr int kToleratedHandOverFailures = 8;
 
 int g_ungradedValidation = 0;
-
-void pumpFor(int ms) {
-    QElapsedTimer clock;
-    clock.start();
-    while (clock.elapsed() < ms) QCoreApplication::processEvents(QEventLoop::AllEvents, 10);
-}
-
-// The plugin's own type, with its two counters BOUND the way a QML reader binds them -- which is
-// the only reader they exist for, and one that is frozen at its first value without a NOTIFY.
-QString cacheQmlSource() {
-    return QStringLiteral(R"(
-import QtQuick
-import com.wallpaperx
-
-Item {
-    id: root
-    width: 68
-    height: 36
-    property Item rendererItem: renderer
-    property string publishedReason: renderer.unavailableReason
-    property var boundImports: renderer.importCount
-    property var boundReused: renderer.reusedImportCount
-    property int reasonSignals: 0
-    property int frameShownSignals: 0
-
-    WallpaperXRenderer {
-        id: renderer
-        anchors.fill: parent
-        monitorId: 0
-        onUnavailableReasonChanged: root.reasonSignals++
-        onFrameShownChanged: root.frameShownSignals++
-    }
-}
-)");
-}
-
-struct Scene {
-    QQuickRenderControl control;
-    QQuickWindow window{&control};
-    QQmlEngine engine;
-    std::unique_ptr<QQmlComponent> component;
-    std::unique_ptr<QObject> root;
-    QQuickItem* item = nullptr;
-
-    // One scene-graph pass. `afterFrame` runs once the frame has been rendered and before the
-    // context is dropped, which is where a readback may run without disturbing Qt's own state.
-    void renderPass(const std::function<void()>& afterFrame = nullptr) {
-        control.polishItems();
-        control.beginFrame();
-        control.sync();
-        control.endFrame();
-        if (afterFrame) afterFrame();
-        // For item_import_release_test's reason: a real compositor's GUI thread holds no context
-        // between frames, and a harness that left one current would hide a free made there.
-        if (QOpenGLContext* current = QOpenGLContext::currentContext()) current->doneCurrent();
-    }
-
-    quint64 imports() const { return item->property("importCount").toULongLong(); }
-    quint64 reused() const { return item->property("reusedImportCount").toULongLong(); }
-    quint64 pictures() const { return imports() + reused(); }
-    QString reason() const { return root->property("publishedReason").toString(); }
-};
-
-GLuint nativeName(QSGTexture* texture) {
-    if (texture == nullptr) return 0;
-    auto* opengl = texture->nativeInterface<QNativeInterface::QSGOpenGLTexture>();
-    return opengl == nullptr ? 0 : opengl->nativeTexture();
-}
-
-void announce(QDBusConnection& bus, quint64 generation) {
-    QDBusMessage ready =
-        QDBusMessage::createSignal(QString::fromUtf8(kPath), QString::fromUtf8(kInterface), QStringLiteral("FrameReady"));
-    ready.setArguments({kFirstMonitor, static_cast<qulonglong>(generation)});
-    bus.send(ready);
-}
-
-// Runs passes until the item has asked for nothing new for a third of a second, which is what makes
-// "the next request" mean the next one this phase causes. Needed rather than a fixed number of
-// passes: the item's startup makes several forced fetches that coalesce into trailing ones, and one
-// landing after a phase has started scheduling replies is served as that phase's first -- measured,
-// it put a ninth failed hand-over into a run meant to stop at eight. False when the item never goes
-// quiet inside the bound.
-bool settleQuiet(Scene& scene, ExportingStub& stub) {
-    int quietRounds = 0;
-    int seen = stub.requests();
-    QElapsedTimer clock;
-    clock.start();
-    while (quietRounds < 10) {
-        if (clock.elapsed() > 5000) return false;
-        scene.renderPass();
-        pumpFor(30);
-        if (stub.requests() == seen) {
-            ++quietRounds;
-        } else {
-            seen = stub.requests();
-            quietRounds = 0;
-        }
-    }
-    return true;
-}
-
-// Announces the next picture and runs passes until the item has drawn one more. Lockstep: one
-// picture asked for, one drawn, so a count read afterwards describes exactly the drive. False when
-// no picture arrived in the bound, which every caller must branch on.
-bool drawNext(Scene& scene, ExportingStub& stub, QDBusConnection& bus) {
-    const quint64 before = scene.pictures();
-    announce(bus, static_cast<quint64>(stub.served()) + 1);
-    return pumpUntil(
-        [&] {
-            scene.renderPass();
-            return scene.pictures() > before;
-        },
-        5000);
-}
-
-// Which of a few flat colours a pixel is, or -1: the readback is compared by nearest colour rather
-// than exactly, so the check is about WHICH picture is shown and not about a driver's rounding.
-int nearestColour(const unsigned char* pixel, const std::vector<std::array<unsigned char, 4>>& palette) {
-    int best = -1;
-    int bestDistance = 1 << 30;
-    for (size_t i = 0; i < palette.size(); ++i) {
-        int distance = 0;
-        for (int c = 0; c < 3; ++c) distance += std::abs(static_cast<int>(pixel[c]) - palette[i][c]);
-        if (distance < bestDistance) {
-            bestDistance = distance;
-            best = static_cast<int>(i);
-        }
-    }
-    return bestDistance <= 60 ? best : -1;
-}
 
 // Watches QSGTexture objects die, keyed by the object. Connected to the window, which outlives
 // every local of a phase, so a texture reaped in the window's own teardown writes through nothing
@@ -800,46 +680,50 @@ bool runPhase(const PhaseName& which) {
                     return true;
                 }
                 const int base = stub.served();
+                wallpaperx::testing::GlSemaphoreFaults& faults = wallpaperx::testing::g_glSemaphoreFaults;
+                const int failed0 = faults.waitsFailed.load();
 
                 if (phase == Phase::HandOverReset) {
                     // GOAL: S13.203's reset -- a picture drawn ends a run of failed hand-overs, so
                     //       failures separated by one good picture are two runs, not one: five, a
                     //       good picture, then eight more keep the wallpaper silently.
-                    // WHY-THIS-SHAPE: every reply's acquire is decided by the stub as it is built,
-                    //       because after each failure the item asks again by itself and nothing the
-                    //       test does from outside can land between the two. The second run is held
-                    //       at its ninth request, so what is read is the state after exactly eight.
-                    //       The good picture between the runs comes WITHOUT an acquire, and that is
-                    //       forced: on the NVIDIA driver one rejected glImportSemaphoreFdEXT makes
-                    //       every later import in that context fail with GL_OUT_OF_MEMORY -- measured
-                    //       in a scratch program -- so a picture WITH a real acquire after the first
-                    //       run can never be drawn here, and the reset would be unreachable.
-                    // CONTROL: `m_handOversFailed = 0;` deleted from the drawn-picture branch of
-                    //       WallpaperXItem::updatePaintNode (backend/kde/wallpaperx_item.cpp) -> "FAIL:
+                    // WHY-THIS-SHAPE: the failures are waits the test fails (gl_semaphore_fault.h),
+                    //       not descriptors the driver refuses: a refused import now gives up the
+                    //       hand-over for the context and draws, so it makes no run at all. The first
+                    //       run is armed as five failures and the item's own re-asks consume them;
+                    //       its sixth picture, WITH its real acquire, waits and is drawn. The second
+                    //       run is armed only once the item is idle, and held at its ninth request, so
+                    //       what is read is the state after exactly eight.
+                    // CONTROL: in WallpaperXItem::updatePaintNode (backend/kde/wallpaperx_item.cpp),
+                    //       (a) `m_handOversFailed = 0;` deleted from the drawn-picture branch -> "FAIL:
                     //       eight failures after a good picture still keep it, silently (frame shown:
-                    //       no, reason [WallpaperX produced a frame this desktop could not import.])".
-                    //       kToleratedHandOverFailures 8 -> 7 reddens the same line. Both observed
-                    //       2026-09-22 on the NVIDIA entry. Reverted.
+                    //       no, reason [WallpaperX produced a frame this desktop could not import.])";
+                    //       (b) kToleratedHandOverFailures 8 -> 7 reddens the same line; (c) `if
+                    //       (importRefused)` made `if (importRefused || !handedOver)`, a failed wait
+                    //       giving up the context -> "FAIL: five failed hand-overs are followed by a
+                    //       good picture, which is drawn (1 waits failed)". Observed 2026-09-23 on the
+                    //       NVIDIA entry. Reverted.
                     // COVERAGE-ASSERT: the good picture between the runs is asserted to have been
-                    //       drawn, and the stub to have sent exactly thirteen unusable acquires.
-                    stub.sendAcquireFrom(base + 1, ExportingStub::Acquire::Unusable);
-                    stub.sendAcquireFrom(base + 6, ExportingStub::Acquire::None);
-                    stub.sendAcquireFrom(base + 7, ExportingStub::Acquire::Unusable);
-                    stub.holdServeNumber(base + 15);
+                    //       drawn, and exactly thirteen waits to have been failed.
+                    faults.failWaits.store(5);
                     announce(bus, static_cast<quint64>(base) + 1);
                     const bool firstRun = pumpUntil(
                         [&] {
                             scene.renderPass();
-                            return stub.served() >= base + 6 && scene.pictures() > pictures0;
+                            return scene.pictures() > pictures0;
                         },
                         10000);
-                    check(firstRun, "five failed hand-overs are followed by a good picture, which is drawn");
+                    check(firstRun && faults.waitsFailed.load() - failed0 == 5,
+                          "five failed hand-overs are followed by a good picture, which is drawn (" +
+                              std::to_string(faults.waitsFailed.load() - failed0) + " waits failed)");
                     if (!firstRun) {
                         std::fprintf(stderr, "  served %d after the first picture, the item reports [%s]\n",
                                      stub.served() - base, scene.reason().toStdString().c_str());
                         return true;
                     }
                     shown = itemTexture(scene.item);
+                    faults.failWaits.store(kToleratedHandOverFailures);
+                    stub.holdServeNumber(stub.served() + kToleratedHandOverFailures + 1);
                     announce(bus, static_cast<quint64>(stub.served()) + 1);
                     const bool held = pumpUntil(
                         [&] {
@@ -851,16 +735,16 @@ bool runPhase(const PhaseName& which) {
                     if (!held) return true;
                     for (int pass = 0; pass < 5; ++pass) scene.renderPass();
                     pumpFor(50);
-                    // Built: five, eight, and the second run's ninth, held.
-                    check(stub.unusableAcquiresSent() == 5 + kToleratedHandOverFailures + 1,
-                          "thirteen hand-overs failed, in two runs (" + std::to_string(stub.unusableAcquiresSent()) +
-                              " unusable acquires built, the last held)");
+                    check(faults.waitsFailed.load() - failed0 == 5 + kToleratedHandOverFailures,
+                          "thirteen hand-overs failed, in two runs (" +
+                              std::to_string(faults.waitsFailed.load() - failed0) + " waits failed)");
                     check(stillShowing(), "eight failures after a good picture still keep it, silently (frame "
                                           "shown: " +
                                               std::string(claimsFrameShown(scene.item) ? "yes" : "no") + ", reason [" +
                                               scene.reason().toStdString() + "])");
-                    stub.sendHeldReply();
+                    faults.failWaits.store(0);
                     stub.refuseFurtherWith(QStringLiteral("io.wallpaperx.Error.NoFrame"));
+                    stub.sendHeldReply();
                     pumpFor(100);
                     return true;
                 }
@@ -871,25 +755,28 @@ bool runPhase(const PhaseName& which) {
                 //       produced a frame this desktop could not import." Both directions: a blip must
                 //       not take a wallpaper off the screen, and a hand-over that has stopped working
                 //       must not freeze it on one picture while the item reports it is fine.
-                // WHY-THIS-SHAPE: the stub decides each reply's acquire as it builds it and holds the
-                //       ninth request, because the item asks again by itself after every failure and
-                //       nothing from outside can land between two of those. The eight are hand-overs
-                //       on the import kept for this image -- the reuse path -- which is where a
-                //       failure leaves a picture worth keeping.
+                // WHY-THIS-SHAPE: each failure is a wait that fails after its semaphore imported
+                //       (gl_semaphore_fault.h). A descriptor the driver refuses cannot build the run
+                //       any more: the first refused import gives up the hand-over for the context and
+                //       draws. The ninth request is held by the stub as it arrives, because the item
+                //       asks again by itself after every failure. The eight are hand-overs on the
+                //       import kept for this image -- the reuse path -- which is where a failure
+                //       leaves a picture worth keeping.
                 // CONTROL: in backend/kde/wallpaperx_item.cpp, (a) kToleratedHandOverFailures 8 -> 7
                 //       -> "FAIL: eight failed hand-overs in a row keep the picture, silently",
                 //       printing "frame shown: no, reason [WallpaperX produced a frame this desktop
                 //       could not import.]"; (b) the `m_handOversFailed <= kToleratedHandOverFailures
                 //       &&` term deleted from `stillDrawing` -> "FAIL: the ninth failure takes the
-                //       picture off and says why (frame shown: yes, reason [])". Also measured, and
-                //       unreachable rather than covered: that the run's count lives on the item and
-                //       not on the node. The count reset wherever a node is built leaves every phase
-                //       here green, because a rebuilt node holds no picture -- a failure then blanks
-                //       whatever the count says, and the first picture drawn resets it anyway.
-                //       Observed 2026-09-22 on the NVIDIA entry. Reverted.
-                // COVERAGE-ASSERT: exactly eight unusable acquires are asserted to have gone out
-                //       before the held ninth, and the counters not to have moved.
-                stub.sendAcquireFrom(base + 1, ExportingStub::Acquire::Unusable);
+                //       picture off and says why (frame shown: yes, reason [])"; (c) `if
+                //       (importRefused)` made `if (importRefused || !handedOver)` -> "FAIL: the item
+                //       asks again after each failed hand-over, up to the held ninth request", the
+                //       first failure drawn unwaited. Also measured, and unreachable rather than
+                //       covered: that the run's count lives on the item and not on the node (GOALS.md,
+                //       S13.203). (a) and (b) observed 2026-09-22 and again 2026-09-23, (c) 2026-09-23,
+                //       all on the NVIDIA entry. Reverted.
+                // COVERAGE-ASSERT: exactly eight waits are asserted to have been failed before the
+                //       held ninth, and the counters not to have moved.
+                faults.failWaits.store(kToleratedHandOverFailures);
                 stub.holdServeNumber(base + kToleratedHandOverFailures + 1);
                 announce(bus, static_cast<quint64>(base) + 1);
                 const bool reached = pumpUntil(
@@ -905,10 +792,9 @@ bool runPhase(const PhaseName& which) {
                 }
                 for (int pass = 0; pass < 5; ++pass) scene.renderPass();
                 pumpFor(50);
-                // Nine built: the eight that failed, and the ninth, held.
-                check(stub.unusableAcquiresSent() == kToleratedHandOverFailures + 1,
+                check(faults.waitsFailed.load() - failed0 == kToleratedHandOverFailures,
                       "eight hand-overs failed before the held ninth (" +
-                          std::to_string(stub.unusableAcquiresSent()) + " unusable acquires built)");
+                          std::to_string(faults.waitsFailed.load() - failed0) + " waits failed)");
                 check(stillShowing(), "eight failed hand-overs in a row keep the picture, silently (frame shown: " +
                                           std::string(claimsFrameShown(scene.item) ? "yes" : "no") + ", reason [" +
                                           scene.reason().toStdString() + "])");
@@ -918,11 +804,13 @@ bool runPhase(const PhaseName& which) {
                 // CONTROL: the drawn-picture count moved in WallpaperXItem::updatePaintNode
                 //       (backend/kde/wallpaperx_item.cpp) to just after `reused` is chosen, counting
                 //       attempts -> "FAIL: failed pictures count in neither counter", printing "8
-                //       more". Observed 2026-09-22 on the NVIDIA entry. Reverted.
+                //       more". Observed 2026-09-22, re-observed 2026-09-23 with the run built from failed
+                //       waits, on the NVIDIA entry. Reverted.
                 check(scene.pictures() == pictures0, "failed pictures count in neither counter (" +
                                                          std::to_string(scene.pictures() - pictures0) + " more)");
 
                 // The ninth, and the one held after it so the item's next re-ask does not run on.
+                faults.failWaits.store(1);
                 stub.holdServeNumber(base + kToleratedHandOverFailures + 2);
                 stub.sendHeldReply();
                 const bool blanked = pumpUntil(
@@ -945,7 +833,8 @@ bool runPhase(const PhaseName& which) {
                 // CONTROL: in ~FrameNode (backend/kde/wallpaperx_item.cpp), `releaseClaimWhenReadsFinish
                 //       (m_claim);` made `(void)m_claim;` -> "FAIL: the picture the dropped node was
                 //       drawing is given back once it goes", printing "0 release(s)". Observed
-                //       2026-09-22 on the NVIDIA entry. Reverted.
+                //       2026-09-22, re-observed 2026-09-23 with the run built from failed waits, on the
+                //       NVIDIA entry. Reverted.
                 const bool givenBack = pumpUntil(
                     [&] {
                         scene.renderPass();
@@ -955,6 +844,7 @@ bool runPhase(const PhaseName& which) {
                 check(givenBack && stub.releases().size() == 1,
                       "the picture the dropped node was drawing is given back once it goes (" +
                           std::to_string(stub.releases().size()) + " release(s))");
+                faults.failWaits.store(0);
                 return true;
             }
 
@@ -971,12 +861,14 @@ bool runPhase(const PhaseName& which) {
                 //       kinds of failure: its first hand-over follows a fresh import and the rest are
                 //       on the import kept for it. The initial report is required to list the served
                 //       layout, or a withdrawal of it would be dropped before it was sent and the
-                //       check could not fail.
+                //       check could not fail. Each failure is a failed wait (gl_semaphore_fault.h): a
+                //       descriptor the driver refuses now gives up the hand-over and draws.
                 // CONTROL: in WallpaperXItem::updatePaintNode (backend/kde/wallpaperx_item.cpp),
                 //       `stopped == Stopped::Layout &&` made `stopped != Stopped::Nothing &&` -> "FAIL:
-                //       no failed hand-over withdraws the layout it arrived in", printing the report
-                //       that dropped it. Observed 2026-09-22 on the NVIDIA entry with the dma_buf export
-                //       forced. Reverted.
+                //       no failed hand-over withdraws the layout it arrived in (1 further report(s), the
+                //       served layout dropped)". And `if (importRefused)` made `if (importRefused ||
+                //       !handedOver)` -> "FAIL: four hand-overs failed, fresh and kept", no run built.
+                //       Observed 2026-09-23 on the NVIDIA entry with the dma_buf export forced. Reverted.
                 if (stub.handleType() != 1) {
                     notVerified(kGoal, "this entry's export is not a dma_buf, so the frame has no layout to withdraw "
                                        "(the entry forces WALLPAPERX_FORCE_HANDLE_TYPE=dmabuf)");
@@ -995,7 +887,9 @@ bool runPhase(const PhaseName& which) {
                 }
                 const size_t reports0 = stub.modifierReports().size();
                 const int base = stub.served();
-                stub.sendAcquireFrom(base + 1, ExportingStub::Acquire::Unusable);
+                wallpaperx::testing::GlSemaphoreFaults& faults = wallpaperx::testing::g_glSemaphoreFaults;
+                const int failed0 = faults.waitsFailed.load();
+                faults.failWaits.store(4);
                 stub.holdServeNumber(base + 5);
                 announce(bus, static_cast<quint64>(base) + 1);
                 const bool reached = pumpUntil(
@@ -1008,9 +902,10 @@ bool runPhase(const PhaseName& which) {
                 if (!reached) return true;
                 pumpFor(200);
                 // Four failed, and the fifth built and held.
-                check(stub.unusableAcquiresSent() == 5, "four hand-overs failed before the held fifth (" +
-                                                            std::to_string(stub.unusableAcquiresSent()) +
-                                                            " unusable acquires built)");
+                check(faults.waitsFailed.load() - failed0 == 4, "four hand-overs failed before the held fifth (" +
+                                                                    std::to_string(faults.waitsFailed.load() - failed0) +
+                                                                    " waits failed)");
+                faults.failWaits.store(0);
                 bool dropped = false;
                 for (size_t i = reports0; i < stub.modifierReports().size(); ++i) {
                     const auto& list = stub.modifierReports()[i].modifiers;

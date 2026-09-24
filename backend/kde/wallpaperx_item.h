@@ -40,6 +40,10 @@ namespace wallpaperx {
 // picture that brings that acquire: waiting on it is the one thing that tells the driver the
 // memory holds something else now, so a picture arriving without one is imported afresh.
 //
+// The acquire comes one of two ways, chosen by each fetch: a value on the daemon's acquire
+// timeline, imported once per node, when this item can wait on it; a new binary semaphore per
+// picture otherwise, which always works and is where any doubt sends it back.
+//
 // What is NOT cached is the claim: the daemon must not draw into the image being sampled, so every
 // picture's hold is given back as soon as the node stops sampling it.
 //
@@ -65,13 +69,13 @@ class WallpaperXItem : public QQuickItem {
     // which is a window where the desktop shows neither a wallpaper nor a message.
     Q_PROPERTY(bool frameShown READ frameShown NOTIFY frameShownChanged)
     // Properties rather than plain accessors because the only readers outside this process load
-    // the item through its QML module and have no other way to ask. One change signal for both:
-    // a picture moves exactly one of them, and the announcement rides the hop to this thread that
-    // every drawn picture already makes -- a second signal would be a second queued event per
-    // video frame. Without a NOTIFY a QML binding on either would be read once and then frozen,
-    // which is the one reading this exists for.
+    // the item through its QML module and have no other way to ask. One change signal for all
+    // three, emitted after every picture drawn or failed, on the hop to this thread that each
+    // already makes -- a signal of its own would be another queued event per video frame. Without
+    // a NOTIFY a QML binding on them would be read once and then frozen.
     Q_PROPERTY(quint64 importCount READ importCount NOTIFY importCountsChanged)
     Q_PROPERTY(quint64 reusedImportCount READ reusedImportCount NOTIFY importCountsChanged)
+    Q_PROPERTY(quint64 semaphoreImportCount READ semaphoreImportCount NOTIFY importCountsChanged)
 
 public:
     explicit WallpaperXItem(QQuickItem* parent = nullptr);
@@ -102,6 +106,9 @@ public:
     // a predicate rather than a literal buried in the parse.
     static constexpr int kFrameReplyFields = 12;
 
+    // acquire_value, the first field past those, which only GetFrameFdOnTimeline's reply carries.
+    static constexpr int kAcquireValueField = 12;
+
     // Whether a reply carries enough fields to be read. A newer daemon may send MORE, which is
     // fine; fewer is not.
     static bool replyIsReadable(int fieldCount);
@@ -129,6 +136,11 @@ public:
     // video's frame rate.
     quint64 importCount() const { return m_importCount.load(std::memory_order_relaxed); }
     quint64 reusedImportCount() const { return m_reusedImportCount.load(std::memory_order_relaxed); }
+
+    // How many semaphores this item has tried to import into its context, successful or not: one
+    // per picture on the binary path, one per node on the timeline path. Attempts, because each is
+    // an exposure -- on NVIDIA one failed import leaves every later one in the context failing.
+    quint64 semaphoreImportCount() const { return m_semaphoreImportCount.load(std::memory_order_relaxed); }
 
 signals:
     void monitorIdChanged();
@@ -167,6 +179,11 @@ private:
         // Where the claim is registered, so dropping this frame gives the image back only if the
         // item has not already done so on its way off the screen.
         std::shared_ptr<ClaimSet> claims;
+        // The daemon that sent the reply, by unique name, and where its claim is released: for a
+        // request for a value the name it was addressed to (see fetchFrame()), otherwise the owner
+        // as known when the reply was read. A value waited on another daemon's timeline never
+        // completes, so only the first is exact enough to pair with one.
+        std::string sender;
 
         PendingFrame() = default;
         ~PendingFrame();
@@ -189,12 +206,18 @@ private:
     // Asks only when this item neither holds a reply nor has a request out. The scene-change
     // caller's question, which fetchFrame(0) cannot express because 0 forces.
     void ensureFrameRequested();
+    // Whether the next fetch may ask for a value on the acquire timeline rather than sync_fds: this
+    // process holds the current daemon's timeline, and this item's context can wait on it and has
+    // not refused it. Decided per fetch, so any doubt costs one picture's binary semaphore rather
+    // than a value nothing can wait on. GUI thread.
+    bool fetchOnTimeline();
     // The reply half of fetchFrame, on the GUI thread once the bus answers. `monitorId` is the
-    // monitor the request named, which is what the claim must be recorded against.
-    void takeFrameReply(int monitorId, const QDBusMessage& call);
+    // monitor the request named, which is what the claim must be recorded against; `sender` is
+    // PendingFrame::sender; `askedForValue`, whether the request was GetFrameFdOnTimeline.
+    void takeFrameReply(int monitorId, const QDBusMessage& call, const std::string& sender, bool askedForValue);
     // The same reply when this item has moved to another monitor since asking: the hold the
     // daemon recorded is given straight back, because nothing else ends it.
-    static void releaseFrameReply(int monitorId, const QDBusMessage& call);
+    static void releaseFrameReply(int monitorId, const QDBusMessage& call, const std::string& sender);
     // Which image a reply granted, 0 for one that granted none.
     static quint64 grantedBufferId(const QDBusMessage& call);
     // Asks again after a refusal, while this item has nothing on screen. GUI thread.
@@ -280,6 +303,7 @@ private:
     // Render thread, read by whoever asks. See importCount().
     std::atomic<quint64> m_importCount{0};
     std::atomic<quint64> m_reusedImportCount{0};
+    std::atomic<quint64> m_semaphoreImportCount{0};
     // Hand-overs that failed since a picture last reached the screen. What separates a blip, which
     // must not take a wallpaper off the screen, from a producer hand-over that has stopped working,
     // which has to say so. On the item rather than on the node, so a node rebuilt for an unrelated
@@ -338,6 +362,12 @@ private:
     // Bumped every time the marks are invalidated, so the render thread can tell whether the
     // shown generation it read is still the one it is about to write back to.
     quint64 m_generationEpoch = 0;  // guarded by m_importedMutex
+    // What the render thread has found about waiting on the daemon's acquire timeline, for the GUI
+    // thread choosing which method a fetch uses: whether this item's context can wait on one at all
+    // -- false too once the context has refused a semaphore import -- and the daemon whose timeline
+    // this item failed to import or wait on, which it asks for sync_fds from then on.
+    bool m_contextWaitsOnTimeline = false;  // guarded by m_importedMutex
+    std::string m_timelineRefusedBy;        // guarded by m_importedMutex
     QString m_renderReason;         // guarded by m_importedMutex
 };
 

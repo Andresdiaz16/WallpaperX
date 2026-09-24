@@ -108,6 +108,33 @@ const SemaphoreApi& semaphoreApi() {
     return api;
 }
 
+// The GL_NV_timeline_semaphore side. Create rather than Gen: a semaphore's type has to be set before
+// it is imported, and a name from glGenSemaphoresEXT is not an object until its first use.
+struct TimelineApi {
+    using CreateFn = void (*)(GLsizei, GLuint*);
+    using ParameterivFn = void (*)(GLuint, GLenum, const GLint*);
+    using ParameterUi64vFn = void (*)(GLuint, GLenum, const GLuint64*);
+
+    CreateFn create = nullptr;
+    ParameterivFn parameteriv = nullptr;
+    ParameterUi64vFn parameterUi64v = nullptr;
+
+    bool complete() const { return create != nullptr && parameteriv != nullptr && parameterUi64v != nullptr; }
+};
+
+const TimelineApi& timelineApi() {
+    static const TimelineApi api = [] {
+        TimelineApi resolved;
+        resolved.create = reinterpret_cast<TimelineApi::CreateFn>(eglGetProcAddress("glCreateSemaphoresNV"));
+        resolved.parameteriv =
+            reinterpret_cast<TimelineApi::ParameterivFn>(eglGetProcAddress("glSemaphoreParameterivNV"));
+        resolved.parameterUi64v =
+            reinterpret_cast<TimelineApi::ParameterUi64vFn>(eglGetProcAddress("glSemaphoreParameterui64vEXT"));
+        return resolved;
+    }();
+    return api;
+}
+
 // The EGL_ANDROID_native_fence_sync side, resolved like the two above. It is what turns "this
 // process has finished with the image" into something the kernel decides: the fence goes into the
 // current context's command stream and the descriptor duplicated out of it becomes readable when
@@ -296,6 +323,10 @@ struct ContextCapabilities {
     const char* dmaBuf = nullptr;
     const char* opaqueFd = nullptr;
     const char* sync = nullptr;
+    // Waiting on a Vulkan timeline, which is `sync` plus GL_NV_timeline_semaphore. Its own answer
+    // because a context can have the first without the second -- Mesa does -- and then keeps the
+    // per-picture binary path.
+    const char* timeline = nullptr;
     // Whether this context can say when its reads have finished. Its own answer rather than
     // `sync`'s: waiting on the producer's semaphore is GL_EXT_semaphore and fencing our own work
     // is EGL, so a context can do either without the other -- and going without costs different
@@ -370,6 +401,14 @@ ContextCapabilities probeCapabilities(EGLDisplay display) {
         out.sync = "this GL context does not advertise GL_EXT_semaphore_fd";
     } else if (!semaphoreApi().complete()) {
         out.sync = "the GL_EXT_semaphore_fd entry points could not be resolved";
+    }
+
+    if (out.sync != nullptr) {
+        out.timeline = out.sync;
+    } else if (!hasGlExtension("GL_NV_timeline_semaphore")) {
+        out.timeline = "this GL context does not advertise GL_NV_timeline_semaphore";
+    } else if (!timelineApi().complete()) {
+        out.timeline = "the GL_NV_timeline_semaphore entry points could not be resolved";
     }
 
     return out;
@@ -473,7 +512,7 @@ void FrameImport::waitForReadsToFinish() {
 // no token meaning "whatever Vulkan last used", so the two sides naming the same layout is the
 // whole of the agreement -- and nothing checks it: an ownership transfer's halves are invisible
 // to the validation layers.
-bool FrameImport::waitOnSyncFds(Request& request, unsigned int texture, std::string& error) {
+bool FrameImport::waitOnSyncFds(Request& request, unsigned int texture, std::string& error, bool* importRefused) {
     const SemaphoreApi& api = semaphoreApi();
 
     for (int& syncFd : request.syncFds) {
@@ -501,6 +540,7 @@ bool FrameImport::waitOnSyncFds(Request& request, unsigned int texture, std::str
         if (glGetError() != GL_NO_ERROR) {
             api.destroy(1, &semaphore);
             if (sameOpenFile(gift, syncFd)) ::close(gift);
+            if (importRefused != nullptr) *importRefused = true;
             error = "glImportSemaphoreFdEXT rejected the frame's sync descriptor";
             return false;
         }
@@ -699,7 +739,7 @@ FrameImport::Result FrameImport::import(Request& request) {
     return out;
 }
 
-bool FrameImport::acquire(Request& request, unsigned int texture, std::string* whyNot) {
+bool FrameImport::acquire(Request& request, unsigned int texture, std::string* whyNot, bool* importRefused) {
     const bool mustAcquire = std::any_of(request.syncFds.begin(), request.syncFds.end(),
                                          [](int syncFd) { return syncFd >= 0; });
     if (!mustAcquire) return true;
@@ -715,9 +755,88 @@ bool FrameImport::acquire(Request& request, unsigned int texture, std::string* w
     }
 
     std::string error;
-    if (waitOnSyncFds(request, texture, error)) return true;
+    if (waitOnSyncFds(request, texture, error, importRefused)) return true;
     if (whyNot != nullptr) *whyNot = std::move(error);
     return false;
+}
+
+bool FrameImport::supportsTimeline(std::string* whyNot) {
+    if (kcmpBudgetSpent()) return granted(kKcmpBudgetSpent, whyNot);
+    return granted(capabilities().timeline, whyNot);
+}
+
+FrameImport::Timeline FrameImport::importTimeline(int fd, std::string* whyNot, bool* importRefused) {
+    const auto refuse = [whyNot](const char* reason) {
+        if (whyNot != nullptr) *whyNot = reason;
+        return Timeline{};
+    };
+    if (fd < 0) return refuse("no timeline descriptor to import");
+    if (!supportsTimeline(whyNot)) return Timeline{};
+
+    const SemaphoreApi& semaphores = semaphoreApi();
+    const TimelineApi& timelines = timelineApi();
+    while (glGetError() != GL_NO_ERROR) {
+    }
+
+    GLuint semaphore = 0;
+    timelines.create(1, &semaphore);
+    if (semaphore == 0 || glGetError() != GL_NO_ERROR) {
+        if (semaphore != 0) semaphores.destroy(1, &semaphore);
+        return refuse("glCreateSemaphoresNV failed");
+    }
+    const GLint type = GL_SEMAPHORE_TYPE_TIMELINE_NV;
+    timelines.parameteriv(semaphore, GL_SEMAPHORE_TYPE_NV, &type);
+    if (glGetError() != GL_NO_ERROR) {
+        semaphores.destroy(1, &semaphore);
+        return refuse("glSemaphoreParameterivNV would not make the semaphore a timeline");
+    }
+
+    // From a duplicate, for waitOnSyncFds' reason: the import takes the descriptor on success and
+    // says nothing about failure. The caller's own stays theirs either way.
+    const int gift = ::fcntl(fd, F_DUPFD_CLOEXEC, 0);
+    if (gift < 0) {
+        semaphores.destroy(1, &semaphore);
+        return refuse("the acquire timeline's descriptor could not be duplicated for import");
+    }
+    semaphores.importFd(semaphore, GL_HANDLE_TYPE_OPAQUE_FD_EXT, static_cast<GLint>(gift));
+    if (glGetError() != GL_NO_ERROR) {
+        semaphores.destroy(1, &semaphore);
+        if (sameOpenFile(gift, fd)) ::close(gift);
+        if (importRefused != nullptr) *importRefused = true;
+        return refuse("glImportSemaphoreFdEXT rejected the acquire timeline");
+    }
+    return Timeline{semaphore};
+}
+
+bool FrameImport::acquire(const Timeline& timeline, uint64_t value, unsigned int texture, std::string* whyNot) {
+    const auto refuse = [whyNot](const char* reason) {
+        if (whyNot != nullptr) *whyNot = reason;
+        return false;
+    };
+    if (timeline.semaphore == 0) return refuse("there is no imported timeline to wait on");
+    if (value == 0) return refuse("a timeline wait for value 0 names no picture");
+    if (texture == 0) return refuse("there is no texture to acquire the frame against");
+    if (!supportsTimeline(whyNot)) return false;
+
+    while (glGetError() != GL_NO_ERROR) {
+    }
+    const GLuint64 wanted = value;
+    timelineApi().parameterUi64v(timeline.semaphore, GL_TIMELINE_SEMAPHORE_VALUE_NV, &wanted);
+    if (glGetError() != GL_NO_ERROR) return refuse("glSemaphoreParameterui64vEXT would not take the frame's value");
+
+    // The texture and layout are waitOnSyncFds' for the same reason: this wait is the acquire.
+    const GLuint waited = texture;
+    const GLenum layout = GL_LAYOUT_GENERAL_EXT;
+    semaphoreApi().wait(timeline.semaphore, 0, nullptr, 1, &waited, &layout);
+    if (glGetError() != GL_NO_ERROR) return refuse("glWaitSemaphoreEXT would not acquire the frame");
+    return true;
+}
+
+void FrameImport::release(const Timeline& timeline) {
+    if (timeline.semaphore == 0) return;
+    // GL keeps a deleted semaphore alive until the waits queued on it have run.
+    const GLuint semaphore = timeline.semaphore;
+    semaphoreApi().destroy(1, &semaphore);
 }
 
 FrameImport::Result FrameImport::importOpaqueFd(Request& request) {

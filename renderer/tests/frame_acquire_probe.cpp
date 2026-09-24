@@ -232,8 +232,11 @@ bool run(wallpaperx::testing::ValidationGrade& grade) {
         // CONTROL: the `if (!device.info().hasExternalSemaphoreFd) return -1;` early return
         //       deleted from exportFrameAcquireFd (renderer/vulkan/frame_export.cpp) -> "FAIL: a
         //       device that cannot export an acquire semaphore returns no descriptor instead of
-        //       failing", printing "threw ... vkGetSemaphoreFdKHR entry point missing", on the
-        //       lavapipe entry. Observed 2026-08-31. Reverted.
+        //       failing", on the lavapipe entry. Observed 2026-08-31 printing "threw ...
+        //       vkGetSemaphoreFdKHR entry point missing"; re-observed 2026-09-23, after the
+        //       descriptor query moved behind the semaphore's creation, printing "threw ...
+        //       vkCreateSemaphore failed with VK_ERROR_INVALID_EXTERNAL_HANDLE" beside one
+        //       validation warning. Reverted.
         int none = -2;
         bool threw = false;
         try {

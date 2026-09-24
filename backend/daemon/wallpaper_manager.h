@@ -41,6 +41,19 @@ struct InvalidRequest : std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
+// This consumer will not be given an acquire timeline, and asking again will not change that while
+// the daemon runs: the GPU cannot export one, or the caller has no bus name to key it on. It goes on
+// waiting on per-picture sync_fds.
+struct TimelineUnavailable : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
+// Every acquire-timeline slot is taken. Clears when a holder leaves the bus; until then the consumer
+// waits on per-picture sync_fds and may ask again.
+struct TimelineLimitReached : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
 // A screen size reported under a connector name no monitor answers to. Its own type because the
 // cure is elsewhere: the name has to be bound first.
 struct UnknownOutput : InvalidRequest {
@@ -165,8 +178,13 @@ struct FrameHandle {
     uint64_t generation = 0;
 
     // -1 when the GPU cannot export one, which leaves the consumer reading without the
-    // queue-family acquire -- undefined, and what every consumer did before this existed.
+    // queue-family acquire, which is undefined. Also -1 for a picture asked for on the caller's
+    // acquire timeline, which is given `acquireValue` instead.
     int acquireFd = -1;
+
+    // The value to wait for on the consumer's acquire timeline, already reached when this is
+    // handed out. 0 when the consumer has none, which is what acquireFd is for.
+    uint64_t acquireValue = 0;
 
     // Handed to a consumer this monitor's playing video has served before: one of many a second for
     // as long as it keeps reading. False for a consumer the session has not served, which is the
@@ -298,6 +316,11 @@ public:
     // refuse while images are free -- four consumers sharing one image leave four unheld -- which
     // is the price of not evicting a holder to make room for the fifth.
     static constexpr size_t kMaxHoldersPerMonitor = 4;
+
+    // Consumers holding an acquire timeline at once, departed ones not yet freed included. Bounds
+    // what peers can make the daemon keep; one past it is told to ask again later, and meanwhile
+    // uses sync_fds, which still works.
+    static constexpr size_t kMaxAcquireTimelines = 8;
 
     // Video wallpapers holding an open decode session at once: a ceiling on the video memory
     // decoders hold, not a hardware session limit. Monitor ids are the client's to choose and each
@@ -531,7 +554,12 @@ public:
     // be no name to withdraw it under, and a claim nothing can end takes an image out of the
     // ring for the life of the daemon. A frame exported that way can be redrawn under its
     // reader.
-    FrameExport exportCurrentFrame(int monitorId, const std::string& client = {});
+    //
+    // `onTimeline` is the caller saying it can wait on its acquire timeline for this picture. The
+    // picture carries a value only then, and only while `client` holds a live one; otherwise a new
+    // binary semaphore. The consumer chooses per request, so a timeline it never received or could
+    // not import cannot leave it with a value it has no way to wait on.
+    FrameExport exportCurrentFrame(int monitorId, const std::string& client = {}, bool onTimeline = false);
 
     // Drops `client`'s claim on one image, because it says it has stopped reading it. Returns
     // the monitors whose deferred render should be retried now that an image may be free.
@@ -549,6 +577,30 @@ public:
     // consumer that crashed holding a frame would keep that image out of the ring forever --
     // and plasmashell restarts are routine, while this daemon does not.
     std::vector<int> forgetHeldBuffers(const std::string& client, std::vector<FrameAvailable>* announce = nullptr);
+
+    // A descriptor for `client`'s acquire timeline, created on its first request and kept until it
+    // leaves the bus. It only makes the timeline available: a picture carries a value on it only
+    // when the request for that picture asks. Each call is a new descriptor for the same payload,
+    // so asking again -- a consumer that lost the first answer -- is harmless. GPU work: call from
+    // the render worker. Throws TimelineUnavailable, and GpuFailure when the driver fails.
+    int acquireTimelineFd(const std::string& client);
+
+    // `client` has left the bus, so its timeline goes. Only marked here, under the state lock; the
+    // GPU thread destroys it at its next export or registration. Posting a worker task per
+    // departure instead would let short-lived bus clients fill the bounded queue and refuse frame
+    // requests. Bus thread.
+    void forgetAcquireTimeline(const std::string& client);
+
+    // A request from `client` queued on the render worker can create state for it -- a hold, a
+    // timeline -- after it has left the bus, and the departure that should end that state has then
+    // already been handled. These close that window. noteRequestQueued() runs on the bus thread
+    // before the post; noteRequestDone() when the request has been answered or refused, and returns
+    // true when `client` left while it was queued and this was its last: the departure is then
+    // applied again, over whatever the requests created. noteDeparted() runs with the departure.
+    // Bounded by the worker's queue.
+    void noteRequestQueued(const std::string& client);
+    [[nodiscard]] bool noteRequestDone(const std::string& client);
+    void noteDeparted(const std::string& client);
 
     // One consistent snapshot of everything GetStatus reports. Deliberately not two accessors:
     // separate lock acquisitions let a render commit in between, producing a reply that claims
@@ -932,9 +984,10 @@ private:
     // held. Caller must hold m_stateMutex.
     void pruneOutputReportsLocked();
 
-    // Both of a hand-over's descriptors, or neither and a throw with the GPU health recorded.
-    // Caller must hold m_gpuMutex, which is what keeps `target` alive across the export.
-    FrameHandle exportHandle(const OffscreenTarget& target);
+    // The memory and its acquire -- a value on `timeline` when the consumer has one, a new binary
+    // semaphore otherwise -- or neither and a throw with the GPU health recorded. Caller must hold
+    // m_gpuMutex, which is what keeps `target` and `timeline` alive across the export.
+    FrameHandle exportHandle(const OffscreenTarget& target, AcquireTimeline* timeline);
 
     // The images `monitorId` has handed out and not got back. Caller must hold m_stateMutex.
     std::vector<uint64_t> heldBuffersLocked(int monitorId) const;
@@ -1041,6 +1094,32 @@ private:
     // hold a Device&, so the Device must outlive them.
     std::unique_ptr<Device> m_device;
     std::unique_ptr<OffscreenTargetManager> m_targets;
+
+    // Each consumer's acquire timeline, by DBus unique name. Split between the two locks: the list
+    // and `departed` are m_stateMutex's, so the bus thread can mark a departure without touching the
+    // GPU; the timeline object is created, signalled and destroyed only under m_gpuMutex. An entry is
+    // removed only under both, which is what keeps a pointer the GPU thread holds valid. After
+    // m_device, which the timelines reference.
+    struct ConsumerTimeline {
+        std::string client;
+        std::unique_ptr<AcquireTimeline> timeline;
+        bool departed = false;
+    };
+    std::vector<ConsumerTimeline> m_acquireTimelines;
+
+    // The live timeline `client` registered, or null. Caller holds m_gpuMutex and not m_stateMutex.
+    AcquireTimeline* liveAcquireTimeline(const std::string& client);
+
+    // Destroys the timelines of consumers that have left. Caller holds m_gpuMutex and not
+    // m_stateMutex: a timeline whose last signal did not finish waits for it.
+    void reapDepartedTimelinesLocked();
+
+    // See noteRequestQueued(). Guarded by m_stateMutex.
+    struct QueuedRequests {
+        int count = 0;
+        bool departed = false;
+    };
+    std::map<std::string, QueuedRequests> m_queuedRequests;
     std::string m_resolvedShaderDir;
 
     // One monitor's open video file, looping: the decoder, its picture pool, one converted picture

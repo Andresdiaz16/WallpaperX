@@ -13,6 +13,7 @@
 #include <QDBusPendingCallWatcher>
 #include <QDBusReply>
 #include <QDBusUnixFileDescriptor>
+#include <QOpenGLContext>
 #include <QQuickWindow>
 #include <QSGRendererInterface>
 #include <QSGSimpleTextureNode>
@@ -21,9 +22,11 @@
 #include <QThread>
 #include <QTimer>
 
+#include <fcntl.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdio>
 #include <mutex>
@@ -91,11 +94,9 @@ constexpr int kPaintProbeMaxMs = 2000;
 
 namespace {
 
-// Every descriptor a request still owns. The import contract is that a FAILED import leaves them
-// with the caller, and a frame superseded before the render thread arrives was never offered to
-// the importer at all -- so both cases end here. One helper because a sync descriptor forgotten on
-// one of the three paths below leaks at exactly the same rate as the memory one, which is one per
-// frame, which ends a login session.
+// Every descriptor a request still owns: a FAILED import leaves them with the caller, and a frame
+// superseded before the render thread arrives never reached the importer. One helper, because a sync
+// descriptor forgotten on any path leaks one per frame, as the memory one would.
 void closeDescriptors(FrameImport::Request& request) {
     if (request.fd >= 0) ::close(request.fd);
     request.fd = -1;
@@ -111,42 +112,79 @@ void disownDescriptors(FrameImport::Request& request) {
     for (int& syncFd : request.syncFds) syncFd = -1;
 }
 
-// Render thread, context current. A driver that imports memory but not semaphores must keep
-// drawing wallpapers: the frame is then read without the producer's queue-family acquire, which is
-// undefined and is what every consumer did before sync_fds carried anything. Dropped here rather
-// than inside import(), which refuses a wait it cannot perform -- the choice to go without is the
-// desktop's to make, not the importer's to make silently.
-//
-// Asked every frame, which costs a key check: supportsSync() caches the extension answers per GL
-// context. Only the diagnostic is held to once per process.
-void dropUnwaitableSync(FrameImport::Request& request) {
-    if (request.syncFds.empty()) return;
+// GL contexts that have refused a semaphore import. On NVIDIA none succeeds there again, so such a
+// context draws without the producer's acquire for the rest of its life -- a small risk of a torn or
+// stale picture, chosen over a blank desktop. Per context, since a node is rebuilt in the same one;
+// forgotten when it is destroyed, so a later one at the same address starts clean. Render threads.
+std::mutex g_refusingMutex;
+std::vector<const QOpenGLContext*> g_refusingContexts;  // guarded by g_refusingMutex
 
-    static std::once_flag reported;
-    std::string whyNot;
-    if (FrameImport::supportsSync(&whyNot)) return;
-    std::call_once(reported, [&whyNot] {
-        std::fprintf(stderr,
-                     "wallpaperx: drawing frames without the producer's hand-over -- %s. The wallpaper still "
-                     "shows; what is lost is the guarantee that the compositor reads it only after the daemon "
-                     "has finished writing it.\n",
-                     whyNot.c_str());
-    });
+bool contextRefusesSemaphores() {
+    const QOpenGLContext* context = QOpenGLContext::currentContext();
+    if (context == nullptr) return false;
+    std::lock_guard<std::mutex> lock(g_refusingMutex);
+    return std::find(g_refusingContexts.begin(), g_refusingContexts.end(), context) != g_refusingContexts.end();
+}
+
+// Only for a refusal by glImportSemaphoreFdEXT itself: a flag set for anything else would give up the
+// hand-over for the session over a failure that says nothing about the context.
+void noteContextRefusedSemaphores(const std::string& why) {
+    QOpenGLContext* context = QOpenGLContext::currentContext();
+    if (context == nullptr) return;
+    {
+        std::lock_guard<std::mutex> lock(g_refusingMutex);
+        if (std::find(g_refusingContexts.begin(), g_refusingContexts.end(), context) != g_refusingContexts.end()) {
+            return;
+        }
+        g_refusingContexts.push_back(context);
+    }
+    QObject::connect(
+        context, &QOpenGLContext::aboutToBeDestroyed, context,
+        [context] {
+            std::lock_guard<std::mutex> lock(g_refusingMutex);
+            std::erase(g_refusingContexts, context);
+        },
+        Qt::DirectConnection);
+    std::fprintf(stderr,
+                 "wallpaperx: this desktop's graphics context refused a semaphore import (%s), and on this driver "
+                 "none succeeds there again. It now draws without waiting for the daemon's hand-over: the wallpaper "
+                 "keeps showing, but may occasionally show a picture the daemon had not finished writing.\n",
+                 why.c_str());
+}
+
+// Render thread, context current. A context that cannot wait -- no support, or an import refused --
+// still draws, reading the frame without the producer's acquire, which is undefined. Here rather than
+// in import(): going without is the desktop's choice, not the importer's to make silently. Checked
+// per picture, a value too, since the item can have moved to another context since asking.
+void dropUnwaitableSync(FrameImport::Request& request) {
+    if (request.syncFds.empty() && request.timelineValue == 0) return;
+
+    if (!contextRefusesSemaphores()) {
+        const bool value = request.timelineValue != 0;
+        std::string whyNot;
+        if (value ? FrameImport::supportsTimeline(&whyNot) : FrameImport::supportsSync(&whyNot)) return;
+        // Per form: a value lands here only until the next fetch, and must not use up the other report.
+        static std::once_flag reportedSync;
+        static std::once_flag reportedValue;
+        std::call_once(value ? reportedValue : reportedSync, [&whyNot] {
+            std::fprintf(stderr,
+                         "wallpaperx: drawing frames without the producer's hand-over -- %s. The wallpaper still "
+                         "shows; what is lost is the guarantee that the compositor reads it only after the daemon "
+                         "has finished writing it.\n",
+                         whyNot.c_str());
+        });
+    }
     for (int syncFd : request.syncFds) {
         if (syncFd >= 0) ::close(syncFd);
     }
     request.syncFds.clear();
+    request.timelineValue = 0;
 }
 
-// Render thread, and there is one per window, so the record is shared under a lock.
-//
-// Once per distinct reason, not once per process: a failed import withdraws the modifier that
-// caused it, and the layout the daemon picks instead can fail differently -- that second
-// sentence is the one worth reading. Not "changed since last time" either, because two items on
-// different monitors can fail alternately and that would log at display rate.
-//
-// Capped because one reason names the two GPU UUIDs, and the frame's half is whatever the daemon
-// sent: without a bound, a peer that varies it defeats the once-per-reason rule.
+// Render threads, one per window, hence the lock. Once per distinct reason: a failed import withdraws
+// its modifier, and the layout chosen instead can fail differently. Not "changed since last time":
+// two items failing alternately would log at display rate. Capped because a reason names the frame's
+// GPU UUID, which is whatever the daemon sent, and a peer varying it would defeat the rule.
 void reportImportFailure(const std::string& reason) {
     constexpr std::size_t kMaxReasons = 8;
     static std::mutex mutex;
@@ -204,12 +242,145 @@ void askWhoOwnsTheDaemon() {
     });
 }
 
-// GUI thread, where the bus connection is.
-//
-// Addressed to the unique name that granted the claim, never to the well-known one: a unique
-// name is never reused, so a release delayed past a daemon restart is dropped by the bus instead
-// of freeing the SUCCESSOR's image of the same id under whoever is reading it. Empty only before
-// this process has learned any owner, where the well-known name is all there is.
+// This process's acquire timeline, as the daemon last answered. One per process: the daemon keys it
+// on the bus connection every item shares, and each node imports it into its own context. Written by
+// the GUI thread, read by render threads. `owner` is the unique name the request was addressed to,
+// and only the current daemon's record is ever replaced. Until it is Held for the current daemon,
+// fetches ask for sync_fds.
+struct AcquireTimelineRecord {
+    enum class State { NotAsked, Asking, Held, Refused };
+    State state = State::NotAsked;
+    std::string owner;
+    int fd = -1;       // Held only; owned
+    quint64 ask = 0;   // numbers the requests, so an answer to one that was superseded is dropped
+    // NotAsked after a failed answer: not asked again before this, since each ask takes the
+    // daemon's GPU lock and one comes with every binary picture.
+    std::chrono::steady_clock::time_point retryAfter{};
+};
+std::mutex g_timelineMutex;
+AcquireTimelineRecord g_timeline;  // guarded by g_timelineMutex
+
+// Errors meaning this daemon will never hand this process a timeline. Anything else is asked about
+// again after kRefusedRetryMs; until then pictures come with sync_fds, as after a lost answer.
+bool timelineRefusalIsPermanent(const QString& name) {
+    return name == QLatin1String("io.wallpaperx.Daemon.Error.Unsupported") ||
+           name == QLatin1String("org.freedesktop.DBus.Error.UnknownMethod") ||
+           name == QLatin1String("org.freedesktop.DBus.Error.UnknownInterface");
+}
+
+// Whether the record already answers for `daemon`, or it asked too recently. Caller holds
+// g_timelineMutex.
+bool timelineSettledLocked(const std::string& daemon) {
+    using State = AcquireTimelineRecord::State;
+    if (g_timeline.state == State::Asking) return true;
+    if ((g_timeline.state == State::Held || g_timeline.state == State::Refused) && g_timeline.owner == daemon) {
+        return true;
+    }
+    return g_timeline.state == State::NotAsked && std::chrono::steady_clock::now() < g_timeline.retryAfter;
+}
+
+// GUI thread, the only one that knows which daemon is current. Asks `daemon` for its timeline if it
+// still is, addressed to its unique name so the answer can only be that daemon's.
+void askForAcquireTimeline(const std::string& daemon) {
+    if (daemon.empty() || QString::fromStdString(daemon) != g_daemonOwner) return;
+    QCoreApplication* app = QCoreApplication::instance();
+    QDBusConnection bus = QDBusConnection::sessionBus();
+    if (app == nullptr || !bus.isConnected()) return;
+
+    quint64 ask = 0;
+    int stale = -1;
+    {
+        std::lock_guard<std::mutex> lock(g_timelineMutex);
+        if (timelineSettledLocked(daemon)) return;
+        stale = std::exchange(g_timeline.fd, -1);
+        g_timeline.state = AcquireTimelineRecord::State::Asking;
+        g_timeline.owner.clear();
+        ask = ++g_timeline.ask;
+    }
+    if (stale >= 0) ::close(stale);
+
+    QDBusMessage request = QDBusMessage::createMethodCall(QString::fromStdString(daemon), QString::fromUtf8(kPath),
+                                                          QString::fromUtf8(kInterface),
+                                                          QStringLiteral("GetAcquireTimeline"));
+    // On qApp, for askWhoOwnsTheDaemon()'s reason: the item that asked may be gone by the answer,
+    // and the record would then say Asking for good.
+    auto* watcher = new QDBusPendingCallWatcher(bus.asyncCall(request), app);
+    QObject::connect(watcher, &QDBusPendingCallWatcher::finished, app, [ask, daemon](QDBusPendingCallWatcher* done) {
+        done->deleteLater();
+        const QDBusMessage reply = done->reply();
+        int fd = -1;
+        if (!done->isError() && !reply.arguments().isEmpty()) {
+            fd = ::fcntl(reply.arguments().at(0).value<QDBusUnixFileDescriptor>().fileDescriptor(), F_DUPFD_CLOEXEC,
+                         0);
+        }
+        const bool permanent = done->isError() && timelineRefusalIsPermanent(done->error().name());
+        int superseded = -1;
+        {
+            std::lock_guard<std::mutex> lock(g_timelineMutex);
+            using State = AcquireTimelineRecord::State;
+            if (g_timeline.ask != ask) {
+                superseded = fd;
+            } else if (fd >= 0) {
+                superseded = std::exchange(g_timeline.fd, fd);
+                g_timeline.state = State::Held;
+                g_timeline.owner = daemon;
+            } else if (permanent) {
+                g_timeline.state = State::Refused;
+                g_timeline.owner = daemon;
+            } else {
+                // Busy, a failed export, a daemon that has gone, or a descriptor that could not be taken.
+                superseded = fd;
+                g_timeline.state = State::NotAsked;
+                g_timeline.retryAfter = std::chrono::steady_clock::now() + std::chrono::milliseconds(kRefusedRetryMs);
+            }
+        }
+        if (superseded >= 0) ::close(superseded);
+        if (permanent) {
+            static std::once_flag reported;
+            const std::string why = sanitizeForLog(done->error().message().toStdString());
+            std::call_once(reported, [&why] {
+                std::fprintf(stderr, "wallpaperx: waiting on a semaphore per picture -- the daemon has no acquire "
+                                     "timeline for this desktop: %s\n",
+                             why.c_str());
+            });
+        }
+    });
+}
+
+// Render thread. Only a cheap early return: whether the record may be replaced is the GUI thread's
+// to decide, since only it knows whether `sender` is still the daemon.
+void wantAcquireTimeline(const std::string& sender) {
+    if (sender.empty()) return;
+    QCoreApplication* app = QCoreApplication::instance();
+    if (app == nullptr) return;
+    {
+        std::lock_guard<std::mutex> lock(g_timelineMutex);
+        if (timelineSettledLocked(sender)) return;
+    }
+    QMetaObject::invokeMethod(app, [sender] { askForAcquireTimeline(sender); }, Qt::QueuedConnection);
+}
+
+// Whether this process holds the acquire timeline `owner` granted. Any thread.
+bool holdsAcquireTimeline(const std::string& owner) {
+    if (owner.empty()) return false;
+    std::lock_guard<std::mutex> lock(g_timelineMutex);
+    return g_timeline.state == AcquireTimelineRecord::State::Held && g_timeline.owner == owner;
+}
+
+// Render thread. A descriptor of its own for the timeline `sender` granted, or -1 when this process
+// holds none from that name. Duplicated under the lock, so the GUI thread replacing the record
+// cannot close the number between it being read and being imported.
+int acquireTimelineFdFor(const std::string& sender) {
+    if (sender.empty()) return -1;
+    std::lock_guard<std::mutex> lock(g_timelineMutex);
+    if (g_timeline.state != AcquireTimelineRecord::State::Held || g_timeline.owner != sender) return -1;
+    return ::fcntl(g_timeline.fd, F_DUPFD_CLOEXEC, 0);
+}
+
+// GUI thread. Addressed to the unique name that granted the claim, never the well-known one: a unique
+// name is never reused, so a release delayed past a daemon restart is dropped by the bus instead of
+// freeing the SUCCESSOR's image of the same id under whoever is reading it. Empty only before this
+// process has learned any owner.
 void sendReleaseBuffer(const std::string& owner, int monitorId, quint64 bufferId) {
     QDBusConnection bus = QDBusConnection::sessionBus();
     if (!bus.isConnected()) return;
@@ -225,12 +396,9 @@ void sendReleaseBuffer(const std::string& owner, int monitorId, quint64 bufferId
 }
 
 // Tells the daemon this process has stopped reading an image, if this was the last import of it.
-//
-// Runs on the render thread, from scene graph teardown and from a destructor, so it must neither
-// block nor throw: an exception on either path is std::terminate inside plasmashell.
-//
-// Posted to qApp rather than to the item that fetched the frame, because the scene graph destroys
-// a texture AFTER the item that imported it is gone, and that is exactly when this fires.
+// Render thread, from scene graph teardown and from a destructor, so it must neither block nor
+// throw: a throw there is std::terminate inside plasmashell. Posted to qApp, not to the item, because
+// the scene graph destroys a texture AFTER the item that imported it is gone.
 void releaseClaim(const BufferClaims::Claim& claim) noexcept {
     try {
         if (!BufferClaims::instance().giveBack(claim)) return;
@@ -265,16 +433,11 @@ struct OwnedFd {
     int take() { return std::exchange(fd, -1); }
 };
 
-// One claim waiting on the descriptor that says this process's GPU has finished reading the image.
-// GUI thread, because that is where the notifier's event loop and the bus connection are.
-//
-// It gives the claim back only when the fence signals, so until then the ledger still counts the
-// import -- which is what makes a second live import of the same image, and a daemon replaced in
-// the meantime, come out right without either being asked about here.
-//
-// The deadline bounds a fence that never signals: nothing else would ever free the claim, and the
-// daemon takes none back, so that image would be out of the ring for the session. Orders of
-// magnitude beyond the reads it covers, which are one desktop frame's worth.
+// One claim waiting on the fence that says this process's GPU has finished reading the image. GUI
+// thread, where the notifier's event loop and the bus are. Until the fence signals the ledger still
+// counts the import, which is what makes a second live import of the image, or a daemon replaced
+// meanwhile, come out right. The deadline bounds a fence that never signals: nothing else would free
+// the claim, and that image would be out of the ring for the session.
 constexpr int kFenceDeadlineMs = 5000;
 
 class PendingRelease : public QObject {
@@ -335,15 +498,10 @@ void noteUnfencedRelease(const std::string& whyNot) {
 }
 
 // The same, for a claim whose image this process has been READING: the daemon may draw into it the
-// moment it is told, and the commands sampling it can still be queued when the host is done with
-// the texture. So the claim waits on a fence placed after those commands instead.
-//
-// Render thread, context current, and called where the texture died: the fence covers the commands
-// issued before it, and a texture still alive can still be drawn with.
-//
-// Every path that cannot park the claim releases it now rather than dropping it -- a dropped claim
-// leaves the ledger counting an import that no longer exists, so no later import of that image
-// would be released either.
+// moment it is told, and commands sampling it can still be queued, so the claim waits on a fence
+// placed after them. Render thread, context current, called where the texture died: the fence
+// covers only commands issued before it. A path that cannot park the claim releases it now rather
+// than dropping it -- a dropped claim leaves the ledger counting an import that no longer exists.
 void releaseClaimWhenReadsFinish(const BufferClaims::Claim& claim) noexcept {
     try {
         if (!claim.held()) return;
@@ -387,13 +545,10 @@ void releaseUnimported(const std::shared_ptr<ClaimSet>& claims, const BufferClai
     if (claims && claims->remove(claim)) releaseClaim(claim);
 }
 
-// Which of the daemon's images an import describes.
-//
-// The buffer id carries it: the daemon numbers images from a counter it never resets, so within
-// one of its lifetimes an id is one image, and a ring it rebuilds gets fresh ids. Across lifetimes
-// it is not enough -- ids start from one again -- which is what `daemon` answers, the same count
-// the release ledger keys on. The shape rides along so an image that does not match the import
-// held for it is imported again rather than drawn at the wrong size or layout.
+// Which of the daemon's images an import describes. Within one daemon lifetime the buffer id is one
+// image, since the counter is never reset; across lifetimes ids start from one again, which is what
+// `daemon` answers, as in the release ledger. The shape rides along so an image that does not match
+// the import held for it is imported again rather than drawn at the wrong size or layout.
 struct ImportKey {
     uint64_t daemon = 0;
     int monitorId = -1;
@@ -440,7 +595,8 @@ constexpr int kToleratedHandOverFailures = 8;
 // the memory behind an import it already has holds a different picture now, so a kept import must
 // not be drawn for it -- see the header's note on what a reuse costs.
 bool carriesHandOver(const FrameImport::Request& request) {
-    return std::any_of(request.syncFds.begin(), request.syncFds.end(), [](int syncFd) { return syncFd >= 0; });
+    return request.timelineValue != 0 ||
+           std::any_of(request.syncFds.begin(), request.syncFds.end(), [](int syncFd) { return syncFd >= 0; });
 }
 
 // What stopped a picture reaching the screen. Named rather than read back out of the error text,
@@ -453,14 +609,11 @@ enum class Stopped {
     HandOver,  // the memory is imported; the producer's acquire could not be performed
 };
 
-// What the item hands the scene graph: the picture on the screen, the imports it can switch
-// between without describing memory to the driver again, and the daemon's hold on the image it is
-// sampling now.
-//
-// All of it is the render thread's, the destructor included -- the scene graph destroys its nodes
-// there with a context current, which the GL frees need and the item's own destructor, on the GUI
-// thread, cannot offer. It is also why the imports are kept here: an item leaving the screen asks
-// for its node to be destroyed, so "holds nothing importable" and "has no node" are one fact.
+// What the item hands the scene graph: the picture on the screen, the imports it can switch between
+// without describing memory to the driver again, and the daemon's hold on the image it samples now.
+// All of it is the render thread's, the destructor included -- the GL frees need the context the
+// scene graph has current there. It is also why the imports are kept here: an item leaving the
+// screen asks for its node to be destroyed, so "holds nothing importable" and "has no node" are one.
 class FrameNode : public QSGSimpleTextureNode {
 public:
     // One image described to the driver once, with the scene graph's wrapper around it. The two
@@ -494,9 +647,8 @@ public:
     private:
         // The import goes before the wrapper, never after: from outside this plugin the scene
         // graph's texture destruction is the moment the import's fate can be observed, and
-        // freeing afterwards would leave the GL objects alive past the only handle to them.
-        //
-        // A null wrapper means this was moved from, and then the import went with it.
+        // freeing afterwards would leave the GL objects alive past the only handle to them. A null
+        // wrapper means this was moved from, and the import went with it.
         void free() {
             if (m_texture == nullptr) return;
             FrameImport::release(m_imported);
@@ -518,9 +670,32 @@ public:
 
     ~FrameNode() override {
         m_imports.clear();
+        FrameImport::release(m_timeline);
         // Silent when the item gave this image back on its way off the screen: the same claim
         // released twice would free an image another reader in this process still holds.
         if (m_claims && m_claims->remove(m_claim)) releaseClaimWhenReadsFinish(m_claim);
+    }
+
+    // The acquire timeline `sender` granted, imported into this node's context by the first picture
+    // that needs it and kept: one semaphore import per node, not per picture. Null on failure, with
+    // `importRefused` as for FrameImport::importTimeline(). `imports` counts attempts.
+    FrameImport::Timeline timeline(const std::string& sender, std::atomic<quint64>& imports, std::string& failure,
+                                   bool& importRefused) {
+        if (m_timeline.semaphore != 0 && m_timelineSender == sender) return m_timeline;
+        const int fd = acquireTimelineFdFor(sender);
+        if (fd < 0) {
+            // A descriptor that could not be duplicated, or the record replaced for a newer daemon
+            // while this picture was in flight.
+            failure = "no acquire timeline from the daemon that sent this frame";
+            return {};
+        }
+        imports.fetch_add(1, std::memory_order_relaxed);
+        const FrameImport::Timeline imported = FrameImport::importTimeline(fd, &failure, &importRefused);
+        ::close(fd);
+        if (imported.semaphore == 0) return {};
+        FrameImport::release(std::exchange(m_timeline, imported));
+        m_timelineSender = sender;
+        return m_timeline;
     }
 
     // The import held for this image, or null. Reading only: present() is what moves the node.
@@ -539,13 +714,11 @@ public:
         forgetUnusable();
     }
 
-    // Draws the import held for `key` and takes the daemon's hold on the picture in it.
-    //
-    // The hold it replaces is given back here rather than when its import is freed: the import
-    // stays for the next picture drawn into the same image, and a hold kept that long would leave
-    // the daemon with nowhere to draw. This is the first moment nothing of this item's still
-    // samples the previous picture -- the commands that did were issued by earlier passes, which
-    // is what the fence inside the release covers.
+    // Draws the import held for `key` and takes the daemon's hold on the picture in it. The hold it
+    // replaces is given back here, not when its import is freed: the import stays for the next
+    // picture drawn into that image, and a hold kept that long leaves the daemon nowhere to draw.
+    // Nothing of this item's samples the previous picture after this but commands earlier passes
+    // issued, which the fence inside the release covers.
     void present(const ImportKey& key, const std::shared_ptr<ClaimSet>& claims,
                  const BufferClaims::Claim& claim) {
         const auto shown = std::find_if(m_imports.begin(), m_imports.end(),
@@ -568,12 +741,9 @@ public:
         forgetUnusable();
     }
 
-    // Every import but the one on the screen. What the item asks for when the marks its frames were
-    // fetched against stop meaning anything: no later hand-over can name any of these, and the one
-    // being drawn is kept only because taking a picture off the desktop costs more than it does.
-    //
-    // The one path that frees imports without a picture arriving -- and the cases that need it, a
-    // daemon that exited and a monitor this item left, are exactly the ones where none ever will.
+    // Every import but the one on the screen, for when the marks its frames were fetched against stop
+    // meaning anything: no later hand-over can name these. The one path that frees imports without a
+    // picture arriving, which a daemon that exited and a monitor this item left both need.
     void forgetAllButDrawn() {
         std::erase_if(m_imports, [this](const Import& import) { return !isDrawn(import); });
     }
@@ -585,15 +755,10 @@ private:
     bool isDrawn(const Import& import) const { return import.texture() == texture(); }
 
     // Drops every import that is neither on the screen, nor the one just taken in, nor one a later
-    // hand-over could still name -- an image of the ring being drawn from, meaning same daemon
-    // lifetime, same monitor, same size and layout.
-    //
-    // A daemon that has exited and a monitor this item no longer shows are the cases that matter:
-    // their imports pin memory nothing will hand over again, and left to the count alone they
-    // drain one per picture, which for a still wallpaper is never. A second entry under the front's
-    // own key goes for another reason: two entries one lookup cannot tell apart is a state this
-    // must not be left in. The count is the backstop for a ring rebuilt with everything but the
-    // ids the same, and is walked from the least recently drawn.
+    // hand-over could still name -- an image of the ring being drawn from. Left to the count alone, a
+    // gone daemon's or monitor's imports would drain one per picture, which for a still wallpaper is
+    // never. A second entry under the front's key goes too: one lookup could not tell them apart. The
+    // count is the backstop for a ring rebuilt with only new ids, walked from the least recently drawn.
     void forgetUnusable() {
         const ImportKey current = m_imports.front().key();
         for (std::size_t at = m_imports.size(); at > 1; --at) {
@@ -612,6 +777,10 @@ private:
     // node's to give back.
     std::shared_ptr<ClaimSet> m_claims;
     BufferClaims::Claim m_claim;
+    // See timeline(). Safe to keep after its daemon has gone: every value that name sent was reached
+    // before it was sent, so even a late one waits for nothing. The next daemon's picture replaces it.
+    FrameImport::Timeline m_timeline;
+    std::string m_timelineSender;
 };
 
 }  // namespace
@@ -627,7 +796,8 @@ WallpaperXItem::PendingFrame::PendingFrame(PendingFrame&& other) noexcept
     : request(std::move(other.request)),
       generation(other.generation),
       claim(other.claim),
-      claims(std::move(other.claims)) {
+      claims(std::move(other.claims)),
+      sender(std::move(other.sender)) {
     disownDescriptors(other.request);
     other.claim = {};
 }
@@ -640,6 +810,7 @@ WallpaperXItem::PendingFrame& WallpaperXItem::PendingFrame::operator=(PendingFra
         generation = other.generation;
         claim = other.claim;
         claims = std::move(other.claims);
+        sender = std::move(other.sender);
         disownDescriptors(other.request);
         other.claim = {};
     }
@@ -906,9 +1077,8 @@ void WallpaperXItem::reportSize() {
 }
 
 // Every generation mark at once, and the frame they describe. Generations belong to one monitor
-// and one daemon instance, so a change of either invalidates all of them -- resetting some and not
-// the rest is what made a restarted daemon's frames read as older than the screen. The epoch bump
-// is what makes a pass that is importing right now discard its write-back.
+// and one daemon instance, so a change of either invalidates all of them. The epoch bump is what
+// makes a pass that is importing right now discard its write-back.
 void WallpaperXItem::discardHeldFrame() {
     m_fetchedGeneration = 0;
     m_retriedGeneration = 0;
@@ -1065,6 +1235,13 @@ void WallpaperXItem::ensureFrameRequested() {
     fetchFrame(0);
 }
 
+bool WallpaperXItem::fetchOnTimeline() {
+    const std::string owner = g_daemonOwner.toStdString();
+    if (!holdsAcquireTimeline(owner)) return false;
+    std::lock_guard<std::mutex> lock(m_importedMutex);
+    return m_contextWaitsOnTimeline && m_timelineRefusedBy != owner;
+}
+
 void WallpaperXItem::fetchFrame(quint64 generation) {
     // Nothing to do with a frame while this item is not on the screen, and every one fetched would
     // take an image out of the daemon's ring for a wallpaper nobody is looking at.
@@ -1093,15 +1270,18 @@ void WallpaperXItem::fetchFrame(quint64 generation) {
         return;
     }
 
-    // ASYNCHRONOUS, and this is not a preference. A blocking call here parks the thread that
-    // runs the compositor's UI until the daemon answers -- and worse, the first fetch happens
-    // while QML is still building this item, where the nested event loop a blocking call needs
-    // never gets to run. Measured: the call never returned, the item drew nothing, and the
-    // desktop had no way to say why. The daemon answering the same request over qdbus in
-    // milliseconds is what located it.
+    // ASYNCHRONOUS, and this is not a preference. A blocking call parks the thread that runs the
+    // compositor's UI until the daemon answers -- and the first fetch happens while QML is still
+    // building this item, where the nested event loop a blocking call needs never runs: it never
+    // returns.
+    //
+    // A value is only valid on the timeline of the daemon that sent it, and QtDBus leaves a reply's
+    // sender blank, so a request for one is sent to the unique name, which then labels the reply.
+    const bool onTimeline = fetchOnTimeline();
+    const QString addressedTo = onTimeline ? g_daemonOwner : QString();
     QDBusMessage request = QDBusMessage::createMethodCall(
-        QString::fromUtf8(kService), QString::fromUtf8(kPath), QString::fromUtf8(kInterface),
-        QStringLiteral("GetFrameFd"));
+        onTimeline ? addressedTo : QString::fromUtf8(kService), QString::fromUtf8(kPath), QString::fromUtf8(kInterface),
+        onTimeline ? QStringLiteral("GetFrameFdOnTimeline") : QStringLiteral("GetFrameFd"));
     request.setArguments({m_monitorId});
     // Checked before asking, not after: with no bus, asyncCall hands back a null pending call
     // whose watcher never emits anything, so the in-flight latch below would never clear and
@@ -1118,18 +1298,20 @@ void WallpaperXItem::fetchFrame(quint64 generation) {
     // The reply carries no monitor id of its own.
     const int requestedMonitor = m_monitorId;
     connect(watcher, &QDBusPendingCallWatcher::finished, this,
-            [this, requestedMonitor](QDBusPendingCallWatcher* done) {
+            [this, requestedMonitor, addressedTo](QDBusPendingCallWatcher* done) {
                 done->deleteLater();
                 // Cleared before any early return, or one dropped reply stops fetching for good.
                 m_fetchInFlight = false;
                 const std::optional<quint64> queued = std::exchange(m_queuedFetch, std::nullopt);
+                // Who sent it: the name a value request was addressed to, else the owner as known now.
+                const std::string sender = (addressedTo.isEmpty() ? g_daemonOwner : addressedTo).toStdString();
                 // A reply for a monitor this item has since stopped showing is still a frame the
                 // daemon recorded a hold for, so it is given back rather than dropped with the
                 // message. Nothing else would: the daemon takes no claim back on its own.
                 if (requestedMonitor == m_monitorId) {
-                    takeFrameReply(requestedMonitor, done->reply());
+                    takeFrameReply(requestedMonitor, done->reply(), sender, !addressedTo.isEmpty());
                 } else {
-                    releaseFrameReply(requestedMonitor, done->reply());
+                    releaseFrameReply(requestedMonitor, done->reply(), sender);
                 }
                 if (queued) fetchFrame(*queued);
             });
@@ -1252,11 +1434,12 @@ quint64 WallpaperXItem::grantedBufferId(const QDBusMessage& call) {
 // recorded the hold when it answered, so the claim is taken and handed straight back; dropping
 // the message instead pins that image until this process leaves the bus. Reports nothing: the
 // reason it would publish describes a screen this item has stopped showing.
-void WallpaperXItem::releaseFrameReply(int monitorId, const QDBusMessage& call) {
-    releaseClaim(BufferClaims::instance().take(monitorId, grantedBufferId(call), g_daemonOwner.toStdString()));
+void WallpaperXItem::releaseFrameReply(int monitorId, const QDBusMessage& call, const std::string& sender) {
+    releaseClaim(BufferClaims::instance().take(monitorId, grantedBufferId(call), sender));
 }
 
-void WallpaperXItem::takeFrameReply(int monitorId, const QDBusMessage& call) {
+void WallpaperXItem::takeFrameReply(int monitorId, const QDBusMessage& call, const std::string& sender,
+                                    bool askedForValue) {
     if (call.type() != QDBusMessage::ReplyMessage) {
         // A bus error is jargon about transport ("The name io.wallpaperx.Daemon was not provided
         // by any .service files"), so it is answered in this plugin's own words. Only the
@@ -1312,7 +1495,8 @@ void WallpaperXItem::takeFrameReply(int monitorId, const QDBusMessage& call) {
     // -- so from here on every path that drops this frame owes it a release, and `frame` owning
     // the claim is what makes that automatic.
     frame.request.bufferId = grantedBufferId(call);
-    frame.claim = BufferClaims::instance().take(monitorId, frame.request.bufferId, g_daemonOwner.toStdString());
+    frame.claim = BufferClaims::instance().take(monitorId, frame.request.bufferId, sender);
+    frame.sender = sender;
     // Registered before anything else can fail, for the same reason the claim is taken first: from
     // here the set is what owes this image back, whichever path drops it.
     frame.claims = m_claims;
@@ -1332,13 +1516,9 @@ void WallpaperXItem::takeFrameReply(int monitorId, const QDBusMessage& call) {
     frame.request.drmFormat = args.at(7).toUInt();
     frame.request.drmModifier = args.at(8).toULongLong();
 
-    // Field 5, sync_fds: what must be waited on before this frame is sampled. Read into the
-    // request whatever the count -- ALL of them, not the first -- so a daemon that later sends
-    // more than one is waited on completely rather than sampled early, which is the tearing the
-    // old outright refusal of this field existed to prevent.
-    //
-    // Duplicated like the memory descriptor above: the reply's own descriptors close when this
-    // message goes out of scope.
+    // Field 5, sync_fds: what must be waited on before this frame is sampled. ALL of them, not the
+    // first, so a daemon that sends more than one is waited on completely rather than sampled early.
+    // Duplicated like the memory descriptor: the reply's own close with this message.
     const QDBusArgument syncFds = args.at(5).value<QDBusArgument>();
     bool syncTaken = true;
     syncFds.beginArray();
@@ -1359,6 +1539,14 @@ void WallpaperXItem::takeFrameReply(int monitorId, const QDBusMessage& call) {
     if (!syncTaken) {
         setFetchReason(tr("WallpaperX sent a frame this plugin could not take hold of."));
         return;
+    }
+
+    // Field 12, acquire_value, the other form of the same hand-over: a value on this process's
+    // acquire timeline. Kept only when sync_fds is empty -- one picture, one hand-over, and the
+    // descriptors already in hand win over a value from a reply that sent both. Read only from a
+    // reply to GetFrameFdOnTimeline: only its `sender` is exact enough to pair a value with.
+    if (askedForValue && args.size() > kAcquireValueField && frame.request.syncFds.empty()) {
+        frame.request.timelineValue = args.at(kAcquireValueField).toULongLong();
     }
 
     // Field 9, the per-plane offsets and pitches. Only the dma_buf path needs them, but they are
@@ -1495,9 +1683,8 @@ QSGNode* WallpaperXItem::updatePaintNode(QSGNode* old, UpdatePaintNodeData*) {
 
         const ImportKey key = importKeyFor(incoming->claim, incoming->request);
         // An import is drawn again only for a picture that brings the producer's hand-over: waiting
-        // on it is the one thing that tells the driver the memory holds something else now, and
-        // neither extension promises anything without it. A picture arriving without one is
-        // described to the driver afresh, as every picture was before imports were kept.
+        // on it is the one thing that tells the driver the memory holds something else now. A
+        // picture arriving without one is described to the driver afresh.
         const FrameNode::Import* reused =
             node != nullptr && carriesHandOver(incoming->request) ? node->held(key) : nullptr;
 
@@ -1547,21 +1734,63 @@ QSGNode* WallpaperXItem::updatePaintNode(QSGNode* old, UpdatePaintNodeData*) {
             }
         }
 
-        // The hand-over, per picture, whichever way its memory got here.
-        if (stopped == Stopped::Nothing && !FrameImport::acquire(incoming->request, importedTexture, &failure)) {
+        // What the next fetch may ask for. A picture that brought sync_fds is one this process could
+        // have had a value for instead; asked once per daemon, and the pictures before the answer
+        // lose nothing.
+        const bool contextWaits = FrameImport::supportsTimeline() && !contextRefusesSemaphores();
+        std::string refusedBy;
+        {
+            std::lock_guard<std::mutex> lock(m_importedMutex);
+            m_contextWaitsOnTimeline = contextWaits;
+            refusedBy = m_timelineRefusedBy;
+        }
+        if (contextWaits && !incoming->request.syncFds.empty()) wantAcquireTimeline(incoming->sender);
+
+        // A value asked for before this item gave up on that daemon's timeline. Not drawn, since
+        // reading it unwaited in a context that can wait is undefined, and not counted as a failed
+        // hand-over, since none was tried: the fetch that replaces it asks for sync_fds.
+        if (stopped == Stopped::Nothing && incoming->request.timelineValue != 0 && refusedBy == incoming->sender) {
             stopped = Stopped::HandOver;
-            ++m_handOversFailed;
+            failure = "this item no longer waits on that daemon's acquire timeline";
         }
 
-        // A picture that could not be handed over leaves the node drawing the last one that was, so
-        // the item neither blanks nor says it is drawing nothing -- this file's rule elsewhere is
-        // that a frame on screen outranks a message about a fetch that failed. Its imports stay
-        // with it: every one is still good.
-        //
-        // Bounded, because that tolerance is for a blip. A hand-over that has stopped working
-        // altogether would otherwise freeze the wallpaper on one picture while the item went on
-        // reporting that it is drawing normally, which is the one state nothing else here can tell
-        // the user about.
+        // The hand-over, in the form the daemon sent: a value, waited on through the node's one
+        // import of the timeline, or sync_fds, each imported as a semaphore of its own. A refused
+        // import draws this picture unwaited, since its memory imported fine.
+        if (stopped == Stopped::Nothing) {
+            bool handedOver = false;
+            bool importRefused = false;
+            if (incoming->request.timelineValue != 0) {
+                const FrameImport::Timeline timeline =
+                    node->timeline(incoming->sender, m_semaphoreImportCount, failure, importRefused);
+                handedOver = timeline.semaphore != 0 &&
+                             FrameImport::acquire(timeline, incoming->request.timelineValue, importedTexture, &failure);
+                if (!handedOver && !importRefused) {
+                    // Any other failure to import or wait on that daemon's timeline, transient ones
+                    // included: this item asks it for sync_fds from now on.
+                    std::lock_guard<std::mutex> lock(m_importedMutex);
+                    m_timelineRefusedBy = incoming->sender;
+                }
+            } else {
+                const auto semaphores = std::count_if(incoming->request.syncFds.begin(), incoming->request.syncFds.end(),
+                                                      [](int syncFd) { return syncFd >= 0; });
+                m_semaphoreImportCount.fetch_add(static_cast<quint64>(semaphores), std::memory_order_relaxed);
+                handedOver = FrameImport::acquire(incoming->request, importedTexture, &failure, &importRefused);
+            }
+            if (importRefused) {
+                noteContextRefusedSemaphores(failure);
+                handedOver = true;
+            }
+            if (!handedOver) {
+                stopped = Stopped::HandOver;
+                ++m_handOversFailed;
+            }
+        }
+
+        // A picture that could not be handed over leaves the node drawing the last one that was,
+        // imports and all: a frame on screen outranks a message about a fetch that failed. Bounded,
+        // because that tolerance is for a blip; a hand-over that has stopped working would otherwise
+        // freeze the wallpaper while the item went on reporting that it draws normally.
         const bool stillDrawing = stopped == Stopped::HandOver && m_handOversFailed <= kToleratedHandOverFailures &&
                                   node != nullptr && node->texture() != nullptr;
 
@@ -1595,6 +1824,8 @@ QSGNode* WallpaperXItem::updatePaintNode(QSGNode* old, UpdatePaintNodeData*) {
             QMetaObject::invokeMethod(
                 this,
                 [this, failed, epoch] {
+                    // Before the guard: a failed hand-over still moved semaphoreImportCount.
+                    emit importCountsChanged();
                     // Epoch-guarded like the mark above, and for the same reason: a monitor
                     // change or daemon restart can land between the post and its delivery, and
                     // recording a retry for a generation that has since been discarded burns the
@@ -1610,10 +1841,8 @@ QSGNode* WallpaperXItem::updatePaintNode(QSGNode* old, UpdatePaintNodeData*) {
                 },
                 Qt::QueuedConnection);
         } else {
-            // Both counted at the one event they describe -- a picture drawn -- so their sum is
-            // what this item put on the screen and the split is how much of it needed an import of
-            // its own. Counted at the top of either branch they would count attempts, and no
-            // relation between them would be assertable.
+            // Both counted at the one event they describe, a picture drawn, so their sum is what this
+            // item put on the screen and the split is how much of it needed an import of its own.
             (reused == nullptr ? m_importCount : m_reusedImportCount).fetch_add(1, std::memory_order_relaxed);
             // The run of failed hand-overs is over: this is the picture that proves it.
             m_handOversFailed = 0;
@@ -1634,12 +1863,9 @@ QSGNode* WallpaperXItem::updatePaintNode(QSGNode* old, UpdatePaintNodeData*) {
                 m_nodeHasFrame = true;
                 m_renderReason.clear();
             }
-            // What a drawn picture owes this item's own thread. The retry mark is cleared so
-            // "retried once" means once per failure, not once per session: the same generation can
-            // be re-fetched later (a window change re-asks) and must be allowed its retry again if
-            // that import fails too. The counts and the reason are published here rather than from
-            // hops of their own, which would be more queued events per video frame; the render
-            // thread may not emit at all.
+            // What a drawn picture owes this item's own thread. The retry mark is cleared so "retried
+            // once" means once per failure: the same generation can be re-fetched later and must get
+            // its retry again. One hop for all of it, since each is a queued event per video frame.
             QMetaObject::invokeMethod(
                 this,
                 [this] {

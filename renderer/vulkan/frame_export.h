@@ -2,16 +2,17 @@
 
 #pragma once
 
+#include "device.h"
 #include "drm_formats.h"
 #include "memory.h"
 
 #include <array>
 #include <cstdint>
+#include <optional>
 #include <vector>
 
 namespace wallpaperx {
 
-class Device;
 struct OffscreenTarget;
 
 // The DRM fourcc naming a compositor needs for `format`, or 0 if this format has no
@@ -87,7 +88,7 @@ ExportedFrame exportFrame(Device& device, const OffscreenTarget& target);
 // A descriptor the consumer waits on before it samples the frame `target` published, and which
 // carries the queue-family acquire reversing that render's release. -1 when this device has no
 // VK_KHR_external_semaphore_fd, which leaves the consumer reading memory the graphics queue
-// formally still owns -- undefined, and the state everything was in before this existed.
+// formally still owns, which is undefined.
 //
 // Already signalled when it is returned, which is what makes a binary semaphore safe to send
 // across a process boundary: it is signalled by its own submit here and the descriptor is taken
@@ -105,5 +106,47 @@ ExportedFrame exportFrame(Device& device, const OffscreenTarget& target);
 // The caller owns the descriptor and must close() it. Throws on the same split exportFrame() uses;
 // throws runtime_error if the target has no published frame, which is a caller bug.
 int exportFrameAcquireFd(Device& device, const OffscreenTarget& target);
+
+// One consumer's acquire, as a timeline semaphore: exported once and advanced once per picture,
+// where exportFrameAcquireFd() above builds and exports a new binary semaphore every time. The
+// consumer imports the payload once and waits on each picture's value; the queue-family acquire and
+// layout still ride on that wait, as they do on the binary one.
+//
+// Every value signal() returns has already been reached when it returns, so a consumer never holds
+// a value its payload will not get to -- not even after this producer dies, since an imported
+// payload keeps its count. That is the only thing standing between a wrong value and a consumer
+// whose GPU queue waits for ever: a GL consumer has no way to read the payload before it waits.
+//
+// GPU thread only, like everything that submits.
+class AcquireTimeline {
+public:
+    // Whether `device` can export a timeline semaphore as an opaque descriptor.
+    static bool supported(Device& device);
+
+    // Throws runtime_error when !supported(device), and on the split exportFrame() uses.
+    explicit AcquireTimeline(Device& device);
+    ~AcquireTimeline();
+
+    AcquireTimeline(const AcquireTimeline&) = delete;
+    AcquireTimeline& operator=(const AcquireTimeline&) = delete;
+
+    // A new descriptor naming this timeline's payload; the caller owns it. Each call is a new
+    // descriptor for the same payload, so a consumer asking twice imports the same counter.
+    int exportFd();
+
+    // Signals the next value after everything submitted so far -- the render that published
+    // `target` among it -- and waits for it. Throws runtime_error if the target has no published
+    // frame, and GpuFailure when the wait does not complete; the value is then never handed out,
+    // and the next call signals past it.
+    uint64_t signal(const OffscreenTarget& target);
+
+private:
+    Device& m_device;
+    VkSemaphore m_semaphore = VK_NULL_HANDLE;
+    // The highest value ever submitted, reached or not: a timeline's signals must increase.
+    uint64_t m_submitted = 0;
+    // A signal whose wait did not complete, and so may still be pending when this is destroyed.
+    std::optional<Device::SubmitTicket> m_unfinished;
+};
 
 }

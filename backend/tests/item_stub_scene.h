@@ -34,6 +34,7 @@
 
 #include <EGL/egl.h>
 #include <GL/gl.h>
+#include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -43,6 +44,7 @@
 #include <functional>
 #include <iterator>
 #include <map>
+#include <memory>
 #include <optional>
 #include <string>
 #include <utility>
@@ -152,6 +154,18 @@ public:
     void holdNextReply() { m_holdNext = true; }
     bool replyIsHeld() const { return m_heldConnection.has_value(); }
 
+    // Holds every frame reply, oldest first, until sendOldestHeld(). For a drive that must deliver
+    // exactly one reply between two render passes while the item already has the next request out:
+    // released as it arrived, the next reply could replace one the render thread had not yet seen.
+    void holdEveryReply(bool hold) { m_holdEvery = hold; }
+    size_t heldReplies() const { return m_heldQueue.size(); }
+    bool sendOldestHeld() {
+        if (m_heldQueue.empty()) return false;
+        auto [connection, reply] = std::move(m_heldQueue.front());
+        m_heldQueue.erase(m_heldQueue.begin());
+        return connection.send(reply);
+    }
+
     // Serves the sequence round and round instead of refusing once it runs out: a daemon's ring,
     // handing the same few images back in turn for as long as it is asked.
     void rotate() { m_rotate = true; }
@@ -176,6 +190,38 @@ public:
     // replies before it as they were scheduled. Decided per reply as it is built, for
     // holdServeNumber()'s reason: the item's own re-asks do not wait for the test.
     void sendAcquireFrom(int serveNumber, Acquire mode) { m_acquireFrom[serveNumber] = mode; }
+
+    // The acquire timeline, one per caller. Absent -- the default -- answers GetAcquireTimeline as a
+    // daemon from before it did, UnknownMethod, so every test not about the timeline stays on
+    // sync_fds. Grant creates and hands over the caller's timeline; Silent creates it and never
+    // answers, which is a lost reply; BadDescriptor hands over a descriptor that is no semaphore
+    // payload, which the driver refuses at import.
+    enum class Timeline { Absent, Grant, Silent, BadDescriptor };
+    void serveTimelines(Timeline mode) { m_timelineMode = mode; }
+    // The next `count` asks are answered with `errorName`, whatever the mode.
+    void refuseTimelineAsks(int count, QString errorName) {
+        m_timelineRefusals = count;
+        m_timelineRefusal = std::move(errorName);
+    }
+    // Each timeline is signalled `count` times as it is created, so its payload starts far ahead of
+    // what another stub's has reached: a value from the other waited on this one then completes
+    // rather than stalling the GPU, and only an import count can tell the pairing was wrong.
+    void advanceTimelinesOnGrant(int count) { m_advanceOnGrant = count; }
+    // GetFrameFd replies carry `value` as a thirteenth field and no sync_fds: a daemon answering
+    // the method nobody asked for a value on as if they had.
+    void sendValueOnGetFrameFd(quint64 value) { m_valueOnGetFrameFd = value; }
+    // Numbers this stub's frames from `offset` + 1 instead of 1. Set before the first serve.
+    void numberGenerationsFrom(quint64 offset) { m_generationOffset = offset; }
+    // The generation the next frame served will carry: what a FrameReady announcing it names.
+    quint64 nextGeneration() const { return m_generationOffset + static_cast<quint64>(m_served) + 1; }
+
+    int timelineAsks() const { return static_cast<int>(m_askTimesMs.size()); }
+    // When each ask arrived, in milliseconds since this stub was made.
+    const std::vector<qint64>& timelineAskTimesMs() const { return m_askTimesMs; }
+    int timelinesGranted() const { return m_timelinesGranted; }
+    int onTimelineRequests() const { return m_onTimelineRequests; }
+    // Pictures that went out as a value on a timeline this stub granted.
+    int valuesSent() const { return m_valuesSent; }
 
     // Every SetImportModifiers the item sent, answered with success as the daemon answers one it
     // accepts. The only view there is of a withdrawal: the plugin withdraws a layout by reporting
@@ -226,10 +272,13 @@ public:
             m_modifierReports.push_back(std::move(report));
             return connection.send(message.createReply());
         }
-        if (message.member() != QLatin1String("GetFrameFd")) return false;
+        if (message.member() == QLatin1String("GetAcquireTimeline")) return answerTimeline(message, connection);
+        const bool onTimeline = message.member() == QLatin1String("GetFrameFdOnTimeline");
+        if (!onTimeline && message.member() != QLatin1String("GetFrameFd")) return false;
         // Counted before anything here can go wrong, so "the item asked" and "the stub answered"
         // stay separate verdicts.
         ++m_requests;
+        if (onTimeline) ++m_onTimelineRequests;
         if (!m_refuseWith.isEmpty()) {
             return connection.send(message.createErrorReply(
                 m_refuseWith, QStringLiteral("this stub was told to refuse every further hand-over")));
@@ -275,7 +324,21 @@ public:
         if (auto it = m_acquireFrom.upper_bound(m_served + 1); it != m_acquireFrom.begin()) {
             acquireMode = std::prev(it)->second;
         }
-        if (acquireMode == Acquire::Real) {
+        // A value only for a request that asked on the timeline this stub granted the caller, as
+        // the daemon does; everyone else gets sync_fds and, on the timeline method, a value of 0.
+        quint64 value = 0;
+        const auto timeline = m_timelines.find(message.service());
+        const bool valued = onTimeline && timeline != m_timelines.end() && timeline->second;
+        if (valued) {
+            try {
+                value = timeline->second->signal(served);
+                ++m_valuesSent;
+            } catch (const std::exception& e) {
+                m_acquireError = e.what();
+            }
+        } else if (!onTimeline && m_valueOnGetFrameFd != 0) {
+            value = m_valueOnGetFrameFd;
+        } else if (acquireMode == Acquire::Real) {
             try {
                 const int acquireFd = wallpaperx::exportFrameAcquireFd(m_device, served);
                 if (acquireFd >= 0) {
@@ -293,7 +356,7 @@ public:
                 ++m_unusableAcquiresSent;
             }
         }
-        if (acquireMode == Acquire::Real) m_acquireFdsSent += static_cast<int>(syncFds.size());
+        if (acquireMode == Acquire::Real && value == 0) m_acquireFdsSent += static_cast<int>(syncFds.size());
 
         QList<FramePlane> planes;
         for (const wallpaperx::ExportedFramePlane& plane : frame.planes) {
@@ -306,15 +369,21 @@ public:
         // One generation per frame served, starting at 1. The item ignores a FrameReady naming a
         // generation it already holds, so a stub that answered 1 for every frame could never be
         // made to fetch a second one.
-        const quint64 generation = static_cast<quint64>(m_served);
+        const quint64 generation = m_generationOffset + static_cast<quint64>(m_served);
         // Both taken from the export rather than invented: the importer refuses a frame whose
         // device is not the one this context runs on, and these tests import for real.
-        const QDBusMessage reply = message.createReply(
+        QList<QVariant> fields =
             frameReplyFields(handle, frame.width, frame.height, frame.memorySize, m_handleType, generation,
                              frame.drmFormat, frame.modifier, planes,
                              QByteArray(reinterpret_cast<const char*>(frame.deviceUuid.data()),
                                         static_cast<qsizetype>(frame.deviceUuid.size())),
-                             m_bufferIdOverride != 0 ? m_bufferIdOverride : frame.bufferId, syncFds));
+                             m_bufferIdOverride != 0 ? m_bufferIdOverride : frame.bufferId, syncFds);
+        if (onTimeline || value != 0) fields.append(QVariant::fromValue(static_cast<qulonglong>(value)));
+        const QDBusMessage reply = message.createReply(fields);
+        if (m_holdEvery) {
+            m_heldQueue.emplace_back(connection, reply);
+            return true;
+        }
         if (m_holdNext || m_served == m_holdAtServe) {
             m_holdNext = false;
             if (m_served == m_holdAtServe) m_holdAtServe = -1;
@@ -348,6 +417,59 @@ public:
     int unusableAcquiresSent() const { return m_unusableAcquiresSent; }
 
 private:
+    bool answerTimeline(const QDBusMessage& message, const QDBusConnection& connection) {
+        m_askTimesMs.push_back(m_clock.elapsed());
+        if (m_timelineRefusals > 0) {
+            --m_timelineRefusals;
+            return connection.send(
+                message.createErrorReply(m_timelineRefusal, QStringLiteral("this stub was told to refuse this ask")));
+        }
+        if (m_timelineMode == Timeline::Absent) {
+            return connection.send(message.createErrorReply(QStringLiteral("org.freedesktop.DBus.Error.UnknownMethod"),
+                                                            QStringLiteral("no method GetAcquireTimeline here")));
+        }
+        std::unique_ptr<wallpaperx::AcquireTimeline>& timeline = m_timelines[message.service()];
+        try {
+            if (!timeline) {
+                timeline = std::make_unique<wallpaperx::AcquireTimeline>(m_device);
+                for (int i = 0; i < m_advanceOnGrant; ++i) timeline->signal(*m_sequence.front());
+            }
+        } catch (const std::exception& e) {
+            m_acquireError = e.what();
+            timeline.reset();
+            return connection.send(message.createErrorReply(QStringLiteral("io.wallpaperx.Daemon.Error.Unsupported"),
+                                                            QString::fromStdString(m_acquireError)));
+        }
+        if (m_timelineMode == Timeline::Silent) return true;  // registered, and the answer never comes
+        int fd = timeline->exportFd();
+        if (m_timelineMode == Timeline::BadDescriptor) {
+            ::close(fd);
+            fd = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+        }
+        QDBusUnixFileDescriptor handle(fd);
+        ::close(fd);  // QDBusUnixFileDescriptor took its own duplicate.
+        ++m_timelinesGranted;
+        return connection.send(message.createReply(QList<QVariant>{QVariant::fromValue(handle)}));
+    }
+
+    bool m_holdEvery = false;
+    std::vector<std::pair<QDBusConnection, QDBusMessage>> m_heldQueue;
+    Timeline m_timelineMode = Timeline::Absent;
+    int m_timelineRefusals = 0;
+    QString m_timelineRefusal;
+    int m_advanceOnGrant = 0;
+    quint64 m_valueOnGetFrameFd = 0;
+    quint64 m_generationOffset = 0;
+    std::vector<qint64> m_askTimesMs;
+    int m_timelinesGranted = 0;
+    int m_onTimelineRequests = 0;
+    int m_valuesSent = 0;
+    QElapsedTimer m_clock = [] {
+        QElapsedTimer started;
+        started.start();
+        return started;
+    }();
+    std::map<QString, std::unique_ptr<wallpaperx::AcquireTimeline>> m_timelines;
     bool m_rotate = false;
     const wallpaperx::OffscreenTarget* m_serveNext = nullptr;
     quint64 m_lastModifier = 0;

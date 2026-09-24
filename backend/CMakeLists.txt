@@ -266,6 +266,9 @@ enable_testing()
 
 add_executable(wallpaperx-dbus-service-test tests/dbus_service_test.cpp)
 target_link_libraries(wallpaperx-dbus-service-test PRIVATE wallpaperx-daemon-lib)
+# The test defines sd_bus_send to fail one reply on demand; exported, or libsdbus-c++ binds
+# libsystemd's.
+target_link_options(wallpaperx-dbus-service-test PRIVATE "LINKER:--export-dynamic-symbol=sd_bus_send")
 # Header-only test scaffolding shared with the renderer's probes (support/), for
 # reading an exported frame's bytes back through its fd. Not part of the renderer
 # library: nothing WallpaperX ships CPU-maps an exported frame, only a test does.
@@ -1253,6 +1256,10 @@ if(DBUS_RUN_SESSION)
                 WALLPAPERX_SHADER_DIR="${WALLPAPERX_SHADER_OUTPUT_DIR}"
                 WALLPAPERX_TEST_IMAGE_DIR="${WALLPAPERX_ITEM_ASSET_DIR}")
             add_dependencies(wallpaperx-item-import-cache-test wallpaperxplugin wallpaperx-shaders)
+            # tests/gl_semaphore_fault.h defines eglGetProcAddress in the executable to fail a GL
+            # semaphore wait on demand; exported, or the plugin -- loaded at runtime -- binds libEGL's.
+            target_link_options(wallpaperx-item-import-cache-test PRIVATE
+                "LINKER:--export-dynamic-symbol=eglGetProcAddress")
             foreach(cache_phase counts single pixels no-acquire handover handover-reset handover-modifier
                                 stale-daemon stale-monitor offscreen publish not-opengl)
                 set(cache_environment "QT_QPA_PLATFORM=wayland\;xcb\;offscreen;QT_NO_XDG_DESKTOP_PORTAL=1")
@@ -1270,6 +1277,43 @@ if(DBUS_RUN_SESSION)
                     RESOURCE_LOCK wallpaperx_bus_tests
                     SKIP_RETURN_CODE 77)
             endforeach()
+
+            # The acquire timeline, from the plugin's side: one entry per phase, for
+            # item_release_ledger's reason -- the plugin's timeline record and its list of contexts
+            # that refused an import are process-wide. Needs GL_NV_timeline_semaphore, so every
+            # phase but two reports NOT VERIFIED on Mesa.
+            add_executable(wallpaperx-item-timeline-test tests/item_timeline_test.cpp)
+            target_link_libraries(wallpaperx-item-timeline-test PRIVATE
+                wallpaperx-renderer wallpaperx-frame-import
+                Qt6::Core Qt6::DBus Qt6::Gui Qt6::Qml Qt6::Quick Qt6::QuickPrivate
+                PkgConfig::EGL OpenGL::GL)
+            target_include_directories(wallpaperx-item-timeline-test PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../renderer/tests)
+            target_compile_definitions(wallpaperx-item-timeline-test PRIVATE
+                WALLPAPERX_QML_MODULE_PATH="${CMAKE_CURRENT_BINARY_DIR}/qml"
+                WALLPAPERX_SHADER_DIR="${WALLPAPERX_SHADER_OUTPUT_DIR}"
+                WALLPAPERX_TEST_IMAGE_DIR="${WALLPAPERX_ITEM_ASSET_DIR}")
+            target_link_options(wallpaperx-item-timeline-test PRIVATE
+                "LINKER:--export-dynamic-symbol=eglGetProcAddress"
+                "LINKER:--export-dynamic-symbol=glGetStringi")
+            add_dependencies(wallpaperx-item-timeline-test wallpaperxplugin wallpaperx-shaders)
+            foreach(timeline_phase steady old-daemon unsupported unknown-interface retry-busy retry-exportfailed
+                                   lost-reply refused-timeline refused-binary wait-no-trip setup-create setup-type
+                                   stray-value restart stale-value context-move)
+                add_test(NAME item_timeline_${timeline_phase}
+                         COMMAND ${DBUS_RUN_SESSION} -- $<TARGET_FILE:wallpaperx-item-timeline-test> ${timeline_phase})
+                set_tests_properties(item_timeline_${timeline_phase} PROPERTIES
+                    ENVIRONMENT "QT_QPA_PLATFORM=wayland\;xcb\;offscreen;QT_NO_XDG_DESKTOP_PORTAL=1"
+                    RESOURCE_LOCK wallpaperx_bus_tests
+                    SKIP_RETURN_CODE 77)
+            endforeach()
+            # The steady phase again on the dma_buf export, the other handle type the plugin waits on.
+            add_test(NAME item_timeline_steady-dmabuf
+                     COMMAND ${DBUS_RUN_SESSION} -- $<TARGET_FILE:wallpaperx-item-timeline-test> steady)
+            set_tests_properties(item_timeline_steady-dmabuf PROPERTIES
+                ENVIRONMENT "QT_QPA_PLATFORM=wayland\;xcb\;offscreen;QT_NO_XDG_DESKTOP_PORTAL=1;WALLPAPERX_FORCE_HANDLE_TYPE=dmabuf"
+                RESOURCE_LOCK wallpaperx_bus_tests
+                SKIP_RETURN_CODE 77)
 
             foreach(offscreen_phase hidden painted)
                 add_test(NAME item_offscreen_${offscreen_phase}

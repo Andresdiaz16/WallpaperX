@@ -591,6 +591,104 @@ std::vector<int> WallpaperManager::forgetHeldBuffers(const std::string& client, 
     return toRender;
 }
 
+int WallpaperManager::acquireTimelineFd(const std::string& client) {
+    if (client.empty()) {
+        throw TimelineUnavailable("a caller with no bus name has nothing its timeline could be kept under");
+    }
+
+    std::lock_guard<std::mutex> gpuLock(m_gpuMutex);
+    ensureGpu();
+    // First, so the departed do not count against the limit below.
+    reapDepartedTimelinesLocked();
+
+    try {
+        if (AcquireTimeline* existing = liveAcquireTimeline(client)) return existing->exportFd();
+
+        if (!AcquireTimeline::supported(*m_device)) {
+            throw TimelineUnavailable("this GPU cannot export a timeline semaphore");
+        }
+        {
+            std::lock_guard<std::mutex> stateLock(m_stateMutex);
+            if (m_acquireTimelines.size() >= kMaxAcquireTimelines) {
+                throw TimelineLimitReached("this daemon already keeps an acquire timeline for " +
+                                           std::to_string(kMaxAcquireTimelines) + " consumers; ask again later");
+            }
+        }
+
+        auto timeline = std::make_unique<AcquireTimeline>(*m_device);
+        const int fd = timeline->exportFd();
+        {
+            std::lock_guard<std::mutex> stateLock(m_stateMutex);
+            try {
+                m_acquireTimelines.push_back(ConsumerTimeline{client, std::move(timeline), false});
+            } catch (...) {
+                ::close(fd);
+                throw;
+            }
+        }
+        // Once per consumer, not per request. Whether its pictures then use it is per request, and the
+        // per-picture line says which form each one took.
+        std::printf("wallpaperx-daemon: handed %s an acquire timeline\n", sanitizeForLog(client).c_str());
+        std::fflush(stdout);
+        return fd;
+    } catch (const GpuFailure& e) {
+        recordHealth(&DaemonHealth::gpu, HealthStatus::Fail, e.what());
+        throw;
+    }
+}
+
+void WallpaperManager::forgetAcquireTimeline(const std::string& client) {
+    std::lock_guard<std::mutex> stateLock(m_stateMutex);
+    for (ConsumerTimeline& entry : m_acquireTimelines) {
+        if (entry.client == client) entry.departed = true;
+    }
+}
+
+void WallpaperManager::reapDepartedTimelinesLocked() {
+    std::vector<ConsumerTimeline> departed;
+    {
+        std::lock_guard<std::mutex> stateLock(m_stateMutex);
+        if (std::none_of(m_acquireTimelines.begin(), m_acquireTimelines.end(),
+                         [](const ConsumerTimeline& entry) { return entry.departed; })) {
+            return;
+        }
+        const auto live = std::stable_partition(m_acquireTimelines.begin(), m_acquireTimelines.end(),
+                                                [](const ConsumerTimeline& entry) { return !entry.departed; });
+        std::move(live, m_acquireTimelines.end(), std::back_inserter(departed));
+        m_acquireTimelines.erase(live, m_acquireTimelines.end());
+    }
+}
+
+void WallpaperManager::noteRequestQueued(const std::string& client) {
+    if (client.empty()) return;
+    std::lock_guard<std::mutex> stateLock(m_stateMutex);
+    ++m_queuedRequests[client].count;
+}
+
+bool WallpaperManager::noteRequestDone(const std::string& client) {
+    if (client.empty()) return false;
+    std::lock_guard<std::mutex> stateLock(m_stateMutex);
+    const auto it = m_queuedRequests.find(client);
+    if (it == m_queuedRequests.end() || --it->second.count > 0) return false;
+    const bool departed = it->second.departed;
+    m_queuedRequests.erase(it);
+    return departed;
+}
+
+void WallpaperManager::noteDeparted(const std::string& client) {
+    std::lock_guard<std::mutex> stateLock(m_stateMutex);
+    if (const auto it = m_queuedRequests.find(client); it != m_queuedRequests.end()) it->second.departed = true;
+}
+
+AcquireTimeline* WallpaperManager::liveAcquireTimeline(const std::string& client) {
+    std::lock_guard<std::mutex> stateLock(m_stateMutex);
+    const auto it = std::find_if(m_acquireTimelines.begin(), m_acquireTimelines.end(),
+                                 [&client](const ConsumerTimeline& entry) {
+                                     return !entry.departed && entry.client == client;
+                                 });
+    return it == m_acquireTimelines.end() ? nullptr : it->timeline.get();
+}
+
 std::vector<uint64_t> WallpaperManager::intersectImportModifiersLocked() const {
     std::vector<uint64_t> shared;
     bool first = true;
@@ -2120,12 +2218,16 @@ WallpaperManager::RenderPass WallpaperManager::renderPassLocked(int monitorId, b
     return RenderPass{RenderOutcome{committed, generation}, false};
 }
 
-FrameHandle WallpaperManager::exportHandle(const OffscreenTarget& target) {
+FrameHandle WallpaperManager::exportHandle(const OffscreenTarget& target, AcquireTimeline* timeline) {
     FrameHandle handle;
     try {
         handle.frame = wallpaperx::exportFrame(*m_device, target);
         try {
-            handle.acquireFd = wallpaperx::exportFrameAcquireFd(*m_device, target);
+            if (timeline != nullptr) {
+                handle.acquireValue = timeline->signal(target);
+            } else {
+                handle.acquireFd = wallpaperx::exportFrameAcquireFd(*m_device, target);
+            }
         } catch (...) {
             // The memory descriptor is already open and nothing else will close it. A frame with
             // no acquire beside it is not offered: the consumer would read unowned memory while
@@ -2165,10 +2267,13 @@ bool WallpaperManager::reportConsumer(std::vector<ConsumerReport>& reports, cons
     return true;
 }
 
-FrameExport WallpaperManager::exportCurrentFrame(int monitorId, const std::string& client) {
+FrameExport WallpaperManager::exportCurrentFrame(int monitorId, const std::string& client, bool onTimeline) {
     requireValidMonitorId(monitorId);
 
     std::lock_guard<std::mutex> gpuLock(m_gpuMutex);
+    // Here as well as at registration, so a consumer that left is freed by the next picture anyone
+    // asks for rather than only by the next consumer to register.
+    reapDepartedTimelinesLocked();
 
     FrameExport out;
     uint64_t generation = 0;
@@ -2264,7 +2369,7 @@ FrameExport WallpaperManager::exportCurrentFrame(int monitorId, const std::strin
 
     FrameHandle handle;
     try {
-        handle = exportHandle(target);
+        handle = exportHandle(target, onTimeline && !client.empty() ? liveAcquireTimeline(client) : nullptr);
     } catch (...) {
         // The consumer never got the image, so it must not stay charged with holding one it
         // cannot name to release. Undoing this one id restores the whole record, because

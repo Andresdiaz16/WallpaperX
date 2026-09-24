@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <exception>
 #include <optional>
+#include <type_traits>
 #include <utility>
 
 namespace wallpaperx {
@@ -58,18 +59,70 @@ void DbusService::watchClientExits() {
             // Only a departure. The same signal announces arrivals and well-known-name handovers,
             // and reacting to those would drop a live consumer's set.
             if (!oldOwner.empty() && newOwner.empty()) {
-                // A monitor the departed consumer's set left with no frame can be drawn again
-                // now that the constraint is gone, and this is the only thing that will retry it.
-                applyImportModifierUpdate(m_manager.forgetImportModifiers(name));
-
-                // Likewise its claim on the images it was reading. A consumer that crashed
-                // holding a frame -- plasmashell restarts are routine, this daemon does not --
-                // would otherwise keep those images out of the ring for good.
-                std::vector<FrameAvailable> available;
-                for (const int monitorId : m_manager.forgetHeldBuffers(name, &available)) m_worker.post(monitorId);
-                announceAvailableFrames(available);
+                m_manager.noteDeparted(name);
+                forgetClient(name);
             }
         });
+}
+
+void DbusService::forgetClient(const std::string& client) {
+    // A monitor the departed consumer's set left with no frame can be drawn again now that the
+    // constraint is gone, and this is the only thing that will retry it.
+    applyImportModifierUpdate(m_manager.forgetImportModifiers(client));
+
+    // Its acquire timeline goes too: nothing will ever be handed to that name again.
+    m_manager.forgetAcquireTimeline(client);
+
+    // Likewise its claim on the images it was reading. A consumer that crashed holding a frame --
+    // plasmashell restarts are routine, this daemon does not -- would otherwise keep those images
+    // out of the ring for good.
+    std::vector<FrameAvailable> available;
+    for (const int monitorId : m_manager.forgetHeldBuffers(client, &available)) m_worker.post(monitorId);
+    announceAvailableFrames(available);
+}
+
+template <class Call, class Complete>
+void DbusService::postCall(Call call, Complete complete) {
+    const char* sender = m_object->getCurrentlyProcessedMessage().getSender();
+    const std::string client = sender ? sender : "";
+    // Counted down on every path, a throw included: a count left above zero means this client's
+    // departure is never applied again, and an image it held stays out of the ring for good.
+    m_manager.noteRequestQueued(client);
+    try {
+        m_worker.postTask([this, call = std::move(call), complete = std::move(complete),
+                           client](wallpaperx::RenderWorker::TaskState state) mutable {
+            std::exception_ptr failed;
+            try {
+                // Answered rather than dropped: destroying the Result sends nothing, leaving the client
+                // blocked for the full reply timeout on a request that will never run.
+                switch (state) {
+                    case RenderWorker::TaskState::ShuttingDown:
+                        call.returnError(
+                            sdbus::Error(sdbus::Error::Name{kErrorShuttingDown}, "the daemon is shutting down"));
+                        break;
+                    case RenderWorker::TaskState::Busy:
+                        call.returnError(sdbus::Error(sdbus::Error::Name{kErrorBusy},
+                                                      "too many requests are already waiting; retry"));
+                        break;
+                    case RenderWorker::TaskState::Run:
+                        complete(std::move(call), client);
+                        break;
+                }
+            } catch (...) {
+                failed = std::current_exception();
+            }
+            // Not applied at shutdown: the manager goes with the process, and forgetting would only
+            // post work and emit signals during teardown.
+            if (m_manager.noteRequestDone(client) && state != RenderWorker::TaskState::ShuttingDown) {
+                forgetClient(client);
+            }
+            if (failed) std::rethrow_exception(failed);
+        });
+    } catch (...) {
+        // postTask throws only before the task is queued, so nothing else will count this one down.
+        if (m_manager.noteRequestDone(client)) forgetClient(client);
+        throw;
+    }
 }
 
 DbusService::~DbusService() {
@@ -96,37 +149,31 @@ void DbusService::registerVTable() {
                 // Async: the handler hands the export to the GPU thread and returns, so
                 // the event loop keeps serving while the frame is produced.
                 .implementedAs([this](FrameFdCall&& call, int32_t monitorId) {
-                    // Read here and carried, not read on the worker: the currently-processed
-                    // message is only current inside the handler.
-                    const char* sender = m_object->getCurrentlyProcessedMessage().getSender();
-                    m_worker.postTask(
-                        [this, call = std::move(call), monitorId, client = std::string(sender ? sender : "")](
-                            wallpaperx::RenderWorker::TaskState state) mutable {
-                            // Answered rather than dropped: destroying the Result sends
-                            // nothing, leaving a GUI client blocked for the full reply
-                            // timeout on a request that will never run.
-                            switch (state) {
-                                case RenderWorker::TaskState::ShuttingDown:
-                                    call.returnError(
-                                        sdbus::Error(sdbus::Error::Name{kErrorShuttingDown},
-                                                     "the daemon is shutting down"));
-                                    return;
-                                case RenderWorker::TaskState::Busy:
-                                    call.returnError(
-                                        sdbus::Error(sdbus::Error::Name{kErrorBusy},
-                                                     "too many frame exports are already "
-                                                     "waiting; retry"));
-                                    return;
-                                case RenderWorker::TaskState::Run:
-                                    break;
-                            }
-                            completeGetFrameFd(std::move(call), monitorId, std::move(client));
-                        });
+                    postCall(std::move(call), [this, monitorId](FrameFdCall&& queued, const std::string& client) {
+                        completeFrame(std::move(queued), monitorId, client);
+                    });
                 })
                 .withInputParamNames("monitor_id")
                 .withOutputParamNames("fd", "width", "height", "memory_size", "handle_type", "sync_fds",
                                       "frame_generation", "drm_format", "drm_modifier", "planes", "device_uuid",
                                       "buffer_id"),
+            sdbus::registerMethod("GetFrameFdOnTimeline")
+                .implementedAs([this](TimelineFrameCall&& call, int32_t monitorId) {
+                    postCall(std::move(call), [this, monitorId](TimelineFrameCall&& queued, const std::string& client) {
+                        completeFrame(std::move(queued), monitorId, client);
+                    });
+                })
+                .withInputParamNames("monitor_id")
+                .withOutputParamNames("fd", "width", "height", "memory_size", "handle_type", "sync_fds",
+                                      "frame_generation", "drm_format", "drm_modifier", "planes", "device_uuid",
+                                      "buffer_id", "acquire_value"),
+            sdbus::registerMethod("GetAcquireTimeline")
+                .implementedAs([this](AcquireTimelineCall&& call) {
+                    postCall(std::move(call), [this](AcquireTimelineCall&& queued, const std::string& client) {
+                        completeGetAcquireTimeline(std::move(queued), client);
+                    });
+                })
+                .withOutputParamNames("timeline"),
             sdbus::registerMethod("ReleaseBuffer")
                 .implementedAs([this](int32_t monitorId, uint64_t bufferId) {
                     const char* sender = m_object->getCurrentlyProcessedMessage().getSender();
@@ -347,13 +394,16 @@ void DbusService::announceAvailableFrames(const std::vector<FrameAvailable>& ava
     for (const FrameAvailable& frame : available) emitFrameReady(frame.monitorId, frame.generation);
 }
 
-void DbusService::completeGetFrameFd(FrameFdCall call, int32_t monitorId, std::string client) {
+template <class Call>
+void DbusService::completeFrame(Call call, int32_t monitorId, const std::string& client) {
     // Runs on the render worker's thread, so nothing here may throw past this frame --
     // an escaping exception would be std::terminate on a bare thread. Every path below
     // either returns results or returns an error on `call`.
+    constexpr bool onTimeline = std::is_same_v<Call, TimelineFrameCall>;
+    constexpr const char* method = onTimeline ? "GetFrameFdOnTimeline" : "GetFrameFd";
     FrameExport exported;
     try {
-        exported = m_manager.exportCurrentFrame(monitorId, client);
+        exported = m_manager.exportCurrentFrame(monitorId, client, onTimeline);
     } catch (const InvalidRequest& e) {
         call.returnError(sdbus::Error(sdbus::Error::Name{kErrorInvalidArgs}, e.what()));
         return;
@@ -378,9 +428,9 @@ void DbusService::completeGetFrameFd(FrameFdCall call, int32_t monitorId, std::s
             // because which of two consumers was refused is the whole diagnosis. Once per episode:
             // a consumer refused while a video plays is refused again for every picture.
             if (exported.firstRefusal) {
-                std::printf("wallpaperx-daemon: GetFrameFd(monitor=%d) refused for %s -- no image may be handed over "
+                std::printf("wallpaperx-daemon: %s(monitor=%d) refused for %s -- no image may be handed over "
                             "until one is released\n",
-                            monitorId, sanitizeForLog(client).c_str());
+                            method, monitorId, sanitizeForLog(client).c_str());
                 std::fflush(stdout);
             }
             call.returnError(sdbus::Error(sdbus::Error::Name{kErrorNoFreeImage},
@@ -438,29 +488,56 @@ void DbusService::completeGetFrameFd(FrameFdCall call, int32_t monitorId, std::s
     // Whether an acquire went with it, for the same reason: a frame handed over unsynchronised is
     // read without the queue-family acquire, and nothing downstream of here says so.
     if (!exported.handle->routine) {
-        std::printf("wallpaperx-daemon: GetFrameFd(monitor=%d) served generation %llu as %s, %s\n", monitorId,
+        std::printf("wallpaperx-daemon: %s(monitor=%d) served generation %llu as %s, %s\n", method, monitorId,
                     static_cast<unsigned long long>(exported.handle->generation),
                     frame.type == ExportedFrame::HandleType::DmaBuf ? "dma_buf" : "opaque fd",
-                    syncFds.empty() ? "unsynchronised" : "with an acquire semaphore");
+                    exported.handle->acquireValue != 0 ? "with a value on its acquire timeline"
+                    : syncFds.empty()                  ? "unsynchronised"
+                                                       : "with an acquire semaphore");
         std::fflush(stdout);
     }
 
-    call.returnResults(fd, frame.width, frame.height, frame.memorySize,
-                       frame.type == ExportedFrame::HandleType::DmaBuf ? 1 : 0,
-                       // sync_fds: an already-signalled binary semaphore the consumer waits on
-                       // before sampling. It carries the queue-family acquire and the layout
-                       // transition reversing the render's release, which the importing API has
-                       // no other way to express. Empty only where the GPU cannot export one; a
-                       // consumer that cannot wait may close it and read anyway, which is
-                       // undefined but is what every consumer did before this existed.
-                       std::move(syncFds),
-                       exported.handle->generation, frame.drmFormat, frame.modifier, planes,
-                       // Which GPU allocated the memory. An opaque fd is importable only on that
-                       // device, and without this the plugin can only report the driver's refusal.
-                       std::vector<uint8_t>(frame.deviceUuid.begin(), frame.deviceUuid.end()),
-                       // Which image, as against frame_generation's which render. A consumer
-                       // keeping several buffers imports each id once.
-                       frame.bufferId);
+    // sync_fds: an already-signalled binary semaphore the consumer waits on before sampling. It
+    // carries the queue-family acquire and the layout transition reversing the render's release,
+    // which the importing API has no other way to express. Empty only where the GPU cannot export
+    // one, or where the picture carries a value instead; a consumer that cannot wait may close it
+    // and read anyway, which is undefined.
+    const int32_t handleType = frame.type == ExportedFrame::HandleType::DmaBuf ? 1 : 0;
+    // Which GPU allocated the memory. An opaque fd is importable only on that device, and without
+    // this the plugin can only report the driver's refusal.
+    std::vector<uint8_t> deviceUuid(frame.deviceUuid.begin(), frame.deviceUuid.end());
+    // buffer_id: which image, as against frame_generation's which render. A consumer keeping
+    // several buffers imports each id once.
+    if constexpr (onTimeline) {
+        // acquire_value: the value to wait for, already reached, standing in for sync_fds.
+        call.returnResults(fd, frame.width, frame.height, frame.memorySize, handleType, std::move(syncFds),
+                           exported.handle->generation, frame.drmFormat, frame.modifier, planes, std::move(deviceUuid),
+                           frame.bufferId, exported.handle->acquireValue);
+    } else {
+        call.returnResults(fd, frame.width, frame.height, frame.memorySize, handleType, std::move(syncFds),
+                           exported.handle->generation, frame.drmFormat, frame.modifier, planes, std::move(deviceUuid),
+                           frame.bufferId);
+    }
+}
+
+void DbusService::completeGetAcquireTimeline(AcquireTimelineCall call, const std::string& client) {
+    // The worker's thread, like completeFrame(), and under the same rule: nothing escapes.
+    int fd = -1;
+    try {
+        fd = m_manager.acquireTimelineFd(client);
+    } catch (const TimelineUnavailable& e) {
+        call.returnError(sdbus::Error(sdbus::Error::Name{kErrorUnsupported}, e.what()));
+        return;
+    } catch (const TimelineLimitReached& e) {
+        call.returnError(sdbus::Error(sdbus::Error::Name{kErrorBusy}, e.what()));
+        return;
+    } catch (const std::exception& e) {
+        call.returnError(sdbus::Error(sdbus::Error::Name{kErrorExportFailed}, e.what()));
+        return;
+    }
+    // Adopted at once, so a throw below still closes it.
+    sdbus::UnixFd timeline(fd, sdbus::adopt_fd);
+    call.returnResults(timeline);
 }
 
 std::string DbusService::getStatus() {

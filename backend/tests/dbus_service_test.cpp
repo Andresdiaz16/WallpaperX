@@ -45,6 +45,7 @@
 #include "tests/test_report.h"
 
 #include <sdbus-c++/sdbus-c++.h>
+#include <systemd/sd-bus.h>
 
 #include <nlohmann/json.hpp>
 
@@ -105,6 +106,32 @@ extern "C" VkResult vkCreateFramebuffer(VkDevice device, const VkFramebufferCrea
     if (real == nullptr) return VK_ERROR_INITIALIZATION_FAILED;
     if (g_framebufferGate.enter()) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
     return real(device, info, allocator, framebuffer);
+}
+
+// Where the post-call phase fails the daemon's reply to one named consumer: sd-bus's send, which
+// sdbus-c++ reaches as a dynamic symbol, so defining it here (exported by the CMake entry) puts a
+// throw inside the worker task that answers the call -- the one path no bus client can cause.
+std::atomic<bool> g_failReplyArmed{false};
+std::mutex g_failReplyMutex;
+std::string g_failReplyTo;  // guarded by g_failReplyMutex
+std::atomic<int> g_repliesFailed{0};
+
+extern "C" int sd_bus_send(sd_bus* bus, sd_bus_message* message, uint64_t* cookie) {
+    using Fn = int (*)(sd_bus*, sd_bus_message*, uint64_t*);
+    using DestinationFn = const char* (*)(sd_bus_message*);
+    static const Fn real = reinterpret_cast<Fn>(::dlsym(RTLD_NEXT, "sd_bus_send"));
+    static const DestinationFn destination =
+        reinterpret_cast<DestinationFn>(::dlsym(RTLD_DEFAULT, "sd_bus_message_get_destination"));
+    if (real == nullptr) return -ENOSYS;
+    if (g_failReplyArmed.load() && message != nullptr && destination != nullptr) {
+        const char* to = destination(message);
+        std::lock_guard<std::mutex> lock(g_failReplyMutex);
+        if (to != nullptr && g_failReplyTo == to && g_failReplyArmed.exchange(false)) {
+            ++g_repliesFailed;
+            return -EIO;
+        }
+    }
+    return real(bus, message, cookie);
 }
 
 namespace {
@@ -738,6 +765,30 @@ void runHostChecks(sdbus::IProxy& proxy, const std::string& imagePath, const Che
                  {"out", "a(tt):planes"},
                  {"out", "ay:device_uuid"},
                  {"out", "t:buffer_id"}}},
+        // GetFrameFd's fields in GetFrameFd's order, then the value: the plugin reads the first
+        // twelve with the same parser for both methods.
+        // CONTROL: in DbusService::registerVTable (backend/daemon/dbus_service.cpp), "acquire_value"
+        //       renamed "value" on GetFrameFdOnTimeline and "timeline" renamed "fd" on
+        //       GetAcquireTimeline -> "FAIL: wire signature of method GetFrameFdOnTimeline is
+        //       unchanged" printing `t:acquire_value(out)` against `t:value(out)`, and the same line
+        //       for GetAcquireTimeline printing `h:timeline(out)` against `h:fd(out)`. Observed
+        //       2026-09-23. Reverted.
+        {"method", "GetFrameFdOnTimeline",
+         ArgList{{"in", "i:monitor_id"},
+                 {"out", "h:fd"},
+                 {"out", "u:width"},
+                 {"out", "u:height"},
+                 {"out", "t:memory_size"},
+                 {"out", "i:handle_type"},
+                 {"out", "ah:sync_fds"},
+                 {"out", "t:frame_generation"},
+                 {"out", "u:drm_format"},
+                 {"out", "t:drm_modifier"},
+                 {"out", "a(tt):planes"},
+                 {"out", "ay:device_uuid"},
+                 {"out", "t:buffer_id"},
+                 {"out", "t:acquire_value"}}},
+        {"method", "GetAcquireTimeline", ArgList{{"out", "h:timeline"}}},
         // The id is the one GetFrameFd's `buffer_id` handed out, which is why both are `t`:
         // a consumer says which image it has finished with by naming it back.
         // CONTROL: the second name in `.withInputParamNames("monitor_id", "buffer_id")` on
@@ -806,10 +857,10 @@ void runHostChecks(sdbus::IProxy& proxy, const std::string& imagePath, const Che
     // CONTROL: `sdbus::registerMethod("Debug").implementedAs([this]() { (void)this; })`
     //       added to DbusService::registerVTable (backend/daemon/dbus_service.cpp) ->
     //       "FAIL: io.wallpaperx.Daemon exports exactly the methods this table names",
-    //       printing expected "'GetFrameFd', 'GetStatus', 'SetMonitorOutput',
-    //       'SetWallpaper'" against actual with 'Debug' first, and it was the only red
-    //       line -- every per-member signature check stayed green, which is the
-    //       measurement showing this is not redundant with them. Reverted.
+    //       printing the ten expected names, 'GetAcquireTimeline' to 'SetWallpaper', against
+    //       actual with 'Debug' first. Re-observed 2026-09-23 in one build with the two renames
+    //       above: the only per-member lines red beside it were those two members', so nothing in
+    //       the per-member loop sees an added method. Reverted.
     {
         std::vector<std::string> expectedMethods, expectedSignals;
         for (const auto& [element, name, expectedArgs] : expected) {
@@ -1442,11 +1493,11 @@ void runRenderChecks(sdbus::IProxy& proxy, FrameReadyLog& signals, const std::st
         //       "FAIL: sync_fds carries an acquire descriptor exactly when GetStatus says this
         //       daemon produces them" twice on dbus_service, dbus_service_dmabuf and
         //       dbus_service_classic, with the Lavapipe entries still green. Reverted.
-        // CONTROL: in WallpaperManager::exportCurrentFrame (backend/daemon/wallpaper_manager.cpp)
+        // CONTROL: in WallpaperManager::exportHandle (backend/daemon/wallpaper_manager.cpp)
         //       the acquire export guarded by a `static int handedOut` so only the first
         //       hand-over gets one -- a stand-in for any export that produces a payload less
         //       often than once per hand-over -> the same FAIL, once, on the SECOND hand-over
-        //       only, with the first still green. Reverted.
+        //       only, with the first still green. Re-observed 2026-09-23. Reverted.
         // CONTROL: `gpuJson["frame_sync"]` in DbusService::getStatus (backend/daemon/dbus_service.cpp)
         //       made to publish "yes"/"no" -> "FAIL: GetStatus names the frame hand-over mode as
         //       either \"semaphore\" or \"none\"" on both drivers, and the agreement below did not
@@ -1692,7 +1743,8 @@ void runRenderChecks(sdbus::IProxy& proxy, FrameReadyLog& signals, const std::st
     //       everything. All three are printed so a failure shows the taxonomy that was
     //       actually observed rather than one mismatched string.
     // CONTROL: two, from opposite ends, both re-run 2026-08-05. (a) the
-    //       `reason == Unsupported` branch disabled in DbusService::completeGetFrameFd:
+    //       `reason == Unsupported` branch disabled in DbusService::completeFrame
+    //       (backend/daemon/dbus_service.cpp; re-observed 2026-09-23, the same three lines):
     //       the taxonomy line read "unrenderable type:
     //       'io.wallpaperx.Daemon.Error.NoFrame'" -> "FAIL: a wallpaper type this build
     //       cannot render is reported as Unsupported" (plus the Unsupported-reply-text
@@ -1744,8 +1796,9 @@ void runRenderChecks(sdbus::IProxy& proxy, FrameReadyLog& signals, const std::st
     //       break on any message edit, while agreement between the two channels is
     //       the actual contract and cannot be satisfied by a canned string.
     // CONTROL: the `+ exported.lastError` dropped from the RenderFailed reply in
-    //       dbus_service.cpp -> "FAIL: the RenderFailed reply carries the same error
-    //       text GetStatus reports". Reverted.
+    //       DbusService::completeFrame (backend/daemon/dbus_service.cpp) -> "FAIL: the
+    //       RenderFailed reply carries the same error text GetStatus reports". Re-observed
+    //       2026-09-23. Reverted.
     {
         const std::string replyText = errorMessageFrom([&] { getFrameFd(proxy, kMonitorCorrupt); });
         const StatusReply status = getStatusOrExplain(proxy);
@@ -2225,8 +2278,9 @@ void runImportModifierWireChecks(sdbus::IProxy& proxy, FrameReadyLog& signals, c
 // that widening on its own does not give you: a monitor the departed set left with NO frame
 // recovers only if the daemon hands it back AND something posts it. Two pieces of production
 // code are involved and neither is visible from the other tier -- WallpaperManager::
-// forgetImportModifiers() returns the monitors, and DbusService::watchClientExits()'s callback
-// posts each one to the render worker -- so this drives the real daemon over the real bus.
+// forgetImportModifiers() returns the monitors, and the departure handler (through
+// DbusService::forgetClient()) posts each one to the render worker -- so this drives the real
+// daemon over the real bus.
 //
 // WHAT KEEPS THE MONITOR FRAMELESS IS THE IMAGE FILE, NOT THE MODIFIER SET, and that is what
 // makes the phase answerable on every host. Using the set to block the render would need a
@@ -2328,7 +2382,8 @@ void runModifierWithdrawalRenderChecks(sdbus::IProxy& proxy, FrameReadyLog& sign
     //       in WallpaperManager::forgetImportModifiers (backend/daemon/wallpaper_manager.cpp)
     //       changed to `adoptImportModifiersLocked(...); return {};`, and separately the
     //       `for (...) m_worker.post(monitorId);` loop deleted from
-    //       DbusService::watchClientExits (backend/daemon/dbus_service.cpp). Observed red on
+    //       DbusService::applyImportModifierUpdate (backend/daemon/dbus_service.cpp), which the
+    //       departure path calls (the second re-observed 2026-09-23, alone). Observed red on
     //       the NVIDIA host: the first mutation reddens this, the manager-tier check and "a
     //       reporting consumer leaving the bus is announced to the others" (3 failures on both
     //       drivers, re-observed 2026-09-16), the second reddens this one alone. Both printed the monitor's stale
@@ -3007,7 +3062,8 @@ void runImportModifierClientChecks(const wallpaperx::WallpaperManager::Config& c
 // The key is the SENDER's unique bus name, taken from the message rather than from any
 // argument -- so a consumer cannot report on another's behalf, and the name is the one
 // NameOwnerChanged later carries. Withdrawal is DbusService::watchClientExits(), which
-// subscribes to the bus's own NameOwnerChanged and forgets a departed reporter.
+// subscribes to the bus's own NameOwnerChanged and forgets a departed reporter through
+// forgetClient().
 //
 // Its own manager, connection and service, on the connection's unique bus name rather than
 // io.wallpaperx.Daemon: the shared phases own that name. Nothing renders here, so this
@@ -3063,11 +3119,12 @@ void runImportModifierClientWireChecks(const wallpaperx::WallpaperManager::Confi
     //       assert -- but the retry loop has a bound and reaching it FAILS the check rather
     //       than falling through, so a subscription that never fires cannot be graded as a
     //       slow one (X.1).
-    // CONTROL: the `m_manager.forgetImportModifiers(name)` call deleted from
-    //       DbusService::watchClientExits (backend/daemon/dbus_service.cpp). Observed red on
-    //       the NVIDIA host, and the only failure in that run, with the diagnostic "the
-    //       departed consumer's set was still in force after 100 attempts over 5 s".
-    //       Reverted.
+    // CONTROL: the `applyImportModifierUpdate(m_manager.forgetImportModifiers(client));` line
+    //       deleted from DbusService::forgetClient (backend/daemon/dbus_service.cpp), which the
+    //       departure handler calls. Observed red on the NVIDIA host with the diagnostic "the
+    //       departed consumer's set was still in force after 100 attempts over 5 s"; re-observed
+    //       2026-09-23, red beside the two other departure checks the same line feeds (the
+    //       re-render and the announcement). Reverted.
     consumerA.reset();
     bool acceptedAfterExit = false;
     int attempts = 0;
@@ -3348,12 +3405,12 @@ void runImportModifierAnnouncementChecks(const wallpaperx::WallpaperManager::Con
     //       left and from the one that reported. Retrying the refused report until it is
     //       accepted -- which is how the departure itself is graded elsewhere in this file --
     //       establishes that the set widened and says nothing about anybody being told.
-    // CONTROL: `applyImportModifierUpdate(m_manager.forgetImportModifiers(name));` in
-    //       DbusService::watchClientExits (backend/daemon/dbus_service.cpp) replaced by a bare
-    //       `m_manager.forgetImportModifiers(name);`, so the set still widens and nothing is
+    // CONTROL: `applyImportModifierUpdate(m_manager.forgetImportModifiers(client));` in
+    //       DbusService::forgetClient (backend/daemon/dbus_service.cpp) replaced by a bare
+    //       `m_manager.forgetImportModifiers(client);`, so the set still widens and nothing is
     //       announced. Observed red here -- "2 announcement(s) arrived ... 3 were expected" --
     //       alongside S6.51's re-render check, which the same line also posts; 2 failures. The
-    //       two checks above stayed green. Reverted.
+    //       two checks above stayed green. Re-observed 2026-09-23. Reverted.
     departing.reset();
     const bool announcedDeparture = announced.waitFor(3);
     check(announcedDeparture, "a reporting consumer leaving the bus is announced to the others");
@@ -4558,10 +4615,11 @@ void runBufferReleaseWireChecks(const wallpaperx::WallpaperManager::Config& conf
     //       this error exists to be distinguishable from. Asked by a third connection holding
     //       nothing, so the per-consumer cap cannot be what answers.
     // CONTROL: the `if (exported.reason == NoFrameReason::NoFreeImage)` branch in
-    //       DbusService::completeGetFrameFd (backend/daemon/dbus_service.cpp) deleted, so the
+    //       DbusService::completeFrame (backend/daemon/dbus_service.cpp) disabled, so the
     //       refusal falls through to the generic no-frame reply -> "FAIL: a hand-over that
     //       would take the producer's last image is refused as NoFreeImage on the wire",
-    //       printing "it answered 'io.wallpaperx.Daemon.Error.NoFrame'". Reverted.
+    //       printing "it answered 'io.wallpaperx.Daemon.Error.NoFrame'". Re-observed 2026-09-23.
+    //       Reverted.
     const std::string refusedName = wallpaperx::testing::errorNameFrom(
         [&carol] { wallpaperx::testing::getFrameFd(*carol, kMonitorReleaseWire); });
     check(refusedName == "io.wallpaperx.Daemon.Error.NoFreeImage",
@@ -4582,9 +4640,10 @@ void runBufferReleaseWireChecks(const wallpaperx::WallpaperManager::Config& conf
     //       repeats there cannot be leftovers from the fill.
     // CONTROL: `emitFrameReady(monitorId, m_manager.snapshot().monitors.at(monitorId)
     //       .generation);` added at the top of the NoFreeImage branch in
-    //       DbusService::completeGetFrameFd (backend/daemon/dbus_service.cpp) -> "FAIL: the
+    //       DbusService::completeFrame (backend/daemon/dbus_service.cpp) -> "FAIL: the
     //       refused hand-over announced nothing -- one FrameReady per render, and no more", and
-    //       the barrier before the departure below red for the same reason. Reverted.
+    //       the barrier before the departure below red for the same reason. Re-observed
+    //       2026-09-23. Reverted.
     check(signals.countFor(kMonitorReleaseWire) == static_cast<size_t>(kExpectedRingDepth),
           "the refused hand-over announced nothing -- one FrameReady per render, and no more");
 
@@ -6035,6 +6094,554 @@ void runResizeBarrierChecks(const wallpaperx::WallpaperManager::Config& config, 
     }
 }
 
+// ---------------------------------------------------------------------------- //
+// The acquire timeline: one per consumer connection, a value per picture
+// ---------------------------------------------------------------------------- //
+
+// Mirrored from WallpaperManager::kMaxAcquireTimelines rather than read from it: the limit a
+// consumer meets on the wire is what is graded, and taking both sides from one symbol would let a
+// change to it pass unnoticed.
+constexpr size_t kExpectedMaxAcquireTimelines = 8;
+
+// Whether the driver itself can hand a timeline semaphore across a process boundary, asked of the
+// Vulkan API directly: the daemon's "Unsupported" is graded against this, so it must not come from
+// the daemon's own AcquireTimeline::supported().
+bool driverExportsTimelines(wallpaperx::Device& device) {
+    if (!device.info().hasExternalSemaphoreFd || !device.timelineSemaphore()) return false;
+    VkSemaphoreTypeCreateInfo type{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
+    type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+    VkPhysicalDeviceExternalSemaphoreInfo query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_SEMAPHORE_INFO};
+    query.pNext = &type;
+    query.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT;
+    VkExternalSemaphoreProperties properties{VK_STRUCTURE_TYPE_EXTERNAL_SEMAPHORE_PROPERTIES};
+    vkGetPhysicalDeviceExternalSemaphoreProperties(device.physicalDevice(), &query, &properties);
+    const VkExternalSemaphoreFeatureFlags both =
+        VK_EXTERNAL_SEMAPHORE_FEATURE_EXPORTABLE_BIT | VK_EXTERNAL_SEMAPHORE_FEATURE_IMPORTABLE_BIT;
+    return (properties.externalSemaphoreFeatures & both) == both;
+}
+
+// A consumer's timeline imported into a device of this test's own, so the value the daemon handed
+// out can be compared with the count its payload has actually reached. The consumer's GPU cannot
+// read the payload before it waits, so a value not yet reached is a wait that may never end.
+class TimelineReader {
+public:
+    explicit TimelineReader(wallpaperx::Device& device) : m_device(device) {}
+    ~TimelineReader() {
+        if (m_semaphore != VK_NULL_HANDLE) vkDestroySemaphore(m_device.device(), m_semaphore, nullptr);
+    }
+    TimelineReader(const TimelineReader&) = delete;
+    TimelineReader& operator=(const TimelineReader&) = delete;
+
+    // Imports from a duplicate of `fd`, which stays the caller's.
+    bool import(int fd, std::string& why) {
+        auto importFd = reinterpret_cast<PFN_vkImportSemaphoreFdKHR>(
+            vkGetDeviceProcAddr(m_device.device(), "vkImportSemaphoreFdKHR"));
+        if (importFd == nullptr) {
+            why = "vkImportSemaphoreFdKHR did not resolve on the test's device";
+            return false;
+        }
+        VkSemaphoreTypeCreateInfo type{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
+        type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+        VkSemaphoreCreateInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+        info.pNext = &type;
+        if (vkCreateSemaphore(m_device.device(), &info, nullptr, &m_semaphore) != VK_SUCCESS) {
+            m_semaphore = VK_NULL_HANDLE;
+            why = "the test's device would not create a timeline semaphore";
+            return false;
+        }
+        const int gift = ::fcntl(fd, F_DUPFD_CLOEXEC, 0);
+        if (gift < 0) {
+            why = "the timeline descriptor could not be duplicated";
+            return false;
+        }
+        VkImportSemaphoreFdInfoKHR import{VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_FD_INFO_KHR};
+        import.semaphore = m_semaphore;
+        import.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT;
+        import.fd = gift;
+        if (importFd(m_device.device(), &import) != VK_SUCCESS) {
+            ::close(gift);  // not taken on failure
+            why = "the daemon's timeline descriptor would not import into the test's device";
+            return false;
+        }
+        return true;
+    }
+
+    bool counter(uint64_t& value, std::string& why) const {
+        if (vkGetSemaphoreCounterValue(m_device.device(), m_semaphore, &value) != VK_SUCCESS) {
+            why = "vkGetSemaphoreCounterValue failed";
+            return false;
+        }
+        return true;
+    }
+
+private:
+    wallpaperx::Device& m_device;
+    VkSemaphore m_semaphore = VK_NULL_HANDLE;
+};
+
+// Waits until `name` has no owner on the bus. Asked of the bus itself, which emits the departure
+// signal before it answers this, so a request sent to the daemon after a true return is read by
+// the daemon after the departure. False when the name is still owned after five seconds.
+bool waitNameGone(sdbus::IProxy& bus, const std::string& name) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    for (;;) {
+        bool owned = true;
+        bus.callMethod("NameHasOwner").onInterface("org.freedesktop.DBus").withArguments(name).storeResultsTo(owned);
+        if (!owned) return true;
+        if (std::chrono::steady_clock::now() > deadline) return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+}
+
+std::string uniqueNameOf(sdbus::IProxy& proxy) { return proxy.getConnection().getUniqueName(); }
+
+void runAcquireTimelineWireChecks(const wallpaperx::WallpaperManager::Config& config, const std::string& imagePath,
+                                  const Check& check) {
+    const char* kGoals = "S13.214, S13.217, S13.218 and S13.222's daemon halves (a value per picture on the caller's "
+                         "own timeline, sync_fds for every other request, Unsupported and Busy)";
+    constexpr int32_t kMonitor = 0;
+    PhaseDeviceGrade grade("the acquire-timeline wire phase", check);
+    wallpaperx::testing::FrameReadyLog signals;
+    wallpaperx::WallpaperManager manager(config);
+    CaptureGradeOnExit captureGrade{grade, manager};
+
+    auto serviceConn = sdbus::createSessionBusConnection();
+    DbusService service(*serviceConn, manager);
+    serviceConn->enterEventLoopAsync();
+    const sdbus::ServiceName daemonName{serviceConn->getUniqueName()};
+    const sdbus::ObjectPath objectPath{DbusService::kObjectPath};
+    auto listener = sdbus::createProxy(daemonName, objectPath);
+    listener->uponSignal("FrameReady")
+        .onInterface(DbusService::kInterface)
+        .call([&signals](int32_t monitorId, uint64_t generation) { signals.record(monitorId, generation); });
+    auto bus = sdbus::createProxy(sdbus::ServiceName{"org.freedesktop.DBus"}, sdbus::ObjectPath{"/org/freedesktop/DBus"});
+
+    // Each on a connection of its own, for the unique name the daemon keys a timeline on. alice asks
+    // for a timeline; bob never does, which is what a plugin from before the timeline is.
+    auto alice = sdbus::createProxy(daemonName, objectPath);
+    auto bob = sdbus::createProxy(daemonName, objectPath);
+
+    wallpaperx::testing::setWallpaper(*alice, "static", imagePath, kMonitor);
+    if (!signals.wait(kMonitor, 1)) {
+        grade.expectNoDevice();
+        wallpaperx::testing::notVerified(kGoals, "the daemon drew no frame on this host, so nothing could be handed over");
+        return;
+    }
+    std::unique_ptr<wallpaperx::Device> probe;
+    try {
+        probe = std::make_unique<wallpaperx::Device>(/*enableValidation=*/false);
+    } catch (const std::exception& e) {
+        wallpaperx::testing::notVerified(kGoals, std::string("the test's own Vulkan device could not be made: ") + e.what());
+        return;
+    }
+    const bool binaryAcquires = probe->info().hasExternalSemaphoreFd;
+    const bool exportable = driverExportsTimelines(*probe);
+
+    // One picture, given straight back so the per-consumer cap never answers in its place.
+    const auto binaryPicture = [&](sdbus::IProxy& who) {
+        wallpaperx::testing::Frame frame = wallpaperx::testing::getFrameFd(who, kMonitor);
+        wallpaperx::testing::releaseBuffer(who, kMonitor, frame.bufferId);
+        return frame;
+    };
+    const auto timelinePicture = [&](sdbus::IProxy& who) {
+        wallpaperx::testing::TimelineFrame reply = wallpaperx::testing::getFrameFdOnTimeline(who, kMonitor);
+        wallpaperx::testing::releaseBuffer(who, kMonitor, reply.frame.bufferId);
+        return reply;
+    };
+    const auto oneValidSync = [](const wallpaperx::testing::Frame& frame) {
+        return frame.syncFds.size() == 1 && frame.syncFds.front().get() >= 0;
+    };
+
+    // GOAL: S13.222 -- a consumer that never asks for a timeline (a plugin from before it) is handed
+    //       the binary semaphore on every picture, and asking GetFrameFdOnTimeline without holding a
+    //       timeline gets the same, with a value of 0. False if the daemon hands anyone a value it did
+    //       not ask for on a timeline of its own.
+    // WHY-THIS-SHAPE: asked before alice holds a timeline AND after, because the defect this guards
+    //       is a timeline being given to whoever asks next or to everyone once one exists -- only the
+    //       second reading can show that. Three pictures, so a value on the second or third is seen.
+    // CONTROL: in WallpaperManager::exportCurrentFrame (backend/daemon/wallpaper_manager.cpp), the
+    //       timeline passed to exportHandle made the first one registered, whoever asked and by
+    //       which method -> "FAIL: a consumer that never asked for a timeline gets sync_fds on every
+    //       GetFrameFd, while another consumer holds a timeline (0 of 3)" and "FAIL: and
+    //       GetFrameFdOnTimeline without a timeline answers value 0 with sync_fds, while another
+    //       consumer holds a timeline (value 10, 0 sync descriptor(s))"; the before-reading stayed
+    //       green. Observed 2026-09-23 on the NVIDIA entry. Reverted.
+    if (!binaryAcquires) {
+        wallpaperx::testing::notVerified("S13.222's daemon half", "this GPU exports no binary semaphore, so no "
+                                                                  "picture here can carry sync_fds");
+    }
+    const auto bobIsServedBinary = [&](const char* when) {
+        int binary = 0;
+        for (int i = 0; i < 3; ++i) binary += oneValidSync(binaryPicture(*bob)) ? 1 : 0;
+        const wallpaperx::testing::TimelineFrame asked = timelinePicture(*bob);
+        if (!binaryAcquires) return;
+        check(binary == 3, (std::string("a consumer that never asked for a timeline gets sync_fds on every "
+                                        "GetFrameFd, ") + when + " (" + std::to_string(binary) + " of 3)")
+                               .c_str());
+        check(asked.acquireValue == 0 && oneValidSync(asked.frame),
+              (std::string("and GetFrameFdOnTimeline without a timeline answers value 0 with sync_fds, ") + when +
+               " (value " + std::to_string(asked.acquireValue) + ", " + std::to_string(asked.frame.syncFds.size()) +
+               " sync descriptor(s))")
+                  .c_str());
+    };
+    bobIsServedBinary("before anyone holds a timeline");
+
+    // GOAL: S13.218 -- GetAcquireTimeline answers Unsupported only where the GPU can never export a
+    //       timeline: on a driver that can, the first consumer is given one.
+    // WHY-THIS-SHAPE: the driver is asked directly through the test's own device, not through the
+    //       daemon's AcquireTimeline::supported(), which is part of what is graded.
+    // CONTROL: in WallpaperManager::acquireTimelineFd (backend/daemon/wallpaper_manager.cpp),
+    //       `!AcquireTimeline::supported(*m_device)` made `true` -> "FAIL: a GPU that can export a
+    //       timeline gives the first consumer one (refused with
+    //       'io.wallpaperx.Daemon.Error.Unsupported')". Observed 2026-09-23 on the NVIDIA entry.
+    //       Reverted. The Unsupported direction runs only where the driver cannot export one.
+    sdbus::UnixFd aliceTimeline;
+    std::string refusal;
+    try {
+        aliceTimeline = wallpaperx::testing::getAcquireTimeline(*alice);
+    } catch (const sdbus::Error& e) {
+        refusal = e.getName();
+    }
+    if (!exportable) {
+        check(refusal == kErrUnsupported,
+              ("a GPU that cannot export a timeline is answered Unsupported (answered '" + refusal + "')").c_str());
+        wallpaperx::testing::notVerified(
+            "S13.214, S13.217 and S13.222's daemon halves, and S13.218's Busy half (its Unsupported half ran above)",
+            "this GPU cannot export a timeline semaphore, so no value can be handed over here");
+        return;
+    }
+    check(refusal.empty() && aliceTimeline.get() >= 0,
+          ("a GPU that can export a timeline gives the first consumer one (refused with '" + refusal + "')").c_str());
+    if (!refusal.empty()) return;
+    TimelineReader reader(*probe);
+    std::string why;
+    if (!reader.import(aliceTimeline.get(), why)) {
+        wallpaperx::testing::notVerified("S13.214's reached-value clause", why);
+        return;
+    }
+
+    // GOAL: S13.214 -- a picture asked for on the timeline carries a nonzero value and no sync_fds,
+    //       each value is past the last, and every value has ALREADY been reached on the payload when
+    //       the reply arrives. False for a value the payload has not reached: the consumer's GPU cannot
+    //       read the count before it waits, so that wait may never end and stalls plasmashell.
+    // WHY-THIS-SHAPE: the count is read from the consumer's own descriptor imported into a separate
+    //       device, after the reply -- what a consumer can know, not what the daemon believes.
+    // CONTROL: AcquireTimeline::signal (renderer/vulkan/frame_export.cpp) made to return `value + 1`
+    //       -> "FAIL: every value has been reached on the payload when the reply arrives (0 of 4)",
+    //       printing "value 2, the payload read 1" and so on. Observed 2026-09-23 on the NVIDIA
+    //       entry. Reverted.
+    uint64_t previous = 0;
+    int reached = 0;
+    int increasing = 0;
+    int asValue = 0;
+    constexpr int kPictures = 4;
+    for (int i = 0; i < kPictures; ++i) {
+        const wallpaperx::testing::TimelineFrame reply = timelinePicture(*alice);
+        uint64_t count = 0;
+        const bool read = reader.counter(count, why);
+        if (reply.acquireValue != 0 && reply.frame.syncFds.empty()) ++asValue;
+        if (reply.acquireValue > previous) ++increasing;
+        if (read && reply.acquireValue != 0 && count >= reply.acquireValue) ++reached;
+        if (!read || count < reply.acquireValue) {
+            std::fprintf(stderr, "  picture %d: value %llu, the payload read %s%llu\n", i,
+                         static_cast<unsigned long long>(reply.acquireValue), read ? "" : "(unreadable) ",
+                         static_cast<unsigned long long>(count));
+        }
+        previous = reply.acquireValue;
+    }
+    check(asValue == kPictures, ("a picture asked for on the caller's timeline carries a value and no sync_fds (" +
+                                 std::to_string(asValue) + " of " + std::to_string(kPictures) + ")")
+                                    .c_str());
+    check(increasing == kPictures,
+          ("each value is past the one before (" + std::to_string(increasing) + " of " + std::to_string(kPictures) + ")")
+              .c_str());
+    check(reached == kPictures, ("every value has been reached on the payload when the reply arrives (" +
+                                 std::to_string(reached) + " of " + std::to_string(kPictures) + ")")
+                                    .c_str());
+
+    // GOAL: S13.217 -- holding a timeline switches nothing: the same consumer's GetFrameFd still gets
+    //       sync_fds. The consumer chooses per request, which is what lets it fall back after a lost
+    //       answer or a refused import without telling the daemon anything.
+    // CONTROL: the `onTimeline &&` term dropped from the exportHandle call in
+    //       WallpaperManager::exportCurrentFrame (backend/daemon/wallpaper_manager.cpp) -> "FAIL: a
+    //       consumer holding a timeline still gets sync_fds from GetFrameFd (0 of 2)", and nothing
+    //       else red. Observed 2026-09-23 on the NVIDIA entry. Reverted.
+    int aliceBinary = 0;
+    for (int i = 0; i < 2; ++i) aliceBinary += oneValidSync(binaryPicture(*alice)) ? 1 : 0;
+    check(aliceBinary == 2, ("a consumer holding a timeline still gets sync_fds from GetFrameFd (" +
+                             std::to_string(aliceBinary) + " of 2)")
+                                .c_str());
+    bobIsServedBinary("while another consumer holds a timeline");
+
+    // GOAL: S13.218 -- at the limit of eight consumers the ninth is answered Busy, never Unsupported,
+    //       and a holder leaving the bus frees its slot, so the ninth's next ask is granted.
+    // WHY-THIS-SHAPE: the departure is waited for at the bus (NameHasOwner false), and a GetStatus
+    //       round trip follows it: the daemon handles the departure signal and GetStatus on one
+    //       connection, in order, so the ninth's retry is read after the departure. No sleep.
+    // CONTROL: two, both reverted, observed 2026-09-23 on the NVIDIA entry. (a) In
+    //       DbusService::completeGetAcquireTimeline (backend/daemon/dbus_service.cpp) the
+    //       TimelineLimitReached arm answered kErrorUnsupported -> "FAIL: the ninth consumer at the
+    //       limit is answered Busy (answered 'io.wallpaperx.Daemon.Error.Unsupported')". (b)
+    //       `m_manager.forgetAcquireTimeline(client);` deleted from DbusService::forgetClient ->
+    //       "FAIL: once a holder leaves the bus, the ninth is given a timeline (answered
+    //       'io.wallpaperx.Daemon.Error.Busy')". Also: the client test in liveAcquireTimeline
+    //       (backend/daemon/wallpaper_manager.cpp) made `||` -> "FAIL: and GetFrameFdOnTimeline
+    //       without a timeline answers value 0 ... (value 5, 0 sync descriptor(s))" above, and this
+    //       phase's Busy line red with "answered ''".
+    std::vector<std::unique_ptr<sdbus::IProxy>> holders;
+    int granted = 1;  // alice
+    for (size_t i = 1; i < kExpectedMaxAcquireTimelines; ++i) {
+        holders.push_back(sdbus::createProxy(daemonName, objectPath));
+        try {
+            (void)wallpaperx::testing::getAcquireTimeline(*holders.back());
+            ++granted;
+        } catch (const sdbus::Error& e) {
+            std::fprintf(stderr, "  holder %zu refused: %s\n", i, e.getName().c_str());
+        }
+    }
+    if (granted != static_cast<int>(kExpectedMaxAcquireTimelines)) {
+        check(false, ("eight consumers are each given a timeline (" + std::to_string(granted) + ")").c_str());
+        return;
+    }
+    auto ninth = sdbus::createProxy(daemonName, objectPath);
+    const std::string atLimit = errorNameFrom([&] { (void)wallpaperx::testing::getAcquireTimeline(*ninth); });
+    check(atLimit == "io.wallpaperx.Daemon.Error.Busy",
+          ("the ninth consumer at the limit is answered Busy (answered '" + atLimit + "')").c_str());
+    const std::string leaving = uniqueNameOf(*holders.front());
+    holders.erase(holders.begin());
+    const bool gone = waitNameGone(*bus, leaving);
+    (void)wallpaperx::testing::getStatus(*alice);
+    if (!gone) {
+        wallpaperx::testing::harnessFailure("a holder's connection was closed and its name was still owned five "
+                                            "seconds later, so no departure could be graded");
+        return;
+    }
+    const std::string afterLeave = errorNameFrom([&] { (void)wallpaperx::testing::getAcquireTimeline(*ninth); });
+    check(afterLeave.empty(), ("once a holder leaves the bus, the ninth is given a timeline (answered '" +
+                               afterLeave + "')")
+                                  .c_str());
+}
+
+// GOAL: S13.219 -- a consumer that leaves the bus with requests still queued behind the render
+//       thread leaves nothing behind: neither the timeline nor the image those requests create after
+//       its departure was handled. False for the leak the review found, where twelve such departures
+//       left a fresh consumer refused both a timeline (Busy) and a frame (NoFreeImage).
+// WHY-THIS-SHAPE: the render thread is held inside a render (the framebuffer gate) while twelve
+//       consumers queue GetAcquireTimeline and GetFrameFd, prove the queueing with a GetStatus round
+//       trip, and leave; each departure is waited for at the bus. Only then is the thread released,
+//       so every request provably runs after its sender's departure -- a timing race cannot make it
+//       run first and pass for the wrong reason. The simpler shape, a slow render in front, is what
+//       the builder measured with, and whether it holds long enough is up to the host.
+// CONTROL: WallpaperManager::noteRequestDone (backend/daemon/wallpaper_manager.cpp) made to return
+//       false always, so no departure is applied again -> "FAIL: after twelve consumers left with
+//       requests queued, a fresh consumer is given a timeline (answered
+//       'io.wallpaperx.Daemon.Error.Busy')", "FAIL: and a frame (answered
+//       'io.wallpaperx.Daemon.Error.NoFreeImage')" and "FAIL: no departed consumer still holds an
+//       image (4 of 12 do)". Observed 2026-09-23 on the NVIDIA entry. Reverted.
+// COVERAGE-ASSERT: the gate must be seen to fire, every departure seen at the bus, and afterwards
+//       each victim is asked of the daemon's own hold ledger by name.
+void runDepartedQueueChecks(const wallpaperx::WallpaperManager::Config& config, const std::string& imagePath,
+                            const Check& check) {
+    const char* kGoals = "S13.219 (a consumer that leaves with requests queued leaves no timeline and no hold)";
+    constexpr int32_t kServed = 0;
+    constexpr int32_t kHeld = 1;
+    constexpr int kVictims = 12;
+    PhaseDeviceGrade grade("the departed-queue phase", check);
+    wallpaperx::testing::FrameReadyLog signals;
+    wallpaperx::WallpaperManager manager(config);
+    CaptureGradeOnExit captureGrade{grade, manager};
+
+    auto serviceConn = sdbus::createSessionBusConnection();
+    DbusService service(*serviceConn, manager);
+    serviceConn->enterEventLoopAsync();
+    // Before the service is destroyed, on every exit: a held render would park its worker's stop.
+    struct Unblock {
+        ~Unblock() { g_framebufferGate.release(); }
+    } unblock;
+    const sdbus::ServiceName daemonName{serviceConn->getUniqueName()};
+    const sdbus::ObjectPath objectPath{DbusService::kObjectPath};
+    auto listener = sdbus::createProxy(daemonName, objectPath);
+    listener->uponSignal("FrameReady")
+        .onInterface(DbusService::kInterface)
+        .call([&signals](int32_t monitorId, uint64_t generation) { signals.record(monitorId, generation); });
+    auto bus = sdbus::createProxy(sdbus::ServiceName{"org.freedesktop.DBus"}, sdbus::ObjectPath{"/org/freedesktop/DBus"});
+    auto control = sdbus::createProxy(daemonName, objectPath);
+
+    wallpaperx::testing::setWallpaper(*control, "static", imagePath, kServed);
+    if (!signals.wait(kServed, 1)) {
+        grade.expectNoDevice();
+        wallpaperx::testing::notVerified(kGoals, "the daemon drew no frame on this host");
+        return;
+    }
+    {
+        wallpaperx::Device probe(/*enableValidation=*/false);
+        if (!driverExportsTimelines(probe)) {
+            wallpaperx::testing::notVerified(kGoals, "this GPU cannot export a timeline semaphore, so no consumer "
+                                                     "here can be left holding one");
+            return;
+        }
+    }
+
+    g_framebufferGate.arm(CallGate::Mode::Hold);
+    wallpaperx::testing::setWallpaper(*control, "static", imagePath, kHeld);
+    if (!g_framebufferGate.waitFired(std::chrono::seconds(30))) {
+        wallpaperx::testing::harnessFailure("the render thread never reached the held monitor's image creation, so "
+                                            "nothing could be queued behind it");
+        return;
+    }
+    std::vector<std::string> victims;
+    for (int i = 0; i < kVictims; ++i) {
+        auto victim = sdbus::createProxy(daemonName, objectPath);
+        victims.push_back(uniqueNameOf(*victim));
+        {
+            // Scoped: a message outliving its proxy's connection crashes in its destructor.
+            const auto noReply = [](sdbus::MethodReply, std::optional<sdbus::Error>) {};
+            victim->callMethodAsync(victim->createMethodCall(sdbus::InterfaceName{DbusService::kInterface},
+                                                             sdbus::MethodName{"GetAcquireTimeline"}),
+                                    noReply);
+            sdbus::MethodCall frame = victim->createMethodCall(sdbus::InterfaceName{DbusService::kInterface},
+                                                               sdbus::MethodName{"GetFrameFd"});
+            frame << kServed;
+            victim->callMethodAsync(frame, noReply);
+        }
+        // Answered on the bus thread in the order sent: once it returns, both above are queued.
+        (void)wallpaperx::testing::getStatus(*victim);
+        victim.reset();
+        if (!waitNameGone(*bus, victims.back())) {
+            wallpaperx::testing::harnessFailure("a departed consumer's name was still owned five seconds after its "
+                                                "connection closed");
+            return;
+        }
+    }
+    (void)wallpaperx::testing::getStatus(*control);
+    g_framebufferGate.release();
+
+    auto fresh = sdbus::createProxy(daemonName, objectPath);
+    const std::string timeline = errorNameFrom([&] { (void)wallpaperx::testing::getAcquireTimeline(*fresh); });
+    std::string frameRefusal;
+    try {
+        const wallpaperx::testing::Frame frame = wallpaperx::testing::getFrameFd(*fresh, kServed);
+        wallpaperx::testing::releaseBuffer(*fresh, kServed, frame.bufferId);
+    } catch (const sdbus::Error& e) {
+        frameRefusal = e.getName();
+    }
+    check(timeline.empty(), ("after twelve consumers left with requests queued, a fresh consumer is given a "
+                             "timeline (answered '" + timeline + "')")
+                                .c_str());
+    check(frameRefusal.empty(), ("and a frame (answered '" + frameRefusal + "')").c_str());
+    // Asked by ending it: a freed hold always either names a monitor to redraw or re-announces the
+    // committed frame, so "neither" means there was nothing to free.
+    int stillHolding = 0;
+    for (const std::string& victim : victims) {
+        std::vector<wallpaperx::FrameAvailable> announced;
+        if (!manager.forgetHeldBuffers(victim, &announced).empty() || !announced.empty()) ++stillHolding;
+    }
+    check(stillHolding == 0, ("no departed consumer still holds an image (" + std::to_string(stillHolding) + " of " +
+                              std::to_string(kVictims) + " do)")
+                                 .c_str());
+}
+
+// GOAL: S13.219 on the throw path -- when answering a departed consumer's queued request throws
+//       inside the worker task (here, sending the reply fails), its count still comes down and its
+//       departure is still applied again, so the image the request recorded does not stay held.
+// WHY-THIS-SHAPE: the consumer departs while its GetFrameFd waits behind a held render (the phase
+//       above's shape), and only its reply's send is failed -- the export and the hold happen as
+//       usual, then the throw. A later GetFrameFd from another consumer runs behind it on the one
+//       worker, so when that returns the throwing task has finished; the hold ledger is then asked.
+//       The throw is observed reaching RenderWorker::runTask, which logs "render worker task error:
+//       [org.freedesktop.DBus.Error.IOError] Failed to send D-Bus message".
+// CONTROL: in DbusService::postCall (backend/daemon/dbus_service.cpp), `if (failed)
+//       std::rethrow_exception(failed);` moved above the count-down, so a throw skips it -> "FAIL: a
+//       departed consumer whose queued request threw holds no image afterwards", and nothing else
+//       red. Observed 2026-09-23 on the NVIDIA entry. Reverted. The other throw path -- postTask
+//       itself throwing before the task is queued -- is not reached: only a failed allocation there
+//       can throw, and nothing here can make one fail at that call alone.
+// COVERAGE-ASSERT: exactly one send must have been failed, and it must be the departed consumer's.
+void runPostCallThrowChecks(const wallpaperx::WallpaperManager::Config& config, const std::string& imagePath,
+                            const Check& check) {
+    const char* kGoals = "S13.219's throw path (a request that throws still applies its sender's departure)";
+    constexpr int32_t kServed = 0;
+    constexpr int32_t kHeld = 1;
+    PhaseDeviceGrade grade("the post-call throw phase", check);
+    wallpaperx::testing::FrameReadyLog signals;
+    wallpaperx::WallpaperManager manager(config);
+    CaptureGradeOnExit captureGrade{grade, manager};
+
+    auto serviceConn = sdbus::createSessionBusConnection();
+    DbusService service(*serviceConn, manager);
+    serviceConn->enterEventLoopAsync();
+    struct Unblock {
+        ~Unblock() {
+            g_framebufferGate.release();
+            g_failReplyArmed.store(false);
+        }
+    } unblock;
+    const sdbus::ServiceName daemonName{serviceConn->getUniqueName()};
+    const sdbus::ObjectPath objectPath{DbusService::kObjectPath};
+    auto listener = sdbus::createProxy(daemonName, objectPath);
+    listener->uponSignal("FrameReady")
+        .onInterface(DbusService::kInterface)
+        .call([&signals](int32_t monitorId, uint64_t generation) { signals.record(monitorId, generation); });
+    auto bus = sdbus::createProxy(sdbus::ServiceName{"org.freedesktop.DBus"}, sdbus::ObjectPath{"/org/freedesktop/DBus"});
+    auto control = sdbus::createProxy(daemonName, objectPath);
+
+    wallpaperx::testing::setWallpaper(*control, "static", imagePath, kServed);
+    if (!signals.wait(kServed, 1)) {
+        grade.expectNoDevice();
+        wallpaperx::testing::notVerified(kGoals, "the daemon drew no frame on this host");
+        return;
+    }
+    g_framebufferGate.arm(CallGate::Mode::Hold);
+    wallpaperx::testing::setWallpaper(*control, "static", imagePath, kHeld);
+    if (!g_framebufferGate.waitFired(std::chrono::seconds(30))) {
+        wallpaperx::testing::harnessFailure("the render thread never reached the held monitor's image creation");
+        return;
+    }
+    std::string victimName;
+    {
+        auto victim = sdbus::createProxy(daemonName, objectPath);
+        victimName = uniqueNameOf(*victim);
+        {
+            sdbus::MethodCall frame = victim->createMethodCall(sdbus::InterfaceName{DbusService::kInterface},
+                                                               sdbus::MethodName{"GetFrameFd"});
+            frame << kServed;
+            victim->callMethodAsync(frame, [](sdbus::MethodReply, std::optional<sdbus::Error>) {});
+        }
+        (void)wallpaperx::testing::getStatus(*victim);
+    }
+    if (!waitNameGone(*bus, victimName)) {
+        wallpaperx::testing::harnessFailure("the departed consumer's name was still owned five seconds later");
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_failReplyMutex);
+        g_failReplyTo = victimName;
+    }
+    const int failed0 = g_repliesFailed.load();
+    g_failReplyArmed.store(true);
+    (void)wallpaperx::testing::getStatus(*control);
+    g_framebufferGate.release();
+
+    // Behind the victim's task on the one worker: once this is answered, that task has run.
+    std::string after;
+    try {
+        const wallpaperx::testing::Frame frame = wallpaperx::testing::getFrameFd(*control, kServed);
+        wallpaperx::testing::releaseBuffer(*control, kServed, frame.bufferId);
+    } catch (const sdbus::Error& e) {
+        after = e.getName();
+    }
+    g_failReplyArmed.store(false);
+    if (g_repliesFailed.load() - failed0 != 1) {
+        wallpaperx::testing::notVerified(kGoals, "the reply to the departed consumer was never sent through the "
+                                                 "interposed sd_bus_send, so no throw reached the worker task");
+        return;
+    }
+    std::vector<wallpaperx::FrameAvailable> announced;
+    const bool stillHolds = !manager.forgetHeldBuffers(victimName, &announced).empty() || !announced.empty();
+    check(after.empty(), ("the worker went on serving after the throw (answered '" + after + "')").c_str());
+    check(!stillHolds, "a departed consumer whose queued request threw holds no image afterwards");
+}
+
 }  // namespace
 
 int main() {
@@ -6193,6 +6800,12 @@ int main() {
         runOutputSizeRestartRenderChecks(config, imagePath, check);
         runResizeReleaseChecks(config, imagePath, check);
         runResizeBarrierChecks(config, imagePath, check);
+
+        // The acquire timeline. Each its own manager, connection and service; the second holds the
+        // render thread with the framebuffer gate, so it runs after the resize phases release it.
+        runAcquireTimelineWireChecks(config, imagePath, check);
+        runDepartedQueueChecks(config, imagePath, check);
+        runPostCallThrowChecks(config, imagePath, check);
 
         // Its own manager and Device, scoped inside the call so both are torn down
         // before the validation warning count is read below.

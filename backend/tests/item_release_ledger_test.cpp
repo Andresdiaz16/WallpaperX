@@ -261,11 +261,12 @@ bool runPhase(Phase phase) {
             //       code and a different failure. The distinction is exactly what makes this
             //       phase worth having: dropped-frame grades the PendingFrame destructor, this
             //       one grades the branch that never builds a PendingFrame.
-            // CONTROL: the `else { releaseFrameReply(requestedMonitor, done->reply()); }` arm in
-            //       WallpaperXItem::fetchFrame (backend/kde/wallpaperx_item.cpp) emptied -> "FAIL:
-            //       a reply for a monitor the item has stopped showing is released", printing "0
-            //       release(s) arrived in five seconds after the in-flight reply landed". The only
-            //       red line across all four phases of this binary. Reverted.
+            // CONTROL: the `else { releaseFrameReply(requestedMonitor, done->reply(), sender); }`
+            //       arm in WallpaperXItem::fetchFrame (backend/kde/wallpaperx_item.cpp) emptied ->
+            //       "FAIL: a reply for a monitor the item has stopped showing is released",
+            //       printing "0 release(s) arrived in five seconds after the in-flight reply
+            //       landed". The only red line across all four phases of this binary. Re-observed
+            //       2026-09-23. Reverted.
             // COVERAGE-ASSERT: the reply is required to have been HELD and then sent, and the
             //       item required to have moved monitors before it was, so a run where the stub
             //       answered straight away cannot report the branch as established -- it would
@@ -338,10 +339,11 @@ bool runPhase(Phase phase) {
             //       The ordering that makes the refusal a sound barrier is the plugin's own: it
             //       keeps one fetch in flight, so the second request cannot be sent until the
             //       first reply has been handed to takeFrameReply.
-            // CONTROL: `releaseClaim(claim);` deleted from
+            // CONTROL: `releaseUnimported(claims, claim);` deleted from
             //       WallpaperXItem::PendingFrame::~PendingFrame (backend/kde/wallpaperx_item.cpp)
             //       -> "FAIL: a frame dropped without ever being imported is released", printing
-            //       0 releases. Reverted.
+            //       "0 release(s) arrived after the item moved to another monitor". Re-observed
+            //       2026-09-23. Reverted.
             const auto publishedReason = [&scene] {
                 return scene.root->property("publishedReason").toString();
             };

@@ -54,6 +54,24 @@ namespace {
     throwVkFailure(context, result);
 }
 
+// An opaque descriptor for `semaphore`'s payload, which the caller owns. `who` prefixes the errors.
+int exportSemaphoreFd(Device& device, VkSemaphore semaphore, const char* who) {
+    auto pfnGetSemaphoreFd =
+        reinterpret_cast<PFN_vkGetSemaphoreFdKHR>(vkGetDeviceProcAddr(device.device(), "vkGetSemaphoreFdKHR"));
+    if (!pfnGetSemaphoreFd) {
+        // The device was created with the extension enabled, so a missing entry point is the
+        // driver withholding what it advertised.
+        throw GpuFailure(std::string(who) + ": vkGetSemaphoreFdKHR entry point missing");
+    }
+    int fd = -1;
+    VkSemaphoreGetFdInfoKHR getFdInfo{VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR};
+    getFdInfo.semaphore = semaphore;
+    getFdInfo.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT;
+    const VkResult r = pfnGetSemaphoreFd(device.device(), &getFdInfo, &fd);
+    if (r != VK_SUCCESS || fd < 0) throwNoDescriptor(std::string(who) + ": vkGetSemaphoreFdKHR", r);
+    return fd;
+}
+
 // Describes where each memory plane sits inside the exported allocation. Without this an
 // importer only has an fd and no way to interpret it.
 //
@@ -216,14 +234,6 @@ int exportFrameAcquireFd(Device& device, const OffscreenTarget& target) {
         return -1;
     }
 
-    auto pfnGetSemaphoreFd = reinterpret_cast<PFN_vkGetSemaphoreFdKHR>(
-        vkGetDeviceProcAddr(device.device(), "vkGetSemaphoreFdKHR"));
-    if (!pfnGetSemaphoreFd) {
-        // The device was created with the extension enabled, so a missing entry point is the
-        // driver withholding what it advertised.
-        throw GpuFailure("exportFrameAcquireFd: vkGetSemaphoreFdKHR entry point missing");
-    }
-
     VkExportSemaphoreCreateInfo exportInfo{VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO};
     exportInfo.handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT;
     VkSemaphoreCreateInfo semaphoreInfo{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
@@ -268,13 +278,73 @@ int exportFrameAcquireFd(Device& device, const OffscreenTarget& target) {
     device.wait(*cleanup.inFlight);
     cleanup.inFlight.reset();
 
-    int fd = -1;
-    VkSemaphoreGetFdInfoKHR getFdInfo{VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR};
-    getFdInfo.semaphore = semaphore;
-    getFdInfo.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT;
-    const VkResult r = pfnGetSemaphoreFd(device.device(), &getFdInfo, &fd);
-    if (r != VK_SUCCESS || fd < 0) throwNoDescriptor("exportFrameAcquireFd: vkGetSemaphoreFdKHR", r);
-    return fd;
+    return exportSemaphoreFd(device, semaphore, "exportFrameAcquireFd");
+}
+
+bool AcquireTimeline::supported(Device& device) {
+    if (!device.info().hasExternalSemaphoreFd || !device.timelineSemaphore()) return false;
+
+    // Asked for the timeline type specifically: a driver may export binary semaphores and not
+    // timelines, and creating one it cannot export fails only at the export.
+    VkSemaphoreTypeCreateInfo type{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
+    type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+    VkPhysicalDeviceExternalSemaphoreInfo query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_SEMAPHORE_INFO};
+    query.pNext = &type;
+    query.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT;
+    VkExternalSemaphoreProperties properties{VK_STRUCTURE_TYPE_EXTERNAL_SEMAPHORE_PROPERTIES};
+    vkGetPhysicalDeviceExternalSemaphoreProperties(device.physicalDevice(), &query, &properties);
+    return (properties.externalSemaphoreFeatures & VK_EXTERNAL_SEMAPHORE_FEATURE_EXPORTABLE_BIT) != 0;
+}
+
+AcquireTimeline::AcquireTimeline(Device& device) : m_device(device) {
+    m_device.assertGpuThread("AcquireTimeline");
+    if (!supported(m_device)) {
+        throw std::runtime_error("AcquireTimeline: this device cannot export a timeline semaphore");
+    }
+
+    VkExportSemaphoreCreateInfo exportInfo{VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO};
+    exportInfo.handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT;
+    VkSemaphoreTypeCreateInfo type{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
+    type.pNext = &exportInfo;
+    type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+    type.initialValue = 0;
+    VkSemaphoreCreateInfo semaphoreInfo{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+    semaphoreInfo.pNext = &type;
+    if (const VkResult r = vkCreateSemaphore(m_device.device(), &semaphoreInfo, nullptr, &m_semaphore);
+        r != VK_SUCCESS) {
+        throwVkFailure("AcquireTimeline: vkCreateSemaphore", r);
+    }
+}
+
+AcquireTimeline::~AcquireTimeline() {
+    // Only a signal whose wait failed can still be pending; every other one was waited out.
+    if (m_unfinished && !m_device.safeToFree("a consumer's acquire timeline", *m_unfinished)) return;
+    vkDestroySemaphore(m_device.device(), m_semaphore, nullptr);
+}
+
+int AcquireTimeline::exportFd() {
+    m_device.assertGpuThread("AcquireTimeline::exportFd");
+    return exportSemaphoreFd(m_device, m_semaphore, "AcquireTimeline::exportFd");
+}
+
+uint64_t AcquireTimeline::signal(const OffscreenTarget& target) {
+    m_device.assertGpuThread("AcquireTimeline::signal");
+    if (!target.published()) {
+        throw std::runtime_error("AcquireTimeline::signal: the target has no published frame to acquire");
+    }
+
+    // exportFrameAcquireFd()'s batch, with a value instead of a new semaphore: empty, there only to
+    // carry the signal, whose first synchronization scope covers the render that published this
+    // frame. Waited on before the value leaves, which is the contract the class comment states.
+    const uint64_t value = m_submitted + 1;
+    Device::SubmitScope scope;
+    scope.timelineSignal.emplace_back(m_semaphore, value);
+    const Device::SubmitTicket ticket = m_device.submit([](VkCommandBuffer) {}, scope);
+    m_submitted = value;
+    m_unfinished = ticket;
+    m_device.wait(ticket);
+    m_unfinished.reset();
+    return value;
 }
 
 }

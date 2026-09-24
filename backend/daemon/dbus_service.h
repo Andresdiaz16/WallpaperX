@@ -76,8 +76,9 @@ private:
     void announceAvailableFrames(const std::vector<FrameAvailable>& available);
 
     // Returns (fd, width, height, memory_size, handle_type, sync_fds, frame_generation,
-    //          drm_format, drm_modifier, planes). What each field means, and why sync_fds is a
-    //          reserved array rather than a bare 'h', is PLAN.md's DBus Interface section.
+    //          drm_format, drm_modifier, planes, device_uuid, buffer_id). What each field means,
+    //          and why sync_fds is a reserved array rather than a bare 'h', is PLAN.md's DBus
+    //          Interface section.
     //
     // Answered from the render worker's thread, not in the handler. Exporting needs the GPU and
     // the GPU lock is held for a whole render, so answering here would park the single
@@ -87,10 +88,42 @@ private:
         sdbus::Result<sdbus::UnixFd, uint32_t, uint32_t, uint64_t, int32_t, std::vector<sdbus::UnixFd>, uint64_t,
                       uint32_t, uint64_t, std::vector<sdbus::Struct<uint64_t, uint64_t>>, std::vector<uint8_t>,
                       uint64_t>;
-    // `client` is the caller's DBus unique name, read in the handler because that is the only
-    // place the message is current: by the time this runs the event loop has moved on. It is
-    // what the hand-over is recorded against, and what a departure later withdraws.
-    void completeGetFrameFd(FrameFdCall call, int32_t monitorId, std::string client);
+
+    // GetFrameFdOnTimeline: GetFrameFd's fields and then acquire_value, asked by a caller that can
+    // wait on its acquire timeline for this picture. The value is nonzero, and sync_fds empty,
+    // while the caller holds a live timeline; otherwise the reply is GetFrameFd's with a value of
+    // 0. Choosing per request is what lets a consumer go back to sync_fds whenever it cannot wait
+    // on the timeline -- an answer it never got, an import its driver refused -- with no call to
+    // undo anything.
+    using TimelineFrameCall =
+        sdbus::Result<sdbus::UnixFd, uint32_t, uint32_t, uint64_t, int32_t, std::vector<sdbus::UnixFd>, uint64_t,
+                      uint32_t, uint64_t, std::vector<sdbus::Struct<uint64_t, uint64_t>>, std::vector<uint8_t>,
+                      uint64_t, uint64_t>;
+
+    // Both frame methods. Which one it answers, and so whether the picture may carry a value, is
+    // the call's type. `client` is the caller's DBus unique name: it is what the hand-over is
+    // recorded against, and what a departure later withdraws.
+    template <class Call>
+    void completeFrame(Call call, int32_t monitorId, const std::string& client);
+
+    // Returns (timeline): the caller's acquire timeline, which it imports once and then waits on for
+    // each picture it asks GetFrameFdOnTimeline for. Answered from the render worker in the frame
+    // methods' queue: creating it is GPU work, and a frame asked for after this cannot be answered
+    // before it. Unsupported means this daemon will not give this caller one while it runs; Busy,
+    // that every slot is taken for now.
+    using AcquireTimelineCall = sdbus::Result<sdbus::UnixFd>;
+    void completeGetAcquireTimeline(AcquireTimelineCall call, const std::string& client);
+
+    // Posts `complete(call, client)` to the render worker for an asynchronous method, reading the
+    // caller's name here -- the message is current only inside the handler -- and answering the
+    // call itself when the worker refuses it. Call from inside the handler.
+    template <class Call, class Complete>
+    void postCall(Call call, Complete complete);
+
+    // Everything the daemon keeps for `client`, dropped because it left the bus. On the bus thread
+    // with the departure, and on the worker again when a request `client` queued before leaving
+    // has run and may have recorded something for it after the first pass.
+    void forgetClient(const std::string& client);
 
     // The consumer says it has stopped reading one image, so the producer may draw into it
     // again. Synchronous: it touches bookkeeping only, and the renders it unblocks go to the

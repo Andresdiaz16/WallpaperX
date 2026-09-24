@@ -84,6 +84,11 @@ private:
     void run();
     void runJob(Job& job);
 
+    // Runs `task` with nothing escaping: it is called on the worker thread, on a handler thread that
+    // posted into a full queue, and from stop() during teardown -- on every one of them a throw
+    // would be std::terminate. Logged instead.
+    static void runTask(Task& task, TaskState state) noexcept;
+
     // Rounds that have thrown in a row, so an episode is logged once and retried more slowly the
     // longer it lasts. Worker thread only.
     unsigned m_clockFailures = 0;

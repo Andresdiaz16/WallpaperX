@@ -290,6 +290,28 @@ private:
     VkCallFault m_fault;
 };
 
+// The same lever for the semaphore descriptor query, which an acquire timeline's export makes.
+thread_local VkCallFaultPlan* t_getSemaphoreFdFault = nullptr;
+
+VKAPI_ATTR VkResult VKAPI_CALL faultingGetSemaphoreFd(VkDevice device, const VkSemaphoreGetFdInfoKHR* info, int* pFd) {
+    if (const VkResult injected = armedFault(t_getSemaphoreFdFault); injected != VK_SUCCESS) return injected;
+
+    auto* realFn = reinterpret_cast<PFN_vkGetSemaphoreFdKHR>(realDeviceProcAddr(device, "vkGetSemaphoreFdKHR"));
+    if (realFn == nullptr) return VK_ERROR_INITIALIZATION_FAILED;
+    return realFn(device, info, pFd);
+}
+
+class GetSemaphoreFdFault {
+public:
+    GetSemaphoreFdFault(int failAt, VkResult result) : m_fault(&t_getSemaphoreFdFault, failAt, result) {}
+
+    int observed() const { return m_fault.observed(); }
+    int injected() const { return m_fault.injected(); }
+
+private:
+    VkCallFault m_fault;
+};
+
 }  // namespace
 
 extern "C" VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(VkDevice device, const char* pName) {
@@ -299,6 +321,9 @@ extern "C" VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(VkDevice
     // one export.
     if (t_getMemoryFdFault != nullptr && pName != nullptr && std::strcmp(pName, "vkGetMemoryFdKHR") == 0) {
         return reinterpret_cast<PFN_vkVoidFunction>(&faultingGetMemoryFd);
+    }
+    if (t_getSemaphoreFdFault != nullptr && pName != nullptr && std::strcmp(pName, "vkGetSemaphoreFdKHR") == 0) {
+        return reinterpret_cast<PFN_vkVoidFunction>(&faultingGetSemaphoreFd);
     }
     return realDeviceProcAddr(device, pName);
 }
@@ -3422,6 +3447,67 @@ void runGpuFailureChecks(const std::string& bluePath, const WallpaperManager::Co
                              static_cast<unsigned long long>(held),
                              holderStillHolds ? "kept its claim" : "lost the claim it already had",
                              newcomerCharged ? "was left charged with one" : "was charged with nothing");
+            }
+        }
+    }
+
+    // GOAL: S13.220 -- a GPU failure while exporting an EXISTING consumer's acquire timeline again
+    //       reaches /health's gpu check, as the first export's does. False for the shape the review
+    //       found, where the re-export ran outside the block that records GPU failures, so a driver
+    //       failing every repeat ask was invisible to /health.
+    // WHY-THIS-SHAPE: the consumer is registered first with no fault, so the faulted call is the
+    //       re-export and nothing else. A render before it puts gpu back to ok, which the arms above
+    //       left failed, and that is asserted as the premise: otherwise "fail" afterwards could be
+    //       left over. Called on this thread, which owns the device, like every export here.
+    // CONTROL: in WallpaperManager::acquireTimelineFd (backend/daemon/wallpaper_manager.cpp), the
+    //       `if (AcquireTimeline* existing = ...) return existing->exportFd();` line moved above the
+    //       `try` -> "FAIL: a GPU failure re-exporting an existing consumer's timeline is recorded
+    //       against the GPU", printing "gpu after a failed timeline re-export: ok (NVIDIA GeForce RTX
+    //       3080 Ti (Heap))". Observed 2026-09-23. Reverted.
+    // COVERAGE-ASSERT: the interposer must have injected exactly once, or it is a skip.
+    {
+        const char* kGoal = "S13.220 (a GPU failure re-exporting a consumer's timeline reaches /health)";
+        const std::string consumer = ":test.timeline.consumer";
+        daemon.manager().requestWallpaper("static", bluePath, 0);
+        daemon.manager().renderPending(0);
+        const HttpReply before = daemon.health();
+        std::string setupError;
+        bool registered = false;
+        try {
+            ::close(daemon.manager().acquireTimelineFd(consumer));
+            registered = true;
+        } catch (const std::exception& e) {
+            setupError = e.what();
+        }
+        if (!before.ok() || healthCheckStatus(before.json, "gpu") != "ok") {
+            notVerified(kGoal, "gpu did not read ok after a successful render, so a failure afterwards could be "
+                               "left over from an earlier arm");
+        } else if (!registered) {
+            notVerified(kGoal, "the consumer could not be given a timeline in the first place: " + setupError);
+        } else {
+            bool threw = false;
+            int injected = 0;
+            {
+                GetSemaphoreFdFault fault(/*failAt=*/1, VK_ERROR_INITIALIZATION_FAILED);
+                try {
+                    ::close(daemon.manager().acquireTimelineFd(consumer));
+                } catch (const std::exception&) {
+                    threw = true;
+                }
+                injected = fault.injected();
+            }
+            const HttpReply after = daemon.health();
+            if (injected != 1) {
+                notVerified(kGoal, "the interposed vkGetSemaphoreFdKHR did not land on the re-export");
+            } else {
+                check(threw, "a re-export whose descriptor query fails is failed to its caller");
+                check(after.ok() && healthCheckStatus(after.json, "gpu") == "fail",
+                      "a GPU failure re-exporting an existing consumer's timeline is recorded against the GPU");
+                if (!after.ok() || healthCheckStatus(after.json, "gpu") != "fail") {
+                    std::fprintf(stderr, "  gpu after a failed timeline re-export: %s (%s)\n",
+                                 healthCheckStatus(after.json, "gpu").c_str(),
+                                 healthCheckDetail(after.json, "gpu").c_str());
+                }
             }
         }
     }

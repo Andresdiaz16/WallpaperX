@@ -34,8 +34,17 @@ void RenderWorker::stop() {
         m_queuedRenders.clear();
         m_queuedTasks = 0;
     }
-    for (Job& job : dropped) {
-        if (job.task) job.task(TaskState::ShuttingDown);
+    for (Job& job : dropped) runTask(job.task, TaskState::ShuttingDown);
+}
+
+void RenderWorker::runTask(Task& task, TaskState state) noexcept {
+    if (!task) return;
+    try {
+        task(state);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "wallpaperx-daemon: render worker task error: %s\n", e.what());
+    } catch (...) {
+        std::fprintf(stderr, "wallpaperx-daemon: render worker task error: unknown exception\n");
     }
 }
 
@@ -76,7 +85,7 @@ void RenderWorker::postTask(Task task) {
         }
     }
     if (refused != TaskState::Run) {
-        if (task) task(refused);
+        runTask(task, refused);
         return;
     }
     m_wake.notify_one();
@@ -167,8 +176,8 @@ void RenderWorker::runJob(Job& job) {
             if (outcome.rendered && m_onFrameReady) {
                 m_onFrameReady(job.monitorId, outcome.generation);
             }
-        } else if (job.task) {
-            job.task(TaskState::Run);
+        } else {
+            runTask(job.task, TaskState::Run);
         }
     } catch (const std::exception& e) {
         // renderPending records failures in the monitor's status rather than throwing and
