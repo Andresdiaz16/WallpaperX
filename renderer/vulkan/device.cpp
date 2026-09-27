@@ -13,7 +13,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <iostream>
 #include <thread>
 #include <stdexcept>
 #include <utility>
@@ -90,10 +89,11 @@ std::vector<VkExtensionProperties> enumerateDeviceExtensions(VkPhysicalDevice ph
         extensions.resize(r == VK_SUCCESS ? count : 0);
     }
     if (r != VK_SUCCESS) {
-        std::cerr << "[vulkan] vkEnumerateDeviceExtensionProperties failed with " << vkResultName(r)
-                  << "; treating the device as having no optional extension -- no dma_buf export, no descriptor "
-                     "heap or buffer, no hardware video decode"
-                  << std::endl;
+        std::fprintf(stderr,
+                     "[vulkan] vkEnumerateDeviceExtensionProperties failed with %s; treating the device as having "
+                     "no optional extension -- no dma_buf export, no descriptor heap or buffer, no hardware video "
+                     "decode\n",
+                     vkResultName(r).c_str());
     }
     return extensions;
 }
@@ -111,7 +111,8 @@ VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(
     // needs to see when a machine misbehaves, so suppressing them at the messenger's
     // delivery mask (which is what excluding the type did) threw away the diagnostic in
     // order to avoid counting it.
-    std::cerr << "[vulkan] " << data->pMessage << std::endl;
+    // One call, so the line reaches stderr in one write and no other thread's lands inside it.
+    std::fprintf(stderr, "[vulkan] %s\n", data->pMessage);
 
     // Counted only when it is the validation layer talking about us. A stale ICD
     // manifest left over from an uninstalled driver is a host packaging problem, and
@@ -144,7 +145,7 @@ VkDebugUtilsMessengerCreateInfoEXT debugMessengerInfo(void* owner) {
 
 }
 
-Device::Device(bool enableValidation) {
+Device::Device(bool enableValidation, std::function<void()> onLost) : m_onLost(std::move(onLost)) {
     try {
         createInstance(enableValidation);
         selectPhysicalDevice();
@@ -273,9 +274,8 @@ void Device::createInstance(bool enableValidation) {
             if (syncValidationAvailable) {
                 instanceExtensions.push_back(VK_EXT_VALIDATION_FEATURES_EXTENSION_NAME);
             } else {
-                std::cerr << "[vulkan] validation layer present but VK_EXT_validation_features is not -- "
-                             "running without synchronization validation"
-                          << std::endl;
+                std::fprintf(stderr, "[vulkan] validation layer present but VK_EXT_validation_features is not -- "
+                                     "running without synchronization validation\n");
             }
         }
     }
@@ -688,12 +688,12 @@ void Device::createCommandPool() {
 void Device::assertGpuThread(const char* what) const {
     if (std::this_thread::get_id() == m_gpuThread) return;
 
-    std::cerr << "[vulkan] FATAL: " << (what ? what : "GPU call")
-              << " was made from a thread other than the one that created the Device. Vulkan submission is "
-                 "not free-threaded and this Device shares one command pool, so this is a data race. In the "
-                 "daemon this means a DBus handler reached the GPU directly instead of going through the "
-                 "render worker."
-              << std::endl;
+    std::fprintf(stderr,
+                 "[vulkan] FATAL: %s was made from a thread other than the one that created the Device. Vulkan "
+                 "submission is not free-threaded and this Device shares one command pool, so this is a data race. "
+                 "In the daemon this means a DBus handler reached the GPU directly instead of going through the "
+                 "render worker.\n",
+                 what ? what : "GPU call");
     std::abort();
 }
 
@@ -906,7 +906,14 @@ bool Device::lost() const {
 }
 
 VkResult Device::observe(VkResult result) noexcept {
-    if (result == VK_ERROR_DEVICE_LOST) m_lost = true;
+    if (result != VK_ERROR_DEVICE_LOST || m_lost) return result;
+    m_lost = true;
+    if (m_onLost) {
+        try {
+            m_onLost();
+        } catch (...) {
+        }
+    }
     return result;
 }
 

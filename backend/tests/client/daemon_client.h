@@ -228,10 +228,11 @@ struct Frame {
     uint64_t bufferId = 0;
 };
 
-inline Frame getFrameFd(sdbus::IProxy& proxy, int32_t monitorId) {
+inline Frame getFrameFd(sdbus::IProxy& proxy, int32_t monitorId, std::chrono::microseconds timeout = {}) {
     Frame frame;
     proxy.callMethod("GetFrameFd")
         .onInterface(DbusService::kInterface)
+        .withTimeout(timeout)
         .withArguments(monitorId)
         .storeResultsTo(frame.fd, frame.width, frame.height, frame.memorySize, frame.handleType, frame.syncFds,
                         frame.generation, frame.drmFormat, frame.drmModifier, frame.planes, frame.deviceUuid,

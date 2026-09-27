@@ -107,12 +107,14 @@
 #include <netinet/in.h>
 #include <poll.h>
 #include <signal.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 extern char** environ;
 
 using wallpaperx::DbusService;
+using wallpaperx::testing::blockedIn;
 using wallpaperx::testing::Check;
 using wallpaperx::testing::validationWaived;
 using wallpaperx::testing::Frame;
@@ -1629,9 +1631,9 @@ void checkConcurrentClients(sdbus::IProxy& proxy, FrameReadyLog& signals, const 
 // `blocked` is the union over a caller-supplied set of threads, and `ignored` comes from
 // the leader. That split is not tidiness: a signal's *disposition* is per-process, but its
 // *blocked* mask is per-thread, and /proc/<pid>/status reports only the thread-group
-// leader's. A daemon that blocked SIGPIPE on the render worker or an sdbus dispatch thread
-// -- both of which printf, so either can take the failing write -- would leave the leader's
-// mask clean and satisfy a leader-only read while doing exactly what S6.37 forbids.
+// leader's. A daemon that blocked SIGPIPE on another of its threads -- the log writer, whose
+// write is the one that fails -- would leave the leader's mask clean and satisfy a leader-only
+// read while doing exactly what S6.37 forbids.
 struct SignalMasks {
     bool read = false;
     uint64_t blocked = 0;
@@ -1789,15 +1791,16 @@ void checkHangupShutdown(NameWatcher& names, const Check& check) {
 //       (1) The behavioural half: a SetWallpaper issued after the reader of the daemon's
 //       stdout is gone still gets a reply, still renders, and GetStatus still answers.
 //       That is what `wallpaperx-daemon | head` does, and at the default disposition the
-//       daemon dies inside the handler at exit 141 with an empty stderr.
+//       daemon dies at exit 141 on the log writer's failed write, with an empty stderr.
 //       (2) The disposition half, read from /proc: the behavioural half alone cannot tell
 //       ignored from blocked -- both survive the write -- and the goal explicitly rejects
 //       blocking. SigBlk/SigIgn is the only externally visible difference between the two.
 //       Read as a union over the daemon's own threads, not from /proc/<pid>/status: the
 //       disposition is per-process but the blocked mask is per-thread, and that file is
-//       the thread-group leader's alone. The daemon's render worker and sdbus dispatch
-//       threads both printf, so either can take the failing write, and a mask installed on
-//       one of them is invisible to the leader-only read. "Own threads" is the tid set
+//       the thread-group leader's alone. The failing write is the log writer thread's
+//       (backend/daemon/log_pump.cpp), and the union covers every thread the daemon starts,
+//       since the goal forbids SIGPIPE blocked on any of them and a mask installed on one is
+//       invisible to the leader-only read. "Own threads" is the tid set
 //       snapshotted before the first render rather than a scan at check time -- the ICD's
 //       thread pool blocks nearly every signal and would make this red on a correct daemon
 //       under Lavapipe; readSignalMasks carries the measurement.
@@ -1805,27 +1808,23 @@ void checkHangupShutdown(NameWatcher& names, const Check& check) {
 //       actually writing to stdout while serving that call. If that printf ever goes
 //       away, nothing generates EPIPE and all of the above passes on a daemon with the
 //       bug reintroduced -- so the write is asserted rather than assumed.
-// CONTROL: three, all re-run 2026-08-05 against this shape of the phase.
-//       (a) `std::signal(SIGPIPE, SIG_IGN)` deleted from backend/daemon/main.cpp -> 5 FAILs: SetWallpaper
-//       came back [org.freedesktop.DBus.Error.NoReply], GetStatus came back
-//       ServiceUnknown, "the daemon ignores SIGPIPE", and the exit checks with
-//       "terminated by signal 13".
-//       (b) SIGPIPE *blocked* (pthread_sigmask) instead of ignored -> exactly 2 FAILs,
-//       "the daemon ignores SIGPIPE" and "SIGPIPE is ignored rather than merely blocked"
-//       (SigBlk=0x5003 SigIgn=0x0), while every behavioural check above stayed green --
-//       which is precisely the configuration S6.37 says must fail and which part (1)
-//       alone cannot see.
-//       (c) the per-thread half of (b), which is why part (2) reads the daemon's other
-//       threads and not just the leader: `pthread_sigmask(SIG_BLOCK, {SIGPIPE})` installed
-//       inside main.cpp's sigwait watcher lambda only -> "FAIL: SIGPIPE is ignored rather
-//       than merely blocked", SigBlk=0x5003 SigIgn=0x1000, on BOTH the default-ICD and the
-//       lavapipe entry. The counterfactual was measured, not assumed: with the sample
-//       restricted back to the leader alone and the same mutation still in place, the run
-//       printed "all checks passed". All reverted.
-// COVERAGE-ASSERT: the trigger is asserted on THIS daemon's fd 1, from a render issued
-//       while its stdout still has a reader, and not from the earlier daemon's captured
-//       output. That capture is stdout and stderr merged onto one pipe (the constructor
-//       dup2()s one write end onto both), so it can only establish "the binary printed
+// CONTROL: in backend/daemon/main.cpp via control_run.sh, re-run 2026-09-26 on NVIDIA, reverted.
+//       Deleting main()'s SIGPIPE ignore alone cannot be the control for this phase: cpp-httplib's
+//       Server constructor ignores SIGPIPE process-wide too (third_party/httplib.h), before this
+//       phase breaks stdout. (a) SIGPIPE put back to SIG_DFL right after the HttpServer is built ->
+//       "the daemon ignores SIGPIPE", the SetWallpaper and GetStatus answers, the thread-sampling
+//       line and both exit lines red. (b) SIGPIPE *blocked* (pthread_sigmask) in place of main()'s
+//       SIG_IGN -> "SIGPIPE is ignored rather than merely blocked" (SigIgn has it from cpp-httplib),
+//       every behavioural check here green -- the configuration S6.37 says must fail, which part
+//       (1) cannot see; S14.35's two reader-gone lines go red with it. (c) The same block installed
+//       inside the sigwait watcher lambda only -> the same line, alone. For (c) the counterfactual
+//       was measured 2026-08-05: with the sample restricted to the leader and the mutation in
+//       place, the run printed "all checks passed".
+// COVERAGE-ASSERT: the trigger is asserted on the pipe that is THIS daemon's stdout destination,
+//       from a render issued while it still has a reader, and not from the earlier daemon's
+//       captured output; the write it arms is the log writer's. That capture is stdout and
+//       stderr merged onto one pipe (the constructor dup2()s one write end onto both), so it can
+//       only establish "the binary printed
 //       this somewhere" -- and dbus_service.cpp has three fprintf(stderr, ...) SetWallpaper
 //       lines right beside the printf, so a refactor moving the entry log to stderr would
 //       leave the assert green while nothing in this phase generated EPIPE at all. Reading
@@ -1914,8 +1913,8 @@ void checkClosedStdout(NameWatcher& names, const std::string& bluePath, const st
         std::fprintf(stderr, "  SetWallpaper after the stdout reader was closed: %s\n", e.what());
     }
     check(answered,
-          "the daemon answers SetWallpaper after its stdout reader is gone (the handler's own printf is the "
-          "write that fails there)");
+          "the daemon answers SetWallpaper after its stdout reader is gone (its entry line reaches the broken "
+          "pipe through the log writer, whose write is the one that fails)");
 
     // Hoisted, because the validation scan at the end of this function is only evidence if
     // the daemon actually did GPU work: an empty stderr capture from a child that died at
@@ -1944,8 +1943,8 @@ void checkClosedStdout(NameWatcher& names, const std::string& bluePath, const st
         }
         // COVERAGE-ASSERT: what the blocked-mask check is worth is a function of how many
         // threads it actually sampled, and that number comes from runtime state (a /proc
-        // scan) rather than from the source. This daemon has three threads before it
-        // renders -- leader, render worker, sigwait watcher -- so a sample of one means the
+        // scan) rather than from the source. This daemon has four threads before it
+        // renders -- leader, render worker, sigwait watcher, log writer -- so a sample of one means the
         // snapshot or the read silently fell back to the leader and the line above is back
         // to the weaker property it used to assert. Measured, not assumed: with the
         // non-leader tasks skipped, the "SIGPIPE blocked on the watcher thread" control
@@ -1958,11 +1957,14 @@ void checkClosedStdout(NameWatcher& names, const std::string& bluePath, const st
         }
     }
 
-    // The shutdown path writes to the broken stdout too ("... received, shutting down" through
-    // the daemon's own descriptor for that pipe, then "stopped cleanly" and the flush at exit),
-    // so this is a second, independent EPIPE -- and the last chance for one to turn a clean exit
-    // into 141. CONTROL: backend/daemon/main.cpp's StopLog::print made to abort on EPIPE, via
-    // control_run.sh 2026-09-24, reverted -> the two exit lines below red, signal 6.
+    // The shutdown path writes to stdout too ("... received, shutting down", "stopped cleanly",
+    // the flush at exit). Through the log writer (backend/daemon/log_pump.cpp) those land in its
+    // own pipe; the broken destination was dropped at the first failed write, so the exit is
+    // graded for surviving the pipe as a whole, not a second EPIPE. CONTROL: the log writer's
+    // abandoned-destination branch (Stream::write's `n == kGone`) made to abort, via control_run.sh
+    // 2026-09-27, reverted -> both exit lines red, with the SetWallpaper and GetStatus answers
+    // after the break, the thread-sampling line and S14.35's two reader-gone usage lines: the
+    // daemon died at the first failed write.
     const int exitCode = deaf.shutdown(SIGTERM);
     check(deaf.exitedNormally(), "a daemon whose stdout is closed still exits through main() on SIGTERM");
     if (!deaf.exitedNormally()) {
@@ -1990,7 +1992,7 @@ void checkClosedStdout(NameWatcher& names, const std::string& bluePath, const st
     //       run in which no Vulkan work happened at all -- the same hollowing main() guards
     //       against with its "serving" anchor. Read after shutdown(), because output() is
     //       complete only once the reader thread has seen EOF. stderr, not stdout, is where
-    //       Device's messenger writes ("[vulkan] ..." via std::cerr), which is why breaking
+    //       Device's messenger writes ("[vulkan] ..." via fprintf(stderr)), which is why breaking
     //       fd 1 does not take this oracle with it.
     // CONTROL: deaf spawned with WALLPAPERX_VALIDATION=0 while wantValidation was true ->
     //       the run printed the named skip below instead of a green check, i.e. the gate
@@ -2180,9 +2182,10 @@ void checkBusLoss(const Check& check) {
     //       reworded message in main.cpp turns those red instead of leaving this one
     //       vacuously green.
     //
-    // CONTROL: in backend/daemon/main.cpp, via control_run.sh, 2026-09-24, reverted. The watcher
-    //       made to print its "received" line for every signal it takes, straight after sigwait,
-    //       so ~ShutdownWatch's own wake is reported as a signal -> this line red, alone.
+    // CONTROL: in backend/daemon/main.cpp, via control_run.sh, re-observed 2026-09-25, reverted. The
+    //       watcher made to print its "received" line for
+    //       every signal it takes, straight after sigwait, so ~ShutdownWatch's own wake is reported
+    //       as a signal -> this line red, alone.
     //       The watcher's `if (teardown.finished) return;` deleted no longer reaches this line:
     //       ~ShutdownWatch's wake is then taken for an outside SIGUSR1 and ignored, join() never
     //       returns, and the alarm kills the daemon (signal 14) before main's fatal line -> 8 FAILs
@@ -2219,6 +2222,14 @@ void checkBusLoss(const Check& check) {
 // themselves unexercised on every run -- green suites with nothing behind them.
 // ---------------------------------------------------------------------------- //
 
+// "LD_PRELOAD=" with `library` after whatever this process preloads: a sanitizer runtime preloaded by
+// the build must stay first.
+std::string preloading(const char* library) {
+    const char* inherited = std::getenv("LD_PRELOAD");
+    const std::string before = inherited != nullptr && *inherited != '\0' ? std::string(inherited) + ":" : "";
+    return "LD_PRELOAD=" + before + library;
+}
+
 // The environment a daemon whose stop must stick is started with: the wedge library preloaded and
 // armed, and a HOME, cache and config/state of its own so nothing it writes touches the
 // developer's. SpawnedDaemon adds scratch XDG directories when none are given; `home` is named
@@ -2231,7 +2242,7 @@ std::vector<std::string> wedgedDaemonEnv(const std::string& validationEnv, const
             "DBUS_SESSION_BUS_ADDRESS=" + busAddress,
             "HOME=" + home.string(),
             "XDG_CACHE_HOME=" + (home / "cache").string(),
-            std::string("LD_PRELOAD=") + WALLPAPERX_WEDGE_SHIM,
+            preloading(WALLPAPERX_WEDGE_SHIM),
             "WALLPAPERX_TEST_WEDGE_FREE=1"};
 }
 
@@ -2280,9 +2291,9 @@ bool primeTeardownWedge(sdbus::IProxy& proxy, const std::string& clip, std::stri
 //       bus was destroyed, with its teardown wedged; nothing armed the watchdog" -- the process
 //       had to be SIGKILLed at the harness timeout. The escalation phase below stayed GREEN under
 //       it, which is the separation the two phases exist for: the second signal does not need the
-//       alarm. First observed 2026-08-19 with the FIFO wedge; re-observed 2026-09-22 on the
-//       NVIDIA entry with the preloaded one, and 2026-09-24 via control_run.sh after the alarm
-//       gained a handler of its own (that line alone red). Reverted.
+//       alarm. Re-observed 2026-09-26 via control_run.sh on NVIDIA, that line alone red; the
+//       guards now also record the stop's reason as a failure, which this phase does not read.
+//       Reverted.
 // COVERAGE-ASSERT: the wedge is verified before the verdict is read -- the daemon must have drawn
 //       the video whose decoder the preloaded library holds, and its own line must be in the
 //       output -- and a run that could not stage it reports NOT VERIFIED. Without that, a daemon
@@ -2381,23 +2392,16 @@ void checkStuckTeardownIsBounded(const std::string& validationEnv, const std::st
 //       alone is green under the control. The absence of the deadline's own line is asserted
 //       for the same reason -- it is what the daemon prints when nothing shortened the stop.
 // CONTROL: the sigaction/pthread_sigmask block that installs forceExitOnSecondSignal (inside the
-//       watcher's second `if (outside)`) deleted from backend/daemon/main.cpp -> two red,
-//       re-observed 2026-09-24 via control_run.sh after the switch to StopLog, with the same
-//       output (a wedged stop ended 1840 ms after the second SIGTERM). "FAIL: the daemon says that a
-//       second signal is what ended it", printing "it left with exit code -1, signal 14, and
-//       said none of it"; and "FAIL: the second signal ends the daemon promptly rather than at
-//       the deadline". The second signal simply stays pending -- it is blocked in every thread
-//       and the watcher has left its sigwait -- so the process dies on the unwind's own SIGALRM
-//       instead.
-//       Note which check did NOT fire: "the stop ends on the second signal rather than on the
-//       teardown deadline" stayed green, because the alarm beat the watcher's deadline and
-//       "shutdown blocked" was never printed. That is exactly why the message and the elapsed
-//       time are asserted as well; the absence check alone would have been green here.
-//       First observed 2026-08-19 with the FIFO wedge, printing "3884 ms ... against a 5000 ms
-//       teardown deadline"; re-observed 2026-09-22 on the NVIDIA entry with the preloaded wedge,
-//       printing "it left with exit code -1, signal 14, and said none of it" and "a wedged stop
-//       ended 1832 ms after the second SIGTERM" -- the three-second deadline measured from the
-//       first signal. Reverted.
+//       watcher's second `if (outside)`) deleted from backend/daemon/main.cpp -> "FAIL: the daemon
+//       says that a second signal is what ended it" and "FAIL: the second signal ends the daemon
+//       promptly rather than at the deadline". The second signal simply stays pending -- it is
+//       blocked in every thread and the watcher has left its sigwait -- so one of the two 3 s
+//       deadlines ends the stop instead, and which one is a race. When the watcher's wins, "the
+//       stop ends on the second signal rather than on the teardown deadline" goes red too (seen
+//       2026-09-26 via control_run.sh on NVIDIA: three red); when the alarm wins, that line stays
+//       green (seen 2026-09-22 and 2026-09-24, printing "it left with exit code -1, signal 14, and
+//       said none of it"), which is why the message and the elapsed time are asserted as well.
+//       Reverted.
 // COVERAGE-ASSERT: the wedge is verified before the verdict is read -- the video must have drawn
 //       and the wedge's own line must be in the output -- and a run that could not stage it
 //       reports NOT VERIFIED rather than grading a stop that was never stuck.
@@ -2537,7 +2541,7 @@ std::string describeTreeChange(const std::map<std::string, std::string>& before,
 //       backend/daemon/wallpaper_manager.cpp, ~WallpaperManager given a loop that frees each video
 //       session under an ApplyingRecord naming its file -- the Stage E2 shutdown record -> "FAIL: a
 //       stop the deadline ended wrote nothing", printing "added wallpaperx/applying-0.json". Both
-//       observed 2026-09-21 on the NVIDIA entry; (a) re-observed 2026-09-24 via control_run.sh,
+//       observed 2026-09-21 on the NVIDIA entry; (a) re-observed 2026-09-26 via control_run.sh,
 //       that line alone red. Reverted.
 // COVERAGE-ASSERT: the wedge's own line must be in the daemon's output, and the video must have
 //       drawn first; otherwise the phase reports NOT VERIFIED rather than grading an ordinary stop.
@@ -2572,7 +2576,7 @@ void checkWatchdogEndsAStuckStopWritingNothing(const std::string& validationEnv,
     SpawnedDaemon daemon({validationEnv, std::string("DBUS_SESSION_BUS_ADDRESS=") + bus.address(),
                           "HOME=" + home.path().string(), "XDG_CONFIG_HOME=" + configHome.string(),
                           "XDG_STATE_HOME=" + stateHome.string(), "XDG_CACHE_HOME=" + (home.path() / "cache").string(),
-                          std::string("LD_PRELOAD=") + WALLPAPERX_WEDGE_SHIM, "WALLPAPERX_TEST_WEDGE_FREE=1"});
+                          preloading(WALLPAPERX_WEDGE_SHIM), "WALLPAPERX_TEST_WEDGE_FREE=1"});
     if (!daemon.waitForOutput(std::string("serving ") + DbusService::kBusName, std::chrono::seconds(30))) {
         if (reportedStartupFault(daemon, kGoal)) return;
         notVerified(kGoal, "the daemon for this phase never reached the bus");
@@ -2629,6 +2633,225 @@ void checkWatchdogEndsAStuckStopWritingNothing(const std::string& validationEnv,
     std::printf("daemon_system_test: a stop wedged in the manager's teardown ended %.1f s after SIGTERM, %zu state "
                 "file(s) compared\n",
                 elapsed, stateBefore.size());
+}
+
+// After the bus a daemon was serving on is destroyed: the moment its unwind installed the teardown
+// alarm's handler, which /proc shows as SIGALRM moving from ignored to caught. `before` is the last
+// look that did not see it yet. False if it was not seen within 10 s, or the daemon ended first.
+bool awaitAlarmArmed(const SpawnedDaemon& daemon, Clock::time_point& before, Clock::time_point& seen) {
+    before = Clock::now();
+    for (const auto deadline = before + std::chrono::seconds(10); Clock::now() < deadline;) {
+        const auto look = Clock::now();
+        const std::optional<bool> caught = wallpaperx::testing::catchesSignal(daemon.pid(), SIGALRM);
+        if (!caught) return false;
+        if (*caught) {
+            seen = look;
+            return true;
+        }
+        before = look;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return false;
+}
+
+// GOAL: S14.30 -- a stop the teardown alarm ends (here a failed bus loop whose unwind is wedged)
+//       delivers the lines queued before the alarm, and then its own "teardown deadline passed", to
+//       a destination that resumes during the alarm's 250 ms flush; the process still dies of
+//       SIGALRM. False if the alarm's handler dies without the flush: the queued lines, which say
+//       why the stop happened, go with the process.
+// WHY-THIS-SHAPE: the reader resumes 30 ms after the alarm is due, and the alarm is due 3 s after
+//       its handler was installed, which /proc shows (SIGALRM caught): so the resume provably comes
+//       after the alarm fired. The last look that did not see it bounds how late the resume can be;
+//       more than 200 ms after the earliest the alarm could have fired is NOT VERIFIED, since the
+//       flush may have given up by then. On the bus-loss path because a signal-driven stop also
+//       arms the signal thread's own 3 s deadline, which races the alarm.
+// CONTROL: in backend/daemon/main.cpp, `flushBeforeExit(kLine);` deleted from onTeardownDeadline's
+//       last branch -> "the lines queued before the teardown alarm, then its own line, reach the
+//       destination" red, alone. Observed 2026-09-25 via control_run.sh on NVIDIA; reverted. By
+//       hand, reverted: the resume moved 300 ms later -> NOT VERIFIED, no FAIL.
+void checkAlarmDeliversQueuedLines(const std::string& validationEnv, const std::string& clip, const Check& check) {
+    constexpr const char* kGoal = "S14.30 (a stop the teardown alarm ends delivers what was queued, and says so)";
+    std::error_code ec;
+    if (!std::filesystem::exists(clip, ec)) {
+        notVerified(kGoal, "the video fixture " + clip + " was not generated, so no teardown frees a decoder");
+        return;
+    }
+    ScratchDir work("alarmflush");
+    if (!work.ok()) {
+        notVerified(kGoal, "a scratch directory could not be created");
+        return;
+    }
+    NestedBus bus;
+    if (!bus.ok()) {
+        if (const char* fault = bus.preambleFault()) {
+            phaseSetupFault(kGoal, fault);
+            return;
+        }
+        notVerified(kGoal, bus.reason());
+        return;
+    }
+    SpawnedDaemon daemon(wedgedDaemonEnv(validationEnv, bus.address(), work.path()));
+    if (!daemon.waitForOutput(std::string("serving ") + DbusService::kBusName, std::chrono::seconds(30))) {
+        if (reportedStartupFault(daemon, kGoal)) return;
+        notVerified(kGoal, "the daemon for this phase never reached the bus");
+        return;
+    }
+    bool queued = false;
+    {
+        auto connection = sdbus::createSessionBusConnectionWithAddress(bus.address());
+        connection->enterEventLoopAsync();
+        auto proxy = sdbus::createProxy(*connection, sdbus::ServiceName{DbusService::kBusName},
+                                        sdbus::ObjectPath{DbusService::kObjectPath});
+        std::string why;
+        if (!primeTeardownWedge(*proxy, clip, why)) {
+            notVerified(kGoal, why);
+            return;
+        }
+        if (!daemon.stallCapture(why)) {
+            wallpaperx::testing::harnessFailure(std::string(kGoal) + ": " + why);
+            return;
+        }
+        // A request the daemon refuses, logging one line to each stream: queued behind the stall.
+        try {
+            setWallpaper(*proxy, "alarmmark", "/nonexistent", 0, std::chrono::seconds(5));
+        } catch (const sdbus::Error& e) {
+            queued = e.getName() == "org.freedesktop.DBus.Error.InvalidArgs";
+        }
+    }
+    bus.kill();
+    Clock::time_point notYet;
+    Clock::time_point armedBy;
+    const bool armed = awaitAlarmArmed(daemon, notYet, armedBy);
+    if (armed) std::this_thread::sleep_until(armedBy + std::chrono::milliseconds(2900));
+    const std::optional<long> mainIn = blockedIn(daemon.pid(), daemon.pid());
+    if (armed) std::this_thread::sleep_until(armedBy + std::chrono::milliseconds(3030));
+    const bool held = daemon.captureStillStalled();
+    const auto resumedAt = Clock::now();
+    daemon.resumeCapture();
+    daemon.waitForExit();
+#ifdef SYS_pause
+    const bool wedged = mainIn && *mainIn == SYS_pause;
+#else
+    const bool wedged = false;  // no pause system call here to recognise the wedge by
+#endif
+    if (!held) {
+        wallpaperx::testing::harnessFailure(std::string(kGoal) + ": something drained the stalled stream");
+        return;
+    }
+    if (!queued || !armed || !wedged) {
+        notVerified(kGoal, !queued ? "the request that queues a line was not refused as expected"
+                           : !armed ? "the daemon's unwind was never seen to install the teardown alarm"
+                                    : "the stop was not seen stuck in the wedged decoder free");
+        return;
+    }
+    if (resumedAt - (notYet + std::chrono::seconds(3)) > std::chrono::milliseconds(200)) {
+        notVerified(kGoal, "this test resumed the stream too long after the alarm to be sure it was inside its flush");
+        return;
+    }
+    const std::string output = daemon.output().substr(std::min(daemon.stalledAt(), daemon.output().size()));
+    const size_t out = output.find("SetWallpaper(type=\"alarmmark\"");
+    const size_t err = output.find("SetWallpaper rejected");
+    const size_t wedgeLine = output.find("wedge_shim: holding");
+    const size_t deadline = output.find("teardown deadline passed, exiting now");
+    const bool delivered = out != std::string::npos && err != std::string::npos && wedgeLine != std::string::npos &&
+                           deadline != std::string::npos && std::max({out, err, wedgeLine}) < deadline;
+    check(delivered, "the lines queued before the teardown alarm, then its own line, reach the destination");
+    if (!delivered) std::fprintf(stderr, "  after the resume: %s\n", output.c_str());
+    const bool byAlarm = !daemon.exitedNormally() && daemon.termSignal() == SIGALRM;
+    check(byAlarm, "and the process still dies of SIGALRM");
+    if (!byAlarm) std::fprintf(stderr, "  exit code or signal: %d\n", daemon.termSignal());
+}
+
+// GOAL: S14.37 -- a start that fails (the bus loop throws) and then, during its teardown, sees the
+//       device lost exits 1 as the failure it is, and does not say the GPU was lost. False if the
+//       loss takes over the stop: 75 then has the service manager restart the daemon as for a GPU
+//       loss, and the log names the wrong cause.
+// WHY-THIS-SHAPE: the render is held at its submission by the shim until /proc shows the unwind has
+//       installed the teardown alarm (so the failure is already recorded), and only then is the
+//       loss released into it. Releasing it on a timer could put the loss before the throw, where
+//       75 is the right answer. A run where the shim never failed a submission is NOT VERIFIED.
+// CONTROL: in backend/daemon/main.cpp, the `StopReason::Failed` store deleted from ~ArmTeardown ->
+//       both lines red, alone: the loss took over the stop, exit 75 and "the GPU device was lost".
+//       Re-observed 2026-09-27 via control_run.sh on NVIDIA; reverted. By hand, reverted: the shim's
+//       hold variable misspelt -> NOT VERIFIED "no render reached a submission", no FAIL.
+void checkLossDuringFailedStart(const std::string& validationEnv, const std::string& bluePath, const Check& check) {
+    constexpr const char* kGoal = "S14.37 (a loss seen while a failed start tears down is not a GPU-loss exit)";
+    ScratchDir work("failedstartloss");
+    if (!work.ok()) {
+        notVerified(kGoal, "a scratch directory could not be created");
+        return;
+    }
+    NestedBus bus;
+    if (!bus.ok()) {
+        if (const char* fault = bus.preambleFault()) {
+            phaseSetupFault(kGoal, fault);
+            return;
+        }
+        notVerified(kGoal, bus.reason());
+        return;
+    }
+    const std::filesystem::path gate = work.path() / "release";
+    const std::filesystem::path trigger = work.path() / "lose";
+    std::error_code ec;
+    std::filesystem::create_directories(work.path() / "cache", ec);
+    SpawnedDaemon daemon({validationEnv, "DBUS_SESSION_BUS_ADDRESS=" + bus.address(), "HOME=" + work.path().string(),
+                          "XDG_CACHE_HOME=" + (work.path() / "cache").string(), preloading(WALLPAPERX_DEVICE_LOST_SHIM),
+                          "WALLPAPERX_TEST_LOSE_DEVICE=" + trigger.string(),
+                          "WALLPAPERX_TEST_HOLD_SUBMIT=" + gate.string()});
+    if (!daemon.waitForOutput(std::string("serving ") + DbusService::kBusName, std::chrono::seconds(30))) {
+        if (reportedStartupFault(daemon, kGoal)) return;
+        notVerified(kGoal, "the daemon for this phase never reached the bus");
+        return;
+    }
+    {
+        auto connection = sdbus::createSessionBusConnectionWithAddress(bus.address());
+        connection->enterEventLoopAsync();
+        auto proxy = sdbus::createProxy(*connection, sdbus::ServiceName{DbusService::kBusName},
+                                        sdbus::ObjectPath{DbusService::kObjectPath});
+        try {
+            setWallpaper(*proxy, "static", bluePath, 0, std::chrono::seconds(10));
+        } catch (const std::exception& e) {
+            notVerified(kGoal, std::string("the daemon refused the still whose render is held: ") + e.what());
+            return;
+        }
+    }
+    bool held = false;
+    for (const auto deadline = Clock::now() + std::chrono::seconds(30); !held && Clock::now() < deadline;) {
+        held = std::filesystem::exists(gate.string() + ".held", ec);
+        if (!held) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    if (!held) {
+        daemon.shutdown(SIGKILL);
+        notVerified(kGoal, "no render reached a submission for the shim to hold");
+        return;
+    }
+    bus.kill();
+    Clock::time_point notYet;
+    Clock::time_point armedBy;
+    const bool armed = awaitAlarmArmed(daemon, notYet, armedBy);
+    const bool released = std::ofstream(trigger).good() && std::ofstream(gate).good();
+    const int exitCode = daemon.waitForExit();
+    const std::string output = daemon.output();
+    if (!released) {
+        wallpaperx::testing::harnessFailure(std::string(kGoal) + ": the trigger or the gate file could not be created");
+        return;
+    }
+    if (!armed || !std::filesystem::exists(trigger.string() + ".fired", ec)) {
+        notVerified(kGoal, !armed ? "the daemon's unwind was never seen to install the teardown alarm"
+                                  : "the shim never failed the held submission, so no loss was seen");
+        return;
+    }
+    if (daemon.sanitizerReported()) {
+        check(false, "a failed start that then sees a loss exits 1 -- not graded: the sanitizer reported, and the "
+                     "exit status is its");
+        return;
+    }
+    check(daemon.exitedNormally() && exitCode == 1, "a failed start that then sees the device lost exits 1, not 75");
+    if (!(daemon.exitedNormally() && exitCode == 1)) {
+        std::fprintf(stderr, "  exit code %d, signal %d\n", exitCode, daemon.termSignal());
+    }
+    check(output.find("the GPU device was lost") == std::string::npos,
+          "and it does not report the loss as why it stopped");
 }
 
 // GOAL: S13.197 -- a restored video's renders are posted only after the playing record is open, so
@@ -3089,6 +3312,106 @@ void checkCommandLine(NameWatcher& names, const std::string& validationEnv, cons
         const bool shown = !ranOn && !tookName && exitCode == 0 && output.find(kUsageLine) != std::string::npos;
         check(shown, (std::string(help) + " prints the usage and exits 0").c_str());
         if (!shown) std::fprintf(stderr, "  exit %d, output: %s\n", exitCode, output.c_str());
+    }
+}
+
+// How one run of the daemon binary with its stdout and stderr on a pipe whose reader was closed
+// before it started ended: `wallpaperx-daemon --help | true` once true has exited.
+struct ReaderGoneRun {
+    bool started = false;
+    bool ended = false;  // false: still running after 10 s, and killed
+    int status = 0;
+};
+
+ReaderGoneRun runWithOutputReaderGone(const std::vector<std::string>& args, const std::vector<std::string>& extraEnv) {
+    ReaderGoneRun run;
+    int ends[2];
+    if (pipe2(ends, O_CLOEXEC) != 0) return run;
+    close(ends[0]);
+    std::vector<std::string> env = wallpaperx::testing::mergedEnvironment(extraEnv);
+    std::vector<char*> envp;
+    for (std::string& entry : env) envp.push_back(entry.data());
+    envp.push_back(nullptr);
+    std::string binary = WALLPAPERX_DAEMON_BINARY;
+    std::vector<std::string> argStorage = args;
+    std::vector<char*> argv{binary.data()};
+    for (std::string& arg : argStorage) argv.push_back(arg.data());
+    argv.push_back(nullptr);
+    const pid_t parent = getpid();
+    const pid_t pid = fork();
+    if (pid < 0) {
+        close(ends[1]);
+        return run;
+    }
+    if (pid == 0) {
+        if (dup2(ends[1], STDOUT_FILENO) == -1 || dup2(ends[1], STDERR_FILENO) == -1) {
+            _exit(wallpaperx::testing::kChildDup2FailedExit);
+        }
+        // As a shell starts it: SIGPIPE at its default action, and deliverable.
+        struct sigaction dfl {};
+        dfl.sa_handler = SIG_DFL;
+        sigaction(SIGPIPE, &dfl, nullptr);
+        sigset_t pipeSignal;
+        sigemptyset(&pipeSignal);
+        sigaddset(&pipeSignal, SIGPIPE);
+        sigprocmask(SIG_UNBLOCK, &pipeSignal, nullptr);
+        execChildOrDie(parent, binary.c_str(), argv.data(), envp.data());
+    }
+    close(ends[1]);
+    run.started = true;
+    for (const auto deadline = Clock::now() + std::chrono::seconds(10); !run.ended && Clock::now() < deadline;) {
+        run.ended = waitpid(pid, &run.status, WNOHANG) == pid;
+        if (!run.ended) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    if (!run.ended) {
+        kill(pid, SIGKILL);
+        waitpid(pid, &run.status, 0);
+    }
+    return run;
+}
+
+// GOAL: S14.35 -- `--help` and a refused argument, with stdout and stderr on a pipe whose reader has
+//       already gone, exit 0 and 2 as they do with a reader; neither dies of SIGPIPE. False if
+//       SIGPIPE is ignored only once serving begins: the usage text reaches the log writer
+//       (backend/daemon/log_pump.cpp) before that, and its failed write kills the process.
+// WHY-THIS-SHAPE: forked here rather than through SpawnedDaemon, whose reader thread is the very
+//       thing that must be absent; the reader is closed before the fork, so no write can find it.
+//       The child resets SIGPIPE to its default, as a shell does, since this process's own
+//       disposition would otherwise be inherited through exec.
+// CONTROL: in backend/daemon/main.cpp, main()'s SIGPIPE ignore moved into serve(), after the
+//       usage has been printed -> both lines red, alone. Observed
+//       2026-09-25 via control_run.sh on NVIDIA; reverted.
+void checkUsageWithOutputReaderGone(const std::string& validationEnv, const Check& check) {
+    ScratchDir home("readergone");
+    if (!home.ok()) {
+        notVerified("S14.35", "a scratch HOME could not be created");
+        return;
+    }
+    const std::vector<std::string> env{validationEnv, "HOME=" + home.path().string(),
+                                       "XDG_CONFIG_HOME=" + (home.path() / "config").string(),
+                                       "XDG_STATE_HOME=" + (home.path() / "state").string()};
+    for (const auto& [arg, expected] : {std::pair<const char*, int>{"--help", 0}, {"--bogus", 2}}) {
+        const ReaderGoneRun run = runWithOutputReaderGone({arg}, env);
+        if (!run.started) {
+            wallpaperx::testing::harnessFailure(std::string(arg) + " with its output's reader gone: fork failed");
+            continue;
+        }
+        if (run.ended && WIFEXITED(run.status)) {
+            if (const char* fault = wallpaperx::testing::forkPreambleFault(WEXITSTATUS(run.status))) {
+                wallpaperx::testing::harnessFailure(std::string(arg) + " with its output's reader gone: " + fault);
+                continue;
+            }
+        }
+        const bool held = run.ended && WIFEXITED(run.status) && WEXITSTATUS(run.status) == expected;
+        check(held, (std::string(arg) + " exits " + std::to_string(expected) +
+                     " with its output's reader gone, rather than dying of SIGPIPE")
+                        .c_str());
+        if (!held) {
+            std::fprintf(stderr, "  %s: %s\n", arg,
+                         !run.ended                 ? "still running after 10 s"
+                         : WIFSIGNALED(run.status) ? ("signal " + std::to_string(WTERMSIG(run.status))).c_str()
+                                                   : ("exit " + std::to_string(WEXITSTATUS(run.status))).c_str());
+        }
     }
 }
 
@@ -6028,7 +6351,8 @@ void checkFileSizeLimit(NameWatcher& names, const std::string& validationEnv, co
     //       the config -- a failure this phase would report against the daemon. The limit is
     //       applied in the forked child rather than to this process, because a limit here
     //       would apply to the harness's own writes too.
-    // CONTROL: `std::signal(SIGXFSZ, SIG_IGN)` disabled in backend/daemon/main.cpp -> four FAILs: the
+    // CONTROL: main()'s `std::signal(SIGXFSZ, SIG_IGN)` in backend/daemon/main.cpp disabled -> four
+    //       FAILs, re-observed 2026-09-26 via control_run.sh on NVIDIA: the
     //       SetWallpaper call itself (the daemon dies mid-reply), "a config write that
     //       exceeds the file-size limit does not kill the daemon", and both shutdown checks,
     //       printing "  exited normally 0, timed out 0, signal 25". Re-observed 2026-09-15
@@ -6610,9 +6934,9 @@ int main() {
                 //       `std::runtime_error("no")`, so a second instance still dies with a
                 //       fatal line but for no stated reason -> "FAIL: the second instance is
                 //       refused with org.freedesktop.DBus.Error.FileExists", alone: "says why it
-                //       exited" stayed green. Observed 2026-09-24 via control_run.sh. Reverted.
-                //       (A throw before the bus connection no longer reaches this check: the
-                //       first instance dies too, and the run timed out at 600 s.)
+                //       exited" stayed green. Re-observed 2026-09-26 via control_run.sh. Reverted.
+                //       (A throw placed before the bus connection cannot serve as this control:
+                //       the first instance dies of it too.)
                 check(secondOutput.find("org.freedesktop.DBus.Error.FileExists") != std::string::npos,
                       "the second instance is refused with org.freedesktop.DBus.Error.FileExists");
             }
@@ -6659,7 +6983,8 @@ int main() {
             // CONTROL: in backend/daemon/main.cpp, via control_run.sh, all observed 2026-09-24 on
             //       NVIDIA, reverted. main's final status set on `!= StopReason::None` instead of
             //       `== StopReason::DeviceLost` -> this line, the SIGINT and SIGHUP exit-0 lines and
-            //       every other phase's exit-0 and destructor-chain lines red (30 FAILs).
+            //       every other phase's exit-0 and destructor-chain lines red (30 FAILs; re-observed
+            //       2026-09-26 via control_run.sh, the first 20 of them shown by the tool).
             //       Re-observed 2026-09-24 after the watcher began ignoring a wake it has no reason
             //       for: ~ShutdownWatch's wake sent as SIGTERM instead of kWakeSignal -> 18 FAILs of
             //       the same kind, this line first: the wake lands in the handler the stop armed and
@@ -6701,10 +7026,10 @@ int main() {
             //       the forced path -> "FAIL: the daemon leaves through main() rather than
             //       through the teardown watchdog", "FAIL: the daemon exits 0 on SIGTERM"
             //       ("exit code 1") and "FAIL: the daemon runs its destructor chain on the way
-            //       out", with every other phase's exit-0 check beside them. Re-observed
-            //       2026-09-24 via control_run.sh (35 FAILs): a zero deadline is also alarm(0),
-            //       which arms nothing, so the wedged connection-loss phase's "still ends" line
-            //       goes red with them. Reverted.
+            //       out", with every other phase's exit-0 check beside them. A zero deadline is also
+            //       alarm(0), which arms nothing, so the wedged connection-loss phase's "still ends"
+            //       line goes red with them (39 FAILs 2026-09-25). Re-observed 2026-09-26 via
+            //       control_run.sh, the first 20 shown by the tool. Reverted.
             const bool leftThroughMain = daemonOutput.find("shutdown blocked") == std::string::npos;
             check(leftThroughMain, "the daemon leaves through main() rather than through the teardown watchdog");
             check(names.waitFor(false), "the bus name is released once the daemon exits");
@@ -6766,6 +7091,7 @@ int main() {
         // which that accounting would otherwise report as a leak in this process.
         // The command line and the port it picks, each spawning daemons of their own.
         checkCommandLine(names, validationEnv, check);
+        checkUsageWithOutputReaderGone(validationEnv, check);
         checkDefaultConfigPort(names, validationEnv, check);
         checkChosenConfigPort(names, validationEnv, check);
         checkHttpLifecycle(names, bluePath, validationEnv, check);
@@ -6816,6 +7142,8 @@ int main() {
         checkStuckTeardownIsBounded(validationEnv, wedgeClip, check);
         checkSecondSignalEndsAStuckStop(validationEnv, wedgeClip, check);
         checkWatchdogEndsAStuckStopWritingNothing(validationEnv, check);
+        checkAlarmDeliversQueuedLines(validationEnv, wedgeClip, check);
+        checkLossDuringFailedStart(validationEnv, bluePath, check);
         checkTheRestoredVideoIsPostedAfterTheRecordOpens(validationEnv, wedgeClip, check);
 
         // Every Frame's UnixFd closes at scope exit, and the daemon is gone, so this

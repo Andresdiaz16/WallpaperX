@@ -3,18 +3,16 @@
 #include "crash_record.h"
 #include "dbus_service.h"
 #include "http_server.h"
+#include "log_pump.h"
 #include "wallpaper_manager.h"
 
 #include <sdbus-c++/sdbus-c++.h>
 
-#include <algorithm>
 #include <atomic>
-#include <cerrno>
 #include <charconv>
 #include <chrono>
 #include <condition_variable>
 #include <csignal>
-#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -25,10 +23,7 @@
 #include <system_error>
 #include <thread>
 
-#include <fcntl.h>
 #include <pthread.h>
-#include <sys/socket.h>
-#include <sys/stat.h>
 #include <sysexits.h>
 #include <unistd.h>
 
@@ -37,8 +32,8 @@ namespace {
 // spends it too. Must exceed the config writer's 2 s deadline.
 constexpr std::chrono::seconds kTeardownDeadline{3};
 
-// Why the daemon is stopping. The first to arrive stands.
-enum class StopReason { None, Signal, DeviceLost };
+// Why the daemon is stopping. The first to arrive stands. Failed: startup or the bus loop threw.
+enum class StopReason { None, Signal, DeviceLost, Failed };
 
 // Written only under main's LoopGate mutex, which pairs it with whether the event loop was
 // entered. At namespace scope and lock-free because signal handlers read it, the SIGALRM one
@@ -55,82 +50,63 @@ constexpr int kExitDeviceLost = EX_TEMPFAIL;
 // Anyone can send it, so it means nothing without a reason the daemon recorded before sending.
 constexpr int kWakeSignal = SIGUSR1;
 
-// For a stop that did not finish in order. A lost device keeps its status: its teardown is the
-// one most likely to block, on a driver that will never answer.
+// The status main settled on once nothing observable is left to tear down; -1 until then.
+std::atomic<int> g_finalStatus{-1};
+static_assert(std::atomic<int>::is_always_lock_free);
+
+int settle(int status) {
+    g_finalStatus.store(status);
+    return status;
+}
+
+// For a stop cut short. One that got as far as its final lines keeps the status it settled on. A
+// lost device keeps its status: its teardown is the one most likely to block, on a driver that
+// will never answer.
 int failureStatus() {
+    if (const int settled = g_finalStatus.load(); settled >= 0) return settled;
     return g_stopReason.load() == StopReason::DeviceLost ? kExitDeviceLost : 1;
 }
 
-// Lets a second SIGINT/SIGTERM end a stop that is stuck. Async-signal-safe.
-void forceExitOnSecondSignal(int) {
-    static constexpr char kForced[] = "wallpaperx-daemon: asked again, exiting now\n";
-    ssize_t ignored = ::write(STDERR_FILENO, kForced, sizeof(kForced) - 1);
-    (void)ignored;
-    std::_Exit(failureStatus());
+// For every exit that skips the rest of teardown: what is queued goes first, when it can in time;
+// `line` after it, bypassing the queue. Async-signal-safe.
+void flushBeforeExit(std::string_view line = {}) noexcept {
+    wallpaperx::logpump::flush(wallpaperx::logpump::kExitFlush);
+    if (!line.empty()) wallpaperx::logpump::writeErrNow(line.data(), line.size());
 }
 
-// The teardown alarm. Any other stop dies of the SIGALRM itself, as a supervisor expects of an
-// abandoned teardown.
+[[noreturn]] void exitNow(int status, std::string_view line = {}) noexcept {
+    flushBeforeExit(line);
+    std::_Exit(status);
+}
+
+// Lets a second SIGINT/SIGTERM end a stop that is stuck.
+void forceExitOnSecondSignal(int) {
+    exitNow(failureStatus(), "wallpaperx-daemon: asked again, exiting now\n");
+}
+
+// The teardown alarm. Any stop that neither settled nor lost the device dies of the SIGALRM itself,
+// as a supervisor expects of an abandoned teardown.
 void onTeardownDeadline(int sig) {
-    if (g_stopReason.load() == StopReason::DeviceLost) std::_Exit(kExitDeviceLost);
+    if (g_finalStatus.load() >= 0) exitNow(failureStatus());
+    constexpr std::string_view kLine = "wallpaperx-daemon: teardown deadline passed, exiting now\n";
+    if (g_stopReason.load() == StopReason::DeviceLost) exitNow(kExitDeviceLost, kLine);
+    flushBeforeExit(kLine);
     std::signal(sig, SIG_DFL);
     ::raise(sig);  // delivered as the handler returns
 }
 
 // First caller wins: re-arming per stage would hand each a fresh deadline, and the budget is
-// for the whole stop. main() does not block SIGALRM.
+// for the whole stop. main() does not block SIGALRM, and ignores it until here, so one sent from
+// outside cannot end a daemon that is not stopping.
 void armTeardown(bool& armed) {
     if (armed) return;
     armed = true;
+    struct sigaction deadline {};
+    deadline.sa_handler = onTeardownDeadline;
+    sigemptyset(&deadline.sa_mask);
+    sigaction(SIGALRM, &deadline, nullptr);
     ::alarm(static_cast<unsigned>(kTeardownDeadline.count()));
 }
-
-// For log lines on the path from a signal or a device loss to the stop: a reader that stopped
-// draining loses the line rather than holding up the stop. Its own descriptor, because O_NONBLOCK
-// on fd 1 or 2 would land on a description every other writer shares, stdio included.
-class StopLog {
-public:
-    explicit StopLog(int fd) {
-        struct stat st {};
-        if (::fstat(fd, &st) != 0) return;
-        if (S_ISSOCK(st.st_mode) || S_ISREG(st.st_mode)) {
-            // A socket (journald's stream) is sent to with MSG_DONTWAIT; a file has no reader to
-            // fall behind. Shared, not reopened: reopening a file would give it an offset of its own.
-            m_fd = ::fcntl(fd, F_DUPFD_CLOEXEC, 0);
-            return;
-        }
-        // A pipe or terminal: through /proc this is a new open file description, so the
-        // O_NONBLOCK stays on it. If that fails (a pipe with no reader yet, no /proc), lines are dropped.
-        char path[32];
-        std::snprintf(path, sizeof(path), "/proc/self/fd/%d", fd);
-        m_fd = ::open(path, O_WRONLY | O_NONBLOCK | O_CLOEXEC | O_NOCTTY);
-    }
-    ~StopLog() {
-        if (m_fd >= 0) ::close(m_fd);
-    }
-    StopLog(const StopLog&) = delete;
-    StopLog& operator=(const StopLog&) = delete;
-
-    // One write, so a pipe gets the line whole or not at all.
-    [[gnu::format(printf, 2, 3)]] void print(const char* format, ...) const {
-        if (m_fd < 0) return;
-        char line[512];
-        va_list args;
-        va_start(args, format);
-        const int length = std::vsnprintf(line, sizeof(line), format, args);
-        va_end(args);
-        if (length <= 0) return;
-        const size_t size = std::min(static_cast<size_t>(length), sizeof(line) - 1);
-        line[size - 1] = '\n';  // a truncated line still ends one
-        if (::send(m_fd, line, size, MSG_DONTWAIT | MSG_NOSIGNAL) < 0 && errno == ENOTSOCK) {
-            ssize_t ignored = ::write(m_fd, line, size);
-            (void)ignored;
-        }
-    }
-
-private:
-    int m_fd = -1;  // -1: nothing to write to without blocking
-};
 
 constexpr char kUsage[] =
     "usage: wallpaperx-daemon [--config-port <port>]\n"
@@ -174,9 +150,13 @@ std::optional<Options> parseArguments(int argc, char** argv, bool& help) {
     }
     return options;
 }
-}  // namespace
+// For an exit that skips main's return.
+void flushLogs() {
+    std::fflush(nullptr);
+    wallpaperx::logpump::flush(wallpaperx::logpump::kExitFlush);
+}
 
-int main(int argc, char** argv) {
+int serve(int argc, char** argv) {
     bool help = false;
     const std::optional<Options> options = parseArguments(argc, argv, help);
     if (!options || help) {
@@ -184,8 +164,6 @@ int main(int argc, char** argv) {
                      wallpaperx::HttpServer::kDefaultPort);
         return help ? 0 : 2;
     }
-    const StopLog stopOut(STDOUT_FILENO);
-    const StopLog stopErr(STDERR_FILENO);
 
     // Blocked before any thread exists, since a thread inherits the mask of its creator
     // and both the render worker and the sd-bus loop start below. The sigwait thread is
@@ -202,25 +180,9 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    struct sigaction deadline {};
-    deadline.sa_handler = onTeardownDeadline;
-    sigemptyset(&deadline.sa_mask);
-    if (sigaction(SIGALRM, &deadline, nullptr) != 0) {
-        std::fprintf(stderr, "wallpaperx-daemon: fatal: could not install the teardown alarm\n");
-        return 1;
-    }
-
-    // SIG_IGN, not blocked: a blocked SIGPIPE still returns EPIPE but stays pending, and
-    // the sigwait thread below would eventually consume it as a shutdown.
-    if (std::signal(SIGPIPE, SIG_IGN) == SIG_ERR) {
-        std::fprintf(stderr, "wallpaperx-daemon: fatal: could not ignore SIGPIPE\n");
-        return 1;
-    }
-
-    // Same reasoning: exceeding RLIMIT_FSIZE would otherwise kill the daemon mid-write.
-    // Ignored, so the write fails with EFBIG and ConfigStore reports it.
-    if (std::signal(SIGXFSZ, SIG_IGN) == SIG_ERR) {
-        std::fprintf(stderr, "wallpaperx-daemon: fatal: could not ignore SIGXFSZ\n");
+    // Until a stop arms the deadline; see armTeardown.
+    if (std::signal(SIGALRM, SIG_IGN) == SIG_ERR) {
+        std::fprintf(stderr, "wallpaperx-daemon: fatal: could not ignore SIGALRM\n");
         return 1;
     }
 
@@ -258,14 +220,6 @@ int main(int argc, char** argv) {
             bool finished = false;
         } teardown;
 
-        // Declared beside the objects whose destructors can block, so the watchdog is armed at
-        // the top of the unwind rather than after them.
-        bool teardownArmed = false;
-        struct ArmTeardown {
-            bool& armed;
-            ~ArmTeardown() { armTeardown(armed); }
-        };
-
         // Entering and leaving the event loop is the one pair sdbus-c++ supports being used
         // from two threads; every other IConnection method is thread-aware but not thread-safe.
         // This keeps the signal thread out of the connection while main is still registering
@@ -275,6 +229,22 @@ int main(int argc, char** argv) {
             std::mutex mutex;
             bool entered = false;  // g_stopReason is the other half
         } loopGate;
+
+        // Declared beside the objects whose destructors can block, so the watchdog is armed at
+        // the top of the unwind rather than after them. A stop with no reason by then is a throw,
+        // and recording it keeps a device loss that teardown then sees from becoming the reason.
+        bool teardownArmed = false;
+        struct ArmTeardown {
+            bool& armed;
+            LoopGate& gate;
+            ~ArmTeardown() {
+                {
+                    std::lock_guard<std::mutex> lock(gate.mutex);
+                    if (g_stopReason.load() == StopReason::None) g_stopReason.store(StopReason::Failed);
+                }
+                armTeardown(armed);
+            }
+        };
 
         // sigwait on its own thread, not a handler: leaveEventLoop() takes locks and is not
         // async-signal-safe. A guard rather than a bare std::thread because enterEventLoop()
@@ -300,8 +270,7 @@ int main(int argc, char** argv) {
                 pthread_kill(thread.native_handle(), kWakeSignal);
                 thread.join();
             }
-        } shutdownWatch{std::thread([&connection, &watchSignals, &shutdownSignals, &teardown, &loopGate,
-                                     &stopOut, &stopErr] {
+        } shutdownWatch{std::thread([&connection, &watchSignals, &shutdownSignals, &teardown, &loopGate] {
             // Guarded because this is a bare thread, where an escaping exception is
             // std::terminate -- a core dump in place of the clean stop this thread exists to
             // give, and main's own catch cannot intercept it.
@@ -329,23 +298,21 @@ int main(int argc, char** argv) {
                         inLoop = loopGate.entered;
                     }
                     if (reasonRecorded) break;
-                    stopErr.print("wallpaperx-daemon: ignoring %s, which nothing in the daemon sent\n",
-                                  strsignal(received));
+                    std::fprintf(stderr, "wallpaperx-daemon: ignoring %s, which nothing in the daemon sent\n",
+                                 strsignal(received));
                 }
                 // An outside signal is reported even when a lost device got its reason in first;
                 // the device's own wake needs no line, as the loss announced itself.
                 const bool outside = received != kWakeSignal;
-                if (outside) {
-                    stopOut.print("wallpaperx-daemon: %s received, shutting down\n", strsignal(received));
-                }
+                if (outside) std::printf("wallpaperx-daemon: %s received, shutting down\n", strsignal(received));
                 // Caught on its own: a loop that will not leave still has the deadline below
                 // bounding it, which is better than abandoning the stop immediately.
                 try {
                     if (inLoop) connection->leaveEventLoop();
                 } catch (const std::exception& error) {
-                    stopErr.print("wallpaperx-daemon: could not stop the bus loop: %s\n", error.what());
+                    std::fprintf(stderr, "wallpaperx-daemon: could not stop the bus loop: %s\n", error.what());
                 } catch (...) {
-                    stopErr.print("wallpaperx-daemon: could not stop the bus loop\n");
+                    std::fprintf(stderr, "wallpaperx-daemon: could not stop the bus loop\n");
                 }
 
                 // Unblocked here, not earlier: until now these have to reach the sigwait above.
@@ -369,46 +336,38 @@ int main(int argc, char** argv) {
                                            [&teardown] { return teardown.finished; })) {
                     return;
                 }
-                // write(2) on the descriptor, not printf + fflush(nullptr): flushing every
-                // stream takes every stream's lock, and the thread this is escaping from may
-                // hold one. A last resort that can block on what it is escaping is not one.
-                static constexpr char kBlocked[] =
-                    "wallpaperx-daemon: shutdown blocked, exiting now\n";
-                ssize_t ignored = ::write(STDERR_FILENO, kBlocked, sizeof(kBlocked) - 1);
-                (void)ignored;
+                // Not stdio, whose locks the thread this is escaping from may hold.
+                exitNow(failureStatus(), "wallpaperx-daemon: shutdown blocked, exiting now\n");
             } catch (...) {
                 // The deadline went with the stack it was on, so nothing bounds this stop now.
-                static constexpr char kLost[] =
-                    "wallpaperx-daemon: shutdown watch failed, exiting now\n";
-                ssize_t ignored = ::write(STDERR_FILENO, kLost, sizeof(kLost) - 1);
-                (void)ignored;
+                exitNow(failureStatus(), "wallpaperx-daemon: shutdown watch failed, exiting now\n");
             }
-            // Nonzero: teardown was abandoned, and a supervisor reading only the status
-            // should not be told this was a clean stop.
-            std::_Exit(failureStatus());
         }), teardown, teardownArmed};
 
-        // Constructed after the watcher: this reads the config file, and a signal arriving
-        // during that read must be able to stop the daemon.
-        wallpaperx::WallpaperManager manager(config);
-        // On the render worker's thread. Hands the stop to the signal thread, which can already
-        // carry one out from any point in startup and bounds it with the deadline.
-        const auto onDeviceLost = [&loopGate, &shutdownWatch, &stopErr] {
+        // Hands the stop to the signal thread, which can already carry one out from any point in
+        // startup and bounds it with the deadline. Called by the Device, on the thread that saw
+        // the loss and before the call that saw it returns. A stop already under way keeps its reason.
+        config.onDeviceLost = [&loopGate, &shutdownWatch] {
+            // Whatever the reason: the job that saw the loss is still running, and a deadline or a
+            // driver crash may end it before its record is withdrawn.
+            wallpaperx::stopBlamingWallpapers();
             {
                 std::lock_guard<std::mutex> lock(loopGate.mutex);
                 if (g_stopReason.load() != StopReason::None) return;
                 g_stopReason.store(StopReason::DeviceLost);
             }
-            // Woken before the line is written, so no write can stand between a loss and its stop.
             pthread_kill(shutdownWatch.thread.native_handle(), kWakeSignal);
-            stopErr.print("wallpaperx-daemon: the GPU device was lost; exiting with status %d so the "
-                          "service manager restarts the daemon\n", kExitDeviceLost);
+            std::fprintf(stderr, "wallpaperx-daemon: the GPU device was lost; exiting with status %d so the "
+                                 "service manager restarts the daemon\n", kExitDeviceLost);
         };
-        wallpaperx::DbusService service(*connection, manager, onDeviceLost);
+        // Constructed after the watcher: this reads the config file, and a signal arriving
+        // during that read must be able to stop the daemon.
+        wallpaperx::WallpaperManager manager(config);
+        wallpaperx::DbusService service(*connection, manager);
         // Destroyed before ~DbusService joins the render worker and ~WallpaperManager tears the
         // device down, which is what the deadline is for. This is the one that covers a throw
         // out of requestName() below, where the server further down does not exist yet.
-        ArmTeardown armBeforeService{teardownArmed};
+        ArmTeardown armBeforeService{teardownArmed, loopGate};
 
         // Before the name is claimed: this is what fills the monitor map.
         if (g_stopReason.load() == StopReason::None) service.restoreSaved();
@@ -452,7 +411,7 @@ int main(int argc, char** argv) {
         // manager.snapshot(), so HTTP has to stop before anything it reads is torn down.
         wallpaperx::HttpServer httpServer(manager, options->configPort);
         // Destroyed first of everything here, so the ordinary stop is bounded from its own top.
-        ArmTeardown armBeforeHttp{teardownArmed};
+        ArmTeardown armBeforeHttp{teardownArmed, loopGate};
 
         // Published under the gate, so a signal arriving before this point stops the loop being
         // entered at all rather than calling into the connection while the object is still
@@ -476,18 +435,20 @@ int main(int argc, char** argv) {
         // render worker), then the manager (GPU teardown + leak report), the shutdown
         // watcher, and the connection it holds last.
     } catch (const std::exception& e) {
+        // The try scope is gone, so this is as settled as the clean path below.
+        const int status = settle(failureStatus());
         std::fprintf(stderr, "wallpaperx-daemon: fatal: %s\n", e.what());
         // The same hazard as the clean path below, and more likely here: a start that
         // failed is a start whose config read may still be outstanding.
         if (wallpaperx::configLoadAbandoned()) {
-            std::fflush(nullptr);
-            std::_Exit(failureStatus());
+            flushLogs();
+            std::_Exit(status);
         }
-        return failureStatus();
+        return status;
     }
 
     // Final by now: a stop is recorded before the loop can be left, and the first one stands.
-    const int exitStatus = g_stopReason.load() == StopReason::DeviceLost ? kExitDeviceLost : 0;
+    const int exitStatus = settle(g_stopReason.load() == StopReason::DeviceLost ? kExitDeviceLost : 0);
     if (exitStatus == 0) {
         std::printf("wallpaperx-daemon: stopped cleanly\n");
     } else {
@@ -498,8 +459,33 @@ int main(int argc, char** argv) {
     // destruction would run library code already torn down. Everything with observable effects
     // is destroyed by here.
     if (wallpaperx::configLoadAbandoned()) {
-        std::fflush(nullptr);
+        flushLogs();
         std::_Exit(exitStatus);
     }
     return exitStatus;
+}
+}  // namespace
+
+int main(int argc, char** argv) {
+    // Before the log writer exists, the writer being one of the threads this protects.
+    const auto fatal = [](std::string_view line) {
+        ssize_t ignored = ::write(STDERR_FILENO, line.data(), line.size());
+        (void)ignored;
+        return 1;
+    };
+    // SIG_IGN, not blocked: a blocked SIGPIPE still returns EPIPE but stays pending, and the
+    // sigwait thread would eventually consume it as a shutdown.
+    if (std::signal(SIGPIPE, SIG_IGN) == SIG_ERR) return fatal("wallpaperx-daemon: fatal: could not ignore SIGPIPE\n");
+    // Same reasoning: exceeding RLIMIT_FSIZE would otherwise kill the daemon mid-write. Ignored, so
+    // the write fails with EFBIG and ConfigStore reports it.
+    if (std::signal(SIGXFSZ, SIG_IGN) == SIG_ERR) return fatal("wallpaperx-daemon: fatal: could not ignore SIGXFSZ\n");
+
+    // First after those, so every line from here on -- this file's, the libraries' -- goes through it.
+    if (!wallpaperx::logpump::install()) return fatal("wallpaperx-daemon: fatal: could not start the log writer\n");
+    const int status = serve(argc, argv);
+    // What runs after main -- static destructors, the Vulkan loader, a sanitizer's end-of-run
+    // report -- then writes to the destinations directly.
+    std::fflush(nullptr);
+    wallpaperx::logpump::release();
+    return status;
 }

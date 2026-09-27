@@ -26,6 +26,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 
 using wallpaperx::Device;
 using wallpaperx::testing::check;
@@ -124,7 +125,8 @@ void expectThrow(const char* what, Call&& call) {
 //       and Lavapipe. (a) observe() removed from the vkQueueSubmit call in Device::submit ->
 //       "FAIL: a submit answering DEVICE_LOST makes lost() true" and, as a knock-on, the "stays
 //       true" line. (b) observe() made to assign `m_lost = result == VK_ERROR_DEVICE_LOST` ->
-//       "FAIL: lost() stays true after a later submission succeeds", and only that.
+//       "FAIL: lost() stays true after a later submission succeeds", and only that; (b) re-observed
+//       2026-09-25 via control_run.sh on both entries.
 void submitLoss() {
     Case c;
     if (!open(c)) return;
@@ -146,7 +148,8 @@ void submitLoss() {
 // CONTROL: observe() in renderer/vulkan/device.cpp made to latch on `result < 0` as well ->
 //       "FAIL: a submit answering VK_ERROR_OUT_OF_HOST_MEMORY leaves lost() false", its
 //       device-memory twin, and the two out-of-memory lines of the wait and retire cases below --
-//       four, and no DEVICE_LOST check. Observed 2026-09-24. Reverted.
+//       four, and no DEVICE_LOST check. Observed 2026-09-24; re-observed 2026-09-25 via
+//       control_run.sh on both entries. Reverted.
 void submitOutOfMemory(VkResult result, const char* name) {
     Case c;
     if (!open(c)) return;
@@ -193,7 +196,7 @@ void waitLoss() {
 //       daemon whose device still works.
 // CONTROL: observe() in renderer/vulkan/device.cpp made to latch on `result == VK_TIMEOUT` as
 //       well -> "FAIL: a fence wait answering VK_TIMEOUT leaves lost() false", and only that.
-//       Observed 2026-09-24. Reverted.
+//       Observed 2026-09-24; re-observed 2026-09-25 via control_run.sh on both entries. Reverted.
 void waitNotLoss(VkResult result, const char* name) {
     Case c;
     if (!open(c)) return;
@@ -264,6 +267,59 @@ void drainLoss() {
     check(c.device->lost(), "the teardown wait answering DEVICE_LOST makes lost() true");
 }
 
+// GOAL: the Device's loss handler (its constructor's `onLost`) runs exactly once however many
+//       calls answer VK_ERROR_DEVICE_LOST, on the thread that made the first of them and while
+//       that call is still in progress, and never for an out-of-memory result. False if a second
+//       loss runs it again, or it runs late (after the failing call has returned, where its caller
+//       may already be logging to a stalled stream), or a shortage runs it: the daemon's handler
+//       stops the process for a restart.
+// WHY-THIS-SHAPE: two scripted losses, not one: with a single failing call a handler with no
+//       once-only latch looks identical to a correct one. `inCall` is set around each call on this
+//       thread, so "during the call" is read by the handler itself, not inferred from order.
+// CONTROL: in Device::observe() (renderer/vulkan/device.cpp) via control_run.sh 2026-09-25 on
+//       NVIDIA and Lavapipe, all reverted. (a) The once-only latch dropped (`|| m_lost` removed) ->
+//       "run the loss handler exactly once" red, alone. (b) The handler call made `if ((false))` ->
+//       the exactly-once, in-progress and thread lines red; no mutation of the shipped shape runs
+//       the handler late, so those two are only shown able to fail together with the count.
+//       (c) Latching on any negative result -> "an out-of-memory submit does not run the loss
+//       handler" red, with the four out-of-memory lost() lines above.
+void lossHandler() {
+    int calls = 0;
+    bool inCall = false;
+    bool duringCall = false;
+    std::thread::id where;
+    Case c;
+    try {
+        c.device = std::make_unique<Device>(false, [&] {
+            ++calls;
+            duringCall = inCall;
+            where = std::this_thread::get_id();
+        });
+    } catch (const std::exception& e) {
+        std::printf("device_lost_probe: no device on this host (%s)\n", e.what());
+        g_noDevice = true;
+        return;
+    }
+    const auto failing = [&](const char* what) {
+        inCall = true;
+        expectThrow(what, [&] { (void)c.device->submit(emptyBatch); });
+        inCall = false;
+    };
+
+    arm(g_submit, {VK_ERROR_OUT_OF_HOST_MEMORY});
+    failing("a submit answering VK_ERROR_OUT_OF_HOST_MEMORY");
+    check(calls == 0, "an out-of-memory submit does not run the loss handler");
+
+    arm(g_submit, {VK_ERROR_DEVICE_LOST, VK_ERROR_DEVICE_LOST});
+    failing("a submit answering DEVICE_LOST");
+    failing("a second submit answering DEVICE_LOST");
+    check(delivered(g_submit) == 2, "both scripted DEVICE_LOSTs reached vkQueueSubmit");
+    check(calls == 1, "two submits answering DEVICE_LOST run the loss handler exactly once");
+    check(calls > 0 && duringCall, "the loss handler runs while the failing call is still in progress");
+    check(calls > 0 && where == std::this_thread::get_id(), "the loss handler runs on the thread that saw the loss");
+    if (calls != 1) std::fprintf(stderr, "  the handler ran %d times\n", calls);
+}
+
 }  // namespace
 
 extern "C" VkResult vkQueueSubmit(VkQueue queue, uint32_t submitCount, const VkSubmitInfo* pSubmits, VkFence fence) {
@@ -305,6 +361,7 @@ int main() {
         retireStatus(VK_ERROR_DEVICE_LOST, "DEVICE_LOST", true);
         retireStatus(VK_ERROR_OUT_OF_HOST_MEMORY, "VK_ERROR_OUT_OF_HOST_MEMORY", false);
         drainLoss();
+        lossHandler();
     } catch (const std::exception& e) {
         wallpaperx::testing::fail(std::string("unexpected exception: ") + e.what());
     }

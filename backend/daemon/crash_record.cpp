@@ -3,6 +3,7 @@
 #include "crash_record.h"
 
 #include "log_escape.h"
+#include "log_pump.h"
 
 #include <nlohmann/json.hpp>
 
@@ -61,6 +62,10 @@ std::atomic<int> g_playingFd{-1};
 std::atomic<const std::string*> g_blame{nullptr};
 std::atomic<pid_t> g_blameTid{0};
 
+// Set by stopBlamingWallpapers(). Sequentially consistent against g_slot's publish, so a record
+// being constructed as it is set is seen by one side or the other and removed.
+std::atomic<bool> g_blameless{false};
+
 constexpr int kFatalSignals[] = {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT};
 constexpr int kHandlerSlots = 32;  // every signal above is below this
 struct sigaction g_previous[kHandlerSlots] = {};
@@ -95,37 +100,47 @@ std::string signalName(int signal) {
     return name != nullptr ? "SIG" + std::string(name) : "signal " + std::to_string(signal);
 }
 
+// Removes the record published as `generation` without touching its descriptor, which the applying
+// thread could close and reuse meanwhile. The path is copied and the generation re-checked, so a
+// record withdrawn and replaced during the copy is left to its own thread rather than unlinked by a
+// torn name. A read-modify-write rather than a load: its release half keeps the copy from drifting
+// past it, which a fence would also do but TSan cannot model. Async-signal-safe.
+void unlinkPublished(uint64_t generation) {
+    if (generation == kFree || generation == kHeld) return;
+    char path[PATH_MAX];
+    std::memcpy(path, g_path, sizeof(path));
+    uint64_t still = generation;
+    if (g_slot.compare_exchange_strong(still, generation, std::memory_order_acq_rel)) ::unlink(path);
+}
+
 // Everything here is async-signal-safe: the records were formatted in advance, so this only
 // writes to open descriptors, or unlinks a path already spelled out.
 void onFatalSignal(int sig, siginfo_t* info, void* context) {
     const std::string* blame = g_blame.load(std::memory_order_acquire);
     const int playingFd = g_playingFd.load(std::memory_order_acquire);
-    if (blame != nullptr && playingFd >= 0 && ::gettid() == g_blameTid.load(std::memory_order_acquire)) {
+    const bool blameless = g_blameless.load();
+    if (!blameless && blame != nullptr && playingFd >= 0 && ::gettid() == g_blameTid.load(std::memory_order_acquire)) {
         const ssize_t ignored = ::write(playingFd, blame->data(), blame->size());
         (void)ignored;
         writeSignalLine(playingFd, sig);
     }
 
     const uint64_t generation = g_slot.load(std::memory_order_acquire);
-    if (generation != kFree && generation != kHeld) {
-        if (::gettid() == g_tid.load(std::memory_order_relaxed)) {
-            // The record is this thread's, and this thread is here, so nothing withdraws it.
-            writeSignalLine(g_fd.load(std::memory_order_relaxed), sig);
-        } else {
-            // Never written to from here: this thread's death says nothing about the wallpaper,
-            // and the descriptor could be closed and reused by the applying thread meanwhile.
-            // The path is copied and the generation re-checked, so a record withdrawn and
-            // replaced during the copy is left to its own thread rather than unlinked by a torn
-            // name. A read-modify-write rather than a load: its release half keeps the copy
-            // from drifting past it, which a fence would also do but TSan cannot model.
-            char path[PATH_MAX];
-            std::memcpy(path, g_path, sizeof(path));
-            uint64_t still = generation;
-            if (g_slot.compare_exchange_strong(still, generation, std::memory_order_acq_rel)) ::unlink(path);
-        }
+    if (!blameless && generation != kFree && generation != kHeld && ::gettid() == g_tid.load(std::memory_order_relaxed)) {
+        // The record is this thread's, and this thread is here, so nothing withdraws it.
+        writeSignalLine(g_fd.load(std::memory_order_relaxed), sig);
+    } else {
+        // This thread's death says nothing about the wallpaper, nor about any the other threads
+        // go on applying while the log below is flushed.
+        stopBlamingWallpapers();
     }
 
-    // A sanitizer's handler, where one was installed, still gets to print its report.
+    // Before the previous handler, which may not return: what is queued goes out first, an abort's
+    // message included. Only a flush, not release(): the other threads run on, and on the original
+    // descriptors a stalled destination would block them and a sanitizer's report after this. That
+    // report goes through the pipe, flushed by the death callback install() registers.
+    logpump::flush(logpump::kExitFlush);
+
     if (sig >= 0 && sig < kHandlerSlots) {
         const struct sigaction& previous = g_previous[sig];
         if ((previous.sa_flags & SA_SIGINFO) != 0) {
@@ -451,6 +466,10 @@ ApplyingRecord::ApplyingRecord(const std::filesystem::path& stateDir, int monito
     // a crash on another thread would leave it to refuse this wallpaper on no evidence.
     uint64_t expected = kFree;
     if (!g_slot.compare_exchange_strong(expected, kHeld, std::memory_order_acq_rel)) return;
+    if (g_blameless.load()) {
+        g_slot.store(kFree, std::memory_order_release);
+        return;
+    }
 
     const int fd = createRecordFile(file);
     if (fd < 0) {
@@ -470,7 +489,10 @@ ApplyingRecord::ApplyingRecord(const std::filesystem::path& stateDir, int monito
     std::memcpy(g_path, m_file.c_str(), m_file.size() + 1);
     g_tid.store(::gettid(), std::memory_order_relaxed);
     g_fd.store(fd, std::memory_order_relaxed);
-    g_slot.store(++g_lastGeneration, std::memory_order_release);
+    g_slot.store(++g_lastGeneration);
+    // Set since the check above: stopBlamingWallpapers() may have looked before this record was
+    // published, and nothing may stay on disk once it has run.
+    if (g_blameless.load()) ::unlink(m_file.c_str());
 }
 
 ApplyingRecord::~ApplyingRecord() {
@@ -482,6 +504,11 @@ ApplyingRecord::~ApplyingRecord() {
     ::close(m_fd);
     ::unlink(m_file.c_str());
     g_slot.store(kFree, std::memory_order_release);
+}
+
+void stopBlamingWallpapers() noexcept {
+    g_blameless.store(true);
+    unlinkPublished(g_slot.load());
 }
 
 void installFatalSignalHandlers() {

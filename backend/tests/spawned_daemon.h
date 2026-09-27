@@ -15,14 +15,22 @@
 #include <poll.h>
 #include <signal.h>
 #include <sys/resource.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
+#include <termios.h>
 #include <unistd.h>
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <stdexcept>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -65,6 +73,103 @@ inline bool sanitizerReportedIn(std::string_view output) {
     return output.find("Sanitizer: reported") != std::string_view::npos;
 }
 
+// The system call thread `tid` of `pid` is blocked in; -1 when running, nothing when /proc will not
+// say (it needs ptrace access, which a test has over the daemon it forked).
+inline std::optional<long> blockedIn(pid_t pid, pid_t tid) {
+    std::ifstream in("/proc/" + std::to_string(pid) + "/task/" + std::to_string(tid) + "/syscall");
+    std::string number;
+    if (!(in >> number)) return std::nullopt;
+    if (number == "running") return -1;
+    return std::strtol(number.c_str(), nullptr, 10);
+}
+
+// Whether `pid` has a handler installed for `signo`, read from /proc's SigCgt; nothing when that
+// cannot be read.
+inline std::optional<bool> catchesSignal(pid_t pid, int signo) {
+    std::ifstream in("/proc/" + std::to_string(pid) + "/status");
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.rfind("SigCgt:", 0) != 0) continue;
+        const unsigned long long mask = std::strtoull(line.c_str() + 7, nullptr, 16);
+        return (mask >> (signo - 1) & 1ull) != 0;
+    }
+    return std::nullopt;
+}
+
+// A stream the daemon writes to, made into a reader that stopped reading: filled from a writer of
+// this process's own until not one more byte fits. The filler is newlines, so a reader that
+// resumes sees only empty lines ahead of what the daemon wrote. A terminal is not filled but
+// suspended, as Ctrl-S does (tcflow TCOOFF), after which it takes nothing.
+class StreamStall {
+public:
+    enum class Kind { Pipe, Socket, Terminal };
+
+    // Takes ownership of `writer`: a non-blocking description of the pipe (never the daemon's
+    // own, which must stay blocking), a descriptor of the daemon's end of the socket (written
+    // with MSG_DONTWAIT), or the terminal opened with O_NONBLOCK.
+    StreamStall(int writer, Kind kind) : m_fd(writer), m_kind(kind) {
+        if (m_fd < 0) return;
+        if (m_kind == Kind::Terminal && tcflow(m_fd, TCOOFF) != 0) return;
+        // Page-sized first, then single bytes: a pipe refuses a 4096-byte write with up to 4095 free.
+        for (const size_t size : {size_t{4096}, size_t{1}}) {
+            if (!fill(size)) return;
+        }
+        m_full = true;
+    }
+    ~StreamStall() { resume(); }
+    StreamStall(const StreamStall&) = delete;
+    StreamStall& operator=(const StreamStall&) = delete;
+
+    bool full() const { return m_full; }
+    size_t written() const { return m_written; }
+
+    // False if even one byte now fits, i.e. something drained or resumed the stream since.
+    bool stillFull() const {
+        if (m_fd < 0) return false;
+        const char byte = '\n';
+        ssize_t n = -1;
+        do n = put(&byte, 1);
+        while (n < 0 && errno == EINTR);
+        return n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK);
+    }
+
+    // Lets the stream flow again (a terminal) and gives up this writer, so the reader can reach
+    // end-of-file once the daemon has gone. Idempotent.
+    void resume() {
+        if (m_fd < 0) return;
+        if (m_kind == Kind::Terminal) (void)tcflow(m_fd, TCOON);
+        close(m_fd);
+        m_fd = -1;
+    }
+
+private:
+    ssize_t put(const char* data, size_t size) const {
+        return m_kind == Kind::Socket ? send(m_fd, data, size, MSG_DONTWAIT | MSG_NOSIGNAL) : write(m_fd, data, size);
+    }
+
+    // Until a write of `size` is refused as full. False on any other error, or at a cap far past
+    // any pipe's or socket's capacity, which a reader still draining it would reach.
+    bool fill(size_t size) {
+        constexpr size_t kCap = size_t{16} << 20;
+        const std::string chunk(size, '\n');
+        while (m_written < kCap) {
+            const ssize_t n = put(chunk.data(), size);
+            if (n > 0) {
+                m_written += static_cast<size_t>(n);
+                continue;
+            }
+            if (n < 0 && errno == EINTR) continue;
+            return n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK);
+        }
+        return false;
+    }
+
+    int m_fd = -1;
+    Kind m_kind;
+    bool m_full = false;
+    size_t m_written = 0;
+};
+
 // ---------------------------------------------------------------------------- //
 // The daemon under test, as a child process.
 // ---------------------------------------------------------------------------- //
@@ -87,6 +192,19 @@ public:
         // has exited: every later write to stdout fails with EPIPE. stderr is still
         // captured, so the daemon can still be heard complaining.
         Breakable,
+        // As Captured, but on a stream socket rather than a pipe: the layout journald gives a
+        // unit. A socket cannot be reopened through /proc, which is what a daemon's non-blocking
+        // log path has to cope with.
+        CapturedSocket,
+        // As Captured, but on a pseudo-terminal: the daemon run from a shell. The terminal
+        // translates each "\n" to "\r\n" in output().
+        CapturedTerminal,
+        // stdout closed at launch (`>&-`), stderr captured.
+        StdoutClosed,
+        // stderr closed at launch, stdout captured.
+        StderrClosed,
+        // Both closed at launch; output() stays empty.
+        BothClosed,
     };
 
     // `extraEnv` entries are "KEY=VALUE"; each replaces any inherited entry for that key.
@@ -95,10 +213,14 @@ public:
     // since this process's own is the build tree. A non-zero `fileSizeLimit` is an
     // RLIMIT_FSIZE applied to the child, which is how a config write can be made to fail
     // the way a systemd unit's LimitFSIZE= makes it fail on a user's machine. `args` follow
-    // the binary on its command line.
+    // the binary on its command line. `stalledFromStart` (Captured, CapturedSocket and
+    // CapturedTerminal only) fills the capture stream and stops reading it before the daemon is
+    // started, as stallCapture() does later; stalledFromStart() says whether that worked.
     explicit SpawnedDaemon(const std::vector<std::string>& extraEnvIn = {},
                            Stdout stdoutMode = Stdout::Captured, const std::string& workingDir = {},
-                           rlim_t fileSizeLimit = 0, const std::vector<std::string>& args = {}) {
+                           rlim_t fileSizeLimit = 0, const std::vector<std::string>& args = {},
+                           bool stalledFromStart = false)
+        : m_mode(stdoutMode) {
         // The daemon persists wallpapers under $XDG_CONFIG_HOME. Unset, it would read and
         // rewrite the developer's own config -- restoring test wallpapers into their
         // desktop, and carrying one test's 28 monitors into the next. A fresh directory
@@ -130,7 +252,11 @@ public:
         }
 
         int fds[2];
-        if (pipe2(fds, O_CLOEXEC) != 0) throw std::runtime_error("pipe2 failed");
+        if (!openCaptureStream(fds)) throw std::runtime_error("the capture stream could not be created");
+        if (m_mode == Stdout::CapturedSocket) {
+            struct stat st {};
+            if (fstat(fds[1], &st) == 0) m_captureInode = st.st_ino;
+        }
 
         int outFds[2] = {-1, -1};
         if (stdoutMode == Stdout::Breakable && pipe2(outFds, O_CLOEXEC) != 0) {
@@ -150,6 +276,13 @@ public:
         envp.reserve(env.size() + 1);
         for (std::string& entry : env) envp.push_back(entry.data());
         envp.push_back(nullptr);
+
+        // Before the fork, while this process still holds both ends; the reader starts held.
+        if (stalledFromStart) {
+            m_stall.emplace(captureWriter(fds), stallKind());
+            m_stalledFromStart = m_stall->full();
+            m_holdCapture.store(true, std::memory_order_release);
+        }
 
         std::string binary = WALLPAPERX_DAEMON_BINARY;
         std::vector<std::string> argStorage = args;
@@ -181,6 +314,10 @@ public:
             if (dup2(childStdout, STDOUT_FILENO) == -1 || dup2(fds[1], STDERR_FILENO) == -1) {
                 _exit(wallpaperx::testing::kChildDup2FailedExit);
             }
+            // close is async-signal-safe. Closed after the dup2s, so the number stays free for
+            // the daemon to find closed rather than being reused by anything here.
+            if (m_mode == Stdout::StdoutClosed || m_mode == Stdout::BothClosed) close(STDOUT_FILENO);
+            if (m_mode == Stdout::StderrClosed || m_mode == Stdout::BothClosed) close(STDERR_FILENO);
             // chdir is async-signal-safe, which is the whole constraint between fork() and
             // exec(). Its code is in forked_child.h's preamble map with the other three, so
             // every site that grades a startup already names a refused chdir correctly
@@ -452,9 +589,9 @@ public:
         }
     }
 
-    // Stops draining the capture pipe for good, so it can be filled and the daemon's stderr made
-    // a reader that stopped reading. Returns once the reader thread has read for the last time;
-    // false if it did not confirm within 2 s. Output written after this is never captured, and
+    // Stops draining the capture stream until resumeCapture(), so it can be filled and the daemon's
+    // output made a reader that stopped reading. Returns once the reader thread has read for the
+    // last time; false if it did not confirm within 2 s. While held, output is not captured and
     // exited() stays false until shutdown()/waitForExit() reaps the process.
     bool holdCapture() {
         m_holdCapture.store(true, std::memory_order_release);
@@ -462,7 +599,115 @@ public:
         return m_holdChanged.wait_for(lock, std::chrono::seconds(2), [this] { return m_captureHeld; });
     }
 
+    // holdCapture(), then the capture stream filled from this process's end (StreamStall), so the
+    // daemon's stdout and stderr lead to a reader that stopped reading and has no room left.
+    // Captured, CapturedSocket and CapturedTerminal. False, with `why` saying so, if either step
+    // failed; the stream then must not be taken as stalled. Output from here on is in output()
+    // past stalledAt(), once resumeCapture() has let it through.
+    bool stallCapture(std::string& why) {
+        if (!holdCapture()) {
+            why = "the capture reader did not stop reading";
+            return false;
+        }
+        m_stalledAt = output().size();
+        m_stall.emplace(captureWriter(nullptr), stallKind());
+        if (!m_stall->full()) {
+            why = std::string("the capture stream could not be filled from this side (") + std::strerror(errno) + ")";
+            return false;
+        }
+        return true;
+    }
+
+    // Whether stalledFromStart filled the stream before the daemon started.
+    bool stalledFromStart() const { return m_stalledFromStart; }
+    // Whether the stall still holds: false once anything drained or resumed the capture stream.
+    // Ask before the daemon is reaped.
+    bool captureStillStalled() const { return m_stall.has_value() && m_stall->stillFull(); }
+    size_t stallBytes() const { return m_stall.has_value() ? m_stall->written() : 0; }
+    size_t stalledAt() const { return m_stalledAt; }
+
+    // Undoes stallCapture(): the stream flows and the reader reads again, filler first.
+    void resumeCapture() {
+        if (m_stall.has_value()) m_stall->resume();
+        m_holdCapture.store(false, std::memory_order_release);
+    }
+
+    // Breakable mode: fills the stdout pipe that nothing reads, from a writer of this process's
+    // own, so stdout alone is a reader that stopped reading. False if it could not be filled.
+    bool stallStdout() {
+        if (m_stdoutFd < 0) return false;
+        const std::string path = "/proc/self/fd/" + std::to_string(m_stdoutFd);
+        m_stdoutStall.emplace(open(path.c_str(), O_WRONLY | O_NONBLOCK | O_CLOEXEC), StreamStall::Kind::Pipe);
+        return m_stdoutStall->full();
+    }
+    bool stdoutStillStalled() const { return m_stdoutStall.has_value() && m_stdoutStall->stillFull(); }
+    size_t stdoutStallBytes() const { return m_stdoutStall.has_value() ? m_stdoutStall->written() : 0; }
+
+    // Whether each line read is echoed as "[daemon] ..." to this process's stdout. Off for a phase
+    // that makes the daemon write hundreds of kilobytes.
+    void echo(bool on) { m_echo.store(on, std::memory_order_relaxed); }
+
 private:
+    StreamStall::Kind stallKind() const {
+        return m_mode == Stdout::CapturedSocket     ? StreamStall::Kind::Socket
+               : m_mode == Stdout::CapturedTerminal ? StreamStall::Kind::Terminal
+                                                    : StreamStall::Kind::Pipe;
+    }
+
+    bool openCaptureStream(int fds[2]) {
+        if (m_mode == Stdout::CapturedSocket) return socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, fds) == 0;
+        if (m_mode != Stdout::CapturedTerminal) return pipe2(fds, O_CLOEXEC) == 0;
+        const int master = posix_openpt(O_RDWR | O_NOCTTY | O_CLOEXEC);
+        if (master < 0) return false;
+        char name[128];
+        if (grantpt(master) != 0 || unlockpt(master) != 0 || ptsname_r(master, name, sizeof(name)) != 0) {
+            close(master);
+            return false;
+        }
+        const int slave = open(name, O_RDWR | O_NOCTTY | O_CLOEXEC);
+        if (slave < 0) {
+            close(master);
+            return false;
+        }
+        m_ptyName = name;
+        fds[0] = master;
+        fds[1] = slave;
+        return true;
+    }
+
+    // A writer onto the capture stream in the daemon's direction, owned by the caller; -1 if none
+    // could be had. `fds` is the pair before the fork, when this process still holds both ends.
+    // After it, a socket's daemon end is taken from the daemon (pidfd_getfd), found by its inode.
+    int captureWriter(const int* fds) const {
+        switch (stallKind()) {
+            case StreamStall::Kind::Terminal:
+                return open(m_ptyName.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK | O_CLOEXEC);
+            case StreamStall::Kind::Pipe: {
+                // Opening a pipe's /proc entry for writing yields a new write description of it.
+                const std::string path = "/proc/self/fd/" + std::to_string(fds != nullptr ? fds[0] : m_readFd);
+                return open(path.c_str(), O_WRONLY | O_NONBLOCK | O_CLOEXEC);
+            }
+            case StreamStall::Kind::Socket:
+                break;
+        }
+        if (fds != nullptr) return fcntl(fds[1], F_DUPFD_CLOEXEC, 0);
+        if (m_pid <= 0 || m_captureInode == 0) return -1;
+        const std::string want = "socket:[" + std::to_string(m_captureInode) + "]";
+        const std::string dir = "/proc/" + std::to_string(m_pid) + "/fd/";
+        for (int fd = 0; fd < 1024; ++fd) {
+            char target[64];
+            const ssize_t n = readlink((dir + std::to_string(fd)).c_str(), target, sizeof(target) - 1);
+            if (n <= 0 || std::string_view(target, static_cast<size_t>(n)) != want) continue;
+            const int pidfd = static_cast<int>(syscall(SYS_pidfd_open, m_pid, 0));
+            if (pidfd < 0) return -1;
+            const int copy = static_cast<int>(syscall(SYS_pidfd_getfd, pidfd, fd, 0));
+            close(pidfd);
+            return copy;
+        }
+        errno = ENOENT;
+        return -1;
+    }
+
     void readLoop() {
         char buf[4096];
         std::string pending;
@@ -473,10 +718,13 @@ private:
                     m_captureHeld = true;
                 }
                 m_holdChanged.notify_all();
-                while (!m_stopReader.load(std::memory_order_acquire)) {
+                while (m_holdCapture.load(std::memory_order_acquire) && !m_stopReader.load(std::memory_order_acquire)) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(20));
                 }
-                break;
+                if (m_holdCapture.load(std::memory_order_acquire)) break;  // reaped while held
+                std::lock_guard<std::mutex> lock(m_mutex);
+                m_captureHeld = false;
+                continue;
             }
             // Polled rather than blocked in read(): a child that forks something inheriting this
             // pipe leaves it open after the daemon exits, and a blocking read would then never
@@ -498,6 +746,8 @@ private:
             // line, the validation scan -- then reads a short buffer and fails, or passes,
             // for a reason that has nothing to do with the daemon.
             if (n < 0 && errno == EINTR) continue;
+            // A terminal's master reads EIO once every slave descriptor is closed: its EOF.
+            if (n < 0 && errno == EIO && m_mode == Stdout::CapturedTerminal) break;
             if (n < 0) {
                 m_readFailed.store(true, std::memory_order_release);
                 break;
@@ -510,11 +760,14 @@ private:
             pending.append(buf, static_cast<size_t>(n));
             size_t nl;
             while ((nl = pending.find('\n')) != std::string::npos) {
-                std::printf("  [daemon] %s\n", pending.substr(0, nl).c_str());
+                std::string line = pending.substr(0, nl);
                 pending.erase(0, nl + 1);
+                if (!line.empty() && line.back() == '\r') line.pop_back();
+                // Empty lines are a stall's filler.
+                if (!line.empty() && m_echo.load(std::memory_order_relaxed)) std::printf("  [daemon] %s\n", line.c_str());
             }
         }
-        if (!pending.empty()) std::printf("  [daemon] %s\n", pending.c_str());
+        if (!pending.empty() && m_echo.load(std::memory_order_relaxed)) std::printf("  [daemon] %s\n", pending.c_str());
         std::fflush(stdout);
         m_readerDone.store(true, std::memory_order_release);
     }
@@ -565,6 +818,15 @@ private:
     // one case the config home cannot hold the copies.
     std::optional<wallpaperx::testing::ScratchDir> m_configHome;
     std::optional<wallpaperx::testing::ScratchDir> m_stateHome;
+
+    Stdout m_mode;
+    ino_t m_captureInode = 0;  // CapturedSocket: the daemon's end, to find it in /proc/<pid>/fd
+    std::string m_ptyName;     // CapturedTerminal: the terminal's path, to stall and resume it
+    std::optional<StreamStall> m_stall;
+    std::optional<StreamStall> m_stdoutStall;
+    bool m_stalledFromStart = false;
+    size_t m_stalledAt = 0;
+    std::atomic<bool> m_echo{true};
 
     pid_t m_pid = -1;
     int m_readFd = -1;

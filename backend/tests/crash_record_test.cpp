@@ -14,6 +14,7 @@
 // uses.
 
 #include "daemon/crash_record.h"
+#include "daemon/log_pump.h"
 
 #include "support/forked_child.h"
 #include "tests/client/scratch_dir.h"
@@ -21,6 +22,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <csignal>
@@ -31,6 +33,7 @@
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <new>
 #include <optional>
 #include <string>
 #include <system_error>
@@ -56,6 +59,14 @@ using wallpaperx::testing::harnessFailure;
 using wallpaperx::testing::notVerified;
 using wallpaperx::testing::ScratchDir;
 
+// In log_writer_fault.cpp: the next memrchr call, which only the log writer makes, faults.
+void wallpaperxTestFaultInLogWriter();
+
+#if defined(WALLPAPERX_FAKE_SANITIZER_DEATH)
+// In sanitizer_death_fake.cpp: the death callback the log writer registered, as a sanitizer holds it.
+void (*wallpaperxTestDeathCallback())();
+#endif
+
 namespace {
 
 // What every forked child records. The monitor id is arbitrary but must match what the parent
@@ -68,6 +79,8 @@ constexpr const char* kPath = "/pictures/the-one-that-crashed.png";
 // The child could not put a record on disk at all, so nothing it did afterwards means
 // anything. Distinct from forked_child.h's preamble codes and from any signal death.
 constexpr int kChildRecordFailedExit = 120;
+// The child could not set up the daemon's log writer, or the stalled stream it writes to.
+constexpr int kChildLogWriterFailedExit = 119;
 
 // How long a child gets to reach the point the parent is waiting for. Generous: this is the
 // bound past which the run is declared broken, not a measurement of anything.
@@ -90,7 +103,51 @@ enum class Mode {
     KilledMidApply,   // SIGKILL from the parent while the record is live
     CleanExit,        // the record is destroyed the ordinary way
     ChainPrevious,    // a handler installed before ours must still run
+    // With the daemon's log writer running: a memory fault on the writer's own thread.
+    FaultOnLogWriter,
+    // With the log writer running and its destination full, so the handler's flush waits: SIGABRT
+    // on another thread, and the applying thread starts a new record once the handler has begun.
+    AbortElsewhereWhileStalled,
 };
+
+const char* modeName(Mode mode) {
+    switch (mode) {
+        case Mode::FaultOnApplying: return "a memory fault on the applying thread";
+        case Mode::AbortOnApplying: return "an abort on the applying thread";
+        case Mode::AbortElsewhere: return "an abort on another thread";
+        case Mode::KilledMidApply: return "killed mid-apply";
+        case Mode::CleanExit: return "a clean exit";
+        case Mode::ChainPrevious: return "an abort chained to a previous handler";
+        case Mode::FaultOnLogWriter: return "a fault on the log writer's thread";
+        case Mode::AbortElsewhereWhileStalled: return "a crash elsewhere with the output stalled";
+    }
+    return "an unnamed mode";
+}
+
+// Descriptors 1 and 2 on a pipe that is full and never read, the reader kept open so a write
+// meets a full pipe rather than a closed one. False if it could not be filled.
+bool stallOwnOutput() {
+    int ends[2];
+    if (::pipe2(ends, O_CLOEXEC) != 0) return false;
+    if (::fcntl(ends[1], F_SETFL, O_NONBLOCK) != 0) return false;
+    const char filler[4096] = {};
+    for (const size_t size : {sizeof(filler), size_t{1}}) {
+        for (;;) {
+            const ssize_t n = ::write(ends[1], filler, size);
+            if (n > 0) continue;
+            if (n < 0 && errno == EINTR) continue;
+            if (n < 0 && errno == EAGAIN) break;
+            return false;
+        }
+    }
+    if (::fcntl(ends[1], F_SETFL, 0) != 0) return false;
+    return ::dup2(ends[1], STDOUT_FILENO) >= 0 && ::dup2(ends[1], STDERR_FILENO) >= 0;
+}
+
+bool outputToDevNull() {
+    const int null = ::open("/dev/null", O_WRONLY | O_CLOEXEC);
+    return null >= 0 && ::dup2(null, STDOUT_FILENO) >= 0 && ::dup2(null, STDERR_FILENO) >= 0;
+}
 
 // The write end of the pipe the ChainPrevious child's own SIGABRT handler reports through.
 // A global because a sigaction handler takes no context, and write() is async-signal-safe.
@@ -118,6 +175,47 @@ void notePreviousHandlerRan(int) {
     for (;;) std::this_thread::sleep_for(std::chrono::seconds(1));
 }
 
+// Shared with the forked child: set once its own setup is done and the handlers are installed, so
+// that from then on only the code under test -- the handler, the record -- decides when it ends.
+// A child that never ends before this is the harness's fault; after it, the handler's.
+class StagedFlag {
+public:
+    StagedFlag() {
+        void* page = ::mmap(nullptr, sizeof(std::atomic<int>), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+        if (page != MAP_FAILED) m_flag = new (page) std::atomic<int>(0);
+    }
+    ~StagedFlag() {
+        if (m_flag != nullptr) ::munmap(m_flag, sizeof(std::atomic<int>));
+    }
+    StagedFlag(const StagedFlag&) = delete;
+    StagedFlag& operator=(const StagedFlag&) = delete;
+    bool ok() const { return m_flag != nullptr; }
+    std::atomic<int>* get() const { return m_flag; }
+    bool isSet() const { return m_flag != nullptr && m_flag->load() == 1; }
+
+private:
+    std::atomic<int>* m_flag = nullptr;
+};
+
+// The running child's flag, set by the parent just before fork() so the child inherits it.
+std::atomic<int>* g_staged = nullptr;
+
+void markStaged() {
+    if (g_staged != nullptr) g_staged->store(1);
+}
+
+// Why a child that had to be killed was: before markStaged(), the harness's own setup stalled; after
+// it, the code under test kept the process alive.
+void reportNeverEnded(bool staged, const std::string& what) {
+    if (!staged) {
+        harnessFailure(what + " stalled in this harness's own setup, before its handlers were installed");
+        return;
+    }
+    check(false, (what + " ended within 20 s of its handlers taking over: it never did, so the crash handler (or the "
+                         "record it held) kept the process alive")
+                     .c_str());
+}
+
 [[noreturn]] void runChildBody(Mode mode, const std::filesystem::path& dir, int readyFd, int chainFd) {
     if (mode == Mode::ChainPrevious) {
         g_chainFd = chainFd;
@@ -127,19 +225,41 @@ void notePreviousHandlerRan(int) {
         previous.sa_flags = 0;
         ::sigaction(SIGABRT, &previous, nullptr);
     }
+    // As the daemon's main() does: the log writer first, then the handlers.
+    if (mode == Mode::FaultOnLogWriter || mode == Mode::AbortElsewhereWhileStalled) {
+        const bool routed = mode == Mode::FaultOnLogWriter ? outputToDevNull() : stallOwnOutput();
+        if (!routed || !wallpaperx::logpump::install()) _exit(kChildLogWriterFailedExit);
+    }
     installFatalSignalHandlers();
+    markStaged();
 
     std::promise<void> recordLive;
     std::future<void> live = recordLive.get_future();
 
     std::thread applying([&] {
-        ApplyingRecord record(dir, kMonitorId, kType, kPath);
+        std::optional<ApplyingRecord> record(std::in_place, dir, kMonitorId, kType, kPath);
         // Nothing below says anything unless the record actually reached the disk. Exiting
         // with a code of its own keeps "the harness could not set this up" apart from "the
         // handler did the wrong thing", which is otherwise the same missing file.
         std::error_code ec;
-        if (!std::filesystem::exists(crashRecordPath(dir, kMonitorId), ec)) _exit(kChildRecordFailedExit);
+        const std::filesystem::path file = crashRecordPath(dir, kMonitorId);
+        if (!std::filesystem::exists(file, ec)) _exit(kChildRecordFailedExit);
         recordLive.set_value();
+
+        if (mode == Mode::AbortElsewhereWhileStalled) {
+            // The handler removing this record is the sign it has begun; the next record is then
+            // started while its flush holds the process open. No deadline of its own: the parent's
+            // kill bounds it, so 'b' only ever means the record was removed first.
+            while (std::filesystem::exists(file, ec)) {
+                std::this_thread::sleep_for(std::chrono::microseconds(100));
+            }
+            record.reset();
+            record.emplace(dir, kMonitorId, kType, kPath);
+            const char byte = 'b';
+            const ssize_t ignored = ::write(readyFd, &byte, 1);
+            (void)ignored;
+            sleepForever();
+        }
 
         switch (mode) {
             case Mode::FaultOnApplying:
@@ -149,6 +269,8 @@ void notePreviousHandlerRan(int) {
                 std::abort();
             case Mode::AbortElsewhere:
             case Mode::KilledMidApply:
+            case Mode::FaultOnLogWriter:
+            case Mode::AbortElsewhereWhileStalled:
                 sleepForever();  // holds the record open for whatever kills this process
             case Mode::CleanExit:
                 break;
@@ -157,8 +279,18 @@ void notePreviousHandlerRan(int) {
 
     live.wait();
     switch (mode) {
+        case Mode::AbortElsewhereWhileStalled:
+            // Queued behind the full destination, so the handler's flush has a line it cannot deliver.
+            std::printf("a line the destination will not take\n");
+            std::fflush(stdout);
+            [[fallthrough]];
         case Mode::AbortElsewhere:
             std::abort();  // the main thread dies; the applying thread is still holding a record
+        case Mode::FaultOnLogWriter:
+            wallpaperxTestFaultInLogWriter();
+            std::printf("a line for the log writer to write\n");
+            std::fflush(stdout);
+            sleepForever();
         case Mode::KilledMidApply: {
             const char byte = 'r';
             const ssize_t ignored = ::write(readyFd, &byte, 1);
@@ -196,11 +328,12 @@ struct ChildResult {
     bool reaped = false;
     int status = 0;
     bool previousHandlerRan = false;
+    bool laterRecordAttempted = false;  // AbortElsewhereWhileStalled: a record was begun inside the handler
 };
 
-// Runs one child to its end and returns how it died. `ok` is false when the harness itself
-// could not get the child to the point being graded -- never when the child did something
-// unexpected, which is a verdict and belongs in a check().
+// Runs one child to its end and returns how it died. `ok` is false when there is nothing left to
+// grade: the harness could not get the child to the point being graded, or the child never ended,
+// which is already reported (as a verdict once its handlers were in charge).
 ChildResult runChild(Mode mode, const std::filesystem::path& dir, bool& ok) {
     ok = false;
     ChildResult out;
@@ -218,6 +351,19 @@ ChildResult runChild(Mode mode, const std::filesystem::path& dir, bool& ok) {
         return out;
     }
 
+    StagedFlag staged;
+    if (!staged.ok()) {
+        ::close(ready[0]);
+        ::close(ready[1]);
+        ::close(chain[0]);
+        ::close(chain[1]);
+        harnessFailure("could not map the flag a forked child reports its setup through");
+        return out;
+    }
+    g_staged = staged.get();
+
+    // A child inherits unflushed stdio, and one whose output is a full pipe would block writing it.
+    std::fflush(nullptr);
     const pid_t parentBeforeFork = ::getpid();
     const pid_t pid = ::fork();
     if (pid < 0) {
@@ -262,19 +408,41 @@ ChildResult runChild(Mode mode, const std::filesystem::path& dir, bool& ok) {
         ::kill(pid, SIGKILL);
     }
 
+    // GOAL: X.3 -- a child whose crash handler never finishes is the handler's failure, not this
+    //       harness's: every mode but KilledMidApply leaves the ending to the handler (or, for
+    //       CleanExit, to the record's destructor).
+    // WHY-THIS-SHAPE: the staged flag, not the mode alone, decides the blame: a child stuck in
+    //       its own setup before the handlers exist says nothing about them. KilledMidApply was
+    //       SIGKILLed by this harness, so one that outlives that is the host's, never the handler's.
+    // CONTROL: in backend/daemon/crash_record.cpp via control_run.sh 2026-09-27, reverted:
+    //       onFatalSignal's flush given an hour -> "a forked child (a crash elsewhere with the
+    //       output stalled) ended within 20 s of its handlers taking over" red, alone. By hand,
+    //       reverted: an endless sleep before the stalled mode's handlers are installed ->
+    //       "FAIL (harness): ... stalled in this harness's own setup", no FAIL.
     out.reaped = waitForExit(pid, out.status);
     if (!out.reaped) {
         ::kill(pid, SIGKILL);
         int discarded = 0;
         waitForExit(pid, discarded);
-        harnessFailure("a forked child did not exit within the harness's bound");
+        const std::string what = std::string("a forked child (") + modeName(mode) + ")";
+        if (mode == Mode::KilledMidApply) {
+            harnessFailure(what + " outlived the SIGKILL this harness sent it");
+        } else {
+            reportNeverEnded(staged.isSet(), what);
+        }
     }
+    g_staged = nullptr;
 
     // After the reap, so the byte is either in the pipe or was never written.
     char byte = 0;
     int flags = ::fcntl(chain[0], F_GETFL, 0);
     if (flags >= 0) ::fcntl(chain[0], F_SETFL, flags | O_NONBLOCK);
     out.previousHandlerRan = ::read(chain[0], &byte, 1) == 1;
+    if (mode == Mode::AbortElsewhereWhileStalled) {
+        flags = ::fcntl(ready[0], F_GETFL, 0);
+        if (flags >= 0) ::fcntl(ready[0], F_SETFL, flags | O_NONBLOCK);
+        out.laterRecordAttempted = ::read(ready[0], &byte, 1) == 1 && byte == 'b';
+    }
 
     ::close(ready[0]);
     ::close(chain[0]);
@@ -287,6 +455,10 @@ ChildResult runChild(Mode mode, const std::filesystem::path& dir, bool& ok) {
         }
         if (WEXITSTATUS(out.status) == kChildRecordFailedExit) {
             harnessFailure("a forked child could not put a record on disk, so its outcome grades nothing");
+            return out;
+        }
+        if (WEXITSTATUS(out.status) == kChildLogWriterFailedExit) {
+            harnessFailure("a forked child could not route its output or start the log writer");
             return out;
         }
     }
@@ -319,9 +491,11 @@ bool diedOf(const ChildResult& result, int sig) {
 //       ungraded and SIGABRT (6) alone leaves the other. The SIGSEGV case is a real store to a
 //       PROT_NONE page rather than raise(SIGSEGV): raise() would grade the handler against a
 //       signal the thread sent itself, which is not the case the breaker exists for.
-// CONTROL: in backend/daemon/crash_record.cpp, the `::write(fd, line, n)` in onFatalSignal()
-//       deleted -> "FAIL: the record left by a fault on the applying thread is stamped with
-//       SIGSEGV" and the same for SIGABRT, four FAIL lines in all, ctest Failed. Reverted.
+// CONTROL: in backend/daemon/crash_record.cpp, the `::write(fd, line, n)` in writeSignalLine()
+//       deleted -> "the record left by a memory fault on the applying thread is stamped with it"
+//       and "the reason a client reads ... names that signal", each for the fault and the abort,
+//       with the chaining phase's stamp line and the playing record's "and the signal that killed
+//       it": six. Re-observed 2026-09-25 via control_run.sh; reverted.
 void runStampedChecks(int sig, Mode mode, const char* what) {
     ScratchDir scratch("crashstamp");
     if (!scratch.ok()) {
@@ -368,10 +542,12 @@ void runStampedChecks(int sig, Mode mode, const char* what) {
 //       long enough to look safe. The positive direction is runStampedChecks above: the same
 //       abort moved onto the applying thread does leave a stamped record, so a build that
 //       never wrote one at all would fail there rather than pass here.
-// CONTROL: in backend/daemon/crash_record.cpp, the `::unlink(path)` that onFatalSignal()'s
-//       other-thread branch performs once its compare-exchange confirms the copied name
-//       replaced by `(void)path` -> "FAIL: a crash on a thread that is not applying leaves
-//       no record" and "...leaves no file on disk", ctest Failed. Reverted.
+// CONTROL: in backend/daemon/crash_record.cpp, the `::unlink(path)` that unlinkPublished()
+//       performs once its compare-exchange confirms the copied name replaced by `(void)path` ->
+//       "a crash on a thread that is not applying leaves no record" and "...leaves no file on
+//       disk" red, with the log-writer fault phase's line; the stalled phase below is NOT VERIFIED
+//       under it, since the record it waits to see removed never is. Re-observed 2026-09-25 via
+//       control_run.sh; reverted.
 void runOtherThreadChecks() {
     ScratchDir scratch("crashother");
     if (!scratch.ok()) {
@@ -393,6 +569,356 @@ void runOtherThreadChecks() {
           "a crash on a thread that is not applying leaves no file on disk");
 }
 
+// GOAL: S14.33 -- a memory fault on the log writer's own thread (backend/daemon/log_pump.cpp)
+//       while a wallpaper is being applied leaves no applying record. False if that thread keeps
+//       the fault signals blocked: the kernel then kills the process with no handler run, and the
+//       next start refuses a wallpaper that did nothing.
+// WHY-THIS-SHAPE: the fault is a real store to a PROT_NONE page inside memrchr, which only the log
+//       writer calls here (log_writer_fault.cpp takes libc's place). tgkill(SIGSEGV) at that thread
+//       would not do: a blocked signal sent from outside stays pending rather than killing.
+// CONTROL: in backend/daemon/log_pump.cpp, SIGSEGV left in the writer thread's blocked set (dropped
+//       from install()'s sigdelset list) -> "a fault on the log writer's thread while a wallpaper
+//       is applied leaves no record" red, alone. Observed 2026-09-25 via control_run.sh; reverted.
+void runLogWriterFaultChecks() {
+    ScratchDir scratch("crashwriter");
+    if (!scratch.ok()) {
+        notVerified("S14.33", "no scratch state directory could be created");
+        return;
+    }
+    bool ok = false;
+    const ChildResult result = runChild(Mode::FaultOnLogWriter, scratch.path(), ok);
+    if (!ok) return;
+    if (kDeathSignalObservable) {
+        check(diedOf(result, SIGSEGV), "a fault on the log writer's thread still ends the process with SIGSEGV");
+        if (!diedOf(result, SIGSEGV)) std::fprintf(stderr, "  child died: %s\n", howItDied(result).c_str());
+    }
+    std::error_code ec;
+    check(!std::filesystem::exists(crashRecordPath(scratch.path(), kMonitorId), ec),
+          "a fault on the log writer's thread while a wallpaper is applied leaves no record");
+}
+
+// GOAL: S14.34 -- a fatal signal on a thread that is not applying, with the output stalled so the
+//       handler's 250 ms flush runs its full length, leaves no applying record -- neither the one
+//       live at the signal nor one the applying thread starts while the handler flushes. False if
+//       the handler only removes the live record: the render thread goes on applying, and the
+//       process dies holding the next one.
+// WHY-THIS-SHAPE: the applying thread starts its next record when it sees the live one removed,
+//       which is the handler's first act, so the new record provably begins inside the flush and
+//       not before the signal or after the death; a loop of records timed against the 250 ms
+//       would be a bet on the scheduler. It reports the attempt through a pipe; a child that
+//       never made it is NOT VERIFIED, not a pass.
+// CONTROL: in backend/daemon/crash_record.cpp, onFatalSignal's other-thread branch made a bare
+//       `unlinkPublished(generation)` instead of stopBlamingWallpapers() -> this phase's "leaves no
+//       record, even one begun during the handler's flush" red, alone; S13.12's phase above stays
+//       green, since the live record is still removed. Re-observed 2026-09-27 via control_run.sh;
+//       reverted. By hand, reverted: the child's 'b' byte made 'x' -> NOT VERIFIED, no FAIL.
+void runStalledOtherThreadChecks() {
+    ScratchDir scratch("crashstalled");
+    if (!scratch.ok()) {
+        notVerified("S14.34", "no scratch state directory could be created");
+        return;
+    }
+    bool ok = false;
+    const ChildResult result = runChild(Mode::AbortElsewhereWhileStalled, scratch.path(), ok);
+    if (!ok) return;
+    if (!result.laterRecordAttempted) {
+        notVerified("S14.34", "the applying thread never began a record inside the handler's flush, so nothing "
+                              "was staged for the handler to refuse");
+        return;
+    }
+    if (kDeathSignalObservable) {
+        check(diedOf(result, SIGABRT), "a crash elsewhere with the output stalled still ends the process with SIGABRT");
+        if (!diedOf(result, SIGABRT)) std::fprintf(stderr, "  child died: %s\n", howItDied(result).c_str());
+    }
+    std::error_code ec;
+    check(!std::filesystem::exists(crashRecordPath(scratch.path(), kMonitorId), ec),
+          "a crash on a thread that is not applying, with the output stalled, leaves no record, even one begun "
+          "during the handler's flush");
+}
+
+// ---------------------------------------------------------------------------- //
+// A sanitizer's report on a stalled output: a handler installed before the daemon's that writes a
+// report to descriptor 2, runs the death callback the log writer registered, and exits -- the
+// order a sanitizer's Die() runs them in.
+// ---------------------------------------------------------------------------- //
+
+#if defined(WALLPAPERX_FAKE_SANITIZER_DEATH)
+
+// More than a pipe holds (64 KiB) and less than the log writer's queue (256 KiB), in lines a pipe
+// takes whole.
+constexpr size_t kReportLines = 200;
+constexpr size_t kReportLineSize = 1024;
+constexpr int kFakeSanitizerExit = 42;
+// The crash spends at most two 250 ms flushes (the daemon's handler's, then the death callback's);
+// the rest is margin for a loaded runner. A handler that blocks on the destination never ends.
+constexpr auto kReportCrashEnd = std::chrono::milliseconds(1250);
+// After the report is written: late enough that a process skipping the death callback's flush has
+// exited, early enough to be inside the 250 ms that flush waits.
+constexpr auto kResumeAfterReport = std::chrono::milliseconds(50);
+constexpr auto kResumeLatest = std::chrono::milliseconds(200);
+
+char g_report[kReportLines * kReportLineSize];
+int g_reportNotifyFd = -1;
+
+std::string reportLine(size_t i) {
+    char head[32];
+    const int n = std::snprintf(head, sizeof(head), "==fakesan== %04zu ", i);
+    return std::string(head, static_cast<size_t>(n)) + std::string(kReportLineSize - 1 - static_cast<size_t>(n), 'r');
+}
+
+void notifyParent(char byte) {
+    const ssize_t ignored = ::write(g_reportNotifyFd, &byte, 1);
+    (void)ignored;
+}
+
+void fakeSanitizerHandler(int) {
+    for (size_t done = 0; done < sizeof(g_report);) {
+        const ssize_t n = ::write(STDERR_FILENO, g_report + done, sizeof(g_report) - done);
+        if (n > 0) done += static_cast<size_t>(n);
+        else if (n < 0 && errno != EINTR) break;
+    }
+    notifyParent('w');
+    if (void (*callback)() = wallpaperxTestDeathCallback(); callback != nullptr) callback();
+    _exit(kFakeSanitizerExit);
+}
+
+[[noreturn]] void runReportChildBody(int destination, int notifyFd) {
+    for (size_t i = 0; i < kReportLines; ++i) {
+        const std::string line = reportLine(i) + "\n";
+        std::memcpy(g_report + i * kReportLineSize, line.data(), kReportLineSize);
+    }
+    g_reportNotifyFd = notifyFd;
+    // Blocking, as a destination a process is started with usually is: what release() hands back.
+    if (::dup2(destination, STDOUT_FILENO) < 0 || ::dup2(destination, STDERR_FILENO) < 0) {
+        _exit(kChildLogWriterFailedExit);
+    }
+    // As a sanitizer's runtime does before main(): its handler is in place before the daemon's.
+    struct sigaction previous {};
+    previous.sa_handler = fakeSanitizerHandler;
+    sigemptyset(&previous.sa_mask);
+    ::sigaction(SIGSEGV, &previous, nullptr);
+    if (!wallpaperx::logpump::install()) _exit(kChildLogWriterFailedExit);
+    installFatalSignalHandlers();
+    markStaged();
+    notifyParent('f');
+    faultNow();
+}
+
+struct ReportRun {
+    bool ok = false;  // false: already reported
+    std::optional<std::chrono::steady_clock::duration> endedAfterFault;
+    int status = 0;
+    std::optional<std::chrono::steady_clock::duration> resumedAfterReport;  // nothing: never written
+    std::string delivered;
+};
+
+bool awaitByte(int fd, char expected, std::chrono::milliseconds limit) {
+    struct pollfd waitOn {
+        fd, POLLIN, 0
+    };
+    char byte = 0;
+    return ::poll(&waitOn, 1, static_cast<int>(limit.count())) == 1 && ::read(fd, &byte, 1) == 1 && byte == expected;
+}
+
+// One crash with the destination -- a pipe this process holds the reader of -- full before the
+// child starts. Resumed `kResumeAfterReport` after the report is written when `resume`; never read
+// otherwise.
+ReportRun runReportChild(bool resume) {
+    using std::chrono::steady_clock;
+    ReportRun out;
+    int dest[2] = {-1, -1};
+    int notify[2] = {-1, -1};
+    if (::pipe2(dest, O_CLOEXEC) != 0 || ::pipe2(notify, O_CLOEXEC) != 0) {
+        harnessFailure("could not create the destination or notify pipe for a report child");
+        return out;
+    }
+    const auto closeAll = [&] {
+        for (int* fd : {&dest[0], &dest[1], &notify[0], &notify[1]}) {
+            if (*fd >= 0) ::close(*fd);
+            *fd = -1;
+        }
+    };
+    // Filled through a description of its own, so the one the child inherits stays blocking.
+    {
+        const std::string self = "/proc/self/fd/" + std::to_string(dest[1]);
+        const int filler = ::open(self.c_str(), O_WRONLY | O_NONBLOCK | O_CLOEXEC);
+        const std::string lines(4096, '\n');
+        bool full = false;
+        for (size_t size : {lines.size(), size_t{1}}) {
+            for (;;) {
+                const ssize_t n = filler < 0 ? -1 : ::write(filler, lines.data(), size);
+                if (n > 0) continue;
+                full = n < 0 && errno == EAGAIN;
+                break;
+            }
+        }
+        if (filler >= 0) ::close(filler);
+        if (!full) {
+            closeAll();
+            harnessFailure("the report child's destination pipe could not be filled");
+            return out;
+        }
+    }
+    StagedFlag staged;
+    if (!staged.ok()) {
+        closeAll();
+        harnessFailure("could not map the flag a report child reports its setup through");
+        return out;
+    }
+    g_staged = staged.get();
+    std::fflush(nullptr);
+    const pid_t parentBeforeFork = ::getpid();
+    const pid_t pid = ::fork();
+    if (pid < 0) {
+        closeAll();
+        harnessFailure("fork failed");
+        return out;
+    }
+    if (pid == 0) {
+        ::close(dest[0]);
+        ::close(notify[0]);
+        if (!wallpaperx::testing::armAgainstParentDeath(parentBeforeFork)) {
+            _exit(wallpaperx::testing::kChildArmFailedExit);
+        }
+        wallpaperx::testing::suppressCoreDump();
+        runReportChildBody(dest[1], notify[1]);
+    }
+    ::close(dest[1]);
+    ::close(notify[1]);
+    dest[1] = notify[1] = -1;
+    g_staged = nullptr;
+
+    const auto killAndReap = [&] {
+        ::kill(pid, SIGKILL);
+        int discarded = 0;
+        waitForExit(pid, discarded);
+    };
+    if (!awaitByte(notify[0], 'f', std::chrono::duration_cast<std::chrono::milliseconds>(kChildTimeout))) {
+        killAndReap();
+        closeAll();
+        harnessFailure("a report child never reached its fault: it could not set up, or stalled doing so");
+        return out;
+    }
+    const auto faultAt = steady_clock::now();
+    const auto giveUpAt = faultAt + std::chrono::seconds(5);
+
+    if (resume) {
+        if (awaitByte(notify[0], 'w', std::chrono::seconds(5))) {
+            const auto writtenAt = steady_clock::now();
+            std::this_thread::sleep_for(kResumeAfterReport);
+            out.resumedAfterReport = steady_clock::now() - writtenAt;
+            char buffer[65536];
+            for (;;) {
+                struct pollfd readable {
+                    dest[0], POLLIN, 0
+                };
+                const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(giveUpAt - steady_clock::now());
+                if (left.count() <= 0 || ::poll(&readable, 1, static_cast<int>(left.count())) != 1) break;
+                const ssize_t n = ::read(dest[0], buffer, sizeof(buffer));
+                if (n <= 0) break;  // end of file: every writer, the child included, is gone
+                out.delivered.append(buffer, static_cast<size_t>(n));
+            }
+        }
+    }
+    for (;;) {
+        const pid_t done = ::waitpid(pid, &out.status, WNOHANG);
+        if (done == pid) {
+            out.endedAfterFault = steady_clock::now() - faultAt;
+            break;
+        }
+        if (done < 0 && errno != EINTR) break;
+        if (steady_clock::now() >= giveUpAt) {
+            killAndReap();
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    closeAll();
+    out.ok = true;
+    return out;
+}
+
+// GOAL: S14.41 -- a crash with the output stalled throughout, whose previous handler (a sanitizer's)
+//       writes a report larger than a pipe holds to descriptor 2, still ends within 1250 ms of the
+//       fault, as that handler chose. False if the daemon's handler hands the process's blocking
+//       descriptors back before chaining: the report's write then blocks on the full destination.
+// WHY-THIS-SHAPE: a stand-in handler, not a sanitizer: only a sanitized build has one, and this
+//       project has no AddressSanitizer tree to register the check in. It does what a sanitizer's
+//       Die() does, in that order: report to descriptor 2, the registered death callback, _exit.
+//       Timed from the child's own mark just before the fault, never from the parent's fork.
+// CONTROL: in backend/daemon/crash_record.cpp via control_run.sh 2026-09-27, reverted:
+//       onFatalSignal's `logpump::flush(logpump::kExitFlush)` made `logpump::release()` ->
+//       "ends within 1250 ms of the fault" and "as that handler chose" red; the resumed phase
+//       below NOT VERIFIED (its report is never written).
+// COVERAGE-ASSERT: the exit status 42 is the stand-in's own, so a green run proves the chain
+//       reached it and it ran to its end.
+void runReportStalledThroughoutChecks() {
+    const ReportRun run = runReportChild(false);
+    if (!run.ok) return;
+    const bool inTime = run.endedAfterFault && *run.endedAfterFault <= kReportCrashEnd;
+    check(inTime, "a crash whose previous handler writes a 200 KiB report, with the output stalled throughout, "
+                  "ends within 1250 ms of the fault");
+    const bool asChosen = run.endedAfterFault && WIFEXITED(run.status) && WEXITSTATUS(run.status) == kFakeSanitizerExit;
+    check(asChosen, "and ends as that handler chose (its exit 42)");
+    std::printf("crash_record_test: report on a stalled output: %s\n",
+                run.endedAfterFault
+                    ? ("ended " + std::to_string(std::chrono::duration<double>(*run.endedAfterFault).count()) +
+                       " s after the fault")
+                          .c_str()
+                    : "still running 5 s after the fault, killed");
+}
+
+// GOAL: S14.42 -- a destination that resumes inside the death callback's 250 ms flush receives the
+//       whole report the previous handler wrote after the daemon's handler had given up waiting.
+//       False if the death callback does not flush: the process exits with the report still queued.
+// WHY-THIS-SHAPE: resumed 50 ms after the stand-in says its report is written, not at a fixed time
+//       after the fault: the daemon's handler has flushed by then, so only the death callback's
+//       flush can deliver it, and a process without one has already exited. A resume later than
+//       200 ms after the report is NOT VERIFIED rather than a verdict.
+// CONTROL: in backend/daemon/log_pump.cpp via control_run.sh 2026-09-27, reverted: the callback
+//       install() registers made `[] {}` -> "receives all 200 lines of the report" red, alone.
+void runReportResumedChecks() {
+    const ReportRun run = runReportChild(true);
+    if (!run.ok) return;
+    if (!run.resumedAfterReport) {
+        notVerified("S14.42", "the stand-in handler never wrote its report within 5 s of the fault (S14.41 grades that)");
+        return;
+    }
+    if (*run.resumedAfterReport > kResumeLatest) {
+        notVerified("S14.42", "this test resumed the destination " +
+                                  std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                     *run.resumedAfterReport)
+                                                     .count()) +
+                                  " ms after the report, too late to be sure it was inside the 250 ms flush");
+        return;
+    }
+    std::vector<std::string> seen;
+    for (size_t at = 0; at < run.delivered.size();) {
+        size_t end = run.delivered.find('\n', at);
+        if (end == std::string::npos) end = run.delivered.size();
+        std::string line = run.delivered.substr(at, end - at);
+        if (line.rfind("==fakesan== ", 0) == 0) seen.push_back(std::move(line));
+        at = end + 1;
+    }
+    bool whole = seen.size() == kReportLines;
+    for (size_t i = 0; whole && i < kReportLines; ++i) whole = seen[i] == reportLine(i);
+    check(whole, "a destination resumed inside the death callback's flush receives all 200 lines of the report, "
+                 "whole and in order");
+    if (!whole) std::fprintf(stderr, "  %zu report line(s) arrived\n", seen.size());
+}
+
+#endif  // WALLPAPERX_FAKE_SANITIZER_DEATH
+
+void runReportChecks() {
+#if defined(WALLPAPERX_FAKE_SANITIZER_DEATH)
+    runReportStalledThroughoutChecks();
+    runReportResumedChecks();
+#else
+    notVerified("S14.41, S14.42", "this build is sanitized: its runtime's own death callback would clash with the "
+                                  "stand-in these checks register");
+#endif
+}
+
 // GOAL: S13.17 -- a process ended with no handler running (SIGKILL: the out-of-memory killer,
 //       a teardown alarm, a power cut) while applying leaves an UNSTAMPED record, and the
 //       reason a client reads says it was killed rather than naming a signal. False if that
@@ -403,8 +929,9 @@ void runOtherThreadChecks() {
 //       record, and the check would call that a defect -- or after the destructor, on a
 //       machine slower or faster than this one.
 // CONTROL: in backend/daemon/crash_record.cpp, ApplyingRecord's constructor changed to return
-//       before its write loop (`if (true) { ::close(fd); return; }`) -> "FAIL: a process
-//       killed while applying leaves a record", ctest Failed. Reverted.
+//       before its write loop (`if (true) { ::close(fd); return; }`) -> "a process killed while
+//       applying leaves a record" red, with every other phase that reads a record back (seven
+//       lines in all). Re-observed 2026-09-25 via control_run.sh; reverted.
 void runKilledChecks() {
     ScratchDir scratch("crashkilled");
     if (!scratch.ok()) {
@@ -470,8 +997,8 @@ void runCleanExitChecks() {
 //       because it runs inside a signal handler where only async-signal-safe calls are legal;
 //       and the pipe is drained after the reap, so "no byte" cannot mean "not yet".
 // CONTROL: in backend/daemon/crash_record.cpp, the whole `if (sig >= 0 && sig < kHandlerSlots)`
-//       block in onFatalSignal() deleted -> "FAIL: the handler installed before this one still
-//       runs", ctest Failed. Reverted.
+//       block in onFatalSignal() made `if (false)` -> "FAIL: the handler installed before this one
+//       still runs", alone. Re-observed 2026-09-25 via control_run.sh; reverted.
 void runChainingChecks() {
     ScratchDir scratch("crashchain");
     if (!scratch.ok()) {
@@ -608,8 +1135,20 @@ enum class PlayingMode {
     KilledNamed,      // SIGKILL while the guard is live: no handler runs
 };
 
+const char* playingModeName(PlayingMode mode) {
+    switch (mode) {
+        case PlayingMode::FaultNamed: return "a fault on the guarded thread";
+        case PlayingMode::FaultElsewhere: return "a fault beside the guarded thread";
+        case PlayingMode::FaultAfterGuard: return "a fault after the guard ended";
+        case PlayingMode::FaultAfterEnd: return "a fault after the record ended";
+        case PlayingMode::KilledNamed: return "killed while guarded";
+    }
+    return "an unnamed mode";
+}
+
 [[noreturn]] void runPlayingChildBody(PlayingMode mode, const std::filesystem::path& dir, int readyFd) {
     installFatalSignalHandlers();
+    markStaged();
     wallpaperx::PlayingRecord record(dir);
     record.start({{kPlayingMonitor, kPlayingPath, 1}, {kOtherPlayingMonitor, kOtherPlayingPath, 0}});
     std::error_code ec;
@@ -661,6 +1200,14 @@ ChildResult runPlayingChild(PlayingMode mode, const std::filesystem::path& dir, 
         harnessFailure("could not create the readiness pipe for a playing-record child");
         return out;
     }
+    StagedFlag staged;
+    if (!staged.ok()) {
+        ::close(ready[0]);
+        ::close(ready[1]);
+        harnessFailure("could not map the flag a playing-record child reports its setup through");
+        return out;
+    }
+    g_staged = staged.get();
     const pid_t parentBeforeFork = ::getpid();
     const pid_t pid = ::fork();
     if (pid < 0) {
@@ -689,13 +1236,23 @@ ChildResult runPlayingChild(PlayingMode mode, const std::filesystem::path& dir, 
         }
         ::kill(pid, SIGKILL);
     }
+    // runChild's attribution. CONTROL: in backend/daemon/crash_record.cpp via control_run.sh
+    //       2026-09-27, reverted: onFatalSignal made to pause for good after writing the blame line
+    //       -> "a playing-record child (a fault on the guarded thread) ended within 20 s of its
+    //       handlers taking over" red, once for each of the two phases that fault a guarded thread.
     out.reaped = waitForExit(pid, out.status);
     if (!out.reaped) {
         ::kill(pid, SIGKILL);
         int discarded = 0;
         waitForExit(pid, discarded);
-        harnessFailure("a playing-record child did not exit within the harness's bound");
+        const std::string what = std::string("a playing-record child (") + playingModeName(mode) + ")";
+        if (mode == PlayingMode::KilledNamed) {
+            harnessFailure(what + " outlived the SIGKILL this harness sent it");
+        } else {
+            reportNeverEnded(staged.isSet(), what);
+        }
     }
+    g_staged = nullptr;
     ::close(ready[0]);
     if (out.reaped && WIFEXITED(out.status)) {
         if (const char* fault = wallpaperx::testing::forkPreambleFault(WEXITSTATUS(out.status)); fault != nullptr) {
@@ -728,7 +1285,8 @@ std::string describeDied(const std::optional<wallpaperx::PlayingHistory>& histor
 //       onFatalSignal() deleted -> "FAIL: a fault on the thread working on a video names that video
 //       in the playing record", printing "the record names no video", and "FAIL: and the signal
 //       that killed it" (a signal is read only beside a name); the replacement check below then
-//       reports a harness fault, having no named death to replace. Observed 2026-09-21; reverted.
+//       reports a harness fault, having no named death to replace. Re-observed 2026-09-25 via
+//       control_run.sh; reverted.
 void runPlayingBlameChecks() {
     ScratchDir scratch("playingnamed");
     if (!scratch.ok()) {
@@ -769,7 +1327,8 @@ void runPlayingBlameChecks() {
 //       record was ended names nothing"; (d) PlayingBlame's constructor made to write `line` into
 //       the record at once, as a record-per-picture design would -> "FAIL: SIGKILL while a video is
 //       being worked on names nothing" and the three cases above with it. Each of (a)-(c) reddened
-//       its own case alone. All observed 2026-09-21; reverted.
+//       its own case alone. All observed 2026-09-21, (a) re-observed 2026-09-25 via control_run.sh;
+//       reverted.
 void runPlayingNamesNothingChecks() {
     struct Case {
         PlayingMode mode;
@@ -911,6 +1470,9 @@ int main() {
         runStampedChecks(SIGSEGV, Mode::FaultOnApplying, "a memory fault");
         runStampedChecks(SIGABRT, Mode::AbortOnApplying, "an abort");
         runOtherThreadChecks();
+        runLogWriterFaultChecks();
+        runStalledOtherThreadChecks();
+        runReportChecks();
         runKilledChecks();
         runCleanExitChecks();
         runChainingChecks();

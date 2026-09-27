@@ -150,10 +150,15 @@ private:
 };
 
 // SIGSEGV, SIGBUS, SIGILL, SIGFPE and SIGABRT: stamps the live record with the signal when the
-// dying thread is the one applying, removes it when another thread dies -- the wallpaper being
-// applied is not what killed that one -- and names in the playing record the video the dying
-// thread's PlayingBlame names, if any. Then hands the signal to whatever handler was there before
-// and re-raises it. Call once, before any thread exists.
+// dying thread is the one applying, and otherwise stopBlamingWallpapers() -- the wallpaper being
+// applied is not what killed that thread -- and names in the playing record the video the dying
+// thread's PlayingBlame names, if any. Then flushes the log pump and hands the signal to whatever
+// handler was there before, and re-raises it. Call once, before any thread exists.
 void installFatalSignalHandlers();
+
+// For a process whose end is not a wallpaper's doing -- its GPU device was lost, or a thread
+// applying none is dying. Removes the applying record on disk, if any; no later ApplyingRecord is
+// written and no fatal signal names a wallpaper or a video. Permanent. Async-signal-safe.
+void stopBlamingWallpapers() noexcept;
 
 }

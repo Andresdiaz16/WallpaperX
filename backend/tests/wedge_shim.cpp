@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-// Preloaded into the real daemon by daemon_system_test, to stage three things no request to the
-// daemon can produce. Each is off unless its variable is set, and every other call is forwarded:
+// Preloaded into the real daemon by daemon_system_test and device_loss_restart_test, to stage what
+// no request to the daemon can produce. Each is off unless its variable is set, and every other
+// call is forwarded:
 //
 //   WALLPAPERX_TEST_WEDGE_FREE=1            a decoder freed on the MAIN thread never returns --
 //                                           only ~WallpaperManager frees one there, after the
@@ -20,11 +21,25 @@
 //                                           having delivered a picture, not on a packet number,
 //                                           because how many packets the first picture costs differs
 //                                           between the hardware and software decoders.
+//   WALLPAPERX_TEST_CRASH_MARK=path         with the above, the file created just before the fault:
+//                                           the moment of the crash, for a test whose stderr is
+//                                           stalled and so cannot carry the line that says so.
+//   WALLPAPERX_TEST_LINE_AT_EXIT=1          one line on descriptor 2 as the library loads, and one
+//                                           from its destructor, which runs after main() returns.
+//   WALLPAPERX_TEST_SLOW_EXIT_MS=n          that destructor says so on descriptor 2, then sleeps n
+//                                           milliseconds: a static destruction slower than the
+//                                           daemon's teardown deadline.
+//   WALLPAPERX_TEST_FAIL_SHUTDOWN_WATCH=1   the first mutex lock a thread makes after sigwait()
+//                                           returns fails with EINVAL, which std::mutex throws: the
+//                                           daemon's signal thread fails as it starts a stop.
 //
 // Not linked into anything shipped.
 
 #include <dlfcn.h>
+#include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
+#include <signal.h>
 #include <sys/mman.h>
 #include <time.h>
 #include <unistd.h>
@@ -72,7 +87,58 @@ bool hasDelivered(const AVCodecContext* context) {
     return it != g_delivered.end() && it->second > 0;
 }
 
+void writeLine(const char* line) {
+    const ssize_t ignored = ::write(STDERR_FILENO, line, std::strlen(line));
+    (void)ignored;
+}
+
+__attribute__((constructor)) void announceLoad() {
+    if (enabled("WALLPAPERX_TEST_LINE_AT_EXIT")) writeLine("wedge_shim: loaded, with a line to write at exit\n");
+}
+
+__attribute__((destructor)) void writeAtExit() {
+    if (enabled("WALLPAPERX_TEST_LINE_AT_EXIT")) writeLine("wedge_shim: written after main returned\n");
+    if (const long slowMs = number("WALLPAPERX_TEST_SLOW_EXIT_MS"); slowMs > 0) {
+        writeLine("wedge_shim: sleeping in a library destructor, after main returned\n");
+        const timespec wait{slowMs / 1000, (slowMs % 1000) * 1000000};
+        ::nanosleep(&wait, nullptr);
+    }
+}
+
+thread_local bool t_failNextLock = false;
+
+// Plain pointers, not function-local statics: a static's guard may itself lock a mutex.
+using SigwaitFn = int (*)(const sigset_t*, int*);
+using MutexLockFn = int (*)(pthread_mutex_t*);
+std::atomic<SigwaitFn> g_realSigwait{nullptr};
+std::atomic<MutexLockFn> g_realMutexLock{nullptr};
+
 }  // namespace
+
+extern "C" int sigwait(const sigset_t* set, int* sig) {
+    SigwaitFn real = g_realSigwait.load();
+    if (real == nullptr) {
+        real = reinterpret_cast<SigwaitFn>(::dlsym(RTLD_NEXT, "sigwait"));
+        g_realSigwait.store(real);
+    }
+    if (real == nullptr) return EINVAL;
+    const int result = real(set, sig);
+    if (result == 0 && enabled("WALLPAPERX_TEST_FAIL_SHUTDOWN_WATCH")) t_failNextLock = true;
+    return result;
+}
+
+extern "C" int pthread_mutex_lock(pthread_mutex_t* mutex) {
+    if (t_failNextLock) {
+        t_failNextLock = false;
+        return EINVAL;
+    }
+    MutexLockFn real = g_realMutexLock.load();
+    if (real == nullptr) {
+        real = reinterpret_cast<MutexLockFn>(::dlsym(RTLD_NEXT, "pthread_mutex_lock"));
+        g_realMutexLock.store(real);
+    }
+    return real != nullptr ? real(mutex) : EINVAL;
+}
 
 extern "C" void avcodec_free_context(AVCodecContext** context) {
     using Fn = void (*)(AVCodecContext**);
@@ -105,6 +171,11 @@ extern "C" int avcodec_send_packet(AVCodecContext* context, const AVPacket* pack
         static constexpr char kDying[] = "wedge_shim: faulting on the decoder's thread\n";
         const ssize_t ignored = ::write(STDERR_FILENO, kDying, sizeof(kDying) - 1);
         (void)ignored;
+        // After the line, so a test that sees the file knows the line was already written.
+        if (const char* mark = std::getenv("WALLPAPERX_TEST_CRASH_MARK"); mark != nullptr && *mark != '\0') {
+            const int fd = open(mark, O_WRONLY | O_CREAT | O_CLOEXEC, 0644);
+            if (fd >= 0) ::close(fd);
+        }
         // A store to a page mapped PROT_NONE, not raise(): a fault the thread took, which is the
         // case the daemon's handler is written for.
         void* page = ::mmap(nullptr, 4096, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);

@@ -14,6 +14,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <atomic>
 #include <chrono>
@@ -429,6 +430,12 @@ public:
         std::chrono::steady_clock::duration idleSessionRelease = kIdleSessionRelease;
         std::chrono::steady_clock::duration refusalLogInterval = kRefusalLogInterval;
         std::chrono::steady_clock::duration cleanPlayAfter = kCleanPlayAfter;
+
+        // Handed to the Device: runs the moment a GPU call first answers VK_ERROR_DEVICE_LOST, on
+        // whichever thread made it, usually with the GPU lock held: the stop starts while the job
+        // that saw the loss is still unwinding, which a hung or crashing driver may never let it
+        // finish. Must not block or call into this manager.
+        std::function<void()> onDeviceLost;
     };
 
     explicit WallpaperManager(Config config);
@@ -536,10 +543,11 @@ public:
     // render's do, and stop that video.
     ClockRound advanceVideo(std::chrono::steady_clock::time_point now);
 
-    // Whether the device this manager built has been lost. Permanent: the device is built once
-    // and never rebuilt, so every later render fails. False before one exists -- a device that
-    // could not be created is retried by the next render. Render worker thread.
-    bool deviceLost() const;
+    // Whether the device this manager built has been lost and Config::onDeviceLost, which the loss
+    // has already called, is set: the process is stopping for it. Permanent: the device is built
+    // once and never rebuilt. Without a handler a lost device only fails renders, which is what
+    // in-process tests that inject a loss rely on. Render worker thread.
+    bool stopsForLostDevice() const;
 
     // Exports the monitor's most recent frame as a fresh fd. An empty handle means nothing was
     // handed over, with `reason` saying which state that is; a thrown exception means the

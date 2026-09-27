@@ -44,6 +44,7 @@ std::string g_installedDaemon;
 #include <optional>
 #include <set>
 #include <sstream>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -299,8 +300,9 @@ void checkUnit(const fs::path& unit, const fs::path& expectedExec) {
     // CONTROL: in backend/CMakeLists.txt, both install-time cmake_path calls (bin and shader
     //       directory) based on "/usr/local" instead of the install prefix -> this line red, with
     //       the verify line, the DESTDIR ExecStart line, every odd prefix's three lines, every
-    //       refused row but backslash, and both absolute-bin-directory lines. Observed 2026-09-24
-    //       via control_run.sh; reverted.
+    //       refused row but backslash on both lines, both absolute-bin-directory lines, both
+    //       linked-bin lines and the relative prefix's ExecStart and verify lines (65 in all).
+    //       Re-observed 2026-09-25 via control_run.sh; reverted.
     execStartNames(text, expectedExec, "plain prefix");
 
     // GOAL: S14.7 -- the unit restarts the daemon when it exits nonzero (75 after a lost device)
@@ -441,7 +443,11 @@ std::optional<UnitCopies> unitCopiesInBuildTree(const fs::path& buildDir = WALLP
 
 // S14.8: prefixes systemd can represent only quoted, each installed and read back three ways.
 void checkOddPrefixes(const fs::path& root) {
-    for (const char* name : {"with space", "pct%n", "dol$HOME", "brace${HOME}x", "all of %i $x ;#@~"}) {
+    // After the first five, what the refusals added for S14.16 must still let through: `]`, which
+    // is not a glob character on its own, and valid UTF-8 beyond ASCII -- accents, a four-byte
+    // emoji, and U+0085, a control character to Unicode that systemd accepts.
+    for (const char* name : {"with space", "pct%n", "dol$HOME", "brace${HOME}x", "all of %i $x ;#@~", "c]x",
+                             "caf\xc3\xa9 \xf0\x9f\x98\x80", "nel\xc2\x85x"}) {
         const std::string label = std::string("prefix \"") + name + "\"";
         const fs::path prefix = root / "odd" / name;
         const Install installed = install(prefix);
@@ -471,6 +477,9 @@ void checkOddPrefixes(const fs::path& root) {
         //       doubled -> "pct%n" and "all of" red on all three; `$` doubled -> the three `$`
         //       prefixes red on all three. Re-observed 2026-09-24. By hand here, reverted: the binary
         //       copied aside instead of moved -> only the moved-aside line red, for all five.
+        //       S14.16's accepted rows, via control_run.sh 2026-09-24, reverted: the UTF-8 pattern
+        //       made ASCII-only -> "café 😀" and the U+0085 row red on "succeeds" and "writes the
+        //       unit", alone; code 93 (]) added to the refused list -> "c]x" red on the same two, alone.
         execStartNames(readFile(unit), binary, label);
         if (!kHaveAnalyze) continue;
         checkVerify(unit, label + ": ");
@@ -504,6 +513,14 @@ void checkRefusedPrefixes(const fs::path& root) {
         {"double quote", "quo\"x"}, {"single quote", "apo'x"}, {"backslash", "bs\\x"},
         {"newline", "nl\nx"},       {"tab", "tab\tx"},         {"byte 1", "ctl\x01x"},
         {"byte 127", "del\x7fx"},
+        // systemd's glob characters, refused in an executable path however it is quoted.
+        {"star", "star*x"},         {"question mark", "q?x"},  {"bracket", "b[x"},
+        // Not valid UTF-8, which systemd ignores a unit line for: a lone byte, an overlong NUL, a
+        // surrogate, a truncated sequence; then three Unicode noncharacters, which it counts as
+        // invalid too (U+FFFE, U+FDD0, U+1FFFE).
+        {"byte 255", "ff\xffx"},    {"overlong NUL", "ov\xc0\x80x"}, {"surrogate", "sur\xed\xa0\x80x"},
+        {"truncated sequence", "tr\xe2\x82x"}, {"U+FFFE", "nc\xef\xbf\xbex"}, {"U+FDD0", "nc\xef\xb7\x90x"},
+        {"U+1FFFE", "nc\xf0\x9f\xbf\xbex"},
     };
     for (const auto& [label, name] : prefixes) {
         const fs::path prefix = root / "refused" / name;
@@ -516,18 +533,33 @@ void checkRefusedPrefixes(const fs::path& root) {
         // WHY-THIS-SHAPE: the path is looked for in the error only (errorNames above). The unit
         //       step runs before anything is copied, so every row, backslash included, is refused
         //       by it.
-        // CONTROL: in backend/CMakeLists.txt, via control_run.sh, reverted, re-observed 2026-09-24:
-        //       the path dropped from the refusal message -> all seven "naming the path" lines red,
-        //       backslash's included; code 34 (") alone removed -> the double-quote rows only; the
-        //       refused list emptied -> every row but backslash red on both lines. A backslash row
-        //       stays refused even then, by CMake's own file(WRITE): it creates the parent
-        //       directories reading the backslash as a separator and then cannot open the path.
+        // CONTROL: in backend/CMakeLists.txt, via control_run.sh, reverted, re-observed 2026-09-24
+        //       after S14.16's rows were added: the path dropped from both refusal messages -> all
+        //       seventeen "naming the path" lines red, backslash's included; code 34 (") alone
+        //       removed -> the double-quote row only, on both lines; the refused list emptied (codes
+        //       and the control range) -> the quote, control, DEL and glob rows red on both lines. A
+        //       backslash row stays refused even then, by CMake's own file(WRITE): it creates the
+        //       parent directories reading the backslash as a separator and then cannot open the
+        //       path; the UTF-8 rows by their own check. S14.16's rows: the glob code 42 removed ->
+        //       the star row only; the UTF-8 test made `if(FALSE)` -> the seven UTF-8 and
+        //       noncharacter rows; its noncharacter half dropped -> the three noncharacter rows.
         const bool named = !installed.ok && errorNames(installed.output, prefix.string());
         check(named, ("prefix with a " + label + ": the install fails with an error naming the path").c_str());
         if (!named) std::fprintf(stderr, "  install output:\n%s\n", installed.output.c_str());
+        // GOAL: S14.8, S14.16 -- the refusal comes before anything is copied, so a refused prefix
+        //       is left as it was: here, not even created.
+        // WHY-THIS-SHAPE: the prefix itself, not the unit: a refusal after the binary and shaders
+        //       were copied would leave no unit and still pass a check on the unit alone.
+        // CONTROL: in backend/CMakeLists.txt, via control_run.sh, reverted: a
+        //       `file(MAKE_DIRECTORY "${_wx_prefix}/bin")` put ahead of the path checks -> this line
+        //       red for sixteen rows, with the absolute-bin-directory "nothing is installed" line and
+        //       the three DESTDIR lines (the directory made under /opt fails first there): 20.
+        //       Re-observed 2026-09-25. The backslash
+        //       row stays green: CMake reads its backslash as a separator, so the directory it makes
+        //       is not the prefix this line looks at.
         std::error_code ec;
-        const bool noUnit = !fs::exists(unitPath(prefix), ec);
-        check(noUnit, ("prefix with a " + label + ": no unit is installed").c_str());
+        const bool untouched = !fs::exists(prefix, ec);
+        check(untouched, ("prefix with a " + label + ": nothing is created under the prefix").c_str());
     }
 }
 
@@ -557,7 +589,7 @@ void checkDestdir(const fs::path& root) {
     // GOAL: S14.6 -- a staged install names the final path, not the staging one: a package
     //       built with DESTDIR must start /opt/..., not /build/destdir/opt/....
     // CONTROL: in backend/CMakeLists.txt, both install-time cmake_path calls based on
-    //       `$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}` -> this line red, alone. Observed 2026-09-24 via
+    //       `$ENV{DESTDIR}${_wx_prefix}` -> this line red, alone. Re-observed 2026-09-25 via
     //       control_run.sh; reverted.
     if (haveUnit) execStartNames(readFile(unit), binaryPath(finalPrefix), "with DESTDIR");
 }
@@ -637,8 +669,10 @@ void checkAbsoluteBindir(const fs::path& root) {
     // WHY-THIS-SHAPE: "the install fails" alone is satisfied by this unbuilt tree whatever the
     //       check does, so the error must name the would-be shader directory, and nothing at all
     //       may exist under the prefix afterwards.
-    // CONTROL: in backend/CMakeLists.txt, the shader-path comparison made `if(FALSE)` -> both lines
-    //       below red, alone. Observed 2026-09-24 via control_run.sh; reverted.
+    // CONTROL: in backend/CMakeLists.txt, via control_run.sh 2026-09-25, reverted: the one
+    //       shader-location check (where the daemon would look, resolved through links, against
+    //       where the shaders go) made `if(FALSE)` -> both lines below red, with the linked-bin
+    //       phase's two, which that same check refuses.
     const fs::path other = root / "absbin-other";
     const Install moved = install(other, {}, {}, build.string());
     if (!moved.ran) return;
@@ -654,8 +688,8 @@ void checkAbsoluteBindir(const fs::path& root) {
     // WHY-THIS-SHAPE: the unit being written is the evidence the check passed, since it is written
     //       after the check; the install still fails afterwards, on the binary this tree never built.
     // CONTROL: in backend/CMakeLists.txt, the install-time relative path computed from
-    //       "${CMAKE_INSTALL_PREFIX}/bin" instead of the bin directory actually used -- a check that
-    //       assumes a relative bin directory -> this line red, alone. Observed 2026-09-24 via
+    //       "${_wx_prefix}/bin" instead of the bin directory actually used -- a check that assumes
+    //       a relative bin directory -> this line red, alone. Re-observed 2026-09-24 via
     //       control_run.sh; reverted.
     const Install kept = install(configured, {}, {}, build.string());
     if (!kept.ran) return;
@@ -684,10 +718,14 @@ int boundPort(const StatusReply& status) {
     }
 }
 
-// S14.6: the installed binary, run with no override, finds the installed shaders and draws.
-void checkInstalledDaemon(NameWatcher& names, const fs::path& root, const fs::path& prefix) {
-    constexpr const char* kGoals = "S14.6's run of the installed daemon";
-    const fs::path home = root / "home";
+// S14.6: the installed binary, run with no override, finds the installed shaders and draws. A
+// non-empty `label` names an install other than the plain one in every line; `homeTag` keeps its
+// HOME apart, so no run restores another's wallpapers.
+void checkInstalledDaemon(NameWatcher& names, const fs::path& root, const fs::path& prefix,
+                          const std::string& label = "", const std::string& homeTag = "home") {
+    const std::string goals = label.empty() ? "S14.6's run of the installed daemon" : label + ": the installed daemon's run";
+    const auto named = [&label](const char* text) { return label.empty() ? std::string(text) : label + ": " + text; };
+    const fs::path home = root / homeTag;
     const std::string blue = wallpaperx::testing::writeSolidPng((root / "blue.png").string(), 8, 8, {0, 0, 255, 255});
     g_installedDaemon = binaryPath(prefix).string();
 
@@ -699,7 +737,7 @@ void checkInstalledDaemon(NameWatcher& names, const fs::path& root, const fs::pa
                           "XDG_STATE_HOME=" + (home / ".local" / "state").string()},
                          SpawnedDaemon::Stdout::Captured, {}, 0, {"--config-port", "0"});
     if (!names.waitFor(true)) {
-        check(false, "the installed daemon starts and acquires the bus name");
+        check(false, named("the installed daemon starts and acquires the bus name").c_str());
         return;
     }
 
@@ -713,15 +751,17 @@ void checkInstalledDaemon(NameWatcher& names, const fs::path& root, const fs::pa
     //       and the marker printed; the same call made the throwing setWallpaper -> "plain
     //       install: unexpected exception" and the marker printed. Observed 2026-09-24.
     const bool stillSent = wallpaperx::testing::trySetWallpaper(*proxy, "static", blue, 0, std::chrono::seconds(10));
-    check(stillSent && frames.wait(0, 1), "the installed daemon draws a still with the installed shaders");
+    check(stillSent && frames.wait(0, 1), named("the installed daemon draws a still with the installed shaders").c_str());
     const std::string clip = std::string(WALLPAPERX_VIDEO_ASSET_DIR) + "/wallpaper_bands.mp4";
     std::error_code ec;
     if (!fs::exists(clip, ec)) {
-        notVerified(kGoals, "the video fixture " + clip + " was not generated, so the video shaders were not drawn with");
+        notVerified(goals.c_str(),
+                    "the video fixture " + clip + " was not generated, so the video shaders were not drawn with");
     } else {
         const bool videoSent =
             wallpaperx::testing::trySetWallpaper(*proxy, "video", clip, 1, std::chrono::seconds(10));
-        check(videoSent && frames.waitAtLeast(1, 2), "the installed daemon plays a video with the installed shaders");
+        check(videoSent && frames.waitAtLeast(1, 2),
+              named("the installed daemon plays a video with the installed shaders").c_str());
     }
     const StatusReply status = getStatus(*proxy, std::chrono::seconds(10));
     for (const char* monitor : {"0", "1"}) {
@@ -743,7 +783,7 @@ void checkInstalledDaemon(NameWatcher& names, const fs::path& root, const fs::pa
     //       renders stayed green on the build tree's shaders. Observed 2026-09-24; reverted.
     const int port = boundPort(status);
     if (port <= 0) {
-        check(false, "the installed daemon reports the config port it bound");
+        check(false, named("the installed daemon reports the config port it bound").c_str());
     } else {
         httplib::Client client = wallpaperx::testing::makeClient(port);
         const wallpaperx::testing::HttpReply health = wallpaperx::testing::get(client, "/health");
@@ -753,7 +793,7 @@ void checkInstalledDaemon(NameWatcher& names, const fs::path& root, const fs::pa
         const std::string detail = shaders.value("detail", std::string());
         const fs::path expected = shaderDir(prefix);
         const bool installedOnes = shaders.value("status", std::string()) == "ok" && fs::equivalent(detail, expected, ec);
-        check(installedOnes, "/health reports the installed daemon using the installed shader directory");
+        check(installedOnes, named("/health reports the installed daemon using the installed shader directory").c_str());
         if (!installedOnes) {
             std::fprintf(stderr, "  /health shaders: %s\n  expected:        %s\n", shaders.dump().c_str(),
                          expected.c_str());
@@ -763,13 +803,16 @@ void checkInstalledDaemon(NameWatcher& names, const fs::path& root, const fs::pa
     const int exitCode = daemon.shutdown(SIGTERM);
     if (daemon.sanitizerReported()) {
         // Its exit status is then the sanitizer's, and grading it would blame the stop path.
-        check(false, "the installed daemon exits 0 on SIGTERM -- not graded: the daemon's sanitizer reported "
-                     "warnings, and the exit status is the sanitizer's");
+        check(false, named("the installed daemon exits 0 on SIGTERM -- not graded: the daemon's sanitizer reported "
+                           "warnings, and the exit status is the sanitizer's")
+                         .c_str());
     } else {
-        check(exitCode == 0, "the installed daemon exits 0 on SIGTERM");
+        check(exitCode == 0, named("the installed daemon exits 0 on SIGTERM").c_str());
     }
     if (!names.waitFor(false)) harnessFailure("the bus name is still owned after the installed daemon was reaped");
 }
+
+void checkMissingShaderLine(NameWatcher& names, const fs::path& root, const fs::path& prefix);
 
 // S14.6 for an ordinary prefix: the files, the unit, what the install leaves in the build tree and
 // its manifest, and the installed daemon run.
@@ -816,7 +859,8 @@ void checkPlainInstall(const fs::path& root) {
     //       The daemon installed to sbin -> this line, the verify line, the installed-daemon start,
     //       the DESTDIR binary line and each odd prefix's binary line red. `_wx_unit_dir` set to
     //       lib/systemd/user -> the unit line below and every other "writes the unit" / "lands
-    //       under it" line red, with both manifest lines and the absolute-bin-directory accept line.
+    //       under it" line red, with both manifest lines, the absolute-bin-directory accept line and
+    //       the relative prefix's placement line; re-observed 2026-09-24 via control_run.sh.
     const fs::path binary = binaryPath(prefix);
     check(fs::is_regular_file(binary) && ::access(binary.c_str(), X_OK) == 0,
           "the install puts an executable wallpaperx-daemon in <prefix>/" WALLPAPERX_TEST_BINDIR);
@@ -830,6 +874,184 @@ void checkPlainInstall(const fs::path& root) {
     }
     NameWatcher names;
     checkInstalledDaemon(names, root, prefix);
+    checkMissingShaderLine(names, root, prefix);
+}
+
+// GOAL: S14.17 -- an install whose <prefix>/bin is a symbolic link to a directory elsewhere, where
+//       the daemon (which finds its shaders from /proc/self/exe, resolved through every link) would
+//       miss the shaders installed under <prefix>/share, is refused with an error naming the prefix,
+//       before anything is copied; a whole prefix reached through a link still installs, and the
+//       daemon installed there draws.
+// WHY-THIS-SHAPE: the refused layout is a dotfile manager's (bin linked to a sibling tree one level
+//       deeper), and "nothing copied" is read from both ends of the link. The accepted one is run,
+//       not only installed: the refusal's whole point is where the running daemon looks.
+// CONTROL: in backend/CMakeLists.txt, via control_run.sh, re-observed 2026-09-25, reverted. (a) The
+//       shader-location check made `if(FALSE)` ->
+//       "bin a link elsewhere" both lines red, with the absolute-bin-directory phase's two, which
+//       it also refuses. (b) The shader directory compared unresolved (`set(_wx_real_shaders
+//       "${_wx_shaders}")`) -> "prefix reached through a link: the install succeeds" red, alone:
+//       the whole-prefix link refused, so nothing ran.
+void checkSymlinkedPrefixes(NameWatcher& names, const fs::path& root) {
+    std::error_code ec;
+    const fs::path dotfiles = root / "links" / "dotfiles" / "bin";
+    const fs::path refused = root / "links" / "binlink";
+    fs::create_directories(dotfiles, ec);
+    fs::create_directories(refused, ec);
+    fs::create_directory_symlink("../dotfiles/bin", refused / "bin", ec);
+    if (ec || !fs::is_directory(refused / "bin")) {
+        harnessFailure("the linked bin directory could not be made under " + refused.string());
+        return;
+    }
+    const Install linkedBin = install(refused);
+    if (linkedBin.ran) {
+        const bool named = !linkedBin.ok && errorNames(linkedBin.output, refused.string());
+        check(named, "bin a link elsewhere: the install is refused with an error naming the prefix");
+        if (!named) std::fprintf(stderr, "  install output:\n%s\n", linkedBin.output.c_str());
+        const bool nothing = fs::is_empty(dotfiles, ec) && !fs::exists(refused / "share", ec);
+        check(nothing, "bin a link elsewhere: nothing is copied, through the link or beside it");
+    }
+
+    // GOAL: S14.17 -- a staged install (DESTDIR) is not refused for links on the machine that
+    //       builds the package: the same linked-bin prefix, staged, installs, and lands under DESTDIR.
+    //       False if the link check reads this host's copy of the final path, which says nothing
+    //       about the system the package is unpacked onto.
+    // WHY-THIS-SHAPE: the very prefix refused above, so the only difference is DESTDIR; "lands
+    //       under DESTDIR" is read from the staged binary, since a refusal copies nothing.
+    // CONTROL: in backend/CMakeLists.txt via control_run.sh 2026-09-25, reverted: _wx_resolve's
+    //       DESTDIR early return made `if(FALSE)`, so links are resolved on this host even for a
+    //       staged install -> this line red, alone.
+    const fs::path staging = root / "links" / "staging";
+    const Install stagedLink = install(refused, {"DESTDIR=" + staging.string()});
+    if (stagedLink.ran) {
+        check(stagedLink.ok && fs::is_regular_file(binaryPath(staging / refused.relative_path())),
+              "bin a link elsewhere, staged with DESTDIR: the install succeeds under DESTDIR");
+        if (!stagedLink.ok) std::fprintf(stderr, "  install output:\n%s\n", stagedLink.output.c_str());
+    }
+
+    const fs::path real = root / "links" / "real-prefix";
+    const fs::path linked = root / "links" / "linked-prefix";
+    fs::create_directories(real, ec);
+    fs::create_directory_symlink(real, linked, ec);
+    if (ec || !fs::is_directory(linked)) {
+        harnessFailure("the linked prefix could not be made at " + linked.string());
+        return;
+    }
+    const Install whole = install(linked);
+    if (!whole.ran) return;
+    check(whole.ok, "prefix reached through a link: the install succeeds");
+    if (!whole.ok) {
+        std::fprintf(stderr, "%s\n", whole.output.c_str());
+        return;
+    }
+    checkInstalledDaemon(names, root, linked, "prefix reached through a link", "home-linked");
+}
+
+// GOAL: S14.18 -- a relative --prefix is taken from the directory the install runs in: the binary,
+//       the shaders and the unit land there, the unit's ExecStart names that binary by its absolute
+//       path, systemd accepts the unit, and the daemon installed there draws.
+// WHY-THIS-SHAPE: cmake runs from a scratch directory through `sh -c 'cd'`, the umask phase's
+//       wrapper pattern, so the build tree's own directory never absorbs a stray install. ExecStart
+//       is compared with the absolute path, which a unit written with the relative prefix fails.
+// CONTROL: in backend/CMakeLists.txt, via control_run.sh 2026-09-24, reverted: `_wx_prefix` taken
+//       as CMAKE_INSTALL_PREFIX unchanged -> "relative prefix: the install succeeds" red, alone.
+void checkRelativePrefix(NameWatcher& names, const fs::path& root) {
+    const fs::path from = root / "relative-from";
+    std::error_code ec;
+    fs::create_directories(from, ec);
+    if (ec) {
+        harnessFailure("the directory to install from could not be made at " + from.string());
+        return;
+    }
+    const Install installed = install("relpfx", {}, {"/bin/sh", "-c", "cd \"$0\" && exec \"$@\"", from.string()});
+    if (!installed.ran) return;
+    check(installed.ok, "relative prefix: the install succeeds");
+    if (!installed.ok) {
+        std::fprintf(stderr, "%s\n", installed.output.c_str());
+        return;
+    }
+    const fs::path prefix = from / "relpfx";
+    check(fs::is_regular_file(binaryPath(prefix)) && fs::is_directory(shaderDir(prefix)) &&
+              fs::is_regular_file(unitPath(prefix)),
+          "relative prefix: the binary, the shaders and the unit are under the directory the install ran in");
+    if (!fs::is_regular_file(unitPath(prefix))) return;
+    execStartNames(readFile(unitPath(prefix)), binaryPath(prefix), "relative prefix");
+    if (kHaveAnalyze) checkVerify(unitPath(prefix), "relative prefix: ");
+    checkInstalledDaemon(names, root, prefix, "relative prefix", "home-relative");
+}
+
+// GOAL: S14.19 -- a daemon whose shader directory is missing says so once on stderr ("nothing can
+//       be drawn"), not once per render: every render retries the lookup, and a line per render
+//       would flood the journal.
+// WHY-THIS-SHAPE: the installed shaders are moved aside, so the daemon's own lookup fails as in a
+//       broken install, and three stills are set on three monitors; each monitor's error is waited
+//       for, so three renders provably failed before the line is counted. Breakable mode captures
+//       stderr alone, so a line sent to stdout does not count.
+// CONTROL: in backend/daemon/wallpaper_manager.cpp, via control_run.sh 2026-09-24, reverted:
+//       `if (newlyFailed)` made `if (true)` -> "exactly one stderr line" red, alone; the fprintf's
+//       stream made stdout -> the same line red, alone.
+// COVERAGE-ASSERT: the number of monitors that reported the shader error is asserted to be three
+//       before the count means anything; fewer is NOT VERIFIED, not a pass. By hand 2026-09-25,
+//       reverted: the error needle made one no error contains -> "0 of 3 renders reported the
+//       missing shader directory", NOT VERIFIED, a skip, no FAIL.
+void checkMissingShaderLine(NameWatcher& names, const fs::path& root, const fs::path& prefix) {
+    constexpr const char* kGoals = "S14.19 (one stderr line for a missing shader directory)";
+    constexpr const char* kLine = "nothing can be drawn";
+    const fs::path shaders = shaderDir(prefix);
+    const fs::path aside = shaders.string() + ".aside";
+    std::error_code ec;
+    fs::rename(shaders, aside, ec);
+    if (ec) {
+        harnessFailure("could not move " + shaders.string() + " aside: " + ec.message());
+        return;
+    }
+    struct PutBack {
+        const fs::path& from;
+        const fs::path& to;
+        ~PutBack() {
+            std::error_code ec;
+            fs::rename(from, to, ec);
+            if (ec) harnessFailure("could not put " + to.string() + " back: " + ec.message());
+        }
+    } putBack{aside, shaders};
+
+    const fs::path home = root / "home-noshaders";
+    const std::string blue = wallpaperx::testing::writeSolidPng((root / "blue.png").string(), 8, 8, {0, 0, 255, 255});
+    g_installedDaemon = binaryPath(prefix).string();
+    FrameReadyLog frames;
+    auto proxy = wallpaperx::testing::subscribeFrameReady(frames);
+    SpawnedDaemon daemon({"WALLPAPERX_VALIDATION=0", "HOME=" + home.string(),
+                          "XDG_CONFIG_HOME=" + (home / ".config").string(),
+                          "XDG_STATE_HOME=" + (home / ".local" / "state").string()},
+                         SpawnedDaemon::Stdout::Breakable, {}, 0, {"--config-port", "0"});
+    if (!names.waitFor(true)) {
+        notVerified(kGoals, "the installed daemon with its shaders moved aside never acquired the bus name");
+        return;
+    }
+    int failed = 0;
+    for (int32_t monitor = 0; monitor < 3; ++monitor) {
+        if (!wallpaperx::testing::trySetWallpaper(*proxy, "static", blue, monitor, std::chrono::seconds(10))) continue;
+        for (const auto until = wallpaperx::testing::Clock::now() + std::chrono::seconds(30);
+             wallpaperx::testing::Clock::now() < until && !daemon.exited();) {
+            const StatusReply status = getStatus(*proxy, std::chrono::seconds(5));
+            const nlohmann::json* entry = wallpaperStatus(status, std::to_string(monitor));
+            if (entry != nullptr && entry->value("last_error", std::string()).find("shader directory") != std::string::npos) {
+                ++failed;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+    }
+    const int exitCode = daemon.shutdown(SIGTERM);
+    (void)exitCode;
+    if (failed != 3) {
+        notVerified(kGoals, std::to_string(failed) + " of 3 renders reported the missing shader directory");
+        return;
+    }
+    const std::string out = daemon.output();
+    size_t lines = 0;
+    for (size_t at = out.find(kLine); at != std::string::npos; at = out.find(kLine, at + 1)) ++lines;
+    check(lines == 1, "missing shader directory: exactly one stderr line says nothing can be drawn, for three renders");
+    if (lines != 1) std::fprintf(stderr, "  %zu such lines on stderr\n", lines);
 }
 
 // One phase, with its own catch: an unexpected throw is reported against it, and the phases after
@@ -879,6 +1101,9 @@ int main() {
         runPhase("odd prefixes", [&] { checkOddPrefixes(root.path()); });
         runPhase("refused prefixes", [&] { checkRefusedPrefixes(root.path()); });
         runPhase("absolute bin directory", [&] { checkAbsoluteBindir(root.path()); });
+        NameWatcher names;
+        runPhase("linked prefixes", [&] { checkSymlinkedPrefixes(names, root.path()); });
+        runPhase("relative prefix", [&] { checkRelativePrefix(names, root.path()); });
     } catch (const std::exception& e) {
         check(false, (std::string("unexpected exception: ") + e.what()).c_str());
     }

@@ -2,11 +2,12 @@
 
 // RenderWorker's stop for a lost device (S14.5), in process.
 //
-// The worker is where the daemon learns its device is gone: it asks the manager after every job
-// and every clock round, tells its owner once, and then does no more GPU work. The daemon system
-// test sees the result of that from outside -- an exit status -- and cannot tell a worker that
-// stopped from one that kept submitting to a dead device while main() was on its way out. This
-// file can: it counts the submissions the daemon's code makes, through an interposed
+// The Device tells the owner of a loss (WallpaperManager::Config::onDeviceLost) the moment a call
+// answers VK_ERROR_DEVICE_LOST; the worker asks the manager after every job and every clock round
+// and, once the device is lost in a daemon that stops for it, does no more GPU work. The daemon
+// system test sees the result of that from outside -- an exit status -- and cannot tell a worker
+// that stopped from one that kept submitting to a dead device while main() was on its way out.
+// This file can: it counts the submissions the daemon's code makes, through an interposed
 // vkQueueSubmit that answers VK_ERROR_DEVICE_LOST once armed.
 
 #include "daemon/render_worker.h"
@@ -65,11 +66,13 @@ struct Answer {
             promise.set_value(state);
         };
     }
-    // The answer, once it has come; nothing when it has not come within the bound.
+    // The answer, once it has come; nothing when it has not come within the bound. May be asked
+    // again.
     std::optional<TaskState> await() {
-        if (future.wait_for(kWait) != std::future_status::ready) return std::nullopt;
-        return future.get();
+        if (!got && future.wait_for(kWait) == std::future_status::ready) got = future.get();
+        return got;
     }
+    std::optional<TaskState> got;
 };
 
 const char* nameOf(std::optional<TaskState> state) {
@@ -111,25 +114,26 @@ void withCallback(const std::string& blue, const std::string& red) {
     constexpr const char* kGoals = "S14.5 with a device-lost callback";
     g_lose.store(false);
 
-    WallpaperManager manager(smallConfig());
-    FrameReadyLog frames;
     std::atomic<int> calls{0};
     std::atomic<int> submitsAtCall{-1};
     std::promise<void> called;
     std::future<void> calledFuture = called.get_future();
+    WallpaperManager::Config config = smallConfig();
+    config.onDeviceLost = [&] {
+        if (calls.fetch_add(1) == 0) {
+            submitsAtCall.store(g_submits.load());
+            called.set_value();
+        }
+    };
+    WallpaperManager manager(std::move(config));
+    FrameReadyLog frames;
     // Ahead of the worker: a task left queued is answered by the worker's destructor, so what it
     // writes to must still exist then.
     Answer healthy;
-    Answer after;
+    std::vector<std::unique_ptr<Answer>> probes;
     Answer later;
-    RenderWorker worker(
-        manager, [&frames](int monitorId, uint64_t generation) { frames.record(monitorId, generation); },
-        [&] {
-            if (calls.fetch_add(1) == 0) {
-                submitsAtCall.store(g_submits.load());
-                called.set_value();
-            }
-        });
+    RenderWorker worker(manager,
+                        [&frames](int monitorId, uint64_t generation) { frames.record(monitorId, generation); });
 
     if (!firstFrame(manager, worker, frames, blue, kGoals)) return;
 
@@ -139,10 +143,14 @@ void withCallback(const std::string& blue, const std::string& red) {
     // WHY-THIS-SHAPE: read after a task has been answered from the worker, which is after the
     //       check that follows the render has run; read straight after FrameReady it would race
     //       that check and pass for a worker that was about to stop.
-    // CONTROL: WallpaperManager::deviceLost() (backend/daemon/wallpaper_manager.cpp) made to
-    //       return `m_device != nullptr` -> "FAIL: a task after a frame on a healthy device runs"
-    //       and "FAIL: the device-lost callback is not called for a healthy device". Observed
-    //       2026-09-24 on NVIDIA and Lavapipe. Reverted.
+    // CONTROL: via control_run.sh 2026-09-25 on NVIDIA and Lavapipe, both reverted.
+    //       (a) WallpaperManager::stopsForLostDevice() (backend/daemon/wallpaper_manager.cpp) made
+    //       to return `m_device != nullptr` -> "a task after a frame on a healthy device runs"
+    //       red, with "a render that loses the device calls the manager's device-lost handler",
+    //       since the stopped worker never runs that render. (b) Device::observe()
+    //       (renderer/vulkan/device.cpp) made to call its handler for every result -> "the
+    //       device-lost callback is not called for a healthy device" red, with the two lines of
+    //       the exactly-once check below.
     worker.postTask(healthy.task());
     const std::optional<TaskState> healthyState = healthy.await();
     check(healthyState == TaskState::Run, "a task after a frame on a healthy device runs");
@@ -152,34 +160,40 @@ void withCallback(const std::string& blue, const std::string& red) {
     manager.requestWallpaper("static", red, 1);
     worker.post(1);
     if (calledFuture.wait_for(kWait) != std::future_status::ready) {
-        check(false, "a render that loses the device makes the worker call its device-lost callback");
+        check(false, "a render that loses the device calls the manager's device-lost handler");
         return;
     }
 
-    // GOAL: S14.5 -- once the owner has been told, the worker refuses new work the way a stopping
-    //       worker does, answering a task ShuttingDown on the posting thread before postTask()
-    //       returns, and starts no GPU work. False if a request after the loss is queued and run
-    //       on the dead device, or answered only when the process tears the worker down.
-    // WHY-THIS-SHAPE: the answer is read immediately after postTask(), because the claim is that
-    //       it is answered inline; a wait would also pass for a worker that answered it much
-    //       later from its own thread. The second task is posted after a render and a wake, and
-    //       the worker is not stopped until that task has been answered: a worker still serving
-    //       runs the render first (one FIFO), so its submission is counted before the join,
-    //       rather than racing stop() for it.
-    // CONTROL: in backend/daemon/render_worker.cpp, stopForLostDevice()'s `m_stop = true` block
-    //       deleted, so the worker returns without refusing -> "FAIL: a task posted after the
-    //       loss is answered ShuttingDown on the posting thread before postTask returns" and "FAIL:
-    //       a task posted after a later render request is refused too" (each after its 30 s
-    //       bound, as nothing answers them until stop()). Observed 2026-09-24. Reverted.
-    worker.postTask(after.task());
-    const bool inline1 = after.answered.load();
-    const std::optional<TaskState> afterState = after.await();
-    check(inline1 && afterState == TaskState::ShuttingDown && after.thread == std::this_thread::get_id(),
-          "a task posted after the loss is answered ShuttingDown on the posting thread before postTask returns");
-    if (!(inline1 && afterState == TaskState::ShuttingDown)) {
-        std::fprintf(stderr, "  answered %s, %s\n", nameOf(afterState),
-                     inline1 ? "inline" : "not before postTask returned");
+    // GOAL: S14.5 -- once the device is lost, the worker comes to refuse new work the way a
+    //       stopping worker does, answering a task ShuttingDown on the posting thread before
+    //       postTask() returns, and never runs a task posted after the loss. False if a request
+    //       after the loss is queued and run on the dead device, or answered only when the
+    //       process tears the worker down.
+    // WHY-THIS-SHAPE: the handler runs inside the failing submission, before the worker has
+    //       finished that job and set its stop, so a single task posted on hearing of the loss
+    //       races the worker's own check. Tasks are posted until one is answered inline; the
+    //       ones posted in the gap sit queued behind a worker that has returned, and must come
+    //       back ShuttingDown from stop(), never Run. "Inline" is the posting thread's id.
+    // CONTROL: in backend/daemon/render_worker.cpp via control_run.sh 2026-09-25 on NVIDIA and
+    //       Lavapipe, both reverted. (a) stopForLostDevice()'s `m_stop = true;` deleted, so the
+    //       worker returns without refusing -> this line, "a task posted after a later render
+    //       request is refused too" and "no task posted after the loss is run" red. (b) its
+    //       stopsForLostDevice() test made `true ||` so it never stops -> the same three and "the
+    //       worker submits nothing after the loss is reported".
+    // COVERAGE-ASSERT: the probes posted are counted and printed; the refusal is read off the
+    //       last one, so a loop that posted none cannot pass.
+    bool refusedInline = false;
+    for (const auto until = std::chrono::steady_clock::now() + kWait; std::chrono::steady_clock::now() < until;) {
+        Answer& probe = *probes.emplace_back(std::make_unique<Answer>());
+        worker.postTask(probe.task());
+        if (probe.answered.load() && probe.thread == std::this_thread::get_id()) {
+            refusedInline = probe.await() == TaskState::ShuttingDown;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
+    check(!probes.empty() && refusedInline,
+          "after the loss, a task is answered ShuttingDown on the posting thread before postTask returns");
 
     manager.requestWallpaper("static", blue, 2);
     worker.post(2);
@@ -191,42 +205,48 @@ void withCallback(const std::string& blue, const std::string& red) {
 
     worker.stop();
 
-    // GOAL: S14.5 -- the callback is called exactly once, and no submission is made after it.
-    //       False if a worker that has reported the loss goes on rendering: work started on a
-    //       lost device is what a hung driver may hold when the stop deadline kills the process,
-    //       and a render killed that way is blamed on its wallpaper.
+    size_t ranAfterLoss = 0;
+    for (const std::unique_ptr<Answer>& probe : probes) {
+        if (probe->await() != TaskState::ShuttingDown) ++ranAfterLoss;
+    }
+    check(ranAfterLoss == 0, "no task posted after the loss is run; the ones queued in the gap are refused by stop()");
+    std::printf("device_loss_worker_test: %zu task(s) posted after the loss before one was refused inline, %zu run\n",
+                probes.size(), ranAfterLoss);
+
+    // GOAL: S14.5 -- the handler is called exactly once, and no submission is made after it.
+    //       False if a worker whose device is lost goes on rendering: work started on a lost
+    //       device is what a hung driver may hold when the stop deadline kills the process, and a
+    //       render killed that way is blamed on its wallpaper.
     // WHY-THIS-SHAPE: submissions are counted at the driver boundary, not inferred from
     //       FrameReady: a render on a lost device fails, so it announces nothing whether or not
     //       it ran. Read after stop() has joined the worker, so nothing can still be in flight.
-    // CONTROL: two in backend/daemon/render_worker.cpp, both observed 2026-09-24 on NVIDIA and
-    //       Lavapipe, both reverted. (a) run()'s `if (stopForLostDevice()) return;` after runJob()
-    //       made to call it and carry on -> "FAIL: the device-lost callback is called exactly
-    //       once", and only that: the check after the clock round calls it a second time.
-    //       (b) stopForLostDevice() made to call the callback and return false without setting
-    //       m_stop, a worker that reports and serves on -> "FAIL: the worker submits nothing after
-    //       reporting the loss", with the callback count and both refusal lines red beside it.
-    check(calls.load() == 1, "the device-lost callback is called exactly once");
+    // CONTROL: the handler count by the Device::observe() every-result control above (both lines
+    //       red); the submission count by the `true ||` worker control above. Removing observe()'s
+    //       once-only latch (renderer/vulkan/device.cpp) left this green, 2026-09-25: the stopped
+    //       worker makes no second failing call, so the latch is graded in renderer's
+    //       device_lost_probe instead.
+    check(calls.load() == 1, "the device-lost handler is called exactly once");
     if (calls.load() != 1) std::fprintf(stderr, "  it was called %d times\n", calls.load());
-    check(g_submits.load() == submitsAtCall.load(), "the worker submits nothing after reporting the loss");
+    check(g_submits.load() == submitsAtCall.load(), "the worker submits nothing after the loss is reported");
     if (g_submits.load() != submitsAtCall.load()) {
-        std::fprintf(stderr, "  %d submission(s) after the callback\n", g_submits.load() - submitsAtCall.load());
+        std::fprintf(stderr, "  %d submission(s) after the handler\n", g_submits.load() - submitsAtCall.load());
     }
-    std::printf("device_loss_worker_test: with a callback, the loss was reported after %d submission(s) and none "
+    std::printf("device_loss_worker_test: with a handler, the loss was reported at submission %d and none "
                 "followed\n",
                 submitsAtCall.load());
 }
 
-// GOAL: S14.5 -- without a callback, a worker whose device is lost serves on, as it did before
-//       the callback existed: tasks run, renders are attempted (and fail). False if the loss now
-//       stops every worker, which would turn the in-process DEVICE_LOST tests into tests of a
-//       stopped worker and change what the daemon's DBus handlers answer without one.
+// GOAL: S14.5 -- without a Config::onDeviceLost handler, a worker whose device is lost serves on:
+//       tasks run, renders are attempted (and fail). False if the loss now stops every worker,
+//       which would turn the in-process DEVICE_LOST tests into tests of a stopped worker and
+//       change what the daemon's DBus handlers answer without one.
 // WHY-THIS-SHAPE: the render after the loss is proven attempted by the submission count, and the
 //       task behind it by its Run answer; FrameReady cannot show either, since a render on a
 //       lost device announces nothing.
-// CONTROL: in backend/daemon/render_worker.cpp, stopForLostDevice() made to stop whenever the
-//       device is lost and call the callback only if there is one -> "FAIL: without a callback,
-//       a task after the loss still runs" and "FAIL: without a callback, the worker is still
-//       serving after two lost renders". Observed 2026-09-24 on NVIDIA and Lavapipe. Reverted.
+// CONTROL: `if (!m_config.onDeviceLost) return false;` deleted from
+//       WallpaperManager::stopsForLostDevice() (backend/daemon/wallpaper_manager.cpp), via
+//       control_run.sh 2026-09-25 on NVIDIA and Lavapipe -> "without a callback, a task after the
+//       loss still runs" and "... still serving after two lost renders" red. Reverted.
 void withoutCallback(const std::string& blue, const std::string& red) {
     constexpr const char* kGoals = "S14.5 without a device-lost callback";
     g_lose.store(false);

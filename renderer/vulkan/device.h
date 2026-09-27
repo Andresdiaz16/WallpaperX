@@ -66,7 +66,9 @@ struct DeviceInfo {
 
 class Device {
 public:
-    explicit Device(bool enableValidation);
+    // `onLost` runs once, on the thread whose call first saw VK_ERROR_DEVICE_LOST, before that
+    // call returns. It must not block or call back into this Device; a throw from it is swallowed.
+    explicit Device(bool enableValidation, std::function<void()> onLost = {});
     ~Device();
 
     Device(const Device&) = delete;
@@ -430,6 +432,7 @@ private:
 
     // Written only by observe().
     bool m_lost = false;
+    std::function<void()> m_onLost;
 };
 
 }

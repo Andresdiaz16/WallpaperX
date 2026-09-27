@@ -2338,7 +2338,7 @@ void runHealthStateChecks(const std::string& bluePath, const std::string& shader
                 //       "... does not implicate the GPU", and "the shader check's detail
                 //       names the directory that could not be found", the body showing
                 //       shaders={pending,""} and the directory named under gpu instead.
-                //       Reverted.
+                //       Re-observed 2026-09-25 via control_run.sh (the same three). Reverted.
                 check(healthCheckStatus(health.json, "shaders") == "fail",
                       "a missing shader directory is reported as a shader failure");
                 check(healthCheckStatus(health.json, "gpu") == "pending",

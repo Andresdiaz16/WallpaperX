@@ -116,6 +116,7 @@ add_library(wallpaperx-daemon-lib STATIC
     daemon/dbus_service.cpp
     daemon/kept_rows.cpp
     daemon/http_server.cpp
+    daemon/log_pump.cpp
     daemon/render_worker.cpp
     daemon/wallpaper_manager.cpp
 )
@@ -287,24 +288,57 @@ install(CODE "
     set(_wx_unit_template \"${CMAKE_CURRENT_SOURCE_DIR}/packaging/wallpaperx-daemon.service.in\")
 " COMPONENT daemon)
 install(CODE [[
-    cmake_path(ABSOLUTE_PATH _wx_bindir BASE_DIRECTORY "${CMAKE_INSTALL_PREFIX}" NORMALIZE
+    # A relative prefix is taken from the directory the install runs in, as CMake's own rules
+    # below take it; the unit needs the absolute path.
+    cmake_path(ABSOLUTE_PATH CMAKE_INSTALL_PREFIX NORMALIZE OUTPUT_VARIABLE _wx_prefix)
+    cmake_path(ABSOLUTE_PATH _wx_bindir BASE_DIRECTORY "${_wx_prefix}" NORMALIZE
                OUTPUT_VARIABLE _wx_bin)
-    cmake_path(ABSOLUTE_PATH _wx_shader_dir BASE_DIRECTORY "${CMAKE_INSTALL_PREFIX}" NORMALIZE
+    cmake_path(ABSOLUTE_PATH _wx_shader_dir BASE_DIRECTORY "${_wx_prefix}" NORMALIZE
                OUTPUT_VARIABLE _wx_shaders)
-    # The path is compiled into the daemon. An absolute bin or data directory does not move with
-    # a prefix given now, while the other one does.
-    file(RELATIVE_PATH _wx_from_bin "${_wx_bin}" "${_wx_shaders}")
-    if(NOT _wx_from_bin STREQUAL _wx_shader_dir_from_bindir)
-        message(FATAL_ERROR "this prefix puts the shaders at ${_wx_shaders}, but the daemon installed "
-                            "to ${_wx_bin} was built to look in ${_wx_shader_dir_from_bindir} from "
-                            "there. Install with the configured prefix, or configure with "
-                            "CMAKE_INSTALL_BINDIR and CMAKE_INSTALL_DATADIR both relative.")
+    # The daemon applies its compiled-in path to /proc/self/exe, which the kernel has resolved
+    # through every symbolic link, so the comparison is between resolved paths. Under DESTDIR it is
+    # between the paths as written: links in a staging tree say nothing about the target system.
+    # A directory the install has yet to create resolves as the part of it that exists, plus the rest.
+    function(_wx_resolve path out)
+        if(NOT "$ENV{DESTDIR}" STREQUAL "")
+            set(${out} "${path}" PARENT_SCOPE)
+            return()
+        endif()
+        set(_head "${path}")
+        set(_tail "")
+        while(NOT EXISTS "${_head}")
+            cmake_path(GET _head FILENAME _name)
+            cmake_path(GET _head PARENT_PATH _head)
+            if(_tail STREQUAL "")
+                set(_tail "${_name}")
+            else()
+                set(_tail "${_name}/${_tail}")
+            endif()
+        endwhile()
+        file(REAL_PATH "${_head}" _real)
+        if(NOT _tail STREQUAL "")
+            cmake_path(APPEND _real "${_tail}")
+            cmake_path(NORMAL_PATH _real)
+        endif()
+        set(${out} "${_real}" PARENT_SCOPE)
+    endfunction()
+    _wx_resolve("${_wx_bin}" _wx_found)
+    cmake_path(APPEND _wx_found "${_wx_shader_dir_from_bindir}")
+    cmake_path(NORMAL_PATH _wx_found)
+    _wx_resolve("${_wx_found}" _wx_found)
+    _wx_resolve("${_wx_shaders}" _wx_real_shaders)
+    if(NOT _wx_found STREQUAL _wx_real_shaders)
+        message(FATAL_ERROR "cannot install to ${_wx_prefix}: the daemon installed to ${_wx_bin} "
+                            "would look for its shaders in ${_wx_found}, but they are installed to "
+                            "${_wx_shaders}. Install with the configured prefix, configure with "
+                            "CMAKE_INSTALL_BINDIR and CMAKE_INSTALL_DATADIR both relative, and do "
+                            "not make the bin directory a symbolic link to another place.")
     endif()
 
     set(_wx_exe "${_wx_bin}/wallpaperx-daemon")
     # systemd refuses these in an executable path however they are escaped ("Executable path
-    # contains special characters"), so the unit could never load.
-    set(_wx_refused 34 39 92 127)
+    # contains special characters"), so the unit could never load. * ? [ are its glob characters.
+    set(_wx_refused 34 39 42 63 91 92 127)
     foreach(_wx_code RANGE 1 31)
         list(APPEND _wx_refused ${_wx_code})
     endforeach()
@@ -313,9 +347,22 @@ install(CODE [[
         string(FIND "${_wx_exe}" "${_wx_char}" _wx_at)
         if(NOT _wx_at EQUAL -1)
             message(FATAL_ERROR "systemd cannot run an executable whose path contains a quote, a "
-                                "backslash or a control character: ${_wx_exe}")
+                                "backslash, a control character or one of * ? [: ${_wx_exe}")
         endif()
     endforeach()
+    # systemd ignores a unit line that is not valid UTF-8, and counts noncharacters as invalid.
+    # Checked on the bytes spelled out in hex, one "xx " per byte, which CMake's regex can match.
+    string(HEX "${_wx_exe}" _wx_hex)
+    string(REGEX REPLACE "(..)" "\\1 " _wx_hex "${_wx_hex}")
+    set(_wx_cont "[89ab][0-9a-f] ")
+    string(CONCAT _wx_utf8 "^([0-7][0-9a-f] |c[2-9a-f] ${_wx_cont}|d[0-9a-f] ${_wx_cont}"
+           "|e0 [ab][0-9a-f] ${_wx_cont}|e[1-9a-cef] ${_wx_cont}${_wx_cont}|ed [89][0-9a-f] ${_wx_cont}"
+           "|f0 [9ab][0-9a-f] ${_wx_cont}${_wx_cont}|f[1-3] ${_wx_cont}${_wx_cont}${_wx_cont}"
+           "|f4 8[0-9a-f] ${_wx_cont}${_wx_cont})*$")
+    set(_wx_nonchar " (ef b7 [9a][0-9a-f]|ef bf b[ef]|f[0-4] [89ab]f bf b[ef]) ")
+    if(NOT _wx_hex MATCHES "${_wx_utf8}" OR " ${_wx_hex}" MATCHES "${_wx_nonchar}")
+        message(FATAL_ERROR "systemd cannot load a unit whose executable path is not valid UTF-8: ${_wx_exe}")
+    endif()
     # Anything else is quoted, with % doubled (specifiers are expanded inside quotes too) and
     # the ":" prefix, which stops $ in the path being taken for a variable in argv[0].
     if(_wx_exe MATCHES "^[A-Za-z0-9/._+,:=@~-]+$")
@@ -329,7 +376,7 @@ install(CODE [[
 
     # What install(FILES) would do: written under DESTDIR, recorded in the manifest without it,
     # 0644 whatever the umask.
-    cmake_path(ABSOLUTE_PATH _wx_unit_dir BASE_DIRECTORY "${CMAKE_INSTALL_PREFIX}" NORMALIZE)
+    cmake_path(ABSOLUTE_PATH _wx_unit_dir BASE_DIRECTORY "${_wx_prefix}" NORMALIZE)
     set(_wx_unit "${_wx_unit_dir}/wallpaperx-daemon.service")
     set(_wx_staged_unit "$ENV{DESTDIR}${_wx_unit}")
     message(STATUS "Installing: ${_wx_staged_unit}")
@@ -425,7 +472,8 @@ endif()
 # It needs renderer/tests on the include path for support/forked_child.h, which is where the
 # PR_SET_PDEATHSIG preamble and the core-dump suppression live -- shared with the renderer's
 # own forking probe rather than copied.
-add_executable(wallpaperx-crash-record-test tests/crash_record_test.cpp)
+# log_writer_fault.cpp replaces libc's memrchr in this binary, to fault on the log writer's thread.
+add_executable(wallpaperx-crash-record-test tests/crash_record_test.cpp tests/log_writer_fault.cpp)
 target_link_libraries(wallpaperx-crash-record-test PRIVATE wallpaperx-daemon-lib)
 target_include_directories(wallpaperx-crash-record-test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../renderer/tests)
@@ -440,7 +488,18 @@ set_target_properties(wallpaperx-crash-record-test PROPERTIES AUTOMOC OFF AUTOUI
 # sanitizer's handler, are unaffected and still run.
 if(WALLPAPERX_SANITIZE)
     target_compile_definitions(wallpaperx-crash-record-test PRIVATE WALLPAPERX_SIGNAL_EXIT_IS_THE_SIGNAL=false)
+else()
+    # A stand-in for a sanitizer's death-callback registration, which a sanitized build has for real.
+    target_sources(wallpaperx-crash-record-test PRIVATE tests/sanitizer_death_fake.cpp)
+    target_compile_definitions(wallpaperx-crash-record-test PRIVATE WALLPAPERX_FAKE_SANITIZER_DEATH=1)
 endif()
+
+# The log writer against a destination that refuses a write or has lost its reader, in forked
+# children. log_pump_write_fault.cpp replaces libc's write(2) in this binary to stage the refusal.
+add_executable(wallpaperx-log-pump-test tests/log_pump_test.cpp tests/log_pump_write_fault.cpp)
+target_link_libraries(wallpaperx-log-pump-test PRIVATE wallpaperx-daemon-lib)
+target_include_directories(wallpaperx-log-pump-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../renderer/tests)
+set_target_properties(wallpaperx-log-pump-test PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
 
 # The refusal half of the same feature: what a start does with a record it finds. Separate
 # from the binary above because this one drives a WallpaperManager and renders on the GPU,
@@ -816,6 +875,35 @@ find_package(Vulkan REQUIRED)
 target_link_libraries(wallpaperx-test-device-lost-shim PRIVATE ${CMAKE_DL_LIBS} Vulkan::Headers)
 target_include_directories(wallpaperx-test-device-lost-shim PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../renderer/tests)
 set_target_properties(wallpaperx-test-device-lost-shim PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+# daemon_system_test holds a render at its submission, and loses the device, during a failed start.
+target_compile_definitions(wallpaperx-daemon-system-test PRIVATE
+    WALLPAPERX_DEVICE_LOST_SHIM="$<TARGET_FILE:wallpaperx-test-device-lost-shim>")
+add_dependencies(wallpaperx-daemon-system-test wallpaperx-test-device-lost-shim)
+
+# What that library's one line does to the stream it lands on. Links the Vulkan loader only for the
+# entry point the shim interposes; the fake submit never reaches a driver.
+add_executable(wallpaperx-device-lost-shim-test tests/device_lost_shim_test.cpp)
+target_link_libraries(wallpaperx-device-lost-shim-test PRIVATE Vulkan::Vulkan)
+target_include_directories(wallpaperx-device-lost-shim-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/../renderer/tests)
+set_target_properties(wallpaperx-device-lost-shim-test PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+target_compile_definitions(wallpaperx-device-lost-shim-test PRIVATE
+    WALLPAPERX_DEVICE_LOST_SHIM="$<TARGET_FILE:wallpaperx-test-device-lost-shim>")
+add_dependencies(wallpaperx-device-lost-shim-test wallpaperx-test-device-lost-shim)
+add_test(NAME device_lost_shim COMMAND $<TARGET_FILE:wallpaperx-device-lost-shim-test>)
+# no-tsan: preloading an uninstrumented library into a sanitized binary is untried.
+set_tests_properties(device_lost_shim PROPERTIES LABELS "novulkan;no-tsan" SKIP_RETURN_CODE 77)
+# AddressSanitizer refuses to start unless its runtime is first in the initial library list, and
+# the child this entry runs preloads the shim; the test keeps an inherited LD_PRELOAD ahead of it.
+if(WALLPAPERX_SANITIZE STREQUAL "address")
+    execute_process(COMMAND ${CMAKE_CXX_COMPILER} -print-file-name=libasan.so
+                    OUTPUT_VARIABLE _wx_asan_runtime OUTPUT_STRIP_TRAILING_WHITESPACE)
+    if(IS_ABSOLUTE "${_wx_asan_runtime}" AND EXISTS "${_wx_asan_runtime}")
+        set_property(TEST device_lost_shim APPEND PROPERTY ENVIRONMENT "LD_PRELOAD=${_wx_asan_runtime}")
+    else()
+        message(WARNING "No AddressSanitizer runtime found to preload; device_lost_shim will not start here")
+    endif()
+endif()
 
 # The real daemon losing its device, exiting 75, and being started again on the same HOME.
 add_executable(wallpaperx-device-loss-restart-test tests/device_loss_restart_test.cpp)
@@ -922,6 +1010,10 @@ set_tests_properties(config_store PROPERTIES LABELS "novulkan"
 add_test(NAME crash_record COMMAND $<TARGET_FILE:wallpaperx-crash-record-test>)
 set_tests_properties(crash_record PROPERTIES LABELS "novulkan"
                      SKIP_RETURN_CODE 77)
+# The same reasons as crash_record: forked children and files only. Its CPU-time bound is a quarter
+# of the window, far from a correct writer's few milliseconds, so it takes no timing lock.
+add_test(NAME log_pump COMMAND $<TARGET_FILE:wallpaperx-log-pump-test>)
+set_tests_properties(log_pump PROPERTIES LABELS "novulkan" SKIP_RETURN_CODE 77)
 
 # Its companion needs a device, so it is registered the way the other GPU entries are: no
 # label on the default-ICD run, which is what disables it in the TSan tree (the proprietary
@@ -1166,6 +1258,19 @@ if(DBUS_RUN_SESSION)
         add_test(NAME device_loss_restart_lavapipe
                  COMMAND ${DBUS_RUN_SESSION} -- $<TARGET_FILE:wallpaperx-device-loss-restart-test>)
         set_tests_properties(device_loss_restart_lavapipe PROPERTIES
+            ENVIRONMENT "VK_ICD_FILENAMES=${WALLPAPERX_LAVAPIPE_ICD}"
+            LABELS "lavapipe"
+            RESOURCE_LOCK wallpaperx_bus_tests
+            SKIP_RETURN_CODE 77)
+    endif()
+    # The same binary's crash phases on their own: a crash's last lines through the log writer.
+    add_test(NAME crash_log_flush
+             COMMAND ${DBUS_RUN_SESSION} -- $<TARGET_FILE:wallpaperx-device-loss-restart-test> crash-flush)
+    set_tests_properties(crash_log_flush PROPERTIES RESOURCE_LOCK wallpaperx_bus_tests SKIP_RETURN_CODE 77)
+    if(WALLPAPERX_LAVAPIPE_ICD)
+        add_test(NAME crash_log_flush_lavapipe
+                 COMMAND ${DBUS_RUN_SESSION} -- $<TARGET_FILE:wallpaperx-device-loss-restart-test> crash-flush)
+        set_tests_properties(crash_log_flush_lavapipe PROPERTIES
             ENVIRONMENT "VK_ICD_FILENAMES=${WALLPAPERX_LAVAPIPE_ICD}"
             LABELS "lavapipe"
             RESOURCE_LOCK wallpaperx_bus_tests

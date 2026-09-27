@@ -34,14 +34,6 @@ public:
     // contract.
     using FrameReadyFn = std::function<void(int monitorId, uint64_t generation)>;
 
-    // Called once, on the worker thread, when a job or a clock round leaves the manager's device
-    // lost. The worker then runs nothing more and refuses posts as a stopping one does, leaving
-    // what is queued for stop() to answer: anything it started on a lost device could be what a
-    // hung driver is holding when the process is killed, and a render killed that way is
-    // recorded against its wallpaper. Must not throw. Without one the worker serves on, and every
-    // render fails.
-    using DeviceLostFn = std::function<void()>;
-
     // Why a task is being invoked: to do its work, or to answer that it never will. Every task
     // is invoked exactly once -- destroying an sdbus::Result sends nothing, leaving the caller
     // blocked for the full 25 s reply timeout.
@@ -57,7 +49,7 @@ public:
 
     // `manager` must outlive this worker, as must anything the callbacks touch. Call stop()
     // before tearing either down; the destructor does too, but stop() lets the owner pick when.
-    RenderWorker(WallpaperManager& manager, FrameReadyFn onFrameReady, DeviceLostFn onDeviceLost = {});
+    RenderWorker(WallpaperManager& manager, FrameReadyFn onFrameReady);
     ~RenderWorker();
 
     RenderWorker(const RenderWorker&) = delete;
@@ -104,12 +96,14 @@ private:
     // video plays.
     std::optional<std::chrono::steady_clock::time_point> runClock();
 
-    // True when the worker has just stopped for a lost device, having told the owner.
+    // True when a job or a clock round left the device lost in a daemon that stops for it (see
+    // WallpaperManager::stopsForLostDevice). The worker then runs nothing more and refuses posts as
+    // a stopping one does, leaving what is queued for stop() to answer: anything it started on a
+    // lost device would fail, and could be what a hung driver holds the stop up on.
     bool stopForLostDevice();
 
     WallpaperManager& m_manager;
     FrameReadyFn m_onFrameReady;
-    DeviceLostFn m_onDeviceLost;
 
     std::mutex m_mutex;
     std::condition_variable m_wake;

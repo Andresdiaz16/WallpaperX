@@ -382,7 +382,17 @@ void WallpaperManager::ensureGpu() {
     try {
         m_resolvedShaderDir = resolveShaderDir(m_config.shaderDir);
     } catch (const std::exception& e) {
-        recordHealth(&DaemonHealth::shaders, HealthStatus::Fail, e.what());
+        bool newlyFailed = false;
+        {
+            std::lock_guard<std::mutex> stateLock(m_stateMutex);
+            newlyFailed = m_health.shaders.status != HealthStatus::Fail;
+            recordHealthLocked(&DaemonHealth::shaders, HealthStatus::Fail, e.what());
+        }
+        // Once per failure, not per render: every render retries this.
+        if (newlyFailed) {
+            std::fprintf(stderr, "wallpaperx-daemon: nothing can be drawn: %s\n",
+                         sanitizeForLog(e.what(), 1024).c_str());
+        }
         throw;
     }
     recordHealth(&DaemonHealth::shaders, HealthStatus::Ok, m_resolvedShaderDir);
@@ -394,7 +404,7 @@ void WallpaperManager::ensureGpu() {
     std::unique_ptr<Device> device;
     std::unique_ptr<OffscreenTargetManager> targets;
     try {
-        device = std::make_unique<Device>(m_config.enableValidation);
+        device = std::make_unique<Device>(m_config.enableValidation, m_config.onDeviceLost);
         targets = std::make_unique<OffscreenTargetManager>(*device);
     } catch (const std::exception& e) {
         recordHealth(&DaemonHealth::gpu, HealthStatus::Fail, e.what());
@@ -426,7 +436,8 @@ void WallpaperManager::ensureGpu() {
     std::fflush(stdout);
 }
 
-bool WallpaperManager::deviceLost() const {
+bool WallpaperManager::stopsForLostDevice() const {
+    if (!m_config.onDeviceLost) return false;
     std::lock_guard<std::mutex> gpuLock(m_gpuMutex);
     return m_device && m_device->lost();
 }
@@ -2141,8 +2152,7 @@ WallpaperManager::RenderPass WallpaperManager::renderPassLocked(int monitorId, b
             if (it == m_monitors.end() || it->second.requestSeq != seq) return RenderPass{{}, true};
             refusals = ++it->second.deferredRenders;
         }
-        // Once per episode, and outside the state lock: a stalled stderr must not hold a lock every
-        // bus handler takes. A producer drawing at display rate would otherwise write a line per
+        // Once per episode: a producer drawing at display rate would otherwise write a line per
         // frame; the running count is in GetStatus for anyone who wants the rest.
         if (refusals == 1) {
             std::fprintf(stderr,
