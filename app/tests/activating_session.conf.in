@@ -1,0 +1,17 @@
+<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<!-- The bus app_kscreen_launcher runs on: private_session.conf plus one service directory, which
+     app/tests/CMakeLists.txt fills with the test's own io.wallpaperx.test.Launcher.* stand-ins and
+     nothing else. No standard service directory, so the real KScreen launcher cannot start. -->
+<busconfig>
+  <type>session</type>
+  <keep_umask/>
+  <listen>unix:tmpdir=/tmp</listen>
+  <auth>EXTERNAL</auth>
+  <servicedir>@WALLPAPERX_APP_TEST_SERVICE_DIR@</servicedir>
+  <policy context="default">
+    <allow send_destination="*" eavesdrop="true"/>
+    <allow eavesdrop="true"/>
+    <allow own="*"/>
+  </policy>
+</busconfig>

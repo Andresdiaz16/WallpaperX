@@ -1,0 +1,137 @@
+{
+  "features": 255,
+  "outputs": [
+    {
+      "brightness": 1,
+      "clones": [],
+      "connected": true,
+      "currentModeId": "2",
+      "ddcCiAllowed": true,
+      "enabled": true,
+      "followPreferredMode": false,
+      "hdr": false,
+      "iccProfilePath": "",
+      "icon": "",
+      "id": 1,
+      "modes": [
+        {
+          "id": "1",
+          "name": "2560x1440@60",
+          "refreshRate": 59.95100021362305,
+          "size": {
+            "height": 1440,
+            "width": 2560
+          }
+        },
+        {
+          "id": "2",
+          "name": "2560x1440@165",
+          "refreshRate": 164.95799255371094,
+          "size": {
+            "height": 1440,
+            "width": 2560
+          }
+        }
+      ],
+      "name": "DP-4",
+      "pos": {
+        "x": 1440,
+        "y": 761
+      },
+      "preferredModes": [
+        "1"
+      ],
+      "priority": 1,
+      "replicationSource": 0,
+      "rotation": 1,
+      "scale": 1,
+      "sdr-brightness": 330,
+      "size": {
+        "height": 1440,
+        "width": 2560
+      },
+      "sizeMM": {
+        "height": 336,
+        "width": 597
+      },
+      "type": 14,
+      "vrrPolicy": 0,
+      "wcg": false
+    },
+    {
+      "brightness": 1,
+      "clones": [],
+      "connected": true,
+      "currentModeId": "33",
+      "ddcCiAllowed": true,
+      "enabled": true,
+      "followPreferredMode": false,
+      "hdr": false,
+      "iccProfilePath": "",
+      "icon": "",
+      "id": 2,
+      "modes": [
+        {
+          "id": "32",
+          "name": "2560x1440@60",
+          "refreshRate": 59.939998626708984,
+          "size": {
+            "height": 1440,
+            "width": 2560
+          }
+        },
+        {
+          "id": "33",
+          "name": "2560x1440@170",
+          "refreshRate": 169.83099365234375,
+          "size": {
+            "height": 1440,
+            "width": 2560
+          }
+        }
+      ],
+      "name": "DP-3",
+      "pos": {
+        "x": 0,
+        "y": 0
+      },
+      "preferredModes": [
+        "32"
+      ],
+      "priority": 2,
+      "replicationSource": 0,
+      "rotation": 2,
+      "scale": 1,
+      "sdr-brightness": 436,
+      "size": {
+        "height": 2560,
+        "width": 1440
+      },
+      "sizeMM": {
+        "height": 335,
+        "width": 596
+      },
+      "type": 14,
+      "vrrPolicy": 0,
+      "wcg": false
+    }
+  ],
+  "screen": {
+    "currentSize": {
+      "height": 2201,
+      "width": 4000
+    },
+    "id": 0,
+    "maxActiveOutputsCount": 2,
+    "maxSize": {
+      "height": 64000,
+      "width": 64000
+    },
+    "minSize": {
+      "height": 0,
+      "width": 0
+    }
+  },
+  "tabletModeAvailable": false,
+  "tabletModeEngaged": false
+}

@@ -10,18 +10,28 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # --------------------------------------------------------------------------- #
 
 find_package(Qt6 REQUIRED COMPONENTS Core DBus Quick Qml QuickControls2)
-qt_standard_project_setup()
+# 6.8 sets QTP0001 and QTP0004 to NEW. QTP0001 puts the QML module under qrc:/qt/qml, which is on
+# the engine's default import path; without it the installed binary finds no module, since only
+# the build tree has a WallpaperX/qmldir beside it.
+qt_standard_project_setup(REQUIRES 6.8)
 
 find_package(sdbus-c++ REQUIRED CONFIG)
 find_package(nlohmann_json REQUIRED)
 
 # --------------------------------------------------------------------------- #
-# wallpaperx GUI (placeholder — sources added in later steps)
+# wallpaperx GUI
 # --------------------------------------------------------------------------- #
 
 qt_add_executable(wallpaperx
     main.cpp
+    kde/kscreen_config.cpp
+    kde/kscreen_config.h
+    kde/kscreen_client.cpp
+    kde/kscreen_client.h
 )
+
+# The generated QML type registration includes these headers by bare name.
+target_include_directories(wallpaperx PRIVATE kde)
 
 target_link_libraries(wallpaperx PRIVATE
     Qt6::Core
@@ -37,7 +47,8 @@ qt_add_qml_module(wallpaperx
     URI WallpaperX
     VERSION 1.0
     QML_FILES
-        qml/main.qml
+        qml/Main.qml
+        qml/MonitorPicker.qml
 )
 
 # Nothing installed this app until now -- it was only ever run out of the build directory. The
@@ -48,6 +59,9 @@ include(GNUInstallDirs)
 install(TARGETS wallpaperx RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(FILES com.wallpaperx.app.desktop
         DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/applications)
+
+enable_testing()
+add_subdirectory(tests)
 
 message(STATUS "wallpaperx configured")
 message(STATUS "  Qt6: ${Qt6_VERSION}")
