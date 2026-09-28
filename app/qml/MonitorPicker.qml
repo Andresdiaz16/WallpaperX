@@ -13,6 +13,12 @@ Item {
 
     required property KScreenClient kscreen
 
+    // `template` with %1, %2... filled from `values` in one pass: chained arg() would also fill a
+    // "%2" that a monitor's name brought in.
+    function fill(template: string, values: list<string>): string {
+        return template.replace(/%([1-9])/g, (marker, n) => n <= values.length ? values[n - 1] : marker);
+    }
+
     readonly property var placed: kscreen.monitors.filter(m => m.selectable)
     // Replicas drawn with the monitor they copy. One whose source has no tile is listed with the rest.
     readonly property var mirrors: kscreen.monitors.filter(m => m.mirrorOf !== "" && m.enabled && m.connected
@@ -95,6 +101,9 @@ Item {
     }
 
     readonly property real margin: 24
+    // The height at which the width, not the height, limits the drawing.
+    implicitHeight: bounds.width > 0 ? bounds.height * (width - 2 * margin) / bounds.width + 2 * margin + footer.height : 0
+    clip: true
     readonly property real layoutScale: bounds.width > 0 && bounds.height > 0
         ? Math.min((width - 2 * margin) / bounds.width, (height - 2 * margin - footer.height) / bounds.height)
         : 0
@@ -124,6 +133,7 @@ Item {
                 width: Math.max(tile.placement.area.width * root.layoutScale - 4, 1)
                 height: Math.max(tile.placement.area.height * root.layoutScale - 4, 1)
                 radius: 4
+                clip: true
                 color: tile.selected ? palette.highlight : palette.button
                 border.width: tile.selected ? 3 : 1
                 border.color: tile.selected ? palette.highlightedText : palette.mid
@@ -197,9 +207,8 @@ Item {
                 border.color: palette.mid
 
                 Accessible.role: Accessible.StaticText
-                Accessible.name: qsTr("%1 (%2), mirrors %3").arg(copy.modelData.displayName)
-                                                            .arg(copy.modelData.outputName)
-                                                            .arg(copy.modelData.mirrorOf)
+                Accessible.name: root.fill(qsTr("%1 (%2), mirrors %3"),
+                                           [copy.modelData.displayName, copy.modelData.outputName, copy.modelData.mirrorOf])
 
                 ColumnLayout {
                     anchors.centerIn: parent
@@ -237,7 +246,7 @@ Item {
         height: visible ? implicitHeight : 0
         textFormat: Text.PlainText
         text: qsTr("Not showing a desktop: %1").arg(root.unplaced.map(
-            m => m.mirrorOf === "" ? m.outputName : qsTr("%1 (mirrors %2)").arg(m.outputName).arg(m.mirrorOf)).join(", "))
+            m => m.mirrorOf === "" ? m.outputName : root.fill(qsTr("%1 (mirrors %2)"), [m.outputName, m.mirrorOf])).join(", "))
     }
 
     ColumnLayout {

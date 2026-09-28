@@ -9,7 +9,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # Dependencies
 # --------------------------------------------------------------------------- #
 
-find_package(Qt6 REQUIRED COMPONENTS Core DBus Quick Qml QuickControls2)
+find_package(Qt6 REQUIRED COMPONENTS Core Concurrent DBus Quick Qml QuickControls2)
 # 6.8 sets QTP0001 and QTP0004 to NEW. QTP0001 puts the QML module under qrc:/qt/qml, which is on
 # the engine's default import path; without it the installed binary finds no module, since only
 # the build tree has a WallpaperX/qmldir beside it.
@@ -17,6 +17,8 @@ qt_standard_project_setup(REQUIRES 6.8)
 
 find_package(sdbus-c++ REQUIRED CONFIG)
 find_package(nlohmann_json REQUIRED)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(LIBZIP REQUIRED IMPORTED_TARGET libzip)
 
 # --------------------------------------------------------------------------- #
 # wallpaperx GUI
@@ -28,19 +30,27 @@ qt_add_executable(wallpaperx
     kde/kscreen_config.h
     kde/kscreen_client.cpp
     kde/kscreen_client.h
+    library/wpx_package.cpp
+    library/wpx_package.h
+    library/library_manager.cpp
+    library/library_manager.h
+    library/preview_image_provider.cpp
+    library/preview_image_provider.h
 )
 
 # The generated QML type registration includes these headers by bare name.
-target_include_directories(wallpaperx PRIVATE kde)
+target_include_directories(wallpaperx PRIVATE kde library)
 
 target_link_libraries(wallpaperx PRIVATE
     Qt6::Core
+    Qt6::Concurrent
     Qt6::DBus
     Qt6::Quick
     Qt6::Qml
     Qt6::QuickControls2
     SDBusCpp::sdbus-c++
     nlohmann_json::nlohmann_json
+    PkgConfig::LIBZIP
 )
 
 qt_add_qml_module(wallpaperx
@@ -49,6 +59,8 @@ qt_add_qml_module(wallpaperx
     QML_FILES
         qml/Main.qml
         qml/MonitorPicker.qml
+        qml/LibraryView.qml
+        qml/WallpaperDetail.qml
 )
 
 # Nothing installed this app until now -- it was only ever run out of the build directory. The

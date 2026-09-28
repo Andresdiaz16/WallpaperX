@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 // app/qml/MonitorPicker.qml, driven offscreen by a real KScreenClient reading a fake KScreen on a
-// private bus. Goals S15.13, S15.17, S15.24 and S15.26 in GOALS.md.
+// private bus. Goals S15.13, S15.17, S15.24, S15.26 and S15.55 in GOALS.md.
 //
 // Layout on the offscreen platform is the same arithmetic as on a display: item geometry is
 // computed by QML bindings, not by the window system. What this cannot see is rendering.
@@ -10,12 +10,15 @@
 #include "kscreen_client.h"
 #include "kscreen_config.h"
 #include "kscreen_fixtures.h"
+#include "qml_load.h"
 #include "tests/test_report.h"
 
 #include <QGuiApplication>
 #include <QQmlComponent>
 #include <QJSValue>
+#include <QQmlContext>
 #include <QQmlEngine>
+#include <QQmlExpression>
 #include <QQuickItem>
 #include <QQuickWindow>
 #include <QTest>
@@ -32,7 +35,7 @@ using wallpaperx::testing::notVerified;
 
 namespace {
 
-constexpr const char* kGoals = "S15.13, S15.17, S15.24, S15.26";
+constexpr const char* kGoals = "S15.13, S15.17, S15.24, S15.26, S15.55";
 constexpr int kWaitMs = 5000;
 // MonitorPicker.qml draws each tile 2 px inside its screen's rectangle on every side.
 constexpr double kTileInset = 4;
@@ -434,6 +437,51 @@ void emptyConnector(Picker& p) {
            QStringLiteral("S15.26: the footer should read \"Not showing a desktop: DP-3\"; the picker shows: %1").arg(lines.join(u'|')));
 }
 
+// S15.55: monitor names that hold "%1" and "%2".
+void percentInNames(Picker& p) {
+    const QString dell = QStringLiteral("Dell %2");
+    const QString hdmi = QStringLiteral("HDMI %1");
+    const QString edp = QStringLiteral("eDP %2");
+    const QString vga = QStringLiteral("VGA %1");
+    const auto tiles = p.show("S15.55", configOf({output({.name = dell, .id = 1}),
+                                                  output({.name = hdmi, .id = 2, .replicationSource = qlonglong(1)}),
+                                                  output({.name = edp, .id = 3, .enabled = false, .withPos = false, .withSize = false}),
+                                                  output({.name = vga, .id = 4, .x = qlonglong(1920), .replicationSource = qlonglong(3)})}),
+                              {dell, hdmi, edp, vga});
+    if (!tiles) {
+        return;
+    }
+    QQuickItem* band = tiles->mirrors.value(hdmi);
+    // GOAL: S15.55 -- a monitor name holding "%1" or "%2" is shown as it is in the mirror band's
+    //       accessible name and in the footer, both as a plain entry and inside "(mirrors ...)",
+    //       never filled in by the next value.
+    // WHY-THIS-SHAPE: every name holds a marker, so a chained substitution goes wrong whichever
+    //       value comes first; the band's name is read through a QML expression on the band, since
+    //       the attached Accessible object has no public C++ accessor. The footer is matched as a
+    //       whole line: "eDP %2" also occurs inside the mirror entry, so a substring test for the
+    //       plain entry could never fail on its own. The order is KScreen's (eDP id 3, VGA id 4).
+    // CONTROL: app/qml/MonitorPicker.qml, the band's `root.fill(qsTr("%1 (%2), mirrors %3"), [...])`
+    //       made `qsTr("%1 (%2), mirrors %3").arg(...).arg(...).arg(...)` -> red, "S15.55: the
+    //       mirror band's accessible name is "HDMI HDMI Dell %2 (%2), mirrors %3""; the footer's
+    //       `root.fill(qsTr("%1 (mirrors %2)"), [m.outputName, m.mirrorOf])` made
+    //       `qsTr("%1 (mirrors %2)").arg(m.outputName).arg(m.mirrorOf)` -> red, "S15.55: the footer
+    //       reads "Not showing a desktop: eDP %2, VGA eDP %2 (mirrors %2)""; the plain entry
+    //       `m.outputName` made `qsTr("%1").arg(m.outputName).arg(m.mirrorOf)` -> red, "the footer
+    //       reads "Not showing a desktop: eDP , VGA %1 (mirrors eDP %2)""; restored.
+    if (!band) {
+        expect(false, QStringLiteral("S15.55: no mirror band for %1; mirror tiles %2").arg(hdmi, keys(tiles->mirrors)));
+    } else {
+        QQmlExpression name(qmlContext(band), band, QStringLiteral("Accessible.name"));
+        const QString got = name.evaluate().toString();
+        expect(!name.hasError() && got == QStringLiteral("HDMI %1 (HDMI %1), mirrors Dell %2"),
+               QStringLiteral("S15.55: the mirror band's accessible name is \"%1\"%2").arg(got, name.hasError() ? name.error().toString() : QString()));
+    }
+    const QStringList lines = textsUnder(p.root).split(u'\n');
+    const auto footer = std::ranges::find_if(lines, [](const QString& l) { return l.startsWith(QLatin1String("Not showing a desktop: ")); });
+    expect(footer != lines.end() && *footer == QStringLiteral("Not showing a desktop: eDP %2, VGA %1 (mirrors eDP %2)"),
+           QStringLiteral("S15.55: the footer reads \"%1\"").arg(footer != lines.end() ? *footer : QStringLiteral("(no footer)")));
+}
+
 } // namespace
 
 int main(int argc, char* argv[]) {
@@ -474,11 +522,21 @@ int main(int argc, char* argv[]) {
     QQmlEngine engine;
     QQmlComponent component(&engine);
     component.loadFromModule("WallpaperX", "MonitorPicker");
-    std::unique_ptr<QObject> root(component.createWithInitialProperties({{QStringLiteral("kscreen"), QVariant::fromValue(client.get())}}));
+    const QVariantMap given{{QStringLiteral("kscreen"), QVariant::fromValue(client.get())}};
+    std::unique_ptr<QObject> root(component.createWithInitialProperties(given));
     auto* picker = qobject_cast<QQuickItem*>(root.get());
     if (picker == nullptr) {
-        wallpaperx::testing::harnessFailure("MonitorPicker did not load: " + component.errorString().toStdString());
-        static_cast<void>(wallpaperx::testing::reportHarnessFaults("loading app/qml/MonitorPicker.qml"));
+        // GOAL (harness): a picker that cannot be made is blamed on its owner -- the file, the test's
+        //       own initial property, or a Qt module this install lacks (qml_load.h).
+        // CONTROL: app/qml/MonitorPicker.qml given `required property int neverGiven` -> red, "FAIL:
+        //       app/qml/MonitorPicker.qml did not load: ...Required property neverGiven was not
+        //       initialized"; its `import QtQuick.Layouts` made `import QtQuick.NoSuchModule` -> "FAIL
+        //       (harness): app/qml/MonitorPicker.qml needs QtQuick.NoSuchModule, which this Qt install
+        //       lacks"; by hand, test-side, the key "kscreen" misspelt "kscreenx" -> "FAIL (harness): the
+        //       test passed kscreenx, which app/qml/MonitorPicker.qml does not have"; each restored.
+        reportLoadFailure(component, given, QStringLiteral("app/qml/MonitorPicker.qml"));
+        static_cast<void>(wallpaperx::testing::reportCheckFailures());
+        static_cast<void>(wallpaperx::testing::reportHarnessFaults("in this test file or its Qt install, not in the app"));
         return 1;
     }
     picker->setParentItem(window.contentItem());
@@ -494,6 +552,7 @@ int main(int argc, char* argv[]) {
     overlappingScreens(p);
     mirroredScreens(p);
     emptyConnector(p);
+    percentInNames(p);
 
     root.reset();
     client.reset();

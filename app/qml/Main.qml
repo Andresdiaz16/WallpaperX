@@ -9,9 +9,10 @@ ApplicationWindow {
     id: window
 
     required property KScreenClient kscreen
+    required property LibraryManager library
 
     width: 1280
-    height: 720
+    height: 800
     visible: true
     title: qsTr("WallpaperX")
 
@@ -25,16 +26,31 @@ ApplicationWindow {
             font.pointSize: 16
         }
         MonitorPicker {
+            id: picker
             Layout.fillWidth: true
-            Layout.fillHeight: true
+            // What the desktop's shape asks for, capped so the library below keeps its room.
+            Layout.preferredHeight: Math.max(220, Math.min(picker.implicitHeight, window.height * 0.45))
             kscreen: window.kscreen
         }
         Label {
             textFormat: Text.PlainText
             text: window.kscreen.selectedOutput === ""
                 ? qsTr("No monitor selected")
-                : qsTr("Selected: %1 (%2)").arg(window.kscreen.selectedMonitor.displayName)
-                                          .arg(window.kscreen.selectedOutput)
+                : picker.fill(qsTr("Selected: %1 (%2)"),
+                              [window.kscreen.selectedMonitor.displayName, window.kscreen.selectedOutput])
+        }
+
+        StackLayout {
+            Layout.fillWidth: true
+            Layout.fillHeight: true
+            currentIndex: window.library.selectedPath === "" ? 0 : 1
+
+            LibraryView {
+                library: window.library
+            }
+            WallpaperDetail {
+                library: window.library
+            }
         }
     }
 }
