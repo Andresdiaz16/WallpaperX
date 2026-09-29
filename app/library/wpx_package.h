@@ -60,8 +60,9 @@ struct FileStamp {
     friend bool operator==(const FileStamp&, const FileStamp&) = default;
 };
 
-// A .wpx file in the library. Either usable, with every manifest field read and checked against
-// the archive, or broken: `problem` says why, and only the file fields are set.
+// One wallpaper: a folder in the library, or a .wpx archive being checked before it is unpacked.
+// Either usable, with every manifest field read and checked against the files beside it, or
+// broken: `problem` says why, and only the file fields are set.
 struct Wallpaper {
     Q_GADGET
     QML_VALUE_TYPE(wallpaper)
@@ -75,14 +76,15 @@ struct Wallpaper {
     Q_PROPERTY(QString author MEMBER author CONSTANT)
     Q_PROPERTY(QStringList tags MEMBER tags CONSTANT)
     Q_PROPERTY(QString assetName MEMBER assetName CONSTANT)
+    Q_PROPERTY(QString assetPath MEMBER assetPath CONSTANT)
     Q_PROPERTY(QUrl previewSource READ previewSource CONSTANT)
     Q_PROPERTY(QList<wallpaperx::WallpaperProperty> properties MEMBER properties CONSTANT)
 
 public:
-    // Absolute path of the .wpx archive, as decodeFileName gives it.
+    // Absolute path of the wallpaper's folder, or of the archive, as decodeFileName gives it.
     QString filePath;
     QString fileName;
-    // The file as it was read; not given to QML.
+    // wallpaper.json in a folder, the whole file for an archive; not given to QML.
     FileStamp stamp;
     QString problem;
 
@@ -91,16 +93,22 @@ public:
     QString title;
     QString author;
     QStringList tags;
-    // Names of entries inside the archive, checked to exist and to be plain relative paths.
+    // Plain relative paths inside the folder or archive, checked to name a file there.
     QString assetName;
     QString previewName;
+    // The file the daemon is to open: `assetName` inside a usable folder, checked to resolve
+    // inside it. Empty for an archive, which has nothing on disk to open.
+    QString assetPath;
+    // The files as they were read; for an archive, the archive's own.
+    FileStamp previewStamp;
+    FileStamp assetStamp;
     // In the order wallpaper.json lists them.
     QList<WallpaperProperty> properties;
 
     // False for a default-constructed Wallpaper, which stands for none.
     bool usable() const { return !filePath.isEmpty() && problem.isEmpty(); }
     QString displayTitle() const { return title.isEmpty() ? fileName : title; }
-    // An image://wallpaperx-preview URL naming this version of the file, so an edited archive
+    // An image://wallpaperx-preview URL naming this version of the preview, so a rewritten one
     // gets a new URL instead of a cached image. Empty for a broken wallpaper.
     QUrl previewSource() const;
 
@@ -115,40 +123,58 @@ inline constexpr qint64 kMaxPreviewBytes = 32 << 20;
 // sentence for the user.
 std::expected<Wallpaper, QString> parseManifest(const QByteArray& json);
 
-// Reads one .wpx archive. Never fails: an archive that cannot be used comes back broken.
-Wallpaper readWallpaper(const QString& path);
+// Reads the .wpx archive open as `fd`, which stays the caller's, shown as `path`. Never fails: an
+// archive that cannot be used comes back broken. The path need not be UTF-8: nothing is ever set
+// from it.
+Wallpaper readWallpaper(int fd, const QString& path);
+// Reads one wallpaper folder by the same rules. The folder itself must not be a link, and every
+// file wallpaper.json names must, its links followed, be a file inside it.
+Wallpaper readWallpaperFolder(const QString& path);
 
-// The uncompressed bytes of one archive entry, refused when larger than `maxBytes`.
-std::expected<QByteArray, QString> readPackageEntry(const QString& archivePath, const QString& entryName,
-                                                    qint64 maxBytes);
+// The bytes of `name` inside a wallpaper folder, refused when larger than `maxBytes`, or when it
+// is not inside the folder by readWallpaperFolder's rule.
+std::expected<QByteArray, QString> readWallpaperEntry(const QString& folderPath, const QString& name,
+                                                      qint64 maxBytes);
 
-// Every package entry (isPackageFileName) directly in `directory` that is a regular file, not
-// empty unless through a link, or cannot be stat'ed; usable ones first, each group by title. A
-// directory that does not exist is an empty library; one that cannot be listed is the error.
+// Every wallpaper folder directly in `directory`: each subfolder not hidden, and each link to a
+// folder, which is listed broken. Usable ones first, each group by title. A directory that does
+// not exist is an empty library; one that cannot be listed is the error.
 std::expected<QList<Wallpaper>, QString> scanLibrary(const QString& directory);
 // The order scanLibrary lists in.
 bool listedBefore(const Wallpaper& a, const Wallpaper& b);
 
-// Whether a directory entry named `name` is listed: *.wpx in any case, not hidden.
+// Whether a directory entry named `name` is a package: *.wpx in any case, not hidden.
 bool isPackageFileName(QByteArrayView name);
+// Refuses what could reach outside a folder: absolute, empty parts, ".", "..", backslashes.
+bool isPlainRelativePath(const QString& name);
 
 // A file-system path as text and back, losing nothing: bytes that are not UTF-8 become lone
 // surrogates (U+DC80..U+DCFF), so such a path is not valid UTF-16 and cannot be mistaken for one
 // that is. QFile::decodeName would turn them into U+FFFD, naming another file or none.
 QString decodeFileName(QByteArrayView bytes);
 QByteArray encodeFileName(QStringView name);
+// The absolute path, as bytes, of a file URL naming this computer (no host, or localhost).
+// Nothing for any other URL, for file:name, which has no absolute path, and for a path holding a
+// NUL byte, which no file has.
+std::optional<QByteArray> localPathOfFileUrl(const QUrl& url);
 
-// $XDG_DATA_HOME/wallpaperx, or ~/.local/share/wallpaperx when that is unset.
+// $XDG_DATA_HOME/wallpaperx, or ~/.local/share/wallpaperx when that is unset: where a .wpx put
+// by hand is imported from, and the parent of wallpapersDirectory.
 QString defaultLibraryDirectory();
+// Where the wallpaper folders live, inside `libraryDirectory`.
+QString wallpapersDirectory(const QString& libraryDirectory);
 
 FileStamp stampFrom(const struct stat& st);
+// What `fd` holds from its offset to the end: EFBIG when that is more than `maxBytes`, else the
+// errno of a failed read.
+std::expected<QByteArray, int> readToEnd(int fd, qint64 maxBytes);
 // Nothing when `path` cannot be stat'ed.
 std::optional<FileStamp> stampOf(const QString& path);
 
 // The id previewSource() puts after "image://wallpaperx-preview/", and its inverse.
-QString previewImageId(const QString& archivePath, const QString& entryName, const FileStamp& stamp);
+QString previewImageId(const QString& folderPath, const QString& entryName, const FileStamp& stamp);
 struct PreviewLocation {
-    QString archivePath;
+    QString folderPath;
     QString entryName;
 };
 std::optional<PreviewLocation> parsePreviewImageId(const QString& id);

@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 // app/qml/Main.qml offscreen, as the app loads it, with a real KScreenClient reading a fake KScreen
-// on a private bus and a real LibraryManager over a scratch folder. Goals S15.54 and S15.55 in
-// GOALS.md.
+// on a private bus, and a real LibraryManager and Importer over scratch folders. Goals S15.54,
+// S15.55 and S15.82 in GOALS.md.
 
 #include "fake_kscreen.h"
+#include "importer.h"
 #include "kscreen_client.h"
 #include "kscreen_config.h"
 #include "kscreen_fixtures.h"
@@ -33,12 +34,8 @@ using wallpaperx::testing::notVerified;
 
 namespace {
 
-constexpr const char* kGoals = "S15.54, S15.55";
+constexpr const char* kGoals = "S15.54, S15.55, S15.82";
 constexpr int kWaitMs = 5000;
-
-void expect(bool cond, const QString& msg) {
-    check(cond, msg.toStdString().c_str());
-}
 
 // Qt answers a platform plugin it cannot load with qFatal, which aborts before this file can
 // report anything. That is a property of the Qt install, so it becomes a skip naming it.
@@ -233,6 +230,39 @@ void selectedLabel(Window& w, QQuickItem* root) {
     expect(got == u"Selected: Dell %2 (Dell %2)", QStringLiteral("S15.55: Main's selected line reads \"%1\"").arg(got));
 }
 
+void importerWired(Window& w, QQuickItem* root, LibraryManager& library, Importer& importer) {
+    library.rescan();
+    if (!waitFor([&] { return library.state() == LibraryManager::State::Ready; }, kWaitMs) || !settle(w.window)) {
+        expect(false, QStringLiteral("S15.82: Main's empty library never settled Ready"));
+        return;
+    }
+    // GOAL: S15.82 -- the app's window shows the library view, wired to the importer, while no
+    //       wallpaper is open (its empty library names the importer's drop folder), and the detail
+    //       view once one is opened.
+    // WHY-THIS-SHAPE: Main.qml's own StackLayout decides which view shows, so the real Main.qml is
+    //       loaded; each state is recognised by text only that view shows while it is current.
+    // CONTROL: app/qml/Main.qml, `currentIndex: window.library.selectedPath === "" ? 0 : 1` made
+    //       `currentIndex: 1` -> red, "S15.82: with nothing open Main shows no "No wallpapers yet.
+    //       ..." line"; made `currentIndex: 0` -> red, "S15.82: with ocean open Main shows no Apply
+    //       button"; restored.
+    const QString sentence = QStringLiteral("No wallpapers yet. Import a .wpx file, or put one in %1.").arg(importer.dropDirectory());
+    const QQuickItem* empty = labelStarting(root, sentence);
+    expect(empty != nullptr, QStringLiteral("S15.82: with nothing open Main shows no \"%1\" line").arg(sentence));
+    const QString ocean = library.directory() + QStringLiteral("/ocean");
+    if (!writeFolder(ocean, planEntries(QByteArray(kPlanManifest))).isEmpty()) {
+        testing::harnessFailure("S15.82: the ocean wallpaper could not be written");
+        return;
+    }
+    library.rescan();
+    if (!waitFor([&] { return library.wallpapers().size() == 1; }, kWaitMs) || !library.select(ocean) || !settle(w.window)) {
+        expect(false, QStringLiteral("S15.82: ocean was never listed and opened"));
+        return;
+    }
+    const QQuickItem* apply = labelStarting(root, QStringLiteral("Apply"));
+    expect(apply != nullptr && labelStarting(root, sentence) == nullptr, QStringLiteral("S15.82: with ocean open Main shows no Apply button"));
+    library.clearSelection();
+}
+
 } // namespace
 
 int main(int argc, char* argv[]) {
@@ -264,13 +294,16 @@ int main(int argc, char* argv[]) {
     // Every getEdid is held, so each screen keeps its connector name as its display name.
     fake->edidMode = FakeKScreen::Mode::Hold;
     auto client = std::make_unique<KScreenClient>(QDBusConnection::sessionBus(), fake->service());
-    auto library = std::make_unique<LibraryManager>(scratch.path() + QStringLiteral("/library"), 30);
+    const QString libraryDirectory = scratch.path() + QStringLiteral("/wallpaperx");
+    auto library = std::make_unique<LibraryManager>(wallpapersDirectory(libraryDirectory), 30);
+    auto importer = std::make_unique<Importer>(libraryDirectory, wallpapersDirectory(libraryDirectory), 30);
 
     QQmlEngine engine;
     QQmlComponent component(&engine);
     component.loadFromModule("WallpaperX", "Main");
     const QVariantMap given{{QStringLiteral("kscreen"), QVariant::fromValue(client.get())},
-                            {QStringLiteral("library"), QVariant::fromValue(library.get())}};
+                            {QStringLiteral("library"), QVariant::fromValue(library.get())},
+                            {QStringLiteral("importer"), QVariant::fromValue(importer.get())}};
     std::unique_ptr<QObject> root(component.createWithInitialProperties(given));
     auto* window = qobject_cast<QQuickWindow*>(root.get());
     if (window == nullptr) {
@@ -284,9 +317,11 @@ int main(int argc, char* argv[]) {
         Window w{*window, *client, *fake};
         pickerHeight(w);
         selectedLabel(w, window->contentItem());
+        importerWired(w, window->contentItem(), *library, *importer);
     }
 
     root.reset();
+    importer.reset();
     library.reset();
     client.reset();
     fake.reset();

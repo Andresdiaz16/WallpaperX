@@ -2,26 +2,19 @@
 
 #pragma once
 
+#include "folder_watcher.h"
 #include "wpx_package.h"
 
 #include <QAbstractListModel>
-#include <QDeadlineTimer>
 #include <QHash>
 #include <QList>
 #include <QObject>
 #include <QSet>
-#include <QSocketNotifier>
 #include <QString>
-#include <QTimer>
 #include <QVariantMap>
 #include <QtQml/qqmlregistration.h>
 
-#include <chrono>
-#include <memory>
 #include <optional>
-#include <variant>
-
-struct inotify_event;
 
 namespace wallpaperx {
 
@@ -45,20 +38,14 @@ private:
     QList<Wallpaper> m_rows;
 };
 
-// The wallpapers in one folder, which of them the user opened, and the property values they set.
+// The wallpaper folders in one folder, which of them the user opened, and the property values they
+// set.
 //
-// Scans run off the GUI thread, since a package is opened and read to list it, and one at a time.
-// The folder is watched with inotify, and a change is read once changes have been quiet for
-// `settleMs`. A package being written is not read until it is finished: closed by the program
-// writing it, moved in whole, or not written to for `holdMs`, which is all that ends a truncate(2)
-// with no file open. Meanwhile a listed one keeps the row it had, so the selection and its values
-// survive the rewrite. An empty file is never listed, so a package emptied and not being written
-// loses its row. Packages present when the folder is first read are read at once.
-//
-// Without inotify, or once a watch it needs cannot be placed for want of kernel resources, the
-// folder is polled every `pollMs` instead, and a change is read once one poll finds nothing
-// further changed. Polling sees no close: only a package seen changing while a scan ran keeps its
-// row, and a writer pausing for longer than a poll can still be read half-way.
+// Scans run off the GUI thread, since every folder's wallpaper.json is read to list it, and one at
+// a time; FolderWatcher (Items::Folders) says when. A wallpaper with a file being written is not
+// read until it is finished; meanwhile a listed one keeps the row it had, so the selection and its
+// values survive the rewrite. Folders present when the library is first read are read at once,
+// unless a process has a file in one open for writing.
 class LibraryManager : public QObject {
     Q_OBJECT
     QML_ELEMENT
@@ -80,16 +67,14 @@ public:
     enum class State { Loading, Ready, Unavailable };
     Q_ENUM(State)
 
-    // Poll: never try inotify, as if it could not be started.
-    enum class Watching { Inotify, Poll };
+    using Watching = FolderWatcher::Watching;
 
     explicit LibraryManager(QString directory, int settleMs = 250, int pollMs = 2000,
                             Watching watching = Watching::Inotify, int holdMs = 30000, QObject* parent = nullptr);
-    ~LibraryManager() override;
 
     // Whether the folder is polled: inotify was not asked for, could not be started, or ran out
     // of watches.
-    bool polling() const { return std::holds_alternative<PollWatch>(m_watch); }
+    bool polling() const { return m_watcher.polling(); }
     State state() const { return m_state; }
     QString unavailableReason() const { return m_unavailableReason; }
     QString directory() const { return m_directory; }
@@ -110,6 +95,10 @@ public:
     // wallpaper drops the values set on the previous one.
     Q_INVOKABLE bool select(const QString& filePath);
     Q_INVOKABLE void clearSelection();
+    // Selects `filePath` once a scan that began after this call lists it usable, or now if the
+    // list already does. A scan that holds the folder back does not count. Given up when the scan
+    // that counts does not list it usable, and by select() or clearSelection().
+    Q_INVOKABLE void reveal(const QString& filePath);
     // False, changing nothing, unless the selected wallpaper has property `key` and it can hold
     // `value` (WallpaperProperty::accept).
     Q_INVOKABLE bool setPropertyValue(const QString& key, const QVariant& value);
@@ -122,74 +111,19 @@ signals:
     void propertyValuesChanged();
 
 private:
-    // The folder's own watch: it reports every entry's changes, and which entries are being written.
-    struct FolderWatch {
-        int wd = -1;
-        // Each name written to since this watch was placed and not since closed, moved in, moved
-        // away or removed, until it is released `holdMs` after its last write.
-        QHash<QByteArray, QDeadlineTimer> writing;
-    };
-    // While the folder cannot be watched (missing, not a folder, unreadable): the nearest ancestor
-    // that can be, waiting for a change to `awaited`, the next name on the way down.
-    struct AncestorWatch {
-        int wd = -1;
-        QByteArray awaited;
-    };
-    // What one poll sees: how the folder opens, and every package entry's file.
-    struct Observation {
-        struct Entry {
-            QByteArray name;
-            // Followed through a link; empty when it cannot be stat'ed.
-            FileStamp stamp;
-            quint32 mode = 0;
-            friend bool operator==(const Entry&, const Entry&) = default;
-        };
-        int openError = 0;
-        quint64 device = 0;
-        quint64 inode = 0;
-        QList<Entry> entries;
-        friend bool operator==(const Observation&, const Observation&) = default;
-    };
-    // Instead of any inotify watch, once set for the rest of the manager's life.
-    struct PollWatch {
-        Observation polled;
-        // As the latest scan began; a scan is owed while it differs from `polled`.
-        Observation scanned;
-    };
-    using Watch = std::variant<std::monostate, FolderWatch, AncestorWatch, PollWatch>;
-    // The target of every listed link to one file, which the folder's watch does not see.
-    struct LinkWatch {
-        int wd = -1;
-        QList<QByteArray> names;
-        // Set by a write, as FolderWatch::writing is for a name.
-        std::optional<QDeadlineTimer> writing;
-    };
     // YesThenAgain: another scan is owed once this one is published.
     enum class Scanning { No, Yes, YesThenAgain };
+    // A reveal() waiting for a scan to begin, then for that scan's result.
+    struct Reveal {
+        QString filePath;
+        bool scanBegun = false;
+    };
 
     // The one writer of state, reason and list. A selection the new list no longer holds as
     // usable is dropped, with its values; an edit the new version cannot hold is dropped for good.
     void settle(State state, QString reason, QList<Wallpaper> wallpapers);
-    // Keeps the watch, and what it knows, when it is still on the path it was placed for. Never
-    // called while polling.
-    void placeWatch();
-    // Returns whether a link's target changed between being read and being watched.
-    bool watchLinks();
-    // For good: closing the descriptor drops every watch, and with them what they knew.
-    void pollInstead(const char* failed, int error);
-    void readWatchEvents();
-    // Whether `event` can change what a scan lists.
-    bool handle(const inotify_event& event);
-    bool handleLink(const inotify_event& event);
-    // The deadline for a name or link written to now.
-    QDeadlineTimer holdFromNow();
-    // Drops every hold whose deadline has passed, and schedules a scan if one was.
-    void releaseHolds();
-    QSet<QByteArray> unfinished() const;
-    // `scan` with each name in m_unfinishedDuringScan showing the row it had, or none.
-    QList<Wallpaper> holdBack(QList<Wallpaper> scan) const;
-    Observation observe() const;
-    void poll();
+    // `scan` with each folder named in `held` showing the row it had, or none.
+    QList<Wallpaper> holdBack(QList<Wallpaper> scan, const QSet<QByteArray>& held) const;
     // Emits whichever of selectionChanged and propertyValuesChanged the change caused.
     template <typename Change>
     void changeSelection(Change change);
@@ -202,21 +136,9 @@ private:
     // Values the user set on the selected wallpaper, each one it accepts: checked when set, and
     // pruned by settle() whenever the wallpaper is read again.
     QVariantMap m_edits;
+    std::optional<Reveal> m_reveal;
     Scanning m_scanning = Scanning::No;
-    QTimer m_settle;
-    // Runs only while polling.
-    QTimer m_poll;
-    std::chrono::milliseconds m_hold;
-    // Due no later than the earliest hold's deadline while any is held.
-    QTimer m_holdExpiry;
-    // -1, with no notifier, exactly when polling.
-    int m_inotify = -1;
-    std::unique_ptr<QSocketNotifier> m_inotifyReady;
-    Watch m_watch;
-    // Every name unfinished at any point since the running scan began, or seen changing by a poll
-    // during it, which it may have read half-written. Scans never overlap, so one set serves.
-    QSet<QByteArray> m_unfinishedDuringScan;
-    QList<LinkWatch> m_linkWatches;
+    FolderWatcher m_watcher;
 };
 
 } // namespace wallpaperx

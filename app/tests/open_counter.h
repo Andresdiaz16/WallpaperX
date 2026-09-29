@@ -7,16 +7,17 @@
 namespace wallpaperx::apptest {
 
 struct OpenCounts {
-    // opendir() of the folder: one per scan, and one per poll when the folder is polled.
-    int folderOpens = 0;
-    // A *.wpx directly in the folder opened read-only: only a scan (or a preview read) does that.
-    int packageOpens = 0;
+    // opendir() of the folder off the main thread: one per scan, which runs on the thread pool.
+    int scans = 0;
+    // opendir() of the folder on the main thread: the watcher's walk before each scan, and each
+    // poll when the folder is polled.
+    int watcherOpens = 0;
 };
 
-// Counts what this process opens in one folder, by replacing opendir() and open() for the test
-// binary (open_counter.cpp). An inotify IN_OPEN watch would also count other processes, such as
-// a file indexer, opening the same scratch folder. One counter at a time; its callers assert it
-// saw the first scan, so a dead counter goes red, never "idle".
+// Counts what this process opens in one folder, by replacing opendir() for the test binary
+// (open_counter.cpp). An inotify IN_OPEN watch would also count other processes, such as a file
+// indexer, opening the same scratch folder. One counter at a time; its callers assert it saw the
+// first scan, so a dead counter goes red, never "idle".
 class OpenCounter {
 public:
     explicit OpenCounter(const QString& directory);

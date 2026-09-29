@@ -10,6 +10,7 @@ ApplicationWindow {
 
     required property KScreenClient kscreen
     required property LibraryManager library
+    required property Importer importer
 
     width: 1280
     height: 800
@@ -47,6 +48,7 @@ ApplicationWindow {
 
             LibraryView {
                 library: window.library
+                importer: window.importer
             }
             WallpaperDetail {
                 library: window.library

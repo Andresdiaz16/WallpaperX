@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 // app/library/wpx_package.cpp and app/library/preview_image_provider.cpp, with no bus and no
-// event loop: one wallpaper.json, one .wpx archive, one folder, one preview address at a time.
-// Goals S15.31-S15.35, S15.45, S15.47, S15.48, S15.50, S15.51, S15.53, S15.55, S15.58 in GOALS.md.
+// event loop: one wallpaper.json, one .wpx archive, one wallpaper folder, one library folder, one
+// preview address at a time. Goals S15.31-S15.35, S15.45, S15.47, S15.48, S15.50, S15.51, S15.53,
+// S15.55, S15.67, S15.68 in GOALS.md.
 
+#include "openat2_shim.h"
 #include "preview_image_provider.h"
 #include "wpx_fixtures.h"
 #include "wpx_package.h"
@@ -13,6 +15,7 @@
 #include <QDir>
 #include <QImageReader>
 #include <QRandomGenerator>
+#include <QScopeGuard>
 #include <QTemporaryDir>
 #include <QUrl>
 
@@ -27,7 +30,10 @@
 #include <thread>
 
 #include <fcntl.h>
+#include <linux/openat2.h>
+#include <sys/inotify.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 using namespace wallpaperx;
@@ -39,10 +45,6 @@ using wallpaperx::testing::notVerified;
 namespace {
 
 constexpr int kFifoTimeoutMs = 3000;
-
-void expect(bool cond, const QString& msg) {
-    check(cond, msg.toStdString().c_str());
-}
 
 QString keysOf(const QList<WallpaperProperty>& properties) {
     QStringList keys;
@@ -58,61 +60,54 @@ QByteArray edited(const std::function<void(OrderedJson&)>& change) {
     return jsonBytes(json);
 }
 
-// Runs `work`, described by `what`, on its own thread and waits at most kFifoTimeoutMs. Nothing is
-// returned, with a failed check, when it threw or blocked. On a timeout the FIFO at `fifo` is
-// opened for writing, which releases a reader blocked opening it. A worker still blocked after
-// that cannot be joined, so the run reports it and exits at once rather than hang in the thread's
-// destructor.
-// CONTROL: by hand, test-side: the S15.33 FIFO work made `std::this_thread::sleep_for(20s)` ->
-//       "FAIL: S15.33: readWallpaper on a FIFO blocked for 3000 ms, and opening the FIFO's write
-//       end did not release it", exit 1 after about 5 s instead of 20; restored.
+// runBounded (wpx_fixtures.h) catches this file's throws too.
 // CONTROL: app/library/wpx_package.cpp, parseManifest's `Json::parse_error` and `Json::exception`
-//       catch clauses deleted, so badjson.wpx throws out of the scan -> red, "FAIL: S15.34: scanning
-//       a folder holding a FIFO threw: [json.exception.parse_error.101] ...", beside runPhase's
-//       "an exception escaped malformedManifests ..."; ctest graded it Failed, not aborted; restored.
-template <typename Result>
-std::optional<Result> runBounded(const std::function<Result()>& work, const QString& fifo, const QString& what) {
-    std::promise<Result> promise;
-    std::future<Result> result = promise.get_future();
-    std::jthread worker([&] {
-        try {
-            promise.set_value(work());
-        } catch (...) {
-            promise.set_exception(std::current_exception());
-        }
-    });
-    const QString blocked = QStringLiteral("%1 blocked for %2 ms").arg(what).arg(kFifoTimeoutMs);
-    if (result.wait_for(std::chrono::milliseconds(kFifoTimeoutMs)) == std::future_status::ready) {
-        try {
-            return result.get();
-        } catch (const std::exception& e) {
-            expect(false, QStringLiteral("%1 threw: %2").arg(what, QString::fromLocal8Bit(e.what())));
-        } catch (...) {
-            expect(false, QStringLiteral("%1 threw something that is not a std::exception").arg(what));
-        }
-        return std::nullopt;
-    }
-    for (int attempt = 0; attempt < 200 && result.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready; ++attempt) {
-        const int fd = ::open(QFile::encodeName(fifo).constData(), O_WRONLY | O_NONBLOCK | O_CLOEXEC);
-        if (fd >= 0) {
-            ::close(fd);
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
-    if (result.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) {
-        expect(false, blocked + QStringLiteral(", and opening the FIFO's write end did not release it"));
-        static_cast<void>(wallpaperx::testing::reportCheckFailures());
-        std::fflush(stderr);
-        std::_Exit(1);
-    }
-    expect(false, blocked);
-    return std::nullopt;
-}
+//       catch clauses deleted, so badjson's manifest throws out of the scan -> red, "FAIL: S15.34:
+//       scanning a library holding a FIFO threw: [json.exception.parse_error.101] ...", beside
+//       runPhase's "an exception escaped malformedManifests ..."; ctest graded it Failed, not aborted.
 
 bool isBrokenOnly(const Wallpaper& w) {
     return !w.usable() && !w.problem.isEmpty() && w.type.isEmpty() && w.title.isEmpty() && w.author.isEmpty() &&
            w.tags.isEmpty() && w.assetName.isEmpty() && w.previewName.isEmpty() && w.properties.isEmpty() &&
-           w.previewSource().isEmpty();
+           w.previewSource().isEmpty() && w.assetPath.isEmpty();
+}
+
+// readWallpaper on the archive at `path`, opened as the importer opens one. A fixture that cannot
+// be opened is a harness fault, and reads as no wallpaper.
+Wallpaper readArchive(const QString& path) {
+    const int fd = ::open(QFile::encodeName(path).constData(), O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+    if (fd < 0) {
+        harnessFailure("S15.33: " + path.toStdString() + " could not be opened: " + std::strerror(errno));
+        return {};
+    }
+    Wallpaper read = readWallpaper(fd, path);
+    ::close(fd);
+    return read;
+}
+
+bool makeSymlink(const QString& target, const QString& link) {
+    return ::symlink(QFile::encodeName(target).constData(), QFile::encodeName(link).constData()) == 0;
+}
+
+// Rewrites `path` in place with the same bytes and sets its modification time `plusNs` later
+// before closing it. Whether the inode and size stayed and the time moved.
+bool rewriteLater(const QString& path, qint64 plusNs) {
+    const auto bytes = readBytes(path);
+    struct stat before {};
+    if (!bytes || ::stat(QFile::encodeName(path).constData(), &before) != 0) {
+        return false;
+    }
+    const int fd = ::open(QFile::encodeName(path).constData(), O_WRONLY | O_TRUNC | O_CLOEXEC);
+    if (fd < 0) {
+        return false;
+    }
+    const qint64 when = qint64(before.st_mtim.tv_sec) * 1'000'000'000 + before.st_mtim.tv_nsec + plusNs;
+    const timespec times[2] = {{0, UTIME_OMIT}, {when / 1'000'000'000, when % 1'000'000'000}};
+    struct stat after {};
+    const bool done = ::write(fd, bytes->constData(), size_t(bytes->size())) == bytes->size() && ::futimens(fd, times) == 0 &&
+                      ::fstat(fd, &after) == 0;
+    return ::close(fd) == 0 && done && after.st_ino == before.st_ino && after.st_size == before.st_size &&
+           (after.st_mtim.tv_sec != before.st_mtim.tv_sec || after.st_mtim.tv_nsec != before.st_mtim.tv_nsec);
 }
 
 // S15.31
@@ -362,7 +357,6 @@ void badArchives(const QString& root) {
     atCap.append(QByteArray(kMaxManifestBytes - plan.size(), ' '));
     Entries bigPreview = planEntries(plan);
     bigPreview[1].second = QByteArray(kMaxPreviewBytes + 1, '\0');
-    const bool asRoot = ::geteuid() == 0;
 
     // Every fixture is built before the one check of the faults, so none is graded unbuilt.
     QString setupFault;
@@ -378,24 +372,25 @@ void badArchives(const QString& root) {
     make("huge.wpx", planEntries(huge));
     make("atcap.wpx", planEntries(atCap));
     make("future.wpx", planEntries(edited([](OrderedJson& j) { j["schema_version"] = "2"; })));
-    make("bigpreview.wpx", bigPreview);
-    make("percent.wpx", {{QStringLiteral("shot%1.png"), QByteArray((1 << 20) + 1, '\0')}});
     if (!writeBytes(at("notzip.wpx"), "hello")) {
         setupFault = QStringLiteral("notzip.wpx could not be written");
     }
-    if (!asRoot) {
-        make("locked.wpx", planEntries(plan));
-        if (!setMode(at("locked.wpx"), 0)) {
-            setupFault = QStringLiteral("locked.wpx could not be made mode 000");
-        }
+    if (const QString why = writeFolder(at("bigpreview"), bigPreview); !why.isEmpty()) {
+        setupFault = why;
+    }
+    if (const QString why = writeFolder(at("percent"), {{QStringLiteral("shot%1.png"), QByteArray((1 << 20) + 1, '\0')}}); !why.isEmpty()) {
+        setupFault = why;
+    }
+    const QString fifo = at("fifo.wpx");
+    if (::mkfifo(QFile::encodeName(fifo).constData(), 0644) != 0) {
+        setupFault = QStringLiteral("mkfifo failed: ") + QString::fromLocal8Bit(std::strerror(errno));
     }
     if (!setupFault.isEmpty()) {
-        harnessFailure("S15.33: a fixture archive could not be built: " + setupFault.toStdString());
-        static_cast<void>(setMode(at("locked.wpx"), 0644));
+        harnessFailure("S15.33: a fixture could not be built: " + setupFault.toStdString());
         return;
     }
 
-    const Wallpaper good = readWallpaper(at("good.wpx"));
+    const Wallpaper good = readArchive(at("good.wpx"));
     expect(good.usable() && good.filePath == at("good.wpx") && good.fileName == u"good.wpx" && good.title == u"Ocean Waves" &&
                !good.previewSource().isEmpty(),
            QStringLiteral("S15.33: a good archive read as usable=%1 title \"%2\" problem \"%3\"").arg(good.usable()).arg(good.title, good.problem));
@@ -404,7 +399,7 @@ void badArchives(const QString& root) {
     //       valid JSON: without the cap the over-size one would be read as usable, which is what goes red.
     // CONTROL: app/library/wpx_package.cpp, `st.size > static_cast<zip_uint64_t>(maxBytes)` made
     //       `false && ...` -> red, "S15.33: huge.wpx read as usable=1 title "Ocean Waves""; restored, green.
-    const Wallpaper atCapRead = readWallpaper(at("atcap.wpx"));
+    const Wallpaper atCapRead = readArchive(at("atcap.wpx"));
     expect(atCapRead.usable(), QStringLiteral("S15.33: a wallpaper.json of exactly 1 MiB was refused: %1").arg(atCapRead.problem));
 
     const ArchiveCase cases[] = {
@@ -420,15 +415,14 @@ void badArchives(const QString& root) {
     //       shown or applied.
     // WHY-THIS-SHAPE: the manifest-field emptiness is checked on every broken result because the
     //       asset check runs after parsing, when those fields are already filled.
-    // CONTROL: app/library/wpx_package.cpp, the `for (const QString& name : {parsed->previewName, ...})`
-    //       loop's `return broken(...)` made `continue` -> red, "noasset.wpx read as usable=1"; the
-    //       same `return broken(...)` made to return the parsed wallpaper with `problem` set -> red,
-    //       "noasset.wpx read as usable=0 title "Ocean Waves""; the ZIP_ER_NOZIP branch's condition
-    //       made `false` -> red, "notzip.wpx ... It cannot be read as a ZIP archive"; the open
-    //       failure's `.arg(systemError(errno))` dropped -> red, "a mode-000 archive read as ...
-    //       "It cannot be opened.""; restored, green each time.
+    // CONTROL: app/library/wpx_package.cpp, ArchiveContents::find's `if (!locate(m_zip, name)) {`
+    //       made `if (false) {` -> red, "noasset.wpx read as usable=1"; readFrom's asset
+    //       `return broken(std::move(file), asset.error());` made to return the parsed wallpaper
+    //       with `problem` set -> red, "noasset.wpx read as usable=0 title "Ocean Waves""; the
+    //       ZIP_ER_NOZIP branch's condition made `false` -> red, "notzip.wpx ... It cannot be read
+    //       as a ZIP archive"; restored, green each time.
     for (const ArchiveCase& c : cases) {
-        const Wallpaper w = readWallpaper(c.file);
+        const Wallpaper w = readArchive(c.file);
         expect(isBrokenOnly(w) && w.problem.contains(QLatin1String(c.reason)) && w.filePath == c.file &&
                    w.fileName == QFileInfo(c.file).fileName(),
                QStringLiteral("S15.33: %1 read as usable=%2 title \"%3\" problem \"%4\"; wanted broken, \"%5\", nothing else set")
@@ -437,52 +431,35 @@ void badArchives(const QString& root) {
                    .arg(w.title, w.problem, QLatin1String(c.reason)));
     }
 
-    // An unreadable file: root reads through mode 000, so this cannot be set up as root.
-    if (asRoot) {
-        notVerified("S15.33 (an unreadable archive)", "running as root, which can read a mode-000 file");
-    } else {
-        const Wallpaper w = readWallpaper(at("locked.wpx"));
-        const bool restored = setMode(at("locked.wpx"), 0644);
-        expect(isBrokenOnly(w) && w.problem == u"It cannot be opened: Permission denied." && w.fileName == u"locked.wpx",
-               QStringLiteral("S15.33: a mode-000 archive read as usable=%1 problem \"%2\"").arg(w.usable()).arg(w.problem));
-        if (!restored) {
-            harnessFailure("S15.33: locked.wpx could not be made readable again");
-        }
-    }
-
-    // GOAL: S15.33 -- a preview entry over 32 MiB uncompressed is refused by its size record.
-    // CONTROL: shares the size-cap mutation above (`false &&`) -> red, "a 32 MiB + 1 preview was read"; restored.
-    const auto preview = readPackageEntry(at("bigpreview.wpx"), QStringLiteral("preview.png"), kMaxPreviewBytes);
+    // GOAL: S15.33 -- a preview file over 32 MiB in a wallpaper folder is refused by its size, before
+    //       it is read.
+    // CONTROL: app/library/wpx_package.cpp, readToEnd's `if (size > maxBytes) {` made `if (false) {`
+    //       -> red, "S15.33: a 32 MiB + 1 preview was read: 33554433 bytes" (and the two checks below
+    //       it that rely on the same cap, S15.55's and S15.67's); restored.
+    const auto preview = readWallpaperEntry(at("bigpreview"), QStringLiteral("preview.png"), kMaxPreviewBytes);
     expect(!preview && preview.error() == u"preview.png is larger than 32 MiB.",
            QStringLiteral("S15.33: a 32 MiB + 1 preview was read: %1").arg(preview ? QStringLiteral("%1 bytes").arg(preview->size()) : preview.error()));
 
-    // GOAL: S15.55 -- an entry name holding "%1" is quoted as it is in a refusal, not taken as a
+    // GOAL: S15.55 -- a file name holding "%1" is quoted as it is in a refusal, not taken as a
     //       place for the size to go.
-    // CONTROL: app/library/wpx_package.cpp, readEntry's `.arg(name, QString::number(maxBytes >> 20))`
+    // CONTROL: app/library/wpx_package.cpp, FolderContents::read's `.arg(name, QString::number(maxBytes >> 20))`
     //       made `.arg(name).arg(QString::number(maxBytes >> 20))` -> red, "S15.55: ... "shot1.png
     //       is larger than %2 MiB.""; restored.
-    const auto percent = readPackageEntry(at("percent.wpx"), QStringLiteral("shot%1.png"), 1 << 20);
+    const auto percent = readWallpaperEntry(at("percent"), QStringLiteral("shot%1.png"), 1 << 20);
     expect(!percent && percent.error() == u"shot%1.png is larger than 1 MiB.",
-           QStringLiteral("S15.55: an entry named %1 over the cap was refused with \"%2\"")
+           QStringLiteral("S15.55: a file named %1 over the cap was refused with \"%2\"")
                .arg(QStringLiteral("shot%1.png"), percent ? QStringLiteral("nothing") : percent.error()));
 
-    // GOAL: S15.33 -- a FIFO handed to readWallpaper directly (one swapped in after the folder was
-    //       listed) is refused as "not a regular file" without blocking the reading thread.
-    // WHY-THIS-SHAPE: run on its own thread with a deadline (runBounded), so a hang is reported as
-    //       a failure, never as a stuck ctest entry and never as a pass.
-    // CONTROL: app/library/wpx_package.cpp, openArchive's `O_RDONLY | O_CLOEXEC | O_NONBLOCK` made
-    //       `O_RDONLY | O_CLOEXEC` -> red, "S15.33: readWallpaper on a FIFO blocked for 3000 ms";
-    //       restored, green.
-    const QString fifo = at("fifo.wpx");
-    if (::mkfifo(QFile::encodeName(fifo).constData(), 0644) != 0) {
-        harnessFailure("S15.33: mkfifo failed: " + std::string(std::strerror(errno)));
-        return;
-    }
-    const auto read = runBounded<Wallpaper>([&fifo] { return readWallpaper(fifo); }, fifo, QStringLiteral("S15.33: readWallpaper on a FIFO"));
-    if (read) {
-        expect(isBrokenOnly(*read) && read->problem == u"It is not a regular file.",
-               QStringLiteral("S15.33: a FIFO read as usable=%1 problem \"%2\"").arg(read->usable()).arg(read->problem));
-    }
+    // GOAL: S15.33 -- a descriptor that is not a regular file (a FIFO put in a .wpx's place) is
+    //       refused as "not a regular file", not handed to the ZIP reader.
+    // WHY-THIS-SHAPE: opened here with O_NONBLOCK, so the open cannot hang; whether the importer's
+    //       own open of such a path blocks is S15.76's (importer_test.cpp).
+    // CONTROL: app/library/wpx_package.cpp, openArchive's `|| !S_ISREG(st.st_mode)` deleted -> red,
+    //       "S15.33: a FIFO read as usable=0 problem "It cannot be read as a ZIP archive: Operation
+    //       not supported.""; restored.
+    const Wallpaper fifoRead = readArchive(fifo);
+    expect(isBrokenOnly(fifoRead) && fifoRead.problem == u"It is not a regular file.",
+           QStringLiteral("S15.33: a FIFO read as usable=%1 problem \"%2\"").arg(fifoRead.usable()).arg(fifoRead.problem));
 }
 
 // S15.34
@@ -497,60 +474,62 @@ void scanFolder(const QString& root) {
     noAsset.removeLast();
 
     QString fault;
-    if (!QDir().mkpath(lib) || !QDir().mkpath(elsewhere)) {
-        fault = QStringLiteral("the library folders could not be made");
-    }
-    const auto make = [&fault](const QString& path, const Entries& entries) {
-        if (const QString why = writeZip(path, entries); !why.isEmpty()) {
+    const auto make = [&fault](const QString& dir, const Entries& entries) {
+        if (const QString why = writeFolder(dir, entries); !why.isEmpty()) {
             fault = why;
         }
     };
-    make(at(QStringLiteral("ocean.wpx")), planEntries(plan));
-    // Lower case, so by title alone it would sort after every broken file's name in any locale;
+    make(at(QStringLiteral("ocean")), planEntries(plan));
+    // Lower case, so by title alone it would sort after every broken folder's name in any locale;
     // only the usable-first rule puts it ahead of them.
-    make(at(QStringLiteral("still.wpx")), planEntries(edited([](OrderedJson& j) { j["title"] = "zebra still"; })));
-    make(elsewhere + QStringLiteral("/linked.wpx"), planEntries(edited([](OrderedJson& j) { j["title"] = "Linked"; })));
-    make(at(QStringLiteral(".hidden.wpx")), planEntries(plan));
-    make(at(QStringLiteral("nomanifest.wpx")), noManifest);
-    make(at(QStringLiteral("badjson.wpx")), planEntries("{ nope"));
-    make(at(QStringLiteral("escape.wpx")), planEntries(edited([](OrderedJson& j) { j["file"] = "../../evil"; })));
-    make(at(QStringLiteral("future.wpx")), planEntries(edited([](OrderedJson& j) { j["schema_version"] = "2"; })));
-    make(at(QStringLiteral("outofrange.wpx")), planEntries(edited([](OrderedJson& j) { j["properties"]["speed"]["default"] = 9; })));
-    make(at(QStringLiteral("missingasset.wpx")), noAsset);
-    make(at(QStringLiteral("readme.txt")), planEntries(plan));
-    if (!writeBytes(at(QStringLiteral("notzip.wpx")), "hello") || !QDir().mkpath(at(QStringLiteral("adir.wpx"))) ||
-        ::mkfifo(QFile::encodeName(at(QStringLiteral("fifo.wpx"))).constData(), 0644) != 0 ||
-        !QFile::link(QStringLiteral("../elsewhere/linked.wpx"), at(QStringLiteral("link.wpx")))) {
-        fault = QStringLiteral("a plain file, folder, FIFO or symlink could not be made");
+    make(at(QStringLiteral("still")), planEntries(edited([](OrderedJson& j) { j["title"] = "zebra still"; })));
+    make(elsewhere + QStringLiteral("/linked"), planEntries(edited([](OrderedJson& j) { j["title"] = "Linked"; })));
+    make(at(QStringLiteral(".hidden")), planEntries(plan));
+    make(at(QStringLiteral(".import-abc123")), planEntries(plan));
+    make(at(QStringLiteral("nomanifest")), noManifest);
+    make(at(QStringLiteral("badjson")), planEntries("{ nope"));
+    make(at(QStringLiteral("escape")), planEntries(edited([](OrderedJson& j) { j["file"] = "../../evil"; })));
+    make(at(QStringLiteral("future")), planEntries(edited([](OrderedJson& j) { j["schema_version"] = "2"; })));
+    make(at(QStringLiteral("outofrange")), planEntries(edited([](OrderedJson& j) { j["properties"]["speed"]["default"] = 9; })));
+    make(at(QStringLiteral("missingasset")), noAsset);
+    make(at(QStringLiteral("assetdir")), noAsset);
+    make(at(QStringLiteral("fifojson")), noManifest);
+    if (!QDir().mkpath(at(QStringLiteral("assetdir/assets/video.mp4"))) ||
+        ::mkfifo(QFile::encodeName(at(QStringLiteral("fifojson/wallpaper.json"))).constData(), 0644) != 0 ||
+        !writeBytes(at(QStringLiteral("readme.txt")), "hello") || !writeZip(at(QStringLiteral("package.wpx")), planEntries(plan)).isEmpty() ||
+        ::mkfifo(QFile::encodeName(at(QStringLiteral("fifo"))).constData(), 0644) != 0 ||
+        !makeSymlink(QStringLiteral("../elsewhere/linked"), at(QStringLiteral("linked"))) ||
+        !makeSymlink(QStringLiteral("readme.txt"), at(QStringLiteral("filelink"))) ||
+        !makeSymlink(QStringLiteral("nothing-here"), at(QStringLiteral("dangling")))) {
+        fault = QStringLiteral("a plain file, archive, FIFO, symlink or folder could not be made");
     }
     const bool asRoot = ::geteuid() == 0;
     if (!asRoot) {
-        make(at(QStringLiteral("locked.wpx")), planEntries(plan));
-        if (!setMode(at(QStringLiteral("locked.wpx")), 0)) {
-            fault = QStringLiteral("locked.wpx could not be made mode 000");
+        make(at(QStringLiteral("locked")), planEntries(plan));
+        if (!setMode(at(QStringLiteral("locked")), 0)) {
+            fault = QStringLiteral("locked could not be made mode 000");
         }
     }
     if (!fault.isEmpty()) {
         harnessFailure("S15.34: the library folder could not be built: " + fault.toStdString());
-        static_cast<void>(setMode(at(QStringLiteral("locked.wpx")), 0644));
+        static_cast<void>(setMode(at(QStringLiteral("locked")), 0755));
         return;
     }
 
     using Scan = std::expected<QList<Wallpaper>, QString>;
-    // GOAL: S15.34 -- a FIFO named *.wpx in the folder never blocks a scan.
-    // WHY-THIS-SHAPE: bounded as in S15.33. Three defences stand in front of the hang -- the scan
-    //       skips what stat() says is not a regular file, it skips an empty file (a FIFO's size is
-    //       0), and the open is O_NONBLOCK -- so the mutation has to remove all three to reach it;
-    //       removing fewer is caught by the listing check below or by S15.33.
-    // CONTROL: app/library/wpx_package.cpp, scanLibrary's `if (!S_ISREG(st.st_mode)) { continue; }`
-    //       and its empty-file `continue` block deleted and openArchive's `| O_NONBLOCK` deleted, in
-    //       one patch -> red, "S15.34: scanning a folder holding a FIFO blocked for 3000 ms"; restored.
-    //       The same break without the empty-file block left this check green (the FIFO is skipped
-    //       as empty); only S15.33 and the listing below went red.
-    const QString fifo = at(QStringLiteral("fifo.wpx"));
-    const auto scanned = runBounded<Scan>([&lib] { return scanLibrary(lib); }, fifo, QStringLiteral("S15.34: scanning a folder holding a FIFO"));
-    if (!asRoot && !setMode(at(QStringLiteral("locked.wpx")), 0644)) {
-        harnessFailure("S15.34: locked.wpx could not be made readable again");
+    // GOAL: S15.34 -- a wallpaper folder whose wallpaper.json is a FIFO never blocks a scan; it
+    //       is listed broken, "wallpaper.json is not a regular file.".
+    // WHY-THIS-SHAPE: bounded as in S15.33. A FIFO directly in the library is not a folder, so a
+    //       scan never opens it; one named by wallpaper.json inside a folder is opened, and only
+    //       the non-blocking open stands in front of the hang.
+    // CONTROL: app/library/wpx_package.cpp, FolderContents::open's `O_RDONLY | O_NONBLOCK | O_NOCTTY`
+    //       made `O_RDONLY | O_NOCTTY` -> red, "S15.34: scanning a library holding a FIFO blocked for
+    //       3000 ms"; restored.
+    const QString fifo = at(QStringLiteral("fifojson/wallpaper.json"));
+    const auto scanned = runBounded<Scan>([&lib] { return scanLibrary(lib); }, fifo, QStringLiteral("S15.34: scanning a library holding a FIFO"), kFifoTimeoutMs);
+    const Wallpaper linkRead = readWallpaperFolder(at(QStringLiteral("linked")));
+    if (!asRoot && !setMode(at(QStringLiteral("locked")), 0755)) {
+        harnessFailure("S15.34: locked could not be made readable again");
     }
     if (!scanned) {
         return;
@@ -561,64 +540,90 @@ void scanFolder(const QString& root) {
     }
     const QList<Wallpaper>& list = **scanned;
 
-    // GOAL: S15.34 -- the folder's usable wallpapers are all listed as usable, and every broken
-    //       file is listed with its reason; one bad file stops nothing else from loading.
+    // GOAL: S15.34 -- every wallpaper folder in the library is listed, usable ones first by title
+    //       and broken ones after by folder name, each broken one with its own reason; a link to a
+    //       folder is listed broken; hidden folders (the importer's unfinished ones among them),
+    //       plain files, .wpx archives, FIFOs and links to anything but a folder are not listed.
     // WHY-THIS-SHAPE: the whole listing is compared in order, so a missing, extra or reordered
-    //       entry is named; usable ones first by title, then broken ones by file name. One usable
-    //       title is lower case: with capitalised titles only, the C locale sorts them all before
-    //       the broken names anyway and the usable-first rule goes untested.
-    // CONTROL: app/library/wpx_package.cpp, listedBefore()'s `if (a.usable() != b.usable())` block deleted
-    //       -> red, "listed [link.wpx, ocean.wpx, badjson.wpx(broken), ... still.wpx]";
-    //       isPackageFileName's `!name.startsWith('.') &&` deleted -> red, ".hidden.wpx" listed;
-    //       scanLibrary's `if (!S_ISREG(st.st_mode)) { continue; }` deleted -> red, "adir.wpx(broken)"
-    //       listed (the FIFO is still dropped as an empty file); its first fstatat's flags `0` made
-    //       `AT_SYMLINK_NOFOLLOW` -> red, "link.wpx" missing; the scan made to return the first
-    //       broken file's problem as its error -> red, "the library folder could not be scanned";
-    //       restored, green each time.
-    QStringList want{QStringLiteral("link.wpx"), QStringLiteral("ocean.wpx"), QStringLiteral("still.wpx"),
-                     QStringLiteral("badjson.wpx"), QStringLiteral("escape.wpx"), QStringLiteral("future.wpx")};
+    //       entry is named. One usable title is lower case: with capitalised titles only, the C
+    //       locale sorts them all before the broken names anyway and the usable-first rule goes
+    //       untested.
+    // CONTROL: app/library/wpx_package.cpp, listedBefore()'s `if (a.usable() != b.usable())` block
+    //       deleted -> red, "listed [Ocean Waves, assetdir(broken), ... zebra still]"; scanLibrary's
+    //       `if (name.startsWith('.')) {` made `if (false) {` -> red, "listed [Ocean Waves, Ocean
+    //       Waves, Ocean Waves, zebra still, .(broken), ..(broken), ...]" (.hidden and
+    //       .import-abc123 by their titles); `if (S_ISDIR(st.st_mode)) {` made `if (true) {` -> red,
+    //       "fifo is broken with "It is not a folder."" and the same for package.wpx and readme.txt;
+    //       the link branch's `wallpapers.append(broken(...))` deleted -> red, "linked" missing; restored.
+    QStringList want{QStringLiteral("Ocean Waves"), QStringLiteral("zebra still"), QStringLiteral("assetdir(broken)"),
+                     QStringLiteral("badjson(broken)"), QStringLiteral("escape(broken)"), QStringLiteral("fifojson(broken)"),
+                     QStringLiteral("future(broken)"), QStringLiteral("linked(broken)")};
     if (!asRoot) {
-        want.append(QStringLiteral("locked.wpx"));
+        want.append(QStringLiteral("locked(broken)"));
     }
-    want += QStringList{QStringLiteral("missingasset.wpx"), QStringLiteral("nomanifest.wpx"), QStringLiteral("notzip.wpx"),
-                        QStringLiteral("outofrange.wpx")};
+    want += QStringList{QStringLiteral("missingasset(broken)"), QStringLiteral("nomanifest(broken)"), QStringLiteral("outofrange(broken)")};
     QStringList got;
     for (const Wallpaper& w : list) {
-        got.append(w.fileName + (w.usable() ? QString() : QStringLiteral("(broken)")));
+        got.append(w.usable() ? w.title : w.fileName + QStringLiteral("(broken)"));
     }
-    QStringList wantMarked;
-    for (const QString& name : want) {
-        const bool usable = name == u"still.wpx" || name == u"link.wpx" || name == u"ocean.wpx";
-        wantMarked.append(name + (usable ? QString() : QStringLiteral("(broken)")));
-    }
-    expect(got == wantMarked, QStringLiteral("S15.34: the folder listed [%1], not [%2]").arg(got.join(u", "), wantMarked.join(u", ")));
+    expect(got == want, QStringLiteral("S15.34: the library listed [%1], not [%2]").arg(got.join(u", "), want.join(u", ")));
 
+    // GOAL: S15.34 -- each broken folder is broken for its own reason, with nothing read from its
+    //       manifest kept.
+    // CONTROL: app/library/wpx_package.cpp, FolderContents::open's `|| !S_ISREG(st.st_mode)` deleted
+    //       -> red, "assetdir is usable" and "fifojson is broken with "wallpaper.json is not valid
+    //       JSON ...""; restored.
+    // COVERAGE-ASSERT: the number of broken rows whose reason was compared.
     const QMap<QString, QString> reasons{
-        {QStringLiteral("badjson.wpx"), QStringLiteral("wallpaper.json is not valid JSON")},
-        {QStringLiteral("escape.wpx"), QStringLiteral("\"file\" is not a plain path")},
-        {QStringLiteral("future.wpx"), QStringLiteral("schema version \"2\"")},
-        {QStringLiteral("locked.wpx"), QStringLiteral("Permission denied")},
-        {QStringLiteral("missingasset.wpx"), QStringLiteral("has no assets/video.mp4")},
-        {QStringLiteral("nomanifest.wpx"), QStringLiteral("has no wallpaper.json")},
-        {QStringLiteral("notzip.wpx"), QStringLiteral("not a ZIP archive")},
-        {QStringLiteral("outofrange.wpx"), QStringLiteral("default outside its min and max")},
+        {QStringLiteral("assetdir"), QStringLiteral("assets/video.mp4 is not a regular file.")},
+        {QStringLiteral("badjson"), QStringLiteral("wallpaper.json is not valid JSON")},
+        {QStringLiteral("escape"), QStringLiteral("wallpaper.json's \"file\" is not a plain path inside the wallpaper.")},
+        {QStringLiteral("fifojson"), QStringLiteral("wallpaper.json is not a regular file.")},
+        {QStringLiteral("future"), QStringLiteral("schema version \"2\"")},
+        {QStringLiteral("linked"), QStringLiteral("It is a link to a folder. A wallpaper has to be a folder inside the library itself.")},
+        {QStringLiteral("locked"), QStringLiteral("It cannot be opened: Permission denied.")},
+        {QStringLiteral("missingasset"), QStringLiteral("The folder has no assets/video.mp4, which wallpaper.json names.")},
+        {QStringLiteral("nomanifest"), QStringLiteral("The folder has no wallpaper.json.")},
+        {QStringLiteral("outofrange"), QStringLiteral("default outside its min and max")},
     };
+    int reasonsChecked = 0;
     for (const Wallpaper& w : list) {
         if (!w.usable()) {
-            expect(w.problem.contains(reasons.value(w.fileName, QStringLiteral("\x01"))),
+            ++reasonsChecked;
+            expect(isBrokenOnly(w) && w.problem.contains(reasons.value(w.fileName, QStringLiteral("\x01"))),
                    QStringLiteral("S15.34: %1 is broken with \"%2\", not \"%3\"").arg(w.fileName, w.problem, reasons.value(w.fileName)));
+        } else if (w.fileName == u"assetdir" || w.fileName == u"fifojson") {
+            expect(false, QStringLiteral("S15.34: %1 is usable").arg(w.fileName));
         }
     }
-    const auto link = std::ranges::find(list, QStringLiteral("link.wpx"), &Wallpaper::fileName);
-    expect(link != list.end() && link->title == u"Linked" && link->filePath == at(QStringLiteral("link.wpx")),
-           QStringLiteral("S15.34: the symlink to a package was not listed under its own name with the target's title"));
+    expect(reasonsChecked >= 9, QStringLiteral("S15.34: %1 broken folder(s) had their reason checked, not 9 or more").arg(reasonsChecked));
+
+    // GOAL: S15.34 -- a usable folder's row names the folder, and its assetPath is the folder, a
+    //       slash and the manifest's file: the path the daemon is to open.
+    // CONTROL: app/library/wpx_package.cpp, readFolderAt's `read.assetPath = read.filePath + u'/' + read.assetName;`
+    //       deleted -> red, "S15.34: ocean read as path … name ocean asset path """; restored.
+    const auto ocean = std::ranges::find(list, QStringLiteral("ocean"), &Wallpaper::fileName);
+    expect(ocean != list.end() && ocean->filePath == at(QStringLiteral("ocean")) && ocean->title == u"Ocean Waves" &&
+               ocean->assetPath == at(QStringLiteral("ocean/assets/video.mp4")),
+           QStringLiteral("S15.34: ocean read as path %1 name %2 asset path \"%3\"")
+               .arg(ocean != list.end() ? ocean->filePath : QString(), ocean != list.end() ? ocean->fileName : QString(),
+                    ocean != list.end() ? ocean->assetPath : QString()));
+
+    // GOAL: S15.34 -- a wallpaper folder that is a link is refused by the folder reader itself,
+    //       not only by the scan, so nothing reads through it into another folder.
+    // CONTROL: app/library/wpx_package.cpp, readFolderAt's `O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC`
+    //       made `O_RDONLY | O_DIRECTORY | O_CLOEXEC` -> red, "S15.34: the linked folder read
+    //       directly as usable=1 "Linked""; restored.
+    expect(isBrokenOnly(linkRead) && linkRead.problem == u"It is a link, not a folder.",
+           QStringLiteral("S15.34: the linked folder read directly as usable=%1 \"%2\" problem \"%3\"")
+               .arg(linkRead.usable()).arg(linkRead.title, linkRead.problem));
 
     // GOAL: S15.34 -- a folder that does not exist is an empty library, not an error; a path that
     //       is a file, or a folder that cannot be listed, is an error that says which.
-    // CONTROL: app/library/wpx_package.cpp, `if (error == ENOENT) {` made `if (false) {` -> red,
-    //       "a missing folder gave an error"; `if (error == ENOTDIR) {` made `if (false) {` -> red,
-    //       "a path that is a file gave ... cannot be read: Not a directory"; the opendir failure made
-    //       to return an empty list -> red, "a folder that cannot be listed gave a listing"; restored.
+    // CONTROL: app/library/wpx_package.cpp, scanLibrary's `if (error == ENOENT) {` made `if (false) {`
+    //       -> red, "a missing folder gave an error"; `if (error == ENOTDIR) {` made `if (false) {` ->
+    //       red, "a path that is a file gave ... cannot be read: Not a directory"; the opendir failure
+    //       made to return an empty list -> red, "a folder that cannot be listed gave a listing"; restored.
     const auto missing = scanLibrary(root + QStringLiteral("/no/such/folder"));
     expect(missing && missing->isEmpty(), QStringLiteral("S15.34: a missing folder gave %1")
                                               .arg(missing ? QStringLiteral("%1 entries").arg(missing->size()) : QStringLiteral("an error: ") + missing.error()));
@@ -639,18 +644,46 @@ void scanFolder(const QString& root) {
         }
         expect(!denied && denied.error() == closed + QStringLiteral(" cannot be read: Permission denied."),
                QStringLiteral("S15.34: a folder that cannot be listed gave %1").arg(denied ? QStringLiteral("a listing") : denied.error()));
+
+        // GOAL: S15.34 -- an entry that is listed but cannot be looked at (a library readable but
+        //       not searchable) is a broken row giving the kernel's own reason, not one some later
+        //       call left behind in errno.
+        // CONTROL: app/library/wpx_package.cpp, scanLibrary's per-entry `const int error = errno;`
+        //       given `::close(-1);` just before it -> red, "S15.34: an entry that cannot be looked
+        //       at read as [a: It cannot be read: Bad file descriptor.]"; restored.
+        const QString unsearchable = root + QStringLiteral("/unsearchable");
+        if (!writeFolder(unsearchable + QStringLiteral("/a"), planEntries(plan)).isEmpty() || !setMode(unsearchable, 0444)) {
+            harnessFailure("S15.34: the library that cannot be searched could not be made");
+            static_cast<void>(setMode(unsearchable, 0755));
+            return;
+        }
+        const auto rows = scanLibrary(unsearchable);
+        if (!setMode(unsearchable, 0755)) {
+            harnessFailure("S15.34: the library that cannot be searched could not be made searchable again");
+        }
+        QStringList read;
+        for (const Wallpaper& w : rows.value_or(QList<Wallpaper>())) {
+            read.append(w.fileName + QStringLiteral(": ") + w.problem);
+        }
+        expect(rows && read == QStringList{QStringLiteral("a: It cannot be read: Permission denied.")},
+               QStringLiteral("S15.34: an entry that cannot be looked at read as [%1]%2").arg(read.join(u" | "), rows ? QString() : QStringLiteral(", ") + rows.error()));
     }
 }
 
 // S15.50
-void fileNamesThatAreNotUtf8(const QString& root) {
+void folderNamesThatAreNotUtf8(const QString& root) {
     const QString dir = root + QStringLiteral("/names");
+    const QString staging = root + QStringLiteral("/names-staging");
     const QByteArray dirBytes = QFile::encodeName(dir);
-    const auto package = zipBytes(dir + QStringLiteral(".scratch"), planEntries(QByteArray(kPlanManifest)));
-    const RawNamesRemover removeRawNames(dir, {"caf\xe8.wpx", "caf\xe9.wpx"});
-    if (!QDir().mkpath(dir) || !package || !writeRawName(dir, "caf\xe8.wpx", *package) || !writeRawName(dir, "caf\xe9.wpx", *package) ||
-        !writeRawName(dir, "caf\xc3\xa9.wpx", *package) || !QFile::link(QStringLiteral("nothing-here.wpx"), dir + QStringLiteral("/dangling.wpx"))) {
-        harnessFailure("S15.50: the folder of odd names could not be built");
+    const RawNamesRemover removeRawNames(dir, {"caf\xe8", "caf\xe9"});
+    bool built = QDir().mkpath(dir);
+    for (const QByteArray& name : {QByteArray("caf\xe8"), QByteArray("caf\xe9"), QByteArray("caf\xc3\xa9")}) {
+        const QString staged = staging + QStringLiteral("/w");
+        built = built && writeFolder(staged, planEntries(QByteArray(kPlanManifest))).isEmpty() &&
+                ::rename(QFile::encodeName(staged).constData(), (dirBytes + '/' + name).constData()) == 0;
+    }
+    if (!built) {
+        harnessFailure("S15.50: the folders with odd names could not be built");
         return;
     }
     const auto scan = scanLibrary(dir);
@@ -662,38 +695,29 @@ void fileNamesThatAreNotUtf8(const QString& root) {
         const auto it = std::ranges::find_if(*scan, [&](const Wallpaper& w) { return encodeFileName(w.filePath) == dirBytes + '/' + name; });
         return it == scan->end() ? nullptr : &*it;
     };
-    const QString notUtf8 = QStringLiteral("Its path is not valid UTF-8, so it cannot be set as a wallpaper. Rename the file.");
-    const Wallpaper* e8 = rowFor("caf\xe8.wpx");
-    const Wallpaper* e9 = rowFor("caf\xe9.wpx");
-    const Wallpaper* valid = rowFor("caf\xc3\xa9.wpx");
-    const Wallpaper* dangling = rowFor("dangling.wpx");
+    const QString notUtf8 = QStringLiteral("Its path is not valid UTF-8, so it cannot be set as a wallpaper. Rename the folder.");
+    const Wallpaper* e8 = rowFor("caf\xe8");
+    const Wallpaper* e9 = rowFor("caf\xe9");
+    const Wallpaper* valid = rowFor("caf\xc3\xa9");
     QStringList listed;
     for (const Wallpaper& w : *scan) {
         listed.append(QString::fromLatin1(encodeFileName(w.fileName).toPercentEncoding()) + (w.usable() ? QString() : QStringLiteral("(broken: ") + w.problem + u')'));
     }
-    // GOAL: S15.50 -- a package whose name is not UTF-8 is listed, broken, with the reason; two
-    //       such names differing in one byte are two rows with distinct paths, each converting back
-    //       to its own file's bytes; a valid UTF-8 name is read normally.
+    // GOAL: S15.50 -- a wallpaper folder whose name is not UTF-8 is listed, broken, with the reason;
+    //       two such names differing in one byte are two rows with distinct paths, each converting
+    //       back to its own folder's bytes; a valid UTF-8 name is read normally.
     // WHY-THIS-SHAPE: each row is looked up by converting its path back to bytes, so a row whose
-    //       text no longer names its file is not found; comparing texts would pass two names both
+    //       text no longer names its folder is not found; comparing texts would pass two names both
     //       decoded to U+FFFD.
-    // CONTROL: app/library/wpx_package.cpp, readWallpaper's `if (!QStringView(path).isValidUtf16()) {`
-    //       made `if (false) {` -> red, "S15.50: the folder of odd names listed [caf%C3%A9.wpx,
-    //       caf%E8.wpx, caf%E9.wpx, ...]", both read as usable; decodeFileName's
-    //       `QChar(char16_t(0xDC00 + value))` made `QChar(char16_t(0xFFFD))` (what QFile::decodeName
-    //       does) -> red, both rows became "caf%EF%BF%BD.wpx(broken: It cannot be opened: No such file
-    //       or directory.)"; restored, green each time.
-    expect(scan->size() == 4 && e8 && e9 && valid && e8 != e9 && e8->filePath != e9->filePath && e8->problem == notUtf8 &&
+    // CONTROL: app/library/wpx_package.cpp, readFolderAt's `if (!QStringView(path).isValidUtf16()) {`
+    //       made `if (false) {` -> red, "S15.50: the folder of odd names listed [caf%C3%A9, caf%E8,
+    //       caf%E9]", all three usable; decodeFileName's `QChar(char16_t(0xDC00 + value))` made
+    //       `QChar(char16_t(0xFFFD))` (what QFile::decodeName does) -> red, both rows named
+    //       "caf%EF%BF%BD" and read as usable; restored, green each time.
+    expect(scan->size() == 3 && e8 && e9 && valid && e8 != e9 && e8->filePath != e9->filePath && e8->problem == notUtf8 &&
                e9->problem == notUtf8 && !QStringView(e8->filePath).isValidUtf16() && valid->usable() &&
-               valid->fileName == QStringLiteral("café.wpx"),
+               valid->fileName == QStringLiteral("café"),
            QStringLiteral("S15.50: the folder of odd names listed [%1]").arg(listed.join(u", ")));
-
-    // GOAL: S15.50 -- a link to a file that does not exist is listed broken, saying so.
-    // CONTROL: app/library/wpx_package.cpp, scanLibrary's `if (error == ENOENT && ::fstatat(`
-    //       made `if (error == ENOENT || ::fstatat(` (every ENOENT dropped) -> red, "dangling.wpx
-    //       ... not listed"; restored.
-    expect(dangling && !dangling->usable() && dangling->problem == u"It is a link to a file that does not exist.",
-           QStringLiteral("S15.50: the dangling link is %1").arg(dangling ? dangling->problem : QStringLiteral("not listed: [%1]").arg(listed.join(u", "))));
 
     // GOAL: S15.50 -- a path's text converts back to exactly the bytes it came from, for any
     //       bytes: valid UTF-8 as the same text QString::fromUtf8 gives, anything else as text that
@@ -704,7 +728,10 @@ void fileNamesThatAreNotUtf8(const QString& root) {
     //       deleted -> red, "S15.50: ef bb bf 62 6f 6d 2e 77 70 78 came back as 62 6f 6d 2e 77 70 78";
     //       encodeFileName's `bytes.append(static_cast<char>(unit & 0xFF));` made `bytes.append('?');`
     //       -> red, "S15.50: 63 61 66 e9 2e 77 70 78 came back as 3f 3f 3f 3f 3f 3f 3f 3f"; restored.
-    // COVERAGE-ASSERT: the number of byte strings compared.
+    // COVERAGE-ASSERT: the number of byte strings compared, 11 fixed and 300 random. It guards this
+    //       check against an edit that narrows its samples; no production change can move it.
+    //       Controlled test-side: the random loop's bound made 0 -> red, "S15.50: 11 byte strings
+    //       were compared, not 311"; restored.
     QList<QByteArray> samples{"plain.wpx", "caf\xc3\xa9.wpx", "caf\xe9.wpx", "\xef\xbb\xbf" "bom.wpx", "\xff\xfe", "a\x80z",
                               "\xc0\xaf", "\xed\xa0\x80", "\xf0\x9f\x98\x80.wpx", "\xc3", "\xe2\x82"};
     QRandomGenerator random(15050);
@@ -717,45 +744,226 @@ void fileNamesThatAreNotUtf8(const QString& root) {
     }
     int compared = 0;
     for (const QByteArray& bytes : samples) {
+        ++compared;
         const QString text = decodeFileName(bytes);
         const QByteArray back = encodeFileName(text);
         const bool utf8 = QString::fromUtf8(bytes).toUtf8() == bytes && !bytes.startsWith("\xef\xbb\xbf");
         const bool ok = back == bytes && (utf8 ? text == QString::fromUtf8(bytes) && text.isValidUtf16() : true) &&
                         (!utf8 && !bytes.startsWith("\xef\xbb\xbf") ? !text.isValidUtf16() : true);
-        ++compared;
         expect(ok, QStringLiteral("S15.50: %1 came back as %2 (valid UTF-16: %3)")
                        .arg(QString::fromLatin1(bytes.toHex(' ')), QString::fromLatin1(back.toHex(' '))).arg(text.isValidUtf16()));
     }
     expect(compared == 311, QStringLiteral("S15.50: %1 byte strings were compared, not 311").arg(compared));
 }
 
-// S15.58
-void emptyFiles(const QString& root) {
-    const QString dir = root + QStringLiteral("/empties");
-    const QString target = root + QStringLiteral("/empty-target.wpx");
-    if (!QDir().mkpath(dir) || !writeZip(dir + QStringLiteral("/good.wpx"), planEntries(QByteArray(kPlanManifest))).isEmpty() ||
-        !writeBytes(dir + QStringLiteral("/empty.wpx"), {}) || !writeBytes(target, {}) ||
-        !QFile::link(target, dir + QStringLiteral("/emptylink.wpx"))) {
-        harnessFailure("S15.58: the folder of empty files could not be built");
+// S15.67
+void sharedValidator(const QString& root) {
+    const QString dir = root + QStringLiteral("/shared");
+    const QByteArray plan(kPlanManifest);
+    Entries noPreview = planEntries(plan);
+    noPreview.removeAt(1);
+    QByteArray huge = plan;
+    huge.append(QByteArray(kMaxManifestBytes + 1 - plan.size(), ' '));
+    QByteArray atCap = plan;
+    atCap.append(QByteArray(kMaxManifestBytes - plan.size(), ' '));
+    if (!writeFolder(dir + QStringLiteral("/nopreview"), noPreview).isEmpty() ||
+        !writeZip(dir + QStringLiteral("/nopreview.wpx"), noPreview).isEmpty() ||
+        !writeFolder(dir + QStringLiteral("/whole"), planEntries(plan)).isEmpty() ||
+        !writeZip(dir + QStringLiteral("/whole.wpx"), planEntries(plan)).isEmpty() ||
+        !writeFolder(dir + QStringLiteral("/huge"), planEntries(huge)).isEmpty() ||
+        !writeFolder(dir + QStringLiteral("/atcap"), planEntries(atCap)).isEmpty()) {
+        harnessFailure("S15.67: the folders and archives could not be built");
         return;
     }
-    // GOAL: S15.58 -- an empty file in the folder is not listed at all (it is one not yet
-    //       written), while a link to an empty file is listed, broken.
-    // WHY-THIS-SHAPE: both are in one folder beside a usable package, so the listing as a whole
-    //       is compared.
-    // CONTROL: app/library/wpx_package.cpp, scanLibrary's empty-file `continue` block deleted ->
-    //       red, "S15.58: ... listed [good.wpx, empty.wpx(broken), emptylink.wpx(broken)]";
-    //       its `&& !S_ISLNK(link.st_mode)` deleted -> red, "... listed [good.wpx]"; restored.
-    const auto scan = scanLibrary(dir);
-    QStringList got;
-    if (scan) {
-        for (const Wallpaper& w : *scan) {
-            got.append(w.fileName + (w.usable() ? QString() : QStringLiteral("(broken)")));
-        }
+    // GOAL: S15.67 -- one validator serves a folder and an archive: the same contents missing the
+    //       preview wallpaper.json names are refused in both, each saying so, while the same
+    //       contents whole are usable in both.
+    // WHY-THIS-SHAPE: the control is made in the one place both readers share (readFrom), so both
+    //       rows going red together is what shows the rule is shared rather than written twice;
+    //       the whole pair proves the refusal is about the preview and nothing else.
+    // CONTROL: app/library/wpx_package.cpp, readFrom's `contents.find(parsed->previewName)` made
+    //       `contents.find(parsed->assetName)` -> red, "S15.67: the folder missing its preview read
+    //       as usable=1 ..." and "... the archive missing its preview read as usable=1 ..."; restored.
+    const Wallpaper folder = readWallpaperFolder(dir + QStringLiteral("/nopreview"));
+    const Wallpaper archive = readArchive(dir + QStringLiteral("/nopreview.wpx"));
+    const Wallpaper wholeFolder = readWallpaperFolder(dir + QStringLiteral("/whole"));
+    const Wallpaper wholeArchive = readArchive(dir + QStringLiteral("/whole.wpx"));
+    expect(isBrokenOnly(folder) && folder.problem == u"The folder has no preview.png, which wallpaper.json names.",
+           QStringLiteral("S15.67: the folder missing its preview read as usable=%1 problem \"%2\"").arg(folder.usable()).arg(folder.problem));
+    expect(isBrokenOnly(archive) && archive.problem == u"The archive has no preview.png, which wallpaper.json names.",
+           QStringLiteral("S15.67: the archive missing its preview read as usable=%1 problem \"%2\"").arg(archive.usable()).arg(archive.problem));
+    expect(wholeFolder.usable() && wholeArchive.usable() && wholeFolder.properties == wholeArchive.properties &&
+               wholeFolder.title == wholeArchive.title,
+           QStringLiteral("S15.67: the same contents whole read as folder usable=%1 (%2), archive usable=%3 (%4)")
+               .arg(wholeFolder.usable()).arg(wholeFolder.problem).arg(wholeArchive.usable()).arg(wholeArchive.problem));
+
+    // GOAL: S15.67 -- a folder's wallpaper.json is held to the archive's 1 MiB cap: exactly 1 MiB is
+    //       read, one byte more is refused before it is parsed.
+    // WHY-THIS-SHAPE: both manifests are PLAN's example padded with spaces, so without the cap the
+    //       larger one would read as usable.
+    // CONTROL: app/library/wpx_package.cpp, readToEnd's `if (size > maxBytes) {` made `if (false) {`
+    //       -> red, "S15.67: a folder's 1 MiB + 1 wallpaper.json read as usable=1 ..." (its read
+    //       loop alone refuses only a file that grows past the cap while read); restored.
+    const Wallpaper hugeRead = readWallpaperFolder(dir + QStringLiteral("/huge"));
+    const Wallpaper atCapRead = readWallpaperFolder(dir + QStringLiteral("/atcap"));
+    expect(isBrokenOnly(hugeRead) && hugeRead.problem == u"wallpaper.json is larger than 1 MiB." && atCapRead.usable(),
+           QStringLiteral("S15.67: a folder's 1 MiB + 1 wallpaper.json read as usable=%1 problem \"%2\"; exactly 1 MiB read as usable=%3 \"%4\"")
+               .arg(hugeRead.usable()).arg(hugeRead.problem).arg(atCapRead.usable()).arg(atCapRead.problem));
+}
+
+// S15.68
+void containment(const QString& root) {
+    const QString dir = root + QStringLiteral("/contain");
+    const QString outsideRoot = root + QStringLiteral("/outside.png");
+    const QString outsideFifo = root + QStringLiteral("/outside.fifo");
+    const QByteArray plan(kPlanManifest);
+    Entries noAsset = planEntries(plan);
+    noAsset.removeLast();
+    Entries noPreview = planEntries(plan);
+    noPreview.removeAt(1);
+    const auto at = [&dir](const char* name) { return dir + QLatin1Char('/') + QLatin1String(name); };
+    // rel's link climbs to contain/outside.mp4: out of the wallpaper, still inside the library.
+    const bool built =
+        writeBytes(outsideRoot, pngBytes(32, 18)) &&
+        writeFolder(dir, {{QStringLiteral("outside.mp4"), "outside the wallpaper"},
+                          {QStringLiteral("outside-assets/video.mp4"), "outside the wallpaper"}}).isEmpty() &&
+        writeFolder(at("abs"), noAsset).isEmpty() && QDir().mkpath(at("abs/assets")) &&
+        makeSymlink(outsideRoot, at("abs/assets/video.mp4")) && writeFolder(at("rel"), noAsset).isEmpty() &&
+        QDir().mkpath(at("rel/assets")) && makeSymlink(QStringLiteral("../../outside.mp4"), at("rel/assets/video.mp4")) &&
+        writeFolder(at("dirlink"), noAsset).isEmpty() && makeSymlink(QStringLiteral("../outside-assets"), at("dirlink/assets")) &&
+        writeFolder(at("inside"), noAsset).isEmpty() && writeBytes(at("inside/real.mp4"), "inside the wallpaper") &&
+        QDir().mkpath(at("inside/assets")) && makeSymlink(QStringLiteral("../real.mp4"), at("inside/assets/video.mp4")) &&
+        writeFolder(at("abspreview"), noPreview).isEmpty() && makeSymlink(outsideRoot, at("abspreview/preview.png")) &&
+        writeFolder(at("absinside"), noAsset).isEmpty() && writeBytes(at("absinside/real.mp4"), "inside the wallpaper") &&
+        QDir().mkpath(at("absinside/assets")) && makeSymlink(at("absinside/real.mp4"), at("absinside/assets/video.mp4")) &&
+        writeFolder(at("outin"), noAsset).isEmpty() && writeBytes(at("outin/real.mp4"), "inside the wallpaper") &&
+        QDir().mkpath(at("outin/assets")) && makeSymlink(QStringLiteral("../../outin/real.mp4"), at("outin/assets/video.mp4")) &&
+        ::mkfifo(QFile::encodeName(outsideFifo).constData(), 0644) == 0 &&
+        writeFolder(at("fifolink"), noAsset).isEmpty() && QDir().mkpath(at("fifolink/assets")) &&
+        makeSymlink(outsideFifo, at("fifolink/assets/video.mp4"));
+    if (!built) {
+        harnessFailure("S15.68: the folders with links could not be built");
+        return;
     }
-    expect(scan && got == QStringList{QStringLiteral("good.wpx"), QStringLiteral("emptylink.wpx(broken)")},
-           QStringLiteral("S15.58: a folder with an empty file and a link to one listed [%1]%2")
-               .arg(got.join(u", "), scan ? QString() : QStringLiteral(": ") + scan.error()));
+    // Opening the FIFO for reading raises IN_OPEN on it; finding it with O_PATH does not.
+    const int fifoOpens = ::inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    if (fifoOpens < 0 || ::inotify_add_watch(fifoOpens, QFile::encodeName(outsideFifo).constData(), IN_OPEN) < 0) {
+        harnessFailure("S15.68: the outside FIFO could not be watched for opens");
+        if (fifoOpens >= 0) {
+            ::close(fifoOpens);
+        }
+        return;
+    }
+    const auto takeFifoOpens = [fifoOpens] {
+        int opens = 0;
+        alignas(inotify_event) char buffer[4096];
+        for (ssize_t got; (got = ::read(fifoOpens, buffer, sizeof buffer)) > 0;) {
+            for (const char* p = buffer; p < buffer + got; p += sizeof(inotify_event) + reinterpret_cast<const inotify_event*>(p)->len) {
+                opens += (reinterpret_cast<const inotify_event*>(p)->mask & IN_OPEN) != 0 ? 1 : 0;
+            }
+        }
+        return opens;
+    };
+    // Whether this kernel has openat2 at all, asked directly; without it the first pass below is
+    // the fallback too, and only the second pass means anything.
+    open_how asked{};
+    asked.flags = O_RDONLY | O_DIRECTORY | O_CLOEXEC;
+    const long probe = ::syscall(SYS_openat2, AT_FDCWD, QFile::encodeName(dir).constData(), &asked, sizeof asked);
+    const bool kernelHasOpenat2 = probe >= 0 || errno != ENOSYS;
+    if (probe >= 0) {
+        ::close(int(probe));
+    }
+    if (!kernelHasOpenat2) {
+        notVerified("S15.68 (with openat2)", "this kernel has no openat2, so only the fallbacks can be exercised");
+    }
+    static_cast<void>(takeOpenat2Calls());
+    static_cast<void>(takeFifoOpens());
+
+    const QString leads = QStringLiteral("assets/video.mp4 leads outside the wallpaper's folder.");
+    for (const int refused : {0, ENOSYS, EPERM}) {
+        if (refused == 0 && !kernelHasOpenat2) {
+            continue;
+        }
+        const QString how = refused == 0 ? QStringLiteral("with openat2")
+                                         : QStringLiteral("openat2 refused with %1").arg(QLatin1String(refused == ENOSYS ? "ENOSYS" : "EPERM"));
+        // Off again at the end of each pass and when one throws, so no later phase runs refused.
+        setOpenat2Refused(refused);
+        const auto unrefuse = qScopeGuard([] { setOpenat2Refused(0); });
+        // GOAL: S15.68 -- a file wallpaper.json names is usable exactly when, its links followed, it
+        //       lies inside the wallpaper's own folder: an asset linked to an absolute path outside,
+        //       by a relative path that climbs out, through a linked folder, or to a FIFO outside is
+        //       refused, "leads outside the wallpaper's folder", and that FIFO is never opened; one
+        //       linked inside -- relatively, absolutely, or by a ".." out and back in -- is usable,
+        //       its assetPath the name wallpaper.json gives. The same with openat2, and when it is
+        //       refused with ENOSYS (an old kernel) or EPERM (a sandbox).
+        // WHY-THIS-SHAPE: the relative link climbs out of the wallpaper but not the library, so a
+        //       check bounded by the library would pass it. openat2_shim.cpp refuses openat2 in this
+        //       process, which drives the fallback that finds the file with O_PATH and asks /proc
+        //       where it is; openat2's own RESOLVE_BENEATH refuses the absolute and out-and-in links
+        //       that land inside, so those go to the fallback in every pass. Whether the FIFO was
+        //       opened is read from inotify's IN_OPEN on it, which a blocked writer would only show
+        //       by timing.
+        // CONTROL: app/library/wpx_package.cpp, openBeneath's `RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS`
+        //       made `RESOLVE_NO_MAGICLINKS` -> red, "S15.68 (with openat2): abs read as usable=1", the
+        //       same for rel, dirlink and abspreview, fifolink read as "not a regular file" and "the
+        //       FIFO outside was opened 1 time(s)", the other passes green; the fallback's
+        //       `if (folder.isEmpty() || !file.startsWith(folder == "/" ? folder : folder + '/')) {`
+        //       made `if (folder.isEmpty()) {` -> red, those same lines in all three passes;
+        //       `errno != EXDEV && ` dropped from `if (fd >= 0 || (errno != EXDEV && ...))` -> red,
+        //       "S15.68 (with openat2): absinside read as usable=0 ... leads outside" and outin only;
+        //       `&& errno != EPERM` dropped -> red, every row of the EPERM pass only, e.g. "S15.68
+        //       (openat2 refused with EPERM): inside read as usable=0 problem "wallpaper.json cannot be
+        //       opened: Operation not permitted.""; the whole condition made `if (true) {` -> red, every
+        //       row of both refused passes, and absinside and outin with openat2; the fallback's
+        //       `O_PATH | O_CLOEXEC` made `O_RDONLY | O_NONBLOCK | O_CLOEXEC` -> red, "S15.68 (...): the
+        //       FIFO outside was opened 1 time(s)" in every pass and nothing else; restored.
+        // COVERAGE-ASSERT: openat2 was asked for every read of each pass, so the refused passes
+        //       went the other way; and an open of the FIFO by this test is seen, so the IN_OPEN
+        //       watch is live (test-side control: the watch made on IN_ACCESS -> red, "this test's own
+        //       open of the FIFO was seen 0 time(s)", every "opened" line still green).
+        const auto expectRefused = [&](const char* name, const QString& reason) {
+            const Wallpaper w = readWallpaperFolder(at(name));
+            expect(isBrokenOnly(w) && w.problem == reason,
+                   QStringLiteral("S15.68 (%1): %2 read as usable=%3 problem \"%4\", not \"%5\"")
+                       .arg(how, QLatin1String(name)).arg(w.usable()).arg(w.problem, reason));
+        };
+        expectRefused("abs", leads);
+        expectRefused("rel", leads);
+        expectRefused("dirlink", leads);
+        expectRefused("abspreview", QStringLiteral("preview.png leads outside the wallpaper's folder."));
+        expectRefused("fifolink", leads);
+        const int opened = takeFifoOpens();
+        expect(opened == 0, QStringLiteral("S15.68 (%1): the FIFO outside was opened %2 time(s)").arg(how).arg(opened));
+        for (const char* name : {"inside", "absinside", "outin"}) {
+            const Wallpaper w = readWallpaperFolder(at(name));
+            expect(w.usable() && w.assetPath == at(name) + QStringLiteral("/assets/video.mp4"),
+                   QStringLiteral("S15.68 (%1): %2 read as usable=%3 problem \"%4\" asset path \"%5\"")
+                       .arg(how, QLatin1String(name)).arg(w.usable()).arg(w.problem, w.assetPath));
+        }
+
+        // GOAL: S15.68 -- the preview provider reads a folder's preview through the same check: a
+        //       preview linked outside the folder is not read, and gives no image.
+        // CONTROL: the RESOLVE_BENEATH and startsWith mutations above -> red, "S15.68 (with
+        //       openat2): reading abspreview's preview.png gave 111 byte(s), and the provider an
+        //       image", and for the startsWith one the same in the refused passes; restored.
+        const auto entry = readWallpaperEntry(at("abspreview"), QStringLiteral("preview.png"), kMaxPreviewBytes);
+        PreviewImageProvider provider;
+        QSize size;
+        const QImage image = provider.requestImage(previewImageId(at("abspreview"), QStringLiteral("preview.png"), FileStamp{1, 2, 3, 4}), &size, QSize());
+        expect(!entry && entry.error() == u"preview.png leads outside the wallpaper's folder." && image.isNull(),
+               QStringLiteral("S15.68 (%1): reading abspreview's preview.png gave %2, and the provider %3")
+                   .arg(how, entry ? QStringLiteral("%1 byte(s)").arg(entry->size()) : entry.error(),
+                        image.isNull() ? QStringLiteral("no image") : QStringLiteral("an image")));
+        const int asked = takeOpenat2Calls();
+        expect(asked >= 10, QStringLiteral("S15.68 (%1): openat2 was asked %2 time(s) for ten reads").arg(how).arg(asked));
+    }
+    const int own = ::open(QFile::encodeName(outsideFifo).constData(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    if (own >= 0) {
+        ::close(own);
+    }
+    const int seen = takeFifoOpens();
+    ::close(fifoOpens);
+    expect(own >= 0 && seen == 1, QStringLiteral("S15.68: this test's own open of the FIFO was seen %1 time(s); the watch for opens is not live").arg(seen));
 }
 
 // S15.51
@@ -779,20 +987,21 @@ void turnedPreview(const QString& root) {
     QBuffer probe(&jpeg);
     probe.open(QIODevice::ReadOnly);
     QImageReader stored(&probe);
-    const QString path = root + QStringLiteral("/turned.wpx");
+    const QString folder = root + QStringLiteral("/turned");
     if (!jpeg.startsWith("\xff\xd8") || stored.size() != QSize(400, 300) || (stored.transformation() & QImageIOHandler::TransformationRotate90) == 0 ||
-        !writeZip(path, {{QStringLiteral("turned.jpg"), jpeg}}).isEmpty()) {
+        !writeFolder(folder, {{QStringLiteral("turned.jpg"), jpeg}}).isEmpty()) {
         harnessFailure("S15.51: a JPEG turned by its EXIF orientation could not be built");
         return;
     }
     PreviewImageProvider provider;
-    const QString id = previewImageId(path, QStringLiteral("turned.jpg"), FileStamp{1, 2, 3, 4});
+    const QString id = previewImageId(folder, QStringLiteral("turned.jpg"), FileStamp{1, 2, 3, 4});
     // GOAL: S15.51 -- a preview turned 90 degrees by its EXIF orientation is reported at its shown
     //       size (300x400, not the stored 400x300) and decoded covering the requested box in that
     //       orientation, never enlarged.
     // WHY-THIS-SHAPE: a 160x90 box: covering the shown 300x400 gives 160x213; working in the stored
     //       orientation instead gives 160x120, which leaves the tile short, and a box larger than
-    //       the image must give the whole image as shown, 300x400.
+    //       the image must give the whole image as shown, 300x400. The preview is in a wallpaper
+    //       folder, as every preview the app shows is.
     // CONTROL: app/library/preview_image_provider.cpp, `turned ? stored.transposed() : stored`
     //       made `stored` -> red, "S15.51: a 160x90 request gave 160x120, reported 400x300";
     //       `reader.setScaledSize(turned ? target.transposed() : target);` made
@@ -808,28 +1017,28 @@ void turnedPreview(const QString& root) {
 
 // S15.45
 void previewAddresses(const QString& root) {
-    const QString odd = root + QStringLiteral("/odd dir %41 ?q #frag ü/wall paper%2F?#.wpx");
+    const QString odd = root + QStringLiteral("/odd dir %41 ?q #frag ü/wall paper%2F?#");
     FileStamp stamp{1, 2, 3, 4};
-    // GOAL: S15.45 -- a preview address carries the archive path and entry name through a URL and
-    //       back unchanged, as QML's image loader splits it, for paths holding '/', '%', '?', '#',
-    //       spaces and non-ASCII characters.
+    // GOAL: S15.45 -- a preview address carries the wallpaper folder's path and the preview's name
+    //       through a URL and back unchanged, as QML's image loader splits it, for paths holding
+    //       '/', '%', '?', '#', spaces and non-ASCII characters.
     // WHY-THIS-SHAPE: the id is taken from the URL the way QQuickPixmapCache does,
     //       `toString(RemoveScheme | RemoveAuthority).mid(1)`, not from previewImageId() directly:
     //       the URL is where percent-decoding and '?'/'#' splitting would damage a raw path.
-    // CONTROL: app/library/wpx_package.cpp, previewImageId's `QString::fromLatin1(archivePath.toUtf8().toBase64(kIdEncoding))`
-    //       made the raw `archivePath` -> red, "S15.45: ... came back as nothing"; restored.
+    // CONTROL: app/library/wpx_package.cpp, previewImageId's `QString::fromLatin1(folderPath.toUtf8().toBase64(kIdEncoding))`
+    //       made the raw `folderPath` -> red, "S15.45: ... came back as nothing"; restored.
     for (const auto& [path, entry] : {std::pair{odd, QStringLiteral("previews/p ü#?%.png")},
-                                      std::pair{QStringLiteral("/tmp/plain.wpx"), QStringLiteral("preview.png")}}) {
+                                      std::pair{QStringLiteral("/tmp/plain"), QStringLiteral("preview.png")}}) {
         Wallpaper w;
         w.filePath = path;
         w.fileName = QFileInfo(path).fileName();
         w.previewName = entry;
-        w.stamp = stamp;
+        w.previewStamp = stamp;
         const QUrl url = w.previewSource();
         const auto back = parsePreviewImageId(url.toString(QUrl::RemoveScheme | QUrl::RemoveAuthority).mid(1));
-        expect(url.scheme() == u"image" && url.host() == QLatin1String(kPreviewProviderId) && back && back->archivePath == path &&
+        expect(url.scheme() == u"image" && url.host() == QLatin1String(kPreviewProviderId) && back && back->folderPath == path &&
                    back->entryName == entry,
-               QStringLiteral("S15.45: %1 in %2 came back as %3").arg(entry, path, back ? back->entryName + QStringLiteral(" in ") + back->archivePath : QStringLiteral("nothing")));
+               QStringLiteral("S15.45: %1 in %2 came back as %3").arg(entry, path, back ? back->entryName + QStringLiteral(" in ") + back->folderPath : QStringLiteral("nothing")));
     }
     // GOAL: S15.45 -- an id that was not made by previewImageId gives nothing, never a path.
     // CONTROL: app/library/wpx_package.cpp, parsePreviewImageId's `if (parts.size() != 3)` made
@@ -837,56 +1046,46 @@ void previewAddresses(const QString& root) {
     for (const QString& garbage : {QString(), QStringLiteral("a/b"), QStringLiteral("1-2-3-4/!!!/Zm9v"), QStringLiteral("1-2-3-4//Zm9v"),
                                    QStringLiteral("1-2-3-4/Zm9v/Zm9v/Zm9v"), QStringLiteral("1-2-3-4/Zm9v")}) {
         const auto got = parsePreviewImageId(garbage);
-        expect(!got, QStringLiteral("S15.45: the id \"%1\" gave %2 in %3").arg(garbage, got ? got->entryName : QString(), got ? got->archivePath : QString()));
+        expect(!got, QStringLiteral("S15.45: the id \"%1\" gave %2 in %3").arg(garbage, got ? got->entryName : QString(), got ? got->folderPath : QString()));
     }
 
-    // GOAL: S15.45 -- a rewritten archive gets a different preview address, so QML does not show a
-    //       cached image of the old one; an unchanged archive keeps its address; a broken one has none.
-    // WHY-THIS-SHAPE: the rewrite keeps inode and size and is checked to have done so, and the
-    //       rewritten file must still read as usable with an address, so a failed or truncated
-    //       rewrite cannot pass as "a different address".
+    // GOAL: S15.45 -- a wallpaper whose preview is rewritten gets a different preview address, so
+    //       QML does not show a cached image of the old one; an unchanged one keeps its address; a
+    //       broken one has none.
+    // WHY-THIS-SHAPE: only preview.png is rewritten, in place with the same bytes, its time set two
+    //       seconds on before the close and checked to have moved, so the address can change only
+    //       through the preview's own stamp (not wallpaper.json's, which is untouched), and not by
+    //       the clock's resolution.
     // CONTROL: app/library/wpx_package.cpp, previewImageId's `QString::number(stamp.size),
     //       QString::number(stamp.modifiedNs)` made `QStringLiteral("0"), QStringLiteral("0")` -> red,
-    //       "the rewritten archive kept its address"; its `QString::number(stamp.device)` made a
-    //       per-call counter -> red, "an unchanged archive's address changed between reads";
-    //       previewSource()'s `if (!usable()) {` made `if (false) {` -> red, "a broken wallpaper has
-    //       a preview address"; restored, green each time.
-    const QString path = root + QStringLiteral("/changing.wpx");
-    if (!writeZip(path, planEntries(QByteArray(kPlanManifest))).isEmpty()) {
-        harnessFailure("S15.45: changing.wpx could not be written");
+    //       "the rewritten preview kept its address"; its `QString::number(stamp.device)` made a
+    //       per-call counter -> red, "an unchanged wallpaper's address changed between reads";
+    //       previewSource()'s `previewImageId(filePath, previewName, previewStamp)` made `..., stamp)`
+    //       -> red, "the rewritten preview kept its address"; `if (!usable()) {` made `if (false) {`
+    //       -> red, "a broken wallpaper has a preview address"; restored, green each time.
+    const QString path = root + QStringLiteral("/changing");
+    if (!writeFolder(path, planEntries(QByteArray(kPlanManifest))).isEmpty()) {
+        harnessFailure("S15.45: the folder changing could not be written");
         return;
     }
-    const QUrl first = readWallpaper(path).previewSource();
-    const QUrl again = readWallpaper(path).previewSource();
-    expect(!first.isEmpty() && first == again, QStringLiteral("S15.45: an unchanged archive's address changed between reads"));
-    const auto bytes = readBytes(path);
-    struct stat before {};
-    if (!bytes || ::stat(QFile::encodeName(path).constData(), &before) != 0) {
-        harnessFailure("S15.45: changing.wpx could not be read back");
+    const QUrl first = readWallpaperFolder(path).previewSource();
+    const QUrl again = readWallpaperFolder(path).previewSource();
+    expect(!first.isEmpty() && first == again, QStringLiteral("S15.45: an unchanged wallpaper's address changed between reads"));
+    if (!rewriteLater(path + QStringLiteral("/preview.png"), 2'000'000'000)) {
+        harnessFailure("S15.45: preview.png could not be rewritten in place with the same size and a later time");
         return;
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(20));
-    struct stat after {};
-    if (!writeBytes(path, *bytes) || ::stat(QFile::encodeName(path).constData(), &after) != 0 || after.st_ino != before.st_ino ||
-        after.st_size != before.st_size) {
-        harnessFailure("S15.45: changing.wpx could not be rewritten in place with the same size");
-        return;
-    }
-    const QUrl rewritten = readWallpaper(path).previewSource();
-    if (before.st_mtim.tv_sec == after.st_mtim.tv_sec && before.st_mtim.tv_nsec == after.st_mtim.tv_nsec) {
-        notVerified("S15.45 (a rewrite changes the address)", "the file system kept the same modification time across a rewrite");
-    } else {
-        expect(!rewritten.isEmpty() && rewritten != first,
-               QStringLiteral("S15.45: the rewritten archive kept its address %1 (now \"%2\")").arg(first.toString(), rewritten.toString()));
-    }
+    const QUrl rewritten = readWallpaperFolder(path).previewSource();
+    expect(!rewritten.isEmpty() && rewritten != first,
+           QStringLiteral("S15.45: the rewritten preview kept its address %1 (now \"%2\")").arg(first.toString(), rewritten.toString()));
     Wallpaper broken;
     broken.filePath = path;
     broken.previewName = QStringLiteral("preview.png");
     broken.problem = QStringLiteral("x");
     expect(broken.previewSource().isEmpty(), QStringLiteral("S15.45: a broken wallpaper has a preview address"));
 
-    // GOAL: S15.45 -- the provider decodes the preview scaled down to cover the requested box and
-    //       never enlarges it; it reports the full size, and an address it cannot serve gives a
+    // GOAL: S15.45 -- the provider decodes a folder's preview scaled down to cover the requested box
+    //       and never enlarges it; it reports the full size, and an address it cannot serve gives a
     //       null image.
     // WHY-THIS-SHAPE: a square 100x100 box against a 16:9 image separates "cover" (178x100) from
     //       "fit" (100x56); a 4000x4000 request checks the no-enlarge rule.
@@ -897,7 +1096,7 @@ void previewAddresses(const QString& root) {
     //       a failed read made to return a 1x1 image -> red, "an address the provider cannot serve
     //       gave an image"; restored, green each time.
     PreviewImageProvider provider;
-    const QString id = readWallpaper(path).previewSource().toString(QUrl::RemoveScheme | QUrl::RemoveAuthority).mid(1);
+    const QString id = readWallpaperFolder(path).previewSource().toString(QUrl::RemoveScheme | QUrl::RemoveAuthority).mid(1);
     const auto request = [&](QSize box) {
         QSize size;
         const QImage image = provider.requestImage(id, &size, box);
@@ -914,19 +1113,23 @@ void previewAddresses(const QString& root) {
     expect(width == QSize(320, 180), QStringLiteral("S15.45: a width-only 320 request gave %1x%2").arg(width.width()).arg(width.height()));
     QSize none;
     expect(provider.requestImage(QStringLiteral("garbage"), &none, QSize()).isNull() &&
-               provider.requestImage(previewImageId(root + QStringLiteral("/absent.wpx"), QStringLiteral("preview.png"), stamp), &none, QSize()).isNull(),
+               provider.requestImage(previewImageId(root + QStringLiteral("/absent"), QStringLiteral("preview.png"), stamp), &none, QSize()).isNull(),
            QStringLiteral("S15.45: an address the provider cannot serve gave an image"));
 }
 
 // S15.47
 void defaultDirectory(const QString& root) {
-    // GOAL: S15.47 -- the library folder is $XDG_DATA_HOME/wallpaperx, so a test or a user with a
-    //       moved data folder never reads ~/.local/share.
+    // GOAL: S15.47 -- the library folder is $XDG_DATA_HOME/wallpaperx, and the wallpaper folders
+    //       live in its wallpapers/, so a test or a user with a moved data folder never reads
+    //       ~/.local/share.
     // CONTROL: app/library/wpx_package.cpp, `GenericDataLocation` made `HomeLocation` -> red,
-    //       "defaultLibraryDirectory() is /home/.../wallpaperx"; restored, green.
+    //       "defaultLibraryDirectory() is /home/.../wallpaperx"; wallpapersDirectory's
+    //       `QStringLiteral("/wallpapers")` made `QStringLiteral("/library")` -> red,
+    //       "wallpapersDirectory() of it is …/library"; restored, green.
     const QString want = root + QStringLiteral("/XDG_DATA_HOME/wallpaperx");
-    expect(defaultLibraryDirectory() == want,
-           QStringLiteral("S15.47: defaultLibraryDirectory() is %1, not %2").arg(defaultLibraryDirectory(), want));
+    expect(defaultLibraryDirectory() == want && wallpapersDirectory(defaultLibraryDirectory()) == want + QStringLiteral("/wallpapers"),
+           QStringLiteral("S15.47: defaultLibraryDirectory() is %1 and wallpapersDirectory() of it is %2, not %3 and its wallpapers/")
+               .arg(defaultLibraryDirectory(), wallpapersDirectory(defaultLibraryDirectory()), want));
 }
 
 } // namespace
@@ -935,7 +1138,7 @@ int main(int argc, char* argv[]) {
     wallpaperx::testing::g_testName = "wpx_package";
     QTemporaryDir scratch;
     if (!scratch.isValid()) {
-        notVerified("S15.31-S15.35, S15.45, S15.47, S15.48, S15.50, S15.51, S15.53, S15.55, S15.58", "no temporary folder could be made");
+        notVerified("S15.31-S15.35, S15.45, S15.47, S15.48, S15.50, S15.51, S15.53, S15.55, S15.67, S15.68", "no temporary folder could be made");
         return wallpaperx::testing::reportNotVerifiedOrPassed();
     }
     isolateXdg(scratch.path());
@@ -947,16 +1150,11 @@ int main(int argc, char* argv[]) {
     runPhase("acceptValues", acceptValues);
     runPhase("badArchives", [&] { badArchives(root); });
     runPhase("scanFolder", [&] { scanFolder(root); });
-    runPhase("fileNamesThatAreNotUtf8", [&] { fileNamesThatAreNotUtf8(root); });
-    runPhase("emptyFiles", [&] { emptyFiles(root); });
+    runPhase("folderNamesThatAreNotUtf8", [&] { folderNamesThatAreNotUtf8(root); });
+    runPhase("sharedValidator", [&] { sharedValidator(root); });
+    runPhase("containment", [&] { containment(root); });
     runPhase("turnedPreview", [&] { turnedPreview(root); });
     runPhase("previewAddresses", [&] { previewAddresses(root); });
     runPhase("defaultDirectory", [&] { defaultDirectory(root); });
-
-    const bool failed = wallpaperx::testing::reportCheckFailures();
-    const bool faulted = wallpaperx::testing::reportHarnessFaults("in this test file's fixtures, not in the app");
-    if (failed || faulted) {
-        return 1;
-    }
-    return wallpaperx::testing::reportNotVerifiedOrPassed();
+    return verdict();
 }

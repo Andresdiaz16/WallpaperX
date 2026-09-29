@@ -2,6 +2,8 @@
 
 #include "wpx_package.h"
 
+#include "unique_fd.h"
+
 #include <QColor>
 #include <QDir>
 #include <QFileInfo>
@@ -14,13 +16,16 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <climits>
 #include <cmath>
 #include <memory>
 #include <string_view>
 
 #include <dirent.h>
 #include <fcntl.h>
+#include <linux/openat2.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 namespace wallpaperx {
@@ -39,16 +44,6 @@ QString systemError(int error)
 QString fromJson(const Json& value)
 {
     return QString::fromStdString(value.get<std::string>());
-}
-
-// Refuses what could reach outside a directory the archive is unpacked into.
-bool isPlainRelativePath(const QString& name)
-{
-    if (name.isEmpty() || name.contains(u'\\') || name.contains(QChar(0))) {
-        return false;
-    }
-    const auto parts = QStringView(name).split(u'/');
-    return std::ranges::none_of(parts, [](QStringView part) { return part.isEmpty() || part == u"." || part == u".."; });
 }
 
 const QRegularExpression& colorPattern()
@@ -135,14 +130,9 @@ struct OpenedArchive {
     FileStamp stamp;
 };
 
-std::expected<OpenedArchive, QString> openArchive(const QString& path)
+// Takes `fd`, closing it on failure too.
+std::expected<OpenedArchive, QString> openArchive(int fd)
 {
-    // O_NONBLOCK: something other than a regular file put in its place since it was listed, a FIFO
-    // say, is refused below instead of blocking the open.
-    const int fd = ::open(encodeFileName(path).constData(), O_RDONLY | O_CLOEXEC | O_NONBLOCK);
-    if (fd < 0) {
-        return std::unexpected(QStringLiteral("It cannot be opened: %1.").arg(systemError(errno)));
-    }
     struct stat st {};
     if (::fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
         ::close(fd);
@@ -216,7 +206,215 @@ Wallpaper broken(Wallpaper wallpaper, QString problem)
     return result;
 }
 
+struct ReadFile {
+    QByteArray bytes;
+    FileStamp stamp;
+};
+
+// The files of one wallpaper, wherever they are kept. Messages are sentences for the user.
+class Contents {
+public:
+    virtual ~Contents() = default;
+    virtual std::expected<ReadFile, QString> read(const QString& name, qint64 maxBytes) = 0;
+    // The file wallpaper.json names as `name`.
+    virtual std::expected<FileStamp, QString> find(const QString& name) = 0;
+};
+
+class ArchiveContents final : public Contents {
+public:
+    ArchiveContents(zip_t* zip, FileStamp stamp) : m_zip(zip), m_stamp(stamp) {}
+
+    std::expected<ReadFile, QString> read(const QString& name, qint64 maxBytes) override
+    {
+        auto bytes = readEntry(m_zip, name, maxBytes);
+        if (!bytes) {
+            return std::unexpected(bytes.error());
+        }
+        return ReadFile{std::move(*bytes), m_stamp};
+    }
+
+    std::expected<FileStamp, QString> find(const QString& name) override
+    {
+        if (!locate(m_zip, name)) {
+            return std::unexpected(QStringLiteral("The archive has no %1, which wallpaper.json names.").arg(name));
+        }
+        return m_stamp;
+    }
+
+private:
+    zip_t* m_zip;
+    FileStamp m_stamp;
+};
+
+// Where /proc says `fd` is open; empty when it cannot tell.
+QByteArray openedPath(int fd)
+{
+    const QByteArray link = "/proc/self/fd/" + QByteArray::number(fd);
+    QByteArray target(PATH_MAX, Qt::Uninitialized);
+    const ssize_t length = ::readlink(link.constData(), target.data(), size_t(target.size()));
+    if (length <= 0 || length >= target.size()) {
+        return {};
+    }
+    target.truncate(length);
+    return target;
+}
+
+// Opens `name` below the folder `dirfd`, refusing with EXDEV a file that, links followed, is not
+// inside it.
+int openBeneath(int dirfd, const QByteArray& name, int flags)
+{
+    open_how how{};
+    how.flags = static_cast<quint64>(flags | O_CLOEXEC);
+    how.resolve = RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS;
+    const int fd = static_cast<int>(::syscall(SYS_openat2, dirfd, name.constData(), &how, sizeof how));
+    // EXDEV also refuses an absolute link, or a ".." out and back in, that lands inside; ENOSYS is
+    // a kernel before 5.6, and a sandbox filtering openat2 answers ENOSYS or EPERM.
+    if (fd >= 0 || (errno != EXDEV && errno != ENOSYS && errno != EPERM)) {
+        return fd;
+    }
+    // Found with O_PATH, which opens nothing, then checked, then opened through its own descriptor:
+    // a device or FIFO outside the folder is never opened, even to be refused.
+    const UniqueFd found(::openat(dirfd, name.constData(), O_PATH | O_CLOEXEC));
+    if (!found) {
+        return -1;
+    }
+    const QByteArray folder = openedPath(dirfd);
+    const QByteArray file = openedPath(found.get());
+    if (folder.isEmpty() || !file.startsWith(folder == "/" ? folder : folder + '/')) {
+        errno = EXDEV;
+        return -1;
+    }
+    return ::open(("/proc/self/fd/" + QByteArray::number(found.get())).constData(), flags | O_CLOEXEC);
+}
+
+class FolderContents final : public Contents {
+public:
+    explicit FolderContents(int dirfd) : m_dir(dirfd) {}
+
+    std::expected<ReadFile, QString> read(const QString& name, qint64 maxBytes) override
+    {
+        struct stat st {};
+        auto fd = open(name, QStringLiteral("The folder has no %1.").arg(name), st);
+        if (!fd) {
+            return std::unexpected(fd.error());
+        }
+        auto bytes = readToEnd(fd->get(), maxBytes);
+        if (!bytes) {
+            return std::unexpected(bytes.error() == EFBIG
+                                       ? QStringLiteral("%1 is larger than %2 MiB.").arg(name, QString::number(maxBytes >> 20))
+                                       : QStringLiteral("%1 cannot be read: %2.").arg(name, systemError(bytes.error())));
+        }
+        return ReadFile{std::move(*bytes), stampFrom(st)};
+    }
+
+    std::expected<FileStamp, QString> find(const QString& name) override
+    {
+        struct stat st {};
+        auto fd = open(name, QStringLiteral("The folder has no %1, which wallpaper.json names.").arg(name), st);
+        if (!fd) {
+            return std::unexpected(fd.error());
+        }
+        return stampFrom(st);
+    }
+
+private:
+    std::expected<UniqueFd, QString> open(const QString& name, QString missing, struct stat& st)
+    {
+        // O_NONBLOCK: a FIFO under the name is refused below instead of blocking the open.
+        UniqueFd fd(openBeneath(m_dir, name.toUtf8(), O_RDONLY | O_NONBLOCK | O_NOCTTY));
+        if (!fd) {
+            switch (const int error = errno) {
+            case ENOENT:
+            case ENOTDIR:
+                return std::unexpected(std::move(missing));
+            case EXDEV:
+                return std::unexpected(QStringLiteral("%1 leads outside the wallpaper's folder.").arg(name));
+            default:
+                return std::unexpected(QStringLiteral("%1 cannot be opened: %2.").arg(name, systemError(error)));
+            }
+        }
+        if (::fstat(fd.get(), &st) != 0 || !S_ISREG(st.st_mode)) {
+            return std::unexpected(QStringLiteral("%1 is not a regular file.").arg(name));
+        }
+        return fd;
+    }
+
+    int m_dir;
+};
+
+// The one validator for a folder and an archive: the manifest, then every file it names.
+Wallpaper readFrom(Wallpaper file, Contents& contents)
+{
+    const auto manifest = contents.read(QString::fromLatin1(kManifestName), kMaxManifestBytes);
+    if (!manifest) {
+        return broken(std::move(file), manifest.error());
+    }
+    file.stamp = manifest->stamp;
+    auto parsed = parseManifest(manifest->bytes);
+    if (!parsed) {
+        return broken(std::move(file), parsed.error());
+    }
+    const auto preview = contents.find(parsed->previewName);
+    if (!preview) {
+        return broken(std::move(file), preview.error());
+    }
+    const auto asset = contents.find(parsed->assetName);
+    if (!asset) {
+        return broken(std::move(file), asset.error());
+    }
+    parsed->filePath = std::move(file.filePath);
+    parsed->fileName = std::move(file.fileName);
+    parsed->stamp = file.stamp;
+    parsed->previewStamp = *preview;
+    parsed->assetStamp = *asset;
+    return std::move(*parsed);
+}
+
+Wallpaper namedFile(const QString& path)
+{
+    Wallpaper file;
+    file.filePath = path;
+    file.fileName = QFileInfo(path).fileName();
+    return file;
+}
+
+// The folder `name` in `parent` (a descriptor, or AT_FDCWD), shown as `path`.
+Wallpaper readFolderAt(int parent, const QByteArray& name, const QString& path)
+{
+    Wallpaper folder = namedFile(path);
+    // The daemon and Plasma take a path as a D-Bus string, which must be UTF-8.
+    if (!QStringView(path).isValidUtf16()) {
+        return broken(std::move(folder), QStringLiteral("Its path is not valid UTF-8, so it cannot be set as a wallpaper. "
+                                                        "Rename the folder."));
+    }
+    UniqueFd dir(::openat(parent, name.constData(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
+    if (!dir) {
+        const int error = errno;
+        struct stat link {};
+        if (::fstatat(parent, name.constData(), &link, AT_SYMLINK_NOFOLLOW) == 0 && S_ISLNK(link.st_mode)) {
+            return broken(std::move(folder), QStringLiteral("It is a link, not a folder."));
+        }
+        return broken(std::move(folder), error == ENOTDIR ? QStringLiteral("It is not a folder.")
+                                                          : QStringLiteral("It cannot be opened: %1.").arg(systemError(error)));
+    }
+    FolderContents contents(dir.get());
+    Wallpaper read = readFrom(std::move(folder), contents);
+    if (read.usable()) {
+        read.assetPath = read.filePath + u'/' + read.assetName;
+    }
+    return read;
+}
+
 } // namespace
+
+bool isPlainRelativePath(const QString& name)
+{
+    if (name.isEmpty() || name.contains(u'\\') || name.contains(QChar(0))) {
+        return false;
+    }
+    const auto parts = QStringView(name).split(u'/');
+    return std::ranges::none_of(parts, [](QStringView part) { return part.isEmpty() || part == u"." || part == u".."; });
+}
 
 QString WallpaperProperty::typeName() const
 {
@@ -281,7 +479,7 @@ QUrl Wallpaper::previewSource() const
         return {};
     }
     return QUrl(QStringLiteral("image://%1/%2")
-                    .arg(QString::fromLatin1(kPreviewProviderId), previewImageId(filePath, previewName, stamp)));
+                    .arg(QString::fromLatin1(kPreviewProviderId), previewImageId(filePath, previewName, previewStamp)));
 }
 
 std::expected<Wallpaper, QString> parseManifest(const QByteArray& json)
@@ -348,7 +546,7 @@ std::expected<Wallpaper, QString> parseManifest(const QByteArray& json)
             return std::unexpected(QStringLiteral("wallpaper.json has no \"%1\".").arg(QLatin1StringView(key)));
         }
         if (!isPlainRelativePath(*name)) {
-            return std::unexpected(QStringLiteral("wallpaper.json's \"%1\" is not a plain path inside the archive.")
+            return std::unexpected(QStringLiteral("wallpaper.json's \"%1\" is not a plain path inside the wallpaper.")
                                        .arg(QLatin1StringView(key)));
         }
         (std::string_view(key) == "preview" ? wallpaper.previewName : wallpaper.assetName) = *name;
@@ -380,50 +578,40 @@ std::expected<Wallpaper, QString> parseManifest(const QByteArray& json)
     return wallpaper;
 }
 
-Wallpaper readWallpaper(const QString& path)
+Wallpaper readWallpaper(int fd, const QString& path)
 {
-    Wallpaper file;
-    file.filePath = path;
-    file.fileName = QFileInfo(path).fileName();
-    // The daemon and Plasma take a path as a D-Bus string, which must be UTF-8.
-    if (!QStringView(path).isValidUtf16()) {
-        return broken(std::move(file), QStringLiteral("Its path is not valid UTF-8, so it cannot be set as a wallpaper. "
-                                                      "Rename the file."));
+    Wallpaper file = namedFile(path);
+    const int own = ::fcntl(fd, F_DUPFD_CLOEXEC, 0);
+    if (own < 0) {
+        return broken(std::move(file), QStringLiteral("It cannot be opened: %1.").arg(systemError(errno)));
     }
-
-    auto archive = openArchive(path);
+    auto archive = openArchive(own);
     if (!archive) {
         return broken(std::move(file), archive.error());
     }
     file.stamp = archive->stamp;
-
-    const auto manifest = readEntry(archive->zip.get(), QString::fromLatin1(kManifestName), kMaxManifestBytes);
-    if (!manifest) {
-        return broken(std::move(file), manifest.error());
-    }
-    auto parsed = parseManifest(*manifest);
-    if (!parsed) {
-        return broken(std::move(file), parsed.error());
-    }
-    for (const QString& name : {parsed->previewName, parsed->assetName}) {
-        if (!locate(archive->zip.get(), name)) {
-            return broken(std::move(file), QStringLiteral("The archive has no %1, which wallpaper.json names.").arg(name));
-        }
-    }
-    parsed->filePath = std::move(file.filePath);
-    parsed->fileName = std::move(file.fileName);
-    parsed->stamp = file.stamp;
-    return std::move(*parsed);
+    ArchiveContents contents(archive->zip.get(), archive->stamp);
+    return readFrom(std::move(file), contents);
 }
 
-std::expected<QByteArray, QString> readPackageEntry(const QString& archivePath, const QString& entryName,
-                                                    qint64 maxBytes)
+Wallpaper readWallpaperFolder(const QString& path)
 {
-    auto archive = openArchive(archivePath);
-    if (!archive) {
-        return std::unexpected(archive.error());
+    return readFolderAt(AT_FDCWD, encodeFileName(path), path);
+}
+
+std::expected<QByteArray, QString> readWallpaperEntry(const QString& folderPath, const QString& name,
+                                                      qint64 maxBytes)
+{
+    UniqueFd dir(::open(encodeFileName(folderPath).constData(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    if (!dir) {
+        return std::unexpected(QStringLiteral("%1 cannot be opened: %2.").arg(folderPath, systemError(errno)));
     }
-    return readEntry(archive->zip.get(), entryName, maxBytes);
+    FolderContents contents(dir.get());
+    auto file = contents.read(name, maxBytes);
+    if (!file) {
+        return std::unexpected(file.error());
+    }
+    return std::move(file->bytes);
 }
 
 std::expected<QList<Wallpaper>, QString> scanLibrary(const QString& directory)
@@ -442,6 +630,7 @@ std::expected<QList<Wallpaper>, QString> scanLibrary(const QString& directory)
     }
 
     QList<Wallpaper> wallpapers;
+    const int dirFd = ::dirfd(listing.get());
     for (;;) {
         errno = 0;
         const dirent* entry = ::readdir(listing.get());
@@ -449,42 +638,33 @@ std::expected<QList<Wallpaper>, QString> scanLibrary(const QString& directory)
             break;
         }
         // Every call below takes the entry's own bytes; `path` is only what the row shows.
-        const char* name = entry->d_name;
-        if (!isPackageFileName(name)) {
+        const QByteArray name(entry->d_name);
+        // Also skips "." and "..", and the importer's unfinished folders.
+        if (name.startsWith('.')) {
             continue;
         }
         const QString path = dir.absoluteFilePath(decodeFileName(name));
         struct stat st {};
-        // Followed, so a link to a package counts; a subfolder or FIFO named *.wpx is not one.
-        if (::fstatat(::dirfd(listing.get()), name, &st, 0) != 0) {
+        if (::fstatat(dirFd, name.constData(), &st, AT_SYMLINK_NOFOLLOW) != 0) {
             const int error = errno;
-            struct stat link {};
-            // ENOENT is also an entry removed since it was listed, which is not shown.
-            if (error == ENOENT && ::fstatat(::dirfd(listing.get()), name, &link, AT_SYMLINK_NOFOLLOW) != 0) {
+            // Removed since it was listed.
+            if (error == ENOENT) {
                 continue;
             }
-            Wallpaper unreadable;
-            unreadable.filePath = path;
-            unreadable.fileName = QFileInfo(path).fileName();
-            unreadable.problem = error == ENOENT ? QStringLiteral("It is a link to a file that does not exist.")
-                                                 : QStringLiteral("It cannot be read: %1.").arg(systemError(error));
-            wallpapers.append(std::move(unreadable));
+            wallpapers.append(broken(namedFile(path), QStringLiteral("It cannot be read: %1.").arg(systemError(error))));
             continue;
         }
-        if (!S_ISREG(st.st_mode)) {
+        if (S_ISLNK(st.st_mode)) {
+            // Not followed: what changes inside a folder is watched, and the watch stops at the link.
+            if (struct stat target {}; ::fstatat(dirFd, name.constData(), &target, 0) == 0 && S_ISDIR(target.st_mode)) {
+                wallpapers.append(broken(namedFile(path), QStringLiteral("It is a link to a folder. A wallpaper has to be "
+                                                                         "a folder inside the library itself.")));
+            }
             continue;
         }
-        // An empty file is one not yet written, never a package. Through a link it is listed, broken:
-        // the link's watch is the only thing that notices its target filled in outside the folder.
-        if (struct stat link {}; st.st_size == 0 && ::fstatat(::dirfd(listing.get()), name, &link, AT_SYMLINK_NOFOLLOW) == 0
-                                 && !S_ISLNK(link.st_mode)) {
-            continue;
+        if (S_ISDIR(st.st_mode)) {
+            wallpapers.append(readFolderAt(dirFd, name, path));
         }
-        Wallpaper wallpaper = readWallpaper(path);
-        // Taken before the read, and set on a file that could not be opened too, so a caller
-        // comparing it with the file now sees any change made while or since it was read.
-        wallpaper.stamp = stampFrom(st);
-        wallpapers.append(std::move(wallpaper));
     }
     // readdir's end and its failure differ only in errno.
     if (const int error = errno; error != 0) {
@@ -511,10 +691,48 @@ QString defaultLibraryDirectory()
     return QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation) + QStringLiteral("/wallpaperx");
 }
 
+QString wallpapersDirectory(const QString& libraryDirectory)
+{
+    return libraryDirectory + QStringLiteral("/wallpapers");
+}
+
 FileStamp stampFrom(const struct stat& st)
 {
     return FileStamp{static_cast<quint64>(st.st_dev), static_cast<quint64>(st.st_ino), static_cast<qint64>(st.st_size),
                      static_cast<qint64>(st.st_mtim.tv_sec) * 1'000'000'000 + st.st_mtim.tv_nsec};
+}
+
+std::expected<QByteArray, int> readToEnd(int fd, qint64 maxBytes)
+{
+    struct stat st {};
+    const qint64 size = ::fstat(fd, &st) == 0 ? qint64(st.st_size) : 0;
+    if (size > maxBytes) {
+        return std::unexpected(EFBIG);
+    }
+    // To the end, not to st_size: the file may be growing. One byte over says it is too large.
+    QByteArray bytes(qsizetype(std::max<qint64>(size, 0)) + 1, Qt::Uninitialized);
+    qsizetype done = 0;
+    for (;;) {
+        if (done == bytes.size()) {
+            if (bytes.size() > maxBytes) {
+                return std::unexpected(EFBIG);
+            }
+            bytes.resize(std::min<qsizetype>(bytes.size() * 2, maxBytes + 1));
+        }
+        const ssize_t got = ::read(fd, bytes.data() + done, size_t(bytes.size() - done));
+        if (got < 0 && errno == EINTR) {
+            continue;
+        }
+        if (got < 0) {
+            return std::unexpected(errno);
+        }
+        if (got == 0) {
+            break;
+        }
+        done += got;
+    }
+    bytes.truncate(done);
+    return bytes;
 }
 
 std::optional<FileStamp> stampOf(const QString& path)
@@ -566,6 +784,20 @@ QByteArray encodeFileName(QStringView name)
     return bytes;
 }
 
+std::optional<QByteArray> localPathOfFileUrl(const QUrl& url)
+{
+    if (!url.isLocalFile() || !(url.host().isEmpty() || url.host() == u"localhost")) {
+        return std::nullopt;
+    }
+    // Through the encoded path, so a name that is not UTF-8 keeps its bytes.
+    QByteArray path = QByteArray::fromPercentEncoding(url.path(QUrl::FullyEncoded).toLatin1());
+    // A %00 would end the path early at every system call, naming another file.
+    if (!path.startsWith('/') || path.contains('\0')) {
+        return std::nullopt;
+    }
+    return path;
+}
+
 namespace {
 
 constexpr auto kIdEncoding = QByteArray::Base64UrlEncoding | QByteArray::OmitTrailingEquals;
@@ -573,11 +805,11 @@ constexpr auto kIdEncoding = QByteArray::Base64UrlEncoding | QByteArray::OmitTra
 } // namespace
 
 // Base64url so a path's '/', '%', '?' and '#' survive the trip through a URL unchanged.
-QString previewImageId(const QString& archivePath, const QString& entryName, const FileStamp& stamp)
+QString previewImageId(const QString& folderPath, const QString& entryName, const FileStamp& stamp)
 {
     return QStringLiteral("%1-%2-%3-%4/%5/%6")
         .arg(QString::number(stamp.device), QString::number(stamp.inode), QString::number(stamp.size),
-             QString::number(stamp.modifiedNs), QString::fromLatin1(archivePath.toUtf8().toBase64(kIdEncoding)),
+             QString::number(stamp.modifiedNs), QString::fromLatin1(folderPath.toUtf8().toBase64(kIdEncoding)),
              QString::fromLatin1(entryName.toUtf8().toBase64(kIdEncoding)));
 }
 

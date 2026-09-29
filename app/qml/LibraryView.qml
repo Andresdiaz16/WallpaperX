@@ -4,6 +4,7 @@ pragma ComponentBehavior: Bound
 
 import QtQuick
 import QtQuick.Controls
+import QtQuick.Dialogs
 import QtQuick.Layouts
 import WallpaperX
 
@@ -12,8 +13,35 @@ Item {
     id: root
 
     required property LibraryManager library
+    required property Importer importer
 
     readonly property bool listing: library.state === LibraryManager.Ready && grid.count > 0
+
+    // Lines for the user above the grid, shown until dismissed.
+    component Banner: Frame {
+        id: banner
+
+        property string text
+        signal dismissed
+
+        Layout.fillWidth: true
+        visible: banner.text.length > 0
+
+        RowLayout {
+            anchors.fill: parent
+
+            Label {
+                Layout.fillWidth: true
+                wrapMode: Text.Wrap
+                textFormat: Text.PlainText
+                text: banner.text
+            }
+            Button {
+                text: qsTr("Dismiss")
+                onClicked: banner.dismissed()
+            }
+        }
+    }
 
     ColumnLayout {
         anchors.fill: parent
@@ -33,10 +61,34 @@ Item {
                 color: palette.placeholderText
                 text: root.library.directory
             }
+            BusyIndicator {
+                Layout.preferredHeight: importButton.implicitHeight
+                Layout.preferredWidth: importButton.implicitHeight
+                visible: root.importer.busy
+                running: visible
+            }
+            Button {
+                id: importButton
+                text: qsTr("Import…")
+                onClicked: importDialog.open()
+            }
             Button {
                 text: qsTr("Rescan")
-                onClicked: root.library.rescan()
+                onClicked: {
+                    root.library.rescan();
+                    root.importer.rescan();
+                }
             }
+        }
+
+        Banner {
+            text: root.importer.notices.join("\n")
+            onDismissed: root.importer.dismissNotices()
+        }
+
+        Banner {
+            text: root.importer.problems.join("\n")
+            onDismissed: root.importer.dismissProblems()
         }
 
         GridView {
@@ -150,11 +202,23 @@ Item {
                     case LibraryManager.Unavailable:
                         return qsTr("Wallpapers could not be listed. %1").arg(root.library.unavailableReason);
                     default:
-                        return qsTr("No wallpapers yet. Put .wpx files in %1.").arg(root.library.directory);
+                        return qsTr("No wallpapers yet. Import a .wpx file, or put one in %1.").arg(root.importer.dropDirectory);
                     }
                 }
             }
             Item { Layout.fillHeight: true }
+        }
+    }
+
+    FileDialog {
+        id: importDialog
+
+        title: qsTr("Import wallpapers")
+        fileMode: FileDialog.OpenFiles
+        nameFilters: [qsTr("WallpaperX wallpapers (*.wpx)")]
+        onAccepted: {
+            for (const file of importDialog.selectedFiles)
+                root.importer.importFile(file);
         }
     }
 }

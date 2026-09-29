@@ -26,14 +26,22 @@ pkg_check_modules(LIBZIP REQUIRED IMPORTED_TARGET libzip)
 
 qt_add_executable(wallpaperx
     main.cpp
+    single_instance.cpp
+    single_instance.h
     kde/kscreen_config.cpp
     kde/kscreen_config.h
     kde/kscreen_client.cpp
     kde/kscreen_client.h
+    library/current_exception.h
+    library/unique_fd.h
     library/wpx_package.cpp
     library/wpx_package.h
+    library/folder_watcher.cpp
+    library/folder_watcher.h
     library/library_manager.cpp
     library/library_manager.h
+    library/importer.cpp
+    library/importer.h
     library/preview_image_provider.cpp
     library/preview_image_provider.h
 )
@@ -71,6 +79,9 @@ include(GNUInstallDirs)
 install(TARGETS wallpaperx RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(FILES com.wallpaperx.app.desktop
         DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/applications)
+# The desktop entry opens .wpx files by this type; nothing here runs update-mime-database.
+install(FILES com.wallpaperx.app.xml
+        DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/mime/packages)
 
 enable_testing()
 add_subdirectory(tests)

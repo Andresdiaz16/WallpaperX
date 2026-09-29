@@ -21,7 +21,7 @@ QImage PreviewImageProvider::requestImage(const QString& id, QSize* size, const 
     if (!location) {
         return {};
     }
-    auto bytes = readPackageEntry(location->archivePath, location->entryName, kMaxPreviewBytes);
+    auto bytes = readWallpaperEntry(location->folderPath, location->entryName, kMaxPreviewBytes);
     if (!bytes) {
         return {};
     }

@@ -1,4 +1,4 @@
-# S15.54, S15.55: app/qml/Main.qml offscreen, with the picker and both library views it holds, in
+# S15.54, S15.55, S15.82: app/qml/Main.qml offscreen, with the picker and both library views it holds, in
 # a module of its own under the app's URI (a subdirectory, for the reason library_view/ gives). On
 # the private bus, since it stands up the fake KScreen there.
 set(qml_dir ${WALLPAPERX_APP_TESTS_DIR}/../qml)

@@ -17,8 +17,12 @@ set(WALLPAPERX_APP_KDE_SOURCES
 set(WALLPAPERX_APP_LIBRARY_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/../library/wpx_package.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../library/wpx_package.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/../library/folder_watcher.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../library/folder_watcher.h
     ${CMAKE_CURRENT_SOURCE_DIR}/../library/library_manager.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../library/library_manager.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/../library/importer.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../library/importer.h
 )
 set(WALLPAPERX_APP_PREVIEW_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/../library/preview_image_provider.cpp
@@ -53,11 +57,12 @@ set_tests_properties(app_kscreen_config PROPERTIES LABELS "novulkan" SKIP_RETURN
 
 find_package(Qt6 COMPONENTS Test Quick QuickTest)
 
-# S15.31-S15.35, S15.45, S15.47, S15.48, S15.50, S15.51, S15.53, S15.55, S15.58: one wallpaper.json,
-# one .wpx, one folder, one preview address.
+# S15.31-S15.35, S15.45, S15.47, S15.48, S15.50, S15.51, S15.53, S15.55, S15.67, S15.68: one
+# wallpaper.json, one .wpx, one wallpaper folder, one library folder, one preview address, with and
+# without openat2 (openat2_shim.cpp stands in for a kernel that lacks it, or a sandbox that refuses it).
 # No bus and no event loop. TIMEOUT backs up the test's own bound on a scan blocked by a FIFO.
 if(Qt6Quick_FOUND)
-    qt_add_executable(wallpaperx-wpx-package-test wpx_package_test.cpp ${WALLPAPERX_APP_LIBRARY_SOURCES}
+    qt_add_executable(wallpaperx-wpx-package-test wpx_package_test.cpp openat2_shim.cpp ${WALLPAPERX_APP_LIBRARY_SOURCES}
                       ${WALLPAPERX_APP_PREVIEW_SOURCES})
     wallpaperx_app_test_target(wallpaperx-wpx-package-test)
     wallpaperx_app_library_test_target(wallpaperx-wpx-package-test)
@@ -66,29 +71,45 @@ if(Qt6Quick_FOUND)
     set_tests_properties(app_wpx_package PROPERTIES LABELS "novulkan" SKIP_RETURN_CODE 77 TIMEOUT 60)
 else()
     message(WARNING "Qt6 Quick not found -- app_wpx_package (S15.31-S15.35, S15.45, S15.47, S15.48, S15.50, S15.51, "
-                    "S15.53, S15.55, S15.58) is not registered")
+                    "S15.53, S15.55, S15.67, S15.68) is not registered")
 endif()
 
-# S15.36-S15.44, S15.48, S15.49, S15.57: LibraryManager against real folders, watched through inotify. No bus.
-qt_add_executable(wallpaperx-library-manager-test library_manager_test.cpp open_counter.cpp ${WALLPAPERX_APP_LIBRARY_SOURCES})
+# S15.36-S15.44, S15.48, S15.49, S15.57, S15.69: LibraryManager against real library folders of
+# wallpaper folders, watched through inotify. No bus.
+# openat2_shim.cpp counts the wallpaper files read (each through openat2), so an idle library is
+# shown to read none.
+qt_add_executable(wallpaperx-library-manager-test library_manager_test.cpp open_counter.cpp openat2_shim.cpp ${WALLPAPERX_APP_LIBRARY_SOURCES})
 wallpaperx_app_test_target(wallpaperx-library-manager-test)
 wallpaperx_app_library_test_target(wallpaperx-library-manager-test)
 add_test(NAME app_library_manager COMMAND wallpaperx-library-manager-test)
 set_tests_properties(app_library_manager PROPERTIES LABELS "novulkan" SKIP_RETURN_CODE 77 TIMEOUT 90)
 
-# S15.52, S15.56, S15.58-S15.66: LibraryManager following a folder as it changes -- new packages
-# read once finished, rewrites and holds, empty files, polling, the watch limit (in a user namespace
-# of its own, through unshare) -- and its list model under Qt's model tester. No bus.
+# S15.52, S15.56, S15.59-S15.66, S15.70-S15.74, S15.86-S15.88: LibraryManager following a library as
+# it changes -- folders read once no file in them is open for writing, rewrites and holds, polling,
+# an overflowing event queue, the watch limit and a file system where a lease says nothing (each in
+# a user namespace of its own, through unshare) -- and its list model under Qt's model tester. No bus.
 if(Qt6Test_FOUND)
-    qt_add_executable(wallpaperx-library-changes-test library_changes_test.cpp open_counter.cpp ${WALLPAPERX_APP_LIBRARY_SOURCES})
+    qt_add_executable(wallpaperx-library-changes-test library_changes_test.cpp open_counter.cpp openat2_shim.cpp ${WALLPAPERX_APP_LIBRARY_SOURCES})
     wallpaperx_app_test_target(wallpaperx-library-changes-test)
     wallpaperx_app_library_test_target(wallpaperx-library-changes-test)
     target_link_libraries(wallpaperx-library-changes-test PRIVATE Qt6::Test)
     add_test(NAME app_library_changes COMMAND wallpaperx-library-changes-test)
-    set_tests_properties(app_library_changes PROPERTIES LABELS "novulkan" SKIP_RETURN_CODE 77 TIMEOUT 90)
+    # Six namespace children, each bounded at 10 s (kNamespaceChildMs), plus about 16 s for the
+    # rest: every verdict prints before this TIMEOUT, even with all six hung.
+    set_tests_properties(app_library_changes PROPERTIES LABELS "novulkan" SKIP_RETURN_CODE 77 TIMEOUT 120)
 else()
-    message(WARNING "Qt6 Test not found -- app_library_changes (S15.52, S15.56, S15.58-S15.66) is not registered")
+    message(WARNING "Qt6 Test not found -- app_library_changes (S15.52, S15.56, S15.59-S15.66, S15.70-S15.74, S15.86-S15.88) is not registered")
 endif()
+
+# S15.58, S15.75-S15.81, S15.89-S15.93: unpacking a .wpx into a wallpaper folder, and the Importer's
+# drop folder (links in it included) and explicit imports. The free-space case runs in a user and
+# mount namespace of its own, through unshare. No bus.
+qt_add_executable(wallpaperx-importer-test importer_test.cpp open_counter.cpp ${WALLPAPERX_APP_LIBRARY_SOURCES})
+wallpaperx_app_test_target(wallpaperx-importer-test)
+wallpaperx_app_library_test_target(wallpaperx-importer-test)
+add_test(NAME app_importer COMMAND wallpaperx-importer-test)
+# One namespace child, bounded at 10 s (kNamespaceChildMs), plus about 30 s for the rest.
+set_tests_properties(app_importer PROPERTIES LABELS "novulkan" SKIP_RETURN_CODE 77 TIMEOUT 120)
 
 # The bus tests run on a private bus from a config with no service directories, so nothing can be
 # auto-started on it (app_kscreen_launcher's can start only its own test stand-ins);
@@ -149,6 +170,21 @@ if(DBUS_RUN_SESSION)
     set_tests_properties(app_installed_starts PROPERTIES LABELS "novulkan" SKIP_RETURN_CODE 77
                          TIMEOUT 90 RESOURCE_LOCK wallpaperx_bus_tests)
 
+    # S15.83, S15.84, S15.93-S15.95: the app this tree built, run as separate processes on the private bus -- a
+    # second launch hands its files to the first over org.freedesktop.Application and exits.
+    qt_add_executable(wallpaperx-single-instance-test single_instance_test.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../single_instance.cpp
+                      ${CMAKE_CURRENT_SOURCE_DIR}/../single_instance.h ${WALLPAPERX_APP_LIBRARY_SOURCES})
+    wallpaperx_app_test_target(wallpaperx-single-instance-test)
+    wallpaperx_app_library_test_target(wallpaperx-single-instance-test)
+    target_include_directories(wallpaperx-single-instance-test PRIVATE ${WALLPAPERX_APP_TESTS_DIR}/..)
+    target_compile_definitions(wallpaperx-single-instance-test PRIVATE WALLPAPERX_APP_BINARY="$<TARGET_FILE:wallpaperx>")
+    add_dependencies(wallpaperx-single-instance-test wallpaperx)
+    add_test(NAME app_single_instance
+             COMMAND ${DBUS_RUN_SESSION} --config-file=${WALLPAPERX_APP_TEST_BUS_CONFIG}
+                     -- $<TARGET_FILE:wallpaperx-single-instance-test>)
+    set_tests_properties(app_single_instance PROPERTIES LABELS "novulkan" SKIP_RETURN_CODE 77 TIMEOUT 120
+                         RESOURCE_LOCK wallpaperx_bus_tests)
+
     if(Qt6Test_FOUND AND Qt6Quick_FOUND)
         # S15.13, S15.17, S15.24, S15.26, S15.55: the picker's tiles, offscreen. Its own QML module under the app's URI, built from
         # the app's own MonitorPicker.qml and C++ types, because the app's module lives inside the
@@ -171,24 +207,35 @@ if(DBUS_RUN_SESSION)
                              ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
                              RESOURCE_LOCK wallpaperx_bus_tests)
 
-        # S15.45, S15.46, S15.52, S15.55: LibraryView.qml and WallpaperDetail.qml; S15.54, S15.55:
-        # Main.qml. In subdirectories because two modules with one URI in one build folder share its
-        # generated qmake_WallpaperX.qrc (the qmldir), so the last one generated would replace the picker's.
+        # S15.45, S15.46, S15.52, S15.55, S15.82: LibraryView.qml and WallpaperDetail.qml; S15.54,
+        # S15.55, S15.82: Main.qml. In subdirectories because two modules with one URI in one build
+        # folder share its generated qmake_WallpaperX.qrc (the qmldir), so the last one generated
+        # would replace the picker's.
         if(Qt6QuickTest_FOUND)
             add_subdirectory(library_view)
             add_subdirectory(main_window)
         else()
-            message(WARNING "Qt6 QuickTest not found -- app_library_view (S15.45, S15.46, S15.52, S15.55) and "
-                            "app_main_window (S15.54, S15.55) are not registered")
+            message(WARNING "Qt6 QuickTest not found -- app_library_view (S15.45, S15.46, S15.52, S15.55, S15.82) and "
+                            "app_main_window (S15.54, S15.55, S15.82) are not registered")
         endif()
     else()
         message(WARNING "Qt6 Test or Quick not found -- app_monitor_picker (S15.13, S15.17, S15.24, S15.26, S15.55), "
-                        "app_library_view (S15.45, S15.46, S15.52, S15.55) and app_main_window (S15.54, S15.55) "
-                        "are not registered")
+                        "app_library_view (S15.45, S15.46, S15.52, S15.55, S15.82) and app_main_window (S15.54, S15.55, "
+                        "S15.82) are not registered")
     endif()
 else()
     message(WARNING "dbus-run-session not found -- app_kscreen_client (S15.6-S15.12, S15.14, S15.16, S15.18-S15.20, "
                     "S15.23, S15.25, S15.26, S15.28), app_kscreen_launcher (S15.27, S15.29, S15.30), app_installed_starts "
-                    "(S15.15), app_monitor_picker (S15.13, S15.17, S15.24, S15.26, S15.55), app_library_view "
-                    "(S15.45, S15.46, S15.52, S15.55) and app_main_window (S15.54, S15.55) are not registered")
+                    "(S15.15), app_single_instance (S15.83, S15.84, S15.93-S15.95), app_monitor_picker (S15.13, S15.17, S15.24, S15.26, "
+                    "S15.55), app_library_view (S15.45, S15.46, S15.52, S15.55, S15.82) and app_main_window (S15.54, S15.55, "
+                    "S15.82) are not registered")
 endif()
+
+# S15.85: the MIME type and desktop entry, installed with the app's own rules into a scratch prefix
+# and their databases built there, never on this system. No bus.
+qt_add_executable(wallpaperx-desktop-integration-test desktop_integration_test.cpp)
+wallpaperx_app_test_target(wallpaperx-desktop-integration-test)
+wallpaperx_app_library_test_target(wallpaperx-desktop-integration-test)
+add_dependencies(wallpaperx-desktop-integration-test wallpaperx)
+add_test(NAME app_desktop_integration COMMAND wallpaperx-desktop-integration-test ${CMAKE_COMMAND} ${PROJECT_BINARY_DIR})
+set_tests_properties(app_desktop_integration PROPERTIES LABELS "novulkan" SKIP_RETURN_CODE 77 TIMEOUT 90)

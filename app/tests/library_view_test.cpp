@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 // app/qml/LibraryView.qml and app/qml/WallpaperDetail.qml, offscreen, driven by a real
-// LibraryManager over a scratch folder and served previews by the real PreviewImageProvider.
-// Goals S15.45, S15.46, S15.52 and S15.55 in GOALS.md.
+// LibraryManager over a scratch library of wallpaper folders and a real Importer, and served
+// previews by the real PreviewImageProvider. Goals S15.45, S15.46, S15.52, S15.55 and S15.82 in
+// GOALS.md.
 
 #include "fake_kscreen.h"
+#include "importer.h"
 #include "library_manager.h"
 #include "preview_image_provider.h"
 #include "qml_load.h"
@@ -20,8 +22,10 @@
 #include <QQmlExpression>
 #include <QQuickItem>
 #include <QQuickWindow>
+#include <QRegularExpression>
 #include <QTemporaryDir>
 #include <QTest>
+#include <QThreadPool>
 #include <QtQuickTest/quicktest.h>
 
 #include <algorithm>
@@ -43,12 +47,8 @@ using wallpaperx::testing::notVerified;
 
 namespace {
 
-constexpr const char* kGoals = "S15.45, S15.46, S15.52, S15.55";
+constexpr const char* kGoals = "S15.45, S15.46, S15.52, S15.55, S15.82";
 constexpr int kWaitMs = 5000;
-
-void expect(bool cond, const QString& msg) {
-    check(cond, msg.toStdString().c_str());
-}
 
 // Qt answers a platform plugin it cannot load with qFatal, which aborts before this file can
 // report anything. That is a property of the Qt install, so it becomes a skip naming it.
@@ -139,13 +139,16 @@ bool settleEvents(QQuickWindow& window) {
 }
 
 // A view that does not load is blamed on the file, the test's own initial property, or a missing Qt
-// module (qml_load.h).
+// module (qml_load.h). LibraryView takes the importer too; WallpaperDetail does not.
 // CONTROL: app/qml/LibraryView.qml given `required property int neverGiven` -> red, "FAIL:
 //       app/qml/LibraryView.qml did not load: ...Required property neverGiven was not initialized"; restored.
-std::unique_ptr<QQuickItem> load(QQmlEngine& engine, QQuickWindow& window, const char* type, LibraryManager& library) {
+std::unique_ptr<QQuickItem> load(QQmlEngine& engine, QQuickWindow& window, const char* type, LibraryManager& library, Importer* importer = nullptr) {
     QQmlComponent component(&engine);
     component.loadFromModule("WallpaperX", type);
-    const QVariantMap given{{QStringLiteral("library"), QVariant::fromValue(&library)}};
+    QVariantMap given{{QStringLiteral("library"), QVariant::fromValue(&library)}};
+    if (importer != nullptr) {
+        given.insert(QStringLiteral("importer"), QVariant::fromValue(importer));
+    }
     std::unique_ptr<QObject> object(component.createWithInitialProperties(given));
     auto* item = qobject_cast<QQuickItem*>(object.get());
     if (item == nullptr) {
@@ -159,8 +162,8 @@ std::unique_ptr<QQuickItem> load(QQmlEngine& engine, QQuickWindow& window, const
 }
 
 // S15.45, S15.46: the grid.
-void grid(QQmlEngine& engine, QQuickWindow& window, LibraryManager& library, const QString& ocean) {
-    const auto view = load(engine, window, "LibraryView", library);
+void grid(QQmlEngine& engine, QQuickWindow& window, LibraryManager& library, Importer& importer, const QString& ocean) {
+    const auto view = load(engine, window, "LibraryView", library, &importer);
     if (!view) {
         return;
     }
@@ -182,15 +185,15 @@ void grid(QQmlEngine& engine, QQuickWindow& window, LibraryManager& library, con
     QQuickItem* usableArea = firstInheriting(usable, "QQuickMouseArea");
     QQuickItem* brokenArea = firstInheriting(broken, "QQuickMouseArea");
 
-    // GOAL: S15.46 -- a broken file's tile shows its reason and offers no click; a usable one does.
+    // GOAL: S15.46 -- a broken wallpaper's tile shows its reason and offers no click; a usable one does.
     // WHY-THIS-SHAPE: the MouseArea's `enabled` is read directly because a click on a broken tile
     //       is also refused by LibraryManager::select(), so the click check below cannot see the
     //       QML gate alone; the usable tile's area being enabled shows the lookup found the right item.
     // CONTROL: app/qml/LibraryView.qml, the MouseArea's `enabled: tile.modelData.usable` made
     //       `enabled: true` -> red, "S15.46: the broken tile's click area is enabled"; the reason
     //       label's `tile.modelData.problem` made `qsTr("Broken")` -> red, "the broken tile does not
-    //       show its reason; it shows Broken|broken.wpx|"; restored.
-    expect(textsUnder(broken).contains(QStringLiteral("It is not a ZIP archive, so not a WallpaperX package.")),
+    //       show its reason; it shows Broken|broken|"; restored.
+    expect(textsUnder(broken).contains(QStringLiteral("wallpaper.json is not valid JSON")),
            QStringLiteral("S15.46: the broken tile does not show its reason; it shows %1").arg(textsUnder(broken)));
     // Read as a property: QQuickMouseArea's `enabled` is its own, and QQuickItem::isEnabled() is not it.
     const auto enabled = [](const QQuickItem* area) { return area && area->property("enabled").toBool(); };
@@ -204,7 +207,7 @@ void grid(QQmlEngine& engine, QQuickWindow& window, LibraryManager& library, con
     //       the tiles at all, so the broken click selecting nothing is not a click that went nowhere.
     // CONTROL: app/qml/LibraryView.qml `enabled: true` together with app/library/library_manager.cpp
     //       select()'s `|| !it->usable()` deleted, in one patch (either alone still refuses) -> red,
-    //       "S15.46: clicking the broken tile opened "…/broken.wpx""; restored.
+    //       "S15.46: clicking the broken tile opened "…/broken""; restored.
     QTest::mouseClick(&window, Qt::LeftButton, {}, centreOf(broken));
     settleEvents(window);
     expect(library.selectedPath().isEmpty(), QStringLiteral("S15.46: clicking the broken tile opened \"%1\"").arg(library.selectedPath()));
@@ -213,11 +216,11 @@ void grid(QQmlEngine& engine, QQuickWindow& window, LibraryManager& library, con
     expect(library.selectedPath() == ocean, QStringLiteral("S15.46: clicking the usable tile opened \"%1\", not %2").arg(library.selectedPath(), ocean));
     library.clearSelection();
 
-    // GOAL: S15.45 -- a usable tile's preview loads through QML's own image loader from a folder
-    //       whose path holds a space, '#', '?', '%' and a non-ASCII letter.
+    // GOAL: S15.45 -- a usable tile's preview loads through QML's own image loader from a wallpaper
+    //       folder whose path holds a space, '#', '?', '%' and a non-ASCII letter.
     // WHY-THIS-SHAPE: this is the only check that runs the real URL-to-provider path; the package
     //       test's round trip imitates how Qt splits the URL, this one does not have to.
-    // CONTROL: app/library/wpx_package.cpp, previewImageId's archive part made the raw `archivePath`
+    // CONTROL: app/library/wpx_package.cpp, previewImageId's folder part made the raw `folderPath`
     //       instead of its base64 -> red, "S15.45: the usable tile's preview ended with status 3"; restored.
     QQuickItem* image = firstInheriting(usable, "QQuickImage");
     // Image.Ready is 1 and Image.Error 3; Null (0) and Loading (2) are not an outcome yet.
@@ -231,7 +234,7 @@ void grid(QQmlEngine& engine, QQuickWindow& window, LibraryManager& library, con
 // S15.46: the detail view.
 void detail(QQmlEngine& engine, QQuickWindow& window, LibraryManager& library, const QString& ocean) {
     if (!library.select(ocean)) {
-        expect(false, QStringLiteral("S15.46: ocean.wpx could not be opened for the detail view"));
+        expect(false, QStringLiteral("S15.46: ocean could not be opened for the detail view"));
         return;
     }
     const auto view = load(engine, window, "WallpaperDetail", library);
@@ -332,31 +335,32 @@ void detail(QQmlEngine& engine, QQuickWindow& window, LibraryManager& library, c
     expect(toggle->property("checked").toBool(), QStringLiteral("S15.46: after a click and a reset the switch is off"));
 }
 
-// S15.52, S15.55: a folder too long to fit, scrolled to its end.
+// S15.52, S15.55: a library too long to fit, scrolled to its end.
 void busyGrid(QQmlEngine& engine, QQuickWindow& window, const QString& root) {
     constexpr int kPackages = 40;
     const QString dir = root + QStringLiteral("/busy");
-    const QString badName = QStringLiteral("bad %2 %1.wpx");
-    bool built = QDir().mkpath(dir) && writeBytes(dir + QLatin1Char('/') + badName, "hello");
+    const QString badName = QStringLiteral("bad %2 %1");
+    bool built = writeFolder(dir + QLatin1Char('/') + badName, {{QStringLiteral("wallpaper.json"), "hello"}}).isEmpty();
     for (int i = 0; i < kPackages && built; ++i) {
         OrderedJson json = planManifest();
         json["title"] = QStringLiteral("Tile %1").arg(i, 2, 10, QLatin1Char('0')).toStdString();
         const Entries entries{{QStringLiteral("wallpaper.json"), jsonBytes(json)},
                               {QStringLiteral("preview.png"), pngBytes(64, 36)},
                               {QStringLiteral("assets/video.mp4"), QByteArrayLiteral("not really a video")}};
-        built = writeZip(dir + QStringLiteral("/tile%1.wpx").arg(i, 2, 10, QLatin1Char('0')), entries).isEmpty();
+        built = writeFolder(dir + QStringLiteral("/tile%1").arg(i, 2, 10, QLatin1Char('0')), entries).isEmpty();
     }
     if (!built) {
-        harnessFailure("S15.52: the folder of forty packages could not be built");
+        harnessFailure("S15.52: the library of forty wallpapers could not be built");
         return;
     }
     LibraryManager library(dir, 30);
+    Importer importer(root + QStringLiteral("/busy-drop"), dir, 30);
     library.rescan();
     if (!waitUntil([&] { return library.state() == LibraryManager::State::Ready && library.wallpapers().size() == kPackages + 1; }, kWaitMs)) {
-        expect(false, QStringLiteral("S15.52: the folder of forty packages never settled; state %1").arg(int(library.state())));
+        expect(false, QStringLiteral("S15.52: the library of forty wallpapers never settled; state %1").arg(int(library.state())));
         return;
     }
-    const auto view = load(engine, window, "LibraryView", library);
+    const auto view = load(engine, window, "LibraryView", library, &importer);
     if (!view) {
         return;
     }
@@ -390,38 +394,48 @@ void busyGrid(QQmlEngine& engine, QQuickWindow& window, const QString& root) {
         }
     }
 
-    // GOAL: S15.55 -- a broken tile's accessible name quotes its file name as it is, "%1" and
+    // GOAL: S15.55 -- a broken tile's accessible name quotes its folder name as it is, "%1" and
     //       "%2" included, and then the reason.
     // WHY-THIS-SHAPE: read through a QML expression on the tile, since the attached Accessible
-    //       object has no public C++ accessor; the file name holds both markers, so a chained
+    //       object has no public C++ accessor; the folder name holds both markers, so a chained
     //       substitution changes it whichever order it runs in.
+    //       The whole name is compared with the reason the tile's row carries, since the reason
+    //       holds a byte offset; that reason is then matched on its own against the literal text
+    //       for the fixture's "hello", so a wrong or empty reason in the row cannot pass by being
+    //       compared with itself.
     // CONTROL: app/qml/LibraryView.qml, the one-pass `.replace(/%[12]/g, ...)` made
     //       `.arg(tile.modelData.fileName).arg(tile.modelData.problem)` -> red, "S15.55: the
-    //       broken tile's accessible name is "bad %2 It is not a ZIP archive..."; restored.
+    //       broken tile's accessible name is "bad %2 wallpaper.json is not valid JSON ..."; restored.
+    //       app/library/wpx_package.cpp, the invalid-JSON reason "wallpaper.json is not valid JSON
+    //       (at byte %1)." made "... is not valid (at byte %1)." -> red, "S15.55: ... the row's
+    //       reason is "wallpaper.json is not valid (at byte 1)."" (and S15.46's shown reason), though
+    //       the name equals the row's reason exactly; restored.
     if (!broken) {
         expect(false, QStringLiteral("S15.55: the broken tile is not among the delegates at the grid's end: [%1]").arg(keptPaths.join(u", ")));
     } else {
         QQmlExpression name(qmlContext(broken), broken, QStringLiteral("Accessible.name"));
         const QString got = name.evaluate().toString();
-        const QString want = badName + QStringLiteral(", cannot be used: It is not a ZIP archive, so not a WallpaperX package.");
-        expect(!name.hasError() && got == want,
-               QStringLiteral("S15.55: the broken tile's accessible name is \"%1\"%2, not \"%3\"")
-                   .arg(got, name.hasError() ? QStringLiteral(" (") + name.error().toString() + u')' : QString(), want));
+        const QString problem = broken->property("modelData").value<Wallpaper>().problem;
+        const QString want = badName + QStringLiteral(", cannot be used: ") + problem;
+        const bool reasonIsJson = QRegularExpression(QStringLiteral("^wallpaper\\.json is not valid JSON \\(at byte \\d+\\)\\.$")).match(problem).hasMatch();
+        expect(!name.hasError() && got == want && reasonIsJson,
+               QStringLiteral("S15.55: the broken tile's accessible name is \"%1\"%2, not \"%3\"; the row's reason is \"%4\"")
+                   .arg(got, name.hasError() ? QStringLiteral(" (") + name.error().toString() + u')' : QString(), want, problem));
     }
 
-    // GOAL: S15.52 -- when a package far above the visible rows changes, the grid stays where the
+    // GOAL: S15.52 -- when a wallpaper far above the visible rows changes, the grid stays where the
     //       user scrolled it and every tile it holds is kept, not rebuilt.
-    // WHY-THIS-SHAPE: the changed package is one whose tile is not instantiated at the grid's
+    // WHY-THIS-SHAPE: the changed wallpaper is one whose tile is not instantiated at the grid's
     //       end, so nothing held has a reason to change; each held tile is kept by a QPointer, so
     //       a rebuilt one reads as destroyed even if a new one took its place.
     // CONTROL: app/library/library_manager.cpp, WallpaperListModel::assign() made a reset
     //       (`beginResetModel(); m_rows = std::move(wallpapers); endResetModel(); return;` first)
-    //       -> red, "S15.52: after tile01.wpx changed (reread 1) the grid's contentY went 1350 -> 0
-    //       and 0 of 17 tiles survived"; app/qml/LibraryView.qml's `model: root.library.wallpaperModel`
+    //       -> red, "S15.52: after tile01 changed (reread 1) the grid's contentY went 1350 -> 0 and
+    //       0 of 17 tiles survived"; app/qml/LibraryView.qml's `model: root.library.wallpaperModel`
     //       made `root.library.wallpapers` -> red, the same line; IN_CLOSE_WRITE deleted from
-    //       app/library/library_manager.cpp's kFolderEvents, so the rewrite is never re-read -> red,
+    //       app/library/folder_watcher.cpp's kInsideEvents, so the rewrite is never re-read -> red,
     //       "(reread 0)"; restored.
-    // COVERAGE-ASSERT: the grid was scrolled away from the top, a package with no tile was found,
+    // COVERAGE-ASSERT: the grid was scrolled away from the top, a wallpaper with no tile was found,
     //       and at least a screenful of tiles was held.
     expect(scrolled > 0 && changed >= 0 && kept.size() >= 8,
            QStringLiteral("S15.52: the grid was not scrolled away from its top (contentY %1, %2 tiles held, a row with no tile %3)")
@@ -435,8 +449,9 @@ void busyGrid(QQmlEngine& engine, QQuickWindow& window, const QString& root) {
     // CONTROL: by hand, test-side, the time set to `target.stamp.modifiedNs` itself -> "NOT VERIFIED
     //       -- S15.52 (the grid keeps its place) ... kept the modification time"; restored.
     const Wallpaper target = library.wallpapers().value(changed);
-    const auto bytes = readBytes(target.filePath);
-    const auto modified = bytes ? rewriteWithTime(target.filePath, *bytes, target.stamp.modifiedNs + 2'000'000'000) : std::nullopt;
+    const QString manifest = target.filePath + QStringLiteral("/wallpaper.json");
+    const auto bytes = readBytes(manifest);
+    const auto modified = bytes ? rewriteWithTime(manifest, *bytes, target.stamp.modifiedNs + 2'000'000'000) : std::nullopt;
     if (!modified) {
         harnessFailure("S15.52: " + target.fileName.toStdString() + " could not be rewritten");
         return;
@@ -456,6 +471,132 @@ void busyGrid(QQmlEngine& engine, QQuickWindow& window, const QString& root) {
     expect(reread && std::abs(now - scrolled) < 0.5 && survived == kept.size(),
            QStringLiteral("S15.52: after %1 changed (reread %2) the grid's contentY went %3 -> %4 and %5 of %6 tiles survived")
                .arg(target.fileName).arg(reread).arg(scrolled).arg(now).arg(survived).arg(kept.size()));
+}
+
+QQuickItem* buttonNamed(QQuickItem* view, const QString& text) {
+    for (QQuickItem* button : allInheriting(view, "QQuickAbstractButton")) {
+        if (button->property("text").toString() == text) {
+            return button;
+        }
+    }
+    return nullptr;
+}
+
+// The banner (a Frame) whose label starts with `prefix`, shown or not.
+QQuickItem* bannerStarting(QQuickItem* view, const QString& prefix) {
+    for (QQuickItem* frame : allInheriting(view, "QQuickFrame")) {
+        for (QQuickItem* label : allInheriting(frame, "QQuickLabel")) {
+            if (label->property("text").toString().startsWith(prefix)) {
+                return frame;
+            }
+        }
+    }
+    return nullptr;
+}
+
+bool click(QQuickWindow& window, QQuickItem* item) {
+    if (item == nullptr || !item->isVisible() || !settleEvents(window)) {
+        return false;
+    }
+    QTest::mouseClick(&window, Qt::LeftButton, {}, centreOf(item));
+    return settleEvents(window);
+}
+
+// S15.82: the importer as the library view shows it.
+void importerViews(QQmlEngine& engine, QQuickWindow& window, const QString& root) {
+    if (::geteuid() == 0) {
+        notVerified("S15.82", "running as root, which can write into a read-only folder");
+        return;
+    }
+    const QString drop = root + QStringLiteral("/view-drop");
+    const QString wallpapers = drop + QStringLiteral("/wallpapers");
+    const auto package = zipBytes(root + QStringLiteral("/view.scratch"), planEntries(titled("Dropped")));
+    if (!package || !QDir().mkpath(wallpapers) || !setMode(wallpapers, 0555)) {
+        harnessFailure("S15.82: the drop folder with a read-only wallpapers/ could not be built");
+        return;
+    }
+    LibraryManager library(wallpapers, 30);
+    Importer importer(drop, wallpapers, 30);
+    library.rescan();
+    importer.rescan();
+    const auto view = load(engine, window, "LibraryView", library, &importer);
+    const bool ready = view && waitUntil([&] { return library.state() == LibraryManager::State::Ready && !importer.busy(); }, kWaitMs) &&
+                       settleEvents(window);
+    if (!ready) {
+        static_cast<void>(setMode(wallpapers, 0755));
+        expect(!view, QStringLiteral("S15.82: the empty library never settled, or the view was never laid out"));
+        return;
+    }
+
+    // GOAL: S15.82 -- an empty library says where a .wpx can be put -- the importer's drop
+    //       folder -- and the header offers Import… and Rescan.
+    // CONTROL: app/qml/LibraryView.qml, the empty sentence's `.arg(root.importer.dropDirectory)` made
+    //       `.arg(root.library.directory)` -> red, "S15.82: the empty library reads [...…/view-drop/wallpapers.|...]";
+    //       the Import button given `visible: false` -> red, "S15.82: the header's Import… button is
+    //       missing or hidden"; restored.
+    const QString sentence = QStringLiteral("No wallpapers yet. Import a .wpx file, or put one in %1.").arg(importer.dropDirectory());
+    expect(textsUnder(view.get()).contains(sentence), QStringLiteral("S15.82: the empty library reads [%1], not \"%2\"").arg(textsUnder(view.get()), sentence));
+    QQuickItem* importButton = buttonNamed(view.get(), QStringLiteral("Import…"));
+    QQuickItem* rescanButton = buttonNamed(view.get(), QStringLiteral("Rescan"));
+    expect(importButton && importButton->isVisible(), QStringLiteral("S15.82: the header's Import… button is missing or hidden"));
+
+    // GOAL: S15.82 -- an import that fails is shown as its sentence in a banner with a Dismiss
+    //       button, and Dismiss clears it; Rescan then re-reads the drop folder, so a file whose
+    //       import failed is imported once the reason is gone, and the success is shown as its
+    //       own banner, "Imported <title>.", whose Dismiss clears it too.
+    // WHY-THIS-SHAPE: the file is dropped while wallpapers/ is read-only, so its import fails and
+    //       is not recorded; the folder is made writable with no event the drop folder's watch
+    //       reports, so only the Rescan button can bring the retry. Buttons are pressed with real
+    //       clicks, which also shows each is visible and enabled; each banner is found by its
+    //       label, shown or not, so a hidden banner is told apart from a missing one.
+    // CONTROL: app/qml/LibraryView.qml, one per run: the problems Banner given `visible: false` ->
+    //       red, "the problems banner is hidden" (and its Dismiss line, as a hidden button cannot be
+    //       clicked); its `onDismissed: root.importer.dismissProblems()` made `onDismissed: {}` ->
+    //       red, "after Dismiss the problems are [x.wpx could not be imported. ...]" only; Rescan's
+    //       `root.importer.rescan();` deleted -> red, "after Rescan the notices are [] and the
+    //       library lists []"; the notices Banner given `visible: false` -> red, "the notices banner
+    //       is hidden" (and its Dismiss line); its `onDismissed: root.importer.dismissNotices()` made
+    //       `onDismissed: {}` -> red, "after Dismiss the notices are [Imported Dropped.]" only; the
+    //       shared Banner's `visible: banner.text.length > 0` made `visible: false` -> red, all four
+    //       banner lines; restored.
+    const QString staged = drop + QStringLiteral("/.x.wpx");
+    if (!writeBytes(staged, *package) || ::rename(QFile::encodeName(staged).constData(), QFile::encodeName(drop + QStringLiteral("/x.wpx")).constData()) != 0) {
+        static_cast<void>(setMode(wallpapers, 0755));
+        harnessFailure("S15.82: x.wpx could not be dropped in");
+        return;
+    }
+    const bool failed = waitUntil([&] { return !importer.problems().isEmpty() && !importer.busy(); }, kWaitMs) && settleEvents(window);
+    if (!setMode(wallpapers, 0755)) {
+        harnessFailure("S15.82: wallpapers/ could not be made writable again");
+        return;
+    }
+    if (!failed || !importer.problems().constFirst().startsWith(QStringLiteral("x.wpx could not be imported."))) {
+        expect(false, QStringLiteral("S15.82: the import into a read-only wallpapers/ reported [%1]").arg(importer.problems().join(QStringLiteral(" | "))));
+        return;
+    }
+    QQuickItem* problems = bannerStarting(view.get(), QStringLiteral("x.wpx could not be imported."));
+    expect(problems && problems->isVisible(), QStringLiteral("S15.82: the problems banner is %1").arg(problems ? QStringLiteral("hidden") : QStringLiteral("missing")));
+    const bool dismissedProblems = problems && click(window, buttonNamed(problems, QStringLiteral("Dismiss")));
+    expect(dismissedProblems && importer.problems().isEmpty() && !problems->isVisible(),
+           QStringLiteral("S15.82: after Dismiss the problems are [%1]").arg(importer.problems().join(QStringLiteral(" | "))));
+
+    const bool rescanned = click(window, rescanButton);
+    const bool imported = rescanned && waitUntil([&] { return !importer.notices().isEmpty() && library.wallpapers().size() == 1; }, kWaitMs) &&
+                          settleEvents(window);
+    QStringList listed;
+    for (const Wallpaper& w : library.wallpapers()) {
+        listed.append(w.displayTitle());
+    }
+    expect(imported && importer.notices() == QStringList{QStringLiteral("Imported Dropped.")},
+           QStringLiteral("S15.82: after Rescan the notices are [%1] and the library lists [%2]").arg(importer.notices().join(QStringLiteral(" | ")), listed.join(u", ")));
+    if (!imported) {
+        return;
+    }
+    QQuickItem* notices = bannerStarting(view.get(), QStringLiteral("Imported Dropped."));
+    expect(notices && notices->isVisible(), QStringLiteral("S15.82: the notices banner is %1").arg(notices ? QStringLiteral("hidden") : QStringLiteral("missing")));
+    const bool dismissedNotices = notices && click(window, buttonNamed(notices, QStringLiteral("Dismiss")));
+    expect(dismissedNotices && importer.notices().isEmpty() && !notices->isVisible(),
+           QStringLiteral("S15.82: after Dismiss the notices are [%1]").arg(importer.notices().join(QStringLiteral(" | "))));
 }
 
 } // namespace
@@ -482,17 +623,18 @@ int main(int argc, char* argv[]) {
     }
 
     const QString dir = scratch.path() + QStringLiteral("/lib #?% é");
-    const QString ocean = dir + QStringLiteral("/ocean.wpx");
-    if (!QDir().mkpath(dir) || !writeZip(ocean, planEntries(QByteArray(kPlanManifest))).isEmpty() ||
-        !writeBytes(dir + QStringLiteral("/broken.wpx"), "hello")) {
+    const QString ocean = dir + QStringLiteral("/ocean");
+    if (!writeFolder(ocean, planEntries(QByteArray(kPlanManifest))).isEmpty() ||
+        !writeFolder(dir + QStringLiteral("/broken"), {{QStringLiteral("wallpaper.json"), "hello"}}).isEmpty()) {
         harnessFailure("the library folder could not be built");
         static_cast<void>(wallpaperx::testing::reportHarnessFaults("in this test file's fixtures, not in the app"));
         return 1;
     }
     auto library = std::make_unique<LibraryManager>(dir, 30);
+    auto importer = std::make_unique<Importer>(scratch.path() + QStringLiteral("/drop"), dir, 30);
     library->rescan();
     if (!waitUntil([&] { return library->state() == LibraryManager::State::Ready && library->wallpapers().size() == 2; }, kWaitMs)) {
-        expect(false, QStringLiteral("the library never listed its two files; state %1").arg(int(library->state())));
+        expect(false, QStringLiteral("the library never listed its two wallpapers; state %1").arg(int(library->state())));
     } else {
         QQuickWindow window;
         window.resize(1000, 700);
@@ -502,12 +644,16 @@ int main(int argc, char* argv[]) {
         if (!QTest::qWaitForWindowExposed(&window)) {
             notVerified(kGoals, "the offscreen window was never exposed, so no click can reach it");
         } else {
-            grid(engine, window, *library, ocean);
+            grid(engine, window, *library, *importer, ocean);
             detail(engine, window, *library, ocean);
             busyGrid(engine, window, scratch.path());
+            importerViews(engine, window, scratch.path());
         }
     }
+    importer.reset();
     library.reset();
+    // No import may still be writing into the scratch folder when it is removed.
+    static_cast<void>(QThreadPool::globalInstance()->waitForDone(30000));
 
     const bool failed = wallpaperx::testing::reportCheckFailures();
     const bool faulted = wallpaperx::testing::reportHarnessFaults("in this test file or its fixtures, not in the app");

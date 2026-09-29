@@ -1,4 +1,4 @@
-# S15.45, S15.46, S15.52, S15.55: app/qml/LibraryView.qml and WallpaperDetail.qml offscreen, in their own module
+# S15.45, S15.46, S15.52, S15.55, S15.82: app/qml/LibraryView.qml and WallpaperDetail.qml offscreen, in their own module
 # under the app's URI like the picker. On the private bus because a QGuiApplication's platform
 # theme may connect to the session bus. QuickTest for qWaitForPolish: the views use Layouts, which
 # place nothing until the window is polished.
