@@ -33,8 +33,15 @@ struct PersistedWallpaper {
     std::string output;
 
     // What `output`'s screen last reported. A fact about that name, so it is written only
-    // beside it.
-    std::optional<OutputSize> outputSize;
+    // beside it. The `output_size` field as JSON text, empty when the row has none; text for the
+    // reason propertiesJson gives: a row kept for a newer build carries it as read.
+    std::string outputSizeJson;
+
+    // The wallpaper's edited values, which belong to `type` and `path` and go wherever they go: the
+    // `properties` field as JSON text, empty when the row has none. Text rather than
+    // WallpaperProperties because a row kept for a newer build carries values this build cannot
+    // type, and only the manager knows which rows those are; it types the rest itself.
+    std::string propertiesJson;
 };
 
 // Not a fit -- real names run under a dozen bytes -- but a finite bound on a string a
@@ -73,6 +80,13 @@ inline std::string outputSizeError(const OutputSize& size) {
     }
     return {};
 }
+
+// The form a config row carries a size in.
+std::string toJsonText(const OutputSize& size);
+
+// The reverse. Anything unreadable -- not an object, a missing or non-integer side, a negative
+// one, text that is not JSON -- comes back 0x0, which outputSizeError() refuses.
+OutputSize outputSizeFromJson(const std::string& text);
 
 struct LoadResult {
     std::vector<PersistedWallpaper> entries;

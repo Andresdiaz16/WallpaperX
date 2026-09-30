@@ -36,6 +36,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -61,7 +62,7 @@ using Check = std::function<void(bool, const char*)>;
 // Shared, not copied, because the two tiers must agree on what the switch *means*: a
 // ThreadSanitizer run waives both with one variable, and a tier that disagreed would
 // either drown the report in layer noise or claim a GPU-side oracle it did not have.
-// It moved to the renderer's test-support header because the renderer probes cannot
+// It lives in the renderer's test-support header because the renderer probes cannot
 // reach backend/tests, while the backend tests already have renderer/tests on their
 // include path.
 //
@@ -276,6 +277,20 @@ inline void setWallpaper(sdbus::IProxy& proxy, const std::string& type, const st
         .onInterface(DbusService::kInterface)
         .withTimeout(timeout)
         .withArguments(type, path, monitorId);
+}
+
+// A wallpaper's properties as they travel: `a{sv}`, each value's D-Bus type saying what it is.
+using WireProperties = std::map<std::string, sdbus::Variant>;
+
+inline void setWallpaperWithProperties(sdbus::IProxy& proxy, const std::string& type, const std::string& path,
+                                       int32_t monitorId, const WireProperties& properties) {
+    proxy.callMethod("SetWallpaperWithProperties")
+        .onInterface(DbusService::kInterface)
+        .withArguments(type, path, monitorId, properties);
+}
+
+inline void setWallpaperProperties(sdbus::IProxy& proxy, int32_t monitorId, const WireProperties& properties) {
+    proxy.callMethod("SetWallpaperProperties").onInterface(DbusService::kInterface).withArguments(monitorId, properties);
 }
 
 // The same call for a phase that only needs the wallpaper set: false, with the error printed,

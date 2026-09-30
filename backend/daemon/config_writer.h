@@ -69,7 +69,8 @@ public:
         // counted yet" cannot read as "nothing lost".
         SaveResult saved;
 
-        bool onDisk() const { return state == State::NeverAsked || state == State::OnDisk; }
+        static bool onDisk(State s) noexcept { return s == State::NeverAsked || s == State::OnDisk; }
+        bool onDisk() const noexcept { return onDisk(state); }
     };
 
     explicit ConfigWriter(ConfigStore store);
@@ -87,14 +88,17 @@ public:
     bool refusing() const;
 
     // Hands rows over without waiting. False when nothing was queued -- disabled, refused, or
-    // no thread -- and outcome() then carries which.
-    bool queue(const std::vector<PersistedWallpaper>& rows);
+    // no thread -- and outcome() then carries which. Taken by value so the copy, if any, is made
+    // before anything here changes: a throw leaves this object as it was.
+    bool queue(std::vector<PersistedWallpaper> rows);
 
-    // queue(), then a bounded wait: a wait that runs out leaves the write in flight and the
-    // rows not known to be on disk. Returns whether THESE rows reached the file, true when
-    // persistence is disabled since durability was never promised. On false, `whyNot` receives
-    // this write's own reason, raw.
-    bool write(const std::vector<PersistedWallpaper>& rows, std::string* whyNot = nullptr);
+    // A bounded wait for the last queue() to land: a wait that runs out leaves the write in
+    // flight and the rows not known to be on disk. Returns whether they reached the file, true
+    // when persistence is disabled since durability was never promised. Builds no reason, so
+    // it cannot throw: a caller that has already committed a change relies on that.
+    bool awaitQueued() noexcept;
+    // The same wait; on false, `whyNot` receives the write's own reason, raw.
+    bool awaitQueued(std::string& whyNot);
 
     // The single answer to whether the file holds what was handed over. Everything a report
     // needs is in it, so nothing else here answers part of the same question.
@@ -105,7 +109,12 @@ private:
     // recording why. Caller holds m_mutex.
     void startLocked();
 
+    void waitForQueued() noexcept;
+
     Outcome outcomeLocked() const;
+    // The state outcomeLocked() reports, with none of its strings. Caller holds m_mutex and,
+    // when m_worker is set, the worker's mutex.
+    Outcome::State stateLocked() const noexcept;
 
     const ConfigStore m_store;
 

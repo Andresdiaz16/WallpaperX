@@ -119,6 +119,7 @@ add_library(wallpaperx-daemon-lib STATIC
     daemon/log_pump.cpp
     daemon/render_worker.cpp
     daemon/wallpaper_manager.cpp
+    daemon/wallpaper_properties.cpp
 )
 
 target_include_directories(wallpaperx-daemon-lib PUBLIC
@@ -814,8 +815,22 @@ if(WALLPAPERX_FFMPEG_EXECUTABLE)
         COMMENT "Generating video wallpaper fixture wallpaper_rate120_ms.mkv"
         VERBATIM
     )
+    # 240 pictures a second with regular timestamps, twice the cap at speed 1: the file whose own time
+    # trails the capped drawing time by design, which is where the schedule's late test and the lag it
+    # banks are graded.
+    add_custom_command(
+        OUTPUT ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_rate240.mp4
+        COMMAND ${WALLPAPERX_FFMPEG_EXECUTABLE} -y -v error
+                -f lavfi -i color=c=black:size=320x240:rate=240:duration=3
+                -vf "drawbox=x=0:y=0:w=320:h=120:color=0xFF0000@1:t=fill,format=yuv420p,setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv"
+                -c:v libx264 -profile:v baseline -g 30 -pix_fmt yuv420p -r 240
+                ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_rate240.mp4
+        COMMENT "Generating video wallpaper fixture wallpaper_rate240.mp4"
+        VERBATIM
+    )
     add_custom_target(wallpaperx-backend-video-fixtures
-                      DEPENDS ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_bands.mp4
+                      DEPENDS ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_rate240.mp4
+                              ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_bands.mp4
                               ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_one_picture.mp4
                               ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_slow.mp4
                               ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_fast.mp4

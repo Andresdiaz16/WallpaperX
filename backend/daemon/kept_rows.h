@@ -49,7 +49,7 @@ public:
     std::vector<PersistedWallpaper>& carried() { return m_carried; }
     const std::vector<PersistedWallpaper>& carried() const { return m_carried; }
 
-    // Clears the wallpaper half of a kept row, answering whether there was one to clear -- the
+    // Clears the wallpaper half of a kept row, its properties included, answering whether there was one to clear -- the
     // caller reports the loss, and only when there was one. Takes the row, not an id: one
     // caller holds a copy not yet carried. Says nothing about `output`: a lost name is a
     // different loss, counted separately.

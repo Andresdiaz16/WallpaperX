@@ -20,6 +20,7 @@
 #include "tests/client/scratch_dir.h"
 #include "tests/name_watcher.h"
 #include "tests/spawned_daemon.h"
+#include "tests/test_phase.h"
 #include "tests/test_report.h"
 
 #include <sdbus-c++/sdbus-c++.h>
@@ -255,10 +256,11 @@ double seconds(Clock::duration d) { return std::chrono::duration<double>(d).coun
 // WHY-THIS-SHAPE: the file, not the shim's line, which it drops rather than block on a stream that
 //       will not take it; a lost line would read as a loss that never happened. The file left by
 //       an earlier round on the same HOME is removed first.
-// CONTROL: in backend/daemon/dbus_service.cpp, setWallpaper() made to `_Exit(3)` for a still on
-//       monitor 2, the request that provokes each loss -> "the daemon is still running when the
-//       shim fails its next submission" red for the static, stalled-stderr and unfinished-render
-//       phases, and no harness fault. Observed 2026-09-25 via control_run.sh on NVIDIA; reverted.
+// CONTROL: in backend/daemon/dbus_service.cpp, `if (type == "static" && monitorId == 2) std::_Exit(3);`
+//       added to DbusService::setWallpaper() before the request is recorded -- a still on monitor 2,
+//       the request that provokes each loss -> "the daemon is still running when the shim fails its
+//       next submission" red for the static, stalled-stderr and unfinished-render phases, and no
+//       harness fault. Observed 2026-09-29 via control_run.sh on NVIDIA; reverted.
 std::optional<Clock::time_point> loseDevice(const SpawnedDaemon& daemon, const Home& home, sdbus::IProxy& proxy,
                                             const std::function<void()>& provoke, const std::string& phase) {
     const fs::path fired = home.trigger().string() + ".fired";
@@ -314,7 +316,7 @@ bool checkLostExit(const SpawnedDaemon& daemon, int exitCode, const std::string&
     //       apart from a crash (a signal) and from the fatal-error exit 1.
     // WHY-THIS-SHAPE: exitedNormally() is asserted with the code, because a death by signal
     //       reports -1 and "nonzero" alone would pass a crash as the designed exit.
-    // CONTROL: in backend/daemon/main.cpp, via control_run.sh, re-observed 2026-09-26 on NVIDIA,
+    // CONTROL: in backend/daemon/main.cpp, via control_run.sh, observed 2026-09-26 on NVIDIA,
     //       reverted. (a) kExitDeviceLost made 1 -> this line and both message lines red for the
     //       still and all three video rounds, with "every round ended in a device-loss exit", both
     //       stuck stops', the unfinished render's and the four stalled-output loss phases' status
@@ -336,7 +338,7 @@ bool checkLostExit(const SpawnedDaemon& daemon, int exitCode, const std::string&
           (phase + ": the daemon reports its stop as the device-loss one").c_str());
     // CONTROL: backend/daemon/main.cpp printing "stopped cleanly" whatever the exit status (an
     //       unconditional line ahead of the status-dependent one) -> the check below red for the
-    //       still and all three video rounds, and nothing else. Re-observed 2026-09-24 via
+    //       still and all three video rounds, and nothing else. Observed 2026-09-24 via
     //       control_run.sh; reverted.
     check(out.find(kCleanStop) == std::string::npos,
           (phase + ": a device-loss stop does not report itself as a clean one").c_str());
@@ -347,7 +349,7 @@ bool checkLostExit(const SpawnedDaemon& daemon, int exitCode, const std::string&
     //       asserts the same needle's presence on a SIGTERM stop: a reworded line turns that red.
     // CONTROL: the signal thread in backend/daemon/main.cpp made to print its "received" line
     //       for every stop (its first `if (outside)`, the one before std::printf, made `if (true)`)
-    //       -> this line red for the still and all three video rounds, nothing else. Re-observed
+    //       -> this line red for the still and all three video rounds, nothing else. Observed
     //       2026-09-25 via control_run.sh. Reverted.
     check(out.find(kSignalLine) == std::string::npos,
           (phase + ": a device-loss stop does not report a signal it was never sent").c_str());
@@ -371,7 +373,7 @@ void checkNothingBlamed(const Home& home, const std::string& phase, bool videoPl
     //       its stop as the device-loss one" red for the still and all three rounds: 11. Every
     //       "exits with status 75" line stayed green, the stalled-output loss phases' included.
     //       The exit is placed ahead of observe()'s loss callback, so main's stopBlamingWallpapers()
-    //       never runs. Re-observed 2026-09-26 via control_run.sh on NVIDIA; reverted.
+    //       never runs. Observed 2026-09-26 via control_run.sh on NVIDIA; reverted.
     const std::vector<std::string> records = applyingRecords(home.stateDir());
     check(records.empty(), (phase + ": no applying-* record is left in the state directory").c_str());
     for (const std::string& name : records) std::fprintf(stderr, "  %s: left behind: %s\n", phase.c_str(), name.c_str());
@@ -390,7 +392,7 @@ void checkNothingBlamed(const Home& home, const std::string& phase, bool videoPl
     //       "still plays", "every round ended in a device-loss exit", both final "after three
     //       device losses" lines and the stalled-output loss phases' "exits with status 75" (20
     //       shown, the tool's limit). The abort is placed ahead of observe()'s loss callback.
-    //       Re-observed 2026-09-26 via control_run.sh on NVIDIA; reverted.
+    //       Observed 2026-09-26 via control_run.sh on NVIDIA; reverted.
     // COVERAGE-ASSERT: after a video played the record must be there to read; absent, these two
     //       checks would compare nothing. Controlled in backend/daemon/crash_record.cpp:
     //       PlayingRecord::start() made to return right after claiming the record, so none is
@@ -466,7 +468,7 @@ void checkStaticLossAndRestart(NameWatcher& names, const std::string& blue, cons
     // CONTROL: backend/daemon/main.cpp's device-loss handler (`config.onDeviceLost`) made to delete
     //       the config file -> this line and all six restart lines below red, with the video
     //       phase's round-2 restart, its round count, both final lines and the unfinished-render
-    //       phase's restart line: 12. Re-observed 2026-09-26 via control_run.sh on NVIDIA; reverted.
+    //       phase's restart line: 12. Observed 2026-09-26 via control_run.sh on NVIDIA; reverted.
     check(saved == expected, "static loss: the config file still holds all three monitors after the exit");
 
     fs::remove(home.trigger());
@@ -480,7 +482,7 @@ void checkStaticLossAndRestart(NameWatcher& names, const std::string& blue, cons
     //       "redraws monitor N" / "reports monitor N" lines red, with the video phase's round-2
     //       restart, its round count and both final lines. And the Device::observe() `_Exit(75)`
     //       control above -> of these six, only monitor 2's two lines red, since the record left
-    //       behind makes the restart refuse that wallpaper. Both re-observed 2026-09-24 on NVIDIA
+    //       behind makes the restart refuse that wallpaper. Both observed 2026-09-24 on NVIDIA
     //       via control_run.sh; reverted.
     if (!nameFree(names, "static loss's restart")) return;
     FrameReadyLog restored;
@@ -534,7 +536,7 @@ void checkRepeatedVideoLoss(NameWatcher& names) {
     // CONTROL: the Device::observe() `std::abort()` control -> the blame and count lines above,
     //       then "video loss 3: the restarted daemon still plays the video" and both final
     //       "after three device losses" lines red: the video refused after two counted deaths.
-    //       The fuller list is in checkNothingBlamed's annotation. Re-observed 2026-09-26. Reverted.
+    //       The fuller list is in checkNothingBlamed's annotation. Observed 2026-09-26. Reverted.
     // COVERAGE-ASSERT: the number of losses that actually reached a device-loss exit is counted
     //       and asserted, so a loop that stopped early cannot read as three. Red under the
     //       exit-status-1, no-handler, wake-only and abort controls above, all 2026-09-26.
@@ -649,7 +651,7 @@ void checkNoDeviceIsNotLoss(NameWatcher& names, const std::string& blue, const s
     //       later render is still attempted and reported" red, alone: the worker stops after the
     //       first render, and since no Device ever existed to report a loss the daemon stays up.
     //       The three stalled-output video-loss phases report NOT VERIFIED under it (the worker
-    //       stopped before any device was made, so no video played). Re-observed 2026-09-25 via
+    //       stopped before any device was made, so no video played). Observed 2026-09-25 via
     //       control_run.sh; reverted.
     std::string firstError;
     bool drew = false;
@@ -784,7 +786,7 @@ void checkStuckLossStop(NameWatcher& names, const std::string& still, OutsideSig
     //       the status is graded. Controls (a) and (b) each disable one path, which is what makes
     //       them deterministic. The wedge line is waited for before the verdict, so a stop that was
     //       never stuck is reported NOT VERIFIED rather than graded as this one.
-    // CONTROL: in backend/daemon/main.cpp via control_run.sh, re-observed 2026-09-26 on NVIDIA,
+    // CONTROL: in backend/daemon/main.cpp via control_run.sh, observed 2026-09-26 on NVIDIA,
     //       reverted. (a) The signal thread's deadline exit made `_Exit(1)` and armTeardown's alarm
     //       removed, so only that path can end the stop -> "exits with status 75" red in both
     //       phases, alone. (b) onTeardownDeadline's DeviceLost branch (`exitNow(kExitDeviceLost,
@@ -820,7 +822,7 @@ void checkStuckLossStop(NameWatcher& names, const std::string& still, OutsideSig
 //       stop is reported as the SIGTERM's" and "exactly one line" red; the exit-0 and "stops
 //       cleanly" lines stay green, because the SIGUSR1 stop itself exits 0 -- the defect. (b) The
 //       "ignoring" line's fprintf duplicated -> "exactly one line per outside SIGUSR1", alone;
-//       re-observed 2026-09-25.
+//       observed 2026-09-25.
 void checkOutsideWakeSignalIgnored(NameWatcher& names, const std::string& blue) {
     constexpr const char* kGoals = "an outside SIGUSR1 is ignored, not taken for a stop";
     const std::string phase = "outside SIGUSR1";
@@ -1179,7 +1181,7 @@ bool playWatchedVideo(sdbus::IProxy& proxy, FrameReadyLog& frames, const std::st
 // CONTROL: in backend/daemon/log_pump.cpp via control_run.sh 2026-09-25 on NVIDIA, each red on the
 //       pipe, socket and terminal phases, all reverted. (a) The destination written blocking
 //       (O_NONBLOCK dropped from its /proc reopen, MSG_DONTWAIT from its send) -> all four S14.21
-//       lines and the order line (re-observed 2026-09-27). (b) One queue per stream whatever the layout (`used = shared ? 2 : 2`) -> the order
+//       lines and the order line (observed 2026-09-27). (b) One queue per stream whatever the layout (`used = shared ? 2 : 2`) -> the order
 //       line: stdout's lines all came out before stderr's. (c) kQueueLimit 32 KiB -> the same
 //       line, alone: lines were dropped. (d) kMaxLine 1024 -> the same line, every marker split.
 //       The log writer never installed (backend/daemon/main.cpp) -> all five.
@@ -1448,7 +1450,7 @@ enum class StalledEnd {
 //       confirmed before the second signal: alive 1 s in, its main thread in pause() inside the
 //       wedge -- otherwise NOT VERIFIED, since a stop that was not stuck has nothing to force.
 // CONTROL: via control_run.sh on NVIDIA, each on all three destinations, all reverted.
-//       Re-observed 2026-09-26: (a) logpump::release() in backend/daemon/log_pump.cpp given an
+//       Observed 2026-09-26: (a) logpump::release() in backend/daemon/log_pump.cpp given an
 //       hour -> the SIGTERM and loss "ends within" lines; statuses stay 0 and 75, the alarm's.
 //       (b) As (a) with `g_finalStatus.store(exitStatus);` deleted in backend/daemon/main.cpp ->
 //       also the SIGTERM "exits 0" lines. (c) flushBeforeExit()'s flush in backend/daemon/main.cpp,
@@ -1605,7 +1607,7 @@ void checkStalledEnd(NameWatcher& names, const std::string& blue, Destination de
 //       name and the bus calls are what show it came up; a harness that could not fill the stream
 //       first reports that, never a verdict (by hand 2026-09-25, reverted: the pre-fill reported
 //       as failed -> all three phases "FAIL (harness)", no FAIL).
-// CONTROL: via control_run.sh on NVIDIA, each on all three destinations, reverted, re-observed
+// CONTROL: via control_run.sh on NVIDIA, each on all three destinations, reverted, observed
 //       2026-09-26. The log writer never installed (backend/daemon/main.cpp's `logpump::install()`
 //       skipped) -> GetStatus, SetWallpaper and SIGTERM lines red: the daemon took its name and
 //       then stopped on its first line. logpump::release() in backend/daemon/log_pump.cpp given
@@ -1714,7 +1716,7 @@ void checkClosedAtLaunch(NameWatcher& names, const std::string& blue, SpawnedDae
 //       outside SIGALRM is delivered on the kill() to a thread that has it unblocked, so by the
 //       time a render round trip is done a handler would have run. Alive is read from the bus
 //       name and the capture pipe, not from kill(0), which a zombie also answers.
-// CONTROL: in backend/daemon/main.cpp via control_run.sh, re-observed 2026-09-26 on NVIDIA,
+// CONTROL: in backend/daemon/main.cpp via control_run.sh, observed 2026-09-26 on NVIDIA,
 //       reverted: the startup `std::signal(SIGALRM, SIG_IGN)` made `std::signal(SIGALRM,
 //       onTeardownDeadline)` -> "still draws", "still running", "exits 0" and "stops cleanly" red,
 //       alone.
@@ -2265,39 +2267,53 @@ void checkCrashFlushIsBounded(NameWatcher& names, Destination dest) {
 }
 
 void runLossAndStallPhases(NameWatcher& names, const std::string& blue, const std::string& red) {
-    checkStaticLossAndRestart(names, blue, red);
-    checkRepeatedVideoLoss(names);
-    checkNoDeviceIsNotLoss(names, blue, red);
-    checkStuckLossStop(names, blue, OutsideSignals::None);
-    checkStuckLossStop(names, blue, OutsideSignals::OneWhenStuck);
-    checkOutsideWakeSignalIgnored(names, blue);
-    checkOneStreamStalled(names, blue, OneStalled::StdoutThenSigterm);
-    checkOneStreamStalled(names, blue, OneStalled::StderrThenSigusr1);
-    checkOneStreamStalled(names, blue, OneStalled::StderrThenDeviceLoss);
-    checkOutsideAlarmIgnored(names, blue, red);
-    checkLossInsideUnfinishedRender(names, blue);
-    checkLineAfterMainReturns(names);
-    checkShutdownWatchFailureFlushes(names);
-    checkFailedStartPastDeadline(names);
+    using wallpaperx::testing::phaseSelected;
+    if (phaseSelected("staticLossAndRestart")) checkStaticLossAndRestart(names, blue, red);
+    if (phaseSelected("repeatedVideoLoss")) checkRepeatedVideoLoss(names);
+    if (phaseSelected("noDeviceIsNotLoss")) checkNoDeviceIsNotLoss(names, blue, red);
+    if (phaseSelected("stuckLossStop/noSignal")) checkStuckLossStop(names, blue, OutsideSignals::None);
+    if (phaseSelected("stuckLossStop/oneSigtermWhenStuck")) checkStuckLossStop(names, blue, OutsideSignals::OneWhenStuck);
+    if (phaseSelected("outsideWakeSignalIgnored")) checkOutsideWakeSignalIgnored(names, blue);
+    if (phaseSelected("oneStreamStalled/stdoutThenSigterm")) {
+        checkOneStreamStalled(names, blue, OneStalled::StdoutThenSigterm);
+    }
+    if (phaseSelected("oneStreamStalled/stderrThenSigusr1")) {
+        checkOneStreamStalled(names, blue, OneStalled::StderrThenSigusr1);
+    }
+    if (phaseSelected("oneStreamStalled/stderrThenDeviceLoss")) {
+        checkOneStreamStalled(names, blue, OneStalled::StderrThenDeviceLoss);
+    }
+    if (phaseSelected("outsideAlarmIgnored")) checkOutsideAlarmIgnored(names, blue, red);
+    if (phaseSelected("lossInsideUnfinishedRender")) checkLossInsideUnfinishedRender(names, blue);
+    if (phaseSelected("lineAfterMainReturns")) checkLineAfterMainReturns(names);
+    if (phaseSelected("shutdownWatchFailureFlushes")) checkShutdownWatchFailureFlushes(names);
+    if (phaseSelected("failedStartPastDeadline")) checkFailedStartPastDeadline(names);
     for (const Destination dest : {Destination::Pipe, Destination::Socket, Destination::Terminal}) {
+        const std::string on = std::string("/") + describe(dest);
         // A destination this host cannot give (no pseudo-terminals) costs its own phases, not the rest.
         // By hand 2026-09-25, reverted: posix_openpt made to fail -> one "FAIL (harness): terminal
         // phases: ..." and every later phase still ran, no FAIL.
         try {
-            checkServesWhileStalled(names, blue, red, dest);
-            checkLongStall(names, dest);
-            checkStartedStalled(names, blue, dest);
+            if (phaseSelected("servesWhileStalled" + on)) checkServesWhileStalled(names, blue, red, dest);
+            if (phaseSelected("longStall" + on)) checkLongStall(names, dest);
+            if (phaseSelected("startedStalled" + on)) checkStartedStalled(names, blue, dest);
             for (const StalledEnd end : {StalledEnd::Sigterm, StalledEnd::SecondSigterm, StalledEnd::DeviceLoss}) {
-                checkStalledEnd(names, blue, dest, end);
+                const char* how = end == StalledEnd::Sigterm         ? "/sigterm"
+                                  : end == StalledEnd::SecondSigterm ? "/secondSigterm"
+                                                                     : "/deviceLoss";
+                if (phaseSelected("stalledEnd" + on + how)) checkStalledEnd(names, blue, dest, end);
             }
         } catch (const std::exception& e) {
             harnessFailure(std::string(describe(dest)) + " phases: " + e.what());
         }
     }
-    checkQueueBounded(names);
+    if (phaseSelected("queueBounded")) checkQueueBounded(names);
     for (const SpawnedDaemon::Stdout mode : {SpawnedDaemon::Stdout::StdoutClosed, SpawnedDaemon::Stdout::StderrClosed,
                                              SpawnedDaemon::Stdout::BothClosed}) {
-        checkClosedAtLaunch(names, blue, mode);
+        const char* which = mode == SpawnedDaemon::Stdout::StdoutClosed   ? "closedAtLaunch/stdout"
+                            : mode == SpawnedDaemon::Stdout::StderrClosed ? "closedAtLaunch/stderr"
+                                                                          : "closedAtLaunch/both";
+        if (phaseSelected(which)) checkClosedAtLaunch(names, blue, mode);
     }
 }
 
@@ -2316,9 +2332,14 @@ int main(int argc, char** argv) {
         NameWatcher names;
         if (crashFlush) {
             for (const Destination dest : {Destination::Pipe, Destination::Socket, Destination::Terminal}) {
+                const std::string on = std::string("/") + describe(dest);
                 try {
-                    checkCrashDeliversQueuedLine(names, dest);
-                    checkCrashFlushIsBounded(names, dest);
+                    if (wallpaperx::testing::phaseSelected("crashDeliversQueuedLine" + on)) {
+                        checkCrashDeliversQueuedLine(names, dest);
+                    }
+                    if (wallpaperx::testing::phaseSelected("crashFlushIsBounded" + on)) {
+                        checkCrashFlushIsBounded(names, dest);
+                    }
                 } catch (const std::exception& e) {
                     harnessFailure(std::string("crash on a ") + describe(dest) + ": " + e.what());
                 }

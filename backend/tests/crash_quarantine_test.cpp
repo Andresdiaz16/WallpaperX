@@ -522,11 +522,12 @@ void runPlaybackDeathChecks(const std::filesystem::path& root) {
     // WHY-THIS-SHAPE: the reset is graded by a death after it, because "not refused" alone is also
     //       what a reset to one short would show. The other monitor's request comes first, in a run of
     //       its own, so a reset that cleared every monitor goes red before the real one runs.
-    // CONTROL: in backend/daemon/wallpaper_manager.cpp, (a) `m_playing.clear(monitorId);` deleted from
-    //       requestWallpaper() -> "FAIL: setting the video again clears its refusal at the next
-    //       start" and "FAIL: after being set again, one more named death refuses nothing", printing
-    //       "the 3rd time"; (b) that line replaced by a loop clearing every monitor id -> exactly
-    //       "FAIL: a request for another monitor resets nothing". Observed 2026-09-21; reverted.
+    // CONTROL: in WallpaperManager::requestWallpaper (backend/daemon/wallpaper_manager.cpp), via
+    //       control_batch.sh, 2026-09-29, both reverted. (a) `m_playing.clear(monitorId);` deleted ->
+    //       "FAIL: setting the video again clears its refusal at the next start" and "FAIL: after
+    //       being set again, one more named death refuses nothing", printing "the 3rd time"; (b) that
+    //       line replaced by a loop clearing every monitor id -> exactly "FAIL: a request for another
+    //       monitor resets nothing".
     if (!runStart(configFile, stateDir, [&](WallpaperManager& m) {
             m.requestWallpaper("video", goodVideo, kGoodVideoMonitor);
         })) {
@@ -646,7 +647,7 @@ int main(int argc, char** argv) {
         //       `state.quarantined = crash && ...` replaced with `= false` -> 20 FAIL lines,
         //       from "a monitor whose record matches its wallpaper is refused with a reason"
         //       through "a consumer leaving the bus re-posts the refused monitor too", the video
-        //       row's four among them. Re-observed 2026-09-16. Reverted.
+        //       row's four among them. Observed 2026-09-16. Reverted.
         {
             const WallpaperManager::Snapshot snap = manager.snapshot();
             const std::optional<wallpaperx::MonitorStatus> crashed = monitor(snap, kCrashedMonitor);
@@ -761,7 +762,7 @@ int main(int argc, char** argv) {
         //       in the import-modifier checks below). With both removed: "FAIL: the refused
         //       wallpaper is never opened, let alone decoded -- the refused file was opened 1
         //       time(s); the rendered one 1", 13 FAIL lines in all, the video row's two among
-        //       them. Re-observed 2026-09-16. Both reverted.
+        //       them. Observed 2026-09-16. Both reverted.
         if (crashedWatch.ok() && movedOnWatch.ok()) {
             const int refusedOpens = crashedWatch.drain();
             const int controlOpens = movedOnWatch.drain();
@@ -832,7 +833,7 @@ int main(int argc, char** argv) {
             //       beside it, with the two re-post record checks further down. (The same call added
             //       to renderPassLocked()'s quarantined branch instead reddens only those two re-post
             //       checks, because the first pass returns earlier -- at the already-serviced test.)
-            //       Both re-observed 2026-09-16. Reverted.
+            //       Both observed 2026-09-16. Reverted.
             check(recordOnDisk(stateDir, kCrashedMonitor),
                   "the record stays on disk, so a second restart refuses too");
             check(recordOnDisk(stateDir, kKilledMonitor),
@@ -857,8 +858,8 @@ int main(int argc, char** argv) {
         //       row no longer holds.
         // CONTROL: in backend/daemon/wallpaper_manager.cpp, the removeCrashRecord() call in the
         //       unsupported-type branch of WallpaperManager::renderPassLocked deleted -> "FAIL: a
-        //       stale record on an unrenderable row is removed by its pass". Re-observed
-        //       2026-09-15 with the row a `shader`, red on both ICD entries. Reverted.
+        //       stale record on an unrenderable row is removed by its pass". Observed
+        //       2026-09-15, red on both ICD entries. Reverted.
         check(!recordOnDisk(stateDir, kUnsupportedMonitor),
               "a stale record on an unrenderable row is removed by its pass");
 
@@ -895,7 +896,7 @@ int main(int argc, char** argv) {
         //       WallpaperManager::renderPassLocked deleted -> "FAIL: an import-modifier report does
         //       not decode a refused wallpaper", "FAIL: the record survives an import-modifier
         //       report", and the two checks after them that the monitor is still refused and that a
-        //       departing consumer re-posts it. Re-observed 2026-09-14. Reverted.
+        //       departing consumer re-posts it. Observed 2026-09-14. Reverted.
         {
             // Taken from the daemon's own answer rather than written as a fourcc here: a
             // report for any other format is refused outright, so a hardcoded constant would

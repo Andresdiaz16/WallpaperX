@@ -18,6 +18,7 @@
 
 #include "support/forked_child.h"
 #include "tests/client/scratch_dir.h"
+#include "tests/test_phase.h"
 #include "tests/test_report.h"
 
 #include <nlohmann/json.hpp>
@@ -495,7 +496,7 @@ bool diedOf(const ChildResult& result, int sig) {
 //       deleted -> "the record left by a memory fault on the applying thread is stamped with it"
 //       and "the reason a client reads ... names that signal", each for the fault and the abort,
 //       with the chaining phase's stamp line and the playing record's "and the signal that killed
-//       it": six. Re-observed 2026-09-25 via control_run.sh; reverted.
+//       it": six. Observed 2026-09-25 via control_run.sh; reverted.
 void runStampedChecks(int sig, Mode mode, const char* what) {
     ScratchDir scratch("crashstamp");
     if (!scratch.ok()) {
@@ -546,7 +547,7 @@ void runStampedChecks(int sig, Mode mode, const char* what) {
 //       performs once its compare-exchange confirms the copied name replaced by `(void)path` ->
 //       "a crash on a thread that is not applying leaves no record" and "...leaves no file on
 //       disk" red, with the log-writer fault phase's line; the stalled phase below is NOT VERIFIED
-//       under it, since the record it waits to see removed never is. Re-observed 2026-09-25 via
+//       under it, since the record it waits to see removed never is. Observed 2026-09-25 via
 //       control_run.sh; reverted.
 void runOtherThreadChecks() {
     ScratchDir scratch("crashother");
@@ -610,7 +611,7 @@ void runLogWriterFaultChecks() {
 // CONTROL: in backend/daemon/crash_record.cpp, onFatalSignal's other-thread branch made a bare
 //       `unlinkPublished(generation)` instead of stopBlamingWallpapers() -> this phase's "leaves no
 //       record, even one begun during the handler's flush" red, alone; S13.12's phase above stays
-//       green, since the live record is still removed. Re-observed 2026-09-27 via control_run.sh;
+//       green, since the live record is still removed. Observed 2026-09-27 via control_run.sh;
 //       reverted. By hand, reverted: the child's 'b' byte made 'x' -> NOT VERIFIED, no FAIL.
 void runStalledOtherThreadChecks() {
     ScratchDir scratch("crashstalled");
@@ -931,7 +932,7 @@ void runReportChecks() {
 // CONTROL: in backend/daemon/crash_record.cpp, ApplyingRecord's constructor changed to return
 //       before its write loop (`if (true) { ::close(fd); return; }`) -> "a process killed while
 //       applying leaves a record" red, with every other phase that reads a record back (seven
-//       lines in all). Re-observed 2026-09-25 via control_run.sh; reverted.
+//       lines in all). Observed 2026-09-25 via control_run.sh; reverted.
 void runKilledChecks() {
     ScratchDir scratch("crashkilled");
     if (!scratch.ok()) {
@@ -998,7 +999,7 @@ void runCleanExitChecks() {
 //       and the pipe is drained after the reap, so "no byte" cannot mean "not yet".
 // CONTROL: in backend/daemon/crash_record.cpp, the whole `if (sig >= 0 && sig < kHandlerSlots)`
 //       block in onFatalSignal() made `if (false)` -> "FAIL: the handler installed before this one
-//       still runs", alone. Re-observed 2026-09-25 via control_run.sh; reverted.
+//       still runs", alone. Observed 2026-09-25 via control_run.sh; reverted.
 void runChainingChecks() {
     ScratchDir scratch("crashchain");
     if (!scratch.ok()) {
@@ -1285,7 +1286,7 @@ std::string describeDied(const std::optional<wallpaperx::PlayingHistory>& histor
 //       onFatalSignal() deleted -> "FAIL: a fault on the thread working on a video names that video
 //       in the playing record", printing "the record names no video", and "FAIL: and the signal
 //       that killed it" (a signal is read only beside a name); the replacement check below then
-//       reports a harness fault, having no named death to replace. Re-observed 2026-09-25 via
+//       reports a harness fault, having no named death to replace. Observed 2026-09-25 via
 //       control_run.sh; reverted.
 void runPlayingBlameChecks() {
     ScratchDir scratch("playingnamed");
@@ -1327,7 +1328,7 @@ void runPlayingBlameChecks() {
 //       record was ended names nothing"; (d) PlayingBlame's constructor made to write `line` into
 //       the record at once, as a record-per-picture design would -> "FAIL: SIGKILL while a video is
 //       being worked on names nothing" and the three cases above with it. Each of (a)-(c) reddened
-//       its own case alone. All observed 2026-09-21, (a) re-observed 2026-09-25 via control_run.sh;
+//       its own case alone. (a) observed 2026-09-25 via control_run.sh, the others 2026-09-21;
 //       reverted.
 void runPlayingNamesNothingChecks() {
     struct Case {
@@ -1467,19 +1468,20 @@ int main() {
     }
 
     try {
-        runStampedChecks(SIGSEGV, Mode::FaultOnApplying, "a memory fault");
-        runStampedChecks(SIGABRT, Mode::AbortOnApplying, "an abort");
-        runOtherThreadChecks();
-        runLogWriterFaultChecks();
-        runStalledOtherThreadChecks();
-        runReportChecks();
-        runKilledChecks();
-        runCleanExitChecks();
-        runChainingChecks();
-        runOnDiskChecks();
-        runPlayingBlameChecks();
-        runPlayingNamesNothingChecks();
-        runPlayingRecordRules();
+        using wallpaperx::testing::phaseSelected;
+        if (phaseSelected("stampedFault")) runStampedChecks(SIGSEGV, Mode::FaultOnApplying, "a memory fault");
+        if (phaseSelected("stampedAbort")) runStampedChecks(SIGABRT, Mode::AbortOnApplying, "an abort");
+        if (phaseSelected("otherThread")) runOtherThreadChecks();
+        if (phaseSelected("logWriterFault")) runLogWriterFaultChecks();
+        if (phaseSelected("stalledOtherThread")) runStalledOtherThreadChecks();
+        if (phaseSelected("report")) runReportChecks();
+        if (phaseSelected("killed")) runKilledChecks();
+        if (phaseSelected("cleanExit")) runCleanExitChecks();
+        if (phaseSelected("chaining")) runChainingChecks();
+        if (phaseSelected("onDisk")) runOnDiskChecks();
+        if (phaseSelected("playingBlame")) runPlayingBlameChecks();
+        if (phaseSelected("playingNamesNothing")) runPlayingNamesNothingChecks();
+        if (phaseSelected("playingRecordRules")) runPlayingRecordRules();
     } catch (const std::exception& e) {
         harnessFailure(std::string("the run ended in an unhandled exception: ") + e.what());
     }

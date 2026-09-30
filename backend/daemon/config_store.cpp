@@ -39,6 +39,7 @@ constexpr const char* kKeyOutput = "output";
 constexpr const char* kKeyOutputSize = "output_size";
 constexpr const char* kKeyWidth = "width";
 constexpr const char* kKeyHeight = "height";
+constexpr const char* kKeyProperties = "properties";
 
 // load() returns from a dozen places; this is what keeps the descriptor from leaking out
 // of any of them.
@@ -104,8 +105,8 @@ bool readMonitorId(const nlohmann::json& object, int& out) {
     return readInt(object.at(kKeyMonitorId), out);
 }
 
-// Anything unreadable comes back 0x0, which the manager's range check refuses and reports. A size
-// is a measurement the screen sends again, so it never costs the row it rides on.
+// A size is a measurement the screen sends again, so an unreadable one never costs the row it
+// rides on: it comes back 0x0 and the manager refuses and reports it.
 OutputSize readOutputSize(const nlohmann::json& field) {
     int width = 0;
     int height = 0;
@@ -118,6 +119,19 @@ OutputSize readOutputSize(const nlohmann::json& field) {
 }
 
 }  // namespace
+
+// No nlohmann::json: destroying a non-empty one allocates inside its noexcept destructor, and
+// this runs on every manager call that saves, where an allocation failure must stay a
+// std::bad_alloc rather than std::terminate. Keys in the order dump() sorts them.
+std::string toJsonText(const OutputSize& size) {
+    return std::string("{\"") + kKeyHeight + "\":" + std::to_string(size.height) + ",\"" + kKeyWidth +
+           "\":" + std::to_string(size.width) + "}";
+}
+
+OutputSize outputSizeFromJson(const std::string& text) {
+    const nlohmann::json field = nlohmann::json::parse(text, nullptr, false);
+    return field.is_discarded() ? OutputSize{} : readOutputSize(field);
+}
 
 std::filesystem::path defaultConfigPath() {
     if (const char* xdg = std::getenv("XDG_CONFIG_HOME"); xdg != nullptr && *xdg != '\0') {
@@ -255,7 +269,10 @@ LoadResult ConfigStore::load() const {
                 ++result.malformedEntries;
                 continue;
             }
-            if (element.contains(kKeyOutputSize)) entry.outputSize = readOutputSize(element.at(kKeyOutputSize));
+            // Optional, and like properties below, not judged here: see PersistedWallpaper::propertiesJson.
+            if (element.contains(kKeyOutputSize)) entry.outputSizeJson = element.at(kKeyOutputSize).dump();
+            // A config written before properties existed has none.
+            if (element.contains(kKeyProperties)) entry.propertiesJson = element.at(kKeyProperties).dump();
             result.entries.push_back(std::move(entry));
         }
     } catch (const std::exception& e) {
@@ -300,13 +317,22 @@ SaveResult ConfigStore::save(const std::vector<PersistedWallpaper>& entries) con
             nlohmann::json row{{kKeyMonitorId, entry.monitorId},
                                {kKeyType, wallpaperOk ? entry.type : ""},
                                {kKeyPath, wallpaperOk ? entry.path : ""}};
+            // Only beside a wallpaper they belong to, and only when there are some, for the reason
+            // `output` below gives.
+            if (wallpaperOk && (!entry.type.empty() || !entry.path.empty()) && !entry.propertiesJson.empty()) {
+                // Every caller passes text dump() produced. Anything else costs this field, not the
+                // whole write.
+                nlohmann::json properties = nlohmann::json::parse(entry.propertiesJson, nullptr, false);
+                if (!properties.is_discarded()) row[kKeyProperties] = std::move(properties);
+            }
             // Only when there is one: a config for an install that never named a screen
             // stays byte-identical to what a build without this field writes.
             if (nameOk && !entry.output.empty()) {
                 row[kKeyOutput] = entry.output;
-                if (entry.outputSize) {
-                    row[kKeyOutputSize] = {{kKeyWidth, entry.outputSize->width},
-                                           {kKeyHeight, entry.outputSize->height}};
+                if (!entry.outputSizeJson.empty()) {
+                    // Same contract as properties above.
+                    nlohmann::json size = nlohmann::json::parse(entry.outputSizeJson, nullptr, false);
+                    if (!size.is_discarded()) row[kKeyOutputSize] = std::move(size);
                 }
             }
             monitors.push_back(std::move(row));

@@ -7,6 +7,7 @@
 // Manifests are raw JSON text or nlohmann::ordered_json, never QJsonObject: QJsonObject sorts keys,
 // which would erase the property order the tests exist to check.
 
+#include "tests/test_phase.h"
 #include "tests/test_report.h"
 
 #include <QBuffer>
@@ -301,6 +302,7 @@ inline void pump(int ms) {
 // test or from the file's own fixtures, and the line says so rather than guessing.
 template <typename Phase>
 void runPhase(const char* name, Phase phase) {
+    if (!testing::phaseSelected(name)) return;
     std::string escaped;
     try {
         phase();

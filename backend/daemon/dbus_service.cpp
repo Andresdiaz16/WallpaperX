@@ -38,6 +38,37 @@ constexpr const char* kErrorBusy = "io.wallpaperx.Daemon.Error.Busy";
 constexpr const char* kErrorUnknownOutput = "io.wallpaperx.Daemon.Error.UnknownOutput";
 constexpr const char* kErrorInvalidArgs = "org.freedesktop.DBus.Error.InvalidArgs";
 
+// Each value by its D-Bus type -- d, b, or s holding "#rrggbb" -- and nothing converted: an i for
+// a float property is a client that does not know what it is sending. Which keys and values are
+// acceptable is the manager's rule.
+WallpaperProperties fromWire(const std::map<std::string, sdbus::Variant>& wire) {
+    // Before the copy, which is what the bound is for.
+    if (wire.size() > kMaxProperties) {
+        throw InvalidRequest("at most " + std::to_string(kMaxProperties) + " properties, got " +
+                             std::to_string(wire.size()));
+    }
+    WallpaperProperties properties;
+    for (const auto& [key, value] : wire) {
+        if (value.containsValueOfType<double>()) {
+            properties.emplace(key, value.get<double>());
+        } else if (value.containsValueOfType<bool>()) {
+            properties.emplace(key, value.get<bool>());
+        } else if (value.containsValueOfType<std::string>()) {
+            const std::optional<Colour> colour = parseColour(value.get<std::string>());
+            if (!colour) {
+                throw InvalidRequest("property " + sanitizeForLog(key, 128) + " is a string but not a colour \"#rrggbb\"");
+            }
+            properties.emplace(key, *colour);
+        } else {
+            const char* signature = value.peekValueType();
+            throw InvalidRequest("property " + sanitizeForLog(key, 128) + " has D-Bus type " +
+                                 sanitizeForLog(signature != nullptr ? signature : "", 64) +
+                                 "; expected d, b or s");
+        }
+    }
+    return properties;
+}
+
 }  // namespace
 
 DbusService::DbusService(sdbus::IConnection& connection, WallpaperManager& manager)
@@ -142,9 +173,22 @@ void DbusService::registerVTable() {
         ->addVTable(
             sdbus::registerMethod("SetWallpaper")
                 .implementedAs([this](const std::string& type, const std::string& path, int32_t monitorId) {
-                    setWallpaper(type, path, monitorId);
+                    setWallpaper("SetWallpaper", type, path, monitorId, {});
                 })
                 .withInputParamNames("type", "path", "monitor_id"),
+            // A method of its own rather than a fourth argument on SetWallpaper: a changed signature
+            // is refused by the bus for every client still sending three.
+            sdbus::registerMethod("SetWallpaperWithProperties")
+                .implementedAs([this](const std::string& type, const std::string& path, int32_t monitorId,
+                                      const WireProperties& properties) {
+                    setWallpaper("SetWallpaperWithProperties", type, path, monitorId, properties);
+                })
+                .withInputParamNames("type", "path", "monitor_id", "properties"),
+            sdbus::registerMethod("SetWallpaperProperties")
+                .implementedAs([this](int32_t monitorId, const WireProperties& properties) {
+                    setWallpaperProperties(monitorId, properties);
+                })
+                .withInputParamNames("monitor_id", "properties"),
             sdbus::registerMethod("GetFrameFd")
                 // Async: the handler hands the export to the GPU thread and returns, so
                 // the event loop keeps serving while the frame is produced.
@@ -259,21 +303,25 @@ void DbusService::emitFrameReady(int monitorId, uint64_t generation) {
     }
 }
 
-void DbusService::setWallpaper(const std::string& type, const std::string& path, int32_t monitorId) {
+void DbusService::setWallpaper(const char* method, const std::string& type, const std::string& path,
+                               int32_t monitorId, const WireProperties& properties) {
     // On entry, not on success: most clients drop the error reply, so logging afterwards
     // left failed requests indistinguishable from ones that never arrived. Both strings
     // come off the wire, hence sanitizeForLog -- see log_escape.h.
-    std::printf("wallpaperx-daemon: SetWallpaper(type=%s, path=%s, monitor=%d)\n",
-                sanitizeForLog(type).c_str(), sanitizeForLog(path).c_str(), monitorId);
+    // The count only when there are some, so a line with none reads as it always has. One printf:
+    // the render thread writes stdout too, and could land inside a line built from several.
+    const std::string counted = properties.empty() ? "" : ", properties=" + std::to_string(properties.size());
+    std::printf("wallpaperx-daemon: %s(type=%s, path=%s, monitor=%d%s)\n", method, sanitizeForLog(type).c_str(),
+                sanitizeForLog(path).c_str(), monitorId, counted.c_str());
     std::fflush(stdout);
 
     try {
-        m_manager.requestWallpaper(type, path, monitorId);
+        m_manager.requestWallpaper(type, path, monitorId, fromWire(properties));
     } catch (const InvalidRequest& e) {
-        std::fprintf(stderr, "wallpaperx-daemon: SetWallpaper rejected (monitor=%d): %s\n", monitorId, e.what());
+        std::fprintf(stderr, "wallpaperx-daemon: %s rejected (monitor=%d): %s\n", method, monitorId, e.what());
         throw sdbus::Error(sdbus::Error::Name{kErrorInvalidArgs}, e.what());
     } catch (const std::exception& e) {
-        std::fprintf(stderr, "wallpaperx-daemon: SetWallpaper failed (monitor=%d): %s\n", monitorId, e.what());
+        std::fprintf(stderr, "wallpaperx-daemon: %s failed (monitor=%d): %s\n", method, monitorId, e.what());
         throw sdbus::Error(sdbus::Error::Name{kErrorRenderFailed}, e.what());
     }
 
@@ -281,6 +329,26 @@ void DbusService::setWallpaper(const std::string& type, const std::string& path,
     // needs its monitor's target released, and that is GPU work, so it belongs on the
     // worker rather than in this handler.
     m_worker.post(monitorId);
+}
+
+void DbusService::setWallpaperProperties(int32_t monitorId, const WireProperties& properties) {
+    // Refusals only: a slider sends one of these per step, and a line for each accepted one would
+    // bury everything else in the journal.
+    try {
+        m_manager.setWallpaperProperties(monitorId, fromWire(properties));
+    } catch (const InvalidRequest& e) {
+        std::fprintf(stderr, "wallpaperx-daemon: SetWallpaperProperties rejected (monitor=%d): %s\n", monitorId,
+                     e.what());
+        throw sdbus::Error(sdbus::Error::Name{kErrorInvalidArgs}, e.what());
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "wallpaperx-daemon: SetWallpaperProperties failed (monitor=%d): %s\n", monitorId,
+                     e.what());
+        throw sdbus::Error(sdbus::Error::Name{kErrorRenderFailed}, e.what());
+    }
+
+    // No render: the picture on screen is still right. The round this wakes times the picture
+    // waiting after it at the new speed, which the worker's current sleep was computed without.
+    m_worker.wake();
 }
 
 void DbusService::setImportModifiers(const std::string& client, uint32_t drmFormat,
@@ -315,7 +383,8 @@ void DbusService::setMonitorOutput(int32_t monitorId, const std::string& outputN
                      monitorId, e.what());
         throw sdbus::Error(sdbus::Error::Name{kErrorInvalidArgs}, e.what());
     } catch (const std::exception& e) {
-        // The binding stands although the write failed, so the redraws it owes are still owed.
+        // A write that failed leaves the binding standing, so the redraws it owes are still owed.
+        // A save that could not be queued undid the binding and owes none.
         for (const int id : redraw) m_worker.post(id);
         // As SetWallpaper does: the save behind this can throw on a machine out of threads
         // or memory, and letting that escape the callback tells the client nothing.
@@ -343,8 +412,7 @@ void DbusService::setOutputSize(const std::string& outputName, uint32_t width, u
         std::fprintf(stderr, "wallpaperx-daemon: SetOutputSize rejected: %s\n", e.what());
         throw sdbus::Error(sdbus::Error::Name{kErrorInvalidArgs}, e.what());
     } catch (const std::exception& e) {
-        // The size stands although its save could not be queued, so the redraw it owes is still owed.
-        for (const int id : redraw) m_worker.post(id);
+        // No redraw: a size whose save could not be queued was undone.
         std::fprintf(stderr, "wallpaperx-daemon: SetOutputSize failed: %s\n", e.what());
         throw sdbus::Error(sdbus::Error::Name{kErrorRenderFailed}, e.what());
     }
@@ -588,6 +656,9 @@ std::string DbusService::getStatus() {
                              {"path_literal", literal ? nlohmann::json(*literal) : nlohmann::json(nullptr)},
                              {"generation", monitor.generation},
                              {"has_frame", monitor.hasFrame}};
+        // As set, not as applied: a speed below the playback range plays at its bottom. Keys
+        // need no escaping, since propertiesError() admits only ASCII letters, digits and "_-.".
+        entry["properties"] = toJson(monitor.properties);
         if (monitor.hasFrame) {
             entry["width"] = monitor.width;
             entry["height"] = monitor.height;

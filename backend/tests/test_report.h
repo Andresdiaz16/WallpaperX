@@ -95,14 +95,32 @@ inline void notVerified(const char* goals, const std::string& reason) {
     ++g_notVerified;
 }
 
-// Prints the failure summary, if there is one. Returns true when the run must go red.
+// Set by tests/test_phase.h once a run offers its first phase: test_phase.h's verdict(), which prints
+// which phases ran and returns true when the run's phases make it red (see there for when). Printed by
+// reportCheckFailures(), and its red returned by reportNotVerifiedOrPassed(), which every run that is
+// not already red reaches -- so every main() that adopts phases gets the check without calling it.
+// CONTROL: via control_batch.sh, 2026-09-29: crash_record_test with one phase name offered three
+//       times, --phase '^onDisk$' -> Failed; the same with the verdict test dropped from
+//       reportNotVerifiedOrPassed() -> Passed, "all checks passed" printed under the "phase name(s)
+//       offered twice: killed" FAIL (harness) line, so the red rests on that test alone. Reverted.
+inline bool (*g_phaseFilterVerdict)() = nullptr;
+
+// Prints the failure summary, if there is one. Returns true when checks failed, and only then.
 //
 // Split from reportNotVerifiedOrPassed() rather than folded into it because two callers put
 // their own red channel between the two halves, and they order it differently:
 // kpackage_metadata_test prints its harness-fault line after this summary and returns 1 for
 // either, daemon_system_test returns 1 here and never reaches its harness line. A single
-// do-everything epilogue would have to pick one of those orders for both.
+// do-everything epilogue would have to pick one of those orders for both. The phase verdict is
+// printed here but not returned: a true return would send daemon_system_test past its own
+// harness summary for a run whose checks all held.
+// CONTROL: via control_batch.sh, 2026-09-29: daemon_system_test given one setup fault and a
+//       dependent phase renamed, --phase '^sigintShutdown$' -> Failed, with "1 phase(s) could not
+//       be set up by the harness ... No conclusion about the daemon either way." after the
+//       FAIL (harness) line. With this returning the verdict instead -> Failed without that line.
+//       Reverted.
 [[nodiscard]] inline bool reportCheckFailures() {
+    if (g_phaseFilterVerdict != nullptr) static_cast<void>(g_phaseFilterVerdict());
     if (g_failures > 0) {
         std::fprintf(stderr, "%s: %d check(s) failed\n", g_testName, g_failures);
         return true;
@@ -136,6 +154,7 @@ constexpr const char* kSkipReasonHost = "goal(s) could not be exercised on this 
 // covered, so a run that quietly stopped sweeping is visible.
 [[nodiscard]] inline int reportNotVerifiedOrPassed(const char* skipClause = kSkipReasonHost,
                                                    const std::string& passDetail = "") {
+    if (g_phaseFilterVerdict != nullptr && g_phaseFilterVerdict()) return 1;
     // Part 2 of the contract, enforced here rather than trusted to each main(): reaching
     // this with failures pending would return 77 and let ctest print "Skipped" over a run
     // that had red in it. Unreachable from all six callers today -- they all ask

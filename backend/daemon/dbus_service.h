@@ -8,6 +8,7 @@
 #include <sdbus-c++/sdbus-c++.h>
 
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -51,7 +52,16 @@ private:
     // Returns once the request is recorded and queued: a successful reply means "accepted",
     // not "the frame is ready" -- FrameReady announces that. Only client-side mistakes fail
     // synchronously, since they cost nothing to detect.
-    void setWallpaper(const std::string& type, const std::string& path, int32_t monitorId);
+    //
+    // SetWallpaper and SetWallpaperWithProperties both land here, `method` naming which in the log;
+    // SetWallpaper is the second with no properties.
+    using WireProperties = std::map<std::string, sdbus::Variant>;
+    void setWallpaper(const char* method, const std::string& type, const std::string& path, int32_t monitorId,
+                      const WireProperties& properties);
+
+    // Replaces the properties of the wallpaper a monitor holds without setting it again, so a
+    // playing video carries on. Wakes the worker, which re-times the picture waiting to be shown.
+    void setWallpaperProperties(int32_t monitorId, const WireProperties& properties);
 
     // Complete on return, unlike SetWallpaper: an accepted reply means the mapping reached the
     // config file. An error means it did not -- the binding still stands for this run but will

@@ -11,6 +11,7 @@
 // cache against them and cannot include this header.
 #include "ring_depth.h"
 #include "vulkan/frame_export.h"
+#include "wallpaper_properties.h"
 
 #include <cstdint>
 #include <filesystem>
@@ -75,6 +76,7 @@ struct BufferHold {
 struct MonitorStatus {
     std::string type;
     std::string path;
+    WallpaperProperties properties;
     uint32_t width = 0;
     uint32_t height = 0;
     uint64_t generation = 0;
@@ -447,8 +449,16 @@ public:
     // Records a request; GPU-free. Throws InvalidRequest for a malformed one, and everything
     // that can only fail on the GPU fails later in renderPending(). The caller must then post
     // the monitor to the render worker, types this build cannot draw included -- those still
-    // need their target released.
-    void requestWallpaper(const std::string& type, const std::string& path, int monitorId);
+    // need their target released. `properties` replace whatever the previous wallpaper had.
+    void requestWallpaper(const std::string& type, const std::string& path, int monitorId,
+                          const WallpaperProperties& properties = {});
+
+    // Replaces the properties of the wallpaper this monitor holds, keeping the wallpaper: a video
+    // plays on from the picture it is at. Throws InvalidRequest for a bad id, a set
+    // propertiesError() refuses, or a monitor holding no wallpaper. Needs no render; the caller
+    // wakes the render worker, whose next round times the waiting picture at the new speed. The
+    // write is queued, not waited on, since a slider sends a stream of these. Idempotent.
+    void setWallpaperProperties(int monitorId, const WallpaperProperties& properties);
 
     // Records the connector name a monitor is known by -- "DP-3". Throws InvalidRequest for a
     // bad id or a name outputNameError() rejects, and std::runtime_error when the name did not
@@ -698,6 +708,8 @@ private:
     struct MonitorState {
         std::string type;
         std::string path;
+        // Changed without a new request, so a playing video keeps its session through a change.
+        WallpaperProperties properties;
 
         // Counts accepted requests, where generation counts completed renders: the worker
         // snapshots requestSeq before rendering and refuses to commit if it has moved.
@@ -885,10 +897,10 @@ private:
     // wallpaper's. Caller must hold m_stateMutex.
     static MonitorState::ReopenBudget& playbackBudgetLocked(MonitorState& state);
 
-    // Records that the held picture was just drawn. One drawn later than its own interval -- a
-    // stall, not jitter -- restarts the schedule from `now`, so a long stall is not followed by
-    // pictures shown back to back.
-    static void markShown(VideoSession& session, std::chrono::steady_clock::time_point now);
+    // Records that the held picture was just drawn. One drawn more than its own interval at
+    // `speed` after it was due -- a stall, not jitter -- restarts the schedule from `now`, so a long stall is not
+    // followed by pictures shown back to back.
+    static void markShown(VideoSession& session, std::chrono::steady_clock::time_point now, double speed);
 
     // Credits `state`'s wallpaper with the play since its last clock picture, for the picture shown at
     // `now` -- nothing when that one was not `onTime`. True exactly once per wallpaper, when that play
@@ -1039,15 +1051,19 @@ private:
     // The persistence report, over that live state. Same locking rule.
     std::string keptDetail(const std::string& base) const;
 
-    // Hands `entries` to the writer without waiting, and reports a refusal or a missing
-    // thread as persistence health. Safe to call with no lock held.
-    void queuePersist(const std::vector<PersistedWallpaper>& entries);
+    // Hands `entries` to the writer without waiting; a refusal or a missing thread reaches
+    // persistence health through the writer's outcome. Never blocks, so a change can be queued
+    // under m_stateMutex and undone there if this throws: nothing is handed over in that case.
+    void queuePersist(std::vector<PersistedWallpaper> entries);
 
-    // The same, then the writer's bounded wait. Returns whether THESE entries are known to
-    // be on disk; on false, `whyNot` receives that write's own reason, sanitized. Takes no lock
-    // of its own, but it parks the calling thread on the write for up to the writer's deadline,
-    // which is why restoreSaved() hands its repair to queuePersist() instead.
-    bool persist(const std::vector<PersistedWallpaper>& entries, std::string* whyNot = nullptr);
+    // The writer's bounded wait for what was last queued. Returns whether it is known to be on
+    // disk; on false, `whyNot` receives that write's own reason, sanitized. Parks the calling
+    // thread for up to the writer's deadline, so never under m_stateMutex -- and never at
+    // startup, which is why restoreSaved()'s repair is only queued.
+    bool awaitPersisted(std::string& whyNot);
+    // The same wait with no answer, for a caller that has already committed its change and so
+    // must not throw.
+    void awaitPersisted() noexcept;
 
     // Folds the writer's answer, and the losses outliving it, into a health copy rather
     // than m_health: the writer's thread cannot touch this object.
@@ -1171,9 +1187,20 @@ private:
             std::chrono::steady_clock::time_point timeline;
             std::chrono::steady_clock::time_point due;
         };
+        // Keeps what is left of its distance from the picture on screen in the file's own time,
+        // running at `speed` from `from`. A speed change re-times the rest of the wait and keeps
+        // the part already waited, so the picture neither leaves at the old rate nor becomes due
+        // at a moment that had already passed when the speed changed.
         struct Waiting {
-            std::chrono::steady_clock::time_point due;
-            std::chrono::steady_clock::time_point timeline;
+            OnScreen previous;
+            std::chrono::steady_clock::time_point from;
+            std::chrono::nanoseconds left{};
+            double speed = 1.0;
+
+            // Re-times the rest of the wait from `now` when `speed` differs. A picture already
+            // due stays due where it was.
+            void retime(std::chrono::steady_clock::time_point now, double newSpeed);
+            OnScreen planned() const;
         };
         std::variant<Undrawn, OnScreen, Waiting> clock;
 

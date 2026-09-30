@@ -19,6 +19,7 @@ bool LiveWallpapers::holds(int monitorId) const {
 }
 
 bool KeptRows::dropWallpaper(PersistedWallpaper& row) {
+    row.propertiesJson.clear();
     if (row.type.empty() && row.path.empty()) return false;
     row.type.clear();
     row.path.clear();
@@ -53,7 +54,7 @@ std::vector<PersistedWallpaper> KeptRows::rowsToWrite(const LiveWallpapers& live
         if (monitorId < m_maxMonitors || live.outputs.count(row.output) != 0 ||
             !written.insert(row.output).second) {
             row.output.clear();
-            row.outputSize.reset();
+            row.outputSizeJson.clear();
         }
     }
     for (const auto& [name, binding] : live.outputs) {
@@ -62,7 +63,7 @@ std::vector<PersistedWallpaper> KeptRows::rowsToWrite(const LiveWallpapers& live
         // screen.
         row.monitorId = binding.monitorId;
         row.output = name;
-        row.outputSize = binding.size;
+        row.outputSizeJson = binding.size ? toJsonText(*binding.size) : std::string();
     }
 
     std::vector<PersistedWallpaper> entries;

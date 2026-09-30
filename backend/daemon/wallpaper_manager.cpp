@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -136,6 +137,18 @@ std::chrono::nanoseconds gapBetween(const PictureTiming& before, const PictureTi
         if (gap > std::chrono::nanoseconds::zero() && gap <= kMaxPictureInterval) return gap;
     }
     return ownInterval(before);
+}
+
+// A span of the file's own time as it passes on screen at `speed`, which playbackSpeed() bounds.
+std::chrono::nanoseconds atSpeed(std::chrono::nanoseconds span, double speed) {
+    return std::chrono::nanoseconds(std::llround(static_cast<double>(span.count()) / speed));
+}
+
+// How long `picture` holds the screen at `speed`. Floored again after dividing: the due times are
+// never closer than kMinPictureInterval, so an allowance or a wait under it measures a spacing the
+// schedule never uses.
+std::chrono::nanoseconds intervalAtSpeed(const PictureTiming& picture, double speed) {
+    return std::max(atSpeed(ownInterval(picture), speed), kMinPictureInterval);
 }
 
 WallpaperManager::Config withCheckedTiming(WallpaperManager::Config config) {
@@ -266,7 +279,7 @@ void WallpaperManager::writeRepairedConfig() {
     //
     // Queued, not waited on: the bus name is held and no event loop exists yet, so a wait here
     // answers nothing.
-    queuePersist(*repair);
+    queuePersist(std::move(*repair));
 }
 
 void WallpaperManager::recordStartingVideos() {
@@ -293,7 +306,12 @@ LiveWallpapers WallpaperManager::liveWallpapers() const {
     LiveWallpapers live;
     live.rows.reserve(m_monitors.size());
     for (const auto& [monitorId, state] : m_monitors) {
-        live.rows.push_back(PersistedWallpaper{monitorId, state.type, state.path, {}});
+        PersistedWallpaper row;
+        row.monitorId = monitorId;
+        row.type = state.type;
+        row.path = state.path;
+        row.propertiesJson = toJsonText(state.properties);
+        live.rows.push_back(std::move(row));
     }
     for (const auto& [name, monitorId] : m_outputs) {
         const auto size = m_outputSizes.find(name);
@@ -891,7 +909,8 @@ void WallpaperManager::applyImportModifiersLocked() {
     for (int id : monitorIds) releaseTarget(id);
 }
 
-void WallpaperManager::requestWallpaper(const std::string& type, const std::string& path, int monitorId) {
+void WallpaperManager::requestWallpaper(const std::string& type, const std::string& path, int monitorId,
+                                        const WallpaperProperties& properties) {
     if (!isKnownType(type)) {
         // Sanitized because this message is echoed to the log and returned over the bus,
         // and `type` is whatever the client sent -- a 200 000-character type string was
@@ -902,6 +921,7 @@ void WallpaperManager::requestWallpaper(const std::string& type, const std::stri
                              " (expected static, video or shader)");
     }
     requireValidMonitorId(monitorId);
+    if (const std::string why = propertiesError(properties); !why.empty()) throw InvalidRequest(why);
 
     // An early-out, not a guarantee: rendering is asynchronous, so without this the commonest
     // user error returns success and then silence. Both halves matter -- the type check alone
@@ -929,13 +949,32 @@ void WallpaperManager::requestWallpaper(const std::string& type, const std::stri
     }
     if (refusal) throw InvalidRequest(describeRejection(kComponent, *refusal, sanitizeForLog(path)));
 
-    std::vector<PersistedWallpaper> toPersist;
     {
         std::lock_guard<std::mutex> stateLock(m_stateMutex);
 
+        // All or nothing, so an error reply means nothing changed: the wallpaper is swapped in to
+        // build its save, and swapped back if queueing that throws.
+        std::string nextType = type;
+        std::string nextPath = path;
+        WallpaperProperties nextProperties = properties;
+        const bool existed = m_monitors.count(monitorId) != 0;
         MonitorState& state = m_monitors[monitorId];
-        state.type = type;
-        state.path = path;
+        const auto swapWallpaper = [&] {
+            state.type.swap(nextType);
+            state.path.swap(nextPath);
+            state.properties.swap(nextProperties);
+        };
+        swapWallpaper();
+        try {
+            // Before the kept row below is cleared, which changes nothing here: a live monitor's
+            // wallpaper already wins over a kept row for the same id.
+            queuePersist(m_kept.rowsToWrite(liveWallpapers()));
+        } catch (...) {
+            swapWallpaper();
+            if (!existed) m_monitors.erase(monitorId);
+            throw;
+        }
+
         ++state.requestSeq;
         // Bumped even when type and path are what this monitor already held: the same path can
         // name different bytes, and a decode session opened on the old ones must not be reused.
@@ -950,7 +989,7 @@ void WallpaperManager::requestWallpaper(const std::string& type, const std::stri
         // it counts renders, and no render has happened yet.
         state.hasFrame = false;
 
-        // A row kept for a newer build loses its monitor to this request, and the save below
+        // A row kept for a newer build loses its monitor to this request, and the save above
         // drops it. Erased and reported once, here: the same collision is counted when the
         // config is restored, and a client claiming the id later cost the user the same
         // picture with nothing anywhere saying so.
@@ -958,23 +997,45 @@ void WallpaperManager::requestWallpaper(const std::string& type, const std::stri
             m_kept.carried().begin(), m_kept.carried().end(),
             [monitorId](const PersistedWallpaper& row) { return row.monitorId == monitorId; });
         if (kept != m_kept.carried().end() && KeptRows::dropWallpaper(*kept)) m_kept.countReplacedKept();
-
-        toPersist = m_kept.rowsToWrite(liveWallpapers());
     }
 
     // Any request, whatever it names: it is a new statement about this monitor.
     m_playing.clear(monitorId);
 
     // Outside the lock, and before the render: what the user asked for is worth keeping
-    // whether or not it turns out to draw.
-    persist(toPersist);
+    // whether or not it turns out to draw. The no-answer wait, which cannot throw: the change is
+    // committed, and an error reply now would leave it saved and never drawn.
+    awaitPersisted();
+}
+
+void WallpaperManager::setWallpaperProperties(int monitorId, const WallpaperProperties& properties) {
+    requireValidMonitorId(monitorId);
+    if (const std::string why = propertiesError(properties); !why.empty()) throw InvalidRequest(why);
+
+    std::lock_guard<std::mutex> stateLock(m_stateMutex);
+    const auto it = m_monitors.find(monitorId);
+    if (it == m_monitors.end() || it->second.type.empty()) {
+        throw InvalidRequest("monitor " + std::to_string(monitorId) +
+                             " holds no wallpaper; properties are set with SetWallpaperWithProperties");
+    }
+    // The rule re-asserting a screen's size follows: unchanged writes only while the file is not
+    // known to hold it. Which is why a save that cannot be queued undoes the change: kept, it
+    // would make the retry look unchanged and on disk.
+    if (it->second.properties == properties && m_writer.outcome().onDisk()) return;
+    WallpaperProperties next = properties;
+    it->second.properties.swap(next);
+    try {
+        queuePersist(m_kept.rowsToWrite(liveWallpapers()));
+    } catch (...) {
+        it->second.properties.swap(next);
+        throw;
+    }
 }
 
 void WallpaperManager::setMonitorOutput(int monitorId, const std::string& outputName, std::vector<int>& redraw) {
     requireValidMonitorId(monitorId);
     requireValidOutputName(outputName);
 
-    std::vector<PersistedWallpaper> toPersist;
     {
         std::lock_guard<std::mutex> stateLock(m_stateMutex);
         // At most two monitors change size: this one, and the one the name leaves.
@@ -985,33 +1046,45 @@ void WallpaperManager::setMonitorOutput(int monitorId, const std::string& output
         redraw.reserve(redraw.size() + 2);
 
         // Idempotent is advertised, so a client may re-assert every name on each screen
-        // change; persist() parks this thread -- the bus event loop -- on the write. Skipped
+        // change; awaitPersisted() parks this thread -- the bus event loop -- on the write. Skipped
         // only when the file is known to hold what the map holds: any other answer, including a
         // write still outstanding, means re-asserting is the only retry a client can reach.
-        const BindResult bound = bindOutputLocked(monitorId, outputName);
-        if (bound == BindResult::Unchanged && m_writer.outcome().onDisk()) {
-            return;
+        //
+        // Which is why a bind whose save cannot be queued is undone: kept, it would make that
+        // retry look unchanged and on disk. Both maps are bounded by the monitor limit.
+        std::map<std::string, int> outputsBefore = m_outputs;
+        std::set<std::string> notDrawnBefore = m_outputsNotDrawn;
+        BindResult bound = BindResult::Unchanged;
+        try {
+            bound = bindOutputLocked(monitorId, outputName);
+            if (bound == BindResult::Unchanged && m_writer.outcome().onDisk()) return;
+            // Before the kept name below is cleared, which changes nothing here: a name bound
+            // live already wins over a kept row carrying it.
+            queuePersist(m_kept.rowsToWrite(liveWallpapers()));
+        } catch (...) {
+            m_outputs.swap(outputsBefore);
+            m_outputsNotDrawn.swap(notDrawnBefore);
+            throw;
         }
 
         redrawIfResizedLocked(monitorId, sizeHere, redraw);
         if (leaving != monitorId) redrawIfResizedLocked(leaving, sizeLeaving, redraw);
 
         // A name carried for a build with more monitors is taken over by this one, and the save
-        // below drops it. Erased and reported here for the reason its wallpaper sibling above
-        // is: m_kept.rowsToWrite(liveWallpapers()) is const, runs on every save, and cannot say what it dropped.
-        // Unchanged means the name was already this monitor's, so nothing new is superseded.
+        // above drops it. Erased and reported here for the reason its wallpaper sibling in
+        // requestWallpaper() is: rowsToWrite() is const, runs on every save, and cannot say what
+        // it dropped. Unchanged means the name was already this monitor's, so nothing new is
+        // superseded.
         if (bound != BindResult::Unchanged) {
             const auto kept = std::find_if(
                 m_kept.carried().begin(), m_kept.carried().end(),
                 [&outputName](const PersistedWallpaper& row) { return row.output == outputName; });
             if (kept != m_kept.carried().end() && !kept->output.empty()) {
                 kept->output.clear();
-                kept->outputSize.reset();
+                kept->outputSizeJson.clear();
                 m_kept.countTakenOverName();
             }
         }
-
-        toPersist = m_kept.rowsToWrite(liveWallpapers());
     }
 
     // Outside the lock. Persisted because only the app can name a screen again, and it may not
@@ -1019,7 +1092,7 @@ void WallpaperManager::setMonitorOutput(int monitorId, const std::string& output
     // is an aggregate carrying other monitors' failures: the contract is that an accepted reply
     // means this mapping reached the file.
     std::string whyNot;
-    if (!persist(toPersist, &whyNot)) {
+    if (!awaitPersisted(whyNot)) {
         throw std::runtime_error(whyNot.empty() ? "the screen name did not reach the config file"
                                                 : whyNot);
     }
@@ -1031,28 +1104,35 @@ void WallpaperManager::setOutputSize(const std::string& outputName, uint32_t wid
     const OutputSize size{width, height};
     if (const std::string why = outputSizeError(size); !why.empty()) throw InvalidRequest(why);
 
-    std::vector<PersistedWallpaper> toPersist;
-    {
-        std::lock_guard<std::mutex> stateLock(m_stateMutex);
-        const auto bound = m_outputs.find(outputName);
-        if (bound == m_outputs.end()) {
-            throw UnknownOutput("no monitor answers to output " + sanitizeForLog(outputName) +
-                                "; it must be named with SetMonitorOutput first");
-        }
-        // The same rule as re-asserting a name: an unchanged report writes only while the file
-        // is not known to hold it.
-        const auto known = m_outputSizes.find(outputName);
-        if (known != m_outputSizes.end() && known->second == size && m_writer.outcome().onDisk()) return;
-
-        redraw.reserve(redraw.size() + 1);
-        const OutputSize before = targetSizeLocked(bound->second);
-        m_outputSizes.insert_or_assign(outputName, size);
-        pruneOutputReportsLocked();
-        redrawIfResizedLocked(bound->second, before, redraw);
-        toPersist = m_kept.rowsToWrite(liveWallpapers());
+    std::lock_guard<std::mutex> stateLock(m_stateMutex);
+    const auto bound = m_outputs.find(outputName);
+    if (bound == m_outputs.end()) {
+        throw UnknownOutput("no monitor answers to output " + sanitizeForLog(outputName) +
+                            "; it must be named with SetMonitorOutput first");
     }
+    // The same rule as re-asserting a name, and undone on a save that cannot be queued for the
+    // same reason.
+    const auto known = m_outputSizes.find(outputName);
+    if (known != m_outputSizes.end() && known->second == size && m_writer.outcome().onDisk()) return;
+    const std::optional<OutputSize> sizeBefore =
+        known != m_outputSizes.end() ? std::optional<OutputSize>(known->second) : std::nullopt;
 
-    queuePersist(toPersist);
+    redraw.reserve(redraw.size() + 1);
+    const OutputSize before = targetSizeLocked(bound->second);
+    const auto stored = m_outputSizes.insert_or_assign(outputName, size).first;
+    try {
+        queuePersist(m_kept.rowsToWrite(liveWallpapers()));
+    } catch (...) {
+        if (sizeBefore) {
+            stored->second = *sizeBefore;
+        } else {
+            m_outputSizes.erase(stored);
+        }
+        throw;
+    }
+    // After the save: it prunes only names no monitor answers to, which the file never holds.
+    pruneOutputReportsLocked();
+    redrawIfResizedLocked(bound->second, before, redraw);
 }
 
 void WallpaperManager::setOutputVisible(const std::string& outputName, bool visible) {
@@ -1171,18 +1251,22 @@ LoadResult WallpaperManager::loadWithDeadline() const {
 // Neither records health: every reader goes through snapshot(), which asks the writer and
 // overwrites persistence with its answer. An abandoned wait marks the worker stalled, so that
 // is in the answer too.
-void WallpaperManager::queuePersist(const std::vector<PersistedWallpaper>& entries) {
-    m_writer.queue(entries);
+void WallpaperManager::queuePersist(std::vector<PersistedWallpaper> entries) {
+    m_writer.queue(std::move(entries));
 }
 
-bool WallpaperManager::persist(const std::vector<PersistedWallpaper>& entries, std::string* whyNot) {
+bool WallpaperManager::awaitPersisted(std::string& whyNot) {
     std::string why;
-    if (m_writer.write(entries, &why)) return true;
+    if (m_writer.awaitQueued(why)) return true;
 
     // Sanitized here, once, because this one leaves the process: the store composes its errors
     // around a path, and a path is arbitrary bytes the daemon did not choose.
-    if (whyNot != nullptr) *whyNot = sanitizeForLog(why, 1024, LogFraming::Bare);
+    whyNot = sanitizeForLog(why, 1024, LogFraming::Bare);
     return false;
+}
+
+void WallpaperManager::awaitPersisted() noexcept {
+    (void)m_writer.awaitQueued();
 }
 
 void WallpaperManager::applyPersistOutcomeLocked(DaemonHealth& health) const {
@@ -1250,8 +1334,12 @@ std::vector<int> WallpaperManager::restoreSaved() {
     // entry it came from may restore perfectly well without it.
     int displacedNames = 0;
     int rejectedNames = 0;
-    int rejectedSizes = 0;
     int duplicateIds = 0;
+    // Both settled per monitor or screen, not per row: a later row replacing an earlier one's
+    // wallpaper or size makes up for what the earlier one lost, and that loss is a duplicate's.
+    std::set<std::string> sizeRejectedFor;
+    // Only on rows this build applies: a kept row's values are its newer build's to judge.
+    std::map<int, int> droppedPropertiesOn;
 
     // Screen name -> the kept row that claimed it last, in file order. The sweep at the end
     // needs "who claimed this name last", which m_kept.carried()'s own order does not carry.
@@ -1295,7 +1383,6 @@ std::vector<int> WallpaperManager::restoreSaved() {
         const bool nameValid = !entry.output.empty() && outputNameError(entry.output).empty();
         const bool nameTravels = nameValid && entry.monitorId >= kMaxMonitors;
         if (!entry.output.empty() && !nameValid && !nameTravels) ++rejectedNames;
-        const bool sizeValid = entry.outputSize && outputSizeError(*entry.outputSize).empty();
 
         // Dropped, not kept: a kept entry is only ever superseded by a live monitor
         // claiming its id, and a negative id can never be one -- so keeping it means
@@ -1311,16 +1398,22 @@ std::vector<int> WallpaperManager::restoreSaved() {
             continue;
         }
 
-        // Counted only beside a name that survives: a size lost with its name is that name's loss.
-        if (nameValid && entry.outputSize && !sizeValid) ++rejectedSizes;
-
         // Independent halves of a row: this one is restored even when the other cannot be.
         // Last-wins -- file order carries no meaning. What matters is that the loss is
         // reported, not left as two monitors quietly answering to one screen.
         if (nameValid && entry.monitorId < kMaxMonitors) {
             if (bindOutputLocked(entry.monitorId, entry.output) == BindResult::Displaced) ++displacedNames;
-            // A row without one does not erase a size an earlier row gave the same screen.
-            if (sizeValid) m_outputSizes.insert_or_assign(entry.output, *entry.outputSize);
+            // A row without one does not erase a size an earlier row gave the same screen. Judged
+            // only beside a name bound here: a size lost with its name is that name's loss, and one
+            // travelling with a kept name is its newer build's to judge.
+            if (!entry.outputSizeJson.empty()) {
+                const OutputSize size = outputSizeFromJson(entry.outputSizeJson);
+                if (outputSizeError(size).empty()) {
+                    m_outputSizes.insert_or_assign(entry.output, size);
+                } else {
+                    sizeRejectedFor.insert(entry.output);
+                }
+            }
         }
 
         // A row with no wallpaper stops here rather than falling into the arm below, whose
@@ -1351,7 +1444,7 @@ std::vector<int> WallpaperManager::restoreSaved() {
                 PersistedWallpaper keep = entry;
                 if (heldLive && KeptRows::dropWallpaper(keep)) ++duplicateIds;
                 if (!nameTravels) keep.output.clear();
-                if (!nameTravels || !sizeValid) keep.outputSize.reset();
+                if (!nameTravels) keep.outputSizeJson.clear();
                 // Nothing left to carry. Kept, it would ride every save for the life of the
                 // install and come back as a wallpaper that did not return.
                 if (keep.type.empty() && keep.path.empty() && keep.output.empty()) continue;
@@ -1366,15 +1459,16 @@ std::vector<int> WallpaperManager::restoreSaved() {
                 if (!heldLive) {
                     held.type = entry.type;
                     held.path = entry.path;
+                    held.propertiesJson = entry.propertiesJson;
                 }
             }
             if (nameTravels) {
                 // The name counter, not the row counter: what was lost here is a screen's
                 // name, and duplicateIds counts wallpapers.
                 if (!held.output.empty() && held.output != entry.output) ++displacedNames;
-                if (held.output != entry.output) held.outputSize.reset();
+                if (held.output != entry.output) held.outputSizeJson.clear();
                 held.output = entry.output;
-                if (sizeValid) held.outputSize = entry.outputSize;
+                if (!entry.outputSizeJson.empty()) held.outputSizeJson = entry.outputSizeJson;
                 keptNameOwner[entry.output] = entry.monitorId;
             }
             continue;
@@ -1396,6 +1490,9 @@ std::vector<int> WallpaperManager::restoreSaved() {
         }
         state.type = entry.type;
         state.path = entry.path;
+        int dropped = 0;
+        state.properties = usableProperties(propertiesFromJson(entry.propertiesJson, dropped), dropped);
+        droppedPropertiesOn[entry.monitorId] = dropped;
         ++state.requestSeq;
         ++state.wallpaperSeq;
         state.lastError.clear();
@@ -1427,9 +1524,17 @@ std::vector<int> WallpaperManager::restoreSaved() {
         if (m_outputs.count(kept.output) != 0 || owner == keptNameOwner.end() ||
             owner->second != kept.monitorId) {
             kept.output.clear();
-            kept.outputSize.reset();
+            kept.outputSizeJson.clear();
             ++displacedNames;
         }
+    }
+
+    int droppedProperties = 0;
+    for (const auto& [monitorId, dropped] : droppedPropertiesOn) droppedProperties += dropped;
+    int rejectedSizes = 0;
+    // Only a name still bound: one a later row took away is counted as displaced, not here.
+    for (const std::string& name : sizeRejectedFor) {
+        rejectedSizes += m_outputs.count(name) != 0 && m_outputSizes.count(name) == 0 ? 1 : 0;
     }
 
     // Later rows can unbind names an earlier row sized, and the file holds thousands of rows.
@@ -1474,6 +1579,10 @@ std::vector<int> WallpaperManager::restoreSaved() {
                     " screen sizes dropped, unusable; those screens are drawn at the default size "
                     "until they report again");
     }
+    if (droppedProperties > 0) {
+        m_kept.note(std::to_string(droppedProperties) +
+                    " wallpaper property values dropped, unusable; those values must be set again");
+    }
     if (duplicateIds > 0) {
         // Not "the last entry won": three collisions feed this counter and one is resolved by
         // the EARLIER row, the one this build can show. The copy is named by its own note
@@ -1488,8 +1597,9 @@ std::vector<int> WallpaperManager::restoreSaved() {
     // malformed, so nothing would tell the user those wallpapers did not come back.
     // Recomposed from the raw path rather than appended to the recorded detail, which is
     // already sanitized and would be escaped a second time.
-    repaired = displacedNames > 0 || rejectedNames > 0 || rejectedSizes > 0 || duplicateIds > 0 ||
-               m_kept.anyDropped();
+    // Any rejected size, not only those left uncompensated: the rewrite removes its bytes either way.
+    repaired = displacedNames > 0 || rejectedNames > 0 || !sizeRejectedFor.empty() || duplicateIds > 0 ||
+               droppedProperties > 0 || m_kept.anyDropped();
     if ((!m_kept.carried().empty() || repaired) && m_health.persistence.status == HealthStatus::Ok) {
         recordHealthLocked(&DaemonHealth::persistence, HealthStatus::Ok,
                            keptDetail(m_store.file().string()));
@@ -1664,14 +1774,36 @@ WallpaperManager::VideoSession& WallpaperManager::videoSessionLocked(int monitor
     return entry->second;
 }
 
-void WallpaperManager::markShown(VideoSession& session, SteadyTime now) {
+void WallpaperManager::VideoSession::Waiting::retime(SteadyTime now, double newSpeed) {
+    if (newSpeed == speed) return;
+    const SteadyTime timeline = from + atSpeed(left, speed);
+    // Never before the wait began, and never past the moment it was already due, which a speed
+    // change can no longer move.
+    const SteadyTime changed = std::clamp(now, from, timeline);
+    const std::chrono::nanoseconds waited(std::llround(static_cast<double>((changed - from).count()) * speed));
+    left = changed == timeline ? std::chrono::nanoseconds::zero()
+                               : std::max(left - waited, std::chrono::nanoseconds::zero());
+    from = changed;
+    speed = newSpeed;
+}
+
+WallpaperManager::VideoSession::OnScreen WallpaperManager::VideoSession::Waiting::planned() const {
+    const SteadyTime timeline = from + atSpeed(left, speed);
+    return OnScreen{timeline, std::max(timeline, previous.due + kMinPictureInterval)};
+}
+
+void WallpaperManager::markShown(VideoSession& session, SteadyTime now, double speed) {
     using Session = VideoSession;
     // Terminal for the schedule: what is on screen is what the session holds.
     if (std::holds_alternative<Session::OnScreen>(session.clock)) return;
     Session::OnScreen shown{now, now};
-    if (const auto* waiting = std::get_if<Session::Waiting>(&session.clock);
-        waiting != nullptr && now - waiting->timeline <= ownInterval(session.pipeline->timing())) {
-        shown = Session::OnScreen{waiting->timeline, waiting->due};
+    if (auto* waiting = std::get_if<Session::Waiting>(&session.clock)) {
+        waiting->retime(now, speed);
+        const Session::OnScreen planned = waiting->planned();
+        // Late against `due`: under the picture-rate cap `timeline` trails on purpose. The trail is
+        // bounded to one interval so a long run at the cap banks no lag to be shown back to back.
+        const std::chrono::nanoseconds interval = intervalAtSpeed(session.pipeline->timing(), speed);
+        if (now - planned.due <= interval) shown = {std::max(planned.timeline, planned.due - interval), planned.due};
     }
     session.clock = shown;
 }
@@ -1841,12 +1973,15 @@ std::optional<SteadyTime> WallpaperManager::advanceSessionLocked(int monitorId, 
     const uint64_t wallpaperSeq = session.wallpaperSeq;
 
     std::optional<uint64_t> playing;
+    // For the whole round: a change arriving meanwhile wakes the worker for another.
+    double speed = 1.0;
     {
         std::lock_guard<std::mutex> stateLock(m_stateMutex);
         playing = playingSeqLocked(monitorId, wallpaperSeq);
-        // Stopped play ends the stretch the next picture's time is counted from.
-        if (const auto it = m_monitors.find(monitorId); !playing && it != m_monitors.end()) {
-            it->second.cleanPlay.lastShown.reset();
+        if (const auto it = m_monitors.find(monitorId); it != m_monitors.end()) {
+            speed = playbackSpeed(it->second.properties);
+            // Stopped play ends the stretch the next picture's time is counted from.
+            if (!playing) it->second.cleanPlay.lastShown.reset();
         }
     }
     if (!playing) {
@@ -1900,11 +2035,12 @@ std::optional<SteadyTime> WallpaperManager::advanceSessionLocked(int monitorId, 
                 }
                 return now;
             }
-            const SteadyTime timeline = shown.timeline + gapBetween(before, after);
-            session.clock = Session::Waiting{std::max(timeline, shown.due + kMinPictureInterval), timeline};
+            session.clock = Session::Waiting{shown, shown.timeline, gapBetween(before, after), speed};
         }
-        if (const auto* waiting = std::get_if<Session::Waiting>(&session.clock); waiting != nullptr && waiting->due > now) {
-            return waiting->due;
+        // Every draw below passes here first, so what it reads is timed at this round's speed.
+        if (auto* waiting = std::get_if<Session::Waiting>(&session.clock)) {
+            waiting->retime(now, speed);
+            if (const SteadyTime due = waiting->planned().due; due > now) return due;
         }
 
         const OffscreenTarget* target = nullptr;
@@ -1916,7 +2052,7 @@ std::optional<SteadyTime> WallpaperManager::advanceSessionLocked(int monitorId, 
         // picture waits one interval rather than being drawn under a reader. Nothing is counted or
         // logged: deferredRenders counts renders owed, and this monitor owes none -- the render
         // path reports the same broken reserve the moment anything posts this monitor.
-        if (target == nullptr) return now + ownInterval(session.pipeline->timing());
+        if (target == nullptr) return now + intervalAtSpeed(session.pipeline->timing(), speed);
 
         uint64_t generation = 0;
         bool playedClean = false;
@@ -1933,8 +2069,11 @@ std::optional<SteadyTime> WallpaperManager::advanceSessionLocked(int monitorId, 
                 return now;
             }
             // Drawn more than an interval past its time, it was held up by a stop nothing reported.
+            // Never more than the file's own interval: slowing playback does not make a stop clean.
             const auto* waiting = std::get_if<Session::Waiting>(&session.clock);
-            const bool onTime = waiting != nullptr && now - waiting->due <= ownInterval(session.pipeline->timing());
+            const PictureTiming timing = session.pipeline->timing();
+            const bool onTime = waiting != nullptr && now - waiting->planned().due <=
+                                                          std::min(intervalAtSpeed(timing, speed), ownInterval(timing));
             session.pipeline->draw(*m_targets, *target);
             generation = commitFrameLocked(it->second, *target);
             // A picture shown is playback working, so the reopens start again from here: what the
@@ -1944,7 +2083,7 @@ std::optional<SteadyTime> WallpaperManager::advanceSessionLocked(int monitorId, 
         }
         // Outside the state lock: it writes to the state directory.
         if (playedClean) m_playing.clear(monitorId);
-        markShown(session, now);
+        markShown(session, now, speed);
         round.shown.push_back(ClockRound::Shown{monitorId, generation});
         // The next picture is decoded at once, so its time is known before it is due.
         return now;
@@ -2196,7 +2335,7 @@ WallpaperManager::RenderPass WallpaperManager::renderPassLocked(int monitorId, b
                     m_targets->render(*still, *target);
                 } else {
                     clip->pipeline->draw(*m_targets, *target);
-                    markShown(*clip, std::chrono::steady_clock::now());
+                    markShown(*clip, std::chrono::steady_clock::now(), playbackSpeed(it->second.properties));
                 }
             } catch (const std::exception&) {
                 // m_stateMutex is held here, so the locked recorder: the same sorting, one lock in.
@@ -2457,6 +2596,7 @@ WallpaperManager::Snapshot WallpaperManager::snapshot() const {
         MonitorStatus entry;
         entry.type = state.type;
         entry.path = state.path;
+        entry.properties = state.properties;
         entry.generation = state.generation;
         entry.hasFrame = state.hasFrame;
         entry.lastError = state.lastError;
