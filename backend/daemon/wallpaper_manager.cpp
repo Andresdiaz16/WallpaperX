@@ -160,6 +160,7 @@ WallpaperManager::Config withCheckedTiming(WallpaperManager::Config config) {
     };
     check(config.unwatchedAfter, "unwatchedAfter");
     check(config.idleSessionRelease, "idleSessionRelease");
+    check(config.pausedSessionRelease, "pausedSessionRelease");
     check(config.refusalLogInterval, "refusalLogInterval");
     check(config.cleanPlayAfter, "cleanPlayAfter");
     return config;
@@ -319,6 +320,7 @@ LiveWallpapers WallpaperManager::liveWallpapers() const {
                                                                 ? std::nullopt
                                                                 : std::optional<OutputSize>(size->second)});
     }
+    live.pause = m_pauseSettings;
     return live;
 }
 
@@ -1054,6 +1056,7 @@ void WallpaperManager::setMonitorOutput(int monitorId, const std::string& output
         // retry look unchanged and on disk. Both maps are bounded by the monitor limit.
         std::map<std::string, int> outputsBefore = m_outputs;
         std::set<std::string> notDrawnBefore = m_outputsNotDrawn;
+        std::map<std::string, FocusReport> focusBefore = m_outputFocus;
         BindResult bound = BindResult::Unchanged;
         try {
             bound = bindOutputLocked(monitorId, outputName);
@@ -1064,6 +1067,7 @@ void WallpaperManager::setMonitorOutput(int monitorId, const std::string& output
         } catch (...) {
             m_outputs.swap(outputsBefore);
             m_outputsNotDrawn.swap(notDrawnBefore);
+            m_outputFocus.swap(focusBefore);
             throw;
         }
 
@@ -1178,6 +1182,72 @@ void WallpaperManager::setOutputVisible(const std::string& outputName, bool visi
     credit = MonitorState::ResumeCredit{credit.at ? std::max(now, *credit.at + m_config.unwatchedAfter) : now, generation};
 }
 
+void WallpaperManager::setMonitorPause(int monitorId, const std::string& mode) {
+    requireValidMonitorId(monitorId);
+    const std::optional<PauseMode> parsed = pauseModeFromName(mode);
+    if (!parsed) {
+        std::string expected;
+        for (size_t i = 0; i < std::size(kPauseModes); ++i) {
+            if (i != 0) expected += i + 1 == std::size(kPauseModes) ? " or " : ", ";
+            expected += toString(kPauseModes[i]);
+        }
+        throw InvalidRequest("unknown pause mode " + sanitizeForLog(mode) + " (expected " + expected + ")");
+    }
+    // Play is no setting at all, so a config that never paused anything is written as before.
+    std::optional<std::string> next;
+    if (*parsed != PauseMode::Play) next = toJsonText(*parsed);
+
+    {
+        std::lock_guard<std::mutex> stateLock(m_stateMutex);
+        const auto current = m_pauseSettings.find(monitorId);
+        const bool unchanged = current == m_pauseSettings.end() ? !next : next && current->second == *next;
+        // Unchanged writes only while the file is not known to hold it, as setOutputSize() does --
+        // which is why a save that cannot be queued is undone below.
+        if (unchanged && m_writer.outcome().onDisk()) return;
+
+        // Set aside rather than copied, so putting it back cannot throw.
+        decltype(m_pauseSettings)::node_type previous;
+        if (current != m_pauseSettings.end()) previous = m_pauseSettings.extract(current);
+        try {
+            if (next) m_pauseSettings.emplace(monitorId, std::move(*next));
+            queuePersist(m_kept.rowsToWrite(liveWallpapers()));
+        } catch (...) {
+            m_pauseSettings.erase(monitorId);
+            if (!previous.empty()) m_pauseSettings.insert(std::move(previous));
+            throw;
+        }
+        endPlayIfPausedLocked(monitorId);
+    }
+
+    // As requestWallpaper() waits: the setting is committed, so a failed write is persistence
+    // health's to report, not this call's.
+    awaitPersisted();
+}
+
+void WallpaperManager::setOutputFocus(const std::string& client, const std::string& outputName, bool windowFocused,
+                                      bool windowMaximized) {
+    requireValidOutputName(outputName);
+
+    std::lock_guard<std::mutex> stateLock(m_stateMutex);
+    const auto bound = m_outputs.find(outputName);
+    if (bound == m_outputs.end()) {
+        throw UnknownOutput("no monitor answers to output " + sanitizeForLog(outputName) +
+                            "; it must be named with SetMonitorOutput first");
+    }
+    // Not persisted, for setOutputVisible()'s reason.
+    if (!windowFocused && !windowMaximized) {
+        m_outputFocus.erase(outputName);
+        return;
+    }
+    m_outputFocus.insert_or_assign(outputName, FocusReport{client, windowFocused, windowMaximized});
+    endPlayIfPausedLocked(bound->second);
+}
+
+bool WallpaperManager::forgetOutputFocus(const std::string& client) {
+    std::lock_guard<std::mutex> stateLock(m_stateMutex);
+    return std::erase_if(m_outputFocus, [&client](const auto& entry) { return entry.second.reporter == client; }) > 0;
+}
+
 WallpaperManager::BindResult WallpaperManager::bindOutputLocked(int monitorId,
                                                                 const std::string& outputName) {
     bool displaced = false;
@@ -1187,11 +1257,12 @@ WallpaperManager::BindResult WallpaperManager::bindOutputLocked(int monitorId,
         // Erased, not left: a name on two monitors is two plugin instances answering to one
         // screen, and whichever came back first would decide who shows the wrong picture.
         //
-        // What that name reported about being drawn goes with the binding: no consumer has said
-        // anything about the monitor taking it over, and an unreported screen is taken to be
-        // drawn. Left behind, a screen that was dark before its name moved would stop the new
-        // monitor's video with nothing able to correct it.
+        // What that name reported about being drawn, and about its windows, goes with the binding:
+        // no consumer has said anything about the monitor taking it over, and an unreported screen
+        // is taken to be drawn with nothing focused. Left behind, a screen that was dark before its
+        // name moved would stop the new monitor's video with nothing able to correct it.
         m_outputsNotDrawn.erase(existing->first);
+        m_outputFocus.erase(existing->first);
         m_outputs.erase(existing);
         displaced = true;
     }
@@ -1204,6 +1275,7 @@ WallpaperManager::BindResult WallpaperManager::bindOutputLocked(int monitorId,
             continue;
         }
         m_outputsNotDrawn.erase(it->first);
+        m_outputFocus.erase(it->first);
         it = m_outputs.erase(it);
         displaced = true;
     }
@@ -1340,6 +1412,10 @@ std::vector<int> WallpaperManager::restoreSaved() {
     std::set<std::string> sizeRejectedFor;
     // Only on rows this build applies: a kept row's values are its newer build's to judge.
     std::map<int, int> droppedPropertiesOn;
+    // Monitor id -> the last `pause` text a row gave it. Not m_pauseSettings: that erases play,
+    // which would make an explicit play indistinguishable from a row that says nothing.
+    std::map<int, std::string> pauseRead;
+    std::set<int> pauseConflicts;
 
     // Screen name -> the kept row that claimed it last, in file order. The sweep at the end
     // needs "who claimed this name last", which m_kept.carried()'s own order does not carry.
@@ -1416,12 +1492,28 @@ std::vector<int> WallpaperManager::restoreSaved() {
             }
         }
 
+        // The monitor's own, whatever else the row holds, and last wins as a name does. A value
+        // this build does not know is kept as read: a newer build wrote it.
+        const bool pauseTravels = !entry.pauseJson.empty() && entry.monitorId >= kMaxMonitors;
+        if (!entry.pauseJson.empty()) {
+            const auto [read, first] = pauseRead.try_emplace(entry.monitorId, entry.pauseJson);
+            if (!first && read->second != entry.pauseJson) pauseConflicts.insert(entry.monitorId);
+            read->second = entry.pauseJson;
+            if (entry.monitorId < kMaxMonitors) {
+                if (pauseModeFromJson(entry.pauseJson) == PauseMode::Play) {
+                    m_pauseSettings.erase(entry.monitorId);
+                } else {
+                    m_pauseSettings.insert_or_assign(entry.monitorId, entry.pauseJson);
+                }
+            }
+        }
+
         // A row with no wallpaper stops here rather than falling into the arm below, whose
         // health text is the user's only notice that a wallpaper did not come back. Only a
-        // name bound for a bigger build is still worth carrying; a row with nothing left on
-        // it would otherwise ride every save for the life of the install.
-        if (entry.type.empty() && entry.path.empty() && !nameTravels) {
-            if (entry.output.empty()) m_kept.countDroppedEntry();
+        // name or a setting for a bigger build is still worth carrying; a row with nothing left
+        // on it would otherwise ride every save for the life of the install.
+        if (entry.type.empty() && entry.path.empty() && !nameTravels && !pauseTravels) {
+            if (entry.output.empty() && entry.pauseJson.empty()) m_kept.countDroppedEntry();
             continue;
         }
 
@@ -1445,9 +1537,11 @@ std::vector<int> WallpaperManager::restoreSaved() {
                 if (heldLive && KeptRows::dropWallpaper(keep)) ++duplicateIds;
                 if (!nameTravels) keep.output.clear();
                 if (!nameTravels) keep.outputSizeJson.clear();
+                // Applied above instead.
+                if (!pauseTravels) keep.pauseJson.clear();
                 // Nothing left to carry. Kept, it would ride every save for the life of the
                 // install and come back as a wallpaper that did not return.
-                if (keep.type.empty() && keep.path.empty() && keep.output.empty()) continue;
+                if (keep.type.empty() && keep.path.empty() && keep.output.empty() && keep.pauseJson.empty()) continue;
                 if (nameTravels) keptNameOwner[keep.output] = keep.monitorId;
                 keptIndex.emplace(entry.monitorId, m_kept.carried().size());
                 m_kept.carried().push_back(std::move(keep));
@@ -1471,6 +1565,7 @@ std::vector<int> WallpaperManager::restoreSaved() {
                 if (!entry.outputSizeJson.empty()) held.outputSizeJson = entry.outputSizeJson;
                 keptNameOwner[entry.output] = entry.monitorId;
             }
+            if (pauseTravels) held.pauseJson = entry.pauseJson;
             continue;
         }
 
@@ -1587,10 +1682,17 @@ std::vector<int> WallpaperManager::restoreSaved() {
         // Not "the last entry won": three collisions feed this counter and one is resolved by
         // the EARLIER row, the one this build can show. The copy is named by its own note
         // rather than located here, since where it lands depends on the state directory.
+        // Conditional because that note comes later, from preserveUnreadableConfig(), and can
+        // say the copy failed.
         m_kept.note(std::to_string(duplicateIds) +
                            " entries dropped, another entry claimed the same monitor; the one "
-                           "this build can show was kept, and the rest survive only in the "
-                           "preserved copy named above");
+                           "this build can show was kept, and the rest survive only if the "
+                           "file was copied (see below)");
+    }
+    if (!pauseConflicts.empty()) {
+        m_kept.note(std::to_string(pauseConflicts.size()) +
+                    " monitors given conflicting pause settings by several entries; the last entry's "
+                    "was kept, and the rest survive only if the file was copied (see below)");
     }
 
     // Kept entries are invisible otherwise: they are in no monitor's status and are not
@@ -1599,7 +1701,7 @@ std::vector<int> WallpaperManager::restoreSaved() {
     // already sanitized and would be escaped a second time.
     // Any rejected size, not only those left uncompensated: the rewrite removes its bytes either way.
     repaired = displacedNames > 0 || rejectedNames > 0 || !sizeRejectedFor.empty() || duplicateIds > 0 ||
-               droppedProperties > 0 || m_kept.anyDropped();
+               droppedProperties > 0 || !pauseConflicts.empty() || m_kept.anyDropped();
     if ((!m_kept.carried().empty() || repaired) && m_health.persistence.status == HealthStatus::Ok) {
         recordHealthLocked(&DaemonHealth::persistence, HealthStatus::Ok,
                            keptDetail(m_store.file().string()));
@@ -1613,6 +1715,27 @@ std::vector<int> WallpaperManager::restoreSaved() {
 
 void WallpaperManager::closeVideoSessionLocked(int monitorId) {
     m_videoSessions.erase(monitorId);
+}
+
+void WallpaperManager::releaseVideoSessionLocked(int monitorId) {
+    const auto session = m_videoSessions.find(monitorId);
+    if (session == m_videoSessions.end()) return;
+    {
+        std::lock_guard<std::mutex> stateLock(m_stateMutex);
+        const auto it = m_monitors.find(monitorId);
+        if (it != m_monitors.end()) {
+            MonitorState& state = it->second;
+            const VideoSession& released = session->second;
+            const std::optional<StreamPosition> shown = std::holds_alternative<VideoSession::Undrawn>(released.clock)
+                                                            ? released.openedAt
+                                                            : released.pipeline->shownPosition();
+            state.releasedAt.reset();
+            if (shown && state.wallpaperSeq == released.wallpaperSeq) {
+                state.releasedAt = MonitorState::ReleasedAt{state.wallpaperSeq, *shown};
+            }
+        }
+    }
+    closeVideoSessionLocked(monitorId);
 }
 
 void WallpaperManager::closeFailedVideoSessionLocked(int monitorId, Fault failure) {
@@ -1645,6 +1768,35 @@ bool WallpaperManager::screenDrawnLocked(int monitorId) const {
     return true;
 }
 
+const WallpaperManager::FocusReport* WallpaperManager::focusReportLocked(int monitorId) const {
+    for (const auto& [name, boundId] : m_outputs) {
+        if (boundId != monitorId) continue;
+        const auto report = m_outputFocus.find(name);
+        return report == m_outputFocus.end() ? nullptr : &report->second;
+    }
+    return nullptr;
+}
+
+bool WallpaperManager::pausedLocked(int monitorId) const {
+    const auto setting = m_pauseSettings.find(monitorId);
+    if (setting == m_pauseSettings.end()) return false;
+    const std::optional<PauseMode> mode = pauseModeFromJson(setting->second);
+    if (!mode) return false;
+    const FocusReport* report = focusReportLocked(monitorId);
+    switch (*mode) {
+        case PauseMode::Play: return false;
+        case PauseMode::Always: return true;
+        case PauseMode::WhileWindowFocused: return report != nullptr && report->windowFocused;
+        case PauseMode::WhileWindowMaximized: return report != nullptr && report->windowMaximized;
+    }
+    return false;
+}
+
+void WallpaperManager::endPlayIfPausedLocked(int monitorId) {
+    if (!pausedLocked(monitorId)) return;
+    if (const auto it = m_monitors.find(monitorId); it != m_monitors.end()) it->second.cleanPlay.lastShown.reset();
+}
+
 bool WallpaperManager::resumeCreditStands(const MonitorState& state) {
     return state.resumeCredit.at && state.resumeCredit.generation == state.generation && state.hasFrame &&
            drawableType(state.type) == Drawable::Clip && state.parkedWallpaperSeq != state.wallpaperSeq;
@@ -1674,7 +1826,7 @@ std::optional<uint64_t> WallpaperManager::currentSeqLocked(int monitorId, uint64
 
 std::optional<uint64_t> WallpaperManager::playingSeqLocked(int monitorId, uint64_t wallpaperSeq) const {
     const std::optional<uint64_t> current = currentSeqLocked(monitorId, wallpaperSeq);
-    if (!current) return std::nullopt;
+    if (!current || pausedLocked(monitorId)) return std::nullopt;
     const auto it = m_monitors.find(monitorId);
     if (!watchedLocked(monitorId, it->second)) return std::nullopt;
     return current;
@@ -1708,7 +1860,7 @@ bool WallpaperManager::evictIdleVideoSessionLocked() {
     // requestSeq is left alone deliberately: bumping it would owe a render for a monitor whose
     // picture is unchanged, which reopens the file this eviction just closed -- and reports a
     // render outstanding until it does. Whatever re-posts the monitor opens a session then.
-    closeVideoSessionLocked(victimId);
+    releaseVideoSessionLocked(victimId);
     return true;
 }
 
@@ -1741,30 +1893,53 @@ WallpaperManager::VideoSession& WallpaperManager::videoSessionLocked(int monitor
 
     // What the card can hold is settled by trying: a decoder's images are ffmpeg's to size, so
     // nothing here can predict them.
+    // Spent by this attempt whether or not it opens, so a failure never repeats at the same position.
+    std::optional<StreamPosition> startAt;
+    {
+        std::lock_guard<std::mutex> stateLock(m_stateMutex);
+        const auto it = m_monitors.find(monitorId);
+        if (it != m_monitors.end()) {
+            if (it->second.releasedAt && it->second.releasedAt->forSeq == wallpaperSeq) {
+                startAt = it->second.releasedAt->shown;
+            }
+            it->second.releasedAt.reset();
+        }
+    }
+
     auto blame = std::make_unique<const std::string>(playingBlameLine(monitorId, path));
     std::unique_ptr<VideoPipeline> pipeline;
-    retryAfterEvictionLocked([&] {
-        // On disk across the open and the first decode -- the spans in which the file's content is
-        // what runs. Per attempt, and declared first so a pipeline that fails is freed under it
-        // and the record is withdrawn before an eviction frees another file's decoder.
-        const ApplyingRecord applying(m_config.stateDir, monitorId, "video", path);
-        auto opened = std::make_unique<VideoPipeline>(*m_device, path, m_resolvedShaderDir,
-                                                      VideoPipeline::Playback::Loop);
-        // A file with no picture cannot be drawn at a later pass either, so this fails now.
-        if (!opened->decodeNext()) {
-            throw WallpaperContentError(describeRejection("VideoPipeline", "no picture could be decoded", path));
-        }
-        pipeline = std::move(opened);
-    });
+    const auto open = [&] {
+        retryAfterEvictionLocked([&] {
+            // On disk across the open and the first decode -- the spans in which the file's content is
+            // what runs, the decode forward to `startAt` included. Per attempt, and declared first so a
+            // pipeline that fails is freed under it and the record is withdrawn before an eviction frees
+            // another file's decoder.
+            const ApplyingRecord applying(m_config.stateDir, monitorId, "video", path);
+            auto opened = std::make_unique<VideoPipeline>(*m_device, path, m_resolvedShaderDir,
+                                                          VideoPipeline::Playback::Loop, startAt);
+            // A file with no picture cannot be drawn at a later pass either, so this fails now.
+            if (!opened->decodeNext()) {
+                throw WallpaperContentError(describeRejection("VideoPipeline", "no picture could be decoded", path));
+            }
+            pipeline = std::move(opened);
+        });
+    };
+    try {
+        open();
+    } catch (const WallpaperContentError&) {
+        // The position may be what failed, and the file is only blamed for failing from its start.
+        if (!startAt) throw;
+        startAt.reset();
+        open();
+    }
 
-    const auto entry =
-        m_videoSessions
-            .insert_or_assign(monitorId, VideoSession{wallpaperSeq, ++m_videoSessionUse, path, std::move(blame),
-                                                        std::move(pipeline), {}})
-            .first;
+    const auto entry = m_videoSessions
+                           .insert_or_assign(monitorId, VideoSession{wallpaperSeq, ++m_videoSessionUse, path,
+                                                                     std::move(blame), std::move(pipeline), startAt, {}})
+                           .first;
     {
         // A new session's readers are all new to it, and its play starts afresh. This is the only
-        // place a session is made, so the only reset either needs.
+        // place a session is made, so the only reset any of these needs.
         std::lock_guard<std::mutex> stateLock(m_stateMutex);
         if (const auto it = m_monitors.find(monitorId); it != m_monitors.end()) {
             it->second.served.clear();
@@ -1973,11 +2148,13 @@ std::optional<SteadyTime> WallpaperManager::advanceSessionLocked(int monitorId, 
     const uint64_t wallpaperSeq = session.wallpaperSeq;
 
     std::optional<uint64_t> playing;
+    bool paused = false;
     // For the whole round: a change arriving meanwhile wakes the worker for another.
     double speed = 1.0;
     {
         std::lock_guard<std::mutex> stateLock(m_stateMutex);
         playing = playingSeqLocked(monitorId, wallpaperSeq);
+        paused = pausedLocked(monitorId);
         if (const auto it = m_monitors.find(monitorId); it != m_monitors.end()) {
             speed = playbackSpeed(it->second.properties);
             // Stopped play ends the stretch the next picture's time is counted from.
@@ -1985,19 +2162,19 @@ std::optional<SteadyTime> WallpaperManager::advanceSessionLocked(int monitorId, 
         }
     }
     if (!playing) {
-        // Stopped, for whatever reason: nobody can see it, a render is owed, its file held one
-        // picture. The picture on screen stays where it is -- nothing here touches the frame -- and
-        // all this decides is how long the decoder and its picture pool are kept against playing
-        // starting again. What freeing them costs is not only the reopen: the file is opened from
-        // the beginning, so a video that resumes after this starts over rather than carrying on.
+        // Stopped, for whatever reason: paused, nobody can see it, a render is owed, its file held
+        // one picture. The picture on screen stays where it is -- nothing here touches the frame --
+        // and all this decides is how long the decoder and its picture pool are kept against playing
+        // starting again. The session that replaces a released one seeks back to that picture.
         // Outside the state lock, because freeing them re-enters ffmpeg and the driver and every
         // bus handler would wait behind it. A session whose file held one picture waits the same
         // interval as any other: it draws no picture again, but a resize still redraws that picture
         // from it rather than reopening the file.
         if (!session.idleSince) session.idleSince = now;
-        const SteadyTime releaseAt = *session.idleSince + m_config.idleSessionRelease;
+        const SteadyTime releaseAt =
+            *session.idleSince + (paused ? m_config.pausedSessionRelease : m_config.idleSessionRelease);
         if (now < releaseAt) return releaseAt;
-        closeVideoSessionLocked(monitorId);
+        releaseVideoSessionLocked(monitorId);
         return std::nullopt;
     }
     const uint64_t seq = *playing;
@@ -2616,6 +2793,22 @@ WallpaperManager::Snapshot WallpaperManager::snapshot() const {
         out.monitors.emplace(monitorId, std::move(entry));
     }
     out.outputs = m_outputs;
+
+    const auto pauseStatus = [this](int monitorId) {
+        PauseStatus status;
+        const auto setting = m_pauseSettings.find(monitorId);
+        if (setting != m_pauseSettings.end()) status.mode = pauseModeFromJson(setting->second);
+        status.paused = pausedLocked(monitorId);
+        if (const FocusReport* report = focusReportLocked(monitorId)) {
+            status.windowFocused = report->windowFocused;
+            status.windowMaximized = report->windowMaximized;
+        }
+        return status;
+    };
+    for (const auto& [monitorId, state] : m_monitors) out.pause.emplace(monitorId, pauseStatus(monitorId));
+    for (const auto& [monitorId, setting] : m_pauseSettings) {
+        if (!out.pause.contains(monitorId)) out.pause.emplace(monitorId, pauseStatus(monitorId));
+    }
     return out;
 }
 

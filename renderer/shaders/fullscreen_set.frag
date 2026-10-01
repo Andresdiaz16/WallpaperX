@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 #version 460
 
 layout(set = 0, binding = 0) uniform sampler2D tex;

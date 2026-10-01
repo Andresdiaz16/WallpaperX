@@ -40,10 +40,10 @@ class VideoPipeline {
 public:
     enum class Playback { Once, Loop };
 
-    // Opens `file`; nothing is decoded until the first call. Throws what VideoDecoder's
-    // constructor throws.
+    // Opens `file`; nothing is decoded until the first call, which shows the picture at `startAt`
+    // when one is given, as VideoDecoder's constructor describes. Throws what that constructor throws.
     VideoPipeline(Device& device, const std::string& file, const std::string& shaderDir,
-                  Playback playback = Playback::Once);
+                  Playback playback = Playback::Once, std::optional<StreamPosition> startAt = std::nullopt);
 
     VideoPipeline(const VideoPipeline&) = delete;
     VideoPipeline& operator=(const VideoPipeline&) = delete;
@@ -71,12 +71,17 @@ public:
     struct PictureTiming {
         std::optional<std::chrono::nanoseconds> presentation;
         std::optional<std::chrono::nanoseconds> duration;
-        // The first picture this pipeline showed, or the first after a loop: its presentation
-        // time says nothing about its distance from the picture before it.
+        // The first picture of a pass through the file: the first this pipeline showed, unless it
+        // started part way in, or the first after a loop. Its presentation time says nothing about
+        // its distance from the picture before it.
         bool startsPass = false;
     };
     // Throws std::logic_error before the first picture.
     PictureTiming timing() const;
+
+    // Where the picture draw() last showed lies in the file, for a pipeline opened on it later to
+    // start there. Empty before the first draw and when the decoder could not find it again.
+    std::optional<StreamPosition> shownPosition() const { return m_shownPosition; }
 
 private:
     // Built and replaced together, so the renderer never outlives the image it shows.
@@ -94,6 +99,8 @@ private:
     std::unique_ptr<Stage> m_stage;
     // The converted picture's; meaningful once m_stage exists.
     PictureTiming m_timing;
+    std::optional<StreamPosition> m_convertedPosition;
+    std::optional<StreamPosition> m_shownPosition;
 };
 
 }

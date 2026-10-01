@@ -25,6 +25,7 @@
 #include "support/test_image.h"
 #include "tests/client/daemon_client.h"
 #include "tests/client/scratch_dir.h"
+#include "tests/frame_import_request.h"
 #include "tests/gl_import_harness.h"
 #include "tests/spawned_daemon.h"
 #include "tests/test_report.h"
@@ -229,10 +230,6 @@ GpuUuid vulkanUuidForDeviceNamed(const std::string& wanted) {
 // established nothing: counting it as a refusal would grade the importer for this file's failure.
 enum class Outcome { Imported, RefusedAndHandedBack, RefusedAndConsumed, NeverAttempted };
 
-// Fills a Request from a GetFrameFd reply. The descriptor is DUPLICATED, exactly as
-// WallpaperXItem::onFrameReply does with the one QDBusUnixFileDescriptor hands it: the reply
-// object owns its own copy and closes it, and the importer's contract is about the copy it is
-// given.
 // Whether this kernel answers kcmp at all. FrameImport uses it as its only means of deciding who
 // owns a refused frame's descriptor, and where it is missing (no CONFIG_KCMP) or blocked (a
 // seccomp policy) the importer leaks one per refusal deliberately -- so the leak check below has
@@ -255,25 +252,6 @@ bool kcmpUsable() {
     return usable;
 }
 
-wallpaperx::FrameImport::Request requestFromFrame(const wallpaperx::testing::Frame& frame) {
-    wallpaperx::FrameImport::Request request;
-    request.fd = ::dup(frame.fd.get());
-    // Reported here rather than at each call site: two of the three forgot, and a descriptor this
-    // file failed to duplicate is indistinguishable from one the importer refused to take.
-    if (request.fd < 0) {
-        harnessFailure(std::string("the frame's descriptor could not be duplicated: ") + std::strerror(errno));
-    }
-    request.width = frame.width;
-    request.height = frame.height;
-    request.memorySize = frame.memorySize;
-    request.handleType = frame.handleType == 1 ? wallpaperx::FrameImport::HandleType::DmaBuf
-                                               : wallpaperx::FrameImport::HandleType::OpaqueFd;
-    request.drmFormat = frame.drmFormat;
-    request.drmModifier = frame.drmModifier;
-    request.deviceUuid = frame.deviceUuid;
-    for (const auto& plane : frame.planes) request.planes.emplace_back(plane.get<0>(), plane.get<1>());
-    return request;
-}
 
 // ---------------------------------------------------------------------------- //
 // The run.

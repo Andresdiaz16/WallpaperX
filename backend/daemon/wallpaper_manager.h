@@ -7,9 +7,11 @@
 #include "crash_record.h"
 #include "kept_rows.h"
 #include "log_escape.h"
+#include "pause_mode.h"
 // kTargetDepth and the two numbers behind it: separate because the KDE plugin sizes its import
 // cache against them and cannot include this header.
 #include "ring_depth.h"
+#include "video/stream_position.h"
 #include "vulkan/frame_export.h"
 #include "wallpaper_properties.h"
 
@@ -120,6 +122,17 @@ struct MonitorStatus {
     // answer to "why has this wallpaper stopped moving".
     bool screenVisible = true;
     bool watched = false;
+};
+
+// A monitor's pause setting and what it comes to now. Apart from MonitorStatus because a screen can
+// be set to pause before any wallpaper is chosen for it.
+struct PauseStatus {
+    // Nothing for a setting a newer build wrote, which this one keeps and does not apply.
+    std::optional<PauseMode> mode = PauseMode::Play;
+    bool paused = false;
+    // What the screen bound to this monitor last reported; false when it has not.
+    bool windowFocused = false;
+    bool windowMaximized = false;
 };
 
 // True once a config read has been abandoned mid-call. That thread is still blocked in the
@@ -348,16 +361,21 @@ public:
     // costs one paused picture: the next hand-over starts it again.
     static constexpr std::chrono::seconds kUnwatchedAfter{2};
 
-    // How long a decode session stays open after its monitor stops playing. Stopping already ends
-    // the cost of playing, so what this trades is the video memory a decoder and its picture pool
-    // hold against the cost of coming back, which is not only a file open, a stream probe and one
-    // decode: a reopened file starts at its first picture, so a video that resumes after this plays
-    // from the beginning rather than carrying on. The last picture stays on screen throughout.
+    // How long a decode session stays open after its monitor stops being watched. Stopping already
+    // ends the cost of playing, so what this trades is the video memory a decoder and its picture
+    // pool hold against the cost of coming back: a file open, a
+    // stream probe, and a seek back to the picture it stopped on, which decodes up to a keyframe
+    // interval before anything is shown. The last picture stays on screen throughout.
     //
     // Five seconds is past every transient -- a menu, a notification, a window animation, a screen
     // redrawn at a new size -- and far below the absences whose memory is worth having back: a
     // locked screen, a fullscreen window, a session switched away.
     static constexpr std::chrono::seconds kIdleSessionRelease{5};
+
+    // The same while the monitor's pause setting stops it, whether or not it is also unwatched.
+    // Longer, because a focus mode pauses and resumes with every change of window focus, and one
+    // coming back inside this carries on from the open decoder at once.
+    static constexpr std::chrono::seconds kPausedSessionRelease{30};
 
     // How often one consumer's refusal on one monitor is worth a line. A consumer that holds its
     // fill of a playing video is refused for every picture it does not release in time, so this is
@@ -430,6 +448,7 @@ public:
         // below the ~292 years at which adding one to now() would overflow; some bound is needed.
         std::chrono::steady_clock::duration unwatchedAfter = kUnwatchedAfter;
         std::chrono::steady_clock::duration idleSessionRelease = kIdleSessionRelease;
+        std::chrono::steady_clock::duration pausedSessionRelease = kPausedSessionRelease;
         std::chrono::steady_clock::duration refusalLogInterval = kRefusalLogInterval;
         std::chrono::steady_clock::duration cleanPlayAfter = kCleanPlayAfter;
 
@@ -488,6 +507,25 @@ public:
     // rejects and UnknownOutput for one no monitor answers to. Idempotent: only the change from
     // covered to drawn credits the monitor with having been seen.
     void setOutputVisible(const std::string& outputName, bool visible);
+
+    // Sets when this monitor's video stops on the picture it shows, by PauseMode name. Throws
+    // InvalidRequest for a bad id or an unknown name. Survives every wallpaper change. All or
+    // nothing up to the queued save, which is then waited on without an answer, as requestWallpaper()
+    // does: a failed write is reported in persistence health. The caller wakes the render worker.
+    // Idempotent.
+    void setMonitorPause(int monitorId, const std::string& mode);
+
+    // Records what the screen named `outputName` reports about its windows: whether one has the
+    // focus there, and whether one there is maximized or fullscreen. Not persisted. A screen that
+    // has never reported, or whose reporter `client` has since left the bus, is taken to have
+    // neither, so the focus modes play until a report says otherwise. Throws as setOutputVisible()
+    // does. The caller wakes the render worker. Idempotent.
+    void setOutputFocus(const std::string& client, const std::string& outputName, bool windowFocused,
+                        bool windowMaximized);
+
+    // Drops every focus report `client` made, because it left the bus. Returns whether any went,
+    // which may have ended a pause, so the caller wakes the render worker.
+    bool forgetOutputFocus(const std::string& client);
 
     // Records what the consumer named by `client` says it can import, and returns the monitors
     // to re-post so their images are rebuilt against it. GPU-free, like requestWallpaper: the
@@ -636,6 +674,9 @@ public:
         // Connector name -> monitor id. Its own field: a named monitor need not have a
         // wallpaper.
         std::map<std::string, int> outputs;
+
+        // Every monitor holding a wallpaper or a pause setting.
+        std::map<int, PauseStatus> pause;
     };
     Snapshot snapshot() const;
 
@@ -813,6 +854,15 @@ private:
         };
         ResumeCredit resumeCredit;
 
+        // Where the wallpaper `forSeq` names stood when its session was released, so the session
+        // that replaces it starts on the picture that stayed on screen. Held here because the
+        // session is gone; spent by the next attempt to open one for this monitor, whatever it plays.
+        struct ReleasedAt {
+            uint64_t forSeq = 0;
+            StreamPosition shown;
+        };
+        std::optional<ReleasedAt> releasedAt;
+
         // The wallpaper whose file held a single picture: it is on screen and there is nothing
         // after it, so no clock advances it and no session is opened to play it. Keyed by
         // wallpaperSeq for ReopenBudget's reason, and held here rather than on the session
@@ -913,11 +963,16 @@ private:
     std::optional<std::chrono::steady_clock::time_point> advanceSessionLocked(
         int monitorId, std::chrono::steady_clock::time_point now, ClockRound& round);
 
-    // The three entries to a monitor's retained decode session, all on the GPU thread with
+    // The four entries to a monitor's retained decode session, all on the GPU thread with
     // m_gpuMutex held. A routine teardown -- a screen gone dark, an eviction, a wallpaper replaced --
     // re-enters ffmpeg and the driver but blames nothing: it is not the file's content running, so
     // a death in it must not refuse a working wallpaper. A caller that holds a record keeps it.
     void closeVideoSessionLocked(int monitorId);
+
+    // The same for a session freed only to have its memory back, which the next session for the
+    // same wallpaper resumes from: it records the picture on screen as MonitorState::releasedAt.
+    // Takes m_stateMutex.
+    void releaseVideoSessionLocked(int monitorId);
 
     // The same after `failure` broke the session, named to the fatal-signal handler only when the
     // failure was the file's: freeing a pipeline on a device that has just failed can itself crash
@@ -934,12 +989,20 @@ private:
     // picture. Caller must hold m_stateMutex.
     std::optional<uint64_t> currentSeqLocked(int monitorId, uint64_t wallpaperSeq) const;
 
-    // The same, and watched: what the clock advances, what the idle release frees, and what decides
-    // a session is worth reopening. Eviction deliberately asks the narrower pair instead --
-    // currentSeqLocked() and screenDrawnLocked() -- because a consumer that has not fetched for a
-    // moment must not cost its screen the decoder it is visibly playing. Caller must hold
-    // m_stateMutex.
+    // The same, watched and not paused: what the clock advances, and what decides a session is worth
+    // reopening. Eviction deliberately asks the narrower pair instead -- currentSeqLocked() and
+    // screenDrawnLocked() -- because a consumer that has not fetched for a moment must not cost its
+    // screen the decoder it is visibly playing. Caller must hold m_stateMutex.
     std::optional<uint64_t> playingSeqLocked(int monitorId, uint64_t wallpaperSeq) const;
+
+    // Whether this monitor's pause setting, against what its screen last reported, stops its video
+    // now. Caller must hold m_stateMutex.
+    bool pausedLocked(int monitorId) const;
+
+    // Ends the clean-play stretch of a monitor that is paused now. Called by every change that can
+    // pause one, so a pause and its end landing between two clock rounds is not counted as played.
+    // Caller must hold m_stateMutex.
+    void endPlayIfPausedLocked(int monitorId);
 
     // Whether anything can see this monitor: its screen is being drawn and nothing it published is
     // sitting uncollected. Reads the clock itself, so no caller can ask with a stale one. Caller
@@ -1174,6 +1237,9 @@ private:
         // heap so its bytes stay put when the session is moved: the handler holds their address.
         std::unique_ptr<const std::string> blame;
         std::unique_ptr<VideoPipeline> pipeline;
+        // The MonitorState::releasedAt this session was opened at: the picture on screen until the
+        // session draws one of its own.
+        std::optional<StreamPosition> openedAt;
 
         // The held picture: the first, never drawn; the one on screen, whose successor is decoded
         // next; or that successor, waiting for `due`. `timeline` is a picture's place on the file's
@@ -1206,7 +1272,8 @@ private:
 
         // When the clock first found this session's monitor not playing, or nothing while it is.
         // The whole off switch: a video nobody can see stops at once and keeps its picture, and
-        // this is what says how long it has been stopped, whatever stopped it.
+        // this is what says how long it has been stopped, whatever stopped it. Which release delay
+        // runs from it is decided each round by what stops it then.
         std::optional<std::chrono::steady_clock::time_point> idleSince;
     };
     std::map<int, VideoSession> m_videoSessions;
@@ -1235,6 +1302,25 @@ private:
     // there would be answered with success and never sent again. Absent means drawn, which is what
     // a screen that has never reported is taken to be. Guarded by m_stateMutex.
     std::set<std::string> m_outputsNotDrawn;
+
+    // Monitor id -> its pause setting as the config row carries it, JSON text; absent means play.
+    // Text so a setting a newer build wrote is kept as read -- pauseModeFromJson() says which mode
+    // it is, if any. Guarded by m_stateMutex.
+    std::map<int, std::string> m_pauseSettings;
+
+    // What each screen reported about its windows, by name for m_outputsNotDrawn's reason, and who
+    // reported it, so the report dies with its reporter. Only a report of a focused or maximized
+    // window is held: absent means neither. Every key is a bound name -- bindOutputLocked() drops a
+    // name's report with its binding. Guarded by m_stateMutex.
+    struct FocusReport {
+        std::string reporter;
+        bool windowFocused = false;
+        bool windowMaximized = false;
+    };
+    std::map<std::string, FocusReport> m_outputFocus;
+
+    // The report for the screen bound to this monitor, or null. Caller must hold m_stateMutex.
+    const FocusReport* focusReportLocked(int monitorId) const;
 
     // What each consumer reported it can import, keyed by its DBus unique name, and the
     // intersection currently in force. Per-consumer because the daemon must satisfy all of

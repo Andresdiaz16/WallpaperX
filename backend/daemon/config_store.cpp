@@ -40,6 +40,7 @@ constexpr const char* kKeyOutputSize = "output_size";
 constexpr const char* kKeyWidth = "width";
 constexpr const char* kKeyHeight = "height";
 constexpr const char* kKeyProperties = "properties";
+constexpr const char* kKeyPause = "pause";
 
 // load() returns from a dozen places; this is what keeps the descriptor from leaking out
 // of any of them.
@@ -273,6 +274,7 @@ LoadResult ConfigStore::load() const {
             if (element.contains(kKeyOutputSize)) entry.outputSizeJson = element.at(kKeyOutputSize).dump();
             // A config written before properties existed has none.
             if (element.contains(kKeyProperties)) entry.propertiesJson = element.at(kKeyProperties).dump();
+            if (element.contains(kKeyPause)) entry.pauseJson = element.at(kKeyPause).dump();
             result.entries.push_back(std::move(entry));
         }
     } catch (const std::exception& e) {
@@ -310,7 +312,7 @@ SaveResult ConfigStore::save(const std::vector<PersistedWallpaper>& entries) con
             // file cannot carry leaves the screen anonymous either way.
             if (!nameOk && !entry.output.empty()) ++result.skippedNames;
             // Nothing left worth a row.
-            if (!wallpaperOk && (!nameOk || entry.output.empty())) continue;
+            if (!wallpaperOk && (!nameOk || entry.output.empty()) && entry.pauseJson.empty()) continue;
 
             // Both keys stay present whatever survives: load() reads a row missing either one
             // as malformed, which would turn a degraded write into a lost row at the next start.
@@ -334,6 +336,12 @@ SaveResult ConfigStore::save(const std::vector<PersistedWallpaper>& entries) con
                     nlohmann::json size = nlohmann::json::parse(entry.outputSizeJson, nullptr, false);
                     if (!size.is_discarded()) row[kKeyOutputSize] = std::move(size);
                 }
+            }
+            // Beside anything or nothing: it belongs to the monitor id. Absent means play, so a config
+            // that never set one is byte-identical to what a build without this field writes.
+            if (!entry.pauseJson.empty()) {
+                nlohmann::json pause = nlohmann::json::parse(entry.pauseJson, nullptr, false);
+                if (!pause.is_discarded()) row[kKeyPause] = std::move(pause);
             }
             monitors.push_back(std::move(row));
         }

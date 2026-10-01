@@ -3,6 +3,7 @@
 #include "video_decoder.h"
 
 #include "frame_converter.h"
+#include "reset_point.h"
 
 #include "../vulkan/format_features.h"
 #include "../vulkan/gpu_fault.h"
@@ -56,6 +57,11 @@ constexpr int kIoBufferSize = 32768;
 constexpr const char* kNoProtocols = "none";
 
 constexpr const char* kComponent = "VideoDecoder";
+
+// The most pictures a start decodes and drops to reach its picture from the keyframe it decodes from.
+// The catch-up holds the GPU lock; 250 is x264's and x265's default keyframe interval, so a default
+// closed-GOP file always reaches its picture.
+constexpr int64_t kCatchUpPictures = 250;
 
 // An ffmpeg error that is not the GPU's: memory, or the file, which it names.
 [[noreturn]] void throwFileFailure(const std::string& reason, int err, const std::string& file) {
@@ -271,7 +277,8 @@ DecodedFrame::DecodedFrame(DecodedFrame&& other) noexcept
       m_frame(std::exchange(other.m_frame, nullptr)),
       m_colour(other.m_colour),
       m_presentation(other.m_presentation),
-      m_duration(other.m_duration) {}
+      m_duration(other.m_duration),
+      m_position(other.m_position) {}
 
 DecodedFrame& DecodedFrame::operator=(DecodedFrame&& other) noexcept {
     if (this != &other) {
@@ -281,6 +288,7 @@ DecodedFrame& DecodedFrame::operator=(DecodedFrame&& other) noexcept {
         m_colour = other.m_colour;
         m_presentation = other.m_presentation;
         m_duration = other.m_duration;
+        m_position = other.m_position;
     }
     return *this;
 }
@@ -364,13 +372,16 @@ DecodedFrame::HostPlanes DecodedFrame::hostPlanes() const {
 
 // --------------------------------------------------------------------------- VideoDecoder
 
-VideoDecoder::VideoDecoder(Device& device, const std::string& file) : m_device(device), m_file(file) {
+VideoDecoder::VideoDecoder(Device& device, const std::string& file, std::optional<StreamPosition> position)
+    : m_device(device), m_file(file) {
     m_device.assertGpuThread("VideoDecoder::VideoDecoder");
     try {
         m_packet = av_packet_alloc();
         if (m_packet == nullptr) throwOutOfMemory("VideoDecoder");
         openContainer();
+        // The decoder first: whether it is the device's decides how the start seeks.
         openDecoder();
+        if (position) startAt(*position);
     } catch (...) {
         closeAll();
         throw;
@@ -621,42 +632,208 @@ void VideoDecoder::openDecoder() {
 }
 
 void VideoDecoder::reopenInSoftware() {
-    m_reopenInSoftware = false;
+    m_pending = Pending::Nothing;
     m_flushed = false;
     m_awaitingHardwareSetup = false;
     m_parkedFailure = nullptr;
     retireDecoder();
     av_packet_unref(m_packet);
+    seekToResume();
+    openDecoder();
+}
 
+void VideoDecoder::seekAgain() {
+    // A start on the device is positioned at a reset point it has read, so it never retries.
+    if (decodesOnDevice()) throw std::logic_error("VideoDecoder: a seek retry on the hardware decoder");
+    m_pending = Pending::Nothing;
+    avcodec_flush_buffers(m_codec);
+    m_flushed = false;
+    av_packet_unref(m_packet);
+    seekToResume();
+}
+
+// Nothing is marked returned, so a hardware failure during the drop resumes at the same picture.
+void VideoDecoder::startAt(StreamPosition position) {
+    const int64_t before = av_sat_sub64(position.m_timestamp, 1);
+    if (before <= streamStart()) return;
+    if (decodesOnDevice()) {
+        startAtResetPoint(before);
+        return;
+    }
+    m_returned.lastTimestamp = before;
+    m_startedAfter = before;
+    seekToResume();
+}
+
+void VideoDecoder::startAtFirstPicture() {
+    rewind();
+    m_resume = std::monostate{};
+    m_returned = {};
+    m_startedAfter.reset();
+}
+
+bool VideoDecoder::withinCatchUp(int64_t distance) const {
+    const AVStream& stream = *m_format->streams[m_stream];
+    const std::optional<std::chrono::nanoseconds> interval = nominalInterval(stream);
+    const std::optional<std::chrono::nanoseconds> span = inNanoseconds(distance, stream.time_base);
+    return interval && span && *span <= kCatchUpPictures * *interval;
+}
+
+int64_t VideoDecoder::nextSeekBack(int64_t back) const {
+    if (back != 0) return av_sat_add64(back, back);
+    return std::max<int64_t>(1, av_rescale_q(1, AVRational{1, 1}, m_format->streams[m_stream]->time_base));
+}
+
+// Each window aims twice as far back as the last and is read up to where the last one began. The first
+// window's first reset point is taken as it is met, which is where a keyframe start always decoded
+// from; in a later one the last is taken, being the nearest, and sought again.
+void VideoDecoder::startAtResetPoint(int64_t resume) {
+    std::optional<PacketMark> newer;
+    for (int64_t back = 0;; back = nextSeekBack(back)) {
+        const int64_t target = av_sat_sub64(resume, back);
+        bool fromStart = target <= streamStart();
+        if (!fromStart && av_seek_frame(m_format, m_stream, target, AVSEEK_FLAG_BACKWARD) < 0) {
+            // Where a failed seek left the container is not known, and reading from the first packet
+            // is bounded only when the position itself is within the budget; seekToResume() decides alike.
+            if (!withinCatchUp(resume - streamStart())) {
+                rewind();
+                return;
+            }
+            fromStart = true;
+        }
+        if (fromStart) {
+            rewind();
+        } else {
+            m_packetsRead.reset();
+        }
+        const Window window = scanWindow(resume, newer, fromStart, back == 0);
+        if (!window.last) {
+            // From the start, the first packet is not timestamped at or before the position.
+            // Past the budget, a reset point further back could only be shown where it stands, and
+            // reading back to it holds the GPU lock for as long as the position is from it.
+            if (fromStart || !withinCatchUp(back)) {
+                rewind();
+                return;
+            }
+            if (window.first) newer = window.first;
+            continue;
+        }
+        const ResetPoint& reset = *window.last;
+        if (back != 0 && !seekToPacket(reset.mark, fromStart ? std::nullopt : std::optional<int64_t>(target))) {
+            // Only a file changed since the scan gets here.
+            rewind();
+            return;
+        }
+        const bool withinBudget = withinCatchUp(resume - reset.time);
+        if (!withinBudget && (reset.fileStart || reset.time <= streamStart())) {
+            rewind();
+            return;
+        }
+        m_returned.lastTimestamp = withinBudget ? resume : av_sat_sub64(reset.time, 1);
+        m_resume = DropThrough{};
+        m_startedAfter = m_returned.lastTimestamp;
+        return;
+    }
+}
+
+// Reads packets without decoding them, from where the container stands -- a packet already held
+// first -- until one decoded after the position or the first packet of the window read before.
+// Nothing before a reset point in decode order is shown after it, so none past that one is nearer.
+// With `stopAtFirst` the first reset point found is left held for the decoder.
+VideoDecoder::Window VideoDecoder::scanWindow(int64_t resume, const std::optional<PacketMark>& newer, bool fromStart,
+                                              bool stopAtFirst) {
+    Window window;
+    for (;;) {
+        if (m_packet->data == nullptr) {
+            const int err = readVideoPacket();
+            if (err == AVERROR_EOF) return window;
+            if (err < 0) throwFileFailure("cannot read the wallpaper", err, m_file);
+        }
+        const bool fileStart = fromStart && !window.first;
+        if (!window.first) window.first = PacketMark::of(*m_packet);
+        const int64_t time = m_packet->pts != AV_NOPTS_VALUE ? m_packet->pts : m_packet->dts;
+        if (time != AV_NOPTS_VALUE && time <= resume &&
+            (fileStart || resetsDecoder(*m_format->streams[m_stream]->codecpar, *m_packet))) {
+            window.last = ResetPoint{PacketMark::of(*m_packet), time, fileStart};
+            if (stopAtFirst) return window;
+        }
+        const int64_t order = m_packet->dts != AV_NOPTS_VALUE ? m_packet->dts : m_packet->pts;
+        const bool past = (newer && newer->matches(*m_packet)) || (order != AV_NOPTS_VALUE && order > resume);
+        av_packet_unref(m_packet);
+        if (past) return window;
+    }
+}
+
+// Leaves the packet `mark` names read and held, as rewind() leaves packet 1: found after a seek to
+// `target`, else by reading from the first packet. A packet held from before the seek is dropped: it
+// could be that same one, which would then be sent twice.
+bool VideoDecoder::seekToPacket(const PacketMark& mark, std::optional<int64_t> target) {
+    av_packet_unref(m_packet);
+    if (target && av_seek_frame(m_format, m_stream, *target, AVSEEK_FLAG_BACKWARD) >= 0) {
+        m_packetsRead.reset();
+        if (skipToPacket(mark)) return true;
+    }
+    rewind();
+    return skipToPacket(mark);
+}
+
+// Stops at a packet decoded after the one sought: `mark` is a reset point, so every packet before it
+// in decode order is also presented before it.
+bool VideoDecoder::skipToPacket(const PacketMark& mark) {
+    const int64_t sought = mark.dts != AV_NOPTS_VALUE ? mark.dts : mark.pts;
+    for (;;) {
+        if (m_packet->data == nullptr && readVideoPacket() < 0) return false;
+        if (mark.matches(*m_packet)) return true;
+        const int64_t at = m_packet->dts != AV_NOPTS_VALUE ? m_packet->dts : m_packet->pts;
+        av_packet_unref(m_packet);
+        if (sought != AV_NOPTS_VALUE && at != AV_NOPTS_VALUE && at > sought) return false;
+    }
+}
+
+bool VideoDecoder::decodesOnDevice() const { return m_codec != nullptr && m_codec->hw_device_ctx != nullptr; }
+
+void VideoDecoder::seekToResume() {
+    // Ending without meeting that packet's picture means software did not decode the same pictures.
+    const bool byPacket = m_returned.lastPacket && !std::holds_alternative<DropThroughPacket>(m_resume);
+    if (!m_returned.lastTimestamp && !byPacket && m_startedAfter) {
+        // A count of pictures since a start part way in says nothing measured from the first packet, so
+        // this resumes by timestamp, where the count is never a number to drop. It is kept: it is what
+        // says pictures have been shown.
+        m_returned.lastTimestamp = m_startedAfter;
+        m_returned.lastPacket.reset();
+        m_resume = std::monostate{};
+    }
     if (!m_returned.lastTimestamp) {
-        // Ending without meeting that packet's picture means software did not decode the same pictures.
-        const bool packetMissed = std::holds_alternative<DropThroughPacket>(m_resume);
         rewind();
         if (m_returned.count == 0) {
             m_resume = std::monostate{};
-        } else if (m_returned.lastPacket && !packetMissed) {
+        } else if (byPacket) {
             m_resume = DropThroughPacket{};
         } else {
             m_resume = DropCount{m_returned.count};
         }
-    } else {
-        // Each retry aims twice as far back, from a second, so a demuxer that lands past its
-        // target costs a few keyframe intervals rather than the whole file.
-        const Seeked* unlanded = std::get_if<Seeked>(&m_resume);
-        const int64_t second =
-            std::max<int64_t>(1, av_rescale_q(1, AVRational{1, 1}, m_format->streams[m_stream]->time_base));
-        int64_t back = 0;
-        if (unlanded != nullptr) back = unlanded->back == 0 ? second : av_sat_add64(unlanded->back, unlanded->back);
-        const int64_t target = av_sat_sub64(*m_returned.lastTimestamp, back);
-        if (target > streamStart() && av_seek_frame(m_format, m_stream, target, AVSEEK_FLAG_BACKWARD) >= 0) {
-            m_packetsRead.reset();
-            m_resume = Seeked{back};
-        } else {
-            rewind();
-            m_resume = DropThrough{};
-        }
+        return;
     }
-    openDecoder();
+    // Each retry aims further back, so a demuxer that lands past its target costs a few keyframe
+    // intervals rather than the whole file. A start has shown nothing, so it has no continuity to keep
+    // past the catch-up budget and starts at the stream's first picture instead.
+    const Seeked* unlanded = std::get_if<Seeked>(&m_resume);
+    const int64_t back = unlanded != nullptr ? nextSeekBack(unlanded->back) : 0;
+    const bool starting = m_returned.count == 0;
+    if (starting && back != 0 && !withinCatchUp(back)) {
+        startAtFirstPicture();
+        return;
+    }
+    const int64_t target = av_sat_sub64(*m_returned.lastTimestamp, back);
+    if (target > streamStart() && av_seek_frame(m_format, m_stream, target, AVSEEK_FLAG_BACKWARD) >= 0) {
+        m_packetsRead.reset();
+        m_resume = Seeked{back};
+    } else if (starting && !withinCatchUp(*m_returned.lastTimestamp - streamStart())) {
+        startAtFirstPicture();
+    } else {
+        rewind();
+        m_resume = DropThrough{};
+    }
 }
 
 int64_t VideoDecoder::streamStart() const {
@@ -684,7 +861,7 @@ void VideoDecoder::rewind() {
 // does in Matroska, which gives packet 1 no decode time; its byte position does in a raw bitstream,
 // which cannot seek by time.
 bool VideoDecoder::seekToFirstPacket() {
-    const FirstPacket& first = *m_firstPacket;
+    const PacketMark& first = *m_firstPacket;
     const int64_t presented = first.pts != AV_NOPTS_VALUE ? first.pts : streamStart();
     return (first.dts != AV_NOPTS_VALUE && seekLandsOnFirstPacket(first.dts, AVSEEK_FLAG_BACKWARD)) ||
            (presented != first.dts && seekLandsOnFirstPacket(presented, AVSEEK_FLAG_BACKWARD)) ||
@@ -694,19 +871,23 @@ bool VideoDecoder::seekToFirstPacket() {
 bool VideoDecoder::seekLandsOnFirstPacket(int64_t target, int flags) {
     const int stream = (flags & AVSEEK_FLAG_BYTE) != 0 ? -1 : m_stream;
     if (av_seek_frame(m_format, stream, target, flags) < 0) return false;
-    if (readVideoPacket() >= 0 && isFirstPacket()) return true;
+    if (readVideoPacket() >= 0 && m_firstPacket->matches(*m_packet)) return true;
     av_packet_unref(m_packet);
     return false;
 }
 
-// By byte position where packet 1 has one. Otherwise by timestamps and size, which another packet
-// could share, and a false match misnumbers every packet after it for a resume by packet number;
-// so that match is only made between packets without a position, and needs a timestamp.
-bool VideoDecoder::isFirstPacket() const {
-    const FirstPacket& first = *m_firstPacket;
-    if (first.position) return m_packet->pos == *first.position;
-    return m_packet->pos < 0 && (first.dts != AV_NOPTS_VALUE || first.pts != AV_NOPTS_VALUE) &&
-           m_packet->dts == first.dts && m_packet->pts == first.pts && m_packet->size == first.size;
+VideoDecoder::PacketMark VideoDecoder::PacketMark::of(const AVPacket& packet) {
+    return PacketMark{packet.pos >= 0 ? std::optional<int64_t>(packet.pos) : std::nullopt, packet.dts, packet.pts,
+                      packet.size};
+}
+
+// By byte position where the mark has one. Otherwise by timestamps and size, which another packet
+// could share, and a false match of packet 1 misnumbers every packet after it for a resume by packet
+// number; so that match is only made between packets without a position, and needs a timestamp.
+bool VideoDecoder::PacketMark::matches(const AVPacket& packet) const {
+    if (position) return packet.pos == *position;
+    return packet.pos < 0 && (dts != AV_NOPTS_VALUE || pts != AV_NOPTS_VALUE) && packet.dts == dts &&
+           packet.pts == pts && packet.size == size;
 }
 
 void VideoDecoder::restart() {
@@ -715,6 +896,7 @@ void VideoDecoder::restart() {
     m_flushed = false;
     m_returned = {};
     m_resume = std::monostate{};
+    m_startedAfter.reset();
     rewind();
 }
 
@@ -735,7 +917,7 @@ bool VideoDecoder::admit(int64_t timestamp, std::optional<uint64_t> packet) {
         // point does: pictures between the two may never have been decoded.
         if (timestamp == AV_NOPTS_VALUE) return false;
         if (timestamp > *m_returned.lastTimestamp) {
-            m_reopenInSoftware = true;
+            require(Pending::SeekAgain);
         } else {
             m_resume = DropThrough{};
         }
@@ -757,16 +939,37 @@ void VideoDecoder::recordReturned(int64_t timestamp, std::optional<uint64_t> pac
     ++m_returned.count;
 }
 
-// Called with each packet read. Only the first after a seek shows where it landed; any later one
-// can only show that a picture past the resume point was left to decode.
+// A seek can land on a picture that is not a keyframe: a transport stream's does, having no index.
+// Its references were never decoded, and recordLanding() proves nothing from it. Software only, as
+// every Seeked state is.
+bool VideoDecoder::beforeLandingKeyframe() const {
+    const auto* seeked = std::get_if<Seeked>(&m_resume);
+    return seeked != nullptr && seeked->landing == Landing::NoPacket && (m_packet->flags & AV_PKT_FLAG_KEY) == 0;
+}
+
+// Called with each packet decoded. The first after a seek is a keyframe and shows where it landed;
+// any later one can only show that a picture past the resume point was left to decode.
 void VideoDecoder::recordLanding() {
     auto* seeked = std::get_if<Seeked>(&m_resume);
     if (seeked == nullptr || seeked->landing == Landing::Unproven) return;
     const int64_t at = m_packet->pts != AV_NOPTS_VALUE ? m_packet->pts : m_packet->dts;
     const bool atOrBefore = at != AV_NOPTS_VALUE && at <= *m_returned.lastTimestamp;
-    const bool keyframe = (m_packet->flags & AV_PKT_FLAG_KEY) != 0;
-    const bool first = seeked->landing == Landing::NoPacket;
-    seeked->landing = atOrBefore && (keyframe || !first) ? Landing::NothingPast : Landing::Unproven;
+    if (seeked->landing == Landing::NoPacket && atOrBefore && m_returned.count == 0 &&
+        !withinCatchUp(*m_returned.lastTimestamp - at)) {
+        // A start past the budget from its keyframe shows the keyframe, as startAtResetPoint() does. No
+        // rewind: this packet is about to be sent.
+        if (at <= streamStart()) {
+            m_returned = {};
+            m_startedAfter.reset();
+            m_resume = std::monostate{};
+        } else {
+            m_returned.lastTimestamp = av_sat_sub64(at, 1);
+            m_startedAfter = m_returned.lastTimestamp;
+            m_resume = DropThrough{};
+        }
+        return;
+    }
+    seeked->landing = atOrBefore ? Landing::NothingPast : Landing::Unproven;
 }
 
 bool VideoDecoder::attachDevice() {
@@ -992,7 +1195,7 @@ AVPixelFormat VideoDecoder::choose(AVCodecContext* codec, const AVPixelFormat* o
     }
     // Never software on this context: it was opened for the device -- single-threaded, and for
     // AV1 a decoder with no software output of its own.
-    m_reopenInSoftware = true;
+    require(Pending::ReopenInSoftware);
     return AV_PIX_FMT_NONE;
 }
 
@@ -1003,7 +1206,7 @@ int VideoDecoder::allocatePicture(AVCodecContext* codec, AVFrame* frame, int fla
     auto* self = static_cast<VideoDecoder*>(codec->opaque);
     if (codec->hw_frames_ctx != nullptr && !self->holds(*codec->hw_frames_ctx, frame->width, frame->height)) {
         self->m_path = Path::SoftwareRefused;
-        self->m_reopenInSoftware = true;
+        self->require(Pending::ReopenInSoftware);
         return AVERROR(ENOSYS);
     }
     return avcodec_default_get_buffer2(codec, frame, flags);
@@ -1032,10 +1235,7 @@ int VideoDecoder::readVideoPacket() {
 
 void VideoDecoder::numberPacket() {
     m_packet->opaque = reinterpret_cast<void*>(static_cast<uintptr_t>(++*m_packetsRead));
-    if (*m_packetsRead == 1) {
-        m_firstPacket = FirstPacket{m_packet->pos >= 0 ? std::optional<int64_t>(m_packet->pos) : std::nullopt,
-                                    m_packet->dts, m_packet->pts, m_packet->size};
-    }
+    if (*m_packetsRead == 1) m_firstPacket = PacketMark::of(*m_packet);
 }
 
 // What an ffmpeg error during decoding means. Returns only when the hardware path failed on a
@@ -1050,7 +1250,7 @@ void VideoDecoder::failDecode(const char* what, int err) {
                 kComponent, failed + ": the hardware decoder failed and the device no longer answers", m_file));
         }
         m_path = Path::SoftwareRefused;
-        m_reopenInSoftware = true;
+        require(Pending::ReopenInSoftware);
         return;
     }
     throwFileFailure(failed, err, m_file);
@@ -1063,9 +1263,10 @@ std::optional<DecodedFrame> VideoDecoder::next() {
     for (;;) {
         // What the format callback decided during the last ffmpeg call comes before what that
         // call returned: a refusal of every format reads as bad input or as the end otherwise.
-        if (m_reopenInSoftware) reopenInSoftware();
+        if (m_pending == Pending::ReopenInSoftware) reopenInSoftware();
+        if (m_pending == Pending::SeekAgain) seekAgain();
         int err = avcodec_receive_frame(m_codec, m_frame);
-        if (m_reopenInSoftware) continue;
+        if (m_pending != Pending::Nothing) continue;
         if (m_parkedFailure) failDecode("avcodec_receive_frame", err);
         if (err == 0) {
             m_awaitingHardwareSetup = false;
@@ -1085,6 +1286,7 @@ std::optional<DecodedFrame> VideoDecoder::next() {
             frame.m_duration = out->duration > 0 ? inNanoseconds(out->duration, stream.time_base)
                                                  : nominalInterval(stream);
             recordReturned(timestamp, packet);
+            if (m_returned.lastTimestamp) frame.m_position = StreamPosition(*m_returned.lastTimestamp);
             return frame;
         }
         // Nothing more can be sent after the flush, so a decoder that still asks for input has
@@ -1093,13 +1295,19 @@ std::optional<DecodedFrame> VideoDecoder::next() {
             const auto* seeked = std::get_if<Seeked>(&m_resume);
             if ((seeked != nullptr && seeked->landing != Landing::NothingPast) ||
                 std::holds_alternative<DropThroughPacket>(m_resume)) {
-                m_reopenInSoftware = true;
+                require(Pending::SeekAgain);
                 continue;
             }
             if (std::holds_alternative<DropCount>(m_resume)) {
                 throw WallpaperContentError(describeRejection(
                     kComponent, "the wallpaper ended before software decoding reached the pictures already returned",
                     m_file));
+            }
+            // A start past the last picture, which a position from another file can be. Not again:
+            // restart() makes this an ordinary pass.
+            if (m_startedAfter && m_returned.count == 0) {
+                restart();
+                continue;
             }
             // A play-once caller may not call again, which would hold a decoder retired near the end until close.
             releaseRetiredCodec();
@@ -1118,6 +1326,10 @@ std::optional<DecodedFrame> VideoDecoder::next() {
         const bool resend = m_packet->data != nullptr;
         if (!resend) {
             err = readVideoPacket();
+            while (err >= 0 && beforeLandingKeyframe()) {
+                av_packet_unref(m_packet);
+                err = readVideoPacket();
+            }
             if (err == AVERROR_EOF) {
                 m_flushed = true;
             } else if (err < 0) {
@@ -1132,7 +1344,7 @@ std::optional<DecodedFrame> VideoDecoder::next() {
         // that promise broken, and failing is better than spinning on it.
         if (err == AVERROR(EAGAIN) && !resend) continue;
         av_packet_unref(m_packet);
-        if (m_reopenInSoftware) continue;
+        if (m_pending != Pending::Nothing) continue;
         if (m_parkedFailure) failDecode("avcodec_send_packet", err);
         if (err == AVERROR(EAGAIN)) {
             throw std::logic_error("VideoDecoder: ffmpeg refused the same packet twice without giving a frame");

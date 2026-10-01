@@ -446,10 +446,11 @@ void runHardwareChecks(Device& device) {
     //       references no other picture, so a run that stopped there would exercise none of
     //       ffmpeg's reference-picture handling and would never reach the one validation message
     //       this probe excuses, leaving the excuse itself unexercised.
-    // CONTROL: renderer/video/video_decoder.cpp, next()'s end-of-stream test widened to take an
-    //       EAGAIN on the hardware path as the end, so the hardware path stops as soon as ffmpeg
-    //       first asks for input. Observed: "FAIL: the hardware path decoded 1 frames where a
-    //       software decode of the same file decodes 10". Reverted.
+    // CONTROL: via control_batch.sh, 2026-10-01, renderer/video/video_decoder.cpp, next()'s end-of-stream
+    //       test widened to take an EAGAIN on the hardware path, once a picture has been returned, as the
+    //       end -> "FAIL: the hardware path decoded 1 frames where a software decode of the same file decodes
+    //       10". Reverted. Widened for every EAGAIN, the earlier check "decoded to no frames at all" fails
+    //       first and this one is not reached.
     int hardwareFrames = 1;
     while (std::optional<DecodedFrame> more = decoder.next()) {
         ++hardwareFrames;
@@ -510,10 +511,11 @@ void runRefusedChecks(Device& device) {
     //       hardcoded number. A hardcoded number is a claim about the fixture generator; the
     //       comparison is a claim about the reopen, and it is the only form that can see a
     //       reopen which resumes where the hardware attempt stopped instead of starting again.
-    // CONTROL: renderer/video/video_decoder.cpp, reopenInSoftware() without the rewind() it makes when
-    //       no picture has a timestamp to resume after, so software carries on from the packets the
-    //       hardware attempt consumed. Observed: "FAIL: the software reopen produced 5 frames where a
-    //       never-hardware decode of the same file produces 10". Reverted.
+    // CONTROL: renderer/video/video_decoder.cpp, seekToResume() -- which reopenInSoftware() calls --
+    //       without the rewind() it makes when no picture has a timestamp to resume after, so software
+    //       carries on from the packets the hardware attempt consumed. Observed: "FAIL: the software reopen
+    //       produced 5 frames where a never-hardware decode of the same file produces 10", via
+    //       control_batch.sh 2026-09-30. Reverted.
     const DecodeResult refused = decodeAll(device, asset("h264_10bit.mp4"));
     check(refused.path == VideoDecoder::Path::SoftwareRefused,
           "10-bit H.264 did not report Path::SoftwareRefused");

@@ -104,6 +104,10 @@ void DbusService::forgetClient(const std::string& client) {
     // Its acquire timeline goes too: nothing will ever be handed to that name again.
     m_manager.forgetAcquireTimeline(client);
 
+    // And what it said about its screens' windows: with nobody left to say a window is focused
+    // there, a pause that rested on it ends.
+    if (m_manager.forgetOutputFocus(client)) m_worker.wake();
+
     // Likewise its claim on the images it was reading. A consumer that crashed holding a frame --
     // plasmashell restarts are routine, this daemon does not -- would otherwise keep those images
     // out of the ring for good.
@@ -248,6 +252,16 @@ void DbusService::registerVTable() {
                     setOutputVisible(outputName, visible);
                 })
                 .withInputParamNames("output_name", "visible"),
+            sdbus::registerMethod("SetMonitorPause")
+                .implementedAs([this](int32_t monitorId, const std::string& mode) { setMonitorPause(monitorId, mode); })
+                .withInputParamNames("monitor_id", "mode"),
+            sdbus::registerMethod("SetOutputFocus")
+                .implementedAs([this](const std::string& outputName, bool windowFocused, bool windowMaximized) {
+                    // The sender, for SetImportModifiers' reason: it is what a departure names.
+                    const char* sender = m_object->getCurrentlyProcessedMessage().getSender();
+                    setOutputFocus(sender ? sender : "", outputName, windowFocused, windowMaximized);
+                })
+                .withInputParamNames("output_name", "window_focused", "window_maximized"),
             sdbus::registerMethod("GetStatus").implementedAs([this]() { return getStatus(); }).withOutputParamNames("status"),
             // frame_generation rides along with the monitor id. A bare FrameReady(monitor)
             // was unambiguous only while rendering was synchronous; now that several
@@ -386,6 +400,7 @@ void DbusService::setMonitorOutput(int32_t monitorId, const std::string& outputN
         // A write that failed leaves the binding standing, so the redraws it owes are still owed.
         // A save that could not be queued undid the binding and owes none.
         for (const int id : redraw) m_worker.post(id);
+        m_worker.wake();
         // As SetWallpaper does: the save behind this can throw on a machine out of threads
         // or memory, and letting that escape the callback tells the client nothing.
         std::fprintf(stderr, "wallpaperx-daemon: SetMonitorOutput failed (monitor=%d): %s\n",
@@ -395,6 +410,8 @@ void DbusService::setMonitorOutput(int32_t monitorId, const std::string& outputN
 
     // A name carries its screen's size, so moving one can change what a monitor is drawn at.
     for (const int id : redraw) m_worker.post(id);
+    // And its window report, whose loss can end a pause.
+    m_worker.wake();
 }
 
 void DbusService::setOutputSize(const std::string& outputName, uint32_t width, uint32_t height) {
@@ -438,6 +455,43 @@ void DbusService::setOutputVisible(const std::string& outputName, bool visible) 
     // What resumes a video stopped because nothing could see it. No render is posted: the monitor
     // still holds the picture it stopped on, and the clock round this wake runs is what decides
     // whether anything has to be drawn or reopened.
+    m_worker.wake();
+}
+
+void DbusService::setMonitorPause(int32_t monitorId, const std::string& mode) {
+    std::printf("wallpaperx-daemon: SetMonitorPause(monitor=%d, mode=%s)\n", monitorId, sanitizeForLog(mode).c_str());
+    std::fflush(stdout);
+
+    try {
+        m_manager.setMonitorPause(monitorId, mode);
+    } catch (const InvalidRequest& e) {
+        std::fprintf(stderr, "wallpaperx-daemon: SetMonitorPause rejected (monitor=%d): %s\n", monitorId, e.what());
+        throw sdbus::Error(sdbus::Error::Name{kErrorInvalidArgs}, e.what());
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "wallpaperx-daemon: SetMonitorPause failed (monitor=%d): %s\n", monitorId, e.what());
+        throw sdbus::Error(sdbus::Error::Name{kErrorRenderFailed}, e.what());
+    }
+
+    // No render: a paused video keeps the picture it is showing, and one resumed goes on from it.
+    m_worker.wake();
+}
+
+void DbusService::setOutputFocus(const std::string& client, const std::string& outputName, bool windowFocused,
+                                 bool windowMaximized) {
+    // Refusals only: this follows every change of the focused window.
+    try {
+        m_manager.setOutputFocus(client, outputName, windowFocused, windowMaximized);
+    } catch (const UnknownOutput& e) {
+        std::fprintf(stderr, "wallpaperx-daemon: SetOutputFocus rejected: %s\n", e.what());
+        throw sdbus::Error(sdbus::Error::Name{kErrorUnknownOutput}, e.what());
+    } catch (const InvalidRequest& e) {
+        std::fprintf(stderr, "wallpaperx-daemon: SetOutputFocus rejected: %s\n", e.what());
+        throw sdbus::Error(sdbus::Error::Name{kErrorInvalidArgs}, e.what());
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "wallpaperx-daemon: SetOutputFocus failed: %s\n", e.what());
+        throw sdbus::Error(sdbus::Error::Name{kErrorRenderFailed}, e.what());
+    }
+
     m_worker.wake();
 }
 
@@ -723,6 +777,19 @@ std::string DbusService::getStatus() {
     }
     status["outputs"] = std::move(outputs);
     status["outputs_literal"] = std::move(outputsLiteral);
+
+    // Its own object for the reason `outputs` is: a screen can be set to pause before anything is
+    // chosen for it. `mode` is null for a setting a newer build wrote, which this one keeps and
+    // does not apply; `paused` is what that setting and the screen's last report come to now.
+    nlohmann::json pause = nlohmann::json::object();
+    for (const auto& [monitorId, monitor] : snap.pause) {
+        pause[std::to_string(monitorId)] = {
+            {"mode", monitor.mode ? nlohmann::json(toString(*monitor.mode)) : nlohmann::json(nullptr)},
+            {"paused", monitor.paused},
+            {"window_focused", monitor.windowFocused},
+            {"window_maximized", monitor.windowMaximized}};
+    }
+    status["pause"] = std::move(pause);
 
     return status.dump();
 }

@@ -82,6 +82,7 @@
 #include "support/cover_expectation.h"
 #include "support/decoder_message_id.h"
 #include "support/exported_frame_map.h"
+#include "support/picture_counter.h"
 #include "support/test_image.h"
 #include "support/validation_grade.h"
 #include "tests/client/call_gate.h"
@@ -91,6 +92,12 @@
 #include "tests/self_exec.h"
 #include "tests/test_phase.h"
 #include "tests/test_report.h"
+
+#if WALLPAPERX_HAVE_FRAME_IMPORT
+#include "frame_import.h"
+#include "tests/frame_import_request.h"
+#include "tests/gl_import_harness.h"
+#endif
 
 #include <sdbus-c++/sdbus-c++.h>
 
@@ -390,6 +397,139 @@ private:
 
 OpenFailure g_openFailure;
 
+// While armed: at every seek the decoder makes, and at the first few packets it is handed after each,
+// whether the crash record for one monitor was on disk naming one file. What says the catch-up of a
+// resumed video -- the seek back and the decode forward, inside the open -- runs under the open's record.
+// Counted from the thread that makes the call, which is the render worker's.
+class RecordWatch {
+public:
+    void arm(const std::filesystem::path& stateDir, int monitorId, const std::string& path) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_stateDir = stateDir;
+        m_monitorId = monitorId;
+        m_path = path;
+        m_seeks = m_seeksCovered = m_packets = m_packetsCovered = 0;
+        m_packetsLeft = 0;
+        m_armed.store(true);
+    }
+    void disarm() { m_armed.store(false); }
+
+    void seek() { note(true); }
+    void packet() { note(false); }
+
+    int seeks() const { return read(m_seeks); }
+    int seeksCovered() const { return read(m_seeksCovered); }
+    int packets() const { return read(m_packets); }
+    int packetsCovered() const { return read(m_packetsCovered); }
+
+private:
+    // Packets are noted only just after a seek: those are the catch-up's, while one handed over once
+    // the resumed picture is shown is the clock's, which runs under no record.
+    static constexpr int kPacketsAfterSeek = 3;
+
+    void note(bool isSeek) {
+        if (!m_armed.load(std::memory_order_relaxed)) return;
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (!isSeek && m_packetsLeft == 0) return;
+        const std::optional<wallpaperx::CrashRecord> record = wallpaperx::readCrashRecord(m_stateDir, m_monitorId);
+        const bool covered = record && record->path == m_path;
+        if (isSeek) {
+            ++m_seeks;
+            if (covered) ++m_seeksCovered;
+            m_packetsLeft = kPacketsAfterSeek;
+        } else {
+            --m_packetsLeft;
+            ++m_packets;
+            if (covered) ++m_packetsCovered;
+        }
+    }
+    int read(const int& value) const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return value;
+    }
+
+    std::atomic<bool> m_armed{false};
+    mutable std::mutex m_mutex;
+    std::filesystem::path m_stateDir;
+    int m_monitorId = 0;
+    std::string m_path;
+    int m_seeks = 0;
+    int m_seeksCovered = 0;
+    int m_packets = 0;
+    int m_packetsCovered = 0;
+    int m_packetsLeft = 0;
+};
+
+RecordWatch g_recordWatch;
+
+// The last watched wallpaper file opened on this thread; see g_contextFiles below.
+thread_local std::string t_lastWallpaperOpened;
+
+// While armed: counts the seeks aimed at or past `fromSeconds` -- a resume's seek to where a video stood --
+// and fails the first read after each of them with EIO while `count` lasts. With `alsoNextOpen`, each failed
+// read also fails the next open() of the same file, so the open from the first picture that follows fails too.
+class FarReadFailure {
+public:
+    void arm(double fromSeconds, int count, bool alsoNextOpen) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_from = fromSeconds;
+        m_left = count;
+        m_alsoNextOpen = alsoNextOpen;
+        m_farSeeks = 0;
+        m_injected = 0;
+        m_pending = nullptr;
+        m_armed.store(true);
+    }
+    void disarm() { m_armed.store(false); }
+
+    void seek(const AVFormatContext* format, int stream, int64_t timestamp, int flags) {
+        if (!m_armed.load(std::memory_order_relaxed) || format == nullptr || stream < 0 ||
+            (flags & AVSEEK_FLAG_BYTE) != 0) {
+            return;
+        }
+        const double seconds = static_cast<double>(timestamp) * av_q2d(format->streams[stream]->time_base);
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (seconds < m_from) return;
+        ++m_farSeeks;
+        if (m_left > 0) m_pending = format;
+    }
+    // The error to fail this read with, or 0.
+    int readFailure(const AVFormatContext* format) {
+        if (!m_armed.load(std::memory_order_relaxed)) return 0;
+        std::string path;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (m_pending == nullptr || m_pending != format) return 0;
+            m_pending = nullptr;
+            --m_left;
+            ++m_injected;
+            if (m_alsoNextOpen) path = t_lastWallpaperOpened;
+        }
+        if (!path.empty()) g_openFailure.arm(path, EACCES, 1);
+        return AVERROR(EIO);
+    }
+    int farSeeks() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_farSeeks;
+    }
+    int injected() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_injected;
+    }
+
+private:
+    std::atomic<bool> m_armed{false};
+    mutable std::mutex m_mutex;
+    double m_from = 0;
+    int m_left = 0;
+    bool m_alsoNextOpen = false;
+    int m_farSeeks = 0;
+    int m_injected = 0;
+    const AVFormatContext* m_pending = nullptr;
+};
+
+FarReadFailure g_farRead;
+
 // A mount table read in place of /proc/self/mountinfo while set: how a phase puts a wallpaper on a
 // network filesystem without mounting one (S13.194, S13.195). Empty is the machine's own.
 std::mutex g_mountTableMutex;
@@ -400,7 +540,6 @@ std::atomic<bool> g_mountTableSet{false};
 // and not another's. Learned at the context's first packet from the last wallpaper file opened on
 // that thread: a decoder opens its file and then decodes from it on the same thread, with no other
 // wallpaper opened in between.
-thread_local std::string t_lastWallpaperOpened;
 std::mutex g_contextFilesMutex;
 std::map<const AVCodecContext*, std::string> g_contextFiles;
 
@@ -548,6 +687,7 @@ extern "C" int avcodec_send_packet(AVCodecContext* context, const AVPacket* pack
             g_contextFiles.try_emplace(context, t_lastWallpaperOpened);
         }
         if (crashDueFor(CrashOn::Decode, context) && g_playbackFailure.hasDelivered(context)) faultNow();
+        if (packet != nullptr) g_recordWatch.packet();
         g_decodeCalls.fetch_add(1, std::memory_order_relaxed);
         g_decodeGate.enter();
     }
@@ -584,6 +724,24 @@ extern "C" int avcodec_receive_frame(AVCodecContext* context, AVFrame* frame) {
     const int result = real(context, frame);
     if (result == 0 && isDecodersContext(context)) g_playbackFailure.delivered(context);
     return result;
+}
+
+// Noted before the real seek: the seek itself is inside the span a record must cover.
+extern "C" int av_seek_frame(AVFormatContext* format, int stream, int64_t timestamp, int flags) {
+    using Fn = int (*)(AVFormatContext*, int, int64_t, int);
+    static const Fn real = reinterpret_cast<Fn>(::dlsym(RTLD_NEXT, "av_seek_frame"));
+    if (real == nullptr) return -1;
+    g_recordWatch.seek();
+    g_farRead.seek(format, stream, timestamp, flags);
+    return real(format, stream, timestamp, flags);
+}
+
+extern "C" int av_read_frame(AVFormatContext* format, AVPacket* packet) {
+    using Fn = int (*)(AVFormatContext*, AVPacket*);
+    static const Fn real = reinterpret_cast<Fn>(::dlsym(RTLD_NEXT, "av_read_frame"));
+    if (real == nullptr) return -1;
+    if (const int failure = g_farRead.readFailure(format); failure != 0) return failure;
+    return real(format, packet);
 }
 
 namespace {
@@ -2353,7 +2511,9 @@ void runEvictionRecordCheck(const WallpaperManager::Config& base, const std::vec
     //       positive half, the `const ApplyingRecord applying(...)` line deleted from the open's
     //       attempt -> "FAIL: and a record naming the new file IS on disk once its own open and first
     //       decode are running". Each observed 2026-09-21 on the NVIDIA entry, (a) together with the
-    //       applying-record control in runPlaybackBlameChecks. Reverted.
+    //       applying-record control in runPlaybackBlameChecks. (a) re-run via control_batch.sh, --phase
+    //       '^evictionRecord$', 2026-09-30, now that an eviction frees through releaseVideoSessionLocked():
+    //       the same line, printing the record naming video_parked_0.mp4. Reverted.
     g_closeFileGate.arm(CallGate::Mode::Hold, clips[0]);
     const size_t ninth = std::size(kEvictionMonitors) - 1;
     post(ninth);
@@ -3057,10 +3217,11 @@ void runOnePictureChecks(const WallpaperManager::Config& config, const std::stri
     //       that had already closed it before the resize, which the resize check above would then
     //       be grading against a reopen.
     // CONTROL: in backend/daemon/wallpaper_manager.cpp, advanceSessionLocked()'s stopped branch
-    //       reduced to `if (!session.idleSince) session.idleSince = now; return std::nullopt;`, so
-    //       nothing is ever freed -> "FAIL: a parked one-picture video's decoder and file are
-    //       released once it has been idle", printing the fixture still open after the wait, with every
-    //       other release line in the file red beside it. Observed 2026-09-29. Reverted.
+    //       reduced to `if (!session.idleSince) session.idleSince = now; return std::nullopt;` -- the
+    //       delay choice and the releaseVideoSessionLocked() call gone -- so nothing is ever freed ->
+    //       "FAIL: a parked one-picture video's decoder and file are released once it has been idle",
+    //       printing wallpaper_one_picture.mp4 still open after the wait. Re-run via control_batch.sh,
+    //       --phase '^onePicture$', 2026-09-30. Reverted.
     //       NOT graded here: whether the park branch SCHEDULES that release. Making it return
     //       nothing leaves this check green, because the resize above posts a job and the round
     //       that follows any job starts the countdown anyway. runParkedReleaseChecks below is the
@@ -3201,14 +3362,15 @@ void runOffSwitchChecks(const WallpaperManager::Config& config, const std::strin
     //       makes the release meaningful -- without it a daemon that had already closed the file
     //       before the video stopped would pass.
     // CONTROL: in backend/daemon/wallpaper_manager.cpp, advanceSessionLocked()'s stopped branch
-    //       made to `return std::nullopt;` before the release -- so nothing is ever freed -> "FAIL:
-    //       a video stopped for a few seconds has its file and decoder released", printing the clip
-    //       still open, together with the one-picture phase's release line and the reopen line
-    //       below. Making it release immediately (`const SteadyTime releaseAt = *session.
-    //       idleSince;`) reddens "the stopped video still holds its file open just after stopping"
-    //       -- and a dozen other checks in this file with it, since a session freed the moment it
-    //       stops breaks every reuse and resize property Stage E2 established. Both observed
-    //       2026-09-29. Reverted.
+    //       made to `return std::nullopt;` in place of choosing the delay and calling
+    //       releaseVideoSessionLocked() -- so nothing is ever freed -> "FAIL: a video stopped for a few
+    //       seconds has its file and decoder released", printing wallpaper_bands.mp4 still open, and the
+    //       reopen line below ("0 open(s) of the clip since the hand-over"). Making it release
+    //       immediately (`const SteadyTime releaseAt = *session.idleSince;`) reddens "the stopped video
+    //       still holds its file open just after stopping", printing "open files: none" -- and a dozen
+    //       other checks in this file with it, since a session freed the moment it stops breaks every
+    //       reuse and resize property Stage E2 established. Both re-run via control_batch.sh, --phase
+    //       '^offSwitch$', 2026-09-30. Reverted.
     {
         const std::multiset<std::string> openNow = g_files.live();
         reportUnless(openNow.count(clip) == 1, "the stopped video still holds its file open just after stopping",
@@ -3231,10 +3393,11 @@ void runOffSwitchChecks(const WallpaperManager::Config& config, const std::strin
     //       after that, so the close is due at their sum. The lower bound is the sum less a margin
     //       for the poll; the upper bound allows a second and a half of late waking. Both bounds read
     //       the phase's own config.
-    // CONTROL: backend/daemon/wallpaper_manager.cpp, the release computed from kIdleSessionRelease
-    //       instead of m_config.idleSessionRelease -> "FAIL: the stopped video is released after the
-    //       configured idle interval, not sooner or later", released 5.816 s after its first picture
-    //       where 2.750 s was due. Reverted.
+    // CONTROL: backend/daemon/wallpaper_manager.cpp, the unwatched arm of the release delay in
+    //       advanceSessionLocked() computed from kIdleSessionRelease instead of
+    //       m_config.idleSessionRelease, via control_batch.sh, --phase '^offSwitch$', 2026-09-30 ->
+    //       "FAIL: the stopped video is released after the configured idle interval, not sooner or
+    //       later", released 5.811 s after its first picture where 2.750 s was due. Reverted.
     if (releasedSession) {
         const std::vector<PictureLog::Event> shown = pictures.forMonitor(kMonitorWatch);
         if (shown.empty()) {
@@ -3263,13 +3426,12 @@ void runOffSwitchChecks(const WallpaperManager::Config& config, const std::strin
     }
 
     // GOAL: S13.148 -- a hand-over to a named consumer starts a stopped video again, and a video
-    //       whose session was released opens its file afresh to do it. That fresh open is what
-    //       makes a resumed video play from the file's beginning: nothing of the old session
-    //       survives it, and a VideoPipeline is constructed at the file's first picture (which
-    //       renderer/tests/video_pipeline_timing_* grades for S13.145). False for a daemon that
-    //       leaves a stopped video stopped -- a desktop that comes back to a frozen wallpaper for
-    //       ever -- and false for one that needs a render to be posted before it will reopen,
-    //       since nothing posts one: the monitor's request is already serviced.
+    //       whose session was released opens its file afresh to do it: nothing of the old session
+    //       survives. Which picture the fresh open shows -- the one on screen when it stopped -- is
+    //       S15.151's hand-over half, graded by frame number in runResumeChecks. False for a daemon that leaves a
+    //       stopped video stopped -- a desktop that comes back to a frozen wallpaper for ever -- and
+    //       false for one that needs a render to be posted before it will reopen, since nothing
+    //       posts one: the monitor's request is already serviced.
     // WHY-THIS-SHAPE: nothing but the hand-over is done. No render is posted and no size reported,
     //       so the pictures that follow can only have come from the daemon deciding for itself that
     //       the monitor is watched again. The reopen is counted from a reset taken before the
@@ -3277,9 +3439,11 @@ void runOffSwitchChecks(const WallpaperManager::Config& config, const std::strin
     // CONTROL: in backend/daemon/wallpaper_manager.cpp, the `if (!client.empty())
     //       noteHandoverServed(monitorId);` line deleted from exportCurrentFrame() -> "FAIL: a
     //       hand-over to a named consumer starts a stopped video again", after the 30-second signal
-    //       limit. Deleting the reopen loop body in reopenVideosLocked() -- `if (!owed) continue;`
-    //       changed to `continue;` -- reddens the same line for the other half, since the monitor
-    //       becomes watched with no session to play from. Both observed 2026-09-20. Reverted.
+    //       limit; re-run via control_batch.sh, --phase '^offSwitch$', 2026-09-30. Deleting the reopen
+    //       loop body in reopenVideosLocked() -- `if (!owed) continue;` changed to `continue;` -- reddens
+    //       the same line for the other half, since the monitor becomes watched with no session to play
+    //       from; observed 2026-09-20. The reopen count's own control is the never-release break above,
+    //       which leaves nothing to reopen: "0 open(s) of the clip since the hand-over". Reverted.
     g_files.resetCounts();
     const Handover resume = handOver(manager, worker, kMonitorWatch, ":1.801");
     check(resume.served, "the stopped video's last picture can still be handed over");
@@ -3292,7 +3456,7 @@ void runOffSwitchChecks(const WallpaperManager::Config& config, const std::strin
     check(restarted, "a hand-over to a named consumer starts a stopped video again");
     if (restarted) {
         reportUnless(g_files.opens(clip) == 1,
-                     "and a video whose session was released opens its file again to do it, from the beginning",
+                     "and a video whose session was released opens its file again to do it",
                      std::to_string(g_files.opens(clip)) + " open(s) of the clip since the hand-over");
     }
 }
@@ -3395,6 +3559,53 @@ bool quiescedByGeneration(const PictureLog& pictures, int monitorId, std::chrono
 
 // `config` is the one the phase's manager was built with: every wait and bound below reads the
 // daemon's intervals from it.
+// A consumer that takes the newest picture and gives it straight back, as the KDE plugin does, without
+// reading it. A refused fetch is an ordinary answer.
+// GOAL: S15.182 -- the daemon takes back every buffer it has just served to a consumer that is still on
+//       the bus; a refusal is the daemon's failure, never folded into "the video stalled".
+// WHY-THIS-SHAPE: graded in the destructor, so every path out of the phase -- a notVerified return
+//       included -- grades it; one try around both calls would swallow the release refusal as if it
+//       were a refused fetch, which is how the phases' copies of this loop hid it.
+// CONTROL: via control_batch.sh, 2026-10-01, reverted: DbusService::releaseBuffer
+//       (backend/daemon/dbus_service.cpp) throwing InvalidRequest before the manager call -> "FAIL: the
+//       daemon takes back every buffer it served to the pause phase's consumer", and the visibility and
+//       speed phases' lines, each phase run alone, printing "the daemon refused to take back buffer 1 (2,
+//       6) it had just served: org.freedesktop.DBus.Error.InvalidArgs"; the stalls that follow are red too.
+class GiveBack {
+public:
+    GiveBack(sdbus::IProxy& proxy, std::string what) : m_proxy(proxy), m_what(std::move(what)) {}
+    GiveBack(const GiveBack&) = delete;
+    GiveBack& operator=(const GiveBack&) = delete;
+    ~GiveBack() {
+        check(m_releaseFault.empty(), m_what.c_str());
+        if (!m_releaseFault.empty()) std::fprintf(stderr, "  %s\n", m_releaseFault.c_str());
+    }
+
+    // Whether a picture was served.
+    bool take(int32_t monitorId) {
+        std::optional<wallpaperx::testing::Frame> frame;
+        try {
+            frame.emplace(getFrameFd(m_proxy, monitorId));
+        } catch (const sdbus::Error&) {
+            return false;
+        }
+        try {
+            wallpaperx::testing::releaseBuffer(m_proxy, monitorId, frame->bufferId);
+        } catch (const sdbus::Error& e) {
+            if (m_releaseFault.empty()) {
+                m_releaseFault = "the daemon refused to take back buffer " + std::to_string(frame->bufferId) +
+                                 " it had just served: " + e.getName() + ": " + e.getMessage();
+            }
+        }
+        return true;
+    }
+
+private:
+    sdbus::IProxy& m_proxy;
+    std::string m_what;
+    std::string m_releaseFault;
+};
+
 void runVisibilityChecks(sdbus::IProxy& proxy, const PictureLog& pictures, const std::string& clip,
                          const WallpaperManager::Config& config) {
     using wallpaperx::testing::setMonitorOutput;
@@ -3402,6 +3613,7 @@ void runVisibilityChecks(sdbus::IProxy& proxy, const PictureLog& pictures, const
     const char* kGoals = "S13.154-S13.157 (a collecting consumer keeps a video playing, a covered screen's video stops "
                          "the screen coming back starts it again)";
     const std::string screen = "DP-VIS";
+    GiveBack giveBack(proxy, "the daemon takes back every buffer it served to the visibility phase's consumer");
 
     setMonitorOutput(proxy, kMonitorVisible, screen);
     setWallpaper(proxy, "video", clip, kMonitorVisible);
@@ -3425,7 +3637,7 @@ void runVisibilityChecks(sdbus::IProxy& proxy, const PictureLog& pictures, const
         uint64_t newest = 0;     // the newest generation announced by the end
         int collected = 0;       // hand-overs served to this consumer inside the window
     };
-    const auto collectUntilQuiet = [&proxy, &pictures](std::chrono::milliseconds quiet, std::chrono::seconds limit) {
+    const auto collectUntilQuiet = [&giveBack, &pictures](std::chrono::milliseconds quiet, std::chrono::seconds limit) {
         Watched out;
         out.newest = latestGeneration(pictures, kMonitorVisible);
         Clock::time_point lastChange = Clock::now();
@@ -3435,13 +3647,7 @@ void runVisibilityChecks(sdbus::IProxy& proxy, const PictureLog& pictures, const
             if (now != out.newest) {
                 out.newest = now;
                 lastChange = Clock::now();
-                try {
-                    const wallpaperx::testing::Frame frame = getFrameFd(proxy, kMonitorVisible);
-                    wallpaperx::testing::releaseBuffer(proxy, kMonitorVisible, frame.bufferId);
-                    ++out.collected;
-                } catch (const sdbus::Error&) {
-                    // A refusal is an ordinary answer and says nothing about these goals.
-                }
+                if (giveBack.take(kMonitorVisible)) ++out.collected;
                 continue;
             }
             if (Clock::now() - lastChange >= quiet) {
@@ -3532,12 +3738,7 @@ void runVisibilityChecks(sdbus::IProxy& proxy, const PictureLog& pictures, const
     int servedWhileCovered = 0;
     const Clock::time_point coveredUntil = Clock::now() + kQuietWindow;
     while (Clock::now() < coveredUntil) {
-        try {
-            const wallpaperx::testing::Frame frame = getFrameFd(proxy, kMonitorVisible);
-            wallpaperx::testing::releaseBuffer(proxy, kMonitorVisible, frame.bufferId);
-            ++servedWhileCovered;
-        } catch (const sdbus::Error&) {
-        }
+        if (giveBack.take(kMonitorVisible)) ++servedWhileCovered;
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
     check(servedWhileCovered > 0, "a covered screen still serves the picture it stopped on");
@@ -3770,17 +3971,13 @@ void runSpeedChecks(sdbus::IProxy& proxy, const PictureLog& pictures, const std:
     // unwatchedAfter, which would be graded as a slow one -- so what was collected is remembered
     // across calls, and the picture that ended one call is taken by the next.
     uint64_t collected = 0;
+    GiveBack giveBack(proxy, "the daemon takes back every buffer it served to the speed phase's consumer");
     const auto collectUntil = [&](const std::function<bool()>& until, Clock::duration limit) {
         const Clock::time_point deadline = Clock::now() + limit;
         for (;;) {
             if (const uint64_t now = latestGeneration(pictures, kMonitorSpeed); now > collected) {
                 collected = now;
-                try {
-                    const wallpaperx::testing::Frame frame = getFrameFd(proxy, kMonitorSpeed);
-                    wallpaperx::testing::releaseBuffer(proxy, kMonitorSpeed, frame.bufferId);
-                } catch (const sdbus::Error&) {
-                    // A refusal is an ordinary answer and says nothing about these goals.
-                }
+                giveBack.take(kMonitorSpeed);
             }
             if (until()) return true;
             if (Clock::now() >= deadline) return false;
@@ -6656,7 +6853,10 @@ void runPlaybackBlameChecks(const WallpaperManager::Config& base, const std::vec
     //       and an eviction, each printing the record naming video_session_0.mp4. The applying-record
     //       half: the same function made to free under an `ApplyingRecord` naming the file -> the four
     //       "-- and leaves no applying record either" lines, beside S13.119's and S13.130's. Both
-    //       observed 2026-09-21 on the NVIDIA entry. Reverted.
+    //       observed 2026-09-21 on the NVIDIA entry, and both re-run via control_batch.sh, --phase
+    //       '^playbackBlame$', 2026-09-30, NVIDIA, now that the idle release and an eviction reach
+    //       closeVideoSessionLocked() through releaseVideoSessionLocked(): the same four lines each.
+    //       Reverted.
     struct Teardown {
         const char* scenario;
         const char* what;
@@ -6742,20 +6942,17 @@ constexpr int kMonitorClean = 0;
 //       reading a clear as a defect. The three-second case is the one this suite could not fail
 //       before: under the old rule that hide was credited as play, measured on unmodified production
 //       at the time.
-// CONTROL: in backend/daemon/wallpaper_manager.cpp, the three `cleanPlay.lastShown.reset()` drops
-//       this drive crosses deleted -- setOutputVisible()'s, videoSessionLocked()'s (the session is
-//       released and reopened inside both hides) and advanceSessionLocked()'s stopped branch -> both
-//       "FAIL: a 6 s hide is not counted as play" and "FAIL: a 3 s hide is not counted as play",
-//       each printing "the count is 0". The same three deleted AND creditCleanPlayLocked()'s
-//       `onTime` term replaced by the rule before the fix, `now - *play.lastShown <=
-//       kMaxPictureInterval` -> the 3 s run red and the 6 s run GREEN, which is exactly the defect
-//       the short hide was added for. Measured and NOT usable as controls: deleting
-//       setOutputVisible()'s drop alone leaves both green (the clock's stopped branch drops the
-//       anchor a moment later), and the `onTime` term alone defends neither hide -- a session
-//       reopened after the release draws its first picture on time. Both controls via
-//       control_batch.sh, each hide length alone, 2026-09-30, NVIDIA, with the on-time test reading
-//       `waiting->planned().due`: the first red on both runs, "the count is 0"; the second red on the 3 s
-//       run, "the count is 0", and green on the 6 s run. Reverted.
+// CONTROL: via control_batch.sh, each hide length alone, 2026-09-30, NVIDIA, in
+//       backend/daemon/wallpaper_manager.cpp, reverted. The three `cleanPlay.lastShown.reset()` drops this
+//       drive crosses deleted -- setOutputVisible()'s, videoSessionLocked()'s (the session is released and
+//       reopened at its stopping picture inside both hides) and advanceSessionLocked()'s stopped branch ->
+//       "FAIL: a 3 s hide is not counted as play" and "FAIL: a 6 s hide is not counted as play", each
+//       printing "the count is 0". The same three deleted AND creditCleanPlayLocked()'s `onTime` term
+//       replaced by the rule before the fix, `now - *play.lastShown <= kMaxPictureInterval` -> the 3 s run
+//       red, "the count is 0", and the 6 s run GREEN, which is exactly the defect the short hide was added
+//       for. Measured and NOT usable as controls: the `onTime` replacement alone leaves both runs green (the
+//       drops above defend them), and setOutputVisible()'s drop alone leaves both green, 2026-10-01 (the
+//       clock's stopped branch drops the anchor a moment later).
 // COVERAGE-ASSERT: the session is required to have been released during the hide, so the "released"
 //       part of the goal is exercised rather than assumed, and the count is read once before the
 //       hide so the run is known to have started carrying one.
@@ -7572,6 +7769,1162 @@ void runOpenAtRequestChecks(const WallpaperManager::Config& config, const std::s
                  s ? "last_error: " + s->lastError : std::string("no status"));
 }
 
+// --------------------------------------------------------------------------- //
+// Step 15 chunk 3c: the pause setting stops and resumes a playing video, and a video whose decoder was
+// released resumes on the picture it stopped on. Over the bus, because the method, the manager and the
+// worker being woken are the chain under test.
+// --------------------------------------------------------------------------- //
+
+// The counter fixture the resume phases play: 320 pictures, 30 a second, each drawing its own frame
+// number (renderer/CMakeLists.txt's counter recipe).
+std::string counterClipPath() { return std::string(WALLPAPERX_COUNTER_VIDEO); }
+
+// Why a served frame could not be read, by whose doing. Only `hostLimit` is a reason to skip.
+struct ReadFailure {
+    std::string hostLimit;
+    std::string daemonFault;
+    // Already printed as FAIL (harness); nothing read after it is graded.
+    bool harness = false;
+};
+
+// Reads the frame number a counter fixture draws into every picture, from a frame served over the bus:
+// by mapping a LINEAR dma_buf, or by importing an opaque fd into GL on the GPU that exported it -- the
+// plugin's own importer. Nothing, with the reason filed by whose doing it was, when it cannot.
+class CounterReader {
+public:
+    std::optional<int> read(const wallpaperx::testing::Frame& frame, ReadFailure& failure) {
+        if (frame.handleType == 1 && frame.drmModifier == wallpaperx::testing::kDrmModifierLinear &&
+            !frame.planes.empty()) {
+            const wallpaperx::testing::MappedFrame mapped(frame.fd.get(), frame.memorySize);
+            if (!mapped.valid()) {
+                failure.hostLimit = "the exported fd could not be mapped: " + mapped.error();
+                return std::nullopt;
+            }
+            std::vector<unsigned char> pixels;
+            pixels.reserve(static_cast<size_t>(frame.width) * frame.height * 4);
+            for (uint32_t y = 0; y < frame.height; ++y) {
+                const unsigned char* row = mapped.row(frame.planes[0].get<0>(), frame.planes[0].get<1>(), y,
+                                                      static_cast<size_t>(frame.width) * 4);
+                if (row == nullptr) {
+                    failure.daemonFault = "the frame's published layout (offset " +
+                                          std::to_string(frame.planes[0].get<0>()) + ", row pitch " +
+                                          std::to_string(frame.planes[0].get<1>()) + ") puts row " + std::to_string(y) +
+                                          " outside its " + std::to_string(frame.memorySize) + " bytes";
+                    return std::nullopt;
+                }
+                pixels.insert(pixels.end(), row, row + static_cast<size_t>(frame.width) * 4);
+            }
+            return wallpaperx::testing::counterFromBgra(pixels, frame.width, frame.height);
+        }
+#if WALLPAPERX_HAVE_FRAME_IMPORT
+        if (!m_glReady) {
+            std::array<uint8_t, 16> uuid{};
+            if (frame.deviceUuid.size() == uuid.size()) std::copy(frame.deviceUuid.begin(), frame.deviceUuid.end(), uuid.begin());
+            if (!m_gl.createMatching(uuid, m_glWhy)) {
+                failure.hostLimit = "no GL context on the exporting GPU: " + m_glWhy;
+                return std::nullopt;
+            }
+            m_glReady = true;
+        }
+        wallpaperx::FrameImport::Request request = wallpaperx::testing::requestFromFrame(frame);
+        if (request.fd < 0) {
+            failure.harness = true;
+            return std::nullopt;
+        }
+        if (wallpaperx::FrameImport::supportsSync()) {
+            for (const sdbus::UnixFd& sync : frame.syncFds) {
+                const int fd = ::dup(sync.get());
+                if (fd < 0) {
+                    wallpaperx::testing::harnessFailure(std::string("a sync descriptor could not be duplicated: ") +
+                                                        std::strerror(errno));
+                    failure.harness = true;
+                } else {
+                    request.syncFds.push_back(fd);
+                }
+            }
+        }
+        const wallpaperx::FrameImport::Result imported =
+            failure.harness ? wallpaperx::FrameImport::Result{} : wallpaperx::FrameImport::import(request);
+        // import() sets to -1 what it consumed.
+        if (request.fd >= 0) ::close(request.fd);
+        for (const int fd : request.syncFds) {
+            if (fd >= 0) ::close(fd);
+        }
+        if (failure.harness) return std::nullopt;
+        if (imported.texture == 0) {
+            // Either side: this host's GL refusing, or metadata the daemon published that no importer
+            // could take. Nothing here tells the two apart, so it is not graded.
+            failure.hostLimit = "the frame could not be imported (this host's GL, or the daemon's published "
+                                "metadata): " + imported.error;
+            return std::nullopt;
+        }
+        std::string why;
+        const std::vector<unsigned char> pixels = wallpaperx::testing::readSampled(imported.texture, frame.width,
+                                                                                   frame.height, why);
+        wallpaperx::FrameImport::release(imported);
+        if (pixels.empty()) {
+            failure.hostLimit = why;
+            return std::nullopt;
+        }
+        return wallpaperx::testing::counterFromBgra(pixels, frame.width, frame.height);
+#else
+        failure.hostLimit = "this build has no GL importer, and the export is not a LINEAR dma_buf that could be mapped";
+        return std::nullopt;
+#endif
+    }
+
+private:
+#if WALLPAPERX_HAVE_FRAME_IMPORT
+    wallpaperx::testing::HeadlessGl m_gl;
+    bool m_glReady = false;
+    std::string m_glWhy;
+#endif
+};
+
+// One served picture: its generation -- one per picture committed -- and the frame number read from it.
+struct ReadPicture {
+    uint64_t generation = 0;
+    int counter = -1;
+};
+
+// A consumer that takes each newly announced picture, as the KDE plugin does, reads its frame number
+// and gives it straight back. Only on a NEW generation: a release re-announces the frame it frees, and
+// fetching on those would be the polling consumer runVisibilityChecks warns about -- and, while the
+// video is stopped, a task posted to the worker that would wake it. A fetch serves the newest picture,
+// so a slow consumer can skip one; each reading keeps its generation, and a check about two successive
+// pictures uses only readings whose generations are successive.
+class CountedPictures {
+public:
+    CountedPictures(sdbus::IProxy& proxy, const PictureLog& pictures, int32_t monitorId, CounterReader& reader)
+        : m_proxy(proxy), m_pictures(pictures), m_monitorId(monitorId), m_reader(reader) {}
+
+    // The picture served now, whatever its generation; nothing when it could not be read.
+    std::optional<ReadPicture> current() {
+        std::optional<wallpaperx::testing::Frame> frame;
+        try {
+            frame.emplace(getFrameFd(m_proxy, m_monitorId));
+        } catch (const sdbus::Error& e) {
+            // The daemon's own answer: no importer or readback on this host produces it.
+            if (m_failure.daemonFault.empty()) {
+                m_failure.daemonFault = "the daemon refused to serve the picture on screen: " + e.getName() + ": " +
+                                        e.getMessage();
+            }
+            return std::nullopt;
+        }
+        const std::optional<int> counter = readInto(*frame);
+        giveBack(*frame);
+        if (!counter) return std::nullopt;
+        return ReadPicture{frame->generation, *counter};
+    }
+    // Every picture read, in the order they were announced.
+    const std::vector<ReadPicture>& pictures() const { return m_pictures_read; }
+
+    // Takes pictures until `until` holds or `limit` passes; whether it held.
+    bool takeUntil(const std::function<bool()>& until, Clock::duration limit) {
+        const Clock::time_point deadline = Clock::now() + limit;
+        for (;;) {
+            takeNew();
+            if (until()) return true;
+            if (Clock::now() >= deadline || failed()) return false;
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+    }
+    bool takeAtLeast(size_t more, Clock::duration limit) {
+        const size_t target = m_pictures_read.size() + more;
+        return takeUntil([&] { return m_pictures_read.size() >= target; }, limit);
+    }
+    // Takes pictures until none new for `quiet`; false when it never went quiet inside `limit`.
+    bool takeUntilQuiet(std::chrono::milliseconds quiet, std::chrono::seconds limit) {
+        Clock::time_point lastChange = Clock::now();
+        const Clock::time_point deadline = Clock::now() + limit;
+        while (Clock::now() < deadline && !failed()) {
+            if (takeNew()) {
+                lastChange = Clock::now();
+                continue;
+            }
+            if (Clock::now() - lastChange >= quiet) return true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        return false;
+    }
+    // The first failure of each kind so far.
+    const ReadFailure& failure() const { return m_failure; }
+    bool failed() const {
+        return m_failure.harness || !m_failure.daemonFault.empty() || !m_failure.hostLimit.empty();
+    }
+    // True the first time only, so a failure asked about at several points is reported once.
+    bool firstReport() { return !std::exchange(m_reported, true); }
+
+private:
+    bool takeNew() {
+        const uint64_t newest = latestGeneration(m_pictures, m_monitorId);
+        if (newest <= m_taken) return false;
+        m_taken = newest;
+        std::optional<wallpaperx::testing::Frame> frame;
+        try {
+            frame.emplace(getFrameFd(m_proxy, m_monitorId));
+        } catch (const sdbus::Error&) {
+            // A refusal to serve is an ordinary answer; the picture after it is taken instead.
+            return true;
+        }
+        if (frame->generation > m_lastRead) {
+            m_lastRead = frame->generation;
+            if (const std::optional<int> counter = readInto(*frame)) {
+                m_pictures_read.push_back(ReadPicture{frame->generation, *counter});
+            }
+        }
+        giveBack(*frame);
+        return true;
+    }
+    std::optional<int> readInto(const wallpaperx::testing::Frame& frame) {
+        ReadFailure failure;
+        const std::optional<int> counter = m_reader.read(frame, failure);
+        if (m_failure.hostLimit.empty()) m_failure.hostLimit = failure.hostLimit;
+        if (m_failure.daemonFault.empty()) m_failure.daemonFault = failure.daemonFault;
+        m_failure.harness = m_failure.harness || failure.harness;
+        return counter;
+    }
+    // The daemon refusing a buffer it has just served to this connection is its fault, not an answer.
+    void giveBack(const wallpaperx::testing::Frame& frame) {
+        try {
+            wallpaperx::testing::releaseBuffer(m_proxy, m_monitorId, frame.bufferId);
+        } catch (const sdbus::Error& e) {
+            if (m_failure.daemonFault.empty()) {
+                m_failure.daemonFault = "the daemon refused to take back buffer " + std::to_string(frame.bufferId) +
+                                        " it had just served: " + e.getName() + ": " + e.getMessage();
+            }
+        }
+    }
+
+    sdbus::IProxy& m_proxy;
+    const PictureLog& m_pictures;
+    int32_t m_monitorId;
+    CounterReader& m_reader;
+    uint64_t m_taken = 0;
+    uint64_t m_lastRead = 0;
+    std::vector<ReadPicture> m_pictures_read;
+    ReadFailure m_failure;
+    bool m_reported = false;
+};
+
+// Whether the taker's readings stopped, and if so reports why, by whose doing: the daemon's fault is a
+// FAIL, a harness fault was already printed as one, and only this host's limit is a skip.
+// GOAL: a served frame the daemon lays out or takes back wrongly is graded as the daemon's failure,
+//       never as a reading this host could not make.
+// WHY-THIS-SHAPE: one failure field would put "a row outside its memory" and "no GL context" in the
+//       same skip; the reader files each where it arises, since only it knows which one it hit.
+// CONTROL: via control_batch.sh, --phase '^resume$', 2026-09-30, each alone, reverted, in
+//       backend/daemon/dbus_service.cpp: GetFrameFd publishing each plane's offset plus the memory's size ->
+//       on video_wallpaper_lavapipe (a mapped LINEAR dma_buf) "FAIL: the daemon's served frame is readable as
+//       published, and taken back when given back", printing "the frame's published layout (offset 76800, row
+//       pitch 640) puts row 0 outside its 76800 bytes"; DbusService::releaseBuffer refusing every id -> the same
+//       line on video_wallpaper, "the daemon refused to take back buffer 1 it had just served". A descriptor
+//       the test could not duplicate (test-side, dup(-1), by hand, 2026-09-30) prints only "FAIL (harness):
+//       the frame's descriptor could not be duplicated", no FAIL against the daemon. A GetFrameFd refusal of
+//       the picture on screen is the daemon's too: completeFrame() answering NoFrame for a generation it
+//       already served, via control_batch.sh, --phase '^resume$', 2026-10-01 -> the same line, printing "the
+//       daemon refused to serve the picture on screen: io.wallpaperx.Daemon.Error.NoFrame".
+bool readingStopped(CountedPictures& taker, const char* goals) {
+    if (!taker.failed()) return false;
+    if (!taker.firstReport()) return true;
+    const ReadFailure& failure = taker.failure();
+    if (!failure.daemonFault.empty()) {
+        check(false, "the daemon's served frame is readable as published, and taken back when given back");
+        std::fprintf(stderr, "  %s\n", failure.daemonFault.c_str());
+    } else if (!failure.harness) {
+        notVerified(goals, "the pictures could not be read back on this host: " + failure.hostLimit);
+    }
+    return true;
+}
+
+// A manager with a service on a connection of its own, and a proxy to it that records FrameReady. The
+// phase's grade is captured once the bus has stopped and before the manager is destroyed, by member order.
+struct BusRig {
+    BusRig(const WallpaperManager::Config& config, PhaseGrade& grade) : manager(config), captureGrade{grade, manager} {
+        serviceConn = sdbus::createSessionBusConnection();
+        service.emplace(*serviceConn, manager);
+        serviceConn->enterEventLoopAsync();
+        daemonName = serviceConn->getUniqueName();
+        proxy = sdbus::createProxy(sdbus::ServiceName{daemonName}, sdbus::ObjectPath{DbusService::kObjectPath});
+        proxy->uponSignal("FrameReady")
+            .onInterface(DbusService::kInterface)
+            .call([this](int32_t monitorId, uint64_t generation) { pictures.record(monitorId, generation); });
+    }
+    // The proxy first, then the service, then the manager: a signal still in flight names `pictures`.
+    ~BusRig() {
+        proxy.reset();
+        service.reset();
+        serviceConn.reset();
+    }
+    BusRig(const BusRig&) = delete;
+    BusRig& operator=(const BusRig&) = delete;
+
+    PictureLog pictures;
+    WallpaperManager manager;
+    CaptureGradeOnExit captureGrade;
+    std::unique_ptr<sdbus::IConnection> serviceConn;
+    std::optional<DbusService> service;
+    std::string daemonName;
+    std::unique_ptr<sdbus::IProxy> proxy;
+};
+
+constexpr int32_t kMonitorPause = 0;
+
+// `base` is copied into the config this phase's manager is built from; every wait below reads its intervals.
+void runPauseChecks(const WallpaperManager::Config& base, const std::string& clip) {
+    using wallpaperx::testing::setMonitorOutput;
+    using wallpaperx::testing::setMonitorPause;
+    using wallpaperx::testing::setOutputFocus;
+    using wallpaperx::testing::setWallpaperProperties;
+    const char* kGoals = "S15.146-S15.149 (the pause setting stops a playing video, and what resumes it)";
+    // Long enough that the worker's own deadline for a paused session is never what resumes it: every
+    // resume below must come from the call that ended the pause waking it.
+    WallpaperManager::Config config = base;
+    config.pausedSessionRelease = std::chrono::seconds(60);
+    const wallpaperx::testing::ScratchDir scratch("videopause");
+    if (!scratch.ok()) {
+        notVerified(kGoals, "no scratch directory could be created");
+        return;
+    }
+    config.configFile = scratch.path() / "config.json";
+    PhaseGrade grade("the pause phase");
+    BusRig rig(config, grade);
+    sdbus::IProxy& proxy = *rig.proxy;
+    const std::string screen = "DP-PAUSE";
+    GiveBack giveBack(proxy, "the daemon takes back every buffer it served to the pause phase's consumer");
+
+    uint64_t collected = 0;
+    // Takes every new picture until it goes quiet for kQuietWindow (true) or `limit` passes (false).
+    const auto collectUntilQuiet = [&](std::chrono::seconds limit) {
+        Clock::time_point lastChange = Clock::now();
+        const Clock::time_point deadline = Clock::now() + limit;
+        while (Clock::now() < deadline) {
+            if (const uint64_t now = latestGeneration(rig.pictures, kMonitorPause); now > collected) {
+                collected = now;
+                lastChange = Clock::now();
+                giveBack.take(kMonitorPause);
+                continue;
+            }
+            if (Clock::now() - lastChange >= kQuietWindow) return true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        return false;
+    };
+    // Takes pictures until one newer than `after` has been shown, or `limit` passes.
+    const auto playsPast = [&](uint64_t after, std::chrono::seconds limit) {
+        const Clock::time_point deadline = Clock::now() + limit;
+        while (Clock::now() < deadline) {
+            if (const uint64_t now = latestGeneration(rig.pictures, kMonitorPause); now > collected) {
+                collected = now;
+                giveBack.take(kMonitorPause);
+                if (now > after) return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        return false;
+    };
+    const auto pausedNow = [&proxy]() {
+        const StatusReply status = getStatusOrExplain(proxy);
+        const nlohmann::json* entry = wallpaperx::testing::pauseStatus(status, std::to_string(kMonitorPause));
+        return entry != nullptr && entry->value("paused", false);
+    };
+
+    setMonitorOutput(proxy, kMonitorPause, screen);
+    setWallpaper(proxy, "video", clip, kMonitorPause);
+    if (!settlesWithin(std::chrono::seconds(30), [&] { return latestGeneration(rig.pictures, kMonitorPause) > 0; })) {
+        grade.expectNoDevice();
+        notVerified(kGoals, "the video render on this host produced no frame, so there was nothing to pause");
+        return;
+    }
+    // The premise every stop below is measured against: this consumer keeps the video playing.
+    const uint64_t startedAt = latestGeneration(rig.pictures, kMonitorPause);
+    if (!playsPast(startedAt + 5, std::chrono::seconds(10))) {
+        notVerified(kGoals, "the video did not play for a collecting consumer, so a pause would establish nothing");
+        return;
+    }
+
+    // GOAL: S15.146 -- always_paused stops a video its consumer keeps collecting, GetStatus says it is
+    //       paused, and play starts it again with nothing else asked for.
+    // WHY-THIS-SHAPE: the stop is a quiescence with a deadline while the consumer goes on collecting,
+    //       so it is attributable to the setting alone; the consumer fetches only on a new picture, so
+    //       it cannot wake a stopped worker. The paused session's own release is 60 s away here, so the
+    //       resume within 10 s can only have come from SetMonitorPause waking the worker.
+    // CONTROL: via control_batch.sh, --phase '^pause$', 2026-09-30, each alone, reverted. In
+    //       playingSeqLocked() (backend/daemon/wallpaper_manager.cpp), `|| pausedLocked(monitorId)`
+    //       removed -> "FAIL: always_paused stops a video its consumer keeps collecting, and GetStatus says
+    //       so", after the 25 s limit. In DbusService::setMonitorPause (backend/daemon/dbus_service.cpp),
+    //       `m_worker.wake();` deleted -> "FAIL: setting it back to play starts it again, with nothing else
+    //       asked for", alone.
+    setMonitorPause(proxy, kMonitorPause, "always_paused");
+    const bool stopped = collectUntilQuiet(std::chrono::seconds(25));
+    check(stopped && pausedNow(), "always_paused stops a video its consumer keeps collecting, and GetStatus says so");
+    if (!stopped) {
+        notVerified(kGoals, "the paused video never stopped, so nothing below has a stopped video to resume");
+        return;
+    }
+    const uint64_t pausedAt = latestGeneration(rig.pictures, kMonitorPause);
+
+    // GOAL: S15.149 -- a speed changed while paused shows nothing: no picture is drawn until the pause
+    //       ends.
+    // CONTROL: via control_batch.sh, --phase '^pause$', 2026-09-30, a render owed on every speed change --
+    //       `++it->second.requestSeq;` in WallpaperManager::setWallpaperProperties
+    //       (backend/daemon/wallpaper_manager.cpp) and `m_worker.post(monitorId);` for the wake in
+    //       DbusService::setWallpaperProperties (backend/daemon/dbus_service.cpp) -> "FAIL: a speed changed
+    //       while paused shows nothing", printing "1 picture(s) shown", alone. Reverted.
+    {
+        setWallpaperProperties(proxy, kMonitorPause, {{"speed", sdbus::Variant(0.5)}});
+        const bool quiet = collectUntilQuiet(std::chrono::seconds(10));
+        const uint64_t after = latestGeneration(rig.pictures, kMonitorPause);
+        check(quiet && after == pausedAt, "a speed changed while paused shows nothing");
+        if (after != pausedAt) std::fprintf(stderr, "  %llu picture(s) shown\n", static_cast<unsigned long long>(after - pausedAt));
+        setWallpaperProperties(proxy, kMonitorPause, {{"speed", sdbus::Variant(1.0)}});
+    }
+
+    setMonitorPause(proxy, kMonitorPause, "play");
+    const bool resumed = playsPast(pausedAt, std::chrono::seconds(10));
+    check(resumed && !pausedNow(), "setting it back to play starts it again, with nothing else asked for");
+
+    // GOAL: S15.147 -- a focus report ending because its sender left the bus starts a video it had
+    //       paused again, with no other call.
+    // WHY-THIS-SHAPE: the report comes from a second connection; the video is stopped by it, and the
+    //       connection is then closed. Nothing else happens, so the worker has to be woken by the departure.
+    // CONTROL: via control_batch.sh, --phase '^pause$', 2026-09-30, DbusService::forgetClient
+    //       (backend/daemon/dbus_service.cpp) keeping `m_manager.forgetOutputFocus(client)` and dropping
+    //       its `m_worker.wake()` -> "FAIL: the video plays again once the connection that paused it
+    //       leaves the bus". Reverted.
+    {
+        setMonitorPause(proxy, kMonitorPause, "paused_while_focused");
+        bool stoppedByReport = false;
+        {
+            auto reporter = sdbus::createProxy(sdbus::ServiceName{rig.daemonName}, sdbus::ObjectPath{DbusService::kObjectPath});
+            setOutputFocus(*reporter, screen, true, false);
+            stoppedByReport = collectUntilQuiet(std::chrono::seconds(25)) && pausedNow();
+        }
+        check(stoppedByReport, "a focused window reported by a second connection stops the video (the premise)");
+        if (stoppedByReport) {
+            const uint64_t stoppedAt = latestGeneration(rig.pictures, kMonitorPause);
+            check(playsPast(stoppedAt, std::chrono::seconds(10)),
+                  "the video plays again once the connection that paused it leaves the bus");
+        }
+    }
+
+    // GOAL: S15.148 -- moving a screen's name away from a monitor drops the report on it, and a video it
+    //       had paused plays again with no other call.
+    // CONTROL: via control_batch.sh, --phase '^pause$', 2026-09-30, the `m_worker.wake();` after the
+    //       redraws in DbusService::setMonitorOutput (backend/daemon/dbus_service.cpp) deleted -> "FAIL: a
+    //       monitor given another screen name plays again once the report that paused it is dropped".
+    //       Reverted.
+    {
+        setOutputFocus(proxy, screen, true, false);
+        const bool stoppedByReport = collectUntilQuiet(std::chrono::seconds(25)) && pausedNow();
+        check(stoppedByReport, "a focused window reported on this connection stops the video (the premise)");
+        if (stoppedByReport) {
+            const uint64_t stoppedAt = latestGeneration(rig.pictures, kMonitorPause);
+            setMonitorOutput(proxy, kMonitorPause, "DP-PAUSE-2");
+            check(playsPast(stoppedAt, std::chrono::seconds(10)),
+                  "a monitor given another screen name plays again once the report that paused it is dropped");
+        }
+    }
+}
+
+constexpr int32_t kMonitorResume = 0;
+
+// Where each counter picture lies in the fixture, from libavcodec driven directly.
+struct CounterOrder {
+    std::vector<int> ids;
+    // The picture shown after `id`: the next in the file, or the first after the last.
+    std::optional<int> after(int id) const {
+        const auto it = std::find(ids.begin(), ids.end(), id);
+        if (it == ids.end()) return std::nullopt;
+        return std::next(it) == ids.end() ? ids.front() : *std::next(it);
+    }
+};
+
+std::optional<CounterOrder> counterOrder(const std::string& clip, const char* goals) {
+    std::string why;
+    const std::optional<wallpaperx::testing::CounterReference> reference =
+        wallpaperx::testing::decodeCounterReference(clip, why);
+    if (!reference || !reference->distinctAndReadable()) {
+        wallpaperx::testing::harnessFailure(std::string(goals) + ": the counter fixture " + clip +
+                                            " could not be decoded independently: " +
+                                            (why.empty() ? std::string("its pictures are not each readable once") : why));
+        return std::nullopt;
+    }
+    return CounterOrder{reference->ids};
+}
+
+std::string describeRead(const std::vector<ReadPicture>& read) {
+    std::string text;
+    for (size_t i = 0; i < read.size() && i < 4; ++i) {
+        text += (text.empty() ? "" : ", ") + std::to_string(read[i].counter) + " (generation " +
+                std::to_string(read[i].generation) + ")";
+    }
+    return text.empty() ? "nothing" : text;
+}
+
+// The frame numbers of the two pictures committed next after `stopped`, when both were read: a fetch
+// serves the newest picture, so a consumer the host delayed can miss one, and then there is no answer.
+std::optional<std::pair<int, int>> nextTwo(const std::vector<ReadPicture>& shown, const ReadPicture& stopped) {
+    std::optional<int> first;
+    std::optional<int> second;
+    for (const ReadPicture& p : shown) {
+        if (p.generation == stopped.generation + 1) first = p.counter;
+        if (p.generation == stopped.generation + 2) second = p.counter;
+    }
+    if (!first || !second) return std::nullopt;
+    return std::make_pair(*first, *second);
+}
+
+enum class Graded { Passed, Failed, NotGraded };
+
+// Whether the two pictures after `stopped` are `first` and `second` (either unset: not compared). Fewer
+// than two new pictures after the resume is a video that did not resume, and fails; two or more of which
+// the consumer missed one of the pair is reported as not graded, never read either way. The caller
+// reports a reading that stopped first, so it is never taken for a stalled video.
+// GOAL: a resume that shows nothing new fails the check it was meant to answer; only a consumer that read
+//       new pictures but missed one of the pair is a skip.
+// WHY-THIS-SHAPE: counted from readings newer than the stop, not from all of `shown`, which can hold the
+//       stopped picture itself read again by the hand-over. One function for every resume phase: a copy
+//       per phase is how the eviction phase kept skipping a stalled resume.
+// CONTROL: via control_batch.sh, --phase '^resume$', 2026-09-30, DbusService::setMonitorPause
+//       (backend/daemon/dbus_service.cpp) returning before the manager call for "play" -> "FAIL: a pause
+//       ended inside its delay carries on from the open decoder, with the next picture", printing "stopped
+//       on 11 (generation 12); 0 new picture(s) within 20 s of the resume: nothing"; S15.152's line red
+//       beside it, the video never resumed. Reverted.
+Graded gradeNextTwo(const char* what, const std::vector<ReadPicture>& shown, const ReadPicture& stopped,
+                    std::optional<int> first, std::optional<int> second) {
+    const std::optional<std::pair<int, int>> next = nextTwo(shown, stopped);
+    const auto newer = std::count_if(shown.begin(), shown.end(),
+                                     [&](const ReadPicture& p) { return p.generation > stopped.generation; });
+    if (!next && newer < 2) {
+        check(false, what);
+        std::fprintf(stderr, "  stopped on %d (generation %llu); %ld new picture(s) within 20 s of the resume: %s\n",
+                     stopped.counter, static_cast<unsigned long long>(stopped.generation), static_cast<long>(newer),
+                     describeRead(shown).c_str());
+        return Graded::Failed;
+    }
+    if (!next) {
+        notVerified(what, "the consumer did not read both pictures after the stop (read: " + describeRead(shown) +
+                              "), so which they were is not known");
+        return Graded::NotGraded;
+    }
+    const bool right = (!first || next->first == *first) && (!second || next->second == *second);
+    check(right, what);
+    if (!right) {
+        std::fprintf(stderr, "  stopped on %d (generation %llu), then showed %d and %d\n", stopped.counter,
+                     static_cast<unsigned long long>(stopped.generation), next->first, next->second);
+    }
+    return right ? Graded::Passed : Graded::Failed;
+}
+
+// S15.151-S15.155 on one monitor playing the counter fixture: the pictures a resume shows, read from
+// the served frames.
+void runResumeChecks(const WallpaperManager::Config& base, const std::string& counterClip, const std::string& still) {
+    using wallpaperx::testing::setMonitorOutput;
+    using wallpaperx::testing::setMonitorPause;
+    using wallpaperx::testing::setOutputVisible;
+    const char* kGoals = "S15.151-S15.155 (a video resumes on the picture it stopped on)";
+    const wallpaperx::testing::ScratchDir scratch("videoresume");
+    if (!scratch.ok()) {
+        notVerified(kGoals, "no scratch directory could be created");
+        return;
+    }
+    const std::optional<CounterOrder> order = counterOrder(counterClip, kGoals);
+    if (!order) return;
+    // The fixture's own 4:3, so covering the monitor crops nothing and the counter grid is whole.
+    WallpaperManager::Config config = base;
+    config.width = 160;
+    config.height = 120;
+    config.idleSessionRelease = std::chrono::seconds(2);
+    // Distinct from the idle release, so a daemon using one for the other is seen.
+    config.pausedSessionRelease = std::chrono::seconds(4);
+    config.configFile = scratch.path() / "config.json";
+    config.stateDir = scratch.path() / "state";
+    g_files.watch(counterClip);
+
+    PhaseGrade grade("the resume phase");
+    BusRig rig(config, grade);
+    sdbus::IProxy& proxy = *rig.proxy;
+    CounterReader reader;
+    CountedPictures taker(proxy, rig.pictures, kMonitorResume, reader);
+    const std::string screen = "DP-RESUME";
+    const auto unanswerable = [&]() { return readingStopped(taker, kGoals); };
+
+    setMonitorOutput(proxy, kMonitorResume, screen);
+    // A quarter speed, seven or eight pictures a second, so the consumer rarely misses one; when it
+    // does, the check it would have graded reports that instead of guessing.
+    wallpaperx::testing::setWallpaperWithProperties(proxy, "video", counterClip, kMonitorResume,
+                                                    {{"speed", sdbus::Variant(0.25)}});
+    if (!settlesWithin(std::chrono::seconds(30), [&] { return latestGeneration(rig.pictures, kMonitorResume) > 0; })) {
+        grade.expectNoDevice();
+        notVerified(kGoals, "the counter video produced no frame on this host");
+        return;
+    }
+    // COVERAGE-ASSERT for every check below: the served pictures are read back as the fixture's frame
+    // numbers, each the one after the picture committed before it. A reader that read nothing, or read
+    // the same number from every frame, would make each "showed F" below mean nothing. Only readings of
+    // successive generations are compared, and at least five such pairs must have been.
+    // CONTROL: test-side, by hand, 2026-09-30, NVIDIA: counterFromBgra given the frame's height as its
+    //       width in the GL import path -> "FAIL: the served pictures read back as the fixture's frame
+    //       numbers, in order", "11 successive pair(s) compared", every reading -1. Restored. The mapped
+    //       dma_buf path (Lavapipe) has the same call and was not broken separately.
+    {
+        taker.takeAtLeast(12, std::chrono::seconds(20));
+        if (unanswerable()) return;
+        const std::vector<ReadPicture>& read = taker.pictures();
+        int compared = 0;
+        bool inOrder = true;
+        for (size_t i = 1; i < read.size(); ++i) {
+            if (read[i].generation != read[i - 1].generation + 1) continue;
+            ++compared;
+            if (order->after(read[i - 1].counter) != read[i].counter) inOrder = false;
+        }
+        check(inOrder && compared >= 5, "the served pictures read back as the fixture's frame numbers, in order");
+        if (!inOrder || compared < 5) {
+            std::fprintf(stderr, "  %d successive pair(s) compared; read: %s ...\n", compared, describeRead(read).c_str());
+            return;
+        }
+    }
+
+    // Stops the video with `stop` while still collecting; the picture now on screen.
+    const auto stopOn = [&](const std::function<void()>& stop) -> std::optional<ReadPicture> {
+        stop();
+        if (!taker.takeUntilQuiet(kQuietWindow, std::chrono::seconds(25))) return std::nullopt;
+        return taker.current();
+    };
+    // After `resume`, the pictures read while the next two are shown.
+    const auto resumeAndRead = [&](const std::function<void()>& resume) -> std::vector<ReadPicture> {
+        const size_t from = taker.pictures().size();
+        resume();
+        taker.takeAtLeast(2, std::chrono::seconds(20));
+        return std::vector<ReadPicture>(taker.pictures().begin() + static_cast<long>(from), taker.pictures().end());
+    };
+    const auto nextTwoAre = [&](const char* what, const std::vector<ReadPicture>& shown, const ReadPicture& stopped,
+                                std::optional<int> first, std::optional<int> second) {
+        if (unanswerable()) return;
+        gradeNextTwo(what, shown, stopped, first, second);
+    };
+
+    // GOAL: S15.153 -- a pause ended inside pausedSessionRelease carries on from the open decoder: the
+    //       next picture is the successor of the one on screen, and the file is not opened again.
+    // WHY-THIS-SHAPE: one second of pause against a four-second delay; both the reopen count and the
+    //       picture are asserted, since a daemon that released and resumed exactly would show the same
+    //       picture again rather than its successor. The two pictures are identified by generation as
+    //       well as by frame number, so a consumer the host delayed past one is a skip, not a verdict.
+    // CONTROL: via control_batch.sh, --phase '^resume$', 2026-09-30, advanceSessionLocked()
+    //       (backend/daemon/wallpaper_manager.cpp) releasing a paused session at once -- `paused ?
+    //       std::chrono::steady_clock::duration::zero() : m_config.idleSessionRelease` -> "FAIL: a pause
+    //       ended inside its delay does not open the file again" and "FAIL: a pause ended inside its delay
+    //       carries on from the open decoder, with the next picture", printing "stopped on 11 (generation
+    //       12), then showed 11 and 12" -- the same picture again -- beside S15.152's line (0.603 s).
+    //       Reverted.
+    {
+        const std::optional<ReadPicture> frozen = stopOn([&] { setMonitorPause(proxy, kMonitorResume, "always_paused"); });
+        if (unanswerable()) return;
+        if (!frozen) {
+            check(false, "always_paused stops the counter video (the premise of the resume checks)");
+            return;
+        }
+        g_files.resetCounts();
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        const std::vector<ReadPicture> shown = resumeAndRead([&] { setMonitorPause(proxy, kMonitorResume, "play"); });
+        check(g_files.opens(counterClip) == 0, "a pause ended inside its delay does not open the file again");
+        const std::optional<int> successor = order->after(frozen->counter);
+        nextTwoAre("a pause ended inside its delay carries on from the open decoder, with the next picture", shown,
+                   *frozen, successor, successor ? order->after(*successor) : std::nullopt);
+    }
+
+    // GOAL: S15.152 -- a paused session is released pausedSessionRelease after the pause, not at the
+    //       unwatched delay and not never.
+    // WHY-THIS-SHAPE: measured from the SetMonitorPause call to the file's close, with a deadline and a
+    //       failure branch; the consumer keeps collecting, so the monitor stays watched and only the pause
+    //       stops it. The lower bound is the delay less a margin, so a release at the 2 s idle delay fails.
+    // CONTROL: via control_batch.sh, --phase '^resume$', 2026-09-30, each alone, reverted, in
+    //       advanceSessionLocked() (backend/daemon/wallpaper_manager.cpp): the paused delay replaced by
+    //       m_config.idleSessionRelease -> "FAIL: a paused session is released after pausedSessionRelease,
+    //       not sooner or later", released 2.013 s after the pause; a paused round returning
+    //       `session.idleSince.reset(); return std::nullopt;` -> the same line, "not released after 20 s".
+    // GOAL: S15.151's pause half -- after that release the resume shows the picture that was on screen
+    //       when the video stopped, then its successor.
+    // CONTROL: via control_batch.sh, --phase '^resume$', 2026-09-30, each alone, reverted, in
+    //       backend/daemon/wallpaper_manager.cpp: `startAt` passed as std::nullopt to the VideoPipeline built
+    //       in videoSessionLocked()'s `open` lambda -> "FAIL: a video whose paused session was released
+    //       resumes on the picture it stopped on, then its successor", printing "stopped on 13 (generation
+    //       14), then showed 0 and 1", the hidden and hand-over halves below red the same way, and the three
+    //       S15.155 lines (a fresh open seeks nothing); releaseVideoSessionLocked() never recording
+    //       `releasedAt` -> the same six lines.
+    // GOAL: S15.155 -- the catch-up runs under the open's crash record: at the seek back and at the
+    //       packets decoded forward after it, the record for this monitor is on disk naming this file.
+    // CONTROL: via control_batch.sh, --phase '^resume$', 2026-09-30, the `ApplyingRecord applying(...)`
+    //       in videoSessionLocked()'s `open` lambda (backend/daemon/wallpaper_manager.cpp) declared after the
+    //       pipeline is constructed -> "FAIL: the resume's seek back runs under the open's crash record",
+    //       printing "1 seek(s), 0 under the record; 3 packet(s) after them, 3 under the record", alone. Reverted.
+    //       The packet half has no control of its own: a record withdrawn before the forward decode
+    //       would also be withdrawn before the open's first decode, which S13.119 grades.
+    // COVERAGE-ASSERT: at least one seek and one packet after it were observed during the resume --
+    //       red under the `startAt` break above, where nothing seeks.
+    {
+        const Clock::time_point pausedAt = Clock::now();
+        g_files.resetCounts();
+        const std::optional<ReadPicture> frozen = stopOn([&] { setMonitorPause(proxy, kMonitorResume, "always_paused"); });
+        if (unanswerable()) return;
+        if (!frozen) {
+            check(false, "always_paused stops the counter video again");
+            return;
+        }
+        const bool released = settlesWithin(std::chrono::seconds(20), [&] { return g_files.closes(counterClip) >= 1; });
+        const double seconds = std::chrono::duration<double>(Clock::now() - pausedAt).count();
+        const double due = std::chrono::duration<double>(config.pausedSessionRelease).count();
+        std::printf("video_wallpaper_test: the paused session was released %.3f s after the pause (due at %.3f s)\n",
+                    released ? seconds : -1.0, due);
+        std::fflush(stdout);
+        check(released && seconds >= due - 0.1 && seconds <= due + 1.5,
+              "a paused session is released after pausedSessionRelease, not sooner or later");
+        if (!released) {
+            std::fprintf(stderr, "  not released after 20 s; open files: %s\n", describeFiles(g_files.live()).c_str());
+            return;
+        }
+        g_recordWatch.arm(config.stateDir, kMonitorResume, counterClip);
+        const std::vector<ReadPicture> shown = resumeAndRead([&] { setMonitorPause(proxy, kMonitorResume, "play"); });
+        g_recordWatch.disarm();
+        nextTwoAre("a video whose paused session was released resumes on the picture it stopped on, then its successor",
+                   shown, *frozen, frozen->counter, order->after(frozen->counter));
+        const int seeks = g_recordWatch.seeks();
+        const int packets = g_recordWatch.packets();
+        std::printf("video_wallpaper_test: the resume made %d seek(s), %d under the record; %d packet(s) after them, %d "
+                    "under the record\n",
+                    seeks, g_recordWatch.seeksCovered(), packets, g_recordWatch.packetsCovered());
+        check(seeks >= 1 && packets >= 1, "the resume's seek back and the decode after it were observed");
+        check(seeks >= 1 && g_recordWatch.seeksCovered() == seeks, "the resume's seek back runs under the open's crash record");
+        check(packets >= 1 && g_recordWatch.packetsCovered() == packets,
+              "and so does the decode forward after it");
+    }
+
+    // GOAL: S15.151's hidden half -- a video whose screen was reported not drawn, and whose session was
+    //       released at the unwatched delay, resumes on the picture it stopped on when the screen is drawn
+    //       again, then its successor.
+    // CONTROL: the two S15.151 breaks above -> "FAIL: a video whose hidden session was released resumes on
+    //       the picture it stopped on, then its successor", printing "stopped on 1 (generation 16), then
+    //       showed 0 and 1". Reverted.
+    {
+        g_files.resetCounts();
+        const std::optional<ReadPicture> frozen = stopOn([&] { setOutputVisible(proxy, screen, false); });
+        if (unanswerable()) return;
+        const bool released =
+            frozen && settlesWithin(std::chrono::seconds(20), [&] { return g_files.closes(counterClip) >= 1; });
+        check(released, "a hidden counter video stops and its session is released (the premise)");
+        if (!released) return;
+        const std::vector<ReadPicture> shown = resumeAndRead([&] { setOutputVisible(proxy, screen, true); });
+        nextTwoAre("a video whose hidden session was released resumes on the picture it stopped on, then its successor",
+                   shown, *frozen, frozen->counter, order->after(frozen->counter));
+    }
+
+    // GOAL: S15.151's hand-over half -- a video whose session was released because its consumer stopped
+    //       collecting resumes, at the next hand-over, on the picture it stopped on, then its successor.
+    // WHY-THIS-SHAPE: the consumer stops fetching altogether, so the monitor goes unwatched and the
+    //       session is released at the idle delay; nothing else is asked. Its next fetch is then the
+    //       hand-over that reopens the session, and also reads the stopped picture -- so the frozen
+    //       reading and the resume are one call, and no fetch can land between the release and it.
+    // CONTROL: via control_batch.sh, --phase '^resume$', 2026-09-30, WallpaperManager::noteHandoverServed
+    //       (backend/daemon/wallpaper_manager.cpp) also resetting `releasedAt` -> this line red, printing
+    //       "stopped on 21 (generation 24), then showed 0 and 1", alone: the pause and hidden halves stayed
+    //       green. Reverted.
+    {
+        g_files.resetCounts();
+        const bool released = settlesWithin(std::chrono::seconds(20), [&] { return g_files.closes(counterClip) >= 1; });
+        check(released, "a video nobody collects stops and its session is released (the premise)");
+        if (!released) return;
+        const size_t from = taker.pictures().size();
+        const std::optional<ReadPicture> frozen = taker.current();
+        if (unanswerable()) return;
+        if (!frozen) {
+            check(false, "the stopped video's picture is handed over to a consumer that asks again");
+            return;
+        }
+        taker.takeAtLeast(2, std::chrono::seconds(20));
+        if (unanswerable()) return;
+        const std::vector<ReadPicture> shown(taker.pictures().begin() + static_cast<long>(from), taker.pictures().end());
+        std::printf("video_wallpaper_test: uncollected, released, then handed over %d (generation %llu); read after: %s\n",
+                    frozen->counter, static_cast<unsigned long long>(frozen->generation), describeRead(shown).c_str());
+        std::fflush(stdout);
+        nextTwoAre("a video released because nobody collected it resumes, at the next hand-over, on the picture it "
+                   "stopped on, then its successor",
+                   shown, *frozen, frozen->counter, order->after(frozen->counter));
+    }
+
+    // GOAL: S15.154 -- where a released video stood is for that wallpaper only: set a still and then the
+    //       same video file again, and the video starts at its first picture.
+    // WHY-THIS-SHAPE: the still opens no session, so nothing between spends the recorded position; only the
+    //       wallpaper it was recorded for decides whether it is used. Read while the screen is hidden, from
+    //       the render the new wallpaper owes, which no clock round has moved on.
+    // CONTROL: via control_batch.sh, --phase '^resume$', 2026-09-30, the `releasedAt->forSeq == wallpaperSeq`
+    //       term dropped from videoSessionLocked() (backend/daemon/wallpaper_manager.cpp) -> "FAIL: a video
+    //       set again after a still starts at its first picture, not where the old one stood", printing
+    //       "stopped on 22; the video set again showed 22", alone. Reverted.
+    {
+        g_files.resetCounts();
+        const std::optional<ReadPicture> frozen = stopOn([&] { setOutputVisible(proxy, screen, false); });
+        if (unanswerable()) return;
+        const bool released =
+            frozen && settlesWithin(std::chrono::seconds(20), [&] { return g_files.closes(counterClip) >= 1; });
+        if (!released || frozen->counter == order->ids.front()) {
+            notVerified("S15.154", "the video was not released away from its first picture, so where it starts next "
+                                   "could not tell the two answers apart");
+            return;
+        }
+        uint64_t before = latestGeneration(rig.pictures, kMonitorResume);
+        setWallpaper(proxy, "static", still, kMonitorResume);
+        const bool stillShown = settlesWithin(std::chrono::seconds(20),
+                                              [&] { return latestGeneration(rig.pictures, kMonitorResume) > before; });
+        before = latestGeneration(rig.pictures, kMonitorResume);
+        setWallpaper(proxy, "video", counterClip, kMonitorResume);
+        const bool videoShown = stillShown && settlesWithin(std::chrono::seconds(20), [&] {
+                                    return latestGeneration(rig.pictures, kMonitorResume) > before;
+                                });
+        // A render that never happened is not a verdict on where the video starts.
+        // CONTROL: test-side, by hand, 2026-10-01: the still replaced by an undecodable file -> "FAIL: the still
+        //       and then the video set again are each drawn (the premise of S15.154)", "the still was never
+        //       drawn", and no FAIL on the property's line. Restored.
+        check(stillShown && videoShown, "the still and then the video set again are each drawn (the premise of S15.154)");
+        if (!stillShown || !videoShown) {
+            std::fprintf(stderr, "  %s was never drawn\n", stillShown ? "the video set again" : "the still");
+            return;
+        }
+        const std::optional<ReadPicture> first = taker.current();
+        if (unanswerable()) return;
+        const bool fromStart = first && first->counter == order->ids.front();
+        check(fromStart, "a video set again after a still starts at its first picture, not where the old one stood");
+        if (!fromStart) {
+            std::fprintf(stderr, "  stopped on %d; the video set again showed %s\n", frozen->counter,
+                         first ? std::to_string(first->counter).c_str() : "nothing");
+        }
+    }
+}
+
+// S15.156: an evicted session resumes where it stood, like one the delay released.
+void runResumeEvictionChecks(const WallpaperManager::Config& base, const std::string& counterClip,
+                             const std::vector<std::string>& clips, const std::string& still) {
+    using wallpaperx::testing::setMonitorOutput;
+    using wallpaperx::testing::setOutputVisible;
+    const char* kGoal = "S15.156 (an evicted video resumes on the picture it stopped on)";
+    const std::optional<CounterOrder> order = counterOrder(counterClip, kGoal);
+    if (!order) return;
+    WallpaperManager::Config config = base;
+    config.width = 160;
+    config.height = 120;
+    // Only an eviction may free the hidden monitor's session here.
+    config.idleSessionRelease = std::chrono::seconds(120);
+    config.pausedSessionRelease = std::chrono::seconds(120);
+    g_files.watch(counterClip);
+
+    PhaseGrade grade("the resume-eviction phase");
+    BusRig rig(config, grade);
+    sdbus::IProxy& proxy = *rig.proxy;
+    CounterReader reader;
+    CountedPictures taker(proxy, rig.pictures, kMonitorResume, reader);
+    const auto screenFor = [](int id) { return "DP-EVICT-" + std::to_string(id); };
+
+    setMonitorOutput(proxy, kMonitorResume, screenFor(kMonitorResume));
+    wallpaperx::testing::setWallpaperWithProperties(proxy, "video", counterClip, kMonitorResume,
+                                                    {{"speed", sdbus::Variant(0.25)}});
+    if (!settlesWithin(std::chrono::seconds(30), [&] { return latestGeneration(rig.pictures, kMonitorResume) > 0; })) {
+        grade.expectNoDevice();
+        notVerified(kGoal, "the counter video produced no frame on this host");
+        return;
+    }
+    taker.takeAtLeast(8, std::chrono::seconds(20));
+    setOutputVisible(proxy, screenFor(kMonitorResume), false);
+    const bool quiet = taker.takeUntilQuiet(kQuietWindow, std::chrono::seconds(25));
+    const std::optional<ReadPicture> frozen = quiet ? taker.current() : std::nullopt;
+    if (readingStopped(taker, kGoal)) return;
+    if (!frozen) {
+        check(false, "a hidden counter video stops (the premise of the eviction check)");
+        return;
+    }
+
+    // GOAL: S15.156 -- a session evicted for another screen's decoder records where its video stood, and
+    //       the video resumes there: the picture on screen when it stopped, then its successor.
+    // WHY-THIS-SHAPE: the idle and paused delays are two minutes, so only the eighth other video's open can
+    //       free the hidden monitor's session -- the only one not on a drawn screen. The close is asserted
+    //       before the resume. A reopen never evicts -- it waits for a free slot -- so another monitor is
+    //       then given a still, whose render frees that monitor's session and runs the round that reopens.
+    // CONTROL: via control_batch.sh, --phase '^resumeEviction$', 2026-10-01, closeVideoSessionLocked() in
+    //       place of releaseVideoSessionLocked() in evictIdleVideoSessionLocked()
+    //       (backend/daemon/wallpaper_manager.cpp) -> "FAIL: a video whose session was evicted resumes on the
+    //       picture it stopped on, then its successor", printing "stopped on 7 (generation 8), then showed 0
+    //       and 1". Reverted.
+    g_files.resetCounts();
+    for (int id = 1; id <= static_cast<int>(WallpaperManager::kMaxVideoSessions); ++id) {
+        setMonitorOutput(proxy, id, screenFor(id));
+        setWallpaper(proxy, "video", clips[static_cast<size_t>(id - 1)], id);
+    }
+    const bool evicted = settlesWithin(std::chrono::seconds(60), [&] { return g_files.closes(counterClip) >= 1; });
+    check(evicted, "the hidden video's session is evicted for the eighth other video (the premise)");
+    if (!evicted) return;
+    const size_t from = taker.pictures().size();
+    setOutputVisible(proxy, screenFor(kMonitorResume), true);
+    setWallpaper(proxy, "static", still, 1);
+    taker.takeAtLeast(2, std::chrono::seconds(30));
+    if (readingStopped(taker, kGoal)) return;
+    const std::vector<ReadPicture> shown(taker.pictures().begin() + static_cast<long>(from), taker.pictures().end());
+    if (gradeNextTwo("a video whose session was evicted resumes on the picture it stopped on, then its successor", shown,
+                     *frozen, frozen->counter, order->after(frozen->counter)) == Graded::Failed) {
+        const StatusReply status = getStatusOrExplain(proxy);
+        const nlohmann::json* entry = wallpaperStatus(status, std::to_string(kMonitorResume));
+        std::fprintf(stderr, "  stopped on %d, then showed %s; monitor %d: %s\n", frozen->counter,
+                     describeRead(shown).c_str(), kMonitorResume, entry != nullptr ? entry->dump().c_str() : "no status");
+    }
+}
+
+// S15.175: a resume whose open at the recorded position fails falls back to the first picture, and the
+// position is spent by the attempt.
+void runResumeFallbackChecks(const WallpaperManager::Config& base, const std::string& counterClip) {
+    using wallpaperx::testing::setMonitorOutput;
+    using wallpaperx::testing::setOutputSize;
+    using wallpaperx::testing::setOutputVisible;
+    const char* kGoal = "S15.175 (a resume that cannot open at its position starts at the first picture)";
+    const std::optional<CounterOrder> order = counterOrder(counterClip, kGoal);
+    if (!order) return;
+    const wallpaperx::testing::ScratchDir scratch("videofallback");
+    if (!scratch.ok()) {
+        notVerified(kGoal, "no scratch directory could be created");
+        return;
+    }
+    WallpaperManager::Config config = base;
+    config.width = 160;
+    config.height = 120;
+    config.idleSessionRelease = std::chrono::seconds(2);
+    config.configFile = scratch.path() / "config.json";
+    config.stateDir = scratch.path() / "state";
+    g_files.watch(counterClip);
+    // Seeks this far in are a resume's: the loop's rewind aims at the first packet.
+    constexpr double kFarSeconds = 0.5;
+    constexpr int kFarPicture = 30;
+
+    PhaseGrade grade("the resume-fallback phase");
+    BusRig rig(config, grade);
+    sdbus::IProxy& proxy = *rig.proxy;
+    CounterReader reader;
+    CountedPictures taker(proxy, rig.pictures, kMonitorResume, reader);
+    const std::string screen = "DP-FALLBACK";
+    setMonitorOutput(proxy, kMonitorResume, screen);
+    setWallpaper(proxy, "video", counterClip, kMonitorResume);
+    if (!settlesWithin(std::chrono::seconds(30), [&] { return latestGeneration(rig.pictures, kMonitorResume) > 0; })) {
+        grade.expectNoDevice();
+        notVerified(kGoal, "the counter video produced no frame on this host");
+        return;
+    }
+    const auto statusLine = [&] {
+        const StatusReply status = getStatusOrExplain(proxy);
+        const nlohmann::json* entry = wallpaperStatus(status, std::to_string(kMonitorResume));
+        return entry != nullptr ? entry->dump() : std::string("no status");
+    };
+    // Plays past kFarPicture, hides the screen and waits for the release; the picture it stopped on.
+    const auto playThenRelease = [&]() -> std::optional<ReadPicture> {
+        taker.takeUntil([&] { return !taker.pictures().empty() && taker.pictures().back().counter >= kFarPicture + 10; },
+                        std::chrono::seconds(20));
+        if (readingStopped(taker, kGoal)) return std::nullopt;
+        g_files.resetCounts();
+        setOutputVisible(proxy, screen, false);
+        const bool quiet = taker.takeUntilQuiet(kQuietWindow, std::chrono::seconds(25));
+        const std::optional<ReadPicture> frozen = quiet ? taker.current() : std::nullopt;
+        if (readingStopped(taker, kGoal)) return std::nullopt;
+        const bool released =
+            frozen && settlesWithin(std::chrono::seconds(20), [&] { return g_files.closes(counterClip) >= 1; });
+        if (!released || frozen->counter < kFarPicture) {
+            check(false, "the counter video plays past its first second, stops when hidden and is released (the premise)");
+            std::fprintf(stderr, "  stopped on %s; %s\n", frozen ? std::to_string(frozen->counter).c_str() : "nothing",
+                         released ? "released" : "never released");
+            return std::nullopt;
+        }
+        return frozen;
+    };
+
+    // GOAL: S15.175 -- a resume whose open at the recorded position fails as the file's fault is opened again
+    //       at once from the first picture: the screen shows picture 0 then 1, with no error, and the position
+    //       is tried once.
+    // WHY-THIS-SHAPE: the first read after the resume's seek fails with EIO, which the decoder reports as the
+    //       file's failure; nothing after it is failed, so the open from the start succeeds. Without the
+    //       fallback the screen stays blank, since a render-pass failure blamed on the file is not retried.
+    // CONTROL: via control_batch.sh, --phase '^resumeFallback$', 2026-10-01, reverted: in videoSessionLocked()
+    //       (backend/daemon/wallpaper_manager.cpp) the `catch (const WallpaperContentError&)` fallback made to
+    //       rethrow at once -> "FAIL: a resume whose open at its position fails starts at once at the first
+    //       picture", printing "stopped on 40 (generation 41); 0 new picture(s) within 20 s of the resume:
+    //       nothing", has_frame false and last_error "VideoDecoder: cannot read the wallpaper (Input/output
+    //       error)". Reverted.
+    // COVERAGE-ASSERT: the injected read failure was spent, so the fallback was at stake.
+    std::optional<ReadPicture> frozen = playThenRelease();
+    if (!frozen) return;
+    {
+        g_farRead.arm(kFarSeconds, 1, /*alsoNextOpen=*/false);
+        const size_t from = taker.pictures().size();
+        setOutputVisible(proxy, screen, true);
+        taker.takeAtLeast(2, std::chrono::seconds(20));
+        g_farRead.disarm();
+        if (readingStopped(taker, kGoal)) return;
+        const std::vector<ReadPicture> shown(taker.pictures().begin() + static_cast<long>(from), taker.pictures().end());
+        std::printf("video_wallpaper_test: the open at %d failed its read; %d far seek(s), %d read(s) failed; read after: %s\n",
+                    frozen->counter, g_farRead.farSeeks(), g_farRead.injected(), describeRead(shown).c_str());
+        std::fflush(stdout);
+        check(g_farRead.injected() == 1, "the read after the resume's seek was failed (the premise)");
+        check(g_farRead.farSeeks() == 1, "a resume whose open at its position fails tries the position once");
+        if (gradeNextTwo("a resume whose open at its position fails starts at once at the first picture", shown, *frozen,
+                         order->ids.front(), order->after(order->ids.front())) == Graded::Failed) {
+            std::fprintf(stderr, "  monitor: %s\n", statusLine().c_str());
+        }
+    }
+
+    // GOAL: S15.175's second half -- the position is spent by the attempt: when the open at the position and
+    //       the open from the first picture both fail, the next render of the same wallpaper opens from the
+    //       first picture and seeks to the position no more.
+    // WHY-THIS-SHAPE: the read after the far seek fails, and so does the open() of the file that follows it;
+    //       then a new size is reported, which re-renders the same wallpaper without changing it -- setting it
+    //       again would make the recorded position another wallpaper's and prove nothing.
+    // CONTROL: via control_batch.sh, --phase '^resumeFallback$', 2026-10-01, reverted: in videoSessionLocked()
+    //       (backend/daemon/wallpaper_manager.cpp) `it->second.releasedAt.reset();` moved to after a successful
+    //       open -> both lines red, "then showed 40 and 41" -- the old position, where 0 was due -- and "1 far
+    //       seek(s) at the re-render". Reverted.
+    // COVERAGE-ASSERT: both opens were failed and the screen went blank before the re-render.
+    frozen = playThenRelease();
+    if (!frozen) return;
+    {
+        g_farRead.arm(kFarSeconds, 1, /*alsoNextOpen=*/true);
+        const uint64_t before = latestGeneration(rig.pictures, kMonitorResume);
+        setOutputVisible(proxy, screen, true);
+        const bool blank = settlesWithin(std::chrono::seconds(20), [&] {
+            const StatusReply status = getStatusOrExplain(proxy);
+            const nlohmann::json* entry = wallpaperStatus(status, std::to_string(kMonitorResume));
+            return entry != nullptr && !entry->value("has_frame", true);
+        });
+        const bool bothFailed = blank && g_farRead.injected() == 1 && g_openFailure.left() == 0 &&
+                                latestGeneration(rig.pictures, kMonitorResume) == before;
+        g_farRead.disarm();
+        g_openFailure.disarm();
+        check(bothFailed, "the open at the position and the open from the first picture both failed (the premise)");
+        if (!bothFailed) {
+            std::fprintf(stderr, "  %d read(s) failed; monitor: %s\n", g_farRead.injected(), statusLine().c_str());
+            return;
+        }
+        g_farRead.arm(kFarSeconds, 0, /*alsoNextOpen=*/false);
+        const size_t from = taker.pictures().size();
+        setOutputSize(proxy, screen, 192, 144);
+        taker.takeAtLeast(2, std::chrono::seconds(20));
+        g_farRead.disarm();
+        if (readingStopped(taker, kGoal)) return;
+        const std::vector<ReadPicture> shown(taker.pictures().begin() + static_cast<long>(from), taker.pictures().end());
+        std::printf("video_wallpaper_test: after both opens failed, the re-render made %d far seek(s); read after: %s\n",
+                    g_farRead.farSeeks(), describeRead(shown).c_str());
+        std::fflush(stdout);
+        check(g_farRead.farSeeks() == 0, "after both opens failed, the next render seeks to the position no more");
+        // The screen stayed blank since `before`, so the re-render's pictures are the generations after it.
+        const Graded graded = gradeNextTwo("after both opens failed, the next render opens from the first picture",
+                                           shown, ReadPicture{before, frozen->counter}, order->ids.front(),
+                                           order->after(order->ids.front()));
+        if (graded == Graded::Failed || g_farRead.farSeeks() != 0) {
+            std::fprintf(stderr, "  %d far seek(s) at the re-render; monitor: %s\n", g_farRead.farSeeks(),
+                         statusLine().c_str());
+        }
+    }
+}
+
+// S15.157: time paused is not clean play. Manager-level, like runCleanPlayHideChecks: the playing record
+// is what is read.
+void runCleanPlayPauseChecks(const WallpaperManager::Config& base, const std::string& clip, bool withinOneRound) {
+    const std::string what = withinOneRound ? "a pause begun and ended while the worker ran no round" : "a 4 s pause";
+    const char* kGoal = "S15.157 (time paused is not clean play)";
+    const wallpaperx::testing::ScratchDir scratch("videocleanpause");
+    if (!scratch.ok()) {
+        notVerified(kGoal, "no scratch directory could be created");
+        return;
+    }
+    // Never unwatched: with the worker held the consumer cannot collect, and an unwatched stop would end
+    // the stretch in the pause's place.
+    WallpaperManager::Config config = playsUnwatched(base);
+    config.configFile = scratch.path() / "config.json";
+    config.stateDir = scratch.path() / "state";
+    config.cleanPlayAfter = std::chrono::seconds(3);
+    config.pausedSessionRelease = std::chrono::seconds(30);
+    writeConfig(config.configFile, {{kMonitorClean, "video", clip}});
+    {
+        wallpaperx::PlayingRecord record(config.stateDir);
+        record.start({{kMonitorClean, clip, 1}});
+    }
+
+    PhaseGrade grade("the clean-play pause phase");
+    FrameReadyLog signals;
+    WallpaperManager manager(config);
+    CaptureGradeOnExit captureGrade{grade, manager};
+    Collector collector(manager, kMonitorClean, ":1.cleanpause");
+    RenderWorker worker(manager, [&](int id, uint64_t g) {
+        signals.record(id, g);
+        collector.announced(id, g);
+    });
+    collector.attach(worker);
+    WorkerUnblock unblock{worker};
+    const std::vector<int> restored = manager.restoreSaved();
+    manager.recordStartingVideos();
+    check(deathsIn(config.stateDir) == 1, "the video starts this run carrying one death (the harness's premise)");
+    wallpaperx::testing::nameScreen(manager, kMonitorClean, "DP-CLEANPAUSE");
+    for (const int id : restored) worker.post(id);
+    if (!signals.wait(kMonitorClean, 1)) {
+        grade.expectNoDevice();
+        notVerified(kGoal, "the video did not draw on this host");
+        return;
+    }
+
+    // GOAL: S15.157 -- time paused is not clean play: a pause of four seconds between two visible
+    //       stretches that together fall short of cleanPlayAfter leaves the death count standing, whether
+    //       the clock ran rounds during the pause or the pause began and ended while it ran none.
+    // WHY-THIS-SHAPE: as runCleanPlayHideChecks, with the pause in place of the hide; the second run holds
+    //       the worker in a task across the whole pause, so no clock round ever sees it and only the call
+    //       that paused can end the stretch. The monitor never goes unwatched, or the consumer's silence
+    //       during the hold would end the stretch instead. A run whose visible time reached cleanPlayAfter
+    //       is reported as not graded.
+    // CONTROL: via control_batch.sh, --phase '^cleanPlayPause', 2026-09-30, NVIDIA, each reverted, in
+    //       backend/daemon/wallpaper_manager.cpp. THREE DEFENCES, measured: endPlayIfPausedLocked() made a
+    //       no-op, the paused round's `if (!playing) it->second.cleanPlay.lastShown.reset();` deleted, or
+    //       advanceSessionLocked()'s `onTime` forced true, each alone leaves both runs GREEN -- the first
+    //       picture after a pause is late, and a late picture earns no credit. `onTime` forced true with
+    //       endPlayIfPausedLocked() a no-op -> "FAIL: a pause begun and ended while the worker ran no round
+    //       is not counted as play", "the count is 0", the other run green; with the paused round's drop
+    //       deleted as well -> both runs red, "the count is 0".
+    const Clock::time_point firstShown = Clock::now();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+    double visibleBefore = 0;
+    if (withinOneRound) {
+        HeldWorker hold(worker);
+        visibleBefore = std::chrono::duration<double>(Clock::now() - firstShown).count();
+        if (!hold.held()) {
+            notVerified(kGoal, "the worker could not be held, so no pause could begin and end between two rounds");
+            return;
+        }
+        manager.setMonitorPause(kMonitorClean, "always_paused");
+        std::this_thread::sleep_for(std::chrono::seconds(4));
+        manager.setMonitorPause(kMonitorClean, "play");
+    } else {
+        manager.setMonitorPause(kMonitorClean, "always_paused");
+        worker.wake();
+        visibleBefore = std::chrono::duration<double>(Clock::now() - firstShown).count();
+        std::this_thread::sleep_for(std::chrono::seconds(4));
+        manager.setMonitorPause(kMonitorClean, "play");
+    }
+    const Clock::time_point shownAgain = Clock::now();
+    worker.wake();
+    const size_t before = signals.countFor(kMonitorClean);
+    const bool resumed = settlesWithin(std::chrono::seconds(10), [&] { return signals.countFor(kMonitorClean) >= before + 2; });
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    const int afterPause = deathsIn(config.stateDir);
+    const double visibleAfter = std::chrono::duration<double>(Clock::now() - shownAgain).count();
+    check(resumed, what + ": the video plays again after it");
+    if (visibleBefore + visibleAfter >= 3.0) {
+        notVerified(kGoal, "the visible stretches took " + std::to_string(visibleBefore + visibleAfter) +
+                               " s, not less than cleanPlayAfter, so a clear proves nothing");
+        return;
+    }
+    reportUnless(afterPause == 1, (what + " is not counted as play").c_str(),
+                 "the count is " + std::to_string(afterPause) + ", " + collector.describe());
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -7744,21 +9097,29 @@ int main(int argc, char** argv) {
         // The same chain for a wallpaper's speed: the method, the manager and the worker's wake.
         if (phaseSelected("speed")) {
             PhaseGrade grade("the speed phase");
-            PictureLog pictures;
-            WallpaperManager manager(config);
-            CaptureGradeOnExit captureGrade{grade, manager};
-
-            auto serviceConn = sdbus::createSessionBusConnection();
-            DbusService service(*serviceConn, manager);
-            serviceConn->enterEventLoopAsync();
-            auto proxy = sdbus::createProxy(sdbus::ServiceName{serviceConn->getUniqueName()},
-                                            sdbus::ObjectPath{DbusService::kObjectPath});
-            proxy->uponSignal("FrameReady")
-                .onInterface(DbusService::kInterface)
-                .call([&pictures](int32_t monitorId, uint64_t generation) { pictures.record(monitorId, generation); });
-
-            runSpeedChecks(*proxy, pictures, clip, still, grade);
+            BusRig rig(config, grade);
+            runSpeedChecks(*rig.proxy, rig.pictures, clip, still, grade);
         }
+
+        // Step 15 chunk 3c: the pause setting, and a video resuming where it stood. Each builds its own
+        // manager, service and proxy; the resume phases read pictures by the frame number drawn in them.
+        if (phaseSelected("pause")) runPauseChecks(config, clip);
+        const bool resumeSelected = phaseSelected("resume");
+        const bool resumeEvictionSelected = phaseSelected("resumeEviction");
+        const bool resumeFallbackSelected = phaseSelected("resumeFallback");
+        if (resumeSelected || resumeEvictionSelected || resumeFallbackSelected) {
+            const std::string counterClip = counterClipPath();
+            if (!std::filesystem::exists(counterClip)) {
+                notVerified("S15.151-S15.156, S15.175", "the counter fixture " + counterClip +
+                                                   " was not generated, so no resumed picture could be identified");
+            } else {
+                if (resumeSelected) runResumeChecks(config, counterClip, still);
+                if (resumeEvictionSelected) runResumeEvictionChecks(config, counterClip, clips, still);
+                if (resumeFallbackSelected) runResumeFallbackChecks(config, counterClip);
+            }
+        }
+        if (phaseSelected("cleanPlayPause")) runCleanPlayPauseChecks(config, clip, /*withinOneRound=*/false);
+        if (phaseSelected("cleanPlayPauseHeld")) runCleanPlayPauseChecks(config, clip, /*withinOneRound=*/true);
 
         if (phaseSelected("evictionWatch")) runEvictionWatchChecks(config, clips);
         if (phaseSelected("slowPicture")) {

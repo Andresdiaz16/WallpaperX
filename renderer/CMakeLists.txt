@@ -88,6 +88,7 @@ add_library(wallpaperx-renderer STATIC
     renderers/static_renderer.cpp
     renderers/video_renderer.cpp
     video/video_decoder.cpp
+    video/reset_point.cpp
     video/frame_converter.cpp
     video/video_pipeline.cpp
 )
@@ -425,6 +426,8 @@ if(WALLPAPERX_FFMPEG_EXECUTABLE)
     set(COUNTER_H264 "-c:v libx264 -threads 1 -crf 18 -keyint_min 24 -g 24 -sc_threshold 0")
     set(COUNTER_H264_RAW "${COUNTER_H264} -bf 3 -bsf:v h264_mp4toannexb -f h264")
     set(COUNTER_HEVC_RAW "-c:v libx265 -x265-params log-level=error:keyint=24:min-keyint=24:scenecut=0:bframes=3 -bsf:v hevc_mp4toannexb -f hevc")
+    set(COUNTER_H264_OPENGOP "-c:v libx264 -threads 1 -crf 18 -keyint_min 48 -g 48 -sc_threshold 0 -bf 3 -x264-params open-gop=1:b-adapt=0")
+    set(COUNTER_HEVC_OPENGOP "-c:v libx265 -x265-params log-level=error:keyint=48:min-keyint=48:scenecut=0:bframes=3:b-adapt=0:open-gop=1")
     # The size-change parts: one second each, the count continuing across the parts of a join. 160x120
     # HEVC is below what this GPU decodes, so that join's middle is a refusal.
     set(WALLPAPERX_SIZE_CHANGE_PARTS
@@ -450,8 +453,13 @@ if(WALLPAPERX_FFMPEG_EXECUTABLE)
     execute_process(COMMAND ${WALLPAPERX_FFMPEG_EXECUTABLE} -hide_banner -encoders
                     OUTPUT_VARIABLE WALLPAPERX_FFMPEG_ENCODERS ERROR_QUIET)
     set(WALLPAPERX_SIZE_CHANGE_JOINS "")
+    set(WALLPAPERX_AV1_START_RECIPES "")
     if(WALLPAPERX_FFMPEG_ENCODERS MATCHES "libaom-av1")
-        set(COUNTER_AV1_RAW "-c:v libaom-av1 -cpu-used 8 -g 24 -keyint_min 24 -f obu")
+        # An AV1 file with key frames part way in, for a start on the device; 320x240 because AV1 decodes
+        # nothing under 128 pictures high here.
+        set(COUNTER_AV1 "-c:v libaom-av1 -cpu-used 8 -g 24 -keyint_min 24")
+        set(WALLPAPERX_AV1_START_RECIPES "counter_av1.mp4|320x240|30|4|0|${COUNTER_AV1}")
+        set(COUNTER_AV1_RAW "${COUNTER_AV1} -f obu")
         list(APPEND WALLPAPERX_SIZE_CHANGE_PARTS
             "counter_big_0.obu|640x480|30|1|0|${COUNTER_AV1_RAW}"
             "counter_big_30.obu|320x240|30|1|30|${COUNTER_AV1_RAW}"
@@ -469,6 +477,9 @@ if(WALLPAPERX_FFMPEG_EXECUTABLE)
     set(WALLPAPERX_COUNTER_RECIPES
         ${WALLPAPERX_SIZE_CHANGE_PARTS}
         "counter_long.mp4|320x240|30|10.667|0|${COUNTER_H264} -bf 3"
+        # The first 100 pictures of counter_long.mp4, encoded alike: a file replaced in place by a shorter
+        # one, which a position from the longer file lies past the end of.
+        "counter_long_cut.mp4|320x240|30|3.334|0|${COUNTER_H264} -bf 3"
         "counter_short.mp4|320x240|10|2|0|${COUNTER_H264} -bf 3"
         "counter_bframes.h264|320x240|30|3|0|${COUNTER_H264} -bf 3 -bsf:v h264_mp4toannexb -f h264"
         "counter_seg.ts|320x240|30|4|0|${COUNTER_H264} -bf 3 -f mpegts"
@@ -478,6 +489,31 @@ if(WALLPAPERX_FFMPEG_EXECUTABLE)
         "counter_resize_large.h264|320x240|30|1|0|${COUNTER_H264} -bf 3 -bsf:v h264_mp4toannexb -f h264"
         "counter_resize_small.h264|160x120|30|1|30|${COUNTER_H264} -bf 3 -bsf:v h264_mp4toannexb -f h264"
         "counter_bf2.mkv|320x240|30|2|0|${COUNTER_H264} -bf 2 -f matroska"
+        # Open GOP: keyframes after the first do not reset the decoder (H.264 non-IDR I pictures with a
+        # recovery point, HEVC CRA pictures), and the B pictures after each in decode order are shown
+        # before it. A fixed B pattern and a 48-picture interval, so a seek moved a second early still
+        # lands inside the group before a keyframe; the probe asserts the layout. The MP4s index those
+        # keyframes as sync samples, so their seeks land on them directly.
+        "counter_opengop.ts|320x240|30|6.4|0|${COUNTER_H264_OPENGOP} -f mpegts"
+        "counter_opengop_hevc.ts|320x240|30|6.4|0|${COUNTER_HEVC_OPENGOP} -f mpegts"
+        "counter_opengop.mp4|320x240|30|6.4|0|${COUNTER_H264_OPENGOP}"
+        "counter_opengop_hevc.mp4|320x240|30|6.4|0|${COUNTER_HEVC_OPENGOP} -tag:v hvc1"
+        # For the device start's catch-up budget of 250 pictures: an open-GOP file whose only IDR is its
+        # first picture, 320 pictures long; and one with IDRs forced at pictures 120 and 132, close enough
+        # that one search window holds both, then open GOP for 287 pictures. The probe asserts both layouts.
+        "counter_opengop_long.mp4|128x96|30|10.667|0|${COUNTER_H264_OPENGOP}"
+        "counter_two_idr.mp4|128x96|30|14|0|${COUNTER_H264_OPENGOP} -force_key_frames 4,4.4 -forced-idr 1"
+        # The same open GOP for 1200 pictures, so a start can lie several search windows past the budget.
+        "counter_opengop_xlong.mp4|128x96|30|40|0|${COUNTER_H264_OPENGOP}"
+        # MPEG-2, which decodes in software everywhere, with keyframes 600 pictures apart: a software
+        # start whose seeks land past their target must give up within the budget.
+        "counter_onekey_m2.ts|128x96|30|42|0|-c:v mpeg2video -g 600 -bf 0 -q:v 2 -f mpegts"
+        # Keyframes far apart, for a start past the budget from the keyframe before it: H.264 with IDRs 900
+        # pictures apart (decoded on the device), and MPEG-2 600 apart in Matroska, whose index lands a
+        # software seek on the keyframe at or before its target. The probe asserts both layouts.
+        "counter_sparse_h264.mp4|128x96|30|62|0|-c:v libx264 -threads 1 -crf 18 -g 900 -sc_threshold 0 -bf 3"
+        "counter_sparse_m2.mkv|128x96|30|62|0|-c:v mpeg2video -g 600 -bf 0 -q:v 2 -sc_threshold 1000000000 -f matroska"
+        ${WALLPAPERX_AV1_START_RECIPES}
         # Pairs that differ only in length, 20 and 3000 pictures, for a loop boundary's cost. 128x96
         # still decodes on the GPU and keeps 3000 pictures quick.
         "counter_loop_short.mp4|128x96|30|0.65|0|${COUNTER_H264} -bf 3"
@@ -606,7 +642,17 @@ endif()
 # entry points to inject the failure and count what the resume costs, and Vulkan's create and wait
 # entry points to count what a steady picture costs; no allocator replacement, so no
 # WALLPAPERX_SANITIZE opt-out.
-add_executable(wallpaperx-video-pipeline-probe tests/video_pipeline_probe.cpp)
+set(WALLPAPERX_CATCH_UP_HEADER ${CMAKE_CURRENT_BINARY_DIR}/generated/catch_up_budget.h)
+add_custom_command(
+    OUTPUT ${WALLPAPERX_CATCH_UP_HEADER}
+    COMMAND ${CMAKE_COMMAND} -DSOURCE=${CMAKE_CURRENT_SOURCE_DIR}/video/video_decoder.cpp
+            -DOUTPUT=${WALLPAPERX_CATCH_UP_HEADER} -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/support/catch_up_budget.cmake
+    DEPENDS video/video_decoder.cpp tests/support/catch_up_budget.cmake
+    COMMENT "Reading the decoder's catch-up budget"
+    VERBATIM
+)
+add_executable(wallpaperx-video-pipeline-probe tests/video_pipeline_probe.cpp ${WALLPAPERX_CATCH_UP_HEADER})
+target_include_directories(wallpaperx-video-pipeline-probe PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
 target_link_libraries(wallpaperx-video-pipeline-probe PRIVATE wallpaperx-renderer)
 target_compile_definitions(wallpaperx-video-pipeline-probe PRIVATE
     WALLPAPERX_VIDEO_ASSET_DIR="${WALLPAPERX_VIDEO_ASSET_DIR}"
@@ -615,6 +661,20 @@ add_dependencies(wallpaperx-video-pipeline-probe wallpaperx-shaders)
 if(WALLPAPERX_FFMPEG_EXECUTABLE)
     add_dependencies(wallpaperx-video-pipeline-probe wallpaperx-video-fixtures)
 endif()
+
+# Grades resetsDecoder() packet by packet against an independent reading of the H.264, HEVC and AV1
+# specifications in tests/support/reset_point_reference.h. Bytes only, no Device.
+add_executable(wallpaperx-reset-point-probe tests/reset_point_probe.cpp)
+target_link_libraries(wallpaperx-reset-point-probe PRIVATE wallpaperx-renderer)
+target_compile_definitions(wallpaperx-reset-point-probe PRIVATE
+    WALLPAPERX_VIDEO_ASSET_DIR="${WALLPAPERX_VIDEO_ASSET_DIR}")
+if(WALLPAPERX_FFMPEG_EXECUTABLE)
+    add_dependencies(wallpaperx-reset-point-probe wallpaperx-video-fixtures)
+endif()
+add_test(NAME reset_point_detector COMMAND wallpaperx-reset-point-probe)
+# The AV1 fixture needs libaom and skips without it, apart from the fixtures that are always there.
+add_test(NAME reset_point_detector_av1 COMMAND wallpaperx-reset-point-probe av1)
+set_tests_properties(reset_point_detector reset_point_detector_av1 PROPERTIES SKIP_RETURN_CODE 77 LABELS "novulkan")
 
 # The Device's creation record and its video-decode surface. Interposes vkCreateInstance,
 # vkCreateDevice and vkGetPhysicalDeviceQueueFamilyProperties2, so it can compare what an
@@ -787,7 +847,9 @@ set_tests_properties(frame_converter_shader_read PROPERTIES LABELS "novulkan")
 set(WALLPAPERX_PIPELINE_MODES sequence-device sequence-host resume-timestamps resume-no-timestamps
     resume-late-seek resume-end resume-seek-failure resume-drop-count shape shape-device steady-device
     steady-host loop-device loop-host loop-cost-device loop-cost-host loop-resume release-device retire-device
-    halves-device halves-host timing-device timing-host)
+    halves-device halves-host timing-device timing-host start-at-device start-at-device-ts start-at-host
+    start-at-device-open-gop start-at-device-open-gop-hevc start-at-device-open-gop-mp4 start-at-host-open-gop
+    start-at-device-budget start-at-device-av1)
 foreach(MODE ${WALLPAPERX_PIPELINE_MODES})
     string(REPLACE "-" "_" MODE_NAME "${MODE}")
     add_test(NAME video_pipeline_${MODE_NAME} COMMAND wallpaperx-video-pipeline-probe ${MODE})
@@ -1024,7 +1086,8 @@ if(WALLPAPERX_LAVAPIPE_ICD)
                          PROPERTIES ENVIRONMENT "VK_ICD_FILENAMES=${WALLPAPERX_LAVAPIPE_ICD}"
                                     LABELS "lavapipe" SKIP_RETURN_CODE 77)
     # The pipeline's entries that need no hardware decoder.
-    foreach(MODE sequence-host shape steady-host loop-host loop-cost-host halves-host timing-host)
+    foreach(MODE sequence-host shape steady-host loop-host loop-cost-host halves-host timing-host start-at-host
+                 start-at-host-open-gop)
         string(REPLACE "-" "_" MODE_NAME "${MODE}")
         add_test(NAME video_pipeline_${MODE_NAME}_lavapipe COMMAND wallpaperx-video-pipeline-probe ${MODE})
         set_tests_properties(video_pipeline_${MODE_NAME}_lavapipe

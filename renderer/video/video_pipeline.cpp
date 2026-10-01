@@ -13,8 +13,8 @@ VideoPipeline::Stage::Stage(Device& device, const DecodedFrame& first, const std
     : converter(device, first, shaderDir), renderer(device, converter.frame()) {}
 
 VideoPipeline::VideoPipeline(Device& device, const std::string& file, const std::string& shaderDir,
-                             Playback playback)
-    : m_device(device), m_shaderDir(shaderDir), m_playback(playback), m_decoder(device, file) {}
+                             Playback playback, std::optional<StreamPosition> startAt)
+    : m_device(device), m_shaderDir(shaderDir), m_playback(playback), m_decoder(device, file, startAt) {}
 
 bool VideoPipeline::renderNext(OffscreenTargetManager& targets, const OffscreenTarget& target) {
     // Asserted here as well as in the two halves: the abort has to name the entry point the
@@ -28,7 +28,7 @@ bool VideoPipeline::renderNext(OffscreenTargetManager& targets, const OffscreenT
 bool VideoPipeline::decodeNext() {
     m_device.assertGpuThread("VideoPipeline::decodeNext");
     std::optional<DecodedFrame> frame = m_decoder.next();
-    bool startsPass = !m_stage;
+    bool startsPass = !m_stage && !m_decoder.startedMidStream();
     // No stage means nothing was ever shown, and a stream with nothing to show must not spin here.
     if (!frame && m_playback == Playback::Loop && m_stage) {
         m_decoder.restart();
@@ -45,6 +45,7 @@ bool VideoPipeline::decodeNext() {
     }
     static_cast<void>(m_stage->converter.convert(*frame));
     m_timing = PictureTiming{frame->presentationTime(), frame->duration(), startsPass};
+    m_convertedPosition = frame->position();
     return true;
 }
 
@@ -59,6 +60,7 @@ void VideoPipeline::draw(OffscreenTargetManager& targets, const OffscreenTarget&
     // that has nothing to show.
     if (!m_stage) throw std::logic_error("VideoPipeline::draw: no picture has been decoded");
     targets.render(m_stage->renderer, target);
+    m_shownPosition = m_convertedPosition;
 }
 
 }

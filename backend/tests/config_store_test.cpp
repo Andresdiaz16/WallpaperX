@@ -703,7 +703,8 @@ std::optional<int> clauseCountOrSkip(const std::string& detail, const std::strin
 std::string repairClausesIn(const std::string& detail) {
     static constexpr const char* kRepairClauses[] = {
         "displaced by another entry", "dropped, unusable", "entries dropped, another entry",
-        "entries dropped, no build can apply", "screen names dropped, no build can apply"};
+        "entries dropped, no build can apply", "screen names dropped, no build can apply",
+        "given conflicting pause settings"};
     std::string found;
     for (const char* clause : kRepairClauses) {
         if (detail.find(clause) != std::string::npos) found += std::string(" '") + clause + "'";
@@ -3448,7 +3449,8 @@ void runOutputFieldChecks() {
     //       ConfigStore::save() moved below the `if (!wallpaperOk && (!nameOk ||
     //       entry.output.empty())) continue;` that discards the row -> "FAIL: a row that loses
     //       both halves is reported as one lost wallpaper and one lost name", printing "1
-    //       wallpapers and 0 names reported dropped, 0 rows on disk".
+    //       wallpapers and 0 names reported dropped, 0 rows on disk". Re-run via control_batch.sh,
+    //       2026-09-30, after the skip line gained `&& entry.pauseJson.empty()`: the same. Reverted.
     const std::filesystem::path bothBadFile = scratch.path() / "bothbad.json";
     const ConfigStore bothBadStore(bothBadFile);
     const std::string badUtf8Path = std::string("/tmp/bad\x80name.png");
@@ -3524,7 +3526,8 @@ void runOutputRestoreChecks() {
     //       let a name-only row reach the render arm -> "FAIL: only the rows with a wallpaper
     //       are posted for rendering", printing "posted: 1 2 3 4 5". The first two without the
     //       third left it GREEN, the kept-row arm still catching the row on its empty path.
-    //       Observed 2026-08-14. All reverted.
+    //       Observed 2026-08-14. The three re-run together via control_batch.sh, 2026-09-30, after
+    //       the first guard gained `&& !pauseTravels`: the same line, "posted: 1 2 3 4 5". All reverted.
     // CONTROL, for the two binding checks below: the `if (nameValid && entry.monitorId <
     //       kMaxMonitors && bindOutputLocked(...) == BindResult::Displaced)` statement deleted
     //       from WallpaperManager::restoreSaved(), taking the bind with it (`nameValid` is the
@@ -4004,7 +4007,9 @@ void runOutputLossReportChecks() {
         //       40 41 42" with monitor 2 empty in every field. Without the middle mutation the
         //       other two read green: that guard alone keeps the row. The save-side one alone is
         //       controlled on its own in the phase below, where a held row really is emptied.
-        //       Observed 2026-08-19. All three reverted.
+        //       Observed 2026-08-19. The three re-run together via control_batch.sh, 2026-09-30, after
+        //       each guard gained a pause term: the same line, "ids on disk: 1 2 8 40 41 42", monitor 2
+        //       empty. All three reverted.
         std::vector<int> refusedRowsOnDisk;
         for (const int id : refusedInRangeIds) {
             if (onDisk.count(id) != 0) refusedRowsOnDisk.push_back(id);
@@ -6176,8 +6181,9 @@ void runStartupRepairChecks() {
     //       left holding nothing is not written back", printing "ids on disk: 1 40", and "FAIL:
     //       a second start with no client acting has nothing left to repair", whose detail then
     //       carried "1 entries dropped, no build can apply them" -- the phantom loss this rule
-    //       exists to stop, and nothing else in the binary red. Observed 2026-08-19.
-    //       Reverted.
+    //       exists to stop, and nothing else in the binary red. Observed 2026-08-19; re-run via
+    //       control_batch.sh, --phase 'the repair a start performs is written at that start',
+    //       2026-09-30, after the skip gained `&& row.pauseJson.empty()`: the same two lines. Reverted.
     const bool emptyRowNotWritten = afterFirstStart.count(40) == 0;
     check(emptyRowNotWritten, "a kept row left holding nothing is not written back");
     if (!emptyRowNotWritten) {
@@ -9686,10 +9692,12 @@ void runRequestFailedCallChecks() {
         WallpaperProperties next;
         WallpaperManager::Config config;
         config.configFile = file;
+        // Whether every step started where the sweep assumes; a step that did not is not graded.
+        bool staged = true;
         const auto freshManager = [&](long long step) {
             fresh.reset();
             // An empty file, so the new manager starts with no monitor 5.
-            writeFile(file, "{\"version\":1,\"monitors\":[]}");
+            staged = writeFile(file, "{\"version\":1,\"monitors\":[]}") && staged;
             fresh.emplace(config);
             fresh->requestWallpaper("static", wallpapers[0], 3);
             next = {{"speed", sweepSpeed(step)}};
@@ -9709,9 +9717,13 @@ void runRequestFailedCallChecks() {
             [&] { return wallpaperOf(*fresh, 5); },
             [&](long long step) { return savedOn(5, step); },
         };
-        gradeFailedCallSweep(sweep, sweepFailedCall([&]() -> WallpaperManager& { return *fresh; }, file, sweep,
-                                                     std::max(0LL, total - kWindow)),
-                             kGoals);
+        const SweepOutcome out =
+            sweepFailedCall([&]() -> WallpaperManager& { return *fresh; }, file, sweep, std::max(0LL, total - kWindow));
+        if (staged) {
+            gradeFailedCallSweep(sweep, out, kGoals);
+        } else {
+            notVerified(kGoals, "a step of the new-monitor sweep could not write the empty file it starts from");
+        }
     }
 #endif
 }
@@ -10422,7 +10434,9 @@ void runPropertiesRepairChecks() {
     //       (backend/daemon/wallpaper_manager.cpp) via control_run.sh, --phase 'property values a start
     //       cannot use', 2026-09-29 -> "FAIL: a start that drops property values copies the file aside
     //       first", printing "copies: (none)", and "FAIL: the rewrite holds each row with only its
-    //       usable values", and the kept-row line, which waits on the rewrite. Reverted.
+    //       usable values", and the kept-row line, which waits on the rewrite. Reverted. Re-run via
+    //       control_batch.sh, 2026-09-30, after `repaired` gained the pause-conflict term: the same
+    //       three lines.
     const bool copied = std::filesystem::exists(copy) && readFile(copy) == usersOwn;
     check(copied, "a start that drops property values copies the file aside first");
     if (!copied) std::fprintf(stderr, "  copies: %s\n", joined(preservedCopyNames(file, preservedCopyDir(scratch))).c_str());
@@ -10849,6 +10863,425 @@ void runSavedSpeedAboveCapChecks() {
     }
 }
 
+// ---------------------------------------------------------------------------- //
+// Step 15 chunk 3c: a monitor's pause setting -- how it is written, read back, carried for a newer
+// build, and what a start makes of several rows that disagree about it.
+// ---------------------------------------------------------------------------- //
+using wallpaperx::PauseMode;
+
+// The mode a monitor's pause entry reports, as text: its wire name, "(unknown)" for a value this build
+// keeps and does not apply, "(none)" for a monitor the snapshot does not list.
+std::string pauseModeOf(const WallpaperManager& manager, int monitorId) {
+    const WallpaperManager::Snapshot snap = manager.snapshot();
+    const auto it = snap.pause.find(monitorId);
+    if (it == snap.pause.end()) return "(none)";
+    return it->second.mode ? wallpaperx::toString(*it->second.mode) : "(unknown)";
+}
+
+// A row carrying only a pause, as a newer build or this one writes it for a monitor with no wallpaper.
+nlohmann::json pauseRow(int monitorId, const nlohmann::json& pause) {
+    nlohmann::json row = configRow(monitorId, "", "", "");
+    row["pause"] = pause;
+    return row;
+}
+
+// GOAL: S15.132 -- a monitor's pause setting survives a restart, on a row with a wallpaper and on a row
+//       with nothing else; and S15.133 -- the config writer writes a pause-only row with an empty type and
+//       path, which the next start reads back.
+// WHY-THIS-SHAPE: two monitors, because the two rows reach the file by different rules: the wallpaper
+//       row would be written for its wallpaper anyway, so only the pause-only row can show a writer or
+//       a filter that drops a row with nothing but a pause.
+// CONTROL: via control_batch.sh, --phase 'pause setting across a restart', 2026-09-30, each alone,
+//       reverted. (a) the `live.pause` loop in KeptRows::rowsToWrite (backend/daemon/kept_rows.cpp)
+//       deleted -> "FAIL: a pause setting on a wallpaper's row survives a restart" and the two pause-only
+//       lines. (b) `&& row.pauseJson.empty()` removed from rowsToWrite's final filter -> "FAIL: the
+//       pause-only row is written with an empty type and path" and "FAIL: a pause setting on a monitor
+//       with no wallpaper survives a restart". ConfigStore::save's skip is not reached here -- an empty
+//       type and path are valid text, so the row is written anyway; runPauseOnlyStoreChecks grades it.
+void runPauseRestartChecks() {
+    constexpr const char* kGoals = "S15.132-S15.133 (a pause setting across a restart, and a pause-only row)";
+    const ScratchDir scratch("pauserestart");
+    const std::optional<PhasePaths> paths = preparePhase(scratch, kGoals, 1);
+    if (!paths) return;
+    const ScopedEnv stateHome("XDG_STATE_HOME", stateHomeOf(scratch).string());
+    WallpaperManager::Config managerConfig;
+    managerConfig.configFile = paths->config;
+    {
+        WallpaperManager manager(managerConfig);
+        manager.requestWallpaper("static", paths->wallpapers[0].string(), 2);
+        manager.setMonitorPause(2, "always_paused");
+        manager.setMonitorPause(5, "paused_while_focused");
+        if (!writerIdle(manager)) {
+            check(false, "the pause settings this phase restarts with reached the file");
+            return;
+        }
+    }
+    const nlohmann::json bare = rowJsonIn(paths->config, 5);
+    const bool bareRow = bare.is_object() && bare.value("type", std::string("x")).empty() &&
+                         bare.value("path", std::string("x")).empty() && !bare.contains("output") &&
+                         bare.value("pause", nlohmann::json()) == "paused_while_focused";
+    check(bareRow, "the pause-only row is written with an empty type and path");
+    if (!bareRow) std::fprintf(stderr, "  config.json: %s\n", readFile(paths->config).c_str());
+
+    WallpaperManager restarted(managerConfig);
+    restarted.restoreSaved();
+    check(pauseModeOf(restarted, 2) == "always_paused", "a pause setting on a wallpaper's row survives a restart");
+    check(pauseModeOf(restarted, 5) == "paused_while_focused",
+          "a pause setting on a monitor with no wallpaper survives a restart");
+    if (pauseModeOf(restarted, 2) != "always_paused" || pauseModeOf(restarted, 5) != "paused_while_focused") {
+        std::fprintf(stderr, "  after the restart: monitor 2 %s, monitor 5 %s\n", pauseModeOf(restarted, 2).c_str(),
+                     pauseModeOf(restarted, 5).c_str());
+    }
+}
+
+// GOAL: S15.133's writer half -- ConfigStore::save keeps a row whose wallpaper it cannot write and that
+//       has no name when the row carries a pause: a path that is not valid UTF-8 costs the row its
+//       wallpaper, not its pause.
+// CONTROL: via control_batch.sh, --phase 'pause-only row in the store', 2026-09-30, `&&
+//       entry.pauseJson.empty()` removed from ConfigStore::save's skip (backend/daemon/config_store.cpp)
+//       -> "FAIL: a row whose path cannot be written keeps its pause", the file written with no rows.
+//       Reverted.
+void runPauseOnlyStoreChecks() {
+    const ScratchDir scratch("pausestore");
+    if (!scratch.ok()) {
+        notVerified("S15.133's writer half", "a scratch directory could not be created");
+        return;
+    }
+    const std::filesystem::path file = scratch.path() / "config.json";
+    const ConfigStore store(file);
+    PersistedWallpaper row;
+    row.monitorId = 7;
+    row.type = "static";
+    row.path = std::string("/tmp/bad\x80name.png");
+    row.pauseJson = "\"always_paused\"";
+    const SaveResult saved = store.save({row});
+    const LoadResult loaded = store.load();
+    const auto it = std::find_if(loaded.entries.begin(), loaded.entries.end(),
+                                 [](const PersistedWallpaper& e) { return e.monitorId == 7; });
+    const bool kept = saved.error.empty() && saved.skippedNonUtf8 == 1 && it != loaded.entries.end() &&
+                      it->type.empty() && it->path.empty() && it->pauseJson == "\"always_paused\"";
+    check(kept, "a row whose path cannot be written keeps its pause");
+    if (!kept) std::fprintf(stderr, "  save error '%s'; config.json: %s\n", saved.error.c_str(), readFile(file).c_str());
+}
+
+// GOAL: S15.134 -- a pause value this build does not know is kept exactly as read and that monitor plays:
+//       an unknown string on an id this build uses and an object on an id kept for a newer build are
+//       written back byte for byte by a save made for another reason; the monitor with the unknown string
+//       reports mode null and not paused. A known value on a row kept for its unknown wallpaper type
+//       still applies to that monitor. A saved explicit "play" loads as play and is not written again.
+// WHY-THIS-SHAPE: compared as dump() text for runKeptPropertiesVerbatimChecks' reason; the save is forced
+//       by another monitor, so the rows under test are written by the rule for carrying, not by a change.
+// CONTROL: via control_batch.sh, --phase 'pause values this build does not know', 2026-09-30, each
+//       alone, reverted, in WallpaperManager::restoreSaved() (backend/daemon/wallpaper_manager.cpp):
+//       (a) the applied row's `insert_or_assign` made to store only a value pauseModeFromJson() knows ->
+//       "FAIL: an unknown pause value is written back as it was read", printing "row 1: (no field)"; the
+//       mode-null line went red with it, the monitor then listed nowhere; (b) `if (!pauseTravels)
+//       keep.pauseJson.clear();` made unconditional -> the same line, printing "row 40: (no field)"; (c)
+//       the play arm's `m_pauseSettings.erase(entry.monitorId);` never taken, the text stored instead ->
+//       "FAIL: a saved explicit play loads as play and is dropped at the next save", printing "row 6
+//       pause: \"play\""; (d) the pause applied only to a row of a known type (`&& isKnownType(entry.type)`
+//       on the apply) -> "FAIL: a known pause value on a row kept for its wallpaper type applies to that
+//       monitor", alone.
+void runPauseUnknownValueChecks() {
+    constexpr const char* kGoals = "S15.134 (pause values a newer build wrote are kept, and that monitor plays)";
+    const ScratchDir scratch("pauseunknown");
+    const std::optional<PhasePaths> paths = preparePhase(scratch, kGoals, 2);
+    if (!paths) return;
+    const ScopedEnv stateHome("XDG_STATE_HOME", stateHomeOf(scratch).string());
+    const std::filesystem::path& file = paths->config;
+    const std::string wp = paths->wallpapers[0].string();
+    const nlohmann::json unknownString = "paused_on_battery";
+    const nlohmann::json unknownObject = {{"when", "battery"}, {"below", 20}, {"nested", {1, 2.5}}};
+    nlohmann::json one = configRow(1, "static", wp, "");
+    one["pause"] = unknownString;
+    nlohmann::json forty = configRow(40, "static", wp, "");
+    forty["pause"] = unknownObject;
+    nlohmann::json five = configRow(5, "hologram", wp, "");
+    five["pause"] = "always_paused";
+    nlohmann::json six = configRow(6, "static", wp, "");
+    six["pause"] = "play";
+    const nlohmann::json monitors = nlohmann::json::array({one, forty, five, six});
+    if (!writeFile(file, nlohmann::json({{"version", 1}, {"monitors", monitors}}).dump())) {
+        notVerified(kGoals, "the config file this phase reads could not be written");
+        return;
+    }
+    WallpaperManager::Config managerConfig;
+    managerConfig.configFile = file;
+    WallpaperManager manager(managerConfig);
+    manager.restoreSaved();
+    manager.preserveUnreadableConfig();
+    manager.writeRepairedConfig();
+
+    const WallpaperManager::Snapshot snap = manager.snapshot();
+    const auto entry = [&snap](int id) -> std::optional<wallpaperx::PauseStatus> {
+        const auto it = snap.pause.find(id);
+        if (it == snap.pause.end()) return std::nullopt;
+        return it->second;
+    };
+    const std::optional<wallpaperx::PauseStatus> unknown = entry(1);
+    check(unknown && !unknown->mode && !unknown->paused, "a monitor whose pause value this build does not know plays, "
+                                                         "reporting mode null");
+    const std::optional<wallpaperx::PauseStatus> keptType = entry(5);
+    check(keptType && keptType->mode == PauseMode::Always && keptType->paused,
+          "a known pause value on a row kept for its wallpaper type applies to that monitor");
+
+    const bool saved = saveForAnotherReason(manager, paths->wallpapers[1].string(), 8);
+    check(saved, "the save this phase forces lands");
+    const std::string oneNow = fieldTextIn(file, 1, "pause");
+    const std::string fortyNow = fieldTextIn(file, 40, "pause");
+    const bool asRead = saved && oneNow == unknownString.dump() && fortyNow == unknownObject.dump();
+    check(asRead, "an unknown pause value is written back as it was read");
+    if (!asRead) std::fprintf(stderr, "  row 1: %s; row 40: %s\n", oneNow.c_str(), fortyNow.c_str());
+    const bool playDropped = saved && pauseModeOf(manager, 6) == "play" && fieldTextIn(file, 6, "pause") == "(no field)";
+    check(playDropped, "a saved explicit play loads as play and is dropped at the next save");
+    if (!playDropped) {
+        std::fprintf(stderr, "  monitor 6: %s; row 6 pause: %s\n", pauseModeOf(manager, 6).c_str(),
+                     fieldTextIn(file, 6, "pause").c_str());
+    }
+}
+
+// GOAL: S15.135 -- for an id this build can use, the live setting is the only one written: a row kept for
+//       its unknown wallpaper type carries no pause of its own, so SetMonitorPause(5, "play") removes the
+//       monitor's pause from the file.
+// WHY-THIS-SHAPE: the kept row is the case, because a row this build applies has no separate copy of the
+//       pause to go stale.
+// CONTROL: two defences, and only both together turn this red -- via control_batch.sh, --phase 'a kept
+//       row's pause for a monitor this build uses', 2026-09-30: `if (!pauseTravels) keep.pauseJson.clear();`
+//       deleted from WallpaperManager::restoreSaved() (backend/daemon/wallpaper_manager.cpp) AND the
+//       `monitorId < m_maxMonitors` clearing loop deleted from KeptRows::rowsToWrite
+//       (backend/daemon/kept_rows.cpp) -> "FAIL: SetMonitorPause(play) removes the pause of a monitor
+//       whose row is kept for its type", the row still carrying "always_paused". Each alone left it
+//       green, measured the same day: the other defence clears the stale copy. Reverted.
+void runPauseKeptRowChecks() {
+    constexpr const char* kGoals = "S15.135 (a kept row's pause does not compete with the live setting)";
+    const ScratchDir scratch("pausekeptrow");
+    const std::optional<PhasePaths> paths = preparePhase(scratch, kGoals, 2);
+    if (!paths) return;
+    const ScopedEnv stateHome("XDG_STATE_HOME", stateHomeOf(scratch).string());
+    const std::filesystem::path& file = paths->config;
+    nlohmann::json five = configRow(5, "hologram", paths->wallpapers[0].string(), "");
+    five["pause"] = "always_paused";
+    if (!writeFile(file, nlohmann::json({{"version", 1}, {"monitors", nlohmann::json::array({five})}}).dump())) {
+        notVerified(kGoals, "the config file this phase reads could not be written");
+        return;
+    }
+    WallpaperManager::Config managerConfig;
+    managerConfig.configFile = file;
+    WallpaperManager manager(managerConfig);
+    manager.restoreSaved();
+    if (pauseModeOf(manager, 5) != "always_paused") {
+        notVerified(kGoals, "the kept row's pause was not applied at the start, which S15.134 grades; this check "
+                            "assumes it");
+        return;
+    }
+    manager.setMonitorPause(5, "play");
+    const bool idle = writerIdle(manager);
+    const nlohmann::json row = rowJsonIn(file, 5);
+    const bool removed = idle && row.is_object() && row.value("type", std::string()) == "hologram" && !row.contains("pause");
+    check(removed, "SetMonitorPause(play) removes the pause of a monitor whose row is kept for its type");
+    if (!removed) std::fprintf(stderr, "  config.json: %s\n", readFile(file).c_str());
+}
+
+// GOAL: S15.136 -- a start that finds several rows giving one monitor different pause values reports it:
+//       one clause counting MONITORS ("N monitors given conflicting pause settings"), an explicit play
+//       against always_paused counting as a conflict, ids kept for a newer build counted too. S15.137 --
+//       the last row's value wins, for an id this build uses and for a kept id. S15.138 -- the file is
+//       copied aside before it is rewritten with one row per monitor carrying the winner.
+// WHY-THIS-SHAPE: three conflicting monitors at different shapes, so each wrong rule reads a different
+//       number: monitor 0 always_paused then explicit play (a rule treating play as absent reads 2),
+//       monitor 1 focused / always / focused (a per-row count reads 4), kept id 40 always / maximized (a
+//       rule gated on this build's ids reads 2). Monitor 0's first and last values differ, so a
+//       first-wins rule shows there. Every row is a pause-only row: a second wallpaper row for a monitor
+//       would be a duplicate wallpaper, a repair of its own.
+// CONTROL: via control_batch.sh, --phase 'several rows giving one monitor a pause', 2026-09-30, each
+//       alone, reverted, in WallpaperManager::restoreSaved() (backend/daemon/wallpaper_manager.cpp):
+//       (a) rows whose pauseModeFromJson() is play skipped when recording into pauseRead -> "FAIL: a start
+//       counts each monitor given conflicting pause values once", "2 counted"; (b)
+//       `pauseConflicts.insert(entry.monitorId);` deleted -> the same line, "0 counted", and the copy and
+//       rewrite lines; (c) pauseConflicts made a vector appended per differing row -> the count line, "4
+//       counted"; (d) the recording gated on `entry.monitorId < kMaxMonitors` -> the count line, "2
+//       counted"; (e) `!pauseConflicts.empty() ||` deleted from `repaired` -> "FAIL: a pause conflict
+//       copies the file aside first", "copies: (none)", and "FAIL: the rewrite carries one row per monitor
+//       with the last value"; (f) the applied row's `insert_or_assign` made `try_emplace` (and play's erase
+//       taken only for a monitor whose first row was play), the first row winning -> "FAIL: the last row's
+//       pause value wins", "monitor 0 always_paused", and the rewrite line; (g) the kept row's `if
+//       (pauseTravels) held.pauseJson = entry.pauseJson;` deleted -> the rewrite line alone.
+void runPauseConflictChecks() {
+    constexpr const char* kGoals = "S15.136-S15.138 (several rows giving one monitor different pause values)";
+    const ScratchDir scratch("pauseconflict");
+    const std::optional<PhasePaths> paths = preparePhase(scratch, kGoals, 0);
+    if (!paths) return;
+    const ScopedEnv stateHome("XDG_STATE_HOME", stateHomeOf(scratch).string());
+    const std::filesystem::path& file = paths->config;
+    const std::filesystem::path copy = preservedCopyDir(scratch) / "config.json.bad";
+    const nlohmann::json monitors = nlohmann::json::array({
+        pauseRow(0, "always_paused"), pauseRow(1, "paused_while_focused"), pauseRow(40, "always_paused"),
+        pauseRow(1, "always_paused"), pauseRow(0, "play"), pauseRow(1, "paused_while_focused"),
+        pauseRow(40, "paused_while_maximized")});
+    const std::string original = nlohmann::json({{"version", 1}, {"monitors", monitors}}).dump();
+    if (!writeFile(file, original)) {
+        notVerified(kGoals, "the config file this phase reads could not be written");
+        return;
+    }
+    WallpaperManager::Config managerConfig;
+    managerConfig.configFile = file;
+    WallpaperManager manager(managerConfig);
+    manager.restoreSaved();
+    manager.preserveUnreadableConfig();
+    manager.writeRepairedConfig();
+
+    const std::string detail = manager.snapshot().health.persistence.detail;
+    const std::optional<int> counted = clauseCountOrSkip(detail, " monitors given conflicting pause settings", kGoals);
+    if (counted) {
+        check(*counted == 3, "a start counts each monitor given conflicting pause values once");
+        if (*counted != 3) std::fprintf(stderr, "  %d counted; detail: %s\n", *counted, detail.c_str());
+    }
+    // Monitor 0 ends on play with no wallpaper, which GetStatus lists nowhere: "(none)".
+    const bool lastWins = pauseModeOf(manager, 0) == "(none)" && pauseModeOf(manager, 1) == "paused_while_focused";
+    check(lastWins, "the last row's pause value wins");
+    if (!lastWins) {
+        std::fprintf(stderr, "  monitor 0 %s, monitor 1 %s\n", pauseModeOf(manager, 0).c_str(),
+                     pauseModeOf(manager, 1).c_str());
+    }
+    const bool copied = std::filesystem::exists(copy) && readFile(copy) == original;
+    check(copied, "a pause conflict copies the file aside first");
+    if (!copied) std::fprintf(stderr, "  copies: %s\n", joined(preservedCopyNames(file, preservedCopyDir(scratch))).c_str());
+    const bool rewritten = waitForFile([&] {
+        const nlohmann::json root = nlohmann::json::parse(readFile(file), nullptr, false);
+        if (root.is_discarded() || !root.contains("monitors") || root["monitors"].size() != 2) return false;
+        return fieldTextIn(file, 0, "pause") == "(no row)" && fieldTextIn(file, 1, "pause") == "\"paused_while_focused\"" &&
+               fieldTextIn(file, 40, "pause") == "\"paused_while_maximized\"";
+    });
+    check(rewritten, "the rewrite carries one row per monitor with the last value");
+    if (!rewritten) std::fprintf(stderr, "  config.json: %s\n", readFile(file).c_str());
+}
+
+// GOAL: S15.139 -- rows that agree are not a conflict: one value repeated on several rows, with rows
+//       carrying no pause between or after them, for an id this build uses and for a kept id, gives no
+//       pause clause, no copy, and leaves the file byte for byte as it was.
+// CONTROL: via control_batch.sh, --phase 'several rows agreeing on a pause', 2026-09-30, in
+//       WallpaperManager::restoreSaved() (backend/daemon/wallpaper_manager.cpp), a row with no `pause`
+//       recorded into pauseRead as "" and compared like any other -> "FAIL: rows that agree on a pause, with
+//       rows carrying none between, are no conflict", the detail reading "2 monitors given conflicting pause
+//       settings". Reverted. Deleting the `!first &&` guard is NOT a usable control, measured the same day
+//       (green): try_emplace stores the row's own text, so the first row always compares equal to itself.
+void runPauseAgreementChecks() {
+    constexpr const char* kGoals = "S15.139 (rows that agree on a pause are no conflict)";
+    const ScratchDir scratch("pauseagree");
+    const std::optional<PhasePaths> paths = preparePhase(scratch, kGoals, 0);
+    if (!paths) return;
+    const ScopedEnv stateHome("XDG_STATE_HOME", stateHomeOf(scratch).string());
+    const std::filesystem::path& file = paths->config;
+    const nlohmann::json monitors = nlohmann::json::array({
+        pauseRow(0, "always_paused"), configRow(0, "", "", "DP-1"), pauseRow(0, "always_paused"),
+        pauseRow(2, "paused_while_focused"), configRow(2, "", "", "DP-2"), pauseRow(40, "always_paused"),
+        pauseRow(40, "always_paused")});
+    const std::string original = nlohmann::json({{"version", 1}, {"monitors", monitors}}).dump();
+    if (!writeFile(file, original)) {
+        notVerified(kGoals, "the config file this phase reads could not be written");
+        return;
+    }
+    WallpaperManager::Config managerConfig;
+    managerConfig.configFile = file;
+    WallpaperManager manager(managerConfig);
+    manager.restoreSaved();
+    manager.preserveUnreadableConfig();
+    manager.writeRepairedConfig();
+    const std::string detail = manager.snapshot().health.persistence.detail;
+    const bool noClause = detail.find("conflicting pause") == std::string::npos;
+    check(noClause && startLeftFileAlone(manager, file, scratch, original),
+          "rows that agree on a pause, with rows carrying none between, are no conflict");
+    if (!noClause) std::fprintf(stderr, "  persistence detail: %s\n", detail.c_str());
+}
+
+#if WALLPAPERX_ALLOCATION_INSTRUMENT
+// The pause entry monitor 3 reports, with the value its row in `file` carries.
+std::string pauseStateOf(const WallpaperManager& manager, const std::filesystem::path& file) {
+    return pauseModeOf(manager, 3) + " / file " + fieldTextIn(file, 3, "pause");
+}
+#endif
+
+// GOAL: S15.140 -- a SetMonitorPause that fails on an allocation changes nothing: the monitor keeps the
+//       setting it had, a value this build does not know included, the file is as it was, and the same
+//       call unfaulted then reaches the file.
+// WHY-THIS-SHAPE: runOutputSizeFailedCallChecks()' sweep, twice: once alternating two modes, and once
+//       with a manager per step started from a file whose row carries an unknown value, since a call that
+//       succeeds replaces it.
+// CONTROL: via control_batch.sh, --phase 'a failed SetMonitorPause', 2026-09-30, the catch's restore in
+//       WallpaperManager::setMonitorPause (backend/daemon/wallpaper_manager.cpp) -- the erase and the
+//       insert -- deleted -> "FAIL: a SetMonitorPause that failed on an allocation left the monitor's pause
+//       setting as it was", printing "allocation 1 threw std::bad_alloc: paused_while_focused ->
+//       always_paused", the same for the unknown-value sweep ("(unknown) / file \"paused_on_battery\" ->
+//       play / ..."), and both "the same SetMonitorPause again, unfaulted, reaches the config file" lines.
+//       Reverted. The sweeps fault 9 and 7 allocations, 7 and 6 of them while building the save.
+void runPauseFailedCallChecks() {
+    constexpr const char* kGoals = "S15.140 (a SetMonitorPause that fails on an allocation changes nothing)";
+#if !WALLPAPERX_ALLOCATION_INSTRUMENT
+    notVerified(kGoals, "this build replaces no allocator -- the instrument is compiled out under a sanitizer");
+#else
+    SweepFixture fx("pausealloc", kGoals);
+    if (!fx.manager) return;
+    const std::filesystem::path file = fx.paths->config;
+    const auto modeFor = [](long long step) { return step % 2 == 0 ? "paused_while_focused" : "always_paused"; };
+    {
+        WallpaperManager& manager = *fx.manager;
+        const FailedCallSweep sweep{
+            "SetMonitorPause",
+            "the monitor's pause setting as it was",
+            false,
+            [](long long) {},
+            [&](long long step, long long failAt, std::vector<int>&) {
+                const FailAllocation armed(failAt);
+                manager.setMonitorPause(3, modeFor(step));
+            },
+            [&] { return pauseModeOf(manager, 3); },
+            [&](long long step) { return fieldTextIn(file, 3, "pause") == nlohmann::json(modeFor(step)).dump(); },
+        };
+        gradeFailedCallSweep(sweep, sweepFailedCall([&]() -> WallpaperManager& { return manager; }, file, sweep), kGoals);
+    }
+    {
+        std::optional<WallpaperManager> fresh;
+        WallpaperManager::Config config;
+        config.configFile = file;
+        const std::string wallpaper = fx.paths->wallpapers[0].string();
+        // Whether every step started from the unknown value; a step that did not is not graded, since
+        // the sweep would read its stale state as the failed call's change.
+        bool staged = true;
+        const auto freshManager = [&](long long) {
+            fresh.reset();
+            nlohmann::json row = configRow(3, "static", wallpaper, "");
+            row["pause"] = "paused_on_battery";
+            staged = writeFile(file, nlohmann::json({{"version", 1}, {"monitors", nlohmann::json::array({row})}}).dump()) &&
+                     staged;
+            fresh.emplace(config);
+            fresh->restoreSaved();
+            // Starts the writer, and writes the unknown value back as it was read.
+            fresh->requestWallpaper("static", wallpaper, 3);
+            staged = pauseStateOf(*fresh, file).rfind("(unknown)", 0) == 0 && staged;
+        };
+        freshManager(0);
+        const FailedCallSweep sweep{
+            "SetMonitorPause over an unknown value",
+            "the monitor's pause setting as it was",
+            false,
+            freshManager,
+            [&](long long, long long failAt, std::vector<int>&) {
+                const FailAllocation armed(failAt);
+                fresh->setMonitorPause(3, "always_paused");
+            },
+            [&] { return pauseStateOf(*fresh, file); },
+            [&](long long) { return fieldTextIn(file, 3, "pause") == "\"always_paused\""; },
+        };
+        const SweepOutcome out = sweepFailedCall([&]() -> WallpaperManager& { return *fresh; }, file, sweep);
+        if (staged) {
+            gradeFailedCallSweep(sweep, out, kGoals);
+        } else {
+            notVerified(kGoals, "a step of the unknown-value sweep could not stage a row carrying an unknown pause value");
+        }
+    }
+#endif
+}
+
 int main() {
     wallpaperx::testing::g_testName = "config_store_test";
 
@@ -11003,6 +11436,13 @@ int main() {
         {"a saved speed above 2", runSavedSpeedAboveCapChecks},
         {"losses a later row made up for", runSupersededLossCountChecks},
         {"a rejected size on a name a later row unbound", runUnboundRejectedSizeChecks},
+        {"a monitor's pause setting across a restart", runPauseRestartChecks},
+        {"a pause-only row in the store", runPauseOnlyStoreChecks},
+        {"pause values this build does not know", runPauseUnknownValueChecks},
+        {"a kept row's pause for a monitor this build uses", runPauseKeptRowChecks},
+        {"several rows giving one monitor a pause, disagreeing", runPauseConflictChecks},
+        {"several rows agreeing on a pause", runPauseAgreementChecks},
+        {"a failed SetMonitorPause changes nothing", runPauseFailedCallChecks},
     };
     for (const Phase& phase : kPhases) {
         if (!wallpaperx::testing::phaseSelected(phase.name)) continue;

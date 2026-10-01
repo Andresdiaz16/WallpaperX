@@ -407,6 +407,25 @@ inline void setOutputVisible(sdbus::IProxy& proxy, const std::string& outputName
         .withArguments(outputName, visible);
 }
 
+// Sets a monitor's pause mode by its wire name. Shared for setOutputSize's reason.
+inline void setMonitorPause(sdbus::IProxy& proxy, int32_t monitorId, const std::string& mode,
+                            std::chrono::microseconds timeout = {}) {
+    proxy.callMethod("SetMonitorPause")
+        .onInterface(DbusService::kInterface)
+        .withTimeout(timeout)
+        .withArguments(monitorId, mode);
+}
+
+// Reports what the screen named `outputName` says about its windows, as the KDE plugin will. The
+// daemon records it against the sender, so which connection `proxy` sends on is part of the report.
+inline void setOutputFocus(sdbus::IProxy& proxy, const std::string& outputName, bool windowFocused,
+                           bool windowMaximized, std::chrono::microseconds timeout = {}) {
+    proxy.callMethod("SetOutputFocus")
+        .onInterface(DbusService::kInterface)
+        .withTimeout(timeout)
+        .withArguments(outputName, windowFocused, windowMaximized);
+}
+
 // Reports what the frame consumer can import, as the plugin's render thread does.
 //
 // Here rather than in one test file for the same reason as setMonitorOutput above: the
@@ -522,6 +541,17 @@ inline const nlohmann::json* outputBindings(const StatusReply& status) {
     if (!json.is_object() || !json.contains("outputs")) return nullptr;
     const nlohmann::json& outputs = json["outputs"];
     return outputs.is_object() ? &outputs : nullptr;
+}
+
+// One monitor's entry in GetStatus's top-level `pause` object, or null when the object or the entry
+// is missing or not an object. Guarded as wallpaperStatus() is.
+inline const nlohmann::json* pauseStatus(const StatusReply& status, const std::string& monitorId) {
+    const nlohmann::json& json = status.json();
+    if (!json.is_object() || !json.contains("pause")) return nullptr;
+    const nlohmann::json& pause = json["pause"];
+    if (!pause.is_object()) return nullptr;
+    const auto it = pause.find(monitorId);
+    return it != pause.end() && it->is_object() ? &*it : nullptr;
 }
 
 // The monitor GetStatus says `name` resolves to, or kNoOutputBinding when it resolves to

@@ -42,6 +42,11 @@ struct PersistedWallpaper {
     // WallpaperProperties because a row kept for a newer build carries values this build cannot
     // type, and only the manager knows which rows those are; it types the rest itself.
     std::string propertiesJson;
+
+    // The monitor's pause setting, the `pause` field as JSON text, empty when the row has none. A
+    // fact about the monitor id, so it rides on a row with no wallpaper and no name as well, and is
+    // text for propertiesJson's reason.
+    std::string pauseJson;
 };
 
 // Not a fit -- real names run under a dozen bytes -- but a finite bound on a string a

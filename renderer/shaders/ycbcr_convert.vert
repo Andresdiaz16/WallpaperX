@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 #version 460
 
 // One triangle covering the viewport, from the vertex index alone: no vertex buffer.

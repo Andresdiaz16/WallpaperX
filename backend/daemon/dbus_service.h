@@ -78,6 +78,15 @@ private:
     // either way: it is what recomputes what plays.
     void setOutputVisible(const std::string& outputName, bool visible);
 
+    // A monitor's pause setting, by name. Saved and waited on like SetWallpaper; wakes the worker,
+    // which is what stops or resumes the video.
+    void setMonitorPause(int32_t monitorId, const std::string& mode);
+
+    // What the screen named `outputName` says about its windows, recorded against `client` -- the
+    // sender -- so it ends when that process leaves the bus. Wakes the worker for the same reason.
+    void setOutputFocus(const std::string& client, const std::string& outputName, bool windowFocused,
+                        bool windowMaximized);
+
     void emitFrameReady(int monitorId, uint64_t generation);
 
     // Announces frames that already exist, after an image came free. Same signal as a new

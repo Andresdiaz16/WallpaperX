@@ -838,6 +838,17 @@ void runHostChecks(sdbus::IProxy& proxy, const std::string& imagePath, const Che
         //       unchanged", printing expected `b:visible(in)` against actual `b:shown(in)`.
         //       Observed 2026-09-29. Reverted.
         {"method", "SetOutputVisible", ArgList{{"in", "s:output_name"}, {"in", "b:visible"}}},
+        // GOAL: S15.121 -- the pause setting and the focus report travel as these two methods with
+        //       these argument names, types and order, which chunk 3d's plugin and 3e's app are
+        //       written against.
+        // CONTROL: via control_batch.sh, --phase '^host$', 2026-09-30, in DbusService::registerVTable
+        //       (backend/daemon/dbus_service.cpp): "mode" renamed "pause_mode" on SetMonitorPause ->
+        //       "FAIL: wire signature of method SetMonitorPause is unchanged", printing `s:mode(in)`
+        //       against `s:pause_mode(in)`; "window_maximized" renamed "maximized" on SetOutputFocus ->
+        //       the same line for SetOutputFocus. Each alone. Reverted.
+        {"method", "SetMonitorPause", ArgList{{"in", "i:monitor_id"}, {"in", "s:mode"}}},
+        {"method", "SetOutputFocus",
+         ArgList{{"in", "s:output_name"}, {"in", "b:window_focused"}, {"in", "b:window_maximized"}}},
         {"method", "GetStatus", ArgList{{"out", "s:status"}}},
         // A signal's args carry no direction attribute, hence the empty first field.
         {"signal", "FrameReady", ArgList{{"", "i:monitor_id"}, {"", "t:frame_generation"}}},
@@ -876,7 +887,8 @@ void runHostChecks(sdbus::IProxy& proxy, const std::string& imagePath, const Che
     //       added to DbusService::registerVTable (backend/daemon/dbus_service.cpp) ->
     //       "FAIL: io.wallpaperx.Daemon exports exactly the methods this table names", and nothing
     //       else: nothing in the per-member loop sees an added method. Observed 2026-09-28 with
-    //       the table at twelve methods, via control_run.sh. Reverted.
+    //       the table at twelve methods, via control_run.sh; re-run 2026-09-30 with it at fourteen,
+    //       via control_batch.sh, --phase '^host$': the same line alone. Reverted.
     {
         std::vector<std::string> expectedMethods, expectedSignals;
         for (const auto& [element, name, expectedArgs] : expected) {
@@ -4222,6 +4234,378 @@ void runPropertiesWireChecks(const wallpaperx::WallpaperManager::Config& base, c
     runPropertiesWireChecksOn(manager, config.configFile, imagePath, unrenderablePath, check);
 }
 
+// --------------------------------------------------------------------------- //
+// Step 15 chunk 3c -- a monitor's pause setting and its screen's focus report on the wire: what is
+// refused, which report each mode pauses on, what ends a report, and what GetStatus and the file
+// show. GetStatus's `paused` is the daemon's own decision (the one the video clock asks); whether a
+// paused video really stops drawing is video_wallpaper_test's pause phase. Shader wallpapers, which
+// this build records and never draws.
+// --------------------------------------------------------------------------- //
+constexpr int32_t kMonitorPauseFocused = 0;    // paused_while_focused, answers to DP-PF
+constexpr int32_t kMonitorPauseMaximized = 1;  // paused_while_maximized, answers to DP-PM
+constexpr int32_t kMonitorPauseBare = 2;       // a setting and no wallpaper
+constexpr int32_t kMonitorPauseKept = 3;       // a setting that must outlive two SetWallpaper calls
+constexpr int32_t kMonitorPauseTaker = 4;      // paused_while_focused, takes DP-PF from monitor 0
+
+void runPauseWireChecks(const wallpaperx::WallpaperManager::Config& base, const std::string& unrenderablePath,
+                        const Check& check) {
+    using wallpaperx::testing::pauseStatus;
+    using wallpaperx::testing::setMonitorOutput;
+    using wallpaperx::testing::setMonitorPause;
+    using wallpaperx::testing::setOutputFocus;
+    using wallpaperx::testing::setWallpaperWithProperties;
+    constexpr const char* kInvalidArgs = "org.freedesktop.DBus.Error.InvalidArgs";
+    constexpr const char* kUnknownOutput = "io.wallpaperx.Daemon.Error.UnknownOutput";
+    const char* kGoals = "S15.121-S15.131 (the pause setting and the focus report on the wire)";
+    const wallpaperx::testing::ScratchDir scratch("dbuspause");
+    if (!scratch.ok()) {
+        wallpaperx::testing::notVerified(kGoals, "a scratch directory for this phase's config file could not be made");
+        return;
+    }
+    wallpaperx::WallpaperManager::Config config = base;
+    config.configFile = scratch.path() / "wallpaperx" / "config.json";
+    PhaseDeviceGrade grade("the pause wire phase", check);
+    grade.expectNoDevice();
+    wallpaperx::WallpaperManager manager(config);
+    CaptureGradeOnExit captureGrade{grade, manager};
+
+    auto serviceConn = sdbus::createSessionBusConnection();
+    DbusService service(*serviceConn, manager);
+    serviceConn->enterEventLoopAsync();
+    const sdbus::ServiceName daemonName{serviceConn->getUniqueName()};
+    auto proxyOwner = sdbus::createProxy(daemonName, sdbus::ObjectPath{DbusService::kObjectPath});
+    sdbus::IProxy& proxy = *proxyOwner;
+
+    // The monitor's `pause` entry, or null -- which also stands for a GetStatus that failed, so no
+    // check below reads null as an answer.
+    const auto pauseOf = [&proxy](int32_t monitorId) -> nlohmann::json {
+        const StatusReply status = getStatusOrExplain(proxy);
+        const nlohmann::json* entry = pauseStatus(status, std::to_string(monitorId));
+        return entry != nullptr ? *entry : nlohmann::json(nullptr);
+    };
+    const auto paused = [&pauseOf](int32_t monitorId) -> std::optional<bool> {
+        const nlohmann::json entry = pauseOf(monitorId);
+        if (!entry.is_object() || !entry.contains("paused") || !entry["paused"].is_boolean()) return std::nullopt;
+        return entry["paused"].get<bool>();
+    };
+    const auto pausedIs = [&paused](int32_t monitorId, bool expected) {
+        const std::optional<bool> now = paused(monitorId);
+        return now && *now == expected;
+    };
+
+    const std::string setupError = errorNameFrom([&] {
+        setMonitorOutput(proxy, kMonitorPauseFocused, "DP-PF");
+        setMonitorOutput(proxy, kMonitorPauseMaximized, "DP-PM");
+        setWallpaper(proxy, "shader", unrenderablePath, kMonitorPauseFocused);
+        setWallpaper(proxy, "shader", unrenderablePath, kMonitorPauseMaximized);
+        setWallpaper(proxy, "shader", unrenderablePath, kMonitorPauseKept);
+        setMonitorPause(proxy, kMonitorPauseFocused, "paused_while_focused");
+        setMonitorPause(proxy, kMonitorPauseMaximized, "paused_while_maximized");
+    });
+    // CONTROL: via control_batch.sh, --phase '^pauseWire$', 2026-10-01, PauseMode::WhileWindowMaximized dropped
+    //       from kPauseModes (backend/daemon/pause_mode.h) -> this line red: SetMonitorPause refuses
+    //       paused_while_maximized. Reverted.
+    check(setupError.empty(), "the two window modes can be set on two named monitors");
+    if (!setupError.empty()) {
+        std::fprintf(stderr, "  the setup answered '%s'\n", setupError.c_str());
+        return;
+    }
+
+    // GOAL: S15.125 -- before any SetOutputFocus, a screen is taken to have no focused and no
+    //       maximized window, so both window modes play, and GetStatus shows both window fields false.
+    // CONTROL: via control_batch.sh, --phase '^pauseWire$', 2026-09-30, in pausedLocked()
+    //       (backend/daemon/wallpaper_manager.cpp), the focused case made `return report == nullptr ||
+    //       report->windowFocused;` -> "FAIL: before any focus report, both window modes play", monitor 0
+    //       reading "paused":true, beside the S15.126 and S15.127 lines that need an unreported screen to
+    //       play. Reverted.
+    {
+        const nlohmann::json focused = pauseOf(kMonitorPauseFocused);
+        const nlohmann::json maximized = pauseOf(kMonitorPauseMaximized);
+        const auto unreported = [](const nlohmann::json& entry, const char* mode) {
+            return entry.is_object() && entry == nlohmann::json({{"mode", mode},
+                                                                 {"paused", false},
+                                                                 {"window_focused", false},
+                                                                 {"window_maximized", false}});
+        };
+        const bool plays = unreported(focused, "paused_while_focused") && unreported(maximized, "paused_while_maximized");
+        check(plays, "before any focus report, both window modes play");
+        if (!plays) std::fprintf(stderr, "  monitor 0: %s; monitor 1: %s\n", focused.dump().c_str(), maximized.dump().c_str());
+    }
+
+    // GOAL: S15.124 -- each window mode pauses on its own field of the report and ignores the other:
+    //       paused_while_focused on window_focused, paused_while_maximized on window_maximized; and
+    //       S15.131's window half -- GetStatus's two window fields are the screen's last report.
+    // WHY-THIS-SHAPE: both screens are sent the same report twice, once with only the focused bit and
+    //       once with only the maximized bit, so each mode is seen paused by its own field and playing
+    //       under the other's. One report of both bits would pass a mode that read either field.
+    // CONTROL: via control_batch.sh, --phase '^pauseWire$', 2026-09-30, the two `report->...` fields
+    //       swapped in pausedLocked() (backend/daemon/wallpaper_manager.cpp) -> "FAIL: a focused window
+    //       pauses paused_while_focused and not paused_while_maximized" and "FAIL: a maximized window
+    //       pauses paused_while_maximized and not paused_while_focused", with the later checks that rely on
+    //       a focused report pausing. Reverted. For the window fields: snapshot()'s `status.windowFocused =
+    //       report->windowFocused;` (backend/daemon/wallpaper_manager.cpp) made `= false;` -> "FAIL: GetStatus
+    //       shows what each screen last reported about its windows", alone. Reverted.
+    {
+        const std::string first = errorNameFrom([&] {
+            setOutputFocus(proxy, "DP-PF", true, false);
+            setOutputFocus(proxy, "DP-PM", true, false);
+        });
+        const bool byFocus = first.empty() && pausedIs(kMonitorPauseFocused, true) && pausedIs(kMonitorPauseMaximized, false);
+        const nlohmann::json focusedReport = pauseOf(kMonitorPauseFocused);
+        const std::string second = errorNameFrom([&] {
+            setOutputFocus(proxy, "DP-PF", false, true);
+            setOutputFocus(proxy, "DP-PM", false, true);
+        });
+        const bool byMaximized =
+            second.empty() && pausedIs(kMonitorPauseFocused, false) && pausedIs(kMonitorPauseMaximized, true);
+        const nlohmann::json maximizedReport = pauseOf(kMonitorPauseMaximized);
+        check(byFocus, "a focused window pauses paused_while_focused and not paused_while_maximized");
+        check(byMaximized, "a maximized window pauses paused_while_maximized and not paused_while_focused");
+        const bool fields = focusedReport.is_object() && focusedReport.value("window_focused", false) &&
+                            !focusedReport.value("window_maximized", true) && maximizedReport.is_object() &&
+                            !maximizedReport.value("window_focused", true) &&
+                            maximizedReport.value("window_maximized", false);
+        check(fields, "GetStatus shows what each screen last reported about its windows");
+        if (!byFocus || !byMaximized || !fields) {
+            std::fprintf(stderr, "  answered '%s' then '%s'; after the focused report: %s; after the maximized: %s\n",
+                         first.c_str(), second.c_str(), focusedReport.dump().c_str(), maximizedReport.dump().c_str());
+        }
+    }
+
+    // GOAL: S15.126 -- a report ends when its sender leaves the bus, with no other call: a screen whose
+    //       report came from a connection that closed is taken to have no focused window again. Only
+    //       that sender's reports go; another client's report on another screen stands.
+    // WHY-THIS-SHAPE: the report comes from a second connection that is then closed, and nothing else
+    //       is sent. The wait has a deadline and a failure branch. DP-PM's report, sent on this phase's
+    //       own connection, is what makes "only that sender's" checkable: a forget that cleared every
+    //       report would pass the first half.
+    // CONTROL: via control_batch.sh, --phase '^pauseWire$', 2026-09-30, the `if
+    //       (m_manager.forgetOutputFocus(client)) m_worker.wake();` line deleted from
+    //       DbusService::forgetClient (backend/daemon/dbus_service.cpp) -> "FAIL: a focus report ends when
+    //       the connection that sent it leaves the bus", alone, "10 s after it left" still paused.
+    //       forgetOutputFocus() (backend/daemon/wallpaper_manager.cpp) made to erase every report,
+    //       `std::erase_if(m_outputFocus, [](const auto&) { return true; })` -> "FAIL: and only that sender's
+    //       reports end", and S15.127's second half, which had no report left to lose. Reverted.
+    {
+        const std::string cleared = errorNameFrom([&] { setOutputFocus(proxy, "DP-PF", false, false); });
+        bool reported = false;
+        std::string sent;
+        {
+            auto reporter = sdbus::createProxy(daemonName, sdbus::ObjectPath{DbusService::kObjectPath});
+            sent = errorNameFrom([&] { setOutputFocus(*reporter, "DP-PF", true, false); });
+            reported = sent.empty() && pausedIs(kMonitorPauseFocused, true);
+        }
+        check(cleared.empty() && reported, "a second connection's focus report pauses its screen (the premise)");
+        if (!cleared.empty() || !reported) {
+            std::fprintf(stderr, "  the clear answered '%s', the report '%s'; entry: %s\n", cleared.c_str(), sent.c_str(),
+                         pauseOf(kMonitorPauseFocused).dump().c_str());
+        } else {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+            bool ended = pausedIs(kMonitorPauseFocused, false);
+            while (!ended && std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                ended = pausedIs(kMonitorPauseFocused, false);
+            }
+            check(ended, "a focus report ends when the connection that sent it leaves the bus");
+            if (!ended) std::fprintf(stderr, "  10 s after it left: %s\n", pauseOf(kMonitorPauseFocused).dump().c_str());
+            check(pausedIs(kMonitorPauseMaximized, true), "and only that sender's reports end");
+        }
+    }
+
+    // GOAL: S15.127 -- a report goes with its screen name's binding: moving a name to another monitor
+    //       leaves neither monitor paused by it (the one losing the name has no screen, the one taking
+    //       it has had no report), and a name a monitor gives up does not bring its old report back
+    //       when it is bound again.
+    // WHY-THIS-SHAPE: the monitor taking the name is in the same focused mode, so a report that
+    //       travelled with the name pauses it. The second half renames monitor 1 away from DP-PM and
+    //       back: a report left on the unbound name is invisible until the name is bound again.
+    // CONTROL: via control_batch.sh, --phase '^pauseWire$', 2026-09-30, in bindOutputLocked()
+    //       (backend/daemon/wallpaper_manager.cpp), each alone: `m_outputFocus.erase(existing->first);`
+    //       deleted -> "FAIL: a screen name moved to another monitor takes no focus report with it",
+    //       monitor 4 reading "paused":true; the loop's `m_outputFocus.erase(it->first);` deleted -> "FAIL: a
+    //       name a monitor gave up brings no old report back when bound again", monitor 1 paused. Each alone.
+    //       Reverted.
+    {
+        const std::string moved = errorNameFrom([&] {
+            setOutputFocus(proxy, "DP-PF", true, false);
+            setMonitorPause(proxy, kMonitorPauseTaker, "paused_while_focused");
+        });
+        const bool premise = moved.empty() && pausedIs(kMonitorPauseFocused, true);
+        const std::string taken = errorNameFrom([&] { setMonitorOutput(proxy, kMonitorPauseTaker, "DP-PF"); });
+        const bool noTravel = premise && taken.empty() && pausedIs(kMonitorPauseTaker, false) &&
+                              pausedIs(kMonitorPauseFocused, false);
+        check(noTravel, "a screen name moved to another monitor takes no focus report with it");
+        if (!noTravel) {
+            std::fprintf(stderr, "  answered '%s', '%s'; monitor 0: %s; monitor 4: %s\n", moved.c_str(), taken.c_str(),
+                         pauseOf(kMonitorPauseFocused).dump().c_str(), pauseOf(kMonitorPauseTaker).dump().c_str());
+        }
+        const bool maximizedBefore = pausedIs(kMonitorPauseMaximized, true);
+        const std::string away = errorNameFrom([&] { setMonitorOutput(proxy, kMonitorPauseMaximized, "DP-PM2"); });
+        const std::string back = errorNameFrom([&] { setMonitorOutput(proxy, kMonitorPauseMaximized, "DP-PM"); });
+        const bool noReturn = maximizedBefore && away.empty() && back.empty() && pausedIs(kMonitorPauseMaximized, false);
+        check(noReturn, "a name a monitor gave up brings no old report back when bound again");
+        if (!noReturn) {
+            std::fprintf(stderr, "  paused before %s; answered '%s', '%s'; monitor 1: %s\n",
+                         maximizedBefore ? "yes" : "no", away.c_str(), back.c_str(),
+                         pauseOf(kMonitorPauseMaximized).dump().c_str());
+        }
+    }
+
+    // GOAL: S15.130 -- play is written as no field: pausing a monitor and setting it back to play
+    //       leaves the config file byte for byte as it was before the pause, with no `pause` key.
+    // CONTROL: via control_batch.sh, --phase '^pauseWire$', 2026-09-30, in
+    //       WallpaperManager::setMonitorPause (backend/daemon/wallpaper_manager.cpp), `if (*parsed !=
+    //       PauseMode::Play) next = toJsonText(*parsed);` made unconditional -> "FAIL: play writes no
+    //       pause field, leaving the file as it was before the pause", alone. Reverted.
+    {
+        const std::string before = configTextOnceIdle(manager, config.configFile);
+        const std::string pauseError = errorNameFrom([&] { setMonitorPause(proxy, kMonitorPauseKept, "always_paused"); });
+        const std::string pausedText = configTextOnceIdle(manager, config.configFile);
+        const std::string playError = errorNameFrom([&] { setMonitorPause(proxy, kMonitorPauseKept, "play"); });
+        const std::string after = configTextOnceIdle(manager, config.configFile);
+        const nlohmann::json row = configRowOf(config.configFile, kMonitorPauseKept);
+        const bool asBefore = pauseError.empty() && playError.empty() && !before.empty() && pausedText != before &&
+                              after == before && row.is_object() && !row.contains("pause");
+        check(asBefore, "play writes no pause field, leaving the file as it was before the pause");
+        if (!asBefore) {
+            std::fprintf(stderr, "  answered '%s', '%s'\n  before: %s\n  paused: %s\n  after:  %s\n", pauseError.c_str(),
+                         playError.c_str(), before.c_str(), pausedText.c_str(), after.c_str());
+        }
+    }
+
+    // GOAL: S15.128 -- the setting belongs to the monitor, not the wallpaper: SetWallpaper and
+    //       SetWallpaperWithProperties leave it in force, in GetStatus and in the config file.
+    // CONTROL: via control_batch.sh, --phase '^pauseWire$', 2026-09-30, `m_pauseSettings.erase(monitorId);`
+    //       added to WallpaperManager::requestWallpaper's commit (backend/daemon/wallpaper_manager.cpp) ->
+    //       "FAIL: a pause setting survives SetWallpaper and SetWallpaperWithProperties, in GetStatus and
+    //       in the file", the entry reading "mode":"play", alone. Reverted.
+    {
+        const std::string answered = errorNameFrom([&] {
+            setMonitorPause(proxy, kMonitorPauseKept, "always_paused");
+            setWallpaper(proxy, "shader", unrenderablePath, kMonitorPauseKept);
+            setWallpaperWithProperties(proxy, "shader", unrenderablePath, kMonitorPauseKept,
+                                       {{"speed", sdbus::Variant(1.5)}});
+        });
+        const nlohmann::json entry = pauseOf(kMonitorPauseKept);
+        configTextOnceIdle(manager, config.configFile);
+        const nlohmann::json row = configRowOf(config.configFile, kMonitorPauseKept);
+        const bool kept = answered.empty() && entry.is_object() && entry.value("mode", std::string()) == "always_paused" &&
+                          entry.value("paused", false) && row.is_object() &&
+                          row.value("pause", nlohmann::json()) == "always_paused";
+        check(kept, "a pause setting survives SetWallpaper and SetWallpaperWithProperties, in GetStatus and in the file");
+        if (!kept) {
+            std::fprintf(stderr, "  answered '%s'; entry: %s; file row: %s\n", answered.c_str(), entry.dump().c_str(),
+                         row.dump().c_str());
+        }
+    }
+
+    // GOAL: S15.129 -- GetStatus's `pause` lists a monitor that has a setting and no wallpaper, with
+    //       its mode.
+    // CONTROL: via control_batch.sh, --phase '^pauseWire$', 2026-09-30, the second loop in snapshot()
+    //       (backend/daemon/wallpaper_manager.cpp), over m_pauseSettings, deleted -> "FAIL: a monitor with
+    //       a pause setting and no wallpaper is listed in GetStatus's pause object", and S15.127's first
+    //       line, whose monitor 4 has no wallpaper either. Reverted. The file half is S15.133's, graded
+    //       in config_store_test.
+    {
+        const std::string answered = errorNameFrom([&] { setMonitorPause(proxy, kMonitorPauseBare, "always_paused"); });
+        const StatusReply status = getStatusOrExplain(proxy);
+        const nlohmann::json* entry = pauseStatus(status, std::to_string(kMonitorPauseBare));
+        const bool listed = answered.empty() && status.ok() &&
+                            wallpaperStatus(status, std::to_string(kMonitorPauseBare)) == nullptr && entry != nullptr &&
+                            *entry == nlohmann::json({{"mode", "always_paused"},
+                                                      {"paused", true},
+                                                      {"window_focused", false},
+                                                      {"window_maximized", false}});
+        check(listed, "a monitor with a pause setting and no wallpaper is listed in GetStatus's pause object");
+        if (!listed) std::fprintf(stderr, "  answered '%s'; status: %s\n", answered.c_str(), status.json().dump().c_str());
+    }
+
+    // GOAL: S15.122 -- SetMonitorPause refuses an unknown mode and a monitor id outside [0, 32) as
+    //       InvalidArgs, and changes nothing: no monitor's pause entry moves and the file is not written.
+    //       S15.123 -- SetOutputFocus refuses a name no monitor answers to as UnknownOutput, and an empty
+    //       or over-long name as InvalidArgs (a name that is not UTF-8 at the manager, since sd-bus will
+    //       not send one), recording nothing.
+    // WHY-THIS-SHAPE: every refusal asks for a mode that would change something (always_paused on ids
+    //       that have none, a focused window on a focused-mode screen), so an accepted refusal shows in
+    //       the pause object or the file; the file is compared once the writer is idle.
+    // CONTROL: via control_batch.sh, --phase '^pauseWire$', 2026-09-30, each alone, reverted. In
+    //       WallpaperManager::setMonitorPause (backend/daemon/wallpaper_manager.cpp): the unknown-mode
+    //       throw replaced by falling back to play -> "FAIL: SetMonitorPause refuses an unknown mode as
+    //       InvalidArgs", all three names answered '', and "FAIL: no refused call changed a pause entry or
+    //       wrote the file"; `requireValidMonitorId(monitorId);` deleted -> "FAIL: SetMonitorPause refuses a
+    //       monitor id outside [0, 32) as InvalidArgs" and the same unchanged line, a "-1" entry appearing.
+    //       In WallpaperManager::setOutputFocus, the unbound-name throw made `return;` -> "FAIL:
+    //       SetOutputFocus refuses a name no monitor answers to as UnknownOutput", alone; and its
+    //       `requireValidOutputName(outputName);` deleted -> "FAIL: SetOutputFocus refuses an empty or
+    //       over-long name as InvalidArgs", both bad names answering UnknownOutput, and the non-UTF-8 line
+    //       below.
+    {
+        const auto snapshotAll = [&proxy] {
+            const StatusReply status = getStatusOrExplain(proxy);
+            return status.ok() && status.json().contains("pause") ? status.json()["pause"].dump() : std::string();
+        };
+        const std::string fileBefore = configTextOnceIdle(manager, config.configFile);
+        const std::string pauseBefore = snapshotAll();
+        bool modes = true;
+        for (const char* mode : {"sometimes", "", "Always_Paused"}) {
+            const std::string answer = errorNameFrom([&] { setMonitorPause(proxy, kMonitorPauseKept, mode); });
+            if (answer != kInvalidArgs) {
+                modes = false;
+                std::fprintf(stderr, "  SetMonitorPause(3, \"%s\") answered '%s'\n", mode, answer.c_str());
+            }
+        }
+        check(modes, "SetMonitorPause refuses an unknown mode as InvalidArgs");
+        bool ids = true;
+        for (const int32_t id : {-1, 32}) {
+            const std::string answer = errorNameFrom([&] { setMonitorPause(proxy, id, "always_paused"); });
+            if (answer != kInvalidArgs) {
+                ids = false;
+                std::fprintf(stderr, "  SetMonitorPause(%d, always_paused) answered '%s'\n", id, answer.c_str());
+            }
+        }
+        check(ids, "SetMonitorPause refuses a monitor id outside [0, 32) as InvalidArgs");
+        const std::string unbound = errorNameFrom([&] { setOutputFocus(proxy, "HDMI-UNBOUND", true, true); });
+        check(unbound == kUnknownOutput, "SetOutputFocus refuses a name no monitor answers to as UnknownOutput");
+        if (unbound != kUnknownOutput) std::fprintf(stderr, "  it answered '%s'\n", unbound.c_str());
+        bool names = true;
+        for (const std::string& name : {std::string(), std::string(wallpaperx::kMaxOutputNameBytes + 1, 'D')}) {
+            const std::string answer = errorNameFrom([&] { setOutputFocus(proxy, name, true, true); });
+            if (answer != kInvalidArgs) {
+                names = false;
+                std::fprintf(stderr, "  SetOutputFocus of a %zu-byte name answered '%s'\n", name.size(), answer.c_str());
+            }
+        }
+        check(names, "SetOutputFocus refuses an empty or over-long name as InvalidArgs");
+        // GOAL: S15.123's non-UTF-8 half -- the manager refuses such a name as invalid before any lookup.
+        // WHY-THIS-SHAPE: UnknownOutput derives from InvalidRequest, and an unvalidated non-UTF-8 name is
+        //       simply unbound, so catching InvalidRequest alone would pass with validation gone; the
+        //       subclass is caught first and counts as a failure.
+        // CONTROL: via control_batch.sh, --phase '^pauseWire$', 2026-09-30, `requireValidOutputName(outputName);`
+        //       deleted from WallpaperManager::setOutputFocus (backend/daemon/wallpaper_manager.cpp) -> this
+        //       line red, printing that the name reached the bound-name lookup. Reverted.
+        bool notUtf8 = false;
+        try {
+            manager.setOutputFocus(":1.pause", "DP-\x80", true, true);
+            std::fprintf(stderr, "  a non-UTF-8 name was accepted\n");
+        } catch (const wallpaperx::UnknownOutput&) {
+            std::fprintf(stderr, "  a non-UTF-8 name reached the bound-name lookup\n");
+        } catch (const wallpaperx::InvalidRequest&) {
+            notUtf8 = true;
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "  a non-UTF-8 name threw '%s'\n", e.what());
+        }
+        check(notUtf8, "the manager refuses a non-UTF-8 screen name as invalid, before looking it up");
+        const std::string fileAfter = configTextOnceIdle(manager, config.configFile);
+        const std::string pauseAfter = snapshotAll();
+        const bool unchanged = !fileBefore.empty() && fileAfter == fileBefore && !pauseBefore.empty() && pauseAfter == pauseBefore;
+        check(unchanged, "no refused call changed a pause entry or wrote the file");
+        if (!unchanged) {
+            std::fprintf(stderr, "  pause before: %s\n  pause after:  %s\n  file before: %s\n  file after:  %s\n",
+                         pauseBefore.c_str(), pauseAfter.c_str(), fileBefore.c_str(), fileAfter.c_str());
+        }
+    }
+}
+
 // One accepted request plus one render pass, on this thread. Returns whether a frame
 // committed. Both halves together, because "the daemon was asked and then given a chance to
 // draw" is the unit every check below is stated in.
@@ -7205,6 +7589,8 @@ int main() {
         if (phaseSelected("unservicedRequest")) runUnservicedRequestChecks(config, imagePath, unrenderablePath, check);
         // Its own manager and config file; records shaders, so it draws nothing either.
         if (phaseSelected("propertiesWire")) runPropertiesWireChecks(config, imagePath, unrenderablePath, check);
+        // The same shape for the pause setting and the focus report.
+        if (phaseSelected("pauseWire")) runPauseWireChecks(config, unrenderablePath, check);
 
         // Neither of these renders anything, so neither builds a Device: they grade the
         // per-consumer bookkeeping behind SetImportModifiers, which is pure state. Placed

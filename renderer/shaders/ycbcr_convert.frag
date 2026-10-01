@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 #version 460
 
 // Y' in luma.r; Cb in cb.r; Cr in cr.r. Which image each view reads, and through which

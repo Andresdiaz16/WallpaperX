@@ -856,6 +856,20 @@ target_compile_definitions(wallpaperx-video-wallpaper-test PRIVATE
 if(WALLPAPERX_FFMPEG_EXECUTABLE)
     add_dependencies(wallpaperx-video-wallpaper-test wallpaperx-backend-video-fixtures)
 endif()
+# The renderer's counter fixture, which draws its frame number into every picture: what lets the
+# resume phases say which picture a served frame is. Its directory is the renderer's binary directory,
+# which this file names when it adds that subproject.
+target_compile_definitions(wallpaperx-video-wallpaper-test PRIVATE
+    WALLPAPERX_COUNTER_VIDEO="${CMAKE_CURRENT_BINARY_DIR}/renderer/video_assets/counter_long.mp4")
+if(TARGET wallpaperx-video-fixtures)
+    add_dependencies(wallpaperx-video-wallpaper-test wallpaperx-video-fixtures)
+endif()
+# The GL importer, to read an opaque-fd frame's pixels back on the driver that exported it; a dma_buf
+# frame is mapped instead. Without it the resume phases report the opaque path as not answerable.
+if(WALLPAPERX_HAVE_FRAME_IMPORT)
+    target_link_libraries(wallpaperx-video-wallpaper-test PRIVATE wallpaperx-frame-import)
+    target_compile_definitions(wallpaperx-video-wallpaper-test PRIVATE WALLPAPERX_HAVE_FRAME_IMPORT=1)
+endif()
 
 # The HTTP tier reads the same clip, for the one thing only it can answer: what /health says about a
 # monitor showing a video. Attached here rather than at that target's own definition because the

@@ -26,10 +26,12 @@
 #include "vulkan/gpu_fault.h"
 #include "vulkan/offscreen.h"
 
+#include "catch_up_budget.h"
 #include "support/check.h"
 #include "support/forked_child.h"
 #include "support/gpu_readback.h"
 #include "support/picture_counter.h"
+#include "support/reset_point_reference.h"
 #include "support/validation_grade.h"
 #include "support/video_probe_support.h"
 
@@ -108,26 +110,65 @@ struct SeekCall {
     int64_t target;  // as the decoder asked, before any shift below
     int result;
     bool byte = false;
+    // Whether the first packet of the sought stream read after this seek was a keyframe; unset when
+    // none was read before the next seek.
+    std::optional<bool> landedOnKeyframe;
 };
 std::vector<SeekCall> g_failingSeeks;
+// The g_failingSeeks entry, and its stream, still waiting for its first packet; -1 for none.
+int g_seekAwaitingPacket = -1;
+int g_seekAwaitingStream = -1;
 int g_containerOpens = 0;
+// Opens and flushes of the decoder's SOFTWARE context (no hw_device_ctx): a seek retry flushes and reuses
+// the decoder, so a software pass starts at an open or a flush, and these two together number the passes.
+// A hardware context is never counted, so pass 1 cannot be the failing hardware decoder's.
 int g_decoderOpens = 0;
+int g_decoderFlushes = 0;
 // Added to the first seek's target: a demuxer that lands past what it was asked for.
 int64_t g_seekShiftSeconds = 0;
-enum class SeekFailure { None, AwayFromStart, All };
+// Second: only the second seek of the call fails -- a start's search, or a software start's retry.
+enum class SeekFailure { None, AwayFromStart, All, Second };
 SeekFailure g_seekFailure = SeekFailure::None;
-// avcodec_send_packet refuses every packet while the decoder opened during the failing call is the
-// g_refuseFrom-th to g_refuseThrough-th; 0 is off.
+// avcodec_send_packet refuses every packet sent to the software context while the software pass under way
+// in the failing call is the g_refuseFrom-th to g_refuseThrough-th; 0 is off.
 int g_refuseFrom = 0;
 int g_refuseThrough = 0;
 // Pictures the decoder receives lose their timestamp.
 bool g_stripTimestamps = false;
+
+// Packets sent to the decoder's context, pictures it returned and packets the demuxer read while
+// g_logTraffic is set, each with the number of seeks recorded in g_failingSeeks when it happened; a
+// read also with the number of packets sent before it.
+struct TrafficEntry {
+    int64_t timestamp;
+    size_t afterSeeks;
+    bool device = false;
+    size_t sentBefore = 0;
+};
+bool g_logTraffic = false;
+std::vector<TrafficEntry> g_sentPackets;
+std::vector<TrafficEntry> g_returnedPictures;
+std::vector<TrafficEntry> g_readPackets;
+
+// g_logTraffic for one scope, its logs emptied as it starts and kept after it ends.
+struct TrafficLog {
+    TrafficLog() {
+        g_sentPackets.clear();
+        g_returnedPictures.clear();
+        g_readPackets.clear();
+        g_logTraffic = true;
+    }
+    ~TrafficLog() { g_logTraffic = false; }
+    TrafficLog(const TrafficLog&) = delete;
+    TrafficLog& operator=(const TrafficLog&) = delete;
+};
 
 void clearFailingCallConditions() {
     g_stripTimestamps = false;
     g_receiveExternalRemaining = 0;
     g_inFailingCall = false;
     g_seekShiftSeconds = 0;
+    g_seekAwaitingPacket = -1;
     g_seekFailure = SeekFailure::None;
     g_refuseFrom = 0;
     g_refuseThrough = 0;
@@ -364,6 +405,7 @@ struct FailingCall {
     std::vector<SeekCall> seeks;
     int containerOpens = 0;
     int decoderOpens = 0;
+    int decoderFlushes = 0;
 };
 
 struct PipelineRun {
@@ -396,6 +438,7 @@ PipelineRun runPipeline(Device& device, const std::string& file, size_t expected
         run.failing.seeks = g_failingSeeks;
         run.failing.containerOpens = g_containerOpens;
         run.failing.decoderOpens = g_decoderOpens;
+        run.failing.decoderFlushes = g_decoderFlushes;
         clearFailingCallConditions();
     };
     try {
@@ -425,6 +468,7 @@ PipelineRun runPipeline(Device& device, const std::string& file, size_t expected
                 g_failingSeeks.clear();
                 g_containerOpens = 0;
                 g_decoderOpens = 0;
+                g_decoderFlushes = 0;
                 run.failing.devicePicturesBefore = g_devicePictures;
                 hostBeforeFailure = g_hostPictures;
                 if (plan.arm) plan.arm();
@@ -554,6 +598,12 @@ std::string describeSeeks(const std::vector<SeekCall>& seeks) {
     return text.empty() ? "no seek" : "seeks to " + text;
 }
 
+// Where the first seek landed, for a FAIL line: on a keyframe, on a non-keyframe, or nowhere read.
+const char* describeLanding(const std::vector<SeekCall>& seeks) {
+    if (seeks.empty() || !seeks[0].landedOnKeyframe) return "no packet read";
+    return *seeks[0].landedOnKeyframe ? "a keyframe" : "a non-keyframe";
+}
+
 // ------------------------------------------------------------------------- //
 // Ordinary playback: conversion before rendering, and timestamps that do not rise
 // ------------------------------------------------------------------------- //
@@ -646,12 +696,14 @@ void runResumeTimestampChecks(Device& device, const std::string& label) {
     //       The bound is the fixture's own longest keyframe gap, read off the independent decode, not
     //       the recipe's -g. Three points, because the first picture resumes by rewinding (no earlier
     //       keyframe to seek to) while the others seek.
-    // CONTROL: renderer/video/video_decoder.cpp, each reverted. reopenInSoftware() with its seek
-    //       disabled, so software rewinds and drops through -- the old replay: every picture still once,
-    //       the bound red, "decoded 31 pictures" at 30 in and "292" at 291 in. admit()'s DropThrough
-    //       test `<=` made `<`: "1 shown more than once" at all three points. DropThrough also dropping
-    //       the first picture past the resume point: "1 never shown" at all three. The rewind() dropped
-    //       from reopenInSoftware()'s no-seek branch: the first point alone red, "23 never shown".
+    // CONTROL: renderer/video/video_decoder.cpp, each reverted. seekToResume()'s seek disabled (its `if`
+    //       made `if (false && ...)`), so software rewinds and drops through -- the old replay: every
+    //       picture still once, the bound red, "decoded 31 pictures" at 30 in and "292" at 291 in, via
+    //       control_batch.sh 2026-09-30. admit()'s DropThrough test `<=` made `<`: "1 shown more than once" at
+    //       all three points. DropThrough also dropping the first picture past the resume point: "1 never
+    //       shown" at all three. seekToResume()'s last arm -- the one with no seek, taken when the target is
+    //       at the stream's start -- without its rewind(): the first point alone red, "call 2 showed 24 where
+    //       1 was due ... 23 never shown", via control_batch.sh 2026-10-01.
     // COVERAGE-ASSERT: the late point is at least four bounds in -- red with a keyframe every 100
     //       substituted, "321 pictures with a keyframe gap of 100" -- and each run asserts the failure
     //       met device pictures and software took over.
@@ -749,12 +801,14 @@ void runLateSeekChecks(Device& device, const std::string& label) {
     // WHY-THIS-SHAPE: two sources of a late landing. On the MP4 the first seek's target is moved two
     //       seconds late, so the keyframe it lands on is past the resume point, and a second, earlier
     //       seek is asserted. The transport stream lands late by itself: its seeks after 40 and 100
-    //       pictures were each followed by one a second earlier. Only its sequence is asserted, since
-    //       how far the demuxer overshoots is ffmpeg's.
-    // CONTROL: renderer/video/video_decoder.cpp admit() taking a Seeked picture past the resume point
-    //       as landed (DropThrough) instead of retrying, reverted: MP4 "22 never shown" and "1 seek(s)
-    //       made after the late landing"; transport stream after 40, "9 never shown". After 100 it stayed
-    //       green with two seeks: that retry comes from another branch, so that point grades less.
+    //       pictures land on non-keyframes whose next keyframe is past the resume point, and were each
+    //       followed by one a second earlier. Only its sequence is asserted, since how far the demuxer
+    //       overshoots is ffmpeg's.
+    // CONTROL: via control_batch.sh, 2026-09-30, reverted: renderer/video/video_decoder.cpp admit() taking
+    //       a Seeked picture past the resume point as landed (DropThrough) instead of retrying -> MP4 "22
+    //       never shown" and "1 seek(s) made after the late landing"; transport stream after 40, "9 never
+    //       shown". After 100 it stayed green: no keyframe follows that landing, so its retry comes from
+    //       the end-of-stream branch, and that point grades less.
     // COVERAGE-ASSERT: two seconds of the fixture's pictures exceed its keyframe gap -- red with a
     //       keyframe every 100 substituted, "the seek shift is within a keyframe gap".
     constexpr int kShiftSeconds = 2;
@@ -774,6 +828,21 @@ void runLateSeekChecks(Device& device, const std::string& label) {
         std::fprintf(stderr, "FAIL: %s: %s: %zu seek(s) made after the late landing\n", label.c_str(), what.c_str(),
                      seeks.size());
         fail("a seek that landed late was not retried further back");
+    }
+    // GOAL: S15.178 -- the retry after a late landing aims one second further back, not more: the call
+    //       decodes at most a second of pictures and a keyframe interval, plus the picture after the last shown.
+    // WHY-THIS-SHAPE: counted at the decoder, never timed; the MP4's index lands every retry on the keyframe at
+    //       or before its target, so the count follows the retry's distance. The transport stream is not
+    //       bounded: its seeks land where its demuxer decides.
+    // CONTROL: via control_batch.sh, 2026-10-01, reverted, renderer/video/video_decoder.cpp nextSeekBack()'s
+    //       first step made two seconds -> "seeks to 148480, 117760, 77 pictures decoded to resume, more than the
+    //       55 of a second and a keyframe interval" (53 unbroken). No other check here sees that step.
+    const int retryBound = kFixturePicturesPerSecond + reference->longestKeyframeGap + 1;
+    if (run.failing.picturesDecoded > retryBound) {
+        std::fprintf(stderr, "FAIL: %s: %s: %s, %d pictures decoded to resume, more than the %d of a second and a "
+                             "keyframe interval\n",
+                     label.c_str(), what.c_str(), describeSeeks(seeks).c_str(), run.failing.picturesDecoded, retryBound);
+        fail("the retry after a late landing aimed further back than one second");
     }
     std::printf("%s: %s: %s, %d pictures decoded to resume\n", label.c_str(), what.c_str(),
                 describeSeeks(seeks).c_str(), run.failing.picturesDecoded);
@@ -806,11 +875,11 @@ void runEndChecks(Device& device, const std::string& label) {
     // WHY-THIS-SHAPE: two halves, because each wrong end-of-stream decision reddens only one. The
     //       second needs its pictures' timestamps stripped: on every fixture here a landed seek meets a
     //       timestamped picture first, and without the strip "always walk back" left all of this green.
-    // CONTROL: renderer/video/video_decoder.cpp next(), each reverted. End of stream during a seek never
-    //       walking back: "counter_seg.ts, hardware failing after 119 picture(s): 119 pictures shown
-    //       against 120 ... 1 never shown". Always walking back: "pictures after the seek untimestamped:
-    //       seeks to 163840, 148480, 133120, 102400, 40960, -1024", 822 pictures decoded -- the last being
-    //       the rewind's seek to packet 1's decode timestamp.
+    // CONTROL: renderer/video/video_decoder.cpp next(), via control_batch.sh, 2026-09-30, each reverted.
+    //       End of stream during a seek never walking back: "counter_seg.ts, hardware failing after 119
+    //       picture(s): 119 pictures shown against 120 ... 1 never shown". Always walking back: "pictures
+    //       after the seek untimestamped: seeks to 163840, 148480, 133120, 102400, 40960, -1024", 822
+    //       pictures decoded -- the last being the rewind's seek to packet 1's decode timestamp.
     // COVERAGE-ASSERT: failureExercised() on every run, and one seek asserted on the stripped run.
     for (const char* file : {"counter_long.mp4", "counter_seg.ts"}) {
         const std::optional<CounterReference> reference = counterReference(label, file);
@@ -849,6 +918,43 @@ void runEndChecks(Device& device, const std::string& label) {
     }
     std::printf("%s: %s: %d pictures decoded, %s\n", label.c_str(), what.c_str(), run.failing.picturesDecoded,
                 describeSeeks(run.failing.seeks).c_str());
+
+    // GOAL: S15.160, end of stream -- a resume seek that lands on a non-keyframe, with a keyframe at or
+    //       before the last picture shown next, counts as landed: end of stream then ends playback
+    //       with that one seek.
+    // WHY-THIS-SHAPE: the landing verdict is read only at end of stream while the seek is unsettled,
+    //       so timestamps are stripped as above; the seek is moved a second early because a transport
+    //       stream's own seek lands on the last packet decoded before its target, with no keyframe
+    //       presented at or before it still to come.
+    // CONTROL: via control_batch.sh, each reverted, in renderer/video/video_decoder.cpp. Re-run 2026-10-01:
+    //       recordLanding() always setting Landing::Unproven -> "seeks to 489000, 399000, 309000, 126000"
+    //       (the MP4 half above red too). 2026-09-30: next()'s skip marking the landing Unproven and decoding the
+    //       non-keyframe -- the verdict read at the packet landed on -> the same line, the MP4 half green.
+    // COVERAGE-ASSERT: the first packet read after the seek must not be a keyframe -- red with
+    //       counter_long.mp4 substituted (test-side, by hand, 2026-09-30), "the first landing on a keyframe".
+    const char* const transport = "counter_seg.ts";
+    const std::optional<CounterReference> transportReference = counterReference(label, transport);
+    if (!transportReference) return;
+    const int transportPictures = static_cast<int>(transportReference->ids.size());
+    const PipelineRun early = runPipeline(device, asset(transport), transportReference->ids.size(),
+                                          FailurePlan{transportPictures, [] {
+                                                          g_stripTimestamps = true;
+                                                          g_seekShiftSeconds = -1;
+                                                      }});
+    const std::string earlyWhat =
+        failurePoint(transport, transportPictures) + ", its seek landing a second early, pictures after it untimestamped";
+    if (!failureExercised(label, earlyWhat, early)) return;
+    gradeSequence(label, earlyWhat, early, *transportReference);
+    const std::vector<SeekCall>& seeks = early.failing.seeks;
+    const bool skipped = !seeks.empty() && seeks[0].landedOnKeyframe == false;
+    if (!skipped || seeks.size() != 1) {
+        std::fprintf(stderr, "FAIL: %s: %s: %s, the first landing on %s\n", label.c_str(), earlyWhat.c_str(),
+                     describeSeeks(seeks).c_str(), describeLanding(seeks));
+        fail(!skipped ? "the early seek did not land on a non-keyframe, so the skip to a keyframe was not exercised"
+                      : "end of stream after a seek proven by the keyframe after its landing walked back");
+    }
+    std::printf("%s: %s: %d pictures decoded, %s\n", label.c_str(), earlyWhat.c_str(), early.failing.picturesDecoded,
+                describeSeeks(seeks).c_str());
 }
 
 // ------------------------------------------------------------------------- //
@@ -866,8 +972,10 @@ void runSeekFailureChecks(Device& device, const std::string& label) {
     //       and when every seek fails it opens the file again; either way every picture is shown once.
     // WHY-THIS-SHAPE: av_seek_frame is failed from outside, because the fixture's container seeks.
     //       "Away from the start" fails the resume seek and lets the rewind's seek to packet 1 succeed.
-    // CONTROL: renderer/video/video_decoder.cpp, each reverted. reopenInSoftware()'s failed-seek branch
-    //       without its rewind(): both cases "21 never shown". rewind() without its reopen once every
+    // CONTROL: renderer/video/video_decoder.cpp, each reverted. seekToResume()'s last arm, which a failed
+    //       seek takes, without its rewind(): both cases "21 never shown" (the every-seek case also "1 seeks,
+    //       some failed; container opened 0 time(s)"), via control_batch.sh 2026-09-30. rewind() without its
+    //       reopen once every
     //       attempt fails: the every-seek case alone red, "4 seeks, some failed; container opened 0
     //       time(s)" -- the resume seek, then decode time, presentation time and byte position -- and "21
     //       never shown".
@@ -918,14 +1026,18 @@ void runDropCountChecks(Device& device, const std::string& label) {
     //       ends first, next() throws WallpaperContentError having shown nothing again.
     // WHY-THIS-SHAPE: the first software pass is made to decode nothing by refusing its packets as
     //       damaged, which ffmpeg reports for packets it cannot parse; the second pass is left alone,
-    //       or refused too. The software decoder is told apart by the order it was opened in during
-    //       the failing call.
-    // CONTROL: renderer/video/video_decoder.cpp, each reverted. reopenInSoftware()'s DropCount one
-    //       picture short: the first case "91 pictures shown against 90 ... 1 shown more than once".
-    //       next() returning the end instead of throwing with DropCount pending: the second case "40
-    //       pictures shown, then the stream ended".
-    // COVERAGE-ASSERT: at least two software decoders opened in the failing call -- red with the
-    //       refusal never applied, "1 software decoder(s) opened".
+    //       or refused too. A pass is numbered by what starts it in the failing call -- the software
+    //       decoder's open, then each flush of that decoder -- because a retry flushes and reuses the
+    //       decoder rather than opening another. Numbering by decoder opens alone would see one pass; a
+    //       hardware context is never counted or refused, so pass 1 cannot be the failing hardware decoder.
+    // CONTROL: renderer/video/video_decoder.cpp, via control_batch.sh, re-run 2026-10-01, each reverted.
+    //       seekToResume()'s `m_resume = DropCount{m_returned.count};` one picture short: the first case
+    //       "91 pictures shown against 90 ... call 41 showed 39 where 40 was due ... 1 shown more than
+    //       once". next() returning the end instead of throwing with DropCount pending (its `if` made
+    //       `if (false)`): the second case "40 pictures shown, then the stream ended".
+    // COVERAGE-ASSERT: at least two recovery passes in the failing call -- red with the refusal never
+    //       applied (test-side, `g_refuseFrom = 0`, by hand, re-run 2026-10-01), "1 recovery pass(es) (1
+    //       decoder open(s), 0 flush(es))" for both cases.
     struct Case {
         const char* what;
         int refuseThrough;
@@ -939,17 +1051,18 @@ void runDropCountChecks(Device& device, const std::string& label) {
                                             }});
         const std::string what = failurePoint(file, kAfter) + ", " + c.what;
         if (!failureExercised(label, what, run)) continue;
-        if (run.failing.decoderOpens < 2) {
-            std::fprintf(stderr, "FAIL: %s: %s: %d software decoder(s) opened\n", label.c_str(), what.c_str(),
-                         run.failing.decoderOpens);
+        const int passes = run.failing.decoderOpens + run.failing.decoderFlushes;
+        if (passes < 2) {
+            std::fprintf(stderr, "FAIL: %s: %s: %d recovery pass(es) (%d decoder open(s), %d flush(es))\n", label.c_str(),
+                         what.c_str(), passes, run.failing.decoderOpens, run.failing.decoderFlushes);
             fail("the resume never started a second software pass, so counting was not exercised");
             continue;
         }
         if (c.refuseThrough == 1) {
             checkSoftwareTookOver(label, what, run);
             if (gradeSequence(label, what, run, *reference)) {
-                std::printf("%s: %s: every picture once after %d software decoders\n", label.c_str(), what.c_str(),
-                            run.failing.decoderOpens);
+                std::printf("%s: %s: every picture once after %d recovery passes (%d decoder open(s), %d flush(es))\n",
+                            label.c_str(), what.c_str(), passes, run.failing.decoderOpens, run.failing.decoderFlushes);
             }
             continue;
         }
@@ -964,6 +1077,1473 @@ void runDropCountChecks(Device& device, const std::string& label) {
         std::printf("%s: %s: WallpaperContentError after the %d pictures already shown: %s\n", label.c_str(),
                     what.c_str(), kAfter, run.threw.c_str());
     }
+}
+
+// ------------------------------------------------------------------------- //
+// A pipeline opened at a position another pipeline on the same file handed out
+// ------------------------------------------------------------------------- //
+
+// A file's video packets in decode order, read with libavformat alone. `nal` is the type of the first
+// picture-carrying NAL unit in the packet, -1 for none and for AV1; `reset` is whether the packet resets
+// the decoder, as support/reset_point_reference.h reads it.
+struct GopLayout {
+    AVCodecID codec = AV_CODEC_ID_NONE;
+    struct Packet {
+        int64_t timestamp;
+        bool key;
+        int nal;
+        bool reset;
+    };
+    std::vector<Packet> packets;
+    std::vector<int64_t> pictures;  // the timestamps sorted: picture i's, in output order
+
+    // A keyframe that does not reset the decoder: an H.264 non-IDR I picture, or an HEVC CRA picture.
+    bool openKeyframe(size_t i) const {
+        return packets[i].key && (codec == AV_CODEC_ID_H264 ? packets[i].nal == 1 : packets[i].nal == 21);
+    }
+    // Packets after keyframe `key` in decode order, before the next keyframe, shown before it.
+    std::vector<size_t> leading(size_t key) const {
+        std::vector<size_t> found;
+        for (size_t i = key + 1; i < packets.size() && !packets[i].key; ++i) {
+            if (packets[i].timestamp < packets[key].timestamp) found.push_back(i);
+        }
+        return found;
+    }
+    std::optional<size_t> pictureAt(int64_t timestamp) const {
+        const auto it = std::find(pictures.begin(), pictures.end(), timestamp);
+        return it == pictures.end() ? std::nullopt : std::optional<size_t>(static_cast<size_t>(it - pictures.begin()));
+    }
+    std::optional<size_t> packetAt(int64_t timestamp) const {
+        for (size_t i = 0; i < packets.size(); ++i) {
+            if (packets[i].timestamp == timestamp) return i;
+        }
+        return std::nullopt;
+    }
+    // Where a start at the picture shown at `timestamp` decodes from on the device: the last reset point in
+    // decode order shown before it, or packet 0, from which every picture decodes.
+    size_t nearestReset(int64_t timestamp) const {
+        size_t found = 0;
+        for (size_t i = 1; i < packets.size(); ++i) {
+            if (packets[i].reset && packets[i].timestamp < timestamp) found = i;
+        }
+        return found;
+    }
+    // The keyframe-flagged packet shown last before `timestamp`: where an indexed container's seek lands.
+    std::optional<size_t> lastKeyBefore(int64_t timestamp) const {
+        std::optional<size_t> found;
+        for (size_t i = 0; i < packets.size(); ++i) {
+            if (packets[i].key && packets[i].timestamp < timestamp &&
+                (!found || packets[i].timestamp > packets[*found].timestamp)) {
+                found = i;
+            }
+        }
+        return found;
+    }
+    // Whether a seek to the picture shown at `timestamp` lands on an open keyframe.
+    bool landsOnOpenKeyframe(int64_t timestamp) const {
+        const std::optional<size_t> key = lastKeyBefore(timestamp);
+        return key && openKeyframe(*key);
+    }
+    std::vector<size_t> resets() const {
+        std::vector<size_t> found;
+        for (size_t i = 0; i < packets.size(); ++i) {
+            if (packets[i].reset) found.push_back(i);
+        }
+        return found;
+    }
+    size_t picture(size_t packet) const { return pictureAt(packets[packet].timestamp).value_or(0); }
+    std::string describe(size_t i) const {
+        const Packet& p = packets[i];
+        const bool hevc = codec == AV_CODEC_ID_HEVC;
+        const char* kind = p.reset                                          ? (codec == AV_CODEC_ID_AV1 ? "a shown key frame" : "an IDR")
+                           : codec == AV_CODEC_ID_H264 && p.key && p.nal == 1 ? "a non-IDR I picture"
+                           : hevc && p.nal == 21                              ? "a CRA"
+                           : hevc && p.nal >= 16 && p.nal <= 18               ? "a BLA"
+                           : p.key ? "a keyframe-flagged packet that does not reset the decoder"
+                                   : "not a keyframe";
+        return "packet " + std::to_string(i) + " (picture " + std::to_string(picture(i)) + ", " + kind + ")";
+    }
+};
+
+// `keyFlagsOnly` accepts any codec and reads only timestamps and the container's keyframe flags: `nal` is -1
+// and `reset` false throughout.
+std::optional<GopLayout> readGopLayout(const std::string& file, std::string& why, bool keyFlagsOnly = false) {
+    AVFormatContext* format = nullptr;
+    AVPacket* packet = av_packet_alloc();
+    struct Free {
+        AVFormatContext*& format;
+        AVPacket*& packet;
+        ~Free() {
+            av_packet_free(&packet);
+            avformat_close_input(&format);
+        }
+    } guard{format, packet};
+    if (packet == nullptr || avformat_open_input(&format, file.c_str(), nullptr, nullptr) < 0 ||
+        avformat_find_stream_info(format, nullptr) < 0) {
+        why = "cannot open " + file;
+        return std::nullopt;
+    }
+    const int stream = av_find_best_stream(format, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+    if (stream < 0) {
+        why = file + " has no video stream";
+        return std::nullopt;
+    }
+    GopLayout layout;
+    const AVCodecParameters& parameters = *format->streams[stream]->codecpar;
+    layout.codec = parameters.codec_id;
+    const bool known = layout.codec == AV_CODEC_ID_H264 || layout.codec == AV_CODEC_ID_HEVC || layout.codec == AV_CODEC_ID_AV1;
+    if (!known && !keyFlagsOnly) {
+        why = file + " is not H.264, HEVC or AV1";
+        return std::nullopt;
+    }
+    const int lengthSize = known ? wallpaperx::testing::nalLengthSize(parameters) : 0;
+    while (av_read_frame(format, packet) >= 0) {
+        if (packet->stream_index == stream && !known) {
+            layout.packets.push_back(GopLayout::Packet{packet->pts, (packet->flags & AV_PKT_FLAG_KEY) != 0, -1, false});
+            layout.pictures.push_back(packet->pts);
+        } else if (packet->stream_index == stream) {
+            const auto size = static_cast<size_t>(packet->size);
+            const auto slice = layout.codec == AV_CODEC_ID_AV1
+                                   ? std::nullopt
+                                   : wallpaperx::testing::firstSlice(packet->data, size, layout.codec, lengthSize);
+            layout.packets.push_back(GopLayout::Packet{packet->pts, (packet->flags & AV_PKT_FLAG_KEY) != 0,
+                                                       slice ? slice->type : -1,
+                                                       wallpaperx::testing::referenceResets(parameters, packet->data, size)});
+            layout.pictures.push_back(packet->pts);
+        }
+        av_packet_unref(packet);
+    }
+    std::sort(layout.pictures.begin(), layout.pictures.end());
+    return layout;
+}
+
+// Whether the decode after a start on the device began at packet `expected` of `layout` and went on in
+// decode order: the first packet in g_sentPackets is that one, and each one sent after it is the next.
+// Prints and fails otherwise.
+bool startedAt(const std::string& label, const std::string& what, const GopLayout& layout, size_t expected) {
+    if (g_sentPackets.empty()) {
+        std::fprintf(stderr, "FAIL: %s: %s: no packet was sent to the decoder\n", label.c_str(), what.c_str());
+        fail("a start on the device sent the decoder nothing");
+        return false;
+    }
+    const std::optional<size_t> first = layout.packetAt(g_sentPackets.front().timestamp);
+    bool ok = true;
+    if (!first || !layout.packets[*first].reset) {
+        std::fprintf(stderr, "FAIL: %s: %s: the first packet sent to the decoder was %s, which does not reset the decoder\n",
+                     label.c_str(), what.c_str(), first ? layout.describe(*first).c_str() : "none of the file's");
+        fail("a start on the device decodes from a packet that resets the decoder");
+        ok = false;
+    } else if (*first != expected) {
+        std::fprintf(stderr, "FAIL: %s: %s: the first packet sent to the decoder was %s, where the nearest reset point "
+                             "before the picture is %s\n",
+                     label.c_str(), what.c_str(), layout.describe(*first).c_str(), layout.describe(expected).c_str());
+        fail("a start on the device decodes from the nearest reset point before its picture");
+        ok = false;
+    }
+    for (size_t i = 0; first && i < g_sentPackets.size(); ++i) {
+        const size_t want = *first + i;
+        if (want < layout.packets.size() && g_sentPackets[i].timestamp == layout.packets[want].timestamp) continue;
+        std::fprintf(stderr, "FAIL: %s: %s: packet %zu sent after the start is not packet %zu of the file\n", label.c_str(),
+                     what.c_str(), i, want);
+        fail("a start on the device decodes every packet after its reset point, in order");
+        return false;
+    }
+    return ok;
+}
+
+// What a looping pipeline opened at `startAt` showed over `calls` calls, read back after each. The
+// constructor and the first call run as a "failing call" for the interposers, so the seeks made to
+// reach the position are recorded and `arm`'s conditions (a late seek, a failing one) apply to them.
+// Those conditions are cleared after the first call; given `beforeCall`, they are left to it instead,
+// and it is called before each later call with that call's index.
+struct StartRun {
+    std::vector<int> shown;
+    std::vector<bool> startsPass;
+    std::string threw;
+    std::string readbackFault;
+    std::vector<SeekCall> seeks;
+    int devicePictures = 0;
+    int hostPictures = 0;
+};
+
+StartRun runFrom(Device& device, const std::string& file, std::optional<wallpaperx::StreamPosition> startAt,
+                 size_t calls, const std::function<void()>& arm = {},
+                 const std::function<void(size_t call)>& beforeCall = {}) {
+    StartRun run;
+    struct Clear {
+        ~Clear() {
+            clearFailingCallConditions();
+            g_recordPictures = false;
+        }
+    } clear;
+    OffscreenTargetManager targets(device);
+    const OffscreenTarget& target = targets.create(1, kTargetWidth, kTargetHeight);
+    g_devicePictures = 0;
+    g_hostPictures = 0;
+    g_recordPictures = true;
+    g_failingSeeks.clear();
+    if (arm) arm();
+    g_inFailingCall = true;
+    try {
+        VideoPipeline pipeline(device, file, kShaderDir, VideoPipeline::Playback::Loop, startAt);
+        for (size_t call = 0; call < calls; ++call) {
+            if (call > 0 && beforeCall) beforeCall(call);
+            const bool more = pipeline.renderNext(targets, target);
+            if (call == 0) {
+                run.seeks = g_failingSeeks;
+                if (!beforeCall) clearFailingCallConditions();
+            }
+            if (!more) break;
+            run.startsPass.push_back(pipeline.timing().startsPass);
+            run.shown.push_back(wallpaperx::testing::counterFromBgra(
+                wallpaperx::testing::reclaimAndReadback(device, targets, target), target.width, target.height));
+        }
+    } catch (const std::exception& e) {
+        run.threw = e.what();
+    }
+    run.devicePictures = g_devicePictures;
+    run.hostPictures = g_hostPictures;
+    return run;
+}
+
+// The position of the `index`-th picture (0-based), as a pipeline that showed it hands it out, and the
+// counter it showed; nothing, with the reason printed as a harness failure, when there is none.
+std::optional<wallpaperx::StreamPosition> positionAt(Device& device, const std::string& label, const char* file,
+                                                     size_t index, int expectedId) {
+    try {
+        OffscreenTargetManager targets(device);
+        const OffscreenTarget& target = targets.create(1, kTargetWidth, kTargetHeight);
+        VideoPipeline pipeline(device, asset(file), kShaderDir, VideoPipeline::Playback::Loop);
+        for (size_t call = 0; call <= index; ++call) {
+            if (!pipeline.renderNext(targets, target)) break;
+        }
+        const int shown = wallpaperx::testing::counterFromBgra(
+            wallpaperx::testing::reclaimAndReadback(device, targets, target), target.width, target.height);
+        const std::optional<wallpaperx::StreamPosition> position = pipeline.shownPosition();
+        if (shown == expectedId && position) return position;
+        std::fprintf(stderr, "FAIL: %s: %s: after %zu call(s) the pipeline showed %d where %d was due, %s a position\n",
+                     label.c_str(), file, index + 1, shown, expectedId, position ? "with" : "without");
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "FAIL: %s: %s: reaching picture %zu threw: %s\n", label.c_str(), file, index, e.what());
+    }
+    fail("the harness could not take the position a pipeline hands out for a shown picture");
+    return std::nullopt;
+}
+
+std::string joinIds(const std::vector<int>& ids) {
+    std::string text;
+    for (const int id : ids) text += (text.empty() ? "" : " ") + std::to_string(id);
+    return text;
+}
+
+// Pictures a start is graded on: its own and the four after it.
+constexpr size_t kFollowing = 5;
+
+// kCatchUpPictures, read from renderer/video/video_decoder.cpp at build time (tests/support/catch_up_budget.cmake):
+// a start decodes at most this many pictures forward to reach its position.
+constexpr size_t kCatchUpBudget = WALLPAPERX_CATCH_UP_PICTURES;
+
+// runFrom() over kFollowing calls with the traffic logs recording, which outlive the call for the caller to
+// read. A run that threw is reported here and gives nothing.
+std::optional<StartRun> runLoggedStart(Device& device, const std::string& label, const std::string& what,
+                                       const std::string& file, wallpaperx::StreamPosition position,
+                                       const std::function<void()>& arm = {}) {
+    StartRun run;
+    {
+        const TrafficLog log;
+        run = runFrom(device, file, position, kFollowing, arm);
+    }
+    if (run.threw.empty()) return run;
+    std::fprintf(stderr, "FAIL: %s: %s: threw after %zu pictures: %s\n", label.c_str(), what.c_str(), run.shown.size(),
+                 run.threw.c_str());
+    fail("a pipeline opened at a position threw");
+    return std::nullopt;
+}
+
+// Which starting points a mode grades. The transport stream's are an entry of their own on the device,
+// so a validation message there names that case (see S15.145): their seeks land on non-keyframes, and
+// only the start's search for a reset point keeps those from the hardware decoder.
+enum class StartPoints { All, Mp4, TransportStream };
+
+void runStartAtChecks(Device& device, const std::string& label, bool onDevice, StartPoints points) {
+    if (onDevice ? !hardwareDecoderPresent(device, label) : !videoExtensionsHidden(device, label)) return;
+
+    // GOAL: S15.141 -- a pipeline opened at a position another pipeline on the same file handed out for a
+    //       shown picture shows THAT picture first, then its successors in order, and marks its first
+    //       picture as not starting a pass: on an MP4 and a transport stream with B-frames, early, mid and
+    //       late in the file, and when the first seek lands past the picture. S15.142 -- on the hardware
+    //       path, the search further back after that late landing stays on the hardware decoder. S15.159
+    //       (software only) -- after a seek, packets are skipped only up to the first keyframe.
+    // WHY-THIS-SHAPE: pictures are identified by the counter drawn into them, read back from the target,
+    //       against libavcodec's own order; the position comes from a pipeline that showed the picture,
+    //       as the daemon takes it. Several points, because which keyframe a seek lands on and how many
+    //       reordered pictures it drops differ with each. The late landing is the S13.61 shift of the
+    //       first seek by two seconds. "Stays on hardware" is read from where the decoder's pictures
+    //       live, never from path(). A start on the device never enters the Seeked state, so breaks in
+    //       startAt()'s software branch, admit()'s landing or beforeLandingKeyframe() reach start-at-host only.
+    // CONTROL: via control_batch.sh, each alone, reverted, renderer/video/video_decoder.cpp. Re-run
+    //       2026-10-01: startAt()'s `before` made the position itself -> on start-at-device and start-at-host
+    //       "FAIL: ... counter_long.mp4 opened at picture 40: showed 41 42 43 44 45 where 40 41 42 43 44 was
+    //       due". Host only, 2026-10-01: seekToResume()'s `m_resume = Seeked{back};` deleted, which a software
+    //       start now reaches through -> "showed 24 25 26 27 28 where 40 ..."; 2026-09-30:
+    //       S15.159, beforeLandingKeyframe() without its `Landing::NoPacket` clause -> "counter_seg.ts opened
+    //       at picture 40: showed 48 72 96 0 1 where 40 41 42 43 44 was due". S15.142, device, via
+    //       control_batch.sh 2026-10-01: startAtResetPoint() handing a window with no reset point to software
+    //       (the resume state set, `m_path = Path::SoftwareRefused`, and a reopen in software required) ->
+    //       "counter_long.mp4 opened at picture 290, its first seek landing late: 0 device and 55 host
+    //       picture(s)". In
+    //       renderer/video/video_pipeline.cpp, decodeNext()'s `startsPass` made `!m_stage` -> on
+    //       start-at-device "its first picture is marked as starting a pass" at every point.
+    // COVERAGE-ASSERT: the late-landing run must show a second seek aimed further back, or the late landing
+    //       was never exercised -- red with the shift set to 0 (test-side, by hand, 2026-09-30, start-at-device),
+    //       "seeks to 148479" and "a start whose seek landed late was not retried further back"; and the
+    //       number of points graded.
+    struct Point {
+        const char* file;
+        size_t index;
+        int shiftSeconds;  // added to the first seek's target
+    };
+    int graded = 0;
+    int offered = 0;
+    for (const Point& point : {Point{"counter_long.mp4", 40, 0}, Point{"counter_long.mp4", 100, 0},
+                               Point{"counter_long.mp4", 290, 0}, Point{"counter_long.mp4", 290, 2},
+                               Point{"counter_seg.ts", 40, 0}, Point{"counter_seg.ts", 100, 0},
+                               Point{"counter_seg.ts", 60, -1}}) {
+        const bool late = point.shiftSeconds > 0;
+        const bool early = point.shiftSeconds < 0;
+        const bool transport = std::string(point.file).ends_with(".ts");
+        if ((points == StartPoints::Mp4 && transport) || (points == StartPoints::TransportStream && !transport)) continue;
+        ++offered;
+        const std::optional<CounterReference> reference = counterReference(label, point.file);
+        if (!reference) continue;
+        const std::vector<int>& ids = reference->ids;
+        if (point.index + kFollowing > ids.size()) {
+            fail("a starting point is too near the end of its fixture to grade the pictures after it");
+            continue;
+        }
+        const std::optional<wallpaperx::StreamPosition> position =
+            positionAt(device, label, point.file, point.index, ids[point.index]);
+        if (!position) continue;
+        const std::string what =
+            std::string(point.file) + " opened at picture " + std::to_string(point.index) +
+            (late ? ", its first seek landing late" : early ? ", its first seek landing a second early" : "");
+        const int shift = point.shiftSeconds;
+        const std::optional<StartRun> started =
+            runLoggedStart(device, label, what, asset(point.file), *position,
+                           shift != 0 ? std::function<void()>([shift] { g_seekShiftSeconds = shift; })
+                                      : std::function<void()>());
+        if (!started) continue;
+        const StartRun& run = *started;
+        ++graded;
+        const std::vector<int> due(ids.begin() + static_cast<long>(point.index),
+                                   ids.begin() + static_cast<long>(point.index + kFollowing));
+        if (run.shown != due) {
+            std::fprintf(stderr, "FAIL: %s: %s: showed %s where %s was due\n", label.c_str(), what.c_str(),
+                         joinIds(run.shown).c_str(), joinIds(due).c_str());
+            fail("a pipeline opened at a picture shows it first, then its successors");
+        }
+        if (run.startsPass.empty() || run.startsPass.front()) {
+            std::fprintf(stderr, "FAIL: %s: %s: its first picture is marked as starting a pass\n", label.c_str(),
+                         what.c_str());
+            fail("the first picture of a pipeline opened part way in does not start a pass");
+        }
+        // GOAL: S15.164 -- on the device, a closed-GOP start decodes from the nearest reset point before
+        //       its picture, then every packet after it in decode order.
+        // WHY-THIS-SHAPE: read from the packets the decoder was sent, against the file's own packets read
+        //       with libavformat, so a start from an earlier reset point that still shows the right picture
+        //       is seen; the pictures alone cannot tell the two apart.
+        // CONTROL: via control_batch.sh, 2026-09-30, reverted, renderer/video/reset_point.cpp lengthSize()
+        //       returning 0 for avcC -> on start-at-device "counter_long.mp4 opened at picture 40: the first
+        //       packet sent to the decoder was packet 0 (picture 0, an IDR), where the nearest reset point
+        //       before the picture is packet 24 (picture 24, an IDR)", and the same at 100 and 290.
+        if (onDevice) {
+            std::string why;
+            const std::optional<GopLayout> layout = readGopLayout(asset(point.file), why);
+            if (!layout) {
+                std::fprintf(stderr, "FAIL: %s: %s: %s\n", label.c_str(), what.c_str(), why.c_str());
+                fail("the harness could not read the fixture's packet layout, which is not a verdict on the decoder");
+            } else {
+                startedAt(label, what, *layout, layout->nearestReset(layout->pictures[point.index]));
+            }
+        }
+        // GOAL: S15.166 -- a start on a closed-GOP MP4 makes exactly one seek, on the device as in software:
+        //       the container's index lands it on a keyframe at or before the picture, which resets the decoder.
+        // WHY-THIS-SHAPE: a seek count, because a second seek to the same place shows the same pictures. Not
+        //       on the transport stream, whose points 40 and 100 search further back by design.
+        // CONTROL: via control_batch.sh, 2026-09-30, reverted, renderer/video/video_decoder.cpp
+        //       startAtResetPoint() seeking to the reset point in the first window too (`back != 0 &&` deleted)
+        //       -> on start-at-device "counter_long.mp4 opened at picture 40: seeks to 20479, 20479; a closed-GOP
+        //       MP4 start made more than one seek".
+        if (!transport && !late && run.seeks.size() != 1) {
+            std::fprintf(stderr, "FAIL: %s: %s: %s; a closed-GOP MP4 start made more than one seek\n", label.c_str(),
+                         what.c_str(), describeSeeks(run.seeks).c_str());
+            fail("a start on a closed-GOP MP4 makes one seek");
+        }
+        // GOAL: S15.160 -- a seek that lands on a picture that is not a keyframe is judged at the first
+        //       keyframe after it: one at or before the picture asked for proves the landing, with no
+        //       second seek, and the picture itself is shown first. On the device the judge is the start's
+        //       search, which takes the first reset point after the landing.
+        // WHY-THIS-SHAPE: the first seek is moved a second early, landing on packet 31 of counter_seg.ts
+        //       with keyframe 48 next, for picture 60. No natural transport-stream start can do this: the
+        //       seek lands on the last packet decoded at or before the target, so every later keyframe is
+        //       also presented after it -- points 40 and 100 always search further back.
+        // CONTROL: via control_batch.sh, 2026-09-30, reverted, renderer/video/video_decoder.cpp. Host only:
+        //       next()'s skip also discarding the first keyframe it meets -> on start-at-host "seeks to 311999,
+        //       221999, the first landing on a non-keyframe", pictures still 60-64. Device: startAtResetPoint()
+        //       seeking to the reset point in the first window too (`back != 0 &&` deleted) -> on
+        //       start-at-device-ts "seeks to 311999, 311999, the first landing on a non-keyframe".
+        // COVERAGE-ASSERT: the first packet read after the seek must not be a keyframe, or the skip was never
+        //       exercised -- red with counter_long.mp4 substituted (test-side, by hand, 2026-09-30), "seeks to
+        //       30719, the first landing on a keyframe".
+        if (early) {
+            const bool skipped = !run.seeks.empty() && run.seeks[0].landedOnKeyframe == false;
+            if (!skipped || run.seeks.size() != 1) {
+                std::fprintf(stderr, "FAIL: %s: %s: %s, the first landing on %s\n", label.c_str(), what.c_str(),
+                             describeSeeks(run.seeks).c_str(), describeLanding(run.seeks));
+                fail(!skipped ? "the early seek did not land on a non-keyframe, so the skip to a keyframe was not exercised"
+                              : "a seek proven by the keyframe after its non-keyframe landing was retried");
+            }
+        }
+        if (late) {
+            if (run.seeks.size() < 2 || run.seeks[1].target >= run.seeks[0].target) {
+                std::fprintf(stderr, "FAIL: %s: %s: %s\n", label.c_str(), what.c_str(), describeSeeks(run.seeks).c_str());
+                fail("a start whose seek landed late was not retried further back, so the retry was not exercised");
+            }
+            if (onDevice && (run.hostPictures != 0 || run.devicePictures == 0)) {
+                std::fprintf(stderr, "FAIL: %s: %s: %d device and %d host picture(s)\n", label.c_str(), what.c_str(),
+                             run.devicePictures, run.hostPictures);
+                fail("the search further back after a late landing stays on the hardware decoder");
+            }
+        }
+        std::printf("%s: %s: showed %s, %s, %d device and %d host picture(s)\n", label.c_str(), what.c_str(),
+                    joinIds(run.shown).c_str(), describeSeeks(run.seeks).c_str(), run.devicePictures, run.hostPictures);
+    }
+    if (!g_notVerified) {
+        check(offered == (points == StartPoints::All ? 7 : points == StartPoints::Mp4 ? 4 : 3) && graded == offered,
+              "every starting point this check is written for was graded");
+    }
+    if (points == StartPoints::TransportStream) return;
+
+    // GOAL: S15.143 -- a position at the file's first picture starts there, as a pass of its own. When every
+    //       seek of a start fails, the start reads from the file's first packet if its position is within the
+    //       catch-up budget of the first picture -- showing that position first, not marked as a pass -- and
+    //       past the budget shows the first picture as a new pass. On the device and in software alike.
+    // WHY-THIS-SHAPE: the seek is failed from outside, as S13.63 does, because the fixture's container
+    //       seeks; a failure leaves the container where ffmpeg left it, which only a rewind makes known.
+    //       Pictures 100 and 290 lie either side of the budget, asserted against the decoder's own constant.
+    // CONTROL: via control_batch.sh, 2026-10-01, each alone, reverted, renderer/video/video_decoder.cpp.
+    //       startAt()'s `if (before <= streamStart()) return;` deleted -> on start-at-host "counter_long.mp4
+    //       opened at picture 0: showed 0 1 2 3 4 (first marked no)". Software arm: seekToResume()'s `else if
+    //       (starting && !withinCatchUp(...))` arm deleted -> on start-at-host "opened at picture 290, every
+    //       seek failing: showed 290 291 292 293 294 (first marked no) where 0 1 2 3 4 was due". Device arm:
+    //       `back == 0 ||` put back in startAtResetPoint()'s failed-seek branch -> on start-at-device "opened
+    //       at picture 100, every seek failing: showed 0 1 2 3 4 (first marked yes) where 100 101 102 103 104
+    //       was due".
+    // COVERAGE-ASSERT: each failing case recorded a failed seek.
+    {
+        const char* const file = "counter_long.mp4";
+        const std::optional<CounterReference> reference = counterReference(label, file);
+        if (!reference) return;
+        const std::vector<int>& ids = reference->ids;
+        constexpr size_t kWithin = 100;
+        constexpr size_t kPast = 290;
+        if (!(kWithin < kCatchUpBudget && kPast > kCatchUpBudget) || ids.size() < kPast + kFollowing) {
+            fail("the failed-seek starts no longer lie either side of the catch-up budget in counter_long.mp4");
+            return;
+        }
+        const std::vector<int> due(ids.begin(), ids.begin() + kFollowing);
+        const std::optional<wallpaperx::StreamPosition> first = positionAt(device, label, file, 0, ids[0]);
+        if (!first) return;
+        const StartRun atFirst = runFrom(device, asset(file), first, kFollowing);
+        const bool firstOk = atFirst.threw.empty() && atFirst.shown == due && !atFirst.startsPass.empty() &&
+                             atFirst.startsPass.front();
+        if (!firstOk) {
+            std::fprintf(stderr, "FAIL: %s: %s opened at picture 0: showed %s (first marked %s) where %s was due%s\n",
+                         label.c_str(), file, joinIds(atFirst.shown).c_str(),
+                         !atFirst.startsPass.empty() && atFirst.startsPass.front() ? "yes" : "no", joinIds(due).c_str(),
+                         atFirst.threw.empty() ? "" : ("; threw " + atFirst.threw).c_str());
+            fail("a pipeline opened at the first picture starts there, as a pass of its own");
+        }
+        for (const size_t index : {kWithin, kPast}) {
+            const bool within = index < kCatchUpBudget;
+            const std::optional<wallpaperx::StreamPosition> position = positionAt(device, label, file, index, ids[index]);
+            if (!position) continue;
+            const StartRun failed = runFrom(device, asset(file), position, kFollowing, [] { g_seekFailure = SeekFailure::All; });
+            const bool seekFailed = std::any_of(failed.seeks.begin(), failed.seeks.end(),
+                                                [](const SeekCall& seek) { return seek.result < 0; });
+            const size_t shows = within ? index : 0;
+            const std::vector<int> expected(ids.begin() + static_cast<long>(shows),
+                                            ids.begin() + static_cast<long>(shows + kFollowing));
+            const bool passMark = !failed.startsPass.empty() && failed.startsPass.front();
+            if (!failed.threw.empty() || !seekFailed || failed.shown != expected || passMark == within ||
+                failed.startsPass.empty()) {
+                std::fprintf(stderr, "FAIL: %s: %s opened at picture %zu, every seek failing: showed %s (first marked %s) "
+                                     "where %s was due; %s%s\n",
+                             label.c_str(), file, index, joinIds(failed.shown).c_str(), passMark ? "yes" : "no",
+                             joinIds(expected).c_str(), describeSeeks(failed.seeks).c_str(),
+                             failed.threw.empty() ? "" : ("; threw " + failed.threw).c_str());
+                fail(!seekFailed ? "no seek of the start failed, so the failed-seek rule was not exercised"
+                     : within    ? "a start whose seeks fail within the budget reads from the first packet to its position"
+                                 : "a start whose seeks fail past the budget shows the first picture as a new pass");
+            }
+            std::printf("%s: %s opened at picture %zu, every seek failing: showed %s, %s\n", label.c_str(), file, index,
+                        joinIds(failed.shown).c_str(), describeSeeks(failed.seeks).c_str());
+        }
+    }
+
+    // GOAL: S15.144 -- a pipeline opened at a file's LAST picture shows it, then loops to the first
+    //       picture and plays on: the picture it opened at does not start a pass and the loop's does. The
+    //       daemon parks a file whose pass holds one picture -- two successive pass starts -- so a resumed
+    //       last picture marked as a pass start would park a playing video for good.
+    // CONTROL: the decodeNext() `startsPass` break above -> "FAIL: ... counter_short.mp4 opened at its last
+    //       picture: showed 19 0 1 where 19 0 1 was due; pass starts 110", on both entries. Reverted.
+    {
+        const char* const file = "counter_short.mp4";
+        const std::optional<CounterReference> reference = counterReference(label, file);
+        if (!reference || reference->ids.size() < 3) return;
+        const std::vector<int>& ids = reference->ids;
+        const size_t last = ids.size() - 1;
+        const std::optional<wallpaperx::StreamPosition> position = positionAt(device, label, file, last, ids[last]);
+        if (!position) return;
+        const StartRun run = runFrom(device, asset(file), position, 3);
+        const std::vector<int> due{ids[last], ids[0], ids[1]};
+        const std::vector<bool> marks{false, true, false};
+        if (!run.threw.empty() || run.shown != due || run.startsPass != marks) {
+            std::fprintf(stderr, "FAIL: %s: %s opened at its last picture: showed %s where %s was due; pass starts %s%s\n",
+                         label.c_str(), file, joinIds(run.shown).c_str(), joinIds(due).c_str(),
+                         [&] {
+                             std::string text;
+                             for (const bool mark : run.startsPass) text += mark ? "1" : "0";
+                             return text;
+                         }()
+                             .c_str(),
+                         run.threw.empty() ? "" : ("; threw " + run.threw).c_str());
+            fail("a pipeline opened at the last picture loops and plays on, only the loop's picture starting a pass");
+        }
+    }
+}
+
+// GOAL: S15.172 -- a start part way in on the device, whose pictures then lose their timestamps before the
+//       hardware fails, resumes in software at the picture it started at: never at the picture as many in
+//       from the file's start as were returned since the start. S15.179 -- the same past the catch-up
+//       budget with the resume's seek failing: the resume is still of running playback, so it reads from
+//       the first packet to the picture it started at, and no picture after the failure starts a pass.
+// WHY-THIS-SHAPE: started at 150 of counter_long.mp4, the 20 pictures after the first are returned with their
+//       timestamps stripped, leaving the resume a count and no timestamp; the next call meets a hardware
+//       failure. A count measured from the file's first packet shows picture 21 there. At 300, past the
+//       budget, the resume seek fails as well (a seek to packet 1 still succeeds); a resume taken for a start
+//       that has shown nothing gives up there and shows picture 0 as a new pass. 10 stripped at 300, so the
+//       stripped pictures end before the file does.
+// CONTROL: via control_batch.sh, 2026-10-01, each alone, reverted, renderer/video/video_decoder.cpp
+//       seekToResume(). S15.172: the re-run from the start's position (`if (!m_returned.lastTimestamp &&
+//       !byPacket && m_startedAfter)`) made `if (false)` -> "opened at picture 150, ...: after the hardware
+//       failure showed 21 22 23 (pass marks 000) where 150 151 152 was due". S15.179: that re-run also
+//       setting `m_returned.count = 0;` -> "opened at picture 300, ... its resume seek failing: after the
+//       hardware failure showed 0 1 2 (pass marks 000) where 300 301 302 was due".
+// COVERAGE-ASSERT: the injected failure was consumed and software drew the pictures after it, and in the
+//       S15.179 case a seek made after the failure failed.
+void runStartedFailureChecks(Device& device, const std::string& label) {
+    if (!hardwareDecoderPresent(device, label)) return;
+    const char* const file = "counter_long.mp4";
+    constexpr size_t kAfter = 3;
+    const std::optional<CounterReference> reference = counterReference(label, file);
+    if (!reference) return;
+    const std::vector<int>& ids = reference->ids;
+    struct Case {
+        size_t start;
+        size_t stripped;
+        bool failResumeSeek;
+    };
+    for (const Case& c : {Case{150, 20, false}, Case{300, 10, true}}) {
+        if (c.start + 1 + c.stripped + 1 > ids.size() || c.start + kAfter > ids.size() ||
+            (c.failResumeSeek && c.start <= kCatchUpBudget)) {
+            fail("counter_long.mp4 does not fit the start this check makes");
+            continue;
+        }
+        const std::optional<wallpaperx::StreamPosition> position = positionAt(device, label, file, c.start, ids[c.start]);
+        if (!position) continue;
+        const size_t failing = 1 + c.stripped;  // the call that meets the hardware failure
+        bool consumed = false;
+        bool resumeSeekFailed = false;
+        int hostBefore = 0;
+        size_t seeksBefore = 0;
+        // g_stripTimestamps and the seek failure apply inside a failing call only, which runFrom() opens.
+        const StartRun run = runFrom(device, asset(file), position, failing + kAfter, {}, [&](size_t call) {
+            if (call == 1) g_stripTimestamps = true;
+            if (call == failing) {
+                g_stripTimestamps = false;
+                hostBefore = g_hostPictures;
+                seeksBefore = g_failingSeeks.size();
+                g_receiveExternalRemaining = 1;
+                if (c.failResumeSeek) g_seekFailure = SeekFailure::AwayFromStart;
+            }
+            if (call == failing + 1) {
+                consumed = g_receiveExternalRemaining == 0;
+                resumeSeekFailed = std::any_of(g_failingSeeks.begin() + static_cast<long>(seeksBefore), g_failingSeeks.end(),
+                                               [](const SeekCall& seek) { return seek.result < 0; });
+                g_seekFailure = SeekFailure::None;
+            }
+        });
+        const int hostAfter = run.hostPictures - hostBefore;
+        const std::vector<int> due(ids.begin() + static_cast<long>(c.start), ids.begin() + static_cast<long>(c.start + kAfter));
+        const size_t from = std::min(run.shown.size(), failing);
+        const std::vector<int> after(run.shown.begin() + static_cast<long>(from), run.shown.end());
+        std::string marks;
+        for (size_t i = from; i < run.startsPass.size(); ++i) marks += run.startsPass[i] ? "1" : "0";
+        const std::string what = std::string(file) + " opened at picture " + std::to_string(c.start) + ", " +
+                                 std::to_string(c.stripped) + " pictures without timestamps, then a hardware failure" +
+                                 (c.failResumeSeek ? ", its resume seek failing" : "");
+        if (!run.threw.empty() || !consumed || hostAfter == 0 || (c.failResumeSeek && !resumeSeekFailed)) {
+            std::fprintf(stderr, "FAIL: %s: %s: %s; failure %s, %d host picture(s) after it; %s\n", label.c_str(),
+                         what.c_str(), run.threw.empty() ? "ran" : ("threw " + run.threw).c_str(),
+                         consumed ? "consumed" : "never reached", hostAfter,
+                         resumeSeekFailed ? "a seek after it failed" : "no seek after it failed");
+            fail("the hardware failure after a start's untimestamped pictures was not exercised");
+        } else if (after != due || marks.find('1') != std::string::npos) {
+            std::fprintf(stderr, "FAIL: %s: %s: after the hardware failure showed %s (pass marks %s) where %s was due\n",
+                         label.c_str(), what.c_str(), joinIds(after).c_str(), marks.c_str(), joinIds(due).c_str());
+            fail("a start that lost its timestamps resumes after a hardware failure at the picture it started at, "
+                 "still mid-stream");
+        }
+        std::printf("%s: %s: showed %s\n", label.c_str(), what.c_str(), joinIds(run.shown).c_str());
+    }
+}
+
+// GOAL: S15.173 -- a position past the end of the file -- the old position of a file since replaced in place
+//       by a shorter one -- starts at the file's first picture, as a new pass, on the device and in software.
+// WHY-THIS-SHAPE: picture 300's position in counter_long.mp4 applied to its first 100 pictures, encoded alike,
+//       so every packet lies before the position and the start drops all of them.
+// CONTROL: via control_batch.sh, re-run 2026-10-01, reverted: in renderer/video/video_decoder.cpp next(), the
+//       `if (m_startedAfter && m_returned.count == 0) { restart(); continue; }` clause deleted -> on
+//       start-at-device and start-at-host "counter_long_cut.mp4 opened at picture 300 of counter_long.mp4:
+//       showed  (first marked no) where 0 1 2 3 4 was due".
+// COVERAGE-ASSERT: the cut is shorter than the position, both counted from the independent decodes.
+void runPastEndChecks(Device& device, const std::string& label, bool onDevice) {
+    if (onDevice ? !hardwareDecoderPresent(device, label) : !videoExtensionsHidden(device, label)) return;
+    constexpr size_t kAt = 300;
+    const std::optional<CounterReference> full = counterReference(label, "counter_long.mp4");
+    const std::optional<CounterReference> cut = counterReference(label, "counter_long_cut.mp4");
+    if (!full || !cut) return;
+    if (full->ids.size() <= kAt || cut->ids.size() >= kAt || cut->ids.size() < kFollowing) {
+        std::fprintf(stderr, "FAIL: %s: counter_long.mp4 has %zu pictures and its cut %zu\n", label.c_str(),
+                     full->ids.size(), cut->ids.size());
+        fail("the cut fixture is not shorter than the position this check applies to it");
+        return;
+    }
+    const std::optional<wallpaperx::StreamPosition> position = positionAt(device, label, "counter_long.mp4", kAt, full->ids[kAt]);
+    if (!position) return;
+    const std::string what = "counter_long_cut.mp4 opened at picture " + std::to_string(kAt) + " of counter_long.mp4";
+    const std::optional<StartRun> run = runLoggedStart(device, label, what, asset("counter_long_cut.mp4"), *position);
+    if (!run) return;
+    const std::vector<int> due(cut->ids.begin(), cut->ids.begin() + static_cast<long>(kFollowing));
+    const bool passMark = !run->startsPass.empty() && run->startsPass.front();
+    if (run->shown != due || !passMark) {
+        std::fprintf(stderr, "FAIL: %s: %s: showed %s (first marked %s) where %s was due\n", label.c_str(), what.c_str(),
+                     joinIds(run->shown).c_str(), passMark ? "yes" : "no", joinIds(due).c_str());
+        fail("a position past the end of the file starts at its first picture, as a new pass");
+    }
+    std::printf("%s: %s: showed %s, %s\n", label.c_str(), what.c_str(), joinIds(run->shown).c_str(),
+                describeSeeks(run->seeks).c_str());
+}
+
+// GOAL: S15.174 -- a software start whose seeks land past its picture gives up once a retry would aim further
+//       back than the catch-up budget, and shows the file's first picture as a new pass having decoded a few
+//       pictures, not every one up to the position; a retry seek that fails with the position past the budget
+//       does the same. Within the budget the start shows its own picture.
+// WHY-THIS-SHAPE: MPEG-2, which no device here decodes, in a transport stream with keyframes at 0, 600 and
+//       1200: its seeks land on the next keyframe after their target, so a start at 1150 lands on 1200 until
+//       a retry aims below 600 -- 32 s back, past the budget -- and would then decode 600 to 1150. At 550 a
+//       landing at or before the picture is never found by seeking, so its case fails the retry seek instead,
+//       which reaches the other arm. Pictures decoded are counted at the decoder over the run.
+// CONTROL: via control_batch.sh, re-run 2026-10-01, each alone, reverted, renderer/video/video_decoder.cpp
+//       seekToResume(): `if (starting && back != 0 && !withinCatchUp(back))`'s arm deleted -> "opened at
+//       picture 1150: showed 600 601 602 603 604 (first marked no) where 0 1 2 3 4 was due; seeks to 3578999,
+//       ..., 698999, 11 picture(s) decoded" -- the retries go on until one lands at or before the picture,
+//       on keyframe 600, which recordLanding() then shows as past the budget; the `else if (starting &&
+//       !withinCatchUp(...))` arm deleted -> "opened at picture 550, its retry seek failing: showed 550 551
+//       552 553 554 (first marked no) ... 556 picture(s) decoded". The first arm alone deleted leaves a start
+//       at 550 green, measured again: its retry target falls before the stream's start and the second arm
+//       takes it.
+// COVERAGE-ASSERT: the first seek of each past-budget start landed past the picture (a retry followed it),
+//       and the failing case's second seek failed.
+void runSoftwareBudgetChecks(Device& device, const std::string& label) {
+    if (!videoExtensionsHidden(device, label)) return;
+    const char* const file = "counter_onekey_m2.ts";
+    const std::optional<CounterReference> reference = counterReference(label, file);
+    if (!reference) return;
+    const std::vector<int>& ids = reference->ids;
+    struct Case {
+        size_t index;
+        bool failRetry;
+        bool exact;
+    };
+    int graded = 0;
+    for (const Case& c : {Case{200, false, true}, Case{1150, false, false}, Case{550, true, false}}) {
+        if (ids.size() < c.index + kFollowing) {
+            fail("the MPEG-2 fixture is too short for the starts this check makes");
+            return;
+        }
+        const std::optional<wallpaperx::StreamPosition> position = positionAt(device, label, file, c.index, ids[c.index]);
+        if (!position) continue;
+        const std::string what = std::string(file) + " opened at picture " + std::to_string(c.index) +
+                                 (c.failRetry ? ", its retry seek failing" : "");
+        const std::optional<StartRun> run =
+            runLoggedStart(device, label, what, asset(file), *position,
+                           c.failRetry ? std::function<void()>([] { g_seekFailure = SeekFailure::Second; })
+                                       : std::function<void()>());
+        if (!run) continue;
+        ++graded;
+        const size_t first = c.exact ? c.index : 0;
+        const std::vector<int> due(ids.begin() + static_cast<long>(first),
+                                   ids.begin() + static_cast<long>(first + kFollowing));
+        const bool passMark = !run->startsPass.empty() && run->startsPass.front();
+        const int decoded = run->hostPictures + run->devicePictures;
+        std::printf("%s: %s: showed %s, %s, %d picture(s) decoded\n", label.c_str(), what.c_str(),
+                    joinIds(run->shown).c_str(), describeSeeks(run->seeks).c_str(), decoded);
+        if (run->shown != due || passMark == c.exact || (!c.exact && decoded >= static_cast<int>(kCatchUpBudget))) {
+            std::fprintf(stderr, "FAIL: %s: %s: showed %s (first marked %s) where %s was due; %s, %d picture(s) decoded\n",
+                         label.c_str(), what.c_str(), joinIds(run->shown).c_str(), passMark ? "yes" : "no",
+                         joinIds(due).c_str(), describeSeeks(run->seeks).c_str(), decoded);
+            fail(c.exact ? "a software start within the budget shows its own picture"
+                         : "a software start whose retries pass the budget shows the first picture, having decoded a few");
+        }
+        const bool exercised = c.exact || (c.failRetry ? run->seeks.size() >= 2 && run->seeks[1].result < 0
+                                                       : run->seeks.size() >= 2);
+        if (!exercised) {
+            std::fprintf(stderr, "FAIL: %s: %s: %s\n", label.c_str(), what.c_str(), describeSeeks(run->seeks).c_str());
+            fail("the start's first seek did not land past its picture, so no retry was at stake");
+        }
+    }
+    if (!g_notVerified) check(graded == 3, "every software start past the budget this check is written for was graded");
+}
+
+// GOAL: S15.181 -- a software start whose first seek lands on a keyframe at or before its picture but past
+//       the catch-up budget from it shows that keyframe's picture first, not marked as a pass, having decoded
+//       a few pictures rather than every one up to the position; a keyframe at the file's start makes it the
+//       first picture as a new pass instead; within the budget the start shows its own picture.
+// WHY-THIS-SHAPE: MPEG-2 (decoded in software on every device) in Matroska, whose index lands each seek on
+//       the keyframe at or before its target, with keyframes at 0, 600, 1200 and 1800: 1190 and 1790 land 590
+//       past keyframes 600 and 1200, 590 past keyframe 0, and 650 lands 50 past keyframe 600. Pictures decoded
+//       are counted at the decoder over the run.
+// CONTROL: via control_batch.sh, 2026-10-01, each alone, reverted, renderer/video/video_decoder.cpp
+//       recordLanding(): its new arm's `!withinCatchUp(...)` made `false` -> "counter_sparse_m2.mkv opened at
+//       picture 1190: showed 1190 1191 1192 1193 1194 (first marked no) where 600 601 602 603 604 was due; ...
+//       595 picture(s) decoded", and 1790 and 590 alike; that arm's `at <= streamStart()` made `false` -> "opened at picture 590: showed
+//       0 1 2 3 4 (first marked no) where 0 1 2 3 4 was due".
+// COVERAGE-ASSERT: the keyframes are exactly pictures 0, 600, 1200 and 1800, read from the packets, each
+//       start lies on the side of the budget its case needs, and each made one seek.
+void runSoftwareLandingChecks(Device& device, const std::string& label) {
+    if (!videoExtensionsHidden(device, label)) return;
+    const char* const file = "counter_sparse_m2.mkv";
+    const std::optional<CounterReference> reference = counterReference(label, file);
+    if (!reference) return;
+    const std::vector<int>& ids = reference->ids;
+    std::string why;
+    const std::optional<GopLayout> layout = readGopLayout(asset(file), why, /*keyFlagsOnly=*/true);
+    if (!layout) {
+        std::fprintf(stderr, "FAIL: %s: %s: %s\n", label.c_str(), file, why.c_str());
+        fail("the harness could not read the fixture's packet layout, which is not a verdict on the decoder");
+        return;
+    }
+    std::vector<size_t> keys;
+    for (const GopLayout::Packet& packet : layout->packets) {
+        if (!packet.key) continue;
+        if (const std::optional<size_t> index = layout->pictureAt(packet.timestamp)) keys.push_back(*index);
+    }
+    const bool shape = keys == std::vector<size_t>{0, 600, 1200, 1800} && ids.size() == layout->pictures.size() &&
+                       ids.size() >= 1790 + kFollowing && 590 > kCatchUpBudget && 650 - 600 <= kCatchUpBudget;
+    if (!shape) {
+        std::string list;
+        for (const size_t k : keys) list += (list.empty() ? "" : ", ") + std::to_string(k);
+        std::fprintf(stderr, "FAIL: %s: %s: %zu pictures decoded, %zu packets; keyframes at pictures %s; budget %zu\n",
+                     label.c_str(), file, ids.size(), layout->pictures.size(), list.c_str(), kCatchUpBudget);
+        fail("the sparse-keyframe MPEG-2 fixture lost the structure the software landing cases need");
+        return;
+    }
+    struct Case {
+        size_t index;
+        size_t shows;
+        bool passMark;
+    };
+    int graded = 0;
+    for (const Case& c : {Case{650, 650, false}, Case{1190, 600, false}, Case{1790, 1200, false}, Case{590, 0, true}}) {
+        const std::optional<wallpaperx::StreamPosition> position = positionAt(device, label, file, c.index, ids[c.index]);
+        if (!position) continue;
+        const std::string what = std::string(file) + " opened at picture " + std::to_string(c.index);
+        const std::optional<StartRun> run = runLoggedStart(device, label, what, asset(file), *position);
+        if (!run) continue;
+        ++graded;
+        const std::vector<int> due(ids.begin() + static_cast<long>(c.shows),
+                                   ids.begin() + static_cast<long>(c.shows + kFollowing));
+        const bool passMark = !run->startsPass.empty() && run->startsPass.front();
+        const int decoded = run->hostPictures + run->devicePictures;
+        const bool exact = c.shows == c.index;
+        std::printf("%s: %s: showed %s, %s, %d picture(s) decoded\n", label.c_str(), what.c_str(),
+                    joinIds(run->shown).c_str(), describeSeeks(run->seeks).c_str(), decoded);
+        if (run->shown != due || run->startsPass.empty() || passMark != c.passMark ||
+            (!exact && decoded >= static_cast<int>(kCatchUpBudget))) {
+            std::fprintf(stderr, "FAIL: %s: %s: showed %s (first marked %s) where %s was due; %s, %d picture(s) decoded\n",
+                         label.c_str(), what.c_str(), joinIds(run->shown).c_str(), passMark ? "yes" : "no",
+                         joinIds(due).c_str(), describeSeeks(run->seeks).c_str(), decoded);
+            fail(exact        ? "a software start within the budget of the keyframe it lands on shows its own picture"
+                 : c.passMark ? "a software start landing on the file's first keyframe past the budget shows the first "
+                                "picture as a new pass"
+                              : "a software start landing past the budget from a keyframe part way in shows that keyframe "
+                                "first, having decoded a few pictures");
+        }
+        if (run->seeks.size() != 1) {
+            std::fprintf(stderr, "FAIL: %s: %s: %s\n", label.c_str(), what.c_str(), describeSeeks(run->seeks).c_str());
+            fail("a software start in Matroska made other than one seek, so the landing was not what this case grades");
+        }
+    }
+    if (!g_notVerified) check(graded == 4, "every software landing start this check is written for was graded");
+}
+
+// ------------------------------------------------------------------------- //
+// Opening an open-GOP stream part way in
+// ------------------------------------------------------------------------- //
+
+// The luma samples of the picture timestamped `timestamp`, from a software decode fed the file's video
+// packets from decode-order index `from` on and told to output pictures whose references are missing;
+// nothing if that picture never came out.
+std::optional<std::vector<uint8_t>> softwareLuma(const std::string& file, size_t from, int64_t timestamp,
+                                                 std::string& why) {
+    AVFormatContext* format = nullptr;
+    AVCodecContext* codec = nullptr;
+    AVPacket* packet = av_packet_alloc();
+    AVFrame* frame = av_frame_alloc();
+    struct Free {
+        AVFormatContext*& format;
+        AVCodecContext*& codec;
+        AVPacket*& packet;
+        AVFrame*& frame;
+        ~Free() {
+            av_frame_free(&frame);
+            av_packet_free(&packet);
+            avcodec_free_context(&codec);
+            avformat_close_input(&format);
+        }
+    } guard{format, codec, packet, frame};
+    if (packet == nullptr || frame == nullptr || avformat_open_input(&format, file.c_str(), nullptr, nullptr) < 0 ||
+        avformat_find_stream_info(format, nullptr) < 0) {
+        why = "cannot open " + file;
+        return std::nullopt;
+    }
+    const int stream = av_find_best_stream(format, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+    const AVCodec* decoder = stream >= 0 ? avcodec_find_decoder(format->streams[stream]->codecpar->codec_id) : nullptr;
+    codec = decoder != nullptr ? avcodec_alloc_context3(decoder) : nullptr;
+    if (codec == nullptr || avcodec_parameters_to_context(codec, format->streams[stream]->codecpar) < 0) {
+        why = "cannot make a decoder for " + file;
+        return std::nullopt;
+    }
+    codec->flags |= AV_CODEC_FLAG_OUTPUT_CORRUPT;
+    codec->flags2 |= AV_CODEC_FLAG2_SHOW_ALL;
+    if (avcodec_open2(codec, decoder, nullptr) < 0) {
+        why = "cannot open a decoder for " + file;
+        return std::nullopt;
+    }
+    std::optional<std::vector<uint8_t>> luma;
+    auto take = [&] {
+        while (avcodec_receive_frame(codec, frame) == 0) {
+            if (frame->best_effort_timestamp == timestamp && frame->format == AV_PIX_FMT_YUV420P) {
+                std::vector<uint8_t> samples;
+                for (int y = 0; y < frame->height; ++y) {
+                    const uint8_t* row = frame->data[0] + static_cast<ptrdiff_t>(y) * frame->linesize[0];
+                    samples.insert(samples.end(), row, row + frame->width);
+                }
+                luma = std::move(samples);
+            }
+            av_frame_unref(frame);
+        }
+    };
+    size_t index = 0;
+    while (av_read_frame(format, packet) >= 0) {
+        if (packet->stream_index == stream && index++ >= from) {
+            avcodec_send_packet(codec, packet);
+            take();
+        }
+        av_packet_unref(packet);
+    }
+    avcodec_send_packet(codec, nullptr);
+    take();
+    return luma;
+}
+
+// A seek after which decoding started at an open keyframe: the first packet sent after it is one, and
+// every one of its leading pictures is sent after it, before any later seek. With `afterSkip`, only a
+// seek that landed on a non-keyframe counts, so the decoder's skip is what stopped there. The seek's
+// index and the keyframe's packet index.
+std::optional<std::pair<size_t, size_t>> leadingPicturesSent(const GopLayout& layout, const std::vector<SeekCall>& seeks,
+                                                             bool afterSkip) {
+    for (size_t s = 0; s < seeks.size(); ++s) {
+        if (afterSkip && seeks[s].landedOnKeyframe != false) continue;
+        std::vector<int64_t> sent;
+        for (const TrafficEntry& entry : g_sentPackets) {
+            if (entry.afterSeeks == s + 1) sent.push_back(entry.timestamp);
+        }
+        if (sent.empty()) continue;
+        for (size_t k = 0; k < layout.packets.size(); ++k) {
+            if (layout.packets[k].timestamp != sent.front() || !layout.openKeyframe(k)) continue;
+            const std::vector<size_t> leading = layout.leading(k);
+            const bool all = !leading.empty() && std::all_of(leading.begin(), leading.end(), [&](size_t l) {
+                return std::find(sent.begin(), sent.end(), layout.packets[l].timestamp) != sent.end();
+            });
+            if (all) return std::pair<size_t, size_t>{s, k};
+        }
+    }
+    return std::nullopt;
+}
+
+void runOpenGopStartChecks(Device& device, const std::string& label, bool onDevice, const char* file) {
+    if (onDevice ? !hardwareDecoderPresent(device, label) : !videoExtensionsHidden(device, label)) return;
+    const std::optional<CounterReference> reference = counterReference(label, file);
+    if (!reference) return;
+    std::string why;
+    const std::optional<GopLayout> layout = readGopLayout(asset(file), why);
+    if (!layout || layout->pictures.size() != reference->ids.size()) {
+        std::fprintf(stderr, "FAIL: %s: %s: %s\n", label.c_str(), file,
+                     layout ? "its packets and its decoded pictures differ in number" : why.c_str());
+        fail("the harness could not read the fixture's packet layout, which is not a verdict on the decoder");
+        return;
+    }
+    const bool hevc = layout->codec == AV_CODEC_ID_HEVC;
+    const VkVideoCodecOperationFlagsKHR op =
+        hevc ? VK_VIDEO_CODEC_OPERATION_DECODE_H265_BIT_KHR : VK_VIDEO_CODEC_OPERATION_DECODE_H264_BIT_KHR;
+    if (onDevice && (device.info().videoDecodeOps & op) == 0) {
+        std::printf("%s: %s cannot decode %s -- not answerable\n", label.c_str(), device.info().gpuName.c_str(),
+                    hevc ? "HEVC" : "H.264");
+        g_notVerified = true;
+        return;
+    }
+    const std::vector<int>& ids = reference->ids;
+    constexpr size_t kLeadingTarget = 94;
+
+    // GOAL: S15.161 -- the fixture has the structure this check exists for: a keyframe-flagged packet that
+    //       does not reset the decoder (H.264 non-IDR I, HEVC CRA), followed in decode order by pictures
+    //       shown before it that reference pictures from before it; pictures 93 and 94 are two of them.
+    // WHY-THIS-SHAPE: read from the packets and a decode, never trusted from the encoder options: libx264
+    //       and libx265 decide the layout, and a fixture that lost it would leave every check below green
+    //       for want of the case. For H.264 "references across" is shown by decoding from the keyframe on:
+    //       picture 94 must come out different from the full decode. HEVC's decoder never outputs such a
+    //       picture, so there the RASL NAL type -- the one the standard lets reference across -- is the proof.
+    // CONTROL: test-side, by hand, 2026-09-30, on start-at-host-open-gop: both recipes in
+    //       renderer/CMakeLists.txt rebuilt with open-gop=0 -> "pictures 93 and 94 are not leading pictures
+    //       of a non-IDR of one keyframe", and "... RASL pictures of a CRA ..." for HEVC; the comparison made
+    //       on picture 97, which follows the keyframe -> "picture 94 decoded from the keyframe on matches the
+    //       full decode, so it references nothing before the keyframe" (the message names the constant).
+    std::optional<size_t> key;
+    for (size_t k = 0; k < layout->packets.size() && !key; ++k) {
+        if (!layout->openKeyframe(k)) continue;
+        const std::vector<size_t> leading = layout->leading(k);
+        auto has = [&](size_t picture) {
+            return std::any_of(leading.begin(), leading.end(), [&](size_t l) {
+                return layout->packets[l].timestamp == layout->pictures[picture];
+            });
+        };
+        const bool rasl = std::all_of(leading.begin(), leading.end(), [&](size_t l) {
+            return layout->packets[l].nal == 8 || layout->packets[l].nal == 9;
+        });
+        if (has(kLeadingTarget - 1) && has(kLeadingTarget) && (!hevc || rasl)) key = k;
+    }
+    if (!key) {
+        std::fprintf(stderr, "FAIL: %s: %s: pictures %zu and %zu are not leading %s of one keyframe\n", label.c_str(),
+                     file, kLeadingTarget - 1, kLeadingTarget,
+                     hevc ? "RASL pictures of a CRA" : "pictures of a non-IDR");
+        fail("the open-GOP fixture lost its structure, so no leading picture is ever at stake");
+        return;
+    }
+    const std::optional<size_t> keyPicture = layout->pictureAt(layout->packets[*key].timestamp);
+    std::string across = hevc ? "its leading pictures are RASL" : "";
+    if (!hevc) {
+        const int64_t timestamp = layout->pictures[kLeadingTarget];
+        const std::optional<std::vector<uint8_t>> full = softwareLuma(asset(file), 0, timestamp, why);
+        const std::optional<std::vector<uint8_t>> cut = softwareLuma(asset(file), *key, timestamp, why);
+        size_t differing = 0;
+        if (full && cut && full->size() == cut->size()) {
+            for (size_t i = 0; i < full->size(); ++i) differing += (*full)[i] != (*cut)[i] ? 1 : 0;
+        }
+        if (!full || !cut || full->size() != cut->size() || differing == 0) {
+            std::fprintf(stderr, "FAIL: %s: %s: picture %zu decoded from the keyframe on %s\n", label.c_str(), file,
+                         kLeadingTarget,
+                         !full || !cut ? ("did not come out" + (why.empty() ? "" : ": " + why)).c_str()
+                                       : "matches the full decode, so it references nothing before the keyframe");
+            fail("the open-GOP fixture's leading pictures do not reference across the keyframe");
+            return;
+        }
+        across = "picture " + std::to_string(kLeadingTarget) + " decoded from the keyframe on differs in " +
+                 std::to_string(differing) + " of " + std::to_string(full->size()) + " luma samples";
+    }
+    std::printf("%s: %s: keyframe at picture %zu is %s, its leading pictures %zu and %zu shown before it; %s\n",
+                label.c_str(), file, keyPicture.value_or(0), hevc ? "a CRA" : "a non-IDR I picture", kLeadingTarget - 1,
+                kLeadingTarget, across.c_str());
+
+    struct Point {
+        size_t index;
+        int shiftSeconds;
+        const char* what;
+    };
+    int graded = 0;
+    const Point points[] = {
+        {kLeadingTarget, -1, "its first seek moved a second early"}, {110, 0, "its first seek unmoved"}};
+    for (const Point& point : points) {
+        if (point.index + kFollowing > ids.size()) {
+            fail("a starting point is too near the end of its fixture to grade the pictures after it");
+            continue;
+        }
+        const std::optional<wallpaperx::StreamPosition> position = positionAt(device, label, file, point.index, ids[point.index]);
+        if (!position) continue;
+        const std::string what = std::string(file) + " opened at picture " + std::to_string(point.index) + ", " + point.what;
+        const int shift = point.shiftSeconds;
+        const std::optional<StartRun> started =
+            runLoggedStart(device, label, what, asset(file), *position,
+                           shift != 0 ? std::function<void()>([shift] { g_seekShiftSeconds = shift; })
+                                      : std::function<void()>());
+        if (!started) continue;
+        const StartRun& run = *started;
+        ++graded;
+        // GOAL: S15.162 -- opened at a picture of an open-GOP stream, the pipeline shows that picture first,
+        //       then its successors: in software, when decoding after the seek starts at a keyframe whose
+        //       leading pictures reference pictures that were never decoded; on the device, when it starts
+        //       at the reset point further back.
+        // WHY-THIS-SHAPE: picture 94 is the second leading picture of keyframe 96, so if ffmpeg output the
+        //       leading pictures, 93 would settle a software landing and 94 would be shown decoded without its
+        //       reference; at 93 itself the landing would read as late and be retried. ffmpeg 9.0.2 outputs
+        //       none of them, so the retry from keyframe 48 shows 94 -- the grade holds either way, read from
+        //       the pixels.
+        // CONTROL: via control_batch.sh, 2026-09-30, reverted, renderer/video/video_decoder.cpp. startAt()'s
+        //       `before` made the position itself -> on every device and host entry "showed 95 96 97 98 99
+        //       where 94 ..." and "showed 111 ... where 110 ...". Host only: admit() taking a first picture
+        //       past the resume point as landed -> both transport streams on start-at-host-open-gop, "opened
+        //       at picture 94 ...: showed 97 98 99 100 101 where 94 95 96 97 98 was due". The device-pictures
+        //       check, 2026-10-01: S15.142's break (a window with no reset point handed to software) -> on
+        //       start-at-device-open-gop "0 device and 52 host picture(s)" at 94 and "0 device and 19" at 110.
+        const std::vector<int> due(ids.begin() + static_cast<long>(point.index),
+                                   ids.begin() + static_cast<long>(point.index + kFollowing));
+        if (run.shown != due) {
+            std::fprintf(stderr, "FAIL: %s: %s: showed %s where %s was due\n", label.c_str(), what.c_str(),
+                         joinIds(run.shown).c_str(), joinIds(due).c_str());
+            fail("a pipeline opened at a picture of an open-GOP stream shows it first, then its successors");
+        }
+        if (onDevice && (run.hostPictures != 0 || run.devicePictures == 0)) {
+            std::fprintf(stderr, "FAIL: %s: %s: %d device and %d host picture(s)\n", label.c_str(), what.c_str(),
+                         run.devicePictures, run.hostPictures);
+            fail("the open-GOP start was not decoded on the hardware decoder, so its validation grade says nothing");
+        }
+        if (onDevice) {
+            // GOAL: S15.161 (device) -- an open-GOP start on the device decodes from the nearest reset
+            //       point before its picture, here the IDR at picture 0, never from the open keyframe a seek
+            //       lands on, and then every packet after it in decode order.
+            // WHY-THIS-SHAPE: read from the packets the decoder was sent; the pictures are right either way,
+            //       and a start at the open keyframe shows itself only as validation messages, which this
+            //       entry's grade counts but cannot attribute.
+            // CONTROL: via control_batch.sh, 2026-09-30, reverted, renderer/video/video_decoder.cpp
+            //       scanWindow() taking the container's keyframe flag for resetsDecoder() -> on all three
+            //       device entries "the first packet sent to the decoder was packet 45 (picture 48, a non-IDR
+            //       I picture), which does not reset the decoder" (a CRA for HEVC), and the validation grade
+            //       red again: 52, 8 and 52 warnings. renderer/video/reset_point.cpp hevcUnit() also accepting
+            //       a CRA -> the same line, and 8 warnings, on start-at-device-open-gop-hevc.
+            // COVERAGE-ASSERT: the keyframe a seek to the picture lands on must be an open keyframe, so a
+            //       start from it would have been the open-GOP case; red with the point moved to picture 30
+            //       (test-side, by hand, 2026-09-30): "the keyframe shown last before the picture is packet 0
+            //       (picture 0, an IDR), not an open keyframe".
+            const int64_t at = layout->pictures[point.index];
+            const size_t from = layout->nearestReset(at);
+            startedAt(label, what, *layout, from);
+            const std::optional<size_t> landing = layout->lastKeyBefore(at);
+            if (!layout->landsOnOpenKeyframe(at)) {
+                std::fprintf(stderr, "FAIL: %s: %s: the keyframe shown last before the picture is %s, not an open "
+                                     "keyframe\n",
+                             label.c_str(), what.c_str(), landing ? layout->describe(*landing).c_str() : "none");
+                fail("no open keyframe lies between the reset point and the picture, so the open-GOP case was not at stake");
+            }
+            std::printf("%s: %s: showed %s, %s; decoded from %s, past %s; %d device and %d host picture(s)\n",
+                        label.c_str(), what.c_str(), joinIds(run.shown).c_str(), describeSeeks(run.seeks).c_str(),
+                        layout->describe(from).c_str(), landing ? layout->describe(*landing).c_str() : "no keyframe",
+                        run.devicePictures, run.hostPictures);
+            continue;
+        }
+        // COVERAGE-ASSERT: in software, S15.161's case must have been reached: the first packet sent after a
+        //       seek was an open keyframe, followed by every one of its leading pictures; on a transport stream
+        //       that seek must have landed on a non-keyframe, so the decoder's skip is what stopped there.
+        //       CONTROL: test-side, by hand, 2026-09-30: avcodec_send_packet's interposer dropping every
+        //       packet shown before the last keyframe sent -> on start-at-host-open-gop, all four files,
+        //       both points: "no seek was followed by an open keyframe and all its leading pictures".
+        const bool transport = std::string(file).ends_with(".ts");
+        const std::optional<std::pair<size_t, size_t>> reached = leadingPicturesSent(*layout, run.seeks, transport);
+        std::string returned;
+        size_t listed = 0;
+        for (const TrafficEntry& picture : g_returnedPictures) {
+            if (!reached || picture.afterSeeks != reached->first + 1 || listed++ >= 6) continue;
+            const std::optional<size_t> index = layout->pictureAt(picture.timestamp);
+            returned += (returned.empty() ? "" : " ") + (index ? std::to_string(*index) : std::string("?"));
+        }
+        if (!reached) {
+            std::fprintf(stderr, "FAIL: %s: %s: %s, the first landing on %s; no seek was followed by an open "
+                                 "keyframe and all its leading pictures\n",
+                         label.c_str(), what.c_str(), describeSeeks(run.seeks).c_str(), describeLanding(run.seeks));
+            fail("no leading picture of an open keyframe reached the decoder, so the case was not exercised");
+        }
+        std::printf("%s: %s: showed %s, %s; after seek %zu the decoder was sent the keyframe at picture %zu and "
+                    "its leading pictures, and returned pictures %s; %d device and %d host picture(s)\n",
+                    label.c_str(), what.c_str(), joinIds(run.shown).c_str(), describeSeeks(run.seeks).c_str(),
+                    reached ? reached->first + 1 : 0,
+                    reached ? layout->pictureAt(layout->packets[reached->second].timestamp).value_or(0) : 0,
+                    returned.c_str(), run.devicePictures, run.hostPictures);
+    }
+    if (!g_notVerified) check(graded == 2, "both open-GOP starting points were graded");
+}
+
+// ------------------------------------------------------------------------- //
+// A start on the device whose reset point lies far back
+// ------------------------------------------------------------------------- //
+
+// Packets the demuxer read before the first was sent to the decoder, in the last logged run: the search
+// for a reset point, and nothing of the decode after it.
+size_t searchReads() {
+    return static_cast<size_t>(std::count_if(g_readPackets.begin(), g_readPackets.end(),
+                                             [](const TrafficEntry& read) { return read.sentBefore == 0; }));
+}
+
+// What a start at `index` must show first: its own picture, the reset point's picture, or the file's first
+// picture as a new pass.
+enum class Shows { Picture, ResetPoint, FileStart };
+struct ResetStart {
+    size_t index;
+    Shows shows;
+};
+
+std::optional<GopLayout> deviceLayout(Device& device, const std::string& label, const char* file,
+                                      VkVideoCodecOperationFlagsKHR op, const char* codecName) {
+    if (!hardwareDecoderPresent(device, label) || !haveAsset(file, label)) return std::nullopt;
+    if ((device.info().videoDecodeOps & op) == 0) {
+        std::printf("%s: %s cannot decode %s -- not answerable\n", label.c_str(), device.info().gpuName.c_str(), codecName);
+        g_notVerified = true;
+        return std::nullopt;
+    }
+    std::string why;
+    std::optional<GopLayout> layout = readGopLayout(asset(file), why);
+    if (!layout) {
+        std::fprintf(stderr, "FAIL: %s: %s: %s\n", label.c_str(), file, why.c_str());
+        fail("the harness could not read the fixture's packet layout, which is not a verdict on the decoder");
+    }
+    return layout;
+}
+
+// Opens `file` on the device at each start and grades the pictures shown, the first one's pass mark, where
+// the decode began and that it stayed on the device; `afterRun` sees each run's traffic logs. The number
+// of starts graded.
+int gradeResetStarts(Device& device, const std::string& label, const char* file, const GopLayout& layout,
+                     std::initializer_list<ResetStart> starts,
+                     const std::function<void(const std::string& what, size_t index)>& afterRun = {}) {
+    const std::optional<CounterReference> reference = counterReference(label, file);
+    if (!reference) return 0;
+    const std::vector<int>& ids = reference->ids;
+    if (ids.size() != layout.pictures.size()) {
+        std::fprintf(stderr, "FAIL: %s: %s: %zu pictures decoded, %zu packets read\n", label.c_str(), file, ids.size(),
+                     layout.pictures.size());
+        fail("the harness could not match the fixture's packets to its pictures, which is not a verdict on the decoder");
+        return 0;
+    }
+    int graded = 0;
+    for (const ResetStart& start : starts) {
+        const size_t from = layout.nearestReset(layout.pictures[start.index]);
+        const size_t first = start.shows == Shows::Picture ? start.index : start.shows == Shows::ResetPoint ? layout.picture(from) : 0;
+        if (first + kFollowing > ids.size()) {
+            fail("a starting point is too near the end of its fixture to grade the pictures after it");
+            continue;
+        }
+        const std::optional<wallpaperx::StreamPosition> position = positionAt(device, label, file, start.index, ids[start.index]);
+        if (!position) continue;
+        const std::string what = std::string(file) + " opened at picture " + std::to_string(start.index);
+        const std::optional<StartRun> started = runLoggedStart(device, label, what, asset(file), *position);
+        if (!started) continue;
+        const StartRun& run = *started;
+        ++graded;
+        const std::vector<int> due(ids.begin() + static_cast<long>(first), ids.begin() + static_cast<long>(first + kFollowing));
+        if (run.shown != due) {
+            std::fprintf(stderr, "FAIL: %s: %s: showed %s where %s was due\n", label.c_str(), what.c_str(),
+                         joinIds(run.shown).c_str(), joinIds(due).c_str());
+            fail(start.shows == Shows::Picture      ? "a start on the device within the catch-up budget shows its own picture"
+                 : start.shows == Shows::ResetPoint ? "a start past the catch-up budget from a reset point part way in "
+                                                      "shows that reset point's picture first"
+                                                    : "a start past the catch-up budget from the file's first picture shows "
+                                                      "that picture first");
+        }
+        const bool passMark = !run.startsPass.empty() && run.startsPass.front();
+        if (run.startsPass.empty() || passMark != (start.shows == Shows::FileStart)) {
+            std::fprintf(stderr, "FAIL: %s: %s: its first picture is %smarked as starting a pass\n", label.c_str(),
+                         what.c_str(), passMark ? "" : "not ");
+            fail(start.shows == Shows::FileStart ? "a start that falls back to the file's first picture shows it as a new pass"
+                                                 : "a start part way in does not mark its first picture as a pass");
+        }
+        startedAt(label, what, layout, from);
+        if (run.hostPictures != 0 || run.devicePictures == 0) {
+            std::fprintf(stderr, "FAIL: %s: %s: %d device and %d host picture(s)\n", label.c_str(), what.c_str(),
+                         run.devicePictures, run.hostPictures);
+            fail("a start on the device was not decoded on the hardware decoder");
+        }
+        if (afterRun) afterRun(what, start.index);
+        std::printf("%s: %s: showed %s (first %smarked as a pass), %s; decoded from %s, %zu pictures before it; %d "
+                    "device and %d host picture(s)\n",
+                    label.c_str(), what.c_str(), joinIds(run.shown).c_str(), passMark ? "" : "not ",
+                    describeSeeks(run.seeks).c_str(), layout.describe(from).c_str(), start.index - layout.picture(from),
+                    run.devicePictures, run.hostPictures);
+    }
+    return graded;
+}
+
+void runBudgetChecks(Device& device, const std::string& label) {
+    const VkVideoCodecOperationFlagsKHR h264 = VK_VIDEO_CODEC_OPERATION_DECODE_H264_BIT_KHR;
+    int graded = 0;
+    int offered = 0;
+
+    // GOAL: S15.167 -- a start on the device whose only reset point before its picture is the file's first
+    //       picture decodes forward from it when the picture is within the catch-up budget of 250 pictures,
+    //       and past the budget shows the file's first picture, marked as starting a new pass.
+    // WHY-THIS-SHAPE: an open-GOP file whose only IDR is picture 0, opened at 230 and at 280, either side of
+    //       the budget; the pictures, the pass mark and the packets sent each tell a different wrong answer
+    //       apart, and the budget is counted in pictures, so neither point is near the edge.
+    // CONTROL: via control_batch.sh, 2026-10-01, each alone, reverted, renderer/video/video_decoder.cpp
+    //       startAtResetPoint(): `withinBudget` made `true` -> "counter_opengop_long.mp4 opened at picture 280:
+    //       showed 280 281 282 283 284 where 0 1 2 3 4 was due"; the past-budget branch's `rewind(); return;`
+    //       deleted -> "opened at picture 280: its first picture is not marked as starting a pass".
+    // COVERAGE-ASSERT: the file's only reset point is packet 0, the keyframe a seek to each picture lands on
+    //       is an open keyframe, and 230 and 280 lie either side of the budget, their distances from that
+    //       reset point read from the packets; red with the recipe's open-gop=1 removed (test-side, by hand,
+    //       2026-09-30): "counter_opengop_long.mp4: 7 reset point(s) ...; the keyframes before pictures 230 and
+    //       280 are not both open". The budget is the decoder's own: kCatchUpPictures set to 100000, via
+    //       control_batch.sh 2026-10-01 -> this structure line red, "lost the structure the catch-up budget's
+    //       file-start case needs".
+    if (const std::optional<GopLayout> layout = deviceLayout(device, label, "counter_opengop_long.mp4", h264, "H.264")) {
+        offered += 2;
+        const std::vector<size_t> resets = layout->resets();
+        const auto openLanding = [&](size_t index) { return layout->landsOnOpenKeyframe(layout->pictures[index]); };
+        const size_t from = resets.empty() ? 0 : layout->picture(resets[0]);
+        if (resets != std::vector<size_t>{0} || !openLanding(230) || !openLanding(280) || 230 - from >= kCatchUpBudget ||
+            280 - from <= kCatchUpBudget) {
+            std::fprintf(stderr, "FAIL: %s: counter_opengop_long.mp4: %zu reset point(s), the first %s; the keyframes "
+                                 "before pictures 230 and 280 %s open\n",
+                         label.c_str(), resets.size(), resets.empty() ? "none" : layout->describe(resets[0]).c_str(),
+                         openLanding(230) && openLanding(280) ? "are" : "are not both");
+            fail("the long open-GOP fixture lost the structure the catch-up budget's file-start case needs");
+        } else {
+            graded += gradeResetStarts(device, label, "counter_opengop_long.mp4", *layout,
+                                       {ResetStart{230, Shows::Picture}, ResetStart{280, Shows::FileStart}});
+        }
+    }
+
+    // GOAL: S15.168 -- past the budget from a reset point part way in, a start on the device shows that
+    //       reset point's picture first, not marked as a new pass. S15.169 -- when one search window holds two
+    //       reset points, the start decodes from the nearer one.
+    // WHY-THIS-SHAPE: IDRs at pictures 120 and 132 with no keyframe between them, then open GOP: picture 402
+    //       is 270 past IDR 132, and picture 245 lands its seeks on open keyframes 228 and 180 until the
+    //       window aimed four seconds back, which lands on IDR 120 and reads on past IDR 132. The pictures
+    //       at 245 are right from either IDR, so only the packets sent show which was used.
+    // CONTROL: via control_batch.sh, 2026-09-30, each alone, reverted, renderer/video/video_decoder.cpp:
+    //       S15.168, `av_sat_sub64(reset.time, 1)` made `resume` -> "counter_two_idr.mp4 opened at picture
+    //       402: showed 402 403 404 405 406 where 132 133 134 135 136 was due"; S15.169, scanWindow() called
+    //       with `stopAtFirst` true in every window -> "opened at picture 245: the first packet sent to the
+    //       decoder was packet 120 (picture 120, an IDR), where the nearest reset point before the picture
+    //       is packet 132 (picture 132, an IDR)", and the run-time assert below red with it. S15.177: that
+    //       break with seekToPacket()'s first `av_packet_unref(m_packet);` also deleted, so the held reset
+    //       point is sent twice -> the same lines and "packet 1 sent after the start is not packet 121 of the
+    //       file". Re-run 2026-09-30.
+    // COVERAGE-ASSERT: the layout -- three reset points, the last two with no keyframe between them, open
+    //       keyframes before both pictures, 245 within and 402 past the budget from IDR 132 -- red with the
+    //       recipe's second forced IDR removed (test-side, by hand, 2026-09-30): "reset points packet 0 (picture
+    //       0, an IDR), packet 120 (picture 120, an IDR)". At run time, one stretch of reads between two seeks
+    //       must read both IDRs before anything is decoded: the search saw both, so nearest against first was
+    //       at stake. It reads the search's own traffic, so the stopAtFirst break turns it red too.
+    if (const std::optional<GopLayout> layout = deviceLayout(device, label, "counter_two_idr.mp4", h264, "H.264")) {
+        offered += 2;
+        const std::vector<size_t> resets = layout->resets();
+        const bool shape = resets.size() == 3 && resets[0] == 0 && [&] {
+            for (size_t i = resets[1] + 1; i < resets[2]; ++i) {
+                if (layout->packets[i].key) return false;
+            }
+            return true;
+        }();
+        const auto openLanding = [&](size_t index) { return layout->landsOnOpenKeyframe(layout->pictures[index]); };
+        const size_t near = shape ? layout->picture(resets[2]) : 0;
+        if (!shape || !openLanding(245) || !openLanding(402) || 245 - near > kCatchUpBudget || 402 - near <= kCatchUpBudget) {
+            std::string list;
+            for (const size_t r : resets) list += (list.empty() ? "" : ", ") + layout->describe(r);
+            std::fprintf(stderr, "FAIL: %s: counter_two_idr.mp4: reset points %s; the keyframes before pictures 245 and "
+                                 "402 %s open\n",
+                         label.c_str(), list.c_str(), openLanding(245) && openLanding(402) ? "are" : "are not both");
+            fail("the two-IDR fixture lost the structure the nearest-reset-point and part-way budget cases need");
+        } else {
+            const int64_t a = layout->packets[resets[1]].timestamp;
+            const int64_t b = layout->packets[resets[2]].timestamp;
+            graded += gradeResetStarts(
+                device, label, "counter_two_idr.mp4", *layout,
+                {ResetStart{245, Shows::Picture}, ResetStart{402, Shows::ResetPoint}},
+                [&](const std::string& what, size_t index) {
+                    if (index != 245) return;
+                    bool both = false;
+                    for (const TrafficEntry& read : g_readPackets) {
+                        if (read.timestamp != a || read.sentBefore != 0) continue;
+                        both = both || std::any_of(g_readPackets.begin(), g_readPackets.end(), [&](const TrafficEntry& other) {
+                                   return other.timestamp == b && other.sentBefore == 0 && other.afterSeeks == read.afterSeeks;
+                               });
+                    }
+                    if (!both) {
+                        std::fprintf(stderr, "FAIL: %s: %s: no stretch of reads between two seeks read both IDRs before "
+                                             "decoding began\n",
+                                     label.c_str(), what.c_str());
+                        fail("no search window held both reset points, so nearest against first was not at stake");
+                    }
+                });
+        }
+    }
+
+    // GOAL: S15.171 -- the search for a reset point is bounded by the budget: a start on the device past the
+    //       budget, on an open-GOP file whose only IDR is its first picture, reads about as many packets far into
+    //       the file as nearer in, and never back to the file's start; when the search's second seek fails, it
+    //       reads no further before starting at the first picture.
+    // WHY-THIS-SHAPE: the packets the demuxer read before the first was sent, at pictures 700 and 1150 of 1200.
+    //       The two are compared, not held to a number: how much one window reads is the container's, while
+    //       growing with the position is the defect. Each must also stay below its own position, which a
+    //       search read back to the start cannot. The pictures are graded as a start at the first picture.
+    // CONTROL: via control_batch.sh, each alone, reverted, renderer/video/video_decoder.cpp
+    //       startAtResetPoint(). 2026-09-30: `|| !withinCatchUp(back)` deleted from the no-reset-point branch
+    //       -> "searching read 711 packets at picture 700 and 1162 at 1150" (520 and 490 unbroken). 2026-10-01:
+    //       the failed-seek branch's `if (!withinCatchUp(resume - streamStart()))` made `if (false)` -> "its
+    //       second seek failing: seeks to 588799, 573439 (failed), -1024, -1024; ... 1156 packets read
+    //       searching" (5 unbroken).
+    // COVERAGE-ASSERT: both positions lie more than twice the budget past the file's only reset point, read
+    //       from the packets, so a bounded search and one read back to the start cannot read alike; and the
+    //       failure case must show its second seek failed.
+    if (const std::optional<GopLayout> layout = deviceLayout(device, label, "counter_opengop_xlong.mp4", h264, "H.264")) {
+        const char* const file = "counter_opengop_xlong.mp4";
+        constexpr size_t kNear = 700;
+        constexpr size_t kFar = 1150;
+        offered += 3;
+        const std::vector<size_t> resets = layout->resets();
+        if (resets != std::vector<size_t>{0} || layout->pictures.size() < kFar + kFollowing ||
+            kNear - layout->picture(0) <= 2 * kCatchUpBudget) {
+            std::fprintf(stderr, "FAIL: %s: %s: %zu pictures, %zu reset point(s), the first %s\n", label.c_str(), file,
+                         layout->pictures.size(), resets.size(), resets.empty() ? "none" : layout->describe(resets[0]).c_str());
+            fail("the extra-long open-GOP fixture lost the structure the bounded search needs");
+        } else {
+            std::vector<size_t> reads;
+            graded += gradeResetStarts(device, label, file, *layout,
+                                       {ResetStart{kNear, Shows::FileStart}, ResetStart{kFar, Shows::FileStart}},
+                                       [&](const std::string&, size_t) { reads.push_back(searchReads()); });
+            if (reads.size() == 2) {
+                std::printf("%s: %s: searching read %zu packets at picture %zu and %zu at %zu\n", label.c_str(), file,
+                            reads[0], kNear, reads[1], kFar);
+                if (reads[0] >= kNear || reads[1] >= kFar || reads[1] >= reads[0] + (kFar - kNear) / 2) {
+                    std::fprintf(stderr, "FAIL: %s: %s: searching read %zu packets at picture %zu and %zu at %zu\n",
+                                 label.c_str(), file, reads[0], kNear, reads[1], kFar);
+                    fail("a start past the budget searched further back the further into the file it lay");
+                }
+            }
+            const std::optional<CounterReference> reference = counterReference(label, file);
+            // CONTROL: test-side, by hand, 2026-10-01: the reference cut to 1000 pictures here -> "FAIL: ...
+            //       counter_opengop_xlong.mp4: 1000 pictures decoded, 1200 packets read" and the harness line
+            //       below, where the unguarded read past the end had been undefined behaviour. Restored.
+            const bool matched = reference && reference->ids.size() == layout->pictures.size();
+            if (reference && !matched) {
+                std::fprintf(stderr, "FAIL: %s: %s: %zu pictures decoded, %zu packets read\n", label.c_str(), file,
+                             reference->ids.size(), layout->pictures.size());
+                fail("the harness could not match the fixture's packets to its pictures, which is not a verdict on the "
+                     "decoder");
+            }
+            const std::optional<wallpaperx::StreamPosition> position =
+                matched ? positionAt(device, label, file, kFar, reference->ids[kFar]) : std::nullopt;
+            const std::string what = std::string(file) + " opened at picture " + std::to_string(kFar) +
+                                     ", its second seek failing";
+            const std::optional<StartRun> run =
+                position ? runLoggedStart(device, label, what, asset(file), *position,
+                                          [] { g_seekFailure = SeekFailure::Second; })
+                         : std::nullopt;
+            if (run) {
+                ++graded;
+                const size_t searched = searchReads();
+                const bool secondFailed = run->seeks.size() >= 2 && run->seeks[1].result < 0;
+                const bool fileStart = !run->shown.empty() && run->shown.front() == reference->ids[0] &&
+                                       !run->startsPass.empty() && run->startsPass.front();
+                std::printf("%s: %s: %s; showed %s; %zu packets read searching\n", label.c_str(), what.c_str(),
+                            describeSeeks(run->seeks).c_str(), joinIds(run->shown).c_str(), searched);
+                if (!secondFailed || !fileStart || searched >= kCatchUpBudget) {
+                    std::fprintf(stderr, "FAIL: %s: %s: %s; showed %s (first %smarked as a pass); %zu packets read "
+                                         "searching\n",
+                                 label.c_str(), what.c_str(), describeSeeks(run->seeks).c_str(), joinIds(run->shown).c_str(),
+                                 fileStart ? "" : "maybe not ", searched);
+                    fail(!secondFailed ? "the second seek of the search did not fail, so the case was not exercised"
+                                       : "a search whose seek failed past the budget read on instead of starting at the "
+                                         "first picture");
+                }
+            }
+        }
+    }
+    // GOAL: S15.180 -- on the device the budget is measured from the reset point the start decodes from,
+    //       whichever search window found it: past the budget from a reset point part way in, the start shows
+    //       that reset point's picture, not marked as a pass; past it from the file's first picture, the first
+    //       picture as a new pass; within it, its own picture.
+    // WHY-THIS-SHAPE: IDRs 900 pictures apart, so the first window's reset point lies far back from 890 and
+    //       1780; 1000 and 1150 (the budget exactly, which is inclusive) are within it of IDR 900. The pictures
+    //       shown, the pass mark and the first packet sent each tell a different wrong answer apart.
+    // CONTROL: via control_batch.sh, 2026-10-01, reverted, renderer/video/video_decoder.cpp startAtResetPoint():
+    //       `withinBudget` made `back == 0 || withinCatchUp(...)` -> "counter_sparse_h264.mp4 opened at picture
+    //       1780: showed 1780 1781 1782 1783 1784 where 900 901 902 903 904 was due", and at 890 "showed 890 ...
+    //       where 0 1 2 3 4 was due" and "its first picture is not marked as starting a pass".
+    // COVERAGE-ASSERT: the fixture's reset points are exactly pictures 0, 900 and 1800, no other packet is a
+    //       keyframe, and each start lies on the side of the budget its case needs, read from the packets.
+    if (const std::optional<GopLayout> layout = deviceLayout(device, label, "counter_sparse_h264.mp4", h264, "H.264")) {
+        const char* const file = "counter_sparse_h264.mp4";
+        offered += 4;
+        const std::vector<size_t> resets = layout->resets();
+        std::vector<size_t> at;
+        for (const size_t r : resets) at.push_back(layout->picture(r));
+        const size_t keys = static_cast<size_t>(std::count_if(layout->packets.begin(), layout->packets.end(),
+                                                              [](const GopLayout::Packet& p) { return p.key; }));
+        const bool shape = at == std::vector<size_t>{0, 900, 1800} && keys == 3 && layout->pictures.size() >= 1780 + kFollowing &&
+                           890 > kCatchUpBudget && 1150 - 900 <= kCatchUpBudget && 1780 - 900 > kCatchUpBudget;
+        if (!shape) {
+            std::string list;
+            for (const size_t p : at) list += (list.empty() ? "" : ", ") + std::to_string(p);
+            std::fprintf(stderr, "FAIL: %s: %s: %zu pictures, reset points at pictures %s, %zu keyframe(s); budget %zu\n",
+                         label.c_str(), file, layout->pictures.size(), list.c_str(), keys, kCatchUpBudget);
+            fail("the sparse-keyframe H.264 fixture lost the structure the reset-point budget cases need");
+        } else {
+            graded += gradeResetStarts(device, label, file, *layout,
+                                       {ResetStart{890, Shows::FileStart}, ResetStart{1000, Shows::Picture},
+                                        ResetStart{1150, Shows::Picture}, ResetStart{1780, Shows::ResetPoint}});
+        }
+    }
+    if (!g_notVerified) {
+        check(offered == 11 && graded == offered, "every start this check is written for was graded");
+    }
+}
+
+void runAv1StartChecks(Device& device, const std::string& label) {
+    // GOAL: S15.170 -- an AV1 file opened part way in on the device decodes from the shown key frame
+    //       nearest before its picture, and shows that picture first, decoded on the device.
+    // WHY-THIS-SHAPE: picture 100 with key frames every 24 pictures: the nearest is picture 96, so a start
+    //       that misreads AV1's key frames falls back to the file's first packet and still shows 100 --
+    //       within the budget -- and only the packets sent tell the two apart.
+    // CONTROL: via control_batch.sh, 2026-09-30, reverted, renderer/video/reset_point.cpp av1TemporalUnit()
+    //       returning false -> "counter_av1.mp4 opened at picture 100: the first packet sent to the decoder
+    //       was packet 0 (picture 0, a shown key frame), where the nearest reset point before the picture is
+    //       packet 96 (picture 96, a shown key frame)".
+    // COVERAGE-ASSERT: the nearest reset point before picture 100 must be part way in, read from the packets;
+    //       red with the point moved to 20 (test-side, by hand, 2026-09-30), "no shown key frame part way in
+    //       before picture 20".
+    const std::optional<GopLayout> layout =
+        deviceLayout(device, label, "counter_av1.mp4", VK_VIDEO_CODEC_OPERATION_DECODE_AV1_BIT_KHR, "AV1");
+    if (!layout) return;
+    constexpr size_t kPoint = 100;
+    if (layout->pictures.size() <= kPoint + 5 || layout->nearestReset(layout->pictures[kPoint]) == 0) {
+        std::fprintf(stderr, "FAIL: %s: counter_av1.mp4: %zu pictures, and no shown key frame part way in before "
+                             "picture %zu\n",
+                     label.c_str(), layout->pictures.size(), kPoint);
+        fail("the AV1 fixture lost the key frame part way in that this check starts at");
+        return;
+    }
+    const int graded = gradeResetStarts(device, label, "counter_av1.mp4", *layout, {ResetStart{kPoint, Shows::Picture}});
+    if (!g_notVerified) check(graded == 1, "the AV1 start was graded");
 }
 
 // ------------------------------------------------------------------------- //
@@ -1737,8 +3317,9 @@ void runRetireWaitChecks(Device& device, const std::string& label, const SizeCha
     //       The fallback call's waits are graded before anything that needs the hold to have survived it: a
     //       wait ends the hold, and a check that first demanded a running batch reported that instead.
     // CONTROL: renderer/video/video_decoder.cpp, each reverted. reopenInSoftware() calling closeDecoder()
-    //       instead of retireDecoder(): all three streams, "the fallback call 29 made 1 wait(s), 1 on the held
-    //       batch" (call 31 for both AV1 streams). releaseRetiredCodec() without its hasCompleted() poll: "the
+    //       instead of retireDecoder(): all three streams, "the fallback call 29 made 2 wait(s), 1 on the held
+    //       batch" (call 31 for both AV1 streams), and the end-of-stream and stalled-teardown cases red beside
+    //       it, via control_batch.sh 2026-09-30. releaseRetiredCodec() without its hasCompleted() poll: "the
     //       hardware codec was freed in call 30, while its last reader was still running" (call 32 for AV1).
     //       next() without its first releaseRetiredCodec(): "the hardware codec was never freed by call 33,
     //       the first after its last reader completed" (35 for AV1); the end-of-stream cases stayed green.
@@ -2898,11 +4479,15 @@ void runLoopLandingChecks(Device& device, const std::string& label, bool onDevic
     //       non-keyframe, so its decode-time seek is failed and the byte seek must follow. The Matroska
     //       byte seek reports success and then reads no packet, so its timestamp seeks are failed and a
     //       reopen must follow. A shifted target alone would grade only a landing this harness invented.
-    // CONTROL: renderer/video/video_decoder.cpp, each reverted, both paths. isFirstPacket() true for any
-    //       packet: the transport stream red on both, each with "call 121 (pass 2, picture 0 of it) showed 24
-    //       where 0 was due" and "no seek that succeeded was followed by another attempt", and Matroska green:
-    //       nothing is read for it to judge. A failed read after a seek taken as landed:
-    //       Matroska "call 61 returned false". rewind() without its reopen: Matroska "call 61 returned false".
+    // CONTROL: renderer/video/video_decoder.cpp, each reverted, via control_batch.sh 2026-09-30.
+    //       seekLandsOnFirstPacket() taking any packet as packet 1 (its PacketMark::matches() call made
+    //       `true`): the transport stream red on both paths, "no rewind landing was rejected at a loop
+    //       boundary", and on loop-device "call 121 (pass 2, picture 0 of it) showed 24 where 0 was due";
+    //       Matroska green, nothing being read for it to judge. A failed read after a seek taken as landed:
+    //       on loop-host, Matroska "call 61 returned false". rewind() without its reopen leaves this check
+    //       green, measured via control_batch.sh 2026-10-01: the Matroska case reads on from where its failed
+    //       seeks left it, so the reopen half of S13.72 is not graded here. runLoopFileChecks() grades it:
+    //       "counter_short.mp4 deleted after 10 pictures, every seek failing from then: call 21 returned false".
     // COVERAGE-ASSERT: a successful seek is followed by another attempt at each boundary -- red with the
     //       Matroska seek failures not applied, "no seek that succeeded was followed by another attempt" --
     //       and the premise is measured: measuring the decode-time seek instead reports "not answerable".
@@ -2980,10 +4565,10 @@ void runLoopLandingChecks(Device& device, const std::string& label, bool onDevic
     //       theirs for the whole run, packet 1 included. The late-landing half moves the first seek
     //       past packet 1 on the long MP4: without a position only timestamps and size can reject that
     //       landing, and a match on "has no position" alone would take it.
-    // CONTROL: renderer/video/video_decoder.cpp isFirstPacket(), each reverted, both paths. The match
-    //       without a position always false: MP4, transport stream and Matroska "1 container open(s)" at
-    //       the boundary. That match on "no position" alone: "call 322 (pass 2, picture 0 of it) showed 48
-    //       where 0 was due" on the late landing; the other runs stayed green.
+    // CONTROL: renderer/video/video_decoder.cpp PacketMark::matches(), each reverted, via control_batch.sh
+    //       2026-09-30 on loop-host. The match without a position always false: MP4, transport stream and
+    //       Matroska "1 container open(s)" at the boundary. That match on "no position" alone: "call 322 (pass
+    //       2, picture 0 of it) showed 48 where 0 was due" on the late landing; the other runs stayed green.
     // COVERAGE-ASSERT: positions were cleared at each boundary -- red with clearing off, "read no packet
     //       with a position to clear", and the raw stream "was not opened again" -- and the shift exceeds a
     //       keyframe gap, red with a zero shift.
@@ -3207,7 +4792,8 @@ void runTimingChecks(Device& device, const std::string& label, bool onDevice) {
     //       using). renderer/video/video_decoder.cpp, next()'s `frame.m_presentation` given
     //       AVRational{1, 1} as its base -> "FAIL: each picture is due one file interval after the one
     //       before it", printing "38 of 38 steps are not 100000000 ns; first: 1024000000000 ns at 1".
-    //       Both observed 2026-09-18; reverted.
+    //       Reverted. The second observed 2026-09-18; the first via control_batch.sh 2026-09-30 on timing-host,
+    //       which also printed "39 pair(s) compared, where 38 were due".
     // COVERAGE-ASSERT: the number of pictures decoded and the number of successive pairs actually
     //       compared are both asserted, so a run that decoded two pictures cannot report the same
     //       verdict as one that decoded forty.
@@ -3905,6 +5491,10 @@ extern "C" int avcodec_receive_frame(AVCodecContext* context, AVFrame* frame) {
             pool->peek = *frame->hw_frames_ctx;
         }
     }
+    if (err == 0 && decoders && g_logTraffic) {
+        g_returnedPictures.push_back(
+            TrafficEntry{frame->best_effort_timestamp, g_failingSeeks.size(), frame->format == AV_PIX_FMT_VULKAN});
+    }
     if (err == 0 && decoders && g_inFailingCall && g_stripTimestamps) frame->best_effort_timestamp = AV_NOPTS_VALUE;
     if (err == 0 && decoders && g_recordPictures) {
         ++(frame->format == AV_PIX_FMT_VULKAN ? g_devicePictures : g_hostPictures);
@@ -3920,6 +5510,14 @@ extern "C" int avcodec_receive_frame(AVCodecContext* context, AVFrame* frame) {
 extern "C" int av_read_frame(AVFormatContext* format, AVPacket* packet) {
     static const auto real = realSymbol<int (*)(AVFormatContext*, AVPacket*)>("av_read_frame");
     const int err = real(format, packet);
+    if (err >= 0 && g_inFailingCall && g_seekAwaitingPacket >= 0 && packet->stream_index == g_seekAwaitingStream &&
+        static_cast<size_t>(g_seekAwaitingPacket) < g_failingSeeks.size()) {
+        g_failingSeeks[static_cast<size_t>(g_seekAwaitingPacket)].landedOnKeyframe = (packet->flags & AV_PKT_FLAG_KEY) != 0;
+        g_seekAwaitingPacket = -1;
+    }
+    if (err >= 0 && g_logTraffic) {
+        g_readPackets.push_back(TrafficEntry{packet->pts, g_failingSeeks.size(), false, g_sentPackets.size()});
+    }
     if (err >= 0 && g_clearPositions && packet->pos >= 0) {
         packet->pos = -1;
         if (g_tallying) ++g_tally.positionsCleared;
@@ -3933,17 +5531,28 @@ extern "C" int avcodec_send_packet(AVCodecContext* context, const AVPacket* pack
         ++g_packetsRefused;
         return AVERROR_INVALIDDATA;
     }
-    if (g_inFailingCall && packet != nullptr && isDecodersContext(context) && g_refuseFrom > 0 &&
-        g_decoderOpens >= g_refuseFrom && g_decoderOpens <= g_refuseThrough) {
+    const int pass = g_decoderOpens + g_decoderFlushes;
+    if (g_inFailingCall && packet != nullptr && isDecodersContext(context) && context->hw_device_ctx == nullptr &&
+        g_refuseFrom > 0 && pass >= g_refuseFrom && pass <= g_refuseThrough) {
         return AVERROR_INVALIDDATA;
     }
-    return real(context, packet);
+    const int err = real(context, packet);
+    if (g_logTraffic && packet != nullptr && err != AVERROR(EAGAIN) && isDecodersContext(context)) {
+        g_sentPackets.push_back(TrafficEntry{packet->pts, g_failingSeeks.size()});
+    }
+    return err;
+}
+
+extern "C" void avcodec_flush_buffers(AVCodecContext* context) {
+    static const auto real = realSymbol<void (*)(AVCodecContext*)>("avcodec_flush_buffers");
+    if (g_inFailingCall && isDecodersContext(context) && context->hw_device_ctx == nullptr) ++g_decoderFlushes;
+    real(context);
 }
 
 extern "C" int avcodec_open2(AVCodecContext* context, const AVCodec* codec, AVDictionary** options) {
     static const auto real = realSymbol<int (*)(AVCodecContext*, const AVCodec*, AVDictionary**)>("avcodec_open2");
     const int err = real(context, codec, options);
-    if (err >= 0 && g_inFailingCall && isDecodersContext(context)) ++g_decoderOpens;
+    if (err >= 0 && g_inFailingCall && isDecodersContext(context) && context->hw_device_ctx == nullptr) ++g_decoderOpens;
     if (err >= 0 && g_tallying && isDecodersContext(context)) ++g_tally.decoderOpens;
     if (err >= 0 && g_trackCodecs && isDecodersContext(context)) {
         g_codecs.push_back(CodecRecord{context, context->hw_device_ctx != nullptr, g_poolCall});
@@ -3992,9 +5601,12 @@ extern "C" int av_seek_frame(AVFormatContext* format, int stream, int64_t timest
         aimed += av_rescale_q(g_seekShiftSeconds, AVRational{1, 1}, timeBase);
     }
     const bool refused = g_seekFailure == SeekFailure::All ||
-                         (g_seekFailure == SeekFailure::AwayFromStart && timestamp > start);
+                         (g_seekFailure == SeekFailure::AwayFromStart && timestamp > start) ||
+                         (g_seekFailure == SeekFailure::Second && g_failingSeeks.size() == 1);
     const int result = refused ? AVERROR(EPERM) : real(format, stream, aimed, flags);
     g_failingSeeks.push_back(SeekCall{timestamp, result, byte});
+    g_seekAwaitingPacket = result >= 0 && !byte && stream >= 0 ? static_cast<int>(g_failingSeeks.size()) - 1 : -1;
+    g_seekAwaitingStream = stream;
     return result;
 }
 
@@ -4148,7 +5760,9 @@ int main(int argc, char** argv) {
         "resume-end",        "resume-seek-failure", "resume-drop-count", "shape", "shape-device",
         "steady-device",     "steady-host",   "loop-device",       "loop-host",  "loop-cost-device",
         "loop-cost-host",    "loop-resume",   "release-device",    "retire-device",
-        "halves-device",     "halves-host",   "timing-device",     "timing-host"};
+        "halves-device",     "halves-host",   "timing-device",     "timing-host",       "start-at-device",
+        "start-at-device-ts", "start-at-host", "start-at-device-open-gop", "start-at-device-open-gop-hevc",
+        "start-at-device-open-gop-mp4", "start-at-host-open-gop", "start-at-device-budget", "start-at-device-av1"};
     if (std::find(modes.begin(), modes.end(), mode) == modes.end()) {
         std::fprintf(stderr, "usage: %s <mode>, one of:", argv[0]);
         for (const std::string& m : modes) std::fprintf(stderr, " %s", m.c_str());
@@ -4211,7 +5825,8 @@ int main(int argc, char** argv) {
     }
 
     return runGraded(label, mode == "sequence-host" || mode == "shape" || mode == "steady-host" || mode == "loop-host" ||
-                                mode == "loop-cost-host" || mode == "halves-host" || mode == "timing-host",
+                                mode == "loop-cost-host" || mode == "halves-host" || mode == "timing-host" ||
+                                mode == "start-at-host" || mode == "start-at-host-open-gop",
                      [&](Device& device) {
                          if (mode == "sequence-device") runSequenceChecks(device, label, /*onDevice=*/true);
                          if (mode == "sequence-host") runSequenceChecks(device, label, /*onDevice=*/false);
@@ -4237,5 +5852,56 @@ int main(int argc, char** argv) {
                          if (mode == "loop-cost-device") runLoopCostChecks(device, label, /*onDevice=*/true);
                          if (mode == "loop-cost-host") runLoopCostChecks(device, label, /*onDevice=*/false);
                          if (mode == "loop-resume") runLoopResumeChecks(device, label);
+                         if (mode == "start-at-device") {
+                             runStartAtChecks(device, label, true, StartPoints::Mp4);
+                             runStartedFailureChecks(device, label);
+                             runPastEndChecks(device, label, /*onDevice=*/true);
+                         }
+                         // GOAL: S15.145 -- a transport stream opened part way in on the hardware decoder
+                         //       plays its pictures without breaking the Vulkan specification: this
+                         //       entry's validation grade, over the two transport-stream starting points.
+                         // WHY-THIS-SHAPE: an entry of its own so a failure here names the case: a
+                         //       transport stream's seeks land on non-keyframes, an MP4's never do.
+                         // CONTROL: via control_batch.sh, 2026-09-30, RTX 3080 Ti, reverted: scanWindow() in
+                         //       renderer/video/video_decoder.cpp taking every packet as a reset point, so the
+                         //       start decodes from the non-keyframe its seek landed on -> "58 Vulkan validation
+                         //       warning(s)", beside "the first packet sent to the decoder was packet 39
+                         //       (picture 38, not a keyframe)". A device start depends only on the reset-point
+                         //       test, never on next()'s skip to a keyframe.
+                         if (mode == "start-at-device-ts") {
+                             runStartAtChecks(device, label, true, StartPoints::TransportStream);
+                         }
+                         if (mode == "start-at-host") {
+                             runStartAtChecks(device, label, false, StartPoints::All);
+                             runPastEndChecks(device, label, /*onDevice=*/false);
+                             runSoftwareBudgetChecks(device, label);
+                             runSoftwareLandingChecks(device, label);
+                         }
+                         // GOAL: S15.163 -- an open-GOP stream opened part way in on the hardware decoder,
+                         //       where a seek lands on a keyframe that does not reset the decoder, breaks no
+                         //       Vulkan rule: each entry's validation grade.
+                         // WHY-THIS-SHAPE: one entry per codec for the transport streams and one for MP4,
+                         //       whose index seeks land on the open keyframe directly; S15.161's device check
+                         //       makes each run prove an open keyframe stood where the seek lands.
+                         // CONTROL: via control_batch.sh, 2026-09-30, RTX 3080 Ti, reverted: scanWindow() in
+                         //       renderer/video/video_decoder.cpp taking the container's keyframe flag for
+                         //       resetsDecoder() -> "52 Vulkan validation warning(s)" on the H.264 transport
+                         //       stream, 8 on HEVC's, 52 on the MP4 entry.
+                         if (mode == "start-at-device-open-gop") runOpenGopStartChecks(device, label, true, "counter_opengop.ts");
+                         if (mode == "start-at-device-open-gop-hevc") {
+                             runOpenGopStartChecks(device, label, true, "counter_opengop_hevc.ts");
+                         }
+                         if (mode == "start-at-device-open-gop-mp4") {
+                             runOpenGopStartChecks(device, label, true, "counter_opengop.mp4");
+                             runOpenGopStartChecks(device, label, true, "counter_opengop_hevc.mp4");
+                         }
+                         if (mode == "start-at-device-budget") runBudgetChecks(device, label);
+                         if (mode == "start-at-device-av1") runAv1StartChecks(device, label);
+                         if (mode == "start-at-host-open-gop") {
+                             for (const char* file : {"counter_opengop.ts", "counter_opengop_hevc.ts", "counter_opengop.mp4",
+                                                      "counter_opengop_hevc.mp4"}) {
+                                 runOpenGopStartChecks(device, label, false, file);
+                             }
+                         }
                      });
 }

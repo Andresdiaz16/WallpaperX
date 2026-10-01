@@ -3,11 +3,13 @@
 #pragma once
 
 #include "../vulkan/device.h"
+#include "stream_position.h"
 
 extern "C" {
 #include <libavutil/pixfmt.h>
 }
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdint>
@@ -78,6 +80,9 @@ public:
     // How long it is shown: its own duration, else the stream's nominal frame interval. Empty
     // when neither is known.
     std::optional<std::chrono::nanoseconds> duration() const { return m_duration; }
+    // Where a decoder opened on the same file can start at this picture. Empty when it could not be
+    // found again: it has no timestamp, or the pictures returned before it did not rise in time.
+    std::optional<StreamPosition> position() const { return m_position; }
 
     struct DeviceImage {
         VkImage image = VK_NULL_HANDLE;
@@ -124,6 +129,7 @@ private:
     FrameColour m_colour;
     std::optional<std::chrono::nanoseconds> m_presentation;
     std::optional<std::chrono::nanoseconds> m_duration;
+    std::optional<StreamPosition> m_position;
 };
 
 // Demuxes one file and decodes its video stream on this GPU's hardware decoder when the device
@@ -182,7 +188,25 @@ public:
     // ResourceExhausted when out of memory or file descriptors. A device that still answers
     // selects software instead: ffmpeg failing to adopt it is a property of that pairing, not a
     // fault.
-    VideoDecoder(Device& device, const std::string& file);
+    //
+    // With `startAt`, a position a decoder on this same file handed out, the first picture next()
+    // returns is the one there: it seeks to a keyframe at or before it and drops the pictures up to
+    // it, checking where the seek landed exactly as a software restart does. A position at the
+    // stream's first picture starts there. A position from another file is not detected and lands
+    // wherever its timestamp falls in this one; one past its last picture starts at its first.
+    //
+    // The drop is bounded by a catch-up budget of pictures. From a keyframe more than that before the
+    // position, the first picture is the keyframe's instead, and a keyframe at the stream's start
+    // makes it a plain first pass: a file with keyframes far apart resumes up to one keyframe
+    // interval early. A container whose seek fails is read from its first packet when the position
+    // is within the budget of the stream's start, and starts at the first picture otherwise.
+    //
+    // On the hardware decoder that keyframe is the nearest reset point, as resetsDecoder() defines
+    // one, found by scanning packets back from the position without decoding them. The file's first
+    // packet counts as one. The scan stops about one window past the budget, so a reset point further
+    // back is never found and the start is the stream's first picture. In software, a seek that has
+    // to retry further back than the budget starts at the stream's first picture too.
+    VideoDecoder(Device& device, const std::string& file, std::optional<StreamPosition> startAt = std::nullopt);
     ~VideoDecoder();
 
     VideoDecoder(const VideoDecoder&) = delete;
@@ -206,7 +230,9 @@ public:
     // from. That does not bound the call. If software never decodes that packet into a picture, it
     // decodes from the first packet again and drops as many pictures as were returned, which is not
     // exact when the two decoders emit different pictures; a stream that ends before that many
-    // throws WallpaperContentError.
+    // throws WallpaperContentError. After a start part way in, that count does not reach back to
+    // the first packet, so software starts again at the start's position instead and the pictures
+    // returned since are returned again.
     //
     // Throws GpuFailure for a hardware fault, WallpaperContentError for a container that cannot be
     // read or a stream that cannot be decoded, and std::runtime_error when out of memory. After a
@@ -221,6 +247,11 @@ public:
     // over. The file must not be rewritten in place while this decoder holds it: nothing can detect
     // that, so replacing a wallpaper takes a new decoder or pipeline. Throws as next() does.
     void restart();
+
+    // Whether the pictures since this decoder opened began part way in, at or before the constructor's
+    // `startAt`, rather than at the stream's first picture. False again after restart(), and once a
+    // start falls back to the first picture.
+    bool startedMidStream() const { return m_startedAfter.has_value(); }
 
     Path path() const { return m_path; }
 
@@ -247,13 +278,50 @@ private:
     void retireDecoder() noexcept;
     void closeAll() noexcept;
     void reopenInSoftware();
+    void seekAgain();
+    // Positions the container for a decode that resumes after m_returned, and sets what it drops.
+    // Software only: the hardware decoder seeks only in startAt().
+    void seekToResume();
+    void startAt(StreamPosition position);
+    void startAtResetPoint(int64_t resume);
+    // Gives up a start part way in: the next picture is the stream's first, as a plain open's is.
+    void startAtFirstPicture();
+    // Whether decoding forward `distance`, in stream time base, stays within kCatchUpPictures.
+    bool withinCatchUp(int64_t distance) const;
+    // How far back the search after one `back` before a position aims: a second, then twice as far.
+    int64_t nextSeekBack(int64_t back) const;
+    // A packet as read, which is how a later read recognises it.
+    struct PacketMark {
+        std::optional<int64_t> position;  // unset when the demuxer gave none
+        int64_t dts;
+        int64_t pts;
+        int size;
+        static PacketMark of(const AVPacket& packet);
+        bool matches(const AVPacket& packet) const;
+    };
+    struct ResetPoint {
+        PacketMark mark;
+        int64_t time;
+        bool fileStart;
+    };
+    // What one window of startAtResetPoint()'s search read: its first packet and its last reset point.
+    struct Window {
+        std::optional<PacketMark> first;
+        std::optional<ResetPoint> last;
+    };
+    Window scanWindow(int64_t resume, const std::optional<PacketMark>& newer, bool fromStart, bool stopAtFirst);
+    bool seekToPacket(const PacketMark& mark, std::optional<int64_t> target);
+    bool skipToPacket(const PacketMark& mark);
+    bool decodesOnDevice() const;
     int64_t streamStart() const;
     void rewind();
     bool seekToFirstPacket();
     bool seekLandsOnFirstPacket(int64_t target, int flags);
-    bool isFirstPacket() const;
     bool admit(int64_t timestamp, std::optional<uint64_t> packet);
     void recordReturned(int64_t timestamp, std::optional<uint64_t> packet);
+    // Whether the packet just read comes after a seek and before the first keyframe since; it is
+    // skipped, never decoded.
+    bool beforeLandingKeyframe() const;
     void recordLanding();
     // True means decode on the device. False means the path was decided as software, because
     // ffmpeg cannot decode on a device that still answers.
@@ -302,7 +370,9 @@ private:
     // What a software restart resumes after, since the stream was opened or restarted: how many
     // pictures next() has returned; the last one's timestamp for as long as every one returned had a
     // timestamp above the one before; and the number of the packet it was decoded from, when that
-    // packet was numbered.
+    // packet was numbered. A decoder opened at a position starts as though every picture before it
+    // had been returned: count 0, and the timestamp one below that picture's. Only a new pass zeroes
+    // the count: count 0 is how a start that has shown nothing is told apart.
     struct Returned {
         uint64_t count = 0;
         std::optional<int64_t> lastTimestamp;
@@ -314,21 +384,16 @@ private:
     // decoder's.
     std::optional<uint64_t> m_packetsRead = 0;
     // Packet 1 as last read, which is how a rewind recognises it.
-    struct FirstPacket {
-        std::optional<int64_t> position;  // unset when the demuxer gave none
-        int64_t dts;
-        int64_t pts;
-        int size;
-    };
-    std::optional<FirstPacket> m_firstPacket;
-    // What a restarted software decode drops before it returns a picture again, in stream time
-    // base. Each resumes after m_returned's timestamp or packet, which cannot change while it holds:
-    // none returns a picture.
+    std::optional<PacketMark> m_firstPacket;
+    // What a restarted software decode, or a decoder opened at a position, drops before it returns a
+    // picture, in stream time base. Each resumes after m_returned's timestamp or packet, which cannot
+    // change while it holds: none returns a picture.
     //
     // Seeked is a seek `back` before the resume point, not yet shown to have landed at or before
-    // it. Its packets show that when the first is a keyframe at or before the resume point -- no
-    // picture before a keyframe in decode order is shown after it -- and none since is timestamped
-    // past it: a decode that then ends with no picture has none left to return.
+    // it. Packets before the first keyframe after it are skipped. The rest show the landing when
+    // that keyframe is at or before the resume point -- no picture before a keyframe in decode
+    // order is shown after it -- and none since is timestamped past it: a decode that then ends
+    // with no picture has none left to return. NoPacket is until that keyframe is decoded.
     enum class Landing { NoPacket, NothingPast, Unproven };
     struct Seeked {
         int64_t back;
@@ -351,9 +416,22 @@ private:
     // frame arrives. A format negotiation that comes back without Vulkan while this is set is
     // ffmpeg retreating from a hardware setup that failed after the device's yes.
     bool m_awaitingHardwareSetup = false;
-    // The path was decided as software on a decoder opened for hardware, or a software restart's
-    // seek was not shown to land at or before the picture it resumes after.
-    bool m_reopenInSoftware = false;
+    // What next() must do before it decodes again, decided inside an ffmpeg call. Ordered: a reopen
+    // in software also seeks, so it is never lowered to a seek.
+    enum class Pending {
+        Nothing,
+        // A resume did not reach its picture: its seek was not shown to land at or before it, or a
+        // pass matching by packet ended without meeting that packet. The codec is flushed, not
+        // replaced, so a hardware decode stays on the hardware.
+        SeekAgain,
+        // The path was decided as software on a decoder opened for hardware.
+        ReopenInSoftware,
+    };
+    Pending m_pending = Pending::Nothing;
+    void require(Pending pending) { m_pending = std::max(m_pending, pending); }
+    // While the pictures since the open began part way in: the timestamp the start dropped through,
+    // which a software resume that has lost m_returned's timestamp starts from again.
+    std::optional<int64_t> m_startedAfter;
     // A failure decided inside the format callback, which cannot throw through ffmpeg's frames;
     // rethrown when ffmpeg reports the error that follows.
     std::exception_ptr m_parkedFailure;
