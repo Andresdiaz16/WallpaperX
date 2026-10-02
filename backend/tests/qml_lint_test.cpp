@@ -575,6 +575,9 @@ LintReport lintFile(const std::filesystem::path& file, std::string& hostProblem)
 struct ProbeType {
     const char* type;
     const char* module;  // named in the failure text, so a blind linter is attributed
+    // For a module that exports only singletons, which cannot be a root: the clean probe reads this
+    // member of `type` from an Item, and the dirty probe reads one that does not exist.
+    const char* singletonMember = nullptr;
 };
 
 constexpr ProbeType kMainProbeTypes[] = {
@@ -591,6 +594,11 @@ constexpr ProbeType kConfigProbeTypes[] = {
     {"ColumnLayout", "QtQuick.Layouts"},
     {"Heading", "org.kde.kirigami"},
     {"DataSource", "org.kde.plasma.plasma5support"},
+};
+constexpr ProbeType kWindowsProbeTypes[] = {
+    {"Item", "QtQuick"},
+    {"TasksModel", "org.kde.taskmanager"},
+    {"KWindowSystem", "org.kde.kwindowsystem", "showingDesktop"},
 };
 
 struct PackageQmlFile {
@@ -615,6 +623,15 @@ constexpr PackageQmlFile kPackageQml[] = {
      "import QtQuick\nimport QtQuick.Controls\nimport QtQuick.Layouts\n"
      "import org.kde.kirigami\nimport org.kde.plasma.plasma5support\n",
      kConfigProbeTypes, std::size(kConfigProbeTypes), "config", false},
+    // GOAL: the window watcher's QML is linted like the rest of the package, with the linter proven
+    //       to read Plasma's task manager and KWindowSystem types first.
+    // CONTROL: observed 2026-10-01. A bogus root property in backend/kde/kpackage/contents/ui/
+    //       ScreenWindows.qml -> "FAIL: ... ScreenWindows.qml passes qmllint -W0".
+    //       A stand-in linter that is real qmllint minus its warnings about KWindowSystem's members
+    //       -> ScreenWindows.qml's verdict withheld, exit 77, naming org.kde.kwindowsystem; with the
+    //       KWindowSystem probe dropped from this row the same stand-in passed green.
+    {"contents/ui/ScreenWindows.qml", "import QtQuick\nimport org.kde.kwindowsystem\nimport org.kde.taskmanager\n",
+     kWindowsProbeTypes, std::size(kWindowsProbeTypes), "windows", false},
 };
 
 // "WallpaperItem (org.kde.plasma.plasmoid), Rectangle (QtQuick)" -- for the line a passing run
@@ -679,7 +696,9 @@ enum class OracleVerdict {
 //       answering `success:true, warnings:[]` to everything -- the blind linter, the whole
 //       reason this phase exists -> `... accepted a property this test invented ...`, exit 77
 //       with the package's verdict withheld, NOT a green pass. One warning on the bare clean
-//       probe -> the "could not be attributed to the file" skip. One reporting a different
+//       probe -> the "could not be attributed to the file" skip; on the singleton row's clean
+//       probe, real qmllint plus one warning on that file alone -> the same skip, naming "a read
+//       of `KWindowSystem.showingDesktop`" (observed 2026-10-01). One reporting a different
 //       filename than it was asked about -> the filename-mismatch skip. One whose report omits
 //       "filename" entirely -> `its --json output has no string "filename" ...`, exit 77;
 //       with that field read only when present, the same stand-in produced a green pass over
@@ -701,9 +720,21 @@ OracleVerdict proveOracleDiscriminates(const PackageQmlFile& entry, const std::f
         const ProbeType& probe = entry.probeTypes[t];
         // No comments in the generated QML: qmllint parses a comment whose first word is
         // `qmllint` as a lint directive, and a malformed one is itself a warning.
-        const std::string cleanSource = std::string(entry.probeImports) + probe.type + " {\n}\n";
-        const std::string dirtySource = std::string(entry.probeImports) + probe.type + " {\n    " +
-                                        std::string(kProbeUnknownProperty) + ": 1\n}\n";
+        const auto singletonRead = [&](std::string_view member) {
+            return std::string(entry.probeImports) + "Item {\n    property var wallpaperxQmllintProbeRead: " +
+                   probe.type + "." + std::string(member) + "\n}\n";
+        };
+        // What the clean probe is, in the words both Unusable reasons below use for it.
+        const std::string cleanShape = probe.singletonMember != nullptr
+                                           ? "a read of `" + std::string(probe.type) + "." + probe.singletonMember + "`"
+                                           : "a bare `" + std::string(probe.type) + " { }`";
+        const std::string cleanSource = probe.singletonMember != nullptr
+                                            ? singletonRead(probe.singletonMember)
+                                            : std::string(entry.probeImports) + probe.type + " {\n}\n";
+        const std::string dirtySource = probe.singletonMember != nullptr
+                                            ? singletonRead(kProbeUnknownProperty)
+                                            : std::string(entry.probeImports) + probe.type + " {\n    " +
+                                                  std::string(kProbeUnknownProperty) + ": 1\n}\n";
         const std::string suffix = std::string(entry.probeTag) + "_" + probe.type + ".qml";
         const std::filesystem::path cleanPath = scratch / ("probe_clean_" + suffix);
         const std::filesystem::path dirtyPath = scratch / ("probe_unknown_property_" + suffix);
@@ -735,7 +766,7 @@ OracleVerdict proveOracleDiscriminates(const PackageQmlFile& entry, const std::f
         }
         for (const LintWarning& w : clean.warnings) {
             if (w.countsAgainstMaxWarnings()) {
-                reason = "qmllint at " + g_qmllint + " reports a bare `" + probe.type + " { }` as not clean (" +
+                reason = "qmllint at " + g_qmllint + " reports " + cleanShape + " as not clean (" +
                          describe(w) + "), so a warning on " + std::string(entry.relative) +
                          " could not be attributed to " + std::string(entry.relative);
                 return OracleVerdict::Unusable;
@@ -757,7 +788,10 @@ OracleVerdict proveOracleDiscriminates(const PackageQmlFile& entry, const std::f
         }
         if (!rejected) {
             reason = "qmllint at " + g_qmllint + " accepted a property this test invented (" +
-                     std::string(kProbeUnknownProperty) + ") on a " + probe.type + " root, so it is not reading " +
+                     std::string(kProbeUnknownProperty) + ") on " +
+                     (probe.singletonMember != nullptr ? "the singleton " + std::string(probe.type)
+                                                       : "a " + std::string(probe.type) + " root") +
+                     ", so it is not reading " +
                      probe.module + "'s types and a clean run on " + std::string(entry.relative) +
                      ", which imports that module, would establish nothing";
             return OracleVerdict::Blind;

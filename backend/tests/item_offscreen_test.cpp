@@ -107,7 +107,7 @@ int g_ungradedValidation = 0;
 // phase that left it empty would find the visibility path returning before it sent anything.
 constexpr const char* kOutputName = "DP-OFFSCREEN";
 
-// The stub the other item tests use, plus the two screen reports the item files. Answered rather
+// The stub the other item tests use, plus the three screen reports the item files. Answered rather
 // than left to Qt's unknown-method error, and recorded, because what the item tells the daemon
 // about being drawn is the whole of the second phase -- and because an errored report makes the
 // plugin reset its record and send again, which would turn one answer into a stream of retries.
@@ -130,6 +130,8 @@ public:
                 ++m_sizeReports;
                 return connection.send(message.createReply());
             }
+            // Answered for the reason the other two are: declined, it is logged as a refusal.
+            if (message.member() == QLatin1String("SetOutputFocus")) return connection.send(message.createReply());
             if (message.member() == QLatin1String("SetOutputVisible")) {
                 const QList<QVariant> args = message.arguments();
                 if (args.size() >= 2) {

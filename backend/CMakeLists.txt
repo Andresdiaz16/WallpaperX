@@ -49,6 +49,13 @@ endif()
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../renderer
                  ${CMAKE_CURRENT_BINARY_DIR}/renderer)
 
+# Every ctest entry here is registered through wallpaperx_add_test() or
+# wallpaperx_add_display_test(), never add_test(): they run it with a private HOME and XDG
+# directories, a network of its own, no live display and a private bus that can start no service. Run from a desktop
+# session, a bare entry inherits that session -- and a bus that can activate services starts real
+# desktop daemons as the user. test_isolation and test_isolation_registry check both halves.
+include(${CMAKE_CURRENT_SOURCE_DIR}/../renderer/tests/support/isolated_test.cmake)
+
 # --------------------------------------------------------------------------- #
 # Dependencies
 # --------------------------------------------------------------------------- #
@@ -71,6 +78,10 @@ if(WALLPAPERX_BUILD_KDE_PLUGIN)
     find_package(ECM REQUIRED NO_MODULE)
     set(CMAKE_MODULE_PATH ${ECM_MODULE_PATH} ${CMAKE_MODULE_PATH})
     include(KDEInstallDirs6)
+    # Only enable_testing(), the BUILD_TESTING option and ECM's `appstreamtest` entry, a bare
+    # add_test() outside the isolation wrapper. This project enables testing itself, and that entry
+    # checks the installed files' metadata, which a ctest run never installs.
+    set(KDE_SKIP_TEST_SETTINGS TRUE)
     include(KDECMakeSettings)
 
     find_package(Plasma REQUIRED)
@@ -191,13 +202,13 @@ if(EGL_FOUND AND OpenGL_OpenGL_FOUND)
     # before any check runs. A crash inside the sanitizer is not a report, so no suppression can
     # reach it. What that costs: under TSan the lavapipe twin below is the only import path left,
     # so the opaque one is graded in the unsanitized trees only.
-    add_test(NAME frame_import_probe COMMAND wallpaperx-frame-import-probe)
+    wallpaperx_add_test(NAME frame_import_probe COMMAND wallpaperx-frame-import-probe)
     set_tests_properties(frame_import_probe PROPERTIES
         ENVIRONMENT "WALLPAPERX_FORCE_HANDLE_TYPE=opaque"
         LABELS "novulkan;no-tsan"
         SKIP_RETURN_CODE 77)
 
-    add_test(NAME frame_import_probe_dmabuf COMMAND wallpaperx-frame-import-probe)
+    wallpaperx_add_test(NAME frame_import_probe_dmabuf COMMAND wallpaperx-frame-import-probe)
     set_tests_properties(frame_import_probe_dmabuf PROPERTIES
         ENVIRONMENT "WALLPAPERX_FORCE_HANDLE_TYPE=dmabuf"
         LABELS "novulkan;no-tsan"
@@ -210,12 +221,12 @@ if(EGL_FOUND AND OpenGL_OpenGL_FOUND)
         target_link_libraries(wallpaperx-frame-generation-test PRIVATE
             wallpaperxplugin Qt6::Core Qt6::Quick Qt6::Qml)
         target_include_directories(wallpaperx-frame-generation-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-        add_test(NAME frame_generation COMMAND wallpaperx-frame-generation-test)
+        wallpaperx_add_test(NAME frame_generation COMMAND wallpaperx-frame-generation-test)
         set_tests_properties(frame_generation PROPERTIES LABELS "novulkan" SKIP_RETURN_CODE 77)
     endif()
 
     if(WALLPAPERX_LAVAPIPE_ICD)
-        add_test(NAME frame_import_probe_lavapipe COMMAND wallpaperx-frame-import-probe)
+        wallpaperx_add_test(NAME frame_import_probe_lavapipe COMMAND wallpaperx-frame-import-probe)
         set_tests_properties(frame_import_probe_lavapipe PROPERTIES
             ENVIRONMENT "VK_ICD_FILENAMES=${WALLPAPERX_LAVAPIPE_ICD};WALLPAPERX_FORCE_HANDLE_TYPE=dmabuf"
             LABELS "lavapipe"
@@ -588,7 +599,7 @@ if(Qt6QuickTest_FOUND)
     target_link_libraries(wallpaperx-qml-states-test PRIVATE Qt6::QuickTest Qt6::Qml Threads::Threads)
     # The stub daemon in that file answers on the port main.qml's daemonOrigin names, which is
     # the only way to reach the two decisions refresh() makes before apply() is called.
-    target_include_directories(wallpaperx-qml-states-test PRIVATE ${HTTPLIB_INCLUDE_DIR})
+    target_include_directories(wallpaperx-qml-states-test PRIVATE ${HTTPLIB_INCLUDE_DIR} ${CMAKE_CURRENT_SOURCE_DIR})
     # Explicit, not inherited: qt_standard_project_setup() -- which turns AUTOMOC on globally --
     # is inside the KDE-plugin guard, so a -DWALLPAPERX_BUILD_KDE_PLUGIN=OFF tree (the sanitizer
     # tier's) would otherwise fail to link the Q_OBJECT stub this target now contains.
@@ -919,20 +930,23 @@ set_target_properties(wallpaperx-device-lost-shim-test PROPERTIES AUTOMOC OFF AU
 target_compile_definitions(wallpaperx-device-lost-shim-test PRIVATE
     WALLPAPERX_DEVICE_LOST_SHIM="$<TARGET_FILE:wallpaperx-test-device-lost-shim>")
 add_dependencies(wallpaperx-device-lost-shim-test wallpaperx-test-device-lost-shim)
-add_test(NAME device_lost_shim COMMAND $<TARGET_FILE:wallpaperx-device-lost-shim-test>)
-# no-tsan: preloading an uninstrumented library into a sanitized binary is untried.
-set_tests_properties(device_lost_shim PROPERTIES LABELS "novulkan;no-tsan" SKIP_RETURN_CODE 77)
 # AddressSanitizer refuses to start unless its runtime is first in the initial library list, and
 # the child this entry runs preloads the shim; the test keeps an inherited LD_PRELOAD ahead of it.
+# Set after the wrapper's `--`, through env, so it reaches the test alone: in the entry's
+# environment it would reach /bin/sh and the bus as well, whose exit the leak checker reports.
+set(_wx_device_lost_preload "")
 if(WALLPAPERX_SANITIZE STREQUAL "address")
     execute_process(COMMAND ${CMAKE_CXX_COMPILER} -print-file-name=libasan.so
                     OUTPUT_VARIABLE _wx_asan_runtime OUTPUT_STRIP_TRAILING_WHITESPACE)
     if(IS_ABSOLUTE "${_wx_asan_runtime}" AND EXISTS "${_wx_asan_runtime}")
-        set_property(TEST device_lost_shim APPEND PROPERTY ENVIRONMENT "LD_PRELOAD=${_wx_asan_runtime}")
+        set(_wx_device_lost_preload env "LD_PRELOAD=${_wx_asan_runtime}")
     else()
         message(WARNING "No AddressSanitizer runtime found to preload; device_lost_shim will not start here")
     endif()
 endif()
+wallpaperx_add_test(NAME device_lost_shim COMMAND ${_wx_device_lost_preload} $<TARGET_FILE:wallpaperx-device-lost-shim-test>)
+# no-tsan: preloading an uninstrumented library into a sanitized binary is untried.
+set_tests_properties(device_lost_shim PROPERTIES LABELS "novulkan;no-tsan" SKIP_RETURN_CODE 77)
 
 # The real daemon losing its device, exiting 75, and being started again on the same HOME.
 add_executable(wallpaperx-device-loss-restart-test tests/device_loss_restart_test.cpp)
@@ -1001,16 +1015,16 @@ set_target_properties(wallpaperx-buffer-claims-test PROPERTIES AUTOMOC OFF AUTOU
 # reason. Verify with VK_LOADER_DEBUG=driver: no ICD load line.
 #
 # Registered outside the dbus-run-session guard below: this one talks to nothing.
-add_test(NAME log_escape COMMAND $<TARGET_FILE:wallpaperx-log-escape-test>)
+wallpaperx_add_test(NAME log_escape COMMAND $<TARGET_FILE:wallpaperx-log-escape-test>)
 
 # Outside the guard for the strongest version of log_escape's reason: no bus, no window, no
 # driver, no filesystem. `novulkan` because the sanitizer block below selects by label and an
 # unlabelled entry is disabled there.
-add_test(NAME buffer_claims COMMAND $<TARGET_FILE:wallpaperx-buffer-claims-test>)
+wallpaperx_add_test(NAME buffer_claims COMMAND $<TARGET_FILE:wallpaperx-buffer-claims-test>)
 
 # Reads the linked daemon binary for calls that copy a decoded picture into system memory (S13.9).
 # Opens no driver, hence `novulkan`.
-add_test(NAME no_host_readback
+wallpaperx_add_test(NAME no_host_readback
          COMMAND ${CMAKE_COMMAND} -DBINARY=$<TARGET_FILE:wallpaperx-daemon>
                  -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/no_host_readback.cmake)
 set_tests_properties(no_host_readback PROPERTIES LABELS "novulkan")
@@ -1027,7 +1041,7 @@ set_tests_properties(log_escape PROPERTIES LABELS "novulkan")
 # deterministic, so it needs no RESOURCE_LOCK. `novulkan` for the same reason log_escape
 # carries it: the TSan block below is an allow-list on labels, and nothing here opens a
 # driver.
-add_test(NAME config_store COMMAND $<TARGET_FILE:wallpaperx-config-store-test>)
+wallpaperx_add_test(NAME config_store COMMAND $<TARGET_FILE:wallpaperx-config-store-test>)
 set_tests_properties(config_store PROPERTIES LABELS "novulkan"
                      SKIP_RETURN_CODE 77)
 
@@ -1036,12 +1050,12 @@ set_tests_properties(config_store PROPERTIES LABELS "novulkan"
 # disabled there. SKIP_RETURN_CODE because a host that cannot make a scratch directory, or a
 # filesystem with no symlinks, is this test failing to set up rather than the breaker being
 # wrong. No RESOURCE_LOCK: it competes for nothing and measures no timing.
-add_test(NAME crash_record COMMAND $<TARGET_FILE:wallpaperx-crash-record-test>)
+wallpaperx_add_test(NAME crash_record COMMAND $<TARGET_FILE:wallpaperx-crash-record-test>)
 set_tests_properties(crash_record PROPERTIES LABELS "novulkan"
                      SKIP_RETURN_CODE 77)
 # The same reasons as crash_record: forked children and files only. Its CPU-time bound is a quarter
 # of the window, far from a correct writer's few milliseconds, so it takes no timing lock.
-add_test(NAME log_pump COMMAND $<TARGET_FILE:wallpaperx-log-pump-test>)
+wallpaperx_add_test(NAME log_pump COMMAND $<TARGET_FILE:wallpaperx-log-pump-test>)
 set_tests_properties(log_pump PROPERTIES LABELS "novulkan" SKIP_RETURN_CODE 77)
 
 # Its companion needs a device, so it is registered the way the other GPU entries are: no
@@ -1051,10 +1065,10 @@ set_tests_properties(log_pump PROPERTIES LABELS "novulkan" SKIP_RETURN_CODE 77)
 # working device must report the render-dependent goals unexercised rather than green. No
 # RESOURCE_LOCK: it measures no timing and writes its fixtures into a scratch directory of
 # its own, so it competes with nothing.
-add_test(NAME crash_quarantine COMMAND $<TARGET_FILE:wallpaperx-crash-quarantine-test>)
+wallpaperx_add_test(NAME crash_quarantine COMMAND $<TARGET_FILE:wallpaperx-crash-quarantine-test>)
 set_tests_properties(crash_quarantine PROPERTIES SKIP_RETURN_CODE 77)
 if(WALLPAPERX_LAVAPIPE_ICD)
-    add_test(NAME crash_quarantine_lavapipe COMMAND $<TARGET_FILE:wallpaperx-crash-quarantine-test>)
+    wallpaperx_add_test(NAME crash_quarantine_lavapipe COMMAND $<TARGET_FILE:wallpaperx-crash-quarantine-test>)
     set_tests_properties(crash_quarantine_lavapipe PROPERTIES
         ENVIRONMENT "VK_ICD_FILENAMES=${WALLPAPERX_LAVAPIPE_ICD}"
         LABELS "lavapipe"
@@ -1063,10 +1077,10 @@ endif()
 
 # Registered as crash_quarantine is, for the same reasons: a device, a scratch directory of its
 # own, and no timing measured.
-add_test(NAME device_loss_worker COMMAND $<TARGET_FILE:wallpaperx-device-loss-worker-test>)
+wallpaperx_add_test(NAME device_loss_worker COMMAND $<TARGET_FILE:wallpaperx-device-loss-worker-test>)
 set_tests_properties(device_loss_worker PROPERTIES SKIP_RETURN_CODE 77)
 if(WALLPAPERX_LAVAPIPE_ICD)
-    add_test(NAME device_loss_worker_lavapipe COMMAND $<TARGET_FILE:wallpaperx-device-loss-worker-test>)
+    wallpaperx_add_test(NAME device_loss_worker_lavapipe COMMAND $<TARGET_FILE:wallpaperx-device-loss-worker-test>)
     set_tests_properties(device_loss_worker_lavapipe PROPERTIES
         ENVIRONMENT "VK_ICD_FILENAMES=${WALLPAPERX_LAVAPIPE_ICD}"
         LABELS "lavapipe"
@@ -1078,7 +1092,7 @@ endif()
 # selects tests by label and an unlabelled test is disabled there. SKIP_RETURN_CODE because
 # a source tree that is not where the build recorded it is this test failing to set up, not
 # the package being wrong, and must not print as a package defect.
-add_test(NAME kpackage_metadata COMMAND $<TARGET_FILE:wallpaperx-kpackage-metadata-test>)
+wallpaperx_add_test(NAME kpackage_metadata COMMAND $<TARGET_FILE:wallpaperx-kpackage-metadata-test>)
 set_tests_properties(kpackage_metadata PROPERTIES LABELS "novulkan"
                      SKIP_RETURN_CODE 77)
 
@@ -1087,7 +1101,7 @@ set_tests_properties(kpackage_metadata PROPERTIES LABELS "novulkan"
 # cannot look -- the hosted runner installs no Qt -- has not established the lint half of
 # S10.9/S10.12 and must not report that it has. Why it is a separate entry rather than a phase
 # of kpackage_metadata is in that test's own header.
-add_test(NAME qml_lint COMMAND $<TARGET_FILE:wallpaperx-qml-lint-test>)
+wallpaperx_add_test(NAME qml_lint COMMAND $<TARGET_FILE:wallpaperx-qml-lint-test>)
 set_tests_properties(qml_lint PROPERTIES LABELS "novulkan"
                      SKIP_RETURN_CODE 77)
 
@@ -1096,7 +1110,7 @@ set_tests_properties(qml_lint PROPERTIES LABELS "novulkan"
 # unconditionally, because this row also carries checks that need no module at all -- that the
 # package still ships the file, and that it has no lint directives -- and guarding the entry on
 # the module took those away too. Without a module the binary reports a named skip.
-add_test(NAME qml_lint_surface COMMAND $<TARGET_FILE:wallpaperx-qml-lint-test> surface)
+wallpaperx_add_test(NAME qml_lint_surface COMMAND $<TARGET_FILE:wallpaperx-qml-lint-test> surface)
 set_tests_properties(qml_lint_surface PROPERTIES LABELS "novulkan"
                      SKIP_RETURN_CODE 77)
 
@@ -1104,7 +1118,7 @@ set_tests_properties(qml_lint_surface PROPERTIES LABELS "novulkan"
 # left to the environment: with a real display the plugin would open a window on the developer's
 # desktop, and on a host with none the run would fail for a reason unrelated to the checks.
 if(Qt6QuickTest_FOUND)
-    add_test(NAME qml_states COMMAND $<TARGET_FILE:wallpaperx-qml-states-test>)
+    wallpaperx_add_test(NAME qml_states COMMAND $<TARGET_FILE:wallpaperx-qml-states-test>)
     # RESOURCE_LOCK, and it is the same lock http_config and daemon_system carry rather than one
     # of its own: this entry now binds 127.0.0.1:18462, the port main.qml's daemonOrigin names
     # and the port those two put a real daemon on. Under ctest -jN without it, whichever started
@@ -1130,13 +1144,12 @@ if(Qt6QuickTest_FOUND)
                          SKIP_REGULAR_EXPRESSION "wallpaperx-qml-states: NO STUB DAEMON --")
 endif()
 
-# The DBus service test needs a session bus. dbus-run-session gives each run a
-# private one (isolated from the developer's real session, and works headless in
-# CI). If it isn't installed, skip registering the test rather than fail the build.
-find_program(DBUS_RUN_SESSION dbus-run-session)
-if(DBUS_RUN_SESSION)
-    add_test(NAME dbus_service
-             COMMAND ${DBUS_RUN_SESSION} -- $<TARGET_FILE:wallpaperx-dbus-service-test>)
+# The entries below need a session bus, which wallpaperx_add_test() gives each run through
+# dbus-run-session: private, unable to activate anything, and working headless in CI. If it isn't
+# installed, skip registering them rather than fail the build.
+if(WALLPAPERX_DBUS_RUN_SESSION)
+    wallpaperx_add_test(NAME dbus_service
+             COMMAND $<TARGET_FILE:wallpaperx-dbus-service-test>)
     # Explicitly cleared, for the same reason handle_type_env_default clears its own
     # override: ctest merges each test's ENVIRONMENT into the caller's, so a developer
     # who exported WALLPAPERX_FORCE_TIER while debugging the Classic path would
@@ -1151,8 +1164,8 @@ if(DBUS_RUN_SESSION)
     # metadata) crosses the DBus wire, which is the half a KDE plugin on AMD/Intel
     # will actually consume.
     if(WALLPAPERX_LAVAPIPE_ICD)
-        add_test(NAME dbus_service_lavapipe
-                 COMMAND ${DBUS_RUN_SESSION} -- $<TARGET_FILE:wallpaperx-dbus-service-test>)
+        wallpaperx_add_test(NAME dbus_service_lavapipe
+                 COMMAND $<TARGET_FILE:wallpaperx-dbus-service-test>)
         set_tests_properties(dbus_service_lavapipe PROPERTIES
             ENVIRONMENT "VK_ICD_FILENAMES=${WALLPAPERX_LAVAPIPE_ICD};WALLPAPERX_FORCE_TIER="
             LABELS "lavapipe")
@@ -1166,8 +1179,8 @@ if(DBUS_RUN_SESSION)
     # Registered only now: it used to fail on a check that compared memory_size against
     # lseek, which S5.9 records as over-reporting on this driver's page-rounded backing
     # object. That check is an upper bound now, so this configuration is honest here.
-    add_test(NAME dbus_service_dmabuf
-             COMMAND ${DBUS_RUN_SESSION} -- $<TARGET_FILE:wallpaperx-dbus-service-test>)
+    wallpaperx_add_test(NAME dbus_service_dmabuf
+             COMMAND $<TARGET_FILE:wallpaperx-dbus-service-test>)
     set_tests_properties(dbus_service_dmabuf PROPERTIES
         ENVIRONMENT "WALLPAPERX_FORCE_HANDLE_TYPE=dmabuf;WALLPAPERX_FORCE_TIER="
         SKIP_RETURN_CODE 77)
@@ -1178,8 +1191,8 @@ if(DBUS_RUN_SESSION)
     # is only ever exercised by a renderer probe. Same binary, same private bus, one
     # environment variable -- and dbus_service_test asserts the reported tier really is
     # Classic, so this cannot silently degrade into a second run of the default tier.
-    add_test(NAME dbus_service_classic
-             COMMAND ${DBUS_RUN_SESSION} -- $<TARGET_FILE:wallpaperx-dbus-service-test>)
+    wallpaperx_add_test(NAME dbus_service_classic
+             COMMAND $<TARGET_FILE:wallpaperx-dbus-service-test>)
     set_tests_properties(dbus_service_classic PROPERTIES
         ENVIRONMENT "WALLPAPERX_FORCE_TIER=classic")
 
@@ -1190,8 +1203,8 @@ if(DBUS_RUN_SESSION)
     # in the Classic descriptor update path would be invisible to the gate built to
     # find exactly that.
     if(WALLPAPERX_LAVAPIPE_ICD)
-        add_test(NAME dbus_service_classic_lavapipe
-                 COMMAND ${DBUS_RUN_SESSION} -- $<TARGET_FILE:wallpaperx-dbus-service-test>)
+        wallpaperx_add_test(NAME dbus_service_classic_lavapipe
+                 COMMAND $<TARGET_FILE:wallpaperx-dbus-service-test>)
         set_tests_properties(dbus_service_classic_lavapipe PROPERTIES
             ENVIRONMENT "VK_ICD_FILENAMES=${WALLPAPERX_LAVAPIPE_ICD};WALLPAPERX_FORCE_TIER=classic"
             LABELS "lavapipe"
@@ -1223,8 +1236,8 @@ if(DBUS_RUN_SESSION)
     # Step 7's HTTP config server. Needs a session bus for the same reason the entries
     # above do -- it compares /config against GetStatus, and GetStatus is only reachable
     # over the wire.
-    add_test(NAME http_config
-             COMMAND ${DBUS_RUN_SESSION} -- $<TARGET_FILE:wallpaperx-http-server-test>)
+    wallpaperx_add_test(NAME http_config
+             COMMAND $<TARGET_FILE:wallpaperx-http-server-test>)
     # 77 for the phases that cannot be exercised on a given host: no non-loopback
     # interface (S7.1), or no working Vulkan, which leaves the tier and render-window
     # goals unexercised. ctest turns that into SKIP; without it those runs would exit
@@ -1240,8 +1253,8 @@ if(DBUS_RUN_SESSION)
     # lavapipe-labelled entries run. Without this the torn-read phase -- the one written
     # against a concurrency defect -- is the one thing the race detector never sees.
     if(WALLPAPERX_LAVAPIPE_ICD)
-        add_test(NAME http_config_lavapipe
-                 COMMAND ${DBUS_RUN_SESSION} -- $<TARGET_FILE:wallpaperx-http-server-test>)
+        wallpaperx_add_test(NAME http_config_lavapipe
+                 COMMAND $<TARGET_FILE:wallpaperx-http-server-test>)
         set_tests_properties(http_config_lavapipe PROPERTIES
             ENVIRONMENT "VK_ICD_FILENAMES=${WALLPAPERX_LAVAPIPE_ICD};WALLPAPERX_FORCE_TIER="
             LABELS "lavapipe"
@@ -1253,8 +1266,8 @@ if(DBUS_RUN_SESSION)
     # Its own dbus-run-session, so the daemon it starts cannot collide with the
     # in-process service above under ctest -jN -- each gets a bus of its own, and both
     # request the same well-known name.
-    add_test(NAME daemon_system
-             COMMAND ${DBUS_RUN_SESSION} -- $<TARGET_FILE:wallpaperx-daemon-system-test>)
+    wallpaperx_add_test(NAME daemon_system
+             COMMAND $<TARGET_FILE:wallpaperx-daemon-system-test>)
     # SKIP_RETURN_CODE, for the same reason the renderer probes carry it: the test exits 77
     # when a goal could not be exercised at all on this host (no dbus-daemon, so no private
     # bus to destroy under a running daemon -- S6.35). Without it that run exits non-zero
@@ -1268,8 +1281,8 @@ if(DBUS_RUN_SESSION)
     # the twin still covers the process, wire and concurrency halves and says out loud
     # that it skipped the pixels.
     if(WALLPAPERX_LAVAPIPE_ICD)
-        add_test(NAME daemon_system_lavapipe
-                 COMMAND ${DBUS_RUN_SESSION} -- $<TARGET_FILE:wallpaperx-daemon-system-test>)
+        wallpaperx_add_test(NAME daemon_system_lavapipe
+                 COMMAND $<TARGET_FILE:wallpaperx-daemon-system-test>)
         set_tests_properties(daemon_system_lavapipe PROPERTIES
             ENVIRONMENT "VK_ICD_FILENAMES=${WALLPAPERX_LAVAPIPE_ICD}"
             LABELS "lavapipe"
@@ -1279,13 +1292,13 @@ if(DBUS_RUN_SESSION)
 
     # Device loss, exit 75, and the restart that brings the wallpapers back. Private bus
     # and the shared lock for daemon_system's reasons; the binary also refuses any other bus.
-    add_test(NAME device_loss_restart
-             COMMAND ${DBUS_RUN_SESSION} -- $<TARGET_FILE:wallpaperx-device-loss-restart-test>)
+    wallpaperx_add_test(NAME device_loss_restart
+             COMMAND $<TARGET_FILE:wallpaperx-device-loss-restart-test>)
     set_tests_properties(device_loss_restart PROPERTIES RESOURCE_LOCK wallpaperx_bus_tests
                          SKIP_RETURN_CODE 77)
     if(WALLPAPERX_LAVAPIPE_ICD)
-        add_test(NAME device_loss_restart_lavapipe
-                 COMMAND ${DBUS_RUN_SESSION} -- $<TARGET_FILE:wallpaperx-device-loss-restart-test>)
+        wallpaperx_add_test(NAME device_loss_restart_lavapipe
+                 COMMAND $<TARGET_FILE:wallpaperx-device-loss-restart-test>)
         set_tests_properties(device_loss_restart_lavapipe PROPERTIES
             ENVIRONMENT "VK_ICD_FILENAMES=${WALLPAPERX_LAVAPIPE_ICD}"
             LABELS "lavapipe"
@@ -1293,12 +1306,12 @@ if(DBUS_RUN_SESSION)
             SKIP_RETURN_CODE 77)
     endif()
     # The same binary's crash phases on their own: a crash's last lines through the log writer.
-    add_test(NAME crash_log_flush
-             COMMAND ${DBUS_RUN_SESSION} -- $<TARGET_FILE:wallpaperx-device-loss-restart-test> crash-flush)
+    wallpaperx_add_test(NAME crash_log_flush
+             COMMAND $<TARGET_FILE:wallpaperx-device-loss-restart-test> crash-flush)
     set_tests_properties(crash_log_flush PROPERTIES RESOURCE_LOCK wallpaperx_bus_tests SKIP_RETURN_CODE 77)
     if(WALLPAPERX_LAVAPIPE_ICD)
-        add_test(NAME crash_log_flush_lavapipe
-                 COMMAND ${DBUS_RUN_SESSION} -- $<TARGET_FILE:wallpaperx-device-loss-restart-test> crash-flush)
+        wallpaperx_add_test(NAME crash_log_flush_lavapipe
+                 COMMAND $<TARGET_FILE:wallpaperx-device-loss-restart-test> crash-flush)
         set_tests_properties(crash_log_flush_lavapipe PROPERTIES
             ENVIRONMENT "VK_ICD_FILENAMES=${WALLPAPERX_LAVAPIPE_ICD}"
             LABELS "lavapipe"
@@ -1310,12 +1323,12 @@ if(DBUS_RUN_SESSION)
     # The lock also keeps the two entries apart, since every install rewrites this tree's
     # install_manifest_daemon.txt and the test reads it back. The Lavapipe entry is what puts the
     # install and unit checks, which need no GPU, in continuous integration.
-    add_test(NAME daemon_install
-             COMMAND ${DBUS_RUN_SESSION} -- $<TARGET_FILE:wallpaperx-daemon-install-test>)
+    wallpaperx_add_test(NAME daemon_install
+             COMMAND $<TARGET_FILE:wallpaperx-daemon-install-test>)
     set_tests_properties(daemon_install PROPERTIES RESOURCE_LOCK wallpaperx_bus_tests SKIP_RETURN_CODE 77)
     if(WALLPAPERX_LAVAPIPE_ICD)
-        add_test(NAME daemon_install_lavapipe
-                 COMMAND ${DBUS_RUN_SESSION} -- $<TARGET_FILE:wallpaperx-daemon-install-test>)
+        wallpaperx_add_test(NAME daemon_install_lavapipe
+                 COMMAND $<TARGET_FILE:wallpaperx-daemon-install-test>)
         set_tests_properties(daemon_install_lavapipe PROPERTIES
             ENVIRONMENT "VK_ICD_FILENAMES=${WALLPAPERX_LAVAPIPE_ICD}"
             LABELS "lavapipe"
@@ -1328,8 +1341,8 @@ if(DBUS_RUN_SESSION)
     # requests the same well-known name. SKIP_RETURN_CODE because two things it needs can be
     # absent: the ffmpeg command line that generates its fixture, and a host whose Vulkan
     # stack comes up at all; neither may read as a pass.
-    add_test(NAME video_wallpaper
-             COMMAND ${DBUS_RUN_SESSION} -- $<TARGET_FILE:wallpaperx-video-wallpaper-test>)
+    wallpaperx_add_test(NAME video_wallpaper
+             COMMAND $<TARGET_FILE:wallpaperx-video-wallpaper-test>)
     set_tests_properties(video_wallpaper PROPERTIES
         ENVIRONMENT "WALLPAPERX_FORCE_TIER="
         RESOURCE_LOCK wallpaperx_bus_tests
@@ -1341,8 +1354,8 @@ if(DBUS_RUN_SESSION)
     # everything else and says out loud that it skipped the pixels. It is also a software
     # decode, which is the other half of the decoder this daemon may be handed.
     if(WALLPAPERX_LAVAPIPE_ICD)
-        add_test(NAME video_wallpaper_lavapipe
-                 COMMAND ${DBUS_RUN_SESSION} -- $<TARGET_FILE:wallpaperx-video-wallpaper-test>)
+        wallpaperx_add_test(NAME video_wallpaper_lavapipe
+                 COMMAND $<TARGET_FILE:wallpaperx-video-wallpaper-test>)
         set_tests_properties(video_wallpaper_lavapipe PROPERTIES
             ENVIRONMENT "VK_ICD_FILENAMES=${WALLPAPERX_LAVAPIPE_ICD};WALLPAPERX_FORCE_TIER="
             LABELS "lavapipe"
@@ -1362,16 +1375,19 @@ if(DBUS_RUN_SESSION)
         target_compile_definitions(wallpaperx-item-import-failure-test PRIVATE
             WALLPAPERX_QML_MODULE_PATH="${CMAKE_CURRENT_BINARY_DIR}/qml")
         add_dependencies(wallpaperx-item-import-failure-test wallpaperxplugin)
-        add_test(NAME item_import_failure
-                 COMMAND ${DBUS_RUN_SESSION} -- $<TARGET_FILE:wallpaperx-item-import-failure-test>)
+        # The display form: a nested headless KWin of the entry's own, never the desktop's, because
+        # the item imports only under OpenGL and the offscreen platform has none.
+        wallpaperx_add_display_test(NAME item_import_failure
+                 COMMAND $<TARGET_FILE:wallpaperx-item-import-failure-test>)
         # A fallback chain, not offscreen alone: offscreen forces the software scene graph, which
-        # refuses the RHI, and the item imports only under OpenGL -- so a headless host lands on
-        # offscreen and reports the named skip. Semicolons escaped; ctest splits on bare ones.
-        # Nothing is displayed either way: a render-control window has no native window behind it.
+        # refuses the RHI, and the item imports only under OpenGL -- so a host with no nested
+        # compositor lands on offscreen and reports the named skip. Semicolons escaped; ctest splits
+        # on bare ones. Nothing is displayed: a render-control window has no native window behind it.
         #
-        # QT_NO_XDG_DESKTOP_PORTAL because Qt's theme asks the portal for a colour scheme, which on
-        # a private bus ACTIVATES one that inherits this test's stdout -- ctest then never sees the
-        # pipe close and the entry hangs after the test has exited.
+        # QT_NO_XDG_DESKTOP_PORTAL because Qt's theme asks the portal for a colour scheme, which on a
+        # bus that can activate services starts one that inherits this test's stdout -- ctest then
+        # never sees the pipe close. The entry's private bus has no service directories, so it
+        # cannot activate the portal; this keeps Qt from asking at all.
         set_tests_properties(item_import_failure PROPERTIES
             ENVIRONMENT "QT_QPA_PLATFORM=wayland\;xcb\;offscreen;QT_NO_XDG_DESKTOP_PORTAL=1"
             LABELS "novulkan"
@@ -1389,8 +1405,8 @@ if(DBUS_RUN_SESSION)
         target_compile_definitions(wallpaperx-item-refusal-retry-test PRIVATE
             WALLPAPERX_QML_MODULE_PATH="${CMAKE_CURRENT_BINARY_DIR}/qml")
         add_dependencies(wallpaperx-item-refusal-retry-test wallpaperxplugin)
-        add_test(NAME item_refusal_retry
-                 COMMAND ${DBUS_RUN_SESSION} -- $<TARGET_FILE:wallpaperx-item-refusal-retry-test>)
+        wallpaperx_add_test(NAME item_refusal_retry
+                 COMMAND $<TARGET_FILE:wallpaperx-item-refusal-retry-test>)
         set_tests_properties(item_refusal_retry PROPERTIES
             ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QT_NO_XDG_DESKTOP_PORTAL=1"
             LABELS "novulkan"
@@ -1411,8 +1427,8 @@ if(DBUS_RUN_SESSION)
         target_compile_definitions(wallpaperx-item-modifier-report-test PRIVATE
             WALLPAPERX_QML_MODULE_PATH="${CMAKE_CURRENT_BINARY_DIR}/qml")
         add_dependencies(wallpaperx-item-modifier-report-test wallpaperxplugin)
-        add_test(NAME item_modifier_report
-                 COMMAND ${DBUS_RUN_SESSION} -- $<TARGET_FILE:wallpaperx-item-modifier-report-test>)
+        wallpaperx_add_display_test(NAME item_modifier_report
+                 COMMAND $<TARGET_FILE:wallpaperx-item-modifier-report-test>)
         set_tests_properties(item_modifier_report PROPERTIES
             ENVIRONMENT "QT_QPA_PLATFORM=wayland\;xcb\;offscreen;QT_NO_XDG_DESKTOP_PORTAL=1"
             LABELS "novulkan"
@@ -1431,8 +1447,8 @@ if(DBUS_RUN_SESSION)
         target_compile_definitions(wallpaperx-item-modifier-retry-test PRIVATE
             WALLPAPERX_QML_MODULE_PATH="${CMAKE_CURRENT_BINARY_DIR}/qml")
         add_dependencies(wallpaperx-item-modifier-retry-test wallpaperxplugin)
-        add_test(NAME item_modifier_retry
-                 COMMAND ${DBUS_RUN_SESSION} -- $<TARGET_FILE:wallpaperx-item-modifier-retry-test>)
+        wallpaperx_add_display_test(NAME item_modifier_retry
+                 COMMAND $<TARGET_FILE:wallpaperx-item-modifier-retry-test>)
         set_tests_properties(item_modifier_retry PROPERTIES
             ENVIRONMENT "QT_QPA_PLATFORM=wayland\;xcb\;offscreen;QT_NO_XDG_DESKTOP_PORTAL=1"
             LABELS "novulkan"
@@ -1449,13 +1465,122 @@ if(DBUS_RUN_SESSION)
         target_compile_definitions(wallpaperx-item-size-report-test PRIVATE
             WALLPAPERX_QML_MODULE_PATH="${CMAKE_CURRENT_BINARY_DIR}/qml")
         add_dependencies(wallpaperx-item-size-report-test wallpaperxplugin)
-        add_test(NAME item_size_report
-                 COMMAND ${DBUS_RUN_SESSION} -- $<TARGET_FILE:wallpaperx-item-size-report-test>)
+        wallpaperx_add_test(NAME item_size_report
+                 COMMAND $<TARGET_FILE:wallpaperx-item-size-report-test>)
         set_tests_properties(item_size_report PROPERTIES
             ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QT_NO_XDG_DESKTOP_PORTAL=1"
             LABELS "novulkan"
             RESOURCE_LOCK wallpaperx_bus_tests
             SKIP_RETURN_CODE 77)
+
+        # Stand-ins for Plasma's task manager and KWindowSystem QML modules, for the tests below that
+        # load ScreenWindows.qml with no compositor: they serve the rows a test sets and record what
+        # the file asked for. Built into a directory of their own that only those tests put on their
+        # import path; never installed.
+        set(WALLPAPERX_STANDIN_QML_DIR ${CMAKE_CURRENT_BINARY_DIR}/test_qml)
+        qt_add_qml_module(wallpaperx_taskmanager_standin
+            URI org.kde.taskmanager
+            VERSION 1.0
+            PLUGIN_TARGET wallpaperx_taskmanager_standin
+            NO_PLUGIN_OPTIONAL
+            SOURCES tests/qml_standins/taskmanager_standin.h tests/qml_standins/taskmanager_standin.cpp
+            OUTPUT_DIRECTORY ${WALLPAPERX_STANDIN_QML_DIR}/org/kde/taskmanager)
+        qt_add_qml_module(wallpaperx_kwindowsystem_standin
+            URI org.kde.kwindowsystem
+            VERSION 1.0
+            PLUGIN_TARGET wallpaperx_kwindowsystem_standin
+            NO_PLUGIN_OPTIONAL
+            SOURCES tests/qml_standins/kwindowsystem_standin.h
+            OUTPUT_DIRECTORY ${WALLPAPERX_STANDIN_QML_DIR}/org/kde/kwindowsystem)
+        foreach(standin wallpaperx_taskmanager_standin wallpaperx_kwindowsystem_standin)
+            # lib<plugin>.so is the name the QML engine looks for, as with wallpaperxplugin.
+            set_target_properties(${standin} PROPERTIES PREFIX "lib")
+            target_link_libraries(${standin} PRIVATE Qt6::Core Qt6::Qml)
+            # The generated type registration includes the headers by bare name.
+            target_include_directories(${standin} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests/qml_standins)
+        endforeach()
+
+        # The window report (SetOutputFocus) and the immediate reports at setOutput, from the item's
+        # side, against tests/report_stub.h. Offscreen and no GL, like item_size_report.
+        add_executable(wallpaperx-item-window-report-test tests/item_window_report_test.cpp)
+        target_link_libraries(wallpaperx-item-window-report-test PRIVATE
+            Qt6::Core Qt6::DBus Qt6::Gui Qt6::Qml Qt6::Quick)
+        target_include_directories(wallpaperx-item-window-report-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        target_compile_definitions(wallpaperx-item-window-report-test PRIVATE
+            WALLPAPERX_QML_MODULE_PATH="${CMAKE_CURRENT_BINARY_DIR}/qml")
+        add_dependencies(wallpaperx-item-window-report-test wallpaperxplugin)
+        wallpaperx_add_test(NAME item_window_report COMMAND $<TARGET_FILE:wallpaperx-item-window-report-test>)
+        set_tests_properties(item_window_report PROPERTIES
+            ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QT_NO_XDG_DESKTOP_PORTAL=1"
+            LABELS "novulkan"
+            RESOURCE_LOCK wallpaperx_bus_tests
+            SKIP_RETURN_CODE 77)
+
+        # The packaged QML around the renderer, run for real against a stub daemon on both channels.
+        # Binds 127.0.0.1:18462, main.qml's port, hence the shared lock.
+        add_executable(wallpaperx-plasma-surface-test tests/plasma_surface_test.cpp)
+        target_link_libraries(wallpaperx-plasma-surface-test PRIVATE
+            Qt6::Core Qt6::DBus Qt6::Gui Qt6::Qml Qt6::Quick Threads::Threads)
+        target_include_directories(wallpaperx-plasma-surface-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${HTTPLIB_INCLUDE_DIR})
+        target_compile_definitions(wallpaperx-plasma-surface-test PRIVATE
+            WALLPAPERX_QML_MODULE_PATH="${CMAKE_CURRENT_BINARY_DIR}/qml"
+            WALLPAPERX_STANDIN_QML_PATH="${WALLPAPERX_STANDIN_QML_DIR}"
+            WALLPAPERX_BACKEND_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+        add_dependencies(wallpaperx-plasma-surface-test wallpaperxplugin
+                         wallpaperx_taskmanager_standin wallpaperx_kwindowsystem_standin)
+        wallpaperx_add_test(NAME plasma_surface COMMAND $<TARGET_FILE:wallpaperx-plasma-surface-test>)
+        set_tests_properties(plasma_surface PROPERTIES
+            ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QT_NO_XDG_DESKTOP_PORTAL=1"
+            LABELS "novulkan"
+            RESOURCE_LOCK wallpaperx_bus_tests
+            SKIP_RETURN_CODE 77)
+
+        # ScreenWindows.qml against Plasma's real task manager model, on the nested KWin the display
+        # form starts -- with two outputs, and with KWin's permission checks off so this process may
+        # read the window list as plasmashell does. Real windows come from a client process.
+        add_executable(wallpaperx-screen-windows-kwin-test tests/screen_windows_kwin_test.cpp)
+        target_link_libraries(wallpaperx-screen-windows-kwin-test PRIVATE
+            Qt6::Core Qt6::DBus Qt6::Gui Qt6::Qml Qt6::Quick)
+        target_include_directories(wallpaperx-screen-windows-kwin-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        target_compile_definitions(wallpaperx-screen-windows-kwin-test PRIVATE
+            WALLPAPERX_QML_MODULE_PATH="${CMAKE_CURRENT_BINARY_DIR}/qml"
+            WALLPAPERX_BACKEND_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+        add_dependencies(wallpaperx-screen-windows-kwin-test wallpaperxplugin)
+        wallpaperx_add_display_test(NAME screen_windows_kwin COMMAND $<TARGET_FILE:wallpaperx-screen-windows-kwin-test>)
+        set_tests_properties(screen_windows_kwin PROPERTIES
+            ENVIRONMENT "QT_QPA_PLATFORM=wayland;KWIN_WAYLAND_NO_PERMISSION_CHECKS=1;WALLPAPERX_TEST_KWIN_OUTPUTS=2;QT_NO_XDG_DESKTOP_PORTAL=1"
+            LABELS "novulkan"
+            RESOURCE_LOCK wallpaperx_bus_tests
+            SKIP_RETURN_CODE 77)
+
+        # The import entries skip when their GL is not on the exporting GPU; this one fails, so a
+        # nested compositor that moved clients off the real GPU cannot pass the suite quietly. No
+        # label: it needs a hardware GPU, and skips on a host whose Vulkan has only CPU devices.
+        add_executable(wallpaperx-display-gl-device-test tests/display_gl_device_test.cpp)
+        target_link_libraries(wallpaperx-display-gl-device-test PRIVATE Qt6::Gui Vulkan::Vulkan PkgConfig::EGL OpenGL::GL)
+        target_include_directories(wallpaperx-display-gl-device-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        wallpaperx_add_display_test(NAME display_gl_device COMMAND $<TARGET_FILE:wallpaperx-display-gl-device-test>)
+        set_tests_properties(display_gl_device PROPERTIES
+            ENVIRONMENT "QT_QPA_PLATFORM=wayland\;xcb\;offscreen;QT_NO_XDG_DESKTOP_PORTAL=1"
+            SKIP_RETURN_CODE 77)
+
+        # ScreenWindows.qml's own logic, in Qt Quick Test against the stand-ins. Needs no bus and no
+        # port; registered here only because the stand-ins are built here.
+        if(Qt6QuickTest_FOUND)
+            add_executable(wallpaperx-qml-screen-windows-test tests/qml_screen_windows_test.cpp)
+            target_link_libraries(wallpaperx-qml-screen-windows-test PRIVATE Qt6::QuickTest Qt6::Qml)
+            target_compile_definitions(wallpaperx-qml-screen-windows-test PRIVATE
+                QUICK_TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/qml_windows"
+                WALLPAPERX_STANDIN_QML_PATH="${WALLPAPERX_STANDIN_QML_DIR}")
+            add_dependencies(wallpaperx-qml-screen-windows-test
+                             wallpaperx_taskmanager_standin wallpaperx_kwindowsystem_standin)
+            wallpaperx_add_test(NAME qml_screen_windows COMMAND $<TARGET_FILE:wallpaperx-qml-screen-windows-test>)
+            # A wide screen, not the offscreen platform's square default, which a transposed
+            # geometry would pass.
+            set_tests_properties(qml_screen_windows PROPERTIES
+                ENVIRONMENT "QT_QPA_PLATFORM=offscreen:configfile=${CMAKE_CURRENT_SOURCE_DIR}/tests/qml_windows/offscreen_screens.json"
+                LABELS "novulkan;no-tsan")
+        endif()
 
         # The same item, driven by a stub that serves a frame the importer ACCEPTS -- a real
         # Vulkan export -- so that what the scene graph does with the imported GL objects when it
@@ -1494,8 +1619,8 @@ if(DBUS_RUN_SESSION)
                 WALLPAPERX_SHADER_DIR="${WALLPAPERX_SHADER_OUTPUT_DIR}"
                 WALLPAPERX_TEST_IMAGE_DIR="${WALLPAPERX_ITEM_ASSET_DIR}")
             add_dependencies(wallpaperx-item-import-release-test wallpaperxplugin wallpaperx-shaders)
-            add_test(NAME item_import_release
-                     COMMAND ${DBUS_RUN_SESSION} -- $<TARGET_FILE:wallpaperx-item-import-release-test>)
+            wallpaperx_add_display_test(NAME item_import_release
+                     COMMAND $<TARGET_FILE:wallpaperx-item-import-release-test>)
             set_tests_properties(item_import_release PROPERTIES
                 ENVIRONMENT "QT_QPA_PLATFORM=wayland\;xcb\;offscreen;QT_NO_XDG_DESKTOP_PORTAL=1"
                 RESOURCE_LOCK wallpaperx_bus_tests
@@ -1519,8 +1644,8 @@ if(DBUS_RUN_SESSION)
                 WALLPAPERX_SHADER_DIR="${WALLPAPERX_SHADER_OUTPUT_DIR}"
                 WALLPAPERX_TEST_IMAGE_DIR="${WALLPAPERX_ITEM_ASSET_DIR}")
             add_dependencies(wallpaperx-item-frame-shown-test wallpaperxplugin wallpaperx-shaders)
-            add_test(NAME item_frame_shown
-                     COMMAND ${DBUS_RUN_SESSION} -- $<TARGET_FILE:wallpaperx-item-frame-shown-test>)
+            wallpaperx_add_display_test(NAME item_frame_shown
+                     COMMAND $<TARGET_FILE:wallpaperx-item-frame-shown-test>)
             set_tests_properties(item_frame_shown PROPERTIES
                 ENVIRONMENT "QT_QPA_PLATFORM=wayland\;xcb\;offscreen;QT_NO_XDG_DESKTOP_PORTAL=1"
                 RESOURCE_LOCK wallpaperx_bus_tests
@@ -1544,9 +1669,8 @@ if(DBUS_RUN_SESSION)
                 WALLPAPERX_TEST_IMAGE_DIR="${WALLPAPERX_ITEM_ASSET_DIR}")
             add_dependencies(wallpaperx-item-release-ledger-test wallpaperxplugin wallpaperx-shaders)
             foreach(release_phase repeat-import dropped-frame in-flight-monitor-change daemon-restart)
-                add_test(NAME item_release_${release_phase}
-                         COMMAND ${DBUS_RUN_SESSION} --
-                                 $<TARGET_FILE:wallpaperx-item-release-ledger-test> ${release_phase})
+                wallpaperx_add_display_test(NAME item_release_${release_phase}
+                         COMMAND $<TARGET_FILE:wallpaperx-item-release-ledger-test> ${release_phase})
                 set_tests_properties(item_release_${release_phase} PROPERTIES
                     ENVIRONMENT "QT_QPA_PLATFORM=wayland\;xcb\;offscreen;QT_NO_XDG_DESKTOP_PORTAL=1"
                     RESOURCE_LOCK wallpaperx_bus_tests
@@ -1595,12 +1719,15 @@ if(DBUS_RUN_SESSION)
                 if(cache_phase STREQUAL "handover-modifier")
                     set(cache_environment "${cache_environment};WALLPAPERX_FORCE_HANDLE_TYPE=dmabuf")
                 endif()
-                # A real window, so never on a real desktop's platform.
+                # A real window, so never on a real desktop's platform, and it needs no OpenGL.
                 if(cache_phase STREQUAL "not-opengl")
                     set(cache_environment "QT_QPA_PLATFORM=offscreen;QT_NO_XDG_DESKTOP_PORTAL=1")
+                    wallpaperx_add_test(NAME item_cache_${cache_phase}
+                             COMMAND $<TARGET_FILE:wallpaperx-item-import-cache-test> ${cache_phase})
+                else()
+                    wallpaperx_add_display_test(NAME item_cache_${cache_phase}
+                             COMMAND $<TARGET_FILE:wallpaperx-item-import-cache-test> ${cache_phase})
                 endif()
-                add_test(NAME item_cache_${cache_phase}
-                         COMMAND ${DBUS_RUN_SESSION} -- $<TARGET_FILE:wallpaperx-item-import-cache-test> ${cache_phase})
                 set_tests_properties(item_cache_${cache_phase} PROPERTIES
                     ENVIRONMENT "${cache_environment}"
                     RESOURCE_LOCK wallpaperx_bus_tests
@@ -1629,25 +1756,24 @@ if(DBUS_RUN_SESSION)
             foreach(timeline_phase steady old-daemon unsupported unknown-interface retry-busy retry-exportfailed
                                    lost-reply refused-timeline refused-binary wait-no-trip setup-create setup-type
                                    stray-value restart stale-value context-move)
-                add_test(NAME item_timeline_${timeline_phase}
-                         COMMAND ${DBUS_RUN_SESSION} -- $<TARGET_FILE:wallpaperx-item-timeline-test> ${timeline_phase})
+                wallpaperx_add_display_test(NAME item_timeline_${timeline_phase}
+                         COMMAND $<TARGET_FILE:wallpaperx-item-timeline-test> ${timeline_phase})
                 set_tests_properties(item_timeline_${timeline_phase} PROPERTIES
                     ENVIRONMENT "QT_QPA_PLATFORM=wayland\;xcb\;offscreen;QT_NO_XDG_DESKTOP_PORTAL=1"
                     RESOURCE_LOCK wallpaperx_bus_tests
                     SKIP_RETURN_CODE 77)
             endforeach()
             # The steady phase again on the dma_buf export, the other handle type the plugin waits on.
-            add_test(NAME item_timeline_steady-dmabuf
-                     COMMAND ${DBUS_RUN_SESSION} -- $<TARGET_FILE:wallpaperx-item-timeline-test> steady)
+            wallpaperx_add_display_test(NAME item_timeline_steady-dmabuf
+                     COMMAND $<TARGET_FILE:wallpaperx-item-timeline-test> steady)
             set_tests_properties(item_timeline_steady-dmabuf PROPERTIES
                 ENVIRONMENT "QT_QPA_PLATFORM=wayland\;xcb\;offscreen;QT_NO_XDG_DESKTOP_PORTAL=1;WALLPAPERX_FORCE_HANDLE_TYPE=dmabuf"
                 RESOURCE_LOCK wallpaperx_bus_tests
                 SKIP_RETURN_CODE 77)
 
             foreach(offscreen_phase hidden painted)
-                add_test(NAME item_offscreen_${offscreen_phase}
-                         COMMAND ${DBUS_RUN_SESSION} --
-                                 $<TARGET_FILE:wallpaperx-item-offscreen-test> ${offscreen_phase})
+                wallpaperx_add_display_test(NAME item_offscreen_${offscreen_phase}
+                         COMMAND $<TARGET_FILE:wallpaperx-item-offscreen-test> ${offscreen_phase})
                 set_tests_properties(item_offscreen_${offscreen_phase} PROPERTIES
                     ENVIRONMENT "QT_QPA_PLATFORM=wayland\;xcb\;offscreen;QT_NO_XDG_DESKTOP_PORTAL=1"
                     RESOURCE_LOCK wallpaperx_bus_tests
@@ -1658,7 +1784,7 @@ if(DBUS_RUN_SESSION)
             # nobody runs and nobody misses: ctest prints a full green run with no line for it,
             # which reads exactly like a passing check. The same reasoning registers
             # frame_import_probe unconditionally above.
-            add_test(NAME item_import_release
+            wallpaperx_add_test(NAME item_import_release
                      COMMAND ${CMAKE_COMMAND} -E echo
                      "item_import_release: NOT VERIFIED -- Qt6 QuickPrivate headers were not found at configure "
                      "time, so this check was not built. It is the only check that the GL objects imported from a "
@@ -1666,7 +1792,7 @@ if(DBUS_RUN_SESSION)
                      "current; without it a build that leaks a screen's worth of GPU memory per unplugged monitor "
                      "is green. Install the Qt6 Quick private headers and re-configure.")
             set_tests_properties(item_import_release PROPERTIES SKIP_REGULAR_EXPRESSION "NOT VERIFIED")
-            add_test(NAME item_frame_shown
+            wallpaperx_add_test(NAME item_frame_shown
                      COMMAND ${CMAKE_COMMAND} -E echo
                      "item_frame_shown: NOT VERIFIED -- Qt6 QuickPrivate headers were not found at configure time, "
                      "so this check was not built. It is the only check that the plugin stops telling the desktop a "
@@ -1675,7 +1801,7 @@ if(DBUS_RUN_SESSION)
                      "and re-configure.")
             set_tests_properties(item_frame_shown PROPERTIES SKIP_REGULAR_EXPRESSION "NOT VERIFIED")
             foreach(release_phase repeat-import dropped-frame in-flight-monitor-change daemon-restart)
-                add_test(NAME item_release_${release_phase}
+                wallpaperx_add_test(NAME item_release_${release_phase}
                          COMMAND ${CMAKE_COMMAND} -E echo
                          "item_release_${release_phase}: NOT VERIFIED -- Qt6 QuickPrivate headers were not found at "
                          "configure time, so this check was not built. It is part of the only coverage that the "
@@ -1723,8 +1849,8 @@ if(DBUS_RUN_SESSION)
             set_target_properties(wallpaperx-cross-process-import-test PROPERTIES
                 AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
         endif()
-        add_test(NAME cross_process_import
-                 COMMAND ${DBUS_RUN_SESSION} -- $<TARGET_FILE:wallpaperx-cross-process-import-test>)
+        wallpaperx_add_test(NAME cross_process_import
+                 COMMAND $<TARGET_FILE:wallpaperx-cross-process-import-test>)
         # SKIP_RETURN_CODE because a host whose GL and Vulkan resolve to different drivers, or whose
         # daemon exports a dma_buf, has not exercised this and must not report that it has.
         set_tests_properties(cross_process_import PROPERTIES
@@ -1734,7 +1860,7 @@ if(DBUS_RUN_SESSION)
         # Registered as a permanent skip rather than left absent, for the reason above: a missing
         # entry reads as a green run, and this is the only check that an fd exported by one
         # process imports as correct pixels in another.
-        add_test(NAME cross_process_import
+        wallpaperx_add_test(NAME cross_process_import
                  COMMAND ${CMAKE_COMMAND} -E echo
                  "cross_process_import: NOT VERIFIED -- the frame importer was not built (EGL/OpenGL missing at "
                  "configure time), so nothing checked that an opaque fd exported by one process imports as "
@@ -1743,7 +1869,8 @@ if(DBUS_RUN_SESSION)
     endif()
 else()
     message(WARNING
-        "dbus-run-session not found -- ALL bus-driven tests are unregistered: dbus_service, "
+        "dbus-run-session not found -- test_isolation's bus check reports not verified, and ALL bus-driven "
+        "tests are unregistered: dbus_service, "
         "dbus_service_classic, dbus_service_lavapipe, dbus_service_classic_lavapipe, http_config, "
         "http_config_lavapipe, daemon_system, "
         "daemon_system_lavapipe, item_import_failure, item_import_release, item_frame_shown, "
@@ -1758,6 +1885,37 @@ else()
         "shutdown). A green ctest run without them means much less "
         "than it looks like. Install dbus.")
 endif()
+
+# That every entry in this tree, the renderer's included, runs through isolated_run.sh, and that every
+# one asking Qt for a display platform gets the nested compositor -- read from ctest's own listing,
+# so an entry registered with a bare add_test() is caught however it got there.
+wallpaperx_add_test(NAME test_isolation_registry
+                    COMMAND ${CMAKE_COMMAND} -DCTEST=${CMAKE_CTEST_COMMAND} -DBUILD_DIR=${CMAKE_BINARY_DIR}
+                            -DWRAPPER=${WALLPAPERX_ISOLATED_RUN} -DMINIMUM=100
+                            -P ${WALLPAPERX_ISOLATION_SUPPORT_DIR}/isolation_registry.cmake)
+set_tests_properties(test_isolation_registry PROPERTIES LABELS "novulkan")
+
+# The wrapper driven from outside with a made-up caller: a port bound inside an entry, TMPDIR in its
+# home or runtime directory, home-rooted search paths and Vulkan layers, an inherited platform, a
+# compositor that does not start, a test killed by a signal, a wrapper killed outright.
+wallpaperx_add_test(NAME test_isolation_wrapper
+                    COMMAND ${CMAKE_COMMAND} -DWRAPPER=${WALLPAPERX_ISOLATED_RUN}
+                            -DCONF=${WALLPAPERX_ISOLATED_SESSION_CONF}
+                            -DPROBE=$<TARGET_FILE:wallpaperx-wrapper-probe>
+                            -P ${WALLPAPERX_ISOLATION_SUPPORT_DIR}/isolation_wrapper_test.cmake)
+set_tests_properties(test_isolation_wrapper PROPERTIES LABELS "novulkan")
+
+# Read from inside an entry registered like every other: the private HOME, XDG directories, TMPDIR
+# and bus, and no display (test_isolation) or only the nested compositor's (test_isolation_display).
+# Registered with or without dbus-run-session: everything but the bus check needs no bus, and with
+# none the bus check reports not verified.
+add_executable(wallpaperx-isolation-test tests/isolation_test.cpp)
+target_link_libraries(wallpaperx-isolation-test PRIVATE SDBusCpp::sdbus-c++)
+target_include_directories(wallpaperx-isolation-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+set_target_properties(wallpaperx-isolation-test PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+wallpaperx_add_test(NAME test_isolation COMMAND wallpaperx-isolation-test bus)
+wallpaperx_add_display_test(NAME test_isolation_display COMMAND wallpaperx-isolation-test display)
+set_tests_properties(test_isolation test_isolation_display PROPERTIES LABELS "novulkan" SKIP_RETURN_CODE 77)
 
 # --------------------------------------------------------------------------- #
 # ThreadSanitizer tier

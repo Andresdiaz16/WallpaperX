@@ -15,6 +15,8 @@
 #include "kde/frame_import.h"
 #include "renderers/static_renderer.h"
 #include "support/test_image.h"
+#include "tests/daemon_wire.h"
+#include "tests/pump.h"
 #include "tests/qt_frame_reply.h"
 #include "vulkan/device.h"
 #include "vulkan/frame_export.h"
@@ -51,13 +53,6 @@
 #include <vector>
 
 namespace wallpaperx::testing {
-
-// The bus name, path and interface the plugin talks to. Literals rather than the daemon's own
-// constants: what is under test is that the item speaks the wire the daemon declares, and taking
-// both sides from one symbol would let a rename pass unnoticed.
-inline constexpr const char* kService = "io.wallpaperx.Daemon";
-inline constexpr const char* kPath = "/io/wallpaperx/Daemon";
-inline constexpr const char* kInterface = "io.wallpaperx.Daemon";
 
 // Not square and not a round number of pixels wide, for frame_export_probe's reason: a square
 // target imports fine with width and height transposed.
@@ -502,18 +497,6 @@ inline bool exportNeedsSameDevice(wallpaperx::Device& device, const wallpaperx::
     const bool needs = probe.type != wallpaperx::ExportedFrame::HandleType::DmaBuf;
     if (probe.fd >= 0) ::close(probe.fd);
     return needs;
-}
-
-// Runs the event loop until `done` or the deadline. Bounded, and the caller must have a branch
-// for false: a run that never reached its precondition must say so rather than fall through.
-inline bool pumpUntil(const std::function<bool()>& done, int limitMs) {
-    QElapsedTimer clock;
-    clock.start();
-    while (!done()) {
-        if (clock.elapsed() > limitMs) return false;
-        QCoreApplication::processEvents(QEventLoop::AllEvents, 10);
-    }
-    return true;
 }
 
 inline QSGNode* itemPaintNode(QQuickItem* item) {

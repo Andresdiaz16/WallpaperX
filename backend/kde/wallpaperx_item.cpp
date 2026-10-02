@@ -68,6 +68,10 @@ constexpr const char* kErrorNoFreeImage = "io.wallpaperx.Daemon.Error.NoFreeImag
 // on its own once an image comes free.
 constexpr int kRefusedRetryMs = 2000;
 
+// Where a window report's retry stops doubling: the longest a pause or resume can lag a daemon that
+// has recovered, if no window changes meanwhile.
+constexpr int kWindowRetryMaxMs = 60000;
+
 // A screen size reported before the daemon knows the screen's name. Ordinary while the app has
 // not named it, and answered by the next report once it has.
 constexpr const char* kErrorUnknownOutput = "io.wallpaperx.Daemon.Error.UnknownOutput";
@@ -829,12 +833,14 @@ bool WallpaperXItem::supersedesShown(Arriving generation, Held shown) {
     return generation.value >= shown.value;
 }
 
-WallpaperXItem::WallpaperXItem(QQuickItem* parent) : QQuickItem(parent) {
+WallpaperXItem::WallpaperXItem(QQuickItem* parent) : QQuickItem(parent), m_windowRetryMs(kRefusedRetryMs) {
     setFlag(ItemHasContents, true);
     m_sizeReportTimer.setSingleShot(true);
     connect(&m_sizeReportTimer, &QTimer::timeout, this, &WallpaperXItem::reportSize);
     m_paintWatch.setSingleShot(true);
     connect(&m_paintWatch, &QTimer::timeout, this, &WallpaperXItem::checkPainting);
+    m_windowReportTimer.setSingleShot(true);
+    connect(&m_windowReportTimer, &QTimer::timeout, this, &WallpaperXItem::reportWindows);
     connectToDaemon();
 }
 
@@ -851,8 +857,16 @@ void WallpaperXItem::setMonitorId(int monitorId) {
     updateOnScreen();
 
     forgetGenerations();
+    // A new id can mean the daemon moved this name to another monitor, and a move drops what the
+    // name reported. The id is read back from the daemon, so the move is done: sent now, as
+    // setOutput does, since the size report has failures it never retries.
     m_sizeReported.reset();
+    m_visibleReported.reset();
+    m_windowsReported.reset();
+    restartWindowRetry();
     scheduleSizeReport();
+    reportVisible();
+    reportWindows();
 
     emit monitorIdChanged();
     // A screen that has just been identified may already have a frame waiting; without this the
@@ -863,11 +877,32 @@ void WallpaperXItem::setMonitorId(int monitorId) {
 void WallpaperXItem::setOutput(const QString& output) {
     if (m_output == output) return;
     m_output = output;
-    // Both reports are filed under the screen's name, so neither says anything about the new one.
+    // Every report is filed under the screen's name, so none says anything about the new one. The
+    // window record carries the name, so it never matches a report for the new one.
     m_sizeReported.reset();
     m_visibleReported.reset();
     emit outputChanged();
     scheduleSizeReport();
+    // Not after the size report, which waits to settle: the daemon places these by name alone, and
+    // a video stays stopped until it hears this screen is visible. An unknown-name refusal re-arms
+    // the size report.
+    reportVisible();
+    restartWindowRetry();
+    reportWindows();
+}
+
+void WallpaperXItem::setWindowFocused(bool focused) {
+    if (m_windows.focused == focused) return;
+    m_windows.focused = focused;
+    emit windowFocusedChanged();
+    m_windowReportTimer.start(0);
+}
+
+void WallpaperXItem::setWindowMaximized(bool maximized) {
+    if (m_windows.maximized == maximized) return;
+    m_windows.maximized = maximized;
+    emit windowMaximizedChanged();
+    m_windowReportTimer.start(0);
 }
 
 void WallpaperXItem::scheduleSizeReport() { m_sizeReportTimer.start(kSizeReportSettleMs); }
@@ -918,6 +953,10 @@ void WallpaperXItem::updateOnScreen() {
         releaseHeldImages();
         dropShownFrame();
         reportVisible();
+        // Off the screen it stops speaking for the screen's windows, so another item for the name
+        // may report over this one meanwhile; coming back sends the state even if it is unchanged.
+        m_windowsReported.reset();
+        restartWindowRetry();
         return;
     }
     // Assumed to be painted until a frame handed over proves otherwise, so a wallpaper resumes
@@ -926,6 +965,7 @@ void WallpaperXItem::updateOnScreen() {
     m_painting = true;
     m_paintUnconfirmed = false;
     reportVisible();
+    reportWindows();
     fetchFrame(0);
     // Not left to the dirty mark set on the way out: a window teardown between the two would drop
     // it, and nothing else asks for the pass that frees the node.
@@ -1022,6 +1062,68 @@ void WallpaperXItem::reportVisible() {
     });
 }
 
+void WallpaperXItem::reportWindows() {
+    const WindowReport report{m_output, m_windows};
+    // Off the screen it does not speak for the screen's windows: another item for the same name
+    // may be showing it.
+    if (!m_onScreen || m_output.isEmpty() || m_windowsReported == report) return;
+
+    QDBusConnection bus = QDBusConnection::sessionBus();
+    if (!bus.isConnected()) return;
+    QDBusMessage request = QDBusMessage::createMethodCall(QString::fromUtf8(kService), QString::fromUtf8(kPath),
+                                                          QString::fromUtf8(kInterface),
+                                                          QStringLiteral("SetOutputFocus"));
+    request.setArguments({report.output, report.windows.focused, report.windows.maximized});
+    m_windowsReported = report;
+
+    auto* watcher = new QDBusPendingCallWatcher(bus.asyncCall(request), this);
+    connect(watcher, &QDBusPendingCallWatcher::finished, this, [this, report](QDBusPendingCallWatcher* done) {
+        done->deleteLater();
+        if (!done->isError()) {
+            m_windowRetryMs = kRefusedRetryMs;
+            return;
+        }
+        if (m_windowsReported != report) return;
+        m_windowsReported.reset();
+        const QString name = done->error().name();
+        // No daemon, or one older than this call: a new owner reports again, and an old daemon has
+        // no pause setting for the report to serve. Neither is logged -- this follows every focus
+        // change.
+        if (name == QLatin1String("org.freedesktop.DBus.Error.ServiceUnknown") ||
+            name == QLatin1String("org.freedesktop.DBus.Error.UnknownMethod")) {
+            return;
+        }
+        // Not logged, and retried through the size report as visibility is: its success is the only
+        // sign the daemon knows the name again.
+        if (name == QLatin1String(kErrorUnknownOutput)) {
+            m_sizeReported.reset();
+            if (!m_sizeReportTimer.isActive()) m_sizeReportTimer.start(kRefusedRetryMs);
+            return;
+        }
+        const bool transient = name == QLatin1String(kErrorRenderFailed) ||
+                               name == QLatin1String("org.freedesktop.DBus.Error.NoReply") ||
+                               name == QLatin1String("org.freedesktop.DBus.Error.Timeout");
+        // A refusal that does not clear repeats with every retry, so a run of them is logged once.
+        if (!transient || m_windowRetryMs == kRefusedRetryMs) {
+            std::fprintf(stderr, "wallpaperx: the daemon refused this screen's window state -- %s\n",
+                         sanitizeForLog(done->error().message().toStdString()).c_str());
+        }
+        // Its own retry, backed off. Not the size report's: the daemon can go on accepting that while
+        // refusing this, which would resend both every interval for the session.
+        if (transient) {
+            m_windowReportTimer.start(m_windowRetryMs);
+            m_windowRetryMs = std::min(m_windowRetryMs * 2, kWindowRetryMaxMs);
+        }
+    });
+}
+
+// Stopped, not left to run: the retry it holds was paced for the old run, and each caller resends
+// on its own -- directly, through the size report's success, or on coming back on the screen.
+void WallpaperXItem::restartWindowRetry() {
+    m_windowReportTimer.stop();
+    m_windowRetryMs = kRefusedRetryMs;
+}
+
 // Measured on this item, not on its QScreen: the item is what the frame is stretched over, and on
 // Wayland a fractional scale belongs to the window while QScreen carries the output's integer one.
 void WallpaperXItem::reportSize() {
@@ -1049,6 +1151,7 @@ void WallpaperXItem::reportSize() {
             // needs and the only thing that says when it has one -- so this is where a report the
             // daemon could not place is sent again.
             reportVisible();
+            reportWindows();
             return;
         }
         // Nothing to undo once a newer report has replaced this one.
@@ -1199,16 +1302,27 @@ void WallpaperXItem::connectToDaemon() {
                 // A new daemon takes every screen to be drawn until it is told otherwise, and one
                 // that has gone remembers nothing.
                 m_visibleReported.reset();
+                // Window reports live in the daemon's memory only.
+                m_windowsReported.reset();
+                restartWindowRetry();
                 // On departures too, and before the return below: a daemon numbers its images from
                 // scratch, so every mark this item holds is meaningless either way -- and one that
                 // never comes back is the case where no later frame would clear them or the
                 // imports they describe.
                 forgetGenerations();
+                // Nothing is sent on a departure: it could only be refused as ServiceUnknown, and
+                // the cleared records above make the next arrival send both reports.
                 if (newOwner.isEmpty()) {
                     setFetchReason(tr("WallpaperX is not running."));
                     return;
                 }
                 scheduleSizeReport();
+                // Sent now, as setOutput does: the size report has failures it never retries, and a
+                // name the new daemon does not know yet is refused as UnknownOutput, which re-arms it.
+                // Visibility only from the screen, as reportWindows() gates itself: an item off it
+                // still holds the name, and its "not visible" would override a copy showing it.
+                if (m_onScreen) reportVisible();
+                reportWindows();
                 // Gated: an unconditional retry would add a duplicate match rule per restart,
                 // which is one of the things that makes the subscription fail in the first place.
                 if (!m_subscribed) m_subscribed = subscribeToFrameReady();

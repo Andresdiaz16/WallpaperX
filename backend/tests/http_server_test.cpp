@@ -1072,12 +1072,15 @@ void runBindChecks(sdbus::IProxy& proxy, WallpaperManager& manager, HttpServer& 
     //       distinguish the two bindings at all and the phase skips instead of passing.
     //       Refusal and timeout are also kept apart (tryConnect), because a DROP shows up
     //       as a timeout and only a refusal means "nothing is listening here".
-    // CONTROL: HttpServer::kLoopbackHost changed to "0.0.0.0" -> "FAIL: the config
-    //       server does not answer on this host's non-loopback address", with
-    //       "connect to 192.168.1.186:36605 connected (expected refused)". Reverted.
+    // CONTROL: backend/daemon/http_server.h's kLoopbackHost changed to "0.0.0.0" -> "FAIL:
+    //       the config server does not answer on this host's non-loopback address", with
+    //       "connect to 192.0.2.1:46463 connected (expected refused)" -- the dummy address
+    //       isolated_run.sh gives each entry's private network. Observed 2026-10-01.
     const std::string lanAddress = nonLoopbackAddress();
     if (lanAddress.empty()) {
-        notVerified("S7.1 (loopback-only bind)", "this host has no non-loopback IPv4 interface to test against");
+        notVerified("S7.1 (loopback-only bind)",
+                    "this entry's network has no non-loopback IPv4 interface to test against (isolated_run.sh "
+                    "adds a dummy one at 192.0.2.1 where the host lets it load the dummy driver)");
     } else {
         HeldPort anyPort;
         const bool anyOpened = anyPort.open(INADDR_ANY);

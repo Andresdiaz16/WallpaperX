@@ -1155,4 +1155,55 @@ TestCase {
         verify(backdrop !== null && backdrop.visible,
                "the message is still shown when the renderer module cannot be loaded");
     }
+
+    // GOAL: a hidden copy of the plugin has no renderer, and showing it again creates one before
+    //       anything else runs. Plasma keeps a hidden copy per activity on each screen, under the same
+    //       screen name; a renderer there reports for the screen the user is looking at. And on an
+    //       activity switch the shown copy's renderer must exist inside the switch, not after a poll.
+    // WHY-THIS-SHAPE: hidden through its parent, as Plasma hides a containment, on a screen whose
+    //       Loader was active before the hide, so `active` going false can only be the hide's doing.
+    //       The "shown again" half is read with no wait at all, so a renderer that arrives a turn
+    //       later -- or only after the next poll -- fails it.
+    // CONTROL: in backend/kde/kpackage/contents/ui/main.qml, `root.visible &&` dropped from the
+    //       surface Loader's `active` -> "a hidden copy has no renderer" red. `onVisibleChanged: if
+    //       (!visible) root.reply = null;` added to the root, so a shown copy waits for its next poll
+    //       -> "showing it again creates the renderer at once" red. (`asynchronous: true` on that
+    //       Loader reddens this case too, but at drawnScreenWithStandIn()'s precondition first.)
+    //       Both observed 2026-10-01 through control_batch.sh, reverted.
+    function test_a_hidden_copy_has_no_renderer_and_gets_one_back_at_once() {
+        const drawn = drawnScreenWithStandIn();
+        const host = drawn.item.parent;
+        verify(drawn.surface.active, "the renderer is loaded before the hide, which is what lets this fail");
+        host.visible = false;
+        verify(!drawn.item.visible, "the plugin is hidden through its parent");
+        verify(!drawn.surface.active, "a hidden copy has no renderer");
+        compare(drawn.surface.item, null, "and its renderer item is gone");
+
+        host.visible = true;
+        compare(drawn.surface.status, Loader.Ready, "showing it again creates the renderer at once");
+        verify(drawn.surface.item !== null, "the renderer exists without waiting for anything");
+        compare(drawn.surface.item.monitorId, 0, "and is told its monitor");
+        compare(drawn.surface.item.output, suite.namedScreen, "and its screen's name");
+    }
+
+    // GOAL: a hidden copy keeps asking the daemon what its screen shows, so that when it is shown its
+    //       answer is current and the renderer is created inside the switch rather than after a poll.
+    // WHY-THIS-SHAPE: real requests to the stub, counted while the copy is hidden, over a span in which
+    //       a 1 s poll asks at least twice.
+    // CONTROL: `running: root.visible` given to main.qml's poll Timer -> "a hidden copy keeps polling"
+    //       red. Observed 2026-10-01 through control_batch.sh, reverted.
+    function test_a_hidden_copy_keeps_polling() {
+        if (!stubDaemon.available()) {
+            skip(stubDaemon.unavailableReason());
+        }
+        const host = createTemporaryObject(plugin, suite);
+        compare(host.status, Loader.Ready, "main.qml loaded");
+        const item = host.item;
+        item.connectorOverride = suite.namedScreen;
+        host.visible = false;
+        verify(!item.visible, "the plugin is hidden through its parent");
+        tryVerify(function () { return item.pending === null; }, 5000, "any request in flight has settled");
+        stubDaemon.reset();
+        tryVerify(function () { return stubDaemon.requests() >= 2; }, 5000, "a hidden copy keeps polling");
+    }
 }

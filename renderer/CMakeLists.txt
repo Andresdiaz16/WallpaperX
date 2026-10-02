@@ -671,9 +671,18 @@ target_compile_definitions(wallpaperx-reset-point-probe PRIVATE
 if(WALLPAPERX_FFMPEG_EXECUTABLE)
     add_dependencies(wallpaperx-reset-point-probe wallpaperx-video-fixtures)
 endif()
-add_test(NAME reset_point_detector COMMAND wallpaperx-reset-point-probe)
+# Every entry below is registered through wallpaperx_add_test(), never add_test(): it runs the
+# entry with a private HOME and XDG directories, a network of its own, no live display and a private
+# bus that can start no service, so a suite run from a desktop session cannot reach that session. The probes here
+# open no bus, but a GPU driver writes its shader cache under XDG_CACHE_HOME.
+include(${CMAKE_CURRENT_SOURCE_DIR}/tests/support/isolated_test.cmake)
+enable_testing()
+# test_isolation_wrapper's listener, client and crashing test; built here so the backend's copy of
+# that entry has it too.
+add_executable(wallpaperx-wrapper-probe tests/support/wrapper_probe.cpp)
+wallpaperx_add_test(NAME reset_point_detector COMMAND wallpaperx-reset-point-probe)
 # The AV1 fixture needs libaom and skips without it, apart from the fixtures that are always there.
-add_test(NAME reset_point_detector_av1 COMMAND wallpaperx-reset-point-probe av1)
+wallpaperx_add_test(NAME reset_point_detector_av1 COMMAND wallpaperx-reset-point-probe av1)
 set_tests_properties(reset_point_detector reset_point_detector_av1 PROPERTIES SKIP_RETURN_CODE 77 LABELS "novulkan")
 
 # The Device's creation record and its video-decode surface. Interposes vkCreateInstance,
@@ -690,23 +699,22 @@ target_link_libraries(wallpaperx-handle-type-env-test PRIVATE wallpaperx-rendere
 add_executable(wallpaperx-validation-grade-probe tests/validation_grade_probe.cpp)
 target_link_libraries(wallpaperx-validation-grade-probe PRIVATE wallpaperx-renderer)
 
-enable_testing()
-add_test(NAME tier_selection COMMAND wallpaperx-tier-selection-test)
-add_test(NAME memory_export COMMAND wallpaperx-memory-export-test)
-add_test(NAME gpu_fault COMMAND wallpaperx-gpu-fault-test)
+wallpaperx_add_test(NAME tier_selection COMMAND wallpaperx-tier-selection-test)
+wallpaperx_add_test(NAME memory_export COMMAND wallpaperx-memory-export-test)
+wallpaperx_add_test(NAME gpu_fault COMMAND wallpaperx-gpu-fault-test)
 
 # SKIP_RETURN_CODE because a host that cannot make a temporary directory has no FIFO, directory or
 # symlink to offer openWallpaperFile, and an inconclusive run must not read as a verified one.
-add_test(NAME wallpaper_file_probe COMMAND wallpaperx-wallpaper-file-probe)
+wallpaperx_add_test(NAME wallpaper_file_probe COMMAND wallpaperx-wallpaper-file-probe)
 set_tests_properties(wallpaper_file_probe PROPERTIES SKIP_RETURN_CODE 77)
 
 # The two-argument externalMemoryHandleType() caches WALLPAPERX_FORCE_HANDLE_TYPE in a
 # function-local static, so one process can only ever observe one value of it. Three
 # processes, three environments -- a single binary looping over setenv would test the
 # first value three times and report the other two as passing.
-add_test(NAME handle_type_env_default COMMAND wallpaperx-handle-type-env-test "")
-add_test(NAME handle_type_env_opaque COMMAND wallpaperx-handle-type-env-test opaque)
-add_test(NAME handle_type_env_dmabuf COMMAND wallpaperx-handle-type-env-test dmabuf)
+wallpaperx_add_test(NAME handle_type_env_default COMMAND wallpaperx-handle-type-env-test "")
+wallpaperx_add_test(NAME handle_type_env_opaque COMMAND wallpaperx-handle-type-env-test opaque)
+wallpaperx_add_test(NAME handle_type_env_dmabuf COMMAND wallpaperx-handle-type-env-test dmabuf)
 set_tests_properties(handle_type_env_opaque PROPERTIES ENVIRONMENT "WALLPAPERX_FORCE_HANDLE_TYPE=opaque")
 set_tests_properties(handle_type_env_dmabuf PROPERTIES ENVIRONMENT "WALLPAPERX_FORCE_HANDLE_TYPE=dmabuf")
 # Explicitly unset for the default case: ctest inherits the caller's environment, so a
@@ -725,44 +733,44 @@ set_tests_properties(tier_selection memory_export gpu_fault
                      wallpaper_file_probe
                      PROPERTIES LABELS "novulkan")
 
-add_test(NAME device_probe COMMAND wallpaperx-device-probe)
-add_test(NAME offscreen_probe COMMAND wallpaperx-offscreen-probe)
-add_test(NAME device_affinity_probe COMMAND wallpaperx-device-affinity-probe)
-add_test(NAME static_renderer_probe COMMAND wallpaperx-static-renderer-probe)
-add_test(NAME image_bounds_probe COMMAND wallpaperx-image-bounds-probe)
-add_test(NAME descriptor_allocator_probe COMMAND wallpaperx-descriptor-allocator-probe)
+wallpaperx_add_test(NAME device_probe COMMAND wallpaperx-device-probe)
+wallpaperx_add_test(NAME offscreen_probe COMMAND wallpaperx-offscreen-probe)
+wallpaperx_add_test(NAME device_affinity_probe COMMAND wallpaperx-device-affinity-probe)
+wallpaperx_add_test(NAME static_renderer_probe COMMAND wallpaperx-static-renderer-probe)
+wallpaperx_add_test(NAME image_bounds_probe COMMAND wallpaperx-image-bounds-probe)
+wallpaperx_add_test(NAME descriptor_allocator_probe COMMAND wallpaperx-descriptor-allocator-probe)
 # Three entries, one binary. The three descriptor tiers protect different things and can be
 # asked on different hardware, so they cannot share a verdict: on Lavapipe the heap entry
 # genuinely cannot be answered (that driver completes outstanding work inside the descriptor
 # write, see the probe's header), while the buffer and classic entries are answered there and
 # are the only place the whole-set rule is graded in CI. One entry would report all three as a
 # skip, which is the wrong answer for two of them.
-add_test(NAME descriptor_inflight_heap COMMAND wallpaperx-descriptor-inflight-probe heap)
-add_test(NAME descriptor_inflight_buffer COMMAND wallpaperx-descriptor-inflight-probe buffer)
-add_test(NAME descriptor_inflight_classic COMMAND wallpaperx-descriptor-inflight-probe classic)
-add_test(NAME frame_export_probe COMMAND wallpaperx-frame-export-probe)
+wallpaperx_add_test(NAME descriptor_inflight_heap COMMAND wallpaperx-descriptor-inflight-probe heap)
+wallpaperx_add_test(NAME descriptor_inflight_buffer COMMAND wallpaperx-descriptor-inflight-probe buffer)
+wallpaperx_add_test(NAME descriptor_inflight_classic COMMAND wallpaperx-descriptor-inflight-probe classic)
+wallpaperx_add_test(NAME frame_export_probe COMMAND wallpaperx-frame-export-probe)
 # Two entries, one binary. The probe makes two claims that are verifiable on different
 # hardware: the round trip needs one usable DRM modifier, while modifier *sensitivity*
 # needs two, so a wrong one can be substituted. Lavapipe offers exactly one (LINEAR), so
 # it verifies the first and cannot verify the second. Reporting both as a single verdict
 # means either claiming the control ran when it did not, or marking the whole probe
 # unverified when the round trip demonstrably passed.
-add_test(NAME modifier_roundtrip_probe COMMAND wallpaperx-modifier-roundtrip-probe roundtrip)
-add_test(NAME modifier_sensitivity_probe COMMAND wallpaperx-modifier-roundtrip-probe sensitivity)
-add_test(NAME ownership_transfer_probe COMMAND wallpaperx-ownership-transfer-probe)
-add_test(NAME consumer_modifier_probe COMMAND wallpaperx-consumer-modifier-probe)
-add_test(NAME frame_acquire_probe COMMAND wallpaperx-frame-acquire-probe)
-add_test(NAME target_ring_probe COMMAND wallpaperx-target-ring-probe)
+wallpaperx_add_test(NAME modifier_roundtrip_probe COMMAND wallpaperx-modifier-roundtrip-probe roundtrip)
+wallpaperx_add_test(NAME modifier_sensitivity_probe COMMAND wallpaperx-modifier-roundtrip-probe sensitivity)
+wallpaperx_add_test(NAME ownership_transfer_probe COMMAND wallpaperx-ownership-transfer-probe)
+wallpaperx_add_test(NAME consumer_modifier_probe COMMAND wallpaperx-consumer-modifier-probe)
+wallpaperx_add_test(NAME frame_acquire_probe COMMAND wallpaperx-frame-acquire-probe)
+wallpaperx_add_test(NAME target_ring_probe COMMAND wallpaperx-target-ring-probe)
 # Two entries, one binary, and they answer on different hardware. `render` needs nothing but a
 # Device, so it is answerable everywhere. `modifiers` grades that a DRM format modifier whose
 # tiling features lack a required one is dropped, and telling that apart from a filter that
 # drops everything needs a driver offering two modifiers that differ in some feature -- which
 # Lavapipe, with its single LINEAR modifier, cannot. One verdict for both would either claim
 # that measurement was made where it was not, or mark a working renderer unverified.
-add_test(NAME video_renderer_probe COMMAND wallpaperx-video-renderer-probe render)
-add_test(NAME video_modifier_filter_probe COMMAND wallpaperx-video-renderer-probe modifiers)
+wallpaperx_add_test(NAME video_renderer_probe COMMAND wallpaperx-video-renderer-probe render)
+wallpaperx_add_test(NAME video_modifier_filter_probe COMMAND wallpaperx-video-renderer-probe modifiers)
 # 77 when the host has no Vulkan device at all.
-add_test(NAME device_lost_probe COMMAND wallpaperx-device-lost-probe)
+wallpaperx_add_test(NAME device_lost_probe COMMAND wallpaperx-device-lost-probe)
 set_tests_properties(device_lost_probe PROPERTIES SKIP_RETURN_CODE 77)
 
 # Six entries, one binary, because they answer different questions on different configurations.
@@ -773,12 +781,12 @@ set_tests_properties(device_lost_probe PROPERTIES SKIP_RETURN_CODE 77)
 # one. `shared-decode-queue` manufactures a queue-family report in which the graphics family also
 # decodes -- neither driver here does -- and exits 77 where the driver enables no video extension
 # at all, since the report cannot be manufactured onto a device that has none.
-add_test(NAME device_video_enabled COMMAND wallpaperx-device-video-probe enabled)
-add_test(NAME device_video_enabled_buffer COMMAND wallpaperx-device-video-probe enabled)
-add_test(NAME device_video_enabled_classic COMMAND wallpaperx-device-video-probe enabled)
-add_test(NAME device_video_decode COMMAND wallpaperx-device-video-probe decode)
-add_test(NAME device_video_waits COMMAND wallpaperx-device-video-probe waits)
-add_test(NAME device_video_shared_queue COMMAND wallpaperx-device-video-probe shared-decode-queue)
+wallpaperx_add_test(NAME device_video_enabled COMMAND wallpaperx-device-video-probe enabled)
+wallpaperx_add_test(NAME device_video_enabled_buffer COMMAND wallpaperx-device-video-probe enabled)
+wallpaperx_add_test(NAME device_video_enabled_classic COMMAND wallpaperx-device-video-probe enabled)
+wallpaperx_add_test(NAME device_video_decode COMMAND wallpaperx-device-video-probe decode)
+wallpaperx_add_test(NAME device_video_waits COMMAND wallpaperx-device-video-probe waits)
+wallpaperx_add_test(NAME device_video_shared_queue COMMAND wallpaperx-device-video-probe shared-decode-queue)
 set_tests_properties(device_video_enabled_buffer PROPERTIES ENVIRONMENT "WALLPAPERX_FORCE_TIER=buffer")
 set_tests_properties(device_video_enabled_classic PROPERTIES ENVIRONMENT "WALLPAPERX_FORCE_TIER=classic")
 # Explicitly cleared, like handle_type_env_default: ctest inherits the caller's environment, so a
@@ -797,12 +805,12 @@ set_tests_properties(device_video_shared_queue PROPERTIES SKIP_RETURN_CODE 77)
 # SKIP_RETURN_CODE on all six: without a hardware decoder, or without the ffmpeg command line at
 # configure time, these exit 0 and would be indistinguishable from a run that established
 # something.
-add_test(NAME video_decoder_hardware COMMAND wallpaperx-video-decoder-probe hardware)
-add_test(NAME video_decoder_refused COMMAND wallpaperx-video-decoder-probe refused)
-add_test(NAME video_decoder_no_decoder COMMAND wallpaperx-video-decoder-probe no-decoder)
-add_test(NAME video_decoder_refused_after_setup COMMAND wallpaperx-video-decoder-probe refused-after-setup)
-add_test(NAME video_decoder_fault COMMAND wallpaperx-video-decoder-probe fault)
-add_test(NAME video_decoder_content COMMAND wallpaperx-video-decoder-probe content)
+wallpaperx_add_test(NAME video_decoder_hardware COMMAND wallpaperx-video-decoder-probe hardware)
+wallpaperx_add_test(NAME video_decoder_refused COMMAND wallpaperx-video-decoder-probe refused)
+wallpaperx_add_test(NAME video_decoder_no_decoder COMMAND wallpaperx-video-decoder-probe no-decoder)
+wallpaperx_add_test(NAME video_decoder_refused_after_setup COMMAND wallpaperx-video-decoder-probe refused-after-setup)
+wallpaperx_add_test(NAME video_decoder_fault COMMAND wallpaperx-video-decoder-probe fault)
+wallpaperx_add_test(NAME video_decoder_content COMMAND wallpaperx-video-decoder-probe content)
 set_tests_properties(video_decoder_hardware video_decoder_refused video_decoder_no_decoder
                      video_decoder_refused_after_setup video_decoder_fault video_decoder_content
                      PROPERTIES SKIP_RETURN_CODE 77)
@@ -812,22 +820,22 @@ set_tests_properties(video_decoder_hardware video_decoder_refused video_decoder_
 # unreached states as verified. The device-path, gate, no-ycbcr and shape-fallback entries need a
 # hardware decoder and skip without one. shader_read opens no driver. SKIP_RETURN_CODE throughout:
 # a missing ffmpeg command line, libswscale or decoder must not read as a pass.
-add_test(NAME frame_converter_colour_host COMMAND wallpaperx-frame-converter-probe colour-host)
-add_test(NAME frame_converter_colour_device COMMAND wallpaperx-frame-converter-probe colour-device)
-add_test(NAME frame_converter_edges_host COMMAND wallpaperx-frame-converter-probe edges-host)
-add_test(NAME frame_converter_edges_device COMMAND wallpaperx-frame-converter-probe edges-device)
-add_test(NAME frame_converter_siting COMMAND wallpaperx-frame-converter-probe siting)
-add_test(NAME frame_converter_refusal COMMAND wallpaperx-frame-converter-probe refusal)
-add_test(NAME frame_converter_output COMMAND wallpaperx-frame-converter-probe output)
-add_test(NAME frame_converter_allocation COMMAND wallpaperx-frame-converter-probe allocation)
-add_test(NAME frame_converter_gate COMMAND wallpaperx-frame-converter-probe gate)
-add_test(NAME frame_converter_no_ycbcr COMMAND wallpaperx-frame-converter-probe no-ycbcr)
-add_test(NAME frame_converter_shape_resize COMMAND wallpaperx-frame-converter-probe shape-resize)
-add_test(NAME frame_converter_shape_tags COMMAND wallpaperx-frame-converter-probe shape-tags)
-add_test(NAME frame_converter_shape_fallback COMMAND wallpaperx-frame-converter-probe shape-fallback)
-add_test(NAME frame_converter_shader_read COMMAND wallpaperx-frame-converter-probe shader-read)
-add_test(NAME frame_converter_pipeline_colour_host COMMAND wallpaperx-frame-converter-probe pipeline-colour-host)
-add_test(NAME frame_converter_pipeline_colour_device COMMAND wallpaperx-frame-converter-probe pipeline-colour-device)
+wallpaperx_add_test(NAME frame_converter_colour_host COMMAND wallpaperx-frame-converter-probe colour-host)
+wallpaperx_add_test(NAME frame_converter_colour_device COMMAND wallpaperx-frame-converter-probe colour-device)
+wallpaperx_add_test(NAME frame_converter_edges_host COMMAND wallpaperx-frame-converter-probe edges-host)
+wallpaperx_add_test(NAME frame_converter_edges_device COMMAND wallpaperx-frame-converter-probe edges-device)
+wallpaperx_add_test(NAME frame_converter_siting COMMAND wallpaperx-frame-converter-probe siting)
+wallpaperx_add_test(NAME frame_converter_refusal COMMAND wallpaperx-frame-converter-probe refusal)
+wallpaperx_add_test(NAME frame_converter_output COMMAND wallpaperx-frame-converter-probe output)
+wallpaperx_add_test(NAME frame_converter_allocation COMMAND wallpaperx-frame-converter-probe allocation)
+wallpaperx_add_test(NAME frame_converter_gate COMMAND wallpaperx-frame-converter-probe gate)
+wallpaperx_add_test(NAME frame_converter_no_ycbcr COMMAND wallpaperx-frame-converter-probe no-ycbcr)
+wallpaperx_add_test(NAME frame_converter_shape_resize COMMAND wallpaperx-frame-converter-probe shape-resize)
+wallpaperx_add_test(NAME frame_converter_shape_tags COMMAND wallpaperx-frame-converter-probe shape-tags)
+wallpaperx_add_test(NAME frame_converter_shape_fallback COMMAND wallpaperx-frame-converter-probe shape-fallback)
+wallpaperx_add_test(NAME frame_converter_shader_read COMMAND wallpaperx-frame-converter-probe shader-read)
+wallpaperx_add_test(NAME frame_converter_pipeline_colour_host COMMAND wallpaperx-frame-converter-probe pipeline-colour-host)
+wallpaperx_add_test(NAME frame_converter_pipeline_colour_device COMMAND wallpaperx-frame-converter-probe pipeline-colour-device)
 set_tests_properties(frame_converter_pipeline_colour_host frame_converter_pipeline_colour_device
                      PROPERTIES SKIP_RETURN_CODE 77)
 set_tests_properties(frame_converter_colour_host frame_converter_colour_device frame_converter_edges_host
@@ -852,7 +860,7 @@ set(WALLPAPERX_PIPELINE_MODES sequence-device sequence-host resume-timestamps re
     start-at-device-budget start-at-device-av1)
 foreach(MODE ${WALLPAPERX_PIPELINE_MODES})
     string(REPLACE "-" "_" MODE_NAME "${MODE}")
-    add_test(NAME video_pipeline_${MODE_NAME} COMMAND wallpaperx-video-pipeline-probe ${MODE})
+    wallpaperx_add_test(NAME video_pipeline_${MODE_NAME} COMMAND wallpaperx-video-pipeline-probe ${MODE})
     set_tests_properties(video_pipeline_${MODE_NAME} PROPERTIES SKIP_RETURN_CODE 77)
 endforeach()
 
@@ -895,8 +903,8 @@ set_tests_properties(video_modifier_filter_probe PROPERTIES SKIP_RETURN_CODE 77)
 # loader's layer filter itself (see its main()) rather than taking it from an ENVIRONMENT
 # property here, so it means the same thing run by hand and an edit to this file cannot
 # turn the "absent" entry into a second copy of "installed".
-add_test(NAME validation_grade_installed COMMAND wallpaperx-validation-grade-probe installed)
-add_test(NAME validation_grade_absent COMMAND wallpaperx-validation-grade-probe absent)
+wallpaperx_add_test(NAME validation_grade_installed COMMAND wallpaperx-validation-grade-probe installed)
+wallpaperx_add_test(NAME validation_grade_absent COMMAND wallpaperx-validation-grade-probe absent)
 
 # 77 means the host could not be put in the state the entry grades: no validation-layer
 # package for the installed direction, or a loader too old for the layer filter for the
@@ -959,49 +967,49 @@ set_tests_properties(modifier_roundtrip_probe modifier_sensitivity_probe
                      PROPERTIES RESOURCE_LOCK modifier_roundtrip_probe_test_image SKIP_RETURN_CODE 77)
 
 if(WALLPAPERX_LAVAPIPE_ICD)
-    add_test(NAME device_probe_lavapipe COMMAND wallpaperx-device-probe)
-    add_test(NAME offscreen_probe_lavapipe COMMAND wallpaperx-offscreen-probe)
-    add_test(NAME device_affinity_probe_lavapipe COMMAND wallpaperx-device-affinity-probe)
-    add_test(NAME static_renderer_probe_lavapipe COMMAND wallpaperx-static-renderer-probe)
-    add_test(NAME image_bounds_probe_lavapipe COMMAND wallpaperx-image-bounds-probe)
-    add_test(NAME descriptor_allocator_probe_lavapipe COMMAND wallpaperx-descriptor-allocator-probe)
-    add_test(NAME descriptor_inflight_heap_lavapipe COMMAND wallpaperx-descriptor-inflight-probe heap)
-    add_test(NAME descriptor_inflight_buffer_lavapipe COMMAND wallpaperx-descriptor-inflight-probe buffer)
-    add_test(NAME descriptor_inflight_classic_lavapipe COMMAND wallpaperx-descriptor-inflight-probe classic)
+    wallpaperx_add_test(NAME device_probe_lavapipe COMMAND wallpaperx-device-probe)
+    wallpaperx_add_test(NAME offscreen_probe_lavapipe COMMAND wallpaperx-offscreen-probe)
+    wallpaperx_add_test(NAME device_affinity_probe_lavapipe COMMAND wallpaperx-device-affinity-probe)
+    wallpaperx_add_test(NAME static_renderer_probe_lavapipe COMMAND wallpaperx-static-renderer-probe)
+    wallpaperx_add_test(NAME image_bounds_probe_lavapipe COMMAND wallpaperx-image-bounds-probe)
+    wallpaperx_add_test(NAME descriptor_allocator_probe_lavapipe COMMAND wallpaperx-descriptor-allocator-probe)
+    wallpaperx_add_test(NAME descriptor_inflight_heap_lavapipe COMMAND wallpaperx-descriptor-inflight-probe heap)
+    wallpaperx_add_test(NAME descriptor_inflight_buffer_lavapipe COMMAND wallpaperx-descriptor-inflight-probe buffer)
+    wallpaperx_add_test(NAME descriptor_inflight_classic_lavapipe COMMAND wallpaperx-descriptor-inflight-probe classic)
     # Unlike the Heap tier, frame export needs no capability-skip under Lavapipe:
     # Lavapipe advertises both VK_KHR_external_memory_fd and
     # VK_EXT_external_memory_dma_buf, so exportFrame() takes the DMA_BUF path and
     # succeeds here (verified: distinct fds, correct size, zero validation
     # warnings). This is the only place the DMA_BUF branch runs in CI, since the
     # owner's real GPU is NVIDIA (OPAQUE_FD).
-    add_test(NAME frame_export_probe_lavapipe COMMAND wallpaperx-frame-export-probe)
-    add_test(NAME modifier_roundtrip_probe_lavapipe COMMAND wallpaperx-modifier-roundtrip-probe roundtrip)
-    add_test(NAME modifier_sensitivity_probe_lavapipe COMMAND wallpaperx-modifier-roundtrip-probe sensitivity)
-    add_test(NAME ownership_transfer_probe_lavapipe COMMAND wallpaperx-ownership-transfer-probe)
-    add_test(NAME consumer_modifier_probe_lavapipe COMMAND wallpaperx-consumer-modifier-probe)
-    add_test(NAME frame_acquire_probe_lavapipe COMMAND wallpaperx-frame-acquire-probe)
-    add_test(NAME target_ring_probe_lavapipe COMMAND wallpaperx-target-ring-probe)
-    add_test(NAME video_renderer_probe_lavapipe COMMAND wallpaperx-video-renderer-probe render)
-    add_test(NAME video_modifier_filter_probe_lavapipe COMMAND wallpaperx-video-renderer-probe modifiers)
-    add_test(NAME device_lost_probe_lavapipe COMMAND wallpaperx-device-lost-probe)
+    wallpaperx_add_test(NAME frame_export_probe_lavapipe COMMAND wallpaperx-frame-export-probe)
+    wallpaperx_add_test(NAME modifier_roundtrip_probe_lavapipe COMMAND wallpaperx-modifier-roundtrip-probe roundtrip)
+    wallpaperx_add_test(NAME modifier_sensitivity_probe_lavapipe COMMAND wallpaperx-modifier-roundtrip-probe sensitivity)
+    wallpaperx_add_test(NAME ownership_transfer_probe_lavapipe COMMAND wallpaperx-ownership-transfer-probe)
+    wallpaperx_add_test(NAME consumer_modifier_probe_lavapipe COMMAND wallpaperx-consumer-modifier-probe)
+    wallpaperx_add_test(NAME frame_acquire_probe_lavapipe COMMAND wallpaperx-frame-acquire-probe)
+    wallpaperx_add_test(NAME target_ring_probe_lavapipe COMMAND wallpaperx-target-ring-probe)
+    wallpaperx_add_test(NAME video_renderer_probe_lavapipe COMMAND wallpaperx-video-renderer-probe render)
+    wallpaperx_add_test(NAME video_modifier_filter_probe_lavapipe COMMAND wallpaperx-video-renderer-probe modifiers)
+    wallpaperx_add_test(NAME device_lost_probe_lavapipe COMMAND wallpaperx-device-lost-probe)
     # The software driver is where "a device with no hardware decoder reports none and still
     # builds, submits and tears down" is actually answered -- the real GPU cannot show it. The
     # other three entries grade properties that hold on any driver and are registered here so CI,
     # which selects by this label, runs them at all.
-    add_test(NAME device_video_enabled_lavapipe COMMAND wallpaperx-device-video-probe enabled)
-    add_test(NAME device_video_decode_lavapipe COMMAND wallpaperx-device-video-probe decode)
-    add_test(NAME device_video_waits_lavapipe COMMAND wallpaperx-device-video-probe waits)
-    add_test(NAME device_video_shared_queue_lavapipe COMMAND wallpaperx-device-video-probe shared-decode-queue)
+    wallpaperx_add_test(NAME device_video_enabled_lavapipe COMMAND wallpaperx-device-video-probe enabled)
+    wallpaperx_add_test(NAME device_video_decode_lavapipe COMMAND wallpaperx-device-video-probe decode)
+    wallpaperx_add_test(NAME device_video_waits_lavapipe COMMAND wallpaperx-device-video-probe waits)
+    wallpaperx_add_test(NAME device_video_shared_queue_lavapipe COMMAND wallpaperx-device-video-probe shared-decode-queue)
     # Only the two entries that need no hardware decoder. The other four would report a skip here
     # and say nothing the real-GPU entries do not already say; these two exercise the software
     # decode path and the content classifier, which are what CI can actually answer.
-    add_test(NAME video_decoder_no_decoder_lavapipe COMMAND wallpaperx-video-decoder-probe no-decoder)
-    add_test(NAME video_decoder_content_lavapipe COMMAND wallpaperx-video-decoder-probe content)
+    wallpaperx_add_test(NAME video_decoder_no_decoder_lavapipe COMMAND wallpaperx-video-decoder-probe no-decoder)
+    wallpaperx_add_test(NAME video_decoder_content_lavapipe COMMAND wallpaperx-video-decoder-probe content)
     # Registered here for the label, not for the ICD: what this probe grades is loader- and
     # driver-independent. CI selects by the lavapipe label and has no GPU, so without these two
     # the only check of how a missing validator is reported never runs there.
-    add_test(NAME validation_grade_installed_lavapipe COMMAND wallpaperx-validation-grade-probe installed)
-    add_test(NAME validation_grade_absent_lavapipe COMMAND wallpaperx-validation-grade-probe absent)
+    wallpaperx_add_test(NAME validation_grade_installed_lavapipe COMMAND wallpaperx-validation-grade-probe installed)
+    wallpaperx_add_test(NAME validation_grade_absent_lavapipe COMMAND wallpaperx-validation-grade-probe absent)
     set_tests_properties(
         device_probe_lavapipe
         offscreen_probe_lavapipe
@@ -1068,15 +1076,15 @@ if(WALLPAPERX_LAVAPIPE_ICD)
                          PROPERTIES SKIP_RETURN_CODE 77)
     # The converter's entries that need no hardware decoder. On this driver every stream is decoded
     # in software, so these are its host path; the device path is graded on the real GPU only.
-    add_test(NAME frame_converter_colour_host_lavapipe COMMAND wallpaperx-frame-converter-probe colour-host)
-    add_test(NAME frame_converter_edges_host_lavapipe COMMAND wallpaperx-frame-converter-probe edges-host)
-    add_test(NAME frame_converter_siting_lavapipe COMMAND wallpaperx-frame-converter-probe siting)
-    add_test(NAME frame_converter_refusal_lavapipe COMMAND wallpaperx-frame-converter-probe refusal)
-    add_test(NAME frame_converter_output_lavapipe COMMAND wallpaperx-frame-converter-probe output)
-    add_test(NAME frame_converter_allocation_lavapipe COMMAND wallpaperx-frame-converter-probe allocation)
-    add_test(NAME frame_converter_shape_resize_lavapipe COMMAND wallpaperx-frame-converter-probe shape-resize)
-    add_test(NAME frame_converter_shape_tags_lavapipe COMMAND wallpaperx-frame-converter-probe shape-tags)
-    add_test(NAME frame_converter_pipeline_colour_host_lavapipe
+    wallpaperx_add_test(NAME frame_converter_colour_host_lavapipe COMMAND wallpaperx-frame-converter-probe colour-host)
+    wallpaperx_add_test(NAME frame_converter_edges_host_lavapipe COMMAND wallpaperx-frame-converter-probe edges-host)
+    wallpaperx_add_test(NAME frame_converter_siting_lavapipe COMMAND wallpaperx-frame-converter-probe siting)
+    wallpaperx_add_test(NAME frame_converter_refusal_lavapipe COMMAND wallpaperx-frame-converter-probe refusal)
+    wallpaperx_add_test(NAME frame_converter_output_lavapipe COMMAND wallpaperx-frame-converter-probe output)
+    wallpaperx_add_test(NAME frame_converter_allocation_lavapipe COMMAND wallpaperx-frame-converter-probe allocation)
+    wallpaperx_add_test(NAME frame_converter_shape_resize_lavapipe COMMAND wallpaperx-frame-converter-probe shape-resize)
+    wallpaperx_add_test(NAME frame_converter_shape_tags_lavapipe COMMAND wallpaperx-frame-converter-probe shape-tags)
+    wallpaperx_add_test(NAME frame_converter_pipeline_colour_host_lavapipe
              COMMAND wallpaperx-frame-converter-probe pipeline-colour-host)
     set_tests_properties(frame_converter_colour_host_lavapipe frame_converter_edges_host_lavapipe
                          frame_converter_siting_lavapipe frame_converter_refusal_lavapipe
@@ -1089,9 +1097,25 @@ if(WALLPAPERX_LAVAPIPE_ICD)
     foreach(MODE sequence-host shape steady-host loop-host loop-cost-host halves-host timing-host start-at-host
                  start-at-host-open-gop)
         string(REPLACE "-" "_" MODE_NAME "${MODE}")
-        add_test(NAME video_pipeline_${MODE_NAME}_lavapipe COMMAND wallpaperx-video-pipeline-probe ${MODE})
+        wallpaperx_add_test(NAME video_pipeline_${MODE_NAME}_lavapipe COMMAND wallpaperx-video-pipeline-probe ${MODE})
         set_tests_properties(video_pipeline_${MODE_NAME}_lavapipe
                              PROPERTIES ENVIRONMENT "VK_ICD_FILENAMES=${WALLPAPERX_LAVAPIPE_ICD}"
                                         LABELS "lavapipe" SKIP_RETURN_CODE 77)
     endforeach()
+endif()
+
+# That every entry above really runs isolated, read from ctest's own listing. Only when this is the
+# top-level project: under backend/ the backend's entry lists these too.
+if(PROJECT_IS_TOP_LEVEL)
+    wallpaperx_add_test(NAME test_isolation_registry
+                        COMMAND ${CMAKE_COMMAND} -DCTEST=${CMAKE_CTEST_COMMAND} -DBUILD_DIR=${CMAKE_BINARY_DIR}
+                                -DWRAPPER=${WALLPAPERX_ISOLATED_RUN} -DMINIMUM=50
+                                -P ${WALLPAPERX_ISOLATION_SUPPORT_DIR}/isolation_registry.cmake)
+    set_tests_properties(test_isolation_registry PROPERTIES LABELS "novulkan")
+    wallpaperx_add_test(NAME test_isolation_wrapper
+                        COMMAND ${CMAKE_COMMAND} -DWRAPPER=${WALLPAPERX_ISOLATED_RUN}
+                                -DCONF=${WALLPAPERX_ISOLATED_SESSION_CONF}
+                                -DPROBE=$<TARGET_FILE:wallpaperx-wrapper-probe>
+                                -P ${WALLPAPERX_ISOLATION_SUPPORT_DIR}/isolation_wrapper_test.cmake)
+    set_tests_properties(test_isolation_wrapper PROPERTIES LABELS "novulkan")
 endif()

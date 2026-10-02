@@ -33,12 +33,6 @@
 
 namespace wallpaperx::testing {
 
-inline void pumpFor(int ms) {
-    QElapsedTimer clock;
-    clock.start();
-    while (clock.elapsed() < ms) QCoreApplication::processEvents(QEventLoop::AllEvents, 10);
-}
-
 // The plugin's own type, with its counters BOUND the way a QML reader binds them -- which is the
 // only reader they exist for, and one that is frozen at its first value without a NOTIFY.
 inline QString cacheQmlSource() {

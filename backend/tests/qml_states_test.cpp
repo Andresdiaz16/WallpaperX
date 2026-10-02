@@ -23,6 +23,8 @@
 // cost is that the ctest entry has to be serialised against everything else using that port,
 // which is why it now carries the same RESOURCE_LOCK as http_config and daemon_system.
 
+#include "tests/loopback_stub.h"
+
 #include <QtQuickTest/quicktest.h>
 
 #include <QCoreApplication>
@@ -36,10 +38,7 @@
 
 #include <httplib.h>
 
-#include <sys/socket.h>
-
 #include <atomic>
-#include <chrono>
 #include <cstdio>
 #include <mutex>
 #include <string>
@@ -47,19 +46,15 @@
 
 namespace {
 
-// What main.qml's daemonOrigin names. Not configurable here: a stub on any other port would
-// never be asked.
-constexpr int kDaemonPort = 18462;
+using wallpaperx::testing::kDaemonPort;
 
 // Printed once, and only when the stub could not be brought up. The ctest entry matches it
 // with SKIP_REGULAR_EXPRESSION, so a host where something else holds 18462 reports Skipped
 // rather than a green run in which the two refresh()-path cases silently did not happen.
 //
-// CONTROL, for that wiring: `if (true || !m_primary.bind_to_port(...))` below, i.e. a stub that
-// can never come up -> ctest reported "qml_states .... ***Skipped", the sentinel printed once,
-// and "21 passed, 0 failed, 3 skipped" with each of the three cases naming the port as its
-// reason. Without SKIP_REGULAR_EXPRESSION the same run is a green Passed. Observed 2026-08-19.
-// Reverted.
+// CONTROL, for that wiring: `if (true || !wallpaperx::testing::bindDaemonPort(m_primary))` below,
+// i.e. a stub that can never come up -> ctest reported "qml_states .... ***Skipped", the sentinel
+// printed once, and "39 passed, 0 failed, 5 skipped". Observed 2026-10-01 by hand, and reverted.
 constexpr const char* kNoStubSentinel = "wallpaperx-qml-states: NO STUB DAEMON --";
 
 // A reply the plugin accepts, so that a case which comes out "unreadable" is unreadable for
@@ -121,23 +116,12 @@ public:
             res.set_content(goodReplyBody(), "application/json");
         });
 
-        // SO_REUSEADDR, as the daemon's own HttpServer sets: httplib's default is SO_REUSEPORT,
-        // which does NOT rebind over a socket in TIME_WAIT. Without this the stub failed to
-        // bind whenever a daemon from an earlier entry had just released 18462, and the run
-        // reported Skipped for a port nothing was actually holding -- measured under
-        // `ctest -j4`, where daemon_system finishes moments before this entry starts.
-        m_primary.set_socket_options([](socket_t sock) {
-            int on = 1;
-            ::setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const void*>(&on),
-                         static_cast<socklen_t>(sizeof(on)));
-        });
-
         m_altPort = m_alt.bind_to_any_port("127.0.0.1");
         if (m_altPort <= 0) {
             m_why = "no loopback port could be bound for the foreign-origin server";
             return false;
         }
-        if (!m_primary.bind_to_port("127.0.0.1", kDaemonPort)) {
+        if (!wallpaperx::testing::bindDaemonPort(m_primary)) {
             m_why = QStringLiteral("127.0.0.1:%1 could not be bound -- a wallpaperx-daemon, or another test, "
                                    "already holds the port main.qml's daemonOrigin names")
                         .arg(kDaemonPort);
@@ -145,29 +129,19 @@ public:
             return false;
         }
 
-        m_altThread = std::thread([this] { m_alt.listen_after_bind(); });
-        m_primaryThread = std::thread([this] { m_primary.listen_after_bind(); });
-
-        // Bound is not serving: listen_after_bind runs on the threads above, and a request made
-        // before either is accepting would be refused and read as "the daemon is not running".
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-        while (std::chrono::steady_clock::now() < deadline) {
-            if (m_primary.is_running() && m_alt.is_running()) {
-                m_available = true;
-                return true;
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        if (!wallpaperx::testing::serveOnThread(m_alt, m_altThread) ||
+            !wallpaperx::testing::serveOnThread(m_primary, m_primaryThread)) {
+            m_why = "the stub's listeners gave up before serving";
+            stop();
+            return false;
         }
-        m_why = "the stub's listener threads did not start within five seconds";
-        stop();
-        return false;
+        m_available = true;
+        return true;
     }
 
     void stop() {
-        m_primary.stop();
-        m_alt.stop();
-        if (m_primaryThread.joinable()) m_primaryThread.join();
-        if (m_altThread.joinable()) m_altThread.join();
+        wallpaperx::testing::stopServing(m_primary, m_primaryThread);
+        wallpaperx::testing::stopServing(m_alt, m_altThread);
         m_available = false;
     }
 

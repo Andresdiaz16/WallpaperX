@@ -237,7 +237,13 @@ WallpaperItem {
         // the screen's size, and one loaded only once a wallpaper is set lets the first one be
         // drawn at the default size and then again. Until a frame is shown the backdrop stays
         // over it. Without the id test the renderer would ask for frames belonging to no monitor.
-        active: (root.screenState === "set" || root.screenState === "unset") && root.monitorId >= 0
+        //
+        // Not while this wallpaper is hidden: Plasma keeps the desktop of every activity shown this
+        // session alive and hidden on its screen, and a renderer there would report under the same
+        // screen name as the one shown, with nothing ordering its reports after the shown one's.
+        // Hiding the containment is what Plasma does to stop showing it, so visibility, not the
+        // activity, is the fact; the poll goes on, so the renderer returns without waiting for one.
+        active: root.visible && (root.screenState === "set" || root.screenState === "unset") && root.monitorId >= 0
         source: "WallpaperSurface.qml"
         onLoaded: {
             item.monitorId = root.monitorId;

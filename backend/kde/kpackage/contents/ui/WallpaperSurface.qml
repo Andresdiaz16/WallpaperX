@@ -14,7 +14,18 @@ import QtQuick
 import com.wallpaperx
 
 WallpaperXRenderer {
+    id: renderer
+
     // Set by the Loader through its own binding; -1 until the daemon has named the screen, and
     // the item draws nothing until it is a real id.
     monitorId: -1
+
+    // Loaded for the reason this file is: if Plasma's task manager module fails, the wallpaper
+    // still draws and the screen is reported as having no window.
+    Loader {
+        id: windows
+
+        objectName: "wallpaperxWindows"
+        Component.onCompleted: windows.setSource("ScreenWindows.qml", { "renderer": renderer })
+    }
 }

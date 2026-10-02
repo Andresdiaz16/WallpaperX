@@ -61,6 +61,10 @@ class WallpaperXItem : public QQuickItem {
     // The connector name main.qml resolved monitorId from. This item's pixel size is reported to
     // the daemon under it; empty reports nothing.
     Q_PROPERTY(QString output READ output WRITE setOutput NOTIFY outputChanged)
+    // Whether a window has the focus on this screen, and whether one on it is maximized or
+    // fullscreen. Set from QML, which can see the windows; reported to the daemon under `output`.
+    Q_PROPERTY(bool windowFocused READ windowFocused WRITE setWindowFocused NOTIFY windowFocusedChanged)
+    Q_PROPERTY(bool windowMaximized READ windowMaximized WRITE setWindowMaximized NOTIFY windowMaximizedChanged)
     // Why nothing is being drawn, when nothing is. Empty while the wallpaper is showing, so QML
     // can fall back to the message states main.qml already derives rather than inventing its own.
     Q_PROPERTY(QString unavailableReason READ unavailableReason NOTIFY unavailableReasonChanged)
@@ -125,6 +129,11 @@ public:
     QString output() const { return m_output; }
     void setOutput(const QString& output);
 
+    bool windowFocused() const { return m_windows.focused; }
+    void setWindowFocused(bool focused);
+    bool windowMaximized() const { return m_windows.maximized; }
+    void setWindowMaximized(bool maximized);
+
     QString unavailableReason() const { return m_unavailableReason; }
     bool frameShown() const { return m_frameShown; }
 
@@ -145,6 +154,8 @@ public:
 signals:
     void monitorIdChanged();
     void outputChanged();
+    void windowFocusedChanged();
+    void windowMaximizedChanged();
     void unavailableReasonChanged();
     void frameShownChanged();
     void importCountsChanged();
@@ -267,6 +278,25 @@ private:
     // GUI thread.
     void reportVisible();
 
+    struct Windows {
+        bool focused = false;
+        bool maximized = false;
+        bool operator==(const Windows&) const = default;
+    };
+    // What SetOutputFocus was last told. GUI thread.
+    struct WindowReport {
+        QString output;
+        Windows windows;
+        bool operator==(const WindowReport&) const = default;
+    };
+    // Tells the daemon what the windows on this screen are doing, when that changed or the daemon
+    // may have lost it. GUI thread.
+    void reportWindows();
+    // Wherever the item starts speaking to a different daemon, name or monitor, or stops speaking:
+    // the next refusal starts a new run, retried at the first delay and logged, and a retry left
+    // from the old run is dropped. Each caller arranges its own resend.
+    void restartWindowRetry();
+
     int m_monitorId = -1;
     QString m_output;  // GUI thread only
     // Settles the size before it is reported: a login lays the item out, exposes the window and
@@ -286,6 +316,18 @@ private:
     // The last answer the daemon accepted, so an unchanged one is not sent again. Empty wherever
     // the daemon may have lost it, as the size report is.
     std::optional<bool> m_visibleReported;
+    // The two window facts as QML last set them.
+    Windows m_windows;
+    // The last window report sent and not refused. Forgotten wherever the daemon may have lost it,
+    // and on leaving the screen, after which another item for the name may have reported over it.
+    std::optional<WindowReport> m_windowsReported;
+    // Zero delay after a change, so both facts changing in one QML update are one report rather than
+    // two. Also holds the retry of a refused report, which a change brings forward.
+    QTimer m_windowReportTimer;
+    // How long the next retry of a refused window report waits: doubles while the daemon goes on
+    // refusing, back to the start on an accepted one or a new context (restartWindowRetry). Only the
+    // first refusal of a run is logged.
+    int m_windowRetryMs;
     QTimer m_paintWatch;
     quint64 m_paintMark = 0;   // the count when the watch was last armed
     // One window has ended with no pass and another has been asked for. A single empty window is
