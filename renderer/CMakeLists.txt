@@ -154,6 +154,7 @@ foreach(SHADER_SRC fullscreen.vert fullscreen_set.frag fullscreen_heap.frag ycbc
         COMMAND ${GLSLC_EXECUTABLE} --target-env=vulkan1.3 -o ${SHADER_SPV} ${CMAKE_CURRENT_SOURCE_DIR}/shaders/${SHADER_SRC}
         DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/shaders/${SHADER_SRC}
         COMMENT "Compiling shader ${SHADER_SRC}"
+        VERBATIM
     )
     list(APPEND SHADER_SPV_FILES ${SHADER_SPV})
 endforeach()
@@ -561,9 +562,11 @@ if(WALLPAPERX_FFMPEG_EXECUTABLE)
         list(TRANSFORM JOIN_PARTS PREPEND ${WALLPAPERX_VIDEO_ASSET_DIR}/)
         add_custom_command(
             OUTPUT ${WALLPAPERX_VIDEO_ASSET_DIR}/${JOIN_NAME}
-            COMMAND ${CMAKE_COMMAND} -E cat ${JOIN_PARTS} > ${WALLPAPERX_VIDEO_ASSET_DIR}/${JOIN_NAME}
-            DEPENDS ${JOIN_PARTS}
+            COMMAND ${CMAKE_COMMAND} -DOUTPUT=${WALLPAPERX_VIDEO_ASSET_DIR}/${JOIN_NAME}
+                    -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/support/concat_files.cmake -- ${JOIN_PARTS}
+            DEPENDS ${JOIN_PARTS} tests/support/concat_files.cmake
             COMMENT "Generating video fixture ${JOIN_NAME}"
+            VERBATIM
         )
         list(APPEND WALLPAPERX_VIDEO_ASSETS ${WALLPAPERX_VIDEO_ASSET_DIR}/${JOIN_NAME})
     endforeach()
@@ -572,7 +575,9 @@ if(WALLPAPERX_FFMPEG_EXECUTABLE)
     set(SG_MKV_PARTS ${WALLPAPERX_VIDEO_ASSET_DIR}/counter_sg_0.ts ${WALLPAPERX_VIDEO_ASSET_DIR}/counter_sg_30.ts
                      ${WALLPAPERX_VIDEO_ASSET_DIR}/counter_sg_60.ts)
     set(SG_MKV_LIST ${WALLPAPERX_VIDEO_ASSET_DIR}/counter_shrink_grow_mkv.txt)
-    list(TRANSFORM SG_MKV_PARTS PREPEND "file '" OUTPUT_VARIABLE SG_MKV_LINES)
+    # The list's own quoting: a ' in a path is written '\''.
+    list(TRANSFORM SG_MKV_PARTS REPLACE "'" "'\\\\''" OUTPUT_VARIABLE SG_MKV_LINES)
+    list(TRANSFORM SG_MKV_LINES PREPEND "file '")
     list(TRANSFORM SG_MKV_LINES APPEND "'")
     list(JOIN SG_MKV_LINES "\n" SG_MKV_TEXT)
     file(WRITE ${SG_MKV_LIST} "${SG_MKV_TEXT}\n")
@@ -1107,15 +1112,18 @@ endif()
 # That every entry above really runs isolated, read from ctest's own listing. Only when this is the
 # top-level project: under backend/ the backend's entry lists these too.
 if(PROJECT_IS_TOP_LEVEL)
-    wallpaperx_add_test(NAME test_isolation_registry
-                        COMMAND ${CMAKE_COMMAND} -DCTEST=${CMAKE_CTEST_COMMAND} -DBUILD_DIR=${CMAKE_BINARY_DIR}
-                                -DWRAPPER=${WALLPAPERX_ISOLATED_RUN} -DMINIMUM=50
-                                -P ${WALLPAPERX_ISOLATION_SUPPORT_DIR}/isolation_registry.cmake)
-    set_tests_properties(test_isolation_registry PROPERTIES LABELS "novulkan")
-    wallpaperx_add_test(NAME test_isolation_wrapper
-                        COMMAND ${CMAKE_COMMAND} -DWRAPPER=${WALLPAPERX_ISOLATED_RUN}
-                                -DCONF=${WALLPAPERX_ISOLATED_SESSION_CONF}
-                                -DPROBE=$<TARGET_FILE:wallpaperx-wrapper-probe>
-                                -P ${WALLPAPERX_ISOLATION_SUPPORT_DIR}/isolation_wrapper_test.cmake)
-    set_tests_properties(test_isolation_wrapper PROPERTIES LABELS "novulkan")
+    # A configure and fixture build from a path holding shell syntax (X.33). Slow, so its own label.
+    if(WALLPAPERX_FFMPEG_EXECUTABLE)
+        wallpaperx_add_test(NAME renderer_odd_path_build
+                            COMMAND ${CMAKE_COMMAND} -DSOURCE=${CMAKE_CURRENT_SOURCE_DIR}
+                                    -DWORK=${CMAKE_CURRENT_BINARY_DIR}/odd_path_build
+                                    -DGENERATOR=${CMAKE_GENERATOR} -DCXX=${CMAKE_CXX_COMPILER}
+                                    -DMAKE_PROGRAM=${CMAKE_MAKE_PROGRAM}
+                                    -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/support/odd_path_build_test.cmake)
+        set_tests_properties(renderer_odd_path_build PROPERTIES LABELS "oddpath" TIMEOUT 900)
+    else()
+        wallpaperx_tests_not_registered("ffmpeg CLI not found -- renderer_odd_path_build (X.33) is not registered")
+    endif()
+    wallpaperx_add_isolation_wrapper_tests()
+    wallpaperx_add_isolation_registry()
 endif()

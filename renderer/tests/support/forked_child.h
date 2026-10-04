@@ -15,6 +15,10 @@
 // Nothing here knows what a daemon, a Device or a bus is. A helper that needed any of
 // them could not be shared, and would drag the dependency the wrong way.
 
+#include <fstream>
+#include <optional>
+#include <string>
+
 #include <signal.h>
 #include <sys/prctl.h>
 #include <sys/resource.h>
@@ -72,10 +76,26 @@ inline bool armAgainstParentDeath(pid_t parentBeforeFork) {
 // It suppresses the dump only: the child still raises SIGABRT, waitpid still reports
 // WIFSIGNALED with WTERMSIG == SIGABRT, and a stderr redirected before this call still
 // reaches the parent's pipe.
+//
+// Every test process that crashes on purpose calls this first, not only forked children: the
+// daemon the wedge shim faults (backend/tests/wedge_shim.cpp) and the app's namespace children
+// (app/tests/wpx_fixtures.h) were exec'd, so only a call made after their exec counts.
+// Async-signal-safe: two system calls.
 inline void suppressCoreDump() {
     const rlimit noCore{0, 0};
     setrlimit(RLIMIT_CORE, &noCore);
     prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
+}
+
+// Whether this host's kernel hands a core to a program (core_pattern starts with '|') rather than
+// writing a file; nullopt when /proc/sys/kernel/core_pattern cannot be read. Only on a pipe does
+// WCOREDUMP tell a non-dumpable crash from a dumpable one: with a file pattern, an inherited
+// RLIMIT_CORE of 0 alone already stops the dump, so the bit is clear either way.
+inline std::optional<bool> coreGoesToAProgram() {
+    std::ifstream pattern("/proc/sys/kernel/core_pattern");
+    std::string text;
+    if (!std::getline(pattern, text)) return std::nullopt;
+    return !text.empty() && text.front() == '|';
 }
 
 // The codes a child exits with when it dies before the program it was meant to run has

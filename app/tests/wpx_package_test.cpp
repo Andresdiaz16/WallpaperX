@@ -3,8 +3,10 @@
 // app/library/wpx_package.cpp and app/library/preview_image_provider.cpp, with no bus and no
 // event loop: one wallpaper.json, one .wpx archive, one wallpaper folder, one library folder, one
 // preview address at a time. Goals S15.31-S15.35, S15.45, S15.47, S15.48, S15.50, S15.51, S15.53,
-// S15.55, S15.67, S15.68 in GOALS.md.
+// S15.55, S15.67, S15.68, S15.221-S15.225 in GOALS.md; the last graded against the daemon's own
+// property rules (daemon_rules.cpp).
 
+#include "daemon_rules.h"
 #include "openat2_shim.h"
 #include "preview_image_provider.h"
 #include "wpx_fixtures.h"
@@ -19,6 +21,7 @@
 #include <QTemporaryDir>
 #include <QUrl>
 
+#include <cctype>
 #include <cerrno>
 #include <chrono>
 #include <cmath>
@@ -144,7 +147,7 @@ void manifestOrderAndFields() {
         const WallpaperProperty& speed = plan->properties[0];
         const WallpaperProperty& mute = plan->properties[1];
         const WallpaperProperty& tint = plan->properties[2];
-        expect(speed.type == WallpaperProperty::Type::Float && speed.minimum == 0.1 && speed.maximum == 3.0 &&
+        expect(speed.type == WallpaperProperty::Type::Float && speed.minimum == 0.1 && speed.maximum == 2.0 &&
                    speed.defaultValue == QVariant(1.0) && speed.label == u"Speed",
                QStringLiteral("S15.31: speed read as %1 [%2, %3] default %4 label %5")
                    .arg(speed.typeName())
@@ -209,7 +212,8 @@ void malformedManifests() {
         {"tags as one string", edited([](OrderedJson& j) { j["tags"] = "nature"; }), "tags are not a list of text"},
         {"properties as a list", edited([](OrderedJson& j) { j["properties"] = OrderedJson::array(); }), "properties are not an object"},
         {"a property that is a number", property("speed", "1"), "Property \"speed\" in wallpaper.json is not an object"},
-        {"a property with an empty name", property("", R"({"type": "bool", "default": true})"), "a property with an empty name"},
+        {"a property with an empty name", property("", R"({"type": "bool", "default": true})"),
+         "a property whose name is not 1 to 64 letters, digits, \"_\", \"-\" or \".\"."},
         {"a numeric label", property("speed", R"({"type": "float", "default": 1, "min": 0, "max": 2, "label": 5})"), "label that is not text"},
         {"an unknown property type", property("speed", R"({"type": "int", "default": 1})"), "has type \"int\""},
         {"a property with no type", property("speed", R"({"default": 1})"), "Property \"speed\" in wallpaper.json has no type"},
@@ -239,8 +243,10 @@ void malformedManifests() {
     //       four terms -> "absolute file", "file with .", "file with ..", "file with a backslash
     //       was accepted"; tags' is_array and all_of terms -> "tags as one string", "a tag that is a
     //       number was accepted"; properties' is_object -> "properties as a list was accepted";
-    //       parseProperty's empty-key, is_object, type-refusal, no-default, min<max, range and
-    //       bool tests -> their rows; the colour pattern `{3,8}` -> "#abc was accepted";
+    //       parseProperty's is_object, type-refusal, no-default, min<max, range and bool tests ->
+    //       their rows; inside isPropertyKey's anchoredPattern, `{1,` made `{0,` -> "a property with
+    //       an empty name was accepted" (control_batch, 2026-10-04); inside colorPattern()'s,
+    //       `{6}` made `{3,8}` -> "a colour default #abc was accepted";
     //       parseManifest's `catch (const Json::out_of_range&)` clause deleted -> "a number too
     //       large for a double was refused with "wallpaper.json cannot be read: ..."". Rows with
     //       no break of their own (invalid JSON or UTF-8, no schema_version, no type, numeric
@@ -260,6 +266,160 @@ void malformedManifests() {
         }
     }
     expect(checked == 39, QStringLiteral("S15.32: %1 malformed manifests were checked, not 39").arg(checked));
+}
+
+// What the daemon makes of a wallpaper.json's properties: its own propertiesError() on every default,
+// and for a float "speed" on its min and max too, the two ends a slider can reach. Empty: accepted.
+std::string daemonVerdict(const OrderedJson& properties) {
+    std::vector<std::pair<std::string, DaemonValue>> defaults;
+    std::string extremes;
+    for (const auto& [key, spec] : properties.items()) {
+        const std::string type = spec.value("type", "");
+        if (type == "float") {
+            defaults.emplace_back(key, spec.at("default").get<double>());
+            if (key == "speed") {
+                for (const char* end : {"min", "max"}) {
+                    if (const std::string why = daemonPropertiesError({{key, spec.at(end).get<double>()}}); !why.empty()) {
+                        extremes = why;
+                    }
+                }
+            }
+        } else if (type == "bool") {
+            defaults.emplace_back(key, spec.at("default").get<bool>());
+        } else {
+            defaults.emplace_back(key, spec.at("default").get<std::string>());
+        }
+    }
+    const std::string why = daemonPropertiesError(defaults);
+    return why.empty() ? extremes : why;
+}
+
+// S15.221-S15.225
+void daemonPropertyRules() {
+    const auto spec = [](const char* text) { return OrderedJson::parse(text); };
+    const OrderedJson flag = spec(R"({"type": "bool", "default": true})");
+    const auto one = [&](const std::string& key, const OrderedJson& s) {
+        OrderedJson p = OrderedJson::object();
+        p[key] = s;
+        return p;
+    };
+    const auto many = [&](int n) {
+        OrderedJson p = OrderedJson::object();
+        for (int i = 0; i < n; ++i) {
+            p["k" + std::to_string(i)] = flag;
+        }
+        return p;
+    };
+    const char* badKey = "a property whose name is not 1 to 64 letters, digits, \"_\", \"-\" or \".\".";
+    struct Row {
+        const char* goal;
+        std::string what;
+        OrderedJson properties;
+        const char* reason; // nullptr: usable
+    };
+    // GOAL: S15.221 -- a property key outside [A-Za-z0-9_.-]{1,64} lists the wallpaper broken with
+    //       that reason; a key of 64 allowed characters, and keys using every allowed character, are
+    //       usable.
+    // GOAL: S15.222 -- at most 64 properties: 64 are usable, 65 list it broken saying so.
+    // GOAL: S15.223 -- "speed" declaring a range that starts at or below 0 or ends above 2 is
+    //       refused, naming the range, not narrowed to fit; (0.1, 2] and the smallest positive
+    //       minimum are usable; "Speed" is another key and is not checked.
+    // GOAL: S15.224 -- a "speed" that is not a float, and a "mute" that is not a bool, list broken.
+    // WHY-THIS-SHAPE: each refusal is paired with the usable case on the other side of its boundary
+    //       (64/65 characters and properties, min 0/smallest positive, max 2/2.0001), so neither a
+    //       validator that refuses too much nor one that refuses too little passes; each refusal's
+    //       sentence is matched, so a refusal for some other reason is red.
+    // CONTROL: app/library/wpx_package.cpp, each through control_batch, 2026-10-02 (the first re-run
+    //       2026-10-04, inside anchoredPattern): isPropertyKey's
+    //       `.arg(kMaxPropertyKeyBytes)` made `.arg(kMaxPropertyKeyBytes + 1)` -> red, "S15.221: a
+    //       65-character key was accepted"; `[A-Za-z0-9_.-]` made `[ -~]` -> red, "S15.221: the key
+    //       "my key" was accepted"; `> kMaxProperties` made `> kMaxProperties + 1` -> red, "S15.222: 65
+    //       properties was accepted"; `!(property.minimum > 0.0)` made `property.minimum < 0.0` -> red,
+    //       "S15.223: speed from 0 was accepted"; `> kMaxPlaybackSpeed` made `> 3` -> red, "S15.223: speed to
+    //       2.0001 was accepted"; the not-a-float test made `if (false)` -> red, "S15.224: a bool speed
+    //       was refused with "...allows 0 to 0, ...", not "...is not a float..."" (the range check
+    //       catches it, with the wrong sentence); the mute test made `false` -> red, "S15.224: a float
+    //       mute was accepted".
+    // GOAL: S15.255 -- a key with a trailing newline, also after 64 allowed characters, and a colour
+    //       default with one, are refused, as the daemon refuses them.
+    // WHY-THIS-SHAPE: a pattern anchored with `^...$` matches before a final "\n"; graded against
+    //       the daemon (S15.225 below) as well as by sentence.
+    // CONTROL: app/library/wpx_package.cpp, isPropertyKey's pattern written
+    //       `QStringLiteral("^[A-Za-z0-9_.-]{1,%1}$")` without anchoredPattern (control_batch,
+    //       2026-10-04) -> red, "S15.255: a key ending in a newline was accepted", the 64-character
+    //       row and their S15.225 lines; colorPattern()'s written `QStringLiteral("^#[0-9a-fA-F]{6}$")`
+    //       -> red, "S15.255: a colour default ending in a newline was accepted" and its S15.225 line.
+    std::vector<Row> rows{
+        {"S15.221", "a 64-character key", one(std::string(64, 'k'), flag), nullptr},
+        {"S15.221", "a 65-character key", one(std::string(65, 'k'), flag), badKey},
+        {"S15.221", "the key \"my key\"", one("my key", flag), badKey},
+        {"S15.221", "the key \"a/b\"", one("a/b", flag), badKey},
+        {"S15.221", "a non-ASCII key", one("\xc3\xa9", flag), badKey},
+        {"S15.221", "letters as a key", one("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz", flag), nullptr},
+        {"S15.221", "digits and _.- as a key", one("0123456789_.-", flag), nullptr},
+        {"S15.222", "64 properties", many(64), nullptr},
+        {"S15.222", "65 properties", many(65), "wallpaper.json has 65 properties; WallpaperX takes at most 64."},
+        {"S15.223", "speed in (0.1, 2]", one("speed", spec(R"({"type": "float", "default": 1, "min": 0.1, "max": 2})")), nullptr},
+        {"S15.223", "speed from the smallest positive double", one("speed", spec(R"({"type": "float", "default": 1, "min": 5e-324, "max": 2})")), nullptr},
+        {"S15.223", "speed from 0", one("speed", spec(R"({"type": "float", "default": 1, "min": 0, "max": 2})")),
+         "Property \"speed\" in wallpaper.json allows 0 to 2, and WallpaperX plays video above 0 and at most 2 times its speed."},
+        {"S15.223", "speed from -1", one("speed", spec(R"({"type": "float", "default": 1, "min": -1, "max": 2})")),
+         "Property \"speed\" in wallpaper.json allows -1 to 2, and WallpaperX plays video above 0 and at most 2 times its speed."},
+        {"S15.223", "speed to 2.0001", one("speed", spec(R"({"type": "float", "default": 1, "min": 0.5, "max": 2.0001})")),
+         "Property \"speed\" in wallpaper.json allows 0.5 to 2.0001, and WallpaperX plays video above 0 and at most 2 times its speed."},
+        {"S15.223", "\"Speed\" from 0 to 5", one("Speed", spec(R"({"type": "float", "default": 1, "min": 0, "max": 5})")), nullptr},
+        {"S15.224", "a bool speed", one("speed", flag), "Property \"speed\" in wallpaper.json is not a float, and WallpaperX reads a video's speed as one."},
+        {"S15.224", "a colour speed", one("speed", spec(R"({"type": "color", "default": "#ffffff"})")),
+         "Property \"speed\" in wallpaper.json is not a float, and WallpaperX reads a video's speed as one."},
+        {"S15.224", "a float mute", one("mute", spec(R"({"type": "float", "default": 0.5, "min": 0.1, "max": 1})")),
+         "Property \"mute\" in wallpaper.json is not a bool, and WallpaperX reads \"mute\" as one."},
+        {"S15.224", "a colour mute", one("mute", spec(R"({"type": "color", "default": "#000000"})")),
+         "Property \"mute\" in wallpaper.json is not a bool, and WallpaperX reads \"mute\" as one."},
+        {"S15.224", "a bool mute", one("mute", flag), nullptr},
+        {"S15.255", "a key ending in a newline", one("glow\n", flag), badKey},
+        {"S15.255", "a 64-character key and a newline", one(std::string(64, 'k') + "\n", flag), badKey},
+        {"S15.255", "a colour default ending in a newline", one("tint", OrderedJson{{"type", "color"}, {"default", "#aabbcc\n"}}),
+         "Property \"tint\" in wallpaper.json has a default that is not a color."},
+    };
+    // Every printable ASCII character the rule leaves out, as a one-character key.
+    int outside = 0;
+    for (char c = 0x20; c < 0x7f; ++c) {
+        if (!std::isalnum(static_cast<unsigned char>(c)) && c != '_' && c != '.' && c != '-') {
+            rows.push_back({"S15.221", std::string("the key \"") + c + "\"", one(std::string(1, c), flag), badKey});
+            ++outside;
+        }
+    }
+    // GOAL: S15.225 -- the app lists a wallpaper usable exactly when the daemon would take its
+    //       properties: every default, and a speed's min and max, pass the daemon's own
+    //       propertiesError() (backend/daemon/wallpaper_properties.cpp, compiled in).
+    // WHY-THIS-SHAPE: graded against the daemon's code rather than this table, so a rule changed on
+    //       either side alone is red here even where the table above was changed to match.
+    // CONTROL: app/library/wpx_package.cpp isPropertyKey's `.arg(kMaxPropertyKeyBytes + 1)`
+    //       (control_batch, 2026-10-04) -> red, "S15.225: a 65-character key: the app lists it usable,
+    //       the daemon would refuse it (property name "kkk..." must be 1 to 64 ASCII letters, digits,
+    //       '_', '-' or '.')"; each break above gave its own S15.225 line beside its row's.
+    // COVERAGE-ASSERT: the row count, the 30 printable ASCII characters outside the rule among them.
+    int checked = 0;
+    for (const Row& row : rows) {
+        const auto parsed = parseManifest(edited([&](OrderedJson& j) { j["properties"] = row.properties; }));
+        const QString what = QString::fromStdString(row.what);
+        ++checked;
+        if (row.reason == nullptr) {
+            expect(parsed.has_value(), QStringLiteral("%1: %2 was refused: %3").arg(QLatin1StringView(row.goal), what, parsed ? QString() : parsed.error()));
+        } else if (parsed) {
+            expect(false, QStringLiteral("%1: %2 was accepted").arg(QLatin1StringView(row.goal), what));
+        } else {
+            expect(parsed.error().endsWith(QString::fromUtf8(row.reason)),
+                   QStringLiteral("%1: %2 was refused with \"%3\", not \"%4\"").arg(QLatin1StringView(row.goal), what, parsed.error(), QString::fromUtf8(row.reason)));
+        }
+        const std::string daemon = daemonVerdict(row.properties);
+        expect(parsed.has_value() == daemon.empty(),
+               QStringLiteral("S15.225: %1: the app lists it %2, the daemon would %3")
+                   .arg(what, parsed ? QStringLiteral("usable") : QStringLiteral("broken"),
+                        daemon.empty() ? QStringLiteral("accept it") : QStringLiteral("refuse it (%1)").arg(QString::fromStdString(daemon))));
+    }
+    expect(outside == 30 && checked == 23 + outside,
+           QStringLiteral("S15.221-S15.225: %1 rows were checked, %2 of them characters outside the rule; expected 53 and 30").arg(checked).arg(outside));
 }
 
 // S15.35, S15.53
@@ -329,6 +489,18 @@ void acceptValues() {
                             got ? QString::fromLatin1(got->typeName()) : QString(), c.want->toString()));
         }
     }
+
+    // GOAL: S15.255 -- an edited colour with a trailing newline is refused, and the daemon refuses
+    //       it too, so the app never sends what the daemon would turn down at Apply.
+    // CONTROL: app/library/wpx_package.cpp, colorPattern()'s written `QStringLiteral("^#[0-9a-fA-F]{6}$")`
+    //       without anchoredPattern (control_batch, 2026-10-04) -> red, "S15.255: an edited colour
+    //       "#aabbcc\n" was taken as "#aabbcc\n"; the daemon says "property tint is not a colour"".
+    const QString newline = QStringLiteral("#aabbcc\n");
+    const auto edited = tint.accept(newline);
+    const std::string daemon = daemonPropertiesError({{"tint", newline.toStdString()}});
+    expect(!edited && !daemon.empty(),
+           QStringLiteral("S15.255: an edited colour \"#aabbcc\\n\" was taken as \"%1\"; the daemon says \"%2\"")
+               .arg(edited ? edited->toString() : QStringLiteral("(refused)"), QString::fromStdString(daemon)));
 }
 
 struct ArchiveCase {
@@ -1147,6 +1319,7 @@ int main(int argc, char* argv[]) {
     const QString root = scratch.path();
     runPhase("manifestOrderAndFields", manifestOrderAndFields);
     runPhase("malformedManifests", malformedManifests);
+    runPhase("daemonPropertyRules", daemonPropertyRules);
     runPhase("acceptValues", acceptValues);
     runPhase("badArchives", [&] { badArchives(root); });
     runPhase("scanFolder", [&] { scanFolder(root); });

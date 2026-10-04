@@ -389,6 +389,30 @@ std::string softCoreLimit(pid_t pid) {
     return "";
 }
 
+// As renderer/tests/support/private_bus.sh escapes them: a path as XML element text, and as a D-Bus
+// address value (every byte outside [-0-9A-Za-z_/.*] as %hh, which leaves nothing XML would read).
+std::string xmlText(const std::string& text) {
+    std::string out;
+    for (const char c : text) {
+        out += c == '&' ? std::string("&amp;") : c == '<' ? std::string("&lt;") : c == '>' ? std::string("&gt;") : std::string(1, c);
+    }
+    return out;
+}
+std::string addressValue(const std::string& text) {
+    std::string out;
+    for (const unsigned char c : text) {
+        const bool plain = (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+        if (plain || c == '-' || c == '_' || c == '/' || c == '.' || c == '*') {
+            out += static_cast<char>(c);
+        } else {
+            char hex[4];
+            std::snprintf(hex, sizeof hex, "%%%02x", static_cast<unsigned>(c));
+            out += hex;
+        }
+    }
+    return out;
+}
+
 // A session bus of this test's own, started as a child process so it can be killed.
 //
 // Exists for one reason: to be destroyed under a running daemon. ctest's bus comes from
@@ -403,6 +427,30 @@ public:
             return;
         }
 
+        // Not --session: the stock session configuration can activate every service installed on
+        // the host and listens in the shared /tmp, where the SIGKILL in kill() leaves its socket.
+        // The wrapper's own configuration instead, listening in the entry's private runtime
+        // directory, which the wrapper removes.
+        const char* runtime = std::getenv("XDG_RUNTIME_DIR");
+        if (runtime == nullptr || *runtime == '\0') {
+            m_reason = "XDG_RUNTIME_DIR is unset, so the nested bus has nowhere private to listen";
+            return;
+        }
+        static int started = 0;
+        const std::string confPath =
+            std::string(runtime) + "/nested-bus-" + std::to_string(getpid()) + "-" + std::to_string(++started) + ".conf";
+        {
+            std::ofstream conf(confPath);
+            conf << "<!DOCTYPE busconfig PUBLIC \"-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN\"\n"
+                    " \"http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd\">\n<busconfig>\n  <listen>unix:dir="
+                 << addressValue(runtime) << "</listen>\n  <include>" << xmlText(WALLPAPERX_ISOLATED_SESSION_CONF)
+                 << "</include>\n</busconfig>\n";
+            if (!conf.flush()) {
+                m_reason = "the nested bus's configuration could not be written to " + confPath;
+                return;
+            }
+        }
+
         int fds[2];
         if (pipe2(fds, O_CLOEXEC) != 0) {
             m_reason = "pipe2 failed";
@@ -413,10 +461,10 @@ public:
         // environment there: this process has sdbus dispatch threads, and allocating
         // between fork() and exec() can deadlock on a lock one of them held.
         std::string binary = binaryPath;
-        std::string session = "--session";
+        std::string configFile = "--config-file=" + confPath;
         std::string nofork = "--nofork";
         std::string printAddress = "--print-address";
-        char* argv[] = {binary.data(), session.data(), nofork.data(), printAddress.data(), nullptr};
+        char* argv[] = {binary.data(), configFile.data(), nofork.data(), printAddress.data(), nullptr};
 
         const pid_t parentBeforeFork = getpid();
         m_pid = fork();
@@ -2064,6 +2112,52 @@ void checkClosedStdout(NameWatcher& names, const std::string& bluePath, const st
 //       process", the exit-1 line and the fatal-message line -- with the startup check
 //       above still green. Reverted. The inverted shutdown-line check below does not fire
 //       on this mutation: a daemon that aborts prints no shutdown line either.
+// GOAL: X.26 -- a bus this test starts for itself can activate nothing, and its socket is inside
+//       the entry's private runtime directory, so killing it outright leaves nothing in the shared
+//       /tmp.
+// WHY-THIS-SHAPE: the bus is asked, as test_isolation asks the entry's own: the configuration in
+//       force decides what can be activated, and asking activates nothing. The address it printed
+//       is where its socket is.
+// CONTROL: test-side, control_batch, 2026-10-04, each in NestedBus's generated configuration: the
+//       listen directory made $TMPDIR -> red, "FAIL: the test's own bus listens inside the entry's
+//       private runtime directory" (re-run after the escaping); the runtime directory written
+//       unescaped, with a TMPDIR holding ' +~@%&<' -> dbus-daemon "not well-formed (invalid token)",
+//       reported NOT VERIFIED and the entry Skipped, not red; a <servicedir> added holding one inert service (Exec=/bin/false)
+//       -> red, "FAIL: nothing can be activated on the test's own bus", listing it. `--session` itself,
+//       the configuration this replaced, was not run as a control: it can activate the host's services.
+void checkNestedBusPrivate(const Check& check) {
+    NestedBus bus;
+    if (!bus.ok()) {
+        if (const char* fault = bus.preambleFault()) {
+            phaseSetupFault("the nested bus's isolation (X.26)", fault);
+            return;
+        }
+        notVerified("the nested bus's isolation (X.26)", bus.reason());
+        return;
+    }
+    // dbus-daemon prints its address escaped, as addressValue() escapes the directory it was given.
+    const char* runtime = std::getenv("XDG_RUNTIME_DIR");
+    const bool inside =
+        runtime != nullptr && bus.address().rfind("unix:path=" + addressValue(runtime) + "/", 0) == 0;
+    check(inside, "the test's own bus listens inside the entry's private runtime directory");
+    if (!inside) std::fprintf(stderr, "  its address is %s\n", bus.address().c_str());
+    std::vector<std::string> activatable;
+    try {
+        auto connection = sdbus::createSessionBusConnectionWithAddress(bus.address());
+        auto proxy = sdbus::createProxy(*connection, sdbus::ServiceName{"org.freedesktop.DBus"},
+                                        sdbus::ObjectPath{"/org/freedesktop/DBus"});
+        proxy->callMethod("ListActivatableNames").onInterface("org.freedesktop.DBus").storeResultsTo(activatable);
+    } catch (const std::exception& e) {
+        notVerified("the nested bus's isolation (X.26)", std::string("the bus could not be asked: ") + e.what());
+        return;
+    }
+    const bool inert = activatable == std::vector<std::string>{"org.freedesktop.DBus"};
+    check(inert, "nothing can be activated on the test's own bus (only org.freedesktop.DBus is listed)");
+    if (!inert) {
+        for (const std::string& name : activatable) std::fprintf(stderr, "  activatable: %s\n", name.c_str());
+    }
+}
+
 void checkBusLoss(const Check& check) {
     NestedBus bus;
     if (!bus.ok()) {
@@ -2938,6 +3032,30 @@ void checkTheRestoredVideoIsPostedAfterTheRecordOpens(const std::string& validat
                                          std::to_string(daemon.termSignal()) + ")"
                                    : "the staged fault never fired: this host never decoded the restored video");
         return;
+    }
+    // GOAL: X.27 -- the staged SIGSEGV is not handed to the host's crash collector (which on a
+    //       desktop also raises a crash dialog): the daemon dies with the wait status's core bit clear.
+    // WHY-THIS-SHAPE: the core bit, not the inherited core limit X.3 already reads: on a piped
+    //       core_pattern the kernel calls the collector even at RLIMIT_CORE 0, and only the dumpable
+    //       flag, which execve resets, stops it. On a file pattern there is no collector program,
+    //       so the helper answers "not reached" and says so on stdout, rather than skipping the
+    //       whole entry on such a host for a hazard it cannot have.
+    // CONTROL: via control_batch 2026-10-04, reverted: the suppressCoreDump() call deleted from
+    //       backend/tests/wedge_shim.cpp's fault -> "FAIL: X.27: the daemon's staged SIGSEGV is not
+    //       handed to the core collector", and one new coredumpctl entry. Test-side, the same way:
+    //       coreGoesToAProgram() (renderer/tests/support/forked_child.h) made to return false -> the
+    //       stdout line "X.27: this host's core_pattern writes a file ..." and the entry Passed, no NOT
+    //       VERIFIED (observed in crash_log_flush, which shares the helper; control_batch 2026-10-04).
+    //       That branch cannot go red by design: with no collector program there is nothing to reach.
+    {
+        std::string why;
+        const std::optional<bool> collected = wallpaperx::testing::stagedCrashReachedCollector(daemon, why);
+        if (!collected) {
+            notVerified("X.27 (a deliberate daemon crash does not reach the core collector)", why);
+        } else {
+            check(!*collected, "X.27: the daemon's staged SIGSEGV is not handed to the core collector (no core bit in "
+                               "its wait status)");
+        }
     }
     const std::optional<wallpaperx::PlayingHistory> history = wallpaperx::readPlayingRecord(stateHome / "wallpaperx");
     const bool named = history && history->died && history->died->monitorId == kMonitor && history->died->path == clip;
@@ -7103,6 +7221,7 @@ int main() {
         // run after the phases above have released the name, and before the descriptor
         // accounting below.
         if (phaseSelected("closedStdout")) checkClosedStdout(names, bluePath, validationEnv, wantValidation, check);
+        if (phaseSelected("nestedBusPrivate")) checkNestedBusPrivate(check);
         if (phaseSelected("busLoss")) checkBusLoss(check);
 
         // S7.8 and S7.11. Spawns a daemon of its own and shuts it down, so it runs

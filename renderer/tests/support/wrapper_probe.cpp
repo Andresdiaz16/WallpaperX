@@ -9,10 +9,11 @@
 //   wallpaperx-wrapper-probe crash            -- die of SIGSEGV, marked undumpable so the host's crash
 //                                               collector records nothing
 
+#include "forked_child.h"
+
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <poll.h>
-#include <sys/prctl.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -74,7 +75,9 @@ int main(int argc, char** argv) {
     if (mode == "listen" && argc == 4) return listenOn(argv[2], argv[3]);
     if (mode == "connect" && argc == 3) return connectTo(argv[2]);
     if (mode == "crash" && argc == 2) {
-        ::prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
+        wallpaperx::testing::suppressCoreDump();
+        std::printf("probe dumpable %d\n", ::prctl(PR_GET_DUMPABLE, 0, 0, 0, 0));
+        std::fflush(stdout);
         std::signal(SIGSEGV, SIG_DFL);
         std::raise(SIGSEGV);
         return 3;

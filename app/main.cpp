@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "daemon/apply_controller.h"
+#include "daemon/daemon_client.h"
 #include "kde/kscreen_client.h"
+#include "kde/plasma_controller.h"
 #include "library/importer.h"
 #include "library/library_manager.h"
 #include "library/preview_image_provider.h"
@@ -123,6 +126,9 @@ int main(int argc, char* argv[])
     wallpaperx::LibraryManager library(wallpaperx::wallpapersDirectory(libraryDirectory));
     wallpaperx::Importer importer(libraryDirectory, wallpaperx::wallpapersDirectory(libraryDirectory));
     QObject::connect(&importer, &wallpaperx::Importer::imported, &library, &wallpaperx::LibraryManager::reveal);
+    wallpaperx::DaemonClient daemon(QDBusConnection::sessionBus());
+    wallpaperx::PlasmaController plasma(QDBusConnection::sessionBus());
+    wallpaperx::ApplyController applier(kscreen, library, daemon, plasma);
 
     QQmlApplicationEngine engine;
     engine.addImageProvider(QString::fromLatin1(wallpaperx::kPreviewProviderId), new wallpaperx::PreviewImageProvider);
@@ -130,7 +136,9 @@ int main(int argc, char* argv[])
                      [] { QCoreApplication::exit(1); }, Qt::QueuedConnection);
     engine.setInitialProperties({{QStringLiteral("kscreen"), QVariant::fromValue(&kscreen)},
                                  {QStringLiteral("library"), QVariant::fromValue(&library)},
-                                 {QStringLiteral("importer"), QVariant::fromValue(&importer)}});
+                                 {QStringLiteral("importer"), QVariant::fromValue(&importer)},
+                                 {QStringLiteral("daemon"), QVariant::fromValue(&daemon)},
+                                 {QStringLiteral("applier"), QVariant::fromValue(&applier)}});
     engine.loadFromModule("WallpaperX", "Main");
 
     service.setHandler([&engine, &importer](const QStringList& paths, const QByteArray& activationToken) {
@@ -154,6 +162,7 @@ int main(int argc, char* argv[])
         importer.importPath(wallpaperx::decodeFileName(file));
     }
     kscreen.refresh();
+    daemon.refresh();
     library.rescan();
     importer.rescan();
     return QGuiApplication::exec();

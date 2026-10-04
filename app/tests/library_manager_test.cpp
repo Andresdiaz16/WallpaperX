@@ -437,9 +437,9 @@ void selectionAndValues(const QString& root) {
     expect(m.propertyValues() == defaults, QStringLiteral("S15.40: the defaults read %1").arg(describe(m.propertyValues())));
 
     c.values = 0;
-    const bool tookSpeed = m.setPropertyValue(QStringLiteral("speed"), 2.5);
-    expect(tookSpeed && m.propertyValues().value(QStringLiteral("speed")) == QVariant(2.5) && c.values == 1,
-           QStringLiteral("S15.40: an accepted edit of speed to 2.5 read %1 with %2 signal(s)").arg(describe(m.propertyValues())).arg(c.values));
+    const bool tookSpeed = m.setPropertyValue(QStringLiteral("speed"), 1.8);
+    expect(tookSpeed && m.propertyValues().value(QStringLiteral("speed")) == QVariant(1.8) && c.values == 1,
+           QStringLiteral("S15.40: an accepted edit of speed to 1.8 read %1 with %2 signal(s)").arg(describe(m.propertyValues())).arg(c.values));
 
     // GOAL: S15.40 -- an edit the property cannot hold is refused: false, no value changed, no
     //       propertyValuesChanged.
@@ -460,7 +460,7 @@ void selectionAndValues(const QString& root) {
     }
     // CONTROL: app/library/wpx_package.cpp, accept()'s `if (value.typeId() == QMetaType::QColor) {`
     //       made `if (false) {` -> red, "S15.40: a QColor tint and mute=false read {mute=false,
-    //       speed=2.5, tint=#ffffff}"; restored.
+    //       speed=1.8, tint=#ffffff}" (control_batch, 2026-10-02); restored.
     const bool tookColour = m.setPropertyValue(QStringLiteral("tint"), QColor(255, 0, 0));
     const bool tookMute = m.setPropertyValue(QStringLiteral("mute"), false);
     expect(tookColour && tookMute && m.propertyValues().value(QStringLiteral("tint")) == QVariant(QStringLiteral("#ff0000")) &&
@@ -480,9 +480,9 @@ void selectionAndValues(const QString& root) {
     //       re-selecting the open one keeps them.
     // CONTROL: app/library/library_manager.cpp, the `m_edits.clear();` inside select()'s
     //       changeSelection deleted -> red, "S15.38: re-select kept edits 1, the other wallpaper had
-    //       none 1; after coming back speed read 2.5"; restored.
-    const bool setSpeed = m.setPropertyValue(QStringLiteral("speed"), 2.5);
-    const bool reselect = setSpeed && m.select(ocean) && m.propertyValues().value(QStringLiteral("speed")) == QVariant(2.5);
+    //       none 1; after coming back speed read 1.8" (control_batch, 2026-10-02); restored.
+    const bool setSpeed = m.setPropertyValue(QStringLiteral("speed"), 1.8);
+    const bool reselect = setSpeed && m.select(ocean) && m.propertyValues().value(QStringLiteral("speed")) == QVariant(1.8);
     const bool other = m.select(still) && m.propertyValues().isEmpty();
     const bool back = m.select(ocean);
     expect(reselect && other && back && m.propertyValues() == defaults,
@@ -498,11 +498,12 @@ void selectionAndValues(const QString& root) {
     //       binding (and Apply) would read.
     // CONTROL: app/library/library_manager.cpp, settle()'s pruning `property.accept(m_edits.value(property.key))`
     //       made `std::optional<QVariant>(m_edits.value(property.key))` -> red, "S15.40: after the
-    //       rewrite ... the values read {speed=2.5, tint=#00ff00, zoom=2}" and "an emission exposed
-    //       speed=2.5"; settle()'s `m_edits = std::move(edits);` made `m_edits.clear();` -> red,
-    //       "...the values read {speed=1, tint=#ffffff, zoom=2}"; restored.
+    //       rewrite ... the values read {speed=1.8, tint=#00ff00, zoom=2}" and "an emission exposed
+    //       speed=1.8"; settle()'s `m_edits = std::move(edits);` made `m_edits.clear();` -> red,
+    //       "...the values read {speed=1, tint=#ffffff, zoom=2}" (both control_batch, 2026-10-02);
+    //       restored.
     // COVERAGE-ASSERT: at least one emission was checked.
-    if (!m.setPropertyValue(QStringLiteral("speed"), 2.5) || !m.setPropertyValue(QStringLiteral("mute"), false) ||
+    if (!m.setPropertyValue(QStringLiteral("speed"), 1.8) || !m.setPropertyValue(QStringLiteral("mute"), false) ||
         !m.setPropertyValue(QStringLiteral("tint"), QStringLiteral("#00ff00"))) {
         expect(false, QStringLiteral("S15.40: the edits before the rewrite were refused; values %1").arg(describe(m.propertyValues())));
         return;
@@ -519,7 +520,7 @@ void selectionAndValues(const QString& root) {
         }
     });
     OrderedJson narrowed = planManifest();
-    narrowed["properties"] = OrderedJson::parse(R"({"speed": {"type": "float", "default": 1.0, "min": 0.1, "max": 2.0},
+    narrowed["properties"] = OrderedJson::parse(R"({"speed": {"type": "float", "default": 1.0, "min": 0.1, "max": 1.5},
                                                    "tint": {"type": "color", "default": "#ffffff"},
                                                    "zoom": {"type": "float", "default": 2.0, "min": 0.0, "max": 4.0}})");
     if (!writeBytes(oceanManifest, jsonBytes(narrowed))) {
@@ -539,12 +540,12 @@ void selectionAndValues(const QString& root) {
     //       is rewritten again so the old edit would fit, the value stays at the default, and a
     //       property dropped and restored comes back at its default, not at the old edit.
     // WHY-THIS-SHAPE: follows the S15.40 rewrite on the same open wallpaper, so the edits it made
-    //       (speed 2.5, mute off) are exactly the ones the narrowing refused or dropped.
+    //       (speed 1.8, mute off) are exactly the ones the narrowing refused or dropped.
     // CONTROL: app/library/library_manager.cpp, settle()'s `m_edits = std::move(edits);` deleted
     //       and propertyValues() made to filter instead (`m_edits.value(property.key, property.defaultValue)`
     //       wrapped in `property.accept(...).value_or(property.defaultValue)`), one patch, the
     //       behaviour before decision B -> red, "S15.57: after the file was widened again the
-    //       values read {mute=false, speed=2.5, tint=#00ff00}"; restored.
+    //       values read {mute=false, speed=1.8, tint=#00ff00}" (control_batch, 2026-10-02); restored.
     if (reread) {
         if (!writeBytes(oceanManifest, QByteArray(kPlanManifest))) {
             harnessFailure("S15.57: the widened wallpaper.json could not be written");

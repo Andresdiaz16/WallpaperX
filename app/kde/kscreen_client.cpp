@@ -2,10 +2,10 @@
 
 #include "kscreen_client.h"
 
+#include "dbus_reply.h"
+
 #include <QDBusError>
 #include <QDBusMessage>
-#include <QDBusPendingCall>
-#include <QDBusPendingCallWatcher>
 #include <QDBusServiceWatcher>
 
 #include <algorithm>
@@ -27,16 +27,13 @@ QString notRunning()
 
 QString describe(const QDBusError& error)
 {
-    switch (error.type()) {
-    case QDBusError::ServiceUnknown:
+    if (isUnreachable(error)) {
         return notRunning();
-    case QDBusError::NoReply:
-    case QDBusError::Timeout:
-    case QDBusError::TimedOut:
-        return QStringLiteral("KScreen did not answer.");
-    default:
-        return QStringLiteral("KScreen refused the request: %1").arg(error.message());
     }
+    if (isNoAnswer(error)) {
+        return QStringLiteral("KScreen did not answer.");
+    }
+    return QStringLiteral("KScreen refused the request: %1").arg(clamped(error.message()));
 }
 
 // A model name read from an EDID is kept for the same output only while the same panel is
@@ -49,17 +46,6 @@ void keepKnownNames(QList<Monitor>& fresh, const QList<Monitor>& known)
             monitor.displayName = was->displayName;
         }
     }
-}
-
-template <typename OnReply>
-void whenAnswered(QObject* context, QDBusPendingCall pending, OnReply onReply)
-{
-    auto* watcher = new QDBusPendingCallWatcher(std::move(pending), context);
-    QObject::connect(watcher, &QDBusPendingCallWatcher::finished, context,
-                     [onReply = std::move(onReply)](QDBusPendingCallWatcher* done) {
-                         done->deleteLater();
-                         onReply(done->reply());
-                     });
 }
 
 } // namespace

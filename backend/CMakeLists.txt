@@ -714,6 +714,8 @@ target_compile_definitions(wallpaperx-daemon-system-test PRIVATE
     WALLPAPERX_TEST_IMAGE_DIR="${CMAKE_CURRENT_BINARY_DIR}/test_assets"
     WALLPAPERX_DAEMON_BINARY="$<TARGET_FILE:wallpaperx-daemon>"
     WALLPAPERX_DBUS_DAEMON_BINARY="${DBUS_DAEMON_EXECUTABLE}"
+    # The configuration every entry's bus runs on; the nested bus this test starts uses it too.
+    WALLPAPERX_ISOLATED_SESSION_CONF="${WALLPAPERX_ISOLATED_SESSION_CONF}"
 )
 # Baking the path in is not enough -- without this the test can be built and run against
 # a stale or missing daemon binary, and would report the daemon's absence as a bus
@@ -899,6 +901,7 @@ add_library(wallpaperx-test-wedge-shim SHARED tests/wedge_shim.cpp)
 # while probing a file, which is a field of AVCodecContext. It calls through dlsym, never by link.
 pkg_check_modules(WALLPAPERX_SHIM_LIBAV REQUIRED IMPORTED_TARGET libavcodec libavutil)
 target_link_libraries(wallpaperx-test-wedge-shim PRIVATE ${CMAKE_DL_LIBS} PkgConfig::WALLPAPERX_SHIM_LIBAV)
+target_include_directories(wallpaperx-test-wedge-shim PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../renderer/tests)
 set_target_properties(wallpaperx-test-wedge-shim PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
 target_compile_definitions(wallpaperx-daemon-system-test PRIVATE
     WALLPAPERX_VIDEO_ASSET_DIR="${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}"
@@ -1868,7 +1871,7 @@ if(WALLPAPERX_DBUS_RUN_SESSION)
         set_tests_properties(cross_process_import PROPERTIES SKIP_REGULAR_EXPRESSION "NOT VERIFIED")
     endif()
 else()
-    message(WARNING
+    wallpaperx_tests_not_registered(
         "dbus-run-session not found -- test_isolation's bus check reports not verified, and ALL bus-driven "
         "tests are unregistered: dbus_service, "
         "dbus_service_classic, dbus_service_lavapipe, dbus_service_classic_lavapipe, http_config, "
@@ -1886,24 +1889,11 @@ else()
         "than it looks like. Install dbus.")
 endif()
 
-# That every entry in this tree, the renderer's included, runs through isolated_run.sh, and that every
-# one asking Qt for a display platform gets the nested compositor -- read from ctest's own listing,
-# so an entry registered with a bare add_test() is caught however it got there.
-wallpaperx_add_test(NAME test_isolation_registry
-                    COMMAND ${CMAKE_COMMAND} -DCTEST=${CMAKE_CTEST_COMMAND} -DBUILD_DIR=${CMAKE_BINARY_DIR}
-                            -DWRAPPER=${WALLPAPERX_ISOLATED_RUN} -DMINIMUM=100
-                            -P ${WALLPAPERX_ISOLATION_SUPPORT_DIR}/isolation_registry.cmake)
-set_tests_properties(test_isolation_registry PROPERTIES LABELS "novulkan")
-
 # The wrapper driven from outside with a made-up caller: a port bound inside an entry, TMPDIR in its
 # home or runtime directory, home-rooted search paths and Vulkan layers, an inherited platform, a
-# compositor that does not start, a test killed by a signal, a wrapper killed outright.
-wallpaperx_add_test(NAME test_isolation_wrapper
-                    COMMAND ${CMAKE_COMMAND} -DWRAPPER=${WALLPAPERX_ISOLATED_RUN}
-                            -DCONF=${WALLPAPERX_ISOLATED_SESSION_CONF}
-                            -DPROBE=$<TARGET_FILE:wallpaperx-wrapper-probe>
-                            -P ${WALLPAPERX_ISOLATION_SUPPORT_DIR}/isolation_wrapper_test.cmake)
-set_tests_properties(test_isolation_wrapper PROPERTIES LABELS "novulkan")
+# compositor that does not start, a test killed by a signal, a wrapper killed outright; and, on a
+# private bus, what a run leaves in /tmp and the paths it accepts.
+wallpaperx_add_isolation_wrapper_tests()
 
 # Read from inside an entry registered like every other: the private HOME, XDG directories, TMPDIR
 # and bus, and no display (test_isolation) or only the nested compositor's (test_isolation_display).
@@ -1916,6 +1906,12 @@ set_target_properties(wallpaperx-isolation-test PROPERTIES AUTOMOC OFF AUTOUIC O
 wallpaperx_add_test(NAME test_isolation COMMAND wallpaperx-isolation-test bus)
 wallpaperx_add_display_test(NAME test_isolation_display COMMAND wallpaperx-isolation-test display)
 set_tests_properties(test_isolation test_isolation_display PROPERTIES LABELS "novulkan" SKIP_RETURN_CODE 77)
+
+# That every entry in this tree, the renderer's included, runs through isolated_run.sh, and that every
+# one asking Qt for a display platform gets the nested compositor -- read from ctest's own listing,
+# so an entry registered with a bare add_test() is caught however it got there. Last: its floor is
+# what this configure registered before it (isolated_test.cmake).
+wallpaperx_add_isolation_registry()
 
 # --------------------------------------------------------------------------- #
 # ThreadSanitizer tier

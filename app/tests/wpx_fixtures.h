@@ -7,6 +7,7 @@
 // Manifests are raw JSON text or nlohmann::ordered_json, never QJsonObject: QJsonObject sorts keys,
 // which would erase the property order the tests exist to check.
 
+#include "support/forked_child.h"
 #include "tests/test_phase.h"
 #include "tests/test_report.h"
 
@@ -53,8 +54,9 @@ namespace wallpaperx::apptest {
 
 using OrderedJson = nlohmann::ordered_json;
 
-// PLAN.md's wallpaper.json example with its colour in upper case. The property keys are listed
-// speed, mute, tint -- not alphabetical -- so an implementation that sorts them is caught.
+// PLAN.md's wallpaper.json example with its colour in upper case, and speed's max at 2, the most
+// the daemon plays a video at (PLAN's example says 3, which the app refuses). The property keys
+// are listed speed, mute, tint -- not alphabetical -- so an implementation that sorts them is caught.
 inline constexpr const char* kPlanManifest = R"({
   "schema_version": "1",
   "type": "video",
@@ -64,7 +66,7 @@ inline constexpr const char* kPlanManifest = R"({
   "file": "assets/video.mp4",
   "tags": ["nature", "relaxing"],
   "properties": {
-    "speed": { "type": "float", "default": 1.0, "min": 0.1, "max": 3.0, "label": "Speed" },
+    "speed": { "type": "float", "default": 1.0, "min": 0.1, "max": 2.0, "label": "Speed" },
     "mute":  { "type": "bool",  "default": true,              "label": "Mute"  },
     "tint":  { "type": "color", "default": "#FFFFFF",         "label": "Tint"  }
   }
@@ -82,6 +84,14 @@ inline QByteArray jsonBytes(const OrderedJson& json) {
 inline QByteArray titled(const char* title) {
     OrderedJson json = planManifest();
     json["title"] = title;
+    return jsonBytes(json);
+}
+
+// PLAN's manifest as a shader wallpaper titled "Glow": one Apply must refuse (S15.243).
+inline QByteArray shaderManifest() {
+    OrderedJson json = planManifest();
+    json["type"] = "shader";
+    json["title"] = "Glow";
     return jsonBytes(json);
 }
 
@@ -460,12 +470,17 @@ inline int verdict() {
 // The start of a child run by inNamespace(): refuses to go on, reporting it, unless this process
 // is in a user namespace of its own, and only then prints the start line. Nothing when it may go
 // on, else its exit status.
+// It also makes the child non-dumpable (X.28) and says so, for inNamespace() to check: a crash in
+// it is graded by inNamespace(), and its controls crash it on purpose, so a core would only reach
+// the host's collector. Here because unshare exec'd this process, which made it dumpable again.
 inline std::optional<int> refuseUnlessOwnNamespace(const QString& goal, const QString& parentNamespace) {
+    testing::suppressCoreDump();
     const QByteArray own = userNamespace();
     if (own.isEmpty() || own == parentNamespace.toUtf8()) {
         testing::harnessFailure(goal.toStdString() + ": not in a user namespace of its own (" + own.toStdString() + "), so nothing was changed");
         return verdict();
     }
+    std::printf("namespace child dumpable %d\n", ::prctl(PR_GET_DUMPABLE, 0, 0, 0, 0));
     std::printf("namespace child started\n");
     std::fflush(stdout);
     return std::nullopt;
@@ -540,6 +555,18 @@ inline void inNamespace(const std::string& goal, const QStringList& unshareArgs,
             testing::notVerified(goal.c_str(), "unshare could not run this test in namespaces of its own: " + said.trimmed().toStdString());
         }
         return;
+    }
+    // GOAL: X.28 -- a namespace child is non-dumpable before it runs the code under test, so a
+    //       crash there (every control on that code that aborts) does not reach the host's collector.
+    // WHY-THIS-SHAPE: the kernel's own flag, read back in the child after the call, on every child
+    //       and with no crash needed. Counting coredumpctl entries instead grades only runs where a
+    //       control actually crashes the child, and adds an entry each time it goes red.
+    // CONTROL: via control_batch 2026-10-04, reverted: the suppressCoreDump() call deleted from
+    //       refuseUnlessOwnNamespace() -> app_importer red, "FAIL (harness): S15.76 (free space): X.28:
+    //       the namespace child was still dumpable when it started", with nothing crashed.
+    if (!lines.contains(QStringLiteral("namespace child dumpable 0"))) {
+        testing::harnessFailure(goal + ": X.28: the namespace child was still dumpable when it started, so a crash in "
+                                       "the code under test would reach the host's crash collector");
     }
     bool relayed = child.exitStatus() == QProcess::NormalExit && child.exitCode() == 0;
     for (const QString& line : lines) {

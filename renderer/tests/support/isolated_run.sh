@@ -15,7 +15,9 @@
 #     afterwards, and never placed inside the caller's home or runtime directory;
 #   - no live display: WAYLAND_DISPLAY and DISPLAY are unset, Qt is put on the offscreen platform;
 #   - the bus is a private one whose configuration has no service directories (--config). A bus that
-#     can activate services starts real desktop daemons as the user who ran the tests.
+#     can activate services starts real desktop daemons as the user who ran the tests. It listens
+#     inside the scratch runtime directory (private_bus.sh, which must sit beside this script), so
+#     nothing it leaves is in the shared /tmp.
 # --display is for entries that need a real platform (OpenGL): a headless nested KWin is started on
 # the scratch runtime directory and WAYLAND_DISPLAY names it. Without one they fall back to
 # offscreen, where they report their own skip.
@@ -128,29 +130,56 @@ data_dirs=$kept_dirs
 
 base=${TMPDIR:-/tmp}
 if in_session "$base"; then base=/tmp; fi
+# The bus's and the nested KWin's sockets go in the runtime directory, "$base/wallpaperx-test.XXXXXXXX/
+# runtime" (33 bytes past $base), and a socket path holds 107 bytes, of which dbus-daemon's own socket
+# name takes 16. Past that, the runtime directory alone goes to a second directory of the same name
+# under /tmp, with an owner lock of its own, and /tmp is swept too.
+short_runtime=0
+if [ $((${#base} + 33)) -gt 90 ]; then short_runtime=1; fi
+
+if [ -n "$bus" ] && [ ! -f "$(dirname "$0")/private_bus.sh" ]; then
+    echo "isolated_run.sh: FAIL (harness): private_bus.sh not found beside $0, so no private bus can be started" >&2
+    exit 2
+fi
 
 # ctest ends a timed-out entry with SIGKILL, which no trap sees, so the next run removes what such a
 # run left. A directory is in use while anyone holds the lock on its owner file: the wrapper takes it
 # and everything it starts inherits it, so a test that outlives a killed wrapper keeps its directory.
 # One with no owner file yet is kept until it is old.
-for old in "$base"/wallpaperx-test.*; do
-    [ -d "$old" ] && [ -O "$old" ] || continue
-    if [ -e "$old/owner" ]; then
-        flock -n "$old/owner" true 2>/dev/null || continue
-    else
-        [ -n "$(find "$old" -maxdepth 0 -mmin +5 2>/dev/null)" ] || continue
-    fi
-    rm -rf "$old"
-done
+sweep() {
+    for old in "$1"/wallpaperx-test.*; do
+        [ -d "$old" ] && [ -O "$old" ] || continue
+        if [ -e "$old/owner" ]; then
+            flock -n "$old/owner" true 2>/dev/null || continue
+        else
+            [ -n "$(find "$old" -maxdepth 0 -mmin +5 2>/dev/null)" ] || continue
+        fi
+        rm -rf "$old"
+    done
+}
+sweep "$base"
+if [ "$short_runtime" = 1 ] && [ "$base" != /tmp ]; then sweep /tmp; fi
 
+# owned DIR FD: DIR's owner file locked on descriptor FD (8 or 9), taken before it gets the name the
+# sweep looks for, so no sweep sees an owner file nobody holds.
+owned() {
+    eval "exec $2>\"\$1/owner.new\"" && flock -n "$2" && mv "$1/owner.new" "$1/owner"
+}
 scratch=$(mktemp -d "$base/wallpaperx-test.XXXXXXXX") || {
     echo "isolated_run.sh: FAIL (harness): no scratch directory under $base" >&2; exit 2; }
-# Locked before it takes the name the sweep looks for, so no sweep sees an owner file nobody holds.
-exec 9>"$scratch/owner.new"
-if ! flock -n 9 || ! mv "$scratch/owner.new" "$scratch/owner"; then
+if ! owned "$scratch" 9; then
     echo "isolated_run.sh: FAIL (harness): the owner lock under $scratch could not be taken" >&2
     rm -rf "$scratch"
     exit 2
+fi
+runtime_home=$scratch short=""
+if [ "$short_runtime" = 1 ]; then
+    if ! short=$(mktemp -d /tmp/wallpaperx-test.XXXXXXXX) || ! owned "$short" 8; then
+        echo "isolated_run.sh: FAIL (harness): no short runtime directory under /tmp for TMPDIR=$base" >&2
+        rm -rf "$scratch" ${short:+"$short"}
+        exit 2
+    fi
+    runtime_home=$short
 fi
 
 kwin_pid=""
@@ -159,7 +188,7 @@ cleanup() {
         kill "$kwin_pid" 2>/dev/null
         wait "$kwin_pid" 2>/dev/null
     fi
-    rm -rf "$scratch"
+    rm -rf "$scratch" ${short:+"$short"}
 }
 trap cleanup EXIT
 trap 'exit 129' HUP
@@ -168,13 +197,13 @@ trap 'exit 143' TERM
 
 export HOME="$scratch/home"
 export XDG_CONFIG_HOME="$HOME/.config" XDG_DATA_HOME="$HOME/.local/share" XDG_STATE_HOME="$HOME/.local/state" \
-       XDG_CACHE_HOME="$HOME/.cache" XDG_RUNTIME_DIR="$scratch/runtime"
+       XDG_CACHE_HOME="$HOME/.cache" XDG_RUNTIME_DIR="$runtime_home/runtime"
 export XDG_CONFIG_DIRS="$config_dirs" XDG_DATA_DIRS="$data_dirs"
 # TMP and TEMP as well: some libraries read those instead.
 export TMPDIR="$scratch/tmp" TMP="$scratch/tmp" TEMP="$scratch/tmp"
 if ! mkdir -p "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME" "$XDG_CACHE_HOME" "$XDG_RUNTIME_DIR" "$TMPDIR" ||
    ! chmod 700 "$XDG_RUNTIME_DIR"; then
-    echo "isolated_run.sh: FAIL (harness): the private directories could not be made under $scratch" >&2
+    echo "isolated_run.sh: FAIL (harness): the private directories could not be made under $scratch ($runtime_home)" >&2
     exit 2
 fi
 
@@ -226,7 +255,9 @@ fi
 
 status=0
 if [ -n "$bus" ]; then
-    "$bus" --config-file="$conf" -- "$@" || status=$?
+    # Its socket in the scratch runtime directory, removed with it: a bus killed outright leaves
+    # its socket behind, and in the shared /tmp that was one dead file per killed bus.
+    /bin/sh "$(dirname "$0")/private_bus.sh" --conf-out "$scratch/session-bus.conf" "$bus" "$conf" -- "$@" || status=$?
 else
     # No dbus-run-session on this host: an address nothing listens on, so a client cannot fall back
     # to a bus it finds by itself.

@@ -6,9 +6,11 @@
 
 #include "tests/test_report.h"
 
+#include <QList>
 #include <QQmlComponent>
 #include <QQmlEngine>
 #include <QQmlError>
+#include <QQuickItem>
 #include <QRegularExpression>
 #include <QStringList>
 #include <QVariantMap>
@@ -16,6 +18,19 @@
 #include <memory>
 
 namespace wallpaperx::apptest {
+
+// Every item below `item` that inherits `className`, depth first in tree order, shown or not: a
+// caller that wants only visible ones filters, so each file's visibility rule stays in sight.
+inline QList<QQuickItem*> allInheriting(QQuickItem* item, const char* className) {
+    QList<QQuickItem*> out;
+    for (QQuickItem* child : item->childItems()) {
+        if (child->inherits(className)) {
+            out.append(child);
+        }
+        out += allInheriting(child, className);
+    }
+    return out;
+}
 
 // A Qt module missing from this install is the environment's fault and an initial property the
 // file does not have is the test's; both are harness faults. Anything else is a failure of `file`,

@@ -5,9 +5,13 @@
 // previews by the real PreviewImageProvider. Goals S15.45, S15.46, S15.52, S15.55 and S15.82 in
 // GOALS.md.
 
+#include "apply_controller.h"
+#include "daemon_client.h"
 #include "fake_kscreen.h"
 #include "importer.h"
+#include "kscreen_client.h"
 #include "library_manager.h"
+#include "plasma_controller.h"
 #include "preview_image_provider.h"
 #include "qml_load.h"
 #include "wpx_fixtures.h"
@@ -75,36 +79,17 @@ void collect(QQuickItem* item, QList<QQuickItem*>& out) {
 }
 
 QQuickItem* firstInheriting(QQuickItem* item, const char* className) {
-    for (QQuickItem* child : item->childItems()) {
-        if (child->inherits(className)) {
-            return child;
-        }
-        if (QQuickItem* found = firstInheriting(child, className)) {
-            return found;
-        }
-    }
-    return nullptr;
-}
-
-QList<QQuickItem*> allInheriting(QQuickItem* item, const char* className) {
-    QList<QQuickItem*> out;
-    for (QQuickItem* child : item->childItems()) {
-        if (child->inherits(className)) {
-            out.append(child);
-        }
-        out += allInheriting(child, className);
-    }
-    return out;
+    const QList<QQuickItem*> found = allInheriting(item, className);
+    return found.isEmpty() ? nullptr : found.front();
 }
 
 QString textsUnder(QQuickItem* item) {
     QString out;
-    for (QQuickItem* child : item->childItems()) {
+    for (QQuickItem* child : allInheriting(item, "QQuickItem")) {
         const QVariant text = child->property("text");
         if (child->isVisible() && text.metaType().id() == QMetaType::QString) {
             out += text.toString() + QLatin1Char('|');
         }
-        out += textsUnder(child);
     }
     return out;
 }
@@ -142,12 +127,16 @@ bool settleEvents(QQuickWindow& window) {
 // module (qml_load.h). LibraryView takes the importer too; WallpaperDetail does not.
 // CONTROL: app/qml/LibraryView.qml given `required property int neverGiven` -> red, "FAIL:
 //       app/qml/LibraryView.qml did not load: ...Required property neverGiven was not initialized"; restored.
-std::unique_ptr<QQuickItem> load(QQmlEngine& engine, QQuickWindow& window, const char* type, LibraryManager& library, Importer* importer = nullptr) {
+std::unique_ptr<QQuickItem> load(QQmlEngine& engine, QQuickWindow& window, const char* type, LibraryManager& library, Importer* importer = nullptr,
+                                 ApplyController* applier = nullptr) {
     QQmlComponent component(&engine);
     component.loadFromModule("WallpaperX", type);
     QVariantMap given{{QStringLiteral("library"), QVariant::fromValue(&library)}};
     if (importer != nullptr) {
         given.insert(QStringLiteral("importer"), QVariant::fromValue(importer));
+    }
+    if (applier != nullptr) {
+        given.insert(QStringLiteral("applier"), QVariant::fromValue(applier));
     }
     std::unique_ptr<QObject> object(component.createWithInitialProperties(given));
     auto* item = qobject_cast<QQuickItem*>(object.get());
@@ -232,12 +221,12 @@ void grid(QQmlEngine& engine, QQuickWindow& window, LibraryManager& library, Imp
 }
 
 // S15.46: the detail view.
-void detail(QQmlEngine& engine, QQuickWindow& window, LibraryManager& library, const QString& ocean) {
+void detail(QQmlEngine& engine, QQuickWindow& window, LibraryManager& library, ApplyController& applier, const QString& ocean) {
     if (!library.select(ocean)) {
         expect(false, QStringLiteral("S15.46: ocean could not be opened for the detail view"));
         return;
     }
-    const auto view = load(engine, window, "WallpaperDetail", library);
+    const auto view = load(engine, window, "WallpaperDetail", library, nullptr, &applier);
     if (!view) {
         return;
     }
@@ -246,21 +235,32 @@ void detail(QQmlEngine& engine, QQuickWindow& window, LibraryManager& library, c
         return;
     }
 
-    // GOAL: S15.46 -- Apply is shown and cannot be pressed while applying is not wired.
+    // GOAL: S15.46 -- with no monitor chosen, Apply is shown and cannot be pressed, and the view
+    //       says why.
     // WHY-THIS-SHAPE: "Reset to defaults" is found by the same search and must be enabled, so a
-    //       lookup that returned some disabled button is not mistaken for Apply.
-    // CONTROL: app/qml/WallpaperDetail.qml, Apply's `enabled: false` made `enabled: true` -> red,
-    //       "S15.46: Apply is enabled"; restored.
+    //       lookup that returned some disabled button is not mistaken for Apply. No KScreen answers
+    //       here, so nothing is selected; Apply's enabled side is graded in app_main_window.
+    // CONTROL: app/qml/WallpaperDetail.qml, Apply's `enabled: root.applier.blockedReason === "" && ...`
+    //       made `enabled: root.applier.applyState !== ApplyController.Working` (control_batch) ->
+    //       red, "S15.46: Apply is enabled, Reset is enabled, the reason shown is ...".
     QQuickItem* apply = nullptr;
     QQuickItem* reset = nullptr;
     for (QQuickItem* button : allInheriting(view.get(), "QQuickAbstractButton")) {
         const QString text = button->property("text").toString();
         (text == u"Apply" ? apply : (text == u"Reset to defaults" ? reset : button)) = button;
     }
-    expect(apply && reset && apply->isVisible() && !apply->isEnabled() && reset->isEnabled(),
-           QStringLiteral("S15.46: Apply is %1, Reset is %2")
+    const QString reason = QStringLiteral("Choose a monitor above to apply it to.");
+    QQuickItem* reasonLabel = nullptr;
+    for (QQuickItem* item : allInheriting(view.get(), "QQuickText")) {
+        if (item->isVisible() && item->property("text").toString() == reason) {
+            reasonLabel = item;
+        }
+    }
+    expect(apply && reset && apply->isVisible() && !apply->isEnabled() && reset->isEnabled() && reasonLabel != nullptr,
+           QStringLiteral("S15.46: Apply is %1, Reset is %2, the reason shown is %3")
                .arg(apply ? (apply->isEnabled() ? QStringLiteral("enabled") : QStringLiteral("disabled")) : QStringLiteral("missing"),
-                    reset ? (reset->isEnabled() ? QStringLiteral("enabled") : QStringLiteral("disabled")) : QStringLiteral("missing")));
+                    reset ? (reset->isEnabled() ? QStringLiteral("enabled") : QStringLiteral("disabled")) : QStringLiteral("missing"),
+                    reasonLabel ? reason : QStringLiteral("none")));
 
     QList<QQuickItem*> rows;
     collect<WallpaperProperty>(view.get(), rows);
@@ -303,7 +303,8 @@ void detail(QQmlEngine& engine, QQuickWindow& window, LibraryManager& library, c
     //       binding; resetting without a drag first would pass a slider whose binding breaks on drag.
     // CONTROL: app/qml/WallpaperDetail.qml, the Slider's `onMoved: root.library.setPropertyValue(row.modelData.key, value)`
     //       made `onMoved: { root.library.setPropertyValue(row.modelData.key, value); value = value; }`
-    //       -> red, "S15.46: after a drag and a reset the slider shows 2.7…, not 1"; restored.
+    //       -> red, "S15.46: after a drag and a reset the slider shows 1.85878, not 1" (control_batch,
+    //       2026-10-02); restored.
     const QPointF left = slider->mapToScene(QPointF(slider->width() * 0.5, slider->height() / 2));
     const QPointF right = slider->mapToScene(QPointF(slider->width() * 0.9, slider->height() / 2));
     QTest::mousePress(&window, Qt::LeftButton, {}, left.toPoint());
@@ -312,8 +313,9 @@ void detail(QQmlEngine& engine, QQuickWindow& window, LibraryManager& library, c
     }
     QTest::mouseRelease(&window, Qt::LeftButton, {}, right.toPoint());
     settleEvents(window);
+    // Dragged to 90% of a 0.1-2 track, from 2 (its end): strictly between proves the drag wrote it.
     const double dragged = speed();
-    expect(dragged > 2.0 && dragged <= 3.0 && std::abs(dragged - sliderValue()) < 1e-9,
+    expect(dragged > 1.5 && dragged < 2.0 && std::abs(dragged - sliderValue()) < 1e-9,
            QStringLiteral("S15.46: after dragging the slider right the library holds speed %1 and the slider shows %2").arg(dragged).arg(sliderValue()));
     library.resetPropertyValues();
     settleEvents(window);
@@ -632,6 +634,12 @@ int main(int argc, char* argv[]) {
     }
     auto library = std::make_unique<LibraryManager>(dir, 30);
     auto importer = std::make_unique<Importer>(scratch.path() + QStringLiteral("/drop"), dir, 30);
+    // WallpaperDetail requires an ApplyController. Its clients name services nobody owns on this
+    // bus and are never asked, so no monitor is selected and Apply stays blocked.
+    KScreenClient kscreen(QDBusConnection::sessionBus(), QStringLiteral("io.wallpaperx.test.KScreen.unowned"));
+    DaemonClient daemon(QDBusConnection::sessionBus(), QStringLiteral("io.wallpaperx.test.Daemon.unowned"));
+    PlasmaController plasma(QDBusConnection::sessionBus(), QStringLiteral("io.wallpaperx.test.PlasmaShell.unowned"));
+    auto applier = std::make_unique<ApplyController>(kscreen, *library, daemon, plasma);
     library->rescan();
     if (!waitUntil([&] { return library->state() == LibraryManager::State::Ready && library->wallpapers().size() == 2; }, kWaitMs)) {
         expect(false, QStringLiteral("the library never listed its two wallpapers; state %1").arg(int(library->state())));
@@ -645,11 +653,12 @@ int main(int argc, char* argv[]) {
             notVerified(kGoals, "the offscreen window was never exposed, so no click can reach it");
         } else {
             grid(engine, window, *library, *importer, ocean);
-            detail(engine, window, *library, ocean);
+            detail(engine, window, *library, *applier, ocean);
             busyGrid(engine, window, scratch.path());
             importerViews(engine, window, scratch.path());
         }
     }
+    applier.reset();
     importer.reset();
     library.reset();
     // No import may still be writing into the scratch folder when it is removed.

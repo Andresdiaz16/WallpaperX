@@ -2,6 +2,7 @@
 
 #include "single_instance.h"
 
+#include "kde/dbus_reply.h"
 #include "library/wpx_package.h"
 
 #include <QDBusConnectionInterface>
@@ -115,8 +116,7 @@ Claim claimOrHandOver(QDBusConnection bus, ApplicationService& service, const QL
             return {Claim::Result::HandedOver, {}};
         }
         problem = reply.errorMessage();
-        if (reply.errorName() != QDBusError::errorString(QDBusError::ServiceUnknown)
-            && reply.errorName() != QStringLiteral("org.freedesktop.DBus.Error.NameHasNoOwner")) {
+        if (!isUnreachable(QDBusError(reply))) {
             break;
         }
     }

@@ -907,13 +907,14 @@ void modelRows() {
                .arg(inserts).arg(removals).arg(moves).arg(changes));
 }
 
-// The user's state on a listed wallpaper: it is selected and its speed edited to 2.5.
+// The user's state on a listed wallpaper: it is selected and its speed edited to 1.8, which is not
+// its default and within the range every manifest here declares.
 bool selectEdited(LibraryManager& m, const QString& path) {
-    return m.select(path) && m.setPropertyValue(QStringLiteral("speed"), 2.5);
+    return m.select(path) && m.setPropertyValue(QStringLiteral("speed"), 1.8);
 }
 
 bool keptEdited(const LibraryManager& m, const QString& path) {
-    return m.selectedPath() == path && m.propertyValues().value(QStringLiteral("speed")) == QVariant(2.5);
+    return m.selectedPath() == path && m.propertyValues().value(QStringLiteral("speed")) == QVariant(1.8);
 }
 
 QString selectionOf(const LibraryManager& m) {

@@ -13,6 +13,7 @@ Item {
     id: root
 
     required property LibraryManager library
+    required property ApplyController applier
 
     readonly property wallpaper chosen: library.selectedWallpaper
 
@@ -163,6 +164,22 @@ Item {
                     }
                 }
 
+                Label {
+                    Layout.fillWidth: true
+                    visible: root.applier.liveOutput !== ""
+                    wrapMode: Text.Wrap
+                    textFormat: Text.PlainText
+                    color: palette.placeholderText
+                    text: qsTr("Changes to these settings reach %1 as you make them.").arg(root.applier.liveOutput)
+                }
+                Label {
+                    Layout.fillWidth: true
+                    visible: root.applier.liveError !== ""
+                    wrapMode: Text.Wrap
+                    textFormat: Text.PlainText
+                    text: root.applier.liveError
+                }
+
                 RowLayout {
                     Layout.fillWidth: true
 
@@ -174,11 +191,28 @@ Item {
                     Item {
                         Layout.fillWidth: true
                     }
-                    // Inert until applying to the daemon and Plasma is wired.
-                    Button {
-                        text: qsTr("Apply")
-                        enabled: false
+                    BusyIndicator {
+                        Layout.preferredHeight: applyButton.implicitHeight
+                        Layout.preferredWidth: applyButton.implicitHeight
+                        visible: root.applier.applyState === ApplyController.Working
+                        running: visible
                     }
+                    Button {
+                        id: applyButton
+                        text: qsTr("Apply")
+                        enabled: root.applier.blockedReason === "" && root.applier.applyState !== ApplyController.Working
+                        onClicked: root.applier.apply()
+                    }
+                }
+                // Why Apply is unavailable, else how the last one went.
+                Label {
+                    Layout.fillWidth: true
+                    wrapMode: Text.Wrap
+                    textFormat: Text.PlainText
+                    visible: text !== ""
+                    text: root.applier.blockedReason !== "" && root.applier.applyState !== ApplyController.Working
+                        ? root.applier.blockedReason
+                        : root.applier.applyMessage
                 }
             }
         }

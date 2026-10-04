@@ -118,6 +118,12 @@ public:
 inline constexpr const char* kPreviewProviderId = "wallpaperx-preview";
 inline constexpr qint64 kMaxManifestBytes = 1 << 20;
 inline constexpr qint64 kMaxPreviewBytes = 32 << 20;
+// The daemon's own bounds on what SetWallpaperWithProperties accepts (wallpaper_properties.h), so a
+// wallpaper it would refuse is listed broken instead of failing at Apply. Not `inline`, as in
+// daemon_client.h: internal linkage keeps a copy from merging with a daemon variable of its name.
+constexpr qsizetype kMaxProperties = 64;
+constexpr qsizetype kMaxPropertyKeyBytes = 64;
+constexpr double kMaxPlaybackSpeed = 2.0;
 
 // The manifest fields of a wallpaper.json; the file fields are left empty. The error is a
 // sentence for the user.

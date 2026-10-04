@@ -2,12 +2,14 @@
 # S15.15: the app, installed to a fresh prefix and run from outside its build tree, loads Main.qml
 # and keeps running.
 #
-#   installed_app_test.sh CMAKE APP_BUILD_DIR DBUS_RUN_SESSION BUS_CONFIG
+#   installed_app_test.sh CMAKE APP_BUILD_DIR DBUS_RUN_SESSION BUS_CONFIG PRIVATE_BUS_SH
 #
+# BUS_CONFIG is the wrapper's isolated_session.conf; PRIVATE_BUS_SH starts the bus on it with its
+# socket in the private runtime directory, and writes the configuration it ran to $prefix/bus.conf.
 # Exit 0 pass, 1 fail or harness fault (the lines say which), 77 cannot be answered here.
 
 set -u
-cmake="$1" build_dir="$2" dbus_run_session="$3" bus_config="$4"
+cmake="$1" build_dir="$2" dbus_run_session="$3" bus_config="$4" private_bus="$5"
 name=app_installed_starts
 
 prefix="" drs_pid="" app_pid="" pidfile="" busfile="" launched=0
@@ -22,13 +24,14 @@ prefix="" drs_pid="" app_pid="" pidfile="" busfile="" launched=0
 #   reported, never taken as "no leak".
 # CONTROL: by hand, test-side, each observed: cleanup signalling dbus-run-session before its wait
 #   -> "FAIL (harness): the private bus daemon <pid> outlived its dbus-run-session", exit 1; the
-#   inner shell killing dbus-run-session instead of starting the app -> "FAIL: S15.15: the app
-#   exited with status 137 ..." then the same harness line; the app ignoring SIGTERM (the SIGKILL
+#   inner shell killing dbus-run-session instead of starting the app -> "FAIL (harness): the app
+#   was never started (bus launcher exited with status 137)" then the same harness line
+#   (control_batch, 2026-10-04); the app ignoring SIGTERM (the SIGKILL
 #   path) -> passes, no leak reported; the pid never written -> "FAIL (harness): the private bus
 #   daemon's pid was never recorded ...", exit 1. Restored.
 bus_alive() {
     [ "$(cat "/proc/$1/comm" 2>/dev/null)" = dbus-daemon ] &&
-        tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null | grep -qF -- "$bus_config"
+        tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null | grep -qF -- "$prefix/bus.conf"
 }
 cleanup() {
     local bus_pid=""
@@ -107,7 +110,7 @@ command -v pgrep > /dev/null || harness "pgrep is needed to find the private bus
 # dbus-run-session bus", exit 1.
 cd "$work" || harness "cannot enter $work"
 outer_bus="${DBUS_SESSION_BUS_ADDRESS:-}" \
-"$dbus_run_session" --config-file="$bus_config" -- sh -c '
+/bin/sh "$private_bus" --conf-out "$prefix/bus.conf" "$dbus_run_session" "$bus_config" -- sh -c '
     pgrep -P "$PPID" -x dbus-daemon > "$4" || exit 98
     [ -n "$DBUS_SESSION_BUS_ADDRESS" ] && [ "$DBUS_SESSION_BUS_ADDRESS" != "$outer_bus" ] || exit 99
     echo $$ > "$1"
@@ -144,6 +147,21 @@ if [ "$loaded" = 0 ]; then
     wait "$drs_pid"; status=$?; drs_pid=""
     [ "$status" = 98 ] && harness "the private bus daemon's pid could not be recorded"
     [ "$status" = 99 ] && harness "the app's bus was not a fresh dbus-run-session bus"
+    # GOAL (harness): a run whose app never started -- private_bus.sh refusing, dbus-run-session
+    #   failing -- is reported as a harness fault, never as S15.15 failing.
+    # WHY-THIS-SHAPE: the inner shell records the app's pid just before it execs the app, so an
+    #   empty pid file means the app never ran, whatever status the launcher gave; listing the
+    #   launcher's statuses instead misses every one not listed. launched=0, so cleanup adds no
+    #   second line about a bus that was never started.
+    # CONTROL: test-side, control_batch, 2026-10-04: "$private_bus" given a path that does not exist
+    #   -> "FAIL (harness): the app was never started (bus launcher exited with status 127)"; the same
+    #   with this block deleted -> "FAIL: S15.15: the app exited with status 127 before showing
+    #   Main.qml's window", the misattribution it removes.
+    if [ ! -s "$pidfile" ]; then
+        grep -v '^qt\.qml\.import' "$log" | head -40 >&2
+        launched=0
+        harness "the app was never started (bus launcher exited with status $status)"
+    fi
     if grep -q 'Could not find the Qt platform plugin "offscreen"' "$log"; then
         echo "$name: SKIP -- the offscreen Qt platform plugin is not installed" >&2; exit 77
     fi

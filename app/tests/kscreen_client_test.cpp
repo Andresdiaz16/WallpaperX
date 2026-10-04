@@ -4,7 +4,7 @@
 // S15.6-S15.12, S15.14, S15.16, S15.18-S15.20, S15.23, S15.25, S15.26 and S15.28 in GOALS.md.
 //
 // Every phase stands up its own fake under its own name, never org.kde.KScreen, on a bus that
-// can start nothing (app/tests/private_session.conf; refuseUnlessPrivateBus proves both). The
+// can start nothing (renderer/tests/support/isolated_session.conf; refuseUnlessPrivateBus proves both). The
 // barrier used after a reply is released is the client's count of calls in flight: each call it
 // makes is a QDBusPendingCallWatcher child of it, deleted once its reply has been handled, so when
 // only the calls the fake still holds remain, every reply sent so far has been acted on.
@@ -245,8 +245,9 @@ void unavailableStates() {
     // GOAL: S15.7 -- a service that is not on the bus reads Unavailable, saying KScreen is not running.
     // WHY-THIS-SHAPE: a name nobody owns on a bus that can activate nothing; the bus is asked, so
     //       the premise is proven rather than assumed.
-    // CONTROL: app/kde/kscreen_client.cpp, describe()'s ServiceUnknown case removed -> red, reason
-    //       "KScreen refused the request: ..."; restored, green.
+    // CONTROL: app/kde/kscreen_client.cpp, describe()'s `if (isUnreachable(error))` made `if (false)`
+    //       (control_batch, 2026-10-04) -> red, "S15.7 absent: the reason should say "is not running";
+    //       ... reason "KScreen refused the request: The name ... was not provided by any .service files"".
     {
         const QString nobody = QStringLiteral("io.wallpaperx.test.NobodyHome");
         if (QDBusConnection::sessionBus().interface()->isServiceRegistered(nobody).value()) {
@@ -284,6 +285,39 @@ void unavailableStates() {
         rig->fake->configError = QStringLiteral("backend exploded");
         if (rig->refreshAndSettle("S15.7 getConfig error")) {
             expectUnavailable(*rig, "S15.7 getConfig error", QStringLiteral("KScreen refused the request: backend exploded"));
+        }
+    }
+
+    // GOAL: S15.261 -- a NameHasNoOwner error from KScreen reads as KScreen not running, not as a
+    //       refusal.
+    // WHY-THIS-SHAPE: the private bus answers an absent name with ServiceUnknown (the case above),
+    //       so the fake sends NameHasNoOwner itself; the reason is compared whole.
+    // CONTROL: app/kde/dbus_reply.h, `|| error.name() == u"org.freedesktop.DBus.Error.NameHasNoOwner"`
+    //       deleted from isUnreachable (control_batch, 2026-10-04) -> red, "S15.261: KScreen's
+    //       NameHasNoOwner reads "KScreen refused the request: gone"".
+    if (auto rig = Rig::make("noowner", "S15.261 (KScreen)")) {
+        rig->fake->configMode = FakeKScreen::Mode::Error;
+        rig->fake->errorName = QStringLiteral("org.freedesktop.DBus.Error.NameHasNoOwner");
+        rig->fake->configError = QStringLiteral("gone");
+        if (rig->refreshAndSettle("S15.261")) {
+            const QString want = QStringLiteral("KDE's display configuration service (KScreen) is not running.");
+            expect(rig->client->state() == State::Unavailable && rig->client->unavailableReason() == want,
+                   QStringLiteral("S15.261: KScreen's NameHasNoOwner reads \"%1\"").arg(rig->client->unavailableReason()));
+        }
+    }
+
+    // GOAL: S15.262 -- KScreen's own message in a refusal is cut at 300 characters with "…", so a
+    //       long one cannot fill the window.
+    // CONTROL: app/kde/kscreen_client.cpp, describe()'s `clamped(error.message())` made
+    //       `error.message()` (control_batch, 2026-10-04) -> red, "S15.262: a 400-character refusal
+    //       reads as 429 characters".
+    if (auto rig = Rig::make("longerror", "S15.262 (KScreen)")) {
+        rig->fake->configMode = FakeKScreen::Mode::Error;
+        rig->fake->configError = QString(400, u'e');
+        if (rig->refreshAndSettle("S15.262")) {
+            const QString want = QStringLiteral("KScreen refused the request: ") + QString(300, u'e') + QStringLiteral("…");
+            expect(rig->client->state() == State::Unavailable && rig->client->unavailableReason() == want,
+                   QStringLiteral("S15.262: a 400-character refusal reads as %1 characters").arg(rig->client->unavailableReason().size()));
         }
     }
 

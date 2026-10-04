@@ -24,9 +24,13 @@
 #       (a whole-text match had reported it). -DWRAPPER naming no file -> "FAIL (harness): ... does
 #       not exist". In a scratch project, an entry `/bin/sh <wrapper> --private-network x --config
 #       <conf> -- true`, which skips the wrapper's network step and passes on the shared network ->
-#       "FAIL: bypass_first does not run through ...".
+#       "FAIL: bypass_first does not run through ...". 2026-10-04, control_batch, in all three trees:
+#       -DBUILD_DIR naming a directory with no entries -> "does not include test_isolation_registry
+#       itself" and "only 0 entries were listed".
 # COVERAGE-ASSERT: the listing must contain this entry and at least MINIMUM entries, so a listing
-#       of the wrong directory, or an empty one, cannot pass.
+#       of the wrong directory, or an empty one, cannot pass. MINIMUM is what the configure
+#       registered, so it does not notice a configure that dropped a group for want of a
+#       dependency; WALLPAPERX_REQUIRE_ALL_TESTS (isolated_test.cmake) fails that configure instead.
 
 foreach(required CTEST BUILD_DIR WRAPPER MINIMUM)
     if(NOT DEFINED ${required})
@@ -104,8 +108,16 @@ set(failures 0)
 set(graded 0)
 set(display_entries 0)
 set(saw_self FALSE)
-math(EXPR last "${count} - 1")
-foreach(i RANGE ${last})
+# Built apart from the loop: RANGE of an empty listing's -1 is a CMake error, not an empty loop, and
+# an empty listing must reach the FAIL lines below.
+set(indices "")
+if(count GREATER 0)
+    math(EXPR last "${count} - 1")
+    foreach(i RANGE ${last})
+        list(APPEND indices ${i})
+    endforeach()
+endif()
+foreach(i IN LISTS indices)
     string(JSON name GET "${listing}" tests ${i} name)
     if(name STREQUAL "test_isolation_registry")
         set(saw_self TRUE)

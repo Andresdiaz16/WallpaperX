@@ -11,6 +11,8 @@ ApplicationWindow {
     required property KScreenClient kscreen
     required property LibraryManager library
     required property Importer importer
+    required property DaemonClient daemon
+    required property ApplyController applier
 
     width: 1280
     height: 800
@@ -40,6 +42,13 @@ ApplicationWindow {
                 : picker.fill(qsTr("Selected: %1 (%2)"),
                               [window.kscreen.selectedMonitor.displayName, window.kscreen.selectedOutput])
         }
+        ScreenSettings {
+            Layout.fillWidth: true
+            visible: window.kscreen.selectedOutput !== ""
+            kscreen: window.kscreen
+            daemon: window.daemon
+            applier: window.applier
+        }
 
         StackLayout {
             Layout.fillWidth: true
@@ -52,6 +61,7 @@ ApplicationWindow {
             }
             WallpaperDetail {
                 library: window.library
+                applier: window.applier
             }
         }
     }

@@ -2139,6 +2139,28 @@ struct CrashingDaemon {
                                    "how the process ended");
         return true;
     }
+
+    // GOAL: X.27 -- the staged SIGSEGV is not handed to the host's crash collector: the reaped
+    //       daemon's wait status carries no core bit. Graded on every crash this file stages.
+    // WHY-THIS-SHAPE: as daemon_system_test's: on a piped core_pattern only the dumpable flag the
+    //       shim clears keeps the crash from the collector, the inherited core limit does not; on a
+    //       file pattern there is no collector program, so it counts as not reached, said on stdout.
+    //       Called after the sanitizer gate and the "ended" check, before the phase's own timing
+    //       can give up.
+    // CONTROL: via control_batch 2026-10-04, reverted: the suppressCoreDump() call deleted from
+    //       backend/tests/wedge_shim.cpp's fault -> "FAIL: crash, pipe stalled throughout: X.27: ..."
+    //       and "FAIL: crash, pipe resumed during the flush: X.27: ...", one coredumpctl entry each.
+    void checkNotCollected(const std::string& phase) const {
+        std::string why;
+        const std::optional<bool> collected = wallpaperx::testing::stagedCrashReachedCollector(*daemon, why);
+        if (!collected) {
+            notVerified("X.27 (a deliberate daemon crash does not reach the core collector)", phase + ": " + why);
+            return;
+        }
+        check(!*collected, (phase + ": X.27: the staged SIGSEGV is not handed to the core collector (no core bit in "
+                                    "the wait status)")
+                               .c_str());
+    }
 };
 
 // GOAL: S14.28 -- a line the daemon wrote just before a fatal signal, still queued in the log writer
@@ -2188,6 +2210,18 @@ void checkCrashDeliversQueuedLine(NameWatcher& names, Destination dest) {
         return;
     }
     if (crash.sanitizerTookIt(kGoals, phase)) return;
+    // GOAL: S14.28 -- once the destination accepts again the handler's flush has nothing to wait
+    //       on, so the crashing daemon ends within 5 s of the fault; one still alive was SIGKILLed
+    //       above, and its crash path hung.
+    // WHY-THIS-SHAPE: checked before X.27 and before the "record not seen" branch, so a hang is a
+    //       FAIL, which outranks the NOT VERIFIED those report for a SIGKILLed daemon, instead of
+    //       turning the entry into a skip. The flush is bounded at 250 ms, so 5 s is about 20x.
+    // CONTROL: backend/daemon/crash_record.cpp, a 6 s sleep after onFatalSignal's flush
+    //       (control_batch, 2026-10-04) -> "FAIL: crash, pipe resumed during the flush: the daemon
+    //       ends within 5 s of the fault once the stream is resumed" on each destination.
+    check(ended.has_value(), (phase + ": the daemon ends within 5 s of the fault once the stream is resumed").c_str());
+    if (!ended) std::fprintf(stderr, "  %s: killed at the bound; it then reported signal %d\n", phase.c_str(), daemon.termSignal());
+    crash.checkNotCollected(phase);
     if (!recorded) {
         notVerified(kGoals, phase + ": the handler's record was not seen within 1250 ms of the fault (the daemon ended "
                                 "with signal " + std::to_string(daemon.termSignal()) +
@@ -2253,6 +2287,7 @@ void checkCrashFlushIsBounded(NameWatcher& names, Destination dest) {
         return;
     }
     if (crash.sanitizerTookIt(kGoals, phase)) return;
+    crash.checkNotCollected(phase);
     check(ended.has_value(), (phase + ": the daemon ends within 1250 ms of the fault").c_str());
     const bool ofItsSignal = endedAtAll && !daemon.exitedNormally() && daemon.termSignal() == SIGSEGV;
     check(ofItsSignal, (phase + ": and dies of SIGSEGV, the fault's own signal").c_str());

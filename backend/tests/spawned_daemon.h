@@ -36,6 +36,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace wallpaperx::testing {
@@ -393,6 +394,8 @@ public:
     // reported for an instance that in fact aborted while failing its name request.
     bool exitedNormally() const { return m_exitedNormally; }
     int termSignal() const { return m_termSignal; }
+    // The wait status's core bit: the kernel produced a core, to a file or to a collector program.
+    bool coreDumped() const { return m_coreDumped; }
 
     // True once the capture pipe has stopped delivering -- EOF, or a read error. A cheap
     // gate for "the daemon may be gone", not an answer to it: readFailed() below separates
@@ -799,7 +802,10 @@ private:
         } else {
             m_exitedNormally = WIFEXITED(status);
             m_exitCode = m_exitedNormally ? WEXITSTATUS(status) : -1;
-            if (WIFSIGNALED(status)) m_termSignal = WTERMSIG(status);
+            if (WIFSIGNALED(status)) {
+                m_termSignal = WTERMSIG(status);
+                m_coreDumped = WCOREDUMP(status);
+            }
         }
         m_pid = -1;
 
@@ -839,6 +845,7 @@ private:
     bool m_waitFailed = false;
     bool m_exitedNormally = false;
     int m_termSignal = 0;
+    bool m_coreDumped = false;
     std::thread m_reader;
     std::atomic<bool> m_readerDone{false};
     std::atomic<bool> m_stopReader{false};
@@ -849,5 +856,30 @@ private:
     bool m_captureHeld = false;  // under m_mutex
     std::string m_output;
 };
+
+// X.27, for a daemon reaped after the wedge shim's staged SIGSEGV: whether the kernel handed that
+// crash to the host's core collector. nullopt, with `why` set, when this run cannot tell: the daemon
+// did not die of SIGSEGV, or core_pattern could not be read. On a host whose core_pattern is a file
+// there is no collector program to reach, so the answer is false, said once on stdout: the core
+// bit would not tell anyway, since the inherited RLIMIT_CORE of 0 alone clears it there.
+inline std::optional<bool> stagedCrashReachedCollector(const SpawnedDaemon& daemon, std::string& why) {
+    if (daemon.timedOut() || daemon.exitedNormally() || daemon.termSignal() != SIGSEGV) {
+        why = "the daemon did not die of the staged SIGSEGV (signal " + std::to_string(daemon.termSignal()) + ")";
+        return std::nullopt;
+    }
+    const std::optional<bool> toAProgram = coreGoesToAProgram();
+    if (!toAProgram) {
+        why = "/proc/sys/kernel/core_pattern could not be read";
+        return std::nullopt;
+    }
+    if (!*toAProgram) {
+        static bool said = false;
+        if (!std::exchange(said, true)) {
+            std::printf("X.27: this host's core_pattern writes a file, so no collector program exists for a crash to reach\n");
+        }
+        return false;
+    }
+    return daemon.coreDumped();
+}
 
 }  // namespace wallpaperx::testing

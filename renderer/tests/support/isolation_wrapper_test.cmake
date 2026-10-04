@@ -8,10 +8,13 @@
 #   cmake -DWRAPPER=<isolated_run.sh> -DCONF=<isolated_session.conf> -DPROBE=<wallpaperx-wrapper-probe> -P this
 #
 # Runs inside the wrapper like every entry, so its own TMPDIR is a private scratch directory and its
-# own network is private; every nested wrapper runs with no --bus, so no bus is started.
+# own network is private. Every nested wrapper runs with no --bus, so no bus is started; runs on a
+# private bus are isolation_wrapper_tmp_test.cmake's.
 #
-# CONTROL: observed 2026-10-01, each a scratch copy of isolated_run.sh passed as -DWRAPPER, the entry
-#       itself under the real one. Both unshare steps and the own-namespace check removed -> "FAIL: a
+# CONTROL: observed 2026-10-01, each in a scratch copy of the support directory (isolated_run.sh with
+#       private_bus.sh beside it, which it needs since 2026-10-03) whose isolated_run.sh was passed as
+#       -DWRAPPER, the entry itself under the real one; the re-raise control re-run that way
+#       2026-10-04. Both unshare steps and the own-namespace check removed -> "FAIL: a
 #       port bound inside one entry is not reachable ... (127.0.0.1:18462 accepted a connection from
 #       outside)". `ip link set lo up` replaced by `true` -> "FAIL (harness): the listener inside the
 #       nested entry was not reachable from that entry itself". The signal allowlist widened to every
@@ -263,6 +266,16 @@ run_wrapper(o rc "" bus /bin/sh -c "echo RAN && exec \"${PROBE}\" crash")
 math(EXPR cases "${cases} + 1")
 if(NOT o MATCHES "RAN" OR NOT rc STREQUAL "139")
     fail("a test killed by SIGSEGV comes back as exit status 139, the wrapper itself not crashing (got '${rc}')")
+endif()
+# GOAL: X.28 -- the probe this crash uses is non-dumpable as it raises, so the run adds nothing to
+#       the host's crash collector.
+# WHY-THIS-SHAPE: the probe reads the kernel's flag back after the call and prints it; 139 above is
+#       the same whether or not a core was taken, and no shell or cmake call here exposes the core bit.
+# CONTROL: via control_batch 2026-10-04, reverted: wrapper_probe.cpp's suppressCoreDump() replaced
+#       by RLIMIT_CORE 1 (dumpable, but the kernel skips a piped collector at exactly 1, so the
+#       control itself added no entry) -> "FAIL: the crashing probe was still dumpable as it raised SIGSEGV".
+if(NOT o MATCHES "probe dumpable 0")
+    fail("the crashing probe was still dumpable as it raised SIGSEGV, so the run reaches the crash collector (said: ${o})")
 endif()
 run_wrapper(o rc "" bus /bin/sh -c "echo RAN && exit 148")
 math(EXPR cases "${cases} + 1")

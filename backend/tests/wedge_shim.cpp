@@ -35,6 +35,8 @@
 //
 // Not linked into anything shipped.
 
+#include "support/forked_child.h"
+
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -179,6 +181,9 @@ extern "C" int avcodec_send_packet(AVCodecContext* context, const AVPacket* pack
         // A store to a page mapped PROT_NONE, not raise(): a fault the thread took, which is the
         // case the daemon's handler is written for.
         void* page = ::mmap(nullptr, 4096, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        // Here, not in the harness: execve made the daemon dumpable again, and a dumpable crash
+        // reaches a piped core collector even at RLIMIT_CORE 0 (X.27).
+        wallpaperx::testing::suppressCoreDump();
         if (page != MAP_FAILED) *static_cast<volatile char*>(page) = 1;
     }
     return real != nullptr ? real(context, packet) : -1;

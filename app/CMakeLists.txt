@@ -28,10 +28,17 @@ qt_add_executable(wallpaperx
     main.cpp
     single_instance.cpp
     single_instance.h
+    kde/dbus_reply.h
     kde/kscreen_config.cpp
     kde/kscreen_config.h
     kde/kscreen_client.cpp
     kde/kscreen_client.h
+    kde/plasma_controller.cpp
+    kde/plasma_controller.h
+    daemon/daemon_client.cpp
+    daemon/daemon_client.h
+    daemon/apply_controller.cpp
+    daemon/apply_controller.h
     library/current_exception.h
     library/unique_fd.h
     library/wpx_package.cpp
@@ -47,7 +54,7 @@ qt_add_executable(wallpaperx
 )
 
 # The generated QML type registration includes these headers by bare name.
-target_include_directories(wallpaperx PRIVATE kde library)
+target_include_directories(wallpaperx PRIVATE kde library daemon)
 
 target_link_libraries(wallpaperx PRIVATE
     Qt6::Core
@@ -69,6 +76,7 @@ qt_add_qml_module(wallpaperx
         qml/MonitorPicker.qml
         qml/LibraryView.qml
         qml/WallpaperDetail.qml
+        qml/ScreenSettings.qml
 )
 
 # Nothing installed this app until now -- it was only ever run out of the build directory. The

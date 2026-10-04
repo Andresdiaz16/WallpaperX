@@ -102,8 +102,8 @@ inline std::optional<int> refuseUnlessUnderDbusRunSession() {
 //       dbus-run-session, and the bus daemon is that parent's child), asked of no bus until the
 //       parent is known; then ListActivatableNames must be exactly the allowed set, which a stock
 //       dbus-run-session fails (it lists org.kde.KScreen among its activatable names).
-// CONTROL: by hand, each observed: under plain `dbus-run-session --` without
-//       app/tests/private_session.conf -> exit 1, "can start services on demand" listing
+// CONTROL: by hand, each observed: under plain `dbus-run-session --`, with no configuration of
+//       the test's -> exit 1, "can start services on demand" listing
 //       org.kde.KScreen; the activation test with an extra org.kde.KScreen.service (Exec=/bin/false)
 //       dropped into its service directory -> exit 1, naming it; under ctest -> passes this guard.
 inline std::optional<int> refuseUnlessPrivateBus(const QStringList& activatable = {}) {
@@ -223,6 +223,8 @@ public:
     Mode configMode = Mode::Answer;
     QVariant config;
     QString configError = QStringLiteral("the fake was told to refuse");
+    // The D-Bus error name every Mode::Error reply carries.
+    QString errorName = QStringLiteral("org.kde.test.Error");
     Mode edidMode = Mode::Answer;
     QMap<int, QByteArray> edids;
 
@@ -239,7 +241,7 @@ public:
 
     void reply(const QDBusMessage& call, const QVariant& value) { m_bus.send(call.createReply(value)); }
     void replyError(const QDBusMessage& call, const QString& message) {
-        m_bus.send(call.createErrorReply(QStringLiteral("org.kde.test.Error"), message));
+        m_bus.send(call.createErrorReply(errorName, message));
     }
     void emitConfigChanged() {
         QDBusMessage signal = QDBusMessage::createSignal(QStringLiteral("/backend"), QStringLiteral("org.kde.kscreen.Backend"),

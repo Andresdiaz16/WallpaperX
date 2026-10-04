@@ -73,6 +73,74 @@ function(wallpaperx_add_test)
     _wallpaperx_isolated_test(bus)
 endfunction()
 
+# Sets `out` to the number of ctest entries registered so far in `dir` and every directory below
+# it: test_isolation_registry's floor, taken from what this configure registered rather than typed
+# in, so a host that lacks an optional dependency is not failed for entries it never had.
+function(wallpaperx_registered_test_count out dir)
+    get_property(tests DIRECTORY "${dir}" PROPERTY TESTS)
+    list(LENGTH tests n)
+    get_property(subdirs DIRECTORY "${dir}" PROPERTY SUBDIRECTORIES)
+    foreach(sub IN LISTS subdirs)
+        wallpaperx_registered_test_count(below "${sub}")
+        math(EXPR n "${n} + ${below}")
+    endforeach()
+    set(${out} ${n} PARENT_SCOPE)
+endfunction()
+
+# Sets `out` to `text` escaped as XML element text, for a path written into a bus configuration.
+function(wallpaperx_xml_text out text)
+    string(REPLACE "&" "&amp;" text "${text}")
+    string(REPLACE "<" "&lt;" text "${text}")
+    string(REPLACE ">" "&gt;" text "${text}")
+    set(${out} "${text}" PARENT_SCOPE)
+endfunction()
+
+# Every branch that leaves a group of entries unregistered for want of a dependency says so through
+# this. test_isolation_registry's floor follows what was registered, so it cannot notice such a
+# drop; with WALLPAPERX_REQUIRE_ALL_TESTS on, the configure fails instead.
+option(WALLPAPERX_REQUIRE_ALL_TESTS "Fail the configure when a group of ctest entries cannot be registered" OFF)
+function(wallpaperx_tests_not_registered)
+    string(JOIN "" text ${ARGN})
+    if(WALLPAPERX_REQUIRE_ALL_TESTS)
+        message(FATAL_ERROR "${text} (WALLPAPERX_REQUIRE_ALL_TESTS is on)")
+    endif()
+    message(WARNING "${text}")
+endfunction()
+
+# test_isolation_registry, for the calling project. Call it last in the project's CMake file: its
+# floor is the number of entries registered when it is called, plus 1 for itself.
+function(wallpaperx_add_isolation_registry)
+    wallpaperx_registered_test_count(registered ${PROJECT_SOURCE_DIR})
+    math(EXPR registered "${registered} + 1")
+    wallpaperx_add_test(NAME test_isolation_registry
+                        COMMAND ${CMAKE_COMMAND} -DCTEST=${CMAKE_CTEST_COMMAND} -DBUILD_DIR=${CMAKE_BINARY_DIR}
+                                -DWRAPPER=${WALLPAPERX_ISOLATED_RUN} -DMINIMUM=${registered}
+                                -P ${WALLPAPERX_ISOLATION_SUPPORT_DIR}/isolation_registry.cmake)
+    set_tests_properties(test_isolation_registry PROPERTIES LABELS "novulkan" TIMEOUT 60)
+endfunction()
+
+# The wrapper driven from outside with a made-up caller (test_isolation_wrapper), and, where there
+# is a dbus-run-session, what its private-bus runs leave in /tmp and the paths they accept
+# (test_isolation_wrapper_tmp). Needs the wallpaperx-wrapper-probe target (renderer/CMakeLists.txt).
+function(wallpaperx_add_isolation_wrapper_tests)
+    wallpaperx_add_test(NAME test_isolation_wrapper
+                        COMMAND ${CMAKE_COMMAND} -DWRAPPER=${WALLPAPERX_ISOLATED_RUN}
+                                -DCONF=${WALLPAPERX_ISOLATED_SESSION_CONF}
+                                -DPROBE=$<TARGET_FILE:wallpaperx-wrapper-probe>
+                                -P ${WALLPAPERX_ISOLATION_SUPPORT_DIR}/isolation_wrapper_test.cmake)
+    set_tests_properties(test_isolation_wrapper PROPERTIES LABELS "novulkan")
+    if(WALLPAPERX_DBUS_RUN_SESSION)
+        wallpaperx_add_test(NAME test_isolation_wrapper_tmp
+                            COMMAND ${CMAKE_COMMAND} -DWRAPPER=${WALLPAPERX_ISOLATED_RUN}
+                                    -DCONF=${WALLPAPERX_ISOLATED_SESSION_CONF}
+                                    -DBUS=${WALLPAPERX_DBUS_RUN_SESSION}
+                                    -P ${WALLPAPERX_ISOLATION_SUPPORT_DIR}/isolation_wrapper_tmp_test.cmake)
+        set_tests_properties(test_isolation_wrapper_tmp PROPERTIES LABELS "novulkan" TIMEOUT 120)
+    else()
+        wallpaperx_tests_not_registered("dbus-run-session not found -- test_isolation_wrapper_tmp (X.25, X.30) is not registered")
+    endif()
+endfunction()
+
 function(wallpaperx_add_display_test)
     set(_wx_argc ${ARGC})
     math(EXPR last "${ARGC} - 1")

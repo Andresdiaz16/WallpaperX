@@ -48,8 +48,16 @@ QString fromJson(const Json& value)
 
 const QRegularExpression& colorPattern()
 {
-    static const QRegularExpression pattern(QStringLiteral("^#[0-9a-fA-F]{6}$"));
+    // anchoredPattern, not ^...$: `$` also matches before a final "\n", which the daemon refuses.
+    static const QRegularExpression pattern(QRegularExpression::anchoredPattern(QStringLiteral("#[0-9a-fA-F]{6}")));
     return pattern;
+}
+
+bool isPropertyKey(const QString& key)
+{
+    static const QRegularExpression pattern(
+        QRegularExpression::anchoredPattern(QStringLiteral("[A-Za-z0-9_.-]{1,%1}").arg(kMaxPropertyKeyBytes)));
+    return pattern.match(key).hasMatch();
 }
 
 std::expected<WallpaperProperty, QString> parseProperty(const QString& key, const Json& spec)
@@ -57,8 +65,11 @@ std::expected<WallpaperProperty, QString> parseProperty(const QString& key, cons
     const auto refuse = [&key](const QString& what) {
         return std::unexpected(QStringLiteral("Property \"%1\" in wallpaper.json %2").arg(key, what));
     };
-    if (key.isEmpty()) {
-        return std::unexpected(QStringLiteral("wallpaper.json has a property with an empty name."));
+    // Not quoted back: it can hold anything, a bidirectional override included.
+    if (!isPropertyKey(key)) {
+        return std::unexpected(QStringLiteral("wallpaper.json has a property whose name is not 1 to %1 letters, "
+                                              "digits, \"_\", \"-\" or \".\".")
+                                   .arg(kMaxPropertyKeyBytes));
     }
     if (!spec.is_object()) {
         return refuse(QStringLiteral("is not an object."));
@@ -117,6 +128,23 @@ std::expected<WallpaperProperty, QString> parseProperty(const QString& key, cons
                           : QStringLiteral("has a default that is not a %1.").arg(property.typeName()));
     }
     property.defaultValue = *accepted;
+
+    // The two keys the daemon applies, refused rather than clamped: a clamped range is one the
+    // author never declared.
+    if (key == u"speed") {
+        if (property.type != WallpaperProperty::Type::Float) {
+            return refuse(QStringLiteral("is not a float, and WallpaperX reads a video's speed as one."));
+        }
+        if (!(property.minimum > 0.0) || property.maximum > kMaxPlaybackSpeed) {
+            return refuse(QStringLiteral("allows %1 to %2, and WallpaperX plays video above 0 and at most %3 times "
+                                         "its speed.")
+                              .arg(property.minimum)
+                              .arg(property.maximum)
+                              .arg(kMaxPlaybackSpeed));
+        }
+    } else if (key == u"mute" && property.type != WallpaperProperty::Type::Bool) {
+        return refuse(QStringLiteral("is not a bool, and WallpaperX reads \"mute\" as one."));
+    }
     return property;
 }
 
@@ -566,6 +594,11 @@ std::expected<Wallpaper, QString> parseManifest(const QByteArray& json)
         const Json& properties = doc["properties"];
         if (!properties.is_object()) {
             return std::unexpected(QStringLiteral("wallpaper.json's properties are not an object."));
+        }
+        if (qsizetype(properties.size()) > kMaxProperties) {
+            return std::unexpected(QStringLiteral("wallpaper.json has %1 properties; WallpaperX takes at most %2.")
+                                       .arg(properties.size())
+                                       .arg(kMaxProperties));
         }
         for (const auto& [key, spec] : properties.items()) {
             auto property = parseProperty(QString::fromStdString(key), spec);
