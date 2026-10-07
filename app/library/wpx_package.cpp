@@ -735,6 +735,28 @@ FileStamp stampFrom(const struct stat& st)
                      static_cast<qint64>(st.st_mtim.tv_sec) * 1'000'000'000 + st.st_mtim.tv_nsec};
 }
 
+std::expected<UniqueFd, int> openRegularFile(int dirfd, const char* name, int flags)
+{
+    const UniqueFd found(::openat(dirfd, name, O_PATH | O_CLOEXEC | (flags & O_NOFOLLOW)));
+    struct stat st {};
+    if (!found || ::fstat(found.get(), &st) != 0) {
+        return std::unexpected(errno);
+    }
+    if (!S_ISREG(st.st_mode)) {
+        return std::unexpected(kNotRegularFile);
+    }
+    // The magic link is a link, which O_NOFOLLOW would refuse. O_NONBLOCK, because some callers are
+    // on the GUI thread and a lease break can take lease-break-time (45 s by default).
+    UniqueFd fd(::open(("/proc/self/fd/" + QByteArray::number(found.get())).constData(),
+                       (flags & ~O_NOFOLLOW) | O_CLOEXEC | O_NONBLOCK));
+    if (!fd) {
+        // `found` shows the file is there: ENOENT can only be a /proc not mounted, and must not read
+        // as a missing file.
+        return std::unexpected(errno == ENOENT ? EOPNOTSUPP : errno);
+    }
+    return fd;
+}
+
 std::expected<QByteArray, int> readToEnd(int fd, qint64 maxBytes)
 {
     struct stat st {};

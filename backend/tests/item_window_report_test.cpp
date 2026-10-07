@@ -16,6 +16,7 @@
 #include "tests/report_stub.h"
 #include "tests/stderr_capture.h"
 #include "tests/test_phase.h"
+#include "tests/private_test_bus.h"
 #include "tests/test_report.h"
 
 #include <QByteArray>
@@ -212,6 +213,8 @@ bool backedOff(ReportStub& stub, const Scene& scene, const QString& out) {
 
 int main(int argc, char** argv) {
     wallpaperx::testing::g_testName = "item_window_report_test";
+    // X.34: nothing owned or sent off the private bus.
+    if (const std::optional<int> refused = wallpaperx::testing::refuseOffPrivateTestBus()) return *refused;
     qputenv("QT_QPA_PLATFORM", "offscreen");
     QGuiApplication app(argc, argv);
 
@@ -223,7 +226,6 @@ int main(int argc, char** argv) {
         return wallpaperx::testing::reportNotVerifiedOrPassed();
     }
 
-    QTemporaryDir scratch;
     QQmlEngine engine;
     engine.addImportPath(QString::fromUtf8(WALLPAPERX_QML_MODULE_PATH));
     QQuickWindow window;
@@ -322,9 +324,10 @@ int main(int argc, char** argv) {
             //       pair on the bus the item watches. The size report succeeds here, so either the
             //       direct send at the arrival or the size report's success can satisfy this line;
             //       the direct send alone is graded in restart-size-refused.
-            // CONTROL: `m_windowsReported.reset();` deleted from the serviceOwnerChanged handler in
+            // CONTROL: `m_windowsReported.reset();` deleted from the DaemonWatch::replaced handler in
             //       WallpaperXItem::connectToDaemon (backend/kde/wallpaperx_item.cpp) -> this line red:
-            //       both paths then see the state as already sent.
+            //       both paths then see the state as already sent. Re-run 2026-10-05 via control_batch.sh,
+            //       --phase '^daemon-restart$'. Reverted.
             std::size_t mark = stub.mark();
             scene.renderer->setProperty("windowFocused", true);
             const bool accepted = pumpUntil([&] { return !stub.calls(kFocus, out, mark).empty(); }, kArrivalLimitMs);
@@ -450,7 +453,7 @@ int main(int argc, char** argv) {
             // CONTROL: `m_sizeReported.reset();` and the `m_sizeReportTimer.start(kRefusedRetryMs)`
             //       re-arm deleted from reportWindows's UnknownOutput branch -> the resend line red. A
             //       "refused this screen's window state" fprintf added to that branch -> the log line red.
-            StderrCapture capture(scratch.path() + QStringLiteral("/unknown-output.txt"));
+            StderrCapture capture;
             stub.refuseNext(kFocus, out, kUnknownOutput);
             const std::size_t mark = stub.mark();
             scene.renderer->setProperty("windowFocused", true);
@@ -488,7 +491,7 @@ int main(int argc, char** argv) {
         Scene goneScene = harness.settled(gone);
         if (ready(oldScene, "the silent-refusals phase") && ready(goneScene, "the silent-refusals phase")) {
             stub.refuseAlways(kFocus, old, unknownMethod);
-            StderrCapture capture(scratch.path() + QStringLiteral("/silent.txt"));
+            StderrCapture capture;
             const std::size_t mark = stub.mark();
             oldScene.renderer->setProperty("windowFocused", true);
             pumpFor(kQuietSpanMs);
@@ -506,7 +509,7 @@ int main(int argc, char** argv) {
             // The no-daemon half destroys the older-daemon scene first: the restart that ends it would
             // otherwise send that scene's report into the span being read.
             oldScene.root.reset();
-            StderrCapture goneCapture(scratch.path() + QStringLiteral("/gone.txt"));
+            StderrCapture goneCapture;
             const bool unregistered = bus.unregisterService(QString::fromUtf8(kService));
             pumpFor(kTurnMs);
             goneScene.renderer->setProperty("windowFocused", true);
@@ -549,7 +552,7 @@ int main(int argc, char** argv) {
                 notVerified("the stale-refusal phase", "the first report was not held, or the second never arrived");
                 stub.releaseHeld(QString());
             } else {
-                StderrCapture capture(scratch.path() + QStringLiteral("/stale.txt"));
+                StderrCapture capture;
                 const std::size_t afterBoth = stub.mark();
                 stub.releaseHeld(kRenderFailed);
                 pumpFor(kQuietSpanMs / 2);
@@ -675,7 +678,7 @@ int main(int argc, char** argv) {
             //       the log condition made `if (true)` -> the log-count line alone.
             // COVERAGE-ASSERT: three refused calls must have arrived, so two waits were measured.
             stub.refuseAlways(kFocus, out, kRenderFailed);
-            StderrCapture capture(scratch.path() + QStringLiteral("/busy.txt"));
+            StderrCapture capture;
             const std::size_t mark = stub.mark();
             scene.renderer->setProperty("windowFocused", true);
             const bool three = pumpUntil([&] { return stub.calls(kFocus, out, mark).size() >= 3; }, kBackoffLimitMs);
@@ -783,7 +786,7 @@ int main(int argc, char** argv) {
                                    ReportStub::describe(stub.callsFor(out, 0)) + ")");
             return;
         }
-        StderrCapture capture(scratch.path() + QStringLiteral("/fresh-%1.txt").arg(target));
+        StderrCapture capture;
         stub.refuseNext(kFocus, target, kRenderFailed);
         const std::size_t mark = stub.mark();
         if (!change(scene)) {
@@ -965,10 +968,11 @@ int main(int argc, char** argv) {
             // WHY-THIS-SHAPE: as monitor-size-refused: InvalidArgs is never retried, so the size
             //       report's success cannot be what sent them, and the phase is not verified unless
             //       that refusal is what happened. daemon-restart cannot tell the two paths apart.
-            // CONTROL: in the serviceOwnerChanged handler of WallpaperXItem::connectToDaemon
+            // CONTROL: in the DaemonWatch::replaced handler of WallpaperXItem::connectToDaemon
             //       (backend/kde/wallpaperx_item.cpp), `if (m_onScreen) reportVisible();` deleted -> the
             //       visibility line red; the `reportWindows();` after it deleted -> the window line red;
             //       both deleted -> both red, the size report's refusal the only call after the restart.
+            //       The first two re-run 2026-10-05 via control_batch.sh, --phase '^restart-size-refused$'.
             if (!focusAccepted(stub, scene, out)) {
                 notVerified("the restart-size-refused phase", "the focused state was never accepted before the restart");
             } else {

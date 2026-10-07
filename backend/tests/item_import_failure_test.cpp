@@ -11,7 +11,7 @@
 // contract that a FAILED import leaves them with the caller.
 //
 // The failure is manufactured entirely on the DAEMON side of the wire: a stub service on this
-// run's private bus answers GetFrameFd with a fourcc the importer refuses to lay out (NV12), so
+// run's private bus answers GetFrame with a fourcc the importer refuses to lay out (NV12), so
 // FrameImport::import() fails before it creates any GPU object. Nothing in the plugin knows a
 // test is running, and no production seam exists for this.
 //
@@ -23,6 +23,7 @@
 // OpenGL. A host that has no OpenGL platform skips, with the reason named.
 
 #include "tests/qt_frame_reply.h"
+#include "tests/private_test_bus.h"
 #include "tests/test_report.h"
 
 #include <QCoreApplication>
@@ -107,7 +108,7 @@ int openMemfdCount(const char* name) {
 // string is what the desktop shows the user.
 constexpr const char* kImportFailedReason = "WallpaperX produced a frame this desktop could not import.";
 
-// Answers GetFrameFd with a frame the importer must refuse. A virtual object rather than a slot on
+// Answers GetFrame with a frame the importer must refuse. A virtual object rather than a slot on
 // a QObject, because the reply's shape is the point: it must carry the daemon's ten fields in the
 // daemon's order and types, and an adaptor would put Qt's marshalling of a C++ signature between
 // this file and the wire. A shape the item cannot read shows up as a different published reason,
@@ -117,7 +118,7 @@ public:
     QString introspect(const QString&) const override { return QString(); }
 
     bool handleMessage(const QDBusMessage& message, const QDBusConnection& connection) override {
-        if (message.interface() != QLatin1String(kInterface) || message.member() != QLatin1String("GetFrameFd")) {
+        if (message.interface() != QLatin1String(kInterface) || message.member() != QLatin1String("GetFrame")) {
             return false;
         }
         // Counted before anything here can go wrong, so "the item asked" and "the stub answered"
@@ -164,11 +165,12 @@ public:
         ++m_served;
         m_syncFdsSent += static_cast<int>(syncFds.size());
         return connection.send(message.createReply(
-            frameReplyFields(handle, kFrameWidth, kFrameHeight, memorySize, /*handleType=*/0,
+            frameReplyFields({handle}, kFrameWidth, kFrameHeight, memorySize, /*handleType=*/0,
                              /*generation=*/1, kUnimportableFourcc, /*drmModifier=*/0, planes,
                              // Not this device, and it does not have to be: the fourcc this
                              // phase grades is refused before the importer looks at the GPU.
-                             QByteArray(16, '\0'), /*bufferId=*/1, syncFds)));
+                             QByteArray(16, '\0'), /*bufferId=*/1, /*handover=*/static_cast<quint64>(m_served),
+                             syncFds)));
     }
 
     int requests() const { return m_requests; }
@@ -229,6 +231,8 @@ Item {
 
 int main(int argc, char** argv) {
     wallpaperx::testing::g_testName = "item_import_failure_test";
+    // X.34: nothing owned or sent off the private bus.
+    if (const std::optional<int> refused = wallpaperx::testing::refuseOffPrivateTestBus()) return *refused;
 
     wallpaperx::testing::registerFrameReplyTypes();
 
@@ -308,8 +312,8 @@ int main(int argc, char** argv) {
         //       WallpaperXItem::fetchFrame in backend/kde/wallpaperx_item.cpp
         //       -> "FAIL: the item asked the stub daemon for a frame", after 5s, and the checks
         //       below did not run. Observed 2026-08-21; re-run 2026-09-20 under the Stage E4
-        //       spelling of that guard, which now also tests whether the item is on the screen.
-        //       Reverted.
+        //       spelling of that guard, which now also tests whether the item is on the screen, and
+        //       2026-10-05 via control_batch.sh. Reverted.
         const bool asked = pumpUntil([&stub] { return stub.requests() > 0; }, 5000);
         check(asked, "the item asked the stub daemon for a frame");
         // A stub that could not build its reply is this file's fault, not the plugin's, and is

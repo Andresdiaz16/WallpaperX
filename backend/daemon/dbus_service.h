@@ -25,7 +25,7 @@ class WallpaperManager;
 //
 // Stateless by design: every handler forwards to the WallpaperManager, which owns both the
 // wallpaper state and the lock guarding it. State kept here would be a second truth under a
-// second lock, which is what lets GetStatus and GetFrameFd disagree.
+// second lock, which is what lets GetStatus and GetFrame disagree.
 class DbusService {
 public:
     static constexpr const char* kBusName = "io.wallpaperx.Daemon";
@@ -94,40 +94,32 @@ private:
     // already ignores it.
     void announceAvailableFrames(const std::vector<FrameAvailable>& available);
 
-    // Returns (fd, width, height, memory_size, handle_type, sync_fds, frame_generation,
-    //          drm_format, drm_modifier, planes, device_uuid, buffer_id). What each field means,
-    //          and why sync_fds is a reserved array rather than a bare 'h', is PLAN.md's DBus
-    //          Interface section.
+    // GetFrame. Returns (memory_fd, width, height, memory_size, handle_type, sync_fds,
+    // frame_generation, drm_format, drm_modifier, planes, device_uuid, buffer_id, acquire_value,
+    // handover). What each field means is PLAN.md's DBus Interface section.
     //
     // Answered from the render worker's thread, not in the handler. Exporting needs the GPU and
     // the GPU lock is held for a whole render, so answering here would park the single
     // event-loop thread behind whatever is rendering and take GetStatus with it. The rule that
-    // keeps it fixed -- no DBus handler touches the GPU -- is enforced by assertGpuThread().
-    using FrameFdCall =
-        sdbus::Result<sdbus::UnixFd, uint32_t, uint32_t, uint64_t, int32_t, std::vector<sdbus::UnixFd>, uint64_t,
-                      uint32_t, uint64_t, std::vector<sdbus::Struct<uint64_t, uint64_t>>, std::vector<uint8_t>,
-                      uint64_t>;
+    // keeps it fixed -- no DBus handler touches the GPU -- is enforced by assertGpuThread(). It is
+    // also what sends one caller's replies in the order their hand-overs were numbered.
+    using FrameCall =
+        sdbus::Result<std::vector<sdbus::UnixFd>, uint32_t, uint32_t, uint64_t, int32_t, std::vector<sdbus::UnixFd>,
+                      uint64_t, uint32_t, uint64_t, std::vector<sdbus::Struct<uint64_t, uint64_t>>,
+                      std::vector<uint8_t>, uint64_t, uint64_t, uint64_t>;
 
-    // GetFrameFdOnTimeline: GetFrameFd's fields and then acquire_value, asked by a caller that can
-    // wait on its acquire timeline for this picture. The value is nonzero, and sync_fds empty,
-    // while the caller holds a live timeline; otherwise the reply is GetFrameFd's with a value of
-    // 0. Choosing per request is what lets a consumer go back to sync_fds whenever it cannot wait
-    // on the timeline -- an answer it never got, an import its driver refused -- with no call to
-    // undo anything.
-    using TimelineFrameCall =
-        sdbus::Result<sdbus::UnixFd, uint32_t, uint32_t, uint64_t, int32_t, std::vector<sdbus::UnixFd>, uint64_t,
-                      uint32_t, uint64_t, std::vector<sdbus::Struct<uint64_t, uint64_t>>, std::vector<uint8_t>,
-                      uint64_t, uint64_t>;
+    // `client` is the caller's DBus unique name: it is what the hand-over is recorded against, and
+    // what a departure later withdraws. `onTimeline` and `knownBuffers` as for
+    // WallpaperManager::exportCurrentFrame().
+    void completeFrame(FrameCall call, int32_t monitorId, const std::string& client, bool onTimeline,
+                       const std::vector<uint64_t>& knownBuffers);
 
-    // Both frame methods. Which one it answers, and so whether the picture may carry a value, is
-    // the call's type. `client` is the caller's DBus unique name: it is what the hand-over is
-    // recorded against, and what a departure later withdraws.
-    template <class Call>
-    void completeFrame(Call call, int32_t monitorId, const std::string& client);
+    // Answers `call` with `handle`, taking ownership of its descriptors. A throw means no reply left.
+    void sendFrame(const FrameCall& call, const FrameHandle& handle);
 
     // Returns (timeline): the caller's acquire timeline, which it imports once and then waits on for
-    // each picture it asks GetFrameFdOnTimeline for. Answered from the render worker in the frame
-    // methods' queue: creating it is GPU work, and a frame asked for after this cannot be answered
+    // each picture it asks GetFrame for on it. Answered from the render worker in the frame
+    // method's queue: creating it is GPU work, and a frame asked for after this cannot be answered
     // before it. Unsupported means this daemon will not give this caller one while it runs; Busy,
     // that every slot is taken for now.
     using AcquireTimelineCall = sdbus::Result<sdbus::UnixFd>;
@@ -135,7 +127,8 @@ private:
 
     // Posts `complete(call, client)` to the render worker for an asynchronous method, reading the
     // caller's name here -- the message is current only inside the handler -- and answering the
-    // call itself when the worker refuses it. Call from inside the handler.
+    // call itself when the caller is over its share of the queue or the worker refuses it. Call
+    // from inside the handler.
     template <class Call, class Complete>
     void postCall(Call call, Complete complete);
 
@@ -144,10 +137,10 @@ private:
     // has run and may have recorded something for it after the first pass.
     void forgetClient(const std::string& client);
 
-    // The consumer says it has stopped reading one image, so the producer may draw into it
-    // again. Synchronous: it touches bookkeeping only, and the renders it unblocks go to the
-    // worker like every other one.
-    void releaseBuffer(const std::string& client, int32_t monitorId, uint64_t bufferId);
+    // The consumer says it has stopped reading one image as of hand-over `handover`, so the producer
+    // may draw into it again unless a later hand-over is still on its way. Synchronous: it touches
+    // bookkeeping only, and the renders it unblocks go to the worker like every other one.
+    void releaseBuffer(const std::string& client, int32_t monitorId, uint64_t bufferId, uint64_t handover);
 
     // Records what the consumer can import and re-posts the monitors whose images were built
     // against the previous set. Synchronous: it touches bookkeeping only, and the GPU work

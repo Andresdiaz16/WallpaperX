@@ -136,7 +136,8 @@ private:
     // each linked item whose file a process has open for writing.
     void watchTargets(TreeWatch& tree);
     // Whether some process, this one included, has the regular file `name` open for writing: the
-    // kernel refuses a read lease exactly then. False when that cannot be known.
+    // kernel refuses a read lease exactly then. False when that cannot be known, and without
+    // opening it when `name` is not a regular file.
     bool openForWriting(int dirFd, const char* name) const;
     void hold(TreeWatch& tree, const QByteArray& path);
     // For good: closing the descriptor drops every watch, and with them what they knew.

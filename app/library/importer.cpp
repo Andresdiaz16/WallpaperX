@@ -9,6 +9,7 @@
 #include <QDir>
 #include <QFileInfo>
 #include <QFuture>
+#include <QRandomGenerator>
 #include <QtConcurrent/QtConcurrentRun>
 
 #include <zip.h>
@@ -372,18 +373,35 @@ struct Dropped {
     // Why it cannot be imported as it stands, such as a dangling link; empty when it can be.
     QString problem;
 };
-using DropListing = std::expected<QList<Dropped>, QString>;
+struct DropListing {
+    // The folder listed, open, so its record is read from the same folder however the path changes.
+    std::shared_ptr<DIR> folder;
+    QList<Dropped> files;
+};
+// Unread: no sentence when the folder is missing, the reason otherwise. A missing folder is never an
+// empty listing: its record, read a moment later, may be back and would be pruned of every file.
+using DropScan = std::expected<DropListing, std::optional<QString>>;
+
+// Whether opening the folder `directory` failed with `error` because nothing is at the path. ENOTDIR
+// is both a missing folder (a parent is a file) and something at the path that is not a folder,
+// which the user has to hear about.
+bool nothingAt(const QString& directory, int error)
+{
+    struct stat st {};
+    return error == ENOENT || (error == ENOTDIR && ::stat(encodeFileName(directory).constData(), &st) != 0);
+}
 
 // Each *.wpx in the drop folder, followed through links. An empty one is left out: it is still being
 // made.
-DropListing listDropFolder(const QString& directory)
+DropScan listDropFolder(const QString& directory)
 {
-    const Listing listing(::opendir(encodeFileName(directory).constData()), ::closedir);
+    Listing listing(::opendir(encodeFileName(directory).constData()), ::closedir);
     if (!listing) {
-        if (errno == ENOENT) {
-            return QList<Dropped>();
+        const int error = errno;
+        if (nothingAt(directory, error)) {
+            return std::unexpected(std::nullopt);
         }
-        return std::unexpected(QStringLiteral("%1 cannot be read: %2.").arg(directory, systemError(errno)));
+        return std::unexpected(QStringLiteral("%1 cannot be read: %2.").arg(directory, systemError(error)));
     }
     QList<Dropped> dropped;
     while (const dirent* entry = ::readdir(listing.get())) {
@@ -413,7 +431,7 @@ DropListing listDropFolder(const QString& directory)
         }
         dropped.append({name, path, stampFrom(st), {}});
     }
-    return dropped;
+    return DropListing{std::shared_ptr<DIR>(listing.release(), ::closedir), std::move(dropped)};
 }
 
 // Whether `path` names a package directly in `directory`, however either is spelled.
@@ -428,23 +446,41 @@ bool isInFolder(const QString& path, const QString& directory)
            && parent.st_ino == folder.st_ino;
 }
 
+QString recordUnreadable(const QString& directory, const QString& why)
+{
+    return QStringLiteral("%1 cannot be read (%2), so files in the drop folder are not imported until it can.")
+        .arg(directory + u'/' + QLatin1StringView(kRecordFileName), why);
+}
+
 QString notImported(const QString& path, const QString& why)
 {
     return QStringLiteral("%1 could not be imported. %2").arg(QFileInfo(path).fileName(), why);
 }
 
-// 0, or the errno.
-int writeFileAtomically(const QByteArray& path, const QByteArray& bytes)
+// Replaces `name` in the open directory `folder` with `bytes`, whole or not at all. 0, or the errno.
+// The temporary file is named by hand, since mkostemp has no form relative to a directory.
+int writeFileAtomically(int folder, const char* name, const QByteArray& bytes)
 {
-    QByteArray name = path + ".XXXXXX";
-    const UniqueFd fd(::mkostemp(name.data(), O_CLOEXEC));
+    static constexpr char kLetters[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    QByteArray temporary;
+    UniqueFd fd;
+    for (int attempt = 0; attempt < 100 && !fd; ++attempt) {
+        temporary = QByteArray(name) + '.';
+        for (int i = 0; i < 6; ++i) {
+            temporary += kLetters[QRandomGenerator::system()->bounded(int(sizeof kLetters - 1))];
+        }
+        fd.reset(::openat(folder, temporary.constData(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600));
+        if (!fd && errno != EEXIST) {
+            return errno;
+        }
+    }
     if (!fd) {
-        return errno;
+        return EEXIST;
     }
     if (!writeAll(fd.get(), bytes.constData(), bytes.size()) || ::fsync(fd.get()) != 0
-        || ::rename(name.constData(), path.constData()) != 0) {
+        || ::renameat(folder, temporary.constData(), folder, name) != 0) {
         const int error = errno;
-        ::unlink(name.constData());
+        ::unlinkat(folder, temporary.constData(), 0);
         return error;
     }
     return 0;
@@ -469,13 +505,22 @@ QByteArray contentFolderName(const QByteArray& sha256, int attempt)
 ImportResult unpackPackage(const QString& archivePath, const QString& wallpapersDirectory,
                            const std::atomic<bool>& cancelled)
 {
-    const UniqueFd source(::open(encodeFileName(archivePath).constData(), O_RDONLY | O_CLOEXEC | O_NONBLOCK));
-    if (!source) {
-        return failed(QStringLiteral("It cannot be opened: %1.").arg(systemError(errno)));
+    return unpackPackage(AT_FDCWD, encodeFileName(archivePath), archivePath, wallpapersDirectory, cancelled);
+}
+
+ImportResult unpackPackage(int folder, const QByteArray& name, const QString& archivePath,
+                           const QString& wallpapersDirectory, const std::atomic<bool>& cancelled)
+{
+    const auto opened = openRegularFile(folder, name.constData(), O_RDONLY);
+    if (!opened) {
+        return opened.error() == kNotRegularFile
+                   ? refused(QStringLiteral("It is not a regular file."))
+                   : failed(QStringLiteral("It cannot be opened: %1.").arg(systemError(opened.error())));
     }
+    const UniqueFd& source = *opened;
     struct stat sourceStat {};
-    if (::fstat(source.get(), &sourceStat) != 0 || !S_ISREG(sourceStat.st_mode)) {
-        return refused(QStringLiteral("It is not a regular file."));
+    if (::fstat(source.get(), &sourceStat) != 0) {
+        return failed(QStringLiteral("It cannot be opened: %1.").arg(systemError(errno)));
     }
     const FileStamp sourceStamp = stampFrom(sourceStat);
     const auto withStamp = [&sourceStamp](ImportResult result) {
@@ -602,7 +647,6 @@ Importer::Importer(QString dropDirectory, QString wallpapersDirectory, int settl
     , m_watcher(m_dropDirectory, FolderWatcher::Items::Files, settleMs, pollMs, watching, holdMs)
 {
     connect(&m_watcher, &FolderWatcher::scanDue, this, &Importer::scanDropFolder);
-    loadRecord();
 }
 
 Importer::~Importer()
@@ -625,11 +669,11 @@ void Importer::importPath(const QString& path)
     // The drop folder's scan may have queued this file already; it becomes the user's import.
     if (struct stat st {}; isInFolder(path, m_dropDirectory) && ::stat(encodeFileName(path).constData(), &st) == 0) {
         if (Job* queued = jobFor(keyOf(stampFrom(st)))) {
-            queued->dropped.reset();
+            queued->asker = Job::Asker::User;
             return;
         }
     }
-    enqueue({path, std::nullopt});
+    enqueue({path, std::nullopt, Job::Asker::User});
 }
 
 void Importer::addProblem(const QString& problem)
@@ -682,8 +726,10 @@ void Importer::runNext()
         return;
     }
     m_running = m_queue.takeFirst();
-    QtConcurrent::run([path = m_running->path, directory = m_wallpapersDirectory, cancelled = m_cancelled] {
-        return unpackPackage(path, directory, *cancelled);
+    QtConcurrent::run([path = m_running->path, listed = m_running->listedIn, directory = m_wallpapersDirectory,
+                       cancelled = m_cancelled] {
+        return listed ? unpackPackage(::dirfd(listed->folder.get()), listed->name, path, directory, *cancelled)
+                      : unpackPackage(path, directory, *cancelled);
     })
         .onFailed([] { return failed(QStringLiteral("Importing failed: %1.").arg(describeCurrentException())); })
         .then(this, [this](const ImportResult& result) {
@@ -699,9 +745,10 @@ void Importer::runNext()
 
 void Importer::finish(const Job& job, const ImportResult& result)
 {
+    const bool scanOnly = job.asker == Job::Asker::Scan;
     switch (result.outcome) {
     case ImportResult::Outcome::Imported:
-        if (job.dropped) {
+        if (scanOnly) {
             m_notices.append(QStringLiteral("Imported %1.").arg(result.title));
             emit noticesChanged();
         } else {
@@ -709,7 +756,7 @@ void Importer::finish(const Job& job, const ImportResult& result)
         }
         break;
     case ImportResult::Outcome::AlreadyPresent:
-        if (!job.dropped) {
+        if (!scanOnly) {
             emit imported(result.folderPath);
         }
         break;
@@ -718,23 +765,65 @@ void Importer::finish(const Job& job, const ImportResult& result)
         addProblem(notImported(job.path, result.problem));
         break;
     }
-    // A failure may pass (space, permissions), so that file is tried again at the next scan.
-    if (result.outcome == ImportResult::Outcome::Failed || !(job.dropped || isInFolder(job.path, m_dropDirectory))) {
+    // A failure may pass (space, permissions), so that file is tried again at the next scan; and a
+    // name that was never opened is judged again then from what is there.
+    if (result.outcome == ImportResult::Outcome::Failed || !result.sourceStamp) {
         return;
     }
     // The file as opened, which may be newer than as listed; a newer version is new bytes.
-    const std::optional<DroppedKey> key = result.sourceStamp ? keyOf(*result.sourceStamp) : job.dropped;
-    if (key && !m_record.contains(*key)) {
-        m_record.append(*key);
-        saveRecord();
+    const DroppedKey key = keyOf(*result.sourceStamp);
+    const auto addOnce = [&key](QList<DroppedKey>& keys) {
+        if (!keys.contains(key)) {
+            keys.append(key);
+        }
+    };
+    const auto owe = [this, &addOnce] {
+        addOnce(m_unrecorded);
+        addOnce(m_finishedSinceListing);
+    };
+    // The folder the scan listed it in, whatever is at the path now; for a file only the user named,
+    // the drop folder if it is in it.
+    UniqueFd opened;
+    int folder = -1;
+    if (job.listedIn) {
+        folder = ::dirfd(job.listedIn->folder.get());
+    } else if (isInFolder(job.path, m_dropDirectory)) {
+        auto dropFolder = openDropFolder();
+        if (!dropFolder) {
+            owe();
+            if (dropFolder.error()) {
+                addProblem(*dropFolder.error());
+            }
+            return;
+        }
+        opened = std::move(*dropFolder);
+        folder = opened.get();
+    } else {
+        return;
     }
+    auto record = loadRecordIn(folder);
+    if (!record) {
+        owe();
+        if (record.error()) {
+            addProblem(*record.error());
+        }
+        return;
+    }
+    if (!record->contains(key)) {
+        record->append(key);
+        if (!saveRecord(folder, *record)) {
+            owe();
+            return;
+        }
+    }
+    addOnce(m_finishedSinceListing);
 }
 
 Importer::Job* Importer::jobFor(const DroppedKey& key)
 {
     const auto holds = [this, &key](const Job& job) {
-        if (job.dropped) {
-            return *job.dropped == key;
+        if (job.listedIn) {
+            return job.listedIn->key == key;
         }
         struct stat st {};
         return isInFolder(job.path, m_dropDirectory) && ::stat(encodeFileName(job.path).constData(), &st) == 0
@@ -755,16 +844,23 @@ void Importer::scanDropFolder()
     }
     m_watcher.scanStarting();
     m_scanning = Scanning::Yes;
+    m_finishedSinceListing.clear();
     const QString directory = m_dropDirectory;
     QtConcurrent::run([directory] { return listDropFolder(directory); })
-        .onFailed([directory]() -> DropListing {
+        .onFailed([directory]() -> DropScan {
             return std::unexpected(QStringLiteral("Reading %1 failed: %2.").arg(directory, describeCurrentException()));
         })
-        .then(this, [this](DropListing listing) {
+        .then(this, [this](DropScan listing) {
+            const QSet<QByteArray> held = m_watcher.scanFinished();
             if (listing) {
-                const QSet<QByteArray> held = m_watcher.scanFinished();
+                const int folder = ::dirfd(listing->folder.get());
+                auto record = loadRecordIn(folder);
+                if (!record && record.error()) {
+                    addProblem(*record.error());
+                }
+                bool absorbed = false;
                 QList<DroppedKey> present;
-                for (const Dropped& file : std::as_const(*listing)) {
+                for (const Dropped& file : std::as_const(listing->files)) {
                     // Not recorded, so a repaired link is imported.
                     if (!file.problem.isEmpty()) {
                         addProblem(notImported(file.path, file.problem));
@@ -772,16 +868,27 @@ void Importer::scanDropFolder()
                     }
                     const DroppedKey key = keyOf(file.stamp);
                     present.append(key);
-                    if (!held.contains(file.name) && !m_record.contains(key) && jobFor(key) == nullptr) {
-                        enqueue({file.path, key});
+                    if (!record || record->contains(key)) {
+                        continue;
+                    }
+                    if (m_unrecorded.contains(key)) {
+                        record->append(key);
+                        absorbed = true;
+                    } else if (!held.contains(file.name) && jobFor(key) == nullptr) {
+                        enqueue({file.path, Job::Listed{listing->folder, file.name, key}, Job::Asker::Scan});
                     }
                 }
-                // Forgets files no longer there, so one dropped in again is imported again.
-                if (m_record.removeIf([&present](const DroppedKey& key) { return !present.contains(key); }) > 0) {
-                    saveRecord();
+                // Forgets files no longer there, so one dropped in again is imported again -- from the
+                // debts too, read or not, since a file that is gone needs no protection.
+                const auto gone = [this, &present](const DroppedKey& key) {
+                    return !present.contains(key) && !m_finishedSinceListing.contains(key);
+                };
+                if (record && (record->removeIf(gone) > 0 || absorbed)) {
+                    saveRecord(folder, *record);
                 }
-            } else {
-                qWarning("wallpaperx: %s", qUtf8Printable(listing.error()));
+                m_unrecorded.removeIf(gone);
+            } else if (listing.error()) {
+                qWarning("wallpaperx: %s", qUtf8Printable(*listing.error()));
             }
             if (std::exchange(m_scanning, Scanning::No) == Scanning::YesThenAgain) {
                 scanDropFolder();
@@ -789,18 +896,43 @@ void Importer::scanDropFolder()
         });
 }
 
-void Importer::loadRecord()
+std::expected<UniqueFd, std::optional<QString>> Importer::openDropFolder() const
 {
-    const QByteArray path = encodeFileName(m_dropDirectory) + '/' + kRecordFileName;
-    const UniqueFd fd(::open(path.constData(), O_RDONLY | O_CLOEXEC | O_NONBLOCK));
+    // The record is looked for in the folder this opened, so a missing folder is never read as a
+    // folder with no record.
+    UniqueFd folder(::open(encodeFileName(m_dropDirectory).constData(), O_PATH | O_DIRECTORY | O_CLOEXEC));
+    if (!folder) {
+        const int error = errno;
+        if (nothingAt(m_dropDirectory, error)) {
+            return std::unexpected(std::nullopt);
+        }
+        return std::unexpected(
+            QStringLiteral("The drop folder %1 cannot be opened (%2), so the files imported from it are recorded there "
+                           "once it can.")
+                .arg(m_dropDirectory, systemError(error)));
+    }
+    return folder;
+}
+
+std::expected<QList<Importer::DroppedKey>, std::optional<QString>> Importer::loadRecordIn(int folder) const
+{
+    const auto unreadable = [this](const QString& why) {
+        return std::expected<QList<DroppedKey>, std::optional<QString>>(std::unexpect,
+                                                                        recordUnreadable(m_dropDirectory, why));
+    };
+    const auto fd = openRegularFile(folder, kRecordFileName, O_RDONLY);
     if (!fd) {
-        return;
+        if (fd.error() == ENOENT) {
+            return QList<DroppedKey>{};
+        }
+        return unreadable(fd.error() == kNotRegularFile ? QStringLiteral("not a regular file") : systemError(fd.error()));
     }
     // A record over the cap was not written by this code, so nothing in it is trusted.
-    const auto bytes = readToEnd(fd.get(), 1 << 20);
+    const auto bytes = readToEnd(fd->get(), 1 << 20);
     if (!bytes) {
-        return;
+        return unreadable(bytes.error() == EFBIG ? QStringLiteral("larger than 1 MiB") : systemError(bytes.error()));
     }
+    QList<DroppedKey> record;
     for (const QByteArray& line : bytes->split('\n')) {
         const QList<QByteArray> fields = line.simplified().split(' ');
         if (fields.size() != 3) {
@@ -808,24 +940,28 @@ void Importer::loadRecord()
         }
         bool ok[3] = {};
         const DroppedKey key{fields[0].toULongLong(&ok[0]), fields[1].toLongLong(&ok[1]), fields[2].toLongLong(&ok[2])};
-        if (ok[0] && ok[1] && ok[2] && !m_record.contains(key)) {
-            m_record.append(key);
+        if (ok[0] && ok[1] && ok[2] && !record.contains(key)) {
+            record.append(key);
         }
     }
+    return record;
 }
 
-void Importer::saveRecord() const
+bool Importer::saveRecord(int folder, const QList<DroppedKey>& record)
 {
     QByteArray bytes;
-    for (const DroppedKey& key : m_record) {
+    for (const DroppedKey& key : record) {
         bytes += QByteArray::number(key.inode) + ' ' + QByteArray::number(key.size) + ' '
                  + QByteArray::number(key.modifiedNs) + '\n';
     }
-    const QByteArray path = encodeFileName(m_dropDirectory) + '/' + kRecordFileName;
-    if (const int error = writeFileAtomically(path, bytes); error != 0) {
+    if (const int error = writeFileAtomically(folder, kRecordFileName, bytes); error != 0) {
+        const QByteArray path = encodeFileName(m_dropDirectory) + '/' + kRecordFileName;
         qWarning("wallpaperx: %s cannot be written (%s), so files in %s may be imported again",
                  path.constData(), std::strerror(error), encodeFileName(m_dropDirectory).constData());
+        return false;
     }
+    m_unrecorded.removeIf([&record](const DroppedKey& owed) { return record.contains(owed); });
+    return true;
 }
 
 } // namespace wallpaperx

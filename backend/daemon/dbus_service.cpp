@@ -10,7 +10,6 @@
 #include <cstdio>
 #include <exception>
 #include <optional>
-#include <type_traits>
 #include <utility>
 
 namespace wallpaperx {
@@ -31,12 +30,48 @@ constexpr const char* kErrorUnsupported = "io.wallpaperx.Daemon.Error.Unsupporte
 // next one. Retryable like NoFrame, and the daemon says when -- a FrameReady follows every
 // release and every commit, so a consumer that waits for one is not polling.
 constexpr const char* kErrorNoFreeImage = "io.wallpaperx.Daemon.Error.NoFreeImage";
+// The fifth, and the only one that is the caller's own doing: it has been sent as many descriptors
+// as it may hold without giving any back. Nothing announces the cure, since only the caller can
+// apply it -- a release, or leaving the bus.
+constexpr const char* kErrorTooManyDescriptors = "io.wallpaperx.Daemon.Error.TooManyDescriptors";
+// The sixth, also the caller's own doing: it already has its share of the worker's queue waiting.
+// Distinct from Busy, which is everyone's queue being full.
+constexpr const char* kErrorTooManyRequests = "io.wallpaperx.Daemon.Error.TooManyRequests";
+// The seventh, also the caller's own doing: it has been sent every copy of its acquire timeline one
+// connection is given. Not retryable on that connection.
+constexpr const char* kErrorTooManyTimelineCopies = "io.wallpaperx.Daemon.Error.TooManyTimelineCopies";
 constexpr const char* kErrorShuttingDown = "io.wallpaperx.Daemon.Error.ShuttingDown";
 constexpr const char* kErrorBusy = "io.wallpaperx.Daemon.Error.Busy";
+
+// Below the whole queue, or one caller's share would still be all of it.
+static_assert(WallpaperManager::kMaxQueuedRequestsPerClient < static_cast<int>(RenderWorker::kMaxQueuedTasks));
 // A size for a screen no monitor answers to. Not InvalidArgs: nothing in the call was wrong, and
 // the same call succeeds once SetMonitorOutput has named the screen.
 constexpr const char* kErrorUnknownOutput = "io.wallpaperx.Daemon.Error.UnknownOutput";
 constexpr const char* kErrorInvalidArgs = "org.freedesktop.DBus.Error.InvalidArgs";
+
+// What a caller refused as TooManyDescriptors is told, and the line logged once per run of refusals.
+std::string descriptorRefusal(const std::string& client) {
+    return "caller " + sanitizeForLog(client) + " has been sent " +
+           std::to_string(WallpaperManager::kMaxDescriptorsPerClient) +
+           " file descriptors it has not given back (the images it holds, each frame fetched again while "
+           "held, and one for its acquire timeline, which stays counted until it disconnects); a caller "
+           "holding more could make the bus disconnect this daemon. Give images back with ReleaseBuffer, "
+           "naming the newest hand-over read of each, or disconnect, then ask again";
+}
+
+void logDescriptorRefusal(const std::string& call, const std::string& client) {
+    std::printf("wallpaperx-daemon: %s refused for %s until it gives descriptors back -- it has been sent %u "
+                "it has not returned\n",
+                call.c_str(), sanitizeForLog(client).c_str(), WallpaperManager::kMaxDescriptorsPerClient);
+    std::fflush(stdout);
+}
+
+std::string requestRefusal(const std::string& client) {
+    return "caller " + sanitizeForLog(client) + " already has " +
+           std::to_string(WallpaperManager::kMaxQueuedRequestsPerClient) +
+           " requests waiting to be answered; wait for their replies, then ask again";
+}
 
 // Each value by its D-Bus type -- d, b, or s holding "#rrggbb" -- and nothing converted: an i for
 // a float property is a client that does not know what it is sending. Which keys and values are
@@ -67,6 +102,17 @@ WallpaperProperties fromWire(const std::map<std::string, sdbus::Variant>& wire) 
         }
     }
     return properties;
+}
+
+// For a method whose only effect is its reply. A caller that set the no-reply-expected flag is sent
+// nothing -- sd-bus drops the reply without an error -- so a hand-over or descriptor charged to it
+// is one it can never name to give back. The flag is read here because sdbus-c++'s Result hides it.
+sdbus::MethodVTableItem answeredOnly(sdbus::MethodVTableItem item) {
+    item.callbackHandler = [handler = std::move(item.callbackHandler)](sdbus::MethodCall call) {
+        if (call.doesntExpectReply()) return;
+        handler(std::move(call));
+    };
+    return item;
 }
 
 }  // namespace
@@ -120,9 +166,18 @@ template <class Call, class Complete>
 void DbusService::postCall(Call call, Complete complete) {
     const char* sender = m_object->getCurrentlyProcessedMessage().getSender();
     const std::string client = sender ? sender : "";
+    // Answered here, before anything is recorded or queued, so a burst costs the worker nothing.
+    if (const auto admission = m_manager.admitRequest(client); admission != WallpaperManager::Admission::Admitted) {
+        if (admission == WallpaperManager::Admission::FirstRefusal) {
+            std::printf("wallpaperx-daemon: refusing requests from %s -- it already has %d waiting to be answered\n",
+                        sanitizeForLog(client).c_str(), WallpaperManager::kMaxQueuedRequestsPerClient);
+            std::fflush(stdout);
+        }
+        call.returnError(sdbus::Error(sdbus::Error::Name{kErrorTooManyRequests}, requestRefusal(client)));
+        return;
+    }
     // Counted down on every path, a throw included: a count left above zero means this client's
     // departure is never applied again, and an image it held stays out of the ring for good.
-    m_manager.noteRequestQueued(client);
     try {
         m_worker.postTask([this, call = std::move(call), complete = std::move(complete),
                            client](wallpaperx::RenderWorker::TaskState state) mutable {
@@ -162,7 +217,7 @@ void DbusService::postCall(Call call, Complete complete) {
 
 DbusService::~DbusService() {
     // Explicit, because neither destruction order alone is correct: handlers may still be
-    // dispatching, setWallpaper() posts to m_worker and getFrameFd's task touches m_object, so
+    // dispatching, setWallpaper() posts to m_worker and GetFrame's task touches m_object, so
     // destroying either first leaves the other dangling. stop() joins the render thread, then
     // leaves post() a no-op for any handler still in flight.
     //
@@ -193,41 +248,40 @@ void DbusService::registerVTable() {
                     setWallpaperProperties(monitorId, properties);
                 })
                 .withInputParamNames("monitor_id", "properties"),
-            sdbus::registerMethod("GetFrameFd")
+            answeredOnly(sdbus::registerMethod("GetFrame")
                 // Async: the handler hands the export to the GPU thread and returns, so
                 // the event loop keeps serving while the frame is produced.
-                .implementedAs([this](FrameFdCall&& call, int32_t monitorId) {
-                    postCall(std::move(call), [this, monitorId](FrameFdCall&& queued, const std::string& client) {
-                        completeFrame(std::move(queued), monitorId, client);
+                .implementedAs([this](FrameCall&& call, int32_t monitorId, std::vector<uint64_t> knownBuffers,
+                                      bool onTimeline) {
+                    // Refused here rather than queued, so an oversized list never reaches the worker.
+                    try {
+                        WallpaperManager::requireKnownBuffers(knownBuffers);
+                    } catch (const InvalidRequest& e) {
+                        call.returnError(sdbus::Error(sdbus::Error::Name{kErrorInvalidArgs}, e.what()));
+                        return;
+                    }
+                    postCall(std::move(call), [this, monitorId, knownBuffers = std::move(knownBuffers),
+                                               onTimeline](FrameCall&& queued, const std::string& client) {
+                        completeFrame(std::move(queued), monitorId, client, onTimeline, knownBuffers);
                     });
                 })
-                .withInputParamNames("monitor_id")
-                .withOutputParamNames("fd", "width", "height", "memory_size", "handle_type", "sync_fds",
+                .withInputParamNames("monitor_id", "known_buffer_ids", "on_timeline")
+                .withOutputParamNames("memory_fd", "width", "height", "memory_size", "handle_type", "sync_fds",
                                       "frame_generation", "drm_format", "drm_modifier", "planes", "device_uuid",
-                                      "buffer_id"),
-            sdbus::registerMethod("GetFrameFdOnTimeline")
-                .implementedAs([this](TimelineFrameCall&& call, int32_t monitorId) {
-                    postCall(std::move(call), [this, monitorId](TimelineFrameCall&& queued, const std::string& client) {
-                        completeFrame(std::move(queued), monitorId, client);
-                    });
-                })
-                .withInputParamNames("monitor_id")
-                .withOutputParamNames("fd", "width", "height", "memory_size", "handle_type", "sync_fds",
-                                      "frame_generation", "drm_format", "drm_modifier", "planes", "device_uuid",
-                                      "buffer_id", "acquire_value"),
-            sdbus::registerMethod("GetAcquireTimeline")
+                                      "buffer_id", "acquire_value", "handover")),
+            answeredOnly(sdbus::registerMethod("GetAcquireTimeline")
                 .implementedAs([this](AcquireTimelineCall&& call) {
                     postCall(std::move(call), [this](AcquireTimelineCall&& queued, const std::string& client) {
                         completeGetAcquireTimeline(std::move(queued), client);
                     });
                 })
-                .withOutputParamNames("timeline"),
+                .withOutputParamNames("timeline")),
             sdbus::registerMethod("ReleaseBuffer")
-                .implementedAs([this](int32_t monitorId, uint64_t bufferId) {
+                .implementedAs([this](int32_t monitorId, uint64_t bufferId, uint64_t handover) {
                     const char* sender = m_object->getCurrentlyProcessedMessage().getSender();
-                    releaseBuffer(sender ? sender : "", monitorId, bufferId);
+                    releaseBuffer(sender ? sender : "", monitorId, bufferId, handover);
                 })
-                .withInputParamNames("monitor_id", "buffer_id"),
+                .withInputParamNames("monitor_id", "buffer_id", "handover"),
             sdbus::registerMethod("SetImportModifiers")
                 .implementedAs([this](uint32_t drmFormat, const std::vector<uint64_t>& modifiers) {
                     // The sender's unique name, not anything it could put in the arguments: the
@@ -310,7 +364,7 @@ void DbusService::emitFrameReady(int monitorId, uint64_t generation) {
             .withArguments(static_cast<int32_t>(monitorId), generation);
     } catch (const std::exception& e) {
         // A failed emit must not escape into the worker thread, where it would be
-        // std::terminate. The frame itself is fine and GetFrameFd will still serve it;
+        // std::terminate. The frame itself is fine and GetFrame will still serve it;
         // only the notification was lost, which a polling consumer recovers from.
         std::fprintf(stderr, "wallpaperx-daemon: failed to emit FrameReady(monitor=%d, generation=%llu): %s\n",
                      monitorId, static_cast<unsigned long long>(generation), e.what());
@@ -438,12 +492,14 @@ void DbusService::setOutputSize(const std::string& outputName, uint32_t width, u
 }
 
 void DbusService::setOutputVisible(const std::string& outputName, bool visible) {
-    std::printf("wallpaperx-daemon: SetOutputVisible(output=%s, visible=%s)\n", sanitizeForLog(outputName).c_str(),
-                visible ? "true" : "false");
-    std::fflush(stdout);
-
+    // Changes and refusals only: every wallpaper item reports when it starts and several can share
+    // one screen, so most reports change nothing, and logging each would bury the ones that do.
     try {
-        m_manager.setOutputVisible(outputName, visible);
+        if (m_manager.setOutputVisible(outputName, visible)) {
+            std::printf("wallpaperx-daemon: SetOutputVisible(output=%s, visible=%s)\n",
+                        sanitizeForLog(outputName).c_str(), visible ? "true" : "false");
+            std::fflush(stdout);
+        }
     } catch (const UnknownOutput& e) {
         std::fprintf(stderr, "wallpaperx-daemon: SetOutputVisible rejected: %s\n", e.what());
         throw sdbus::Error(sdbus::Error::Name{kErrorUnknownOutput}, e.what());
@@ -495,11 +551,12 @@ void DbusService::setOutputFocus(const std::string& client, const std::string& o
     m_worker.wake();
 }
 
-void DbusService::releaseBuffer(const std::string& client, int32_t monitorId, uint64_t bufferId) {
+void DbusService::releaseBuffer(const std::string& client, int32_t monitorId, uint64_t bufferId,
+                                uint64_t handover) {
     std::vector<int> toRender;
     std::vector<FrameAvailable> toAnnounce;
     try {
-        toRender = m_manager.releaseBuffer(client, monitorId, bufferId, &toAnnounce);
+        toRender = m_manager.releaseBuffer(client, monitorId, bufferId, handover, &toAnnounce);
     } catch (const InvalidRequest& e) {
         std::fprintf(stderr, "wallpaperx-daemon: ReleaseBuffer rejected (monitor=%d): %s\n", monitorId, e.what());
         throw sdbus::Error(sdbus::Error::Name{kErrorInvalidArgs}, e.what());
@@ -516,20 +573,32 @@ void DbusService::announceAvailableFrames(const std::vector<FrameAvailable>& ava
     for (const FrameAvailable& frame : available) emitFrameReady(frame.monitorId, frame.generation);
 }
 
-template <class Call>
-void DbusService::completeFrame(Call call, int32_t monitorId, const std::string& client) {
-    // Runs on the render worker's thread, so nothing here may throw past this frame --
-    // an escaping exception would be std::terminate on a bare thread. Every path below
-    // either returns results or returns an error on `call`.
-    constexpr bool onTimeline = std::is_same_v<Call, TimelineFrameCall>;
-    constexpr const char* method = onTimeline ? "GetFrameFdOnTimeline" : "GetFrameFd";
+void DbusService::completeFrame(FrameCall call, int32_t monitorId, const std::string& client, bool onTimeline,
+                                const std::vector<uint64_t>& knownBuffers) {
+    // Runs on the render worker's thread. Every path below answers `call`; a frame that fails to
+    // send is answered with an error where the bus still allows it, then rethrown for the worker
+    // to log.
+    constexpr const char* method = "GetFrame";
     FrameExport exported;
+    // Filled only by an export that failed after taking an image out of the ring. Never throws, so
+    // the call below is still answered.
+    std::vector<int> toRender;
+    std::vector<FrameAvailable> toAnnounce;
+    const auto reportFreed = [&]() noexcept {
+        try {
+            for (const int id : toRender) m_worker.post(id);
+            announceAvailableFrames(toAnnounce);
+        } catch (...) {
+        }
+    };
     try {
-        exported = m_manager.exportCurrentFrame(monitorId, client, onTimeline);
+        exported = m_manager.exportCurrentFrame(monitorId, client, onTimeline, knownBuffers, toRender, &toAnnounce);
     } catch (const InvalidRequest& e) {
+        reportFreed();
         call.returnError(sdbus::Error(sdbus::Error::Name{kErrorInvalidArgs}, e.what()));
         return;
     } catch (const std::exception& e) {
+        reportFreed();
         call.returnError(sdbus::Error(sdbus::Error::Name{kErrorExportFailed}, e.what()));
         return;
     }
@@ -562,13 +631,20 @@ void DbusService::completeFrame(Call call, int32_t monitorId, const std::string&
                                               "be reading; ask again when the daemon announces a frame"));
             return;
         }
+        if (exported.reason == NoFrameReason::TooManyDescriptors) {
+            if (exported.firstRefusal) {
+                logDescriptorRefusal(std::string(method) + "(monitor=" + std::to_string(monitorId) + ")", client);
+            }
+            call.returnError(sdbus::Error(sdbus::Error::Name{kErrorTooManyDescriptors}, descriptorRefusal(client)));
+            return;
+        }
         if (exported.reason == NoFrameReason::Unsupported) {
-            // No lastError: this is not a failure and nothing wrote one. The type is not
-            // echoed either -- it is in the client's own request, and repeating client text
-            // into a reply is the habit that produces log injection.
+            // No lastError: this is not a failure and nothing wrote one. The type can only be one
+            // of requestWallpaper()'s literals, and is escaped all the same.
             call.returnError(sdbus::Error(sdbus::Error::Name{kErrorUnsupported},
-                                          "monitor " + std::to_string(monitorId) +
-                                              " holds a wallpaper type this build cannot render, so no "
+                                          "monitor " + std::to_string(monitorId) + " holds a " +
+                                              sanitizeForLog(exported.type, 64) +
+                                              " wallpaper, a type this build cannot render, so no "
                                               "frame will ever be produced for it"));
             return;
         }
@@ -581,26 +657,27 @@ void DbusService::completeFrame(Call call, int32_t monitorId, const std::string&
         return;
     }
 
-    const ExportedFrame& frame = exported.handle->frame;
-
-    // adopt_fd, not the duplicating constructor: exportFrame() handed over ownership of a fresh
-    // fd and nothing else closes it. Taken on the first line after the export so a throw below
-    // runs ~UnixFd -- a polling consumer calls this repeatedly, so a leak becomes EMFILE.
-    sdbus::UnixFd fd(frame.fd, sdbus::adopt_fd);
-
-    // Adopted here for the same reason and just as early: it comes from the same call and leaks in
-    // exactly the same way. Adopted before it is pushed, so a throw out of the vector still runs
-    // ~UnixFd rather than losing the descriptor.
-    std::vector<sdbus::UnixFd> syncFds;
-    if (exported.handle->acquireFd >= 0) {
-        sdbus::UnixFd acquire(exported.handle->acquireFd, sdbus::adopt_fd);
-        syncFds.push_back(std::move(acquire));
-    }
-
-    std::vector<sdbus::Struct<uint64_t, uint64_t>> planes;
-    planes.reserve(frame.planes.size());
-    for (const ExportedFramePlane& plane : frame.planes) {
-        planes.emplace_back(plane.offset, plane.rowPitch);
+    const FrameHandle& handle = *exported.handle;
+    try {
+        sendFrame(call, handle);
+    } catch (...) {
+        // Whatever went wrong, nothing reached the bus: the caller cannot name this image to release
+        // it, so the claim and the descriptors charged for it go now rather than at its departure.
+        // Each step on its own, and the original failure is the one rethrown for the worker to log.
+        try {
+            std::vector<FrameAvailable> toAnnounce;
+            for (const int id : m_manager.withdrawHandover(monitorId, client, handle, &toAnnounce)) {
+                m_worker.post(id);
+            }
+            announceAvailableFrames(toAnnounce);
+        } catch (...) {
+        }
+        try {
+            call.returnError(sdbus::Error(sdbus::Error::Name{kErrorExportFailed},
+                                          "the frame for monitor " + std::to_string(monitorId) + " could not be sent"));
+        } catch (...) {
+        }
+        throw;
     }
 
     // The one line that shows a consumer actually took a frame. Without it the log records
@@ -609,14 +686,40 @@ void DbusService::completeFrame(Call call, int32_t monitorId, const std::string&
     // silent log as a failure.
     // Whether an acquire went with it, for the same reason: a frame handed over unsynchronised is
     // read without the queue-family acquire, and nothing downstream of here says so.
-    if (!exported.handle->routine) {
-        std::printf("wallpaperx-daemon: %s(monitor=%d) served generation %llu as %s, %s\n", method, monitorId,
-                    static_cast<unsigned long long>(exported.handle->generation),
-                    frame.type == ExportedFrame::HandleType::DmaBuf ? "dma_buf" : "opaque fd",
-                    exported.handle->acquireValue != 0 ? "with a value on its acquire timeline"
-                    : syncFds.empty()                  ? "unsynchronised"
-                                                       : "with an acquire semaphore");
+    // Whether the memory went too, since a consumer drawing an import it no longer has is
+    // otherwise indistinguishable here from one drawing the new picture.
+    if (!m_manager.handoverDelivered(monitorId, client)) {
+        std::printf("wallpaperx-daemon: %s(monitor=%d) served generation %llu as %s, %s, %s\n", method, monitorId,
+                    static_cast<unsigned long long>(handle.generation),
+                    handle.frame.type == ExportedFrame::HandleType::DmaBuf ? "dma_buf" : "opaque fd",
+                    handle.frame.fd >= 0 ? "memory sent" : "memory already held",
+                    handle.acquireValue != 0 ? "with a value on its acquire timeline"
+                    : handle.acquireFd >= 0  ? "with an acquire semaphore"
+                                             : "unsynchronised");
         std::fflush(stdout);
+    }
+}
+
+void DbusService::sendFrame(const FrameCall& call, const FrameHandle& handle) {
+    const ExportedFrame& frame = handle.frame;
+
+    // adopt_fd, not the duplicating constructor: exportFrame() handed over ownership of a fresh
+    // fd and nothing else closes it. Adopted on the first lines after the export, each before it
+    // is pushed, so a throw below -- out of a vector included -- runs ~UnixFd: a polling consumer
+    // calls this repeatedly, so a leak becomes EMFILE.
+    std::vector<sdbus::UnixFd> memoryFd;
+    std::vector<sdbus::UnixFd> syncFds;
+    {
+        sdbus::UnixFd memory(frame.fd, sdbus::adopt_fd);
+        sdbus::UnixFd acquire(handle.acquireFd, sdbus::adopt_fd);
+        if (memory.isValid()) memoryFd.push_back(std::move(memory));
+        if (acquire.isValid()) syncFds.push_back(std::move(acquire));
+    }
+
+    std::vector<sdbus::Struct<uint64_t, uint64_t>> planes;
+    planes.reserve(frame.planes.size());
+    for (const ExportedFramePlane& plane : frame.planes) {
+        planes.emplace_back(plane.offset, plane.rowPitch);
     }
 
     // sync_fds: an already-signalled binary semaphore the consumer waits on before sampling. It
@@ -629,17 +732,12 @@ void DbusService::completeFrame(Call call, int32_t monitorId, const std::string&
     // this the plugin can only report the driver's refusal.
     std::vector<uint8_t> deviceUuid(frame.deviceUuid.begin(), frame.deviceUuid.end());
     // buffer_id: which image, as against frame_generation's which render. A consumer keeping
-    // several buffers imports each id once.
-    if constexpr (onTimeline) {
-        // acquire_value: the value to wait for, already reached, standing in for sync_fds.
-        call.returnResults(fd, frame.width, frame.height, frame.memorySize, handleType, std::move(syncFds),
-                           exported.handle->generation, frame.drmFormat, frame.modifier, planes, std::move(deviceUuid),
-                           frame.bufferId, exported.handle->acquireValue);
-    } else {
-        call.returnResults(fd, frame.width, frame.height, frame.memorySize, handleType, std::move(syncFds),
-                           exported.handle->generation, frame.drmFormat, frame.modifier, planes, std::move(deviceUuid),
-                           frame.bufferId);
-    }
+    // several buffers imports each id once. acquire_value: the value to wait for, already reached,
+    // standing in for sync_fds; 0 when sync_fds carries the acquire. handover: what ReleaseBuffer
+    // names to give this reply back, 0 when no claim was recorded.
+    call.returnResults(memoryFd, frame.width, frame.height, frame.memorySize, handleType, syncFds,
+                       handle.generation, frame.drmFormat, frame.modifier, planes, deviceUuid, frame.bufferId,
+                       handle.acquireValue, handle.handover ? handle.handover->number : 0);
 }
 
 void DbusService::completeGetAcquireTimeline(AcquireTimelineCall call, const std::string& client) {
@@ -653,6 +751,13 @@ void DbusService::completeGetAcquireTimeline(AcquireTimelineCall call, const std
     } catch (const TimelineLimitReached& e) {
         call.returnError(sdbus::Error(sdbus::Error::Name{kErrorBusy}, e.what()));
         return;
+    } catch (const TimelineCopyLimitReached& e) {
+        call.returnError(sdbus::Error(sdbus::Error::Name{kErrorTooManyTimelineCopies}, e.what()));
+        return;
+    } catch (const DescriptorLimitReached& e) {
+        if (e.firstRefusal) logDescriptorRefusal("GetAcquireTimeline", client);
+        call.returnError(sdbus::Error(sdbus::Error::Name{kErrorTooManyDescriptors}, descriptorRefusal(client)));
+        return;
     } catch (const std::exception& e) {
         call.returnError(sdbus::Error(sdbus::Error::Name{kErrorExportFailed}, e.what()));
         return;
@@ -660,6 +765,7 @@ void DbusService::completeGetAcquireTimeline(AcquireTimelineCall call, const std
     // Adopted at once, so a throw below still closes it.
     sdbus::UnixFd timeline(fd, sdbus::adopt_fd);
     call.returnResults(timeline);
+    m_manager.timelineCopyDelivered(client);
 }
 
 std::string DbusService::getStatus() {
@@ -680,7 +786,7 @@ std::string DbusService::getStatus() {
         // Which descriptor tier a machine resolved to is the first thing worth knowing
         // when a bug reproduces on one GPU and not another.
         gpuJson["descriptor_tier"] = gpu.descriptorTier;
-        // Whether GetFrameFd's sync_fds carries anything. A consumer seeing an empty array
+        // Whether GetFrame's sync_fds carries anything. A consumer seeing an empty array
         // otherwise cannot tell "this daemon produces none" from "this frame had none".
         gpuJson["frame_sync"] = gpu.frameSync ? "semaphore" : "none";
     }
@@ -732,7 +838,7 @@ std::string DbusService::getStatus() {
         // The other reason a successful SetWallpaper never yields a FrameReady, and not a
         // failure, so it gets its own key rather than last_error. Always emitted: a key
         // that appears only in the bad case is one a client learns about by hitting it.
-        // Shares isRenderableType() with GetFrameFd so the two cannot disagree.
+        // Shares isRenderableType() with GetFrame so the two cannot disagree.
         entry["unsupported"] = !isRenderableType(monitor.type);
         // The third reason a successful SetWallpaper produces no FrameReady: every image on
         // this monitor is being read and the render is waiting for one back. Always emitted,
@@ -747,10 +853,15 @@ std::string DbusService::getStatus() {
         // an image is given back by its holder or by that holder leaving the bus, and by nothing
         // else. Names are bus-assigned but escaped like every other string that came from outside
         // this process.
+        // `descriptors` is what this monitor's hand-overs to that holder count against
+        // kMaxDescriptorsPerClient: an image fetched again while held is one claim but another reply.
         nlohmann::json holders = nlohmann::json::array();
         for (const BufferHold& hold : monitor.holds) {
+            std::vector<uint64_t> ids;
+            for (const HeldBuffer& buffer : hold.buffers) ids.push_back(buffer.id);
             holders.push_back({{"client", sanitizeForLog(hold.client, 256, LogFraming::Bare)},
-                               {"buffers", hold.buffers}});
+                               {"buffers", std::move(ids)},
+                               {"descriptors", WallpaperManager::descriptorsOf(hold)}});
         }
         entry["holders"] = std::move(holders);
         // Why a video has stopped moving, in the two facts it is decided from: what the screen

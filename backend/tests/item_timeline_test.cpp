@@ -13,9 +13,10 @@
 // talks to and its list of contexts that refused an import are process-wide and never reset.
 //
 //   steady              one import per connection, none per picture; pixels right (S13.215, S13.216)
-//   old-daemon          a daemon without the methods: asked once, GetFrameFd only (S13.222, S13.218)
+//   old-daemon          a daemon without the method: asked once, never on the timeline (S13.222, S13.218)
 //   unsupported         Unsupported is final (S13.218)
 //   unknown-interface   so is UnknownInterface (S13.218)
+//   too-many-copies     so is TooManyTimelineCopies (S15.365)
 //   retry-busy          Busy is asked again after about 2 s, then used (S13.218)
 //   retry-exportfailed  so is ExportFailed (S13.218)
 //   lost-reply          a timeline answer that never comes costs nothing (S13.217)
@@ -24,10 +25,12 @@
 //   wait-no-trip        a failed wait gives up the timeline, not the context (S13.223, S13.217)
 //   setup-create        a timeline that cannot be created costs one picture (S13.217)
 //   setup-type          nor one whose type cannot be set (S13.217)
-//   stray-value         a value in a GetFrameFd reply is never read (S13.221)
+//   stray-value         a value in a reply to a request not on the timeline is never read (S13.221)
 //   restart             a value is waited on only on its own daemon's timeline (S13.221)
 //   stale-value         a late value from a daemon given up on is no failed hand-over (S13.224)
 //   context-move        a value that lands in a context unable to wait on it is drawn (S13.225)
+//   late-answer         a timeline answer past QtDBus's 25 s is used, the daemon asked once (S15.336)
+//   replaced-asking     an ask still out to a replaced daemon does not hold up the new one (S15.337)
 //
 // Every phase but refused-binary and stray-value needs a GL context that can wait on a Vulkan
 // timeline (GL_NV_timeline_semaphore), and reports NOT VERIFIED where there is none -- Mesa.
@@ -38,12 +41,15 @@
 #include "tests/gl_semaphore_fault.h"
 #include "tests/item_render_scene.h"
 #include "tests/item_stub_scene.h"
+#include "tests/stream_capture.h"
+#include "tests/private_test_bus.h"
 #include "tests/test_report.h"
 #include "vulkan/device.h"
 #include "vulkan/offscreen.h"
 
 #include <QCoreApplication>
 #include <QDBusConnection>
+#include <QDBusPendingCall>
 #include <QDBusServiceWatcher>
 #include <QGuiApplication>
 #include <QOpenGLContext>
@@ -56,6 +62,8 @@
 #include <QString>
 #include <QUrl>
 
+#include <fcntl.h>
+#include <poll.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -104,6 +112,7 @@ enum class Phase {
     OldDaemon,
     Unsupported,
     UnknownInterface,
+    TooManyCopies,
     RetryBusy,
     RetryExportFailed,
     LostReply,
@@ -114,8 +123,13 @@ enum class Phase {
     SetupType,
     StrayValue,
     Restart,
+    RestartMemory,
     StaleValue,
     ContextMove,
+    LateValue,
+    LateAnswer,
+    ReplacedAsking,
+    RetryReplaced,
 };
 
 struct PhaseName {
@@ -130,6 +144,7 @@ constexpr PhaseName kPhases[] = {
     {Phase::OldDaemon, "old-daemon", "S13.222 and S13.218 (a daemon without the timeline methods)", true},
     {Phase::Unsupported, "unsupported", "S13.218 (Unsupported is not asked again)", true},
     {Phase::UnknownInterface, "unknown-interface", "S13.218 (UnknownInterface is not asked again)", true},
+    {Phase::TooManyCopies, "too-many-copies", "S15.365 (TooManyTimelineCopies is not asked again)", true},
     {Phase::RetryBusy, "retry-busy", "S13.218 (Busy is asked again after about two seconds)", true},
     {Phase::RetryExportFailed, "retry-exportfailed", "S13.218 (ExportFailed is asked again after about two seconds)",
      true},
@@ -141,57 +156,38 @@ constexpr PhaseName kPhases[] = {
      true},
     {Phase::SetupCreate, "setup-create", "S13.217 (a timeline that cannot be created costs one picture)", true},
     {Phase::SetupType, "setup-type", "S13.217 (a timeline whose type cannot be set costs one picture)", true},
-    {Phase::StrayValue, "stray-value", "S13.221 (a value is read only from a GetFrameFdOnTimeline reply)", false},
-    {Phase::Restart, "restart", "S13.221 (a value is waited on only on the timeline of the daemon that sent it)", true},
+    {Phase::StrayValue, "stray-value", "S13.221 (a value is read only from a reply to a request asked on the timeline)", false},
+    {Phase::Restart, "restart",
+     "S13.221 and S15.317 (a value is waited on only on the timeline of the daemon that sent it; the late reply, its "
+     "memory left out, is drawn)",
+     true},
+    {Phase::RestartMemory, "restart-memory",
+     "S13.221 (the late reply from a replaced daemon is drawn through the held import when it carries the memory too)",
+     true},
     {Phase::StaleValue, "stale-value", "S13.224 (a late value from a daemon given up on is not a failed hand-over)",
      true},
     {Phase::ContextMove, "context-move",
      "S13.225 (a value that reaches a context which cannot wait on a timeline is drawn unwaited)", true},
+    {Phase::LateValue, "late-value", "S13.216's ordering (a value is read only once it is reached)", true},
+    {Phase::LateAnswer, "late-answer", "S15.336 (a timeline answer later than QtDBus's 25 s is used, the daemon asked once)",
+     true},
+    {Phase::ReplacedAsking, "replaced-asking",
+     "S15.337 (a request still out to a replaced daemon does not stop the new one being asked; its late answer is "
+     "closed)",
+     true},
+    {Phase::RetryReplaced, "retry-replaced",
+     "S15.348 (a timeline refused for now by one daemon does not delay asking the daemon that replaces it)", true},
 };
 
 // Everything written to stderr while it is alive, which is where the plugin's refused-import line
-// goes. Echoed back to the real stderr when it finishes, so nothing it held is lost to a reader.
-class StderrCapture {
-public:
-    StderrCapture() {
-        std::fflush(stderr);
-        m_file = ::memfd_create("wallpaperx-stderr-capture", MFD_CLOEXEC);
-        m_saved = ::dup(STDERR_FILENO);
-        if (m_file < 0 || m_saved < 0 || ::dup2(m_file, STDERR_FILENO) < 0) {
-            if (m_saved >= 0) ::close(m_saved);
-            m_saved = -1;
-        }
+// goes.
+struct StderrCapture : wallpaperx::testing::StreamCapture {
+    StderrCapture() : StreamCapture(STDERR_FILENO) {}
+    // Ends the capture, echoing it to the real stderr, and returns everything it held.
+    std::string finish() {
+        restore();
+        return text();
     }
-    ~StderrCapture() {
-        finish();
-        if (m_file >= 0) ::close(m_file);
-    }
-    StderrCapture(const StderrCapture&) = delete;
-    StderrCapture& operator=(const StderrCapture&) = delete;
-
-    bool capturing() const { return m_saved >= 0; }
-
-    const std::string& finish() {
-        if (m_saved < 0) return m_text;
-        std::fflush(stderr);
-        ::dup2(m_saved, STDERR_FILENO);
-        ::close(m_saved);
-        m_saved = -1;
-        char buffer[4096];
-        ssize_t got = 0;
-        off_t at = 0;
-        while ((got = ::pread(m_file, buffer, sizeof buffer, at)) > 0) {
-            m_text.append(buffer, static_cast<size_t>(got));
-            at += got;
-        }
-        if (!m_text.empty()) (void)!::write(STDERR_FILENO, m_text.data(), m_text.size());
-        return m_text;
-    }
-
-private:
-    int m_file = -1;
-    int m_saved = -1;
-    std::string m_text;
 };
 
 int occurrences(const std::string& text, const char* needle) {
@@ -253,6 +249,44 @@ Drive drive(Scene& scene, ExportingStub& stub, QDBusConnection& bus, int limit,
     return out;
 }
 
+// A second stub daemon on a connection of its own, granting timelines, ready to take the daemon's
+// name. The change is waited for on a watcher of the plugin's own connection, whose signal the
+// plugin's watch receives first. Taken off the bus and disconnected when it goes, on every path,
+// before the stub it serves from is destroyed.
+struct SuccessorDaemon {
+    QDBusConnection bus;
+    ExportingStub stub;
+    bool ok = false;  // connected, with the stub's object registered
+    QString newOwner;
+    QDBusServiceWatcher watcher{QString::fromUtf8(kService), QDBusConnection::sessionBus(),
+                                QDBusServiceWatcher::WatchForOwnerChange};
+
+    SuccessorDaemon(wallpaperx::Device& device, const std::vector<const wallpaperx::OffscreenTarget*>& ring)
+        : bus(QDBusConnection::connectToBus(QDBusConnection::SessionBus, QStringLiteral("wallpaperx-timeline-b"))),
+          stub(device, ring) {
+        stub.rotate();
+        stub.serveTimelines(ExportingStub::Timeline::Grant);
+        QObject::connect(&watcher, &QDBusServiceWatcher::serviceOwnerChanged,
+                         [this](const QString&, const QString&, const QString& owner) { newOwner = owner; });
+        ok = bus.isConnected() && bus.registerVirtualObject(QString::fromUtf8(kPath), &stub);
+    }
+    ~SuccessorDaemon() {
+        bus.unregisterObject(QString::fromUtf8(kPath));
+        (void)bus.unregisterService(QString::fromUtf8(kService));
+        QDBusConnection::disconnectFromBus(QStringLiteral("wallpaperx-timeline-b"));
+    }
+    SuccessorDaemon(const SuccessorDaemon&) = delete;
+    SuccessorDaemon& operator=(const SuccessorDaemon&) = delete;
+
+    // Moves the daemon's name from `from` to this daemon, and waits, bounded, until the plugin's
+    // connection has seen the change.
+    bool takeNameFrom(QDBusConnection& from) {
+        (void)from.unregisterService(QString::fromUtf8(kService));
+        return ok && bus.registerService(QString::fromUtf8(kService)) &&
+               pumpUntil([&] { return newOwner == bus.baseService(); }, 3000);
+    }
+};
+
 bool runPhase(const PhaseName& which) {
     const Phase phase = which.phase;
     const char* kGoal = which.goal;
@@ -284,6 +318,10 @@ bool runPhase(const PhaseName& which) {
             case Phase::LostReply:
                 stub.serveTimelines(ExportingStub::Timeline::Silent);
                 break;
+            case Phase::LateAnswer:
+            case Phase::ReplacedAsking:
+                stub.serveTimelines(ExportingStub::Timeline::Late);
+                break;
             case Phase::RefusedTimeline:
                 stub.serveTimelines(ExportingStub::Timeline::BadDescriptor);
                 break;
@@ -295,7 +333,12 @@ bool runPhase(const PhaseName& which) {
                 stub.serveTimelines(ExportingStub::Timeline::Grant);
                 stub.refuseTimelineAsks(1000, QStringLiteral("org.freedesktop.DBus.Error.UnknownInterface"));
                 break;
+            case Phase::TooManyCopies:
+                stub.serveTimelines(ExportingStub::Timeline::Grant);
+                stub.refuseTimelineAsks(1000, QStringLiteral("io.wallpaperx.Daemon.Error.TooManyTimelineCopies"));
+                break;
             case Phase::RetryBusy:
+            case Phase::RetryReplaced:
                 stub.serveTimelines(ExportingStub::Timeline::Grant);
                 stub.refuseTimelineAsks(1, QStringLiteral("io.wallpaperx.Daemon.Error.Busy"));
                 break;
@@ -304,8 +347,16 @@ bool runPhase(const PhaseName& which) {
                 stub.refuseTimelineAsks(1, QStringLiteral("io.wallpaperx.Daemon.Error.ExportFailed"));
                 break;
             case Phase::Restart:
+            case Phase::RestartMemory:
                 stub.serveTimelines(ExportingStub::Timeline::Grant);
                 stub.advanceTimelinesOnGrant(200);
+                // Above any number the new daemon will issue in the phase, so a release reaching it that
+                // names one of these is a late claim credited to the wrong daemon.
+                stub.numberHandoversFrom(500);
+                break;
+            case Phase::LateValue:
+                stub.serveTimelines(ExportingStub::Timeline::Grant);
+                stub.ownTimelines();
                 break;
             default:
                 stub.serveTimelines(ExportingStub::Timeline::Grant);
@@ -529,23 +580,97 @@ bool runPhase(const PhaseName& which) {
                 return true;
             }
 
+            case Phase::LateValue: {
+                // GOAL: S13.216's ordering -- a picture handed over as a value is read only once that
+                //       value is reached: what the producer draws into the image before reaching it is
+                //       what the item shows, never the image as it was when the reply came.
+                // WHY-THIS-SHAPE: the stub's own timeline (ownTimelines()) carries a value whose drawing
+                //       (blue) and signal are submitted with the reply but held on the GPU behind a gate.
+                //       In the pass that draws the picture the item's texture is copied
+                //       (copyWhileDrawing(), ordered in GL after the item's wait) and flushed; after a pause
+                //       long enough for an unordered copy to have run, the gate opens; the copy is read only
+                //       then. Reading the item's texture at the end instead would see blue whether or not
+                //       the item waited. Held on the GPU, not merely unsignalled: Vulkan forbids waiting on
+                //       a signal not yet submitted, and the gate keeps every step legal. Relies on this
+                //       queue not running the drawing before the gated batch ahead of it, which the
+                //       control shows holds here (the old picture is what an unwaited copy reads).
+                // CONTROL: in WallpaperXItem::updatePaintNode (backend/kde/wallpaperx_item.cpp) the
+                //       timeline wait skipped for a kept import (`handedOver = reused != nullptr ||
+                //       (timeline.semaphore != 0 && FrameImport::acquire(...))`), via control_run.sh,
+                //       2026-10-05 -> "FAIL: a picture handed over as a value is read only once the value is
+                //       reached (read red where blue was drawn before the value was reached, over red)".
+                //       Reverted.
+                // COVERAGE-ASSERT: the late value must have gone out and been drawn through the kept
+                //       import, and the copy taken.
+                if (!reachTimeline(6)) {
+                    check(false, "the item reaches the timeline within six pictures");
+                    return true;
+                }
+                {
+                    const size_t image = static_cast<size_t>(stub.served()) % 2;  // the image served next
+                    const quint64 reused = scene.reused();
+                    // Each image starts in its own colour (image 0 red, image 1 green); blue is new to both.
+                    // Built now: building it uploads a texture and waits, which the gate would hold for good.
+                    const std::string bluePath = wallpaperx::testing::writeSolidPng(
+                        std::string(WALLPAPERX_TEST_IMAGE_DIR) + "/item_timeline_late.png", 16, 16, kPalette[2]);
+                    wallpaperx::StaticRenderer blue(device, targets.renderPass(), bluePath, WALLPAPERX_SHADER_DIR);
+                    const std::string acquireError0 = stub.acquireError();
+                    stub.lateValueNext([&] { targets.render(blue, *ring[image]); });
+                    announce(bus, stub.nextGeneration());
+                    GLuint copy = 0;
+                    const bool drawn = copyWhileDrawing(scene, [&] { return scene.reused() > reused; }, copy);
+                    std::string why;
+                    if (!stub.lateValueSent() && stub.acquireError() != acquireError0) {
+                        // The stub's own failure, not the plugin's: no late value went out to be waited on.
+                        wallpaperx::testing::harnessFailure("the stub could not send the late value: " +
+                                                            stub.acquireError());
+                        stub.signalLateValue(why);
+                        return true;
+                    }
+                    if (!drawn || !stub.lateValueSent()) {
+                        check(false, "the picture with the late value is drawn through the kept import and copied (late "
+                                     "value sent " + std::to_string(stub.lateValueSent()) + ", drawn and copied " +
+                                         std::to_string(drawn) + ")");
+                        stub.signalLateValue(why);
+                        return true;
+                    }
+                    // Long enough for a copy nothing holds back to have run.
+                    pumpFor(300);
+                    if (!stub.signalLateValue(why)) {
+                        wallpaperx::testing::harnessFailure("the late value could not be reached: " + why);
+                        return true;
+                    }
+                    const std::vector<unsigned char> pixels = readCopy(scene, copy, why);
+                    if (pixels.empty()) {
+                        wallpaperx::testing::harnessFailure("the copy of the drawn picture could not be read back: " + why);
+                        return true;
+                    }
+                    const int seen = nearestColour(&pixels[((kHeight / 2) * kWidth + kWidth / 2) * 4], kPalette);
+                    check(seen == 2, "a picture handed over as a value is read only once the value is reached (read " +
+                                         colourName(seen) + " where blue was drawn before the value was reached, over " +
+                                         colourName(static_cast<int>(image)) + ")");
+                }
+                return true;
+            }
+
             case Phase::OldDaemon:
             case Phase::Unsupported:
-            case Phase::UnknownInterface: {
-                // GOAL: S13.222 and S13.218 -- a daemon that answers GetAcquireTimeline with
-                //       UnknownMethod (one from before it), Unsupported or UnknownInterface is asked
-                //       ONCE; the plugin stays on GetFrameFd and draws every picture with its binary
-                //       semaphore, and never sends GetFrameFdOnTimeline.
+            case Phase::UnknownInterface:
+            case Phase::TooManyCopies: {
+                // GOAL: S13.222, S13.218 and S15.365 -- a daemon that answers GetAcquireTimeline with
+                //       UnknownMethod (one from before it), Unsupported, UnknownInterface or
+                //       TooManyTimelineCopies (this connection has had its copies) is asked ONCE; the
+                //       plugin draws every picture with its binary semaphore, and never asks GetFrame on
+                //       the timeline.
                 // WHY-THIS-SHAPE: the drive lasts well past the plugin's two-second retry, with a
                 //       binary picture every tenth of a second, each of which would ask again if the
                 //       answer were not final -- "asked once" is otherwise true of any run shorter
                 //       than the delay.
-                // CONTROL: in backend/kde/wallpaperx_item.cpp, (a) the three names in
+                // CONTROL: in backend/kde/wallpaperx_item.cpp, (a) the four names in
                 //       timelineRefusalIsPermanent misspelled -> "FAIL: the refusal is final: the
-                //       timeline was asked for once (2 ask(s))" on all three entries; (b) the
+                //       timeline was asked for once (2 ask(s))" on all four entries; (b) the
                 //       holdsAcquireTimeline test deleted from WallpaperXItem::fetchOnTimeline -> on
-                //       old-daemon, "FAIL: no picture was asked for on a timeline (50)". Observed
-                //       2026-09-23 on the NVIDIA entry. Reverted.
+                //       old-daemon, "FAIL: no picture was asked for on a timeline (50)".
                 const quint64 semaphores0 = scene.semaphoreImports();
                 QElapsedTimer clock;
                 clock.start();
@@ -579,7 +704,8 @@ bool runPhase(const PhaseName& which) {
                 //       them)" and "FAIL: the second answer is used: pictures come as values (0), ...";
                 //       (b) `retryAfter` set to now in askForAcquireTimeline's reply handler -> "FAIL: and
                 //       not before the retry delay (301 ms between them)". Observed 2026-09-23 on the
-                //       NVIDIA entry. Reverted.
+                //       NVIDIA entry; re-run via control_batch.sh ((a) on both entries 2026-10-05, (b) on
+                //       retry-busy 2026-10-06, "302 ms"), the same lines. Reverted.
                 QElapsedTimer clock;
                 clock.start();
                 const Drive run = drive(scene, stub, bus, 80,
@@ -601,11 +727,13 @@ bool runPhase(const PhaseName& which) {
                 //       on, and draws every picture with its binary semaphore.
                 // WHY-THIS-SHAPE: the stub creates the caller's timeline and never answers, so a
                 //       daemon asked for a value WOULD send one; only the plugin's own record can keep
-                //       it from asking. Shorter than QtDBus's reply timeout, after which the ask fails
-                //       and is retried -- a different case.
+                //       it from asking. The ask has no timeout, so nothing here changes with the drive's
+                //       length; an answer that does come late, past QtDBus's default 25 s, is
+                //       late-answer's case (S15.336).
                 // CONTROL: the holdsAcquireTimeline test deleted from WallpaperXItem::fetchOnTimeline
                 //       (backend/kde/wallpaperx_item.cpp) -> "FAIL: and no picture was asked for on it
-                //       while the answer was out (1)". Observed 2026-09-23 on the NVIDIA entry. Reverted.
+                //       while the answer was out (1)". Observed 2026-09-23 on the NVIDIA entry; re-run via
+                //       control_batch.sh 2026-10-05 after the ask lost its timeout, the same line. Reverted.
                 const Drive run = drive(scene, stub, bus, 25, nullptr, 60);
                 check(stub.timelineAsks() == 1, "the timeline was asked for (" + std::to_string(stub.timelineAsks()) +
                                                     " ask(s))");
@@ -613,6 +741,150 @@ bool runPhase(const PhaseName& which) {
                                                           std::to_string(stub.onTimelineRequests()) + ")");
                 check(!run.stalled && run.drawn == 25 && drawingCleanly(scene),
                       "every picture is drawn (" + std::to_string(run.drawn) + " of 25; " + describe(scene) + ")");
+                return true;
+            }
+
+            case Phase::LateAnswer: {
+                // GOAL: S15.336 -- an answer to GetAcquireTimeline that comes after QtDBus's default
+                //       25 s reply timeout is adopted: pictures then come as values, and the daemon is
+                //       asked exactly once over the whole run. False for an ask on the default timeout,
+                //       which fails at 25 s, asks again about 2 s later -- a second descriptor the
+                //       daemon charges until this process leaves the bus -- and drops the late answer.
+                // WHY-THIS-SHAPE: the stub holds the ask (Timeline::Late) while pictures keep coming
+                //       every ~200 ms, each of which would ask again if the record were not settled, and
+                //       answers at least 28 s after the ask arrived -- a lower bound, measured from when
+                //       the test saw the ask, so a slow host only makes the answer later.
+                // CONTROL: in askForAcquireTimeline (backend/kde/wallpaperx_item.cpp)
+                //       `bus.asyncCall(request, kNoReplyTimeout)` made `bus.asyncCall(request)`, via
+                //       control_batch.sh, 2026-10-05, NVIDIA -> "FAIL: the daemon is asked for its timeline
+                //       once over the whole run (2 ask(s))" and "FAIL: the late answer is adopted: pictures
+                //       come as values once it arrives (0 value(s), 0 asked before it; ...)". Reverted.
+                // COVERAGE-ASSERT: the answer must have come at least 28 s after the ask, with at least
+                //       twenty pictures drawn while it was out.
+                const Drive toAsk = drive(scene, stub, bus, 20, [&] { return stub.heldTimelineAsks() > 0; }, 60);
+                if (toAsk.stalled || stub.heldTimelineAsks() != 1) {
+                    check(false, "the item asks for its acquire timeline (" + std::to_string(stub.timelineAsks()) + " ask(s))");
+                    return true;
+                }
+                constexpr qint64 kAnswerAfterMs = 28000;
+                QElapsedTimer sinceAsk;
+                sinceAsk.start();
+                const Drive waiting =
+                    drive(scene, stub, bus, 1000, [&] { return sinceAsk.elapsed() >= kAnswerAfterMs; }, 200);
+                const qint64 answeredAfter = sinceAsk.elapsed();
+                const int onTimelineWhileOut = stub.onTimelineRequests();
+                if (!stub.answerHeldTimeline()) {
+                    wallpaperx::testing::harnessFailure("the stub could not answer the held timeline ask");
+                    return true;
+                }
+                const Drive after = drive(scene, stub, bus, 12, [&] { return stub.valuesSent() >= 5; });
+                check(!waiting.stalled && waiting.drawn >= 20 && answeredAfter >= kAnswerAfterMs,
+                      "the answer came at least 28 s after the ask, with pictures drawn meanwhile (" +
+                          std::to_string(answeredAfter) + " ms, " + std::to_string(waiting.drawn) + " drawn)");
+                check(stub.timelineAsks() == 1,
+                      "the daemon is asked for its timeline once over the whole run (" +
+                          std::to_string(stub.timelineAsks()) + " ask(s))");
+                check(onTimelineWhileOut == 0 && stub.valuesSent() >= 5 && !after.stalled && drawingCleanly(scene),
+                      "the late answer is adopted: pictures come as values once it arrives (" +
+                          std::to_string(stub.valuesSent()) + " value(s), " + std::to_string(onTimelineWhileOut) +
+                          " asked before it; " + describe(scene) + ")");
+                return true;
+            }
+
+            case Phase::ReplacedAsking: {
+                // GOAL: S15.337 -- while the plugin's GetAcquireTimeline to a daemon that has lost the
+                //       name (but is still on the bus) is unanswered, the new daemon is asked for its own
+                //       timeline straight away, once, and its pictures come as values; when the old
+                //       daemon's answer then arrives, its descriptor is closed and the new daemon's
+                //       timeline is kept.
+                // WHY-THIS-SHAPE: the old stub holds the ask and then releases the name, staying
+                //       connected, so its answer can still come. That answer carries the write end of
+                //       a pipe this test made: the read end sees end of file only once every copy is
+                //       closed, the plugin's included, which no other observation of the plugin's
+                //       record can show. A Peer.Ping from the old stub's connection, answered by the
+                //       item's connection as it dispatches, is the barrier: messages from one sender
+                //       arrive in order, so the answer was dispatched first.
+                // CONTROL: in backend/kde/wallpaperx_item.cpp via control_batch.sh, re-run 2026-10-06, NVIDIA,
+                //       each reverted: (a) `if (g_timeline.state == State::Asking) return true;` put back
+                //       at the top of timelineSettledLocked -> "FAIL: while the request to the replaced
+                //       daemon is out, the new daemon is asked for its timeline once and its pictures come
+                //       as values (0 ask(s), 0 value(s); the old ask still out)"; (b) `superseded = fd;`
+                //       deleted from the `g_timeline.ask != ask` branch of the reply handler -> only "FAIL:
+                //       the replaced daemon's late answer is closed, not kept (its descriptor still open 5 s
+                //       on)"; (c) that branch's test made `false`, so the late answer is adopted -> "FAIL:
+                //       and the new daemon's timeline is kept: ... (4 of 6, 2 ask(s); ...)" beside (b)'s line.
+                // COVERAGE-ASSERT: the old daemon's ask must still be held when the new one is graded,
+                //       and the ping must have been answered.
+                const Drive toAsk = drive(scene, stub, bus, 20, [&] { return stub.heldTimelineAsks() > 0; }, 60);
+                if (toAsk.stalled || stub.heldTimelineAsks() != 1) {
+                    check(false, "the item asks the first daemon for its acquire timeline (" +
+                                     std::to_string(stub.timelineAsks()) + " ask(s))");
+                    return true;
+                }
+                SuccessorDaemon successor(device, ring);
+                QDBusConnection& busB = successor.bus;
+                ExportingStub& stubB = successor.stub;
+                if (!successor.takeNameFrom(bus)) {
+                    wallpaperx::testing::harnessFailure("the second stub daemon never became the name's owner");
+                    return true;
+                }
+                const quint64 pictures0 = scene.pictures();
+                const bool drewB = pumpUntil(
+                    [&] {
+                        scene.renderPass();
+                        return scene.pictures() > pictures0;
+                    },
+                    5000);
+                if (!drewB || !settleQuiet(scene, stubB)) {
+                    check(false, "the item draws the new daemon's first picture and goes quiet (" + describe(scene) + ")");
+                    return true;
+                }
+                const Drive reachB = drive(scene, stubB, busB, 8, [&] { return stubB.valuesSent() > 0; });
+                check(stub.heldTimelineAsks() == 1 && !reachB.stalled && stubB.timelineAsks() == 1 &&
+                          stubB.valuesSent() > 0,
+                      "while the request to the replaced daemon is out, the new daemon is asked for its timeline once "
+                      "and its pictures come as values (" +
+                          std::to_string(stubB.timelineAsks()) + " ask(s), " + std::to_string(stubB.valuesSent()) +
+                          " value(s); the old ask " + (stub.heldTimelineAsks() == 1 ? "still out" : "gone") + ")");
+
+                int pipeFds[2] = {-1, -1};
+                if (::pipe2(pipeFds, O_CLOEXEC) != 0) {
+                    wallpaperx::testing::harnessFailure("no pipe could be made to stand in for the late timeline");
+                    return true;
+                }
+                const bool answered = stub.answerHeldTimeline(pipeFds[1]);
+                ::close(pipeFds[1]);
+                QDBusPendingCall pong = bus.asyncCall(
+                    QDBusMessage::createMethodCall(QDBusConnection::sessionBus().baseService(), QStringLiteral("/"),
+                                                   QStringLiteral("org.freedesktop.DBus.Peer"), QStringLiteral("Ping")),
+                    5000);
+                const bool finished = pumpUntil([&] { return pong.isFinished(); }, 6000);
+                const bool barrier = finished && !pong.isError();
+                // Checked before the measurement it guards, so a failed staging does not wait it out.
+                if (!answered || !barrier) {
+                    ::close(pipeFds[0]);
+                    const std::string ping = !finished       ? std::string("unanswered after 6 s")
+                                             : pong.isError() ? pong.error().message().toStdString()
+                                                              : std::string("answered");
+                    wallpaperx::testing::harnessFailure(std::string("the late answer could not be staged (answered ") +
+                                                        (answered ? "yes" : "no") + ", ping " + ping + ")");
+                    return true;
+                }
+                const bool closed = pumpUntil(
+                    [&] {
+                        pollfd end{pipeFds[0], POLLIN, 0};
+                        return ::poll(&end, 1, 0) == 1 && (end.revents & POLLHUP) != 0;
+                    },
+                    5000);
+                ::close(pipeFds[0]);
+                check(closed, "the replaced daemon's late answer is closed, not kept (its descriptor still open 5 s on)");
+                const int valuesB = stubB.valuesSent();
+                const Drive steadyB = drive(scene, stubB, busB, 6);
+                check(!steadyB.stalled && stubB.valuesSent() - valuesB == 6 && stubB.timelineAsks() == 1 &&
+                          drawingCleanly(scene),
+                      "and the new daemon's timeline is kept: its pictures go on coming as values (" +
+                          std::to_string(stubB.valuesSent() - valuesB) + " of 6, " +
+                          std::to_string(stubB.timelineAsks()) + " ask(s); " + describe(scene) + ")");
                 return true;
             }
 
@@ -755,9 +1027,10 @@ bool runPhase(const PhaseName& which) {
             }
 
             case Phase::StrayValue: {
-                // GOAL: S13.221 -- a value is read only from a reply to GetFrameFdOnTimeline. A GetFrameFd
-                //       reply carrying a thirteenth field is drawn as a picture with no hand-over:
-                //       imported afresh, never through a kept import, and no timeline touched.
+                // GOAL: S13.221 -- a value is read only from a reply to a request that asked on the
+                //       timeline. A reply to one that did not, carrying a nonzero acquire_value, is
+                //       drawn as a picture with no hand-over: imported afresh, never through a kept
+                //       import, and no timeline touched.
                 // WHY-THIS-SHAPE: one image, so every picture after the first could reuse its import
                 //       -- and would, if the value were read, since a value is a hand-over. The
                 //       counters then tell the two apart without any wait on a timeline that could
@@ -766,12 +1039,12 @@ bool runPhase(const PhaseName& which) {
                 // CONTROL: `askedForValue &&` deleted from WallpaperXItem::takeFrameReply
                 //       (backend/kde/wallpaperx_item.cpp) -> "FAIL: every picture with a stray value is
                 //       drawn (0 of 7)" and "FAIL: each is imported afresh, as a picture without a
-                //       hand-over (0 import(s), 0 reuse(s))". Observed 2026-09-23 on the NVIDIA entry.
-                //       Reverted.
+                //       hand-over (0 import(s), 0 reuse(s))". Observed 2026-09-23 on the NVIDIA entry;
+                //       re-run 2026-10-04 via control_run.sh, the same two lines. Reverted.
                 const quint64 imports0 = scene.imports();
                 const quint64 reused0 = scene.reused();
                 const quint64 semaphores0 = scene.semaphoreImports();
-                stub.sendValueOnGetFrameFd(1);
+                stub.sendValueUnasked(1);
                 stub.serveNext(ring.front());
                 const Drive run = drive(scene, stub, bus, 1);
                 const Drive more = [&] {
@@ -799,52 +1072,49 @@ bool runPhase(const PhaseName& which) {
                 return true;
             }
 
-            case Phase::Restart: {
+            case Phase::Restart:
+            case Phase::RestartMemory: {
                 // GOAL: S13.221 across a daemon restart mid-stream -- a value is only ever waited on the
                 //       timeline of the daemon (unique bus name) it was asked of. A request in flight to
-                //       the old daemon when the name moves is still drawn on the OLD daemon's timeline;
-                //       the new daemon's pictures are waited on its own, imported afresh. False for a
-                //       value paired by the owner at reply time, which is a wait that may never end.
+                //       the old daemon when the name moves is still drawn on the OLD daemon's timeline,
+                //       through the import the node holds for its image -- whether the reply left the
+                //       memory out under the daemon's rule (restart) or carried it (restart-memory) --
+                //       before anything is asked of the new daemon, and nothing is released to either
+                //       daemon for it; the new daemon's pictures are waited on its own, imported afresh.
+                //       False for a value paired by the owner at reply time, which is a wait that may
+                //       never end, and for a reply credited to the new daemon, which matches no import.
                 // WHY-THIS-SHAPE: the old daemon releases the name but stays connected, holding one
-                //       GetFrameFdOnTimeline reply until the plugin has seen the new owner (a watcher on
+                //       GetFrame reply asked on the timeline until the plugin has seen the new owner (a watcher on
                 //       the plugin's own connection, whose change signal the plugin's watcher received
                 //       first). The old daemon's payload is 200 signals ahead of the new one's, so a
                 //       value waited on the wrong timeline COMPLETES -- no stalled GPU -- and only the
                 //       import count and the requests tell the pairing was wrong.
-                // CONTROL: in backend/kde/wallpaperx_item.cpp, (a) the reply's label in
-                //       WallpaperXItem::fetchFrame made the owner as known when the reply is read,
-                //       whatever the request was addressed to -> "FAIL: and its value is drawn on the old
-                //       daemon's timeline, with no import (frame shown: yes, reason [], 0 import(s))",
-                //       "FAIL: the item reaches the new daemon's timeline (1 ask(s), 0 request(s) on
-                //       it)", and the import and steady lines after it; (b) `&& m_timelineSender ==
-                //       sender` deleted from FrameNode::timeline -> "FAIL: and imports the new daemon's
-                //       timeline rather than waiting its values on the old one (1 import(s) for 1
-                //       binary picture(s))". Observed 2026-09-23 on the NVIDIA entry. Reverted.
+                // CONTROL: in backend/kde/wallpaperx_item.cpp, (a) WallpaperXItem::fetchFrame's reply
+                //       handler passing `BufferClaims::instance().currentDaemon()` to takeFrameReply instead
+                //       of `asked` -> "FAIL: and its value is drawn on the old daemon's timeline, through the
+                //       held import (..., 0 reuse(s), 0 import(s), 1 lost; memory left out)" (restart-memory:
+                //       "1 import(s), 0 lost; memory sent") and "FAIL: and nothing is released to either
+                //       daemon for it (0 covering it to the old, 1 to the new)"; (b) `m_fetch != Fetch::Asking
+                //       &&` deleted from discardHeldFrame -> the first line; (c) `forgetStaleImports(node);`
+                //       added straight after the lambda at the top of updatePaintNode -> the first line;
+                //       (d) `&& m_timelineSender == sender` deleted from FrameNode::timeline -> "FAIL: and
+                //       imports the new daemon's timeline rather than waiting its values on the old one (1
+                //       import(s) for 1 binary picture(s))". Via control_batch.sh, re-run 2026-10-06 on the
+                //       NVIDIA entry, (a)-(c) on both restart entries. Reverted.
                 if (!reachTimeline(6)) {
                     check(false, "the item reaches the old daemon's timeline");
                     return true;
                 }
                 (void)drive(scene, stub, bus, 3);
-                QDBusConnection busB =
-                    QDBusConnection::connectToBus(QDBusConnection::SessionBus, QStringLiteral("wallpaperx-timeline-b"));
-                ExportingStub stubB(device, ring);
-                stubB.rotate();
-                stubB.serveTimelines(ExportingStub::Timeline::Grant);
-                // Past anything the old daemon numbered. The old daemon's late reply is drawn after
-                // the item forgot its marks and writes its own generation back, so a new daemon
-                // counting from 1 is read as older than the screen -- reported as a concern of its
-                // own, not what this phase grades.
-                stubB.numberGenerationsFrom(1000);
-                if (!busB.isConnected() || !busB.registerVirtualObject(QString::fromUtf8(kPath), &stubB)) {
+                SuccessorDaemon successor(device, ring);
+                QDBusConnection& busB = successor.bus;
+                ExportingStub& stubB = successor.stub;
+                if (!successor.ok) {
                     wallpaperx::testing::harnessFailure("the second stub daemon could not be put on the bus");
                     return true;
                 }
-                QString newOwner;
-                QDBusServiceWatcher watcher(QString::fromUtf8(kService), QDBusConnection::sessionBus(),
-                                            QDBusServiceWatcher::WatchForOwnerChange);
-                QObject::connect(&watcher, &QDBusServiceWatcher::serviceOwnerChanged,
-                                 [&newOwner](const QString&, const QString&, const QString& owner) { newOwner = owner; });
 
+                if (phase == Phase::RestartMemory) stub.sendMemory(ExportingStub::Memory::Always);
                 stub.holdServeNumber(stub.served() + 1);
                 announce(bus, static_cast<quint64>(stub.served()) + 1);
                 if (!pumpUntil([&] { return stub.replyIsHeld(); }, 3000)) {
@@ -853,16 +1123,26 @@ bool runPhase(const PhaseName& which) {
                 }
                 const bool heldOnTimeline = stub.onTimelineRequests() > 0;
                 const int onTimelineBefore = stub.onTimelineRequests();
-                (void)bus.unregisterService(QString::fromUtf8(kService));
                 stubB.holdServeNumber(1);
-                if (!busB.registerService(QString::fromUtf8(kService)) ||
-                    !pumpUntil([&] { return newOwner == busB.baseService(); }, 3000)) {
+                if (!successor.takeNameFrom(bus)) {
                     wallpaperx::testing::harnessFailure("the second stub daemon never became the name's owner");
                     return true;
                 }
                 pumpFor(50);
                 const quint64 pictures0 = scene.pictures();
                 const quint64 semaphores0 = scene.semaphoreImports();
+                const quint64 imports0 = scene.imports();
+                const quint64 reused0 = scene.reused();
+                const quint64 lost0 = scene.lost();
+                // Releases of earlier pictures land after their fences, so what is counted is a release
+                // covering the late reply's own hand-over, not every release after this point.
+                const quint64 lateNumber = stub.asks().back().handover;
+                const auto coveringLate = [&] {
+                    return std::count_if(stub.releases().begin(), stub.releases().end(),
+                                         [&](const ExportingStub::Release& r) { return r.handover >= lateNumber; });
+                };
+                const int askedOfB = stubB.requests();
+                const bool memorySent = stub.asks().back().memorySent;
                 stub.sendHeldReply();
                 const bool oldDrawn = pumpUntil(
                     [&] {
@@ -872,9 +1152,35 @@ bool runPhase(const PhaseName& which) {
                     3000);
                 check(heldOnTimeline && stub.onTimelineRequests() == onTimelineBefore,
                       "the request in flight across the restart was asked on the old daemon's timeline");
-                check(oldDrawn && drawingCleanly(scene) && scene.semaphoreImports() == semaphores0,
-                      "and its value is drawn on the old daemon's timeline, with no import (" + describe(scene) + ", " +
-                          std::to_string(scene.semaphoreImports() - semaphores0) + " import(s))");
+                check(oldDrawn && drawingCleanly(scene) && scene.semaphoreImports() == semaphores0 &&
+                          scene.pictures() == pictures0 + 1 && scene.reused() == reused0 + 1 &&
+                          scene.imports() == imports0 && scene.lost() == lost0,
+                      "and its value is drawn on the old daemon's timeline, through the held import (" + describe(scene) +
+                          ", " + std::to_string(scene.semaphoreImports() - semaphores0) + " semaphore import(s), " +
+                          std::to_string(scene.reused() - reused0) + " reuse(s), " +
+                          std::to_string(scene.imports() - imports0) + " import(s), " +
+                          std::to_string(scene.lost() - lost0) + " lost; memory " + (memorySent ? "sent" : "left out") +
+                          ")");
+                // CONTROL: `m_fetch = Fetch::Idle;` added before the `fetchFrame(0)` that ends the
+                //       DaemonWatch::replaced handler (backend/kde/wallpaperx_item.cpp), so the fetch is not
+                //       queued behind the reply out -> "FAIL: nothing was asked of the new daemon before the
+                //       old daemon's reply landed (1 request(s))". Via control_batch.sh, re-run 2026-10-06.
+                //       Reverted.
+                check(askedOfB == 0, "nothing was asked of the new daemon before the old daemon's reply landed (" +
+                                         std::to_string(askedOfB) + " request(s))");
+                // The staging this entry claims, which the plugin's declaring decides: a fetch naming
+                // nothing would bring the memory and turn restart into restart-memory.
+                // CONTROL: `if (m_declareNoImports) return declared;` made `return declared;` in
+                //       WallpaperXItem::importsToDeclare (backend/kde/wallpaperx_item.cpp) -> "FAIL: the late
+                //       reply left out the memory, as this entry stages it". Via control_batch.sh, re-run
+                //       2026-10-06. Reverted.
+                check(memorySent == (phase == Phase::RestartMemory),
+                      std::string("the late reply ") + (phase == Phase::RestartMemory ? "carried" : "left out") +
+                          " the memory, as this entry stages it");
+                pumpFor(100);
+                check(coveringLate() == 0 && stubB.releases().empty(),
+                      "and nothing is released to either daemon for it (" + std::to_string(coveringLate()) +
+                          " covering it to the old, " + std::to_string(stubB.releases().size()) + " to the new)");
                 // Every binary acquire the new daemon sent is in the count, the held first one included.
                 const quint64 semaphores1 = scene.semaphoreImports();
                 const int binaryB0 = 0;
@@ -888,6 +1194,13 @@ bool runPhase(const PhaseName& which) {
                         },
                         3000) ||
                     !settleQuiet(scene, stubB)) {
+                    // GOAL: S15.317 -- after a replaced daemon's late reply is drawn, the new daemon's
+                    //       pictures, numbered from 1, are drawn: the late reply's generation counts in
+                    //       the old daemon's numbering and is not written back as the screen's.
+                    // CONTROL: `replaced ? 0 : ` deleted from the generation in
+                    //       WallpaperXItem::takeFrameReply (backend/kde/wallpaperx_item.cpp) -> "FAIL: the
+                    //       item draws the new daemon's first picture and goes quiet (frame shown: yes,
+                    //       reason [])". Via control_batch.sh, re-run 2026-10-06 on the NVIDIA entry. Reverted.
                     check(false, "the item draws the new daemon's first picture and goes quiet (" + describe(scene) + ")");
                     return true;
                 }
@@ -905,9 +1218,77 @@ bool runPhase(const PhaseName& which) {
                 check(!steadyB.stalled && stubB.valuesSent() - valuesB == 8 && drawingCleanly(scene),
                       "the new daemon's pictures keep coming as values and are drawn (" +
                           std::to_string(stubB.valuesSent() - valuesB) + " of 8; " + describe(scene) + ")");
-                busB.unregisterObject(QString::fromUtf8(kPath));
-                (void)busB.unregisterService(QString::fromUtf8(kService));
-                QDBusConnection::disconnectFromBus(QStringLiteral("wallpaperx-timeline-b"));
+
+                // GOAL: S13.221 through the replacement -- the late reply's claim is never released,
+                //       even once the new daemon's pictures have replaced it and its import has ended:
+                //       nothing to the old daemon covers it, and nothing to the new names a number the new
+                //       daemon never issued, which a claim credited to the wrong daemon would.
+                // WHY-THIS-SHAPE: read after the new daemon's pictures have been drawn and their fences
+                //       passed, which is when the late import can end; the at-reply check above samples a
+                //       moment before that. The old daemon numbers its hand-overs from 501, above any the
+                //       new one reaches here, so a release naming one at the new daemon is that claim.
+                // CONTROL: in WallpaperXItem::fetchFrame's reply handler (backend/kde/wallpaperx_item.cpp),
+                //       `BufferClaims::instance().currentDaemon()` passed to takeFrameReply instead of `asked`,
+                //       crediting the late reply to the new daemon -> "FAIL: and the late reply is never
+                //       released, after the new daemon's pictures replaced it either (0 covering it to the old,
+                //       1 naming an unissued number to the new)", the at-reply lines above red beside it. Via
+                //       control_batch.sh, 2026-10-06. Reverted. Deleting only the `daemon ==
+                //       m_daemon.lifetime &&` term in BufferClaims::take leaves this green: the late claim
+                //       still carries the old lifetime, and BufferClaims::giveBack refuses it on that.
+                pumpFor(100);
+                const auto unissuedAtB = std::count_if(
+                    stubB.releases().begin(), stubB.releases().end(),
+                    [&stubB](const ExportingStub::Release& r) { return r.handover > stubB.lastHandover(); });
+                check(coveringLate() == 0 && unissuedAtB == 0,
+                      "and the late reply is never released, after the new daemon's pictures replaced it either (" +
+                          std::to_string(coveringLate()) + " covering it to the old, " + std::to_string(unissuedAtB) +
+                          " naming an unissued number to the new)");
+                return true;
+            }
+
+            case Phase::RetryReplaced: {
+                // GOAL: S15.348's sibling -- a "not now" answer to GetAcquireTimeline delays asking only the
+                //       daemon that gave it: when that daemon is replaced, the new one is asked for its
+                //       timeline at once, not when the old answer's retry delay would have ended.
+                // WHY-THIS-SHAPE: "at once" is graded as "before the old retry delay could have ended",
+                //       both asks stamped by the stubs and compared on one monotonic clock: the delay is
+                //       a floor (now must pass the retry time), so an item still honouring it cannot ask
+                //       sooner. A replacement that itself took most of the delay leaves no margin and is
+                //       reported not verified.
+                // CONTROL: `if (g_timeline.owner != daemon) return false;` deleted from
+                //       timelineSettledLocked (backend/kde/wallpaperx_item.cpp) -> "FAIL: a daemon that
+                //       replaced one that refused the timeline for now is asked at once (asked -1 ms after the
+                //       refusal, replaced at 301 ms)". Via control_batch.sh, 2026-10-06. Reverted.
+                const Drive toAsk = drive(scene, stub, bus, 20, [&] { return stub.timelineAsks() > 0; }, 60);
+                if (toAsk.stalled || stub.timelineAsks() != 1) {
+                    check(false, "the item asks the first daemon for its acquire timeline (" +
+                                     std::to_string(stub.timelineAsks()) + " ask(s))");
+                    return true;
+                }
+                const qint64 refusedAt = stub.clockReferenceMs() + stub.timelineAskTimesMs().front();
+                SuccessorDaemon successor(device, ring);
+                if (!successor.takeNameFrom(bus)) {
+                    wallpaperx::testing::harnessFailure("the second stub daemon never became the name's owner");
+                    return true;
+                }
+                QElapsedTimer now;
+                now.start();
+                const qint64 replacedAt = now.msecsSinceReference();
+                constexpr qint64 kExpectedRetryMs = 2000;  // mirrored from the plugin's kRefusedRetryMs
+                if (replacedAt - refusedAt > kExpectedRetryMs - 500) {
+                    notVerified("S15.348's timeline half", "the replacement ended " + std::to_string(replacedAt - refusedAt) +
+                                                               " ms after the refusal, leaving the retry delay no margin");
+                    return true;
+                }
+                const Drive toB = drive(scene, successor.stub, successor.bus, 10,
+                                        [&] { return successor.stub.timelineAsks() > 0; });
+                const qint64 askedB = successor.stub.timelineAsks() > 0
+                                          ? successor.stub.clockReferenceMs() + successor.stub.timelineAskTimesMs().front()
+                                          : -1;
+                check(!toB.stalled && askedB >= 0 && askedB - refusedAt < kExpectedRetryMs,
+                      "a daemon that replaced one that refused the timeline for now is asked at once (asked " +
+                          std::to_string(askedB >= 0 ? askedB - refusedAt : -1) + " ms after the refusal, replaced at " +
+                          std::to_string(replacedAt - refusedAt) + " ms)");
                 return true;
             }
 
@@ -1049,6 +1430,10 @@ bool runPhase(const PhaseName& which) {
                     return true;
                 }
 
+                // With the memory, though the request named the image: left out, the picture is a lost
+                // import -- the node it named stayed with the first window -- and is asked again
+                // declaring nothing, so the path that draws without the hand-over is never reached.
+                stub.sendMemory(ExportingStub::Memory::Always);
                 stub.holdEveryReply(true);
                 const int onTimeline0 = stub.onTimelineRequests();
                 announce(bus, stub.nextGeneration());
@@ -1111,6 +1496,8 @@ bool runPhase(const PhaseName& which) {
 
 int main(int argc, char** argv) {
     wallpaperx::testing::g_testName = "item_timeline_test";
+    // X.34: nothing owned or sent off the private bus.
+    if (const std::optional<int> refused = wallpaperx::testing::refuseOffPrivateTestBus()) return *refused;
     wallpaperx::testing::registerFrameReplyTypes();
     QGuiApplication app(argc, argv);
     QQuickWindow::setGraphicsApi(QSGRendererInterface::OpenGL);

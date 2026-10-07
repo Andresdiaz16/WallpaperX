@@ -37,4 +37,10 @@ inline constexpr std::size_t kFullConsumers = 2;
 // arithmetic stops paying: each one costs ~8 MB per monitor at 1080p.
 inline constexpr std::uint32_t kTargetDepth = 1 + static_cast<std::uint32_t>(kFullConsumers * kMaxHeldPerClient);
 
+// The most images one GetFrame request may say it can still draw. Bounds what a peer can make the
+// daemon read per request; a consumer keeping one import per image of a ring, plus the one it is
+// drawing from a ring rebuilt since, fits under it.
+inline constexpr std::size_t kMaxKnownBuffers = 8;
+static_assert(kMaxKnownBuffers > kTargetDepth);
+
 }  // namespace wallpaperx

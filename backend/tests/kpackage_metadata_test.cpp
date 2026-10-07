@@ -897,6 +897,46 @@ void runIdentifierAgreementChecks() {
         std::fprintf(stderr, "  S9.3's activation-id comparison withheld: metadata.json's KPlugin.Id "
                              "could not be read\n");
     }
+
+    // GOAL: S9.3's build arm as CMake evaluated it -- this tree's install script installs the
+    //       package directory to share/plasma/<kInstallRoot>/<KPlugin.Id>. False for a rule the
+    //       source text shows but no configuration reaches (inside if(FALSE), or a guard this tree
+    //       does not satisfy), which the source-text reader above grades as live.
+    // WHY-THIS-SHAPE: read from the cmake_install.cmake the build generated (WALLPAPERX_INSTALL_SCRIPT),
+    //       which holds only the rules that were evaluated; a CMake evaluator in this file would
+    //       be a second CMake. The arm is graded only on trees that build the plugin: one built
+    //       without it rightly installs no package, and the trees this entry exists for (the CI
+    //       runner, the sanitizer tree) are built so, so a skip there would hide every other arm.
+    // CONTROL: in backend/CMakeLists.txt the plasma_install_package(...) line wrapped in
+    //       `if(FALSE)` / `endif()`, via control_run.sh on /tmp/wpx-coder/build-kde, 2026-10-05 ->
+    //       "FAIL: this tree's evaluated install script installs the package under its KPlugin.Id
+    //       (0 matching rule(s) ...)", while the source-text checks above stayed green. Reverted.
+    if (WALLPAPERX_KDE_PLUGIN_BUILT == 0) {
+        std::fprintf(stderr, "  S9.3's evaluated install rule not applicable: this tree is configured without the "
+                             "KDE plugin, so its install script rightly holds no package rule\n");
+    } else if (!metadataId) {
+        std::fprintf(stderr, "  S9.3's evaluated install rule withheld: metadata.json's KPlugin.Id could not be read\n");
+    } else if (const std::optional<std::string> script = readFile(WALLPAPERX_INSTALL_SCRIPT); !script) {
+        notVerified("S9.3's evaluated install rule", std::string("the install script ") + WALLPAPERX_INSTALL_SCRIPT +
+                                                         " could not be read");
+    } else {
+        const std::string destination = "/share/plasma/" + std::string(kInstallRoot) + "/" + *metadataId + "\"";
+        const std::string files = "FILES \"" + g_packageDir.lexically_normal().string() + "/\"";
+        int matching = 0;
+        for (size_t at = 0; at < script->size();) {
+            const size_t eol = std::min(script->find('\n', at), script->size());
+            const std::string_view line(script->data() + at, eol - at);
+            if (line.find("file(INSTALL DESTINATION \"") != std::string_view::npos &&
+                line.find(destination) != std::string_view::npos && line.find(files) != std::string_view::npos) {
+                ++matching;
+            }
+            at = eol + 1;
+        }
+        check(matching == 1, ("this tree's evaluated install script installs the package under its KPlugin.Id (" +
+                              std::to_string(matching) + " matching rule(s) for " + destination + " in " +
+                              WALLPAPERX_INSTALL_SCRIPT + ")")
+                                 .c_str());
+    }
 }
 
 // S9.4

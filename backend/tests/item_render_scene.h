@@ -8,6 +8,7 @@
 // and item_timeline_test, which grade the same item on the same drive; two copies of the drive
 // would be two definitions of "one picture drawn".
 
+#include "tests/gl_import_harness.h"
 #include "tests/item_stub_scene.h"
 
 #include <QCoreApplication>
@@ -49,6 +50,7 @@ Item {
     property var boundImports: renderer.importCount
     property var boundReused: renderer.reusedImportCount
     property var boundSemaphores: renderer.semaphoreImportCount
+    property var boundLost: renderer.lostImportCount
     property int reasonSignals: 0
     property int frameShownSignals: 0
 
@@ -88,6 +90,7 @@ struct Scene {
     quint64 reused() const { return item->property("reusedImportCount").toULongLong(); }
     quint64 pictures() const { return imports() + reused(); }
     quint64 semaphoreImports() const { return item->property("semaphoreImportCount").toULongLong(); }
+    quint64 lost() const { return item->property("lostImportCount").toULongLong(); }
     QString reason() const { return root->property("publishedReason").toString(); }
 };
 
@@ -141,6 +144,56 @@ inline bool drawNext(Scene& scene, ExportingStub& stub, QDBusConnection& bus) {
             return scene.pictures() > before;
         },
         5000);
+}
+
+// Runs passes until `drawn()` is true, copying the item's texture after each pass into `copy` (made
+// on first use): glCopyImageSubData, which GL orders after any wait the item queued in that pass and
+// after nothing else. Flushed, never read here: reading would make this thread wait on the GPU, which
+// may itself be waiting on a signal only this thread can send. The import's channel swizzle goes
+// with the copy, since it copies raw texels. False at the bound, or when no copy could be made.
+inline bool copyWhileDrawing(Scene& scene, const std::function<bool()>& drawn, GLuint& copy) {
+    using CopyFn = void (*)(GLuint, GLenum, GLint, GLint, GLint, GLint, GLuint, GLenum, GLint, GLint, GLint, GLint,
+                            GLsizei, GLsizei, GLsizei);
+    const auto copyImage = reinterpret_cast<CopyFn>(eglGetProcAddress("glCopyImageSubData"));
+    if (copyImage == nullptr) return false;
+    const auto take = [&] {
+        const GLuint source = nativeName(itemTexture(scene.item));
+        if (source == 0) return;
+        if (copy == 0) {
+            GLint swizzle[4] = {GL_RED, GL_GREEN, GL_BLUE, GL_ALPHA};
+            glBindTexture(GL_TEXTURE_2D, source);
+            glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_RGBA, swizzle);
+            glGenTextures(1, &copy);
+            glBindTexture(GL_TEXTURE_2D, copy);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, kWidth, kHeight, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+            // Complete with one level, or glCopyImageSubData refuses it.
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+            glTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_RGBA, swizzle);
+            glBindTexture(GL_TEXTURE_2D, 0);
+        }
+        copyImage(source, GL_TEXTURE_2D, 0, 0, 0, 0, copy, GL_TEXTURE_2D, 0, 0, 0, 0, kWidth, kHeight, 1);
+        glFlush();
+    };
+    const bool done = pumpUntil(
+        [&] {
+            scene.renderPass(take);
+            pumpFor(20);
+            return drawn();
+        },
+        5000);
+    return done && copy != 0;
+}
+
+// Reads back what copyWhileDrawing() took, and deletes it.
+inline std::vector<unsigned char> readCopy(Scene& scene, GLuint& copy, std::string& why) {
+    std::vector<unsigned char> pixels;
+    scene.renderPass([&] {
+        pixels = readSampled(copy, kWidth, kHeight, why);
+        glDeleteTextures(1, &copy);
+        copy = 0;
+    });
+    return pixels;
 }
 
 // Which of a few flat colours a pixel is, or -1: the readback is compared by nearest colour rather

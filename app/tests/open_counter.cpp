@@ -36,15 +36,27 @@ void noteFolder(const char* path) {
     }
 }
 
+std::atomic<wallpaperx::apptest::OpendirHook> g_hook{nullptr};
+
 } // namespace
 
 extern "C" DIR* opendir(const char* path) {
     static const auto real = reinterpret_cast<DIR* (*)(const char*)>(::dlsym(RTLD_NEXT, "opendir"));
     noteFolder(path);
-    return real(path);
+    DIR* dir = real(path);
+    if (const auto hook = g_hook.load(); hook != nullptr) {
+        const int saved = errno;
+        hook(path, dir);
+        errno = saved;
+    }
+    return dir;
 }
 
 namespace wallpaperx::apptest {
+
+void setOpendirHook(OpendirHook hook) {
+    g_hook.store(hook);
+}
 
 OpenCounter::OpenCounter(const QString& directory) {
     const QByteArray path = QFile::encodeName(QDir::cleanPath(QDir(directory).absolutePath()));

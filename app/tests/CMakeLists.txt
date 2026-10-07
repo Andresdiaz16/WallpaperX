@@ -70,6 +70,9 @@ endfunction()
 # S15.1-S15.5, S15.21, S15.22, S15.25: the reply parser and the EDID reader. Uses no bus.
 qt_add_executable(wallpaperx-kscreen-config-test kscreen_config_test.cpp ${WALLPAPERX_APP_KDE_SOURCES})
 wallpaperx_app_test_target(wallpaperx-kscreen-config-test)
+# S15.335: a double converted out of int's range ends the run with the sanitizer's report.
+target_compile_options(wallpaperx-kscreen-config-test PRIVATE -fsanitize=float-cast-overflow -fno-sanitize-recover=float-cast-overflow)
+target_link_options(wallpaperx-kscreen-config-test PRIVATE -fsanitize=float-cast-overflow)
 wallpaperx_add_test(NAME app_kscreen_config COMMAND wallpaperx-kscreen-config-test)
 set_tests_properties(app_kscreen_config PROPERTIES LABELS "novulkan" SKIP_RETURN_CODE 77 TIMEOUT 60)
 

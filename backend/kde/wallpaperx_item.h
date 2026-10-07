@@ -16,6 +16,8 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <string>
+#include <vector>
 
 class QDBusMessage;
 
@@ -26,7 +28,7 @@ namespace wallpaperx {
 // Three threads meet here and the split is the whole design:
 //
 //   * the GUI thread constructs this, owns the DBus proxy, and receives FrameReady;
-//   * GetFrameFd is asked ASYNCHRONOUSLY and its reply arrives back on the GUI thread. Not a
+//   * GetFrame is asked ASYNCHRONOUSLY and its reply arrives back on the GUI thread. Not a
 //     preference: a blocking call parks the thread running the compositor's UI, and the first
 //     fetch happens while QML is still building this item, where the nested event loop such a
 //     call needs never runs -- measured, it never returned and the item drew nothing;
@@ -39,6 +41,12 @@ namespace wallpaperx {
 // costs only the daemon's acquire and a change of which texture the node samples. Only for a
 // picture that brings that acquire: waiting on it is the one thing that tells the driver the
 // memory holds something else now, so a picture arriving without one is imported afresh.
+//
+// Each fetch tells the daemon which images the node can draw that way, and the daemon then leaves
+// their memory out of the reply. Told per fetch and never left for the daemon to remember: the
+// node drops imports on its own -- a trim, a teardown, a failed hand-over -- and a reply can cross
+// one. A reply naming an import the node no longer has is drawn by no one; the next fetch claims
+// nothing, so it brings the memory.
 //
 // The acquire comes one of two ways, chosen by each fetch: a value on the daemon's acquire
 // timeline, imported once per node, when this item can wait on it; a new binary semaphore per
@@ -80,6 +88,7 @@ class WallpaperXItem : public QQuickItem {
     Q_PROPERTY(quint64 importCount READ importCount NOTIFY importCountsChanged)
     Q_PROPERTY(quint64 reusedImportCount READ reusedImportCount NOTIFY importCountsChanged)
     Q_PROPERTY(quint64 semaphoreImportCount READ semaphoreImportCount NOTIFY importCountsChanged)
+    Q_PROPERTY(quint64 lostImportCount READ lostImportCount NOTIFY importCountsChanged)
 
 public:
     explicit WallpaperXItem(QQuickItem* parent = nullptr);
@@ -105,13 +114,15 @@ public:
         quint64 value = 0;
     };
 
-    // How many fields GetFrameFd declares. A reply with fewer is not ours, and reading past the
+    // How many fields GetFrame declares. A reply with fewer is not ours, and reading past the
     // end of one is a crash inside the compositor -- which is why this is a named constant and
     // a predicate rather than a literal buried in the parse.
-    static constexpr int kFrameReplyFields = 12;
+    static constexpr int kFrameReplyFields = 14;
 
-    // acquire_value, the first field past those, which only GetFrameFdOnTimeline's reply carries.
+    static constexpr int kBufferIdField = 11;
     static constexpr int kAcquireValueField = 12;
+    // handover, the last of them: what a release of this reply's image names.
+    static constexpr int kHandoverField = 13;
 
     // Whether a reply carries enough fields to be read. A newer daemon may send MORE, which is
     // fine; fewer is not.
@@ -151,6 +162,11 @@ public:
     // an exposure -- on NVIDIA one failed import leaves every later one in the context failing.
     quint64 semaphoreImportCount() const { return m_semaphoreImportCount.load(std::memory_order_relaxed); }
 
+    // Pictures that arrived without memory for an import this item had dropped after naming it in
+    // the request. Each is asked for again once, naming nothing, unless the screen or the daemon
+    // changed meanwhile.
+    quint64 lostImportCount() const { return m_lostImportCount.load(std::memory_order_relaxed); }
+
 signals:
     void monitorIdChanged();
     void outputChanged();
@@ -178,10 +194,11 @@ private slots:
 private:
     // A frame fetched but not yet imported. Owns its fd until the render thread takes it: if
     // this is destroyed with one still in it, the fd is closed here rather than leaked, since a
-    // leak of one fd per frame ends a login session.
+    // leak of one fd per frame ends a login session. request.fd is -1 when the daemon left the
+    // memory out because the fetch named this image as one the node can draw.
     //
     // It owns the daemon's claim on the image the same way, and for the same reason: the daemon
-    // records the hold when it answers GetFrameFd, so every path that drops the frame without
+    // records the hold when it answers GetFrame, so every path that drops the frame without
     // importing it owes a release. A picture that reaches the screen moves the claim to the node.
     struct PendingFrame {
         FrameImport::Request request;
@@ -190,10 +207,9 @@ private:
         // Where the claim is registered, so dropping this frame gives the image back only if the
         // item has not already done so on its way off the screen.
         std::shared_ptr<ClaimSet> claims;
-        // The daemon that sent the reply, by unique name, and where its claim is released: for a
-        // request for a value the name it was addressed to (see fetchFrame()), otherwise the owner
-        // as known when the reply was read. A value waited on another daemon's timeline never
-        // completes, so only the first is exact enough to pair with one.
+        // The unique name of the daemon that sent the reply, which the request was addressed to. A
+        // value waited on another daemon's timeline never completes, so a value is only ever paired
+        // with this.
         std::string sender;
 
         PendingFrame() = default;
@@ -209,30 +225,53 @@ private:
     bool subscribeToFrameReady();
     // Installs the ImportModifiersChanged match rule. False when the bus refused it.
     bool subscribeToImportModifiersChanged();
+    // What becomes of a picture that has arrived and not yet been drawn. Kept across a change of
+    // daemon -- it is still this screen's, from the daemon it was asked of -- and dropped with a
+    // change of monitor or on leaving the screen.
+    enum class Undrawn { Keep, Drop };
     // Drops every generation mark and the frame they describe. See the definition for why they go
     // as a set. discardHeldFrame() is the same without publishing, for the paths that must not.
-    void discardHeldFrame();
-    void forgetGenerations();
+    void discardHeldFrame(Undrawn undrawn);
+    void forgetGenerations(Undrawn undrawn);
     void fetchFrame(quint64 generation);
+    // Owes a fetch of `generation` for when the latch opens: the highest announced, or 0, which
+    // forces and stays forced.
+    void queueFetch(quint64 generation);
     // Asks only when this item neither holds a reply nor has a request out. The scene-change
     // caller's question, which fetchFrame(0) cannot express because 0 forces.
     void ensureFrameRequested();
-    // Whether the next fetch may ask for a value on the acquire timeline rather than sync_fds: this
-    // process holds the current daemon's timeline, and this item's context can wait on it and has
-    // not refused it. Decided per fetch, so any doubt costs one picture's binary semaphore rather
-    // than a value nothing can wait on. GUI thread.
-    bool fetchOnTimeline();
+    // Whether the next fetch, to `daemon`, may ask for a value on the acquire timeline rather than
+    // sync_fds: this process holds that daemon's timeline, and this item's context can wait on it
+    // and has not refused it. Decided per fetch, so any doubt costs one picture's binary semaphore
+    // rather than a value nothing can wait on. GUI thread.
+    bool fetchOnTimeline(const BufferClaims::Daemon& daemon);
+    // The images whose memory the next fetch, to `daemon`, need not be sent: the node's imports
+    // from that daemon for this monitor, at most kMaxKnownBuffers. Empty when the fetch must bring
+    // the memory. GUI thread.
+    std::vector<quint64> importsToDeclare(const BufferClaims::Daemon& daemon);
     // The reply half of fetchFrame, on the GUI thread once the bus answers. `monitorId` is the
-    // monitor the request named, which is what the claim must be recorded against; `sender` is
-    // PendingFrame::sender; `askedForValue`, whether the request was GetFrameFdOnTimeline.
-    void takeFrameReply(int monitorId, const QDBusMessage& call, const std::string& sender, bool askedForValue);
+    // monitor the request named, which is what the claim must be recorded against; `from`, the
+    // daemon the request was addressed to and the lifetime it was asked in; `askedForValue`, whether the
+    // request asked for a value on the acquire timeline; `declared`, the images it said the node
+    // can draw.
+    void takeFrameReply(int monitorId, const QDBusMessage& call, const BufferClaims::Daemon& from,
+                        bool askedForValue, const std::vector<quint64>& declared);
     // The same reply when this item has moved to another monitor since asking: the hold the
-    // daemon recorded is given straight back, because nothing else ends it.
-    static void releaseFrameReply(int monitorId, const QDBusMessage& call, const std::string& sender);
-    // Which image a reply granted, 0 for one that granted none.
-    static quint64 grantedBufferId(const QDBusMessage& call);
+    // daemon recorded is given straight back, because nothing else ends it. `daemon` is the
+    // lifetime the request was asked in.
+    static void releaseFrameReply(int monitorId, const QDBusMessage& call, quint64 daemon);
+    // Whether the generation marks were invalidated since m_generationEpoch read `epoch`. GUI thread.
+    bool marksMovedSince(quint64 epoch);
+    // Records the hand-over a reply made for `monitorId` in the lifetime `daemon`: an unheld claim
+    // for a reply that granted none. Every reply goes through this, in arrival order.
+    static BufferClaims::Claim takeGranted(int monitorId, const QDBusMessage& call, quint64 daemon);
     // Asks again after a refusal, while this item has nothing on screen. GUI thread.
     void retryWhileNothingIsShown();
+    // Ends the wait after a TooManyDescriptors refusal. GUI thread.
+    void reopenFetchAfterBackoff();
+    // A frame served, a new daemon, or the item leaving the screen: the next refusal of either kind
+    // waits the first, shortest time again. GUI thread.
+    void endRefusalRuns();
     // Tells the daemon which dma_buf layouts this driver can import, so it stops choosing ones
     // this process cannot take. Render thread; sends from the GUI thread. Once per process.
     void reportImportModifiersOnce(quint32 drmFormat);
@@ -346,6 +385,7 @@ private:
     std::atomic<quint64> m_importCount{0};
     std::atomic<quint64> m_reusedImportCount{0};
     std::atomic<quint64> m_semaphoreImportCount{0};
+    std::atomic<quint64> m_lostImportCount{0};
     // Hand-overs that failed since a picture last reached the screen. What separates a blip, which
     // must not take a wallpaper off the screen, from a producer hand-over that has stopped working,
     // which has to say so. On the item rather than on the node, so a node rebuilt for an unrelated
@@ -363,12 +403,34 @@ private:
     // The generation a failed import already asked for again, so an unimportable frame is
     // retried once rather than forever.
     quint64 m_retriedGeneration = 0;
-    // A GetFrameFd is out, and the highest generation announced while it was. GUI thread only.
-    bool m_fetchInFlight = false;
+    // Whether a GetFrame is out or its TooManyDescriptors refusal is being waited out, and the
+    // fetch owed when that ends: the refused one and what was announced meanwhile. No fetch is
+    // sent in either. Only Asking has a reply to
+    // come, which may name an import of a daemon or monitor this item has since left. GUI thread
+    // only.
+    enum class Fetch { Idle, Asking, BackingOff };
+    Fetch m_fetch = Fetch::Idle;
     std::optional<quint64> m_queuedFetch;
-    // A retry after a refusal is armed. One at a time, so a refusal answered by another refusal
-    // cannot compound into a growing number of timers. GUI thread only.
-    bool m_retryQueued = false;
+    // Running exactly while m_fetch is BackingOff. A member, not a single shot, so a change of
+    // daemon can end the backoff: the refusal was the old daemon's, and the new one counts from zero.
+    QTimer m_backoffTimer;
+    // The daemon lifetime of a GetFrame that outlived its patience and has not been answered, or 0.
+    // Nothing more is asked of that lifetime until it answers or is replaced: a daemon that has
+    // stopped answering would otherwise collect one more pending call per fetch.
+    quint64 m_unansweredLifetime = 0;
+    // The next GetFrame sent names no imports, because a reply to one that did found the import it
+    // named gone. Cleared when that fetch is sent, so a daemon leaving the memory out of its reply
+    // too is a protocol violation and not a reason to ask again. GUI thread only.
+    bool m_declareNoImports = false;
+    // The retry after a NoFreeImage refusal. One at a time, so a refusal answered by another refusal
+    // cannot compound into a growing number of timers; stopped when the item leaves the screen or
+    // the daemon is replaced, so one armed before cannot set the first wait after. GUI thread only.
+    QTimer m_noImageRetryTimer;
+    // The refusals of each kind in the current run, which double the wait after the next one. Kept
+    // apart because their causes are unrelated: a busy image ring, and this process holding too many
+    // descriptors. Every run ends in endRefusalRuns(). GUI thread only.
+    int m_noImageRefusals = 0;
+    int m_descriptorRefusals = 0;
     // Whether FrameReady is subscribed. Without it no wallpaper change is ever heard, which no
     // single frame's success can retire.
     bool m_subscribed = false;
@@ -393,10 +455,12 @@ private:
     // pending and disagree.
     //
     //   ForgetStaleImports  the marks these imports were fetched against stopped meaning anything
-    //                       -- a daemon replaced, a monitor changed -- so none of them can be
-    //                       handed over again. The picture on the screen stays: it is still a
-    //                       picture, and blanking the desktop until a replacement daemon produces
-    //                       one costs more than the memory does.
+    //                       -- a daemon replaced, a monitor changed -- and no reply asked before
+    //                       that is still to come, so none of them can be handed over again. Acted
+    //                       on after the pass's picture, which may be that last reply's. The
+    //                       picture on the screen stays: it is still a picture, and blanking the
+    //                       desktop until a replacement daemon produces one costs more than the
+    //                       memory does.
     //   Destroy             the image being shown has been given back, so it must stop being
     //                       sampled at all. Outranks the other, whichever was asked for first.
     enum class NodeRequest { None, ForgetStaleImports, Destroy };
@@ -410,6 +474,16 @@ private:
     // this item failed to import or wait on, which it asks for sync_fds from then on.
     bool m_contextWaitsOnTimeline = false;  // guarded by m_importedMutex
     std::string m_timelineRefusedBy;        // guarded by m_importedMutex
+    // The images the node holds an import of and can draw again, as the render thread last found
+    // them, for the GUI thread to declare in the next fetch. Empty whenever the node could not reuse
+    // one -- no node, or a context that cannot wait on the daemon's acquire. Each names the daemon
+    // lifetime and monitor it belongs to, which only the GUI thread can compare with the current.
+    struct KnownImport {
+        quint64 daemon = 0;
+        int monitorId = -1;
+        quint64 bufferId = 0;
+    };
+    std::vector<KnownImport> m_knownImports;  // guarded by m_importedMutex
     QString m_renderReason;         // guarded by m_importedMutex
 };
 

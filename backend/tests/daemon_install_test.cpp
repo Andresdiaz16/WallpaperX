@@ -25,6 +25,7 @@ std::string g_installedDaemon;
 #include "tests/client/scratch_dir.h"
 #include "tests/name_watcher.h"
 #include "tests/spawned_daemon.h"
+#include "tests/test_phase.h"
 #include "tests/test_report.h"
 
 #include <sdbus-c++/sdbus-c++.h>
@@ -1054,15 +1055,7 @@ void checkMissingShaderLine(NameWatcher& names, const fs::path& root, const fs::
     if (lines != 1) std::fprintf(stderr, "  %zu such lines on stderr\n", lines);
 }
 
-// One phase, with its own catch: an unexpected throw is reported against it, and the phases after
-// it still run.
-void runPhase(const char* name, const std::function<void()>& phase) {
-    try {
-        phase();
-    } catch (const std::exception& e) {
-        check(false, (std::string(name) + ": unexpected exception: " + e.what()).c_str());
-    }
-}
+using wallpaperx::testing::guardedPhase;
 
 }  // namespace
 
@@ -1095,15 +1088,15 @@ int main() {
             notVerified("every goal in this file", "a scratch directory could not be created");
             return wallpaperx::testing::reportNotVerifiedOrPassed();
         }
-        runPhase("plain install", [&] { checkPlainInstall(root.path()); });
-        runPhase("DESTDIR", [&] { checkDestdir(root.path()); });
-        runPhase("umask", [&] { checkUnitModeUnderUmask(root.path()); });
-        runPhase("odd prefixes", [&] { checkOddPrefixes(root.path()); });
-        runPhase("refused prefixes", [&] { checkRefusedPrefixes(root.path()); });
-        runPhase("absolute bin directory", [&] { checkAbsoluteBindir(root.path()); });
+        guardedPhase("plain install", [&] { checkPlainInstall(root.path()); });
+        guardedPhase("DESTDIR", [&] { checkDestdir(root.path()); });
+        guardedPhase("umask", [&] { checkUnitModeUnderUmask(root.path()); });
+        guardedPhase("odd prefixes", [&] { checkOddPrefixes(root.path()); });
+        guardedPhase("refused prefixes", [&] { checkRefusedPrefixes(root.path()); });
+        guardedPhase("absolute bin directory", [&] { checkAbsoluteBindir(root.path()); });
         NameWatcher names;
-        runPhase("linked prefixes", [&] { checkSymlinkedPrefixes(names, root.path()); });
-        runPhase("relative prefix", [&] { checkRelativePrefix(names, root.path()); });
+        guardedPhase("linked prefixes", [&] { checkSymlinkedPrefixes(names, root.path()); });
+        guardedPhase("relative prefix", [&] { checkRelativePrefix(names, root.path()); });
     } catch (const std::exception& e) {
         check(false, (std::string("unexpected exception: ") + e.what()).c_str());
     }

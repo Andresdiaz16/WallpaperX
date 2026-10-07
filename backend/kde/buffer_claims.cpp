@@ -19,35 +19,58 @@ auto findEntry(Entries& entries, int monitorId, uint64_t bufferId) {
 
 }  // namespace
 
-BufferClaims::Claim BufferClaims::take(int monitorId, uint64_t bufferId, std::string owner) {
+BufferClaims::Taken BufferClaims::take(uint64_t daemon, int monitorId, uint64_t bufferId, uint64_t handover) {
     if (bufferId == 0) return {};
 
+    Taken taken{Claim{daemon, monitorId, bufferId}, std::nullopt};
     std::lock_guard<std::mutex> lock(m_mutex);
-    auto entry = findEntry(m_entries, monitorId, bufferId);
-    if (entry == m_entries.end()) {
-        m_entries.push_back(Entry{monitorId, bufferId, 1});
-    } else {
-        ++entry->imports;
+    if (daemon == m_daemon.lifetime && !m_daemon.owner.empty()) {
+        auto entry = findEntry(m_entries, monitorId, bufferId);
+        if (entry == m_entries.end()) {
+            m_entries.push_back(Entry{monitorId, bufferId, 1, handover});
+        } else {
+            ++entry->imports;
+            // 0 is a reply that recorded no hand-over, and names nothing a release could.
+            if (entry->newest != 0 && entry->newest < handover) {
+                taken.superseded = Release{m_daemon.owner, entry->newest};
+            }
+            entry->newest = std::max(entry->newest, handover);
+        }
     }
-    return Claim{m_daemon, monitorId, bufferId, std::move(owner)};
+    return taken;
 }
 
-bool BufferClaims::giveBack(const Claim& claim) {
-    if (!claim.held()) return false;
+std::optional<BufferClaims::Release> BufferClaims::giveBack(const Claim& claim) {
+    if (!claim.held()) return std::nullopt;
 
     std::lock_guard<std::mutex> lock(m_mutex);
-    if (claim.daemon != m_daemon) return false;
+    if (claim.daemon != m_daemon.lifetime) return std::nullopt;
     auto entry = findEntry(m_entries, claim.monitorId, claim.bufferId);
-    if (entry == m_entries.end()) return false;
-    if (--entry->imports > 0) return false;
+    if (entry == m_entries.end()) return std::nullopt;
+    if (--entry->imports > 0) return std::nullopt;
+    const uint64_t newest = entry->newest;
     m_entries.erase(entry);
+    return Release{m_daemon.owner, newest};
+}
+
+void BufferClaims::daemonReplaced(std::string owner) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    ++m_daemon.lifetime;
+    m_daemon.owner = std::move(owner);
+    m_entries.clear();
+}
+
+bool BufferClaims::daemonNamed(std::string owner) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (m_daemon.lifetime != 0) return false;
+    m_daemon.lifetime = 1;
+    m_daemon.owner = std::move(owner);
     return true;
 }
 
-void BufferClaims::daemonReplaced() {
+BufferClaims::Daemon BufferClaims::currentDaemon() {
     std::lock_guard<std::mutex> lock(m_mutex);
-    ++m_daemon;
-    m_entries.clear();
+    return m_daemon;
 }
 
 void ClaimSet::add(const BufferClaims::Claim& claim) {
@@ -59,12 +82,7 @@ void ClaimSet::add(const BufferClaims::Claim& claim) {
 bool ClaimSet::remove(const BufferClaims::Claim& claim) {
     if (!claim.held()) return false;
     std::lock_guard<std::mutex> lock(m_mutex);
-    // The owner is not part of the identity: it is where a release is addressed, and the same
-    // image can be claimed once before this process has learned the daemon's unique name and
-    // again after.
-    const auto held = std::find_if(m_claims.begin(), m_claims.end(), [&claim](const BufferClaims::Claim& mine) {
-        return mine.daemon == claim.daemon && mine.monitorId == claim.monitorId && mine.bufferId == claim.bufferId;
-    });
+    const auto held = std::find(m_claims.begin(), m_claims.end(), claim);
     if (held == m_claims.end()) return false;
     m_claims.erase(held);
     return true;

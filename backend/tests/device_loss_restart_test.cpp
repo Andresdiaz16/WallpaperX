@@ -1128,8 +1128,8 @@ bool cameUp(NameWatcher& names, const SpawnedDaemon& daemon, const char* goals, 
 // refused (no image free yet) or failed.
 bool collectPicture(sdbus::IProxy& proxy, int32_t monitorId) {
     try {
-        const wallpaperx::testing::Frame frame = wallpaperx::testing::getFrameFd(proxy, monitorId, kPromptCall);
-        wallpaperx::testing::releaseBuffer(proxy, monitorId, frame.bufferId, kPromptCall);
+        const wallpaperx::testing::Frame frame = wallpaperx::testing::getFrame(proxy, monitorId, {.timeout = kPromptCall});
+        wallpaperx::testing::releaseFrame(proxy, monitorId, frame, kPromptCall);
         return true;
     } catch (const std::exception&) {
         return false;
@@ -1162,7 +1162,7 @@ bool playWatchedVideo(sdbus::IProxy& proxy, FrameReadyLog& frames, const std::st
 // GOAL: S14.21 -- with stdout and stderr on one destination nobody reads (a pipe, a stream socket
 //       as journald gives a unit, a terminal suspended as by Ctrl-S), the daemon answers
 //       promptly: 40 SetWallpaper calls that each log to both streams, GetStatus, and a new
-//       still drawn, announced and handed over by GetFrameFd, each within 2 s.
+//       still drawn, announced and handed over by GetFrame, each within 2 s.
 // GOAL: S14.22 -- a brief stall loses nothing: once the reader resumes, every line written during
 //       it arrives, whole, in the order written -- stdout's and stderr's interleaved as they were
 //       written, on the shared destination -- and no dropped-lines note appears.
@@ -1220,7 +1220,7 @@ void checkServesWhileStalled(NameWatcher& names, const std::string& blue, const 
     }
     const bool status = answered == kCalls && getStatus(*proxy, kPromptCall).ok();
     // The 30 s wait only guards against a hang; the bound is the elapsed time, so a draw the
-    // stall held for seconds is still a FAIL. GetFrameFd is asked of any announced frame, so its
+    // stall held for seconds is still a FAIL. GetFrame is asked of any announced frame, so its
     // line grades the hand-over alone.
     const auto drawStart = Clock::now();
     const bool announced = status &&
@@ -1231,9 +1231,9 @@ void checkServesWhileStalled(NameWatcher& names, const std::string& blue, const 
     bool served = false;
     if (announced) {
         try {
-            served = wallpaperx::testing::getFrameFd(*proxy, kMonitorRed, kPromptCall).fd.isValid();
+            served = wallpaperx::testing::getFrame(*proxy, kMonitorRed, {.timeout = kPromptCall}).fd.isValid();
         } catch (const std::exception& e) {
-            std::fprintf(stderr, "  %s: GetFrameFd: %s\n", phase.c_str(), e.what());
+            std::fprintf(stderr, "  %s: GetFrame: %s\n", phase.c_str(), e.what());
         }
     }
     const bool held = daemon.captureStillStalled();
@@ -1251,7 +1251,7 @@ void checkServesWhileStalled(NameWatcher& names, const std::string& blue, const 
     check(status, (phase + ": GetStatus is answered within 2 s").c_str());
     check(drew, (phase + ": a new still is drawn and announced within 2 s").c_str());
     if (announced && !drew) std::fprintf(stderr, "  %s: announced %.3f s after SetWallpaper\n", phase.c_str(), seconds(drawTook));
-    check(served, (phase + ": GetFrameFd hands the drawn frame over within 2 s").c_str());
+    check(served, (phase + ": GetFrame hands the drawn frame over within 2 s").c_str());
 
     const bool endArrived = sendMarker(*proxy, kCalls, kPadding, std::chrono::seconds(10)) &&
                             waitForOccurrences(daemon, markerType(kCalls, 0), 2);

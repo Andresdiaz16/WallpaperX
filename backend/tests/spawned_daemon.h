@@ -175,6 +175,13 @@ private:
 // The daemon under test, as a child process.
 // ---------------------------------------------------------------------------- //
 
+// A scratch directory the harness gives every daemon could not be made. A run probes for one
+// before it spawns anything, so this means the host lost it mid-run (a full disk, a removed
+// $TMPDIR): the host's fault, never the daemon's, and a type of its own so a caller can say so.
+struct ScratchDirectoryLost : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
 // Spawns the real wallpaperx-daemon binary with its stdout and stderr merged into one
 // pipe, and reads that pipe on a thread for the process's lifetime.
 //
@@ -238,7 +245,7 @@ public:
             // pipe2 or fork failure below throws before this object exists, so the enclosing
             // destructor never runs and the directory would be left in /tmp for good.
             m_configHome.emplace("spawn");
-            if (!m_configHome->ok()) throw std::runtime_error("scratch XDG_CONFIG_HOME could not be created");
+            if (!m_configHome->ok()) throw ScratchDirectoryLost("scratch XDG_CONFIG_HOME could not be created");
             extraEnv.push_back(m_configHome->env());
         }
         // The same for the copy the daemon takes of a config it rejects: unset, it would land
@@ -247,7 +254,7 @@ public:
         if (!stateHomeSet) {
             if (!m_configHome.has_value()) {
                 m_stateHome.emplace("spawnstate");
-                if (!m_stateHome->ok()) throw std::runtime_error("scratch XDG_STATE_HOME could not be created");
+                if (!m_stateHome->ok()) throw ScratchDirectoryLost("scratch XDG_STATE_HOME could not be created");
             }
             extraEnv.push_back(m_configHome.has_value() ? m_configHome->stateEnv() : m_stateHome->stateEnv());
         }

@@ -63,10 +63,9 @@ struct ExportedFrame {
     std::vector<ExportedFramePlane> planes;
 };
 
-// Exports target.image's backing memory as a new file descriptor. Every call
-// produces a fresh fd via a fresh vkGetMemoryFdKHR call (Vulkan's own contract
-// -- see Key Gotchas: "Reusing fd after import" in PLAN.md); the caller owns
-// the returned fd and must close() it if it isn't handed off to an importer.
+// Everything an importer needs to know about target.image's memory except the memory itself:
+// `fd` stays -1. For a consumer that already holds an import of this image, which a new
+// descriptor would only be closed by.
 //
 // Throws GpuFailure when the driver is what failed -- the export entry point missing, a
 // modifier absent from the driver's own list, a result the fd query is not permitted to
@@ -80,9 +79,16 @@ struct ExportedFrame {
 // hands out memory the graphics queue still owns.
 //
 // It does wait, though, for every submission outstanding on the device: renders do not, so
-// this is what makes the returned descriptor name bytes that have actually been drawn. A
-// receiver reading them on the host has no other ordering available, and one reading them on
-// a GPU still needs the acquire below for ownership and layout.
+// this is what makes the frame described name bytes that have actually been drawn -- whether
+// the receiver reads them through a new descriptor or an import it already holds. A receiver
+// reading them on the host has no other ordering available, and one reading them on a GPU
+// still needs the acquire below for ownership and layout.
+ExportedFrame describeFrame(Device& device, const OffscreenTarget& target);
+
+// describeFrame() with the memory exported as a new file descriptor in `fd`. Every call
+// produces a fresh fd via a fresh vkGetMemoryFdKHR call (Vulkan's own contract
+// -- see Key Gotchas: "Reusing fd after import" in PLAN.md); the caller owns
+// the returned fd and must close() it if it isn't handed off to an importer.
 ExportedFrame exportFrame(Device& device, const OffscreenTarget& target);
 
 // A descriptor the consumer waits on before it samples the frame `target` published, and which

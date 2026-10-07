@@ -14,7 +14,7 @@
 //     departure into an unbounded round of bus calls between every consumer on the session --
 //     the per-frame retry the latching design exists to prevent, arrived at by another route.
 //
-// The daemon is a stub on this run's private bus: it answers GetFrameFd with a dma_buf-typed
+// The daemon is a stub on this run's private bus: it answers GetFrame with a dma_buf-typed
 // frame, answers SetImportModifiers with an error or with success on a switch this file owns, and
 // emits ImportModifiersChanged on demand. Nothing in the plugin knows a test is running.
 //
@@ -41,6 +41,7 @@
 
 #include "kde/frame_import.h"
 #include "tests/qt_frame_reply.h"
+#include "tests/private_test_bus.h"
 #include "tests/test_report.h"
 
 #include <QCoreApplication>
@@ -128,7 +129,7 @@ constexpr int kFramesServed = 6000;
 // followed this announcement".
 constexpr int kRoundMs = 5000;
 
-// Answers GetFrameFd with a dma_buf-typed frame, and SetImportModifiers with an error or with
+// Answers GetFrame with a dma_buf-typed frame, and SetImportModifiers with an error or with
 // success. A virtual object rather than an adaptor, for item_import_failure_test's reason: the
 // reply's shape is part of what is under test, and an adaptor would put Qt's marshalling of a C++
 // signature between this file and the wire.
@@ -142,21 +143,11 @@ public:
         if (message.member() == QLatin1String("SetImportModifiers")) {
             // Recorded before the answer, so "the plugin reported" and "this stub refused" stay
             // separate verdicts.
-            const QList<QVariant> args = message.arguments();
+            wallpaperx::testing::ModifierReportArgs args = wallpaperx::testing::readModifierReport(message.arguments());
             Report report;
-            if (args.size() >= 2) {
-                report.drmFormat = args.at(0).toUInt();
-                const QDBusArgument list = args.at(1).value<QDBusArgument>();
-                list.beginArray();
-                while (!list.atEnd()) {
-                    quint64 modifier = 0;
-                    list >> modifier;
-                    report.modifiers.push_back(modifier);
-                }
-                list.endArray();
-            } else {
-                report.malformed = true;
-            }
+            report.malformed = !args.ok;
+            report.drmFormat = args.drmFormat;
+            report.modifiers = std::move(args.modifiers);
             report.refused = m_refusing;
             m_reports.push_back(std::move(report));
             if (!m_refusing) return connection.send(message.createReply());
@@ -165,7 +156,7 @@ public:
                 QStringLiteral("this stub refuses import modifier reports while it is in refusing mode")));
         }
 
-        if (message.member() != QLatin1String("GetFrameFd")) return false;
+        if (message.member() != QLatin1String("GetFrame")) return false;
 
         if (m_served >= kFramesServed) {
             // Every check here is about what the plugin does across frames, so a run that hits
@@ -199,11 +190,12 @@ public:
 
         ++m_served;
         return connection.send(message.createReply(
-            frameReplyFields(handle, kFrameWidth, kFrameHeight, memorySize, /*handleType=*/1,
+            frameReplyFields({handle}, kFrameWidth, kFrameHeight, memorySize, /*handleType=*/1,
                              /*generation=*/static_cast<quint64>(m_served), kXrgb8888, kUnpublishedModifier, planes,
                              // Not this device, and it does not have to be: a dma_buf is not
                              // device bound, and this import is expected to fail regardless.
-                             QByteArray(16, '\0'), /*bufferId=*/static_cast<quint64>(m_served))));
+                             QByteArray(16, '\0'), /*bufferId=*/static_cast<quint64>(m_served),
+                             /*handover=*/static_cast<quint64>(m_served))));
     }
 
     struct Report {
@@ -281,6 +273,8 @@ Item {
 
 int main(int argc, char** argv) {
     wallpaperx::testing::g_testName = "item_modifier_retry_test";
+    // X.34: nothing owned or sent off the private bus.
+    if (const std::optional<int> refused = wallpaperx::testing::refuseOffPrivateTestBus()) return *refused;
 
     wallpaperx::testing::registerFrameReplyTypes();
 

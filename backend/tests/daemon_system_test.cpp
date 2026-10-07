@@ -1,58 +1,23 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-// System-level test for Step 6 task 4: drives the **real daemon binary, in its own
-// process**, over a private session bus.
+// The real daemon binary, in its own process, over a private session bus. What only this can
+// see: a frame mapped by a process that never allocated it, main.cpp as a program (name
+// acquisition, a second instance refused, signals, the destructor chain), and the shipped
+// 1920x1080 geometry, which every in-process test overrides.
 //
-// Everything else in this suite links the daemon's code into the test and calls it.
-// That covers the logic but not the program: `main.cpp` -- bus-name acquisition, the
-// signal mask, the sigwait thread, the destructor chain on the way out -- has no
-// coverage at all from an in-process test, because an in-process test never runs it.
-// Three things are only observable from out here:
-//
-//   1. The frame crosses an address-space boundary. In-process, "the client mapped the
-//      exported fd" proves less than it appears to: the pages were already mapped into
-//      the same process by the exporter. Here the mapping is made by a process that
-//      never allocated the image, which is what a compositor actually does.
-//   2. The daemon is a *program*. It must acquire its name, refuse a second instance,
-//      answer while its GPU thread is busy, and exit 0 on a signal having run its
-//      destructors. None of those is visible to an in-process test.
-//   3. The shipped default geometry (1920x1080) is exercised. Every other test
-//      overrides WallpaperManager::Config to keep software-rasterised runs fast, so the
-//      size the daemon actually ships with is the one size nothing rendered.
-//
-// Run under a private bus: `dbus-run-session -- ./wallpaperx-daemon-system-test`.
-//
-// Rules this file follows, inherited from dbus_service_test:
-//
-//  - Nothing waits on a sleep for a *render*. SetWallpaper returns before the render
-//    happens, so "the frame is ready" is knowable only from FrameReady; negative cases
-//    are settled by posting a later request that does signal, since the daemon has one
-//    FIFO render thread. Process startup is the one exception -- a process appearing on
-//    the bus has its own signal (NameOwnerChanged) and that is what is waited on, not a
-//    poll loop.
-//  - A check that cannot be conclusive on this host says so and is not counted. A
-//    skipped check that silently reads as a pass is the failure mode this suite has
-//    been bitten by most.
+// Nothing waits on a sleep for a render: FrameReady says a frame is ready, and a negative case
+// is settled by a later request that does signal, the render thread being FIFO. A check that
+// cannot be conclusive on this host says so and is not counted.
 
 #include "daemon/dbus_service.h"
-// For HttpServer::kDefaultPort only -- the shipped port number, taken from the header the
-// daemon compiles against rather than written as 18462 here, so a change of port fails
-// this file at build time instead of leaving it probing a port nothing serves.
+// The daemon's own answers for its port, config path, display escaping and crash record, so a
+// change there fails this file instead of leaving it checking a stale literal.
 #include "daemon/http_server.h"
-// For defaultConfigPath() only, and only so the isolation guard in main() asks the same
-// question the daemon does: where would a daemon inheriting THIS process's environment
-// write? A path spelled out here would stop matching the daemon's the moment the rule
-// changed, which is the run where the guard has to work.
 #include "daemon/config_store.h"
-// For sanitizeForLog only: the restart phase asserts that GetStatus publishes the
-// display-safe form of a path while the config file holds the raw bytes, and the expected
-// display form has to come from the daemon's own function rather than be spelled out here.
 #include "daemon/log_escape.h"
-// For crashRecordPath() only: the crash-refusal phase plants a record where the shipped
-// daemon looks for one, and the location has to be the daemon's own answer rather than a
-// filename spelled out here -- which would stop matching the moment the name changed, on the
-// run where the phase has to work.
 #include "daemon/crash_record.h"
+#include "daemon/ring_depth.h"
+#include "tests/alloc_fail_control.h"
 #include "tests/client/blocking_config_write.h"
 #include "tests/client/daemon_client.h"
 #include "tests/client/http_probe.h"
@@ -63,9 +28,6 @@
 #include "tests/test_report.h"
 
 #include "support/exported_frame_map.h"
-// Fork-side scaffolding, shared with renderer/tests/device_affinity_probe.cpp. It lives in
-// the renderer tree because the dependency direction is one-way: a renderer probe may not
-// include a backend header, and backend/tests already has renderer/tests on its path.
 #include "support/forked_child.h"
 
 #include <sdbus-c++/sdbus-c++.h>
@@ -91,6 +53,7 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iterator>
 #include <map>
 #include <memory>
@@ -108,6 +71,7 @@
 #include <netinet/in.h>
 #include <poll.h>
 #include <signal.h>
+#include <sys/mman.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -120,13 +84,14 @@ using wallpaperx::testing::Check;
 using wallpaperx::testing::validationWaived;
 using wallpaperx::testing::Frame;
 using wallpaperx::testing::FrameReadyLog;
-using wallpaperx::testing::getFrameFd;
+using wallpaperx::testing::getFrame;
 using wallpaperx::testing::getStatus;
 using wallpaperx::testing::execChildOrDie;
 using wallpaperx::testing::getStatusOrExplain;
 using wallpaperx::testing::NameWatcher;
 using wallpaperx::testing::openFdCount;
 using wallpaperx::testing::ScratchDir;
+using wallpaperx::testing::ScratchDirectoryLost;
 using wallpaperx::testing::SpawnedDaemon;
 using wallpaperx::testing::setWallpaper;
 using wallpaperx::testing::sanitizerReportedIn;
@@ -135,16 +100,13 @@ using wallpaperx::testing::wallpaperStatus;
 
 namespace {
 
-// The daemon's shipped default, from WallpaperManager::Config. Restated rather than
-// included so that a change to the default fails here loudly instead of silently
-// re-pointing this test at whatever the new value is -- the point of this file is that
-// something renders at the size users get.
+// The daemon's shipped default, restated so a change to it fails here rather than moving this
+// test along with it.
 constexpr uint32_t kDaemonWidth = 1920;
 constexpr uint32_t kDaemonHeight = 1080;
 
-// Monitor ids are partitioned per phase and never reused across them: an assertion
-// about "a monitor with no frame" silently changes meaning the moment another phase has
-// touched that id.
+// Monitor ids are partitioned per phase: "a monitor with no frame" changes meaning once another
+// phase has touched the id.
 constexpr int32_t kMonitorFirstFrame = 0;
 constexpr int32_t kMonitorTiming = 1;
 constexpr int32_t kMonitorLoadBase = 2;    // .. kMonitorLoadBase + loadCount - 1, clamped by kMaxLoadMonitors
@@ -152,95 +114,43 @@ constexpr int32_t kMonitorStormBase = 20;  // .. kMonitorStormBase + kStormMonit
 constexpr int32_t kStormMonitors = 4;
 constexpr int32_t kMonitorBarrierPre = 30;
 constexpr int32_t kMonitorBarrierPost = 31;
-// Inside the daemon's 0..31 monitor range, and above every id the phases before it use --
-// the responsiveness burst runs 2..17 and the storm 20..23, so 24 and 25 are clear of
-// both. Two ids,
-// because the closed-stdout phase renders once with its stdout still readable -- to
-// establish that the handler does write to fd 1 -- and once after breaking it.
+// Clear of the responsiveness burst (2..17) and the storm (20..23). Two, because the
+// closed-stdout phase renders once with its stdout readable and once after breaking it.
 constexpr int32_t kMonitorClosedStdoutPre = 25;
 constexpr int32_t kMonitorClosedStdout = 24;
-// The port-conflict phase's own id: it renders once, to show the daemon is still doing its
-// job while reporting that it lost its config port.
 constexpr int32_t kMonitorLostPort = 27;
-// 18, 19, 28 and 29 belong to the phases that each drive a daemon and an XDG_CONFIG_HOME of
-// their own -- the Step 8 config phases and the Step 10 connector-name phase -- and are
-// declared where they are used. That ownership is what makes reuse legal at all: such a
-// phase's ids are only ever compared with its own, so several of them share 18 and 19. No
-// tally of who currently holds which is kept here, because a tally is what goes stale; grep
-// the kMonitor* declarations. 30 and 31 are the barrier phase's, above. A new phase needs
-// an id retired by an old one, or a daemon of its own; ids are never derived by arithmetic
-// over a case list, since the block of ids consumed then grows silently past 31.
+// 18, 19, 28 and 29 belong to phases that run a daemon and an XDG_CONFIG_HOME of their own and
+// compare ids only with their own, so they share them; each declares its ids where used. Ids are
+// never derived by arithmetic over a case list, which would grow silently past 31.
 
 constexpr int kStormThreads = 4;
 
-// Enough to keep a reply in flight across the device-creation window without the
-// polling itself becoming the bottleneck the first render is waiting on.
 constexpr int kGpuInitWatchers = 3;
-// Sized so each client observes each monitor several times. Monotonicity is a property of
-// one observer's sequence, so a client's *first* look at a monitor can never register a
-// regression -- with a wide monitor pool and few iterations, nearly every observation was
-// a first look and the check had almost nothing to compare. Narrower pool, more
-// iterations: most observations become real comparisons. The count is asserted and
-// printed, so an edit that makes it vacuous again is visible rather than silent.
+// Monotonicity is per observer, and an observer's first look at a monitor compares nothing, so
+// a narrow pool and many iterations make most observations real comparisons (counted and asserted).
 constexpr int kStormIterations = 24;
 
-// Upper bound on how many monitors the responsiveness phase queues at once. Each costs
-// a full-size exportable image in the daemon (~8 MB at 1080p) that lives until it
-// exits, so this is a memory bound as much as a time one.
+// Each queued monitor costs a 1080p exportable image (~8 MB) for the daemon's life.
 constexpr int kMaxLoadMonitors = 16;
 
-// How much dearer a SetWallpaper that will render may be to issue than one that will not,
-// before S6.9 calls it rendering inline. The property says "no more", i.e. 1.0; the slack
-// is for measurement, not for the daemon.
-//
-// Sized from the measured spread, not chosen for comfort. Unmutated the ratio stays within
-// 0.99-1.03 over twenty runs across NVIDIA, lavapipe and tsan+lavapipe alike; a daemon
-// whose handler waits for the render reads 11.96, 19.71 and 5.33 on those same three. Two
-// clears the worst benign reading by ~1.9x and sits ~2.7x under the narrowest defective
-// one.
+// How much dearer a SetWallpaper that renders may be to issue than one that does not, before S6.9
+// calls it rendering inline. Measured: 0.99-1.03 unmutated over twenty runs (NVIDIA, lavapipe,
+// tsan+lavapipe); 5.33-19.71 for a handler that waits for the render.
 constexpr double kIssueCostRatioBound = 2.0;
 
 using wallpaperx::testing::kProcessTimeout;
 
-// The tail of the line main.cpp prints when a signal really did arrive. One constant
-// rather than the literal spelled out at each site, because two of those sites assert its
-// PRESENCE (SIGTERM, SIGHUP) and one asserts its ABSENCE (the connection-loss phase), and
-// the absence check is only able to fail while the needle is still a string this daemon
-// ever prints. Sharing it means a reworded message cannot quietly hollow that check out:
-// it turns the presence checks red first, which points at the reword instead of leaving a
-// silent green behind.
+// One constant because two sites assert its presence and one its absence: a reworded message
+// turns the presence checks red rather than silently hollowing the absence check.
 constexpr const char* kSignalShutdownLine = "received, shutting down";
 
 std::string testAssetDir() { return std::string(WALLPAPERX_TEST_IMAGE_DIR); }
 
-// Goals this run could not exercise at all, because the host or the harness could not
-// build the precondition -- as opposed to goals it exercised and that held. The channel
-// itself is tests/test_report.h; what matters here is why this file uses it.
-//
-// An exit status that is a pure function of the failure count cannot tell the two apart: a
-// phase that returned early after printing a reason would leave ctest reporting PASS for
-// coverage that never ran -- the vacuous-green trap. Reported the way
-// the renderer probes report it: exit 77, which ctest turns into a SKIP through the
-// SKIP_RETURN_CODE property set in backend/CMakeLists.txt. A skip is not a pass, and no
-// reader can mistake it for one.
-//
-// Not a check() failure, deliberately: X.3 forbids reporting a fault of the host or the
-// harness as a fault of the daemon, and every caller here names a cause on this side of
-// the boundary.
+// A goal the host or harness could not exercise: exit 77, a ctest skip, never a FAIL (X.3).
 using wallpaperx::testing::notVerified;
 
-// This file failed to start a child process, so whatever the phase was going to grade was
-// never exercised. Its own channel, separate from both check() and notVerified(): a fork
-// preamble that died is not the daemon misbehaving (X.3 forbids grading it as one), and it
-// is not this host declining to run a case either -- it is the harness itself, and the run
-// must go red naming it rather than skip.
-//
-// Both lines on stdout, for the reason device_affinity_probe's harnessFault() carries: split
-// across stdout and stderr they need an fflush between them to stay adjacent under ctest.
-//
-// Named apart from tests/test_report.h's g_harnessFaults / harnessFailure() rather than
-// shadowing them: the two counters have different epilogues, and a site here that reached the
-// shared name would file a fault into a count this file never reads.
+// A child this file could not start: the harness's fault, red, but never graded as the daemon's.
+// Kept apart from test_report.h's harnessFailure(), whose counter this file's epilogue does not read.
 int g_phaseSetupFaults = 0;
 
 void phaseSetupFault(const char* what, const char* detail) {
@@ -251,17 +161,36 @@ void phaseSetupFault(const char* what, const char* detail) {
     ++g_phaseSetupFaults;
 }
 
+// Runs one phase. A lost scratch directory is the host's fault; any other exception out of a phase --
+// an sdbus::Error from a daemon that died under it -- is a FAIL naming that phase, and the phases
+// after it still run.
+// GOAL: X.3 for a host that loses its scratch directory mid-run (the startup probe passed): each
+//       phase that meets it reports a HARNESS FAULT naming itself, never a FAIL against the daemon.
+//       S15.328's sibling: an exception escaping one phase fails that phase by name and ends no other.
+// CONTROL: test-side: (a) tests/spawned_daemon.h's constructor made to throw ScratchDirectoryLost from
+//       its third spawn on, --phase '^(hangupShutdown|outputVisibleLog|commandLine)$' -> "HARNESS FAULT --
+//       commandLine could not be set up: control: the scratch directory went away", and no FAIL line;
+//       (b) the same, with the ScratchDirectoryLost catch below removed -> "FAIL: commandLine: unexpected
+//       exception: control: the scratch directory went away".
+template <class Phase>
+void hostGuarded(const char* phase, Phase&& run) {
+    wallpaperx::testing::guardedPhase(phase, [&] {
+        try {
+            run();
+        } catch (const ScratchDirectoryLost& e) {
+            phaseSetupFault(phase, e.what());
+        }
+    });
+}
+
 using wallpaperx::testing::Clock;
 
 double millis(Clock::duration d) {
     return std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(d).count();
 }
 
-// The cheapest call in a burst: the one that met the least contention and the least
-// preemption, and so the closest thing to the handler's own cost. Corroborated by the
-// median beside it, which is what the mean or the total cannot be -- a burst is a few
-// hundred microseconds per call, and one preemption anywhere in it moves a total by more
-// than the effect being measured.
+// The cheapest call in a burst, the closest thing to the handler's own cost; one preemption
+// moves a total or a mean by more than the effect measured.
 double minMillis(const std::vector<Clock::duration>& samples) {
     if (samples.empty()) return 0.0;
     return millis(*std::min_element(samples.begin(), samples.end()));
@@ -276,9 +205,7 @@ double medianMillis(std::vector<Clock::duration> samples) {
     return (millis(samples[n / 2 - 1]) + millis(samples[n / 2])) / 2.0;
 }
 
-// A solid RGBA PNG. The daemon scales it to the full target, so a solid source makes
-// every pixel of the exported frame a known value -- which is what lets the content
-// check below be a straight comparison rather than a resampling model.
+// A solid RGBA PNG: scaled to any size, every pixel of the frame is still a known value.
 std::string writeSolidImage(const char* name, unsigned char r, unsigned char g, unsigned char b) {
     std::filesystem::create_directories(testAssetDir());
     const std::string path = testAssetDir() + "/" + name;
@@ -297,15 +224,10 @@ std::string writeSolidImage(const char* name, unsigned char r, unsigned char g, 
 }
 
 
-// The prefix every scratch directory this run creates shares, so the isolation guard can
-// tell a config file written by one of this run's daemons from one written by a process it
-// does not own. Must stay in step with ScratchDir's naming in tests/client/scratch_dir.h.
-//
-// Empty when this host has no temporary directory, through temp_directory_path()'s
-// error_code overload rather than the throwing one: this is called from the isolation guard,
-// which runs outside main()'s try on purpose, so a throw here dies by std::terminate and
-// takes every diagnostic the run was about to print with it. The one caller must treat empty
-// as "unavailable" and never as a needle -- find("") matches at position 0 of every string.
+// The prefix of every scratch directory this run makes (in step with tests/client/scratch_dir.h),
+// so the isolation guard can attribute a config file to this run. Empty when there is no temporary
+// directory -- never thrown, since the guard runs outside main()'s try -- and the caller must not
+// use empty as a needle: find("") matches every string.
 std::string harnessTempPrefix() {
     std::error_code ec;
     const std::filesystem::path base = std::filesystem::temp_directory_path(ec);
@@ -313,19 +235,13 @@ std::string harnessTempPrefix() {
     return (base / ("wpx_test_" + std::to_string(::getpid()) + "_")).string();
 }
 
-// Empty when this host can give the suite a scratch directory; otherwise why it cannot.
-//
-// Probed once, up front, because every daemon this file spawns needs a scratch directory for
-// its XDG_CONFIG_HOME: without one SpawnedDaemon's constructor throws, main()'s catch-all
-// prints "FAIL: unexpected exception", and a machine with no /tmp is recorded as a defect of
-// the daemon. Asked as a positive probe of the host rather than by classifying an exception,
-// so nothing the daemon does can reach this answer.
+// Empty when this host can give the suite a scratch directory; otherwise why it cannot. A
+// positive probe before anything is spawned, so nothing the daemon does can reach this answer.
 std::string scratchDirectoryFault() {
     std::error_code ec;
     const std::filesystem::path base = std::filesystem::temp_directory_path(ec);
     if (ec) {
-        // The value is quoted, and empty and unset are worded apart: an empty $TMPDIR is a
-        // real way to hit this and prints as nothing at all otherwise.
+        // Empty and unset worded apart: an empty $TMPDIR otherwise prints as nothing.
         const char* tmpdir = std::getenv("TMPDIR");
         std::string where = "$TMPDIR is unset, so /tmp was tried";
         if (tmpdir != nullptr) {
@@ -358,14 +274,9 @@ RealConfigWitness witnessRealConfig() {
     return witness;
 }
 
-// True when this daemon's child died in its fork preamble, having reported the fault on the
-// harness channel first -- so a caller only has to bail out. `phase` names what could not be
-// set up.
-//
-// Every site below that grades a daemon's startup goes through this one function rather than
-// testing exit codes itself: a site that handled one preamble code and not the others would
-// read the unhandled ones as a verdict on the daemon, which is how 126 was left behind in the
-// renderer tier.
+// True when this daemon's child died in its fork preamble, the fault already reported on the
+// harness channel. Every startup site goes through this, so no preamble exit code is read as a
+// verdict on the daemon.
 bool reportedStartupFault(const SpawnedDaemon& daemon, const char* phase) {
     const char* fault = daemon.startupFault();
     if (fault == nullptr) return false;
@@ -413,11 +324,8 @@ std::string addressValue(const std::string& text) {
     return out;
 }
 
-// A session bus of this test's own, started as a child process so it can be killed.
-//
-// Exists for one reason: to be destroyed under a running daemon. ctest's bus comes from
-// dbus-run-session and is shared with every other phase in this file, so killing it would
-// take the test's own connection with it.
+// A session bus of this test's own, to be killed under a running daemon; killing ctest's would
+// take this test's own connection with it.
 class NestedBus {
 public:
     NestedBus() {
@@ -427,10 +335,8 @@ public:
             return;
         }
 
-        // Not --session: the stock session configuration can activate every service installed on
-        // the host and listens in the shared /tmp, where the SIGKILL in kill() leaves its socket.
-        // The wrapper's own configuration instead, listening in the entry's private runtime
-        // directory, which the wrapper removes.
+        // Not --session, which can activate every installed service and listens in the shared
+        // /tmp: the wrapper's configuration, listening in the entry's private runtime directory.
         const char* runtime = std::getenv("XDG_RUNTIME_DIR");
         if (runtime == nullptr || *runtime == '\0') {
             m_reason = "XDG_RUNTIME_DIR is unset, so the nested bus has nowhere private to listen";
@@ -457,9 +363,7 @@ public:
             return;
         }
 
-        // Assembled before fork() for the same reason SpawnedDaemon assembles its
-        // environment there: this process has sdbus dispatch threads, and allocating
-        // between fork() and exec() can deadlock on a lock one of them held.
+        // Before fork(): with sdbus threads running, allocating between fork() and exec() can deadlock.
         std::string binary = binaryPath;
         std::string configFile = "--config-file=" + confPath;
         std::string nofork = "--nofork";
@@ -480,9 +384,8 @@ public:
         }
         close(fds[1]);
 
-        // Bounded read of the address line. A bus that fails to start closes the pipe,
-        // which ends this at EOF rather than at the deadline; either way the failure is
-        // reported as a setup failure and never as a property of the daemon.
+        // Bounded; a bus that fails to start closes the pipe and ends this at EOF. Either way a
+        // setup failure, never a property of the daemon.
         const auto deadline = Clock::now() + std::chrono::seconds(10);
         std::string line;
         while (line.find('\n') == std::string::npos) {
@@ -517,19 +420,13 @@ public:
         if (newline != std::string::npos) m_address = line.substr(0, newline);
         if (m_address.empty() && m_reason.empty()) m_reason = "dbus-daemon printed an empty address";
 
-        // GOAL: X.3 -- a bus child that died in its fork preamble is this harness failing,
-        //       and must not be reported as dbus-daemon misbehaving.
-        // WHY-THIS-SHAPE: the reasons recorded above are all written as statements about
-        //       dbus-daemon ("exited before printing an address", "printed no address within
-        //       10s"), and an arming refusal produces exactly the first of them -- measured:
-        //       with armAgainstParentDeath forced false this phase skipped with "dbus-daemon
-        //       exited before printing an address", accusing the host's bus binary of
-        //       something this file did. Consulted only when no address arrived, so a bus
-        //       that started normally never pays for it.
-        // CONTROL: the same forced-false arming -> "HARNESS FAULT -- the connection-loss
-        //       checks (S6.35) could not be set up: the forked child could not arm itself
-        //       against its parent's death", and no NOT VERIFIED line naming dbus-daemon.
-        //       Reverted.
+        // GOAL: X.3 -- a bus child that died in its fork preamble is this harness failing, not
+        //       dbus-daemon misbehaving.
+        // WHY-THIS-SHAPE: the reasons above all speak of dbus-daemon, and a refused arming produces
+        //       "exited before printing an address" (measured), so the preamble is asked first.
+        // CONTROL: armAgainstParentDeath forced false -> "HARNESS FAULT -- the connection-loss
+        //       checks (S6.35) could not be set up: the forked child could not arm itself against
+        //       its parent's death", no NOT VERIFIED naming dbus-daemon. Reverted.
         if (m_address.empty() && m_pid > 0) {
             siginfo_t info{};
             info.si_pid = 0;
@@ -539,29 +436,13 @@ public:
             }
         }
 
-        // The read end is kept and drained for the child's whole lifetime, not closed
-        // here. dbus-daemon's fd 1 stays pointed at this pipe long after the address
-        // line, so closing the only reader would leave it writing into a readerless pipe:
-        // one --session config warning at SIGPIPE's default disposition and the nested bus
-        // dies of the test's own doing, either before the daemon comes up (reported as a
-        // daemon that never started) or after (reported as a connection loss the test did
-        // not cause). Leaving it open and unread is not enough either -- it trades SIGPIPE
-        // for a blocked write once the 64K buffer fills, which stalls the bus instead of
-        // killing it. Same m_readFd/drain-thread pair SpawnedDaemon already uses.
-        //
-        // CONTROL: not expressible as a check here -- making the real dbus-daemon write to
-        // stdout after its address line is host- and version-dependent, so a check built on
-        // it would be the flaky kind. Controlled outside the suite instead, on the
-        // mechanism: a scratch program that forks a child printing one line, then a second
-        // line after a delay, reports "child died on signal 13" when the parent closes the
-        // read end after the first line and "child exited 0" when it drains instead. That
-        // is exactly the difference this member makes, measured rather than argued.
+        // Drained for the child's whole life, not closed: dbus-daemon may write to fd 1 after
+        // the address line, and a readerless pipe kills it (SIGPIPE) while an unread one stalls
+        // it once full -- either blamed on the daemon under test.
         m_readFd = fds[0];
         try {
             m_drain = std::thread([this] { drainLoop(); });
         } catch (...) {
-            // Past fork() with no drain running: kill the child now rather than leave it
-            // writing into a pipe nobody reads for the rest of the phase.
             kill();
             close(m_readFd);
             m_readFd = -1;
@@ -577,14 +458,11 @@ public:
 
     bool ok() const { return !m_address.empty(); }
     const std::string& reason() const { return m_reason; }
-    // Non-null when the bus never started because its child died in the fork preamble --
-    // a fault of this harness rather than of dbus-daemon. See reason() for everything else.
+    // Non-null when the bus child died in the fork preamble: this harness's fault.
     const char* preambleFault() const { return m_preambleFault; }
     const std::string& address() const { return m_address; }
 
-    // Destroys the bus out from under whatever is connected to it. SIGKILL, not SIGTERM:
-    // an orderly bus shutdown is a different event from a bus that vanishes, and the
-    // second is the one a client has no chance to prepare for.
+    // SIGKILL, not SIGTERM: a bus that vanishes, which a client cannot prepare for.
     void kill() {
         if (m_pid > 0) {
             ::kill(m_pid, SIGKILL);
@@ -592,10 +470,7 @@ public:
             waitpid(m_pid, &status, 0);
             m_pid = -1;
         }
-        // After the reap, for the same reason SpawnedDaemon joins after its own: the
-        // drain ends at EOF, and EOF arrives only once the child's write end is gone.
-        // Joining here rather than in the destructor keeps the join on the one path every
-        // exit goes through -- the destructor calls this too.
+        // After the reap: the drain ends at EOF, which comes once the child's write end is gone.
         if (m_drain.joinable()) m_drain.join();
         if (m_readFd >= 0) {
             close(m_readFd);
@@ -604,8 +479,6 @@ public:
     }
 
 private:
-    // Discards whatever dbus-daemon says on stdout after the address line. The bytes are
-    // of no interest; keeping a reader on the pipe is the entire point.
     void drainLoop() {
         char buf[4096];
         while (true) {
@@ -620,15 +493,11 @@ private:
     std::thread m_drain;
     std::string m_address;
     std::string m_reason;
-    // A string literal from forkPreambleFault(), so no ownership to manage.
-    const char* m_preambleFault = nullptr;
+    const char* m_preambleFault = nullptr;  // a literal from forkPreambleFault()
 };
 
-// Whether VK_LAYER_KHRONOS_validation can be loaded on this host. Asked through the
-// loader, from this process, with the same environment the daemon child inherits -- so
-// the answer is the one the child will get. Without it, "the daemon printed no
-// [vulkan] warnings" is equally true of a daemon that had no validator listening, and
-// the only GPU-side oracle this test has would be silently vacuous.
+// Whether VK_LAYER_KHRONOS_validation loads here, asked with the environment the daemon child
+// inherits. Without it, "no [vulkan] warnings" is equally true of a daemon nobody was checking.
 bool validationLayerAvailable() {
     uint32_t count = 0;
     if (vkEnumerateInstanceLayerProperties(&count, nullptr) != VK_SUCCESS) return false;
@@ -640,9 +509,8 @@ bool validationLayerAvailable() {
     return false;
 }
 
-// Lines the daemon printed that came from the validation layer, excluding the one
-// notice Device emits when the layer is present but VK_EXT_validation_features is not
-// -- that is a report about the layer build, not a finding about our Vulkan usage.
+// The validation layer's lines in `output`, less Device's notice that VK_EXT_validation_features
+// is missing, which is about the layer build and not this daemon's Vulkan use.
 std::vector<std::string> validationLines(const std::string& output) {
     std::vector<std::string> lines;
     size_t pos = 0;
@@ -659,9 +527,17 @@ std::vector<std::string> validationLines(const std::string& output) {
     return lines;
 }
 
-// Whether one line of `output` carries both "GPU: " and, after it, "Descriptor tier: " -- what the
-// daemon prints once its Vulkan device exists. Both on ONE line: two unanchored find()s would also
-// accept a GPU name printed at startup beside a tier printed from some unrelated path.
+// Whether `output` holds `line` as a whole line.
+bool hasLine(const std::string& output, const std::string& line) {
+    for (size_t at = output.find(line); at != std::string::npos; at = output.find(line, at + 1)) {
+        const size_t end = at + line.size();
+        if ((at == 0 || output[at - 1] == '\n') && (end == output.size() || output[end] == '\n')) return true;
+    }
+    return false;
+}
+
+// Whether one line carries "GPU: " and after it "Descriptor tier: ", the daemon's device line. One
+// line: two unanchored find()s would accept the halves from unrelated lines.
 bool reportsGpuAndTier(const std::string& output) {
     for (size_t start = 0; start < output.size();) {
         const size_t eol = output.find('\n', start);
@@ -681,11 +557,9 @@ void checkFirstFrame(sdbus::IProxy& proxy, FrameReadyLog& signals, const std::st
     setWallpaper(proxy, "static", bluePath, kMonitorFirstFrame);
     const bool arrived = signals.wait(kMonitorFirstFrame, 1);
     check(arrived, "FrameReady(monitor, 1) arrives for the first static wallpaper");
-    // Everything below reads the frame that signal announced; without it there is
-    // nothing to export and GetFrameFd would fail for a reason already reported.
     if (!arrived) return;
 
-    const Frame frame = getFrameFd(proxy, kMonitorFirstFrame);
+    const Frame frame = getFrame(proxy, kMonitorFirstFrame);
 
     check(fcntl(frame.fd.get(), F_GETFD) != -1, "the fd received from another process is open in this one");
     check(frame.width == kDaemonWidth && frame.height == kDaemonHeight,
@@ -695,17 +569,9 @@ void checkFirstFrame(sdbus::IProxy& proxy, FrameReadyLog& signals, const std::st
     const uint64_t minimumBytes = static_cast<uint64_t>(frame.width) * frame.height * 4;
     check(frame.memorySize >= minimumBytes, "memory_size covers at least width*height*4 bytes");
 
-    // Diagnostic here, a precondition further down. An OPAQUE_FD is a handle to a
-    // driver object -- on NVIDIA a /dev/nvidiactl fd -- with no size and no seek, so
-    // lseek returning -1 is the correct answer for it and asserting on it would fail a
-    // working export. It becomes an assertion only on the dma_buf path, where the fd
-    // does name a sized object and where a published memory_size larger than that
-    // object SIGBUSes the mmap below instead of failing by name.
+    // Asserted only for a dma_buf: an OPAQUE_FD (NVIDIA's /dev/nvidiactl) has no size, and -1
+    // is its correct answer. errno kept now: the printf below may change it.
     const off_t fdSize = lseek(frame.fd.get(), 0, SEEK_END);
-    // Captured here, not where it is printed: printf is allowed to set errno even when it
-    // succeeds, and three of them run in between -- so the skip message below was liable
-    // to name an unrelated error, or "Success", on the one path where that message is the
-    // entire diagnostic.
     const int lseekErrno = errno;
 
     std::printf("daemon_system_test: monitor %d -> %ux%u, memory_size=%llu, handle_type=%d, modifier=0x%llx, "
@@ -715,11 +581,8 @@ void checkFirstFrame(sdbus::IProxy& proxy, FrameReadyLog& signals, const std::st
                 static_cast<unsigned long long>(frame.drmModifier), wallpaperx::testing::fdDescription(frame.fd.get()).c_str(),
                 static_cast<long long>(fdSize));
 
-    // Everything above holds on both handle types. The pixel comparison does not: only
-    // a LINEAR dma_buf is CPU-addressable at a constant stride. OPAQUE_FD (this
-    // machine's NVIDIA policy) carries no layout at all, and a tiled modifier's
-    // rowPitch is not a row length -- mapping either and comparing bytes would fail a
-    // perfectly correct export.
+    // Only a LINEAR single-plane dma_buf is CPU-addressable; an OPAQUE_FD carries no layout and a
+    // tiled rowPitch is not a row length.
     if (frame.handleType != 1) {
         std::printf("daemon_system_test: cross-process content check skipped -- handle_type=%d (OPAQUE_FD); "
                     "the fd is not a dma_buf and cannot be mapped. Run the lavapipe twin for this half.\n",
@@ -732,10 +595,7 @@ void checkFirstFrame(sdbus::IProxy& proxy, FrameReadyLog& signals, const std::st
                     static_cast<unsigned long long>(frame.drmModifier), frame.planes.size());
         return;
     }
-    // "I cannot answer" and "the buffer is too small" are different results and only the
-    // second is a defect. A dma_buf whose driver refuses SEEK_END returns -1, which the
-    // sibling tier treats as a skip -- scoring it as a failure here would report a defect
-    // in the export path for a property of the driver.
+    // A driver that cannot size the fd is a skip, as in the sibling tier, not a defect.
     if (fdSize < 0) {
         std::printf("daemon_system_test: cross-process content check skipped -- lseek(SEEK_END) cannot size this "
                     "fd (%s), so the mapping below could not be bounded safely.\n",
@@ -787,66 +647,26 @@ void checkFirstFrame(sdbus::IProxy& proxy, FrameReadyLog& signals, const std::st
     }
 }
 
-// Samples GetStatus from several clients across the daemon's first device creation, and
-// grades every reply against the one cross-field invariant snapshot() promises.
-//
-// GOAL: S6.18 -- a GetStatus reply is internally consistent: it never reports an
-//       uninitialised GPU beside a monitor that already has a frame.
-// WHY-THIS-SHAPE: the invariant is only *falsifiable* while gpu.initialized is false.
-//       statusSelfConsistent returns true at its first branch once that flag is set,
-//       WallpaperManager::ensureGpu sets it exactly once and nothing clears it, so any
-//       sampling after the first render grades nothing -- which is precisely how this
-//       check spent its previous life in the concurrent-clients storm, pinned at zero
-//       inconsistencies over ~29 replies that had all short-circuited. The window is the
-//       first SetWallpaper: the daemon has monitors in its map, is about to commit a
-//       frame, and has not yet published a GPU. So the watchers start before
-//       checkFirstFrame issues that request and stop after its frame has arrived, which
-//       is the only interval in the whole suite where a two-lock snapshot() could be
-//       caught. checkFirstFrame is called between them rather than duplicated, so the
-//       phase it already owns keeps its own assertions and its own first-render
-//       semantics.
-// COVERAGE-ASSERT: the run is required to have observed the flag both false and true.
-//       Without that, a watcher fleet that started too late would report zero
-//       inconsistencies out of replies that were all post-initialisation -- exactly the
-//       vacuum this move exists to escape -- and it would look identical to a pass.
-// CONTROL: ensureGpu() changed to publish m_gpuStatus.initialized from a detached
-//       thread 1200 ms late, so the first frame commits while the GPU still reads as
-//       absent -> "FAIL: no GetStatus reply reports a frame before the GPU exists" over
-//       8441 replies. The coverage assert went red in the same run (0 post-init), which
-//       is the other half of it observed failing. Reverted.
-// WHAT DID NOT REPRODUCE, recorded so nobody over-trusts this check: splitting
-//       snapshot() into two acquisitions of m_stateMutex -- the regression that
-//       function's own comment warns about -- produced 0 inconsistencies over ~25,000
-//       replies across three runs. It cannot be caught that way. ensureGpu() publishes
-//       the GPU *before* any render commits, so the two reads have to be separated by
-//       the whole of device creation to disagree, and a lock released and immediately
-//       retaken is nowhere near that wide. This check catches a snapshot whose halves
-//       drift far apart; it does not catch a narrow split, and a future reader must not
-//       read its green as proof that snapshot() is still single-locked.
-// CONTROL (the readiness barrier): with the barrier removed, the straddle depends on
-//       three fresh threads each completing a session-bus connect before the daemon
-//       finishes ensureGpu -- an assertion on the scheduler. The barrier makes it a
-//       property of the harness, and its own check ("every status watcher was live
-//       before the first render was requested") is what would fail if a watcher never
-//       reached the bus.
-// CONTROL (the Stopper scope guard): checkFirstFrame patched to `throw
-//       std::runtime_error(...)` on entry, with the watchers live -> with the guard,
-//       exit 1 and "FAIL: unexpected exception: CONTROL: simulated sdbus failure
-//       mid-phase"; with `Stopper` left uninstantiated, exit 134 and "terminate called"
-//       -- the joinable-thread destructor taking the process down and replacing every
-//       FAIL line with a bare abort. Both reverted.
+// GOAL: S6.18 -- a GetStatus reply never reports an uninitialised GPU beside a monitor that
+//       already has a frame.
+// WHY-THIS-SHAPE: falsifiable only while gpu.initialized is false, which ends at the first device
+//       creation for good; so the watchers sample across checkFirstFrame's first SetWallpaper, the
+//       only window in the suite, and are released only once each has had a reply (a barrier,
+//       not the scheduler).
+// COVERAGE-ASSERT: the flag must have been seen both false and true, or every reply was graded
+//       after the window and zero inconsistencies would mean nothing.
+// CONTROL: ensureGpu() publishing m_gpuStatus.initialized 1200 ms late from a detached thread ->
+//       "FAIL: no GetStatus reply reports a frame before the GPU exists" over 8441 replies, and the
+//       coverage assert red (0 post-init). Reverted. A narrow split of snapshot() into two lock
+//       acquisitions does NOT reproduce (0 in ~25,000 replies): this catches halves that drift
+//       far apart, not a narrow split.
+// CONTROL (the Stopper scope guard): checkFirstFrame throwing on entry with the watchers live ->
+//       "FAIL: unexpected exception: CONTROL: simulated sdbus failure mid-phase", exit 1; without
+//       the guard, exit 134 and "terminate called". Reverted.
 struct GpuInitWatch {
     std::atomic<bool> stop{false};
-    // Counts watchers that have completed one SUCCESSFUL reply. The first SetWallpaper
-    // waits on this: the straddle must be a property of the harness, not of whether the
-    // scheduler happened to run three fresh threads (each of which still has a
-    // session-bus connect ahead of it) before the daemon finished creating its device.
-    //
-    // Successful, not merely attempted. Counting failed calls here would let the barrier
-    // release with no watcher having ever been answered, and the phase would then report
-    // "the sampling straddled the first device creation" as the failure -- a timing
-    // story -- when the truth is that GetStatus never worked at all. The bounded wait at
-    // the call site is what keeps a never-answering daemon from hanging the phase.
+    // Watchers with one SUCCESSFUL reply: counting attempts would release the barrier for a
+    // GetStatus that never worked and blame the timing.
     std::atomic<int> ready{0};
     std::atomic<int> replies{0};
     std::atomic<int> preInit{0};
@@ -856,9 +676,7 @@ struct GpuInitWatch {
 };
 
 void gpuInitWatchThread(GpuInitWatch& watch) {
-    // Constructed inside the thread and inside the guard, for the reason stormThread
-    // gives: an exception escaping a thread entry point is std::terminate, which would
-    // replace this phase's FAIL lines with a bare abort.
+    // Everything inside a guard: an exception escaping a thread entry point is std::terminate.
     std::unique_ptr<sdbus::IProxy> proxy;
     try {
         proxy = sdbus::createProxy(sdbus::ServiceName{DbusService::kBusName},
@@ -870,19 +688,10 @@ void gpuInitWatchThread(GpuInitWatch& watch) {
 
     bool announced = false;
     while (!watch.stop.load(std::memory_order_relaxed)) {
-        // Caught although getStatus() does not throw: this is a thread entry
-        // point, so anything that escapes it -- a bad_alloc out of the json, most plausibly
-        // -- is std::terminate and takes the phase's FAIL lines with it.
         try {
             const StatusReply status = getStatus(*proxy);
             if (!status.ok()) {
-                // A failed GetStatus is not a consistency violation. Counted, and reported
-                // below only if it swallowed the whole sample. Deliberately does NOT mark
-                // this watcher ready: readiness means "answered once", so that the pre-init
-                // sample the phase depends on is guaranteed rather than raced for. A watcher
-                // that only ever errors therefore never becomes ready, and the barrier below
-                // falls through on its deadline rather than hanging -- the phase then reports
-                // the zero readiness directly instead of blaming the timing.
+                // Not a consistency violation, and not "ready": readiness is "answered once".
                 ++watch.errors;
             } else {
                 ++watch.replies;
@@ -903,13 +712,8 @@ void gpuInitWatchThread(GpuInitWatch& watch) {
         } catch (const std::exception&) {
             ++watch.errors;
         }
-        // Outside the try/catch, so the error path is paced too. Inside it, a daemon
-        // that starts refusing calls (crashed mid-render, bus name dropped, an immediate
-        // ServiceUnknown instead of a timeout) put three threads into a 100%-CPU spin for
-        // the whole of checkFirstFrame's timeout -- starving the very render being
-        // measured, so a daemon fault surfaced as a timing failure blamed on the render
-        // path. A millisecond still yields hundreds of samples across a device creation
-        // measured in tens to hundreds of milliseconds.
+        // Paces the error path too: an instantly refusing daemon would otherwise spin three
+        // threads at 100% and starve the render being measured.
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 }
@@ -920,17 +724,8 @@ void checkFirstFrameUnderStatusLoad(sdbus::IProxy& proxy, FrameReadyLog& signals
     std::vector<std::thread> watchers;
     watchers.reserve(kGpuInitWatchers);
 
-    // Stop and join on EVERY path out of here, exceptions included, and constructed
-    // BEFORE the spawn loop rather than after it. checkFirstFrame calls setWallpaper()
-    // and getFrameFd() without a try/catch and both throw sdbus::Error when the daemon
-    // answers with an error or dies mid-phase; letting that unwind past a vector of
-    // joinable threads is std::terminate -- a bare SIGABRT in place of this phase's FAIL
-    // lines and main's own handler -- while the live watchers keep writing to a `watch`
-    // whose storage is being destroyed. Declared after the loop it would still leave one
-    // hole: std::thread's own constructor throws std::system_error on EAGAIN when the
-    // process is at its thread limit, and this binary has already spawned the daemon and
-    // several bus connections, so a throw on the second or third iteration would unwind
-    // past the one or two threads already in the vector before any guard existed.
+    // Stops and joins on every path, exceptions included (checkFirstFrame's calls throw on a daemon
+    // error), and exists before the first thread does: std::thread's constructor can itself throw.
     struct Stopper {
         GpuInitWatch& watch;
         std::vector<std::thread>& watchers;
@@ -947,10 +742,8 @@ void checkFirstFrameUnderStatusLoad(sdbus::IProxy& proxy, FrameReadyLog& signals
         watchers.emplace_back([&watch] { gpuInitWatchThread(watch); });
     }
 
-    // Every watcher has answered once before the first render is asked for, so the
-    // pre-init sample below is guaranteed rather than raced for. Bounded: a watcher that
-    // cannot reach the bus at all would otherwise stall the whole test here, and that
-    // fault is reported by the reply/error counts further down.
+    // Every watcher answered once before the first render is asked for; bounded, a watcher that
+    // never reaches the bus is reported by the counts below.
     const auto barrierDeadline = std::chrono::steady_clock::now() + wallpaperx::testing::kSignalTimeout;
     while (watch.ready.load() < kGpuInitWatchers && std::chrono::steady_clock::now() < barrierDeadline) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -965,9 +758,6 @@ void checkFirstFrameUnderStatusLoad(sdbus::IProxy& proxy, FrameReadyLog& signals
     const int preInit = watch.preInit.load();
     const int postInit = watch.postInit.load();
 
-    // The coverage assert comes first: if the sampling missed the transition, the
-    // invariant below was applied to nothing and reporting it as green would be the
-    // same false signal this phase exists to avoid.
     check(readyAtStart == kGpuInitWatchers,
           "every status watcher was live before the first render was requested");
     const bool straddled = preInit > 0 && postInit > 0;
@@ -995,43 +785,17 @@ void checkFirstFrameUnderStatusLoad(sdbus::IProxy& proxy, FrameReadyLog& signals
 // ---------------------------------------------------------------------------- //
 // Phase 3 -- the event loop stays responsive while the GPU thread is busy.
 //
-// This is the one mechanical check of the rule PLAN.md records as unenforced: no DBus
-// handler touches the GPU. SetWallpaper records and posts; GetFrameFd is asynchronous
-// and answered from the GPU thread. A handler that rendered inline would still be
-// *correct* -- it would just serialise every client behind the render queue, which is
-// precisely what cannot be seen from a single-threaded test that waits for each frame.
+// Graded by the cost of ISSUING a request that renders against one that does not (S6.9 below):
+// "GetStatus answers quickly while renders are queued" cannot separate the designs, since an
+// inline-rendering handler has finished the burst before GetStatus is sent.
 //
-// Two properties, chosen because each actually separates the two designs. The first
-// draft of this phase asserted that GetStatus answers quickly while renders are queued,
-// which sounds like the property and is not one: with the handler rendering inline, the
-// whole burst would already have finished by the time GetStatus was issued, so it would
-// have answered quickly too and the check would have passed for the daemon it exists to
-// catch. What does separate them:
-//
-//   - The cost of *issuing* a request that will render, against the cost of issuing one
-//     that will not. See the S6.9 block below for why the comparison is against a `shader`
-//     burst rather than against the render drain.
-//
-// The GetStatus/GetFrameFd ordering is *printed and not asserted*, which is worth
-// stating plainly because the first draft did assert it. The reasoning was that a
-// synchronous GetFrameFd would hold the event loop and GetStatus could not overtake it.
-// That is true, and it still cannot fail: the configuration it describes is unreachable.
-// GetFrameFd does GPU work, the Device aborts on any GPU call from a thread other than
-// its creator, and the creator is the render worker -- so a GetFrameFd answered on the
-// event loop kills the daemon before any ordering can be observed. Controlled, and that
-// is exactly what happens: the daemon dies and the test reports a disconnect rather than
-// the ordering.
-//
-// Which corrects something PLAN.md records: the "no DBus handler touches the GPU" rule
-// is *not* unenforced. The Device's thread pinning enforces it, fatally and at the first
-// violation. The weaker half -- a handler doing slow *non-GPU* work -- has no mechanical
-// enforcement and none of these checks bounds it either: the issue-cost comparison below is
-// a ratio of two runs of the same handler, so any cost both pay cancels out. What it does
-// establish is that the handler neither performs nor waits for the render before replying.
+// The GetStatus/GetFrame ordering is PRINTED, NOT ASSERTED: a GetFrame answered on the event
+// loop does GPU work off the Device's thread, and the Device's pinning aborts the daemon before
+// any ordering can be seen (controlled: the test reports a disconnect). That pinning is what
+// enforces "no DBus handler touches the GPU". Slow non-GPU work in a handler is bounded by
+// nothing here: the issue-cost ratio cancels any cost both bursts pay.
 // ---------------------------------------------------------------------------- //
 
-// Per-call timing rather than one interval around a loop, because the statistic taken from
-// the samples has to be a median.
 Clock::duration timeSetWallpaper(sdbus::IProxy& proxy, const char* type, const std::string& path, int32_t monitorId) {
     const auto callStart = Clock::now();
     setWallpaper(proxy, type, path, monitorId);
@@ -1040,8 +804,7 @@ Clock::duration timeSetWallpaper(sdbus::IProxy& proxy, const char* type, const s
 
 void checkResponsivenessUnderLoad(sdbus::IProxy& proxy, FrameReadyLog& signals, const std::string& bluePath,
                                   const Check& check) {
-    // One warm render, to size the load. The GPU is already initialised by phase 2, so
-    // this measures a render and not a device creation.
+    // One warm render (the device already exists) sizes the load.
     const auto renderStart = Clock::now();
     setWallpaper(proxy, "static", bluePath, kMonitorTiming);
     if (!signals.wait(kMonitorTiming, 1)) {
@@ -1050,43 +813,28 @@ void checkResponsivenessUnderLoad(sdbus::IProxy& proxy, FrameReadyLog& signals, 
     }
     const auto singleRender = Clock::now() - renderStart;
 
-    // Enough queued work that a GPU-blocking handler could not hide, and the sample count
-    // for both bursts below. Distinct monitors, so nothing coalesces away: coalescing is
-    // what makes a burst at *one* monitor finish in one render, and that would leave
-    // nothing to be busy with.
+    // Distinct monitors, so nothing coalesces into one render.
     const double perRenderMs = std::max(1.0, millis(singleRender));
     const int loadCount = std::clamp(static_cast<int>(400.0 / perRenderMs) + 1, 4, kMaxLoadMonitors);
 
-    // The second client is built before the clock starts. Creating a connection costs
-    // milliseconds, and those would land inside the interval being measured.
+    // Built before the clock starts: a connection costs milliseconds.
     auto observer =
         sdbus::createProxy(sdbus::ServiceName{DbusService::kBusName}, sdbus::ObjectPath{DbusService::kObjectPath});
 
-    // Unmeasured, and it has to come first: it puts every monitor the measured calls will
-    // touch into the daemon's map, so the config save each of those calls performs writes a
-    // file of constant size. Without it the file would grow entry by entry underneath the
-    // measurement and part of the difference being measured would be that.
+    // Unmeasured: every monitor enters the map first, so each measured call saves a config of
+    // constant size rather than one growing under the measurement.
     for (int i = 0; i < loadCount; ++i) {
         setWallpaper(proxy, "shader", bluePath, kMonitorLoadBase + i);
     }
 
-    // GOAL: the premise the S6.9 assertion below rests on -- that a `shader` request is
-    //       recorded and then NOT rendered. If it ever renders, the two bursts stop
-    //       differing and the assertion measures nothing while staying green.
-    // WHY-THIS-SHAPE: asked of the daemon over the wire rather than asserted in the test,
-    //       because the test cannot see isRenderableType(). The alternative -- waiting for
-    //       the absence of a FrameReady -- cannot distinguish "never renders" from "has not
-    //       rendered yet", and would have to spend a timeout to say so. `unsupported` is
-    //       the daemon's own published answer and shares isRenderableType() with the
-    //       render path, so the two cannot disagree. The inert type is `shader`, not
-    //       `video`: Step 13 makes video a type the daemon draws, and this burst has to
-    //       stay one that draws nothing or the comparison below loses its control side.
-    // CONTROL: isRenderableType() (backend/daemon/wallpaper_manager.h) changed to
-    //       `type == "static" || type == "shader"` -> "FAIL: the shader burst is recorded as
-    //       a wallpaper this build does not render", with "0/16 monitors report unsupported"
-    //       beside it, on both ICD entries. The ratio on those runs read 0.99 and 0.93 --
-    //       two rendering bursts compared against each other, the vacuous green this
-    //       converts into a red. Observed 2026-09-15. Reverted.
+    // GOAL: the premise of S6.9 below -- a `shader` request is recorded and NOT rendered; if it
+    //       rendered, the two bursts would stop differing and the ratio would measure nothing.
+    // WHY-THIS-SHAPE: the daemon's own `unsupported`, which shares isRenderableType() with the
+    //       render path; waiting for an absent FrameReady cannot tell never from not yet.
+    // CONTROL: isRenderableType() (backend/daemon/wallpaper_manager.h) accepting `shader` ->
+    //       "FAIL: the shader burst is recorded as a wallpaper this build does not render", "0/16
+    //       monitors report unsupported", on both ICD entries (the ratio read 0.99 and 0.93).
+    //       Observed 2026-09-15. Reverted.
     const StatusReply inertStatus = getStatusOrExplain(proxy);
     int unsupportedSeen = 0;
     for (int i = 0; i < loadCount; ++i) {
@@ -1095,24 +843,15 @@ void checkResponsivenessUnderLoad(sdbus::IProxy& proxy, FrameReadyLog& signals, 
     }
     const bool inertBurstIsInert = unsupportedSeen == loadCount;
     if (!inertBurstIsInert) {
-        // Says which of the two ways this failed: the daemon renders shaders now, or the
-        // reply that would have said so never arrived (getStatusOrExplain has printed the
-        // reason for that case immediately above).
         std::fprintf(stderr, "  %d/%d monitors report unsupported%s\n", unsupportedSeen, loadCount,
                      inertStatus.ok() ? "" : " -- and GetStatus did not answer, see above");
     }
     check(inertBurstIsInert, "the shader burst is recorded as a wallpaper this build does not render "
                              "(the S6.9 comparison below is meaningless otherwise)");
 
-    // The control burst. Same monitors as the renderable burst below, so the config save
-    // each call performs writes an identically sized file.
-    //
-    // A separate burst rather than interleaved with it. Alternating the two types pair by
-    // pair sounds fairer -- both calls would meet the same worker -- and measured worse: it
-    // puts the issue loop and the worker loop into a fixed phase relationship, and one call
-    // of each pair comes out ~3x the other. Which one is a coin flip per run (a tsan run
-    // read 3.47 and the next 0.31, the second with the INERT call dearer), so the number
-    // stops being about the wallpaper type at all. X.2 forbids asserting on that.
+    // The control burst, on the same monitors. Not interleaved with the other: measured, pairs
+    // lock the issue and worker loops into a phase where one call of each pair is ~3x the other,
+    // which one by coin flip per run (X.2).
     std::vector<Clock::duration> inertSamples;
     inertSamples.reserve(static_cast<size_t>(loadCount));
     for (int i = 0; i < loadCount; ++i) {
@@ -1127,23 +866,14 @@ void checkResponsivenessUnderLoad(sdbus::IProxy& proxy, FrameReadyLog& signals, 
     }
     const auto issueTime = Clock::now() - loadStart;
 
-    // Asks for the frame of the *last* monitor queued, so its export task sits behind
-    // every render in the FIFO. Issued first; GetStatus below is issued after it and
-    // must still finish first.
-    // Plain variables, not atomics: join() below is the synchronisation point, and
-    // everything the thread wrote happens-before everything read after it.
+    // The last monitor's frame, so its export sits behind every render in the FIFO; GetStatus is
+    // issued after it. Plain variables: join() is the happens-before edge. jthread, so a daemon
+    // dying mid-exchange unwinds rather than terminates.
     Clock::time_point frameDoneAt{};
     bool frameFailed = false;
-    // jthread, not thread: everything between here and the join() below is a blocking DBus
-    // exchange with a daemon that may die or time out mid-burst -- which is exactly what a
-    // daemon answering GetFrameFd on the event loop does. Unwinding past a still-joinable
-    // std::thread is std::terminate, so the one regression this phase exists to catch would
-    // have produced a bare SIGABRT with no FAIL lines instead of reaching main's handler.
-    // The explicit join() below stays: it is the happens-before edge that makes the plain
-    // frameDoneAt/frameFailed safe to read, and it leaves the destructor with nothing to do.
     std::jthread frameRequest([&] {
         try {
-            const Frame frame = getFrameFd(*observer, kMonitorLoadBase + loadCount - 1);
+            const Frame frame = getFrame(*observer, kMonitorLoadBase + loadCount - 1);
             (void)frame;
         } catch (const std::exception&) {
             frameFailed = true;
@@ -1156,7 +886,7 @@ void checkResponsivenessUnderLoad(sdbus::IProxy& proxy, FrameReadyLog& signals, 
     check(status.ok(), "GetStatus still returns parseable JSON while renders are queued");
 
     frameRequest.join();
-    check(!frameFailed, "the GetFrameFd issued while the queue was deep is answered rather than failing");
+    check(!frameFailed, "the GetFrame issued while the queue was deep is answered rather than failing");
 
     bool round1Ok = true;
     for (int i = 0; i < loadCount; ++i) {
@@ -1167,31 +897,26 @@ void checkResponsivenessUnderLoad(sdbus::IProxy& proxy, FrameReadyLog& signals, 
 
     const auto frameLatency = frameDoneAt - loadStart;
     std::printf("daemon_system_test: one render %.1f ms; issuing %d requests took %.1f ms, draining them %.1f ms; "
-                "GetFrameFd behind the queue took %.1f ms and a GetStatus issued after it finished %.1f ms sooner\n",
+                "GetFrame behind the queue took %.1f ms and a GetStatus issued after it finished %.1f ms sooner\n",
                 perRenderMs, loadCount, millis(issueTime), millis(drain), millis(frameLatency),
                 millis(frameDoneAt - statusDoneAt));
 
-    // Printed, never counted -- see the header comment above for why this one cannot
-    // fail for any daemon that does not already abort.
-    std::printf("daemon_system_test: GetStatus %s the GetFrameFd issued before it (corroborating, not asserted -- "
+    // Printed, never counted: see the phase comment.
+    std::printf("daemon_system_test: GetStatus %s the GetFrame issued before it (corroborating, not asserted -- "
                 "the Device's thread pinning is what makes a GPU-touching handler fatal)\n",
                 statusDoneAt < frameDoneAt ? "overtook" : "did not overtake");
 
     const double inertFloor = minMillis(inertSamples);
     const double staticFloor = minMillis(staticSamples);
     const double ratio = inertFloor > 0 ? staticFloor / inertFloor : 0.0;
-    // The sample count is printed rather than asserted: both bursts are the same
-    // unconditional loop over one clamped counter, so no state of the daemon, the host or
-    // the GPU can make them differ -- an assertion on it could only be reddened by editing
-    // the clamp three lines away, which is a check that cannot fail dressed as a guard.
+    // Sample counts printed, not asserted: one unconditional loop each, so nothing but an edit
+    // here could make them differ.
     std::printf("daemon_system_test: cheapest SetWallpaper cost %.3f ms for a request that renders vs %.3f ms for one "
                 "that does not (ratio %.2f, bound %.1f) over %zu and %zu samples; medians %.3f and %.3f\n",
                 staticFloor, inertFloor, ratio, kIssueCostRatioBound, staticSamples.size(), inertSamples.size(),
                 medianMillis(staticSamples), medianMillis(inertSamples));
 
-    // The comparison means something only if exactly one of the two bursts rendered. Not a
-    // silent pass either way: both premises are asserted above, so a run that lands here is
-    // already red and the reason is already printed against the right component.
+    // Meaningful only if exactly one burst rendered; both premises are asserted above.
     if (!round1Ok || !inertBurstIsInert) {
         std::printf("daemon_system_test: the S6.9 issue-cost comparison is abandoned -- %s, so the two bursts do "
                     "not differ in the way the comparison assumes.\n",
@@ -1202,49 +927,20 @@ void checkResponsivenessUnderLoad(sdbus::IProxy& proxy, FrameReadyLog& signals, 
     // GOAL: S6.9 -- issuing a burst of SetWallpaper calls that WILL render costs no more
     //       than issuing an identical burst that renders nothing. False for a daemon whose
     //       handler renders (or waits for the render) before replying.
-    // WHY-THIS-SHAPE: the obvious form -- issue time as a fraction of the render drain --
-    //       has a denominator that is not daemon code. Under
-    //       ThreadSanitizer the drain is mostly uninstrumented rasterisation inside the ICD
-    //       while the handler is instrumented daemon code, so the two sides scale by
-    //       different factors: the tsan tier read 0.2932 then 0.9375 against a 0.25 bound
-    //       on a daemon that is not defective, and 0.9375 is what the defect itself scores.
-    //       The `shader` burst is the same handler, the same validation, the same requestSeq
-    //       bookkeeping and the same config save, differing only in isRenderableType() --
-    //       so sanitizer distortion and host GPU speed appear on both sides and cancel.
-    //       The cheapest call of each burst, not the median or the total: the renderable
-    //       burst -- and only it -- is issued while the worker is drawing, so its calls
-    //       carry lock and stdout contention the inert ones never meet, and a sanitizer
-    //       charges roughly ten times as much for it. That put the tsan median ratio at
-    //       1.11-1.58 and the totals at 2.19 with nothing wrong. Comparing the least
-    //       contended call on each side removes the confound instead of budgeting for it:
-    //       1.01-1.03 over the same runs. It cannot let the defect through, because a
-    //       handler that renders inline has no cheap call to offer -- every one of the
-    //       sixteen monitors is distinct, so every request is a fresh render.
-    // CONTROL: DbusService::setWallpaper made synchronous -- after m_worker.post(), post a
-    //       task carrying a promise and wait on its future, which is the FIFO's completion
-    //       edge for the render just queued. Rendering on the worker keeps the Device's
-    //       thread pinning from aborting first, so the daemon survives to be measured;
-    //       emitFrameReady had to be detached for the same run, because a worker blocking
-    //       on the connection lock while the handler waits on the worker is a deadlock, not
-    //       a slow reply. Observed 2026-09-15 against the `shader` control burst: NVIDIA
-    //       2.159 ms vs 0.040 ms, ratio 53.90; lavapipe 5.343 vs 0.038, ratio 138.88 --
-    //       FAIL on both, against a bound of 2.0 (the sanitizer tier not run that day).
-    //       Reverted.
-    //
-    // What this deliberately does NOT cover: the handler's absolute cost. The config save
-    // runs on both sides, so it cancels -- ConfigStore::save given a 5 ms sleep, some 500x
-    // its real cost, took both sides from 0.14 ms to 5.25 ms and left the ratio at 1.00 and
-    // green. Nothing in this suite bounds the absolute cost of a DBus handler: the in-process
-    // S8.10 phase establishes that the save is not the durable variant, which is a different
-    // question, and a second bound here would reintroduce exactly the host-dependent absolute
-    // number this shape removed. That gap is real and is stated here rather than implied.
-    //
-    // A validity gate, not part of the assertion: a cheapest call measured at 0 ms means this
-    // host's clock cannot resolve a round trip, and a ratio computed from it grades nothing.
-    // Folded into the check as `inertFloor > 0 &&`, it prints
-    // "ratio 1.00" beside a FAIL accusing the daemon of rendering inline. The gate cannot
-    // hide the defect it is next to: a handler that rendered inline has no zero-cost call to
-    // offer, since every one of these monitors is a distinct, fresh render.
+    // WHY-THIS-SHAPE: against a `shader` burst, not the render drain: the drain is not daemon
+    //       code and scales differently under a sanitizer (tsan read 0.94 against a 0.25 bound on
+    //       a sound daemon). The two bursts share handler, validation and config save, differing
+    //       only in isRenderableType(), so host and sanitizer cost cancel. The cheapest call of
+    //       each, because only the renderable burst meets the worker's contention (tsan medians
+    //       1.11-1.58 sound, cheapest 1.01-1.03); an inline renderer has no cheap call, each of the
+    //       sixteen monitors being a fresh render.
+    // CONTROL: DbusService::setWallpaper made to wait on a promise posted behind its render (and
+    //       emitFrameReady detached, to avoid a deadlock) -> FAIL, NVIDIA 2.159 vs 0.040 ms (ratio
+    //       53.90), lavapipe 5.343 vs 0.038 (138.88), bound 2.0. Observed 2026-09-15. Reverted.
+    //       NOT covered: the handler's absolute cost, which cancels (a 5 ms sleep in
+    //       ConfigStore::save left the ratio at 1.00); nothing in this suite bounds it.
+    // A 0 ms cheapest call means this clock cannot resolve a round trip: not verified, never a
+    // FAIL, and an inline renderer has no 0 ms call to hide behind it.
     if (inertFloor <= 0.0 || staticFloor <= 0.0) {
         notVerified("S6.9 (SetWallpaper does not render inline)",
                     "the cheapest call in a burst measured 0 ms, so this host's clock cannot resolve a SetWallpaper "
@@ -1257,22 +953,10 @@ void checkResponsivenessUnderLoad(sdbus::IProxy& proxy, FrameReadyLog& signals, 
 }
 
 // ---------------------------------------------------------------------------- //
-// Phase 4 -- several independent clients, concurrently.
-//
-// Discharges PLAN.md's task-4 obligation: the daemon is multi-threaded (DBus event loop
-// plus one GPU thread) and nothing tested it under contention. Each thread gets its own
-// connection and proxy, because separate clients is what actually happens -- a single
-// proxy shared across threads would exercise sdbus's locking, not the daemon's.
-//
-// What can be asserted from out here is deliberately narrow. `requestSeq` supersede and
-// `servicedSeq` idempotence are internal, and a test that guessed at their values would
-// be asserting on the scheduler. The externally true statements are: nothing crashes,
-// every reply is either well-formed or one of the three named errors that are legitimate
-// mid-flight, and `generation` never goes backwards for a monitor -- which is the
-// observable consequence of both paths being correct. The third of those errors -- the
-// producer refusing to hand over its last free image -- is counted per monitor rather than
-// merely tolerated, so admitting it here does not turn the phase green for a daemon that
-// refuses everything.
+// Phase 4 -- several independent clients, concurrently, each on its own connection (one shared
+// proxy would exercise sdbus's locking, not the daemon's). Only what holds under every
+// interleaving is asserted: nothing crashes, every reply is well-formed or one of three named
+// errors legitimate mid-flight, and a monitor's generation never goes backwards for one observer.
 // ---------------------------------------------------------------------------- //
 struct StormResult {
     std::atomic<int> unexpectedErrors{0};
@@ -1282,33 +966,23 @@ struct StormResult {
     std::mutex mutex;
     std::string firstUnexpected;
 
-    // Per storm monitor: how many hand-overs were served, and how many were refused because
-    // granting one would have left the producer nowhere to draw. Read only after every thread
-    // has joined -- comparing them mid-storm is a race, since the thread that was served and
-    // the thread that was refused record in whichever order they are scheduled.
+    // Per monitor, served and refused for the reserve; compared only after every thread joined.
     std::array<std::atomic<int>, kStormMonitors> served{};
     std::array<std::atomic<int>, kStormMonitors> refusedForReserve{};
 
-    // Every reading of GetStatus's deferred_renders that was above zero, and how many readings
-    // were taken. renderPending()'s deferral path is a backstop the producer's reserve is meant
-    // to keep unreachable, so any non-zero reading is a report that a hand-over got past it.
+    // GetStatus readings of deferred_renders, and those above zero.
     std::atomic<int> deferralReadings{0};
     std::atomic<int> deferralsSeen{0};
 };
 
-// Each client's own high-water mark, held on its stack -- deliberately NOT shared across
-// the storm threads. Monotonicity is a property of one observer's sequence: two clients
-// can read generations 5 and 6 in either real-time order and record them in either order,
-// so a mark shared between them reports a perfectly monotonic daemon as regressing the
-// moment the faster reader records first. Per client, the property is exactly what the
-// daemon promises and nothing about the interleaving can fake a violation.
+// Per client, never shared: two clients may record generations 5 and 6 in either order, so a
+// shared mark would report a monotonic daemon as regressing.
 using GenerationMarks = std::map<int32_t, uint64_t>;
 
 void observeGeneration(StormResult& result, GenerationMarks& marks, int32_t monitorId, uint64_t generation) {
     const auto it = marks.find(monitorId);
     if (it == marks.end()) {
-        // A first look establishes the mark and compares against nothing. Excluded from
-        // the count below so the assertion's actual content is measurable.
+        // A first look compares nothing, so it is not counted.
         marks.emplace(monitorId, generation);
         return;
     }
@@ -1327,10 +1001,7 @@ void recordUnexpected(StormResult& result, const std::string& what) {
 }
 
 void stormThread(int index, const std::string& bluePath, const std::string& redPath, StormResult& result) {
-    // Inside the guard, not before it: an exception escaping a thread entry point is
-    // std::terminate, and createProxy throws if the bus refuses another connection or the
-    // daemon has already died -- turning a storm-phase failure into a bare abort with no
-    // FAIL lines.
+    // Inside the guard: createProxy throws if the bus refuses, and a thread must not throw.
     std::unique_ptr<sdbus::IProxy> proxy;
     try {
         proxy = sdbus::createProxy(sdbus::ServiceName{DbusService::kBusName},
@@ -1340,8 +1011,7 @@ void stormThread(int index, const std::string& bluePath, const std::string& redP
         return;
     }
 
-    // Deterministic per thread, so a failure is reproducible. std::random_device would
-    // make the interleaving that broke the daemon unrecoverable from the log.
+    // Deterministic per thread, so a failing sequence is reproducible.
     GenerationMarks marks;
     uint32_t rng = 0x9e3779b9u * static_cast<uint32_t>(index + 1);
     const auto next = [&rng] {
@@ -1358,25 +1028,16 @@ void stormThread(int index, const std::string& bluePath, const std::string& redP
                     break;
                 case 1: {
                     const StatusReply status = getStatus(*proxy);
-                    // Recorded here rather than left to the catch below: getStatus() hands
-                    // a failed call back as a value, so without this a daemon that stopped
-                    // answering mid-storm would read as an empty reply with no monitor in
-                    // it -- no finding at all. Thrown, it is counted as an unexpected error
-                    // because its name is neither of the two legitimate ones.
-                    // CONTROL: DbusService::getStatus made to throw -> "FAIL: concurrent
-                    //       clients see only the three named errors that are legitimate
-                    //       mid-render", with "29 unexpected failure(s); first was:
-                    //       GetStatus failed with org.sdbuscpp.Error". Reverted.
+                    // getStatus() returns a failure as a value, which would otherwise read as an
+                    // empty reply. CONTROL: DbusService::getStatus made to throw -> "FAIL:
+                    // concurrent clients see only the three named errors that are legitimate
+                    // mid-render", "29 unexpected failure(s); first was: GetStatus failed with
+                    // org.sdbuscpp.Error". Reverted.
                     if (!status.ok()) recordUnexpected(result, status.error());
-                    // Called for the generation observation below. Snapshot consistency
-                    // is deliberately NOT graded from these replies -- see the note at
-                    // the end of this function.
                     const nlohmann::json* entry = wallpaperStatus(status, std::to_string(monitorId));
                     if (entry != nullptr) {
                         observeGeneration(result, marks, monitorId, entry->value("generation", uint64_t{0}));
-                        // Read on every pass rather than once at the end, because the count is
-                        // cleared by the next commit: a deferral that happened mid-storm would
-                        // be gone by the time a single reading after the storm was taken.
+                        // Every pass: the next commit clears the count.
                         if (entry->contains("deferred_renders") && (*entry)["deferred_renders"].is_number_unsigned()) {
                             ++result.deferralReadings;
                             if (entry->value("deferred_renders", uint32_t{0}) > 0) ++result.deferralsSeen;
@@ -1385,9 +1046,9 @@ void stormThread(int index, const std::string& bluePath, const std::string& redP
                     break;
                 }
                 default: {
-                    const Frame frame = getFrameFd(*proxy, monitorId);
+                    const Frame frame = getFrame(*proxy, monitorId);
                     if (fcntl(frame.fd.get(), F_GETFD) == -1) {
-                        recordUnexpected(result, "GetFrameFd returned a closed fd");
+                        recordUnexpected(result, "GetFrame returned a closed fd");
                     }
                     ++result.served.at(static_cast<size_t>(monitorId - kMonitorStormBase));
                     observeGeneration(result, marks, monitorId, frame.generation);
@@ -1396,17 +1057,9 @@ void stormThread(int index, const std::string& bluePath, const std::string& redP
             }
             ++result.calls;
         } catch (const sdbus::Error& e) {
-            // Three legitimate answers mid-storm: a monitor whose render has not committed
-            // yet has no frame; a monitor whose most recent request was superseded before
-            // it rendered reports the previous failure; and a monitor whose other images
-            // are all held refuses the hand-over that would take the producer's last one.
-            // Anything else -- a timeout, a disconnect, an unhandled exception escaping a
-            // handler -- is a defect.
-            //
-            // The third is counted per monitor rather than merely tolerated, because
-            // admitting a name to this list is otherwise a pure weakening: a daemon that
-            // refused EVERY hand-over would leave this phase green. What that count is
-            // asserted against is at the end of checkConcurrentClients().
+            // Legitimate mid-storm: no frame yet, the previous render's failure, and a refusal
+            // to give up the producer's last image -- counted per monitor and graded after the
+            // storm, or a daemon refusing everything would pass. Anything else is a defect.
             const std::string name = e.getName();
             if (name == "io.wallpaperx.Daemon.Error.NoFreeImage") {
                 ++result.refusedForReserve.at(static_cast<size_t>(monitorId - kMonitorStormBase));
@@ -1425,9 +1078,7 @@ void checkConcurrentClients(sdbus::IProxy& proxy, FrameReadyLog& signals, const 
                             const std::string& redPath, const std::string& corruptPath, const Check& check) {
     StormResult result;
 
-    // jthread for the same reason as above: emplace_back can throw (thread exhaustion,
-    // or a reallocation running out of memory) while the vector already holds joinable
-    // threads, and destroying those is std::terminate.
+    // jthread: emplace_back can throw with joinable threads already in the vector.
     std::vector<std::jthread> threads;
     threads.reserve(kStormThreads);
     for (int i = 0; i < kStormThreads; ++i) {
@@ -1443,31 +1094,16 @@ void checkConcurrentClients(sdbus::IProxy& proxy, FrameReadyLog& signals, const 
                      result.firstUnexpected.c_str());
     }
 
-    // GOAL: the producer's reserve refuses a hand-over only when it has images out on loan. A
-    //       monitor that answered "no free image" must have handed at least one image out
-    //       during this storm -- a daemon that refused unconditionally, or one whose admission
-    //       test disagreed with its own bookkeeping, would refuse a monitor it had never served.
-    // WHY-THIS-SHAPE: evaluated after every thread has joined, and per monitor, because that is
-    //       the only form of this that is not an assertion on the scheduler. Comparing the two
-    //       counters mid-storm is a race -- the thread that was served and the thread that was
-    //       refused record in whichever order they run -- and asserting that any particular
-    //       number of refusals happened would be asserting on the interleaving too, since how
-    //       many clients hold how many images at any instant is a scheduling outcome. This is
-    //       also what stops NoFreeImage's admission to the legitimate-error list above from
-    //       being a pure weakening.
-    // CONTROL: a refusal for every named caller on this phase's monitors alone, inserted ahead
-    //       of the admission block in WallpaperManager::exportCurrentFrame (backend/daemon/
-    //       wallpaper_manager.cpp) as `if (!client.empty() && monitorId >= 20) { out.reason =
-    //       NoFreeImage; return out; }` -> "FAIL: a monitor was only refused for want of a free
-    //       image after it had handed one out", printing "4 monitor(s) refused without ever
-    //       serving -- monitor 20: 0 served, 1 refused; ...". Scoped to monitor ids 20 and up
-    //       on purpose: refusing every caller everywhere throws out of an earlier phase, which
-    //       ends the run before this one is reached and would leave the check unattested. It
-    //       also reddens the monotonicity coverage assertion below, because a refused hand-over
-    //       records no generation. Reverted.
-    // COVERAGE-ASSERT: how many refusals this run actually saw is printed beside the verdict,
-    //       so a future change that stopped producing any -- which would make the check above
-    //       vacuously true -- is visible in the log rather than silent.
+    // GOAL: the reserve refuses a hand-over only with images out on loan: a monitor that answered
+    //       "no free image" handed at least one image out during the storm.
+    // WHY-THIS-SHAPE: after every thread joined and per monitor, the one form that does not
+    //       assert on the scheduler; a count of refusals would be the interleaving's.
+    // CONTROL: `if (!client.empty() && monitorId >= 20) { out.reason = NoFreeImage; return out; }`
+    //       ahead of the admission block in WallpaperManager::exportCurrentFrame
+    //       (backend/daemon/wallpaper_manager.cpp) -> "FAIL: a monitor was only refused for want of
+    //       a free image after it had handed one out", "4 monitor(s) refused without ever serving".
+    //       Scoped to this phase's ids: refusing everywhere ends the run in an earlier phase. Reverted.
+    // COVERAGE-ASSERT: the refusals seen are printed beside the verdict, so a run with none is visible.
     {
         int refusalsTotal = 0;
         int monitorsRefusedWithoutServing = 0;
@@ -1491,36 +1127,20 @@ void checkConcurrentClients(sdbus::IProxy& proxy, FrameReadyLog& signals, const 
         std::fflush(stdout);
     }
 
-    // GOAL: no render is ever deferred for want of a free image. exportCurrentFrame()'s reserve
-    //       is what keeps one, and renderPending()'s deferral path is a backstop that should now
-    //       be unreachable -- so any reading above zero is a report that a hand-over got past the
-    //       reserve, which is a wallpaper that stops changing on a monitor under contention.
-    // WHY-THIS-SHAPE: sampled on every GetStatus the storm makes rather than once afterwards,
-    //       because the count is cleared by the next commit: a deferral that really happened
-    //       would be gone by the time a single reading at the end was taken. Non-zero at ANY
-    //       reading is the violation, which makes it independent of the interleaving -- unlike
-    //       an assertion that some particular number of deferrals did or did not occur.
+    // GOAL: no render is ever deferred for want of a free image: the reserve keeps one, so any
+    //       non-zero deferred_renders reading is a hand-over that got past it.
+    // WHY-THIS-SHAPE: read on every storm GetStatus (the next commit clears it), and non-zero at
+    //       any reading is the violation, which holds under every interleaving. Deleting the
+    //       reserve does NOT redden it -- whether clients come to hold every image is a scheduling
+    //       outcome; the deterministic form is dbus_service_test's buffer-hold phase.
     // CONTROL: `if (deferred)` in WallpaperManager::renderPassLocked (backend/daemon/
-    //       wallpaper_manager.cpp) changed to `if (true)`, so every render defers -> "FAIL: no
-    //       render was ever deferred for want of a free image, which the producer's reserve is
-    //       what prevents", printing "21 of 22 readings reported a deferred render", beside the
-    //       checks that need any render to complete. Observed 2026-09-14. Reverted.
-    //       Deleting exportCurrentFrame()'s reserve does NOT redden this: measured, that run
-    //       produced no deferral on any storm monitor at all, because whether the storm's clients
-    //       come to hold every image of one monitor is a scheduling outcome. That is the reason
-    //       the deferral claim is graded here as an invariant over every reading rather than as
-    //       a state this phase drives the daemon into -- the deterministic version of it is in
-    //       dbus_service_test's buffer-hold phase.
-    // COVERAGE-ASSERT: the number of readings is asserted, so a reply that stopped carrying
-    //       deferred_renders -- which would leave the check above true of nothing -- fails
-    //       instead of going quiet. One reading per thread is far below the measured count
-    //       (roughly a third of 4 x 24 calls land on the GetStatus arm; 22 readings measured on
-    //       this host) and is a bound a slow host cannot flake.
-    // CONTROL, for the coverage assertion: `entry["deferred_renders"] = monitor.deferredRenders;`
-    //       in DbusService::getStatus (backend/daemon/dbus_service.cpp) guarded by
-    //       `if (monitor.deferredRenders > 0)` -> "FAIL: deferred_renders was actually readable
-    //       from the storm's GetStatus replies", with the invariant check below still green on
-    //       zero readings, which is exactly the vacuous pass it exists to catch. Reverted.
+    //       wallpaper_manager.cpp) made `if (true)` -> "FAIL: no render was ever deferred for want
+    //       of a free image, which the producer's reserve is what prevents", "21 of 22 readings".
+    //       Observed 2026-09-14. Reverted.
+    // COVERAGE-ASSERT: at least one reading per thread (22 measured). CONTROL: DbusService::getStatus
+    //       (backend/daemon/dbus_service.cpp) writing deferred_renders only when non-zero ->
+    //       "FAIL: deferred_renders was actually readable from the storm's GetStatus replies".
+    //       Reverted.
     check(result.deferralReadings >= kStormThreads,
           "deferred_renders was actually readable from the storm's GetStatus replies");
     check(result.deferralsSeen == 0,
@@ -1531,57 +1151,27 @@ void checkConcurrentClients(sdbus::IProxy& proxy, FrameReadyLog& signals, const 
     }
     check(result.generationRegressions == 0, "a monitor's generation never goes backwards under concurrent clients");
     // GOAL: X.5 -- the monotonicity check asserts how much comparing it actually did.
-    // WHY-THIS-SHAPE: a first look establishes a client's mark and compares against
-    //       nothing, so a run with near-zero repeat observations has asserted
-    //       near-nothing. The bound was kStormThreads (4), and the count turns out to
-    //       be steeply non-linear in kStormIterations -- measured on this host, 8
-    //       iterations yields 1 comparison, 14 yields 6, 16 yields 11 and the shipped
-    //       24 yields 24-27 over eight runs across both ICDs. So the old bound left a
-    //       wide band (5 through 23) in which the check was two-thirds hollow and
-    //       still green. Three per client (12) is half the measured minimum: enough
-    //       margin that a slow host cannot flake it, and enough bite that any
-    //       meaningful reduction fails. Deliberately not tightened to the ~16 the
-    //       GetStatus branch alone should produce -- how many GetFrameFd calls land
-    //       on a monitor with no frame yet is a scheduling outcome, and a bound set at
-    //       the margin would be asserting on the scheduler.
-    // CONTROL: kStormIterations reduced from 24 to 14 -- chosen because the *old*
-    //       bound of 4 still passes there, so the control separates the new check from
-    //       the one it replaces. 6 comparisons, "FAIL: the monotonicity check made
+    // WHY-THIS-SHAPE: three per client, half the measured minimum (24-27 comparisons at 24
+    //       iterations, steeply fewer below), so a slow host cannot flake it; not set at the
+    //       margin, since how many calls meet a frameless monitor is a scheduling outcome.
+    // CONTROL: kStormIterations 24 -> 14 (6 comparisons) -> "FAIL: the monotonicity check made
     //       enough repeat observations to be worth asserting". Reverted.
     check(result.generationComparisons >= kStormThreads * 3,
           "the monotonicity check made enough repeat observations to be worth asserting");
 
-    // The snapshot-consistency invariant is NOT graded here. statusSelfConsistent returns
-    // true the moment gpu.initialized is true (see tests/client/daemon_client.h), that flag
-    // is set once in WallpaperManager::ensureGpu and never cleared, and this phase runs
-    // long after the first render -- so every reply would short-circuit at the first
-    // branch and the count of inconsistent snapshots is 0 by construction. The window the
-    // invariant guards is only open around the daemon's first device creation, so the
-    // check lives where it can fail -- see checkFirstFrameUnderStatusLoad below.
+    // Snapshot consistency is not graded here: it can fail only before the first device exists
+    // (checkFirstFrameUnderStatusLoad).
     std::printf("daemon_system_test: %d concurrent calls across %d clients completed, %d generation comparisons\n",
                 result.calls.load(), kStormThreads, result.generationComparisons.load());
 
-    // The daemon is still there and still correct afterwards. Quiescing each stormed
-    // monitor to a known request and checking where it lands is what makes the storm an
-    // assertion rather than a smoke test: a supersede bug leaves a monitor flagged as
-    // holding a frame whose request was replaced, and a lost request leaves one holding
-    // nothing at all.
-    // Drain first, THEN read the generations. The order matters and the reverse is a
-    // vacuous check: SetWallpaper is asynchronous, so storm renders are still queued when
-    // the threads join. A threshold read at that moment is a *stale* generation, and the
-    // waitAtLeast below would be satisfied by one of those leftover renders committing --
-    // so "every monitor still renders after the storm" would pass for a daemon whose
-    // render worker had wedged the instant the storm ended. One FIFO render thread means
-    // this barrier's own signal proves every storm render has already been serviced.
+    // Each stormed monitor quiesced to a known request: a supersede bug leaves a replaced frame,
+    // a lost request none. Drained FIRST (the FIFO barrier's signal proves every storm render was
+    // serviced): a generation read while storm renders are queued is a threshold a leftover
+    // render would satisfy, passing a worker that wedged when the storm ended.
     setWallpaper(proxy, "static", bluePath, kMonitorBarrierPre);
     const bool drained = signals.wait(kMonitorBarrierPre, 1);
     check(drained, "the storm's queued renders all drain (barrier render completes)");
     if (!drained) {
-        // Checked *and acted on*. Without the return, the snapshot below would be taken
-        // from exactly the non-quiesced state this barrier exists to rule out, and the
-        // waitAtLeast built on it would then be satisfied by a leftover storm render --
-        // reporting "every monitor still renders" for the wedged worker that caused the
-        // barrier to time out in the first place.
         std::printf("daemon_system_test: post-storm state checks abandoned -- the render queue never drained, so "
                     "any generation read now would be a stale threshold.\n");
         return;
@@ -1591,13 +1181,10 @@ void checkConcurrentClients(sdbus::IProxy& proxy, FrameReadyLog& signals, const 
     {
         const StatusReply status = getStatusOrExplain(proxy);
         check(status.ok(), "the daemon still answers GetStatus after the storm");
-        // Acted on for the same reason the drain barrier above is: every generation below
-        // is read from this one reply, and an unanswered call leaves them all at 0 --
-        // which is a threshold any leftover render satisfies, so "every monitor still
-        // renders after the storm" would pass on the strength of the failure just graded.
+        // Acted on: an unanswered call leaves every threshold at 0, which any render satisfies.
         // CONTROL: DbusService::getStatus made to throw -> "FAIL: the daemon still answers
-        //       GetStatus after the storm" and this abandonment line, with the phases after
-        //       it still running. Reverted.
+        //       GetStatus after the storm" and this abandonment line, later phases still running.
+        //       Reverted.
         if (!status.ok()) {
             std::printf("daemon_system_test: post-storm state checks abandoned -- GetStatus did not answer, so "
                         "every threshold below would be a fabricated zero.\n");
@@ -1610,17 +1197,13 @@ void checkConcurrentClients(sdbus::IProxy& proxy, FrameReadyLog& signals, const 
         }
     }
 
-    // Even ids end on a renderable image, odd ids on one that cannot decode, so the two
-    // opposite outcomes are both asserted. A single direction would pass for a daemon
-    // that had stopped rendering as readily as for one that works.
+    // Even ids end on a renderable image, odd on an undecodable one: both outcomes asserted.
     for (int i = 0; i < kStormMonitors; ++i) {
         const int32_t monitorId = kMonitorStormBase + i;
         setWallpaper(proxy, "static", (i % 2 == 0) ? bluePath : corruptPath, monitorId);
     }
 
-    // The renderable ones announce themselves. waitAtLeast, not wait: which generation a
-    // monitor reaches depends on how many of the storm's requests coalesced, which is a
-    // scheduling outcome and not something to assert.
+    // waitAtLeast: how many storm requests coalesced is a scheduling outcome.
     bool quiesced = true;
     for (int i = 0; i < kStormMonitors; i += 2) {
         const int32_t monitorId = kMonitorStormBase + i;
@@ -1628,23 +1211,14 @@ void checkConcurrentClients(sdbus::IProxy& proxy, FrameReadyLog& signals, const 
     }
     check(quiesced, "every monitor still renders after the storm");
 
-    // The failing ones announce nothing, so their state is settled by a barrier instead:
-    // one FIFO render thread means a later request's FrameReady proves the earlier ones
-    // have already been serviced. No sleep, and no assumption about how long a render
-    // takes.
+    // The undecodable ones announce nothing: a later FIFO request's FrameReady settles them.
     setWallpaper(proxy, "static", bluePath, kMonitorBarrierPost);
     check(signals.wait(kMonitorBarrierPost, 1), "the post-storm barrier render completes");
 
-    // Graded, and acted on, for the same reason the `before` reading above is: an
-    // unanswered call leaves an empty object, so every entry below reads as absent and the
-    // two counts land at zero -- which prints as two monitor-state failures for what is in
-    // fact the bus never answering.
-    // CONTROL: an unconditional throw cannot reach this line -- the `before` reading above
-    //       grades and returns first -- so the mutation is scoped: DbusService::getStatus
-    //       made to throw only once the reply contains monitor 31, which is the post-storm
-    //       barrier and is set after that reading. One FAIL, "the daemon still answers
-    //       GetStatus after the post-storm barrier", plus this abandonment line and neither
-    //       monitor-state FAIL. Reverted.
+    // Acted on: an unanswered call would read every monitor as absent, two misattributed FAILs.
+    // CONTROL: DbusService::getStatus throwing only once the reply holds monitor 31 (set after
+    //       the `before` reading) -> one FAIL, "the daemon still answers GetStatus after the
+    //       post-storm barrier", this abandonment line, no monitor-state FAIL. Reverted.
     const StatusReply after = getStatusOrExplain(proxy);
     check(after.ok(), "the daemon still answers GetStatus after the post-storm barrier");
     if (!after.ok()) {
@@ -1682,15 +1256,9 @@ void checkConcurrentClients(sdbus::IProxy& proxy, FrameReadyLog& signals, const 
 // Signals and connection loss (S6.35, S6.36, S6.37)
 // ---------------------------------------------------------------------------- //
 
-// A daemon's signal masks, read from /proc. Every field is a hex bitmask in which signal
-// N is bit N-1.
-//
-// `blocked` is the union over a caller-supplied set of threads, and `ignored` comes from
-// the leader. That split is not tidiness: a signal's *disposition* is per-process, but its
-// *blocked* mask is per-thread, and /proc/<pid>/status reports only the thread-group
-// leader's. A daemon that blocked SIGPIPE on another of its threads -- the log writer, whose
-// write is the one that fails -- would leave the leader's mask clean and satisfy a leader-only
-// read while doing exactly what S6.37 forbids.
+// A daemon's signal masks from /proc (signal N is bit N-1). `blocked` is the union over given
+// threads, since a blocked mask is per-thread and /proc/<pid>/status shows only the leader's;
+// `ignored` is per-process, from the leader.
 struct SignalMasks {
     bool read = false;
     uint64_t blocked = 0;
@@ -1700,8 +1268,7 @@ struct SignalMasks {
 
 constexpr uint64_t signalBit(int signo) { return 1ull << (signo - 1); }
 
-// Parses one /proc/<pid>/task/<tid>/status. Returns false if either field was missing,
-// which the caller must not treat as a clean mask.
+// False if either field is missing, which is never a clean mask.
 bool readTaskMasks(const std::string& path, uint64_t& blocked, uint64_t& ignored) {
     std::ifstream status(path);
     if (!status) return false;
@@ -1726,8 +1293,7 @@ bool readTaskMasks(const std::string& path, uint64_t& blocked, uint64_t& ignored
     return sawBlocked && sawIgnored;
 }
 
-// Every thread of `pid`, as tids. Taken before the daemon's first render, where the only
-// threads in existence are the ones the daemon itself created -- see readSignalMasks.
+// Every thread of `pid`. Taken before the first render, when all of them are the daemon's own.
 std::vector<pid_t> daemonThreads(pid_t pid) {
     std::vector<pid_t> tids;
     std::error_code ec;
@@ -1741,31 +1307,16 @@ std::vector<pid_t> daemonThreads(pid_t pid) {
     return tids;
 }
 
-// Unions SigBlk over exactly `tids`, and takes SigIgn from the leader.
-//
-// The thread set is passed in rather than scanned here, and that is the load-bearing part.
-// A scan of /proc/<pid>/task at the point the check runs would include the ICD's own
-// threads, and those are not the daemon's to answer for: measured on this host, every one
-// of Mesa's 64 `llvmpipe-N` rasterizer threads and its `...:disk$0` cache thread carries
-// SigBlk=0xfffffffe3ffbfaff -- SIGPIPE included -- while the daemon's own three threads
-// carry 0x4003 and 0x0. A union over all tasks is therefore RED on a correct daemon under
-// Lavapipe, which is the red-when-correct state this suite exists to avoid. Filtering by
-// thread name would be an allowlist of driver internals that goes stale the first time a
-// driver renames a thread. Taking the tid set before any GPU work exists excludes them by
-// construction instead.
-//
-// Not covered by that choice, and said out loud: a thread the daemon creates *after* its
-// first render would not be sampled. It creates none today -- every thread appearing after
-// ensureGpu() belongs to the ICD -- so the set is exactly "the threads this program made".
+// Unions SigBlk over exactly `tids` (taken before the first render), never a scan at check time:
+// the ICD's threads block nearly everything (Mesa's 64 llvmpipe threads: 0xfffffffe3ffbfaff,
+// SIGPIPE included), which would be red on a correct daemon under Lavapipe. A thread the daemon
+// created after its first render would not be sampled; it creates none today.
 SignalMasks readSignalMasks(pid_t pid, const std::vector<pid_t>& tids) {
     SignalMasks masks;
     const std::string taskDir = "/proc/" + std::to_string(pid) + "/task/";
 
-    // The leader is required, and it is what `read` is keyed on. A thread can exit between
-    // the tid snapshot and this read, so a failed open on a *non-leader* task is tolerated
-    // -- but never counted as a clean mask, because a union that silently skipped the one
-    // thread with SIGPIPE blocked is the vacuous pass this shape exists to remove. The
-    // count of what was actually sampled is returned and asserted by the caller.
+    // The leader is required; a non-leader that exited since the snapshot is skipped, never
+    // counted clean, and the caller asserts how many were read.
     uint64_t leaderBlocked = 0;
     uint64_t leaderIgnored = 0;
     if (!readTaskMasks(taskDir + std::to_string(pid) + "/status", leaderBlocked, leaderIgnored)) {
@@ -1787,22 +1338,507 @@ SignalMasks readSignalMasks(pid_t pid, const std::vector<pid_t>& tids) {
     return masks;
 }
 
-// GOAL: S6.36 -- SIGHUP shuts the daemon down through the same chain as SIGINT and
-//       SIGTERM: a normal exit with status 0, having printed which signal it saw and
-//       "stopped cleanly". Left at its default disposition it dies at 129 and none of
-//       that chain runs.
-// WHY-THIS-SHAPE: exitedNormally() is asserted separately from `exit == 0`, and before
-//       it, because reap() reports "killed by a signal" and "never exited, SIGKILLed by
-//       the test" as exit code -1 alike. A check written only as `exit == 0` would be red
-//       for all three causes with no way to tell which; and the one this goal is about --
-//       death by default disposition -- is precisely a signal death. The signal name is
-//       matched via strsignal() rather than the literal "Hangup" because the daemon
-//       inherits this process's locale and a translated string would fail a correct
-//       daemon.
+using wallpaperx::testing::HolderEntry;
+using wallpaperx::testing::holderEntry;
+
+// "a, b, c", or "(none)".
+std::string joined(const std::vector<std::string>& names) {
+    if (names.empty()) return "(none)";
+    std::string text;
+    for (const std::string& name : names) {
+        if (!text.empty()) text += ", ";
+        text += name;
+    }
+    return text;
+}
+
+std::string joined(const std::vector<int>& numbers) {
+    std::vector<std::string> names;
+    for (const int n : numbers) names.push_back(std::to_string(n));
+    return joined(names);
+}
+
+// "LD_PRELOAD=" with `library` after whatever this process preloads: a sanitizer runtime preloaded by
+// the build must stay first.
+std::string preloading(const char* library) {
+    const char* inherited = std::getenv("LD_PRELOAD");
+    const std::string before = inherited != nullptr && *inherited != '\0' ? std::string(inherited) + ":" : "";
+    return "LD_PRELOAD=" + before + library;
+}
+
+// A malformed entry is failed here, so a negative check reading "not held" off it cannot pass.
+bool holdsImage(sdbus::IProxy& asker, int32_t monitorId, const std::string& client, uint64_t bufferId) {
+    const HolderEntry held = holderEntry(getStatus(asker), monitorId, client);
+    wallpaperx::testing::check(!held.malformed, ("GetStatus lists the holder " + client + " in the documented shape (" +
+                                                 wallpaperx::testing::describeHolder(held) + ")")
+                                                    .c_str());
+    return held.listed && std::find(held.buffers.begin(), held.buffers.end(), bufferId) != held.buffers.end();
+}
+
+// S15.302, S15.303 and S15.305 on the real daemon: one caller holding an image through two
+// hand-overs of it, released by number, and the race a release used to lose against a hand-over
+// still on its way.
+void checkHandoverRelease(sdbus::IProxy& proxy, FrameReadyLog& signals, const std::string& bluePath,
+                          const Check& check) {
+    // Drawn by no other phase of this daemon (the ids below 18 and from 20 on are theirs).
+    constexpr int32_t kMonitor = 19;
+    constexpr int kTrials = 100;
+    const int depth = static_cast<int>(wallpaperx::kTargetDepth);
+    const sdbus::ServiceName name{DbusService::kBusName};
+    const sdbus::ObjectPath path{DbusService::kObjectPath};
+    auto reader = sdbus::createProxy(name, path);
+    auto observer = sdbus::createProxy(name, path);
+    const std::string readerName = reader->getConnection().getUniqueName();
+
+    uint64_t generation = 0;
+    // One render of the monitor, waited for by its exact generation: nothing else draws it, so the
+    // generations run 1, 2, ... A render that never comes ends the phase as a failure.
+    const auto render = [&] {
+        setWallpaper(proxy, "static", bluePath, kMonitor);
+        ++generation;
+        const bool drew = signals.wait(kMonitor, generation);
+        if (!drew) {
+            check(false, ("the daemon draws the hand-over monitor's generation " + std::to_string(generation)).c_str());
+        }
+        return drew;
+    };
+    // Which image the newest render drew into, read by a second caller that gives it straight back.
+    const auto drawnInto = [&]() -> uint64_t {
+        const Frame seen = getFrame(*observer, kMonitor);
+        wallpaperx::testing::releaseFrame(*observer, kMonitor, seen);
+        return seen.bufferId;
+    };
+    // Renders `count` frames, each read by the observer; the images drawn, in order, or fewer on failure.
+    const auto drawRound = [&](int count) {
+        std::vector<uint64_t> drawn;
+        for (int i = 0; i < count; ++i) {
+            if (!render()) break;
+            drawn.push_back(drawnInto());
+        }
+        return drawn;
+    };
+    const auto ids = [](const std::vector<uint64_t>& list) {
+        std::string out;
+        for (uint64_t id : list) out += (out.empty() ? "" : ", ") + std::to_string(id);
+        return "[" + out + "]";
+    };
+
+    if (!render()) return;
+
+    // GOAL: S15.302 -- a release naming the earlier of two hand-overs of one image keeps the claim,
+    //       and no render draws into that image while it stands; a release naming the later one
+    //       ends it, and the image is drawn into again.
+    // WHY-THIS-SHAPE: where renders land, read by a second caller, over a ring's depth plus one: the
+    //       second half shows the same reading sees the image once free. GetStatus's holder list
+    //       beside it says whether the claim or the render went wrong.
+    // CONTROL: in WallpaperManager::releaseHandoversLocked (backend/daemon/wallpaper_manager.cpp),
+    //       `handover >= held->newest` made `true || ...`, so any release ends the claim -> "FAIL: a
+    //       release naming the earlier of two hand-overs keeps the caller's claim" and "FAIL: and no
+    //       render draws into that image while the claim stands (image 1, drawn [2, 3, 4, 5, 1, 2])".
+    // COVERAGE-ASSERT: the two hand-overs must name one image with rising numbers, and every render
+    //       of both rounds must be read, or the phase stops before grading.
+    const Frame first = getFrame(*reader, kMonitor);
+    const Frame second = getFrame(*reader, kMonitor);
+    if (first.bufferId == 0 || second.bufferId != first.bufferId || first.handover == 0 ||
+        second.handover <= first.handover) {
+        check(false, ("two fetches of one frame are two hand-overs of one image, numbered upward (images " +
+                      std::to_string(first.bufferId) + " and " + std::to_string(second.bufferId) + ", hand-overs " +
+                      std::to_string(first.handover) + " and " + std::to_string(second.handover) + ")")
+                         .c_str());
+        return;
+    }
+    const uint64_t image = first.bufferId;
+    wallpaperx::testing::releaseFrame(*reader, kMonitor, first);
+    check(holdsImage(*reader, kMonitor, readerName, image),
+          "a release naming the earlier of two hand-overs keeps the caller's claim");
+    const std::vector<uint64_t> whileHeld = drawRound(depth + 1);
+    if (static_cast<int>(whileHeld.size()) != depth + 1) return;
+    check(std::find(whileHeld.begin(), whileHeld.end(), image) == whileHeld.end(),
+          ("and no render draws into that image while the claim stands (image " + std::to_string(image) +
+           ", drawn " + ids(whileHeld) + ")")
+              .c_str());
+    wallpaperx::testing::releaseFrame(*reader, kMonitor, second);
+    check(!holdsImage(*reader, kMonitor, readerName, image), "a release naming the later hand-over ends the claim");
+    const std::vector<uint64_t> afterRelease = drawRound(depth + 1);
+    if (static_cast<int>(afterRelease.size()) != depth + 1) return;
+    check(std::find(afterRelease.begin(), afterRelease.end(), image) != afterRelease.end(),
+          ("and the image is drawn into again within a ring's depth of renders (image " + std::to_string(image) +
+           ", drawn " + ids(afterRelease) + ")")
+              .c_str());
+
+    // GOAL: S15.305 on the wire -- a release naming hand-over 0, or one above the latest issued, is
+    //       refused InvalidArgs and changes nothing.
+    // WHY-THIS-SHAPE: nothing else asks this daemon for a frame meanwhile, so one past this caller's
+    //       newest number has not been issued.
+    // CONTROL: in WallpaperManager::releaseBuffer (backend/daemon/wallpaper_manager.cpp), (a) the
+    //       `handover == 0 ||` term deleted -> "FAIL: a release naming hand-over 0 is refused
+    //       InvalidArgs and changes nothing (answered '', still held: yes)"; (b) the `|| handover >
+    //       m_lastHandover` term deleted -> "FAIL: a release naming a hand-over not yet made is refused
+    //       InvalidArgs and changes nothing (answered '', still held: no)".
+    {
+        const Frame held = getFrame(*reader, kMonitor);
+        const std::string zero = wallpaperx::testing::errorNameFrom(
+            [&] { wallpaperx::testing::releaseBuffer(*reader, kMonitor, held.bufferId, 0); });
+        const bool afterZero = holdsImage(*reader, kMonitor, readerName, held.bufferId);
+        check(zero == "org.freedesktop.DBus.Error.InvalidArgs" && afterZero,
+              ("a release naming hand-over 0 is refused InvalidArgs and changes nothing (answered '" + zero +
+               "', still held: " + (afterZero ? "yes" : "no") + ")")
+                  .c_str());
+        const std::string future = wallpaperx::testing::errorNameFrom(
+            [&] { wallpaperx::testing::releaseBuffer(*reader, kMonitor, held.bufferId, held.handover + 1); });
+        const bool afterFuture = holdsImage(*reader, kMonitor, readerName, held.bufferId);
+        check(future == "org.freedesktop.DBus.Error.InvalidArgs" && afterFuture,
+              ("a release naming a hand-over not yet made is refused InvalidArgs and changes nothing (answered '" +
+               future + "', still held: " + (afterFuture ? "yes" : "no") + ")")
+                  .c_str());
+        wallpaperx::testing::releaseFrame(*reader, kMonitor, held);
+    }
+
+    // GOAL: S15.303 -- the race unforced: a GetFrame not waited on, then a release of the hand-over
+    //       read before it, on one connection. The caller keeps the image in every trial.
+    // WHY-THIS-SHAPE: 0 lost of kTrials holds under either order the daemon applies them in; each
+    //       reply is waited for, bounded, and one that never comes fails rather than counts.
+    // CONTROL: the same break as S15.302 -> "FAIL: a release racing a hand-over of the same image
+    //       never leaves the caller without its claim (N of 100 trials lost it)", N measured 24, 37, 66,
+    //       79 and 85 across five runs (NVIDIA and Lavapipe).
+    // COVERAGE-ASSERT: every trial must be answered with the same image, numbered above the one
+    //       released, or the phase stops; the count of trials graded is asserted.
+    Frame read = getFrame(*reader, kMonitor);
+    int lost = 0;
+    int graded = 0;
+    for (int trial = 0; trial < kTrials; ++trial) {
+        auto answered = std::make_shared<std::promise<std::optional<Frame>>>();
+        std::future<std::optional<Frame>> reply = answered->get_future();
+        {
+            sdbus::MethodCall call =
+                reader->createMethodCall(sdbus::InterfaceName{DbusService::kInterface}, sdbus::MethodName{"GetFrame"});
+            wallpaperx::testing::appendFrameArguments(call, kMonitor);
+            reader->callMethodAsync(call, [answered](sdbus::MethodReply out, std::optional<sdbus::Error> error) {
+                if (error) {
+                    answered->set_value(std::nullopt);
+                    return;
+                }
+                try {
+                    answered->set_value(wallpaperx::testing::readFrameReply(out));
+                } catch (...) {
+                    answered->set_value(std::nullopt);
+                }
+            });
+        }
+        wallpaperx::testing::releaseFrame(*reader, kMonitor, read);
+        if (reply.wait_for(std::chrono::seconds(10)) != std::future_status::ready) {
+            check(false, ("the GetFrame sent before the release is answered (trial " + std::to_string(trial) + ")").c_str());
+            return;
+        }
+        std::optional<Frame> next = reply.get();
+        if (!next || next->bufferId != read.bufferId || next->handover <= read.handover) {
+            check(false, ("each racing GetFrame is answered with the same image, numbered upward (trial " +
+                          std::to_string(trial) + ")")
+                             .c_str());
+            return;
+        }
+        if (!holdsImage(*reader, kMonitor, readerName, next->bufferId)) ++lost;
+        ++graded;
+        read = std::move(*next);
+    }
+    wallpaperx::testing::releaseFrame(*reader, kMonitor, read);
+    check(graded == kTrials && lost == 0,
+          ("a release racing a hand-over of the same image never leaves the caller without its claim (" +
+           std::to_string(lost) + " of " + std::to_string(graded) + " trials lost it)")
+              .c_str());
+    std::printf("daemon_system_test: hand-over race, %d trial(s), %d lost the claim\n", graded, lost);
+}
+
+// GOAL: S15.341 -- in the real daemon, over the bus, an allocation that fails while a GetFrame is
+//       answered never strands anything: the caller gets an answer (an error, or the frame), and
+//       after an error no claim stands for it, no descriptor is charged to it, and the monitor --
+//       unwatched beforehand -- is still unwatched. At least one of the failures lands after the
+//       export, where the claim and the charge already exist and must be taken back.
+// WHY-THIS-SHAPE: tests/alloc_fail_shim.cpp, preloaded, fails the Nth operator new (aligned forms
+//       included) the daemon or sdbus-c++ makes on the thread that sends frame replies, for N = 1, 2,
+//       ... until a GetFrame makes fewer than N and is served whole. Every such allocation of the call is
+//       reached in turn, so which ones lie after the export need not be known; a failure there is told
+//       apart by the daemon's own words, "could not be sent". The countdown stays armed until the shim
+//       sees the daemon's own code on that thread wait for its next job (a driver's wait mid-call does
+//       not count), so what the call does after its reply is failed too and never leaks into the next N. The validation layer's allocations are left alone: a
+//       std::bad_alloc thrown inside it crosses the Vulkan C API and ends the process, which no driver
+//       does. A static wallpaper, so nothing else runs on that thread between calls, and the monitor
+//       is driven unwatched (republished, then left uncollected past two seconds) before the sweep and
+//       again after any call served despite its failure, so a delivery recorded for a failed reply would
+//       show at every N. GetStatus is answered on the bus thread.
+// CONTROL: in DbusService::completeFrame (backend/daemon/dbus_service.cpp): (a) the withdrawHandover()
+//       block in the catch around sendFrame() deleted -> "FAIL: ...: no claim and no descriptor stand for the caller
+//       after an error (stranded at 8, 9, 10, 11, 12)"; (b) `m_manager.handoverDelivered(monitorId,
+//       client)` called before `sendFrame(call, handle);` -> "FAIL: ...: the monitor stays unwatched after
+//       an error (watched at 8, 9, 10)"; (c) the returnError() in that catch deleted -> "FAIL: ...: every
+//       GetFrame is answered (unanswered at 8, 9, 10)" and "FAIL: at least one of the failures landed
+//       after the export (0 answered "could not be sent")". Test-side: the shim's waitedByTheDaemon()
+//       made `return false` -> "NOT VERIFIED -- ... never went back to waiting after call 1", so the
+//       stack walk is what recognises the daemon's own wait. A driver's wait mid-call is not stageable
+//       here (none was seen on NVIDIA: "0 wait(s) on that thread by code not the daemon's").
+// COVERAGE-ASSERT: at least one failure after the export ("could not be sent"), the sweep ending on a
+//       call served whole, and that last delivery making the monitor watched -- the reading can see one.
+void checkFrameAllocationFailure(NameWatcher& names, const std::string& validationEnv, const std::string& bluePath,
+                                 const Check& check) {
+    constexpr const char* kGoal = "S15.341 (an allocation failing while the real daemon answers GetFrame strands nothing)";
+    constexpr int32_t kMonitor = 7;
+    constexpr int kMaxSweep = 2000;
+    ScratchDir work("allocfail");
+    if (!work.ok()) {
+        throw ScratchDirectoryLost("a scratch directory could not be created");
+    }
+    const std::string controlPath = (work.path() / "control").string();
+    const int controlFd = ::open(controlPath.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    void* mapped = MAP_FAILED;
+    if (controlFd >= 0 && ::ftruncate(controlFd, sizeof(wallpaperx::testing::AllocFailControl)) == 0) {
+        mapped = ::mmap(nullptr, sizeof(wallpaperx::testing::AllocFailControl), PROT_READ | PROT_WRITE, MAP_SHARED,
+                        controlFd, 0);
+    }
+    if (controlFd >= 0) ::close(controlFd);
+    if (mapped == MAP_FAILED) {
+        phaseSetupFault(kGoal, "the shim's control file could not be made and mapped");
+        return;
+    }
+    struct Unmap {
+        void* at;
+        ~Unmap() { ::munmap(at, sizeof(wallpaperx::testing::AllocFailControl)); }
+    } unmap{mapped};
+    auto& control = *new (mapped) wallpaperx::testing::AllocFailControl{};
+
+    FrameReadyLog signals;
+    auto subscription = wallpaperx::testing::subscribeFrameReady(signals);
+    SpawnedDaemon daemon(std::vector<std::string>{validationEnv, preloading(WALLPAPERX_ALLOC_FAIL_SHIM),
+                                                  "WALLPAPERX_TEST_ALLOC_FAIL=" + controlPath});
+    const bool cameUp = names.waitFor(true);
+    if (!cameUp && reportedStartupFault(daemon, kGoal)) return;
+    check(cameUp, "a fresh daemon acquires the name before the allocation-failure phase");
+    if (!cameUp) return;
+    // On every way out, so the next phase's daemon finds the name free.
+    struct Stop {
+        SpawnedDaemon& daemon;
+        NameWatcher& names;
+        ~Stop() {
+            daemon.shutdown(SIGTERM);
+            static_cast<void>(names.waitFor(false));
+        }
+    } stop{daemon, names};
+
+    const sdbus::ServiceName name{DbusService::kBusName};
+    const sdbus::ObjectPath path{DbusService::kObjectPath};
+    auto controller = sdbus::createProxy(name, path);
+    auto asker = sdbus::createProxy(name, path);
+    const std::string askerName = asker->getConnection().getUniqueName();
+    const auto watched = [&] {
+        const wallpaperx::testing::StatusReply status = getStatus(*controller);
+        const nlohmann::json* entry = wallpaperStatus(status, std::to_string(kMonitor));
+        return entry != nullptr && entry->is_object() && entry->value("watched", false);
+    };
+
+    setWallpaper(*controller, "static", bluePath, kMonitor);
+    if (!signals.wait(kMonitor, 1)) {
+        notVerified(kGoal, "the daemon drew nothing for the phase's monitor on this host");
+        return;
+    }
+    // The first frame teaches the shim which thread sends frame replies.
+    wallpaperx::testing::releaseFrame(*asker, kMonitor, getFrame(*asker, kMonitor));
+    if (control.workerTid.load() == 0) {
+        notVerified(kGoal, "the preloaded shim never saw a frame reply's descriptor appended, so it is not in effect");
+        return;
+    }
+    // Republishes the monitor and waits, bounded, until nothing has collected its newest picture: the
+    // state in which a delivery recorded for a reply that never went out would show.
+    uint64_t generation = 1;
+    const auto driveUnwatched = [&] {
+        setWallpaper(*controller, "static", bluePath, kMonitor);
+        ++generation;
+        if (!signals.wait(kMonitor, generation)) return false;
+        const auto unwatchedBy = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+        while (watched()) {
+            if (std::chrono::steady_clock::now() > unwatchedBy) return false;
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        return true;
+    };
+    if (!driveUnwatched()) {
+        notVerified(kGoal, "the republished monitor never went unwatched, so the state a recorded delivery would "
+                           "change could not be built");
+        return;
+    }
+
+    // A reply can go out while the worker is still finishing its call -- recording the delivery,
+    // logging, a render the undo posted -- so the countdown stays armed until the shim sees the
+    // daemon's own code on that thread wait for its next job.
+    const auto workerBackWaiting = [&](int done0) {
+        const auto by = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (control.callsDone.load() <= done0) {
+            if (std::chrono::steady_clock::now() > by) return false;
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        return true;
+    };
+
+    std::vector<int> unanswered, stranded, watchedAfter, servedAfterFailure;
+    std::string erroredUnfailed;  // a GetFrame no allocation failed in, answered with an error
+    int failed = 0, afterExport = 0, sweptTo = 0;
+    bool servedWhole = false;
+    for (int n = 1; n <= kMaxSweep && !servedWhole; ++n) {
+        sweptTo = n;
+        control.fired.store(0);
+        const int done0 = control.callsDone.load();
+        control.countdown.store(n);
+        std::string errorName, errorText;
+        std::optional<Frame> frame;
+        try {
+            frame = getFrame(*asker, kMonitor, {.timeout = std::chrono::seconds(10)});
+        } catch (const sdbus::Error& e) {
+            errorName = e.getName();
+            errorText = e.getMessage();
+        }
+        const bool noReply =
+            errorName == "org.freedesktop.DBus.Error.NoReply" || errorName == "org.freedesktop.DBus.Error.Timeout";
+        if (daemon.exited()) {
+            check(false, ("the daemon survives an allocation failing while it answers GetFrame (it died at " +
+                          std::to_string(n) + ")")
+                             .c_str());
+            return;
+        }
+        // GOAL: a GetFrame the client gave up on is not taken as finished: the next N is armed only
+        //       once the daemon's worker is back waiting for its next job.
+        // WHY-THIS-SHAPE: a client-side timeout says nothing about the worker, which may still be in
+        //       the call and would spend the next N's countdown there. A worker that never comes back
+        //       after a call that went unanswered is a hang of the daemon's, so it fails; one that does
+        //       not come back after an answer is reported not verified, as before.
+        // CONTROL: in DbusService::completeFrame (backend/daemon/dbus_service.cpp), the second call made to
+        //       sleep 25 s before it answers -> "FAIL: ... the frame-reply thread goes back to waiting after
+        //       call 1, which went unanswered".
+        const bool finished = workerBackWaiting(done0);
+        control.countdown.store(0);
+        const bool fired = control.fired.load() > 0;
+        if (!finished && noReply) {
+            check(false, ("an allocation failing while the real daemon answers GetFrame: the frame-reply thread goes "
+                          "back to waiting after call " +
+                          std::to_string(n) + ", which went unanswered")
+                             .c_str());
+            return;
+        }
+        if (!finished) {
+            notVerified(kGoal, "the frame-reply thread never went back to waiting after call " + std::to_string(n) +
+                                   ", so whether its allocations were done could not be told");
+            return;
+        }
+        if (!fired) {
+            servedWhole = frame.has_value();
+            if (noReply) {
+                unanswered.push_back(n);
+            } else if (!servedWhole) {
+                erroredUnfailed = std::to_string(n) + ": " + errorName + ": " + errorText;
+            }
+            break;
+        }
+        ++failed;
+        if (noReply) {
+            unanswered.push_back(n);
+            continue;
+        }
+        if (frame) {
+            // Failed after the reply went out: the claim is the caller's, and the monitor is now watched,
+            // so it is driven unwatched again before the next allocation is failed.
+            servedAfterFailure.push_back(n);
+            wallpaperx::testing::releaseFrame(*asker, kMonitor, *frame);
+            if (!driveUnwatched()) {
+                notVerified(kGoal, "the monitor never went unwatched again after the call served at " +
+                                       std::to_string(n) + ", so the rest of the sweep had no state to grade");
+                return;
+            }
+            continue;
+        }
+        if (errorText.find("could not be sent") != std::string::npos) ++afterExport;
+        const wallpaperx::testing::StatusReply status = getStatus(*controller);
+        const HolderEntry held = holderEntry(status, kMonitor, askerName);
+        if (held.listed && (held.malformed || !held.buffers.empty() || held.descriptors != 0)) stranded.push_back(n);
+        if (watched()) watchedAfter.push_back(n);
+    }
+    std::printf("daemon_system_test: allocation failure on the frame-reply thread -- %d failed of %d tried, %d after "
+                "the export, %zu served after the failure (%s); %d wait(s) on that thread by code not the daemon's, "
+                "not counted as a call's end\n",
+                failed, sweptTo, afterExport, servedAfterFailure.size(), joined(servedAfterFailure).c_str(),
+                control.otherWaits.load());
+    std::fflush(stdout);
+    if (failed == 0) {
+        notVerified(kGoal, "no allocation was ever failed: no preload took effect, or the runtime binds operator new "
+                           "inside itself");
+        return;
+    }
+    check(unanswered.empty(), ("an allocation failing while the real daemon answers GetFrame: every GetFrame is "
+                               "answered (unanswered at " + joined(unanswered) + ")")
+                                  .c_str());
+    check(erroredUnfailed.empty(), ("a GetFrame in which no allocation failed is served (answered with an error at " +
+                                    erroredUnfailed + ")")
+                                       .c_str());
+    check(stranded.empty(), ("an allocation failing while the real daemon answers GetFrame: no claim and no descriptor "
+                             "stand for the caller after an error (stranded at " + joined(stranded) + ")")
+                                .c_str());
+    check(watchedAfter.empty(), ("an allocation failing while the real daemon answers GetFrame: the monitor stays "
+                                 "unwatched after an error (watched at " + joined(watchedAfter) + ")")
+                                    .c_str());
+    check(afterExport >= 1, ("at least one of the failures landed after the export (" + std::to_string(afterExport) +
+                             " answered \"could not be sent\")")
+                                .c_str());
+    check(servedWhole && watched(), ("the sweep ended on a GetFrame served whole, which made the monitor watched (" +
+                                     std::to_string(sweptTo) + " tried)")
+                                        .c_str());
+}
+
+// GOAL: S15.327 -- SetOutputVisible logs a line only when the report changes what is recorded: of the
+//       six reports true, true, false, false, true, true for one screen, only the two changes are
+//       logged (a first `true` from a screen that never reported changes nothing), in that order.
+// WHY-THIS-SHAPE: a daemon of its own, graded on its complete output after shutdown, because the
+//       capture is complete only then. The count of two is also the positive control: a daemon that
+//       logged nothing would read 0 rather than pass.
+// CONTROL: in DbusService::setOutputVisible (backend/daemon/dbus_service.cpp) the condition made
+//       `m_manager.setOutputVisible(outputName, visible) || true`, via control_batch.sh, --phase
+//       '^outputVisibleLog$', 2026-10-05 -> "FAIL: SetOutputVisible logs only the reports that change
+//       what is recorded (6 line(s): ...)". Reverted.
+void checkOutputVisibleLog(NameWatcher& names, const std::string& validationEnv, const Check& check) {
+    SpawnedDaemon daemon(std::vector<std::string>{validationEnv});
+    const bool cameUp = names.waitFor(true);
+    if (!cameUp && reportedStartupFault(daemon, "the SetOutputVisible log checks (S15.327)")) return;
+    check(cameUp, "a fresh daemon acquires the name before the SetOutputVisible log phase");
+    if (!cameUp) return;
+    {
+        auto proxy = sdbus::createProxy(sdbus::ServiceName{DbusService::kBusName},
+                                        sdbus::ObjectPath{DbusService::kObjectPath});
+        wallpaperx::testing::setMonitorOutput(*proxy, 23, "DP-LOGGED");
+        for (const bool visible : {true, true, false, false, true, true}) {
+            wallpaperx::testing::setOutputVisible(*proxy, "DP-LOGGED", visible);
+        }
+    }
+    daemon.shutdown(SIGTERM);
+    check(names.waitFor(false), "the bus name is released after the SetOutputVisible log phase");
+    const std::string output = daemon.output();
+    std::vector<std::string> lines;
+    for (size_t at = output.find("SetOutputVisible(output="); at != std::string::npos;
+         at = output.find("SetOutputVisible(output=", at + 1)) {
+        lines.push_back(output.substr(at, output.find('\n', at) - at));
+    }
+    std::string listed;
+    for (const std::string& line : lines) listed += " [" + line + "]";
+    check(lines.size() == 2 && lines[0].find("visible=false") != std::string::npos &&
+              lines[1].find("visible=true") != std::string::npos,
+          ("SetOutputVisible logs only the reports that change what is recorded (" + std::to_string(lines.size()) +
+           " line(s):" + listed + ")")
+              .c_str());
+}
+
+// GOAL: S6.36 -- SIGHUP shuts the daemon down through the same chain as SIGINT and SIGTERM: exit
+//       0, the signal named, "stopped cleanly". At its default disposition it dies at 129.
+// WHY-THIS-SHAPE: exitedNormally() apart from `exit == 0`, since reap() reports a signal death and a
+//       SIGKILL by the test both as -1; the name via strsignal(), since the daemon inherits this
+//       process's locale.
 // CONTROL: `sigaddset(&shutdownSignals, SIGHUP)` deleted from backend/daemon/main.cpp -> "FAIL: the
-//       daemon exits through main() on SIGHUP rather than being killed by it (terminated
-//       by signal 1)", plus the exit-0, signal-name and stopped-cleanly checks. Observed
-//       2026-09-24 via control_run.sh, those four lines only. Reverted.
+//       daemon exits through main() on SIGHUP rather than being killed by it (terminated by signal
+//       1)" and the exit-0, signal-name and stopped-cleanly lines. Observed 2026-09-24 via
+//       control_run.sh. Reverted.
 void checkHangupShutdown(NameWatcher& names, const Check& check) {
     SpawnedDaemon hungUp;
     const bool cameUp = names.waitFor(true);
@@ -1824,9 +1860,7 @@ void checkHangupShutdown(NameWatcher& names, const Check& check) {
                      hungUp.timedOut() ? " (it had to be killed after the timeout)" : "");
     }
 
-    // Same shape as the SIGTERM and SIGINT blocks: under a sanitizer the exit code is the
-    // sanitizer's, so the question stops being about the shutdown path and is reported as
-    // that rather than as an accusation against main.cpp.
+    // Under a sanitizer the exit code is the sanitizer's, and is reported as that.
     if (sanitizerReportedIn(output)) {
         check(false, "the SIGHUP daemon's sanitizer reported no warnings (its exit code is the sanitizer's "
                      "here, so the SIGHUP exit-code check cannot run)");
@@ -1840,69 +1874,30 @@ void checkHangupShutdown(NameWatcher& names, const Check& check) {
     check(names.waitFor(false), "the bus name is released after the SIGHUP shutdown");
 }
 
-// GOAL: S6.37 -- a closed stdout does not kill the daemon. The write that fails must
-//       report EPIPE and the daemon must go on serving; and SIGPIPE must be *ignored*,
-//       not blocked, because blocked it stays pending forever instead of letting the
-//       write report.
-// WHY-THIS-SHAPE: three parts, and none of them is redundant.
-//       (1) The behavioural half: a SetWallpaper issued after the reader of the daemon's
-//       stdout is gone still gets a reply, still renders, and GetStatus still answers.
-//       That is what `wallpaperx-daemon | head` does, and at the default disposition the
-//       daemon dies at exit 141 on the log writer's failed write, with an empty stderr.
-//       (2) The disposition half, read from /proc: the behavioural half alone cannot tell
-//       ignored from blocked -- both survive the write -- and the goal explicitly rejects
-//       blocking. SigBlk/SigIgn is the only externally visible difference between the two.
-//       Read as a union over the daemon's own threads, not from /proc/<pid>/status: the
-//       disposition is per-process but the blocked mask is per-thread, and that file is
-//       the thread-group leader's alone. The failing write is the log writer thread's
-//       (backend/daemon/log_pump.cpp), and the union covers every thread the daemon starts,
-//       since the goal forbids SIGPIPE blocked on any of them and a mask installed on one is
-//       invisible to the leader-only read. "Own threads" is the tid set
-//       snapshotted before the first render rather than a scan at check time -- the ICD's
-//       thread pool blocks nearly every signal and would make this red on a correct daemon
-//       under Lavapipe; readSignalMasks carries the measurement.
-//       (3) The coverage assert below, because everything here rests on the daemon
-//       actually writing to stdout while serving that call. If that printf ever goes
-//       away, nothing generates EPIPE and all of the above passes on a daemon with the
-//       bug reintroduced -- so the write is asserted rather than assumed.
-// CONTROL: in backend/daemon/main.cpp via control_run.sh, re-run 2026-09-26 on NVIDIA, reverted.
-//       Deleting main()'s SIGPIPE ignore alone cannot be the control for this phase: cpp-httplib's
-//       Server constructor ignores SIGPIPE process-wide too (third_party/httplib.h), before this
-//       phase breaks stdout. (a) SIGPIPE put back to SIG_DFL right after the HttpServer is built ->
-//       "the daemon ignores SIGPIPE", the SetWallpaper and GetStatus answers, the thread-sampling
-//       line and both exit lines red. (b) SIGPIPE *blocked* (pthread_sigmask) in place of main()'s
-//       SIG_IGN -> "SIGPIPE is ignored rather than merely blocked" (SigIgn has it from cpp-httplib),
-//       every behavioural check here green -- the configuration S6.37 says must fail, which part
-//       (1) cannot see; S14.35's two reader-gone lines go red with it. (c) The same block installed
-//       inside the sigwait watcher lambda only -> the same line, alone. For (c) the counterfactual
-//       was measured 2026-08-05: with the sample restricted to the leader and the mutation in
-//       place, the run printed "all checks passed".
-// COVERAGE-ASSERT: the trigger is asserted on the pipe that is THIS daemon's stdout destination,
-//       from a render issued while it still has a reader, and not from the earlier daemon's
-//       captured output; the write it arms is the log writer's. That capture is stdout and
-//       stderr merged onto one pipe (the constructor dup2()s one write end onto both), so it can
-//       only establish "the binary printed
-//       this somewhere" -- and dbus_service.cpp has three fprintf(stderr, ...) SetWallpaper
-//       lines right beside the printf, so a refactor moving the entry log to stderr would
-//       leave the assert green while nothing in this phase generated EPIPE at all. Reading
-//       the Breakable daemon's own stdout pipe is stream-pure by construction. The exact
-//       needle, quotes included, is coupled to sanitizeForLog's Quoted framing on purpose:
-//       that framing landing is what silently broke the unquoted needle before.
-//       Controlled twice. (i) Harness: needle -> `SetWallpaper(type="zzz"`, a string the
-//       daemon never prints -> "FAIL: the daemon writes to stdout, specifically, while
-//       handling SetWallpaper", alone, followed by the phase's named skip and no cascade.
-//       (ii) Production, and this is the one the old merged-capture form could not see:
-//       DbusService::setWallpaper's entry printf changed to fprintf(stderr, ...) -> the
-//       same single FAIL. The merged capture still contained the line 76 times in that
-//       same run, so the assert this replaced would have stayed green while nothing in
-//       this phase generated an EPIPE at all. Both reverted.
+// GOAL: S6.37 -- a closed stdout does not kill the daemon: the failing write reports EPIPE, the
+//       daemon goes on serving, and SIGPIPE is IGNORED, not blocked (blocked, it stays pending).
+// WHY-THIS-SHAPE: (1) behaviour -- after the reader goes (`wallpaperx-daemon | head`), SetWallpaper
+//       is answered and rendered and GetStatus answers; (2) disposition from /proc, since
+//       behaviour cannot tell ignored from blocked; SigBlk as a union over the daemon's own
+//       threads (readSignalMasks), since the failing write is the log writer thread's
+//       (backend/daemon/log_pump.cpp); (3) the trigger asserted below, or nothing raises EPIPE.
+// CONTROL: in backend/daemon/main.cpp via control_run.sh, re-run 2026-09-26 on NVIDIA, reverted
+//       (cpp-httplib also ignores SIGPIPE, so deleting main()'s ignore alone is no control).
+//       (a) SIG_DFL after the HttpServer is built -> "the daemon ignores SIGPIPE", the SetWallpaper
+//       and GetStatus answers, the thread-sampling and both exit lines red. (b) SIGPIPE blocked
+//       (pthread_sigmask) instead of SIG_IGN -> "SIGPIPE is ignored rather than merely blocked",
+//       every behavioural check green, S14.35's two reader-gone lines red. (c) The block in the
+//       sigwait watcher only -> the same line, alone (a leader-only sample read "all checks
+//       passed", measured 2026-08-05).
+// COVERAGE-ASSERT: the trigger is read from THIS daemon's own stdout pipe, stream-pure (a merged
+//       capture would accept the line from stderr). Needle quoted, as sanitizeForLog frames it.
+//       Controlled twice, both reverted: the needle made `SetWallpaper(type="zzz"` -> "FAIL: the
+//       daemon writes to stdout, specifically, while handling SetWallpaper", alone; and
+//       DbusService::setWallpaper's entry printf moved to stderr -> the same single FAIL.
 void checkClosedStdout(NameWatcher& names, const std::string& bluePath, const std::string& validationEnv,
                        bool wantValidation, const Check& check) {
-    // Spawned with the validation env, unlike its siblings: this is the only phase that
-    // renders in a child process of its own, so it is the only one where an unwatched
-    // child means the daemon's Vulkan usage in this configuration -- a second Device after
-    // another daemon has exited, a render while the process's stdout is in a permanent
-    // error state -- has no oracle at all. Scanned after shutdown, at the end.
+    // With the validation env: the only other child that renders, so the only oracle for a second
+    // Device and a render with stdout broken. Scanned after shutdown.
     SpawnedDaemon deaf({validationEnv}, SpawnedDaemon::Stdout::Breakable);
     const bool cameUp = names.waitFor(true);
     if (!cameUp && reportedStartupFault(deaf, "the closed-stdout checks (S6.37)")) return;
@@ -1920,14 +1915,10 @@ void checkClosedStdout(NameWatcher& names, const std::string& bluePath, const st
         .onInterface(DbusService::kInterface)
         .call([&signals](int32_t monitorId, uint64_t generation) { signals.record(monitorId, generation); });
 
-    // Snapshotted before the first SetWallpaper, which is where main.cpp creates the
-    // Vulkan device: after that the process is full of the ICD's threads (64 of them under
-    // Lavapipe), and those are not this daemon's to answer for. See readSignalMasks.
+    // Before the first SetWallpaper creates the device and the ICD's threads.
     const std::vector<pid_t> daemonOwnThreads = daemonThreads(deaf.pid());
 
-    // One render with the pipe still readable, to establish the trigger. Draining a few
-    // hundred bytes and then closing the read end is faithful to what this phase models:
-    // `wallpaperx-daemon | head` is a reader that reads and then goes away.
+    // One render with the pipe still readable, to establish the trigger: a reader that reads, then goes.
     bool triggerIssued = false;
     try {
         setWallpaper(*proxy, "static", bluePath, kMonitorClosedStdoutPre);
@@ -1936,10 +1927,7 @@ void checkClosedStdout(NameWatcher& names, const std::string& bluePath, const st
         std::fprintf(stderr, "  SetWallpaper before the stdout reader was closed: %s\n", e.what());
     }
     check(triggerIssued, "the daemon answers SetWallpaper while its stdout still has a reader");
-    // Both early returns abandon the phase rather than continue: without the trigger, the
-    // EPIPE checks below would pass on a daemon that never wrote to the broken pipe, which
-    // is the vacuous configuration this assert exists to detect. The wait is deadline-
-    // bounded and its expiry fails the check -- it is never fallen through into.
+    // Without the trigger the EPIPE checks would pass vacuously, so both misses abandon the phase.
     if (!triggerIssued) {
         std::printf("daemon_system_test: closed-stdout checks skipped -- the daemon did not answer the render "
                     "that establishes the trigger, so breaking its stdout would prove nothing.\n");
@@ -1955,11 +1943,7 @@ void checkClosedStdout(NameWatcher& names, const std::string& bluePath, const st
         return;
     }
 
-    // From here the daemon's stdout is a pipe with no reader and no other holder of the
-    // write end: exactly `wallpaperx-daemon | head` once head has exited. Not graded --
-    // breakStdout() returns false only when there is no descriptor to close, which the
-    // Breakable constructor has already ruled out (it sets the descriptor or throws), so a
-    // check here would be one that cannot fail and an `if` here would be dead code.
+    // Not graded: false only with no descriptor, which the Breakable constructor rules out.
     deaf.breakStdout();
 
     bool answered = false;
@@ -1973,9 +1957,7 @@ void checkClosedStdout(NameWatcher& names, const std::string& bluePath, const st
           "the daemon answers SetWallpaper after its stdout reader is gone (its entry line reaches the broken "
           "pipe through the log writer, whose write is the one that fails)");
 
-    // Hoisted, because the validation scan at the end of this function is only evidence if
-    // the daemon actually did GPU work: an empty stderr capture from a child that died at
-    // startup would otherwise be graded as a clean bill of health.
+    // The validation scan at the end is evidence only if the daemon did GPU work.
     bool rendered = false;
     if (answered) {
         rendered = signals.wait(kMonitorClosedStdout, 1);
@@ -1998,14 +1980,8 @@ void checkClosedStdout(NameWatcher& names, const std::string& bluePath, const st
                          static_cast<unsigned long long>(masks.ignored),
                          static_cast<unsigned long long>(signalBit(SIGPIPE)));
         }
-        // COVERAGE-ASSERT: what the blocked-mask check is worth is a function of how many
-        // threads it actually sampled, and that number comes from runtime state (a /proc
-        // scan) rather than from the source. This daemon has four threads before it
-        // renders -- leader, render worker, sigwait watcher, log writer -- so a sample of one means the
-        // snapshot or the read silently fell back to the leader and the line above is back
-        // to the weaker, leader-only property. Measured, not assumed: with the non-leader
-        // tasks skipped and this line removed, the "SIGPIPE blocked on the watcher thread"
-        // control printed "all checks passed".
+        // COVERAGE-ASSERT: four threads exist before the first render; a sample of one is the
+        //       leader-only read, under which control (c) above printed "all checks passed".
         check(masks.threadsRead >= 2,
               "the blocked-signal check sampled the daemon's other threads, not just the group leader");
         if (masks.threadsRead < 2) {
@@ -2014,23 +1990,18 @@ void checkClosedStdout(NameWatcher& names, const std::string& bluePath, const st
         }
     }
 
-    // The shutdown path writes to stdout too ("... received, shutting down", "stopped cleanly",
-    // the flush at exit). Through the log writer (backend/daemon/log_pump.cpp) those land in its
-    // own pipe; the broken destination was dropped at the first failed write, so the exit is
-    // graded for surviving the pipe as a whole, not a second EPIPE. CONTROL: the log writer's
-    // abandoned-destination branch (Stream::write's `n == kGone`) made to abort, via control_run.sh
-    // 2026-09-27, reverted -> both exit lines red, with the SetWallpaper and GetStatus answers
-    // after the break, the thread-sampling line and S14.35's two reader-gone usage lines: the
-    // daemon died at the first failed write.
+    // The shutdown lines go through the log writer, which dropped the broken destination at the
+    // first failed write. CONTROL: its abandoned-destination branch (backend/daemon/log_pump.cpp,
+    // Stream::write's `n == kGone`) made to abort, via control_run.sh 2026-09-27 -> both exit lines
+    // red, with the answers after the break, the thread-sampling line and S14.35's two reader-gone
+    // lines. Reverted.
     const int exitCode = deaf.shutdown(SIGTERM);
     check(deaf.exitedNormally(), "a daemon whose stdout is closed still exits through main() on SIGTERM");
     if (!deaf.exitedNormally()) {
         std::fprintf(stderr, "  terminated by signal %d%s\n", deaf.termSignal(),
                      deaf.timedOut() ? " (it had to be killed after the timeout)" : "");
     }
-    // Its stdout is broken by construction, so "stopped cleanly" cannot be looked for
-    // here: the exit code is the only evidence left, which is exactly the position an
-    // operator is in when this happens for real.
+    // Its stdout is broken, so the exit code is the only evidence of a clean stop.
     if (deaf.sanitizerReported()) {
         check(false, "the closed-stdout daemon's sanitizer reported no warnings (its exit code is the "
                      "sanitizer's here, so the exit-code check cannot run)");
@@ -2039,24 +2010,14 @@ void checkClosedStdout(NameWatcher& names, const std::string& bluePath, const st
     }
     check(names.waitFor(false), "the bus name is released after the closed-stdout daemon exits");
 
-    // GOAL: S6.33 -- zero Vulkan validation warnings across every daemon path the suite
-    //       exercises, this child's render and teardown included.
-    // WHY-THIS-SHAPE: scanned here rather than folded into main()'s single scan, because
-    //       main() reads only the first daemon's output and this is the only other child
-    //       that builds a Device. Gated on `rendered` and not merely on `wantValidation`:
-    //       deaf.output() is stderr only and is empty for a child that died at startup, so
-    //       an ungated `warnings.empty()` would report the GPU-side oracle as clean for a
-    //       run in which no Vulkan work happened at all -- the same hollowing main() guards
-    //       against with its "serving" anchor. Read after shutdown(), because output() is
-    //       complete only once the reader thread has seen EOF. stderr, not stdout, is where
-    //       Device's messenger writes ("[vulkan] ..." via fprintf(stderr)), which is why breaking
-    //       fd 1 does not take this oracle with it.
-    // CONTROL: deaf spawned with WALLPAPERX_VALIDATION=0 while wantValidation was true ->
-    //       the run printed the named skip below instead of a green check, i.e. the gate
-    //       refuses to grade an unwatched child. Reverted.
-    // The waived / no-layer case prints nothing here on purpose: main() announces it once,
-    // loudly, at the top of the run, and repeating it per phase would train a reader to
-    // scroll past the one warning that says the GPU oracle is off.
+    // GOAL: S6.33 -- zero Vulkan validation warnings across every daemon path, this child's render
+    //       and teardown included.
+    // WHY-THIS-SHAPE: this child's own scan, gated on `rendered`: its capture is stderr only (where
+    //       the messenger writes) and empty for a child that never did Vulkan work. Its stdout is
+    //       broken, so the "layer active" line main() requires cannot be read here. A waived or
+    //       absent layer is announced once by main(), not per phase.
+    // CONTROL: deaf spawned with WALLPAPERX_VALIDATION=0 while wantValidation was true -> the named
+    //       skip below instead of a green check. Reverted.
     if (wantValidation && !rendered) {
         std::printf("daemon_system_test: closed-stdout validation scan skipped -- that daemon never rendered, "
                     "so its silence about Vulkan is not evidence. The failure that caused it is above.\n");
@@ -2070,61 +2031,15 @@ void checkClosedStdout(NameWatcher& names, const std::string& bluePath, const st
     }
 }
 
-// GOAL: S6.35 -- losing the bus connection unwinds through main() instead of aborting.
-//       enterEventLoop() throws on connection loss, and every object between it and
-//       main's handler must be destructible on that path; a joinable std::thread
-//       destroyed during that unwind is std::terminate -- exit 134, core dumped, and none
-//       of the destructors S6.30 exists to guarantee.
-// WHY-THIS-SHAPE: the loss is driven by killing a bus this test started itself, not by
-//       the mechanism that found the bug (~1000 unread GetFrameFd calls exhausting
-//       dbus-broker's unix-fd quota). That mechanism cannot be used here and a check
-//       built on it would be worse than none: ctest runs under dbus-run-session, which
-//       starts the reference dbus-daemon, which enforces no such quota -- so the flood
-//       would be absorbed, the connection would survive, and the check would pass green
-//       against a daemon with the bug reintroduced. What the daemon actually sees is a
-//       connection that ends, which is what SIGKILLing its bus produces (verified:
-//       "fatal: [System.Error.ENOTCONN] Failed to get bus poll data"), on any bus
-//       implementation and with no quota involved. What this does NOT establish is that
-//       dbus-broker's fd quota is reachable at ~1000 calls; that is the broker's
-//       behaviour, not this daemon's.
-//       exitedNormally() is asserted before and separately from `exit == 1` for the same
-//       reason as in the SIGHUP phase: the failure mode here IS a signal death, and
-//       reap() folds signal deaths and timeouts into the same -1.
-//       NOT COVERED here, stated because the phase reads as if it were: the orphan is
-//       killed before it is ever sent a SetWallpaper, and main.cpp creates the Vulkan
-//       device on the first one -- so no Device exists, no validation layer is ever
-//       loaded, and the GPU half of the teardown on this unwind path is graded by nothing.
-//       The phase therefore takes no validation env: one would be inert and make the
-//       coverage look wider than it is.
-// CONTROL: three, and the first two are about this phase being able to report at all.
-//       (i) the startup needle changed to one the daemon never prints -> "FAIL: the daemon
-//       comes up on a bus of the test's own...", alone, with the four unwind checks
-//       skipped and the daemon's own output printed. (ii) the tree reconfigured with
-//       DBUS_DAEMON_EXECUTABLE empty (the dbus-daemon-less host) -> "NOT VERIFIED -- the
-//       connection-loss checks (S6.35) could not be exercised: no dbus-daemon binary was
-//       found at configure time", exit 77, and ctest reported `daemon_system ...Skipped`
-//       instead of Passed. Both reverted.
-//       (iii) backend/daemon/main.cpp's ShutdownWatch guard replaced by a bare `std::thread shutdownWatch`
-//       with the pthread_kill/join moved to after enterEventLoop() -- i.e. the code as it
-//       was before f1aa32c. Re-run 2026-08-06: the daemon printed "terminate called
-//       without an active exception" and died on signal 6, and exactly 3 FAILs followed --
-//       "losing the bus connection unwinds through main() instead of aborting the
-//       process", the exit-1 line and the fatal-message line -- with the startup check
-//       above still green. Reverted. The inverted shutdown-line check below does not fire
-//       on this mutation: a daemon that aborts prints no shutdown line either.
 // GOAL: X.26 -- a bus this test starts for itself can activate nothing, and its socket is inside
-//       the entry's private runtime directory, so killing it outright leaves nothing in the shared
-//       /tmp.
-// WHY-THIS-SHAPE: the bus is asked, as test_isolation asks the entry's own: the configuration in
-//       force decides what can be activated, and asking activates nothing. The address it printed
-//       is where its socket is.
-// CONTROL: test-side, control_batch, 2026-10-04, each in NestedBus's generated configuration: the
-//       listen directory made $TMPDIR -> red, "FAIL: the test's own bus listens inside the entry's
-//       private runtime directory" (re-run after the escaping); the runtime directory written
-//       unescaped, with a TMPDIR holding ' +~@%&<' -> dbus-daemon "not well-formed (invalid token)",
-//       reported NOT VERIFIED and the entry Skipped, not red; a <servicedir> added holding one inert service (Exec=/bin/false)
-//       -> red, "FAIL: nothing can be activated on the test's own bus", listing it. `--session` itself,
-//       the configuration this replaced, was not run as a control: it can activate the host's services.
+//       the entry's private runtime directory, so killing it leaves nothing in the shared /tmp.
+// WHY-THIS-SHAPE: the bus itself is asked; asking activates nothing.
+// CONTROL: test-side, control_batch, 2026-10-04, in NestedBus's generated configuration: the
+//       listen directory made $TMPDIR -> "FAIL: the test's own bus listens inside the entry's
+//       private runtime directory"; the directory written unescaped under a TMPDIR holding ' +~@%&<'
+//       -> NOT VERIFIED, Skipped, not red; a <servicedir> with one inert service -> "FAIL: nothing
+//       can be activated on the test's own bus", listing it. `--session` was not run as a control:
+//       it can activate the host's services.
 void checkNestedBusPrivate(const Check& check) {
     NestedBus bus;
     if (!bus.ok()) {
@@ -2158,21 +2073,29 @@ void checkNestedBusPrivate(const Check& check) {
     }
 }
 
+// GOAL: S6.35 -- losing the bus connection unwinds through main() instead of aborting: a joinable
+//       std::thread destroyed on that unwind is std::terminate, and none of S6.30's destructors run.
+// WHY-THIS-SHAPE: the loss is a SIGKILL of a bus this test started ("fatal: [System.Error.ENOTCONN]
+//       Failed to get bus poll data"), not the ~1000-unread-GetFrame flood that found the bug: the
+//       reference dbus-daemon under ctest has no fd quota and would absorb it. exitedNormally()
+//       apart from `exit == 1`, as in the SIGHUP phase. NOT COVERED: the GPU half of this unwind --
+//       the daemon is killed before its first SetWallpaper, so no Device exists (hence no
+//       validation env).
+// CONTROL: (i) the startup needle changed to one never printed -> "FAIL: the daemon comes up on a
+//       bus of the test's own...", alone; (ii) DBUS_DAEMON_EXECUTABLE empty -> "NOT VERIFIED -- the
+//       connection-loss checks (S6.35) could not be exercised: no dbus-daemon binary was found at
+//       configure time", Skipped; (iii) backend/daemon/main.cpp's ShutdownWatch guard replaced by a
+//       bare std::thread joined after enterEventLoop() (the code before f1aa32c), re-run 2026-08-06
+//       -> "terminate called without an active exception", signal 6, and 3 FAILs (unwinds through
+//       main(), exit 1, the fatal message). All reverted.
 void checkBusLoss(const Check& check) {
     NestedBus bus;
     if (!bus.ok()) {
-        // A bus child that never execed is this file's fault specifically, not the host's,
-        // and bus.reason() would name dbus-daemon for it -- see the block that sets this.
         if (const char* fault = bus.preambleFault()) {
             phaseSetupFault("the connection-loss checks (S6.35)", fault);
             return;
         }
-        // X.3: a bus this test could not start is a fault in the harness or the host, and
-        // must never be reported as the daemon aborting -- so this is not a check().
-        // Counted as NOT VERIFIED instead of merely printed: the run's exit status used to
-        // be a pure function of `failures`, so "S6.35 held" and "S6.35 never ran" produced
-        // byte-identical results and ctest reported both as PASS. notVerified() makes the
-        // run exit 77, which ctest reports as a skip.
+        // X.3: the host's or harness's fault, never the daemon aborting; a skip, not a pass.
         notVerified("the connection-loss checks (S6.35)", bus.reason());
         return;
     }
@@ -2224,75 +2147,26 @@ void checkBusLoss(const Check& check) {
     } else {
         check(exitCode == 1, "the daemon exits 1 through main's exception handler when its bus is destroyed");
     }
-    // Named, because the check below is gated on it rather than merely printed after it.
+    // The check below is gated on this.
     const bool reachedTheHandler = output.find("fatal:") != std::string::npos;
     check(reachedTheHandler, "the daemon says why it exited after losing the bus rather than dying silently");
 
-    // GOAL: on the connection-loss path the daemon does not report a signal it was never
-    //       sent. It died because the broker dropped its connection; ~ShutdownWatch wakes
-    //       the sigwait watcher with a pthread_kill(SIGTERM) that is an implementation
-    //       detail of the wake, not a signal from anybody, and the log must not present it
-    //       as one.
-    //
-    // WHY-THIS-SHAPE: the ABSENCE of kSignalShutdownLine, not its presence as an oracle
-    //       for "the watcher was woken and joined": a watcher that cannot distinguish the
-    //       destructor's wake from a real SIGTERM prints `Terminated received, shutting
-    //       down` on this path, where no signal was sent at all, and an operator triaging a
-    //       daemon that vanished reads a genuine-format line pointing at the session manager
-    //       instead of at the bus quota. A presence check passes *because* of that defect.
-    //
-    //       The wake-and-join is carried by the checks above, and each half was run rather
-    //       than argued: ~ShutdownWatch's pthread_kill deleted, so
-    //       the watcher is never woken, leaves join() blocking and the daemon never exits
-    //       -> "FAIL: the daemon notices that its bus connection is gone and exits", plus
-    //       the exitedNormally, exit-1 and fatal-line checks, at 30.6s (2026-08-06). The
-    //       same four, at 30.7s, with the watcher woken but parked for an hour before
-    //       returning. And the pre-f1aa32c bare joinable thread -> "terminate called
-    //       without an active exception", signal 6, three FAILs (exitedNormally, exit-1,
-    //       fatal-line; NOT !timedOut, which that mutation does not reach because the
-    //       abort is immediate). All three reverted.
-    //
-    //       One thing the presence check did cover that this one cannot: a watcher that
-    //       returns early from a FAILED sigwait prints nothing, so it now satisfies this
-    //       line. That case is not uncovered, it moved -- stubbing the watcher to return
-    //       before sigwait leaves this phase entirely green and produces 11 FAILs in the
-    //       SIGTERM/SIGINT/SIGHUP phases, whose daemons then never leave the event loop
-    //       (measured 2026-08-06, 120s of timeouts). It could not stay here: a working
-    //       watcher and a dead one are indistinguishable on this path by design.
-    //
-    //       Not gated on `exitCode == 1`, which would read as the stronger gate: that check
-    //       is itself replaced by a sanitizer-attribution failure under a sanitized build,
-    //       so gating on it would silently disable this one exactly there. The fatal line
-    //       is the load-bearing evidence anyway -- main's catch handler prints it, and the
-    //       handler runs only after ~ShutdownWatch has already woken and joined the
-    //       watcher, so anything the watcher printed is in `output` before it.
-    //
-    // COVERAGE-ASSERT: two, because an absence check has two ways to go quiet.
-    //       (i) It passes trivially when the daemon printed nothing at all, which is not a
-    //       hypothetical: ungated, it stayed green under all three mutations above while
-    //       the daemon was catastrophically broken. So it is not graded unless the daemon
-    //       demonstrably reached main's handler -- otherwise it prints that it was not
-    //       graded, and the failure that caused that is already reported above.
-    //       Gating cannot hide a regression here: the gate is the check on the line above,
-    //       so a daemon that never spoke is red either way.
-    //       (ii) A needle that no longer matches anything can never fire. kSignalShutdownLine
-    //       is shared with the SIGTERM and SIGHUP phases, which assert its PRESENCE, so a
-    //       reworded message in main.cpp turns those red instead of leaving this one
-    //       vacuously green.
-    //
-    // CONTROL: in backend/daemon/main.cpp, via control_run.sh, observed 2026-09-25, reverted. The
-    //       watcher made to print its "received" line for
-    //       every signal it takes, straight after sigwait, so ~ShutdownWatch's own wake is reported
-    //       as a signal -> this line red, alone.
-    //       The watcher's `if (teardown.finished) return;` deleted no longer reaches this line:
-    //       ~ShutdownWatch's wake is then taken for an outside SIGUSR1 and ignored, join() never
-    //       returns, and the alarm kills the daemon (signal 14) before main's fatal line -> 8 FAILs
-    //       (this phase's three exit and fatal-line checks, the second-instance phase's four, and
-    //       another phase's duplicate instance), with this check printed as not graded.
-    // CONTROL (the gate): the same bare-thread mutation, run against this shape on
-    //       2026-08-06, printed "the fabricated-signal check is not graded -- the orphan
-    //       never reached main's exception handler ..." and 3 FAILs, where before the gate
-    //       it printed 3 FAILs and a silent pass on this line. Reverted.
+    // GOAL: on the connection-loss path the daemon does not report a signal it was never sent:
+    //       ~ShutdownWatch's wake of the sigwait watcher is not a signal from anybody.
+    // WHY-THIS-SHAPE: the ABSENCE of kSignalShutdownLine; a presence check would pass because of
+    //       the defect. Wake-and-join is carried by the checks above (pthread_kill deleted -> the
+    //       daemon never exits, four FAILs at 30.6 s, 2026-08-06). Gated on the fatal line, not
+    //       `exitCode == 1`, which a sanitized build replaces; main's handler prints it after the
+    //       watcher is joined.
+    // COVERAGE-ASSERT: (i) not graded unless the daemon reached main's handler -- ungated it stayed
+    //       green while the daemon was broken; (ii) the needle is shared with the presence checks,
+    //       so a reworded message reddens those.
+    // CONTROL: in backend/daemon/main.cpp, via control_run.sh, 2026-09-25, reverted: the watcher
+    //       printing its "received" line for every signal it takes -> this line red, alone.
+    //       (Deleting `if (teardown.finished) return;` no longer reaches it: the alarm kills the
+    //       daemon first, 8 FAILs, this check printed as not graded.)
+    // CONTROL (the gate): the pre-f1aa32c bare-thread mutation, 2026-08-06 -> "the fabricated-signal
+    //       check is not graded ..." and 3 FAILs, where before the gate this line passed silently.
     if (!reachedTheHandler) {
         std::printf("daemon_system_test: the fabricated-signal check is not graded -- the orphan never reached "
                     "main's exception handler, so it never got as far as the point where the watcher would have "
@@ -2304,33 +2178,13 @@ void checkBusLoss(const Check& check) {
 }
 
 // ---------------------------------------------------------------------------- //
-// A daemon whose teardown STICKS, and the three things that end one.
-//
-// All three phases below need a stop that does not finish, and nothing this suite can ask the
-// daemon for produces one: every fixture here is refused early or bounded by a deadline of its
-// own. The wedge is therefore made from outside the daemon's code, by preloading
-// tests/wedge_shim.cpp into it: with WALLPAPERX_TEST_WEDGE_FREE=1 a decoder freed on the MAIN
-// thread never returns, and the only place the daemon frees one there is ~WallpaperManager --
-// the teardown, after ~DbusService has joined the render worker. So a daemon that has drawn a
-// video stops normally right up to the point these phases are about, and then stops dead.
-//
-// The render worker cannot be the wedge: blocking it on a FIFO that a symlink is re-pointed at
-// between the request and the render is a race the render's own open refuses to lose, since it
-// refuses a FIFO.
+// A daemon whose teardown STICKS, and the three things that end one. Nothing the daemon can be
+// asked produces such a stop, so tests/wedge_shim.cpp is preloaded: with
+// WALLPAPERX_TEST_WEDGE_FREE=1 a decoder freed on the MAIN thread never returns, and the only such
+// free is ~WallpaperManager's, after the render worker is joined.
 // ---------------------------------------------------------------------------- //
 
-// "LD_PRELOAD=" with `library` after whatever this process preloads: a sanitizer runtime preloaded by
-// the build must stay first.
-std::string preloading(const char* library) {
-    const char* inherited = std::getenv("LD_PRELOAD");
-    const std::string before = inherited != nullptr && *inherited != '\0' ? std::string(inherited) + ":" : "";
-    return "LD_PRELOAD=" + before + library;
-}
-
-// The environment a daemon whose stop must stick is started with: the wedge library preloaded and
-// armed, and a HOME, cache and config/state of its own so nothing it writes touches the
-// developer's. SpawnedDaemon adds scratch XDG directories when none are given; `home` is named
-// here anyway, since a daemon inheriting the developer's HOME would put its shader cache there.
+// The wedge preloaded and armed, and a HOME and cache of its own for the shader cache.
 std::vector<std::string> wedgedDaemonEnv(const std::string& validationEnv, const std::string& busAddress,
                                          const std::filesystem::path& home) {
     std::error_code ec;
@@ -2353,8 +2207,7 @@ bool primeTeardownWedge(sdbus::IProxy& proxy, const std::string& clip, std::stri
         why = std::string("the daemon refused the video this phase wedges its teardown with: ") + e.what();
         return false;
     }
-    // A frame, not just an accepted request: the decoder exists only once the video has opened,
-    // and it is the decoder's free that the wedge holds.
+    // A frame, not an accepted request: the decoder exists only once the video opened.
     const auto deadline = Clock::now() + std::chrono::seconds(20);
     while (Clock::now() < deadline) {
         const StatusReply status = getStatus(proxy, std::chrono::seconds(10));
@@ -2366,36 +2219,18 @@ bool primeTeardownWedge(sdbus::IProxy& proxy, const std::string& clip, std::stri
     return false;
 }
 
-// GOAL: a teardown that STICKS is ended by the alarm the unwind arms at its top, rather than
-//       running forever. False if the alarm is armed only in ~ShutdownWatch, which is
-//       destroyed last: a destructor that blocks before it is then reached by nothing, and
-//       the daemon has to be SIGKILLed -- which for a systemd unit means every `systemctl
-//       stop` on that machine ends in SIGKILL after the unit's own timeout.
-// WHY-THIS-SHAPE: driven on the CONNECTION-LOSS path, not on a signal, and that is the whole
-//       reason the phase exists separately. On a signal the sigwait watcher is already
-//       running a deadline of its own and ends the process at kTeardownDeadline whatever the
-//       guards do, so a signal-driven version of this check is green with them deleted --
-//       measured, and it is why the obvious shape was rejected. With the bus destroyed
-//       instead, no signal is ever received, the watcher is still parked in sigwait, and the
-//       guards are the only thing left.
-//       `timedOut()` is asserted rather than the exit code alone: shutdown()/waitForExit()
-//       SIGKILL after their own wait and report a code either way, so a code-only check
-//       grades a process that never exited as one that exited for the right reason.
-// CONTROL: both `ArmTeardown` guards (armBeforeService and armBeforeHttp) deleted from
-//       backend/daemon/main.cpp, i.e. the arming left to ~ShutdownWatch, which the wedged
-//       ~WallpaperManager is never reached past -> "FAIL: a daemon whose teardown blocks still
-//       ends, rather than having to be killed", printing "it was still running 30.0 s after its
-//       bus was destroyed, with its teardown wedged; nothing armed the watchdog" -- the process
-//       had to be SIGKILLed at the harness timeout. The escalation phase below stayed GREEN under
-//       it, which is the separation the two phases exist for: the second signal does not need the
-//       alarm. Observed 2026-09-26 via control_run.sh on NVIDIA, that line alone red; the
-//       guards also record the stop's reason as a failure, which this phase does not read.
+// GOAL: a teardown that STICKS is ended by the alarm the unwind arms at its top. False if only
+//       ~ShutdownWatch, destroyed last, arms it: every `systemctl stop` would end in SIGKILL.
+// WHY-THIS-SHAPE: on the CONNECTION-LOSS path, where no signal arrives and the watcher stays in
+//       sigwait; on a signal the watcher's own deadline ends the process with the guards deleted
+//       (measured). timedOut() asserted, since waitForExit() reports a code even after its SIGKILL.
+// CONTROL: both `ArmTeardown` guards (armBeforeService, armBeforeHttp) deleted from
+//       backend/daemon/main.cpp -> "FAIL: a daemon whose teardown blocks still ends, rather than
+//       having to be killed", "still running 30.0 s after its bus was destroyed ...", alone; the
+//       escalation phase below stayed green. Observed 2026-09-26 via control_run.sh on NVIDIA.
 //       Reverted.
-// COVERAGE-ASSERT: the wedge is verified before the verdict is read -- the daemon must have drawn
-//       the video whose decoder the preloaded library holds, and its own line must be in the
-//       output -- and a run that could not stage it reports NOT VERIFIED. Without that, a daemon
-//       whose teardown was never stuck exits promptly and this phase reads green having
-//       graded an ordinary shutdown.
+// COVERAGE-ASSERT: the wedge's own line must be in the output, or NOT VERIFIED: an unstuck stop
+//       exits promptly and would read green.
 void checkStuckTeardownIsBounded(const std::string& validationEnv, const std::string& clip, const Check& check) {
     constexpr const char* kGoal = "S8.20's watchdog clause (a teardown that blocks is ended by the alarm the unwind "
                                   "arms at its top, not left to a destructor that is never reached)";
@@ -2406,8 +2241,7 @@ void checkStuckTeardownIsBounded(const std::string& validationEnv, const std::st
     }
     ScratchDir work("stuckteardown");
     if (!work.ok()) {
-        notVerified(kGoal, "a scratch directory could not be created");
-        return;
+        throw ScratchDirectoryLost("a scratch directory could not be created");
     }
 
     NestedBus bus;
@@ -2428,9 +2262,7 @@ void checkStuckTeardownIsBounded(const std::string& validationEnv, const std::st
     }
 
     {
-        // Scoped, and closed before the bus is killed: this phase's own client must be gone
-        // by then, or destroying the broker would be graded against a connection the harness
-        // still held open.
+        // Closed before the bus is killed, so only the daemon's connection is lost.
         auto connection = sdbus::createSessionBusConnectionWithAddress(bus.address());
         connection->enterEventLoopAsync();
         auto proxy = sdbus::createProxy(*connection, sdbus::ServiceName{DbusService::kBusName},
@@ -2442,9 +2274,7 @@ void checkStuckTeardownIsBounded(const std::string& validationEnv, const std::st
         }
     }
 
-    // Timed from HERE, not from the top of the phase: the wedge above takes seconds of its
-    // own, and folding those into the figure would put the printed line -- and the failure
-    // branch's "still running N s after its bus was destroyed" -- several seconds out.
+    // Timed from the kill, not the phase start: the wedge itself takes seconds.
     const auto killedAt = Clock::now();
     bus.kill();
     const int exitCode = daemon.waitForExit();
@@ -2462,9 +2292,7 @@ void checkStuckTeardownIsBounded(const std::string& validationEnv, const std::st
                      elapsedMs / 1000.0);
         return;
     }
-    // SIGALRM specifically. The process could also leave by the sigwait watcher's own
-    // deadline, and that path prints a line of its own -- so the two are told apart rather
-    // than both accepted as "it exited somehow".
+    // SIGALRM specifically, not the watcher's own deadline.
     const bool endedByTheAlarm = !daemon.exitedNormally() && daemon.termSignal() == SIGALRM;
     check(endedByTheAlarm, "the stuck teardown is ended by the alarm the unwind armed");
     if (!endedByTheAlarm) {
@@ -2477,31 +2305,16 @@ void checkStuckTeardownIsBounded(const std::string& validationEnv, const std::st
                 elapsedMs / 1000.0);
 }
 
-// GOAL: a second SIGINT/SIGTERM ends a stop that is stuck, promptly, and says it is doing so.
-//       False if the second signal does nothing: the user who pressed Ctrl-C twice waits out
-//       the full teardown deadline, and a supervisor's escalation lands on a process that
-//       cannot answer it.
-// WHY-THIS-SHAPE: the same wedged teardown as the phase above, because a second signal only
-//       has anything to end if the first stop is stuck -- on an ordinary stop the process is
-//       gone before a second signal can be sent, and a check written that way would be
-//       grading a race. BOTH the message and the elapsed time are asserted: without the
-//       handler the process still exits, at the teardown deadline, so an exit-code check
-//       alone is green under the control. The absence of the deadline's own line is asserted
-//       for the same reason -- it is what the daemon prints when nothing shortened the stop.
-// CONTROL: the sigaction/pthread_sigmask block that installs forceExitOnSecondSignal (inside the
-//       watcher's second `if (outside)`) deleted from backend/daemon/main.cpp -> "FAIL: the daemon
-//       says that a second signal is what ended it" and "FAIL: the second signal ends the daemon
-//       promptly rather than at the deadline". The second signal simply stays pending -- it is
-//       blocked in every thread and the watcher has left its sigwait -- so one of the two 3 s
-//       deadlines ends the stop instead, and which one is a race. When the watcher's wins, "the
-//       stop ends on the second signal rather than on the teardown deadline" goes red too (seen
-//       2026-09-26 via control_run.sh on NVIDIA: three red); when the alarm wins, that line stays
-//       green (seen 2026-09-22 and 2026-09-24, printing "it left with exit code -1, signal 14, and
-//       said none of it"), which is why the message and the elapsed time are asserted as well.
-//       Reverted.
-// COVERAGE-ASSERT: the wedge is verified before the verdict is read -- the video must have drawn
-//       and the wedge's own line must be in the output -- and a run that could not stage it
-//       reports NOT VERIFIED rather than grading a stop that was never stuck.
+// GOAL: a second SIGINT/SIGTERM ends a stuck stop promptly, and says so.
+// WHY-THIS-SHAPE: the same wedge, since an ordinary stop is gone before a second signal can land.
+//       The message AND the elapsed time are asserted, and the deadline's line absent: without
+//       the handler the process still exits, at the deadline.
+// CONTROL: the block installing forceExitOnSecondSignal deleted from backend/daemon/main.cpp ->
+//       "FAIL: the daemon says that a second signal is what ended it" and "FAIL: the second signal
+//       ends the daemon promptly rather than at the deadline"; which 3 s deadline then wins is a
+//       race, so "the stop ends on the second signal rather than on the teardown deadline" is red
+//       only sometimes (three red 2026-09-26 via control_run.sh on NVIDIA). Reverted.
+// COVERAGE-ASSERT: the wedge's own line must be in the output, or NOT VERIFIED.
 void checkSecondSignalEndsAStuckStop(const std::string& validationEnv, const std::string& clip,
                                      const Check& check) {
     constexpr const char* kGoal = "S8.20's escalation clause (a second shutdown signal ends a stop that is stuck, "
@@ -2513,8 +2326,7 @@ void checkSecondSignalEndsAStuckStop(const std::string& validationEnv, const std
     }
     ScratchDir work("secondsignal");
     if (!work.ok()) {
-        notVerified(kGoal, "a scratch directory could not be created");
-        return;
+        throw ScratchDirectoryLost("a scratch directory could not be created");
     }
 
     NestedBus bus;
@@ -2547,10 +2359,7 @@ void checkSecondSignalEndsAStuckStop(const std::string& validationEnv, const std
     }
 
     ::kill(daemon.pid(), SIGTERM);
-    // Long enough for the watcher to have printed, installed the handler and unblocked these
-    // signals, and well short of the three-second deadline the control has to fall back on.
-    // A shorter wait would make the second signal race the handler's installation, which is
-    // the daemon's setup rather than the behaviour being graded.
+    // Past the handler's installation, well short of the 3 s deadline the control falls back on.
     std::this_thread::sleep_for(std::chrono::milliseconds(1200));
     const auto secondSignal = Clock::now();
     ::kill(daemon.pid(), SIGTERM);
@@ -2574,13 +2383,10 @@ void checkSecondSignalEndsAStuckStop(const std::string& validationEnv, const std
         std::fprintf(stderr, "  it left with exit code %d, signal %d, and said none of it\n", exitCode,
                      daemon.termSignal());
     }
-    // The other route out of a stuck stop, and the one the control falls back on: the
-    // watcher's own deadline. Its presence here means the second signal changed nothing.
+    // The watcher's own deadline line means the second signal changed nothing.
     const bool notTheDeadline = output.find("shutdown blocked") == std::string::npos;
     check(notTheDeadline, "the stop ends on the second signal rather than on the teardown deadline");
-    // Under the 1.8 s the three-second deadline has left when the second signal lands: the
-    // handler runs in the signal itself, so anything near that is the deadline having fired, and
-    // a relative bound would accept it.
+    // Under the 1.8 s the deadline has left: the handler runs in the signal itself.
     const bool prompt = afterSecondMs < 1250;
     check(prompt, "the second signal ends the daemon promptly rather than at the deadline");
     if (!prompt) {
@@ -2591,8 +2397,7 @@ void checkSecondSignalEndsAStuckStop(const std::string& validationEnv, const std
     std::printf("daemon_system_test: a wedged stop ended %.0f ms after the second SIGTERM\n", afterSecondMs);
 }
 
-// Every regular file under `dir`, by path relative to it, with its bytes. What "wrote nothing" is
-// read against: a new file, a removed one or a changed byte all show as a difference.
+// Every regular file under `dir` with its bytes, for "wrote nothing".
 std::map<std::string, std::string> fileTree(const std::filesystem::path& dir) {
     std::map<std::string, std::string> files;
     std::error_code ec;
@@ -2620,28 +2425,18 @@ std::string describeTreeChange(const std::map<std::string, std::string>& before,
     return out.empty() ? " nothing" : out;
 }
 
-// GOAL: S13.191 -- a stop that cannot finish ends the process at the three-second deadline, not
-//       at five and not never, and the path that ends it writes NOTHING to disk: the config and the
-//       state directory (crash records, the playing record) are byte for byte what they were when
-//       the stop began. False for the five-second deadline this replaced, and for any stop that
-//       leaves a record behind when it is cut short -- which the next start would read as a death.
-// WHY-THIS-SHAPE: the stop is wedged for real, in the manager's own teardown, by a library
-//       preloaded into the daemon (tests/wedge_shim.cpp) that never returns from the decoder free on
-//       the main thread -- the one place a stop frees a video. The render-worker wedge the S8.20
-//       phases above use cannot be staged: the FIFO it relies on is refused at the open. The elapsed
-//       time is bounded on both sides: below by the wedge's own line, which
-//       proves the stop was stuck rather than quick, and above at 4.5 s, which a five-second
-//       deadline cannot meet. The directories are compared whole, so no particular file has to be
-//       predicted.
-// CONTROL: (a) in backend/daemon/main.cpp, `kTeardownDeadline{3}` -> `{5}` -> "FAIL: a stop wedged
-//       in the manager's teardown ends at the three-second deadline", printing about 5.0 s; (b) in
-//       backend/daemon/wallpaper_manager.cpp, ~WallpaperManager given a loop that frees each video
-//       session under an ApplyingRecord naming its file -- the Stage E2 shutdown record -> "FAIL: a
-//       stop the deadline ended wrote nothing", printing "added wallpaperx/applying-0.json". On the
-//       NVIDIA entry, (a) observed 2026-09-26 via control_run.sh, that line alone red, and (b)
-//       2026-09-21. Reverted.
-// COVERAGE-ASSERT: the wedge's own line must be in the daemon's output, and the video must have
-//       drawn first; otherwise the phase reports NOT VERIFIED rather than grading an ordinary stop.
+// GOAL: S13.191 -- a stop that cannot finish ends the process at the three-second deadline, and
+//       that path writes NOTHING: config and state directory byte for byte as when the stop began
+//       (a record left behind reads as a death at the next start).
+// WHY-THIS-SHAPE: wedged in the manager's own teardown (tests/wedge_shim.cpp); the elapsed time is
+//       bounded below by the wedge's own line and above at 4.5 s, which a five-second deadline
+//       cannot meet; the directories are compared whole.
+// CONTROL: (a) `kTeardownDeadline{3}` -> `{5}` in backend/daemon/main.cpp -> "FAIL: a stop wedged in
+//       the manager's teardown ends at the three-second deadline", ~5.0 s, alone (2026-09-26 via
+//       control_run.sh, NVIDIA); (b) ~WallpaperManager (backend/daemon/wallpaper_manager.cpp) freeing
+//       each video session under an ApplyingRecord -> "FAIL: a stop the deadline ended wrote
+//       nothing", "added wallpaperx/applying-0.json" (2026-09-21). Reverted.
+// COVERAGE-ASSERT: the video drawn and the wedge's line present, or NOT VERIFIED.
 void checkWatchdogEndsAStuckStopWritingNothing(const std::string& validationEnv, const Check& check) {
     constexpr const char* kGoal = "S13.191 (a stop not finished in 3 s ends the process, and writes nothing)";
     const std::string clip = std::string(WALLPAPERX_VIDEO_ASSET_DIR) + "/wallpaper_bands.mp4";
@@ -2652,8 +2447,7 @@ void checkWatchdogEndsAStuckStopWritingNothing(const std::string& validationEnv,
     }
     ScratchDir home("watchdoghome");
     if (!home.ok()) {
-        notVerified(kGoal, "a scratch HOME could not be created");
-        return;
+        throw ScratchDirectoryLost("a scratch HOME could not be created");
     }
     const std::filesystem::path configHome = home.path() / "config";
     const std::filesystem::path stateHome = home.path() / "state";
@@ -2775,8 +2569,7 @@ void checkAlarmDeliversQueuedLines(const std::string& validationEnv, const std::
     }
     ScratchDir work("alarmflush");
     if (!work.ok()) {
-        notVerified(kGoal, "a scratch directory could not be created");
-        return;
+        throw ScratchDirectoryLost("a scratch directory could not be created");
     }
     NestedBus bus;
     if (!bus.ok()) {
@@ -2875,8 +2668,7 @@ void checkLossDuringFailedStart(const std::string& validationEnv, const std::str
     constexpr const char* kGoal = "S14.37 (a loss seen while a failed start tears down is not a GPU-loss exit)";
     ScratchDir work("failedstartloss");
     if (!work.ok()) {
-        notVerified(kGoal, "a scratch directory could not be created");
-        return;
+        throw ScratchDirectoryLost("a scratch directory could not be created");
     }
     NestedBus bus;
     if (!bus.ok()) {
@@ -2952,27 +2744,16 @@ void checkLossDuringFailedStart(const std::string& validationEnv, const std::str
 }
 
 // GOAL: S13.197 -- a restored video's renders are posted only after the playing record is open, so
-//       a death while the render thread works on that video NAMES it. False for the order reversed:
-//       the first crash of a restart loop would name nobody, no strike would be counted, and the
-//       loop the record exists to break would go on -- restart, play, crash, restart.
-// WHY-THIS-SHAPE: the window between the two calls is microseconds, so nothing outside the process
-//       can land in it unaided. The preloaded library widens it -- creating playing.json takes three
-//       seconds -- and then faults on the render thread at the first picture asked of the daemon's
-//       own decoder after it delivered one, which is the clock's work and never the video's open
-//       (the span the applying record covers). Keyed that way rather than on a packet number: a
-//       fixed count landed inside the open on the software decoder, which needs more packets for a
-//       first picture, and the record then named nothing for a reason that was the harness's.
-//       Both halves are the harness's, not the daemon's: production is unchanged and the daemon is
-//       the shipped binary.
+//       a death in that video's playback NAMES it (else a restart loop's first crash names nobody).
+// WHY-THIS-SHAPE: the preloaded library widens the microsecond window (creating playing.json takes
+//       3 s) and faults on the render thread at the first picture asked of the decoder after one
+//       was delivered -- the clock's work, never the open; a packet count landed inside the open on
+//       the software decoder.
 // CONTROL: in backend/daemon/main.cpp, `service.renderRestored();` moved above
 //       `manager.recordStartingVideos();` -> "FAIL: a death in a restored video's playback names
-//       that video", printing "there is no readable playing record", and "FAIL: and the signal it
-//       died of" -- the renders start while the record is still being created, so the handler has
-//       no descriptor to write to and the file the next start reads is never written. Observed
-//       2026-09-22 on the NVIDIA entry. Reverted.
-// COVERAGE-ASSERT: the daemon must have died of the staged fault, and the fault's own line must be
-//       in its output; a run where it did not reports NOT VERIFIED rather than grading a record
-//       nothing wrote to.
+//       that video" ("there is no readable playing record") and "FAIL: and the signal it died of".
+//       Observed 2026-09-22 on NVIDIA. Reverted.
+// COVERAGE-ASSERT: the daemon must have died of the staged fault, its line present, or NOT VERIFIED.
 void checkTheRestoredVideoIsPostedAfterTheRecordOpens(const std::string& validationEnv, const std::string& clip,
                                                       const Check& check) {
     constexpr const char* kGoal = "S13.197 (a restored video's renders are posted after the playing record is open, "
@@ -2985,8 +2766,7 @@ void checkTheRestoredVideoIsPostedAfterTheRecordOpens(const std::string& validat
     }
     ScratchDir home("restoreorder");
     if (!home.ok()) {
-        notVerified(kGoal, "a scratch HOME could not be created");
-        return;
+        throw ScratchDirectoryLost("a scratch HOME could not be created");
     }
     const std::filesystem::path configHome = home.path() / "config";
     const std::filesystem::path stateHome = home.path() / "state";
@@ -3035,18 +2815,14 @@ void checkTheRestoredVideoIsPostedAfterTheRecordOpens(const std::string& validat
     }
     // GOAL: X.27 -- the staged SIGSEGV is not handed to the host's crash collector (which on a
     //       desktop also raises a crash dialog): the daemon dies with the wait status's core bit clear.
-    // WHY-THIS-SHAPE: the core bit, not the inherited core limit X.3 already reads: on a piped
-    //       core_pattern the kernel calls the collector even at RLIMIT_CORE 0, and only the dumpable
-    //       flag, which execve resets, stops it. On a file pattern there is no collector program,
-    //       so the helper answers "not reached" and says so on stdout, rather than skipping the
-    //       whole entry on such a host for a hazard it cannot have.
-    // CONTROL: via control_batch 2026-10-04, reverted: the suppressCoreDump() call deleted from
+    // WHY-THIS-SHAPE: the core bit, not the core limit: a piped core_pattern calls the collector even
+    //       at RLIMIT_CORE 0. A file pattern has no collector, so that branch answers "not reached"
+    //       on stdout and cannot go red by design.
+    // CONTROL: via control_batch 2026-10-04, reverted: suppressCoreDump() deleted from
     //       backend/tests/wedge_shim.cpp's fault -> "FAIL: X.27: the daemon's staged SIGSEGV is not
-    //       handed to the core collector", and one new coredumpctl entry. Test-side, the same way:
-    //       coreGoesToAProgram() (renderer/tests/support/forked_child.h) made to return false -> the
-    //       stdout line "X.27: this host's core_pattern writes a file ..." and the entry Passed, no NOT
-    //       VERIFIED (observed in crash_log_flush, which shares the helper; control_batch 2026-10-04).
-    //       That branch cannot go red by design: with no collector program there is nothing to reach.
+    //       handed to the core collector", one new coredumpctl entry. Test-side: coreGoesToAProgram()
+    //       (renderer/tests/support/forked_child.h) returning false -> the stdout line "X.27: this
+    //       host's core_pattern writes a file ..." and Passed (seen in crash_log_flush, same helper).
     {
         std::string why;
         const std::optional<bool> collected = wallpaperx::testing::stagedCrashReachedCollector(daemon, why);
@@ -3074,13 +2850,7 @@ void checkTheRestoredVideoIsPostedAfterTheRecordOpens(const std::string& validat
                 named ? "named it" : "did not");
 }
 
-// Used by both phases below: phase 10 asks the daemon what it thinks of its config port
-// when the line it was waiting for never arrived, phase 11 grades the answer.
-
-// GetStatus's config_server object, or nullptr when the reply does not carry one. Same
-// reason wallpaperStatus() exists: operator[] on a const json missing the key dereferences
-// end() under NDEBUG, so a daemon that dropped the field would crash the test instead of
-// failing the check written to catch exactly that.
+// GetStatus's config_server object, or nullptr: operator[] on a const json missing the key is UB.
 const nlohmann::json* configServerReport(const StatusReply& status) {
     const nlohmann::json& json = status.json();
     if (!json.is_object() || !json.contains("config_server")) return nullptr;
@@ -3088,10 +2858,7 @@ const nlohmann::json* configServerReport(const StatusReply& status) {
     return report.is_object() ? &report : nullptr;
 }
 
-// The daemon's own verdict on its config port ("ok", "fail", "pending"), or empty when it
-// could not be asked -- with `why` saying which, since "the daemon says it failed to bind"
-// and "the daemon is gone" lead to different decisions. Opens its own proxy: the caller
-// that needs this has not built one yet, and a proxy is cheap next to a spawn.
+// The daemon's verdict on its config port ("ok", "fail", "pending"), or empty with `why`.
 std::string askConfigServerStatus(std::string& detail, std::string& why) {
     try {
         auto proxy =
@@ -3106,10 +2873,7 @@ std::string askConfigServerStatus(std::string& detail, std::string& why) {
             why = "GetStatus carried no config_server object";
             return {};
         }
-        // is_string() first, both times: value() converts rather than defaults, so it
-        // throws type_error.302 on a present non-string. A throw here leaves the phase and
-        // every phase after it ungraded behind one opaque line (X.4), where a daemon that
-        // published the wrong type should read as "could not be asked" and skip.
+        // is_string() first: value() throws on a present non-string (X.4).
         if (report->contains("detail") && (*report)["detail"].is_string()) {
             detail = (*report)["detail"].get<std::string>();
         }
@@ -3124,36 +2888,23 @@ std::string askConfigServerStatus(std::string& detail, std::string& why) {
     }
 }
 
-// The daemon's bind-failure wording, as this file has to match it in another process's
-// stderr. Duplicated from the `bindError` local http_server.cpp builds on its failed-bind
-// path -- a test cannot read a literal out of a program it only spawns -- and that
-// duplication is silent by nature: a reworded message would turn checkHttpLifecycle's skip
-// reason vague and, worse, turn checkConfigServerLostPort's "the daemon died of the port
-// conflict" FAIL into a skip. So the marker is cross-checked against the daemon's own live
-// report, where the same string arrives over DBus. See the check on `reportDetail` in
-// checkConfigServerLostPort.
+// The daemon's bind wordings (http_server.cpp), duplicated since a spawned program's literals
+// cannot be read; each is cross-checked against the live GetStatus detail, so a reword is caught.
 std::string bindFailureMarker(int port) {
     return std::string("could not bind ") + wallpaperx::HttpServer::kLoopbackHost + ":" + std::to_string(port);
 }
 
-// The daemon's bind-SUCCESS wording, duplicated for the same reason the failure wording is.
-// Guarded by the FAIL arm in awaitConfigServerBind below, and cross-checked against the live
-// GetStatus detail -- which names the bound port too -- by the port-0 phase.
 std::string bindSuccessMarker(int port) {
     return std::string("config server on http://") + wallpaperx::HttpServer::kLoopbackHost + ":" +
            std::to_string(port);
 }
 
-// The success detail GetStatus's config_server carries, duplicated for the same reason.
 std::string listeningDetail(int port) {
     return std::string("listening on ") + wallpaperx::HttpServer::kLoopbackHost + ":" + std::to_string(port);
 }
 
-// A loopback port nothing holds at this instant, for a daemon told to serve on it: the kernel
-// picks it and it is let go at once, so these phases never compete with a developer's own daemon
-// on 18462. What is left is a race with the whole machine for that one ephemeral port in the
-// milliseconds before the daemon binds it, and losing it is a bind failure awaitConfigServerBind
-// reports as a skip, never as a verdict on the daemon. -1 when no port could be had at all.
+// A loopback port the kernel picks and that is let go at once, so no phase competes for 18462.
+// Losing the race for it is a bind failure awaitConfigServerBind reports as a skip. -1: none.
 int unusedLoopbackPort() {
     wallpaperx::testing::HeldPort probe;
     if (!probe.open(INADDR_LOOPBACK, 0)) return -1;
@@ -3162,73 +2913,31 @@ int unusedLoopbackPort() {
 
 std::vector<std::string> configPortArgs(int port) { return {"--config-port", std::to_string(port)}; }
 
-// GOAL: X.3 in both of its directions, for every phase whose checks need the spawned daemon
-//       to be the process listening on `port`. A daemon that reworded its bind-success line
-//       must arrive as a named failure, never as a skip that deletes the phase; a daemon
-//       that quit of its own accord must arrive as a named failure; a daemon the machine
-//       killed must arrive as a skip, never as a verdict on the daemon; and a port genuinely
-//       held by another process must arrive as a skip, asserted only where the daemon's own
-//       bind-failure line says so. Control (f) below is also S13.210's evidence: with 18462
-//       held, only the default-port phase noticed.
-// WHY-THIS-SHAPE: one function, not a copy per phase. The obvious alternative -- each phase
-//       inlining its own wait-and-classify -- is what this replaces, and the cost of it is
-//       measurable: a copy that drops the drain re-wait accuses production of rewording a
-//       log line the daemon did print, and a copy that drops the bind-failure cross-check
-//       files a daemon that died mid-phase as another process holding its port. The arm order
-//       is the substance: each positive signal (the daemon printed the failure line; the
-//       process is gone; the daemon says ok) is consulted before anything is concluded from
-//       an absence, because "no bind line in the buffer" is equally true of all of them.
-//       The process-gone arm asks waitid for the real exit status rather than concluding
-//       from the capture pipe's end-of-file, which is the tempting shorter form and is
-//       wrong in both directions: it carries no status, so an OOM kill reads as the daemon
-//       quitting, and a broken capture pipe reads as a dead daemon that is in fact running.
-//       The second wait covers only the capture pipe's drain -- the daemon answers GetStatus
-//       from an event loop it enters after the HttpServer constructor has printed, so an
-//       "ok" verdict proves the printf already ran -- and it expires into the same FAIL, so
-//       it can never turn a real rewording into a pass (X.1).
-// CONTROL: six, all reverted. (a), (b) and (f) observed 2026-09-23 with all three callers;
-//       (c) to (e) observed earlier from the connector-name and HTTP lifecycle phases only,
-//       date not recorded. (a) the success printf
-//       in backend/daemon/http_server.cpp reworded to "config server listening on
-//       http://%s:%d" -> "FAIL: the bind-success wording the connector-name phase waits for
-//       is still the daemon's" and the same for the HTTP lifecycle phase, each printing the
-//       port the daemon reports it is listening on. (b)
-//       `wallpaperx::HttpServer httpServer(manager, options->configPort);` commented out in
-//       backend/daemon/main.cpp -> "NOT VERIFIED -- ... the daemon printed neither the
-//       bind-success nor the bind-failure line for port <its port>; the daemon reports
-//       config_server pending", from all three callers, and no FAIL from any. (c) that construction replaced
-//       in backend/daemon/main.cpp by a detached thread that `std::_Exit(7)`s two seconds in,
-//       which is a daemon that quit of its own accord mid-phase -> "FAIL: the daemon of the
-//       connector-name phase is still running when its config port is asked about" and the
-//       same for the HTTP lifecycle phase. (d) the same replacement but `kill(getpid(),
-//       SIGKILL)` instead of the exit, which is a daemon the machine took away (the signal is
-//       what this classifies on, not who sent it) -> "NOT VERIFIED -- ... the daemon of the
-//       connector-name phase was killed by signal 9 by something outside this test before its
-//       config port could be graded", from both phases, and no FAIL: the same run under the
-//       old capture-pipe verdict produced (c)'s two FAIL lines instead. (e) readLoop() made to
-//       set m_readerDone (and m_readFailed) and return at once, which is a live daemon behind
-//       a lost capture pipe -> "HARNESS FAULT -- the connector-name phase could not be set up:
-//       the daemon's output pipe failed while it was still running", from both phases; with
-//       the StillRunning arm removed the same build printed (c)'s two FAIL lines against a
-//       daemon that was running the whole time. (f) an unrelated process (a bare listening
-//       socket) made to hold port 18462 -> from the default-port phase, the only caller left
-//       on that port, the port-conflict skip carrying the daemon's own detail: "port 18462 is
-//       held by another process on this machine (a real wallpaperx-daemon?), so the spawned
-//       daemon could not bind it; the daemon reports config_server fail / could not bind
-//       127.0.0.1:18462". Its two older halves were not re-run: with bindFailureMarker
-//       additionally made to match nothing the daemon prints, the neutral skip with the same
-//       detail appended -- where restoring the dropped `|| reportStatus == "fail"` disjunct
-//       claimed the phantom holding process instead; and the timing, 17.7 s with the
-//       two-marker wait above against 37.4 s with the single-marker wait it replaced.
+// GOAL: X.3 both ways, for phases needing the spawned daemon to be the one listening on `port`: a
+//       reworded bind-success line or a daemon that quit is a named FAIL; a daemon the machine
+//       killed, or a port really held by another process (asserted only where the daemon's own
+//       bind-failure line says so), is a skip. Control (f) is also S13.210's evidence.
+// WHY-THIS-SHAPE: one function, not a copy per phase. Each positive signal (the failure line; the
+//       process gone, its status from waitid, not the capture pipe's EOF; the daemon's own "ok")
+//       is consulted before anything is concluded from an absent line. The drain re-wait expires
+//       into the same FAIL (X.1).
+// CONTROL: six, all reverted; (a), (b), (f) 2026-09-23 with all three callers, (c)-(e) earlier.
+//       (a) the success printf in backend/daemon/http_server.cpp reworded -> "FAIL: the
+//       bind-success wording the connector-name phase waits for is still the daemon's" (and the
+//       HTTP lifecycle's). (b) the HttpServer construction in backend/daemon/main.cpp commented out
+//       -> NOT VERIFIED "... printed neither the bind-success nor the bind-failure line ...", no
+//       FAIL. (c) it replaced by a thread that `std::_Exit(7)`s two seconds in -> "FAIL: the daemon
+//       of the connector-name phase is still running when its config port is asked about". (d) the
+//       same with SIGKILL -> NOT VERIFIED "... killed by signal 9 by something outside this test
+//       ...", no FAIL. (e) readLoop() returning at once (a live daemon behind a lost pipe) ->
+//       "HARNESS FAULT -- the connector-name phase could not be set up: the daemon's output pipe
+//       failed while it was still running". (f) a bare socket holding 18462 -> from the
+//       default-port phase only, the port-conflict skip with the daemon's own detail.
 bool awaitConfigServerBind(const SpawnedDaemon& daemon, int port, const char* goals, const char* phase,
                            const Check& check) {
     const std::string bindOk = bindSuccessMarker(port);
     const std::string bindFail = bindFailureMarker(port);
-    // Watches both markers. They are the two branches of one `if` in HttpServer's
-    // constructor, so on a host where the port is taken the answer is in the buffer within
-    // milliseconds; waiting only for the success wording spends the whole ten seconds per
-    // calling phase before reading a failure line it already had. The loop decides only when
-    // to stop waiting -- every arm below concludes exactly as it would have.
+    // Both markers: they are one `if` in HttpServer's constructor, so a taken port answers at once.
     const auto deadline = Clock::now() + std::chrono::seconds(10);
     while (true) {
         if (daemon.waitForOutput(bindOk, std::chrono::milliseconds(100))) return true;
@@ -3247,12 +2956,8 @@ bool awaitConfigServerBind(const SpawnedDaemon& daemon, int port, const char* go
             : std::string("; the daemon reports config_server ") + reportStatus +
                   (reportDetail.empty() ? std::string() : std::string(" / ") + reportDetail);
 
-    // First, because it is the daemon's own words about the port and they do not stop being
-    // true when it later dies. Only this line is evidence about the host: config_server
-    // "fail" alone is equally true of a bind refused for any other reason (EACCES under a
-    // sandbox, EADDRNOTAVAIL with no loopback), and claiming a conflicting process for those
-    // sends the reader hunting a daemon that does not exist -- `daemonSays` carries the real
-    // reason into the neutral skip instead.
+    // First: the daemon's own words, true even if it later died. config_server "fail" alone is
+    // as true of EACCES or EADDRNOTAVAIL, so only this line claims another process holds the port.
     if (daemon.output().find(bindFail) != std::string::npos) {
         notVerified(goals, std::string("port ") + std::to_string(port) +
                                " is held by another process on this machine (a real wallpaperx-daemon?), "
@@ -3297,27 +3002,17 @@ bool awaitConfigServerBind(const SpawnedDaemon& daemon, int port, const char* go
     return false;
 }
 
-// A /health body's `checks` object, or nullptr when the body does not carry one. Third site
-// of the wallpaperStatus()/configServerReport() pattern, and needed for the same reason:
-// `body["checks"]` on a const json is JSON_ASSERT plus a dereference, so a daemon that
-// dropped the key would abort this test rather than fail the check written to catch it.
-// The order matters -- ask whether the key is there, then read it; reading it and then
-// asking `.is_object()` is already too late.
-// CONTROL: `{"checks", checksJson}` dropped from the /health body in http_server.cpp ->
-//       four named FAIL lines starting "the real daemon's /health names shaders, gpu and
-//       wallpapers as separate checks", and the run finishes. With the read-then-ask idiom
-//       the same mutation aborted on json.hpp's `it != object->end()` assertion with no
-//       FAIL line at all. Reverted.
+// A /health body's `checks` object, or nullptr; asked before read, since operator[] on a const
+// json missing the key asserts. CONTROL: `{"checks", checksJson}` dropped from the /health body in
+// backend/daemon/http_server.cpp -> four named FAILs from "the real daemon's /health names shaders,
+// gpu and wallpapers as separate checks", run finished (read-then-ask aborted). Reverted.
 const nlohmann::json* healthChecks(const nlohmann::json& body) {
     if (!body.is_object() || !body.contains("checks")) return nullptr;
     const nlohmann::json& checks = body["checks"];
     return checks.is_object() ? &checks : nullptr;
 }
 
-// The names of the checks reading `pending`, sorted, and a printable form of that list. The
-// aggregate counts failures only, so "ok overall while a dependency is untried" has to name
-// the untried ones: `status == "ok"` alone is equally true of an endpoint with no `pending`
-// state left to report.
+// The checks reading `pending`, sorted: "ok overall" alone is as true with no pending state left.
 std::vector<std::string> pendingCheckNames(const nlohmann::json& body) {
     std::vector<std::string> names;
     const nlohmann::json* checks = healthChecks(body);
@@ -3329,28 +3024,12 @@ std::vector<std::string> pendingCheckNames(const nlohmann::json& body) {
     return names;
 }
 
-std::string joinNames(const std::vector<std::string>& names) {
-    std::string out;
-    for (const std::string& name : names) {
-        if (!out.empty()) out += ", ";
-        out += name;
-    }
-    return out.empty() ? "(none)" : out;
-}
 
 // ---------------------------------------------------------------------------- //
-// Phase 10 -- the HTTP config server, in the shipped binary.
+// Phase 10 -- the HTTP config server, in the shipped binary: the command line that picks the
+// port, main.cpp wiring it up, nothing listening after exit (S7.8), a poll during shutdown
+// (S7.11). Every phase but the default-port one picks its own port.
 // ---------------------------------------------------------------------------- //
-//
-// Everything else about http_server.cpp is checked in process, on an ephemeral port
-// (http_server_test). What is only observable from out here: the command line that picks
-// the port, main.cpp wiring the server up at all, nothing left listening after the process
-// exits (S7.8), and a poll landing during shutdown not reading state being torn down (S7.11,
-// which lives in main.cpp's declaration order).
-//
-// Every phase but one runs its daemon on a port it picked (--config-port), so a developer's
-// own daemon on 18462 costs them nothing. The one that does not is the default-port phase,
-// which exists to grade that default, and which still skips when 18462 is taken.
 
 void awaitNameRelease(NameWatcher& names, const char* nextUp);
 
@@ -3362,12 +3041,9 @@ constexpr const char* kUsageLine = "usage: wallpaperx-daemon [--config-port <por
 //       outside 0-65535) exits 2 before doing anything, naming what was wrong and printing
 //       the usage; --help and -h print the usage and exit 0. False if any of them starts a
 //       daemon, exits with another code, or refuses without saying why.
-// WHY-THIS-SHAPE: the real binary, because main() is the only parser and nothing in process
-//       can call it. "Started nothing" is read from the bus name never being taken, not from
-//       the exit alone: a parser that ignored an argument would start a daemon that runs
-//       until signalled, and this waits five seconds for an exit before calling that out.
-//       The reason is matched per case, not just the usage line, because every refusal
-//       prints the same usage and a parser that refused everything would satisfy that.
+// WHY-THIS-SHAPE: the real binary, main() being the only parser. "Started nothing" is the bus name
+//       never taken; the reason is matched per case, since a parser refusing everything prints the
+//       same usage.
 // CONTROL: each in parseArguments (backend/daemon/main.cpp), each reverted.
 //       (a) `portGiven ||` deleted -> "FAIL: --config-port 5 --config-port 6 is refused",
 //       printing "exit -1 (still running after 5 s, took the bus name: yes)". (b) `|| port >
@@ -3392,8 +3068,7 @@ void checkCommandLine(NameWatcher& names, const std::string& validationEnv, cons
         {{"--config-port", ""}, "--config-port needs a port from 0 to 65535, got ''"},
     };
     const auto run = [&](const std::vector<std::string>& args, int& exitCode, std::string& output, bool& tookName) {
-        // Counted, not asked: a daemon that took the name and let it go again before the
-        // question would read as never having had it.
+        // Counted, not asked: a name taken and let go again would read as never taken.
         const uint64_t eventsBefore = names.events();
         SpawnedDaemon daemon({validationEnv}, SpawnedDaemon::Stdout::Captured, {}, 0, args);
         const auto deadline = Clock::now() + std::chrono::seconds(5);
@@ -3402,8 +3077,7 @@ void checkCommandLine(NameWatcher& names, const std::string& validationEnv, cons
         exitCode = ranOn ? daemon.shutdown(SIGTERM) : daemon.waitForExit();
         if (ranOn) exitCode = -1;
         output = daemon.output();
-        // The name signal travels the bus while the exit travels the process table; a short
-        // wait lets a claim that happened reach the counter before it is read.
+        // The name signal travels the bus, slower than the exit.
         names.waitForEventsPast(eventsBefore, std::chrono::milliseconds(200));
         tookName = names.events() != eventsBefore;
         if (tookName) awaitNameRelease(names, "the next command-line case");
@@ -3505,8 +3179,7 @@ ReaderGoneRun runWithOutputReaderGone(const std::vector<std::string>& args, cons
 void checkUsageWithOutputReaderGone(const std::string& validationEnv, const Check& check) {
     ScratchDir home("readergone");
     if (!home.ok()) {
-        notVerified("S14.35", "a scratch HOME could not be created");
-        return;
+        throw ScratchDirectoryLost("a scratch HOME could not be created");
     }
     const std::vector<std::string> env{validationEnv, "HOME=" + home.path().string(),
                                        "XDG_CONFIG_HOME=" + (home.path() / "config").string(),
@@ -3538,12 +3211,8 @@ void checkUsageWithOutputReaderGone(const std::string& validationEnv, const Chec
 
 // GOAL: S13.208 -- a daemon given no port serves on 18462, the one the desktop plugin asks.
 //       False if the default moved, or a daemon started bare served nowhere.
-// WHY-THIS-SHAPE: the one phase left on the shipped port, on purpose: every other phase picks
-//       its own, and without this nothing would notice the default changing. It skips when
-//       18462 is taken -- the developer's own daemon, usually -- through the same classifier
-//       as the others, so a port conflict is never read as a defect. The port is written out,
-//       not taken from HttpServer::kDefaultPort, since the claim is about the number main.qml
-//       has in it.
+// WHY-THIS-SHAPE: the one phase on the shipped port; skips through the shared classifier when
+//       18462 is taken. Written out, not kDefaultPort: the claim is about the number main.qml has.
 // CONTROL: `int configPort = wallpaperx::HttpServer::kDefaultPort;` in backend/daemon/main.cpp
 //       made `18463`, with 18462 free -> "FAIL: a daemon given no port serves on 18462",
 //       printing "config_server ok / listening on 127.0.0.1:18463", and "FAIL: a daemon given
@@ -3558,9 +3227,7 @@ void checkDefaultConfigPort(NameWatcher& names, const std::string& validationEnv
         if (!reportedStartupFault(daemon, kGoal)) notVerified(kGoal, "the daemon never acquired the bus name");
         return;
     }
-    // Asked first, because the detail names the port whatever it is: a daemon that bound some
-    // other port reads as exactly that, not as a log line that went missing. Anything but ok
-    // goes to the shared classifier, where 18462 being held is a skip.
+    // Asked first: the detail names whatever port was bound. Anything but ok goes to the classifier.
     std::string detail;
     std::string why;
     const std::string status = askConfigServerStatus(detail, why);
@@ -3579,10 +3246,8 @@ void checkDefaultConfigPort(NameWatcher& names, const std::string& validationEnv
 // GOAL: S13.209 -- `--config-port 0` lets the kernel choose, and the daemon names the port it
 //       got in the startup line and in GetStatus's config_server detail, the two agreeing, and
 //       /health answers on it. False if either names 0, or they disagree, or nothing listens.
-// WHY-THIS-SHAPE: the port is read from the startup line and then required of the other two,
-//       so the check is on agreement with a port nobody chose in advance -- the only kind a
-//       test on a shared machine can name. The detail is compared whole, which is also what
-//       keeps listeningDetail() honest as the other phases' duplicate of the daemon's wording.
+// WHY-THIS-SHAPE: agreement with a port nobody chose in advance, read from the startup line; the
+//       detail compared whole keeps listeningDetail() honest.
 // CONTROL: in HttpServer's constructor (backend/daemon/http_server.cpp), the success record made
 //       to name `m_port` and moved above `m_port = bound;`, so it names the port asked for ->
 //       "FAIL: GetStatus names the port the startup line does", alone, printing "startup line
@@ -3650,48 +3315,25 @@ void checkHttpLifecycle(NameWatcher& names, const std::string& bluePath, const s
         return;
     }
 
-    // Whether this daemon is the process on its port decides whether this phase can run at all,
-    // and the four outcomes are told apart in awaitConfigServerBind -- one classifier shared
-    // with the connector-name phase, so the two cannot drift into disagreeing about which
-    // outcome is the daemon's fault and which is the machine's.
     if (!awaitConfigServerBind(daemon, kPort, "S7.8/S7.11 (the HTTP server's process lifecycle)",
                                "the HTTP lifecycle phase", check)) {
         daemon.shutdown(SIGTERM);
         return;
     }
 
-    // GOAL: S7.10/S7.10b end to end -- /health on the daemon's config port, asked of the real
-    //       binary by a process that is not it. A daemon that has just started has not
-    //       touched its shader directory or created a device, so `shaders` and `gpu` read
-    //       `pending` in their own entries while the aggregate, which counts failures only,
-    //       reads `ok`. False in either direction: an aggregate of `pending` has a watchdog
-    //       restarting an idle daemon that is working, and a `pending` that never appears
-    //       has the shipped binary claiming health nobody established.
-    // WHY-THIS-SHAPE: the in-process tier already pins the JSON in far more detail. What
-    //       only this tier can establish is that the shipped binary reaches this state at
-    //       all -- an HttpServer never wired into main.cpp, or a daemon that eagerly
-    //       created a device at startup, would leave every in-process check green. So this
-    //       asserts the names and the pending set beside the aggregate, and no details.
-    //       The pending set is asserted rather than `status == "ok"` alone because alone it
-    //       is vacuous: a daemon that reported everything `ok` from birth satisfies it.
-    // CONTROL: the `wallpaperx::HttpServer httpServer(manager, options->configPort);` line
-    //       removed from backend/daemon/main.cpp -> this phase reports NOT VERIFIED ("the daemon
-    //       printed neither the bind-success nor the bind-failure line for port 42729; the
-    //       daemon reports config_server pending") rather than spending a FAIL on the daemon;
-    //       the run's failures for that mutation come from the port-0 phase and phase 11, which
-    //       grade it directly. Observed 2026-09-23.
-    //       For the body itself, two: the `else if (check->status ==
-    //       HealthStatus::Pending && overall != HealthStatus::Fail)` arm restored in
-    //       http_server.cpp's aggregation -> "FAIL: the real daemon reports ok overall
-    //       before it has used anything, with the dependencies it has not used pending"
-    //       ("pending checks: gpu, shaders; aggregate: pending"); and `HealthStatus status
-    //       = HealthStatus::Ok;` as HealthCheck's default in wallpaper_manager.h -> the
-    //       same line red the other way ("pending checks: (none); aggregate: ok") beside
-    //       the GPU one. And for the three names: the `{"gpu", &snap.health.gpu}` entry
-    //       removed from that same array -> "FAIL: the real daemon's /health names
-    //       shaders, gpu and wallpapers as separate checks" and "FAIL: the real daemon
-    //       reports the GPU as untried before its first wallpaper", the body coming back
-    //       with two checks in it. All reverted.
+    // GOAL: S7.10/S7.10b end to end -- a fresh real daemon's /health has `shaders` and `gpu`
+    //       `pending` while the aggregate, counting failures only, reads `ok`.
+    // WHY-THIS-SHAPE: the in-process tier pins the JSON; only this tier shows the shipped binary
+    //       reaches the state at all. The pending set is asserted, since `ok` alone is as true of a
+    //       daemon reporting ok from birth.
+    // CONTROL: the HttpServer construction removed from backend/daemon/main.cpp -> NOT VERIFIED
+    //       here (the port-0 phase and phase 11 grade it), 2026-09-23. In
+    //       backend/daemon/http_server.cpp: the Pending-and-not-Fail aggregation arm restored ->
+    //       "FAIL: the real daemon reports ok overall before it has used anything, with the
+    //       dependencies it has not used pending" ("aggregate: pending"); HealthCheck's default made
+    //       Ok (backend/daemon/wallpaper_manager.h) -> the same line, "(none)", beside the GPU one;
+    //       the gpu entry removed -> "FAIL: the real daemon's /health names shaders, gpu and
+    //       wallpapers as separate checks" and the GPU-untried line. All reverted.
     httplib::Client cli = wallpaperx::testing::makeClient(kPort);
     const HttpReply fresh = wallpaperx::testing::get(cli, "/health");
     check(fresh.ok(), "the real daemon answers GET /health on its config port");
@@ -3710,7 +3352,7 @@ void checkHttpLifecycle(NameWatcher& names, const std::string& bluePath, const s
               "the real daemon reports the GPU as untried before its first wallpaper");
         if (!idleIsHealthy || !named) {
             std::fprintf(stderr, "  pending checks: %s; aggregate: %s\n  fresh /health: %s\n",
-                         joinNames(untried).c_str(), aggregate.c_str(), fresh.body.c_str());
+                         joined(untried).c_str(), aggregate.c_str(), fresh.body.c_str());
         }
         std::printf("daemon_system_test: /health on port %d before any wallpaper: %s\n", kPort, fresh.body.c_str());
         std::fflush(stdout);
@@ -3733,30 +3375,17 @@ void checkHttpLifecycle(NameWatcher& names, const std::string& bluePath, const s
                     "the daemon never rendered a frame, so nothing in the shipped binary ever moved a health "
                     "check off pending");
     } else {
-        // GOAL: S7.10/S7.10b's other direction in the shipped binary -- once the real
-        //       daemon has rendered a wallpaper, the checks that read `pending` above read
-        //       `ok`, and the GPU one names the device the same daemon reports over DBus.
-        // WHY-THIS-SHAPE: the pending assertions above are worth nothing unless `ok` is
-        //       reachable in this binary -- an endpoint stuck at pending satisfies every
-        //       one of them. The GPU detail is compared against GetStatus's own name and
-        //       tier rather than a literal, because the tier varies by host (Heap on
-        //       NVIDIA, Buffer on Lavapipe, Classic when forced) and a non-empty check
-        //       would pass for a daemon that made a string up. /health carries no
-        //       `descriptor_tier` key of its own.
-        // CONTROL: two, and the first one's result is why the second exists. (a)
-        //       `recordHealth(&DaemonHealth::gpu, HealthStatus::Ok, ...)` deleted from
-        //       ensureGpu -> only "FAIL: the real daemon's /health names the GPU GetStatus
-        //       reports" (detail empty). The status stayed ok because renderPending's
-        //       commit records it too, so the status assertion needed that line deleted as
-        //       well: with both gone -> "FAIL: ... reports the GPU as ok after a render",
-        //       "FAIL: ... reports the aggregate as ok after a successful render" and the
-        //       detail one. (b) the detail alone replaced with the literal "gpu" -> only
-        //       the names-the-GPU check red, with "/health gpu detail: gpu  dbus: NVIDIA
-        //       GeForce RTX 3080 Ti / Heap". All reverted.
+        // GOAL: S7.10/S7.10b's other direction -- after a render, those checks read `ok`, and the
+        //       GPU one names the device GetStatus reports.
+        // WHY-THIS-SHAPE: the pending checks above mean nothing unless `ok` is reachable. Compared
+        //       with GetStatus's name and tier, not a literal: the tier varies by host.
+        // CONTROL: (a) `recordHealth(&DaemonHealth::gpu, HealthStatus::Ok, ...)` deleted from
+        //       ensureGpu -> "FAIL: the real daemon's /health names the GPU GetStatus reports";
+        //       with renderPending's record deleted too -> also "... reports the GPU as ok after a
+        //       render" and "... reports the aggregate as ok after a successful render". (b) the
+        //       detail made "gpu" -> only the names-the-GPU line. All reverted.
         const HttpReply afterRender = wallpaperx::testing::get(cli, "/health");
-        // The GetStatus half is graded below through dbusTier/dbusName: an unanswered call
-        // leaves both empty, which is the "nothing to compare /health's detail against"
-        // check, so the failure is named rather than swallowed.
+        // An unanswered GetStatus leaves both empty, which the check below names.
         const StatusReply status = getStatusOrExplain(*proxy);
         const nlohmann::json& statusJson = status.json();
         const std::string dbusTier = statusJson.contains("gpu") && statusJson["gpu"].is_object()
@@ -3766,8 +3395,7 @@ void checkHttpLifecycle(NameWatcher& names, const std::string& bluePath, const s
                                          ? statusJson["gpu"].value("name", std::string())
                                          : std::string();
         const nlohmann::json* afterChecks = healthChecks(afterRender.json);
-        // ok() stays in the condition: a gpu verdict read out of a body /health did not
-        // answer with 200 would satisfy the assertions below without the endpoint working.
+        // ok() stays: a verdict read from a non-200 body would pass without the endpoint working.
         const bool gpuReported = afterRender.ok() && afterChecks != nullptr && afterChecks->contains("gpu") &&
                                  (*afterChecks)["gpu"].is_object();
         const std::string gpuStatus =
@@ -3792,28 +3420,14 @@ void checkHttpLifecycle(NameWatcher& names, const std::string& bluePath, const s
 
     // GOAL: S7.11 -- a request in flight cannot read state that is being torn down, and
     //       S7.8 -- nothing is left listening once the process is gone.
-    // WHY-THIS-SHAPE: the polling runs ACROSS the SIGTERM rather than before it. A
-    //       shutdown with nothing in flight is the easy case and would pass for a daemon
-    //       that destroyed its manager under a live handler; what has to be observed is a
-    //       poll landing during the teardown, which on this daemon takes milliseconds
-    //       (GPU teardown) -- long enough for a loopback poller to land several requests
-    //       in. The graded facts are then the ones a broken ordering destroys: the daemon
-    //       still exits 0 through its own shutdown path, still prints the line that means
-    //       the destructor chain ran, and never answered a poll with a malformed body.
-    //       The alternative -- asserting that some specific request got a 200 during the
-    //       window -- would be an assertion on the scheduler (X.2), since when the poller
-    //       stops being served is exactly what shutdown decides.
-    // CONTROL: backend/daemon/main.cpp's `HttpServer httpServer(manager);` replaced with
-    //       `auto* leaked = new HttpServer(manager); (void)leaked;` -- the server then
-    //       outlives the manager it reads, which is precisely the ordering the
-    //       declare-it-last comment exists to guarantee. Observed: the daemon died on
-    //       SIGSEGV during shutdown -> "FAIL: the daemon exits 0 on SIGTERM with HTTP
-    //       polls in flight" and "FAIL: the daemon still runs its destructor chain with
-    //       HTTP polls in flight". Reverted.
-    // COVERAGE-ASSERT: the number of responses the poller actually collected is asserted,
-    //       not assumed. A poller that never connected would make the malformed-response
-    //       check trivially true, and this phase would then be grading an ordinary
-    //       shutdown with nothing in flight at all.
+    // WHY-THIS-SHAPE: polling ACROSS the SIGTERM, so a poll lands during teardown; graded are
+    //       what a broken ordering destroys (exit 0, "stopped cleanly", no malformed reply), never
+    //       that a particular request got a 200 (X.2: when serving stops is shutdown's choice).
+    // CONTROL: backend/daemon/main.cpp's HttpServer leaked with `new`, so it outlives the manager
+    //       -> SIGSEGV in shutdown, "FAIL: the daemon exits 0 on SIGTERM with HTTP polls in flight"
+    //       and "FAIL: the daemon still runs its destructor chain with HTTP polls in flight". Reverted.
+    // COVERAGE-ASSERT: the polls collected before the signal are counted, or the malformed check is
+    //       trivially true.
     Poller poller(kPort, "/config?monitor=" + std::to_string(kMonitorHttp));
     for (int i = 0; i < 500 && poller.recorded() < 5; ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -3840,8 +3454,6 @@ void checkHttpLifecycle(NameWatcher& names, const std::string& bluePath, const s
     }
 
     if (sanitizerReportedIn(output)) {
-        // Same shape as the SIGTERM and SIGINT phases: a sanitized build replaces the
-        // exit code, so the exit-code question stops being about the shutdown path.
         check(false, "the HTTP-lifecycle daemon's sanitizer reported no warnings (its exit code is the "
                      "sanitizer's here, so the exit-code check cannot run)");
     } else {
@@ -3852,9 +3464,7 @@ void checkHttpLifecycle(NameWatcher& names, const std::string& bluePath, const s
           "the daemon still runs its destructor chain with HTTP polls in flight");
     check(names.waitFor(false), "the bus name is released after the HTTP-lifecycle daemon exits");
 
-    // S7.8's own assertion. Deliberately after the reap: `shutdown()` does not return
-    // until the process is gone, so a still-open socket here is a socket the exited
-    // process left behind, not one it is still using.
+    // S7.8, after the reap: an open socket now is one the exited process left behind.
     const ConnectResult afterExit = tryConnect("127.0.0.1", kPort, 1000);
     check(afterExit == ConnectResult::Refused, "nothing is listening on the config port once the daemon has exited");
     if (afterExit != ConnectResult::Refused) {
@@ -3863,22 +3473,14 @@ void checkHttpLifecycle(NameWatcher& names, const std::string& bluePath, const s
 }
 
 // ---------------------------------------------------------------------------- //
-// Phase 11 -- S7.14: the daemon says on DBus whether it got its own config port.
+// Phase 11 -- S7.14: the daemon says on DBus whether it got its own config port. Against the real
+// binary: main.cpp alone hands the bind result to the manager.
 // ---------------------------------------------------------------------------- //
-//
-// Both directions run against the real binary, because main.cpp is the only place the
-// bind result is ever handed to the manager. The failing direction needs a process holding
-// the daemon's port before the daemon starts, which an in-process test cannot arrange for a
-// main() it never runs.
 
-// Who holds the listening socket on 127.0.0.1:`port`. Read from /proc, deliberately: the
-// whole question is whether the daemon's own report about that port can be trusted, so the
-// answer has to come from somewhere the daemon does not write.
+// Who holds 127.0.0.1:`port`, from /proc, which the daemon whose report is graded does not write.
 enum class Listener { Daemon, Other, Nobody, Unknown };
 
-// The inode of the socket listening on 127.0.0.1:`port`, or 0 if there is none. Returns
-// false only when /proc/net/tcp could not be read -- "unreadable" and "nothing is
-// listening" are different answers and only one of them says anything about the daemon.
+// The listening socket's inode, 0 for none; false only when /proc/net/tcp is unreadable.
 bool listeningSocketInode(int port, unsigned long long& outInode, std::string& why) {
     std::ifstream tcp("/proc/net/tcp");
     if (!tcp) {
@@ -3924,8 +3526,7 @@ Listener whoListens(int port, pid_t pid, std::string& why) {
     const std::filesystem::directory_iterator end;
     while (entries != end) {
         std::error_code linkEc;
-        // Descriptors open and close under the walk; one that cannot be read at this
-        // instant is not evidence either way.
+        // A descriptor closed under the walk is evidence of nothing.
         const std::filesystem::path link = std::filesystem::read_symlink(entries->path(), linkEc);
         if (!linkEc && link.native() == target) return Listener::Daemon;
         entries.increment(ec);
@@ -3947,11 +3548,8 @@ const char* describeListener(Listener who) {
     return "?";
 }
 
-// A barrier between phases that each spawn a daemon, deliberately not a check: shutdown()
-// does not return until the process is reaped, and a reaped process has had its name
-// released by the kernel whatever the daemon did -- so no mutation makes this red. Release
-// on shutdown is graded, controllably, by the SIGTERM phase. A timeout is reported as what
-// it is: the next phase cannot be set up.
+// A barrier between daemon-spawning phases, not a check: a reaped process's name is released
+// whatever the daemon did, so nothing could make it red (the SIGTERM phase grades release).
 void awaitNameRelease(NameWatcher& names, const char* nextUp) {
     if (!names.waitFor(false)) {
         notVerified(nextUp, "the bus name was still owned after this phase's daemon had been reaped");
@@ -3985,28 +3583,16 @@ void checkConfigServerOwnsPort(NameWatcher& names, const std::string& validation
 
     // GOAL: S7.14's ok direction -- config_server reads ok exactly when this daemon is the
     //       process listening on the port it was told, not merely whenever the daemon is up.
-    // WHY-THIS-SHAPE: /proc is asked who holds the socket, rather than the test believing
-    //       the daemon or believing that a free port stayed free. Asserting only
-    //       `status == "ok"` here passes for a hardcoded string and for a daemon that
-    //       reports ok about a port some other process took between the spawn and the
-    //       call. Sampled AFTER a GetStatus reply on purpose: main.cpp constructs the
-    //       HttpServer, whose constructor records the bind result, before entering the
-    //       event loop -- so a reply having come back is proof the decision is made, and
-    //       nothing answers GetStatus before then. The bus name, which is taken earlier,
-    //       is not that proof.
-    // CONTROL: three. (a) backend/daemon/main.cpp's HttpServer constructed on
-    //       `options->configPort + 1`, its constructor still recording the bind -> "FAIL:
-    //       config_server reads ok exactly when this daemon is the process holding its port"
-    //       and "FAIL: the config_server report names the port it is listening on", printing
-    //       "config_server: ok / listening on 127.0.0.1:44250, but 127.0.0.1:44249 is held by
-    //       nobody" (every other port phase red beside them). (b) the `status["config_server"]
-    //       = ...` line deleted from DbusService::getStatus -> "FAIL: GetStatus carries a
-    //       config_server object" -- not re-run 2026-09-23, dbus_service.cpp unchanged. (c) in
-    //       HttpServer's constructor (backend/daemon/http_server.cpp), the success
-    //       recordConfigServer's detail made empty -> "FAIL: the config_server report names the
-    //       port it is listening on", printing "config_server: ok / (empty), but
-    //       127.0.0.1:36193 is held by the spawned daemon". (a) and (c) observed 2026-09-23.
-    //       All reverted.
+    // WHY-THIS-SHAPE: /proc says who holds the socket; `status == "ok"` alone passes for a
+    //       hardcoded string. Sampled after a GetStatus reply, which comes only once the event loop
+    //       runs, after the HttpServer recorded its bind (the bus name is taken earlier).
+    // CONTROL: (a) backend/daemon/main.cpp's HttpServer on `options->configPort + 1` -> "FAIL:
+    //       config_server reads ok exactly when this daemon is the process holding its port" and
+    //       "FAIL: the config_server report names the port it is listening on" ("... held by
+    //       nobody"); (b) `status["config_server"] = ...` deleted from DbusService::getStatus ->
+    //       "FAIL: GetStatus carries a config_server object" (not re-run 2026-09-23); (c) the success
+    //       detail made empty in backend/daemon/http_server.cpp -> the names-the-port line. (a), (c)
+    //       2026-09-23. All reverted.
     std::string why;
     const Listener who = whoListens(kPort, daemon.pid(), why);
     const nlohmann::json* report = configServerReport(status);
@@ -4048,10 +3634,7 @@ void checkConfigServerOwnsPort(NameWatcher& names, const std::string& validation
     // GOAL: S7.14's placement -- the bind result travels on DBus and NOT in /health's
     //       checks. On the failing side /health is answered by whatever took the port, so a
     //       config_server check there could only ever read ok: a check that cannot fail.
-    // WHY-THIS-SHAPE: asserting the key's absence on its own is satisfied by a /health that
-    //       returned nothing at all, so the same check demands the three real checks are
-    //       present and that GetStatus carries config_server at the same moment. What is
-    //       graded is the two channels *differing*, which is the decision worth protecting.
+    // WHY-THIS-SHAPE: the two channels differing -- absence alone is true of an empty /health.
     // CONTROL: `{"config_server", &snap.health.configServer},` added to http_server.cpp's
     //       checks array (sized 4) -> "FAIL: the bind result is on DBus only -- /health
     //       names its three checks and not config_server". Reverted.
@@ -4060,8 +3643,7 @@ void checkConfigServerOwnsPort(NameWatcher& names, const std::string& validation
     const nlohmann::json* checks = healthChecks(health.json);
     const bool healthUsable = health.ok() && checks != nullptr;
     if (!healthUsable) {
-        // Whether /health answers at all is graded by the HTTP-lifecycle phase, against a
-        // daemon of its own. Grading it again here would give one fault two names.
+        // Graded by the HTTP-lifecycle phase; one fault, one name.
         std::printf("daemon_system_test: the /health-placement check is not graded -- /health did not answer with a "
                     "checks object on this daemon.\n");
     } else {
@@ -4074,19 +3656,11 @@ void checkConfigServerOwnsPort(NameWatcher& names, const std::string& validation
     awaitNameRelease(names, "S7.14 (the fail direction, which follows this one)");
 }
 
-// Direction 2: this test holds the port first, so the daemon cannot have it.
-//
-// `hostRendered` says whether any daemon in this run got a frame out of this host. It is
-// what separates "the conflict crippled the daemon" from "this machine has no working
-// Vulkan", and it must come from outside this phase -- asking the crippled daemon itself
-// would answer the question with the thing being questioned.
+// Direction 2: this test holds the port first. `hostRendered` (from earlier phases, never this
+// daemon) separates "the conflict crippled the daemon" from "no working Vulkan".
 void checkConfigServerLostPort(NameWatcher& names, const std::string& bluePath, const std::string& validationEnv,
                                bool hostRendered, const Check& check) {
-    // The conflict is created here rather than hoped for: this test holds a port the kernel
-    // chose and tells the daemon to serve on it, so the conflict is certain whatever else the
-    // machine runs. The decision to skip is taken on THIS process's bind() -- never on
-    // config_server, the field under test. A gate that read the field would turn a daemon
-    // reporting the wrong thing into a green skip.
+    // The skip is decided on THIS process's bind(), never on config_server, the field under test.
     wallpaperx::testing::HeldPort impostor;
     if (!impostor.open(INADDR_LOOPBACK, 0)) {
         notVerified("S7.14 (the fail direction)",
@@ -4097,20 +3671,11 @@ void checkConfigServerLostPort(NameWatcher& names, const std::string& bluePath, 
 
     SpawnedDaemon daemon({validationEnv}, SpawnedDaemon::Stdout::Captured, {}, 0, configPortArgs(kPort));
     if (!names.waitFor(true)) {
-        // Before the bind-failure branch below, which grades a daemon that reached its bind
-        // attempt: a child that never execed printed nothing, so that branch would fall
-        // through to the skip and name the daemon for it.
         if (reportedStartupFault(daemon, "S7.14 (the fail direction)")) return;
         const std::string startupOutput = daemon.output();
         if (startupOutput.find(bindFailureMarker(kPort)) != std::string::npos) {
-            // It reached its bind attempt, failed it, and then never made it onto the bus.
-            // That is the daemon dying of a port conflict, which is a finding and not a
-            // reason to skip.
-            // UNCONTROLLED: a throwing bind branch does reach this state, but which of the
-            // two branches wins is a race with the name request that happens first -- the
-            // run that was tried took the other one, reporting through the GetStatus check
-            // below. Kept because the alternative is calling a daemon that died of the
-            // conflict a skip.
+            // A daemon dying of the conflict is a finding, not a skip. UNCONTROLLED: a throwing
+            // bind reaches here or the GetStatus check below, by a race with the name request.
             check(false, "the daemon still reaches the bus when its config port is already taken");
         } else {
             notVerified("S7.14 (the fail direction)",
@@ -4119,10 +3684,7 @@ void checkConfigServerLostPort(NameWatcher& names, const std::string& bluePath, 
         return;
     }
 
-    // Declared before the proxy so it is destroyed after it: the FrameReady callback runs on
-    // the proxy's dispatch thread, and a log destroyed first is written to by a signal still
-    // in flight during teardown. ThreadSanitizer reported exactly that race when these two
-    // were the other way round.
+    // Before the proxy, so it outlives the dispatch thread that writes to it (a measured TSan race).
     FrameReadyLog signals;
     auto proxy =
         sdbus::createProxy(sdbus::ServiceName{DbusService::kBusName}, sdbus::ObjectPath{DbusService::kObjectPath});
@@ -4132,11 +3694,8 @@ void checkConfigServerLostPort(NameWatcher& names, const std::string& bluePath, 
 
     const StatusReply status = getStatus(*proxy);
 
-    // COVERAGE-ASSERT for everything below: that the conflict was in force when the report
-    // was read. Held sockets are not shareable -- HeldPort sets SO_REUSEADDR and never
-    // SO_REUSEPORT -- so a daemon found listening here means the phase graded a daemon that
-    // got the port after all, and every "fail" assertion under it would be nonsense.
-    // Sampled after the GetStatus reply, which is proof main() is past its bind attempt.
+    // COVERAGE-ASSERT for everything below: the conflict was in force (HeldPort never sets
+    // SO_REUSEPORT), read after the GetStatus reply, past the bind attempt.
     // CONTROL: SOCK_CLOEXEC dropped from HeldPort (backend/tests/client/http_probe.h), so the
     //       forked daemon inherits this socket -> "FAIL: the port conflict is real: the daemon
     //       is not the process listening on its port", alone. Observed 2026-09-23. Restored.
@@ -4153,25 +3712,14 @@ void checkConfigServerLostPort(NameWatcher& names, const std::string& bluePath, 
 
     // GOAL: S7.14's substantive half -- a daemon that lost its config port says so on DBus,
     //       with a cause an operator can act on, while still serving DBus at all.
-    // WHY-THIS-SHAPE: the port is held by this test before the daemon is spawned, so the
-    //       failure is certain rather than opportunistic; and "still serving" is asserted
-    //       from the same reply that carries the report, because a GetStatus that came back
-    //       is itself the evidence the daemon is alive. The alternative -- reading the
-    //       daemon's stderr line -- says only that it printed something on the way past,
-    //       which is the state this goal exists to improve on.
-    // CONTROL: three, all in HttpServer's constructor (backend/daemon/http_server.cpp),
-    //       observed 2026-09-23. (a) the bind-failure branch's
-    //       `m_manager.recordConfigServer(false, bindError)` deleted -> "FAIL: a daemon
-    //       that could not bind its config port reports config_server fail", "FAIL: the
-    //       failed bind report names the port it could not take" and the wording check below,
-    //       with "  config_server: pending / (empty), while 127.0.0.1:44655 is held by some
-    //       other process". (b) bindError made "could not bind (127.0.0.1:<port>)" -> the
-    //       wording check below red alone; the fail one and the names-the-port one stay green,
-    //       since the host:port is still inside the detail. (c) the bind branch's `return`
-    //       replaced with `throw std::runtime_error(bindError)` -> "FAIL: a daemon that could
-    //       not bind its config port still answers GetStatus" (ServiceUnknown this run;
-    //       NoReply has been seen too, depending on whether the daemon dies before or after
-    //       its name request), plus the two shutdown checks below. All reverted.
+    // WHY-THIS-SHAPE: the conflict is certain, and "still serving" is the same reply that carries
+    //       the report; the stderr line says only that something was printed in passing.
+    // CONTROL: in HttpServer's constructor (backend/daemon/http_server.cpp), 2026-09-23, reverted:
+    //       (a) `m_manager.recordConfigServer(false, bindError)` deleted -> "FAIL: a daemon that
+    //       could not bind its config port reports config_server fail", the names-the-port and
+    //       wording lines; (b) bindError reworded -> the wording check below alone; (c) the bind
+    //       branch throwing -> "FAIL: a daemon that could not bind its config port still answers
+    //       GetStatus" and the two shutdown checks below.
     check(status.ok(), "a daemon that could not bind its config port still answers GetStatus");
     if (!status.ok()) {
         std::fprintf(stderr, "  %s\n", status.error().c_str());
@@ -4186,31 +3734,17 @@ void checkConfigServerLostPort(NameWatcher& names, const std::string& bluePath, 
               "a daemon that could not bind its config port still reports running");
         check(report != nullptr, "GetStatus carries a config_server object");
         check(reportStatus == "fail", "a daemon that could not bind its config port reports config_server fail");
-        // Not merely non-empty: "fail" with no cause sends an operator back to the stderr
-        // this report exists to replace, and the port is the one fact they need to go and
-        // look for the process that took it. Built from the daemon's own two constants, so
-        // a change of host or port fails the build rather than this assertion.
+        // The port is the one fact an operator needs to find what took it.
         check(reportDetail.find(hostPort) != std::string::npos,
               "the failed bind report names the port it could not take");
 
-        // GOAL: X.3 -- two fail-or-skip decisions in this file match the daemon's own
-        //       bind-failure wording in its stderr, and a test cannot read a literal out of
-        //       a program it only spawns. This asserts the duplicate is still the daemon's
-        //       string, so a rewording arrives as a named failure here rather than as those
-        //       two sites quietly deciding "skip" and "never reached its bind attempt".
-        // WHY-THIS-SHAPE: compared against the DETAIL the daemon just reported over DBus,
-        //       which http_server.cpp records from the same local `bindError` it prints.
-        //       Matching the daemon's stderr instead would be circular -- it is exactly the
-        //       text whose stability is in question, and both sides would move together. The
-        //       existing names-the-port check above does not cover this: it looks for
-        //       "127.0.0.1:<port>", which survives any rewording around it.
-        // CONTROL: bindError in HttpServer's constructor (backend/daemon/http_server.cpp)
-        //       made "could not bind (" + kLoopbackHost + ":" + port + ")" -> "FAIL: the
-        //       bind-failure wording this file matches on in the daemon's stderr is still the
-        //       daemon's" with '  bindFailureMarker(35871) = "could not bind 127.0.0.1:35871",
-        //       but the daemon reports "could not bind (127.0.0.1:35871)"', and it was the
-        //       run's only failure -- the names-the-port check above stayed green, since the
-        //       rewording kept the host:port inside it. Observed 2026-09-23. Reverted.
+        // GOAL: X.3 -- the bind-failure wording two fail-or-skip decisions here match is still the
+        //       daemon's, so a reword is a named failure, not two quiet skips.
+        // WHY-THIS-SHAPE: against the DBus detail, recorded from the same `bindError` the daemon
+        //       prints; the names-the-port check survives any rewording around the host:port.
+        // CONTROL: bindError (backend/daemon/http_server.cpp) made "could not bind (host:port)" ->
+        //       "FAIL: the bind-failure wording this file matches on in the daemon's stderr is still
+        //       the daemon's", the run's only failure. Observed 2026-09-23. Reverted.
         const std::string marker = bindFailureMarker(kPort);
         check(reportDetail.find(marker) != std::string::npos,
               "the bind-failure wording this file matches on in the daemon's stderr is still the daemon's");
@@ -4239,25 +3773,14 @@ void checkConfigServerLostPort(NameWatcher& names, const std::string& bluePath, 
         }
     }
 
-    // GOAL: S7.14 is only worth having because the daemon keeps working -- a report from a
-    //       corpse would be a crash, not a diagnosis. So it must still render after losing
-    //       the port.
-    // WHY-THIS-SHAPE: a render, not a second GetStatus: answering the bus is the cheap half
-    //       and GOALS.md claims DBus *and* rendering continue. `hostRendered` is what
-    //       decides whether a missing frame is a failure or an unexercised goal: an earlier
-    //       phase of this same run got a frame out of the same binary, so a frame that never
-    //       arrives here cannot be blamed on the Vulkan stack. Without that distinction this
-    //       would either accuse a host with no ICD or -- the version that matters -- let a
-    //       daemon crippled by the conflict pass as a skip. SetWallpaper is inside the try
-    //       because a daemon killed by the conflict would otherwise throw out of the phase
-    //       and take these diagnostics with it.
-    // CONTROL: two. (a) `throw InvalidRequest("control")` at the top of
-    //       WallpaperManager::requestWallpaper -> "FAIL: a daemon that could not bind its
-    //       config port still accepts SetWallpaper" with the daemon's error text. (b) the
-    //       FrameReady emission in dbus_service.cpp suppressed for this phase's monitor
-    //       only, so the run still renders elsewhere and hostRendered stays true -> "FAIL: a
-    //       daemon that could not bind its config port renders a wallpaper anyway". Both
-    //       reverted.
+    // GOAL: S7.14 -- a daemon that lost its port still renders.
+    // WHY-THIS-SHAPE: a render, not another GetStatus; `hostRendered` decides between a failure
+    //       and an unexercised goal, so neither a host with no ICD is accused nor a crippled daemon
+    //       passed as a skip. SetWallpaper inside the try, so a dead daemon cannot end the phase.
+    // CONTROL: (a) `throw InvalidRequest("control")` atop WallpaperManager::requestWallpaper ->
+    //       "FAIL: a daemon that could not bind its config port still accepts SetWallpaper"; (b)
+    //       FrameReady suppressed for this monitor only in backend/daemon/dbus_service.cpp -> "FAIL:
+    //       a daemon that could not bind its config port renders a wallpaper anyway". Reverted.
     if (status.ok()) {
         bool rendered = false;
         std::string renderError;
@@ -4279,17 +3802,12 @@ void checkConfigServerLostPort(NameWatcher& names, const std::string& bluePath, 
         }
     }
 
-    // The port conflict must not change how the daemon goes down: the HttpServer destructor
-    // still runs on a server that never started a serving thread.
-    // CONTROL: control (c) above -- a throwing bind branch -> "FAIL: a daemon that could not
-    //       bind its config port still exits 0 on SIGTERM" and "FAIL: ... still runs its
-    //       destructor chain", the daemon having printed "fatal: could not bind
-    //       127.0.0.1:45719" and never "stopped cleanly". Observed 2026-09-23. Reverted.
+    // The conflict must not change how the daemon goes down. CONTROL: (c) above -> "FAIL: a daemon
+    // that could not bind its config port still exits 0 on SIGTERM" and "... still runs its
+    // destructor chain". Observed 2026-09-23. Reverted.
     const int exitCode = daemon.shutdown(SIGTERM);
     const std::string output = daemon.output();
     if (sanitizerReportedIn(output)) {
-        // Same shape as every other exit-code site here: a sanitized build replaces the
-        // exit code, so this stops being a question about the shutdown path.
         check(false, "the port-conflict daemon's sanitizer reported no warnings (its exit code is the sanitizer's "
                      "here, so the exit-code check cannot run)");
     } else {
@@ -4301,20 +3819,10 @@ void checkConfigServerLostPort(NameWatcher& names, const std::string& bluePath, 
 }
 
 // ---------------------------------------------------------------------------- //
-// Phase 12 -- Step 8: config persistence, in the shipped binary.
+// Phase 12 -- Step 8: config persistence, in the shipped binary: a restart is two processes and a
+// file, and a config that aborts the daemon would take an in-process test down with it. Each phase
+// owns its XDG_CONFIG_HOME; SpawnedDaemon gives every other spawn a fresh one.
 // ---------------------------------------------------------------------------- //
-//
-// Every check below needs a daemon that is a *process*: a wallpaper surviving a restart is
-// two processes and a file between them, and the worse half of "no config content stops the
-// daemon" is a SIGABRT, which an in-process test cannot report because it dies with it
-// (measured: the const `operator[]` control killed config_store_test outright, printing
-// json.hpp's assertion and no FAIL line).
-//
-// Each of these phases points the daemon at an XDG_CONFIG_HOME it owns and deletes.
-// SpawnedDaemon injects a fresh one per spawn precisely so no test can reach the
-// developer's real ~/.config/wallpaperx -- an earlier run of this suite wrote 28 test
-// wallpapers there and restored them on the next login. A phase that wants state to survive
-// a restart passes its own, which is the only reason to override that default.
 
 std::string readTextFile(const std::filesystem::path& file) {
     std::ifstream in(file, std::ios::binary);
@@ -4335,15 +3843,11 @@ bool writeTextFile(const std::filesystem::path& file, const std::string& text) {
 struct PersistedEntry {
     std::string type;
     std::string path;
-    // Empty when the row carries no connector name, which is the ordinary case: a screen is
-    // only named once the app has run for it.
-    std::string output;
+    std::string output;  // empty: no connector name, the ordinary case
 };
 
-// What the daemon wrote, read straight off the disk. Parsed here rather than through
-// ConfigStore::load() on purpose: this tier's job is to grade the file the shipped binary
-// produced, and a reader that shares the writer's field-name constants agrees with it by
-// construction, including when both are wrong.
+// The file as written, parsed here rather than by ConfigStore::load(), which shares the writer's
+// field names and would agree with it when both were wrong.
 std::map<int, PersistedEntry> configEntries(const std::filesystem::path& file, std::string& why) {
     std::map<int, PersistedEntry> entries;
     const std::string text = readTextFile(file);
@@ -4364,9 +3868,7 @@ std::map<int, PersistedEntry> configEntries(const std::filesystem::path& file, s
         if (!entry["monitor_id"].is_number_integer() || !entry["type"].is_string() || !entry["path"].is_string()) {
             continue;
         }
-        // `output` is optional and is not part of the required-field guard above: a row
-        // written before connector names existed carries none, and dropping such a row
-        // would make the wallpaper checks in the other phases silently stop comparing.
+        // Optional: a row without it is still compared.
         std::string output;
         if (entry.contains("output") && entry["output"].is_string()) output = entry["output"].get<std::string>();
         entries[entry["monitor_id"].get<int>()] =
@@ -4375,13 +3877,8 @@ std::map<int, PersistedEntry> configEntries(const std::filesystem::path& file, s
     return entries;
 }
 
-// Every file under `dir`, so a phase can say "nothing was written here" and name what was
-// if something was. False, with a reason, when the walk could not be made: "the directory
-// could not be read" and "the directory was empty" have to be different answers, or the
-// absence check above becomes evidence of absence on no evidence at all. The non-throwing
-// increment(ec) is what keeps a mid-walk error -- a daemon creating a mode-0000 directory
-// under its cwd, which is exactly what this phase hunts -- from throwing out of the phase
-// and taking every later phase with it.
+// Every file under `dir`; false with a reason when the walk failed, which is not "empty".
+// increment(ec), so a mode-0000 directory the daemon made cannot throw out of the phase.
 bool filesUnder(const std::filesystem::path& dir, std::vector<std::string>& found, std::string& why) {
     std::error_code ec;
     std::filesystem::recursive_directory_iterator it(dir, ec);
@@ -4400,10 +3897,7 @@ bool filesUnder(const std::filesystem::path& dir, std::vector<std::string>& foun
     return true;
 }
 
-// The daemon's /health body, asked on `port`, the one it was told to serve on. Returns false
-// with a reason when the daemon says it is not serving there -- losing a race for the port is
-// a skip, not a finding, and this phase has a GetStatus-based answer for that case that does
-// not need the port at all.
+// The daemon's /health body on `port`; false with a reason when it says it is not serving there.
 bool fetchHealth(const StatusReply& status, int port, nlohmann::json& out, std::string& why, const Check& check) {
     const nlohmann::json* report = configServerReport(status);
     const std::string reportStatus = report ? report->value("status", std::string()) : std::string();
@@ -4415,11 +3909,7 @@ bool fetchHealth(const StatusReply& status, int port, nlohmann::json& out, std::
     httplib::Client cli = wallpaperx::testing::makeClient(port);
     const wallpaperx::testing::HttpReply reply = wallpaperx::testing::get(cli, "/health");
     if (!reply.ok()) {
-        // Not a skip: the daemon just said it owns that port, so a /health that will not
-        // answer is the daemon failing, and the http lifecycle phase grades the same thing.
-        // `why` is deliberately left empty as the marker for "already graded red" -- with a
-        // reason set, callers reported the one fault twice, once as a failure and once as
-        // coverage that did not run, and the run summary exists to keep those apart.
+        // A failure, not a skip (it says it owns the port); `why` left empty marks "already red".
         check(false, "a daemon reporting config_server ok answers GET /health");
         return false;
     }
@@ -4439,13 +3929,10 @@ void checkConfigRestart(NameWatcher& names, const std::string& validationEnv, co
 
     ScratchDir configHome("restart");
     if (!configHome.ok()) {
-        notVerified(kGoals, "a scratch XDG_CONFIG_HOME could not be created under the temp directory");
-        return;
+        throw ScratchDirectoryLost("a scratch XDG_CONFIG_HOME could not be created under the temp directory");
     }
 
-    // A filename carrying every byte class sanitizeForLog rewrites: U+202E, DEL, and a
-    // newline. Legal on Linux, and the whole point -- what is persisted has to be the bytes
-    // that open this file, not the display-safe rendering of them.
+    // Every byte class sanitizeForLog rewrites (U+202E, DEL, newline): persisted must be the bytes.
     const std::string nastyName = std::string("system_persist_\xE2\x80\xAE\x7F\nblue.png");
     std::string nastyPath;
     try {
@@ -4474,9 +3961,7 @@ void checkConfigRestart(NameWatcher& names, const std::string& validationEnv, co
             return;
         }
 
-        // Declared before the proxy so it outlives it: the FrameReady callback runs on the
-        // proxy's dispatch thread.
-        FrameReadyLog signals;
+        FrameReadyLog signals;  // before the proxy, which writes to it
         auto proxy = sdbus::createProxy(sdbus::ServiceName{DbusService::kBusName},
                                         sdbus::ObjectPath{DbusService::kObjectPath});
         proxy->uponSignal("FrameReady")
@@ -4486,20 +3971,12 @@ void checkConfigRestart(NameWatcher& names, const std::string& validationEnv, co
         // GOAL: S8.11, first half -- HealthStatus::Pending still means "no dependency has
         //       been tried yet", and after Step 8 it is reachable exactly when there is no
         //       config file. False if a daemon that restored nothing already reports a GPU.
-        // WHY-THIS-SHAPE: asked of a daemon whose XDG_CONFIG_HOME this phase created empty
-        //       seconds ago, so "no config file" is a fact rather than an assumption, and
-        //       asked before this phase's own SetWallpaper. gpu.initialized on GetStatus is
-        //       asserted unconditionally; the `pending` wording is asserted only when the
-        //       daemon owns the port it was told, because losing a race for that port is a
-        //       skip and not a finding.
-        // CONTROL: this block moved below the SetWallpaper and the FrameReady wait, so the
-        //       same daemon is asked once a device provably exists -> "FAIL: a daemon with
-        //       no config file has created no GPU device at startup" and "FAIL: /health
-        //       reports the GPU as pending on a daemon that restored nothing". Moved back.
-        //       A control that instead gave THIS daemon a populated config file was tried
-        //       and rejected: whether the restore's render has committed by the time the
-        //       reply is built is a race, so it would have been a check graded on the
-        //       scheduler. The restore direction is controlled below, after a FrameReady.
+        // WHY-THIS-SHAPE: the XDG_CONFIG_HOME was made empty by this phase, and this is asked
+        //       before its SetWallpaper; the /health wording only where the daemon owns its port.
+        // CONTROL: this block moved below the SetWallpaper and FrameReady wait -> "FAIL: a daemon
+        //       with no config file has created no GPU device at startup" and "FAIL: /health reports
+        //       the GPU as pending on a daemon that restored nothing". Moved back. (A populated config
+        //       here would race the restore's render; that direction is graded below.)
         const StatusReply beforeAnything = getStatusOrExplain(*proxy);
         if (beforeAnything.ok()) {
             check(!beforeAnything.json().value("gpu", nlohmann::json::object()).value("initialized", true),
@@ -4527,22 +4004,14 @@ void checkConfigRestart(NameWatcher& names, const std::string& validationEnv, co
         awaitNameRelease(names, "the restarted daemon of the config phase");
     }
 
-    // GOAL: S8.3 -- the daemon persists the path it was given, byte for byte. False if the
-    //       file holds the sanitized form: /config and GetStatus both publish
-    //       sanitizeForLog(path), and persisting what they publish would restore a
-    //       different file (PLAN.md Step 8 trap 4).
-    // WHY-THIS-SHAPE: read off the disk and compared to the exact bytes this test passed
-    //       over the bus, and the same reply's published path is asserted to be the
-    //       SANITIZED one. Asserting only the file would pass for a daemon that had stopped
-    //       sanitizing its published surface; asserting only the wire would pass for one
-    //       that persists the display form. The pair is what pins the two boundaries apart.
-    // CONTROL: `{kKeyPath, entry.path}` in ConfigStore::save() replaced with
-    //       `sanitizeForLog(entry.path, 4096, LogFraming::Bare)` -> three FAILs: "the
-    //       daemon persists the path it was given, byte for byte" ("persisted:
-    //       ...system_persist_\xe2\x80\xae\x7f\nblue.png"), "GetStatus publishes the
-    //       restored path in its sanitized form" (it publishes the escaped form escaped
-    //       again), and "the restored wallpaper renders in the new process without any
-    //       client asking" -- the sanitized name names no file. Reverted.
+    // GOAL: S8.3 -- the daemon persists the path it was given, byte for byte, not the sanitized
+    //       form /config and GetStatus publish (which would restore a different file).
+    // WHY-THIS-SHAPE: the file's bytes and the published sanitized form, as a pair: either alone
+    //       passes for one of the two ways to get it wrong.
+    // CONTROL: ConfigStore::save() writing `sanitizeForLog(entry.path, 4096, LogFraming::Bare)` ->
+    //       "the daemon persists the path it was given, byte for byte", "GetStatus publishes the
+    //       restored path in its sanitized form" and "the restored wallpaper renders in the new
+    //       process without any client asking" red. Reverted.
     std::string why;
     const std::map<int, PersistedEntry> saved = configEntries(configHome.configFile(), why);
     const bool savedEntry = saved.count(kMonitorRestore) == 1;
@@ -4559,21 +4028,13 @@ void checkConfigRestart(NameWatcher& names, const std::string& validationEnv, co
         check(saved.at(kMonitorRestore).type == "static", "the persisted entry carries the wallpaper's type");
     }
 
-    // Sampled while no daemon is running, so anything that moves them belongs to the
-    // restart. See the S8.5 check at the end of this phase.
+    // Sampled with no daemon running, for the S8.5 check at the end.
     std::error_code timeEc;
     const std::string bytesBeforeRestart = readTextFile(configHome.configFile());
     const auto mtimeBeforeRestart = std::filesystem::last_write_time(configHome.configFile(), timeEc);
 
-    // Subscribed BEFORE the restarted daemon is spawned, and after the first daemon's name
-    // is provably gone. The restore renders on the daemon's own initiative, and main.cpp
-    // acquires the bus name before it queues that render -- so a subscription made after
-    // "the name is up" opens its window after the signal can already have been emitted, and
-    // FrameReadyLog scans a history that starts empty. The window is wide today only because
-    // the first restore render pays for Vulkan device creation. A match rule naming a
-    // well-known sender is resolved by the bus at delivery time, so installing it while
-    // nobody owns the name still delivers the new daemon's signals. `restored` is declared
-    // before the proxy so it outlives the dispatch thread that writes to it.
+    // Subscribed BEFORE the restart: the name is taken before the restore render is queued, so a
+    // later subscription can miss it. A well-known-sender match rule resolves at delivery.
     FrameReadyLog restored;
     auto proxy =
         sdbus::createProxy(sdbus::ServiceName{DbusService::kBusName}, sdbus::ObjectPath{DbusService::kObjectPath});
@@ -4581,8 +4042,7 @@ void checkConfigRestart(NameWatcher& names, const std::string& validationEnv, co
         .onInterface(DbusService::kInterface)
         .call([&restored](int32_t monitorId, uint64_t generation) { restored.record(monitorId, generation); });
 
-    // The restart. No client call of any kind against this daemon before the assertions:
-    // that is the property.
+    // The restart; no client call precedes the assertions, which is the property.
     const int secondPort = unusedLoopbackPort();
     if (secondPort < 0) {
         notVerified(kGoals, "no free loopback port could be found for the restarted daemon");
@@ -4597,37 +4057,23 @@ void checkConfigRestart(NameWatcher& names, const std::string& validationEnv, co
         return;
     }
 
-    // GOAL: S8.1 -- a wallpaper set before a restart is on the same monitor after it, with
-    //       no client acting. This is the whole of Step 8; everything else constrains how
-    //       it is reached. False if the monitor comes back reporting nothing set.
-    // WHY-THIS-SHAPE: the STATE is graded unconditionally and the FRAME only when the
-    //       daemon before the restart managed to render. A frame-only check would report a
-    //       host with no working Vulkan as a broken restore -- and a state-only check would
-    //       pass for a daemon that restored a path it can no longer open, which is exactly
-    //       what persisting the sanitized form produces. The frame subscription is installed
-    //       before the restarted daemon is spawned, so no startup render can be emitted
-    //       unobserved -- subscribing after the name appears would not do, since the daemon
-    //       owns its name before it queues that render.
+    // GOAL: S8.1 -- a wallpaper set before a restart is on the same monitor after it, no client
+    //       acting.
+    // WHY-THIS-SHAPE: the STATE unconditionally, the FRAME only if the first daemon rendered: a
+    //       frame alone would blame a host without Vulkan, a state alone would pass a restored path
+    //       that cannot open.
     // CONTROL: `service.restoreSaved();` disabled in backend/daemon/main.cpp -> sixteen FAILs, led by
     //       "the wallpaper set before the restart is on that monitor after it, with no client
-    //       asking" and "the restored wallpaper renders in the new process without any
-    //       client asking", and including this phase's two S8.11 lines and the restore lines of
-    //       the crash-refusal, connector-name and unreadable-config phases: sixteen, via
-    //       control_run.sh on the NVIDIA entry, 2026-09-24. Reverted. The restore and its render are separate
-    //       calls since Step 13 Stage E5: `service.renderRestored();` deleted from
-    //       backend/daemon/main.cpp -> "FAIL: the restored wallpaper renders in the new process
-    //       without any client asking", the two S8.11 lines and "a restored monitor whose file is
-    //       missing says why it is blank", the state check staying green. Observed 2026-09-21 on
-    //       the NVIDIA entry. Reverted.
+    //       asking", via control_run.sh on NVIDIA, 2026-09-24; `service.renderRestored();` deleted ->
+    //       "FAIL: the restored wallpaper renders in the new process without any client asking",
+    //       the two S8.11 lines and the missing-file line, the state check green (2026-09-21).
+    //       Reverted.
     const StatusReply afterRestart = getStatusOrExplain(*proxy);
     const nlohmann::json* entry = wallpaperStatus(afterRestart, std::to_string(kMonitorRestore));
     check(entry != nullptr,
           "the wallpaper set before the restart is on that monitor after it, with no client asking");
     if (entry != nullptr) {
         check(entry->value("type", std::string()) == "static", "the restored monitor carries the type it was set with");
-        // GetStatus publishes the sanitized path -- display-safe, not round-trip-safe --
-        // while the file above holds the raw bytes. Both are asserted, because the defect
-        // this pair rules out is the two surfaces being fed from the same string.
         const std::string published = entry->value("path", std::string());
         const std::string expected = wallpaperx::sanitizeForLog(nastyPath, 4096, wallpaperx::LogFraming::Bare);
         check(published == expected, "GetStatus publishes the restored path in its sanitized form");
@@ -4641,16 +4087,13 @@ void checkConfigRestart(NameWatcher& names, const std::string& validationEnv, co
                     "the daemon before the restart never rendered either, so a missing frame here says nothing "
                     "about the restore");
     } else {
-        // Generation 1: this is a fresh process, and the counter lives in it, not in the
-        // file. A restored wallpaper is that process's first render.
+        // Generation 1: the counter lives in the process, not the file.
         check(restored.wait(kMonitorRestore, 1),
               "the restored wallpaper renders in the new process without any client asking");
 
         // GOAL: S8.11, second half -- Pending is NOT what a daemon that restored a
         //       wallpaper reports, because it resolved the GPU at startup on its own.
-        // WHY-THIS-SHAPE: read after the FrameReady above, so the render is known to have
-        //       committed rather than assumed; polling GetStatus until initialized flips
-        //       would pass on a timeout if it were written the other way round.
+        // WHY-THIS-SHAPE: read after the FrameReady, never by polling until the flag flips.
         // CONTROL: the same `service.restoreSaved()` deletion -> "FAIL: a daemon that
         //       restored a wallpaper has resolved its GPU with no client involved" and
         //       "FAIL: /health no longer reports the GPU as untried once a restore has
@@ -4674,31 +4117,16 @@ void checkConfigRestart(NameWatcher& names, const std::string& validationEnv, co
         }
     }
 
-    // GOAL: S8.5 end to end -- a daemon that restores entries needing no repair does not write
-    //       the config file. In process this is asserted on a hand-written file
-    //       (config_store_test); here it is asserted of the shipped binary, where main.cpp's
-    //       own call order is what could break it. The other half of the rule is the opposite
-    //       property: a restore that DOES repair something writes the repair at that start,
-    //       which config_store_test's startup-repair phase grades. This fixture reaches neither
-    //       -- it is the file the first daemon wrote from one valid SetWallpaper, so there is
-    //       nothing in it to repair.
-    // WHY-THIS-SHAPE: the MTIME is what is graded, not the bytes. Bytes cannot work at this
-    //       tier and that is not obvious: the file under test was written by the first
-    //       daemon's own save(), so a second save reproduces it byte for byte -- measured, a
-    //       save of the same rows added to restoreSaved() left a byte comparison completely
-    //       green. Both samples are taken while no daemon is running, so nothing
-    //       but the restart can have moved either.
-    // CONTROL: the `if (repaired)` guard on `m_repair = m_kept.rowsToWrite(liveWallpapers());`
-    //       at the end of WallpaperManager::restoreSaved() (backend/daemon/wallpaper_manager.cpp)
-    //       deleted, so every start hands writeRepairedConfig() a snapshot -> "FAIL: a daemon
-    //       that restores entries needing no repair leaves the config file exactly as it found
-    //       it", with "  the file's mtime moved across a start that only restored". Six more went
-    //       red with it, all in the unreadable-config phases: an empty snapshot written after the
-    //       file was moved aside recreates config.json and replaces the detail saying why it was
-    //       refused. Observed via control_run.sh, 2026-09-29. Reverted. This tier is
-    //       now the only one that answers for the rule: config_store_test's twin reads the file
-    //       inside the manager's lifetime, and since the repair write became asynchronous that
-    //       read beats it.
+    // GOAL: S8.5 end to end -- a daemon restoring entries that need no repair does not write the
+    //       config file (the only tier left that answers for it: the in-process twin's read beats
+    //       the now asynchronous repair write).
+    // WHY-THIS-SHAPE: the MTIME, sampled with no daemon running: a second save reproduces the
+    //       first daemon's file byte for byte (measured: a byte comparison stayed green).
+    // CONTROL: the `if (repaired)` guard on `m_repair = ...` at the end of
+    //       WallpaperManager::restoreSaved() (backend/daemon/wallpaper_manager.cpp) deleted ->
+    //       "FAIL: a daemon that restores entries needing no repair leaves the config file exactly
+    //       as it found it", "the file's mtime moved ...", six unreadable-config lines beside it.
+    //       Via control_run.sh, 2026-09-29. Reverted.
     second.shutdown(SIGTERM);
     awaitNameRelease(names, "the phase after the config restart");
     std::error_code afterEc;
@@ -4717,23 +4145,12 @@ void checkConfigRestart(NameWatcher& names, const std::string& validationEnv, co
 }
 
 // ---------------------------------------------------------------------------- //
-// Step 13 -- a wallpaper the last run died applying, refused by the shipped binary.
+// Step 13 -- a wallpaper the last run died applying, refused by the shipped binary: only this tier
+// shows the binary finds the record ($XDG_STATE_HOME, resolved at startup). The record is planted:
+// a real crash inside the window would be a race.
 // ---------------------------------------------------------------------------- //
-//
-// The decision itself is graded in process (crash_quarantine_test) and the record's own
-// rules in crash_record_test. What only this tier can establish is that the SHIPPED binary
-// finds the record at all: it resolves its state directory from $XDG_STATE_HOME at startup,
-// before the bus name is claimed, and no client is involved. An in-process manager is handed
-// its state directory as a Config field, so it cannot answer that question either way.
-//
-// The record is planted rather than produced by crashing a real daemon. Producing one means
-// killing the daemon inside the window between the record's creation and the submit, which is
-// a few tens of milliseconds of a render this test cannot observe the start of -- a race, and
-// a lost race would print as a defect.
 void checkCrashRefusal(NameWatcher& names, const std::string& validationEnv, const std::string& bluePath,
                        const Check& check) {
-    // This phase drives a daemon and an XDG_CONFIG_HOME of its own, so this id is only ever
-    // compared against its own -- the rule the id table at the top of this file sets out.
     constexpr int32_t kMonitorRefused = 18;
     constexpr const char* kGoals =
         "S13.13/S13.16 through the shipped binary (a wallpaper the last run died applying is refused, and an "
@@ -4741,12 +4158,9 @@ void checkCrashRefusal(NameWatcher& names, const std::string& validationEnv, con
 
     ScratchDir configHome("crashrefusal");
     if (!configHome.ok()) {
-        notVerified(kGoals, "a scratch XDG_CONFIG_HOME could not be created under the temp directory");
-        return;
+        throw ScratchDirectoryLost("a scratch XDG_CONFIG_HOME could not be created under the temp directory");
     }
-    // Where a daemon given this scratch directory as its XDG_STATE_HOME keeps its records.
-    // Both env entries are passed explicitly below: SpawnedDaemon only derives one from the
-    // other when it owns the config home, and here this phase does.
+    // Both env entries passed below: SpawnedDaemon derives one only for a config home it owns.
     const std::filesystem::path stateDir = configHome.preservedDir();
     const std::filesystem::path record = wallpaperx::crashRecordPath(stateDir, kMonitorRefused);
 
@@ -4780,18 +4194,15 @@ void checkCrashRefusal(NameWatcher& names, const std::string& validationEnv, con
 
     // GOAL: S13.13, through the real binary -- a daemon started over a state directory
     //       holding a record that matches its saved wallpaper refuses that wallpaper, says
-    //       which signal the last run died of, and answers GetFrameFd with RenderFailed.
+    //       which signal the last run died of, and answers GetFrame with RenderFailed.
     //       False if the shipped binary looks for its records somewhere else, or does not
     //       look before it applies the config.
-    // WHY-THIS-SHAPE: no client call precedes the assertions -- the refusal has to be the
-    //       daemon's own doing at startup. And the reason is read off GetStatus rather than
-    //       out of the daemon's stderr: a log line proves the daemon noticed, not that a
-    //       frontend can find out.
+    // WHY-THIS-SHAPE: no client call first; the reason from GetStatus, where a frontend reads it.
     // CONTROL: in backend/daemon/wallpaper_manager.cpp, restoreSaved()'s
     //       `state.quarantined = crash && ...` replaced with `= false` -> five FAIL lines,
     //       beginning "the shipped daemon refuses a wallpaper its state directory says the
-    //       last run died applying" with an empty last_error printed, and "GetFrameFd on a
-    //       refused monitor answers RenderFailed on the shipped daemon -- GetFrameFd
+    //       last run died applying" with an empty last_error printed, and "GetFrame on a
+    //       refused monitor answers RenderFailed on the shipped daemon -- GetFrame
     //       answered: a frame". Reverted.
     const StatusReply refused = getStatusOrExplain(*proxy);
     const std::string key = std::to_string(kMonitorRefused);
@@ -4811,11 +4222,11 @@ void checkCrashRefusal(NameWatcher& names, const std::string& validationEnv, con
     }
 
     const std::string frameError =
-        wallpaperx::testing::errorNameFrom([&] { (void)wallpaperx::testing::getFrameFd(*proxy, kMonitorRefused); });
+        wallpaperx::testing::errorNameFrom([&] { (void)wallpaperx::testing::getFrame(*proxy, kMonitorRefused); });
     check(frameError == "io.wallpaperx.Daemon.Error.RenderFailed",
-          "GetFrameFd on a refused monitor answers RenderFailed on the shipped daemon");
+          "GetFrame on a refused monitor answers RenderFailed on the shipped daemon");
     if (frameError != "io.wallpaperx.Daemon.Error.RenderFailed") {
-        std::fprintf(stderr, "  GetFrameFd answered: %s\n", frameError.empty() ? "a frame" : frameError.c_str());
+        std::fprintf(stderr, "  GetFrame answered: %s\n", frameError.empty() ? "a frame" : frameError.c_str());
     }
 
     // GOAL: S13.16, through the real binary -- setting the same wallpaper again is the way
@@ -4830,8 +4241,6 @@ void checkCrashRefusal(NameWatcher& names, const std::string& validationEnv, con
     check(std::filesystem::exists(record), "the record is still on disk while the wallpaper is refused");
     setWallpaper(*proxy, "static", bluePath, kMonitorRefused);
     if (!signals.wait(kMonitorRefused, 1)) {
-        // Not a pass and not a failure of the refusal: this host never rendered, so what a
-        // completed retry leaves behind cannot be read here.
         notVerified("S13.16's render half through the shipped binary",
                     "the retry never produced a FrameReady on this host, so what a completed render does to "
                     "the record could not be observed");
@@ -4843,9 +4252,7 @@ void checkCrashRefusal(NameWatcher& names, const std::string& validationEnv, con
         check(false, "the shipped daemon still reports the monitor after the retry");
     } else {
         check(after->value("has_frame", false), "an explicit set renders the wallpaper the daemon had refused");
-        // Absence of the key, not an empty string: GetStatus omits last_error entirely when
-        // there is none, so a check written as value("last_error", "") == "" would also pass
-        // for a reply that had dropped the field.
+        // Absence of the key: GetStatus omits last_error when there is none.
         check(!after->contains("last_error"), "the refusal is cleared once the wallpaper has been set again");
         if (after->contains("last_error")) {
             std::fprintf(stderr, "  last_error after the retry: %s\n",
@@ -4859,26 +4266,15 @@ void checkCrashRefusal(NameWatcher& names, const std::string& validationEnv, con
 }
 
 // ---------------------------------------------------------------------------- //
-// Step 10 -- the connector name a plugin identifies itself by, across a restart.
+// Step 10 -- the connector name a plugin identifies itself by, across a restart (S10.5): it must
+// come back from the file alone, in a fresh daemon; only the app could re-tell it.
 // ---------------------------------------------------------------------------- //
-//
-// Everything else about connector names is graded in process: the store keeps the field
-// (config_store_test), the manager rebinds what it reads (config_store_test), the bus
-// records it (dbus_service_test), and /config resolves it (http_server_test). None of
-// those crosses a process boundary, and S10.5 is about exactly that boundary -- a screen's
-// name has to come back in a daemon that was started fresh, from the file alone, with no
-// client to re-tell it. A plugin instance cannot re-tell it: only the app can, and the app
-// may not run for weeks.
 void checkOutputRestart(NameWatcher& names, const std::string& validationEnv, const Check& check) {
     using wallpaperx::testing::boundMonitor;
     using wallpaperx::testing::HttpReply;
     using wallpaperx::testing::setMonitorOutput;
 
-    // The restarted daemon's port, picked now so a failure to find one skips before anything runs.
     const int kPort = unusedLoopbackPort();
-    // This phase drives a daemon and an XDG_CONFIG_HOME of its own, so these ids are only
-    // ever compared against its own -- the rule the id table at the top of this file sets
-    // out for a phase that does not share a daemon with any other.
     constexpr int32_t kMonitorNamedA = 18;
     constexpr int32_t kMonitorNamedB = 19;
     constexpr const char* kGoals = "S10.5 (a connector name a plugin can still identify itself by after a restart)";
@@ -4889,20 +4285,15 @@ void checkOutputRestart(NameWatcher& names, const std::string& validationEnv, co
 
     ScratchDir configHome("outputrestart");
     if (!configHome.ok()) {
-        notVerified(kGoals, "a scratch XDG_CONFIG_HOME could not be created under the temp directory");
-        return;
+        throw ScratchDirectoryLost("a scratch XDG_CONFIG_HOME could not be created under the temp directory");
     }
     if (kPort < 0) {
         notVerified(kGoals, "no free loopback port could be found for the restarted daemon");
         return;
     }
 
-    // COVERAGE-ASSERT: every "not the other screen's wallpaper" clause below is vacuous if
-    // the two screens share a file. Pinned at build time rather than by a check(): the two
-    // names are literals in this source, so no behaviour of the daemon, the host or the
-    // harness can make a runtime comparison of them false -- it would occupy a line in the
-    // pass/fail report that nothing could ever turn red. Giving both calls the same name now
-    // stops the file compiling instead.
+    // COVERAGE-ASSERT: the two screens need two files, pinned at build time (literals, which no
+    // runtime check could ever turn red).
     constexpr std::string_view kImageA = "system_output_a.png";
     constexpr std::string_view kImageB = "system_output_b.png";
     static_assert(kImageA != kImageB, "the two screens this phase tells apart need two different wallpapers");
@@ -4917,10 +4308,7 @@ void checkOutputRestart(NameWatcher& names, const std::string& validationEnv, co
         return;
     }
 
-    // Both halves of each row, not the name alone: the checks after the restart compare the
-    // wallpaper path as well, so a row that reached disk carrying the name and no path would
-    // be graded as the restore having lost it. `configWhy` is rewritten on every call and so
-    // always describes the most recent read.
+    // Name and path both, as the checks after the restart compare both.
     std::string configWhy;
     const auto rowsOnDisk = [&] {
         const std::map<int, PersistedEntry> saved = configEntries(configHome.configFile(), configWhy);
@@ -4931,9 +4319,7 @@ void checkOutputRestart(NameWatcher& names, const std::string& validationEnv, co
         return rowPersisted(kMonitorNamedA, nameA, pathA) && rowPersisted(kMonitorNamedB, nameB, pathB);
     };
 
-    // The first daemon's own verdict on whether it could write its config file, taken while
-    // it is still alive and used only if the rows turn out to be missing from that file.
-    // "fail" here is a host that would not take the write, not a defect in the restore.
+    // The first daemon's persistence verdict, read only if the rows are missing.
     std::string persistStatus;
     std::string persistDetail;
     {
@@ -4942,8 +4328,6 @@ void checkOutputRestart(NameWatcher& names, const std::string& validationEnv, co
             if (!reportedStartupFault(first, kGoals)) {
                 notVerified(kGoals, "the first daemon of this phase never acquired the bus name");
             }
-            // Left through the same door as every other exit: the next phase reads ownership
-            // from the bus, not from the process table, so a reap alone is not the barrier.
             first.shutdown(SIGTERM);
             awaitNameRelease(names, "the phase after the connector-name restart");
             return;
@@ -4955,14 +4339,8 @@ void checkOutputRestart(NameWatcher& names, const std::string& validationEnv, co
             setWallpaper(*proxy, "static", pathB, kMonitorNamedB);
             setMonitorOutput(*proxy, kMonitorNamedA, nameA);
             setMonitorOutput(*proxy, kMonitorNamedB, nameB);
-            // A bounded wait for the write to land, not a single health sample taken the
-            // instant the last call returned. WallpaperManager::awaitPersisted() waits on the write
-            // worker only until its own deadline, and once a slow filesystem has marked that
-            // worker stalled every later call enqueues and returns without waiting at all --
-            // so "SetMonitorOutput returned" is not evidence of a write, and killing the
-            // daemon here would discard a snapshot still in flight. Reading the file while
-            // the daemon runs is safe: ConfigStore::save() renames a temporary over it, so a
-            // reader sees the old file or the new one, never a torn one.
+            // Bounded wait for the write: a returned call is no evidence of one, as the write worker
+            // may be marked stalled. Reading mid-run is safe: save() renames over the file.
             constexpr auto kPersistBound = std::chrono::seconds(10);
             const auto persistDeadline = Clock::now() + kPersistBound;
             bool landed = false;
@@ -4971,8 +4349,6 @@ void checkOutputRestart(NameWatcher& names, const std::string& validationEnv, co
                 if (landed || Clock::now() >= persistDeadline) break;
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
             }
-            // Sampled where the wait gave up, so it reports the daemon's persistence health
-            // at the moment the rows were last found missing rather than before the writes.
             if (!landed) {
                 const StatusReply wrote = getStatusOrExplain(*proxy);
                 if (wrote.ok() && wrote.json().contains("persistence") && wrote.json()["persistence"].is_object()) {
@@ -4986,29 +4362,13 @@ void checkOutputRestart(NameWatcher& names, const std::string& validationEnv, co
                 }
             }
         } catch (const sdbus::Error& e) {
-            // Above the std::exception handler, which this derives from, or it would be dead
-            // code. X.3 in the direction that is easy to get backwards: a name the daemon
-            // itself chose means the daemon refused an ordinary screen id and an ordinary
-            // connector name, which is its defect -- filing that as a skip would delete this
-            // phase's only end-to-end grading of the restore. Every other name (the
-            // transport's, and org.sdbuscpp.Error, which is what an exception escaping a
-            // handler becomes) is unattributable and keeps the skip.
-            //
-            // daemonErrorName() alone is not enough here, and measuring it is the only way to
-            // find that out: DbusService rejects a bad argument under the STANDARD name
-            // org.freedesktop.DBus.Error.InvalidArgs (kErrorInvalidArgs in
-            // backend/daemon/dbus_service.cpp), which is outside the daemon's own namespace,
-            // so a daemon that refused "DP-3" would still have skipped. That name is safe to
-            // attribute here because the bus does not generate it for a well-formed call to a
-            // service that exists -- only the callee marshalling arguments does.
-            //
-            // CONTROL: both arms, both reverted. DbusService::setMonitorOutput
-            //       (backend/daemon/dbus_service.cpp) made to throw sdbus::Error under
-            //       kErrorInvalidArgs for every call -> "FAIL: the first daemon records a
-            //       connector name for a valid screen id and name"; with daemonErrorName()
-            //       as the only test the same daemon produced a skip and no FAIL at all.
-            //       Made to throw std::runtime_error instead, which sdbus-c++ delivers as
-            //       org.sdbuscpp.Error -> the skip below, naming that error.
+            // X.3 the other way: a name the daemon chose (its own, or InvalidArgs, which only the
+            // callee generates) is the daemon refusing ordinary arguments -- a FAIL; anything else
+            // (the transport's, org.sdbuscpp.Error) is unattributable and skips.
+            // CONTROL: DbusService::setMonitorOutput (backend/daemon/dbus_service.cpp) throwing
+            //       kErrorInvalidArgs -> "FAIL: the first daemon records a connector name for a valid
+            //       screen id and name" (daemonErrorName() alone skipped it); throwing
+            //       std::runtime_error -> the skip, naming org.sdbuscpp.Error. Both reverted.
             constexpr const char* kRefusedArgs = "org.freedesktop.DBus.Error.InvalidArgs";
             const std::string name = e.getName();
             const std::string message = e.getMessage();
@@ -5026,8 +4386,6 @@ void checkOutputRestart(NameWatcher& names, const std::string& validationEnv, co
             awaitNameRelease(names, "the phase after the connector-name restart");
             return;
         } catch (const std::exception& e) {
-            // X.3: the precondition could not be built, so nothing below is graded against
-            // the daemon's restore. A skip naming the cause, not a FAIL against the restart.
             notVerified(kGoals,
                         std::string("the first daemon would not record the two screen names this phase restarts "
                                     "with: ") +
@@ -5036,9 +4394,7 @@ void checkOutputRestart(NameWatcher& names, const std::string& validationEnv, co
             awaitNameRelease(names, "the phase after the connector-name restart");
             return;
         }
-        // No FrameReady wait: this phase grades stored identity, not pixels. Naming a screen
-        // starts no render at all, and the wallpapers are here only so the restored name has
-        // something of its own to resolve to.
+        // No FrameReady wait: stored identity is graded, not pixels.
         first.shutdown(SIGTERM);
         awaitNameRelease(names, "the restarted daemon of the connector-name phase");
     }
@@ -5046,31 +4402,15 @@ void checkOutputRestart(NameWatcher& names, const std::string& validationEnv, co
     // GOAL: the precondition every check below rests on -- the first daemon put both rows,
     //       connector name and wallpaper path, in $XDG_CONFIG_HOME/wallpaperx/config.json.
     //       False if SetMonitorOutput returns and the file does not hold them.
-    // WHY-THIS-SHAPE: "SetMonitorOutput returned" is not evidence of a write, so the write is
-    //       given a bounded chance to land above and graded here, once the daemon has exited
-    //       and nothing can still be moving the file. Both fields, because the checks after
-    //       the restart consume both: a gate on the name alone lets a lost path arrive as
-    //       "the restarted daemon answers that screen's name with that screen's wallpaper"
-    //       going red for a write that never happened.
-    //       The FAIL-versus-skip split is X.3, and the health field is only ever read on the
-    //       failing side: a daemon reporting persistence ok after the wait expired is a
-    //       daemon lying about a write, which is its defect; a daemon reporting a persistence
-    //       failure is the host refusing the write, which is not. A host that is merely slow
-    //       completes inside the wait and reaches neither arm.
-    // CONTROL: three, all reverted, and they must land on different arms. (a)
-    //       `row[kKeyOutput] = entry.output;` disabled in ConfigStore::save()
-    //       (backend/daemon/config_store.cpp), so the name is accepted and never written ->
-    //       "FAIL: the daemon writes the connector name and the wallpaper it was given into
-    //       $XDG_CONFIG_HOME/wallpaperx/config.json", printing both rows of the file it did
-    //       write, and NONE of the restore checks ran. (b) the same save() made to write a
-    //       different path for any row carrying a name -- the half a name-only gate would let
-    //       through -> the SAME failure above, where under a gate comparing only the name the
-    //       identical daemon produced "FAIL: the restarted daemon answers that screen's name
-    //       with that screen's wallpaper (DP-3)" and again for HDMI-A-1, accusing the restore
-    //       of a write that never happened. (c) the same save() made to return an error
-    //       unconditionally, which is the host refusing the write -> no FAIL from this phase
-    //       at all, only "NOT VERIFIED -- ... the first daemon could not persist the two
-    //       screen rows (it reports persistence fail: ...)".
+    // WHY-THIS-SHAPE: graded once the daemon exited; both fields, as the restore checks read both.
+    //       X.3: persistence "ok" with the rows missing is the daemon's defect, a persistence
+    //       failure the host's refusal.
+    // CONTROL: in ConfigStore::save() (backend/daemon/config_store.cpp), all reverted: (a) the
+    //       name never written -> "FAIL: the daemon writes the connector name and the wallpaper it
+    //       was given into $XDG_CONFIG_HOME/wallpaperx/config.json", no restore check run; (b) a
+    //       wrong path for named rows -> the same failure (a name-only gate blamed the restore);
+    //       (c) save() failing -> no FAIL, "NOT VERIFIED -- ... could not persist the two screen
+    //       rows (it reports persistence fail: ...)".
     if (!rowsOnDisk()) {
         if (persistStatus == "ok") {
             check(false, "the daemon writes the connector name and the wallpaper it was given into "
@@ -5089,19 +4429,14 @@ void checkOutputRestart(NameWatcher& names, const std::string& validationEnv, co
         return;
     }
 
-    // The restart. No client call of any kind against this daemon before the assertions --
-    // no SetMonitorOutput, no SetWallpaper -- because the reads below are the whole point:
-    // a check that named the screens again would establish nothing about the file.
+    // The restart; no client call precedes the reads, which are the point.
     SpawnedDaemon second({validationEnv, configHome.env()}, SpawnedDaemon::Stdout::Captured, {}, 0,
                          configPortArgs(kPort));
     if (!names.waitFor(true)) {
         if (!reportedStartupFault(second, kGoals)) {
             notVerified(kGoals, "the restarted daemon never acquired the bus name");
         }
-        // As the first daemon's equivalent exit: the destructor kills and reaps, which is not
-        // the barrier the next phase reads. Without the release wait the next phase's daemon
-        // can lose its own name request to a name the bus has not dropped yet, and report as
-        // a second instance.
+        // The name's release, not the reap, is what the next phase needs.
         second.shutdown(SIGTERM);
         awaitNameRelease(names, "the phase after the connector-name restart");
         return;
@@ -5171,50 +4506,19 @@ void checkOutputRestart(NameWatcher& names, const std::string& validationEnv, co
         //       never been told the name. False if it answers known=false, which is the
         //       state GOALS.md names, and equally false if it answers another screen's
         //       wallpaper.
-        // WHY-THIS-SHAPE: asserted beside the GetStatus check above rather than instead of
-        //       it, because the two can disagree and only this one is what a plugin instance
-        //       reads. It is also over a real socket to a real process, so a manager that
-        //       restored the map but an HTTP route that consulted something else would be
-        //       caught here and nowhere else. The never-assigned name is asked in the same
-        //       breath: without it "known": true is satisfied by a daemon that says yes to
-        //       every name, and then the whole endpoint means nothing after a restart.
-        //       The query is built by pluginPoll() rather than as a bare `output=<name>`,
-        //       because the bare form is not the shape this GOAL claims: the plugin appends
-        //       a cache-buster to every poll, so a daemon that started refusing requests
-        //       carrying one would answer this phase and fail every real screen.
-        // CONTROL: the same restoreSaved() bind statement deleted (the one quoted in full
-        //       above) -> "FAIL: a screen named before the restart is known to the restarted
-        //       daemon over HTTP (DP-3)" and "FAIL: the restarted daemon answers that
-        //       screen's name with that screen's wallpaper (DP-3)", both again for
-        //       HDMI-A-1, each printing `{"known":false,"monitor_id":null,...}`, while the
-        //       never-assigned line stayed green -- which is what keeps this about the
-        //       restore rather than about the field. Four more, all in the /config handler
-        //       in backend/daemon/http_server.cpp and all reverted. `known = bound !=
-        //       snap.outputs.end()` forced to `known = true`, with the id assignment guarded
-        //       so an unknown name does not dereference end() -> "FAIL: a name the restarted
-        //       daemon was never given is still reported as not known" alone, which is the
-        //       line that stops known=true being a constant. `monitorId = bound->second`
-        //       replaced by `snap.outputs.begin()->second`, the shape of a lookup that
-        //       ignores which name was asked for -> "FAIL: the restarted daemon answers that
-        //       screen's name with that screen's wallpaper (HDMI-A-1)" and "FAIL: a restored
-        //       screen is never answered with the other screen's wallpaper (HDMI-A-1)",
-        //       HDMI-A-1 coming back with monitor 18 and DP-3's file. The output arm made to
-        //       throw, so it answers through its own 500 handler -> all seven lines of this
-        //       block red, both cross-serve lines among them; with that clause gated on
-        //       `reached` instead of `ok()` the same 500 left both of them green. And
-        //       `out["known"] = nullptr` on the output arm -> five red (both known lines, both
-        //       own-wallpaper lines, and the never-assigned one) and the run finished; with
-        //       `value("known", false)` in place of the is_boolean() read, the same daemon
-        //       killed the run with "FAIL: unexpected exception: [json.exception.type_error
-        //       .302] type must be boolean, but is null" as the only line, and the eight later
-        //       phases never ran. For pluginPoll()'s `t=` in particular: parseIdentity() in
-        //       backend/daemon/http_server.cpp made to answer 400 for any parameter other
-        //       than monitor and output -> all seven lines red, each printing `answered 400:
-        //       {"error":"..."}`, where the bare `output=<name>` this replaced stayed green
-        //       under the same daemon. Reverted.
-        // COVERAGE-ASSERT: two static_asserts, one on the wallpaper names above and one on
-        //       the table's size below, so neither the loop nor the not-the-other-screen's
-        //       clause can be hollowed out without the file failing to compile.
+        // WHY-THIS-SHAPE: beside the GetStatus check, since only this is what a plugin reads, over a
+        //       real socket; the never-assigned name in the same breath, or "known": true passes for
+        //       a daemon saying yes to everything; built by pluginPoll(), cache-buster and all.
+        // CONTROL: all reverted. The restoreSaved() bind deleted -> "FAIL: a screen named before the
+        //       restart is known to the restarted daemon over HTTP (DP-3)" and the own-wallpaper
+        //       line, both screens, the never-assigned line green. In the /config handler
+        //       (backend/daemon/http_server.cpp): `known` forced true -> "FAIL: a name the restarted
+        //       daemon was never given is still reported as not known" alone; the lookup ignoring the
+        //       name -> the own-wallpaper and "never answered with the other screen's wallpaper"
+        //       lines (HDMI-A-1); the output arm throwing -> all seven red; `out["known"] = nullptr`
+        //       -> five red, run finished; parseIdentity() refusing any other parameter -> all seven
+        //       red ("answered 400"), where a bare `output=<name>` stayed green.
+        // COVERAGE-ASSERT: two static_asserts (the two wallpapers, the table's size).
         httplib::Client cli = wallpaperx::testing::makeClient(kPort);
         // The plugin's own query, cache-buster and all: main.qml builds
         // `output=<name>&t=<Date.now()>` on every poll. The names here are plain ASCII, so
@@ -5297,8 +4601,7 @@ void checkStartsOnAnyConfig(NameWatcher& names, const std::string& validationEnv
     constexpr const char* kGoals = "S8.2 (no config file content stops the daemon)";
     ScratchDir configHome("anycontent");
     if (!configHome.ok()) {
-        notVerified(kGoals, "a scratch XDG_CONFIG_HOME could not be created under the temp directory");
-        return;
+        throw ScratchDirectoryLost("a scratch XDG_CONFIG_HOME could not be created under the temp directory");
     }
 
     std::string deep = "{\"version\":1,\"monitors\":";
@@ -5430,8 +4733,7 @@ void checkUnreadableRestore(NameWatcher& names, const std::string& validationEnv
 
     ScratchDir configHome("unreadable");
     if (!configHome.ok()) {
-        notVerified(kGoals, "a scratch XDG_CONFIG_HOME could not be created under the temp directory");
-        return;
+        throw ScratchDirectoryLost("a scratch XDG_CONFIG_HOME could not be created under the temp directory");
     }
     const std::string missingPath = (configHome.path() / "unmounted-drive" / "wallpaper.png").string();
     // Serialised, not concatenated: $TMPDIR may hold a quote or a backslash, and a fixture
@@ -5572,8 +4874,7 @@ void checkConfigLocation(NameWatcher& names, const std::string& validationEnv, c
 
     ScratchDir home("home");
     if (!home.ok()) {
-        notVerified(kGoals, "the scratch HOME this phase inspects could not be created");
-        return;
+        throw ScratchDirectoryLost("the scratch HOME this phase inspects could not be created");
     }
 
     // GOAL: S8.9 -- with neither $XDG_CONFIG_HOME nor $HOME usable, persistence is DISABLED
@@ -5723,16 +5024,6 @@ void checkConfigLocation(NameWatcher& names, const std::string& validationEnv, c
     }
 }
 
-std::string joined(const std::vector<std::string>& names) {
-    if (names.empty()) return "(none)";
-    std::string text;
-    for (const std::string& name : names) {
-        if (!text.empty()) text += ", ";
-        text += name;
-    }
-    return text;
-}
-
 // Every <config.json>.bad[.N] the daemon may have written, sorted, so a phase can say how many
 // copies exist and which ones rather than only whether one does. Both the state directory the
 // copies go to and the config directory beside the file are scanned: "no copy was made" has
@@ -5758,8 +5049,7 @@ void checkConfigPreservationOwnership(NameWatcher& names, const std::string& val
 
     ScratchDir configHome("preserveowner");
     if (!configHome.ok()) {
-        notVerified(kGoals, "a scratch XDG_CONFIG_HOME could not be created under the temp directory");
-        return;
+        throw ScratchDirectoryLost("a scratch XDG_CONFIG_HOME could not be created under the temp directory");
     }
     const std::filesystem::path file = configHome.configFile();
     // A hand edit that broke the syntax, with the user's wallpaper paths still legible in
@@ -5885,8 +5175,7 @@ void checkRepairWrittenAfterPreservation(NameWatcher& names, const std::string& 
 
     ScratchDir configHome("repairafterbad");
     if (!configHome.ok()) {
-        notVerified(kGoals, "a scratch XDG_CONFIG_HOME could not be created under the temp directory");
-        return;
+        throw ScratchDirectoryLost("a scratch XDG_CONFIG_HOME could not be created under the temp directory");
     }
     const std::filesystem::path file = configHome.configFile();
     const std::filesystem::path kept = configHome.preservedDir() / "config.json.bad";
@@ -5979,61 +5268,22 @@ void checkStoppableOnAnyConfigFile(NameWatcher& names, const std::string& valida
     constexpr const char* kGoals = "S8.12 (no config file content or type can stop the daemon being stopped)";
 
     // GOAL: S8.12 -- a config.json that is not an ordinary file, or is over the size cap, is
-    //       refused without the daemon ever waiting on it: it reaches the bus, answers, and
-    //       exits on SIGTERM. False if any of these makes it unreachable or SIGKILL-only.
-    //       (S8.12's wording says "refused without being opened", which was the mechanism
-    //       when it was written; the file is now opened O_NONBLOCK and inspected through the
-    //       descriptor, which is what makes opening a FIFO safe. The property the goal is
-    //       about -- the daemon never blocks on it -- is unchanged, and is what is graded
-    //       here.) This is not
-    //       hypothetical and not about exotic input: measured before the guard existed, a
-    //       named pipe at config.json left the daemon parked in wait_for_partner with one
-    //       thread, no bus name, no log line, and immune to SIGTERM and SIGINT, because the
-    //       config was read while shutdown signals were blocked and before the thread that
-    //       consumes them existed. A symlink to /dev/zero did the same while growing
-    //       43 MB/s; a 200 MB file did it for 14 seconds.
-    // WHY-THIS-SHAPE: the daemon is required to be STOPPED, not merely to have started. The
-    //       obvious shape -- S8.2's, "it came up and exited 0" -- passes on exactly the
-    //       daemon this goal exists to catch if it is written as "did not exit non-zero", and
-    //       S8.2's own corpus is regular files, which the FIFO case is not. So each case
-    //       asserts three separable things: the name appears (it did not, before the fix),
-    //       GetStatus answers on it, and the process leaves through main() on SIGTERM without
-    //       having to be killed. `timedOut()` is asserted explicitly because shutdown()
-    //       SIGKILLs after its wait expires and returns an exit code either way -- a check on
-    //       the code alone would grade a hang that had to be killed as a clean exit.
-    //       KNOWN GAP, stated rather than papered over, and MEASURED rather than assumed:
-    //       a config file on a genuinely hung mount blocks the daemon inside the read, which
-    //       none of the cases below reproduce -- they are refused before any byte is asked
-    //       for. Measured out of suite by making that block happen (see CONTROL (b) below):
-    //       the daemon takes the bus name, never serves a request, and then exits 0 five
-    //       seconds after SIGTERM, because the watcher thread stops waiting for a teardown
-    //       that is not coming. So a hung mount now costs the daemon its usefulness rather
-    //       than its stoppability. Nothing in this suite covers it and no committed check
-    //       can: the fixture would have to be a filesystem this harness can hang on demand
-    //       (FUSE), and without one there is no way to reach that state from outside the
-    //       process.
-    // CONTROL: two, both reverted, and the pair is the finding. (a) `O_NONBLOCK` dropped from
-    //       load()'s open in config_store.cpp, so the FIFO blocks in open() exactly as it did
-    //       when the hang was found -> "FAIL: with a named pipe at config.json, the daemon
-    //       says why it refused the file", the detail reading "not saving over it; ...: did
-    //       not respond within 2s, starting without it" instead of naming the file type. The
-    //       daemon still came up and still exited: the two-second load deadline abandons the
-    //       read. (b) that plus `kLoadDeadline` raised to 3600 s in wallpaper_manager.cpp, so
-    //       nothing abandons it -> "FAIL: with a named pipe at config.json, the daemon reaches
-    //       the bus" and "FAIL: ... the daemon exits 0" ("exit code 1"), and the run took
-    //       37.6 s instead of 4.6. The name is what moves under (b): main() parks in the
-    //       manager's constructor, which now runs BEFORE requestName, so that daemon never
-    //       reaches the bus at all -- the phase's GetStatus and detail checks are skipped
-    //       rather than red, and the FAILs land on the two that do not depend on the name.
-    //       What stayed GREEN under (b) is worth as much: the daemon still exited without
-    //       being killed, because backend/daemon/main.cpp's teardown deadline (kTeardownDeadline) fires and ends the
-    //       process -- and it is that deadline, not a clean stop, that the exit code 1 above
-    //       comes from. So stoppability here rests on three independent mechanisms -- the type
-    //       and size guards, the load deadline, and that watchdog -- and no single-mutation
-    //       control can redden the "exits on SIGTERM without having to be killed" checks.
-    // COVERAGE-ASSERT: every case is accounted for -- exercised, or reported as one this
-    //       host could not stage -- against the table's size, so a case that quietly stops
-    //       being planted fails instead of shrinking the phase in silence.
+    //       refused without the daemon ever blocking on it (opened O_NONBLOCK, inspected through
+    //       the descriptor): it reaches the bus, answers, and exits on SIGTERM. Before the guard a
+    //       FIFO parked it unreachable and immune to SIGTERM.
+    // WHY-THIS-SHAPE: STOPPED, not merely started: the name appears, GetStatus answers, and it
+    //       leaves through main() without timedOut() (a SIGKILLed hang still reports a code).
+    //       KNOWN GAP: a config on a hung mount blocks inside the read, which nothing here can stage
+    //       (it needs a FUSE fixture); measured out of suite, the daemon then exits at the teardown
+    //       deadline after SIGTERM, useless but stoppable.
+    // CONTROL: both reverted. (a) `O_NONBLOCK` dropped from load()'s open
+    //       (backend/daemon/config_store.cpp) -> "FAIL: with a named pipe at config.json, the
+    //       daemon says why it refused the file" (the 2 s load deadline still frees it). (b) that
+    //       plus `kLoadDeadline` 3600 s (backend/daemon/wallpaper_manager.cpp) -> "FAIL: ... the
+    //       daemon reaches the bus" and "FAIL: ... the daemon exits 0" ("exit code 1"): the
+    //       teardown deadline in backend/daemon/main.cpp still ends it, so stoppability rests on
+    //       three mechanisms and no single mutation reddens the "without being killed" checks.
+    // COVERAGE-ASSERT: every case exercised or reported unstageable, against the table's size.
     const std::vector<ConfigFileCase> cases{
         {"a named pipe",
          [](const std::filesystem::path& file) { return ::mkfifo(file.c_str(), 0644) == 0; },
@@ -6074,10 +5324,8 @@ void checkStoppableOnAnyConfigFile(NameWatcher& names, const std::string& valida
     for (const ConfigFileCase& c : cases) {
         ScratchDir configHome("stoppable");
         if (!configHome.ok()) {
-            ++unstageable;
-            notVerified(kGoals, std::string("the scratch XDG_CONFIG_HOME for the '") + c.what +
-                                    "' case could not be created");
-            continue;
+            throw ScratchDirectoryLost(std::string("the scratch XDG_CONFIG_HOME for the '") + c.what +
+                                       "' case could not be created");
         }
         std::error_code ec;
         std::filesystem::create_directories(configHome.configFile().parent_path(), ec);
@@ -6212,8 +5460,7 @@ void checkStopBeforeClaiming(NameWatcher& names, const std::string& validationEn
 
     ScratchDir configHome("preclaim");
     if (!configHome.ok()) {
-        notVerified(kGoal, "a scratch XDG_CONFIG_HOME could not be created under the temp directory");
-        return;
+        throw ScratchDirectoryLost("a scratch XDG_CONFIG_HOME could not be created under the temp directory");
     }
     std::error_code ec;
     std::filesystem::create_directories(configHome.configFile().parent_path(), ec);
@@ -6301,8 +5548,7 @@ void checkShutdownDuringStartup(NameWatcher& names, const std::string& validatio
 
     ScratchDir configHome("earlyterm");
     if (!configHome.ok()) {
-        notVerified(kGoal, "a scratch XDG_CONFIG_HOME could not be created under the temp directory");
-        return;
+        throw ScratchDirectoryLost("a scratch XDG_CONFIG_HOME could not be created under the temp directory");
     }
     std::error_code ec;
     std::filesystem::create_directories(configHome.configFile().parent_path(), ec);
@@ -6453,8 +5699,7 @@ void checkFileSizeLimit(NameWatcher& names, const std::string& validationEnv, co
 
     ScratchDir configHome("fsize");
     if (!configHome.ok()) {
-        notVerified(kGoals, "a scratch XDG_CONFIG_HOME could not be created under the temp directory");
-        return;
+        throw ScratchDirectoryLost("a scratch XDG_CONFIG_HOME could not be created under the temp directory");
     }
 
     // GOAL: S8.17 -- a config write that exceeds RLIMIT_FSIZE does not kill the daemon. The
@@ -6550,8 +5795,7 @@ void checkStalledConfigWrite(NameWatcher& names, const std::string& validationEn
 
     ScratchDir configHome("stalledwrite");
     if (!configHome.ok()) {
-        notVerified(kGoals, "a scratch XDG_CONFIG_HOME could not be created under the temp directory");
-        return;
+        throw ScratchDirectoryLost("a scratch XDG_CONFIG_HOME could not be created under the temp directory");
     }
 
     // The fixture, proved before the daemon exists: see blocking_config_write.h. It runs a
@@ -6954,16 +6198,25 @@ int main() {
         using wallpaperx::testing::phaseSelectedFor;
         const bool primaryDaemon =
             phaseSelectedFor("primaryDaemon", {"firstFrameUnderStatusLoad", "responsivenessUnderLoad",
-                                               "concurrentClients", "configServerLostPort"});
+                                               "concurrentClients", "handoverRelease", "configServerLostPort"});
         const bool firstFramePhase = phaseSelectedFor("firstFrameUnderStatusLoad", {"configServerLostPort"});
         const bool responsivenessPhase = phaseSelected("responsivenessUnderLoad");
         const bool concurrentClientsPhase = phaseSelected("concurrentClients");
+        const bool handoverReleasePhase = phaseSelected("handoverRelease");
         primaryDaemonRan = primaryDaemon;
-        primaryDaemonDrew = firstFramePhase || responsivenessPhase || concurrentClientsPhase;
+        primaryDaemonDrew = firstFramePhase || responsivenessPhase || concurrentClientsPhase || handoverReleasePhase;
 
         std::optional<SpawnedDaemon> daemon;
-        if (primaryDaemon) daemon.emplace(std::vector<std::string>{validationEnv});
-        const bool cameUp = primaryDaemon && names.waitFor(true);
+        bool primaryScratchLost = false;
+        if (primaryDaemon) {
+            try {
+                daemon.emplace(std::vector<std::string>{validationEnv});
+            } catch (const ScratchDirectoryLost& e) {
+                phaseSetupFault("the first daemon's phases", e.what());
+                primaryScratchLost = true;
+            }
+        }
+        const bool cameUp = daemon.has_value() && names.waitFor(true);
         daemonCameUp = cameUp;
         // GOAL: X.3 -- on a host where the fork preamble cannot complete (PR_SET_PDEATHSIG
         //       refused by a hardened kernel or a seccomp profile, a failed dup2, a binary
@@ -6978,7 +6231,8 @@ int main() {
         //       bus" and three more name-acquisition FAILs; after it, 8 HARNESS FAULT lines
         //       naming PR_SET_PDEATHSIG, 0 FAILs, and exit 1. Reverted.
         const bool startupWasHarnessFault =
-            primaryDaemon && !cameUp && reportedStartupFault(*daemon, "the bus-name, rendering and SIGTERM checks");
+            primaryDaemon && !cameUp &&
+            (primaryScratchLost || reportedStartupFault(*daemon, "the bus-name, rendering and SIGTERM checks"));
         if (primaryDaemon && !startupWasHarnessFault) {
             check(cameUp, "the daemon acquires io.wallpaperx.Daemon on the session bus");
         }
@@ -7015,6 +6269,7 @@ int main() {
             // without SD_BUS_NAME_REPLACE_EXISTING, so the second process is expected to
             // fail its name request and exit non-zero rather than take the desktop's
             // wallpaper daemon away from the one already serving it.
+            hostGuarded("the second-instance checks (S6.28)", [&] {
             SpawnedDaemon second;
             const int secondExit = second.waitForExit();
             // GOAL: X.3 in its vacuous-green direction -- a second instance that died in the
@@ -7077,6 +6332,7 @@ int main() {
                 check(secondOutput.find("org.freedesktop.DBus.Error.FileExists") != std::string::npos,
                       "the second instance is refused with org.freedesktop.DBus.Error.FileExists");
             }
+            });
 
             auto proxy = sdbus::createProxy(sdbus::ServiceName{DbusService::kBusName},
                                             sdbus::ObjectPath{DbusService::kObjectPath});
@@ -7084,9 +6340,27 @@ int main() {
                 .onInterface(DbusService::kInterface)
                 .call([&signals](int32_t monitorId, uint64_t generation) { signals.record(monitorId, generation); });
 
-            if (firstFramePhase) checkFirstFrameUnderStatusLoad(*proxy, signals, bluePath, check);
-            if (responsivenessPhase) checkResponsivenessUnderLoad(*proxy, signals, bluePath, check);
-            if (concurrentClientsPhase) checkConcurrentClients(*proxy, signals, bluePath, redPath, corruptPath, check);
+            // Each guarded on its own, so one that throws ends none of the others or the SIGTERM
+            // grading below.
+            // GOAL: S15.328's sibling for the phases sharing the first daemon.
+            // CONTROL: test-side: checkHandoverRelease made to throw at its start, --phase
+            //       '^(handoverRelease|hangupShutdown)$' -> "FAIL: handoverRelease: unexpected exception:
+            //       control", with the SIGTERM exit lines and hangupShutdown's phase still run.
+            if (firstFramePhase) {
+                hostGuarded("firstFrameUnderStatusLoad",
+                            [&] { checkFirstFrameUnderStatusLoad(*proxy, signals, bluePath, check); });
+            }
+            if (responsivenessPhase) {
+                hostGuarded("responsivenessUnderLoad",
+                            [&] { checkResponsivenessUnderLoad(*proxy, signals, bluePath, check); });
+            }
+            if (concurrentClientsPhase) {
+                hostGuarded("concurrentClients",
+                            [&] { checkConcurrentClients(*proxy, signals, bluePath, redPath, corruptPath, check); });
+            }
+            if (handoverReleasePhase) {
+                hostGuarded("handoverRelease", [&] { checkHandoverRelease(*proxy, signals, bluePath, check); });
+            }
         }
 
         // SIGTERM, which is what systemd sends (Step 14) and what a `kill` defaults to.
@@ -7094,8 +6368,8 @@ int main() {
         // before it creates any thread, and it does that before requesting the bus name
         // -- so a name that is on the bus is a mask that is already installed. Sent
         // before that point, the default disposition would kill it outright.
-        const int exitCode = primaryDaemon ? daemon->shutdown(SIGTERM) : 0;
-        if (primaryDaemon) {
+        const int exitCode = daemon ? daemon->shutdown(SIGTERM) : 0;
+        if (daemon) {
             daemonOutput = daemon->output();
             daemonOutputRead = true;
         }
@@ -7176,7 +6450,7 @@ int main() {
         // The other signal in the same sigset. Cheap -- it never renders -- and without
         // it a typo that dropped SIGINT from the mask would be invisible, since SIGTERM
         // alone exercises one sigaddset call out of two.
-        if (phaseSelected("sigintShutdown")) {
+        if (phaseSelected("sigintShutdown")) hostGuarded("the SIGINT shutdown checks", [&] {
             SpawnedDaemon interrupted;
             const bool interruptedCameUp = names.waitFor(true);
             const bool interruptedWasHarnessFault =
@@ -7209,100 +6483,66 @@ int main() {
                       "the daemon shuts down cleanly on SIGINT as well as SIGTERM");
                 check(names.waitFor(false), "the bus name is released after the SIGINT shutdown");
             }
-        }
+        });
 
-        // The third signal in that sigset, and the one a terminal close or a logout
-        // sends. Its own phase rather than a third branch of the block above, because it
-        // is a distinct goal (S6.36) with a distinct failure -- exit 129, none of the
-        // chain -- rather than more coverage of the same one.
-        if (phaseSelected("hangupShutdown")) checkHangupShutdown(names, check);
-
-        // S6.37 and S6.35. Both spawn daemons of their own and shut them down, so they
-        // run after the phases above have released the name, and before the descriptor
-        // accounting below.
-        if (phaseSelected("closedStdout")) checkClosedStdout(names, bluePath, validationEnv, wantValidation, check);
-        if (phaseSelected("nestedBusPrivate")) checkNestedBusPrivate(check);
-        if (phaseSelected("busLoss")) checkBusLoss(check);
-
-        // S7.8 and S7.11. Spawns a daemon of its own and shuts it down, so it runs
-        // after the phases above have released the name, and before the descriptor
-        // accounting below -- its httplib clients close their sockets on destruction,
-        // which that accounting would otherwise report as a leak in this process.
-        // The command line and the port it picks, each spawning daemons of their own.
-        if (phaseSelected("commandLine")) checkCommandLine(names, validationEnv, check);
-        if (phaseSelected("usageWithOutputReaderGone")) checkUsageWithOutputReaderGone(validationEnv, check);
-        if (phaseSelected("defaultConfigPort")) checkDefaultConfigPort(names, validationEnv, check);
-        if (phaseSelected("chosenConfigPort")) checkChosenConfigPort(names, validationEnv, check);
-        if (phaseSelected("httpLifecycle")) checkHttpLifecycle(names, bluePath, validationEnv, check);
-
-        // S7.14, both directions. Before the descriptor accounting, since both hold sockets
-        // that close at scope exit.
-        if (phaseSelected("configServerOwnsPort")) checkConfigServerOwnsPort(names, validationEnv, check);
-        // signals is this run's whole FrameReady history, from the daemons of the
-        // phases above: a non-empty one is proof this host can render, which is what
-        // lets the port-conflict phase grade a missing frame instead of skipping on it.
-        if (phaseSelected("configServerLostPort")) {
-            checkConfigServerLostPort(names, bluePath, validationEnv, signals.total() > 0, check);
-        }
-
-        // Step 8. Each spawns daemons of its own, pointed at an XDG_CONFIG_HOME it creates
-        // and deletes, so they run after every phase above has released the name and before
-        // the descriptor accounting below -- their proxies and httplib clients close their
-        // sockets at scope exit, which that accounting would otherwise report as a leak.
-        if (phaseSelected("configRestart")) checkConfigRestart(names, validationEnv, check);
-        // Step 13's crash-loop breaker, beside the restart phase because it is the same
-        // shape: a daemon started over a state directory this phase prepared, with no client
-        // call before the assertions. Its own phase so a host that cannot write the scratch
-        // files reports S13.13 unexercised rather than hiding inside a Step 8 skip.
-        if (phaseSelected("crashRefusal")) checkCrashRefusal(names, validationEnv, bluePath, check);
-        // Step 10, and beside the restart phase above because it is the same shape one goal
-        // further on: that one restarts a wallpaper, this one restarts the connector name a
-        // plugin instance identifies itself by. Its own phase rather than more lines inside
-        // checkConfigRestart, so that a host that cannot set it up reports S10.5 as
-        // unexercised instead of hiding inside a skip that names only the Step 8 goals.
-        if (phaseSelected("outputRestart")) checkOutputRestart(names, validationEnv, check);
-        if (phaseSelected("startsOnAnyConfig")) checkStartsOnAnyConfig(names, validationEnv, check);
-        if (phaseSelected("stoppableOnAnyConfigFile")) checkStoppableOnAnyConfigFile(names, validationEnv, check);
-        if (phaseSelected("configPreservationOwnership")) checkConfigPreservationOwnership(names, validationEnv, check);
-        // Beside the phase above because it grades the other half of the same ordering rule:
-        // that one, that nothing writes before the bus name is held; this one, that the
-        // repair a start owes its config is written after the copy aside rather than over it.
-        if (phaseSelected("repairWrittenAfterPreservation")) {
-            checkRepairWrittenAfterPreservation(names, validationEnv, check);
-        }
-        if (phaseSelected("shutdownDuringStartup")) checkShutdownDuringStartup(names, validationEnv, check);
-        // The other side of the same window: that one grades a signal landing after the name
-        // was taken, this one a signal landing before it was asked for.
-        if (phaseSelected("stopBeforeClaiming")) checkStopBeforeClaiming(names, validationEnv, check);
-        if (phaseSelected("unreadableRestore")) checkUnreadableRestore(names, validationEnv, bluePath, check);
-        if (phaseSelected("configLocation")) checkConfigLocation(names, validationEnv, bluePath, check);
-        if (phaseSelected("fileSizeLimit")) checkFileSizeLimit(names, validationEnv, bluePath, check);
-        if (phaseSelected("stalledConfigWrite")) checkStalledConfigWrite(names, validationEnv, bluePath, check);
-        // Last of the daemon-spawning phases, and on buses of their own: each wedges a render
-        // worker on purpose, so the daemon it leaves behind cannot be stopped cleanly and must
-        // not be holding the name any phase above still needs.
+        // Each phase below spawns daemons of its own and shuts them down, so they run after the
+        // first daemon has released the name, and before the descriptor accounting at the end: their
+        // proxies and httplib clients close their sockets at scope exit. The wedging phases come
+        // last, on buses of their own: the daemon each leaves behind cannot be stopped cleanly.
+        const auto phase = [](const char* name, auto&& body) {
+            if (wallpaperx::testing::phaseSelected(name)) hostGuarded(name, body);
+        };
         const std::string wedgeClip = std::string(WALLPAPERX_VIDEO_ASSET_DIR) + "/wallpaper_bands.mp4";
-        if (phaseSelected("stuckTeardownIsBounded")) checkStuckTeardownIsBounded(validationEnv, wedgeClip, check);
-        if (phaseSelected("secondSignalEndsAStuckStop")) {
-            checkSecondSignalEndsAStuckStop(validationEnv, wedgeClip, check);
-        }
-        if (phaseSelected("watchdogEndsAStuckStopWritingNothing")) {
-            checkWatchdogEndsAStuckStopWritingNothing(validationEnv, check);
-        }
-        if (phaseSelected("alarmDeliversQueuedLines")) checkAlarmDeliversQueuedLines(validationEnv, wedgeClip, check);
-        if (phaseSelected("lossDuringFailedStart")) checkLossDuringFailedStart(validationEnv, bluePath, check);
-        if (phaseSelected("restoredVideoIsPostedAfterTheRecordOpens")) {
+        phase("hangupShutdown", [&] { checkHangupShutdown(names, check); });
+        phase("outputVisibleLog", [&] { checkOutputVisibleLog(names, validationEnv, check); });
+        phase("frameAllocationFailure", [&] { checkFrameAllocationFailure(names, validationEnv, bluePath, check); });
+        phase("closedStdout", [&] { checkClosedStdout(names, bluePath, validationEnv, wantValidation, check); });
+        phase("nestedBusPrivate", [&] { checkNestedBusPrivate(check); });
+        phase("busLoss", [&] { checkBusLoss(check); });
+        phase("commandLine", [&] { checkCommandLine(names, validationEnv, check); });
+        phase("usageWithOutputReaderGone", [&] { checkUsageWithOutputReaderGone(validationEnv, check); });
+        phase("defaultConfigPort", [&] { checkDefaultConfigPort(names, validationEnv, check); });
+        phase("chosenConfigPort", [&] { checkChosenConfigPort(names, validationEnv, check); });
+        phase("httpLifecycle", [&] { checkHttpLifecycle(names, bluePath, validationEnv, check); });
+        phase("configServerOwnsPort", [&] { checkConfigServerOwnsPort(names, validationEnv, check); });
+        // The run's whole FrameReady history so far is the proof this host renders, which lets this
+        // phase grade a missing frame rather than skip on it.
+        phase("configServerLostPort", [&] {
+            checkConfigServerLostPort(names, bluePath, validationEnv, signals.total() > 0, check);
+        });
+        phase("configRestart", [&] { checkConfigRestart(names, validationEnv, check); });
+        phase("crashRefusal", [&] { checkCrashRefusal(names, validationEnv, bluePath, check); });
+        phase("outputRestart", [&] { checkOutputRestart(names, validationEnv, check); });
+        phase("startsOnAnyConfig", [&] { checkStartsOnAnyConfig(names, validationEnv, check); });
+        phase("stoppableOnAnyConfigFile", [&] { checkStoppableOnAnyConfigFile(names, validationEnv, check); });
+        phase("configPreservationOwnership", [&] { checkConfigPreservationOwnership(names, validationEnv, check); });
+        phase("repairWrittenAfterPreservation", [&] { checkRepairWrittenAfterPreservation(names, validationEnv, check); });
+        phase("shutdownDuringStartup", [&] { checkShutdownDuringStartup(names, validationEnv, check); });
+        phase("stopBeforeClaiming", [&] { checkStopBeforeClaiming(names, validationEnv, check); });
+        phase("unreadableRestore", [&] { checkUnreadableRestore(names, validationEnv, bluePath, check); });
+        phase("configLocation", [&] { checkConfigLocation(names, validationEnv, bluePath, check); });
+        phase("fileSizeLimit", [&] { checkFileSizeLimit(names, validationEnv, bluePath, check); });
+        phase("stalledConfigWrite", [&] { checkStalledConfigWrite(names, validationEnv, bluePath, check); });
+        phase("stuckTeardownIsBounded", [&] { checkStuckTeardownIsBounded(validationEnv, wedgeClip, check); });
+        phase("secondSignalEndsAStuckStop", [&] { checkSecondSignalEndsAStuckStop(validationEnv, wedgeClip, check); });
+        phase("watchdogEndsAStuckStopWritingNothing",
+              [&] { checkWatchdogEndsAStuckStopWritingNothing(validationEnv, check); });
+        phase("alarmDeliversQueuedLines", [&] { checkAlarmDeliversQueuedLines(validationEnv, wedgeClip, check); });
+        phase("lossDuringFailedStart", [&] { checkLossDuringFailedStart(validationEnv, bluePath, check); });
+        phase("restoredVideoIsPostedAfterTheRecordOpens", [&] {
             checkTheRestoredVideoIsPostedAfterTheRecordOpens(validationEnv, wedgeClip, check);
-        }
+        });
 
         // Every Frame's UnixFd closes at scope exit, and the daemon is gone, so this
-        // process must be back where it started. A descriptor leaked per GetFrameFd is
+        // process must be back where it started. A descriptor leaked per GetFrame is
         // an eventual EMFILE in a polling consumer, not a one-off.
         const size_t fdsAfter = openFdCount();
         check(fdsAfter <= fdsBefore, "the client leaks no descriptors across the whole run");
         if (fdsAfter > fdsBefore) {
             std::fprintf(stderr, "  %zu open fds before, %zu after\n", fdsBefore, fdsAfter);
         }
+    } catch (const ScratchDirectoryLost& e) {
+        phaseSetupFault("the phase running when the host lost its scratch directory", e.what());
     } catch (const std::exception& e) {
         // Without this an escaping sdbus::Error -- what a host with no usable Vulkan ICD
         // produces -- would abort the process, so ctest would report an opaque SIGABRT
@@ -7406,6 +6646,28 @@ int main() {
             } else {
                 check(false,
                       "the first daemon created its Vulkan device, so its silence about validation means something");
+            }
+        } else {
+            // GOAL: S15.323 -- zero [vulkan] lines count as clean only from a daemon that says its validation
+            //       layer is active. False if a daemon asked for validation whose layer did not load (this
+            //       process found it loadable, so the child should have too) is graded clean.
+            // WHY-THIS-SHAPE: the daemon's own line, which it prints only when its debug messenger exists,
+            //       rather than this process's layer query alone: the child's environment can lose the
+            //       layer when this process still sees it.
+            // CONTROL: in WallpaperManager::ensureGpu (backend/daemon/wallpaper_manager.cpp) the condition
+            //       made `!m_device->validationLayerActive()`, via control_batch.sh, --phase
+            //       '^firstFrameUnderStatusLoad$', 2026-10-05 -> "FAIL: the first daemon says its Vulkan
+            //       validation layer is active, so its silence about validation is graded". Test-side, the
+            //       first daemon spawned with VK_LOADER_LAYERS_DISABLE=VK_LAYER_KHRONOS_validation -> the same
+            //       line. Both reverted.
+            const bool active = hasLine(daemonOutput, "wallpaperx-daemon: Vulkan validation layer active");
+            check(active, "the first daemon says its Vulkan validation layer is active, so its silence about "
+                          "validation is graded");
+            if (!active) {
+                std::fprintf(stderr, "  %s\n",
+                             daemonOutput.find("the layer is not active") != std::string::npos
+                                 ? "it said validation was asked for but the layer is not active"
+                                 : "it said nothing about its validation layer");
             }
         }
     }

@@ -48,6 +48,7 @@
 #include "tests/client/http_probe.h"
 #include "tests/client/scratch_dir.h"
 #include "tests/manager_output.h"
+#include "tests/self_exec.h"
 #include "tests/test_report.h"
 
 #include <httplib.h>
@@ -81,11 +82,14 @@
 
 #include <arpa/inet.h>
 #include <dlfcn.h>
+#include <execinfo.h>
 #include <ifaddrs.h>
 #include <net/if.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <pthread.h>
+#include <fcntl.h>
+#include <sys/prctl.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -102,6 +106,7 @@ using wallpaperx::testing::describe;
 using wallpaperx::testing::FrameReadyLog;
 using wallpaperx::testing::get;
 using wallpaperx::testing::getStatus;
+using wallpaperx::testing::exportDelivered;
 using wallpaperx::testing::getStatusOrExplain;
 using wallpaperx::testing::HeldPort;
 using wallpaperx::testing::HttpReply;
@@ -467,9 +472,56 @@ std::atomic<int> g_injected{0};
 
 unsigned long long selfThreadId() { return static_cast<unsigned long long>(::pthread_self()); }
 
+// The export sweep's plan, on the one thread that runs it: fail the t_sweepFailAt-th allocation
+// made on behalf of this binary (0 = off). Allocations made from inside the Vulkan driver or loader
+// are counted out: a throw unwinding through C frames would be the driver's crash, not a verdict on
+// the daemon.
+thread_local int t_sweepFailAt = 0;
+thread_local int t_sweepSeen = 0;
+thread_local bool t_sweepInjected = false;
+const void* g_mainBase = nullptr;  // set before the sweep arms; read inside the allocator
+
+bool inRuntimeLibrary(const Dl_info& info) {
+    return info.dli_fname != nullptr &&
+           (std::strstr(info.dli_fname, "libstdc++") != nullptr || std::strstr(info.dli_fname, "libgcc_s") != nullptr);
+}
+
+// The daemon is linked into this binary, so a direct caller here is ours. A caller in libstdc++ --
+// std::string's out-of-line growth -- is everyone's, the driver's C++ included, so it is attributed to
+// the first frame above the runtime library instead. backtrace() must have been called once before
+// the sweep arms: its first call loads libgcc_s and allocates.
+bool allocatedByUs(const void* caller) {
+    Dl_info info{};
+    if (::dladdr(caller, &info) == 0) return false;
+    if (info.dli_fbase == g_mainBase) return true;
+    if (!inRuntimeLibrary(info)) return false;
+    void* frames[32];
+    const int depth = ::backtrace(frames, 32);
+    bool pastRuntime = false;  // the frames below the runtime library are this allocator's own
+    for (int i = 0; i < depth; ++i) {
+        Dl_info frame{};
+        if (::dladdr(frames[i], &frame) == 0) return false;
+        const bool runtime = inRuntimeLibrary(frame);
+        if (!pastRuntime) {
+            pastRuntime = runtime;
+            continue;
+        }
+        if (!runtime) return frame.dli_fbase == g_mainBase;
+    }
+    return false;
+}
+
 // Never inlined into operator new, so the unarmed path stays a load and a branch. Must
 // not allocate: it runs inside the allocator.
-[[gnu::noinline]] void noteAllocation(std::size_t bytes) {
+[[gnu::noinline]] void noteAllocation(std::size_t bytes, const void* caller) {
+    if (t_sweepFailAt > 0) {
+        if (allocatedByUs(caller) && ++t_sweepSeen == t_sweepFailAt) {
+            t_sweepFailAt = 0;
+            t_sweepInjected = true;
+            throw std::bad_alloc();
+        }
+        return;
+    }
     if (t_calibrating) {
         if (bytes >= kBigAllocFloor) {
             ++t_calibCount;
@@ -500,7 +552,7 @@ unsigned long long selfThreadId() { return static_cast<unsigned long long>(::pth
 #if WALLPAPERX_ALLOCATION_INSTRUMENT
 
 void* operator new(std::size_t bytes) {
-    if (g_allocProbeArmed.load(std::memory_order_relaxed)) noteAllocation(bytes);
+    if (g_allocProbeArmed.load(std::memory_order_relaxed)) noteAllocation(bytes, __builtin_return_address(0));
     const std::size_t request = bytes == 0 ? 1 : bytes;
     void* p = std::malloc(request);
     while (p == nullptr) {
@@ -1895,6 +1947,146 @@ void runVideoHealthChecks(const Check& check) {
     std::fflush(stdout);
 }
 
+// ---------------------------------------------------------------------------- //
+// An allocation failing anywhere in an export to a named consumer of a video
+// ---------------------------------------------------------------------------- //
+constexpr const char* kExportSweepFlag = "--export-allocation-sweep";
+constexpr int kSweepNotVerified = 77;
+constexpr int kSweepFailed = 1;
+
+#if WALLPAPERX_ALLOCATION_INSTRUMENT
+// The child half: one manager, one video monitor, and exportCurrentFrame() run once per allocation it
+// makes, failing that one. Run in a process of its own because the defect this looks for ends in
+// std::terminate, which would take the rest of this file's report with it.
+int runExportSweepChild() {
+    ::prctl(PR_SET_DUMPABLE, 0);
+    const std::string clip = videoClipPath();
+    if (!std::filesystem::exists(clip)) return kSweepNotVerified;
+    WallpaperManager::Config config;
+    config.width = kTargetWidth;
+    config.height = kTargetHeight;
+    // No validation: what is graded is bookkeeping around one export, and the export path's Vulkan use
+    // is graded with validation on by the phases of the parent process.
+    config.enableValidation = false;
+    WallpaperManager manager(config);
+    manager.requestWallpaper("video", clip, 0);
+    if (!manager.renderPending(0).rendered) {
+        std::printf("http_server_test sweep: the video did not render on this host\n");
+        return kSweepNotVerified;
+    }
+    Dl_info self{};
+    if (::dladdr(reinterpret_cast<const void*>(&runExportSweepChild), &self) == 0) return kSweepNotVerified;
+    g_mainBase = self.dli_fbase;
+    void* prime[1];
+    (void)::backtrace(prime, 1);  // its first call allocates; allocatedByUs() calls it inside the allocator
+
+    // Longer than any short-string buffer, so the consumer record copies it onto the heap.
+    const std::string client = ":sweep.consumer.with.a.long.name";
+    int failures = 0;
+    int swallowed = 0;  // allocations that failed while the call still handed its picture over
+    int failAt = 1;
+    for (; failAt <= 4000; ++failAt) {
+        std::optional<wallpaperx::FrameExport> exported;
+        std::string escaped;
+        t_sweepSeen = 0;
+        t_sweepInjected = false;
+        t_sweepFailAt = failAt;
+        g_allocProbeArmed.store(true);
+        try {
+            // With the delivery its sent reply records, which is where the consumer record is made.
+            exported.emplace(exportDelivered(manager, 0, client));
+        } catch (const std::bad_alloc&) {
+        } catch (const std::exception& e) {
+            escaped = e.what();
+        }
+        t_sweepFailAt = 0;
+        g_allocProbeArmed.store(false);
+        if (!t_sweepInjected) break;  // the call made fewer allocations than failAt: every one was tried
+
+        const WallpaperManager::Snapshot snap = manager.snapshot();
+        bool claimed = false;
+        if (const auto it = snap.monitors.find(0); it != snap.monitors.end()) {
+            for (const wallpaperx::BufferHold& hold : it->second.holds) claimed = claimed || hold.client == client;
+        }
+        const bool handed = exported && exported->handle.has_value();
+        if (handed) {
+            const wallpaperx::FrameHandle& h = *exported->handle;
+            const bool open = h.frame.fd >= 0 && ::fcntl(h.frame.fd, F_GETFD) != -1;
+            if (!claimed || !open) {
+                std::printf("FAIL: allocation %d failed and the picture was handed over %s\n", failAt,
+                            !claimed ? "with no claim recorded for it" : "with its memory descriptor not open");
+                ++failures;
+            }
+            ++swallowed;
+            if (h.frame.fd >= 0) ::close(h.frame.fd);
+            if (h.acquireFd >= 0) ::close(h.acquireFd);
+        } else if (claimed) {
+            std::printf("FAIL: allocation %d failed, nothing was handed over, and a claim was left behind%s%s\n",
+                        failAt, escaped.empty() ? "" : " -- it threw ", escaped.c_str());
+            ++failures;
+        }
+        manager.forgetHeldBuffers(client);
+    }
+    std::printf("http_server_test sweep: %d allocation(s) tried one at a time, %d of them failed while the picture "
+                "was still handed over\n",
+                failAt - 1, swallowed);
+    std::fflush(stdout);
+    if (failAt > 4000) {
+        std::printf("FAIL: the export never ran out of allocations to fail within 4000, so the sweep did not end\n");
+        return kSweepFailed;
+    }
+    // COVERAGE-ASSERT: a failure the call survived proves a failure after the export was reached; with
+    // none, the sweep never got past the export and graded only the refusals before it.
+    if (swallowed == 0) {
+        std::printf("FAIL: no allocation failed after the export was made, so the delivery record was never "
+                    "reached\n");
+        return kSweepFailed;
+    }
+    return failures == 0 ? 0 : kSweepFailed;
+}
+#endif  // WALLPAPERX_ALLOCATION_INSTRUMENT
+
+// GOAL: S15.322 -- an allocation that fails anywhere inside an export to a named consumer of a video
+//       either refuses the whole call, leaving no claim, or hands the picture over with its claim
+//       recorded and its descriptor open. In particular a failure in the consumer record made after
+//       the export (the delivery evidence) never escapes and never terminates the daemon.
+// WHY-THIS-SHAPE: every allocation the call makes is failed in turn, rather than one chosen by size:
+//       the client name is copied into several records before the export, and a size match would
+//       fail those first and never reach the one after. Run in a child of its own (self_exec.h),
+//       because the defect ends in std::terminate. Driver allocations are not failed (see
+//       allocatedByUs()).
+// CONTROL: in WallpaperManager::recordDeliveredLocked (backend/daemon/wallpaper_manager.cpp) the
+//       try/catch removed, which the function's noexcept turns into std::terminate even under
+//       handoverDelivered's own catch -> "FAIL: an allocation failing inside an export to a named
+//       consumer never escapes the call (the sweep child died of signal 6)".
+// COVERAGE-ASSERT: the child requires at least one failure the call survived, and that the sweep ran
+//       out of allocations to fail.
+void runExportAllocationSweep(const Check& check) {
+    const char* kGoal = "S15.322 (an allocation failing inside an export never escapes and never strands a claim)";
+#if !WALLPAPERX_ALLOCATION_INSTRUMENT
+    (void)check;
+    notVerified(kGoal, "this build has no allocation instrument (a sanitizer owns operator new)");
+#else
+    if (!std::filesystem::exists(videoClipPath())) {
+        notVerified(kGoal, "the video fixture " + videoClipPath() + " was not generated");
+        return;
+    }
+    const wallpaperx::testing::SelfExecResult r =
+        wallpaperx::testing::runSelf({kExportSweepFlag}, std::chrono::seconds(240));
+    if (!r.fault.empty() || !r.reaped) {
+        notVerified(kGoal, "the sweep child could not be run to its end: " + (r.fault.empty() ? r.how() : r.fault));
+        return;
+    }
+    if (r.exitedWith(kSweepNotVerified)) {
+        notVerified(kGoal, "the sweep child could not draw a video on this host");
+        return;
+    }
+    check(r.exitedWith(0), ("an allocation failing inside an export to a named consumer never escapes the call "
+                            "(the sweep child " + r.how() + ")")
+                               .c_str());
+#endif
+}
+
 void runHealthStateChecks(const std::string& bluePath, const std::string& shaderPath, const std::string& junkPath,
                           const Check& check) {
     WallpaperManager::Config base;
@@ -3190,7 +3382,7 @@ void runGpuFailureChecks(const std::string& bluePath, const WallpaperManager::Co
         {
             GetMemoryFdFault fault(/*failAt=*/1, injected);
             try {
-                wallpaperx::FrameExport exported = daemon.manager().exportCurrentFrame(0);
+                wallpaperx::FrameExport exported = exportDelivered(daemon.manager(), 0);
                 // Only reached if the fault missed. The caller owns the fd (exportFrame's
                 // contract), and leaking one out of a phase that then keeps running is
                 // X.4's business, not something to leave to process exit.
@@ -3208,8 +3400,8 @@ void runGpuFailureChecks(const std::string& bluePath, const WallpaperManager::Co
 
     // GOAL: S7.10a aimed at the export -- a frame export that fails because the *host* is
     //       out of file descriptors is not the GPU going wrong, and must leave `gpu`
-    //       reading ok while GetFrameFd still fails. False if a consumer that leaks the
-    //       descriptors GetFrameFd hands it can drive /health to blame the graphics driver,
+    //       reading ok while GetFrame still fails. False if a consumer that leaks the
+    //       descriptors GetFrame hands it can drive /health to blame the graphics driver,
     //       which would send an operator to their driver for a problem in RLIMIT_NOFILE.
     // WHY-THIS-SHAPE: VK_ERROR_TOO_MANY_OBJECTS is one of the two results the spec permits
     //       this call to return, and it is what fd exhaustion produces. Run before the
@@ -3253,7 +3445,7 @@ void runGpuFailureChecks(const std::string& bluePath, const WallpaperManager::Co
 
     // GOAL: S7.10e reaches the export too -- when the fd query returns a result this call is
     //       not permitted to return, the driver is what went wrong and /health must record
-    //       it against the GPU. False if a daemon whose every GetFrameFd dies in the driver
+    //       it against the GPU. False if a daemon whose every GetFrame dies in the driver
     //       still reports gpu ok.
     // WHY-THIS-SHAPE: the injected result is VK_ERROR_INITIALIZATION_FAILED, chosen because
     //       it is outside the set vkGetMemoryFdKHR may return. The obvious pick,
@@ -3317,14 +3509,20 @@ void runGpuFailureChecks(const std::string& bluePath, const WallpaperManager::Co
     // driver cannot produce -- only exists on a dma_buf host and would leave the goal ungraded
     // on the NVIDIA machine this daemon targets.
 
-    // Whether the daemon still has a claim for `client` on `bufferId`, asked by ending it. The
-    // hold list is private; a release is the daemon's own report of whether there was a claim
-    // there, and it reports one either by naming a monitor to re-render or by re-announcing the
-    // committed frame -- reportFreedImageLocked() always produces exactly one of the two.
-    auto releaseFreedSomething = [&daemon](const std::string& client, uint64_t bufferId) {
-        std::vector<wallpaperx::FrameAvailable> announced;
-        const std::vector<int> toRender = daemon.manager().releaseBuffer(client, 0, bufferId, &announced);
-        return !toRender.empty() || !announced.empty();
+    // Whether the daemon's claim ledger, as snapshot() publishes it, has `client` holding `bufferId` on
+    // monitor 0. Read, not probed: asking by a release needs a hand-over number from an export of its
+    // own, and that export's refusal would read as "holds nothing".
+    auto holdsImage = [&daemon](const std::string& client, uint64_t bufferId) {
+        const WallpaperManager::Snapshot snap = daemon.manager().snapshot();
+        const auto it = snap.monitors.find(0);
+        if (it == snap.monitors.end()) return false;
+        for (const wallpaperx::BufferHold& hold : it->second.holds) {
+            if (hold.client != client) continue;
+            for (const wallpaperx::HeldBuffer& buffer : hold.buffers) {
+                if (buffer.id == bufferId) return true;
+            }
+        }
+        return false;
     };
 
     // One export for a NAMED client with the fd query failed. VK_ERROR_TOO_MANY_OBJECTS rather
@@ -3339,7 +3537,7 @@ void runGpuFailureChecks(const std::string& bluePath, const WallpaperManager::Co
         NamedExportFault outcome;
         GetMemoryFdFault fault(/*failAt=*/1, VK_ERROR_TOO_MANY_OBJECTS);
         try {
-            wallpaperx::FrameExport exported = daemon.manager().exportCurrentFrame(0, client);
+            wallpaperx::FrameExport exported = exportDelivered(daemon.manager(), 0, client);
             if (exported.handle && exported.handle->frame.fd >= 0) ::close(exported.handle->frame.fd);
             if (exported.handle && exported.handle->acquireFd >= 0) ::close(exported.handle->acquireFd);
         } catch (const std::exception&) {
@@ -3358,7 +3556,7 @@ void runGpuFailureChecks(const std::string& bluePath, const WallpaperManager::Co
         uint64_t held = 0;
         std::string setupError;
         try {
-            wallpaperx::FrameExport granted = daemon.manager().exportCurrentFrame(0, holder);
+            wallpaperx::FrameExport granted = exportDelivered(daemon.manager(), 0, holder);
             if (granted.handle) {
                 held = granted.handle->frame.bufferId;
                 if (granted.handle->frame.fd >= 0) ::close(granted.handle->frame.fd);
@@ -3374,9 +3572,9 @@ void runGpuFailureChecks(const std::string& bluePath, const WallpaperManager::Co
         }();
 
         const NamedExportFault repeat = held != 0 ? faultedExportFor(holder) : NamedExportFault{};
-        const bool holderStillHolds = repeat.reached && releaseFreedSomething(holder, held);
+        const bool holderStillHolds = repeat.reached && holdsImage(holder, held);
         const NamedExportFault fresh = held != 0 ? faultedExportFor(newcomer) : NamedExportFault{};
-        const bool newcomerCharged = fresh.reached && releaseFreedSomething(newcomer, held);
+        const bool newcomerCharged = fresh.reached && holdsImage(newcomer, held);
 
         const uint64_t generationAfter = [&daemon] {
             const WallpaperManager::Snapshot snap = daemon.manager().snapshot();
@@ -3406,22 +3604,18 @@ void runGpuFailureChecks(const std::string& bluePath, const WallpaperManager::Co
                          repeat.threw ? "threw" : "returned normally", fresh.threw ? "threw" : "returned normally");
         } else {
             // GOAL: an export that throws for a client that did NOT already hold that image
-            //       leaves the client charged with nothing. False if a consumer whose GetFrameFd
+            //       leaves the client charged with nothing. False if a consumer whose GetFrame
             //       failed is left holding an image it was never handed -- an id it cannot name
             //       to release, which keeps that image out of the producer's ring until the
             //       consumer leaves the bus.
-            // WHY-THIS-SHAPE: graded by asking the daemon to end the claim and requiring it to
-            //       report that there was none. Asserting on the exception alone establishes
-            //       nothing: the throw is the same with and without the rollback, and the whole
-            //       difference is in state this file cannot read directly. The claim is charged
-            //       BEFORE the descriptors exist, so "never recorded" is not the daemon's
-            //       behaviour here -- the undo is.
-            // CONTROL: the `if (claimAdded)` rollback block in the catch of
+            // WHY-THIS-SHAPE: graded on the claim ledger snapshot() publishes. Asserting on the
+            //       exception alone establishes nothing: the throw is the same with and without the
+            //       rollback. The claim is charged BEFORE the descriptors exist, so "never recorded"
+            //       is not the daemon's behaviour here -- the undo is.
+            // CONTROL: the `undoHandoverLocked(...)` in the `if (record)` rollback in the catch of
             //       WallpaperManager::exportCurrentFrame (backend/daemon/wallpaper_manager.cpp)
-            //       deleted -> "FAIL: a client whose export threw is left holding nothing, so no
-            //       image is stranded in a claim it cannot name", printing "the prior holder
-            //       kept its claim, the newcomer was left charged with one"; the only red line
-            //       in the run, and the check below stayed green. Reverted.
+            //       deleted -> "FAIL: a client whose export threw is left holding nothing, ...", the
+            //       allocation sweep's "claim was left behind" lines beside it.
             check(!newcomerCharged,
                   "a client whose export threw is left holding nothing, so no image is stranded in a claim it "
                   "cannot name");
@@ -3434,14 +3628,11 @@ void runGpuFailureChecks(const std::string& bluePath, const WallpaperManager::Co
             //       image the first one handed over. That is the only configuration in which the
             //       rollback and an unconditional undo disagree; a rollback test that used a
             //       fresh client every time would pass under both.
-            // CONTROL: `if (claimAdded)` in the catch of WallpaperManager::exportCurrentFrame
-            //       (backend/daemon/wallpaper_manager.cpp) changed to `if (true)`, which is the
-            //       rollback undoing more than the call added -> "FAIL: a failed export does not
-            //       take back the claim its client already had on that image", printing "the
-            //       prior holder lost the claim it already had, the newcomer was charged with
-            //       nothing"; the only red line, and the check above stayed green. The two
-            //       controls redden one check each, so the pair is not one assertion written
-            //       twice. Reverted.
+            // CONTROL: WallpaperManager::undoHandoverLocked (backend/daemon/wallpaper_manager.cpp),
+            //       which the rollback calls, made to end the claim whatever came before
+            //       (`record.previous <= held->released` made `true`) -- the rollback undoing more than
+            //       the call added -> "FAIL: a failed export does not take back the claim its client
+            //       already had on that image", alone.
             check(holderStillHolds,
                   "a failed export does not take back the claim its client already had on that image");
             if (!holderStillHolds || newcomerCharged) {
@@ -3463,13 +3654,13 @@ void runGpuFailureChecks(const std::string& bluePath, const WallpaperManager::Co
     //       left failed, and that is asserted as the premise: otherwise "fail" afterwards could be
     //       left over. Called on this thread, which owns the device, like every export here.
     // CONTROL: in WallpaperManager::acquireTimelineFd (backend/daemon/wallpaper_manager.cpp), the
-    //       `if (AcquireTimeline* existing = ...) return existing->exportFd();` line moved above the
-    //       `try` -> "FAIL: a GPU failure re-exporting an existing consumer's timeline is recorded
-    //       against the GPU", printing "gpu after a failed timeline re-export: ok (NVIDIA GeForce RTX
-    //       3080 Ti (Heap))". Observed 2026-09-23. Reverted.
+    //       repeat path -- the lookup of the existing entry and its `return existing->timeline->exportFd();`
+    //       -- moved above the `try` -> "FAIL: a GPU failure re-exporting an existing consumer's timeline is
+    //       recorded against the GPU", alone.
     // COVERAGE-ASSERT: the interposer must have injected exactly once, or it is a skip.
     {
-        const char* kGoal = "S13.220 (a GPU failure re-exporting a consumer's timeline reaches /health)";
+        const char* kGoal = "S13.220 and S15.344 (a GPU failure re-exporting a consumer's timeline reaches /health, "
+                            "and uses up no copy)";
         const std::string consumer = ":test.timeline.consumer";
         daemon.manager().requestWallpaper("static", bluePath, 0);
         daemon.manager().renderPending(0);
@@ -3477,7 +3668,7 @@ void runGpuFailureChecks(const std::string& bluePath, const WallpaperManager::Co
         std::string setupError;
         bool registered = false;
         try {
-            ::close(daemon.manager().acquireTimelineFd(consumer));
+            ::close(wallpaperx::testing::deliveredTimelineFd(daemon.manager(), consumer));
             registered = true;
         } catch (const std::exception& e) {
             setupError = e.what();
@@ -3511,6 +3702,37 @@ void runGpuFailureChecks(const std::string& bluePath, const WallpaperManager::Co
                                  healthCheckStatus(after.json, "gpu").c_str(),
                                  healthCheckDetail(after.json, "gpu").c_str());
                 }
+
+                // GOAL: S15.344 -- a re-export that failed sent the consumer nothing, so it uses up
+                //       none of its kMaxTimelineCopiesPerClient (4) copies: after the first copy and
+                //       the failed one, three more are served, and only the one after those is refused
+                //       as TimelineCopyLimitReached.
+                // WHY-THIS-SHAPE: three, not "some": with the failed export counted, the third of them
+                //       would be the fifth copy and refused, so the count is what tells the two apart.
+                //       The refusal after them shows the limit is in force here at all. Each copy served
+                //       is reported delivered, as DbusService does once its reply is out; the failed one
+                //       throws before any reply exists, so nothing reports it.
+                // CONTROL: in backend/daemon/wallpaper_manager.cpp, copies counted at export -- the
+                //       `++entry->copiesSent;` moved out of WallpaperManager::timelineCopyDelivered into
+                //       acquireTimelineFd's repeat path ahead of `exportFd()`, a new entry started at 1 ->
+                //       "FAIL: a failed timeline re-export uses up no copy: ... (2 served, then
+                //       'TimelineCopyLimitReached')".
+                int servedAfter = 0;
+                std::string refusedAt;
+                for (int i = 0; i < 4 && refusedAt.empty(); ++i) {
+                    try {
+                        ::close(wallpaperx::testing::deliveredTimelineFd(daemon.manager(), consumer));
+                        ++servedAfter;
+                    } catch (const wallpaperx::TimelineCopyLimitReached&) {
+                        refusedAt = "TimelineCopyLimitReached";
+                    } catch (const std::exception& e) {
+                        refusedAt = e.what();
+                    }
+                }
+                check(servedAfter == 3 && refusedAt == "TimelineCopyLimitReached",
+                      ("a failed timeline re-export uses up no copy: three more are served and the fourth is "
+                       "refused for copies (" + std::to_string(servedAfter) + " served, then '" + refusedAt + "')")
+                          .c_str());
             }
         }
     }
@@ -5661,7 +5883,13 @@ void runSilentClientShutdownChecks(WallpaperManager& manager, const Check& check
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+#if WALLPAPERX_ALLOCATION_INSTRUMENT
+    if (argc > 1 && std::strcmp(argv[1], kExportSweepFlag) == 0) return runExportSweepChild();
+#else
+    (void)argc;
+    (void)argv;
+#endif
     wallpaperx::testing::g_testName = "http_server_test";
 
     // Points $XDG_STATE_HOME at a scratch directory for the whole process. Config::stateDir
@@ -5762,6 +5990,7 @@ int main() {
             // Its own daemon, like the phase above, and placed beside it because it is the same
             // question asked of a type this build draws.
             runVideoHealthChecks(check);
+            runExportAllocationSweep(check);
 
             // Recorded through the manager rather than through SetWallpaper, so no render
             // is queued and the "before any device" state above survives into this phase.

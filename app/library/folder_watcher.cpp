@@ -102,21 +102,18 @@ bool FolderWatcher::openForWriting(int dirFd, const char* name) const
 {
     // A package is followed through a link, as the importer reads it; a link in a wallpaper folder
     // is its own entry.
-    const int follow = m_items == Items::Files ? 0 : O_NOFOLLOW;
-    const UniqueFd fd(::openat(dirFd, name, O_RDONLY | follow | O_NONBLOCK | O_NOCTTY | O_CLOEXEC));
-    struct stat st {};
+    const auto fd = openRegularFile(dirFd, name, O_RDONLY | (m_items == Items::Files ? 0 : O_NOFOLLOW));
     struct statfs fs {};
-    if (!fd || ::fstat(fd.get(), &st) != 0 || !S_ISREG(st.st_mode) || ::fstatfs(fd.get(), &fs) != 0
-        || !leasesShowWriters(fs)) {
+    if (!fd || ::fstatfs(fd->get(), &fs) != 0 || !leasesShowWriters(fs)) {
         return false;
     }
     // A writer opening the file while the lease is held breaks it, which signals this process:
     // SIGURG, ignored by default, instead of SIGIO, which would end it.
-    if (::fcntl(fd.get(), F_SETSIG, SIGURG) != 0) {
+    if (::fcntl(fd->get(), F_SETSIG, SIGURG) != 0) {
         return false;
     }
-    if (::fcntl(fd.get(), F_SETLEASE, F_RDLCK) == 0) {
-        ::fcntl(fd.get(), F_SETLEASE, F_UNLCK);
+    if (::fcntl(fd->get(), F_SETLEASE, F_RDLCK) == 0) {
+        ::fcntl(fd->get(), F_SETLEASE, F_UNLCK);
         return false;
     }
     return errno == EAGAIN;

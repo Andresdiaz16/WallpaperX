@@ -58,18 +58,59 @@ struct TimelineLimitReached : std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
+// This consumer has been sent kMaxTimelineCopiesPerClient copies of its acquire timeline. Lasts as
+// long as its connection does.
+struct TimelineCopyLimitReached : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
 // A screen size reported under a connector name no monitor answers to. Its own type because the
 // cure is elsewhere: the name has to be bound first.
 struct UnknownOutput : InvalidRequest {
     using InvalidRequest::InvalidRequest;
 };
 
-// One consumer's claim on a monitor's images: the buffer ids it has been handed and has not
-// given back, oldest first. A holder disappears when its last claim ends, so a monitor's list is
+// One reply handing an image over that has not been given back and carried descriptors -- 1 or 2,
+// depending on whether the consumer already had the memory and which acquire went with it. They
+// count against the consumer until a release covers that reply.
+struct HandoverCharge {
+    uint64_t handover = 0;
+    uint32_t descriptors = 0;
+};
+
+// One image a consumer holds. Every hand-over is numbered from one daemon-wide sequence, and a
+// release names the newest one the consumer has read, giving back that one and every earlier one --
+// never a hand-over whose reply was still on its way when the release was sent. The claim stands
+// while any is outstanding, numbered above `released` up to `newest`, so `released < newest`.
+struct HeldBuffer {
+    uint64_t id = 0;
+    uint64_t newest = 0;
+    uint64_t released = 0;
+    // Outstanding hand-overs that carried descriptors, oldest first. Each costs at least one, so
+    // kMaxDescriptorsPerClient bounds the list.
+    std::vector<HandoverCharge> charges;
+};
+
+// One recorded hand-over: the number its reply carries, and what an undo of it needs.
+struct HandoverRecord {
+    uint64_t number = 0;  // what the reply's `handover` field says, and a release names
+    // The newest hand-over of this image to this caller before this one; 0 when this began the claim.
+    uint64_t previous = 0;
+};
+
+// One consumer's claim on a monitor's images: the buffers it has been handed and has not given
+// back, oldest first. A holder disappears when its last claim ends, so a monitor's list is
 // exactly the consumers currently reading it.
 struct BufferHold {
     std::string client;  // DBus unique name
-    std::vector<uint64_t> buffers;
+    std::vector<HeldBuffer> buffers;
+};
+
+// GetAcquireTimeline refused because the caller already has its fill of descriptors not given
+// back. `firstRefusal`: the first since it was last under the cap, and so worth a line.
+struct DescriptorLimitReached : std::runtime_error {
+    DescriptorLimitReached(const std::string& what, bool first) : std::runtime_error(what), firstRefusal(first) {}
+    bool firstRefusal;
 };
 
 // What a monitor was last asked to display, and what came of it. `generation` is monotonic
@@ -146,7 +187,7 @@ struct GpuStatus {
     std::string name;
     std::string descriptorTier;
 
-    // Whether GetFrameFd's sync_fds carries a descriptor the consumer must wait on before it
+    // Whether GetFrame's sync_fds carries a descriptor the consumer must wait on before it
     // samples the frame. The one thing a consumer cannot work out for itself: it sees an empty
     // array either because this daemon cannot produce one or because it chose not to, and the two
     // call for different reports to the user.
@@ -190,6 +231,8 @@ struct DaemonHealth {
 // binary semaphore signalled per hand-over, since the first wait consumes it. Building both in one
 // place is what stops a consumer being given memory with no way to acquire it.
 struct FrameHandle {
+    // frame.fd is -1 when the consumer said it can still draw this image and the hand-over carries
+    // an acquire; the rest of `frame` describes the image all the same.
     ExportedFrame frame;
     uint64_t generation = 0;
 
@@ -202,14 +245,13 @@ struct FrameHandle {
     // handed out. 0 when the consumer has none, which is what acquireFd is for.
     uint64_t acquireValue = 0;
 
-    // Handed to a consumer this monitor's playing video has served before: one of many a second for
-    // as long as it keeps reading. False for a consumer the session has not served, which is the
-    // event worth recording.
-    bool routine = false;
+    // The hand-over this reply records against the caller's claim on frame.bufferId; empty when no
+    // claim was recorded, as for an unnamed caller. What withdrawHandover() takes back.
+    std::optional<HandoverRecord> handover;
 };
 
 // What a type is drawn with. The single answer to "can this build draw this type" too: a
-// renderable type is exactly one that names a drawer, so the render dispatch, the GetFrameFd
+// renderable type is exactly one that names a drawer, so the render dispatch, the GetFrame
 // reason and the GetStatus field cannot drift apart.
 enum class Drawable { Still, Clip };
 
@@ -240,6 +282,9 @@ enum class NoFrameReason {
                      // producer nowhere to draw, or this consumer already holds its fill.
                      // Temporary: a release frees the ring, and every release is announced with
                      // FrameReady.
+    TooManyDescriptors,  // there is a frame, but this consumer has kMaxDescriptorsPerClient
+                         // descriptors it has not given back. Its own doing, and temporary: a
+                         // release or leaving the bus ends them.
 };
 
 // The result of asking for a monitor's current frame: the frame, or the reason it was not
@@ -249,14 +294,16 @@ struct FrameExport {
 
     // Both meaningful only when `handle` is empty. lastError is non-empty exactly when
     // reason is RenderFailed -- Unsupported deliberately does not carry one, because it
-    // is not a failure and the reason name already states the whole fact.
+    // is not a failure; it carries `type` instead, the wallpaper type this build cannot draw.
     NoFrameReason reason = NoFrameReason::NeverRequested;
     std::string lastError;
+    std::string type;
 
     // Whether this refusal is worth a log line: the first for THIS consumer, or the first in a
     // while. Per consumer, not per monitor, because a second consumer being refused is its own
     // diagnosis. Rate-limited rather than armed by a hand-over, because a consumer holding its fill
-    // is served and refused alternately while a video plays. Meaningful only for NoFreeImage.
+    // is served and refused alternately while a video plays. For TooManyDescriptors: the first
+    // since this consumer was last under the cap. Meaningful only for those two.
     bool firstRefusal = false;
 };
 
@@ -305,7 +352,7 @@ struct ImportModifierUpdate {
 };
 
 // Owns the renderer for the daemon: one Vulkan Device, one OffscreenTargetManager keyed by
-// monitor, and the per-monitor bookkeeping behind SetWallpaper/GetFrameFd. Request and render
+// monitor, and the per-monitor bookkeeping behind SetWallpaper/GetFrame. Request and render
 // are separate phases because rendering is slow and the DBus event loop is single-threaded.
 //
 // Two locks, strictly ordered: m_gpuMutex before m_stateMutex, never the reverse.
@@ -333,10 +380,35 @@ public:
     // is the price of not evicting a holder to make room for the fifth.
     static constexpr size_t kMaxHoldersPerMonitor = 4;
 
+    // Descriptors one consumer may have been sent and not given back: a frame reply's from when it
+    // is sent until the claim on its image ends, a timeline's until the consumer leaves the bus.
+    // dbus-broker keeps every descriptor of a reply its recipient has not read in its own file
+    // table, one table for the whole bus and limited to 1024, and when that fills it disconnects
+    // the sender of the next one -- this daemon, blanking every screen. So a consumer that stops
+    // reading is refused here instead. A well-behaved one needs at most 4 per monitor and 1 for its
+    // timeline, and none for a picture drawn into an image it already holds an import of.
+    static constexpr uint32_t kMaxDescriptorsPerClient = 64;
+
+    // What one holder's claims on one monitor count against kMaxDescriptorsPerClient: the
+    // descriptors its replies actually carried.
+    static uint32_t descriptorsOf(const BufferHold& hold);
+
     // Consumers holding an acquire timeline at once, departed ones not yet freed included. Bounds
     // what peers can make the daemon keep; one past it is told to ask again later, and meanwhile
     // uses sync_fds, which still works.
     static constexpr size_t kMaxAcquireTimelines = 8;
+
+    // Copies of its acquire timeline one consumer is sent per connection, the first included. Bounds
+    // the descriptors a consumer that keeps asking and never reads the replies can leave in the bus's
+    // table, which kMaxDescriptorsPerClient does not: the timeline counts there once however often it
+    // is sent. A well-behaved one asks once per daemon.
+    static constexpr uint32_t kMaxTimelineCopiesPerClient = 4;
+
+    // Requests one consumer may have waiting on the render worker at once: its share of the
+    // worker's queue, so one consumer's burst cannot fill it and refuse everyone else. A
+    // well-behaved one has one frame request out per screen and one timeline request, which this
+    // covers up to the 15 screens kMaxDescriptorsPerClient does.
+    static constexpr int kMaxQueuedRequestsPerClient = 16;
 
     // Video wallpapers holding an open decode session at once: a ceiling on the video memory
     // decoders hold, not a hardware session limit. Monitor ids are the client's to choose and each
@@ -505,8 +577,9 @@ public:
     // picture; nothing a consumer does starts it again while that stands, so the caller wakes the
     // render worker whatever the answer. Throws InvalidRequest for a name the shared validator
     // rejects and UnknownOutput for one no monitor answers to. Idempotent: only the change from
-    // covered to drawn credits the monitor with having been seen.
-    void setOutputVisible(const std::string& outputName, bool visible);
+    // covered to drawn credits the monitor with having been seen. Returns whether the report
+    // changed what was recorded for that screen.
+    bool setOutputVisible(const std::string& outputName, bool visible);
 
     // Sets when this monitor's video stops on the picture it shows, by PauseMode name. Throws
     // InvalidRequest for a bad id or an unknown name. Survives every wallpaper change. All or
@@ -609,7 +682,8 @@ public:
     // take the producer's last free image, the one past kMaxHeldPerClient, the one from a
     // consumer past kMaxHoldersPerMonitor. Nothing may be taken back from a consumer that could
     // still be sampling it, so declining the request is the only bound that does not risk
-    // drawing into an image being read.
+    // drawing into an image being read. One past kMaxDescriptorsPerClient is refused as
+    // TooManyDescriptors, before any of those.
     //
     // The default is for a caller that is not a bus peer, and it records no claim: there would
     // be no name to withdraw it under, and a claim nothing can end takes an image out of the
@@ -620,18 +694,52 @@ public:
     // picture carries a value only then, and only while `client` holds a live one; otherwise a new
     // binary semaphore. The consumer chooses per request, so a timeline it never received or could
     // not import cannot leave it with a value it has no way to wait on.
-    FrameExport exportCurrentFrame(int monitorId, const std::string& client = {}, bool onTimeline = false);
+    //
+    // `knownBuffers` are the images the caller says it can still draw. The memory descriptor is
+    // left out only when the image handed over is one of them and the picture carries an acquire,
+    // since waiting on that is what tells the caller's driver the memory holds a new picture. Asked
+    // per request and never remembered: a consumer drops imports on its own, and only it knows.
+    // Throws InvalidRequest past kMaxKnownBuffers.
+    //
+    // An export is not yet a delivery: a hand-over counts as someone collecting this monitor's
+    // pictures -- what keeps a video playing -- only once its reply is out, so one that never
+    // reaches its caller cannot keep a video decoding. The caller follows every export that
+    // returns a handle with handoverDelivered() or withdrawHandover().
+    //
+    // A failed export takes its own hand-over back. When that ends the claim, the image is
+    // reported as a release reports it: the renders now owed go into `toRender`, and `announce`,
+    // when given, receives the frames to announce. Both are filled only on that path, before the
+    // throw, so a caller must act on them in its catch.
+    //
+    // Once the export has succeeded nothing in here throws, so a claim recorded is always one whose
+    // handle reaches the caller.
+    FrameExport exportCurrentFrame(int monitorId, const std::string& client, bool onTimeline,
+                                   const std::vector<uint64_t>& knownBuffers, std::vector<int>& toRender,
+                                   std::vector<FrameAvailable>* announce = nullptr);
 
-    // Drops `client`'s claim on one image, because it says it has stopped reading it. Returns
-    // the monitors whose deferred render should be retried now that an image may be free.
+    // The hand-over exportCurrentFrame() made to `client` reached it, which is what counts as this
+    // monitor's picture being collected. True when this monitor's playing video has served this
+    // consumer before: one of many a second, not worth a log line. Call on the render worker,
+    // before it runs another export.
+    bool handoverDelivered(int monitorId, const std::string& client) noexcept;
+
+    // Throws InvalidRequest for a list exportCurrentFrame() would refuse, so a bus handler can
+    // refuse it before queueing.
+    static void requireKnownBuffers(const std::vector<uint64_t>& knownBuffers);
+
+    // Gives back `client`'s hand-overs of one image numbered up to `handover`, the newest it says it
+    // has read and stopped reading. The claim ends only when that covers the newest hand-over made;
+    // a later one, whose reply crossed the release, keeps it -- the consumer is about to read it.
+    // Returns the monitors whose deferred render should be retried now that an image may be free.
     // Silent about a claim it does not hold: a consumer releasing twice, or releasing one
-    // already dropped for it, is not making an error. Throws InvalidRequest for a bad id.
+    // already dropped for it, is not making an error. Throws InvalidRequest for a bad monitor id
+    // and for a hand-over number never issued.
     //
     // `announce`, when given, receives the monitors holding a frame a consumer can still read --
     // the freed image has to be published, or a consumer refused for want of one never learns it
     // may ask again. A monitor can be in both: a redraw at a new size is owed while the frame it
     // replaces is still served.
-    std::vector<int> releaseBuffer(const std::string& client, int monitorId, uint64_t bufferId,
+    std::vector<int> releaseBuffer(const std::string& client, int monitorId, uint64_t bufferId, uint64_t handover,
                                    std::vector<FrameAvailable>* announce = nullptr);
 
     // The same for every image on every monitor, because `client` left the bus. Without it a
@@ -639,12 +747,33 @@ public:
     // and plasmashell restarts are routine, while this daemon does not.
     std::vector<int> forgetHeldBuffers(const std::string& client, std::vector<FrameAvailable>* announce = nullptr);
 
+    // Takes back the hand-over exportCurrentFrame() recorded for `handle`, because its reply never
+    // reached the bus: that reply's descriptors only, and the claim itself only if no earlier
+    // hand-over is outstanding. Nothing if a release or departure ended the claim meanwhile. Returns and announces
+    // as releaseBuffer() does when the claim ends.
+    //
+    // Call on the render worker, before it runs another export: the undo is exact only while no
+    // other export can have ended and re-created this claim.
+    std::vector<int> withdrawHandover(int monitorId, const std::string& client, const FrameHandle& handle,
+                                      std::vector<FrameAvailable>* announce = nullptr);
+
     // A descriptor for `client`'s acquire timeline, created on its first request and kept until it
     // leaves the bus. It only makes the timeline available: a picture carries a value on it only
-    // when the request for that picture asks. Each call is a new descriptor for the same payload,
-    // so asking again -- a consumer that lost the first answer -- is harmless. GPU work: call from
-    // the render worker. Throws TimelineUnavailable, and GpuFailure when the driver fails.
+    // when the request for that picture asks. Each call is a new copy of the same timeline, and a
+    // connection is sent at most kMaxTimelineCopiesPerClient of them, so a consumer keeps and
+    // duplicates the one it has rather than asking again. The timeline counts as one descriptor
+    // against kMaxDescriptorsPerClient until the consumer leaves, however often it is sent: no call
+    // gives a copy back, so counting each would only ever grow. GPU work: call from the render
+    // worker, and follow a descriptor that reached its caller with timelineCopyDelivered().
+    // Throws TimelineUnavailable, TimelineLimitReached, TimelineCopyLimitReached,
+    // DescriptorLimitReached, and GpuFailure when the driver fails.
     int acquireTimelineFd(const std::string& client);
+
+    // The descriptor acquireTimelineFd() returned is out on the bus, which is what counts against
+    // kMaxTimelineCopiesPerClient: a reply that failed to send leaves nothing in the bus's table.
+    // Call on the render worker, before it runs another acquireTimelineFd(): the limit's check and
+    // this count are one step only while nothing runs between them.
+    void timelineCopyDelivered(const std::string& client) noexcept;
 
     // `client` has left the bus, so its timeline goes. Only marked here, under the state lock; the
     // GPU thread destroys it at its next export or registration. Posting a worker task per
@@ -654,12 +783,17 @@ public:
 
     // A request from `client` queued on the render worker can create state for it -- a hold, a
     // timeline -- after it has left the bus, and the departure that should end that state has then
-    // already been handled. These close that window. noteRequestQueued() runs on the bus thread
-    // before the post; noteRequestDone() when the request has been answered or refused, and returns
-    // true when `client` left while it was queued and this was its last: the departure is then
-    // applied again, over whatever the requests created. noteDeparted() runs with the departure.
-    // Bounded by the worker's queue.
-    void noteRequestQueued(const std::string& client);
+    // already been handled. These close that window. admitRequest() runs on the bus thread before
+    // the post; noteRequestDone() when an admitted request has been answered or refused, and
+    // returns true when `client` left while it was queued and this was its last: the departure is
+    // then applied again, over whatever the requests created. noteDeparted() runs with the
+    // departure. Bounded by the worker's queue.
+    //
+    // The same count is the client's share of that queue: a request finding kMaxQueuedRequestsPerClient
+    // already waiting is not admitted, and nothing is counted for it. FirstRefusal opens a run of
+    // refusals, which ends after kRequestRefusalQuiet without one or when the client leaves.
+    enum class Admission { Admitted, Refused, FirstRefusal };
+    [[nodiscard]] Admission admitRequest(const std::string& client);
     [[nodiscard]] bool noteRequestDone(const std::string& client);
     void noteDeparted(const std::string& client);
 
@@ -708,13 +842,13 @@ public:
 
 private:
     // What withHandover() decided. One value with three states rather than a flag beside a
-    // maybe-filled list: `holds` is meaningless unless the hand-over was allowed, and only
-    // Granted may be undone -- an image the client already held is one it is still reading.
+    // maybe-filled list: `holds` is meaningless unless the hand-over was allowed.
     struct Handover {
         enum class Outcome { Granted, AlreadyHeld, Refused };
 
         std::vector<BufferHold> holds;  // the claims that would be in force; empty if Refused
         Outcome outcome = Outcome::Refused;
+        uint64_t previous = 0;  // the claim's newest hand-over before this one, if AlreadyHeld
     };
 
     // One consumer of one monitor, as both the refusal log and the hand-over log remember it. Two
@@ -1019,9 +1153,11 @@ private:
     // said otherwise. Caller must hold m_stateMutex.
     bool screenDrawnLocked(int monitorId) const;
 
-    // Records that a hand-over collected this monitor's newest picture, which is what makes it
-    // watched. Takes m_stateMutex itself.
-    void noteHandoverServed(int monitorId);
+    // Records that a hand-over delivered to `client` collected this monitor's newest picture, which
+    // is what makes it watched, and returns handoverDelivered()'s answer. Nothing for an unnamed
+    // caller: a diagnostic poll no claim can be charged to must not keep a video decoding. Caller
+    // must hold m_gpuMutex and not m_stateMutex.
+    bool recordDeliveredLocked(int monitorId, const std::string& client) noexcept;
 
     // Posts the videos that would be playing if they had a decode session: one whose session was
     // freed while nobody was looking, and -- only when this round freed one, so a failure cannot
@@ -1072,23 +1208,47 @@ private:
     // held. Caller must hold m_stateMutex.
     void pruneOutputReportsLocked();
 
-    // The memory and its acquire -- a value on `timeline` when the consumer has one, a new binary
-    // semaphore otherwise -- or neither and a throw with the GPU health recorded. Caller must hold
-    // m_gpuMutex, which is what keeps `target` and `timeline` alive across the export.
-    FrameHandle exportHandle(const OffscreenTarget& target, AcquireTimeline* timeline);
+    // The memory, unless `sendMemory` is false, and its acquire -- a value on `timeline` when the
+    // consumer has one, a new binary semaphore otherwise -- or neither and a throw with the GPU
+    // health recorded. Caller must hold m_gpuMutex, which is what keeps `target` and `timeline`
+    // alive across the export.
+    FrameHandle exportHandle(const OffscreenTarget& target, AcquireTimeline* timeline, bool sendMemory);
 
     // The images `monitorId` has handed out and not got back. Caller must hold m_stateMutex.
     std::vector<uint64_t> heldBuffersLocked(int monitorId) const;
 
-    // The claims that would be in force if `client` were handed `bufferId`, or Refused when a
-    // cap stands in the way. `client` must not be empty. Pure, and it only ever adds: its result
-    // is both what the reserve is tested against and what is stored, so the admission test
-    // cannot disagree with the bookkeeping, and no caller can end a claim through it.
-    static Handover withHandover(std::vector<BufferHold> holds, const std::string& client, uint64_t bufferId);
+    // The claims that would be in force if `client` were handed `bufferId` as hand-over `handover`, in
+    // a reply carrying `descriptors`, or Refused when a cap stands in the way. `client` must not be
+    // empty, and `handover` must be newer than every number recorded. Pure, and it only ever adds:
+    // its result is both what the reserve is tested against and what is stored, so the admission
+    // test cannot disagree with the bookkeeping, and no caller can end a claim through it.
+    static Handover withHandover(std::vector<BufferHold> holds, const std::string& client, uint64_t bufferId,
+                                 uint64_t handover, uint32_t descriptors);
 
-    // Ends `client`'s claim on one image, reporting whether there was one to end. Caller must
-    // hold m_stateMutex.
-    static bool dropHoldLocked(MonitorState& state, const std::string& client, uint64_t bufferId);
+    // Gives back `client`'s hand-overs of `bufferId` numbered up to `handover`, as releaseBuffer()
+    // describes. Reports whether that ended the claim. Caller must hold m_stateMutex.
+    static bool releaseHandoversLocked(MonitorState& state, const std::string& client, uint64_t bufferId,
+                                       uint64_t handover);
+
+    // Takes back `record`, for a reply that was never sent: the claim ends if no earlier hand-over
+    // is outstanding, and otherwise only its charge goes -- an image the client already held is one
+    // it is still reading. Nothing if a release ended the claim meanwhile. Reports whether the claim
+    // ended. Caller must hold m_stateMutex.
+    static bool undoHandoverLocked(MonitorState& state, const std::string& client, uint64_t bufferId,
+                                   const HandoverRecord& record);
+
+    // Descriptors `client` has been sent and not given back, as kMaxDescriptorsPerClient counts
+    // them. Caller must hold m_stateMutex.
+    uint32_t descriptorsInFlightLocked(const std::string& client) const;
+
+    // Whether `client` would pass kMaxDescriptorsPerClient with `more`. When it would, it is recorded
+    // as refused and the result says whether that starts a new episode; when not, the episode
+    // ends. Caller must hold m_stateMutex.
+    struct DescriptorAdmission {
+        bool admitted = true;
+        bool firstRefusal = false;
+    };
+    DescriptorAdmission admitDescriptorsLocked(const std::string& client, uint32_t more);
 
     // Every id in `holds`, which nextUnheld() takes as its membership test. Duplicates are left
     // in: two consumers may hold the same image, and both claims are real.
@@ -1196,21 +1356,38 @@ private:
         std::string client;
         std::unique_ptr<AcquireTimeline> timeline;
         bool departed = false;
+        uint32_t copiesSent = 0;
     };
     std::vector<ConsumerTimeline> m_acquireTimelines;
 
+    // Consumers refused by kMaxDescriptorsPerClient and not back under it since, so each run of
+    // refusals is logged once. Entries go when the consumer is next admitted or leaves the bus.
+    // Guarded by m_stateMutex.
+    std::set<std::string> m_descriptorRefusals;
+
+    // The number of the latest hand-over recorded, across every monitor and consumer; 0 before the
+    // first. Guarded by m_stateMutex.
+    uint64_t m_lastHandover = 0;
+
     // The live timeline `client` registered, or null. Caller holds m_gpuMutex and not m_stateMutex.
     AcquireTimeline* liveAcquireTimeline(const std::string& client);
+    // Its entry, or null. Caller holds m_stateMutex; the pointer stays valid while m_gpuMutex is held.
+    ConsumerTimeline* liveTimelineEntryLocked(const std::string& client);
 
     // Destroys the timelines of consumers that have left. Caller holds m_gpuMutex and not
     // m_stateMutex: a timeline whose last signal did not finish waits for it.
     void reapDepartedTimelinesLocked();
 
-    // See noteRequestQueued(). Guarded by m_stateMutex.
+    // See admitRequest(). Guarded by m_stateMutex. An entry lives while its client has a request
+    // admitted and unanswered, or is in a run of refusals and still on the bus.
     struct QueuedRequests {
         int count = 0;
         bool departed = false;
+        std::optional<std::chrono::steady_clock::time_point> lastRefusal;
+        bool refusing(std::chrono::steady_clock::time_point now) const;
     };
+    // A run of refusals ends after this long without one.
+    static constexpr std::chrono::seconds kRequestRefusalQuiet{10};
     std::map<std::string, QueuedRequests> m_queuedRequests;
     std::string m_resolvedShaderDir;
 

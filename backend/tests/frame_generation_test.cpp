@@ -78,8 +78,9 @@ void checkTheTwoRulesDiffer() {
 // COVERAGE: this grades the decision, not the parse it guards. Reaching the parse itself needs a
 //       bus peer answering malformed replies, which this suite has no way to stand up.
 // CONTROL: `fieldCount >= kFrameReplyFields` changed to `>` in WallpaperXItem::replyIsReadable
-//       -> "FAIL: a reply with exactly the declared fields is read". Observed 2026-08-21.
-//       Reverted.
+//       -> "FAIL: a reply with exactly the declared fields is read". Observed 2026-08-21; re-run
+//       2026-10-04 via control_run.sh with the count at GetFrame's thirteen, and 2026-10-05 via
+//       control_batch.sh at fourteen. Reverted.
 void checkReplyBounds() {
     check(WallpaperXItem::replyIsReadable(WallpaperXItem::kFrameReplyFields),
           "a reply with exactly the declared fields is read");

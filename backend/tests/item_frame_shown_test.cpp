@@ -33,6 +33,7 @@
 // For vulkanDeviceUuid only; this test brings up its own GL through QQuickRenderControl.
 #include "tests/gl_import_harness.h"
 #include "tests/item_stub_scene.h"
+#include "tests/private_test_bus.h"
 #include "tests/test_report.h"
 #include "vulkan/device.h"
 #include "vulkan/frame_export.h"
@@ -367,18 +368,19 @@ bool runFrameShownChecks() {
         //       still hold its texture in the same breath: without that, "the claim stayed true"
         //       could be true of a run where nothing was on screen to claim.
         // CONTROL: `m_nodeHasFrame = false;` added inside the m_importedMutex block of
-        //       WallpaperXItem::forgetGenerations() in backend/kde/wallpaperx_item.cpp -- the shape
-        //       that put the panel over a good wallpaper -> "FAIL: a monitor-id change does not
-        //       withdraw the claim that a frame is on screen", with the two later checks that read
-        //       the same claim red beside it and the release direction abandoned rather than
-        //       passed. Observed 2026-08-23. Reverted.
+        //       WallpaperXItem::discardHeldFrame(Undrawn), which forgetGenerations() calls, in
+        //       backend/kde/wallpaperx_item.cpp -- the shape that put the panel over a good wallpaper
+        //       -> "FAIL: a monitor-id change does not withdraw the claim that a frame is on screen",
+        //       with the two later checks that read the same claim red beside it. Observed 2026-08-23;
+        //       re-run 2026-10-05 via control_batch.sh. Reverted.
         // COVERAGE-ASSERT: the id change is asserted to have been acted on -- the item re-asks the
         //       daemon for the new screen, which only happens past the early return that would
         //       otherwise make this whole phase a no-op graded as a pass. CONTROL: the trailing
         //       `if (m_monitorId >= 0) fetchFrame(0);` deleted from WallpaperXItem::setMonitorId in
         //       backend/kde/wallpaperx_item.cpp -> "FAIL: the item asks the daemon again for the
         //       screen it was moved to", plus the harness line saying the refused fetch that check
-        //       would have produced was never reported. Re-observed 2026-09-14. Reverted.
+        //       would have produced was never reported. Re-observed 2026-09-14 and 2026-10-05 (via
+        //       control_batch.sh). Reverted.
         const int requestsBeforeIdChange = stub.requests();
         check(item->property("monitorId").toInt() == kFirstMonitor, "the item starts on the monitor id the QML set");
         item->setProperty("monitorId", kSecondMonitor);
@@ -478,6 +480,8 @@ bool runFrameShownChecks() {
 
 int main(int argc, char** argv) {
     wallpaperx::testing::g_testName = "item_frame_shown_test";
+    // X.34: nothing owned or sent off the private bus.
+    if (const std::optional<int> refused = wallpaperx::testing::refuseOffPrivateTestBus()) return *refused;
 
     wallpaperx::testing::registerFrameReplyTypes();
 

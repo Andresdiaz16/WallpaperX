@@ -1384,7 +1384,8 @@ int untrustedChild(const QStringList& args) {
     // CONTROL: app/library/folder_watcher.cpp, leasesShowWriters()'s `default: return false;` made
     //       `default: return true;` together with openForWriting()'s `return errno == EAGAIN;` made
     //       `return true;`, one patch -> red, "S15.74: the ramfs library never settled with
-    //       [Good]", and the same for S15.87 (holds kept), also on a ramfs; restored.
+    //       [Good]", and the same for S15.87 (holds kept), also on a ramfs; S15.74's line re-run via
+    //       control_batch.sh 2026-10-05; restored.
     childReady();
     LibraryManager m(dir, kSettleMs, kPollMs, LibraryManager::Watching::Inotify, hold);
     m.rescan();

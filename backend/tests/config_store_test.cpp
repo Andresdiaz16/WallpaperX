@@ -80,6 +80,7 @@ using wallpaperx::SaveResult;
 using wallpaperx::sanitizeForLog;
 using wallpaperx::testing::BlockingWrite;
 using wallpaperx::testing::blockingWriteFixtureWorks;
+using wallpaperx::testing::exportDelivered;
 using wallpaperx::testing::isRegularFile;
 using wallpaperx::testing::nameScreen;
 using wallpaperx::testing::ScratchDir;
@@ -4599,7 +4600,7 @@ void runStrictOwnershipChecks() {
     static constexpr Touch kTouches[] = {
         {"naming the screen", [](WallpaperManager& m) { nameScreen(m, 0, "DP-KEPT"); }},
         {"asking it to render what has not been set", [](WallpaperManager& m) { m.renderPending(0); }},
-        {"asking it for a frame", [](WallpaperManager& m) { m.exportCurrentFrame(0); }},
+        {"asking it for a frame", [](WallpaperManager& m) { (void)exportDelivered(m, 0); }},
     };
     int driven = 0;
     bool placeholderSeen = false;

@@ -137,8 +137,9 @@ void runSelectionChecks(Device& device, OffscreenTargetManager& targets, const s
     //       Checked once, here, so the rest may speak in ids. Both halves are stated because
     //       they fail independently: the id is what the daemon's held list is written in, the
     //       VkImage is what the pixels live in.
-    // CONTROL: `target.bufferId = m_nextBufferId++;` in OffscreenTargetManager::makeTarget
-    //       (renderer/vulkan/offscreen.cpp) changed to `target.bufferId = 1;` -> "FAIL: every
+    // CONTROL: `target.bufferId = g_nextBufferId.fetch_add(1, std::memory_order_relaxed);` in
+    //       OffscreenTargetManager::makeTarget (renderer/vulkan/offscreen.cpp) changed to
+    //       `target.bufferId = 1;` (re-run 2026-10-04 via control_batch.sh) -> "FAIL: every
     //       image has a distinct, non-zero buffer id" as the first line, then both phases
     //       abandoning themselves ("could not name a second image", "reported nowhere to
     //       draw"). The VkImage check beside it stays green, which is the measurement showing
@@ -462,6 +463,39 @@ void runHeldContentChecks(Device& device, OffscreenTargetManager& targets, const
     }
 }
 
+// GOAL: S15.290 -- a buffer id names one image in the whole process: two target managers on one
+//       device hand out disjoint, non-zero ids. False for a counter per manager, under which a
+//       consumer declaring an id it holds of one manager would be sent no memory for another's image.
+// WHY-THIS-SHAPE: two managers alive at once, a full ring in each, so a per-manager counter starting
+//       at 1 in both collides on every slot; ids within one manager are graded above.
+// CONTROL: in renderer/vulkan/offscreen.cpp, the process-wide g_nextBufferId replaced by a member
+//       counter of OffscreenTargetManager starting at 1 -> "FAIL: two target managers in one process
+//       hand out disjoint, non-zero buffer ids (3 distinct of 6, 3 shared)". Via control_batch.sh,
+//       2026-10-04. Reverted.
+void runCrossManagerIdChecks(Device& device) {
+    std::set<uint64_t> first;
+    std::set<uint64_t> both;
+    size_t shared = 0;
+    {
+        OffscreenTargetManager one(device);
+        OffscreenTargetManager two(device);
+        one.create(kRingMonitor, kWidth, kHeight, kDepth);
+        two.create(kRingMonitor, kWidth, kHeight, kDepth);
+        for (const Slot& slot : lapRing(one, kRingMonitor, kDepth)) {
+            first.insert(slot.id);
+            both.insert(slot.id);
+        }
+        for (const Slot& slot : lapRing(two, kRingMonitor, kDepth)) {
+            if (first.count(slot.id) != 0) ++shared;
+            both.insert(slot.id);
+        }
+    }
+    check(both.size() == 2 * kDepth && shared == 0 && both.count(0) == 0,
+          ("two target managers in one process hand out disjoint, non-zero buffer ids (" + std::to_string(both.size()) +
+           " distinct of " + std::to_string(2 * kDepth) + ", " + std::to_string(shared) + " shared)")
+              .c_str());
+}
+
 }  // namespace
 
 int main() {
@@ -480,6 +514,7 @@ int main() {
 
                 runSelectionChecks(device, targets, redPath);
                 runHeldContentChecks(device, targets, redPath, bluePath, greenPath, yellowPath);
+                runCrossManagerIdChecks(device);
             } catch (const std::exception& e) {
                 // Reported, not rethrown: an escaping exception would skip the validation
                 // grade in gradedRun's frame and print no verdict for the checks that did run.

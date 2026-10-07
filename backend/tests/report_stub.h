@@ -4,7 +4,7 @@
 
 // A stand-in daemon for the plugin's three screen reports -- SetOutputSize, SetOutputVisible and
 // SetOutputFocus -- for tests that run the item with no GPU. Every report is recorded in arrival
-// order and answered with success unless a test told it otherwise. GetFrameFd is refused with
+// order and answered with success unless a test told it otherwise. GetFrame is refused with
 // NoFrame, so the item never imports anything and never arms its paint watch; GetAcquireTimeline is
 // answered as a daemon from before it existed.
 //
@@ -63,7 +63,7 @@ public:
     bool handleMessage(const QDBusMessage& message, const QDBusConnection& connection) override {
         if (message.interface() != QLatin1String(kInterface)) return false;
         const QString member = message.member();
-        if (member == QLatin1String("GetFrameFd") || member == QLatin1String("GetFrameFdOnTimeline")) {
+        if (member == QLatin1String("GetFrame")) {
             return connection.send(message.createErrorReply(QStringLiteral("io.wallpaperx.Daemon.Error.NoFrame"),
                                                             QStringLiteral("this stub has no frames")));
         }

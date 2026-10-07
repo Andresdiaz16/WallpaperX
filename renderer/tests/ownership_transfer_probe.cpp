@@ -883,7 +883,8 @@ bool run(wallpaperx::testing::ValidationGrade& grade) {
     //          VK_IMAGE_LAYOUT_UNDEFINED;` added before exportFrame's `return frame;` -> red
     //          with "an export leaves the target's recorded ownership and layout untouched",
     //          and with two later pairing failures naming "UNDEFINED->GENERAL", which is the
-    //          corruption that write causes. A second mutation, an ownership-release barrier
+    //          corruption that write causes (re-run 2026-10-04 via control_batch.sh, the same
+    //          three lines). A second mutation, an ownership-release barrier
     //          submitted from exportFrame, reddens the other two ("an export issues no
     //          queue-family ownership barrier", "an export submits no GPU work"); reduced to
     //          `device.immediateSubmit([](VkCommandBuffer) {});` it reddens the submit check

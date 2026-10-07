@@ -15,6 +15,7 @@
 #include <QUrl>
 #include <QWindow>
 
+#include <algorithm>
 #include <climits>
 #include <cstdio>
 #include <cstring>
@@ -48,16 +49,15 @@ std::optional<QByteArray> currentDirectory()
     return here;
 }
 
-// --help anywhere before "--" wins over an argument refused, so its exit status never depends on
-// what else was given.
-CommandLine parseCommandLine(int argc, char** argv)
+// `arguments` excludes the program name. --help anywhere before "--" wins over an argument
+// refused, so its exit status never depends on what else was given.
+CommandLine parseCommandLine(const QList<QByteArray>& arguments)
 {
     QList<QByteArray> files;
     std::optional<Refused> refused;
     bool options = true;
     const std::optional<QByteArray> here = currentDirectory();
-    for (int i = 1; i < argc; ++i) {
-        const QByteArray argument(argv[i]);
+    for (const QByteArray& argument : arguments) {
         if (options && argument == "--") {
             options = false;
         } else if (options && (argument == "--help" || argument == "-h")) {
@@ -88,13 +88,24 @@ CommandLine parseCommandLine(int argc, char** argv)
 
 int main(int argc, char* argv[])
 {
-    QGuiApplication app(argc, argv);
+    // Qt takes its own options (-reverse, -platform X, ...) out of argv and knows no "--", so it is
+    // shown only what comes before one; it rewrites nothing past the count it is given.
+    const int operandsAt = int(std::find_if(argv + 1, argv + argc, [](const char* a) { return std::strcmp(a, "--") == 0; }) - argv);
+    // Referenced by QGuiApplication for its whole life.
+    int qtArgc = operandsAt;
+    QGuiApplication app(qtArgc, argv);
     QGuiApplication::setApplicationName(QStringLiteral("wallpaperx"));
     QGuiApplication::setApplicationDisplayName(QStringLiteral("WallpaperX"));
     QGuiApplication::setDesktopFileName(QStringLiteral("com.wallpaperx.app"));
 
-    // After QGuiApplication, which takes its own options out of argv.
-    const CommandLine commandLine = parseCommandLine(argc, argv);
+    QList<QByteArray> arguments;
+    for (int i = 1; i < qtArgc; ++i) {
+        arguments.append(argv[i]);
+    }
+    for (int i = operandsAt; i < argc; ++i) {
+        arguments.append(argv[i]);
+    }
+    const CommandLine commandLine = parseCommandLine(arguments);
     if (std::holds_alternative<Help>(commandLine)) {
         std::fputs(kUsage, stdout);
         return 0;

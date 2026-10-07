@@ -40,6 +40,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <exception>
@@ -48,6 +49,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -117,6 +119,7 @@ public:
     struct Release {
         int monitorId = -1;
         quint64 bufferId = 0;
+        quint64 handover = 0;
     };
 
     // One target, served once: what the frames-on-screen phases need.
@@ -134,13 +137,13 @@ public:
     // already handed out.
     void reportBufferIdAs(quint64 bufferId) { m_bufferIdOverride = bufferId; }
 
-    // Builds the next GetFrameFd reply as usual but does not send it until sendHeldReply().
+    // Builds the next GetFrame reply as usual but does not send it until sendHeldReply().
     //
     // For the one state a synchronous stub cannot produce: a reply IN FLIGHT while the item
     // changes which monitor it shows. The daemon records the hold when it answers, so that reply
     // grants a claim to an item that no longer wants it, and only a stub that can pause between
     // the two halves puts the plugin in that position at all.
-    // Refuses every further GetFrameFd with this error name, whatever the sequence has left; an
+    // Refuses every further GetFrame with this error name, whatever the sequence has left; an
     // empty name puts the sequence back in charge. For the checks that are about ONE named
     // refusal, which the exhausted-sequence answer cannot express -- the plugin branches on the
     // name, and NoFreeImage is the only one it treats as temporary.
@@ -190,9 +193,29 @@ public:
     // daemon from before it did, UnknownMethod, so every test not about the timeline stays on
     // sync_fds. Grant creates and hands over the caller's timeline; Silent creates it and never
     // answers, which is a lost reply; BadDescriptor hands over a descriptor that is no semaphore
-    // payload, which the driver refuses at import.
-    enum class Timeline { Absent, Grant, Silent, BadDescriptor };
+    // payload, which the driver refuses at import. Late creates it and holds the request until
+    // answerHeldTimeline(), for an answer that arrives as late as a test chooses.
+    enum class Timeline { Absent, Grant, Silent, BadDescriptor, Late };
     void serveTimelines(Timeline mode) { m_timelineMode = mode; }
+    size_t heldTimelineAsks() const { return m_heldTimelineAsks.size(); }
+    // Answers the oldest held ask with the caller's timeline, or with a duplicate of `instead` when it
+    // is given (the caller keeps `instead`). False when none is held or the descriptor cannot be made.
+    bool answerHeldTimeline(int instead = -1) {
+        if (m_heldTimelineAsks.empty()) return false;
+        auto [connection, message] = std::move(m_heldTimelineAsks.front());
+        m_heldTimelineAsks.erase(m_heldTimelineAsks.begin());
+        int fd = -1;
+        if (instead >= 0) {
+            fd = ::fcntl(instead, F_DUPFD_CLOEXEC, 0);
+        } else if (const auto it = m_timelines.find(message.service()); it != m_timelines.end() && it->second) {
+            fd = it->second->exportFd();
+        }
+        if (fd < 0) return false;
+        QDBusUnixFileDescriptor handle(fd);
+        ::close(fd);  // QDBusUnixFileDescriptor took its own duplicate.
+        if (instead < 0) ++m_timelinesGranted;
+        return connection.send(message.createReply(QList<QVariant>{QVariant::fromValue(handle)}));
+    }
     // The next `count` asks are answered with `errorName`, whatever the mode.
     void refuseTimelineAsks(int count, QString errorName) {
         m_timelineRefusals = count;
@@ -202,11 +225,80 @@ public:
     // what another stub's has reached: a value from the other waited on this one then completes
     // rather than stalling the GPU, and only an import count can tell the pairing was wrong.
     void advanceTimelinesOnGrant(int count) { m_advanceOnGrant = count; }
-    // GetFrameFd replies carry `value` as a thirteenth field and no sync_fds: a daemon answering
-    // the method nobody asked for a value on as if they had.
-    void sendValueOnGetFrameFd(quint64 value) { m_valueOnGetFrameFd = value; }
+    // Replies to requests that did NOT ask on the timeline carry `value` as acquire_value and no
+    // sync_fds: a daemon answering a request nobody asked for a value on as if they had.
+    void sendValueUnasked(quint64 value) { m_valueUnasked = value; }
+
+    // Whether a reply carries the memory. `Daemon` is the daemon's rule: left out exactly when the
+    // request declared the image served and the reply carries an acquire. `Always` is legal too --
+    // memory the caller did not need, which it closes. The rest break the protocol on purpose:
+    // `OmitUndeclared` leaves it out of every reply whatever was declared, `Twice` sends two
+    // descriptors for one image.
+    enum class Memory { Daemon, Always, OmitUndeclared, Twice };
+    void sendMemory(Memory rule) { m_memoryRule = rule; }
+
+    // What each GetFrame said, in arrival order.
+    struct Ask {
+        int monitorId = -1;
+        std::vector<quint64> declared;
+        bool onTimeline = false;
+        // The image the reply served, whether it carried the memory, and its hand-over number; 0,
+        // false and 0 for a request refused.
+        quint64 served = 0;
+        bool memorySent = false;
+        quint64 handover = 0;
+        // When it arrived, on this stub's clock (nowMs()). It is answered at once unless held, so this is
+        // also when its answer left.
+        qint64 arrivedMs = 0;
+    };
+    const std::vector<Ask>& asks() const { return m_asks; }
+    qint64 nowMs() const { return m_clock.elapsed(); }
+    // Replies that left the memory out.
+    int memoryOmitted() const { return m_memoryOmitted; }
     // Numbers this stub's frames from `offset` + 1 instead of 1. Set before the first serve.
     void numberGenerationsFrom(quint64 offset) { m_generationOffset = offset; }
+    // Numbers this stub's hand-overs from `offset` + 1 instead of 1. Set before the first serve.
+    void numberHandoversFrom(quint64 offset) { m_lastHandover = offset; }
+    // The highest hand-over number this stub has issued.
+    quint64 lastHandover() const { return m_lastHandover; }
+    // When this stub's clock started, on QElapsedTimer's monotonic reference, so times two stubs
+    // stamped can be compared.
+    qint64 clockReferenceMs() const { return m_clock.msecsSinceReference(); }
+
+    // Keeps a daemon's ledger of what the caller holds, as the daemon does: every reply is a
+    // numbered hand-over of its image, a release names a number and ends the claim only if it
+    // covers the newest, and an image held is never served again -- the next one in the sequence
+    // is, or NoFreeImage when every image is held. A claim ending is announced as a FrameReady for
+    // the newest generation served, which is how a refused caller learns to ask again.
+    //
+    // Off by default: the plain stub serves its sequence whatever was released, which hides a
+    // leaked hold -- a later serve and release of the same id clears it. A serveNext() image the
+    // caller still holds is refused, not replaced, and counted in forcedHeld().
+    void respectHolds(QDBusConnection announceOn) { m_announceOn = std::move(announceOn); }
+    int forcedHeld() const { return m_forcedHeld; }
+
+    // Refuses a reply as TooManyDescriptors, as the daemon does, once the descriptors it would carry
+    // and those earlier replies carried that no release has covered would pass `cap`. A release
+    // covers the replies of its image numbered up to the one it names. One caller only: every
+    // charge is the item's. 0, the default, applies no cap.
+    void enforceDescriptorCap(int cap) { m_descriptorCap = cap; }
+    int descriptorRefusals() const { return m_descriptorRefusals; }
+    int descriptorsCharged() const {
+        int total = 0;
+        for (const Charge& charge : m_charges) total += charge.descriptors;
+        return total;
+    }
+    // The images whose claim still stands, ascending.
+    std::vector<quint64> outstanding() const {
+        std::vector<quint64> held;
+        for (const auto& [id, claim] : m_claims) {
+            if (claim.released < claim.newest) held.push_back(id);
+        }
+        return held;
+    }
+    // Every serve (S), refusal for want of a free image (X) and claim ended (R), in order, with the
+    // image and hand-over: the trace a stall is read from.
+    const std::string& ledgerLog() const { return m_ledgerLog; }
     // The generation the next frame served will carry: what a FrameReady announcing it names.
     quint64 nextGeneration() const { return m_generationOffset + static_cast<quint64>(m_served) + 1; }
 
@@ -242,38 +334,44 @@ public:
     bool handleMessage(const QDBusMessage& message, const QDBusConnection& connection) override {
         if (message.interface() != QLatin1String(kInterface)) return false;
         if (message.member() == QLatin1String("ReleaseBuffer")) {
-            const QList<QVariant> args = message.arguments();
-            if (args.size() >= 2) {
-                m_releases.push_back(Release{args.at(0).toInt(), args.at(1).toULongLong()});
-            } else {
+            const ReleaseArgs release = readReleaseArgs(message.arguments());
+            if (!release.ok) {
                 ++m_malformedReleases;
+                return connection.send(message.createErrorReply(QStringLiteral("org.freedesktop.DBus.Error.InvalidArgs"),
+                                                                QStringLiteral("this stub could not read the release")));
             }
+            m_releases.push_back(Release{release.monitorId, release.bufferId, release.handover});
+            std::erase_if(m_charges, [&release](const Charge& charge) {
+                return charge.bufferId == release.bufferId && charge.handover <= release.handover;
+            });
+            if (m_announceOn) releaseClaim(release.bufferId, release.handover);
             return connection.send(message.createReply());
         }
         if (message.member() == QLatin1String("SetImportModifiers")) {
-            const QList<QVariant> args = message.arguments();
-            ModifierReport report;
-            if (args.size() >= 2) {
-                report.drmFormat = args.at(0).toUInt();
-                const QDBusArgument list = args.at(1).value<QDBusArgument>();
-                list.beginArray();
-                while (!list.atEnd()) {
-                    quint64 modifier = 0;
-                    list >> modifier;
-                    report.modifiers.push_back(modifier);
-                }
-                list.endArray();
+            ModifierReportArgs args = readModifierReport(message.arguments());
+            if (!args.ok) {
+                ++m_malformedModifierReports;
+                return connection.send(message.createErrorReply(QStringLiteral("org.freedesktop.DBus.Error.InvalidArgs"),
+                                                                QStringLiteral("this stub could not read the report")));
             }
-            m_modifierReports.push_back(std::move(report));
+            m_modifierReports.push_back(ModifierReport{args.drmFormat, std::move(args.modifiers)});
             return connection.send(message.createReply());
         }
         if (message.member() == QLatin1String("GetAcquireTimeline")) return answerTimeline(message, connection);
-        const bool onTimeline = message.member() == QLatin1String("GetFrameFdOnTimeline");
-        if (!onTimeline && message.member() != QLatin1String("GetFrameFd")) return false;
+        if (message.member() != QLatin1String("GetFrame")) return false;
         // Counted before anything here can go wrong, so "the item asked" and "the stub answered"
         // stay separate verdicts.
         ++m_requests;
+        const FrameRequestArgs request = readFrameRequest(message.arguments());
+        if (!request.ok) {
+            ++m_malformedRequests;
+            return connection.send(message.createErrorReply(QStringLiteral("org.freedesktop.DBus.Error.InvalidArgs"),
+                                                            QStringLiteral("this stub could not read the request")));
+        }
+        const bool onTimeline = request.onTimeline;
         if (onTimeline) ++m_onTimelineRequests;
+        m_asks.push_back(Ask{request.monitorId, request.declared, onTimeline});
+        m_asks.back().arrivedMs = m_clock.elapsed();
         if (!m_refuseWith.isEmpty()) {
             return connection.send(message.createErrorReply(
                 m_refuseWith, QStringLiteral("this stub was told to refuse every further hand-over")));
@@ -283,9 +381,35 @@ public:
                 message.createErrorReply(QStringLiteral("io.wallpaperx.Error.NoFrame"),
                                          QStringLiteral("this stub's frame sequence is exhausted")));
         }
-        const wallpaperx::OffscreenTarget& served =
-            m_serveNext != nullptr ? *std::exchange(m_serveNext, nullptr)
-                                   : *m_sequence[static_cast<size_t>(m_served) % m_sequence.size()];
+        const wallpaperx::OffscreenTarget* forced = std::exchange(m_serveNext, nullptr);
+        const wallpaperx::OffscreenTarget* pick =
+            forced != nullptr ? forced : m_sequence[static_cast<size_t>(m_served) % m_sequence.size()];
+        if (m_announceOn && forced != nullptr &&
+            isHeld(m_bufferIdOverride != 0 ? m_bufferIdOverride : forced->bufferId)) {
+            // A staged image the caller still holds: serving another in its place would grade a reply
+            // the test never staged, so the conflict is refused and counted for the test to report.
+            ++m_forcedHeld;
+            return connection.send(message.createErrorReply(QStringLiteral("io.wallpaperx.Daemon.Error.NoFreeImage"),
+                                                            QStringLiteral("this stub's staged image is held")));
+        }
+        if (m_announceOn && forced == nullptr) {
+            // The next image of the sequence nobody holds, as the daemon draws into the next free one.
+            pick = nullptr;
+            for (size_t step = 0; step < m_sequence.size() && pick == nullptr; ++step) {
+                const wallpaperx::OffscreenTarget* candidate =
+                    m_sequence[(static_cast<size_t>(m_served) + step) % m_sequence.size()];
+                if (!isHeld(m_bufferIdOverride != 0 ? m_bufferIdOverride : candidate->bufferId)) pick = candidate;
+            }
+            if (pick == nullptr) {
+                m_ledgerLog += "X0 ";
+                m_refusedForHolds = true;
+                m_refusedMonitor = request.monitorId;
+                m_asks.back().served = 0;
+                return connection.send(message.createErrorReply(QStringLiteral("io.wallpaperx.Daemon.Error.NoFreeImage"),
+                                                                QStringLiteral("this stub holds no free image")));
+            }
+        }
+        const wallpaperx::OffscreenTarget& served = *pick;
 
         wallpaperx::ExportedFrame frame;
         try {
@@ -301,8 +425,9 @@ public:
                                                             QString::fromStdString(m_exportError)));
         }
 
+        // QDBusUnixFileDescriptor takes its own duplicate.
         QDBusUnixFileDescriptor handle(frame.fd);
-        ::close(frame.fd);  // QDBusUnixFileDescriptor took its own duplicate.
+        ::close(frame.fd);
 
         // The acquire descriptor, exported the way the daemon exports it: a fresh already-signalled
         // binary semaphore per hand-over. Unconditional rather than opt-in, because it is what the
@@ -322,17 +447,38 @@ public:
         // A value only for a request that asked on the timeline this stub granted the caller, as
         // the daemon does; everyone else gets sync_fds and, on the timeline method, a value of 0.
         quint64 value = 0;
+        // What this reply's acquire was made as; counted as sent only once the reply is past the cap.
+        int valuesMade = 0;
+        bool unusableMade = false;
+        m_lateInThisReply = false;
         const auto timeline = m_timelines.find(message.service());
         const bool valued = onTimeline && timeline != m_timelines.end() && timeline->second;
-        if (valued) {
+        const bool ownValued = onTimeline && m_ownTimeline != VK_NULL_HANDLE && message.service() == m_ownCaller;
+        if (ownValued) {
             try {
-                value = timeline->second->signal(served);
-                ++m_valuesSent;
+                value = signalOwnValue();
+                ++valuesMade;
             } catch (const std::exception& e) {
                 m_acquireError = e.what();
             }
-        } else if (!onTimeline && m_valueOnGetFrameFd != 0) {
-            value = m_valueOnGetFrameFd;
+        } else if (valued) {
+            try {
+                value = timeline->second->signal(served);
+                ++valuesMade;
+            } catch (const std::exception& e) {
+                m_acquireError = e.what();
+            }
+        } else if (!onTimeline && m_valueUnasked != 0) {
+            value = m_valueUnasked;
+        } else if (acquireMode == Acquire::Real && m_lateBinaryNext) {
+            m_lateBinaryNext = false;
+            try {
+                const int lateFd = exportLateBinary();
+                syncFds.append(QDBusUnixFileDescriptor(lateFd));
+                ::close(lateFd);
+            } catch (const std::exception& e) {
+                m_acquireError = e.what();
+            }
         } else if (acquireMode == Acquire::Real) {
             try {
                 const int acquireFd = wallpaperx::exportFrameAcquireFd(m_device, served);
@@ -348,10 +494,9 @@ public:
             if (notASemaphore >= 0) {
                 syncFds.append(QDBusUnixFileDescriptor(notASemaphore));
                 ::close(notASemaphore);
-                ++m_unusableAcquiresSent;
+                unusableMade = true;
             }
         }
-        if (acquireMode == Acquire::Real && value == 0) m_acquireFdsSent += static_cast<int>(syncFds.size());
 
         QList<FramePlane> planes;
         for (const wallpaperx::ExportedFramePlane& plane : frame.planes) {
@@ -360,20 +505,69 @@ public:
 
         m_handleType = frame.type == wallpaperx::ExportedFrame::HandleType::DmaBuf ? 1 : 0;
         m_lastModifier = frame.modifier;
+        const quint64 bufferId = m_bufferIdOverride != 0 ? m_bufferIdOverride : frame.bufferId;
+        // A value counts only for a request that asked for one, as on the daemon, which sends none
+        // otherwise: one sent unasked is an acquire the caller does not read.
+        const bool carriesAcquire = (onTimeline && value != 0) || !syncFds.isEmpty();
+        const bool declared = std::find(request.declared.begin(), request.declared.end(), bufferId) !=
+                              request.declared.end();
+        QList<QDBusUnixFileDescriptor> memory;
+        switch (m_memoryRule) {
+            case Memory::Daemon:
+                if (!(declared && carriesAcquire)) memory.append(handle);
+                break;
+            case Memory::Always:
+                memory.append(handle);
+                break;
+            case Memory::OmitUndeclared:
+                break;
+            case Memory::Twice:
+                memory.append(handle);
+                memory.append(handle);
+                break;
+        }
+        // The daemon's cap on descriptors sent and not given back, applied as the daemon applies it:
+        // what this reply would carry, admitted against what earlier replies carried and no release
+        // has covered yet.
+        const int carried = static_cast<int>(memory.size() + syncFds.size());
+        if (m_descriptorCap > 0 && descriptorsCharged() + carried > m_descriptorCap) {
+            ++m_descriptorRefusals;
+            return connection.send(
+                message.createErrorReply(QStringLiteral("io.wallpaperx.Daemon.Error.TooManyDescriptors"),
+                                         QStringLiteral("this stub's caller holds too many descriptors")));
+        }
+        // Past the cap, so the reply goes out (or is held to go out): only now is its acquire sent.
+        m_valuesSent += valuesMade;
+        if (unusableMade) ++m_unusableAcquiresSent;
+        if (acquireMode == Acquire::Real && value == 0) m_acquireFdsSent += static_cast<int>(syncFds.size());
+        if (m_lateInThisReply) m_lateDelivered = true;
         ++m_served;
         // One generation per frame served, starting at 1. The item ignores a FrameReady naming a
         // generation it already holds, so a stub that answered 1 for every frame could never be
         // made to fetch a second one.
         const quint64 generation = m_generationOffset + static_cast<quint64>(m_served);
+        if (memory.isEmpty()) ++m_memoryOmitted;
+        // One number per reply, from a sequence that only rises, as the daemon's does.
+        const quint64 handover = ++m_lastHandover;
+        if (m_descriptorCap > 0 && carried > 0) m_charges.push_back(Charge{bufferId, handover, carried});
+        m_asks.back().served = bufferId;
+        m_asks.back().memorySent = !memory.isEmpty();
+        m_asks.back().handover = handover;
+        if (m_announceOn) {
+            m_claims[bufferId].newest = handover;
+            m_claims[bufferId].monitorId = request.monitorId;
+            m_newestByMonitor[request.monitorId] = generation;
+            m_refusedForHolds = false;
+            m_ledgerLog += "S" + std::to_string(bufferId) + "#" + std::to_string(handover) + " ";
+        }
         // Both taken from the export rather than invented: the importer refuses a frame whose
         // device is not the one this context runs on, and these tests import for real.
-        QList<QVariant> fields =
-            frameReplyFields(handle, frame.width, frame.height, frame.memorySize, m_handleType, generation,
+        const QList<QVariant> fields =
+            frameReplyFields(memory, frame.width, frame.height, frame.memorySize, m_handleType, generation,
                              frame.drmFormat, frame.modifier, planes,
                              QByteArray(reinterpret_cast<const char*>(frame.deviceUuid.data()),
                                         static_cast<qsizetype>(frame.deviceUuid.size())),
-                             m_bufferIdOverride != 0 ? m_bufferIdOverride : frame.bufferId, syncFds);
-        if (onTimeline || value != 0) fields.append(QVariant::fromValue(static_cast<qulonglong>(value)));
+                             bufferId, handover, syncFds, value);
         const QDBusMessage reply = message.createReply(fields);
         if (m_holdEvery) {
             m_heldQueue.emplace_back(connection, reply);
@@ -390,6 +584,10 @@ public:
     }
 
     int requests() const { return m_requests; }
+    // Requests whose arguments this stub could not read, answered InvalidArgs.
+    int malformedRequests() const { return m_malformedRequests; }
+    // The same for SetImportModifiers.
+    int malformedModifierReports() const { return m_malformedModifierReports; }
     int served() const { return m_served; }
     int handleType() const { return m_handleType; }
     // The DRM format modifier of the last frame served: the layout a withdrawal would name.
@@ -411,7 +609,200 @@ public:
     // How many replies went out with an acquire the importer cannot wait on.
     int unusableAcquiresSent() const { return m_unusableAcquiresSent; }
 
+    // GetAcquireTimeline hands out this stub's own exportable timeline semaphore instead of an
+    // AcquireTimeline, one caller only, so a value's signal can be submitted and yet held back on
+    // the GPU (lateValueNext()). Set before the item asks.
+    void ownTimelines() { m_ownTimelines = true; }
+    // The next value handed out on the stub's own timeline is signalled by a batch submitted at
+    // once, behind a gate the host opens in signalLateValue() and behind `drawWhileHeld`, which is
+    // called between the two submissions: a producer whose drawing and signal are on their way but
+    // not done. The signal is SUBMITTED before the item can wait on it, since nothing may wait on a
+    // signal not yet submitted -- measured on this driver, such a wait does not hold the reader.
+    // `drawWhileHeld` must not wait on the device: the gate holds the queue.
+    void lateValueNext(std::function<void()> drawWhileHeld) {
+        m_lateValueNext = true;
+        m_drawWhileHeld = std::move(drawWhileHeld);
+    }
+    // The same for the next reply sent as sync_fds: its binary semaphore's signal is submitted
+    // behind the gate and `drawWhileHeld`, and exported while pending. Opened by signalLateValue().
+    void lateBinaryNext(std::function<void()> drawWhileHeld) {
+        m_lateBinaryNext = true;
+        m_drawWhileHeld = std::move(drawWhileHeld);
+    }
+    // Whether the late acquire went into a reply past the descriptor cap: sent, or held by this stub to
+    // be sent. A reply the cap refused does not count. A failure making it is in acquireError().
+    bool lateValueSent() const { return m_lateDelivered; }
+    bool signalLateValue(std::string& why) {
+        if (!m_latePending) {
+            why = "no late value was handed out";
+            return false;
+        }
+        VkSemaphoreSignalInfo open{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO};
+        open.semaphore = m_gate;
+        open.value = m_gateValue;
+        if (const VkResult r = vkSignalSemaphore(m_device.device(), &open); r != VK_SUCCESS) {
+            why = "vkSignalSemaphore on the gate returned " + std::to_string(static_cast<int>(r));
+            return false;
+        }
+        try {
+            m_device.wait(m_lateTicket);
+        } catch (const std::exception& e) {
+            why = e.what();
+            return false;
+        }
+        m_latePending = false;
+        return true;
+    }
+    ~ExportingStub() override {
+        if (m_latePending) {
+            std::string ignored;
+            signalLateValue(ignored);
+        }
+        if (m_gate != VK_NULL_HANDLE) vkDestroySemaphore(m_device.device(), m_gate, nullptr);
+        if (m_ownTimeline != VK_NULL_HANDLE) vkDestroySemaphore(m_device.device(), m_ownTimeline, nullptr);
+        if (m_lateBinary != VK_NULL_HANDLE) vkDestroySemaphore(m_device.device(), m_lateBinary, nullptr);
+    }
+
 private:
+    // A timeline semaphore at value 0, exportable as an opaque fd when `exportable`.
+    VkSemaphore makeTimeline(bool exportable) {
+        VkExportSemaphoreCreateInfo exportInfo{VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO};
+        exportInfo.handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT;
+        VkSemaphoreTypeCreateInfo type{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
+        type.pNext = exportable ? &exportInfo : nullptr;
+        type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+        VkSemaphoreCreateInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+        info.pNext = &type;
+        VkSemaphore semaphore = VK_NULL_HANDLE;
+        if (vkCreateSemaphore(m_device.device(), &info, nullptr, &semaphore) != VK_SUCCESS) return VK_NULL_HANDLE;
+        return semaphore;
+    }
+    // An opaque-fd export of `semaphore`. Throws when the driver gives none.
+    int exportSemaphoreFd(VkSemaphore semaphore) {
+        const auto getFd =
+            reinterpret_cast<PFN_vkGetSemaphoreFdKHR>(vkGetDeviceProcAddr(m_device.device(), "vkGetSemaphoreFdKHR"));
+        VkSemaphoreGetFdInfoKHR fdInfo{VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR};
+        fdInfo.semaphore = semaphore;
+        fdInfo.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT;
+        int fd = -1;
+        if (getFd == nullptr || getFd(m_device.device(), &fdInfo, &fd) != VK_SUCCESS || fd < 0) {
+            throw std::runtime_error("the stub could not export a semaphore descriptor");
+        }
+        return fd;
+    }
+    // Submits `scope` behind the gate signalLateValue() opens, with `drawWhileHeld` run between the
+    // two submissions. m_latePending is set once the work is queued, whatever happens after: the
+    // destructor must open the gate before it destroys anything that work waits on.
+    void submitBehindGate(const wallpaperx::Device::SubmitScope& scope) {
+        wallpaperx::Device::SubmitScope gate;
+        gate.timelineWait.emplace_back(m_gate, ++m_gateValue, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+        m_device.submit([](VkCommandBuffer) {}, gate);
+        if (m_drawWhileHeld) std::exchange(m_drawWhileHeld, nullptr)();
+        m_lateTicket = m_device.submit([](VkCommandBuffer) {}, scope);
+        m_latePending = true;
+    }
+    int exportOwnTimeline() {
+        if (m_ownTimeline == VK_NULL_HANDLE) m_ownTimeline = makeTimeline(true);
+        if (m_gate == VK_NULL_HANDLE) m_gate = makeTimeline(false);
+        if (m_ownTimeline == VK_NULL_HANDLE || m_gate == VK_NULL_HANDLE) {
+            throw std::runtime_error("the stub could not make its own timeline");
+        }
+        return exportSemaphoreFd(m_ownTimeline);
+    }
+    // The next value on the stub's own timeline, signalled after everything already submitted --
+    // the render that published the picture among it -- and, for a late value, only once the gate
+    // opens. An ordinary value is waited for, as the daemon waits before it answers.
+    quint64 signalOwnValue() {
+        const quint64 value = ++m_ownValue;
+        wallpaperx::Device::SubmitScope scope;
+        scope.timelineSignal.emplace_back(m_ownTimeline, value);
+        if (m_lateValueNext) {
+            m_lateValueNext = false;
+            submitBehindGate(scope);
+            m_lateInThisReply = true;
+        } else {
+            m_device.wait(m_device.submit([](VkCommandBuffer) {}, scope));
+        }
+        return value;
+    }
+
+    // A binary semaphore whose signal is submitted behind the gate, exported while pending. Throws
+    // when the driver cannot make or export one.
+    int exportLateBinary() {
+        if (m_gate == VK_NULL_HANDLE) m_gate = makeTimeline(false);
+        VkExportSemaphoreCreateInfo exportInfo{VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO};
+        exportInfo.handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT;
+        VkSemaphoreCreateInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+        info.pNext = &exportInfo;
+        if (m_gate == VK_NULL_HANDLE || m_lateBinary != VK_NULL_HANDLE ||
+            vkCreateSemaphore(m_device.device(), &info, nullptr, &m_lateBinary) != VK_SUCCESS) {
+            throw std::runtime_error("the stub could not make the late acquire semaphore");
+        }
+        wallpaperx::Device::SubmitScope scope;
+        scope.signal = {m_lateBinary};
+        submitBehindGate(scope);
+        const int fd = exportSemaphoreFd(m_lateBinary);
+        m_lateInThisReply = true;
+        return fd;
+    }
+
+    bool m_lateDelivered = false;
+    bool m_lateInThisReply = false;  // the reply being built carries the late acquire
+    bool m_lateBinaryNext = false;
+    VkSemaphore m_lateBinary = VK_NULL_HANDLE;
+    bool m_ownTimelines = false;
+    QString m_ownCaller;
+    VkSemaphore m_ownTimeline = VK_NULL_HANDLE;
+    VkSemaphore m_gate = VK_NULL_HANDLE;
+    quint64 m_ownValue = 0;
+    quint64 m_gateValue = 0;
+    bool m_lateValueNext = false;
+    std::function<void()> m_drawWhileHeld;
+    bool m_latePending = false;
+    wallpaperx::Device::SubmitTicket m_lateTicket;
+
+    struct Claim {
+        quint64 newest = 0;
+        quint64 released = 0;
+        int monitorId = kFirstMonitor;  // the monitor its newest reply was served for
+    };
+
+    // One reply's descriptors, charged until a release covers it.
+    struct Charge {
+        quint64 bufferId = 0;
+        quint64 handover = 0;
+        int descriptors = 0;
+    };
+    int m_descriptorCap = 0;
+    std::vector<Charge> m_charges;
+    int m_descriptorRefusals = 0;
+    int m_forcedHeld = 0;
+    int m_malformedModifierReports = 0;
+    int m_refusedMonitor = kFirstMonitor;
+
+    bool isHeld(quint64 bufferId) const {
+        const auto it = m_claims.find(bufferId);
+        return it != m_claims.end() && it->second.released < it->second.newest;
+    }
+
+    void releaseClaim(quint64 bufferId, quint64 handover) {
+        const auto it = m_claims.find(bufferId);
+        if (it == m_claims.end() || it->second.released >= it->second.newest) return;
+        it->second.released = std::max(it->second.released, handover);
+        if (it->second.released < it->second.newest) return;
+        m_ledgerLog += "R" + std::to_string(bufferId) + "#" + std::to_string(handover) + " ";
+        // The frame a caller refused for want of a free image was asking for, on the monitor it asked
+        // for, if one was; otherwise the newest served on the monitor this image was, which a caller
+        // that has it ignores.
+        const int monitorId = m_refusedForHolds ? m_refusedMonitor : it->second.monitorId;
+        const quint64 generation = m_refusedForHolds ? m_generationOffset + static_cast<quint64>(m_served) + 1
+                                                     : m_newestByMonitor[monitorId];
+        QDBusMessage ready = QDBusMessage::createSignal(QString::fromUtf8(kPath), QString::fromUtf8(kInterface),
+                                                        QStringLiteral("FrameReady"));
+        ready.setArguments({monitorId, static_cast<qulonglong>(generation)});
+        m_announceOn->send(ready);
+    }
+
     bool answerTimeline(const QDBusMessage& message, const QDBusConnection& connection) {
         m_askTimesMs.push_back(m_clock.elapsed());
         if (m_timelineRefusals > 0) {
@@ -422,6 +813,21 @@ private:
         if (m_timelineMode == Timeline::Absent) {
             return connection.send(message.createErrorReply(QStringLiteral("org.freedesktop.DBus.Error.UnknownMethod"),
                                                             QStringLiteral("no method GetAcquireTimeline here")));
+        }
+        if (m_ownTimelines && m_timelineMode == Timeline::Grant) {
+            int own = -1;
+            try {
+                own = exportOwnTimeline();
+            } catch (const std::exception& e) {
+                m_acquireError = e.what();
+                return connection.send(message.createErrorReply(QStringLiteral("io.wallpaperx.Daemon.Error.Unsupported"),
+                                                                QString::fromStdString(m_acquireError)));
+            }
+            m_ownCaller = message.service();
+            QDBusUnixFileDescriptor handle(own);
+            ::close(own);
+            ++m_timelinesGranted;
+            return connection.send(message.createReply(QList<QVariant>{QVariant::fromValue(handle)}));
         }
         std::unique_ptr<wallpaperx::AcquireTimeline>& timeline = m_timelines[message.service()];
         try {
@@ -436,6 +842,10 @@ private:
                                                             QString::fromStdString(m_acquireError)));
         }
         if (m_timelineMode == Timeline::Silent) return true;  // registered, and the answer never comes
+        if (m_timelineMode == Timeline::Late) {
+            m_heldTimelineAsks.emplace_back(connection, message);
+            return true;
+        }
         int fd = timeline->exportFd();
         if (m_timelineMode == Timeline::BadDescriptor) {
             ::close(fd);
@@ -448,12 +858,23 @@ private:
     }
 
     bool m_holdEvery = false;
+    quint64 m_lastHandover = 0;
+    std::optional<QDBusConnection> m_announceOn;
+    std::map<quint64, Claim> m_claims;
+    std::map<int, quint64> m_newestByMonitor;  // the newest generation served on each monitor
+    bool m_refusedForHolds = false;
+    std::string m_ledgerLog;
     std::vector<std::pair<QDBusConnection, QDBusMessage>> m_heldQueue;
+    std::vector<std::pair<QDBusConnection, QDBusMessage>> m_heldTimelineAsks;
     Timeline m_timelineMode = Timeline::Absent;
     int m_timelineRefusals = 0;
     QString m_timelineRefusal;
     int m_advanceOnGrant = 0;
-    quint64 m_valueOnGetFrameFd = 0;
+    quint64 m_valueUnasked = 0;
+    Memory m_memoryRule = Memory::Daemon;
+    std::vector<Ask> m_asks;
+    int m_memoryOmitted = 0;
+    int m_malformedRequests = 0;
     quint64 m_generationOffset = 0;
     std::vector<qint64> m_askTimesMs;
     int m_timelinesGranted = 0;
@@ -537,6 +958,10 @@ Item {
     // Read only by the "never imported" skip, so that a run which could not set up says what the
     // item thought was wrong instead of naming nothing.
     property string publishedReason: renderer.unavailableReason
+    // Every reason the item published, in order, for a phase whose reason changes again within one
+    // turn of the event loop.
+    property string reasonsSeen: ""
+    onPublishedReasonChanged: reasonsSeen += "[" + publishedReason + "]"
 
     WallpaperXRenderer {
         id: renderer

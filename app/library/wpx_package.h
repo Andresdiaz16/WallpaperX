@@ -2,6 +2,8 @@
 
 #pragma once
 
+#include "unique_fd.h"
+
 #include <QByteArray>
 #include <QList>
 #include <QString>
@@ -174,6 +176,15 @@ FileStamp stampFrom(const struct stat& st);
 // What `fd` holds from its offset to the end: EFBIG when that is more than `maxBytes`, else the
 // errno of a failed read.
 std::expected<QByteArray, int> readToEnd(int fd, qint64 maxBytes);
+
+// openRegularFile's error for a name that is there but is not a regular file; never an errno.
+inline constexpr int kNotRegularFile = -1;
+// `name`, relative to `dirfd` or AT_FDCWD, opened with `flags` only once it is known to be a regular
+// file; O_NOFOLLOW in `flags` refuses a link. Found with O_PATH, which opens nothing, checked through
+// that descriptor and opened through it, so a device or FIFO put under the name meanwhile is never
+// opened. Always non-blocking, so a file under another process's write lease is EWOULDBLOCK rather
+// than a wait. The error is an errno or kNotRegularFile.
+std::expected<UniqueFd, int> openRegularFile(int dirfd, const char* name, int flags);
 // Nothing when `path` cannot be stat'ed.
 std::optional<FileStamp> stampOf(const QString& path);
 

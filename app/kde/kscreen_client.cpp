@@ -75,14 +75,16 @@ void KScreenClient::onLauncherOwnerChanged(const QString&, const QString& oldOwn
     // The launcher can stop on its own in a normal session, so it is read once more, which starts
     // it again. Losing that one too before it stayed up ends there, so a launcher that crashes on
     // start, or exits after each answer, is started at most twice.
+    // A name handed straight to a new owner starts nothing, so it is read again without spending
+    // the retry.
     if (!oldOwner.isEmpty()) {
         m_launcherStayUp.stop();
-        if (m_launcherRetrySpent) {
+        if (m_launcherRetrySpent && newOwner.isEmpty()) {
             ++m_generation;
-            settle(State::Unavailable, QStringLiteral("KDE's display configuration service (KScreen) keeps stopping."), {});
+            settle(State::Unavailable, QStringLiteral("KDE's display configuration service (KScreen) keeps stopping."));
         } else {
-            m_launcherRetrySpent = true;
-            settle(State::Loading, {}, {});
+            m_launcherRetrySpent = m_launcherRetrySpent || newOwner.isEmpty();
+            settle(State::Loading, {});
             refresh();
         }
     }
@@ -95,11 +97,11 @@ void KScreenClient::onLauncherOwnerChanged(const QString&, const QString& oldOwn
 
 Monitor KScreenClient::selectedMonitor() const
 {
-    if (!m_selection) {
+    if (!m_selection || m_state != State::Ready) {
         return {};
     }
-    const auto it = std::ranges::find(m_monitors, *m_selection, &Monitor::outputName);
-    return (it == m_monitors.end() || !it->selectable()) ? Monitor{} : *it;
+    const auto it = std::ranges::find(m_answer, *m_selection, &Monitor::outputName);
+    return (it == m_answer.end() || !it->selectable()) ? Monitor{} : *it;
 }
 
 QDBusMessage KScreenClient::call(const QString& path, const QString& interface, const QString& method) const
@@ -111,7 +113,7 @@ void KScreenClient::refresh()
 {
     const quint64 generation = ++m_generation;
     if (m_state == State::Unavailable) {
-        settle(State::Loading, {}, {});
+        settle(State::Loading, {});
     }
 
     QDBusMessage request = call(QString::fromLatin1(kLauncherPath), QString::fromLatin1(kLauncherInterface),
@@ -122,12 +124,12 @@ void KScreenClient::refresh()
             return;
         }
         if (reply.type() == QDBusMessage::ErrorMessage) {
-            settle(State::Unavailable, describe(QDBusError(reply)), {});
+            settle(State::Unavailable, describe(QDBusError(reply)));
             return;
         }
         const QVariantList args = reply.arguments();
         if (args.size() != 1 || args.front().metaType().id() != QMetaType::Bool || !args.front().toBool()) {
-            settle(State::Unavailable, QStringLiteral("KScreen could not load a display backend."), {});
+            settle(State::Unavailable, QStringLiteral("KScreen could not load a display backend."));
             return;
         }
         requestConfig(generation);
@@ -143,29 +145,28 @@ void KScreenClient::requestConfig(quint64 generation)
             return;
         }
         if (reply.type() == QDBusMessage::ErrorMessage) {
-            settle(State::Unavailable, describe(QDBusError(reply)), {});
+            settle(State::Unavailable, describe(QDBusError(reply)));
             return;
         }
         const QVariantList args = reply.arguments();
         const QVariant config = args.size() == 1 ? plainVariant(args.front()) : QVariant();
         if (config.metaType().id() != QMetaType::QVariantMap) {
-            settle(State::Unavailable, QStringLiteral("KScreen answered with something other than a configuration."), {});
+            settle(State::Unavailable, QStringLiteral("KScreen answered with something other than a configuration."));
             return;
         }
         auto monitors = parseKScreenConfig(config.toMap());
         if (!monitors) {
-            settle(State::Unavailable, monitors.error(), {});
+            settle(State::Unavailable, monitors.error());
             return;
         }
-        keepKnownNames(*monitors, m_monitors);
-        settle(State::Ready, {}, std::move(*monitors));
+        settleReady(std::move(*monitors));
         requestMonitorNames(generation);
     });
 }
 
 void KScreenClient::requestMonitorNames(quint64 generation)
 {
-    for (const Monitor& monitor : std::as_const(m_monitors)) {
+    for (const Monitor& monitor : std::as_const(m_answer)) {
         // An empty connector has no panel to name.
         if (monitor.kscreenId < 0 || !monitor.connected) {
             continue;
@@ -179,8 +180,8 @@ void KScreenClient::requestMonitorNames(quint64 generation)
             if (!isCurrent(generation) || reply.type() == QDBusMessage::ErrorMessage || reply.arguments().size() != 1) {
                 return;
             }
-            const auto it = std::ranges::find(m_monitors, id, &Monitor::kscreenId);
-            if (it == m_monitors.end()) {
+            const auto it = std::ranges::find(m_answer, id, &Monitor::kscreenId);
+            if (it == m_answer.end()) {
                 return;
             }
             // An EDID without a name is an answer too: a name carried from the last read gives way.
@@ -198,14 +199,27 @@ void KScreenClient::requestMonitorNames(quint64 generation)
     }
 }
 
-void KScreenClient::settle(State state, QString reason, QList<Monitor> monitors)
+void KScreenClient::settle(State state, QString reason)
 {
-    const Monitor previousSelection = selectedMonitor();
-    const bool stateChanges = m_state != state || m_unavailableReason != reason;
-    const bool monitorsChange = m_monitors != monitors;
+    Q_ASSERT(state != State::Ready);
+    const Shown before = shown();
     m_state = state;
     m_unavailableReason = std::move(reason);
-    m_monitors = std::move(monitors);
+    settled(before);
+}
+
+void KScreenClient::settleReady(QList<Monitor> answer)
+{
+    const Shown before = shown();
+    keepKnownNames(answer, m_answer);
+    m_state = State::Ready;
+    m_unavailableReason.clear();
+    m_answer = std::move(answer);
+    settled(before);
+}
+
+void KScreenClient::settled(const Shown& before)
+{
     // Not restarted by a later answer: the period measures how long this launcher has been up,
     // and a burst of configChanged reads would otherwise keep postponing the re-arm.
     if (m_state == State::Ready && m_launcherRetrySpent && !m_launcherStayUp.isActive()) {
@@ -219,29 +233,29 @@ void KScreenClient::settle(State state, QString reason, QList<Monitor> monitors)
             if (selectedMonitor().outputName.isEmpty()) {
                 m_selection->clear();
             }
-        } else if (std::ranges::count_if(m_monitors, &Monitor::selectable) == 1) {
-            m_selection = std::ranges::find_if(m_monitors, &Monitor::selectable)->outputName;
+        } else if (std::ranges::count_if(m_answer, &Monitor::selectable) == 1) {
+            m_selection = std::ranges::find_if(m_answer, &Monitor::selectable)->outputName;
         }
     }
-    const bool selectionChanges = selectedMonitor() != previousSelection;
 
     // Emitted after every field is written, so no handler sees a state paired with the
     // previous answer's monitors.
-    if (stateChanges) {
+    if (m_state != before.state || m_unavailableReason != before.reason) {
         emit stateChanged();
     }
-    if (monitorsChange) {
+    if (monitors() != before.monitors) {
         emit monitorsChanged();
     }
-    if (selectionChanges) {
+    if (selectedMonitor() != before.selection) {
         emit selectionChanged();
     }
 }
 
 bool KScreenClient::select(const QString& outputName)
 {
-    const auto it = std::ranges::find(m_monitors, outputName, &Monitor::outputName);
-    if (it == m_monitors.end() || !it->selectable()) {
+    const QList<Monitor> shownMonitors = monitors();
+    const auto it = std::ranges::find(shownMonitors, outputName, &Monitor::outputName);
+    if (it == shownMonitors.end() || !it->selectable()) {
         return false;
     }
     if (selectedOutput() != outputName) {

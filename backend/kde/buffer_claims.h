@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -20,44 +21,83 @@ namespace wallpaperx {
 //
 // Free of Qt, like the importer beside it, so the decision can be graded without a bus, a window
 // or a GPU. Its mutex is a leaf: nothing here calls out.
+//
+// It is also the process's one record of which daemon it is speaking to, kept with the claims
+// because a claim means something only against that daemon, and two records could disagree.
 class BufferClaims {
 public:
+    // A daemon lifetime: the stretch between two owner changes of the bus name, numbered, and the
+    // unique name that owned it -- empty when nobody did. A unique name is never reused, so a
+    // release addressed to it cannot reach a successor.
+    //
+    // Lifetime 0 is the stretch before the bus has said who owns the name. Its owner is empty
+    // because it is not known, so nothing may be asked of the daemon in it.
+    struct Daemon {
+        uint64_t lifetime = 0;
+        std::string owner;
+    };
+
     // One hand-over, from the reply that granted it to the import whose end gives it back.
     //
-    // `daemon` numbers the daemon lifetimes this process has watched go by. Buffer ids restart
-    // when the daemon does, so without it a release could name an image the CURRENT daemon has
-    // handed to somebody -- this process included -- and take it out from under its reader.
+    // `daemon` is the lifetime the granting request was asked in. Buffer ids restart when the
+    // daemon does, so without it a release could name an image the CURRENT daemon has handed to
+    // somebody -- this process included -- and take it out from under its reader.
     struct Claim {
         uint64_t daemon = 0;
         int monitorId = -1;
         uint64_t bufferId = 0;
 
-        // The unique bus name that granted it, which is where the release must be addressed:
-        // the well-known name can have moved to a successor by the time one is sent. Empty when
-        // the caller had no owner to name, and then the well-known name is all there is.
-        std::string owner;
-
         // A daemon never issues buffer id 0, so it is the "nothing claimed" state and no second
         // field is needed to say so.
         bool held() const { return bufferId != 0; }
+        bool operator==(const Claim&) const = default;
     };
 
-    // Records that the daemon has handed `bufferId` over. A `bufferId` of 0 records nothing and
-    // returns an unheld claim, so a caller reading a reply need not branch before asking.
+    // What to tell the daemon when an image is given back: who, and the newest hand-over of it this
+    // process has taken -- which gives back every one up to it, and none the daemon made since.
+    struct Release {
+        std::string owner;
+        uint64_t handover = 0;
+    };
+
+    // A reply taken: the claim it granted, and the earlier hand-over of the same image it supersedes,
+    // when this process still holds an import of that image.
     //
-    // `owner` is carried on the claim and nowhere else: it is the release's destination, not part
-    // of what identifies a claim, which is what `daemon` is for.
-    Claim take(int monitorId, uint64_t bufferId, std::string owner = {});
+    // `superseded` must be sent at once. The daemon charges every reply's descriptors until a release
+    // names it, and this ledger otherwise names a hand-over only when the last import of its image
+    // ends -- which for an image re-fetched while it stays on screen is never, until the daemon
+    // refuses this process every picture. It names a number below the reply just taken, so it only
+    // ever gives back replies already read and never ends the claim that reply holds.
+    struct Taken {
+        Claim claim;
+        std::optional<Release> superseded;
+    };
 
-    // Gives one back. True only when this was the LAST live import of that image, which is the
-    // one moment the daemon may be told. False for a claim already given back, and for one
-    // granted by a daemon that has since been replaced -- its ledger went with it.
-    bool giveBack(const Claim& claim);
+    // Records that the daemon of lifetime `daemon` has handed `bufferId` over as hand-over number
+    // `handover`. A `bufferId` of 0 records nothing and returns an unheld claim, so a caller reading
+    // a reply need not branch before asking. A claim from a lifetime that has ended, or one with no
+    // owner to give it back to, is returned unrecorded: it still names the image, which is what an
+    // import of it is found by, but no daemon's ledger holds it. Replies must be taken in the order
+    // they arrived, or a release could name a hand-over this process has not read.
+    [[nodiscard]] Taken take(uint64_t daemon, int monitorId, uint64_t bufferId, uint64_t handover);
 
-    // A different process owns the daemon's bus name now. Every claim the previous one granted is
-    // dropped without being released: there is nobody left to tell, and those ids are about to be
-    // handed out again by the new daemon.
-    void daemonReplaced();
+    // Gives one back. The release to send only when this was the LAST live import of that image,
+    // which is the one moment the daemon may be told. Nothing for a claim already given back, and
+    // for one granted by a daemon since replaced.
+    std::optional<Release> giveBack(const Claim& claim);
+
+    // The bus reports that `owner` -- empty for nobody -- owns the daemon's name now. A new
+    // lifetime, and every claim the previous one granted is dropped without being released: there
+    // is nobody left to tell, and those ids are about to be handed out again by the new daemon.
+    // Every report is a change: the caller must report each one once.
+    void daemonReplaced(std::string owner);
+
+    // The bus's answer to who owned the name when this process started watching it -- empty for
+    // nobody -- which begins the first known lifetime. False, changing nothing, once a change has
+    // been reported: those reports are newer.
+    bool daemonNamed(std::string owner);
+
+    Daemon currentDaemon();
 
     // The process's ledger. Never destroyed: the scene graph can tear a texture down at any point
     // during exit, and that teardown reads this.
@@ -68,12 +108,14 @@ private:
         int monitorId = -1;
         uint64_t bufferId = 0;
         int imports = 0;
+        uint64_t newest = 0;
     };
 
     std::mutex m_mutex;
-    // Every entry was granted by m_daemon, since daemonReplaced() drops the rest. That invariant
-    // is what stops a reused buffer id from matching a claim that outlived its daemon.
-    uint64_t m_daemon = 0;
+    // Every entry was granted by m_daemon, whose owner is not empty, since take() records no other
+    // and daemonReplaced() drops the rest. That invariant is what stops a reused buffer id from
+    // matching a claim that outlived its daemon, and a release from going out unaddressed.
+    Daemon m_daemon;
     std::vector<Entry> m_entries;
 };
 

@@ -467,6 +467,10 @@ target_link_libraries(wallpaperx-log-escape-test PRIVATE wallpaperx-daemon-lib)
 add_executable(wallpaperx-config-store-test tests/config_store_test.cpp)
 target_link_libraries(wallpaperx-config-store-test PRIVATE wallpaperx-daemon-lib)
 
+# Each caller's share of the render worker's queue, on the manager's record alone.
+add_executable(wallpaperx-request-share-test tests/request_share_test.cpp)
+target_link_libraries(wallpaperx-request-share-test PRIVATE wallpaperx-daemon-lib)
+
 # The same trade the http-server test makes above, for the same measured reason. S10.16's
 # allocation half has one lever -- std::thread's constructor allocates before it asks the kernel
 # for anything -- and reaching it means replacing ::operator new/delete in this binary. A
@@ -558,6 +562,11 @@ target_include_directories(wallpaperx-kpackage-metadata-test PRIVATE ${CMAKE_CUR
 # is the only way the test can find them; without it there is nothing to look at.
 target_compile_definitions(wallpaperx-kpackage-metadata-test PRIVATE
     WALLPAPERX_BACKEND_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+    # The install rules as CMake evaluated them for this tree. A rule sealed inside an if() no build
+    # satisfies still reads as live in the source text, and is absent here. Meaningful only where the
+    # plugin is built: elsewhere the package rule is rightly absent.
+    WALLPAPERX_INSTALL_SCRIPT="${CMAKE_CURRENT_BINARY_DIR}/cmake_install.cmake"
+    WALLPAPERX_KDE_PLUGIN_BUILT=$<BOOL:${WALLPAPERX_BUILD_KDE_PLUGIN}>
 )
 
 # The QML the wallpaper package ships (kde/kpackage/contents/ui/) put through Qt's QML linter.
@@ -908,6 +917,17 @@ target_compile_definitions(wallpaperx-daemon-system-test PRIVATE
     WALLPAPERX_WEDGE_SHIM="$<TARGET_FILE:wallpaperx-test-wedge-shim>")
 add_dependencies(wallpaperx-daemon-system-test wallpaperx-test-wedge-shim)
 
+# daemon_system_test's frameAllocationFailure phase fails one chosen allocation on the daemon's
+# frame-reply thread (tests/alloc_fail_shim.cpp). Test-only, and inert unless the test names the
+# control file it arms.
+add_library(wallpaperx-test-alloc-fail-shim SHARED tests/alloc_fail_shim.cpp)
+target_link_libraries(wallpaperx-test-alloc-fail-shim PRIVATE ${CMAKE_DL_LIBS})
+target_include_directories(wallpaperx-test-alloc-fail-shim PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+set_target_properties(wallpaperx-test-alloc-fail-shim PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+target_compile_definitions(wallpaperx-daemon-system-test PRIVATE
+    WALLPAPERX_ALLOC_FAIL_SHIM="$<TARGET_FILE:wallpaperx-test-alloc-fail-shim>")
+add_dependencies(wallpaperx-daemon-system-test wallpaperx-test-alloc-fail-shim)
+
 # The device-loss exit needs a lost device in the real daemon, and hanging a real GPU takes
 # the desktop with it: a library preloaded into it that fails the daemon's queue submissions as
 # VK_ERROR_DEVICE_LOST once a trigger file exists. Test-only, like the wedge shim; Vulkan's headers
@@ -934,20 +954,22 @@ target_compile_definitions(wallpaperx-device-lost-shim-test PRIVATE
     WALLPAPERX_DEVICE_LOST_SHIM="$<TARGET_FILE:wallpaperx-test-device-lost-shim>")
 add_dependencies(wallpaperx-device-lost-shim-test wallpaperx-test-device-lost-shim)
 # AddressSanitizer refuses to start unless its runtime is first in the initial library list, and
-# the child this entry runs preloads the shim; the test keeps an inherited LD_PRELOAD ahead of it.
-# Set after the wrapper's `--`, through env, so it reaches the test alone: in the entry's
-# environment it would reach /bin/sh and the bus as well, whose exit the leak checker reports.
-set(_wx_device_lost_preload "")
+# the children of this entry and of daemon_system preload shims; each test keeps an inherited
+# LD_PRELOAD ahead of them. Set after the wrapper's `--`, through env, so it reaches the test alone:
+# in the entry's environment it would reach /bin/sh and the bus as well, whose exit the leak checker
+# reports.
+set(_wx_asan_preload "")
 if(WALLPAPERX_SANITIZE STREQUAL "address")
     execute_process(COMMAND ${CMAKE_CXX_COMPILER} -print-file-name=libasan.so
                     OUTPUT_VARIABLE _wx_asan_runtime OUTPUT_STRIP_TRAILING_WHITESPACE)
     if(IS_ABSOLUTE "${_wx_asan_runtime}" AND EXISTS "${_wx_asan_runtime}")
-        set(_wx_device_lost_preload env "LD_PRELOAD=${_wx_asan_runtime}")
+        set(_wx_asan_preload env "LD_PRELOAD=${_wx_asan_runtime}")
     else()
-        message(WARNING "No AddressSanitizer runtime found to preload; device_lost_shim will not start here")
+        message(WARNING "No AddressSanitizer runtime found to preload; device_lost_shim and daemon_system's "
+                        "preloading phases will not start here")
     endif()
 endif()
-wallpaperx_add_test(NAME device_lost_shim COMMAND ${_wx_device_lost_preload} $<TARGET_FILE:wallpaperx-device-lost-shim-test>)
+wallpaperx_add_test(NAME device_lost_shim COMMAND ${_wx_asan_preload} $<TARGET_FILE:wallpaperx-device-lost-shim-test>)
 # no-tsan: preloading an uninstrumented library into a sanitized binary is untried.
 set_tests_properties(device_lost_shim PROPERTIES LABELS "novulkan;no-tsan" SKIP_RETURN_CODE 77)
 
@@ -1000,7 +1022,7 @@ endif()
 if(WALLPAPERX_BUILD_KDE_PLUGIN)
     set_target_properties(wallpaperx-daemon-lib wallpaperx-daemon wallpaperx-dbus-service-test
                           wallpaperx-daemon-system-test wallpaperx-http-server-test
-                          wallpaperx-log-escape-test wallpaperx-config-store-test
+                          wallpaperx-log-escape-test wallpaperx-config-store-test wallpaperx-request-share-test
                           wallpaperx-kpackage-metadata-test wallpaperx-qml-lint-test
                           wallpaperx-video-wallpaper-test
         PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
@@ -1024,6 +1046,10 @@ wallpaperx_add_test(NAME log_escape COMMAND $<TARGET_FILE:wallpaperx-log-escape-
 # driver, no filesystem. `novulkan` because the sanitizer block below selects by label and an
 # unlabelled entry is disabled there.
 wallpaperx_add_test(NAME buffer_claims COMMAND $<TARGET_FILE:wallpaperx-buffer-claims-test>)
+# The other way out of the ledger's startup lifetime, which a process leaves only once.
+wallpaperx_add_test(NAME buffer_claims_departure_first
+         COMMAND $<TARGET_FILE:wallpaperx-buffer-claims-test> departure-first)
+set_tests_properties(buffer_claims_departure_first PROPERTIES LABELS "novulkan" SKIP_RETURN_CODE 77)
 
 # Reads the linked daemon binary for calls that copy a decoded picture into system memory (S13.9).
 # Opens no driver, hence `novulkan`.
@@ -1047,6 +1073,12 @@ set_tests_properties(log_escape PROPERTIES LABELS "novulkan")
 wallpaperx_add_test(NAME config_store COMMAND $<TARGET_FILE:wallpaperx-config-store-test>)
 set_tests_properties(config_store PROPERTIES LABELS "novulkan"
                      SKIP_RETURN_CODE 77)
+
+# Each caller's share of the render worker's queue, on the manager's own record: no bus, no device.
+# Outside the guard and `novulkan` for config_store's reasons. One phase sleeps out the manager's
+# fixed ten-second quiet period, so the entry takes about eleven seconds.
+wallpaperx_add_test(NAME request_share COMMAND $<TARGET_FILE:wallpaperx-request-share-test>)
+set_tests_properties(request_share PROPERTIES LABELS "novulkan")
 
 # Outside the guard too: forked children, signals and files, with no bus, port or driver.
 # `novulkan` because the sanitizer block below selects by label and an unlabelled entry is
@@ -1270,7 +1302,7 @@ if(WALLPAPERX_DBUS_RUN_SESSION)
     # in-process service above under ctest -jN -- each gets a bus of its own, and both
     # request the same well-known name.
     wallpaperx_add_test(NAME daemon_system
-             COMMAND $<TARGET_FILE:wallpaperx-daemon-system-test>)
+             COMMAND ${_wx_asan_preload} $<TARGET_FILE:wallpaperx-daemon-system-test>)
     # SKIP_RETURN_CODE, for the same reason the renderer probes carry it: the test exits 77
     # when a goal could not be exercised at all on this host (no dbus-daemon, so no private
     # bus to destroy under a running daemon -- S6.35). Without it that run exits non-zero
@@ -1285,7 +1317,7 @@ if(WALLPAPERX_DBUS_RUN_SESSION)
     # that it skipped the pixels.
     if(WALLPAPERX_LAVAPIPE_ICD)
         wallpaperx_add_test(NAME daemon_system_lavapipe
-                 COMMAND $<TARGET_FILE:wallpaperx-daemon-system-test>)
+                 COMMAND ${_wx_asan_preload} $<TARGET_FILE:wallpaperx-daemon-system-test>)
         set_tests_properties(daemon_system_lavapipe PROPERTIES
             ENVIRONMENT "VK_ICD_FILENAMES=${WALLPAPERX_LAVAPIPE_ICD}"
             LABELS "lavapipe"
@@ -1366,7 +1398,7 @@ if(WALLPAPERX_DBUS_RUN_SESSION)
             SKIP_RETURN_CODE 77)
     endif()
 
-    # The QQuickItem driven by a stub daemon answering GetFrameFd with a frame the importer must
+    # The QQuickItem driven by a stub daemon answering GetFrame with a frame the importer must
     # refuse. Here for the private bus: on the developer's real bus it would reach their daemon.
     if(WALLPAPERX_BUILD_KDE_PLUGIN AND WALLPAPERX_HAVE_FRAME_IMPORT)
         add_executable(wallpaperx-item-import-failure-test tests/item_import_failure_test.cpp)
@@ -1415,6 +1447,39 @@ if(WALLPAPERX_DBUS_RUN_SESSION)
             LABELS "novulkan"
             RESOURCE_LOCK wallpaperx_bus_tests
             SKIP_RETURN_CODE 77)
+        # The same binary on a bus of its own inside the entry's private one, whose policy refuses
+        # GetNameOwner: what the item does when it cannot learn who owns the daemon's name. The nested
+        # bus has no service directories either (deny_owner_lookup.conf.in includes the isolated one).
+        pkg_check_modules(WALLPAPERX_TEST_LIBSYSTEMD REQUIRED IMPORTED_TARGET libsystemd)
+        target_link_libraries(wallpaperx-item-refusal-retry-test PRIVATE PkgConfig::WALLPAPERX_TEST_LIBSYSTEMD)
+        # libdbus, for the interposer that reads (and, in slow-lookup, redirects) the plugin's owner
+        # lookups as QtDBus hands them to it; exported so QtDBus's own call lands on it.
+        pkg_check_modules(WALLPAPERX_TEST_DBUS1 REQUIRED IMPORTED_TARGET dbus-1)
+        target_link_libraries(wallpaperx-item-refusal-retry-test PRIVATE PkgConfig::WALLPAPERX_TEST_DBUS1)
+        target_link_options(wallpaperx-item-refusal-retry-test PRIVATE
+            "LINKER:--export-dynamic-symbol=dbus_connection_send_with_reply")
+        configure_file(tests/deny_owner_lookup.conf.in ${CMAKE_CURRENT_BINARY_DIR}/deny_owner_lookup.conf @ONLY)
+        wallpaperx_add_test(NAME item_refusal_retry_lookup
+                 COMMAND /bin/sh ${WALLPAPERX_ISOLATION_SUPPORT_DIR}/private_bus.sh ${WALLPAPERX_DBUS_RUN_SESSION}
+                         ${CMAKE_CURRENT_BINARY_DIR}/deny_owner_lookup.conf --
+                         $<TARGET_FILE:wallpaperx-item-refusal-retry-test> lookup-failed)
+        set_tests_properties(item_refusal_retry_lookup PROPERTIES
+            ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QT_NO_XDG_DESKTOP_PORTAL=1"
+            LABELS "novulkan"
+            RESOURCE_LOCK wallpaperx_bus_tests
+            SKIP_RETURN_CODE 77)
+        # The same binary's scripted runs, each a process of its own: the plugin's daemon watch, its
+        # one-line latch and its timeline record are process-wide.
+        foreach(refusal_run slow-lookup stale-refusal patience refusal-runs refusal-replaced refusal-log refusal-away
+                            refusal-replaced-retry)
+            wallpaperx_add_test(NAME item_refusal_retry_${refusal_run}
+                     COMMAND $<TARGET_FILE:wallpaperx-item-refusal-retry-test> ${refusal_run})
+            set_tests_properties(item_refusal_retry_${refusal_run} PROPERTIES
+                ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QT_NO_XDG_DESKTOP_PORTAL=1"
+                LABELS "novulkan"
+                RESOURCE_LOCK wallpaperx_bus_tests
+                SKIP_RETURN_CODE 77)
+        endforeach()
 
         # The same item again, driven by a stub that REFUSES the plugin's import-modifier report.
         # No Vulkan: the frame it serves is a memfd with synthesized fields, because what is under
@@ -1671,7 +1736,10 @@ if(WALLPAPERX_DBUS_RUN_SESSION)
                 WALLPAPERX_SHADER_DIR="${WALLPAPERX_SHADER_OUTPUT_DIR}"
                 WALLPAPERX_TEST_IMAGE_DIR="${WALLPAPERX_ITEM_ASSET_DIR}")
             add_dependencies(wallpaperx-item-release-ledger-test wallpaperxplugin wallpaperx-shaders)
-            foreach(release_phase repeat-import dropped-frame in-flight-monitor-change daemon-restart)
+            # late-reply-alive and late-reply-replaced wait out the plugin's 25 s fetch patience, so each
+            # takes about 30 s.
+            foreach(release_phase repeat-import repeat-many dropped-frame in-flight-monitor-change daemon-restart
+                    late-reply late-reply-alive late-reply-replaced)
                 wallpaperx_add_display_test(NAME item_release_${release_phase}
                          COMMAND $<TARGET_FILE:wallpaperx-item-release-ledger-test> ${release_phase})
                 set_tests_properties(item_release_${release_phase} PROPERTIES
@@ -1716,8 +1784,15 @@ if(WALLPAPERX_DBUS_RUN_SESSION)
             # semaphore wait on demand; exported, or the plugin -- loaded at runtime -- binds libEGL's.
             target_link_options(wallpaperx-item-import-cache-test PRIVATE
                 "LINKER:--export-dynamic-symbol=eglGetProcAddress")
+            # tests/bus_monitor.h watches the private bus through sd-bus, the one view of where a call
+            # was addressed.
+            pkg_check_modules(WALLPAPERX_TEST_LIBSYSTEMD REQUIRED IMPORTED_TARGET libsystemd)
+            target_link_libraries(wallpaperx-item-import-cache-test PRIVATE PkgConfig::WALLPAPERX_TEST_LIBSYSTEMD)
             foreach(cache_phase counts single pixels no-acquire handover handover-reset handover-modifier
-                                stale-daemon stale-monitor offscreen publish not-opengl)
+                                stale-daemon stale-monitor offscreen publish not-opengl descriptor-backoff
+                                declare declare-refused declare-monitor declare-daemon unique-name lost-import
+                                protocol restart-pending pending-monitor pending-offscreen no-owner no-item
+                                asking-monitor startup-no-daemon late-acquire newer-reply newer-failure)
                 set(cache_environment "QT_QPA_PLATFORM=wayland\;xcb\;offscreen;QT_NO_XDG_DESKTOP_PORTAL=1")
                 if(cache_phase STREQUAL "handover-modifier")
                     set(cache_environment "${cache_environment};WALLPAPERX_FORCE_HANDLE_TYPE=dmabuf")
@@ -1756,9 +1831,10 @@ if(WALLPAPERX_DBUS_RUN_SESSION)
                 "LINKER:--export-dynamic-symbol=eglGetProcAddress"
                 "LINKER:--export-dynamic-symbol=glGetStringi")
             add_dependencies(wallpaperx-item-timeline-test wallpaperxplugin wallpaperx-shaders)
-            foreach(timeline_phase steady old-daemon unsupported unknown-interface retry-busy retry-exportfailed
+            foreach(timeline_phase steady old-daemon unsupported unknown-interface too-many-copies retry-busy retry-exportfailed
                                    lost-reply refused-timeline refused-binary wait-no-trip setup-create setup-type
-                                   stray-value restart stale-value context-move)
+                                   stray-value restart restart-memory stale-value context-move late-value
+                                   late-answer replaced-asking retry-replaced)
                 wallpaperx_add_display_test(NAME item_timeline_${timeline_phase}
                          COMMAND $<TARGET_FILE:wallpaperx-item-timeline-test> ${timeline_phase})
                 set_tests_properties(item_timeline_${timeline_phase} PROPERTIES
@@ -1803,7 +1879,8 @@ if(WALLPAPERX_DBUS_RUN_SESSION)
                      "leaves a black desktop with no message on it is green. Install the Qt6 Quick private headers "
                      "and re-configure.")
             set_tests_properties(item_frame_shown PROPERTIES SKIP_REGULAR_EXPRESSION "NOT VERIFIED")
-            foreach(release_phase repeat-import dropped-frame in-flight-monitor-change daemon-restart)
+            foreach(release_phase repeat-import repeat-many dropped-frame in-flight-monitor-change daemon-restart
+                    late-reply late-reply-alive late-reply-replaced)
                 wallpaperx_add_test(NAME item_release_${release_phase}
                          COMMAND ${CMAKE_COMMAND} -E echo
                          "item_release_${release_phase}: NOT VERIFIED -- Qt6 QuickPrivate headers were not found at "

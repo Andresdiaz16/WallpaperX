@@ -34,15 +34,34 @@ jobs:
             libavcodec-dev libavformat-dev libavutil-dev \
             libswscale-dev ffmpeg \
             libpipewire-0.3-dev libfftw3-dev \
-            libstb-dev nlohmann-json3-dev
+            libstb-dev nlohmann-json3-dev \
+            dbus util-linux iproute2 procps
+
+      # Every ctest entry runs through renderer/tests/support/isolated_run.sh, which puts it
+      # in an unprivileged user and network namespace and fails the entry when it cannot.
+      # Ubuntu 24.04 lets AppArmor strip the capabilities of such a namespace, so `ip link
+      # set lo up` inside it is refused; the sysctl lifts that for this runner only. The
+      # wrapper itself runs once on `true`, so a runner that still refuses fails here, by
+      # name, rather than as every test entry at once.
+      - name: Allow the tests their own namespaces
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          for tool in dbus-run-session dbus-daemon unshare ip flock setpriv pgrep getent; do
+            command -v "$tool" || { echo "missing: $tool"; exit 1; }
+          done
+          sh renderer/tests/support/isolated_run.sh --config /dev/null -- true
 
       - name: Show Vulkan ICDs (sanity)
         run: ls -la /usr/share/vulkan/icd.d/ || true
 
       # Configure AFTER installing deps so the CMake find_file() for the Lavapipe
       # ICD succeeds and registers the *_lavapipe ctest entries.
+      # WALLPAPERX_REQUIRE_ALL_TESTS stays off here: a hosted runner lacks optional
+      # dependencies (kwin_wayland among them) whose entries are expected to go unregistered.
       - name: Configure
-        run: cmake -S renderer -B renderer/build-ci -G Ninja
+        run: cmake -S renderer -B renderer/build-ci -G Ninja -DWALLPAPERX_REQUIRE_ALL_TESTS=OFF
 
       - name: Build
         run: cmake --build renderer/build-ci
@@ -84,7 +103,19 @@ jobs:
             libswscale-dev ffmpeg \
             libpipewire-0.3-dev libfftw3-dev \
             libstb-dev nlohmann-json3-dev \
-            libzip-dev libsystemd-dev dbus
+            libzip-dev libsystemd-dev \
+            dbus util-linux iproute2 procps
+
+      # As in the renderer job: the isolation wrapper needs namespaces it can configure.
+      - name: Allow the tests their own namespaces
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          for tool in dbus-run-session dbus-daemon unshare ip flock setpriv pgrep getent; do
+            command -v "$tool" || { echo "missing: $tool"; exit 1; }
+          done
+          sh renderer/tests/support/isolated_run.sh --config /dev/null -- true
 
       # Built from source deliberately: the daemon uses the sdbus-c++ v2 API
       # (registerMethod().implementedAs(), sdbus::ServiceName, ...), and Ubuntu 24.04
@@ -102,7 +133,7 @@ jobs:
           sudo ldconfig
 
       - name: Configure
-        run: cmake -S backend -B backend/build-ci -G Ninja -DWALLPAPERX_BUILD_KDE_PLUGIN=OFF
+        run: cmake -S backend -B backend/build-ci -G Ninja -DWALLPAPERX_BUILD_KDE_PLUGIN=OFF -DWALLPAPERX_REQUIRE_ALL_TESTS=OFF
 
       - name: Build
         run: cmake --build backend/build-ci

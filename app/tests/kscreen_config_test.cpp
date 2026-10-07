@@ -10,6 +10,8 @@
 #include <QCoreApplication>
 #include <QString>
 
+#include <cmath>
+#include <limits>
 #include <string>
 
 using namespace wallpaperx;
@@ -129,7 +131,8 @@ void numbers_intOrDouble_andFractionalScale() {
     // WHY-THIS-SHAPE: 1.25 arrives as a double, 2 as an integer: a scale read only from one type
     //       would leave that screen at scale 1 and its logical size equal to its pixels.
     // CONTROL: app/kde/kscreen_config.cpp, `/ monitor.scale` removed from the geometry -> red on
-    //       both screens; restored, green.
+    //       both screens (re-run via control_batch.sh 2026-10-05, after the scale moved below the
+    //       size); restored, green.
     OutputSpec fractional{.name = QStringLiteral("DP-1"), .id = 1, .x = qlonglong(0), .y = qlonglong(0),
                           .width = qlonglong(2560), .height = qlonglong(1440), .scale = 1.25};
     OutputSpec doubled{.name = QStringLiteral("DP-2"), .id = 2, .x = qlonglong(2048), .y = qlonglong(0),
@@ -200,7 +203,8 @@ void untrustworthyReply_isRefusedWhole() {
     // GOAL: S15.3 -- a screen that is not showing a desktop may lack a position and size; it is
     //       listed, and is not selectable.
     // CONTROL: app/kde/kscreen_config.cpp, the refusal's `else if (monitor.enabled && monitor.connected)`
-    //       made `else` -> red, "a disabled output without geometry was refused"; restored, green.
+    //       made `else` -> red, "a disabled output without geometry was refused" (re-run via
+    //       control_batch.sh 2026-10-05); restored, green.
     const auto disabled = parseKScreenConfig(configOf(
         {good, output({.name = QStringLiteral("HDMI-A-1"), .id = 2, .enabled = false, .withPos = false, .withSize = false}),
          output({.name = QStringLiteral("DP-9"), .id = 3, .connected = false, .withPos = false, .withSize = false})}));
@@ -425,13 +429,13 @@ void ids_wholeAndUnique() {
     //       (both outputs, for a shared id): the id alone routes a getEdid answer to a screen.
     // WHY-THIS-SHAPE: each case beside a valid DP-1, so a parser that skipped the bad output or
     //       truncated its id returns a list and goes red; the sentence is matched per case. The
-    //       mirror case is the one S15.22 used to refuse as an unresolvable source: it must now
-    //       fail on the shared id itself, before any source is looked up.
+    //       mirror case fails on the shared id itself, before any source is looked up.
     // CONTROL: app/kde/kscreen_config.cpp, one run each: the shared-id `return std::unexpected`
-    //       made a no-op -> red, "two outputs with id 1 ... was accepted"; `*value !=
-    //       std::trunc(*value)` removed -> red on "2.5"; `*value < 0 ||` removed -> red on "-1";
-    //       `number(id)` made `std::optional<double>(id.toDouble())` -> red on "text"; `*value >
-    //       std::numeric_limits<int>::max() ||` removed -> red on "2^31"; restored, green.
+    //       made a no-op -> red, "two outputs with id 1 ... was accepted"; then in wholeNumber(), each
+    //       via control_batch.sh 2026-10-05: `|| *n !=
+    //       std::trunc(*n)` removed -> red on "2.5"; `*n < min ||` removed -> red on "-1"; `number(value)`
+    //       made `std::optional<double>(value.toDouble())` -> red on "text"; `|| *n > max` removed -> the
+    //       run ends at the float-cast-overflow sanitizer's report on 2^31 (S15.335's build); restored.
     struct Refusal {
         const char* what;
         QVariantMap config;
@@ -482,6 +486,221 @@ void ids_wholeAndUnique() {
     }
 }
 
+// S15.335
+void numbersOutOfRange() {
+    // A single DP-1 with one field replaced; `enabled` false where the field is its size, since an
+    // enabled screen with no readable size is refused outright.
+    const auto with = [](const QString& key, const QVariant& value, bool enabled = true) {
+        QVariantMap dp1 = output({.name = QStringLiteral("DP-1"), .enabled = enabled});
+        if (key == u"width" || key == u"height") {
+            QVariantMap size = dp1.value(QStringLiteral("size")).toMap();
+            size.insert(key, value);
+            dp1.insert(QStringLiteral("size"), size);
+        } else {
+            dp1.insert(key, value);
+        }
+        return configOf({dp1});
+    };
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    // GOAL: S15.335 -- a rotation, size or mode value that is not finite, not whole, or outside what
+    //       an int holds never reaches a conversion to int, and reads as the field's default: a bad
+    //       rotation is upright, a bad size is absent (an enabled screen without one is refused,
+    //       "KScreen did not say where DP-1 is"), and a bad mode or sizeMM is left out of the panel.
+    // WHY-THIS-SHAPE: this binary is built with -fsanitize=float-cast-overflow and no recovery, so a
+    //       conversion out of range ends the run with the sanitizer's report rather than passing on
+    //       whatever the hardware returned; the values the parser produced are checked as well, so a
+    //       parser that clamped instead of refusing goes red too.
+    // CONTROL: app/kde/kscreen_config.cpp via control_batch.sh, 2026-10-05, each reverted: the rotation
+    //       read as `static_cast<int>(number(output.value("rotation")).value_or(1))` -> the run ends in
+    //       "runtime error: 1e+300 is outside the range of representable values of type 'int'";
+    //       `.value_or(1)` on the rotation made `.value_or(1 << 1)` -> "FAIL: S15.335: rotation 1e300
+    //       should read upright"; size()'s width read as `static_cast<int>(number(...).value_or(-1))` ->
+    //       the run ends at the sanitizer's report on 1e300; size()'s width truncated before the
+    //       whole-number test -> "FAIL: S15.335: an enabled DP-1 with width 1920.5 should be refused".
+    //       (size()'s lower bound made INT_MIN stays green, rightly: a negative size is empty, and an
+    //       empty size is treated as absent anyway.)
+    struct Rotation {
+        const char* what;
+        QVariant value;
+    };
+    for (const Rotation& r : {Rotation{"1e300", 1e300}, Rotation{"-1e300", -1e300}, Rotation{"NaN", nan}, Rotation{"2.5", 2.5},
+                              Rotation{"2^31", 2147483648.0}}) {
+        const auto parsed = parseKScreenConfig(with(QStringLiteral("rotation"), r.value));
+        expect(parsed && parsed->size() == 1 && parsed->front().rotation == 0 && !parsed->front().flipped,
+               QStringLiteral("S15.335: rotation %1 should read upright; got %2")
+                   .arg(QLatin1String(r.what), parsed ? (parsed->isEmpty() ? QStringLiteral("no monitor") : describe(parsed->front())) : parsed.error()));
+    }
+    struct Size {
+        const char* what;
+        QString key;
+        QVariant value;
+    };
+    for (const Size& s : {Size{"width 1e300", QStringLiteral("width"), 1e300}, Size{"width 2^31", QStringLiteral("width"), 2147483648.0},
+                          Size{"width 1920.5", QStringLiteral("width"), 1920.5}, Size{"height -5", QStringLiteral("height"), qlonglong(-5)},
+                          Size{"height NaN", QStringLiteral("height"), nan}}) {
+        const auto enabled = parseKScreenConfig(with(s.key, s.value));
+        expect(!enabled && enabled.error().contains(QLatin1String("KScreen did not say where DP-1 is")),
+               QStringLiteral("S15.335: an enabled DP-1 with %1 should be refused; got %2")
+                   .arg(QLatin1String(s.what), enabled ? QStringLiteral("%1 monitor(s)").arg(enabled->size()) : enabled.error()));
+        const auto disabled = parseKScreenConfig(with(s.key, s.value, false));
+        expect(disabled && disabled->size() == 1 && disabled->front().pixelSize.isEmpty(),
+               QStringLiteral("S15.335: a disabled DP-1 with %1 should have no size; got %2")
+                   .arg(QLatin1String(s.what), disabled ? (disabled->isEmpty() ? QStringLiteral("no monitor") : describe(disabled->front())) : disabled.error()));
+    }
+    // A mode 3e9 wide and a NaN sizeMM: neither describes the panel, so the description is empty.
+    QVariantMap panelless = output({.name = QStringLiteral("DP-1")});
+    panelless.insert(QStringLiteral("modes"), QVariantList{QVariantMap{
+                                                  {QStringLiteral("size"), QVariantMap{{QStringLiteral("width"), 3e9}, {QStringLiteral("height"), qlonglong(1080)}}},
+                                                  {QStringLiteral("refreshRate"), 60.0}}});
+    panelless.insert(QStringLiteral("sizeMM"), QVariantMap{{QStringLiteral("width"), nan}, {QStringLiteral("height"), qlonglong(340)}});
+    const auto panel = parseKScreenConfig(configOf({panelless}));
+    expect(panel && panel->size() == 1 && panel->front().panel.isEmpty(),
+           QStringLiteral("S15.335: a mode 3e9 wide and a NaN sizeMM should describe no panel; got [%1]")
+               .arg(panel && !panel->isEmpty() ? panel->front().panel : (panel ? QString() : panel.error())));
+
+    // GOAL: S15.339 -- a positive scale that would give a 1920x1080 screen a logical size outside 1 to
+    //       INT_MAX (1e-306, 1e-300, 1e-7, 1e300) reads as scale 1, with the screen's geometry finite
+    //       and equal to its pixels; a scale that fits (1.25) is kept and divides the size.
+    // WHY-THIS-SHAPE: the scale and the geometry are both read, not just "the parse returned": a parse
+    //       can succeed while the geometry it builds is infinite or far from the screen's pixels, so
+    //       "the parse returned" alone passes that case. 1e-7 and 1e300
+    //       go first: where Qt's assertions are live, QSizeF::operator/ aborts on a scale below 1e-12,
+    //       and their lines are then printed before the abort.
+    // CONTROL: in parseKScreenConfig (app/kde/kscreen_config.cpp), the range test `if (!pixels ||
+    //       pixels->isEmpty() || (holds(...) && holds(...)))` made `if (true)`, via control_batch.sh,
+    //       2026-10-05, app/build -> four FAIL lines, e.g. "FAIL: S15.339: scale 1e-306 should read as 1
+    //       with geometry 1920x1080; got scale=1e-306 geometry=(0,0 infxinf)" and "... scale 1e-07 ...
+    //       got scale=1e-07 geometry=(0,0 1.92e+10x1.08e+10)"; no abort in this build. Reverted.
+    struct Scale {
+        const char* what;
+        double value;
+    };
+    for (const Scale& sc : {Scale{"1e-07", 1e-7}, Scale{"1e300", 1e300}, Scale{"1e-300", 1e-300}, Scale{"1e-306", 1e-306}, Scale{"1.25", 1.25}}) {
+        const bool kept = sc.value == 1.25;
+        const auto parsed = parseKScreenConfig(with(QStringLiteral("scale"), sc.value));
+        const Monitor* m = parsed && parsed->size() == 1 ? &parsed->front() : nullptr;
+        const QRectF want = kept ? QRectF(0, 0, 1536, 864) : QRectF(0, 0, 1920, 1080);
+        const bool finite = m && std::isfinite(m->geometry.width()) && std::isfinite(m->geometry.height());
+        expect(m && m->scale == (kept ? 1.25 : 1.0) && finite && m->geometry == want && m->pixelSize == QSize(1920, 1080),
+               QStringLiteral("S15.339: scale %1 should read as %2 with geometry %3x%4; got %5")
+                   .arg(QLatin1String(sc.what), kept ? QStringLiteral("1.25") : QStringLiteral("1"))
+                   .arg(want.width())
+                   .arg(want.height())
+                   .arg(m ? QStringLiteral("scale=%1 geometry=(%2,%3 %4x%5)")
+                                .arg(m->scale)
+                                .arg(m->geometry.x())
+                                .arg(m->geometry.y())
+                                .arg(m->geometry.width())
+                                .arg(m->geometry.height())
+                          : (parsed ? QStringLiteral("%1 monitor(s)").arg(parsed->size()) : parsed.error())));
+    }
+}
+
+// S15.356
+void positionsInRange() {
+    // DP-1 enabled at (x1, y1); DP-2 at (x2, y2), enabled unless `secondEnabled` is false.
+    const auto two = [](const QVariant& x1, const QVariant& y1, const QVariant& x2, const QVariant& y2,
+                        bool secondEnabled = true) {
+        return configOf({output({.name = QStringLiteral("DP-1"), .id = 1, .x = x1, .y = y1}),
+                         output({.name = QStringLiteral("DP-2"), .id = 2, .x = x2, .y = y2, .enabled = secondEnabled})});
+    };
+    const auto refusedForPosition = [](const auto& parsed) {
+        return !parsed && parsed.error().contains(QLatin1String("KScreen did not say where DP-"));
+    };
+    const auto describeParse = [](const auto& parsed) {
+        return parsed ? QStringLiteral("%1 monitor(s)").arg(parsed->size()) : parsed.error();
+    };
+    const qlonglong zero = 0;
+
+    // GOAL: S15.356 -- a screen position is a whole number that an int holds, as KScreen's are: an
+    //       enabled screen at x or y beyond int's range -- 1.5e308, or one past either end -- is refused
+    //       with the reply ("KScreen did not say where DP-n is"), as a missing position is, so the union
+    //       of the screens' geometries never overflows.
+    // WHY-THIS-SHAPE: the values one past int's ends tell "bounded by int" from "merely finite", and are
+    //       checked on both axes; this binary is built with -fsanitize=float-cast-overflow, so a value
+    //       that reached a conversion to int would end the run with the sanitizer's report.
+    // CONTROL: in point() (app/kde/kscreen_config.cpp), x and y read with `number(...)` instead of
+    //       wholeNumber -> "FAIL: S15.356: two enabled screens at x = 1.5e308 and -1.5e308 should be
+    //       refused; got 2 monitor(s)" and each one-past-int line. Via control_batch.sh, 2026-10-06.
+    //       Reverted.
+    {
+        const auto huge = parseKScreenConfig(two(1.5e308, zero, -1.5e308, zero));
+        expect(refusedForPosition(huge),
+               QStringLiteral("S15.356: two enabled screens at x = 1.5e308 and -1.5e308 should be refused; got %1")
+                   .arg(describeParse(huge)));
+        struct Beyond {
+            const char* what;
+            QVariant x;
+            QVariant y;
+        };
+        for (const Beyond& b : {Beyond{"x = 2^31", 2147483648.0, zero}, Beyond{"x = -2^31 - 1", -2147483649.0, zero},
+                                Beyond{"y = 2^31", zero, 2147483648.0}, Beyond{"y = -2^31 - 1", zero, -2147483649.0}}) {
+            const auto parsed = parseKScreenConfig(two(zero, zero, b.x, b.y));
+            expect(refusedForPosition(parsed), QStringLiteral("S15.356: an enabled DP-2 at %1 should be refused; got %2")
+                                                   .arg(QLatin1String(b.what), describeParse(parsed)));
+        }
+    }
+
+    // GOAL: S15.356 -- and int's whole range is accepted: screens at x = INT_MIN and INT_MAX - 1920 are
+    //       read, and their geometries' union is finite.
+    // CONTROL: point()'s bounds made `kMin / 2` and `kMax / 2` (app/kde/kscreen_config.cpp) -> "FAIL:
+    //       S15.356: screens at x = INT_MIN and INT_MAX - 1920 should be read, their union finite; got KScreen
+    //       did not say where DP-1 is., union width 0". Via control_batch.sh, 2026-10-06. Reverted.
+    {
+        const qlonglong left = std::numeric_limits<int>::min();
+        const qlonglong right = qlonglong(std::numeric_limits<int>::max()) - 1920;
+        const auto parsed = parseKScreenConfig(two(left, zero, right, zero));
+        QRectF united;
+        if (parsed) {
+            for (const Monitor& m : *parsed) united = united.united(m.geometry);
+        }
+        expect(parsed && parsed->size() == 2 && std::isfinite(united.width()) && united.width() > 0,
+               QStringLiteral("S15.356: screens at x = INT_MIN and INT_MAX - 1920 should be read, their union finite; got %1, "
+                              "union width %2")
+                   .arg(describeParse(parsed))
+                   .arg(united.width()));
+    }
+
+    // GOAL: S15.356 -- a disabled screen at an impossible position is kept, with no geometry, as one
+    //       with no position is; the reply is not refused for it.
+    // CONTROL: in parseKScreenConfig (app/kde/kscreen_config.cpp), the missing-position refusal's
+    //       `monitor.enabled && monitor.connected` made `monitor.connected` -> "FAIL: S15.356: a disabled
+    //       DP-2 at x = 1.5e308 beside a valid DP-1 should be kept with no geometry; got KScreen did not say
+    //       where DP-2 is." (S15.3's and S15.335's disabled lines beside it); the number() read in point()
+    //       above -> the same line, "got DP-2 ... geometry=(1.5e+308,0 1920x1080)". Via control_batch.sh,
+    //       2026-10-06. Reverted.
+    {
+        const auto parsed = parseKScreenConfig(two(zero, zero, 1.5e308, zero, false));
+        const Monitor* disabled = nullptr;
+        if (parsed) {
+            for (const Monitor& m : *parsed) disabled = m.outputName == u"DP-2" ? &m : disabled;
+        }
+        expect(parsed && parsed->size() == 2 && disabled && disabled->geometry.isNull(),
+               QStringLiteral("S15.356: a disabled DP-2 at x = 1.5e308 beside a valid DP-1 should be kept with no geometry; got %1")
+                   .arg(disabled ? describe(*disabled) : describeParse(parsed)));
+    }
+
+    // GOAL: S15.356 -- a fractional position is refused as KScreen's are whole (QPoint); a whole one sent
+    //       as a double (1920.0) is read as that number.
+    // CONTROL: the whole-number test `*n != std::trunc(*n)` deleted from wholeNumber
+    //       (app/kde/kscreen_config.cpp) -> "FAIL: S15.356: an enabled DP-2 at x = 1920.5 should be refused;
+    //       got 2 monitor(s)", beside S15.25's and S15.335's fractional lines. Via control_batch.sh,
+    //       2026-10-06. Reverted.
+    {
+        const auto fractional = parseKScreenConfig(two(zero, zero, 1920.5, zero));
+        expect(refusedForPosition(fractional), QStringLiteral("S15.356: an enabled DP-2 at x = 1920.5 should be refused; got %1")
+                                                   .arg(describeParse(fractional)));
+        const auto whole = parseKScreenConfig(two(zero, zero, 1920.0, zero));
+        const Monitor* dp2 = nullptr;
+        if (whole) {
+            for (const Monitor& m : *whole) dp2 = m.outputName == u"DP-2" ? &m : dp2;
+        }
+        expect(dp2 && dp2->geometry.x() == 1920.0,
+               QStringLiteral("S15.356: an enabled DP-2 at x = 1920.0 sent as a double should be read at 1920; got %1")
+                   .arg(dp2 ? describe(*dp2) : describeParse(whole)));
+    }
+}
+
 // S15.21
 void internalFieldsHiddenFromQml() {
     // GOAL: S15.21 -- KScreen's own output id and the panel description are not properties QML
@@ -513,6 +732,8 @@ int main(int argc, char* argv[]) {
     edidNames();
     mirrors();
     ids_wholeAndUnique();
+    numbersOutOfRange();
+    positionsInRange();
     internalFieldsHiddenFromQml();
 
     const bool failed = wallpaperx::testing::reportCheckFailures();

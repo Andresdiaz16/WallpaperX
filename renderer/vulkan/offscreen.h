@@ -22,8 +22,9 @@ inline constexpr VkImageLayout kRenderedLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONL
 struct OffscreenTarget {
     // Identifies this image to a consumer across process boundaries, so one that already
     // imported this buffer can recognise it instead of re-importing every frame. Unique for
-    // the life of the process rather than a slot index: a ring rebuilt at a new size would
-    // otherwise reuse indices for different images.
+    // the life of the process, across every manager in it, rather than a slot index: a
+    // consumer that declares an id it can still draw is sent no memory for it, so an id ever
+    // naming two images would have it draw the wrong one. Never 0.
     uint64_t bufferId = 0;
 
     // Which memory layout the driver picked from the list this image was offered, or
@@ -207,9 +208,6 @@ private:
     Device& m_device;
     VkRenderPass m_renderPass = VK_NULL_HANDLE;
     std::unordered_map<int, Ring> m_targets;
-
-    // Never reset, and starts at 1 so 0 stays available as "no buffer".
-    uint64_t m_nextBufferId = 1;
 };
 
 }

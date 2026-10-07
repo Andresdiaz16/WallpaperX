@@ -370,8 +370,9 @@ void selection() {
     // GOAL: S15.8 -- select() of a screen that is absent or not selectable returns false and
     //       changes nothing; with two selectable screens nothing is chosen for the user.
     // CONTROL: app/kde/kscreen_client.cpp, `|| !it->selectable()` removed from select() -> red,
-    //       "select(HDMI-A-1), a disabled screen, returned true"; settle()'s auto-select
-    //       `count_if(...) == 1` made `>= 1` -> red, "chose DP-3 on its own"; restored, green.
+    //       "select(HDMI-A-1), a disabled screen, returned true"; settled()'s auto-select
+    //       `count_if(...) == 1` made `>= 1` -> red, "chose DP-3 on its own" (re-run via
+    //       control_batch.sh 2026-10-05); restored, green.
     auto rig = Rig::make("selection", "S15.8");
     if (!rig) {
         return;
@@ -408,9 +409,10 @@ void selection() {
     //       the one remaining screen, even though a fresh client would choose that screen itself.
     // WHY-THIS-SHAPE: exactly one selectable screen remains, which is the auto-select condition,
     //       so this is the case where a move is most tempting and hardest to see.
-    // CONTROL: app/kde/kscreen_client.cpp, settle()'s `} else if (std::ranges::count_if` made
+    // CONTROL: app/kde/kscreen_client.cpp, settled()'s `} else if (std::ranges::count_if` made
     //       `} if ((!m_selection || m_selection->isEmpty()) && std::ranges::count_if`, so auto-select
-    //       also runs from the lost state -> red, "the selection moved to DP-4"; restored, green.
+    //       also runs from the lost state -> red, "the selection moved to DP-4"; re-run via
+    //       control_batch.sh 2026-10-05; restored, green.
     rig->fake->config = configOf({dp4, hdmiOff});
     const int reads2 = rig->fake->configCalls;
     rig->fake->emitConfigChanged();
@@ -429,9 +431,10 @@ void selection() {
     // WHY-THIS-SHAPE: the check above sees only the re-read in which DP-3 vanished; a guard that
     //       compares with the previous selection alone is empty-handed on the next re-read, where
     //       "nothing selected, one selectable screen" looks the same as a first start.
-    // CONTROL: app/kde/kscreen_client.cpp, settle()'s `m_selection->clear()` made
+    // CONTROL: app/kde/kscreen_client.cpp, settled()'s `m_selection->clear()` made
     //       `m_selection.reset()`, so a lost selection reads as never-selected -> red, "moved to
-    //       DP-4 one re-read later", while the immediate-move check above stays green; restored, green.
+    //       DP-4 one re-read later", while the immediate-move check above stays green; re-run via
+    //       control_batch.sh 2026-10-05; restored, green.
     const int reads2b = rig->fake->configCalls;
     rig->fake->emitConfigChanged();
     if (!waitFor([&] { return rig->fake->configCalls > reads2b; }, kWaitMs) || !rig->quiesce("S15.8 second re-read")) {
@@ -445,9 +448,9 @@ void selection() {
     //       only the user brings it back.
     // WHY-THIS-SHAPE: two selectable screens are listed, so auto-select cannot be what fills the
     //       selection here; a non-empty selection can only be the lost choice returning.
-    // CONTROL: app/kde/kscreen_client.cpp, settle()'s `m_selection->clear();` deleted, so a lost
+    // CONTROL: app/kde/kscreen_client.cpp, settled()'s `m_selection->clear();` deleted, so a lost
     //       choice is only hidden -> red, "DP-3 came back", while every S15.8 check stays green;
-    //       restored, green.
+    //       re-run via control_batch.sh 2026-10-05; restored, green.
     rig->fake->config = configOf({dp3, dp4});
     const int reads3 = rig->fake->configCalls;
     rig->fake->emitConfigChanged();
@@ -486,8 +489,9 @@ void autoSelectOnlyScreen() {
     //       announced by one selectionChanged.
     // WHY-THIS-SHAPE: a disabled screen sits beside it, so "the only screen" and "the only
     //       selectable screen" differ and the check is on the second.
-    // CONTROL: app/kde/kscreen_client.cpp, settle()'s auto-select branch made `} else if (false &&
-    //       std::ranges::count_if(...) == 1)` -> red, "selected \"\", 0 selectionChanged"; restored, green.
+    // CONTROL: app/kde/kscreen_client.cpp, settled()'s auto-select branch made `} else if (false &&
+    //       std::ranges::count_if(...) == 1)` -> red, "selected \"\", 0 selectionChanged"; re-run via
+    //       control_batch.sh 2026-10-05; restored, green.
     auto rig = Rig::make("autoselect", "S15.8 (auto-select)");
     if (!rig) {
         return;
@@ -524,10 +528,10 @@ void choiceSurvivesOutage() {
     // WHY-THIS-SHAPE: two selectable screens, so auto-select cannot put DP-3 back; only the
     //       remembered choice can. refresh() from Unavailable settles Loading before asking, so
     //       the Loading step is exercised by the same sequence.
-    // CONTROL: app/kde/kscreen_client.cpp, settle()'s `if (m_state == State::Ready)` made
-    //       `m_state != State::Loading`, so an Unavailable read reconciles -> red, "did not come
+    // CONTROL: app/kde/kscreen_client.cpp, settled()'s reconciling `if (m_state == State::Ready) {`
+    //       made `m_state != State::Loading`, so an Unavailable read reconciles -> red, "did not come
     //       back"; made `m_state != State::Unavailable`, so the Loading step reconciles -> the
-    //       same red; restored, green.
+    //       same red; both re-run via control_batch.sh 2026-10-05; restored, green.
     if (auto rig = Rig::make("outage", "S15.16")) {
         KScreenClient& c = *rig->client;
         Emissions e;
@@ -559,9 +563,10 @@ void choiceSurvivesOutage() {
 
     // GOAL: S15.16 -- a client that never had a choice still auto-selects the only selectable
     //       screen when its first read failed and a later one succeeds: an outage is not a loss.
-    // CONTROL: app/kde/kscreen_client.cpp, settle() recording an Unavailable read as a lost
+    // CONTROL: app/kde/kscreen_client.cpp, settled() recording an Unavailable read as a lost
     //       choice (`if (m_state == State::Unavailable && !m_selection) m_selection.emplace();`)
-    //       -> red, "should be auto-selected after the outage"; restored, green.
+    //       -> red, "should be auto-selected after the outage"; re-run via control_batch.sh
+    //       2026-10-05; restored, green.
     if (auto rig = Rig::make("outagefirst", "S15.16 (never chosen)")) {
         rig->fake->backendAnswer = false;
         rig->fake->config = configOf({screen(QStringLiteral("HDMI-A-1"), 3, 0, false), screen(QStringLiteral("DP-4"), 1, 1920)});
@@ -684,8 +689,9 @@ void mirrorSelection() {
     // WHY-THIS-SHAPE: after mirroring starts DP-4 is the only selectable screen, the auto-select
     //       condition, so a lost choice treated as "never chosen" would move there.
     // CONTROL: app/kde/kscreen_config.h, `&& mirrorOf.isEmpty()` removed from selectable() -> red,
-    //       "still selected as a replica"; app/kde/kscreen_client.cpp, settle()'s
-    //       `m_selection->clear();` deleted -> red, "came back when mirroring stopped"; restored, green.
+    //       "still selected as a replica"; app/kde/kscreen_client.cpp, settled()'s
+    //       `m_selection->clear();` deleted -> red, "came back when mirroring stopped" (re-run via
+    //       control_batch.sh 2026-10-05); restored, green.
     rig->fake->config = configOf({dp3, dp4});
     if (!reread(*rig, "S15.23 two screens") || !c.select(QStringLiteral("DP-3"))) {
         expect(false, QStringLiteral("S15.23: could not select DP-3 with mirroring off; ") + summary(c));
@@ -980,8 +986,9 @@ void edidNamesCarried() {
     //       selectionChanged.
     // WHY-THIS-SHAPE: getEdid is held, so the names seen can only have been carried from the
     //       previous answer, not re-read.
-    // CONTROL: app/kde/kscreen_client.cpp, requestConfig's `keepKnownNames(*monitors, m_monitors);`
-    //       deleted -> red, "[DP-4/DP-4, DP-3/DP-3]" with 1 monitorsChanged; restored, green.
+    // CONTROL: app/kde/kscreen_client.cpp, settleReady()'s `keepKnownNames(answer, m_answer);`
+    //       deleted -> red, "[DP-4/DP-4, DP-3/DP-3]" with 1 monitorsChanged; re-run via
+    //       control_batch.sh 2026-10-05; restored, green.
     if (!read(real, "S15.18 unchanged")) {
         return;
     }
@@ -1085,9 +1092,10 @@ void launcherRestart() {
     //       milliseconds, so it is seen by snapshotting at each stateChanged, not by polling.
     // CONTROL: app/kde/kscreen_client.cpp, the `connect(launcher, ...serviceOwnerChanged...)`
     //       deleted -> red, "the launcher left the bus and the client stayed state Ready";
-    //       onLauncherOwnerChanged's `settle(State::Loading, {}, {})` given `m_monitors` -> red,
-    //       "went Loading with 2 monitor(s)"; its loss branch never retrying (`if (true ||
-    //       m_launcherRetrySpent)`) -> red, "the reason should say "is not running""; restored.
+    //       monitors() returning `m_answer` whatever the state (a non-Ready client cannot otherwise
+    //       be made to show a list) -> red, "went Loading with 2 monitor(s)"; the loss branch never
+    //       retrying (`if (m_launcherRetrySpent && newOwner.isEmpty())` made `if (true)`) -> red, "the
+    //       reason should say "is not running"". All re-run via control_batch.sh 2026-10-05; restored.
     struct Seen {
         State state;
         qsizetype monitors;
@@ -1188,35 +1196,124 @@ void launcherReplaced() {
         return read;
     };
 
+    // Every state the client passes through, snapshotted as it is emitted: Unavailable on a
+    // hand-over lasts only until the new owner's answer.
+    QStringList states;
+    QObject::connect(&c, &KScreenClient::stateChanged, [&] {
+        states.append(stateName(c.state()) + (c.unavailableReason().isEmpty() ? QString() : QLatin1Char(' ') + c.unavailableReason()));
+    });
+
     // GOAL: S15.28 -- an owner replaced in one NameOwnerChanged (old and new owner both set) is
-    //       read exactly once, whether or not the loss retry was already spent: unspent, the loss
-    //       retry is that read; spent, the client reads Unavailable and the new owner is read then.
+    //       read exactly once and never reads Unavailable, whether or not the loss retry was
+    //       already spent; and the hand-over spends no retry, so a real loss after it is still
+    //       retried ("is not running" once that read fails, not "keeps stopping").
     // WHY-THIS-SHAPE: the next fake queues for the name, so releasing the old one hands it over
     //       atomically; a watcher of the test's own proves that premise. Each new fake lists one
     //       more screen, so its answer is told apart; counts are read after the quiesce barrier.
-    // CONTROL: app/kde/kscreen_client.cpp, onLauncherOwnerChanged's `&& m_state ==
-    //       State::Unavailable` removed -> red, "retry unspent: the new owner saw 2 requestBackend";
-    //       the new-owner `if` made `else if` -> red, "retry spent: the new owner was never read";
-    //       restored, green.
+    //       The retry is spent by a real loss between the two hand-overs, inside the 60 s stay-up.
+    // CONTROL: app/kde/kscreen_client.cpp via control_batch.sh, 2026-10-05, each reverted:
+    //       onLauncherOwnerChanged's new-owner `&& m_state == State::Unavailable` removed -> "FAIL:
+    //       S15.28 retry unspent: the new owner saw 2 requestBackend"; `if (m_launcherRetrySpent &&
+    //       newOwner.isEmpty())` made `if (m_launcherRetrySpent)` -> "FAIL: S15.28 retry spent: the
+    //       hand-over passed through [... Unavailable ... keeps stopping ...]";
+    //       `m_launcherRetrySpent = m_launcherRetrySpent || newOwner.isEmpty();` made `= true;` ->
+    //       "FAIL: S15.28: the loss after a hand-over read [...keeps stopping...]".
     auto second = std::make_unique<FakeKScreen>(service);
     second->config = configOf({dp3, dp4, screen(QStringLiteral("HDMI-A-2"), 3, 3840)});
+    states.clear();
     if (!handOver(std::move(second), 3, "S15.28 retry unspent")) {
         return;
     }
-    expect(rig->fake->backendCalls == 1 && rig->fake->configCalls == 1,
-           QStringLiteral("S15.28 retry unspent: the new owner saw %1 requestBackend and %2 getConfig, expected 1 each")
+    expect(rig->fake->backendCalls == 1 && rig->fake->configCalls == 1 && !states.join(u'|').contains(QLatin1String("Unavailable")),
+           QStringLiteral("S15.28 retry unspent: the new owner saw %1 requestBackend and %2 getConfig, expected 1 each; the hand-over passed through [%3]")
                .arg(rig->fake->backendCalls)
-               .arg(rig->fake->configCalls));
+               .arg(rig->fake->configCalls)
+               .arg(states.join(QStringLiteral(" -> "))));
+
+    // A real loss, which spends the retry: the retry's read fails with nobody to answer it.
+    states.clear();
+    rig->fake.reset();
+    if (!waitFor([&] { return c.state() == State::Unavailable; }, kWaitMs) || !rig->quiesce("S15.28 loss")) {
+        expect(false, QStringLiteral("S15.28: the launcher left and the client stayed ") + summary(c));
+        return;
+    }
+    expect(c.unavailableReason().contains(QLatin1String("is not running")),
+           QStringLiteral("S15.28: the loss after a hand-over read [%1]; a hand-over that spent no retry is retried once").arg(states.join(QStringLiteral(" -> "))));
+    auto back = std::make_unique<FakeKScreen>(service);
+    back->config = configOf({dp3, dp4, screen(QStringLiteral("HDMI-A-2"), 3, 3840)});
+    if (const QString fault = back->start(); !fault.isEmpty()) {
+        notVerified("S15.28 (retry spent)", "the fake could not come back: " + fault.toStdString());
+        return;
+    }
+    rig->fake = std::move(back);
+    if (!waitFor([&] { return c.state() == State::Ready && c.monitors().size() == 3; }, kWaitMs) || !rig->quiesce("S15.28 back")) {
+        expect(false, QStringLiteral("S15.28: the launcher that came back was never read; ") + summary(c));
+        return;
+    }
 
     auto third = std::make_unique<FakeKScreen>(service);
     third->config = configOf({dp3, dp4, screen(QStringLiteral("HDMI-A-2"), 3, 3840), screen(QStringLiteral("HDMI-A-3"), 4, 5760)});
+    states.clear();
     if (!handOver(std::move(third), 4, "S15.28 retry spent")) {
         return;
     }
+    expect(!states.join(u'|').contains(QLatin1String("Unavailable")),
+           QStringLiteral("S15.28 retry spent: the hand-over passed through [%1]").arg(states.join(QStringLiteral(" -> "))));
     expect(rig->fake->backendCalls == 1 && rig->fake->configCalls == 1,
            QStringLiteral("S15.28 retry spent: the new owner saw %1 requestBackend and %2 getConfig, expected 1 each")
                .arg(rig->fake->backendCalls)
                .arg(rig->fake->configCalls));
+}
+
+// S15.334
+void namesSurviveLauncherLoss() {
+    auto rig = Rig::make("namesloss", "S15.334");
+    if (!rig) {
+        return;
+    }
+    KScreenClient& c = *rig->client;
+    const QString service = rig->fake->service();
+    rig->fake->config = g_fixture;
+    rig->fake->edids = {{1, edidNamed("M27Q P")}, {2, edidNamed("M27Q")}};
+    if (!rig->refreshAndSettle("S15.334") || !rig->quiesce("S15.334") || names(c.monitors()) != QStringLiteral("[DP-4/M27Q P, DP-3/M27Q]") ||
+        !c.select(QStringLiteral("DP-3"))) {
+        expect(false, QStringLiteral("S15.334: could not reach both EDID names with DP-3 selected; ") + summary(c));
+        return;
+    }
+    // GOAL: S15.334 -- the model names a Ready answer showed survive the launcher leaving and a new
+    //       one being read: the new launcher's answer for the same panels shows them before its own
+    //       getEdid answers. While not Ready (Loading after the loss, Unavailable once the retry
+    //       failed) the client reports no monitor and no selection.
+    // WHY-THIS-SHAPE: the new launcher holds every getEdid, so a name seen can only have been
+    //       carried across the non-Ready states; the non-Ready states are snapshotted as emitted.
+    //       The fixture's panels carry sizeMM and modes, which carrying a name requires.
+    // CONTROL: app/kde/kscreen_client.cpp, settleReady() carrying names only when
+    //       `before.state == State::Ready`, via control_batch.sh, 2026-10-05 -> "FAIL: S15.334: after the
+    //       launcher came back the names read [DP-4/DP-4, DP-3/DP-3]". Reverted.
+    QStringList notReady;
+    QObject::connect(&c, &KScreenClient::stateChanged, [&] {
+        if (c.state() != State::Ready && (!c.monitors().isEmpty() || !c.selectedOutput().isEmpty())) {
+            notReady.append(stateName(c.state()) + QStringLiteral(" with %1 monitor(s), selection \"%2\"").arg(c.monitors().size()).arg(c.selectedOutput()));
+        }
+    });
+    rig->fake.reset();
+    if (!waitFor([&] { return c.state() == State::Unavailable; }, kWaitMs) || !rig->quiesce("S15.334 loss")) {
+        expect(false, QStringLiteral("S15.334: the launcher left and the client stayed ") + summary(c));
+        return;
+    }
+    auto next = std::make_unique<FakeKScreen>(service);
+    next->config = g_fixture;
+    next->edidMode = FakeKScreen::Mode::Hold;
+    if (const QString fault = next->start(); !fault.isEmpty()) {
+        notVerified("S15.334", "the new fake KScreen could not stand up: " + fault.toStdString());
+        return;
+    }
+    rig->fake = std::move(next);
+    rig->sinceHeld.start();
+    const bool read = waitFor([&] { return c.state() == State::Ready && rig->fake->heldEdid.size() == 2; }, kWaitMs) && rig->quiesce("S15.334 back", 2);
+    expect(read && names(c.monitors()) == QStringLiteral("[DP-4/M27Q P, DP-3/M27Q]") && c.selectedOutput() == QStringLiteral("DP-3"),
+           QStringLiteral("S15.334: after the launcher came back the names read %1 with getEdid held; ").arg(names(c.monitors())) + summary(c));
+    expect(notReady.isEmpty(), QStringLiteral("S15.334: while not Ready the client reported [%1]").arg(notReady.join(QStringLiteral(" | "))));
 }
 
 // S15.25 and S15.26, the client's side
@@ -1274,12 +1371,13 @@ void readyToUnavailable() {
     //       the three already reads the new state, list and selection.
     // WHY-THIS-SHAPE: the handlers snapshot all three fields at emission time; checking the
     //       fields after the wait instead passes whatever order the signals fire in.
-    // CONTROL: app/kde/kscreen_client.cpp, settle() writing the state and emitting stateChanged
-    //       before the list -> red, "stateChanged saw state Unavailable, 1 monitor(s)"; the getConfig
-    //       error path, then the backend-refused path, passing m_monitors instead of {} -> red, "must
-    //       report no monitor" for that path; restored, green.
-    // COVERAGE-ASSERT: settle()'s `emit monitorsChanged()` removed -> red, "expected all three
-    //       signals, saw stateChanged,selectionChanged".
+    // CONTROL: app/kde/kscreen_client.cpp, monitors() returning `m_answer` whatever the state -> red,
+    //       "stateChanged saw state Unavailable, 1 monitor(s)" on both paths, via control_batch.sh
+    //       2026-10-05; restored, green. A non-Ready client's list is derived from its state in
+    //       monitors(), and every signal is emitted from settled() after the fields are written, so
+    //       monitors() is the place left where an ordering break can be written.
+    // COVERAGE-ASSERT: settled()'s `emit monitorsChanged()` removed -> red, "expected all three
+    //       signals, saw stateChanged,selectionChanged" (re-run via control_batch.sh 2026-10-05).
     for (const bool viaBackend : {false, true}) {
         const char* phase = viaBackend ? "S15.12 (backend refused)" : "S15.12 (getConfig error)";
         auto rig = Rig::make(viaBackend ? "unavailable2" : "unavailable1", phase);
@@ -1371,6 +1469,7 @@ int main(int argc, char* argv[]) {
     edidNamesCarried();
     launcherRestart();
     launcherReplaced();
+    namesSurviveLauncherLoss();
     idsAndEmptyConnectors();
     readyToUnavailable();
 

@@ -280,9 +280,10 @@ int main(int argc, char** argv) {
             // CONTROL: `root.visible &&` dropped from the surface Loader's `active` in main.qml
             //       (backend/kde/kpackage/contents/ui/main.qml) -> "FAIL: a daemon restart is answered by
             //       the shown copy alone". `if (m_onScreen) reportVisible();` made `reportVisible();` in
-            //       the serviceOwnerChanged handler of WallpaperXItem::connectToDaemon
+            //       the DaemonWatch::replaced handler of WallpaperXItem::connectToDaemon
             //       (backend/kde/wallpaperx_item.cpp) -> the same line red: the unloaded renderers each
-            //       send "not visible" after the shown copy's "visible".
+            //       send "not visible" after the shown copy's "visible". The second re-run 2026-10-05 via
+            //       control_batch.sh, --phase '^copies-restart$'.
             Copy a = makeCopy(engine, window, true);
             Copy b = makeCopy(engine, window, false);
             const bool up = a.holder && b.holder && pumpUntil([&] { return a.renderer() != nullptr; }, kArrivalLimitMs);

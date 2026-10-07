@@ -313,9 +313,9 @@ int main(int argc, char** argv) {
     //       restarted daemon has only what its config file kept.
     // WHY-THIS-SHAPE: the stub gives the name up and takes it back, which is a real
     //       NameOwnerChanged pair on the bus the plugin watches -- not a call into the plugin.
-    // CONTROL: `m_sizeReported.reset();` deleted from the serviceOwnerChanged handler in
+    // CONTROL: `m_sizeReported.reset();` deleted from the DaemonWatch::replaced handler in
     //       WallpaperXItem::connectToDaemon (backend/kde/wallpaperx_item.cpp) -> "FAIL: a daemon
-    //       restart reports the unchanged size again". Reverted.
+    //       restart reports the unchanged size again". Re-run 2026-10-05 via control_batch.sh. Reverted.
     {
         const size_t before = reportsFor(sized).size();
         if (!wallpaperx::testing::restartDaemonName(bus)) {
@@ -359,7 +359,7 @@ int main(int argc, char** argv) {
         cases.push_back({QStringLiteral("DP-INVALIDARGS"), QStringLiteral("org.freedesktop.DBus.Error.InvalidArgs"), false, {}});
         cases.push_back({QStringLiteral("DP-OLDDAEMON"), QStringLiteral("org.freedesktop.DBus.Error.UnknownMethod"), false, {}});
 
-        StderrCapture capture(scratch.path() + QStringLiteral("/stderr.txt"));
+        StderrCapture capture;
         bool allRefused = capture.ok();
         if (allRefused) {
             for (Case& c : cases) {

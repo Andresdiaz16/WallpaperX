@@ -35,6 +35,7 @@
 // For vulkanDeviceUuid only; this test brings up its own GL through QQuickRenderControl.
 #include "tests/gl_import_harness.h"
 #include "tests/item_stub_scene.h"
+#include "tests/private_test_bus.h"
 #include "tests/test_report.h"
 #include "vulkan/device.h"
 #include "vulkan/offscreen.h"
@@ -610,7 +611,7 @@ bool runPhase(Phase phase) {
         // CONTROL: in backend/kde/wallpaperx_item.cpp, the `|| !m_onScreen` term deleted from
         //       fetchFrame()'s first guard -> "FAIL: and it asks the daemon for nothing while it is
         //       off the screen, however many frames are announced", printing the extra requests.
-        //       Observed 2026-09-20. Reverted.
+        //       Observed 2026-09-20; re-run 2026-10-05 via control_batch.sh. Reverted.
         // COVERAGE-ASSERT: the number of announcements sent during the silence is asserted, so a
         //       harness edit that stopped sending them would fail here rather than turning the
         //       check back into the vacuous form above.
@@ -683,8 +684,9 @@ bool runPhase(Phase phase) {
         //       It could not be made to fail through a real item. MEASURED: with the retirement
         //       removed, this whole binary stayed green and the claim set was empty at the texture
         //       teardown in both builds -- by then the item's own bookkeeping has emptied it, so
-        //       the two shapes produce identical traffic. The decision is graded directly in
-        //       backend/tests/buffer_claims_test.cpp, which records the same gap.
+        //       the two shapes produce identical traffic. backend/tests/buffer_claims_test.cpp grades
+        //       that sets are independent (a retired set cannot give back its replacement's claim)
+        //       and records the same gap for the exchange itself.
         // CONTROL: in backend/kde/wallpaperx_item.cpp, the `for (const BufferClaims::Claim& claim :
         //       retired->removeAll()) releaseClaim(claim);` loop deleted from releaseHeldImages()
         //       -> "FAIL: hiding it a second time gives the image back again" as well as the first
@@ -741,6 +743,8 @@ Phase phaseFromArgs(int argc, char** argv, bool& recognised) {
 
 int main(int argc, char** argv) {
     wallpaperx::testing::g_testName = "item_offscreen_test";
+    // X.34: nothing owned or sent off the private bus.
+    if (const std::optional<int> refused = wallpaperx::testing::refuseOffPrivateTestBus()) return *refused;
 
     wallpaperx::testing::registerFrameReplyTypes();
 

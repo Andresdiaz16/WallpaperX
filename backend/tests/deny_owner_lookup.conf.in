@@ -1,0 +1,11 @@
+<!-- The private test bus (isolated_session.conf, with no service directories), with one rule added:
+     nobody may ask the bus driver who owns a name. For item_refusal_retry_lookup, which grades what
+     the plugin does when that lookup fails. Started by private_bus.sh, which adds the <listen>. -->
+<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig>
+  <include>@WALLPAPERX_ISOLATED_SESSION_CONF@</include>
+  <policy context="default">
+    <deny send_destination="org.freedesktop.DBus" send_interface="org.freedesktop.DBus" send_member="GetNameOwner"/>
+  </policy>
+</busconfig>

@@ -10,12 +10,16 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <stdexcept>
 #include <utility>
 
 namespace wallpaperx {
 
 namespace {
+
+// Process-wide rather than per manager: see OffscreenTarget::bufferId. Starts at 1 so 0 stays "no buffer".
+std::atomic<uint64_t> g_nextBufferId{1};
 
 // Both halves of an ownership transfer name the same image and subresource; built here so
 // they cannot be given different ones.
@@ -249,7 +253,7 @@ OffscreenTarget OffscreenTargetManager::makeTarget(uint32_t width, uint32_t heig
     imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
     OffscreenTarget target;
-    target.bufferId = m_nextBufferId++;
+    target.bufferId = g_nextBufferId.fetch_add(1, std::memory_order_relaxed);
     target.width = width;
     target.height = height;
     target.image = m_device.memory().createExportableImage(

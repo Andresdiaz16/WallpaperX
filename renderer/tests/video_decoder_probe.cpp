@@ -809,6 +809,18 @@ void runMultiFileChecks(Device& device, const ScratchDir& scratch) {
         check(!opened, std::string(what) + " was opened, so ffmpeg reached a file by a path nobody checked");
         check(asContent && said.find(*path) != std::string::npos,
               std::string(what) + " was not refused as a content error naming the wallpaper (said: " + said + ")");
+        // GOAL: S15.325 -- the refusal says what the wallpaper is in words a user can act on: a list
+        //       of other files to play, of which only a single self-contained video can be shown --
+        //       not ffmpeg's "Invalid argument" or "Invalid data found when processing input".
+        // CONTROL: renderer/video/video_decoder.cpp, throwOpenFailure()'s list of multi-file demuxer
+        //       names emptied, via control_run.sh, 2026-10-05 -> "FAIL: an ffconcat script listing a
+        //       named pipe is not described as a list of other files (said: VideoDecoder: cannot open
+        //       the wallpaper (Invalid argument): ...)", and the same for the other two cases (the HLS
+        //       one "Invalid data found when processing input"). Reverted.
+        check(said.find("is a list of other files to play") != std::string::npos &&
+                  said.find("only a single self-contained video file can be shown") != std::string::npos &&
+                  said.find("Invalid argument") == std::string::npos && said.find("Invalid data") == std::string::npos,
+              std::string(what) + " is not described as a list of other files (said: " + said + ")");
         ++graded;
     }
     check(graded == kCases, "every multi-file case ran (" + std::to_string(graded) + " of 3)");

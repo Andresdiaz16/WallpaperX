@@ -173,7 +173,7 @@ bool testExportedBytesMatchReadback() {
         }
 
         // Exported straight from the layout the render left behind, exactly as
-        // GetFrameFd does.
+        // GetFrame does.
         const auto& target = targets.create(0, kTargetWidth, kTargetHeight);
         targets.render(renderer, target);
 

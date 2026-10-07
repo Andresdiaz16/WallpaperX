@@ -12,6 +12,7 @@
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
+#include <libavutil/avstring.h>
 #include <libavutil/buffer.h>
 #include <libavutil/common.h>
 #include <libavutil/error.h>
@@ -67,6 +68,21 @@ constexpr int64_t kCatchUpPictures = 250;
 [[noreturn]] void throwFileFailure(const std::string& reason, int err, const std::string& file) {
     if (err == AVERROR(ENOMEM)) throwOutOfMemory(kComponent);
     throw WallpaperContentError(describeRejection(kComponent, reason + " (" + avErrorString(err) + ")", file));
+}
+
+// throwFileFailure() for opening a container. One that is a list of other files fails because
+// openContainer() lets ffmpeg open nothing by itself, and ffmpeg's reason ("Invalid argument") says
+// nothing of that.
+[[noreturn]] void throwOpenFailure(const std::string& reason, int err, const std::string& file,
+                                   const AVInputFormat* format) {
+    if (err != AVERROR(ENOMEM) && format != nullptr && av_match_name(format->name, "concat,hls,dash,imf")) {
+        throw WallpaperContentError(describeRejection(
+            kComponent,
+            "the wallpaper is a list of other files to play (a playlist or an ffconcat script); only a single "
+            "self-contained video file can be shown",
+            file));
+    }
+    throwFileFailure(reason, err, file);
 }
 
 struct BufferRef {
@@ -564,10 +580,17 @@ void VideoDecoder::openContainer() {
     if (m_format->protocol_whitelist == nullptr) throwOutOfMemory("VideoDecoder");
     // Frees the context on failure, never a caller's I/O context.
     if (const int err = avformat_open_input(&m_format, m_file.c_str(), nullptr, nullptr); err < 0) {
-        throwFileFailure("cannot open the wallpaper", err, m_file);
+        // The context and the demuxer it found are gone, so the file is probed again to say what it
+        // was -- on this path only, so a file that opens is opened exactly as before.
+        const AVInputFormat* format = nullptr;
+        if (avio_seek(m_io, 0, SEEK_SET) < 0 ||
+            av_probe_input_buffer2(m_io, &format, m_file.c_str(), nullptr, 0, 0) < 0) {
+            format = nullptr;
+        }
+        throwOpenFailure("cannot open the wallpaper", err, m_file, format);
     }
     if (const int err = avformat_find_stream_info(m_format, nullptr); err < 0) {
-        throwFileFailure("cannot read the wallpaper's streams", err, m_file);
+        throwOpenFailure("cannot read the wallpaper's streams", err, m_file, m_format->iformat);
     }
     const int stream = av_find_best_stream(m_format, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
     if (stream == AVERROR_STREAM_NOT_FOUND) {

@@ -54,7 +54,7 @@ constexpr std::chrono::seconds kLoadDeadline{2};
 std::atomic<bool> g_loadAbandoned{false};
 
 // Applied identically by every entry point. Validating on SetWallpaper but not on
-// GetFrameFd would report a bad id as "no frame yet" -- a state a polling consumer is
+// GetFrame would report a bad id as "no frame yet" -- a state a polling consumer is
 // told to retry, so an off-by-one monitor id becomes an infinite retry loop with a
 // blank wallpaper instead of an immediate error.
 void requireValidMonitorId(int monitorId) {
@@ -453,6 +453,14 @@ void WallpaperManager::ensureGpu() {
     std::printf("wallpaperx-daemon: GPU: %s | Vendor: %s | Descriptor tier: %s\n",
                 m_device->info().gpuName.c_str(), toString(m_device->info().vendor),
                 toString(m_device->descriptorTier()));
+    // Said either way when asked for: no [vulkan] line is a clean run only if something was listening.
+    if (m_config.enableValidation) {
+        std::fputs(m_device->validationLayerActive()
+                       ? "wallpaperx-daemon: Vulkan validation layer active\n"
+                       : "wallpaperx-daemon: Vulkan validation was asked for but the layer is not active -- "
+                         "nothing is checking this run\n",
+                   stdout);
+    }
     std::fflush(stdout);
 }
 
@@ -549,7 +557,7 @@ void WallpaperManager::redrawIfResizedLocked(int monitorId, OutputSize before, s
 std::vector<uint64_t> WallpaperManager::flattenHolds(const std::vector<BufferHold>& holds) {
     std::vector<uint64_t> held;
     for (const BufferHold& hold : holds) {
-        held.insert(held.end(), hold.buffers.begin(), hold.buffers.end());
+        for (const HeldBuffer& buffer : hold.buffers) held.push_back(buffer.id);
     }
     return held;
 }
@@ -561,7 +569,7 @@ std::vector<uint64_t> WallpaperManager::heldBuffersLocked(int monitorId) const {
 }
 
 WallpaperManager::Handover WallpaperManager::withHandover(std::vector<BufferHold> holds, const std::string& client,
-                                                          uint64_t bufferId) {
+                                                          uint64_t bufferId, uint64_t handover, uint32_t descriptors) {
     auto holder = std::find_if(holds.begin(), holds.end(),
                                [&client](const BufferHold& hold) { return hold.client == client; });
     if (holder == holds.end()) {
@@ -570,27 +578,109 @@ WallpaperManager::Handover WallpaperManager::withHandover(std::vector<BufferHold
         holder = holds.end() - 1;
     }
 
-    // The same image again -- the ring cycles, so a consumer is handed the buffer it already holds
-    // every kTargetDepth renders -- is the claim it already has, not a second one.
-    if (std::find(holder->buffers.begin(), holder->buffers.end(), bufferId) != holder->buffers.end()) {
-        return Handover{std::move(holds), Handover::Outcome::AlreadyHeld};
+    std::vector<HandoverCharge> charges;
+    if (descriptors != 0) charges.push_back(HandoverCharge{handover, descriptors});
+
+    // The same image again -- a consumer fetching the frame it is already showing -- is the claim it
+    // already has, not a second one; only the reply is recorded.
+    const auto held = std::find_if(holder->buffers.begin(), holder->buffers.end(),
+                                   [bufferId](const HeldBuffer& buffer) { return buffer.id == bufferId; });
+    if (held != holder->buffers.end()) {
+        const uint64_t previous = std::exchange(held->newest, handover);
+        held->charges.insert(held->charges.end(), charges.begin(), charges.end());
+        return Handover{std::move(holds), Handover::Outcome::AlreadyHeld, previous};
     }
 
     // Refused rather than trimmed: this consumer's oldest image is one it has given no sign of
     // having stopped reading, and a claim taken back here is a render drawn under a reader.
     if (holder->buffers.size() >= kMaxHeldPerClient) return {};
 
-    holder->buffers.push_back(bufferId);
+    holder->buffers.push_back(HeldBuffer{bufferId, handover, 0, std::move(charges)});
     return Handover{std::move(holds), Handover::Outcome::Granted};
 }
 
-bool WallpaperManager::dropHoldLocked(MonitorState& state, const std::string& client, uint64_t bufferId) {
-    auto holder = std::find_if(state.holds.begin(), state.holds.end(),
-                               [&client](const BufferHold& hold) { return hold.client == client; });
-    if (holder == state.holds.end()) return false;
-    if (std::erase(holder->buffers, bufferId) == 0) return false;
-    if (holder->buffers.empty()) state.holds.erase(holder);
-    return true;
+namespace {
+
+// `client`'s record of `bufferId` in `holds`, or nothing.
+std::optional<std::pair<std::vector<BufferHold>::iterator, std::vector<HeldBuffer>::iterator>> findHeld(
+    std::vector<BufferHold>& holds, const std::string& client, uint64_t bufferId) {
+    const auto holder =
+        std::find_if(holds.begin(), holds.end(), [&client](const BufferHold& hold) { return hold.client == client; });
+    if (holder == holds.end()) return std::nullopt;
+    const auto held = std::find_if(holder->buffers.begin(), holder->buffers.end(),
+                                   [bufferId](const HeldBuffer& buffer) { return buffer.id == bufferId; });
+    if (held == holder->buffers.end()) return std::nullopt;
+    return std::pair{holder, held};
+}
+
+void endClaim(std::vector<BufferHold>& holds, std::vector<BufferHold>::iterator holder,
+              std::vector<HeldBuffer>::iterator held) {
+    holder->buffers.erase(held);
+    if (holder->buffers.empty()) holds.erase(holder);
+}
+
+}  // namespace
+
+bool WallpaperManager::releaseHandoversLocked(MonitorState& state, const std::string& client, uint64_t bufferId,
+                                              uint64_t handover) {
+    const auto found = findHeld(state.holds, client, bufferId);
+    if (!found) return false;
+    const auto [holder, held] = *found;
+    if (handover >= held->newest) {
+        endClaim(state.holds, holder, held);
+        return true;
+    }
+    held->released = std::max(held->released, handover);
+    std::erase_if(held->charges, [handover](const HandoverCharge& charge) { return charge.handover <= handover; });
+    return false;
+}
+
+bool WallpaperManager::undoHandoverLocked(MonitorState& state, const std::string& client, uint64_t bufferId,
+                                          const HandoverRecord& record) {
+    const auto found = findHeld(state.holds, client, bufferId);
+    if (!found) return false;
+    const auto [holder, held] = *found;
+    // Only an export makes a hand-over newer than this one, and every caller runs before another
+    // export could; a different number means the claim this record was added to has ended.
+    if (held->newest != record.number) return false;
+    if (record.previous <= held->released) {
+        endClaim(state.holds, holder, held);
+        return true;
+    }
+    held->newest = record.previous;
+    std::erase_if(held->charges,
+                  [&record](const HandoverCharge& charge) { return charge.handover == record.number; });
+    return false;
+}
+
+uint32_t WallpaperManager::descriptorsOf(const BufferHold& hold) {
+    uint32_t total = 0;
+    for (const HeldBuffer& buffer : hold.buffers) {
+        for (const HandoverCharge& charge : buffer.charges) total += charge.descriptors;
+    }
+    return total;
+}
+
+uint32_t WallpaperManager::descriptorsInFlightLocked(const std::string& client) const {
+    uint32_t total = 0;
+    for (const auto& [monitorId, state] : m_monitors) {
+        for (const BufferHold& hold : state.holds) {
+            if (hold.client == client) total += descriptorsOf(hold);
+        }
+    }
+    for (const ConsumerTimeline& entry : m_acquireTimelines) {
+        if (!entry.departed && entry.client == client) ++total;
+    }
+    return total;
+}
+
+WallpaperManager::DescriptorAdmission WallpaperManager::admitDescriptorsLocked(const std::string& client,
+                                                                               uint32_t more) {
+    if (descriptorsInFlightLocked(client) + more <= kMaxDescriptorsPerClient) {
+        m_descriptorRefusals.erase(client);
+        return {};
+    }
+    return DescriptorAdmission{false, m_descriptorRefusals.insert(client).second};
 }
 
 // The one place that decides what an image coming free is worth: a render if one is owed,
@@ -607,14 +697,19 @@ void WallpaperManager::reportFreedImageLocked(int monitorId, const MonitorState&
 }
 
 std::vector<int> WallpaperManager::releaseBuffer(const std::string& client, int monitorId, uint64_t bufferId,
-                                                 std::vector<FrameAvailable>* announce) {
+                                                 uint64_t handover, std::vector<FrameAvailable>* announce) {
     requireValidMonitorId(monitorId);
 
     std::lock_guard<std::mutex> stateLock(m_stateMutex);
+    // Refused rather than read as "everything": a number past the latest would end claims on
+    // hand-overs not yet made, which is the release this numbering exists to make impossible.
+    if (handover == 0 || handover > m_lastHandover) {
+        throw InvalidRequest("hand-over " + std::to_string(handover) + " has not been made");
+    }
     auto it = m_monitors.find(monitorId);
     if (it == m_monitors.end()) return {};
 
-    if (!dropHoldLocked(it->second, client, bufferId)) return {};
+    if (!releaseHandoversLocked(it->second, client, bufferId, handover)) return {};
 
     std::vector<int> toRender;
     reportFreedImageLocked(monitorId, it->second, toRender, announce);
@@ -625,6 +720,7 @@ std::vector<int> WallpaperManager::forgetHeldBuffers(const std::string& client, 
     std::vector<int> toRender;
 
     std::lock_guard<std::mutex> stateLock(m_stateMutex);
+    m_descriptorRefusals.erase(client);
     for (auto& [monitorId, state] : m_monitors) {
         // Whether or not it held anything: a consumer that left is neither refused nor reading, and
         // its name would otherwise hold a slot the next consumer needs to be named by.
@@ -639,6 +735,20 @@ std::vector<int> WallpaperManager::forgetHeldBuffers(const std::string& client, 
     return toRender;
 }
 
+std::vector<int> WallpaperManager::withdrawHandover(int monitorId, const std::string& client,
+                                                    const FrameHandle& handle, std::vector<FrameAvailable>* announce) {
+    if (!handle.handover) return {};
+
+    std::lock_guard<std::mutex> stateLock(m_stateMutex);
+    auto it = m_monitors.find(monitorId);
+    if (it == m_monitors.end()) return {};
+    if (!undoHandoverLocked(it->second, client, handle.frame.bufferId, *handle.handover)) return {};
+
+    std::vector<int> toRender;
+    reportFreedImageLocked(monitorId, it->second, toRender, announce);
+    return toRender;
+}
+
 int WallpaperManager::acquireTimelineFd(const std::string& client) {
     if (client.empty()) {
         throw TimelineUnavailable("a caller with no bus name has nothing its timeline could be kept under");
@@ -650,13 +760,35 @@ int WallpaperManager::acquireTimelineFd(const std::string& client) {
     reapDepartedTimelinesLocked();
 
     try {
-        if (AcquireTimeline* existing = liveAcquireTimeline(client)) return existing->exportFd();
+        // Already counted, as the one descriptor a live timeline is. Valid after the lock is let go:
+        // an entry is added or removed only under m_gpuMutex, held here.
+        ConsumerTimeline* existing = nullptr;
+        {
+            std::lock_guard<std::mutex> stateLock(m_stateMutex);
+            existing = liveTimelineEntryLocked(client);
+            if (existing != nullptr && existing->copiesSent >= kMaxTimelineCopiesPerClient) {
+                throw TimelineCopyLimitReached(
+                    "caller " + sanitizeForLog(client) + " has been sent " +
+                    std::to_string(kMaxTimelineCopiesPerClient) +
+                    " copies of its acquire timeline, as many as one connection is sent; each is the same "
+                    "timeline, so keep one and duplicate it rather than asking again. A new connection may ask "
+                    "for a timeline of its own");
+            }
+        }
+        if (existing != nullptr) return existing->timeline->exportFd();
 
         if (!AcquireTimeline::supported(*m_device)) {
             throw TimelineUnavailable("this GPU cannot export a timeline semaphore");
         }
+        // Checked here and charged by the entry pushed below, under two acquisitions: every export
+        // holds m_gpuMutex, so nothing can add to this client's count between them, and a release
+        // only lowers it.
         {
             std::lock_guard<std::mutex> stateLock(m_stateMutex);
+            const DescriptorAdmission admission = admitDescriptorsLocked(client, 1);
+            if (!admission.admitted) {
+                throw DescriptorLimitReached("too many descriptors not given back", admission.firstRefusal);
+            }
             if (m_acquireTimelines.size() >= kMaxAcquireTimelines) {
                 throw TimelineLimitReached("this daemon already keeps an acquire timeline for " +
                                            std::to_string(kMaxAcquireTimelines) + " consumers; ask again later");
@@ -668,7 +800,7 @@ int WallpaperManager::acquireTimelineFd(const std::string& client) {
         {
             std::lock_guard<std::mutex> stateLock(m_stateMutex);
             try {
-                m_acquireTimelines.push_back(ConsumerTimeline{client, std::move(timeline), false});
+                m_acquireTimelines.push_back(ConsumerTimeline{client, std::move(timeline), false, 0});
             } catch (...) {
                 ::close(fd);
                 throw;
@@ -683,6 +815,11 @@ int WallpaperManager::acquireTimelineFd(const std::string& client) {
         recordHealth(&DaemonHealth::gpu, HealthStatus::Fail, e.what());
         throw;
     }
+}
+
+void WallpaperManager::timelineCopyDelivered(const std::string& client) noexcept {
+    std::lock_guard<std::mutex> stateLock(m_stateMutex);
+    if (ConsumerTimeline* entry = liveTimelineEntryLocked(client)) ++entry->copiesSent;
 }
 
 void WallpaperManager::forgetAcquireTimeline(const std::string& client) {
@@ -707,34 +844,60 @@ void WallpaperManager::reapDepartedTimelinesLocked() {
     }
 }
 
-void WallpaperManager::noteRequestQueued(const std::string& client) {
-    if (client.empty()) return;
+bool WallpaperManager::QueuedRequests::refusing(std::chrono::steady_clock::time_point now) const {
+    return lastRefusal && now - *lastRefusal < kRequestRefusalQuiet;
+}
+
+WallpaperManager::Admission WallpaperManager::admitRequest(const std::string& client) {
+    if (client.empty()) return Admission::Admitted;
+    const auto now = std::chrono::steady_clock::now();
     std::lock_guard<std::mutex> stateLock(m_stateMutex);
-    ++m_queuedRequests[client].count;
+    QueuedRequests& queued = m_queuedRequests[client];
+    if (queued.count >= kMaxQueuedRequestsPerClient) {
+        const bool first = !queued.refusing(now);
+        queued.lastRefusal = now;
+        return first ? Admission::FirstRefusal : Admission::Refused;
+    }
+    ++queued.count;
+    return Admission::Admitted;
 }
 
 bool WallpaperManager::noteRequestDone(const std::string& client) {
     if (client.empty()) return false;
+    const auto now = std::chrono::steady_clock::now();
     std::lock_guard<std::mutex> stateLock(m_stateMutex);
     const auto it = m_queuedRequests.find(client);
     if (it == m_queuedRequests.end() || --it->second.count > 0) return false;
     const bool departed = it->second.departed;
-    m_queuedRequests.erase(it);
+    // Kept through a run of refusals: a flood drains its share between batches, and forgetting
+    // the run there would log every batch. noteDeparted() removes it at the latest.
+    if (departed || !it->second.refusing(now)) m_queuedRequests.erase(it);
     return departed;
 }
 
 void WallpaperManager::noteDeparted(const std::string& client) {
     std::lock_guard<std::mutex> stateLock(m_stateMutex);
-    if (const auto it = m_queuedRequests.find(client); it != m_queuedRequests.end()) it->second.departed = true;
+    const auto it = m_queuedRequests.find(client);
+    if (it == m_queuedRequests.end()) return;
+    if (it->second.count == 0) {
+        m_queuedRequests.erase(it);
+    } else {
+        it->second.departed = true;
+    }
 }
 
 AcquireTimeline* WallpaperManager::liveAcquireTimeline(const std::string& client) {
     std::lock_guard<std::mutex> stateLock(m_stateMutex);
+    ConsumerTimeline* entry = liveTimelineEntryLocked(client);
+    return entry == nullptr ? nullptr : entry->timeline.get();
+}
+
+WallpaperManager::ConsumerTimeline* WallpaperManager::liveTimelineEntryLocked(const std::string& client) {
     const auto it = std::find_if(m_acquireTimelines.begin(), m_acquireTimelines.end(),
                                  [&client](const ConsumerTimeline& entry) {
                                      return !entry.departed && entry.client == client;
                                  });
-    return it == m_acquireTimelines.end() ? nullptr : it->timeline.get();
+    return it == m_acquireTimelines.end() ? nullptr : &*it;
 }
 
 std::vector<uint64_t> WallpaperManager::intersectImportModifiersLocked() const {
@@ -1139,7 +1302,7 @@ void WallpaperManager::setOutputSize(const std::string& outputName, uint32_t wid
     redrawIfResizedLocked(bound->second, before, redraw);
 }
 
-void WallpaperManager::setOutputVisible(const std::string& outputName, bool visible) {
+bool WallpaperManager::setOutputVisible(const std::string& outputName, bool visible) {
     requireValidOutputName(outputName);
 
     std::lock_guard<std::mutex> stateLock(m_stateMutex);
@@ -1169,17 +1332,19 @@ void WallpaperManager::setOutputVisible(const std::string& outputName, bool visi
     // See MonitorState::ResumeCredit. A report while a credit is pending or unspent leaves it at its
     // own time -- moving it would let reports in quick succession push it out of reach -- and only
     // takes the current generation, so a picture published meanwhile does not cancel it.
-    if (!visible || wasDrawn) return;
+    const bool changed = wasDrawn != visible;
+    if (!visible || wasDrawn) return changed;
     const auto it = m_monitors.find(bound->second);
-    if (it == m_monitors.end()) return;
+    if (it == m_monitors.end()) return changed;
     MonitorState::ResumeCredit& credit = it->second.resumeCredit;
     const SteadyTime now = std::chrono::steady_clock::now();
     const uint64_t generation = it->second.generation;
     if (credit.at && (*credit.at > now || credit.generation == generation)) {
         credit.generation = generation;
-        return;
+        return changed;
     }
     credit = MonitorState::ResumeCredit{credit.at ? std::max(now, *credit.at + m_config.unwatchedAfter) : now, generation};
+    return changed;
 }
 
 void WallpaperManager::setMonitorPause(int monitorId, const std::string& mode) {
@@ -1832,11 +1997,32 @@ std::optional<uint64_t> WallpaperManager::playingSeqLocked(int monitorId, uint64
     return current;
 }
 
-void WallpaperManager::noteHandoverServed(int monitorId) {
-    std::lock_guard<std::mutex> stateLock(m_stateMutex);
-    const auto it = m_monitors.find(monitorId);
-    // The newest picture is what a hand-over carries, so there is nothing outstanding after one.
-    if (it != m_monitors.end()) it->second.uncollectedSince.reset();
+bool WallpaperManager::recordDeliveredLocked(int monitorId, const std::string& client) noexcept {
+    if (client.empty()) return false;
+    try {
+        std::lock_guard<std::mutex> stateLock(m_stateMutex);
+        const auto it = m_monitors.find(monitorId);
+        if (it == m_monitors.end()) return false;
+        // The newest picture is what a hand-over carries, so there is nothing outstanding after one.
+        it->second.uncollectedSince.reset();
+        // Recorded per consumer rather than derived from the holds: a consumer that gives its image
+        // back before asking for the next one holds none at this moment and is reading all the same.
+        if (m_videoSessions.count(monitorId) == 0) return false;
+        return !reportConsumer(it->second.served, client, Repeat::Once, std::chrono::steady_clock::now(),
+                               m_config.refusalLogInterval);
+    } catch (...) {
+        // Only the consumer record allocates, after the evidence above; losing it costs one log line.
+        return false;
+    }
+}
+
+bool WallpaperManager::handoverDelivered(int monitorId, const std::string& client) noexcept {
+    try {
+        std::lock_guard<std::mutex> gpuLock(m_gpuMutex);
+        return recordDeliveredLocked(monitorId, client);
+    } catch (...) {
+        return false;
+    }
 }
 
 bool WallpaperManager::evictIdleVideoSessionLocked() {
@@ -2561,10 +2747,12 @@ WallpaperManager::RenderPass WallpaperManager::renderPassLocked(int monitorId, b
     return RenderPass{RenderOutcome{committed, generation}, false};
 }
 
-FrameHandle WallpaperManager::exportHandle(const OffscreenTarget& target, AcquireTimeline* timeline) {
+FrameHandle WallpaperManager::exportHandle(const OffscreenTarget& target, AcquireTimeline* timeline,
+                                           bool sendMemory) {
     FrameHandle handle;
     try {
-        handle.frame = wallpaperx::exportFrame(*m_device, target);
+        handle.frame = sendMemory ? wallpaperx::exportFrame(*m_device, target)
+                                  : wallpaperx::describeFrame(*m_device, target);
         try {
             if (timeline != nullptr) {
                 handle.acquireValue = timeline->signal(target);
@@ -2575,7 +2763,7 @@ FrameHandle WallpaperManager::exportHandle(const OffscreenTarget& target, Acquir
             // The memory descriptor is already open and nothing else will close it. A frame with
             // no acquire beside it is not offered: the consumer would read unowned memory while
             // this daemon reported a mode saying it had been handed the acquire.
-            close(handle.frame.fd);
+            if (handle.frame.fd >= 0) close(handle.frame.fd);
             throw;
         }
     } catch (const GpuFailure& e) {
@@ -2610,8 +2798,18 @@ bool WallpaperManager::reportConsumer(std::vector<ConsumerReport>& reports, cons
     return true;
 }
 
-FrameExport WallpaperManager::exportCurrentFrame(int monitorId, const std::string& client, bool onTimeline) {
+void WallpaperManager::requireKnownBuffers(const std::vector<uint64_t>& knownBuffers) {
+    if (knownBuffers.size() > kMaxKnownBuffers) {
+        throw InvalidRequest("at most " + std::to_string(kMaxKnownBuffers) + " known buffer ids, got " +
+                             std::to_string(knownBuffers.size()));
+    }
+}
+
+FrameExport WallpaperManager::exportCurrentFrame(int monitorId, const std::string& client, bool onTimeline,
+                                                 const std::vector<uint64_t>& knownBuffers, std::vector<int>& toRender,
+                                                 std::vector<FrameAvailable>* announce) {
     requireValidMonitorId(monitorId);
+    requireKnownBuffers(knownBuffers);
 
     std::lock_guard<std::mutex> gpuLock(m_gpuMutex);
     // Here as well as at registration, so a consumer that left is freed by the next picture anyone
@@ -2636,6 +2834,7 @@ FrameExport WallpaperManager::exportCurrentFrame(int monitorId, const std::strin
             // window and "never" afterwards for one unchanged request.
             if (!isRenderableType(it->second.type)) {
                 out.reason = NoFrameReason::Unsupported;
+                out.type = it->second.type;
                 return out;
             }
             if (!it->second.lastError.empty()) {
@@ -2665,6 +2864,16 @@ FrameExport WallpaperManager::exportCurrentFrame(int monitorId, const std::strin
 
     const OffscreenTarget& target = m_targets->get(monitorId);
 
+    // What this reply will carry, decided before admission because that is what it is charged.
+    // The memory stays home only beside an acquire: without one the caller has nothing telling
+    // its driver the import it kept now holds another picture, and would have to draw it stale.
+    AcquireTimeline* timeline = onTimeline && !client.empty() ? liveAcquireTimeline(client) : nullptr;
+    const bool sendsAcquireFd = timeline == nullptr && m_device->info().hasExternalSemaphoreFd;
+    const bool carriesAcquire = timeline != nullptr || sendsAcquireFd;
+    const bool sendMemory =
+        !carriesAcquire || std::find(knownBuffers.begin(), knownBuffers.end(), target.bufferId) == knownBuffers.end();
+    const uint32_t descriptors = (sendMemory ? 1u : 0u) + (sendsAcquireFd ? 1u : 0u);
+
     // One image stays out of consumers' hands so a render always has somewhere to draw. Asked
     // of nextUnheld(), which is the same question the render itself asks, so the two cannot
     // come to different answers about what is free. Only a named caller is charged with a
@@ -2678,19 +2887,31 @@ FrameExport WallpaperManager::exportCurrentFrame(int monitorId, const std::strin
     // Refusing costs this consumer a frame it must ask for again; granting past a cap would cost
     // the monitor every render until somebody released, and nothing may be taken back from a
     // consumer that could still be reading it.
-    bool claimAdded = false;
+    //
+    // The descriptor bound comes first: it is this consumer's own doing whatever the others hold.
+    // It says nothing about this monitor's ring, so it neither counts as a refused hand-over nor
+    // as collecting.
+    std::optional<HandoverRecord> record;
     if (!client.empty()) {
         std::lock_guard<std::mutex> stateLock(m_stateMutex);
         auto it = m_monitors.find(monitorId);
         if (it != m_monitors.end()) {
-            Handover next = withHandover(it->second.holds, client, target.bufferId);
+            const DescriptorAdmission admission = admitDescriptorsLocked(client, descriptors);
+            if (!admission.admitted) {
+                out.firstRefusal = admission.firstRefusal;
+                out.reason = NoFrameReason::TooManyDescriptors;
+                return out;
+            }
+            const uint64_t number = m_lastHandover + 1;
+            Handover next = withHandover(it->second.holds, client, target.bufferId, number, descriptors);
             if (next.outcome == Handover::Outcome::Refused ||
                 m_targets->nextUnheld(monitorId, flattenHolds(next.holds)) == nullptr) {
                 ++it->second.refusedHandovers;
-                // Periodic: a consumer stuck being refused is worth saying again, unlike one that
-                // is reading normally.
+                // Periodic: a consumer stuck being refused is worth saying again, unlike one that is
+                // reading normally.
                 out.firstRefusal = reportConsumer(it->second.refusalsReported, client, Repeat::Periodic,
                                                   std::chrono::steady_clock::now(), m_config.refusalLogInterval);
+                out.reason = NoFrameReason::NoFreeImage;
                 // A consumer refused while holding none of this monitor's images is asking for a
                 // picture the daemon had none to give -- its own back-pressure -- so it counts as
                 // collecting, and the video it would otherwise stop keeps playing for it. A
@@ -2701,52 +2922,44 @@ FrameExport WallpaperManager::exportCurrentFrame(int monitorId, const std::strin
                                  [&client](const BufferHold& hold) { return hold.client == client; })) {
                     it->second.uncollectedSince.reset();
                 }
-                out.reason = NoFrameReason::NoFreeImage;
                 return out;
             }
             it->second.holds = std::move(next.holds);
             it->second.refusedHandovers = 0;
-            claimAdded = next.outcome == Handover::Outcome::Granted;
+            m_lastHandover = number;
+            record = HandoverRecord{number, next.previous};
         }
     }
 
     FrameHandle handle;
     try {
-        handle = exportHandle(target, onTimeline && !client.empty() ? liveAcquireTimeline(client) : nullptr);
+        handle = exportHandle(target, timeline, sendMemory);
     } catch (...) {
-        // The consumer never got the image, so it must not stay charged with holding one it
-        // cannot name to release. Undoing this one id restores the whole record, because
-        // withHandover() only ever adds -- and a blind restore of the previous record would
-        // instead resurrect a claim a ReleaseBuffer ended while the export ran.
-        if (claimAdded) {
+        // The consumer never got the image, so it must not stay charged with a reply it never
+        // received, nor with holding one it cannot name to release. Undoing this one hand-over
+        // restores the whole record, because withHandover() only ever adds -- and a blind restore
+        // of the previous record would instead resurrect a claim a ReleaseBuffer ended while the
+        // export ran. An undo that ends the claim frees an image, reported like any release.
+        if (record) {
             std::lock_guard<std::mutex> stateLock(m_stateMutex);
             auto it = m_monitors.find(monitorId);
-            if (it != m_monitors.end()) dropHoldLocked(it->second, client, target.bufferId);
+            if (it != m_monitors.end() && undoHandoverLocked(it->second, client, target.bufferId, *record)) {
+                try {
+                    reportFreedImageLocked(monitorId, it->second, toRender, announce);
+                } catch (...) {
+                    // The export's own failure is the one to rethrow.
+                }
+            }
         }
         throw;
     }
 
-    // The picture is out, and to a consumer the bus can name: the only evidence the daemon has
-    // that anything is looking, and what a video plays on. Not before the export, which can fail
-    // and hand over nothing; not for an unnamed caller either, since a diagnostic poll no claim
-    // can be charged to must not keep a screen's video decoding.
-    if (!client.empty()) noteHandoverServed(monitorId);
-
+    // From here to the return nothing throws: the claim is recorded and the descriptors are open, and
+    // only the caller holding the handle can give either back.
+    static_assert(std::is_nothrow_move_constructible_v<FrameHandle>);
+    handle.handover = record;
     handle.generation = generation;
-    // Only for a monitor with a video session, which this call's m_gpuMutex makes safe to look up;
-    // `served` itself is monitor state, taken under m_stateMutex inside it in the documented order.
-    //
-    // Recorded per consumer rather than derived from the holds: a consumer that gives its image
-    // back before asking for the next one holds none at this moment and is reading all the same,
-    // which made every picture of a playing video log a line.
-    if (!client.empty() && m_videoSessions.count(monitorId) != 0) {
-        std::lock_guard<std::mutex> stateLock(m_stateMutex);
-        if (const auto it = m_monitors.find(monitorId); it != m_monitors.end()) {
-            handle.routine = !reportConsumer(it->second.served, client, Repeat::Once, std::chrono::steady_clock::now(),
-                                             m_config.refusalLogInterval);
-        }
-    }
-    out.handle = std::move(handle);
+    out.handle.emplace(std::move(handle));
     return out;
 }
 

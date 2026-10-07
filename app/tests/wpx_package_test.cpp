@@ -32,11 +32,15 @@
 #include <limits>
 #include <thread>
 
+#include <csignal>
+
 #include <fcntl.h>
 #include <linux/openat2.h>
+#include <poll.h>
 #include <sys/inotify.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 using namespace wallpaperx;
@@ -1304,6 +1308,67 @@ void defaultDirectory(const QString& root) {
                .arg(defaultLibraryDirectory(), wallpapersDirectory(defaultLibraryDirectory()), want));
 }
 
+// S15.354
+void leaseDoesNotBlock(const QString& root) {
+    // GOAL: S15.354 -- opening a file that another process holds a write lease on returns at once
+    //       (refused, EWOULDBLOCK) rather than waiting for the lease to be broken: these opens run on the
+    //       app's GUI thread, and a lease holder may keep it for up to the kernel's 45 s.
+    // WHY-THIS-SHAPE: a child process takes the lease and holds it until told to let go or 8 s pass,
+    //       ignoring the break signal; an open that waits for the lease therefore returns only when the
+    //       child ends it, far past the 2 s bound, and one that does not returns at once. A host that
+    //       will not give the child a lease is reported not verified.
+    // CONTROL: `| O_NONBLOCK` deleted from the reopen in openRegularFile (app/library/wpx_package.cpp)
+    //       -> "FAIL: S15.354: opening a file under another process's write lease returned after 8000 ms,
+    //       opened". Via control_batch.sh, --phase '^leaseDoesNotBlock$', 2026-10-06. Reverted.
+    const QString path = root + QStringLiteral("/leased.wpx");
+    int ready[2] = {-1, -1};
+    int release[2] = {-1, -1};
+    if (!writeBytes(path, "x") || ::pipe2(ready, O_CLOEXEC) != 0 || ::pipe2(release, O_CLOEXEC) != 0) {
+        expect(false, QStringLiteral("S15.354: the leased file or the pipes could not be made"));
+        return;
+    }
+    const QByteArray encoded = QFile::encodeName(path);
+    const pid_t holder = ::fork();
+    if (holder == 0) {
+        ::signal(SIGIO, SIG_IGN);
+        const int fd = ::open(encoded.constData(), O_RDWR);
+        const char leased = fd >= 0 && ::fcntl(fd, F_SETLEASE, F_WRLCK) == 0 ? '1' : '0';
+        static_cast<void>(::write(ready[1], &leased, 1));
+        pollfd until{release[0], POLLIN, 0};
+        static_cast<void>(::poll(&until, 1, 8000));
+        ::_exit(0);
+    }
+    ::close(ready[1]);
+    ::close(release[0]);
+    // The holder may have given up already (an open that waited for it), so its end of the pipe can be
+    // gone: EPIPE, not SIGPIPE, or the run would die before saying what it saw.
+    const auto reap = [&] {
+        const auto previous = ::signal(SIGPIPE, SIG_IGN);
+        static_cast<void>(::write(release[1], "x", 1));
+        ::signal(SIGPIPE, previous);
+        ::close(release[1]);
+        ::close(ready[0]);
+        int status = 0;
+        if (holder > 0) ::waitpid(holder, &status, 0);
+    };
+    char leased = '0';
+    pollfd answer{ready[0], POLLIN, 0};
+    if (holder < 0 || ::poll(&answer, 1, 5000) != 1 || ::read(ready[0], &leased, 1) != 1 || leased != '1') {
+        reap();
+        notVerified("S15.354", "this host would not give a child process a write lease on a scratch file");
+        return;
+    }
+    const auto start = std::chrono::steady_clock::now();
+    const auto opened = openRegularFile(AT_FDCWD, encoded.constData(), O_RDONLY);
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+    const int error = opened ? 0 : opened.error();
+    reap();
+    expect(ms < 2000 && !opened && error == EWOULDBLOCK,
+           QStringLiteral("S15.354: opening a file under another process's write lease returned after %1 ms, %2")
+               .arg(ms)
+               .arg(opened ? QStringLiteral("opened") : QString::fromLocal8Bit(std::strerror(error))));
+}
+
 } // namespace
 
 int main(int argc, char* argv[]) {
@@ -1329,5 +1394,6 @@ int main(int argc, char* argv[]) {
     runPhase("turnedPreview", [&] { turnedPreview(root); });
     runPhase("previewAddresses", [&] { previewAddresses(root); });
     runPhase("defaultDirectory", [&] { defaultDirectory(root); });
+    runPhase("leaseDoesNotBlock", [&] { leaseDoesNotBlock(root); });
     return verdict();
 }

@@ -129,6 +129,11 @@ function(wallpaperx_add_isolation_wrapper_tests)
                                 -DPROBE=$<TARGET_FILE:wallpaperx-wrapper-probe>
                                 -P ${WALLPAPERX_ISOLATION_SUPPORT_DIR}/isolation_wrapper_test.cmake)
     set_tests_properties(test_isolation_wrapper PROPERTIES LABELS "novulkan")
+    get_filename_component(_wx_ci_file "${WALLPAPERX_ISOLATION_SUPPORT_DIR}/../../../.github/workflows/ci.yml" ABSOLUTE)
+    wallpaperx_add_test(NAME test_ci_namespace_probe
+                        COMMAND ${CMAKE_COMMAND} -DWRAPPER=${WALLPAPERX_ISOLATED_RUN} -DCI=${_wx_ci_file}
+                                -P ${WALLPAPERX_ISOLATION_SUPPORT_DIR}/ci_namespace_probe_test.cmake)
+    set_tests_properties(test_ci_namespace_probe PROPERTIES LABELS "novulkan")
     if(WALLPAPERX_DBUS_RUN_SESSION)
         wallpaperx_add_test(NAME test_isolation_wrapper_tmp
                             COMMAND ${CMAKE_COMMAND} -DWRAPPER=${WALLPAPERX_ISOLATED_RUN}

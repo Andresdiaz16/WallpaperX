@@ -25,17 +25,34 @@ std::optional<double> number(const QVariant& value)
     case QMetaType::LongLong:
     case QMetaType::ULongLong:
     case QMetaType::Double:
-        return value.toDouble();
+        if (const double d = value.toDouble(); std::isfinite(d)) {
+            return d;
+        }
+        return std::nullopt;
     default:
         return std::nullopt;
     }
 }
 
+// Nothing unless a whole number from `min` to `max`, which int can hold: converting a double out
+// of its range is undefined.
+std::optional<int> wholeNumber(const QVariant& value, int min, int max)
+{
+    const auto n = number(value);
+    if (!n || *n < min || *n > max || *n != std::trunc(*n)) {
+        return std::nullopt;
+    }
+    return static_cast<int>(*n);
+}
+
 std::optional<QPointF> point(const QVariant& value)
 {
     const QVariantMap map = value.toMap();
-    const auto x = number(map.value(QStringLiteral("x")));
-    const auto y = number(map.value(QStringLiteral("y")));
+    // KScreen positions are ints; anything else would let the screens' union bounds overflow.
+    constexpr int kMin = std::numeric_limits<int>::min();
+    constexpr int kMax = std::numeric_limits<int>::max();
+    const auto x = wholeNumber(map.value(QStringLiteral("x")), kMin, kMax);
+    const auto y = wholeNumber(map.value(QStringLiteral("y")), kMin, kMax);
     if (!x || !y) {
         return std::nullopt;
     }
@@ -45,12 +62,13 @@ std::optional<QPointF> point(const QVariant& value)
 std::optional<QSize> size(const QVariant& value)
 {
     const QVariantMap map = value.toMap();
-    const auto w = number(map.value(QStringLiteral("width")));
-    const auto h = number(map.value(QStringLiteral("height")));
+    constexpr int kMax = std::numeric_limits<int>::max();
+    const auto w = wholeNumber(map.value(QStringLiteral("width")), 0, kMax);
+    const auto h = wholeNumber(map.value(QStringLiteral("height")), 0, kMax);
     if (!w || !h) {
         return std::nullopt;
     }
-    return QSize(static_cast<int>(*w), static_cast<int>(*h));
+    return QSize(*w, *h);
 }
 
 // KScreen::Output::Rotation, one bit per state.
@@ -174,11 +192,11 @@ std::expected<QList<Monitor>, QString> parseKScreenConfig(const QVariantMap& con
         monitor.panel = describePanel(output);
         // The id routes each getEdid answer to one monitor, so it must be exact and unique.
         if (const QVariant id = output.value(QStringLiteral("id")); id.isValid()) {
-            const auto value = number(id);
-            if (!value || *value < 0 || *value > std::numeric_limits<int>::max() || *value != std::trunc(*value)) {
+            const auto value = wholeNumber(id, 0, std::numeric_limits<int>::max());
+            if (!value) {
                 return std::unexpected(QStringLiteral("KScreen gave %1 an id that is not a whole number.").arg(monitor.outputName));
             }
-            monitor.kscreenId = static_cast<int>(*value);
+            monitor.kscreenId = *value;
             if (const auto seen = ids.constFind(monitor.kscreenId); seen != ids.cend()) {
                 return std::unexpected(QStringLiteral("KScreen gave %1 and %2 the same id.").arg(*seen, monitor.outputName));
             }
@@ -187,13 +205,21 @@ std::expected<QList<Monitor>, QString> parseKScreenConfig(const QVariantMap& con
         monitor.enabled = flag(output, QStringLiteral("enabled"));
         monitor.connected = flag(output, QStringLiteral("connected"));
         monitor.primary = number(output.value(QStringLiteral("priority"))).value_or(0) == 1;
-        applyRotation(monitor, static_cast<int>(number(output.value(QStringLiteral("rotation"))).value_or(1)));
-        if (const auto scale = number(output.value(QStringLiteral("scale"))); scale && *scale > 0) {
-            monitor.scale = *scale;
-        }
-
+        // Unreadable, as an unknown flag is, it is upright.
+        applyRotation(monitor, wholeNumber(output.value(QStringLiteral("rotation")), 0, 1 << 7).value_or(1));
         const auto pos = point(output.value(QStringLiteral("pos")));
         const auto pixels = size(output.value(QStringLiteral("size")));
+        // Unreadable, it is 1, and so is one giving a logical size that KScreen's whole-number
+        // geometry could not hold: a tiny scale would make it infinite.
+        if (const auto scale = number(output.value(QStringLiteral("scale"))); scale && *scale > 0) {
+            const auto holds = [&scale](int pixelCount) {
+                const double logical = pixelCount / *scale;
+                return logical >= 1 && logical <= std::numeric_limits<int>::max();
+            };
+            if (!pixels || pixels->isEmpty() || (holds(pixels->width()) && holds(pixels->height()))) {
+                monitor.scale = *scale;
+            }
+        }
         if (pos && pixels && !pixels->isEmpty()) {
             monitor.pixelSize = *pixels;
             monitor.geometry = QRectF(*pos, pixels->toSizeF() / monitor.scale);

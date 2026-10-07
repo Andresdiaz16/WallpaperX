@@ -20,7 +20,7 @@ namespace wallpaperx {
 // is a paint callback inside the compositor and an exception there is not survivable.
 class FrameImport {
 public:
-    // What the daemon says the memory is. Mirrors the handle_type field of GetFrameFd rather
+    // What the daemon says the memory is. Mirrors the handle_type field of GetFrame rather
     // than re-deriving it: the daemon chooses per vendor and only it knows which it picked.
     enum class HandleType { OpaqueFd = 0, DmaBuf = 1 };
 
@@ -49,7 +49,7 @@ public:
         uint64_t bufferId = 0;
 
         // What the daemon says must be waited on before the frame is sampled -- the sync_fds of
-        // GetFrameFd. Each is a binary semaphore payload that is ALREADY signalled; waiting on it
+        // GetFrame. Each is a binary semaphore payload that is ALREADY signalled; waiting on it
         // is what performs the queue-family acquire and the layout transition the producer's
         // release left outstanding, which OpenGL has no other way to express.
         //
@@ -59,7 +59,7 @@ public:
         // the fallback.
         std::vector<int> syncFds;
 
-        // The other form of the same hand-over: the acquire_value of GetFrameFd, a value to wait
+        // The other form of the same hand-over: the acquire_value of GetFrame, a value to wait
         // for on the consumer's acquire timeline. Nonzero only when syncFds is empty -- the daemon
         // sends one or the other. Which timeline it is a value on is the caller's to know.
         uint64_t timelineValue = 0;

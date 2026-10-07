@@ -222,6 +222,76 @@ void options(const QString& root) {
                .arg(relative, QString::number(goneFinished ? fromGone.exitCode() : -1), QString::number(goneFinished), goneErr.trimmed().left(300)));
 }
 
+// S15.331: Qt's own options, before and after `--`.
+void qtOptions(const QString& scratch) {
+    // A home of its own, so its library is not the one handOver() counts.
+    const QString root = scratch + QStringLiteral("/qt-options");
+    const QString here = root + QStringLiteral("/work");
+    const QString wallpapers = root + QStringLiteral("/xdg/XDG_DATA_HOME/wallpaperx/wallpapers");
+    if (!QDir().mkpath(here) || !writeZip(here + QStringLiteral("/-reverse"), planEntries(titled("Reverse"))).isEmpty()) {
+        harnessFailure("S15.331: the package named -reverse could not be written");
+        return;
+    }
+    // GOAL: S15.331 -- after `--` an argument Qt would take as its own option is a file name: `--
+    //       -reverse`, run where a package of that name is, imports it; `-- -platform foo.wpx` starts
+    //       the app rather than handing Qt a platform named foo.wpx (which aborts). Before `--`, Qt
+    //       still takes its options: `-platform offscreen --bogus` is refused naming --bogus, not -platform.
+    // WHY-THIS-SHAPE: each run is the first instance, so what it does with its arguments is its own;
+    //       the import is read from the library folder, and "still running after 3 s with the bus
+    //       name held" is what an app that did not abort looks like.
+    // CONTROL: app/main.cpp via control_batch.sh, 2026-10-05, each reverted: Qt given the whole argv
+    //       (`int qtArgc = argc;`, the operands loop starting at argc) -> "FAIL: S15.331: `-- -reverse`
+    //       left the library listing []" and "S15.331: `-- -platform foo.wpx` ... running 0"; Qt given
+    //       nothing (`int qtArgc = 1;`, the operands loop from 1), via control_run.sh -> "FAIL: S15.331:
+    //       `-platform offscreen --bogus` exited 2 (finished 1); refused with [wallpaperx: -platform is not
+    //       an option wallpaperx takes.]". (`-reverse --help` was tried first and stayed green under that
+    //       break: --help wins over any unknown option.)
+    {
+        QProcess app;
+        startApp(app, root, here, QStringLiteral("exec \"$0\" -- -reverse"));
+        QStringList titles;
+        const bool imported = waitFor([&] {
+            titles.clear();
+            for (const Wallpaper& w : scanLibrary(wallpapers).value_or(QList<Wallpaper>())) {
+                titles.append(w.displayTitle());
+            }
+            return titles.contains(QStringLiteral("Reverse")) || app.state() == QProcess::NotRunning;
+        }, kStartMs);
+        const QString said = QString::fromLocal8Bit(app.readAll());
+        stop(app);
+        expect(imported && titles.contains(QStringLiteral("Reverse")),
+               QStringLiteral("S15.331: `-- -reverse` left the library listing [%1]; it said: %2").arg(titles.join(u", "), said.trimmed().left(300)));
+    }
+    {
+        QProcess app;
+        startApp(app, root, here, QStringLiteral("exec \"$0\" -- -platform foo.wpx"));
+        const bool up = waitFor([&] { return nameOwned() || app.state() == QProcess::NotRunning; }, kStartMs) && nameOwned();
+        static_cast<void>(waitFor([] { return false; }, 3000));
+        const bool running = up && app.state() == QProcess::Running;
+        const QString said = QString::fromLocal8Bit(app.readAll());
+        stop(app);
+        expect(running, QStringLiteral("S15.331: `-- -platform foo.wpx` took the bus name %1, running %2 after 3 s, exit status %3; it said: %4")
+                            .arg(up).arg(running).arg(int(app.exitStatus())).arg(said.trimmed().left(300)));
+    }
+    {
+        // Qt takes `-platform offscreen`, so the first argument the app itself refuses is --bogus. `--help`
+        // would not do here: it wins over an unknown option, so it passes whether or not Qt took any.
+        QProcess app;
+        startApp(app, root, here, QStringLiteral("exec \"$0\" -platform offscreen --bogus"), QProcess::SeparateChannels);
+        const bool finished = exitsWithin(app, 10000);
+        const QString err = QString::fromLocal8Bit(app.readAllStandardError());
+        // The refusal line alone: Qt's own locale notice can come first and fill any fixed-size excerpt.
+        QString refusal;
+        for (const QString& line : err.split(u'\n')) {
+            if (line.contains(QLatin1String("is not an option"))) refusal = line;
+        }
+        expect(finished && app.exitStatus() == QProcess::NormalExit && app.exitCode() == 2 &&
+                   refusal == QLatin1String("wallpaperx: --bogus is not an option wallpaperx takes."),
+               QStringLiteral("S15.331: `-platform offscreen --bogus` exited %1 (finished %2); refused with [%3]")
+                   .arg(finished ? app.exitCode() : -1).arg(finished).arg(refusal));
+    }
+}
+
 // S15.83: a name owned by something that is not a WallpaperX.
 void unansweredHandOver(const QString& root) {
     // GOAL: S15.83 -- a launch that finds the app's bus name owned but cannot hand its files over
@@ -502,6 +572,7 @@ int main(int argc, char* argv[]) {
     }
     runPhase("uriRoundTrip", uriRoundTrip);
     runPhase("options", [&] { options(root); });
+    runPhase("qtOptions", [&] { qtOptions(root); });
     runPhase("unansweredHandOver", [&] { unansweredHandOver(root); });
     runPhase("handOver", [&] { handOver(root); });
 

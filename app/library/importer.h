@@ -13,7 +13,10 @@
 #include <QUrl>
 #include <QtQml/qqmlregistration.h>
 
+#include <dirent.h>
+
 #include <atomic>
+#include <expected>
 #include <memory>
 #include <optional>
 
@@ -60,6 +63,10 @@ inline constexpr const char* kImportRecordName = ".wallpaperx-source";
 // rename. Blocks; for a worker thread. `cancelled` stops it between reads and writes.
 ImportResult unpackPackage(const QString& archivePath, const QString& wallpapersDirectory,
                            const std::atomic<bool>& cancelled);
+// The same, for the .wpx `name` relative to the open directory `folder` (or AT_FDCWD); `archivePath`
+// only names it in messages.
+ImportResult unpackPackage(int folder, const QByteArray& name, const QString& archivePath,
+                           const QString& wallpapersDirectory, const std::atomic<bool>& cancelled);
 
 // Ten lower-case letters from the archive's SHA-256, a different part of it for each `attempt`
 // (0 to 3), taken when an earlier name belongs to other bytes. Letters only, so never a Workshop
@@ -75,7 +82,8 @@ class Importer : public QObject {
     QML_ELEMENT
     QML_UNCREATABLE("Created by the application with the folders it imports from and into.")
     Q_PROPERTY(bool busy READ busy NOTIFY busyChanged)
-    // One sentence per import that did not end in the library, until dismissed.
+    // One sentence per import that did not end in the library, and one at each scan while the drop
+    // folder's record cannot be read; until dismissed.
     Q_PROPERTY(QStringList problems READ problems NOTIFY problemsChanged)
     // One sentence per wallpaper imported from the drop folder, until dismissed.
     Q_PROPERTY(QStringList notices READ notices NOTIFY noticesChanged)
@@ -121,9 +129,19 @@ private:
     };
     struct Job {
         QString path;
-        // For a file the drop folder's scan found, and the user has not asked for since: it as
-        // listed. Empty for one the user asked for, wherever it is.
-        std::optional<DroppedKey> dropped;
+        // Where a scan listed it, if one did: that folder, still open, the name in it and the file's
+        // key as listed. Its bytes are read and its key recorded through that folder, whatever is at
+        // the drop path by then.
+        struct Listed {
+            std::shared_ptr<DIR> folder;
+            QByteArray name;
+            DroppedKey key;
+        };
+        std::optional<Listed> listedIn;
+        // Who is told how it ended: a notice for a file only the scan found, imported() for one
+        // the user asked for, the scan's own included.
+        enum class Asker { Scan, User };
+        Asker asker = Asker::User;
     };
     enum class Scanning { No, Yes, YesThenAgain };
 
@@ -136,8 +154,21 @@ private:
     void scanDropFolder();
     // The running or queued import of the drop folder's file `key`, whoever asked for it.
     Job* jobFor(const DroppedKey& key);
-    void loadRecord();
-    void saveRecord() const;
+    // The drop folder, opened so its record is read from and written to the one folder however the
+    // path changes meanwhile. Otherwise unread: no sentence when nothing is at the path, the
+    // sentence for the user when what is there cannot be opened.
+    std::expected<UniqueFd, std::optional<QString>> openDropFolder() const;
+    // The files in `folder`, the drop folder as opened, already imported, refused or found in the
+    // library, and still there, read afresh at each use: a copy kept between uses would outlive a
+    // volume mounted or unmounted at the drop folder, and import its files again. An empty list when
+    // the folder has no record yet. Otherwise unread: no sentence when the folder itself is missing,
+    // the sentence for the user when the record cannot be read. While it is unread no drop-folder
+    // file is imported by a scan and the record is not written, since either could import again a
+    // wallpaper the user deleted.
+    std::expected<QList<DroppedKey>, std::optional<QString>> loadRecordIn(int folder) const;
+    // Writes `record` back into `folder`, the folder it was read from; once it is written, no key in
+    // it is owed any more. Whether it was written; logs a failure.
+    bool saveRecord(int folder, const QList<DroppedKey>& record);
 
     QString m_dropDirectory;
     QString m_wallpapersDirectory;
@@ -146,9 +177,16 @@ private:
     std::shared_ptr<std::atomic<bool>> m_cancelled = std::make_shared<std::atomic<bool>>(false);
     QStringList m_problems;
     QStringList m_notices;
-    // The drop folder's files already imported, refused or found in the library, and still there.
-    QList<DroppedKey> m_record;
     Scanning m_scanning = Scanning::No;
+    // Keys of drop-folder files that finished importing but are not in their folder's record yet,
+    // because reading or writing it failed: without them the next scan would import those files
+    // again. Added to the record of the next listing that holds the file -- not matched by folder,
+    // whose device number a remount can change -- and kept until a record holding them is written
+    // or a listing no longer shows the file.
+    QList<DroppedKey> m_unrecorded;
+    // Keys finish() has recorded or owed since the latest listing began. A listing taken before the
+    // file finished may not show it, so these are not pruned as gone, from the record or the debts.
+    QList<DroppedKey> m_finishedSinceListing;
     FolderWatcher m_watcher;
 };
 

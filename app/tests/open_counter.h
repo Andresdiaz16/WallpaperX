@@ -4,7 +4,14 @@
 
 #include <QString>
 
+#include <dirent.h>
+
 namespace wallpaperx::apptest {
+
+// Called after every opendir() in the test binary, with its path and result, from whichever thread
+// opened; null to stop. For staging what happens to a folder right after it was listed.
+using OpendirHook = void (*)(const char* path, DIR* result);
+void setOpendirHook(OpendirHook hook);
 
 struct OpenCounts {
     // opendir() of the folder off the main thread: one per scan, which runs on the thread pool.

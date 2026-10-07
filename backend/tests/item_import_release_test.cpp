@@ -38,6 +38,7 @@
 // For vulkanDeviceUuid only; this test brings up its own GL through QQuickRenderControl.
 #include "tests/gl_import_harness.h"
 #include "tests/item_stub_scene.h"
+#include "tests/private_test_bus.h"
 #include "tests/test_report.h"
 #include "vulkan/device.h"
 #include "vulkan/frame_export.h"
@@ -257,6 +258,10 @@ bool runReleaseChecks() {
             return true;
         }
         rootItem->setParentItem(window.contentItem());
+        // Read before any event is pumped: the item is on the screen now, and only the bus's answer
+        // to who owns the daemon's name, which no event loop has yet delivered, may release its
+        // first request.
+        const int requestsBeforeTheAnswer = stub.requests();
         auto* item = qobject_cast<QQuickItem*>(root->property("rendererItem").value<QObject*>());
         if (item == nullptr) {
             // Checked, or a QML wiring fault spins the pump for its full deadline and then
@@ -297,7 +302,17 @@ bool runReleaseChecks() {
         // COVERAGE-ASSERT: the number of acquire descriptors the stub actually sent is asserted,
         //       against the driver's own answer to whether it can export one. Without it, a stub
         //       that stopped sending one leaves both arms of this claim about a reply that carries
-        //       no wait at all -- which is the state that shipped before this work.
+        //       no wait at all -- which is the state that shipped before this work. Read after the
+        //       bounded pump below, since the first request waits for the bus to name the daemon.
+        //
+        // Bounded, with a failure branch: everything below is gated on a texture existing, so a
+        // run that never imported must not fall through into checks about freeing one.
+        const bool imported = pumpUntil(
+            [&] {
+                renderPass(nullptr);
+                return itemTexture(item) != nullptr;
+            },
+            10000);
         if (device.info().hasExternalSemaphoreFd) {
             check(stub.acquireFdsSent() >= 1, "the stub served the frame with an acquire descriptor beside it");
             if (stub.acquireFdsSent() < 1) {
@@ -310,14 +325,25 @@ bool runReleaseChecks() {
             std::fflush(stdout);
         }
 
-        // Bounded, with a failure branch: everything below is gated on a texture existing, so a
-        // run that never imported must not fall through into checks about freeing one.
-        const bool imported = pumpUntil(
-            [&] {
-                renderPass(nullptr);
-                return itemTexture(item) != nullptr;
-            },
-            10000);
+        // GOAL: S15.311 at startup -- the item asks for no frame before the bus has answered who owns
+        //       the daemon's name, so its first request goes to that unique name and never to the
+        //       well-known one; and once the answer is in, it asks.
+        // WHY-THIS-SHAPE: the stub sits on the item's own connection, where QtDBus answers a call at
+        //       once, so a request sent before any event was pumped would already be counted; the
+        //       answer cannot have arrived then, because no event loop has run since the item was
+        //       made. The second half (it did ask) is the imported texture's own request count.
+        // CONTROL: in WallpaperXItem::fetchFrame (backend/kde/wallpaperx_item.cpp), the `if
+        //       (asked.owner.empty()) {...}` early return deleted and the destination made the
+        //       well-known name when the owner is empty -> "FAIL: no frame is asked for before the bus
+        //       has named the daemon, and one is after (1 request(s) before the answer, 1 in all)", with
+        //       "FAIL: the plugin told the daemon it had let the image go" beside it (that claim was
+        //       credited to the unnamed startup lifetime). Via control_batch.sh, 2026-10-05 on the NVIDIA
+        //       entry. Reverted.
+        check(requestsBeforeTheAnswer == 0 && stub.requests() >= 1,
+              ("no frame is asked for before the bus has named the daemon, and one is after (" +
+               std::to_string(requestsBeforeTheAnswer) + " request(s) before the answer, " +
+               std::to_string(stub.requests()) + " in all)")
+                  .c_str());
 
         // Which of the two arms above this host ran. Asked inside a render pass because with no
         // context current the extension strings come back empty, which would report every host as
@@ -580,11 +606,12 @@ bool runReleaseChecks() {
         //       the daemon it had let the image go", printing "0 release(s) arrived in two seconds
         //       after the texture was destroyed". The item going away is what gives its image back;
         //       ~FrameNode's own release finds the claim already retired, and emptying it leaves
-        //       this green. Both observed 2026-09-22 on the NVIDIA entry. Reverted.
-        // CONTROL, for the id: `request.setArguments({monitorId, bufferId});` in
-        //       sendReleaseBuffer (backend/kde/wallpaperx_item.cpp) changed to `bufferId + 1`
-        //       -> "FAIL: and named the monitor and the image it had been given", printing "it
-        //       released monitor 0 image 2; it was given monitor 0 image 1". Reverted.
+        //       this green. Both observed 2026-09-22 on the NVIDIA entry; the first re-run 2026-10-05
+        //       via control_batch.sh. Reverted.
+        // CONTROL, for the id: `request.setArguments({monitorId, bufferId, handover});` in
+        //       sendReleaseBuffer (backend/kde/wallpaperx_item.cpp) given `bufferId + 1` -> "FAIL: and
+        //       named the monitor and the image it had been given". Re-run 2026-10-05 via
+        //       control_batch.sh on the NVIDIA entry. Reverted.
         {
             const bool sent = pumpUntil([&stub] { return !stub.releases().empty(); }, 2000);
             check(sent, "the plugin told the daemon it had let the image go");
@@ -604,13 +631,15 @@ bool runReleaseChecks() {
             }
             // The stub's own channel, so a ReleaseBuffer this harness could not parse is not
             // counted as one that was never sent.
-            // CONTROL: `request.setArguments({monitorId, bufferId});` in sendReleaseBuffer
-            //       (backend/kde/wallpaperx_item.cpp) changed to `{monitorId}` -> "FAIL: every
-            //       ReleaseBuffer the stub saw carried a monitor and an image" AND "FAIL: the
-            //       plugin told the daemon it had let the image go" -- which is the point of
-            //       having both: a release the harness cannot read must not print as one the
-            //       plugin never sent. Reverted.
-            check(stub.malformedReleases() == 0, "every ReleaseBuffer the stub saw carried a monitor and an image");
+            // CONTROL: `request.setArguments({monitorId, bufferId, handover});` in sendReleaseBuffer
+            //       (backend/kde/wallpaperx_item.cpp) changed to `{monitorId, bufferId}` -- the release
+            //       shape before hand-overs were numbered -> "FAIL: every ReleaseBuffer the stub saw
+            //       carried a monitor, an image and a hand-over" AND "FAIL: the plugin told the daemon it
+            //       had let the image go" -- which is the point of having both: a release the harness
+            //       cannot read must not print as one the plugin never sent. Re-run 2026-10-05 via
+            //       control_batch.sh on the NVIDIA entry. Reverted.
+            check(stub.malformedReleases() == 0,
+                  "every ReleaseBuffer the stub saw carried a monitor, an image and a hand-over");
         }
 
         control.invalidate();
@@ -622,6 +651,8 @@ bool runReleaseChecks() {
 
 int main(int argc, char** argv) {
     wallpaperx::testing::g_testName = "item_import_release_test";
+    // X.34: nothing owned or sent off the private bus.
+    if (const std::optional<int> refused = wallpaperx::testing::refuseOffPrivateTestBus()) return *refused;
 
     wallpaperx::testing::registerFrameReplyTypes();
 

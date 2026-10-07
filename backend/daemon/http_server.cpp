@@ -293,7 +293,7 @@ void HttpServer::registerRoutes() {
     m_server->Get("/health", [this](const httplib::Request&, httplib::Response& res) {
         const WallpaperManager::Snapshot snap = m_manager.snapshot();
 
-        // Split the same four ways GetFrameFd's NoFrameReason splits, so the two channels
+        // Split the same four ways GetFrame's NoFrameReason splits, so the two channels
         // cannot disagree about whether a monitor has a picture on it.
         std::size_t failed = 0, unsupported = 0, showing = 0, daemonFaults = 0, outstanding = 0;
         std::string firstFailure, firstUnsupported, firstDaemonFault;

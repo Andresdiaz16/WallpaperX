@@ -10,7 +10,7 @@
 //      semaphore safe to send across a process boundary: the producer signals it, waits for that
 //      batch, and only then takes the descriptor, so a producer that dies immediately afterwards
 //      leaves nothing for the consumer to wait on forever. Delete the signalling submit and every
-//      other check in the project stays green -- the daemon still answers GetFrameFd, the plugin
+//      other check in the project stays green -- the daemon still answers GetFrame, the plugin
 //      still imports the memory, and glWaitSemaphoreEXT is a DEVICE-side wait that blocks no
 //      client call, so the wallpaper simply never appears with nothing reporting why.
 //
@@ -233,8 +233,7 @@ bool run(wallpaperx::testing::ValidationGrade& grade) {
         //       deleted from exportFrameAcquireFd (renderer/vulkan/frame_export.cpp) -> "FAIL: a
         //       device that cannot export an acquire semaphore returns no descriptor instead of
         //       failing", on the lavapipe entry. Observed 2026-08-31 printing "threw ...
-        //       vkGetSemaphoreFdKHR entry point missing"; re-observed 2026-09-23, after the
-        //       descriptor query moved behind the semaphore's creation, printing "threw ...
+        //       vkGetSemaphoreFdKHR entry point missing"; re-observed 2026-09-23 printing "threw ...
         //       vkCreateSemaphore failed with VK_ERROR_INVALID_EXTERNAL_HANDLE" beside one
         //       validation warning. Reverted.
         int none = -2;

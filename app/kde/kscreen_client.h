@@ -64,7 +64,7 @@ public:
 
     State state() const { return m_state; }
     QString unavailableReason() const { return m_unavailableReason; }
-    QList<Monitor> monitors() const { return m_monitors; }
+    QList<Monitor> monitors() const { return m_state == State::Ready ? m_answer : QList<Monitor>{}; }
     // Empty when nothing is selected. Always names a selectable monitor in `monitors`, so it is
     // empty while not Ready even if a choice is remembered.
     QString selectedOutput() const { return selectedMonitor().outputName; }
@@ -88,9 +88,19 @@ private:
     void onLauncherOwnerChanged(const QString& service, const QString& oldOwner, const QString& newOwner);
     QDBusMessage call(const QString& path, const QString& interface, const QString& method) const;
     void requestConfig(quint64 generation);
-    // The one writer of state, reason and monitors, so an Unavailable client never holds a
-    // monitor list and a selection never outlives its monitor in a Ready answer.
-    void settle(State state, QString reason, QList<Monitor> monitors);
+    // The writers of state and reason, settle() for Loading or Unavailable and settleReady() with
+    // an answer, so a selection never outlives its monitor in a Ready answer.
+    void settle(State state, QString reason);
+    void settleReady(QList<Monitor> answer);
+    struct Shown {
+        State state;
+        QString reason;
+        QList<Monitor> monitors;
+        Monitor selection;
+    };
+    Shown shown() const { return {m_state, m_unavailableReason, monitors(), selectedMonitor()}; }
+    // After a write: applies the selection rules, and announces what differs from `before`.
+    void settled(const Shown& before);
     void requestMonitorNames(quint64 generation);
     bool isCurrent(quint64 generation) const { return generation == m_generation; }
 
@@ -99,7 +109,9 @@ private:
     KScreenTimeouts m_timeouts;
     State m_state = State::Loading;
     QString m_unavailableReason;
-    QList<Monitor> m_monitors;
+    // KScreen's latest Ready answer with the model names learned since. Kept, hidden by monitors(),
+    // while not Ready, so the next answer can carry those names instead of showing connector names.
+    QList<Monitor> m_answer;
     // The user's choice; read it only through selectedMonitor(), which hides it while `monitors`
     // does not list it as selectable. nullopt until anything is selected: only then may the sole
     // selectable screen be chosen for the user. Empty once a Ready answer lost it, which blocks
@@ -107,7 +119,8 @@ private:
     // pending read is not an answer and keeps it.
     std::optional<QString> m_selection;
     quint64 m_generation = 0;
-    // Spends the one re-read a launcher loss gets. Cleared only when m_launcherStayUp fires, not
+    // Spends the one re-read a launcher loss gets; a name handed straight to a new owner is no
+    // loss, as nothing need be started. Cleared only when m_launcherStayUp fires, not
     // by a Ready answer or refresh(), so a launcher that exits after every answer, or each
     // "Try again" on one that crashes, gets one start per loss rather than a loop.
     bool m_launcherRetrySpent = false;

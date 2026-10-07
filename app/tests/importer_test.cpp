@@ -29,8 +29,11 @@
 #include <mutex>
 #include <thread>
 
+#include <dirent.h>
 #include <dlfcn.h>
 #include <fcntl.h>
+#include <poll.h>
+#include <pthread.h>
 #include <sys/file.h>
 #include <sys/inotify.h>
 #include <sys/mount.h>
@@ -53,11 +56,26 @@ std::atomic<bool> g_takeNameFirst{false};
 std::atomic<int> g_renameat2Refused{0};
 // Unfinished import folders made so far.
 std::atomic<int> g_unfinishedMade{0};
-// Opens of the one path armed here, by any thread: how many times an import read that package.
+// Opens of the one path armed here, by any thread: how many times an import read that package. A
+// lookup of its name relative to its folder counts too when it is made with O_PATH off the thread
+// that armed the count: an import of a file the scan found, read through the listed folder, as
+// against the drop-folder watch's check for a writer, which runs on the main thread.
 std::mutex g_countedLock;
 QByteArray g_countedPath;
+QByteArray g_countedFolder;  // the canonical path of the folder holding it
+QByteArray g_countedName;
+pthread_t g_countingThread{};
 std::atomic<bool> g_counting{false};
 std::atomic<int> g_countedOpens{0};
+
+// What `dirFd` names, as /proc/self/fd says: its canonical path.
+QByteArray folderOf(int dirFd) {
+    char link[64];
+    std::snprintf(link, sizeof link, "/proc/self/fd/%d", dirFd);
+    char target[4096];
+    const ssize_t n = dirFd >= 0 ? ::readlink(link, target, sizeof target) : -1;
+    return n > 0 ? QByteArray(target, n) : QByteArray();
+}
 
 void noteOpen(const char* path) {
     if (path != nullptr && g_counting.load()) {
@@ -67,6 +85,20 @@ void noteOpen(const char* path) {
         }
     }
 }
+
+void noteOpenAt(int dirFd, const char* path, int flags) {
+    if (path == nullptr || path[0] == '/' || (flags & O_PATH) == 0 || !g_counting.load()) {
+        return;
+    }
+    const std::scoped_lock lock(g_countedLock);
+    if (g_countedName == path && !pthread_equal(pthread_self(), g_countingThread) && folderOf(dirFd) == g_countedFolder) {
+        ++g_countedOpens;
+    }
+}
+
+// Called before every openat() the binary makes, from whichever thread; null for nothing. For staging
+// what happens to a folder just before a file in it is looked up.
+std::atomic<void (*)(int dirFd, const char* path, int flags)> g_beforeOpenat{nullptr};
 
 int modeOf(int flags, va_list args) {
     return ((flags & O_CREAT) != 0 || (flags & O_TMPFILE) == O_TMPFILE) ? va_arg(args, int) : 0;
@@ -130,10 +162,45 @@ extern "C" int renameat2(int oldDirFd, const char* oldPath, int newDirFd, const 
     return real(oldDirFd, oldPath, newDirFd, newPath, flags);
 }
 
+namespace {
+
+// Blocks the calling thread while `hold` is set, with `held` raised meanwhile; at most 20 s, so a test
+// that never releases it fails on its own bounds rather than hanging the run.
+void waitWhileHeld(const std::atomic<bool>& hold, std::atomic<bool>& held) {
+    held = true;
+    for (int waited = 0; hold.load() && waited < 20000; waited += 5) {
+        ::usleep(5000);
+    }
+    held = false;
+}
+
+// While set, an import blocks in its mkdtemp -- its source open, nothing recorded yet -- until cleared.
+std::atomic<bool> g_holdImports{false};
+std::atomic<bool> g_importHeld{false};
+
+// While not empty, open() of exactly this path with O_PATH fails with EACCES without reaching the kernel:
+// a drop folder that cannot be opened.
+std::mutex g_refusedOpenLock;
+QByteArray g_refusedOpen;  // guarded by g_refusedOpenLock
+std::atomic<bool> g_refusingOpen{false};
+
+bool openRefused(const char* path, int flags) {
+    if (!g_refusingOpen.load() || path == nullptr || (flags & O_PATH) == 0) {
+        return false;
+    }
+    const std::scoped_lock lock(g_refusedOpenLock);
+    return g_refusedOpen == path;
+}
+
+} // namespace
+
 extern "C" char* mkdtemp(char* pattern) noexcept {
     static const auto real = reinterpret_cast<char* (*)(char*)>(::dlsym(RTLD_NEXT, "mkdtemp"));
     if (std::strstr(pattern, "/.import-") != nullptr) {
         ++g_unfinishedMade;
+        if (g_holdImports.load()) {
+            waitWhileHeld(g_holdImports, g_importHeld);
+        }
     }
     return real(pattern);
 }
@@ -145,6 +212,10 @@ extern "C" int open(const char* path, int flags, ...) {
     const int mode = modeOf(flags, args);
     va_end(args);
     noteOpen(path);
+    if (openRefused(path, flags)) {
+        errno = EACCES;
+        return -1;
+    }
     return real(path, flags, mode);
 }
 
@@ -155,17 +226,229 @@ extern "C" int open64(const char* path, int flags, ...) {
     const int mode = modeOf(flags, args);
     va_end(args);
     noteOpen(path);
+    if (openRefused(path, flags)) {
+        errno = EACCES;
+        return -1;
+    }
     return real(path, flags, mode);
 }
 
 namespace {
 
-// Counts the opens of `path` while alive. One at a time.
+// While set, a worker's listing of the folder at exactly `g_heldListingPath` blocks once it has read
+// the folder to its end -- the listing taken, its continuation not yet run -- until cleared. The DIR
+// is recognised from its opendir, through open_counter's hook.
+std::mutex g_listingLock;
+QByteArray g_heldListingPath;  // guarded by g_listingLock
+DIR* g_heldListingDir = nullptr;  // guarded by g_listingLock
+pthread_t g_listingMain{};
+std::atomic<bool> g_holdListing{false};
+std::atomic<bool> g_listingHeld{false};
+
+void noteHeldListing(const char* path, DIR* result) {
+    if (result == nullptr || path == nullptr || !g_holdListing.load() || pthread_equal(pthread_self(), g_listingMain)) {
+        return;
+    }
+    const std::scoped_lock lock(g_listingLock);
+    if (g_heldListingPath == path) {
+        g_heldListingDir = result;
+    }
+}
+
+void holdAtListingEnd(DIR* dir) {
+    if (!g_holdListing.load()) {
+        return;
+    }
+    {
+        const std::scoped_lock lock(g_listingLock);
+        if (dir != g_heldListingDir) {
+            return;
+        }
+        g_heldListingDir = nullptr;
+    }
+    waitWhileHeld(g_holdListing, g_listingHeld);
+}
+
+} // namespace
+
+extern "C" struct dirent* readdir(DIR* dir) {
+    static const auto real = reinterpret_cast<struct dirent* (*)(DIR*)>(::dlsym(RTLD_NEXT, "readdir"));
+    struct dirent* entry = real(dir);
+    if (entry == nullptr) {
+        const int saved = errno;
+        holdAtListingEnd(dir);
+        errno = saved;
+    }
+    return entry;
+}
+
+extern "C" struct dirent64* readdir64(DIR* dir) {
+    static const auto real = reinterpret_cast<struct dirent64* (*)(DIR*)>(::dlsym(RTLD_NEXT, "readdir64"));
+    struct dirent64* entry = real(dir);
+    if (entry == nullptr) {
+        const int saved = errno;
+        holdAtListingEnd(dir);
+        errno = saved;
+    }
+    return entry;
+}
+
+namespace {
+
+// Armed by the swap checks (S15.340): the first O_PATH lookup of exactly `g_swapName`, as the code
+// under test spells it, is followed -- before that lookup returns -- by `g_swapFrom` renamed over
+// `g_swapTo`: a name re-pointed between a type check and an open. Renamed with renameat, which
+// nothing here interposes.
+std::mutex g_swapLock;
+QByteArray g_swapName;
+QByteArray g_swapFrom;
+QByteArray g_swapTo;
+std::atomic<bool> g_swapArmed{false};
+std::atomic<int> g_swapsDone{0};
+
+void swapAfterLookup(const char* path, int flags) {
+    if (!g_swapArmed.load() || path == nullptr || (flags & O_PATH) == 0) {
+        return;
+    }
+    const std::scoped_lock lock(g_swapLock);
+    if (g_swapArmed.load() && g_swapName == path) {
+        g_swapArmed = false;
+        if (::renameat(AT_FDCWD, g_swapFrom.constData(), AT_FDCWD, g_swapTo.constData()) == 0) {
+            ++g_swapsDone;
+        }
+    }
+}
+
+int openatCounted(const char* symbol, int dirFd, const char* path, int flags, int mode) {
+    using Real = int (*)(int, const char*, int, ...);
+    static const auto realOpenat = reinterpret_cast<Real>(::dlsym(RTLD_NEXT, "openat"));
+    static const auto realOpenat64 = reinterpret_cast<Real>(::dlsym(RTLD_NEXT, "openat64"));
+    noteOpen(path);
+    noteOpenAt(dirFd, path, flags);
+    if (const auto before = g_beforeOpenat.load()) {
+        before(dirFd, path, flags);
+    }
+    const int fd = (std::strcmp(symbol, "openat") == 0 ? realOpenat : realOpenat64)(dirFd, path, flags, mode);
+    const int saved = errno;
+    swapAfterLookup(path, flags);
+    errno = saved;
+    return fd;
+}
+
+// While set, renameat() onto exactly this file -- a folder's descriptor and a name in it, which is how
+// the importer writes its record -- fails with ENOSPC without reaching the kernel, after the temporary
+// file beside it was written: a record write failing at its last step.
+std::mutex g_refusedRenameLock;
+QByteArray g_refusedRenameFolder;  // canonical
+QByteArray g_refusedRenameName;
+std::atomic<bool> g_refusingRename{false};
+std::atomic<int> g_renamesToRefuse{-1};  // how many more to refuse; every one while below 0
+std::atomic<int> g_renamesRefused{0};
+
+bool renameRefused(int newDirFd, const char* newPath) {
+    if (!g_refusingRename.load() || newPath == nullptr) {
+        return false;
+    }
+    const std::scoped_lock lock(g_refusedRenameLock);
+    if (g_refusedRenameName != newPath || g_renamesToRefuse.load() == 0 || folderOf(newDirFd) != g_refusedRenameFolder) {
+        return false;
+    }
+    if (g_renamesToRefuse.load() > 0) {
+        --g_renamesToRefuse;
+    }
+    ++g_renamesRefused;
+    return true;
+}
+
+} // namespace
+
+// Archives are looked up with openat(O_PATH) and read through /proc/self/fd, so an import of a
+// path is counted here as well as in open().
+extern "C" int openat(int dirFd, const char* path, int flags, ...) {
+    va_list args;
+    va_start(args, flags);
+    const int mode = modeOf(flags, args);
+    va_end(args);
+    return openatCounted("openat", dirFd, path, flags, mode);
+}
+
+extern "C" int openat64(int dirFd, const char* path, int flags, ...) {
+    va_list args;
+    va_start(args, flags);
+    const int mode = modeOf(flags, args);
+    va_end(args);
+    return openatCounted("openat64", dirFd, path, flags, mode);
+}
+
+namespace {
+// Armed by S15.342: the next opendir() of exactly this path that finds nothing renames `g_returnFrom`
+// to it before returning -- a drop folder that comes back while the scan that found it missing runs.
+std::mutex g_returnLock;
+QByteArray g_returnTo;
+QByteArray g_returnFrom;
+std::atomic<bool> g_returnArmed{false};
+std::atomic<int> g_returnsDone{0};
+pthread_t g_returnMain{};  // the thread that armed it, whose opendirs are the watcher's, never the scan's
+
+void returnAfterMissedListing(const char* path, DIR* result) {
+    if (result != nullptr || !g_returnArmed.load() || path == nullptr || pthread_equal(pthread_self(), g_returnMain)) {
+        return;
+    }
+    const std::scoped_lock lock(g_returnLock);
+    if (g_returnArmed.load() && g_returnTo == path) {
+        g_returnArmed = false;
+        if (::renameat(AT_FDCWD, g_returnFrom.constData(), AT_FDCWD, g_returnTo.constData()) == 0) {
+            ++g_returnsDone;
+        }
+    }
+}
+} // namespace
+
+extern "C" int renameat(int oldDirFd, const char* oldPath, int newDirFd, const char* newPath) noexcept {
+    static const auto real = reinterpret_cast<int (*)(int, const char*, int, const char*)>(::dlsym(RTLD_NEXT, "renameat"));
+    if (renameRefused(newDirFd, newPath)) {
+        errno = ENOSPC;
+        return -1;
+    }
+    return real(oldDirFd, oldPath, newDirFd, newPath);
+}
+
+namespace {
+
+// Refuses renames onto `path` -- the first `count`, or every one when it is negative -- while
+// alive. One at a time.
+class RefuseRenameTo {
+public:
+    explicit RefuseRenameTo(const QString& path, int count = -1) {
+        const std::scoped_lock lock(g_refusedRenameLock);
+        const QFileInfo file(path);
+        g_refusedRenameFolder = QFile::encodeName(file.absoluteDir().canonicalPath());
+        g_refusedRenameName = QFile::encodeName(file.fileName());
+        g_renamesToRefuse = count;
+        g_renamesRefused = 0;
+        g_refusingRename = true;
+    }
+    ~RefuseRenameTo() { g_refusingRename = false; }
+    RefuseRenameTo(const RefuseRenameTo&) = delete;
+    RefuseRenameTo& operator=(const RefuseRenameTo&) = delete;
+    int refused() const { return g_renamesRefused.load(); }
+};
+
+} // namespace
+
+namespace {
+
+// Counts the opens of `path` while alive: by its full path, and by its name relative to its folder
+// off this thread. One at a time.
 class OpensOf {
 public:
     explicit OpensOf(const QString& path) {
         const std::scoped_lock lock(g_countedLock);
+        const QFileInfo file(path);
         g_countedPath = QFile::encodeName(path);
+        g_countedFolder = QFile::encodeName(file.absoluteDir().canonicalPath());
+        g_countedName = QFile::encodeName(file.fileName());
+        g_countingThread = pthread_self();
         g_countedOpens = 0;
         g_counting = true;
     }
@@ -719,11 +1002,11 @@ void autoImport(const QString& root) {
     // GOAL: S15.77, S15.78 -- a .wpx in the drop folder when the importer starts is imported once,
     //       recorded by (inode, size, time), and announced by exactly one notice, "Imported
     //       <title>."; one dropped in while it runs likewise; Dismiss empties the notices.
-    // CONTROL: app/library/importer.cpp, finish()'s Imported case `if (job.dropped) {` made
-    //       `if (!job.dropped) {` -> red, "S15.78: the first session ran 1 import(s), noticed [] ..."
+    // CONTROL: app/library/importer.cpp, Importer::finish's Imported case `if (scanOnly) {` made
+    //       `if (!scanOnly) {` -> red, "S15.78: the first session ran 1 import(s), noticed [] ..."
     //       and "a .wpx dropped in while the importer ran gave the notices []"; dismissNotices()'s
     //       `m_notices.clear();` deleted -> red, "S15.78: after Dismiss the notices are [Imported
-    //       Present. | Imported Second.]"; restored.
+    //       Present. | Imported Second.]".
     {
         Session s(drop, wallpapers);
         s.importer().rescan();
@@ -754,9 +1037,10 @@ void autoImport(const QString& root) {
     //       reported again after the next restart.
     // WHY-THIS-SHAPE: each restart is a fresh Importer over the same folders, and import runs are
     //       counted by the importer going busy, which every run does, AlreadyPresent ones included.
-    // CONTROL: app/library/importer.cpp, scanDropFolder()'s `&& !m_record.contains(key)` deleted ->
-    //       red, "S15.77: after a restart 1 import(s) ran ..." (both files in one busy stretch);
-    //       loadRecord()'s first line made `return;` -> red, the same line; restored.
+    // CONTROL: app/library/importer.cpp, `|| record->contains(key)` deleted from the skip test in
+    //       Importer::scanDropFolder -> red, "S15.77: after a restart 1 import(s) ran, noticing []" (both files in one busy
+    //       stretch); loadRecordIn() made to return an empty list once the record is open -> the same
+    //       line.
     const QString brokenLine = QStringLiteral("broken.wpx could not be imported. It is not a ZIP archive, so not a WallpaperX package.");
     {
         Session s(drop, wallpapers);
@@ -786,7 +1070,7 @@ void autoImport(const QString& root) {
     // GOAL: S15.77 -- a wallpaper the user deleted stays deleted across a restart while its .wpx
     //       is still in the drop folder; an explicit import of that .wpx brings it back.
     // CONTROL: the two record breaks above -> red, "S15.77: the deleted wallpaper came back after a
-    //       restart: 1"; restored.
+    //       restart: 1".
     if (!QDir(presentFolder).removeRecursively()) {
         fault("S15.77", QStringLiteral("the imported folder could not be deleted"));
         return;
@@ -806,9 +1090,9 @@ void autoImport(const QString& root) {
         // GOAL: S15.77 -- the record keeps only files still in the drop folder: one removed is
         //       forgotten, and put back (a new file) it is imported again, AlreadyPresent here, with
         //       no notice.
-        // CONTROL: app/library/importer.cpp, scanDropFolder()'s `m_record.removeIf(...)` prune made
-        //       `if (false)` -> red, "S15.77: with present.wpx removed the record still holds its line";
-        //       restored.
+        // CONTROL: app/library/importer.cpp, Importer::scanDropFolder's `record->removeIf(gone) > 0`
+        //       made `false` -> red, "S15.77: with present.wpx removed the record still holds its line:
+        //       [...]".
         if (!QFile::remove(drop + QStringLiteral("/present.wpx"))) {
             fault("S15.77", QStringLiteral("present.wpx could not be removed"));
             return;
@@ -842,7 +1126,7 @@ void failuresAndMarking(const QString& root) {
     //       reason is gone.
     // CONTROL: app/library/importer.cpp, finish()'s `result.outcome == ImportResult::Outcome::Failed ||`
     //       deleted, so a failure is recorded -> red, "S15.80: after wallpapers/ was made writable
-    //       and Rescan pressed, [] was noticed"; restored. (Importer::rescan()'s `scanDropFolder();`
+    //       and Rescan pressed, [] was noticed". (Importer::rescan()'s `scanDropFolder();`
     //       deleted also turns this line red, but it now stops the first listing too, so it shows
     //       only that rescan() lists at all.)
     {
@@ -891,10 +1175,11 @@ void failuresAndMarking(const QString& root) {
     // WHY-THIS-SHAPE: the automatic import fails first (wallpapers/ read-only), so only the
     //       explicit one can have recorded the file; its path goes through "../" so the drop folder
     //       is recognised by identity, not by text.
-    // CONTROL: app/library/importer.cpp, finish()'s `|| isInFolder(job.path, m_dropDirectory)`
-    //       deleted -> red, "S15.79: after the explicit import the record holds []" and "after the
-    //       user deleted it and restarted, 1 import(s) ran and the folder is back"; isInFolder()'s body made `return true;`
-    //       -> red, "S15.79: an explicit import from outside the drop folder recorded [...]"; restored.
+    // CONTROL: app/library/importer.cpp, Importer::finish's `else if (isInFolder(job.path,
+    //       m_dropDirectory))` made `else if (false)` -> red, "S15.79: after the explicit import the
+    //       record holds []", "after the user deleted it and restarted, 1 import(s) ran and the folder is
+    //       back" and the outside-import line ("recorded []"); isInFolder()'s body made `return true;` ->
+    //       red, "S15.79: an explicit import from outside the drop folder recorded [...]".
     {
         const QString drop = root + QStringLiteral("/mark");
         const QString wallpapers = drop + QStringLiteral("/wallpapers");
@@ -1181,8 +1466,10 @@ void unreadableSources(const QString& root) {
     //       blocking the importing thread on the open.
     // WHY-THIS-SHAPE: run on its own thread with a deadline (runBounded), so a hang is reported as
     //       a failure, never as a stuck ctest entry and never as a pass.
-    // CONTROL: app/library/importer.cpp, unpackPackage's source open `O_RDONLY | O_CLOEXEC | O_NONBLOCK`
-    //       made `O_RDONLY | O_CLOEXEC` -> red, "S15.76: unpackPackage on a FIFO blocked for 3000 ms"; restored.
+    // CONTROL: app/library/importer.cpp, unpackPackage's openRegularFile() replaced by a plain
+    //       `::openat(folder, name, O_RDONLY | O_CLOEXEC)` with the type check after it, re-run via
+    //       control_batch.sh 2026-10-06 -> red, "S15.76: unpackPackage on a FIFO blocked for 3000 ms";
+    //       restored.
     const auto read = runBounded<ImportResult>([&] { return unpackPackage(fifo, wallpapers, kNotCancelled); }, fifo,
                                                QStringLiteral("S15.76: unpackPackage on a FIFO"), 3000);
     if (read) {
@@ -1260,13 +1547,16 @@ void askedWhileDropped(const QString& root) {
     // WHY-THIS-SHAPE: the pool's one thread is held so each order is made, not waited for: in the
     //       first, the listing is queued ahead of the hand import and its result handled while that
     //       import is still running; in the second, the listing's import is queued behind a
-    //       second hold when the hand import is asked for. Imports are counted as opens of the
-    //       .wpx, since both would end in the same folder.
-    // CONTROL: app/library/importer.cpp, jobFor()'s hand-queued branch
+    //       second hold when the hand import is asked for. Imports are counted as lookups of the
+    //       .wpx, since both would end in the same folder: a hand import looks it up by its full path,
+    //       a scan's import by its name in the listed folder with O_PATH, off the main thread. The
+    //       drop-folder watch also looks files up by name in the folder, but on the main thread, so it
+    //       is not counted.
+    // CONTROL: app/library/importer.cpp, Importer::jobFor's branch for a job no scan listed
     //       `return isInFolder(job.path, m_dropDirectory) && ::stat(...) == 0 && keyOf(stampFrom(st)) == key;`
-    //       made `return false;` -> red, "S15.77: asked by hand, then found by the scan: 2 import(s) ..."
-    //       only; importPath()'s take-over block deleted -> red, "S15.77: found by the scan, then asked
-    //       by hand: 2 import(s) ..., notices [Imported Asked.]" only; restored.
+    //       made `return false;` -> "FAIL: S15.77: asked by hand, then found by the scan: 2 import(s) of
+    //       the file, ..."; importPath()'s take-over block deleted -> "FAIL: S15.77: found by the scan, then
+    //       asked by hand: 2 import(s) of the file, notices [Imported Asked.], ...".
     for (const bool handFirst : {true, false}) {
         const QString drop = root + (handFirst ? QStringLiteral("/asked-hand-first") : QStringLiteral("/asked-scan-first"));
         const QString wallpapers = drop + QStringLiteral("/wallpapers");
@@ -1354,31 +1644,250 @@ void recordUnwritable(const QString& root) {
     const QString drop = root + QStringLiteral("/norecord");
     const QString wallpapers = drop + QStringLiteral("/wallpapers");
     const auto package = zipBytes(root + QStringLiteral("/norecord.scratch"), planEntries(titled("Unrecorded")));
-    if (!package || !QDir().mkpath(drop + QStringLiteral("/.auto-imported")) || !writeBytes(drop + QStringLiteral("/x.wpx"), *package)) {
-        fault("S15.77", QStringLiteral("the drop folder with a folder for a record could not be built"));
+    if (!package || !QDir().mkpath(drop) || !writeBytes(drop + QStringLiteral("/x.wpx"), *package)) {
+        fault("S15.77", QStringLiteral("the drop folder could not be built"));
         return;
     }
     // GOAL: S15.77 -- a record that cannot be written is reported once, with the reason the write
     //       failed, not one a later call left in errno.
-    // WHY-THIS-SHAPE: a folder where the record goes makes the final rename fail (EISDIR) after the
-    //       temporary file was written, so the failure is followed by that file's removal, which is
-    //       where a late read of errno would pick up another value.
+    // WHY-THIS-SHAPE: this binary's renameat() refuses the record's final rename into the drop folder
+    //       (ENOSPC) after the temporary file beside it was written, so the failure is followed by that
+    //       file's removal, which is where a late read of errno would pick up another value. A folder
+    //       in the record's place cannot stage it: the record is read before every write, and a folder
+    //       there is an unreadable record (S15.332), which writes nothing.
     // CONTROL: app/library/importer.cpp, writeFileAtomically's `const int error = errno;
-    //       ::unlink(name.constData()); return error;` made `::unlink(name.constData());
-    //       ::unlink(name.constData()); return errno;` -> red, "S15.77: the record that cannot be
-    //       written gave the warnings [... (No such file or directory) ...]"; restored.
+    //       ::unlinkat(folder, temporary.constData(), 0); return error;` made
+    //       `::unlinkat(folder, temporary.constData(), 0); ::unlinkat(folder, temporary.constData(), 0);
+    //       return errno;` -> "FAIL: S15.77: the record that cannot be written gave the warnings [... cannot be
+    //       written (No such file or directory) ...]". Via control_batch.sh, 2026-10-06. Reverted.
+    // COVERAGE-ASSERT: exactly the record's rename must have been refused, and no temporary file left.
     QStringList said;
     bool quiet = false;
+    int refused = 0;
     {
         const WarningLog log;
+        const RefuseRenameTo refuse(QDir::cleanPath(drop) + QStringLiteral("/.auto-imported"));
         Session s(drop, wallpapers);
         s.importer().rescan();
         quiet = waitUntil([&] { return !s.importer().notices().isEmpty(); }, kWaitMs) && s.quiesce();
         said = log.containing(u"cannot be written");
+        refused = refuse.refused();
     }
-    const QString want = QStringLiteral("wallpaperx: %1/.auto-imported cannot be written (Is a directory), so files in %1 may be imported again")
+    const QString want = QStringLiteral("wallpaperx: %1/.auto-imported cannot be written (No space left on device), so files in %1 may be imported "
+                                        "again")
                              .arg(QString::fromLocal8Bit(QFile::encodeName(QDir::cleanPath(drop))));
-    expect(quiet && said == QStringList{want}, QStringLiteral("S15.77: the record that cannot be written gave the warnings [%1]").arg(said.join(u" | ")));
+    const QStringList left = entriesOf(drop).filter(QRegularExpression(QStringLiteral("^\\.auto-imported")));
+    expect(quiet && said == QStringList{want} && refused == 1 && left.isEmpty(),
+           QStringLiteral("S15.77: the record that cannot be written gave the warnings [%1] (%2 rename(s) refused, left [%3])")
+               .arg(said.join(u" | ")).arg(refused).arg(left.join(u", ")));
+}
+
+// Counts opens of a FIFO through inotify -- only this process can open the scratch FIFO, so every open
+// counted is this process's -- while holding it open read-write so an open of it never blocks. The
+// first opens it counts drop that hold, so a reader that went on to read sees end of file rather than
+// hanging; from then on it opens the write end every 20 ms, which releases an open still blocked, and
+// counts nothing more -- those opens are mostly its own. A hang guard for the shape a check exists to
+// catch, never a verdict. It proves itself on construction: its own open must be counted.
+class FifoOpenGuard {
+public:
+    explicit FifoOpenGuard(const QString& path) : m_path(QFile::encodeName(path)) {
+        m_inotify = ::inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+        if (m_inotify < 0 || ::inotify_add_watch(m_inotify, m_path.constData(), IN_OPEN) < 0) {
+            return;
+        }
+        m_holder = ::open(m_path.constData(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
+        m_ok = m_holder.load() >= 0 && drain() == 1;
+        if (m_ok) {
+            m_thread = std::jthread([this](std::stop_token stop) { watch(stop); });
+        }
+    }
+    ~FifoOpenGuard() {
+        stop();
+        if (const int holder = m_holder.exchange(-1); holder >= 0) {
+            ::close(holder);
+        }
+        if (m_inotify >= 0) {
+            ::close(m_inotify);
+        }
+    }
+    FifoOpenGuard(const FifoOpenGuard&) = delete;
+    FifoOpenGuard& operator=(const FifoOpenGuard&) = delete;
+    bool ok() const { return m_ok; }
+    // Opens by anyone else before the guard let go (at least one when any happened). Ends the watch,
+    // so call it once, after the work.
+    int finish() {
+        stop();
+        if (m_opens.load() == 0) {
+            m_opens += drain();
+        }
+        return m_opens;
+    }
+
+private:
+    void stop() {
+        if (m_thread.joinable()) {
+            m_thread.request_stop();
+            m_thread.join();
+        }
+    }
+    int drain() {
+        int opens = 0;
+        alignas(inotify_event) char buffer[4096];
+        for (ssize_t n; (n = ::read(m_inotify, buffer, sizeof buffer)) > 0;) {
+            for (ssize_t at = 0; at < n;) {
+                const auto* event = reinterpret_cast<const inotify_event*>(buffer + at);
+                opens += (event->mask & IN_OPEN) != 0;
+                at += ssize_t(sizeof(inotify_event)) + event->len;
+            }
+        }
+        return opens;
+    }
+    void watch(const std::stop_token& stop) {
+        bool released = false;
+        while (!stop.stop_requested()) {
+            pollfd ready{m_inotify, POLLIN, 0};
+            static_cast<void>(::poll(&ready, 1, 20));
+            if (const int opened = drain(); opened > 0 && !released) {
+                m_opens += opened;
+                if (const int holder = m_holder.exchange(-1); holder >= 0) {
+                    ::close(holder);
+                }
+                released = true;
+            }
+            if (released) {
+                if (const int writer = ::open(m_path.constData(), O_WRONLY | O_NONBLOCK | O_CLOEXEC); writer >= 0) {
+                    ::close(writer);
+                }
+            }
+        }
+    }
+
+    QByteArray m_path;
+    int m_inotify = -1;
+    std::atomic<int> m_holder{-1};
+    std::atomic<int> m_opens{0};
+    bool m_ok = false;
+    std::jthread m_thread;
+};
+
+// The record's identity, compared before and after: an unreadable record can be unreadable to this
+// process too (mode 000), so its bytes are not what is compared.
+QString identityOf(const QString& path) {
+    struct stat st {};
+    if (::lstat(QFile::encodeName(path).constData(), &st) != 0) {
+        return QStringLiteral("(none)");
+    }
+    return QStringLiteral("%1 %2 %3 %4 %5").arg(quint64(st.st_ino)).arg(qint64(st.st_size)).arg(st.st_mode, 0, 8)
+        .arg(qint64(st.st_mtim.tv_sec) * 1'000'000'000 + st.st_mtim.tv_nsec).arg(qint64(st.st_ctim.tv_sec) * 1'000'000'000 + st.st_ctim.tv_nsec);
+}
+
+// S15.332: a record that cannot be read.
+void unreadableRecord(const QString& root) {
+    const auto first = zipBytes(root + QStringLiteral("/unread-a.scratch"), planEntries(titled("Kept Away")));
+    const auto later = zipBytes(root + QStringLiteral("/unread-b.scratch"), planEntries(titled("Dropped Later")));
+    if (!first || !later) {
+        fault("S15.332", QStringLiteral("the packages could not be built"));
+        return;
+    }
+    struct Kind {
+        const char* name;
+        const char* why;
+    };
+    // GOAL: S15.332 -- a drop-folder record that exists but cannot be read (no permission, a folder
+    //       or a FIFO in its place, or over 1 MiB) imports nothing from the drop folder, leaves the
+    //       record as it was (a FIFO never opened), and is reported -- "<record> cannot be read
+    //       (<why>), so files in the drop folder are not imported until it can." -- again at the
+    //       next scan after Dismiss. Once it reads again, the next scan uses it: a file it lists stays
+    //       unimported (the wallpaper the user deleted stays deleted) and a new file is imported.
+    // WHY-THIS-SHAPE: a.wpx sits in the drop folder from the start and is listed in the readable
+    //       record written at the end, so "imported nothing" and "the record is used again" are both
+    //       about the file a record exists to keep away. Mode 000 is skipped where this process can
+    //       read it anyway (root). The FIFO is held open by FifoOpenGuard, so an open that blocks
+    //       fails the check instead of hanging the GUI thread, which is the one waiting on it.
+    // CONTROL: app/library/importer.cpp: Importer::scanDropFolder
+    //       taking an unreadable record as empty after reporting it (`record = QList<DroppedKey>{};` after
+    //       addProblem) -> "FAIL: S15.332 (<kind>): 1 import(s) ran, ..." for all four kinds; the
+    //       `addProblem(*record.error());` in scanDropFolder deleted -> "FAIL: S15.332 (<kind>): 0 import(s)
+    //       ran, reported [] ..." for all four; loadRecordIn()'s openRegularFile(folder, kRecordFileName,
+    //       O_RDONLY) replaced by a blocking `::openat(folder, kRecordFileName, O_RDONLY | O_CLOEXEC)` with
+    //       the type check after it -> "FAIL: S15.332 (fifo): ..., the FIFO was opened 1 time(s)", alone.
+    // COVERAGE-ASSERT: a.wpx's key is in the record each case starts from (or would be, for the
+    //       kinds that cannot hold one), and the readable-again half requires the new file imported.
+    for (const Kind kind : {Kind{"permission", "Permission denied"}, Kind{"folder", "not a regular file"},
+                            Kind{"fifo", "not a regular file"}, Kind{"large", "larger than 1 MiB"}}) {
+        const QString label = QStringLiteral("S15.332 (%1)").arg(QLatin1String(kind.name));
+        const QString drop = root + QStringLiteral("/unreadable-") + QLatin1String(kind.name);
+        const QString wallpapers = drop + QStringLiteral("/wallpapers");
+        const QString record = drop + QStringLiteral("/.auto-imported");
+        if (!QDir().mkpath(drop) || !writeBytes(drop + QStringLiteral("/a.wpx"), *first)) {
+            fault("S15.332", QStringLiteral("%1: the drop folder could not be built").arg(label));
+            return;
+        }
+        const QByteArray line = keyOf(drop + QStringLiteral("/a.wpx")).toLatin1() + '\n';
+        bool made = false;
+        if (qstrcmp(kind.name, "permission") == 0) {
+            made = writeBytes(record, line) && ::chmod(QFile::encodeName(record).constData(), 0) == 0;
+            if (made && ::access(QFile::encodeName(record).constData(), R_OK) == 0) {
+                notVerified("S15.332 (permission)", "this process can read a mode-000 file (running as root?)");
+                continue;
+            }
+        } else if (qstrcmp(kind.name, "folder") == 0) {
+            made = QDir().mkpath(record);
+        } else if (qstrcmp(kind.name, "fifo") == 0) {
+            made = ::mkfifo(QFile::encodeName(record).constData(), 0600) == 0;
+        } else {
+            made = writeBytes(record, line + QByteArray((1 << 20) + 1 - line.size(), '\n'));
+        }
+        if (!made) {
+            fault("S15.332", QStringLiteral("%1: the unreadable record could not be made").arg(label));
+            return;
+        }
+        std::optional<FifoOpenGuard> fifoOpens;
+        if (qstrcmp(kind.name, "fifo") == 0) {
+            fifoOpens.emplace(record);
+            if (!fifoOpens->ok()) {
+                harnessFailure("S15.332 (fifo): an inotify watch on the FIFO did not count this test's own open of it");
+                return;
+            }
+        }
+        const QString identity = identityOf(record);
+        const QString want = QStringLiteral("%1 cannot be read (%2), so files in the drop folder are not imported until it can.")
+                                 .arg(QDir::cleanPath(record), QLatin1String(kind.why));
+        Session s(drop, wallpapers);
+        s.importer().rescan();
+        const bool quiet = waitUntil([&] { return !s.importer().problems().isEmpty(); }, kWaitMs) && s.quiesce();
+        const int runs = s.takeRuns();
+        const QStringList reported = s.importer().problems();
+        s.importer().dismissProblems();
+        s.importer().rescan();
+        const bool again = waitUntil([&] { return !s.importer().problems().isEmpty(); }, kWaitMs) && s.quiesce();
+        const int fifoOpened = fifoOpens ? fifoOpens->finish() : 0;
+        expect(quiet && again && runs == 0 && s.takeRuns() == 0 && reported == QStringList{want} && s.importer().problems() == QStringList{want} &&
+                   entriesOf(wallpapers).isEmpty() && identityOf(record) == identity && fifoOpened == 0,
+               QStringLiteral("%1: %2 import(s) ran, reported [%3] and after Dismiss [%4], wallpapers/ holds [%5], the record %6, the FIFO was "
+                              "opened %7 time(s)")
+                   .arg(label).arg(runs).arg(reported.join(u" | "), s.importer().problems().join(u" | "), entriesOf(wallpapers).join(u", "),
+                                             identityOf(record) == identity ? QStringLiteral("unchanged") : QStringLiteral("changed"))
+                   .arg(fifoOpened));
+
+        // Readable again, listing a.wpx; b.wpx is new.
+        fifoOpens.reset();
+        const bool repaired = (QFileInfo(record).isDir() ? QDir().rmdir(record) : QFile::remove(record)) && writeBytes(record, line) &&
+                              dropIn(drop, QStringLiteral("b.wpx"), *later);
+        if (!repaired) {
+            fault("S15.332", QStringLiteral("%1: the record could not be made readable again").arg(label));
+            return;
+        }
+        s.importer().dismissProblems();
+        s.importer().rescan();
+        const bool used = waitUntil([&] { return !s.importer().notices().isEmpty(); }, kWaitMs) && s.quiesce();
+        QStringList titles;
+        for (const QString& entry : entriesOf(wallpapers)) {
+            titles.append(readWallpaperFolder(wallpapers + QLatin1Char('/') + entry).title);
+        }
+        expect(used && titles == QStringList{QStringLiteral("Dropped Later")} && s.importer().problems().isEmpty(),
+               QStringLiteral("%1: once the record read again, wallpapers/ holds [%2] and [%3] was reported").arg(label, titles.join(u", "), s.importer().problems().join(u" | ")));
+    }
 }
 
 constexpr int kPollMs = 100;
@@ -1392,6 +1901,390 @@ bool listedAndQuiet(Session& s, OpenCounter& listings) {
 
 QString modeName(Importer::Watching watching) {
     return watching == Importer::Watching::Inotify ? QStringLiteral("inotify") : QStringLiteral("polling");
+}
+
+// S15.333: a *.wpx link to a FIFO in the drop folder.
+void linkToFifo(const QString& root) {
+    // GOAL: S15.333 -- the drop-folder watch never opens a FIFO a *.wpx link names: not at the first
+    //       scan (inotify), and not by the polling close check when a held file's name is re-pointed
+    //       at one. Opening a FIFO or device can act on it.
+    // WHY-THIS-SHAPE: opens are counted by an inotify watch on the FIFO itself, proved on this test's
+    //       own open first, which also holds the FIFO open so a blocking open fails the check instead
+    //       of hanging the run (FifoOpenGuard). The polling case holds y.wpx open for writing so the
+    //       close check has a held name to look at, then renames a link to the FIFO over it and closes
+    //       the writer.
+    // CONTROL: app/library/folder_watcher.cpp, openForWriting()'s openRegularFile() replaced by an
+    //       `openat(..., O_RDONLY | O_NONBLOCK)` with no type check; and by a blocking `openat(...,
+    //       O_RDONLY)`. Each -> "FAIL: S15.333 (inotify): a .wpx link to a FIFO, there at the start, was
+    //       opened 1 time(s) ..." and "FAIL: S15.333 (polling): ... re-pointed at a FIFO, which was opened 1
+    //       time(s)". Via control_batch.sh, 2026-10-06. Reverted.
+    // COVERAGE-ASSERT: a listing must have run after the link existed, and in the polling case
+    //       y.wpx must have been held (not imported) before the rename.
+    const auto held = zipBytes(root + QStringLiteral("/held.scratch"), planEntries(titled("Held")));
+    for (const auto watching : {Importer::Watching::Inotify, Importer::Watching::Poll}) {
+        const QString label = QStringLiteral("S15.333 (%1)").arg(modeName(watching));
+        const QString base = root + QStringLiteral("/fifo-") + modeName(watching);
+        const QString drop = base + QStringLiteral("/drop");
+        const QString fifo = base + QStringLiteral("/elsewhere/pipe");
+        if (!held || !QDir().mkpath(drop) || !QDir().mkpath(base + QStringLiteral("/elsewhere")) ||
+            ::mkfifo(QFile::encodeName(fifo).constData(), 0600) != 0) {
+            fault("S15.333", QStringLiteral("%1: the FIFO could not be made").arg(label));
+            return;
+        }
+        FifoOpenGuard opens(fifo);
+        OpenCounter listings(drop);
+        if (!opens.ok() || !listings.ok()) {
+            harnessFailure((label + QStringLiteral(": the FIFO's open watch or the listing counter did not work")).toStdString());
+            return;
+        }
+        if (watching == Importer::Watching::Inotify) {
+            if (!QFile::link(fifo, drop + QStringLiteral("/x.wpx"))) {
+                fault("S15.333", QStringLiteral("%1: the link could not be made").arg(label));
+                return;
+            }
+            Session s(drop, drop + QStringLiteral("/wallpapers"), 30000, watching, kPollMs);
+            s.importer().rescan();
+            const bool listed = listedAndQuiet(s, listings);
+            pump(4 * kPollMs);
+            const int opened = opens.finish();
+            expect(listed && opened == 0, QStringLiteral("%1: a .wpx link to a FIFO, there at the start, was opened %2 time(s) (a listing ran: %3)")
+                                              .arg(label).arg(opened).arg(listed));
+            continue;
+        }
+        QFile writer(drop + QStringLiteral("/y.wpx"));
+        if (!writer.open(QIODevice::WriteOnly) || writer.write(held->left(held->size() / 2)) <= 0 || !writer.flush()) {
+            fault("S15.333", QStringLiteral("%1: the held file could not be written").arg(label));
+            return;
+        }
+        Session s(drop, drop + QStringLiteral("/wallpapers"), 30000, watching, kPollMs);
+        s.importer().rescan();
+        const bool listed = listedAndQuiet(s, listings);
+        pump(4 * kPollMs);
+        const int runsWhileHeld = s.takeRuns();
+        const QString staged = drop + QStringLiteral("/.link-staging");
+        if (!QFile::link(fifo, staged) ||
+            ::rename(QFile::encodeName(staged).constData(), QFile::encodeName(drop + QStringLiteral("/y.wpx")).constData()) != 0) {
+            fault("S15.333", QStringLiteral("%1: the link could not be renamed over y.wpx").arg(label));
+            return;
+        }
+        writer.close();
+        pump(8 * kPollMs);
+        static_cast<void>(s.quiesce());
+        const int opened = opens.finish();
+        expect(listed && runsWhileHeld == 0 && opened == 0,
+               QStringLiteral("%1: y.wpx held (%2 import(s) while open, a listing ran: %3), then re-pointed at a FIFO, which was opened %4 time(s)")
+                   .arg(label).arg(runsWhileHeld).arg(listed).arg(opened));
+    }
+}
+
+// S15.338: the record is read at each use, never kept from an earlier read.
+void recordReadFresh(const QString& root) {
+    const auto first = zipBytes(root + QStringLiteral("/fresh-a.scratch"), planEntries(titled("Listed")));
+    const auto later = zipBytes(root + QStringLiteral("/fresh-b.scratch"), planEntries(titled("Unlisted")));
+    if (!first || !later) {
+        fault("S15.338", QStringLiteral("the packages could not be built"));
+        return;
+    }
+    // GOAL: S15.338 -- a drop folder missing when the importer starts reports nothing; when it then
+    //       appears holding a.wpx, b.wpx and a record listing a.wpx only, the next scan imports b.wpx
+    //       and not a.wpx.
+    // WHY-THIS-SHAPE: the folder is built elsewhere and renamed into place whole, so the one scan
+    //       after it sees the files and the record together; a.wpx keeps its inode across the rename,
+    //       so the record's line still names it. b.wpx imported shows the scan ran at all.
+    // CONTROL: app/library/importer.cpp, each reverted: (a) Importer::loadRecordIn answering an empty
+    //       record for a record it has read, so a listed file is not kept away -> "FAIL: S15.338
+    //       (appeared): ... gave 1 import(s), wallpapers [Listed, Unlisted] ..."; (b) listDropFolder's
+    //       `if (nothingAt(directory, error))` made `if (false)` and Importer::scanDropFolder's
+    //       `qWarning(...)` for a listing that failed made `addProblem(...)` -> "FAIL: S15.338 (missing):
+    //       ... reported [... cannot be read: No such file or directory.]". The missing folder is reported
+    //       by nothing else: no single change of the listing or of the scan alone can put a problem in
+    //       front of the user for it.
+    {
+        const QString base = root + QStringLiteral("/appearing");
+        const QString drop = base + QStringLiteral("/drop");
+        const QString staged = base + QStringLiteral("/staged");
+        const QString wallpapers = base + QStringLiteral("/wallpapers");
+        if (!QDir().mkpath(staged) || !QDir().mkpath(wallpapers) || !writeBytes(staged + QStringLiteral("/a.wpx"), *first) ||
+            !writeBytes(staged + QStringLiteral("/b.wpx"), *later) ||
+            !writeBytes(staged + QStringLiteral("/.auto-imported"), keyOf(staged + QStringLiteral("/a.wpx")).toLatin1() + '\n')) {
+            fault("S15.338", QStringLiteral("the folder to appear could not be built"));
+            return;
+        }
+        Session s(drop, wallpapers);
+        s.importer().rescan();
+        const bool quietMissing = s.quiesce();
+        expect(quietMissing && s.takeRuns() == 0 && s.importer().problems().isEmpty() && !QFileInfo::exists(drop),
+               QStringLiteral("S15.338 (missing): a drop folder missing at the start ran imports or reported [%1]")
+                   .arg(s.importer().problems().join(u" | ")));
+        if (::rename(QFile::encodeName(staged).constData(), QFile::encodeName(drop).constData()) != 0) {
+            fault("S15.338", QStringLiteral("the drop folder could not be moved into place"));
+            return;
+        }
+        s.importer().rescan();
+        const bool imported = waitUntil([&] { return !s.importer().notices().isEmpty(); }, kWaitMs) && s.quiesce();
+        QStringList titles;
+        for (const QString& entry : entriesOf(wallpapers)) {
+            titles.append(readWallpaperFolder(wallpapers + QLatin1Char('/') + entry).title);
+        }
+        const int runs = s.takeRuns();
+        expect(imported && runs == 1 && titles == QStringList{QStringLiteral("Unlisted")} &&
+                   s.importer().notices() == QStringList{QStringLiteral("Imported Unlisted.")},
+               QStringLiteral("S15.338 (appeared): the folder that appeared with a record listing a.wpx gave %1 import(s), wallpapers [%2], notices [%3]")
+                   .arg(runs).arg(titles.join(u", "), s.importer().notices().join(u" | ")));
+    }
+
+    // GOAL: S15.338 -- a drop folder that goes away while the importer runs and comes back is not
+    //       imported again: a.wpx, imported and recorded before, is not imported after the return.
+    // WHY-THIS-SHAPE: a rename away and back stands in for an unmount and a remount: a scan while it
+    //       is away lists nothing, which a record kept in memory would take as "a.wpx is gone" and
+    //       forget. Imports are counted by the importer going busy, which an AlreadyPresent run does
+    //       too, so a re-import is seen even though the wallpaper is still in the library.
+    // CONTROL: Importer::loadRecordIn (app/library/importer.cpp) made to keep the first record it reads
+    //       in a static and answer that ever after -> "FAIL: S15.338 (renamed away and back): 1 import(s)
+    //       after the folder came back, ...". Via control_batch.sh, 2026-10-06. Reverted.
+    {
+        const QString base = root + QStringLiteral("/moving");
+        const QString drop = base + QStringLiteral("/drop");
+        const QString away = base + QStringLiteral("/away");
+        const QString wallpapers = base + QStringLiteral("/wallpapers");
+        if (!QDir().mkpath(drop) || !writeBytes(drop + QStringLiteral("/a.wpx"), *first)) {
+            fault("S15.338", QStringLiteral("the moving drop folder could not be built"));
+            return;
+        }
+        Session s(drop, wallpapers);
+        s.importer().rescan();
+        const bool importedBefore = waitUntil([&] { return !s.importer().notices().isEmpty(); }, kWaitMs) && s.quiesce();
+        const QString key = keyOf(drop + QStringLiteral("/a.wpx"));
+        if (!importedBefore || s.takeRuns() != 1 || recordOf(drop) != QStringList{key}) {
+            fault("S15.338", QStringLiteral("a.wpx was not imported and recorded before the folder moved (record [%1])")
+                                 .arg(recordOf(drop).join(u" | ")));
+            return;
+        }
+        const auto move = [](const QString& from, const QString& to) {
+            return ::rename(QFile::encodeName(from).constData(), QFile::encodeName(to).constData()) == 0;
+        };
+        if (!move(drop, away)) {
+            fault("S15.338", QStringLiteral("the drop folder could not be moved away"));
+            return;
+        }
+        s.importer().rescan();
+        const bool quietAway = s.quiesce();
+        if (!move(away, drop)) {
+            fault("S15.338", QStringLiteral("the drop folder could not be moved back"));
+            return;
+        }
+        s.importer().rescan();
+        const bool quietBack = s.quiesce();
+        const int runs = s.takeRuns();
+        expect(quietAway && quietBack && runs == 0 && recordOf(drop) == QStringList{key} && s.importer().problems().isEmpty(),
+               QStringLiteral("S15.338 (renamed away and back): %1 import(s) after the folder came back, the record [%2], reported [%3]")
+                   .arg(runs).arg(recordOf(drop).join(u" | "), s.importer().problems().join(u" | ")));
+    }
+}
+
+// S15.342: a drop folder that comes back between a scan's listing and its record read.
+void folderBackMidScan(const QString& root) {
+    const auto package = zipBytes(root + QStringLiteral("/midscan.scratch"), planEntries(titled("Kept")));
+    const QString base = root + QStringLiteral("/midscan");
+    const QString drop = base + QStringLiteral("/drop");
+    const QString away = base + QStringLiteral("/away");
+    const QString wallpapers = base + QStringLiteral("/wallpapers");
+    if (!package || !QDir().mkpath(drop) || !writeBytes(drop + QStringLiteral("/a.wpx"), *package)) {
+        fault("S15.342", QStringLiteral("the drop folder could not be built"));
+        return;
+    }
+    // GOAL: S15.342 -- a scan whose listing found the drop folder missing neither imports nor prunes
+    //       the record, even when the folder is back before the scan ends: a.wpx, recorded, whose
+    //       wallpaper the user deleted, stays deleted then and at the next scan. False for a prune that
+    //       takes "the listing was empty" from a folder that was not there as "every recorded file is
+    //       gone".
+    // WHY-THIS-SHAPE: this binary's opendir() moves the folder back into place right after the scan's
+    //       listing -- a worker's opendir, never the main thread's, whose walks are the watcher's --
+    //       found it missing, so anything the scan does afterwards by the folder's path finds
+    //       the folder and its record -- the order a mount completing during a scan produces, which no
+    //       timing can stage on demand. Imports are counted by the importer going busy, an
+    //       AlreadyPresent run included.
+    // CONTROL: in Importer::scanDropFolder (app/library/importer.cpp), a listing that found the folder
+    //       missing made to open the folder by path, read its record and save it pruned of every key ->
+    //       "FAIL: S15.342: a scan listed the drop folder missing and then read its record back: 1
+    //       import(s) ran by the next scan's end, and the deleted wallpaper is back".
+    // COVERAGE-ASSERT: the move must have happened inside opendir (a harness fault otherwise).
+    Session s(drop, wallpapers);
+    s.importer().rescan();
+    const bool first = waitUntil([&] { return !s.importer().notices().isEmpty(); }, kWaitMs) && s.quiesce();
+    const QString key = keyOf(drop + QStringLiteral("/a.wpx"));
+    const QString folder = wallpapers + QLatin1Char('/') + expectedName(sha256Of(*package), 0);
+    if (!first || s.takeRuns() != 1 || recordOf(drop) != QStringList{key} || !QDir(folder).removeRecursively() ||
+        ::rename(QFile::encodeName(drop).constData(), QFile::encodeName(away).constData()) != 0) {
+        fault("S15.342", QStringLiteral("a.wpx was not imported and recorded, or its wallpaper deleted, or the folder moved away"));
+        return;
+    }
+    {
+        const std::scoped_lock lock(g_returnLock);
+        g_returnTo = QFile::encodeName(QDir::cleanPath(drop));
+        g_returnFrom = QFile::encodeName(away);
+        g_returnsDone = 0;
+        g_returnMain = pthread_self();
+        g_returnArmed = true;
+    }
+    setOpendirHook(&returnAfterMissedListing);
+    const auto unhook = qScopeGuard([] {
+        g_returnArmed = false;
+        setOpendirHook(nullptr);
+    });
+    s.importer().rescan();
+    const bool quiet = s.quiesce();
+    g_returnArmed = false;
+    if (g_returnsDone.load() != 1) {
+        harnessFailure("S15.342: the listing never found the drop folder missing, so it was never moved back mid-scan");
+        return;
+    }
+    s.importer().rescan();
+    const bool again = s.quiesce();
+    const int runs = s.takeRuns();
+    expect(quiet && again && runs == 0 && !QFileInfo::exists(folder),
+           QStringLiteral("S15.342: a scan listed the drop folder missing and then read its record back: %1 import(s) ran by the next "
+                          "scan's end, and the deleted wallpaper is %2")
+               .arg(runs).arg(QFileInfo::exists(folder) ? QStringLiteral("back") : QStringLiteral("still gone")));
+}
+
+// S15.340: a name re-pointed at a FIFO between its lookup and its open.
+void swapToFifo(const QString& root) {
+    const auto package = zipBytes(root + QStringLiteral("/swap.scratch"), planEntries(titled("Swapped")));
+    const QString base = root + QStringLiteral("/swap");
+    const QString fifo = base + QStringLiteral("/elsewhere/pipe");
+    if (!package || !QDir().mkpath(base + QStringLiteral("/elsewhere")) || ::mkfifo(QFile::encodeName(fifo).constData(), 0600) != 0) {
+        fault("S15.340", QStringLiteral("the FIFO could not be made"));
+        return;
+    }
+    // Stages a link to the FIFO in `folder` and arms its rename over `target` after the next O_PATH
+    // lookup of `name`, spelled as the code under test spells it.
+    const auto arm = [&fifo](const QString& folder, const QByteArray& name, const QString& target) {
+        const QString staged = folder + QStringLiteral("/.swap-staged");
+        if (!QFile::link(fifo, staged)) {
+            return false;
+        }
+        const std::scoped_lock lock(g_swapLock);
+        g_swapName = name;
+        g_swapFrom = QFile::encodeName(staged);
+        g_swapTo = QFile::encodeName(target);
+        g_swapsDone = 0;
+        g_swapArmed = true;
+        return true;
+    };
+    const auto disarm = qScopeGuard([] { g_swapArmed = false; });
+    // The race staged, or a harness fault saying why not: a lookup the swap never followed graded nothing.
+    const auto staged = [](const QString& label) {
+        g_swapArmed = false;
+        if (g_swapsDone.load() != 1) {
+            harnessFailure((label + QStringLiteral(": the name was never looked up with O_PATH, so the swap never ran")).toStdString());
+            return false;
+        }
+        return true;
+    };
+
+    // GOAL: S15.340 -- no FIFO is ever opened through a name that was a regular file when it was
+    //       looked up and was re-pointed at a FIFO before the open: not by the import of a .wpx
+    //       (unpackPackage), not by the drop-folder watch's check for a writer (openForWriting), and
+    //       not by the scan's read of the drop-folder record (Importer::loadRecordIn, reached from
+    //       scanDropFolder). Each goes on with the file it looked up, and nothing hangs. The record
+    //       read after an import (finish(), the same loadRecordIn) is not reached here: no import runs.
+    // WHY-THIS-SHAPE: this binary's openat() renames a link to the FIFO over the name the moment the
+    //       code under test has looked it up with O_PATH -- the window no test can hit by timing. Opens
+    //       are counted on the FIFO itself (FifoOpenGuard), which also keeps a broken shape from
+    //       hanging the run: it holds the FIFO open so an open does not block, and lets go so a read
+    //       ends. The import must still be of the file looked up, and the record still used, so
+    //       "refused everything" is not a pass.
+    // CONTROL: in openRegularFile (app/library/wpx_package.cpp) the reopen through /proc/self/fd made
+    //       `::openat(dirfd, name, (flags & ~O_NOFOLLOW) | O_CLOEXEC)` -> one line per site, the helper
+    //       being shared: "FAIL: S15.340 (unpackPackage): ... the FIFO was opened 1 time(s)", "FAIL: S15.340
+    //       (openForWriting): ..." and "FAIL: S15.340 (loadRecordIn): ...". Via control_batch.sh, 2026-10-06.
+    //       Reverted.
+    // COVERAGE-ASSERT: the swap must have run once per site (a harness fault otherwise), and the
+    //       guard must count its own open first.
+    {
+        const QString label = QStringLiteral("S15.340 (unpackPackage)");
+        const QString dir = base + QStringLiteral("/unpack");
+        const QString wallpapers = dir + QStringLiteral("/wallpapers");
+        const QString target = dir + QStringLiteral("/x.wpx");
+        FifoOpenGuard guard(fifo);
+        if (!QDir().mkpath(wallpapers) || !writeBytes(target, *package) || !guard.ok() || !arm(dir, QFile::encodeName(target), target)) {
+            fault("S15.340", label + QStringLiteral(": the package, the FIFO's guard or the swap could not be set up"));
+            return;
+        }
+        const auto r = runBounded<ImportResult>([&] { return unpackPackage(target, wallpapers, kNotCancelled); }, fifo, label, 5000);
+        const int opened = guard.finish();
+        expect(!staged(label) ||
+                   (r && r->outcome == ImportResult::Outcome::Imported && readWallpaperFolder(r->folderPath).title == u"Swapped" && opened == 0),
+               QStringLiteral("%1: x.wpx re-pointed at a FIFO after its lookup gave %2, and the FIFO was opened %3 time(s)")
+                   .arg(label, r ? describe(*r) : QStringLiteral("nothing")).arg(opened));
+    }
+    {
+        const QString label = QStringLiteral("S15.340 (openForWriting)");
+        const QString drop = base + QStringLiteral("/watch/drop");
+        const QString target = drop + QStringLiteral("/x.wpx");
+        FifoOpenGuard guard(fifo);
+        if (!QDir().mkpath(drop) || !writeBytes(target, *package) || !guard.ok() || !arm(drop, "x.wpx", target)) {
+            fault("S15.340", label + QStringLiteral(": the drop folder, the FIFO's guard or the swap could not be set up"));
+            return;
+        }
+        bool quiet = false;
+        {
+            Session s(drop, base + QStringLiteral("/watch/wallpapers"));
+            s.importer().rescan();
+            quiet = s.quiesce();
+        }
+        const int opened = guard.finish();
+        expect(!staged(label) || (quiet && opened == 0), QStringLiteral("%1: x.wpx re-pointed at a FIFO after the watch looked it up; the FIFO was opened %2 time(s)")
+                                         .arg(label).arg(opened));
+    }
+    {
+        const QString label = QStringLiteral("S15.340 (loadRecordIn)");
+        const QString drop = base + QStringLiteral("/record/drop");
+        const QString record = drop + QStringLiteral("/.auto-imported");
+        FifoOpenGuard guard(fifo);
+        if (!QDir().mkpath(drop) || !writeBytes(drop + QStringLiteral("/a.wpx"), *package) ||
+            !writeBytes(record, keyOf(drop + QStringLiteral("/a.wpx")).toLatin1() + '\n') || !guard.ok() || !arm(drop, ".auto-imported", record)) {
+            fault("S15.340", label + QStringLiteral(": the drop folder, the FIFO's guard or the swap could not be set up"));
+            return;
+        }
+        bool quiet = false;
+        int runs = -1;
+        {
+            Session s(drop, base + QStringLiteral("/record/wallpapers"));
+            s.importer().rescan();
+            quiet = s.quiesce();
+            runs = s.takeRuns();
+        }
+        const int opened = guard.finish();
+        expect(!staged(label) || (quiet && opened == 0 && runs == 0),
+               QStringLiteral("%1: the record re-pointed at a FIFO after its lookup; the FIFO was opened %2 time(s), and %3 import(s) ran "
+                              "of the file the record listed")
+                   .arg(label).arg(opened).arg(runs));
+    }
+
+    // GOAL: S15.340 -- a .wpx that is a link to a FIFO from the start is refused, "It is not a regular
+    //       file.", without the FIFO being opened.
+    // CONTROL: in unpackPackage (app/library/importer.cpp) openRegularFile replaced by a plain
+    //       `::openat(folder, name, O_RDONLY | O_CLOEXEC)` followed by the type check, re-run via
+    //       control_batch.sh, 2026-10-06 -> "FAIL: S15.340 (a link to a FIFO): unpackPackage gave Refused "It is not a
+    //       regular file.", and the FIFO was opened 1 time(s)" (beside the harness fault that the
+    //       swap above found no O_PATH lookup to follow). Reverted.
+    {
+        const QString dir = base + QStringLiteral("/linked");
+        const QString link = dir + QStringLiteral("/linked.wpx");
+        FifoOpenGuard guard(fifo);
+        if (!QDir().mkpath(dir + QStringLiteral("/wallpapers")) || !QFile::link(fifo, link) || !guard.ok()) {
+            fault("S15.340", QStringLiteral("the link to the FIFO or its guard could not be made"));
+            return;
+        }
+        const auto r = runBounded<ImportResult>([&] { return unpackPackage(link, dir + QStringLiteral("/wallpapers"), kNotCancelled); }, fifo,
+                                                QStringLiteral("S15.340 (a link to a FIFO)"), 5000);
+        const int opened = guard.finish();
+        expect(r && r->outcome == ImportResult::Outcome::Refused && r->problem == u"It is not a regular file." && opened == 0,
+               QStringLiteral("S15.340 (a link to a FIFO): unpackPackage gave %1, and the FIFO was opened %2 time(s)")
+                   .arg(r ? describe(*r) : QStringLiteral("nothing")).arg(opened));
+    }
 }
 
 // S15.89: a *.wpx link in the drop folder to a file still being written.
@@ -1411,8 +2304,8 @@ void linkedWhileWritten(const QString& root) {
     //       whether the linked file is open for writing can hold it. A listing is counted after the
     //       link exists (OpenCounter), so "not imported while open" is graded only once one ran; the
     //       half is a broken archive, so importing it would be reported.
-    // CONTROL: app/library/folder_watcher.cpp, openForWriting()'s `const int follow = m_items == Items::Files ? 0 : O_NOFOLLOW;`
-    //       made `const int follow = O_NOFOLLOW;` -> red, all four cases, e.g. "S15.89 (inotify,
+    // CONTROL: app/library/folder_watcher.cpp, openForWriting()'s `O_RDONLY | (m_items == Items::Files ? 0 : O_NOFOLLOW)`
+    //       made `O_RDONLY | O_NOFOLLOW` (via control_batch.sh 2026-10-05) -> red, all four cases, e.g. "S15.89 (inotify,
     //       linked before the start): while the linked file was open and half-written 1 import(s)
     //       ran, reporting [linked.wpx could not be imported. ...]"; watchTargets()'s
     //       `if (openForWriting(dirFd, entry->d_name)) { hold(tree, name); }` deleted -> red, "S15.89
@@ -1720,6 +2613,807 @@ void nulInFileUrl(const QString& root) {
            QStringLiteral("S15.93: the same URL without the NUL left wallpapers/ holding [%1], not one Named").arg(made.join(u", ")));
 }
 
+// A drop folder given as a link, re-pointed at another folder while a scan or an import is under way:
+// a mount changing under the importer. Re-pointed by a rename over the link, so it is never missing.
+[[nodiscard]] bool pointLink(const QByteArray& link, const QByteArray& at) {
+    const QByteArray staged = link + ".repoint";
+    ::unlink(staged.constData());
+    return ::symlink(at.constData(), staged.constData()) == 0 && ::rename(staged.constData(), link.constData()) == 0;
+}
+
+std::mutex g_repointLock;
+QByteArray g_repointLink;
+QByteArray g_repointTo;
+QByteArray g_repointName;  // for the lookup hook: the file name whose lookup triggers it
+pthread_t g_repointMain{};
+std::atomic<bool> g_repointArmed{false};
+std::atomic<int> g_repointsDone{0};
+
+void armRepoint(const QString& link, const QString& to, const QByteArray& name = {}) {
+    const std::scoped_lock lock(g_repointLock);
+    g_repointLink = QFile::encodeName(QDir::cleanPath(link));
+    g_repointTo = QFile::encodeName(to);
+    g_repointName = name;
+    g_repointMain = pthread_self();
+    g_repointsDone = 0;
+    g_repointArmed = true;
+}
+
+void repointNow() {
+    g_repointArmed = false;
+    if (pointLink(g_repointLink, g_repointTo)) {
+        ++g_repointsDone;
+    }
+}
+
+// After a worker -- never the main thread, whose walks are the watcher's -- has listed the link.
+void repointAfterListing(const char* path, DIR* result) {
+    if (result == nullptr || !g_repointArmed.load() || path == nullptr || pthread_equal(pthread_self(), g_repointMain)) {
+        return;
+    }
+    const std::scoped_lock lock(g_repointLock);
+    if (g_repointArmed.load() && g_repointLink == path) {
+        repointNow();
+    }
+}
+
+// Just before a worker first looks up a file of that name with O_PATH, by its name or by a path
+// ending in it: after the scan's listing, so the watcher sees no change while the scan runs.
+void repointBeforeLookup(int, const char* path, int flags) {
+    if (!g_repointArmed.load() || path == nullptr || (flags & O_PATH) == 0 || pthread_equal(pthread_self(), g_repointMain)) {
+        return;
+    }
+    const std::scoped_lock lock(g_repointLock);
+    const QByteArray looked(path);
+    if (g_repointArmed.load() && !g_repointName.isEmpty() && (looked == g_repointName || looked.endsWith('/' + g_repointName))) {
+        repointNow();
+    }
+}
+
+// S15.352: the drop folder's record is written to the folder whose files were listed.
+void recordThroughListedFolder(const QString& root) {
+    const auto package = zipBytes(root + QStringLiteral("/listed.scratch"), planEntries(titled("Listed")));
+    if (!package) {
+        fault("S15.352", QStringLiteral("the package could not be built"));
+        return;
+    }
+    setOpendirHook(&repointAfterListing);
+    const auto unhook = qScopeGuard([] {
+        g_repointArmed = false;
+        setOpendirHook(nullptr);
+    });
+    // GOAL: S15.352 -- a scan's record write goes to the folder the scan listed: when another folder is
+    //       at the drop folder's path by then (a mount changed), that folder's record is left as it was.
+    // WHY-THIS-SHAPE: the drop folder is a link, re-pointed from A to B by this binary's opendir()
+    //       right after the scan's worker has listed A -- no timing can put a mount change there on
+    //       demand. B's record ("7 8 9") names no file, so any save into B would prune it to nothing.
+    //       Polled with a long period, so no second scan runs on its own.
+    // CONTROL: in Importer::scanDropFolder (app/library/importer.cpp), the prune's
+    //       `saveRecord(folder, *record)` made `saveRecord(openDropFolder()->get(), *record)`, saving by
+    //       path -> "FAIL: S15.352 (prune): the folder listed has the record [1 2 3], the folder at the path
+    //       []".
+    // COVERAGE-ASSERT: the link must have been re-pointed exactly once, by the scan's worker.
+    {
+        const QString label = QStringLiteral("S15.352 (prune)");
+        const QString base = root + QStringLiteral("/listed-prune");
+        const QString a = base + QStringLiteral("/A");
+        const QString b = base + QStringLiteral("/B");
+        const QString link = base + QStringLiteral("/drop");
+        const bool built = QDir().mkpath(a) && QDir().mkpath(b) && writeBytes(b + QStringLiteral("/.auto-imported"), "7 8 9\n") &&
+                           writeBytes(a + QStringLiteral("/.auto-imported"), "1 2 3\n");
+        if (!built || !pointLink(QFile::encodeName(link), QFile::encodeName(a))) {
+            fault("S15.352", label + QStringLiteral(": the two folders and the link could not be built"));
+            return;
+        }
+        Session s(link, base + QStringLiteral("/wallpapers"), 30000, Importer::Watching::Poll, 600000);
+        armRepoint(link, b);
+        s.importer().rescan();
+        const bool quiet = s.quiesce();
+        g_repointArmed = false;
+        if (g_repointsDone.load() != 1) {
+            harnessFailure((label + QStringLiteral(": the scan's worker never listed the drop folder, so it was never re-pointed")).toStdString());
+            return;
+        }
+        expect(quiet && recordOf(a).isEmpty() && recordOf(b) == QStringList{QStringLiteral("7 8 9")},
+               QStringLiteral("%1: the folder listed has the record [%2], the folder at the path [%3]")
+                   .arg(label, recordOf(a).join(u" | "), recordOf(b).join(u" | ")));
+    }
+
+    // GOAL: S15.352 -- a file a scan listed is recorded in the folder it was listed in as soon as its
+    //       import ends, whatever is at the drop path by then -- nothing, or another folder -- and
+    //       whether or not the user also asked for it; another folder at the path keeps its record.
+    //       S15.367 -- a key recorded is not owed as well: a folder at the path holding the same file
+    //       (same key) has its file imported by its next scan, not taken as recorded.
+    // WHY-THIS-SHAPE: the import is held in its mkdtemp, its source open, while the user asks for the
+    //       same file (which makes it the user's) and the drop path is unlinked or re-pointed to B; then
+    //       released. The records are read at once, before any scan, so "recorded later" cannot pass. B
+    //       holds a hard link to x, so its scan meets the same key: owed, it would be written to B's
+    //       record without an import.
+    // CONTROL: in Importer::finish (app/library/importer.cpp), (a) `if (job.listedIn)` made
+    //       `if (false && job.listedIn)` -> all four "FAIL: S15.352 (...): after the import the listed
+    //       folder's record is [] ...", another folder's "[<key> | 7 8 9]"; (b) `owe();` added after the
+    //       record's successful save -> "FAIL:
+    //       S15.367: ... B's scan ran 0 import(s) ...".
+    // COVERAGE-ASSERT: each import must have been held, and the user's ask merged into it (one run).
+    for (const bool anotherFolder : {false, true}) {
+        for (const bool userToo : {false, true}) {
+            const QString label = QStringLiteral("S15.352 (%1, %2)")
+                                      .arg(anotherFolder ? QStringLiteral("another folder at the path") : QStringLiteral("nothing at the path"),
+                                           userToo ? QStringLiteral("asked by the user") : QStringLiteral("found by the scan"));
+            const QString base = root + QStringLiteral("/listed-at-once-%1-%2").arg(int(anotherFolder)).arg(int(userToo));
+            const QString a = base + QStringLiteral("/A");
+            const QString b = base + QStringLiteral("/B");
+            const QString link = base + QStringLiteral("/drop");
+            const QString wallpapers = base + QStringLiteral("/wallpapers");
+            const bool built = QDir().mkpath(a) && QDir().mkpath(b) && writeBytes(b + QStringLiteral("/.auto-imported"), "7 8 9\n") &&
+                               writeBytes(a + QStringLiteral("/x.wpx"), *package) &&
+                               ::link(QFile::encodeName(a + QStringLiteral("/x.wpx")).constData(),
+                                      QFile::encodeName(b + QStringLiteral("/x.wpx")).constData()) == 0 &&
+                               pointLink(QFile::encodeName(link), QFile::encodeName(a));
+            if (!built) {
+                fault("S15.352", label + QStringLiteral(": the two folders and the link could not be built"));
+                return;
+            }
+            const QString key = keyOf(a + QStringLiteral("/x.wpx"));
+            Session s(link, wallpapers, 30000, Importer::Watching::Poll, 600000);
+            g_holdImports = true;
+            const auto release = qScopeGuard([] { g_holdImports = false; });
+            s.importer().rescan();
+            const bool held = waitUntil([] { return g_importHeld.load(); }, kWaitMs);
+            if (userToo) {
+                s.importer().importPath(link + QStringLiteral("/x.wpx"));
+            }
+            const bool moved = anotherFolder ? pointLink(QFile::encodeName(link), QFile::encodeName(b))
+                                             : ::unlink(QFile::encodeName(link).constData()) == 0;
+            g_holdImports = false;
+            const bool done = waitUntil([&] { return !s.importer().busy(); }, kWaitMs);
+            const int runs = s.takeRuns();
+            if (!held || !moved || !done || runs != 1) {
+                harnessFailure((label + QStringLiteral(": the import was not held (%1), the path not changed (%2), or it "
+                                                       "ran %3 time(s)")
+                                            .arg(held)
+                                            .arg(moved)
+                                            .arg(runs))
+                                   .toStdString());
+                return;
+            }
+            const QStringList recordA = recordOf(a);
+            const QStringList recordB = recordOf(b);
+            const bool told = userToo ? s.takeImported().size() == 1 && s.importer().notices().isEmpty()
+                                      : s.importer().notices() == QStringList{QStringLiteral("Imported Listed.")};
+            expect(recordA == QStringList{key} && recordB == QStringList{QStringLiteral("7 8 9")} && told,
+                   QStringLiteral("%1: after the import the listed folder's record is [%2], the other folder's [%3]; told %4")
+                       .arg(label, recordA.join(u" | "), recordB.join(u" | "))
+                       .arg(told));
+            if (!anotherFolder || userToo) {
+                continue;
+            }
+            // B is at the path and holds the same file: nothing is owed, so its scan imports it.
+            s.importer().rescan();
+            const bool scanned = s.quiesce();
+            const int bRuns = s.takeRuns();
+            expect(scanned && bRuns == 1 && recordOf(b) == QStringList{key},
+                   QStringLiteral("S15.367: a key recorded at once is not also owed: with B at the path, holding the same "
+                                  "file, B's scan ran %1 import(s) and wrote [%2]")
+                       .arg(bRuns)
+                       .arg(recordOf(b).join(u" | ")));
+        }
+    }
+}
+
+// S15.368, S15.369, S15.370: what is owed, and for how long.
+void owedKeys(const QString& root) {
+    const auto package = zipBytes(root + QStringLiteral("/owed-keys.scratch"), planEntries(titled("Owed")));
+    if (!package) {
+        fault("S15.368", QStringLiteral("the package could not be built"));
+        return;
+    }
+    // A record that cannot be read: a folder in its place.
+    const auto spoil = [](const QString& drop) {
+        const QByteArray record = QFile::encodeName(drop + QStringLiteral("/.auto-imported"));
+        ::unlink(record.constData());
+        return ::mkdir(record.constData(), 0700) == 0;
+    };
+    const auto repair = [](const QString& drop) { return QDir().rmdir(drop + QStringLiteral("/.auto-imported")); };
+
+    // GOAL: S15.368 -- a key owed for a file that has since left the drop folder is no longer owed once
+    //       a listing no longer shows the file: the file put back (the same key), with the record lacking
+    //       it and its wallpaper deleted, is imported again. The debt is pruned whether or not the record
+    //       can be read at that listing.
+    // WHY-THIS-SHAPE: the record is a folder when the user's import finishes, so the key is owed; x.wpx is
+    //       then moved out (rename: the key stays), a scan lists the folder without it, and x.wpx comes
+    //       back. Twice: with the record repaired before that scan, and with it still unreadable then.
+    // CONTROL: in Importer::scanDropFolder (app/library/importer.cpp), (a) `m_unrecorded.removeIf(gone);`
+    //       deleted -> "FAIL: S15.368 (record readable at the prune): ... 0 import(s) ..." and the unreadable
+    //       line; (b) that prune moved inside `if (record) { ... }` -> the unreadable line alone.
+    // COVERAGE-ASSERT: the key must have been owed -- the import done and the record unreadable then.
+    for (const bool readableAtPrune : {true, false}) {
+        const QString label = readableAtPrune ? QStringLiteral("S15.368 (record readable at the prune)")
+                                              : QStringLiteral("S15.368 (record unreadable at the prune)");
+        const QString base = root + (readableAtPrune ? QStringLiteral("/owed-gone-readable") : QStringLiteral("/owed-gone-unreadable"));
+        const QString drop = base + QStringLiteral("/drop");
+        const QString away = base + QStringLiteral("/away.wpx");
+        const QString file = drop + QStringLiteral("/x.wpx");
+        const QString wallpapers = base + QStringLiteral("/wallpapers");
+        if (!QDir().mkpath(drop) || !writeBytes(file, *package) || !spoil(drop)) {
+            fault("S15.368", label + QStringLiteral(": the drop folder could not be built"));
+            return;
+        }
+        Session s(drop, wallpapers, 30000, Importer::Watching::Poll, 600000);
+        s.importer().importPath(file);
+        const bool imported = s.quiesce() && s.takeImported().size() == 1;
+        const bool movedOut = ::rename(QFile::encodeName(file).constData(), QFile::encodeName(away).constData()) == 0;
+        if (!imported || !movedOut || !s.importer().problems().filter(QStringLiteral("cannot be read")).size()) {
+            harnessFailure((label + QStringLiteral(": the import did not finish owed, or the file could not be moved out")).toStdString());
+            return;
+        }
+        if (readableAtPrune && !repair(drop)) {
+            fault("S15.368", label + QStringLiteral(": the record could not be repaired"));
+            return;
+        }
+        s.importer().rescan();
+        const bool pruned = s.quiesce();
+        const QStringList made = entriesOf(wallpapers);
+        const bool back = (readableAtPrune || repair(drop)) && made.size() == 1 &&
+                          QDir(wallpapers + QLatin1Char('/') + made.constFirst()).removeRecursively() &&
+                          ::rename(QFile::encodeName(away).constData(), QFile::encodeName(file).constData()) == 0;
+        if (!back) {
+            fault("S15.368", label + QStringLiteral(": the wallpaper could not be deleted or the file put back"));
+            return;
+        }
+        s.importer().dismissNotices();
+        s.takeRuns();
+        s.importer().rescan();
+        const bool again = s.quiesce();
+        const int runs = s.takeRuns();
+        expect(pruned && again && runs == 1 && entriesOf(wallpapers).size() == 1 &&
+                   s.importer().notices() == QStringList{QStringLiteral("Imported Owed.")},
+               QStringLiteral("%1: once a listing no longer showed the owed file, the file put back ran %2 import(s), notices [%3]")
+                   .arg(label)
+                   .arg(runs)
+                   .arg(s.importer().notices().join(u" | ")));
+    }
+
+    // GOAL: S15.369 -- a key owed while a scan's listing is out, for a file that listing could not show,
+    //       survives that scan, and the next listing that holds the file writes it to the record: the
+    //       file is not imported again.
+    // WHY-THIS-SHAPE: this binary's readdir() holds the scan's worker once it has read the folder to its
+    //       end, before the scan's continuation runs; x.wpx arrives then and the user's import of it ends
+    //       owed (the record is a folder). Released, the scan prunes against a listing without x.wpx.
+    // CONTROL: in Importer::finish (app/library/importer.cpp), `addOnce(m_finishedSinceListing);`
+    //       deleted from `owe` -> "FAIL: S15.369: ... the next scan ran 1 import(s) ...".
+    // COVERAGE-ASSERT: the listing must have been held, and the import owed while it was.
+    {
+        const QString base = root + QStringLiteral("/owed-mid-listing");
+        const QString drop = base + QStringLiteral("/drop");
+        const QString file = drop + QStringLiteral("/x.wpx");
+        const QString wallpapers = base + QStringLiteral("/wallpapers");
+        if (!QDir().mkpath(drop) || !spoil(drop)) {
+            fault("S15.369", QStringLiteral("the drop folder could not be built"));
+            return;
+        }
+        Session s(drop, wallpapers, 30000, Importer::Watching::Poll, 600000);
+        {
+            const std::scoped_lock lock(g_listingLock);
+            g_heldListingPath = QFile::encodeName(QDir::cleanPath(drop));
+            g_heldListingDir = nullptr;
+            g_listingMain = pthread_self();
+        }
+        g_holdListing = true;
+        setOpendirHook(&noteHeldListing);
+        const auto unhook = qScopeGuard([] {
+            g_holdListing = false;
+            setOpendirHook(nullptr);
+        });
+        s.importer().rescan();
+        const bool listingHeld = waitUntil([] { return g_listingHeld.load(); }, kWaitMs);
+        bool owedMeanwhile = false;
+        if (listingHeld && writeBytes(file, *package)) {
+            s.importer().importPath(file);
+            owedMeanwhile = waitUntil([&] { return !s.takeImported().isEmpty(); }, kWaitMs) &&
+                            !s.importer().problems().filter(QStringLiteral("cannot be read")).isEmpty();
+        }
+        g_holdListing = false;
+        const bool settled = s.quiesce();
+        const QStringList made = entriesOf(wallpapers);
+        if (!listingHeld || !owedMeanwhile || !settled || made.size() != 1 || !repair(drop) ||
+            !QDir(wallpapers + QLatin1Char('/') + made.constFirst()).removeRecursively()) {
+            harnessFailure("S15.369: the listing was not held, or the import did not end owed while it was");
+            return;
+        }
+        s.takeRuns();
+        s.importer().rescan();
+        const bool quiet = s.quiesce();
+        const int runs = s.takeRuns();
+        expect(quiet && runs == 0 && entriesOf(wallpapers).isEmpty() && recordOf(drop) == QStringList{keyOf(file)},
+               QStringLiteral("S15.369: a key owed while a listing was out survived it: the next scan ran %1 import(s) and wrote [%2]")
+                   .arg(runs)
+                   .arg(recordOf(drop).join(u" | ")));
+    }
+
+    // GOAL: S15.369 -- a key recorded while a scan's listing is out, for a file that listing does not
+    //       show (moved away meanwhile), is not pruned by that scan: put back, the file is not imported
+    //       again.
+    // WHY-THIS-SHAPE: the scan's own import of x.wpx is held in mkdtemp, its source open; x.wpx is moved
+    //       away and a second scan's listing is held at its end; the import is let go and records the key;
+    //       then the listing, which lacks x.wpx, is let go. Put back, x.wpx must not be imported.
+    // CONTROL: in Importer::scanDropFolder (app/library/importer.cpp), `&& !m_finishedSinceListing.contains(key)`
+    //       deleted from `gone` -> "FAIL: S15.369 (recorded while listed): ... after the scan [] ... 1 import(s)".
+    // COVERAGE-ASSERT: the import and the second listing must both have been held.
+    {
+        const QString base = root + QStringLiteral("/recorded-mid-listing");
+        const QString drop = base + QStringLiteral("/drop");
+        const QString file = drop + QStringLiteral("/x.wpx");
+        const QString away = base + QStringLiteral("/away.wpx");
+        const QString wallpapers = base + QStringLiteral("/wallpapers");
+        if (!QDir().mkpath(drop) || !writeBytes(file, *package)) {
+            fault("S15.369", QStringLiteral("the drop folder could not be built"));
+            return;
+        }
+        const QString key = keyOf(file);
+        Session s(drop, wallpapers, 30000, Importer::Watching::Poll, 600000);
+        g_holdImports = true;
+        const auto releaseImport = qScopeGuard([] { g_holdImports = false; });
+        s.importer().rescan();
+        const bool importHeld = waitUntil([] { return g_importHeld.load(); }, kWaitMs);
+        const bool movedAway = ::rename(QFile::encodeName(file).constData(), QFile::encodeName(away).constData()) == 0;
+        {
+            const std::scoped_lock lock(g_listingLock);
+            g_heldListingPath = QFile::encodeName(QDir::cleanPath(drop));
+            g_heldListingDir = nullptr;
+            g_listingMain = pthread_self();
+        }
+        g_holdListing = true;
+        setOpendirHook(&noteHeldListing);
+        const auto unhook = qScopeGuard([] {
+            g_holdListing = false;
+            setOpendirHook(nullptr);
+        });
+        s.importer().rescan();
+        const bool listingHeld = waitUntil([] { return g_listingHeld.load(); }, kWaitMs);
+        g_holdImports = false;
+        const bool recorded = waitUntil([&] { return recordOf(drop) == QStringList{key}; }, kWaitMs);
+        g_holdListing = false;
+        const bool settled = s.quiesce();
+        const QStringList afterScan = recordOf(drop);
+        if (!importHeld || !movedAway || !listingHeld || !recorded || !settled) {
+            harnessFailure(QStringLiteral("S15.369 (recorded while listed): the import held %1, moved %2, listing held %3, "
+                                          "recorded %4")
+                               .arg(importHeld)
+                               .arg(movedAway)
+                               .arg(listingHeld)
+                               .arg(recorded)
+                               .toStdString());
+            return;
+        }
+        s.takeRuns();
+        const bool putBack = ::rename(QFile::encodeName(away).constData(), QFile::encodeName(file).constData()) == 0;
+        s.importer().rescan();
+        const bool quiet = s.quiesce();
+        const int runs = s.takeRuns();
+        expect(putBack && quiet && afterScan == QStringList{key} && runs == 0,
+               QStringLiteral("S15.369 (recorded while listed): the record after the scan listed before it is [%1]; %2 import(s) "
+                              "once the file was back")
+                   .arg(afterScan.join(u" | "))
+                   .arg(runs));
+    }
+
+    // GOAL: S15.370 -- a key owed is written to the record of whatever folder next lists a file with
+    //       that key, even one of another identity at the drop path (a remount gives a new device): the
+    //       file is not imported again.
+    // WHY-THIS-SHAPE: the record is turned into a folder as the scan's import looks its file up, so the
+    //       key is owed; then the drop path is re-pointed at B, which holds a hard link to the same file.
+    // CONTROL: in Importer::scanDropFolder (app/library/importer.cpp), `if (m_unrecorded.contains(key))`
+    //       made `if (false && m_unrecorded.contains(key))` -> "FAIL: S15.370: ... 1 import(s) ...".
+    // COVERAGE-ASSERT: the record must have been spoiled exactly once, by the import's lookup.
+    {
+        const QString base = root + QStringLiteral("/owed-elsewhere");
+        const QString a = base + QStringLiteral("/A");
+        const QString b = base + QStringLiteral("/B");
+        const QString link = base + QStringLiteral("/drop");
+        const QString wallpapers = base + QStringLiteral("/wallpapers");
+        if (!QDir().mkpath(a) || !QDir().mkpath(b) || !writeBytes(a + QStringLiteral("/x.wpx"), *package) ||
+            !pointLink(QFile::encodeName(link), QFile::encodeName(a))) {
+            fault("S15.370", QStringLiteral("the two folders and the link could not be built"));
+            return;
+        }
+        static std::atomic<bool> s_spoilArmed{false};
+        static std::atomic<int> s_spoiled{0};
+        static QByteArray s_record;
+        s_record = QFile::encodeName(a + QStringLiteral("/.auto-imported"));
+        s_spoiled = 0;
+        s_spoilArmed = true;
+        g_repointMain = pthread_self();
+        g_beforeOpenat = [](int, const char* path, int flags) {
+            if (!s_spoilArmed.load() || path == nullptr || (flags & O_PATH) == 0 || pthread_equal(pthread_self(), g_repointMain) ||
+                std::strcmp(path, "x.wpx") != 0 || !s_spoilArmed.exchange(false)) {
+                return;
+            }
+            ::unlink(s_record.constData());
+            if (::mkdir(s_record.constData(), 0700) == 0) {
+                ++s_spoiled;
+            }
+        };
+        const auto unhook = qScopeGuard([] {
+            s_spoilArmed = false;
+            g_beforeOpenat = nullptr;
+        });
+        Session s(link, wallpapers, 30000, Importer::Watching::Poll, 600000);
+        s.importer().rescan();
+        const bool imported = waitUntil([&] { return !s.importer().notices().isEmpty(); }, kWaitMs) && s.quiesce();
+        if (!imported || s_spoiled.load() != 1 ||
+            ::link(QFile::encodeName(a + QStringLiteral("/x.wpx")).constData(), QFile::encodeName(b + QStringLiteral("/x.wpx")).constData()) != 0 ||
+            !pointLink(QFile::encodeName(link), QFile::encodeName(b))) {
+            harnessFailure(QStringLiteral("S15.370: the import ran %1, the record was spoiled %2 time(s), or B could not be set up")
+                               .arg(imported)
+                               .arg(s_spoiled.load())
+                               .toStdString());
+            return;
+        }
+        s.takeRuns();
+        s.importer().rescan();
+        const bool quiet = s.quiesce();
+        const int runs = s.takeRuns();
+        expect(quiet && runs == 0 && recordOf(b) == QStringList{keyOf(b + QStringLiteral("/x.wpx"))},
+               QStringLiteral("S15.370: an owed key met in a folder of another identity holding the same file: %1 import(s), "
+                              "that folder's record [%2]")
+                   .arg(runs)
+                   .arg(recordOf(b).join(u" | ")));
+    }
+}
+
+// S15.371: a refusal that never opened a regular file records nothing.
+void stamplessRefusal(const QString& root) {
+    const auto package = zipBytes(root + QStringLiteral("/stampless.scratch"), planEntries(titled("Listed")));
+    const QString base = root + QStringLiteral("/stampless");
+    const QString drop = base + QStringLiteral("/drop");
+    const QString file = drop + QStringLiteral("/x.wpx");
+    const QString away = base + QStringLiteral("/away.wpx");
+    const QString fifo = base + QStringLiteral("/fifo");
+    if (!package || !QDir().mkpath(drop) || !writeBytes(file, *package) ||
+        ::mkfifo(QFile::encodeName(fifo).constData(), 0600) != 0) {
+        fault("S15.371", QStringLiteral("the drop folder could not be built"));
+        return;
+    }
+    // GOAL: S15.371 -- a listed file that is no longer a regular file when its import looks it up is
+    //       refused, and nothing is recorded for it: put back, the file is imported.
+    // WHY-THIS-SHAPE: x.wpx is swapped for a FIFO just before the import's lookup of it, after the scan
+    //       listed it as a regular file, so the refusal has no stamp of the file opened. Recording the key
+    //       as listed would keep the real file, put back, from ever being imported.
+    // CONTROL: in Importer::finish (app/library/importer.cpp), the stampless early return made to record
+    //       `job.listedIn->key` instead -> "FAIL: S15.371: the record after the refusal is [<key>]; once the
+    //       file was back, notices []".
+    // COVERAGE-ASSERT: the swap must have happened exactly once, at the import's lookup.
+    static std::atomic<bool> s_swapArmed{false};
+    static std::atomic<int> s_swapped{0};
+    static QByteArray s_file, s_away, s_fifo;
+    s_file = QFile::encodeName(file);
+    s_away = QFile::encodeName(away);
+    s_fifo = QFile::encodeName(fifo);
+    s_swapped = 0;
+    s_swapArmed = true;
+    g_repointMain = pthread_self();
+    g_beforeOpenat = [](int, const char* path, int flags) {
+        if (!s_swapArmed.load() || path == nullptr || (flags & O_PATH) == 0 || pthread_equal(pthread_self(), g_repointMain) ||
+            std::strcmp(path, "x.wpx") != 0 || !s_swapArmed.exchange(false)) {
+            return;
+        }
+        if (::rename(s_file.constData(), s_away.constData()) == 0 && ::rename(s_fifo.constData(), s_file.constData()) == 0) {
+            ++s_swapped;
+        }
+    };
+    const auto unhook = qScopeGuard([] {
+        s_swapArmed = false;
+        g_beforeOpenat = nullptr;
+    });
+    Session s(drop, base + QStringLiteral("/wallpapers"), 30000, Importer::Watching::Poll, 600000);
+    s.importer().rescan();
+    const bool refused = waitUntil([&] { return !s.importer().problems().isEmpty(); }, kWaitMs) && s.quiesce();
+    const QStringList afterRefusal = recordOf(drop);
+    if (!refused || s_swapped.load() != 1 || ::unlink(s_file.constData()) != 0 ||
+        ::rename(s_away.constData(), s_file.constData()) != 0) {
+        harnessFailure(QStringLiteral("S15.371: the refusal came %1 after %2 swap(s), or the file could not be put back")
+                           .arg(refused)
+                           .arg(s_swapped.load())
+                           .toStdString());
+        return;
+    }
+    s.importer().rescan();
+    const bool imported = waitUntil([&] { return !s.importer().notices().isEmpty(); }, kWaitMs) && s.quiesce();
+    expect(afterRefusal.isEmpty() && imported && s.importer().notices() == QStringList{QStringLiteral("Imported Listed.")},
+           QStringLiteral("S15.371: the record after the refusal is [%1]; once the file was back, notices [%2]")
+               .arg(afterRefusal.join(u" | "), s.importer().notices().join(u" | ")));
+}
+
+// S15.372 and S15.373: what is said when the drop folder cannot be listed or opened.
+void dropFolderUnreadable(const QString& root) {
+    const QString base = root + QStringLiteral("/drop-unreadable");
+    const QString plain = base + QStringLiteral("/plain");
+    if (!QDir().mkpath(base) || !writeBytes(plain, "not a folder")) {
+        fault("S15.372", QStringLiteral("the file standing in for the drop folder could not be written"));
+        return;
+    }
+    // GOAL: S15.372 -- a drop path that is something other than a folder (here a regular file) is said
+    //       ("... cannot be read: Not a directory."), while a drop path under a file -- a folder that is not
+    //       there -- says nothing, as a missing folder says nothing.
+    // WHY-THIS-SHAPE: both are ENOTDIR from opendir; only a stat of the path itself tells them apart. Read
+    //       from the importer's warnings, which is where a scan's listing failure goes.
+    // CONTROL: in nothingAt (app/library/importer.cpp), (a) ENOTDIR made always "nothing there" -> "FAIL:
+    //       S15.372: a drop path that is a file logged []"; (b) ENOTDIR made never "nothing there" -> "FAIL:
+    //       S15.372: ... one under a file logged [... cannot be read: Not a directory.]".
+    QStringList atFile;
+    QStringList underFile;
+    for (const bool under : {false, true}) {
+        const WarningLog log;
+        Session s(under ? plain + QStringLiteral("/sub") : plain, base + QStringLiteral("/wallpapers"), 30000,
+                  Importer::Watching::Poll, 600000);
+        s.importer().rescan();
+        static_cast<void>(s.quiesce());
+        (under ? underFile : atFile) = log.containing(u"cannot be read");
+    }
+    expect(atFile.size() == 1 && atFile.constFirst().endsWith(QStringLiteral("cannot be read: Not a directory.")) &&
+               underFile.isEmpty(),
+           QStringLiteral("S15.372: a drop path that is a file logged [%1]; one under a file logged [%2]")
+               .arg(atFile.join(u" | "), underFile.join(u" | ")));
+
+    // GOAL: S15.373 -- a drop folder that cannot be opened when a hand import of one of its files ends is
+    //       said in words that name the drop folder, not its record, which was never reached.
+    // WHY-THIS-SHAPE: this binary's open() refuses the drop folder with O_PATH (EACCES) during the import;
+    //       the file itself is read by its own path, so the import succeeds and only the record is lost.
+    // CONTROL: in Importer::openDropFolder (app/library/importer.cpp), the message made
+    //       `recordUnreadable(m_dropDirectory, systemError(error))` -> "FAIL: S15.373: ... [.../.auto-imported
+    //       cannot be read (Permission denied) ...]".
+    const auto package = zipBytes(root + QStringLiteral("/drop-open.scratch"), planEntries(titled("Asked")));
+    const QString drop = base + QStringLiteral("/drop");
+    if (!package || !QDir().mkpath(drop) || !writeBytes(drop + QStringLiteral("/x.wpx"), *package)) {
+        fault("S15.373", QStringLiteral("the drop folder could not be built"));
+        return;
+    }
+    Session s(drop, base + QStringLiteral("/wallpapers-open"), 30000, Importer::Watching::Poll, 600000);
+    {
+        const std::scoped_lock lock(g_refusedOpenLock);
+        g_refusedOpen = QFile::encodeName(QDir::cleanPath(QDir(drop).absolutePath()));
+    }
+    g_refusingOpen = true;
+    s.importer().importPath(drop + QStringLiteral("/x.wpx"));
+    const bool done = s.quiesce();
+    g_refusingOpen = false;
+    const QString want = QStringLiteral("The drop folder %1 cannot be opened (Permission denied), so the files imported from it "
+                                        "are recorded there once it can.")
+                             .arg(QDir::cleanPath(QDir(drop).absolutePath()));
+    expect(done && s.importer().problems() == QStringList{want} && s.takeImported().size() == 1,
+           QStringLiteral("S15.373: a drop folder that could not be opened was reported as [%1]").arg(s.importer().problems().join(u" | ")));
+}
+
+// S15.353: an imported file's key is kept until a record holding it is written.
+void recordOwedKept(const QString& root) {
+    const auto package = zipBytes(root + QStringLiteral("/owed.scratch"), planEntries(titled("Owed")));
+    if (!package) {
+        fault("S15.353", QStringLiteral("the package could not be built"));
+        return;
+    }
+    // GOAL: S15.353 -- a drop-folder import whose record could not be written is not imported again:
+    //       after the record's write is refused and the user deletes the wallpaper, the next scan
+    //       imports nothing and writes the record holding the file's key.
+    // WHY-THIS-SHAPE: this binary's renameat() refuses the first rename onto the record, the last step
+    //       of its write; deleting the wallpaper means an import would make it again, so "nothing
+    //       imported" is about the key, not about the library already holding the bytes.
+    // CONTROL: `addOnce(m_unrecorded);` deleted from the `owe` lambda in Importer::finish
+    //       (app/library/importer.cpp) -> "FAIL: S15.353 (write refused): after the record's write failed
+    //       and the wallpaper was deleted, the next scan ran 1 import(s) and wrote the record []", the
+    //       read-failed line beside it.
+    // COVERAGE-ASSERT: after the import the record must lack the file's key, its write refused at most
+    //       once -- refused once on this code, and not attempted at all when nothing is owed, which is
+    //       the defect this grades -- or the staging failed.
+    {
+        const QString drop = root + QStringLiteral("/owed-write");
+        const QString wallpapers = drop + QStringLiteral("/wallpapers");
+        if (!QDir().mkpath(drop) || !writeBytes(drop + QStringLiteral("/x.wpx"), *package)) {
+            fault("S15.353", QStringLiteral("the drop folder could not be built"));
+            return;
+        }
+        Session s(drop, wallpapers);
+        bool imported = false;
+        int refused = 0;
+        {
+            const WarningLog log;
+            const RefuseRenameTo refuse(drop + QStringLiteral("/.auto-imported"), 1);
+            s.importer().rescan();
+            imported = waitUntil([&] { return !s.importer().notices().isEmpty(); }, kWaitMs) && s.quiesce();
+            refused = refuse.refused();
+        }
+        const QStringList made = entriesOf(wallpapers);
+        const bool unrecorded = !recordOf(drop).contains(keyOf(drop + QStringLiteral("/x.wpx")));
+        if (!imported || refused > 1 || !unrecorded || made.size() != 1 ||
+            !QDir(wallpapers + QLatin1Char('/') + made.constFirst()).removeRecursively()) {
+            harnessFailure(QStringLiteral("S15.353 (write refused): the import ran %1, %2 record write(s) were refused, the "
+                                          "record %3 the key, and its wallpaper could not be deleted")
+                               .arg(imported)
+                               .arg(refused)
+                               .arg(unrecorded ? QStringLiteral("lacks") : QStringLiteral("holds"))
+                               .toStdString());
+            return;
+        }
+        s.takeRuns();
+        s.importer().rescan();
+        const bool quiet = s.quiesce();
+        const int runs = s.takeRuns();
+        expect(quiet && runs == 0 && recordOf(drop) == QStringList{keyOf(drop + QStringLiteral("/x.wpx"))} && entriesOf(wallpapers).isEmpty(),
+               QStringLiteral("S15.353 (write refused): after the record's write failed and the wallpaper was deleted, the next scan ran %1 "
+                              "import(s) and wrote the record [%2]")
+                   .arg(runs)
+                   .arg(recordOf(drop).join(u" | ")));
+    }
+
+    // GOAL: S15.353 -- a record that cannot be read when an import finishes is said, as at a scan, and
+    //       the key is still kept: once the record reads again, the next scan imports nothing and
+    //       writes it.
+    // WHY-THIS-SHAPE: the record is turned into a folder just as the import's worker looks its file
+    //       up, after the scan's own read of it; only the import's read meets the folder.
+    // CONTROL: the `addProblem(*record.error());` after loadRecordIn in Importer::finish
+    //       (app/library/importer.cpp) deleted -> "FAIL: S15.353 (read failed): when the import finished
+    //       the importer said []; ...".
+    // COVERAGE-ASSERT: the record must have been turned into a folder exactly once, by the import.
+    {
+        const QString drop = root + QStringLiteral("/owed-read");
+        const QString wallpapers = drop + QStringLiteral("/wallpapers");
+        const QString record = drop + QStringLiteral("/.auto-imported");
+        if (!QDir().mkpath(drop) || !writeBytes(drop + QStringLiteral("/x.wpx"), *package)) {
+            fault("S15.353", QStringLiteral("the drop folder could not be built"));
+            return;
+        }
+        static std::atomic<bool> s_spoilArmed{false};
+        static std::atomic<int> s_spoiled{0};
+        static QByteArray s_record;
+        s_record = QFile::encodeName(record);
+        s_spoiled = 0;
+        s_spoilArmed = true;
+        g_repointMain = pthread_self();
+        g_beforeOpenat = [](int, const char* path, int flags) {
+            if (!s_spoilArmed.load() || path == nullptr || (flags & O_PATH) == 0 || pthread_equal(pthread_self(), g_repointMain) ||
+                std::strcmp(path, "x.wpx") != 0 || !s_spoilArmed.exchange(false)) {
+                return;
+            }
+            ::unlink(s_record.constData());
+            if (::mkdir(s_record.constData(), 0700) == 0) {
+                ++s_spoiled;
+            }
+        };
+        const auto unhook = qScopeGuard([] {
+            s_spoilArmed = false;
+            g_beforeOpenat = nullptr;
+        });
+        Session s(drop, wallpapers);
+        s.importer().rescan();
+        const bool imported = waitUntil([&] { return !s.importer().notices().isEmpty(); }, kWaitMs) && s.quiesce();
+        if (!imported || s_spoiled.load() != 1) {
+            harnessFailure(QStringLiteral("S15.353 (read failed): the import ran %1 and the record was spoiled %2 time(s)")
+                               .arg(imported)
+                               .arg(s_spoiled.load())
+                               .toStdString());
+            return;
+        }
+        const QString want = QStringLiteral("%1 cannot be read (not a regular file), so files in the drop folder are not imported "
+                                            "until it can.")
+                                 .arg(QDir::cleanPath(record));
+        const QStringList said = s.importer().problems();
+        const QStringList made = entriesOf(wallpapers);
+        const bool repaired = QDir().rmdir(record) && made.size() == 1 && QDir(wallpapers + QLatin1Char('/') + made.constFirst()).removeRecursively();
+        s.importer().dismissProblems();
+        s.takeRuns();
+        s.importer().rescan();
+        const bool quiet = s.quiesce();
+        const int runs = s.takeRuns();
+        expect(said == QStringList{want} && repaired && quiet && runs == 0 &&
+                   recordOf(drop) == QStringList{keyOf(drop + QStringLiteral("/x.wpx"))},
+               QStringLiteral("S15.353 (read failed): when the import finished the importer said [%1]; once the record read again the "
+                              "next scan ran %2 import(s) and wrote [%3]")
+                   .arg(said.join(u" | "))
+                   .arg(runs)
+                   .arg(recordOf(drop).join(u" | ")));
+    }
+}
+
+// S15.355: a dropped file's bytes are read through the folder that was listed.
+void bytesThroughListedFolder(const QString& root) {
+    const auto listed = zipBytes(root + QStringLiteral("/bytes-a.scratch"), planEntries(titled("Listed")));
+    const auto swapped = zipBytes(root + QStringLiteral("/bytes-b.scratch"), planEntries(titled("Swapped")));
+    const auto linked = zipBytes(root + QStringLiteral("/bytes-c.scratch"), planEntries(titled("Linked In")));
+    const auto elsewhere = zipBytes(root + QStringLiteral("/bytes-d.scratch"), planEntries(titled("By Hand")));
+    if (!listed || !swapped || !linked || !elsewhere) {
+        fault("S15.355", QStringLiteral("the packages could not be built"));
+        return;
+    }
+    // GOAL: S15.355 -- the bytes a scan's import reads are those of the file the scan listed: when the
+    //       drop folder's path is re-pointed at another folder holding a file of the same name between
+    //       the listing and the import's open, the listed file is the one imported.
+    // WHY-THIS-SHAPE: the drop folder is a link from A to B; this binary's openat() re-points it at B
+    //       just before the import's worker first looks x.wpx up (by name or by a path ending in it),
+    //       which is after the scan's listing, so the watcher sees no change during the scan. The two
+    //       files carry different titles, which the notice names.
+    // CONTROL: in Importer::runNext (app/library/importer.cpp), the job always imported by path
+    //       (`unpackPackage(path, directory, *cancelled)` whatever `listed` holds) -> "FAIL: S15.355
+    //       (swapped): ... the notices are [Imported Swapped.], ...". Via control_batch.sh, 2026-10-06.
+    //       Reverted.
+    // COVERAGE-ASSERT: the link must have been re-pointed exactly once, by the import's lookup.
+    {
+        const QString base = root + QStringLiteral("/bytes-swap");
+        const QString a = base + QStringLiteral("/A");
+        const QString b = base + QStringLiteral("/B");
+        const QString link = base + QStringLiteral("/drop");
+        if (!QDir().mkpath(a) || !QDir().mkpath(b) || !writeBytes(a + QStringLiteral("/x.wpx"), *listed) ||
+            !writeBytes(b + QStringLiteral("/x.wpx"), *swapped) || !pointLink(QFile::encodeName(link), QFile::encodeName(a))) {
+            fault("S15.355", QStringLiteral("the two folders and the link could not be built"));
+            return;
+        }
+        Session s(link, base + QStringLiteral("/wallpapers"), 30000, Importer::Watching::Poll, 600000);
+        armRepoint(link, b, "x.wpx");
+        g_beforeOpenat = &repointBeforeLookup;
+        const auto unhook = qScopeGuard([] {
+            g_repointArmed = false;
+            g_beforeOpenat = nullptr;
+        });
+        s.importer().rescan();
+        const bool imported = waitUntil([&] { return !s.importer().notices().isEmpty() || !s.importer().problems().isEmpty(); }, kWaitMs) &&
+                              s.quiesce();
+        if (g_repointsDone.load() != 1) {
+            harnessFailure("S15.355 (swapped): the import never looked x.wpx up, so the folder was never re-pointed");
+            return;
+        }
+        expect(imported && s.importer().notices() == QStringList{QStringLiteral("Imported Listed.")},
+               QStringLiteral("S15.355 (swapped): with the drop folder re-pointed before the import opened x.wpx, the notices are [%1], "
+                              "the problems [%2]")
+                   .arg(s.importer().notices().join(u" | "), s.importer().problems().join(u" | ")));
+    }
+
+    // GOAL: S15.355 -- a .wpx in the drop folder that is a link, relative to the folder holding it, is
+    //       still imported through the listed folder.
+    // CONTROL: in unpackPackage's folder form (app/library/importer.cpp), the open made
+    //       `openRegularFile(folder, name.constData(), O_RDONLY | O_NOFOLLOW)` -> "FAIL: S15.355 (a link in
+    //       the drop folder): the notices are [], the problems [y.wpx could not be imported. It is not a
+    //       regular file.]". Via control_batch.sh, 2026-10-06. Reverted.
+    {
+        const QString base = root + QStringLiteral("/bytes-link");
+        const QString drop = base + QStringLiteral("/drop");
+        if (!QDir().mkpath(drop) || !QDir().mkpath(base + QStringLiteral("/store")) ||
+            !writeBytes(base + QStringLiteral("/store/y.wpx"), *linked) ||
+            ::symlink("../store/y.wpx", QFile::encodeName(drop + QStringLiteral("/y.wpx")).constData()) != 0) {
+            fault("S15.355", QStringLiteral("the drop folder and its link could not be built"));
+            return;
+        }
+        Session s(drop, base + QStringLiteral("/wallpapers"));
+        s.importer().rescan();
+        const bool imported = waitUntil([&] { return !s.importer().notices().isEmpty() || !s.importer().problems().isEmpty(); }, kWaitMs) &&
+                              s.quiesce();
+        expect(imported && s.importer().notices() == QStringList{QStringLiteral("Imported Linked In.")} && s.importer().problems().isEmpty(),
+               QStringLiteral("S15.355 (a link in the drop folder): the notices are [%1], the problems [%2]")
+                   .arg(s.importer().notices().join(u" | "), s.importer().problems().join(u" | ")));
+    }
+
+    // GOAL: S15.355 -- a hand import of a file outside the drop folder is read by its path as before.
+    // CONTROL: in unpackPackage's path form (app/library/importer.cpp), the name passed made the file's
+    //       name alone (`encodeFileName(QFileInfo(archivePath).fileName())`), so it is not found by its
+    //       path -> "FAIL: S15.355 (by hand, outside the drop folder): the import gave [], the problems [z.wpx
+    //       could not be imported. It cannot be opened: No such file or directory.]". Via control_batch.sh,
+    //       2026-10-06. Reverted.
+    {
+        const QString base = root + QStringLiteral("/bytes-hand");
+        const QString file = base + QStringLiteral("/elsewhere/z.wpx");
+        const QString wallpapers = base + QStringLiteral("/wallpapers");
+        if (!QDir().mkpath(base + QStringLiteral("/elsewhere")) || !writeBytes(file, *elsewhere)) {
+            fault("S15.355", QStringLiteral("the file outside the drop folder could not be written"));
+            return;
+        }
+        Session s(base + QStringLiteral("/drop"), wallpapers);
+        s.importer().importPath(file);
+        const bool quiet = s.quiesce();
+        const QStringList folders = s.takeImported();
+        expect(quiet && folders.size() == 1 && readWallpaperFolder(folders.value(0)).title == u"By Hand" && s.importer().problems().isEmpty(),
+               QStringLiteral("S15.355 (by hand, outside the drop folder): the import gave [%1], the problems [%2]")
+                   .arg(folders.join(u" | "), s.importer().problems().join(u" | ")));
+    }
+}
+
 } // namespace
 
 int main(int argc, char* argv[]) {
@@ -1753,11 +3447,22 @@ int main(int argc, char* argv[]) {
     runPhase("askedWhileDropped", [&] { askedWhileDropped(root); });
     runPhase("unusableDrops", [&] { unusableDrops(root); });
     runPhase("recordUnwritable", [&] { recordUnwritable(root); });
+    runPhase("unreadableRecord", [&] { unreadableRecord(root); });
+    runPhase("linkToFifo", [&] { linkToFifo(root); });
+    runPhase("recordReadFresh", [&] { recordReadFresh(root); });
+    runPhase("folderBackMidScan", [&] { folderBackMidScan(root); });
+    runPhase("swapToFifo", [&] { swapToFifo(root); });
     runPhase("linkedWhileWritten", [&] { linkedWhileWritten(root); });
     runPhase("linkedRewritten", [&] { linkedRewritten(root); });
     runPhase("linkWatchRefused", [&] { linkWatchRefused(root); });
     runPhase("linkWatchDropped", [&] { linkWatchDropped(root); });
     runPhase("nulInFileUrl", [&] { nulInFileUrl(root); });
+    runPhase("recordThroughListedFolder", [&] { recordThroughListedFolder(root); });
+    runPhase("owedKeys", [&] { owedKeys(root); });
+    runPhase("stamplessRefusal", [&] { stamplessRefusal(root); });
+    runPhase("dropFolderUnreadable", [&] { dropFolderUnreadable(root); });
+    runPhase("recordOwedKept", [&] { recordOwedKept(root); });
+    runPhase("bytesThroughListedFolder", [&] { bytesThroughListedFolder(root); });
     // No import may still be writing into the scratch folder when it is removed.
     static_cast<void>(QThreadPool::globalInstance()->waitForDone(30000));
     return verdict();

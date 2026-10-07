@@ -33,6 +33,7 @@
 
 #include "support/test_image.h"
 #include "tests/client/scratch_dir.h"
+#include "tests/manager_output.h"
 #include "tests/self_exec.h"
 #include "tests/test_report.h"
 
@@ -66,6 +67,7 @@ using wallpaperx::NoFrameReason;
 using wallpaperx::readCrashRecord;
 using wallpaperx::WallpaperManager;
 using wallpaperx::testing::check;
+using wallpaperx::testing::exportDelivered;
 using wallpaperx::testing::harnessFailure;
 using wallpaperx::testing::notVerified;
 using wallpaperx::testing::ScratchDir;
@@ -94,7 +96,7 @@ constexpr uint32_t kHeight = 64;
 // Counts opens of one file, through inotify.
 //
 // The property "this wallpaper was not decoded" has no other observable: status, health and
-// GetFrameFd all report the refusal, and would report it identically for a build that refused
+// GetFrame all report the refusal, and would report it identically for a build that refused
 // in status and decoded the file anyway. stat(2) times are no good either -- atime is
 // relatime on most mounts, so a second read within the day updates nothing.
 class OpenWatch {
@@ -643,11 +645,11 @@ int main(int argc, char** argv) {
         //       the message and left the request unserviced would satisfy every text
         //       assertion, then decode the file on the first pass -- the crash loop, with a
         //       message on top of it.
-        // CONTROL: in backend/daemon/wallpaper_manager.cpp, restoreSaved()'s
-        //       `state.quarantined = crash && ...` replaced with `= false` -> 20 FAIL lines,
-        //       from "a monitor whose record matches its wallpaper is refused with a reason"
-        //       through "a consumer leaving the bus re-posts the refused monitor too", the video
-        //       row's four among them. Observed 2026-09-16. Reverted.
+        // CONTROL: in backend/daemon/wallpaper_manager.cpp, the crash record's
+        //       `refuse(entry.monitorId, state, describeCrash(*crash));` in the restore made
+        //       `(void)crash;` -> 20 FAIL lines, from "a monitor whose record matches its wallpaper is
+        //       refused with a reason" and "a refused monitor owes no render" on, the video row's among
+        //       them. Via control_batch.sh, 2026-10-06. Reverted.
         {
             const WallpaperManager::Snapshot snap = manager.snapshot();
             const std::optional<wallpaperx::MonitorStatus> crashed = monitor(snap, kCrashedMonitor);
@@ -863,7 +865,7 @@ int main(int argc, char** argv) {
         check(!recordOnDisk(stateDir, kUnsupportedMonitor),
               "a stale record on an unrenderable row is removed by its pass");
 
-        // GOAL: S13.13 -- GetFrameFd's answer for a refused monitor is RenderFailed carrying
+        // GOAL: S13.13 -- GetFrame's answer for a refused monitor is RenderFailed carrying
         //       the reason, not "never requested" and not silence. False if a frontend has to
         //       show an empty screen with nothing to display.
         // CONTROL: in backend/daemon/wallpaper_manager.cpp, the `state.lastError = ...`
@@ -871,7 +873,7 @@ int main(int argc, char** argv) {
         //       NotRendered, "FAIL: a refused monitor's frame request answers RenderFailed"
         //       plus the reason check. Reverted.
         {
-            const wallpaperx::FrameExport exported = manager.exportCurrentFrame(kCrashedMonitor);
+            const wallpaperx::FrameExport exported = exportDelivered(manager, kCrashedMonitor);
             check(!exported.handle.has_value(), "a refused monitor hands out no frame");
             check(exported.reason == NoFrameReason::RenderFailed,
                   "a refused monitor's frame request answers RenderFailed");
@@ -943,27 +945,9 @@ int main(int argc, char** argv) {
             }
         }
 
-        // GOAL: S13.15's third path -- a released image re-posts only a monitor that owes a
-        //       render, and a refused one is marked serviced, so it is never posted at all.
-        //       Stated as "asks for no work" rather than "does not decode": there is no pass
-        //       to observe, which is the point.
-        // WHY-THIS-SHAPE: no hold can exist on a refused monitor -- it has no frame to hand
-        //       over -- so the release path cannot be driven with a real claim. What is graded
-        //       is that neither release entry point returns the refused monitor as work.
-        {
-            std::vector<wallpaperx::FrameAvailable> announce;
-            const std::vector<int> afterRelease = manager.releaseBuffer(":1.5", kCrashedMonitor, 0, &announce);
-            check(afterRelease.empty(), "releasing an image asks for no work on a refused monitor");
-            const std::vector<int> afterDeparture = manager.forgetHeldBuffers(":1.5", &announce);
-            check(std::find(afterDeparture.begin(), afterDeparture.end(), kCrashedMonitor) ==
-                      afterDeparture.end(),
-                  "the sweep for a departed consumer asks for no work on a refused monitor");
-            check(std::none_of(announce.begin(), announce.end(),
-                               [](const wallpaperx::FrameAvailable& entry) {
-                                   return entry.monitorId == kCrashedMonitor;
-                               }),
-                  "nothing announces a frame for a refused monitor, which has none");
-        }
+        // S13.15's third path, the sweep after a consumer leaves, is not graded here: no consumer can
+        // hold an image of a refused monitor, so the sweep skips it whatever the refusal rule says, and
+        // what a refused monitor owes is the renderOutstanding check above.
 
         // ------------------------------------------------------------------ //
         // S13.16: the user's way out

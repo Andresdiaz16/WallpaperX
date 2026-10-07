@@ -94,7 +94,7 @@ inline std::string writeUndecodableFile(const std::string& dir, const std::strin
 }
 
 // Number of descriptors this process currently holds open. Used before/after a block of
-// work to catch a leak: GetFrameFd is called by a polling consumer, so a descriptor
+// work to catch a leak: GetFrame is called by a polling consumer, so a descriptor
 // leaked per call is an eventual EMFILE rather than a one-off.
 inline size_t openFdCount() {
     size_t count = 0;
@@ -200,22 +200,27 @@ private:
     std::vector<std::pair<int32_t, uint64_t>> m_events;
 };
 
-// A proxy on the session bus with `log` subscribed to FrameReady. Call it BEFORE spawning the
-// daemon: a restored wallpaper renders on the daemon's own initiative, and a subscription made
-// after the name appears can miss it. `log` must outlive the proxy.
-inline std::unique_ptr<sdbus::IProxy> subscribeFrameReady(FrameReadyLog& log) {
-    auto proxy =
-        sdbus::createProxy(sdbus::ServiceName{DbusService::kBusName}, sdbus::ObjectPath{DbusService::kObjectPath});
+// A proxy on the session bus with `log` subscribed to FrameReady, addressed to `name` -- the
+// well-known name by default, a service's unique name for the in-process phases. Call it BEFORE
+// spawning the daemon: a restored wallpaper renders on the daemon's own initiative, and a
+// subscription made after the name appears can miss it. `log` must outlive the proxy.
+inline std::unique_ptr<sdbus::IProxy> subscribeFrameReady(
+    FrameReadyLog& log, const sdbus::ServiceName& name = sdbus::ServiceName{DbusService::kBusName}) {
+    auto proxy = sdbus::createProxy(name, sdbus::ObjectPath{DbusService::kObjectPath});
     proxy->uponSignal("FrameReady")
         .onInterface(DbusService::kInterface)
         .call([&log](int32_t monitorId, uint64_t generation) { log.record(monitorId, generation); });
     return proxy;
 }
 
-// Everything GetFrameFd hands back, in one place, so the assertions read as claims
+// Everything GetFrame hands back, in one place, so the assertions read as claims
 // about the frame rather than as tuple indices.
 struct Frame {
+    // Field 0, memory_fd: the memory, invalid when the reply left it out.
     sdbus::UnixFd fd;
+    // How many descriptors field 0 carried. Kept apart from `fd` because a reply carrying two is a
+    // protocol fault `fd` alone would hide.
+    size_t memoryFds = 0;
     uint32_t width = 0;
     uint32_t height = 0;
     uint64_t memorySize = 0;
@@ -227,37 +232,47 @@ struct Frame {
     std::vector<sdbus::Struct<uint64_t, uint64_t>> planes;
     std::vector<uint8_t> deviceUuid;
     uint64_t bufferId = 0;
+    uint64_t acquireValue = 0;
+    // Field 13: this hand-over's number, which a release of the image names.
+    uint64_t handover = 0;
+
+    // What this reply carried that counts against the caller's descriptor cap.
+    size_t descriptors() const { return memoryFds + syncFds.size(); }
 };
 
-inline Frame getFrameFd(sdbus::IProxy& proxy, int32_t monitorId, std::chrono::microseconds timeout = {}) {
+// GetFrame's arguments past the monitor id. The defaults ask for everything the plain way: no image
+// declared as already imported, so the memory always comes, and the acquire as sync_fds. `timeout`
+// is the method-call timeout, zero meaning the bus's own, as on setWallpaper() below.
+struct FrameRequest {
+    std::vector<uint64_t> knownBuffers;
+    bool onTimeline = false;
+    std::chrono::microseconds timeout{};
+};
+
+// GetFrame's reply fields in wire order. The one reader of them: getFrame() below and every test that
+// sends the call without waiting on it go through this.
+inline Frame readFrameReply(sdbus::MethodReply& reply) {
     Frame frame;
-    proxy.callMethod("GetFrameFd")
-        .onInterface(DbusService::kInterface)
-        .withTimeout(timeout)
-        .withArguments(monitorId)
-        .storeResultsTo(frame.fd, frame.width, frame.height, frame.memorySize, frame.handleType, frame.syncFds,
-                        frame.generation, frame.drmFormat, frame.drmModifier, frame.planes, frame.deviceUuid,
-                        frame.bufferId);
+    std::vector<sdbus::UnixFd> memory;
+    reply >> memory >> frame.width >> frame.height >> frame.memorySize >> frame.handleType >> frame.syncFds >>
+        frame.generation >> frame.drmFormat >> frame.drmModifier >> frame.planes >> frame.deviceUuid >> frame.bufferId >>
+        frame.acquireValue >> frame.handover;
+    frame.memoryFds = memory.size();
+    if (!memory.empty()) frame.fd = std::move(memory.front());
     return frame;
 }
 
-// GetFrameFdOnTimeline's reply: GetFrameFd's twelve fields in the same order, then acquire_value.
-// Shared for the reason Frame is: which field is where is a wire fact both tiers must read alike.
-struct TimelineFrame {
-    Frame frame;
-    uint64_t acquireValue = 0;
-};
+// GetFrame's arguments in wire order, likewise the one writer of them.
+inline void appendFrameArguments(sdbus::MethodCall& call, int32_t monitorId, const FrameRequest& request = {}) {
+    call << monitorId << request.knownBuffers << request.onTimeline;
+}
 
-inline TimelineFrame getFrameFdOnTimeline(sdbus::IProxy& proxy, int32_t monitorId) {
-    TimelineFrame out;
-    Frame& frame = out.frame;
-    proxy.callMethod("GetFrameFdOnTimeline")
-        .onInterface(DbusService::kInterface)
-        .withArguments(monitorId)
-        .storeResultsTo(frame.fd, frame.width, frame.height, frame.memorySize, frame.handleType, frame.syncFds,
-                        frame.generation, frame.drmFormat, frame.drmModifier, frame.planes, frame.deviceUuid,
-                        frame.bufferId, out.acquireValue);
-    return out;
+inline Frame getFrame(sdbus::IProxy& proxy, int32_t monitorId, const FrameRequest& request = {}) {
+    sdbus::MethodCall call =
+        proxy.createMethodCall(sdbus::InterfaceName{DbusService::kInterface}, sdbus::MethodName{"GetFrame"});
+    appendFrameArguments(call, monitorId, request);
+    sdbus::MethodReply reply = proxy.callMethod(call, request.timeout);
+    return readFrameReply(reply);
 }
 
 // The caller's acquire timeline, as a descriptor the caller owns.
@@ -439,22 +454,29 @@ inline void setImportModifiers(sdbus::IProxy& proxy, uint32_t drmFormat, const s
         .withArguments(drmFormat, modifiers);
 }
 
-// Tells the daemon the caller has stopped reading one image, so the producer may draw into it
-// again. `bufferId` is the value the same client was handed as GetFrameFd's `buffer_id`.
+// Tells the daemon the caller has stopped reading one image as of hand-over `handover`, so the
+// producer may draw into it again once no later hand-over of it is outstanding. `bufferId` and
+// `handover` are what the same client was handed as GetFrame's `buffer_id` and `handover`.
 //
 // Here rather than in one test file for the reason this header exists: the argument order
-// (monitor first, then the buffer) is a wire fact, and a private copy would go on compiling
-// and passing if it ever changed. The daemon attributes the release to the SENDER, so which
-// proxy this is called on is part of what a caller is saying -- a proxy on a shared connection
-// is the same consumer as far as the daemon can tell.
+// (monitor, buffer, hand-over) is a wire fact, and a private copy would go on compiling and
+// passing if it ever changed. The daemon attributes the release to the SENDER, so which proxy
+// this is called on is part of what a caller is saying -- a proxy on a shared connection is the
+// same consumer as far as the daemon can tell.
 //
 // `timeout` as on setWallpaper() above: zero means the bus's default.
-inline void releaseBuffer(sdbus::IProxy& proxy, int32_t monitorId, uint64_t bufferId,
+inline void releaseBuffer(sdbus::IProxy& proxy, int32_t monitorId, uint64_t bufferId, uint64_t handover,
                           std::chrono::microseconds timeout = {}) {
     proxy.callMethod("ReleaseBuffer")
         .onInterface(DbusService::kInterface)
         .withTimeout(timeout)
-        .withArguments(monitorId, bufferId);
+        .withArguments(monitorId, bufferId, handover);
+}
+
+// Gives back the image `frame` handed over, naming that hand-over.
+inline void releaseFrame(sdbus::IProxy& proxy, int32_t monitorId, const Frame& frame,
+                         std::chrono::microseconds timeout = {}) {
+    releaseBuffer(proxy, monitorId, frame.bufferId, frame.handover, timeout);
 }
 
 // `timeout` as on setWallpaper() above: zero means the bus's default.
@@ -528,6 +550,55 @@ inline const nlohmann::json* wallpaperStatus(const StatusReply& status, const st
     if (!wallpapers.is_object() || !wallpapers.contains(monitorId)) return nullptr;
     const nlohmann::json& entry = wallpapers[monitorId];
     return entry.is_object() ? &entry : nullptr;
+}
+
+// One caller's entry among a monitor's holders in GetStatus, the one reader both tiers use.
+// `listed` is whether the caller appears at all, kept apart from what its entry says; `malformed`
+// marks an entry that breaks the documented shape -- a buffer id that is not an unsigned number, a
+// descriptor count missing or not a number -- so a changed layout reaches the caller's check as a
+// finding rather than as an empty list or as "not listed".
+struct HolderEntry {
+    bool listed = false;
+    bool malformed = false;
+    std::vector<uint64_t> buffers;
+    int64_t descriptors = 0;
+};
+
+inline HolderEntry holderEntry(const StatusReply& status, int32_t monitorId, const std::string& client) {
+    HolderEntry out;
+    const nlohmann::json* entry = wallpaperStatus(status, std::to_string(monitorId));
+    if (entry == nullptr || !entry->contains("holders") || !(*entry)["holders"].is_array()) return out;
+    for (const nlohmann::json& holder : (*entry)["holders"]) {
+        if (!holder.is_object() || holder.value("client", std::string()) != client) continue;
+        out.listed = true;
+        if (holder.contains("buffers") && holder["buffers"].is_array()) {
+            for (const nlohmann::json& id : holder["buffers"]) {
+                if (id.is_number_unsigned()) {
+                    out.buffers.push_back(id.get<uint64_t>());
+                } else {
+                    out.malformed = true;
+                }
+            }
+        } else {
+            out.malformed = true;
+        }
+        if (holder.contains("descriptors") && holder["descriptors"].is_number_integer()) {
+            out.descriptors = holder["descriptors"].get<int64_t>();
+        } else {
+            out.malformed = true;
+        }
+        return out;
+    }
+    return out;
+}
+
+// "not listed", "malformed", or "N descriptor(s) for images [a, b]", for a check's message.
+inline std::string describeHolder(const HolderEntry& holder) {
+    if (!holder.listed) return "not listed";
+    std::string ids;
+    for (const uint64_t id : holder.buffers) ids += (ids.empty() ? "" : ", ") + std::to_string(id);
+    return std::string(holder.malformed ? "malformed entry, " : "") + std::to_string(holder.descriptors) +
+           " descriptor(s) for images [" + ids + "]";
 }
 
 // GetStatus's connector-name map -- sanitized name -> monitor id -- or nullptr when the

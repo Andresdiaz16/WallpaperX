@@ -193,4 +193,26 @@ inline bool phaseSelectedFor(std::string_view name, std::initializer_list<std::s
     return phase_detail::offer(name, dependents);
 }
 
+// Runs one phase with its own catch: an exception escaping it fails that phase by name, and the
+// phases after it still run. Selection stays with the caller (phaseSelected), which may need the
+// answer for more than this call.
+// GOAL: S15.328's sibling -- an exception escaping one phase fails that phase by name and ends no
+//       other. False if a throw in one phase reaches main's catch-all, which names nothing and
+//       cancels every later phase.
+// CONTROL: test-side, a phase made to throw at its start: dbus_service_test's descriptorCap, --phase
+//       '^(descriptorCap|requestShare)$' -> "FAIL: descriptorCap: unexpected exception: control", and
+//       requestShare still announced and run; with this catch removed as well, the run ends in main's
+//       "FAIL: unexpected exception: control" and requestShare never runs. The same throw in
+//       video_wallpaper_test's undecodable phase -> "FAIL: undecodable: unexpected exception: control",
+//       resize still run; in daemon_install_test's checkPlainInstall -> "FAIL: plain install: unexpected
+//       exception: control".
+template <class Phase>
+void guardedPhase(std::string_view name, Phase&& run) {
+    try {
+        run();
+    } catch (const std::exception& e) {
+        check(false, (std::string(name) + ": unexpected exception: " + e.what()).c_str());
+    }
+}
+
 }  // namespace wallpaperx::testing

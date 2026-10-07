@@ -393,7 +393,7 @@ bool runChecks() {
         return true;
     }
 
-    const wallpaperx::testing::Frame frame = wallpaperx::testing::getFrameFd(*proxy, kMonitor);
+    const wallpaperx::testing::Frame frame = wallpaperx::testing::getFrame(*proxy, kMonitor);
     std::printf("cross_process_import_test: daemon pid %d on \"%s\" -> %ux%u, memory_size=%llu, handle_type=%d, "
                 "fourcc=0x%08x; importing on \"%s\"\n",
                 static_cast<int>(daemon.pid()), gpuName.c_str(), frame.width, frame.height,
@@ -547,7 +547,7 @@ bool runChecks() {
     // ------------------------------------------------------------------ //
     //
     // GOAL: S12.3 -- fetching and importing frame after frame does not accumulate descriptors.
-    //       False if any of GetFrameFd's reply, the duplicate handed to the driver, or the
+    //       False if any of GetFrame's reply, the duplicate handed to the driver, or the
     //       importer's own copy is left open per frame; a wallpaper that changes every few
     //       seconds turns one leaked descriptor per frame into an EMFILE by evening.
     // WHY-THIS-SHAPE: growth is measured from AFTER the first cycle rather than from before it.
@@ -580,7 +580,7 @@ bool runChecks() {
     std::string cycleError;
     for (int cycle = 0; cycle < kCycles; ++cycle) {
         {
-            const wallpaperx::testing::Frame again = wallpaperx::testing::getFrameFd(*proxy, kMonitor);
+            const wallpaperx::testing::Frame again = wallpaperx::testing::getFrame(*proxy, kMonitor);
             wallpaperx::FrameImport::Request request2 = requestFromFrame(again);
             // Breaks the loop, never returns: a return here would also delete the refusal phase
             // below and the daemon's ordered shutdown.
@@ -682,7 +682,7 @@ bool runChecks() {
         notVerified(kGoals, "kcmp is unavailable on this host, so the importer cannot decide who owns a "
                             "refused frame's descriptor and leaks it by design");
     } else {
-        const wallpaperx::testing::Frame doomed = wallpaperx::testing::getFrameFd(*proxy, kMonitor);
+        const wallpaperx::testing::Frame doomed = wallpaperx::testing::getFrame(*proxy, kMonitor);
 
         // A size the driver cannot match against the allocation behind the fd. Derived from the
         // real one so the refusal is about the size and not about a fourcc or a plane layout,
