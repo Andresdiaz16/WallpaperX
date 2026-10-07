@@ -7,25 +7,24 @@
 // without this entry they are unchecked text. `qmllint` is the only tool available here that
 // resolves org.kde.plasma.plasmoid and can say that a property does not exist.
 //
-// What the tool does and does not establish, measured on qmllint 6.11.1 rather than assumed,
+// What the tool does and does not establish, measured on qmllint 6.12.0 rather than assumed,
 // because the difference decides how main.qml has to be written to be checkable at all:
 //
 //   - a declarative binding to a property the type does not have (`nosuchproperty: 1`) is a
 //     `missing-property` warning;
-//   - a *read* of a property the file does not declare (`root.wallpaperPat` inside a binding
-//     or a function) is a `missing-property` warning, with a did-you-mean;
-//   - a *write* to a misspelled property inside a JavaScript function body is NOT reported.
-//     Copying main.qml and changing `root.answered = true` to `root.answerd = true` gives
-//     `{"success":true,"warnings":[]}` and this entry stays green. QML accepts the write at
-//     load time too -- it lands on the wrapper, not on the property -- so that typo is
-//     invisible from here and from the desktop both.
+//   - a read in a binding or a function body, or a write in a function body, of a property the
+//     target's declared type does not have (`root.wallpaperPat`, `root.answerd = true`) is a
+//     `missing-property` warning; through a target typed `var` it is not;
+//   - in a file where any nested function -- a function expression, an arrow, an inner
+//     function -- declares a `const` or `let`, no read or write anywhere in the file is checked.
+//     main.qml's request handler does, so in main.qml only the first point holds: changing
+//     `root.wallpaperPath` to `root.wallpaperPat` in the screenState binding gives
+//     `{"success":true,"warnings":[]}` and this entry stays green.
 //
-// So the tool checks names in bindings and in reads, and main.qml is shaped to put every
-// displayed fact in exactly those places: three properties written from JavaScript, and
-// `screenName`, `wallpaperPath` and `screenState` derived from them in declarative bindings
-// that this entry does check. That shape is what the check below is worth; a future edit that
-// moves a displayed fact back into a JavaScript assignment moves it out of coverage without
-// turning anything red, and nothing here can detect that.
+// main.qml is shaped to put every displayed fact in declarative bindings -- `screenName`,
+// `wallpaperPath` and `screenState`, derived from three properties written from JavaScript --
+// so that a linter checking reads in bindings checks them. While the request handler declares
+// `const` locals, this entry checks none of those reads, and nothing here detects that.
 //
 // It grades one half of GOALS.md's S10.9 (and S10.12 for the package's other QML file). The
 // other half -- that the root element is WallpaperItem from org.kde.plasma.plasmoid -- is

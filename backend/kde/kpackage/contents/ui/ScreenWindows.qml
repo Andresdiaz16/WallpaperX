@@ -12,8 +12,9 @@ Item {
     id: root
 
     // The renderer these two facts are written to. Its type is not named here: that would import
-    // com.wallpaperx, tying this file's loading to the renderer module's.
-    required property QtObject renderer
+    // com.wallpaperx, tying this file's loading to the renderer module's. var, not QtObject: qmllint
+    // checks the writes below against a declared type, and QObject has neither property.
+    required property var renderer
 
     // The geometry the task model files each window under: the screen holding the window's centre,
     // so one spanning two screens counts on one of them. An empty one would turn the model's screen

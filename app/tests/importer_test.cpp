@@ -38,6 +38,7 @@
 #include <sys/inotify.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
+#include <sys/statfs.h>
 #include <unistd.h>
 
 using namespace wallpaperx;
@@ -231,6 +232,58 @@ extern "C" int open64(const char* path, int flags, ...) {
         return -1;
     }
     return real(path, flags, mode);
+}
+
+namespace {
+
+// While not Off, fstatfs of a folder at or under g_fakeFsidUnder (its canonical path) reports a filesystem
+// ID built from that folder's own st_dev, which is the kernel's huge_encode_dev of it: Device as vfat
+// measurably reports it (and XFS, exFAT, f2fs), the other two as near misses that are real IDs. Counted in
+// g_fsidsFaked.
+enum class FakeFsid { Off, Device, DeviceSecondWordSet, NextDevice };
+std::atomic<FakeFsid> g_fakeFsid{FakeFsid::Off};
+std::mutex g_fakeFsidLock;
+QByteArray g_fakeFsidUnder;  // guarded by g_fakeFsidLock
+std::atomic<int> g_fsidsFaked{0};
+
+int fakingFsid(int fd, struct statfs* buf, int result) {
+    const FakeFsid mode = g_fakeFsid.load();
+    if (result != 0 || mode == FakeFsid::Off) {
+        return result;
+    }
+    const QByteArray path = folderOf(fd);
+    {
+        const std::scoped_lock lock(g_fakeFsidLock);
+        if (g_fakeFsidUnder.isEmpty() || (path != g_fakeFsidUnder && !path.startsWith(g_fakeFsidUnder + '/'))) {
+            return result;
+        }
+    }
+    struct stat st {};
+    if (::fstat(fd, &st) != 0) {
+        return result;
+    }
+    const quint32 device = quint32(st.st_dev);
+    buf->f_fsid.__val[0] = int(mode == FakeFsid::NextDevice ? device + 1 : device);
+    buf->f_fsid.__val[1] = mode == FakeFsid::DeviceSecondWordSet ? 1 : 0;
+    ++g_fsidsFaked;
+    return result;
+}
+
+} // namespace
+
+// Both symbols by name, whichever one <sys/statfs.h> redirects fstatfs to; the layouts are one on 64-bit.
+static_assert(sizeof(struct statfs) == sizeof(struct statfs64));
+extern "C" int wpxFstatfs(int fd, struct statfs* buf) noexcept __asm__("fstatfs");
+extern "C" int wpxFstatfs64(int fd, struct statfs* buf) noexcept __asm__("fstatfs64");
+
+extern "C" int wpxFstatfs(int fd, struct statfs* buf) noexcept {
+    static const auto real = reinterpret_cast<int (*)(int, struct statfs*)>(::dlsym(RTLD_NEXT, "fstatfs"));
+    return fakingFsid(fd, buf, real(fd, buf));
+}
+
+extern "C" int wpxFstatfs64(int fd, struct statfs* buf) noexcept {
+    static const auto real = reinterpret_cast<int (*)(int, struct statfs*)>(::dlsym(RTLD_NEXT, "fstatfs64"));
+    return fakingFsid(fd, buf, real(fd, buf));
 }
 
 namespace {
@@ -492,6 +545,16 @@ QStringList entriesOf(const QString& dir) {
     QStringList names = QDir(dir).entryList(QDir::AllEntries | QDir::Hidden | QDir::System | QDir::NoDotAndDotDot);
     names.sort();
     return names;
+}
+
+// Deletes every wallpaper, as the user may: an import of the same file is then a real one, not "already
+// present".
+[[nodiscard]] bool deleteWallpapers(const QString& wallpapers) {
+    bool all = true;
+    for (const QString& entry : entriesOf(wallpapers)) {
+        all = QDir(wallpapers + QLatin1Char('/') + entry).removeRecursively() && all;
+    }
+    return all;
 }
 
 QStringList unfinishedIn(const QString& dir) {
@@ -2689,9 +2752,9 @@ void recordThroughListedFolder(const QString& root) {
     //       demand. B's record ("7 8 9") names no file, so any save into B would prune it to nothing.
     //       Polled with a long period, so no second scan runs on its own.
     // CONTROL: in Importer::scanDropFolder (app/library/importer.cpp), the prune's
-    //       `saveRecord(folder, *record)` made `saveRecord(openDropFolder()->get(), *record)`, saving by
-    //       path -> "FAIL: S15.352 (prune): the folder listed has the record [1 2 3], the folder at the path
-    //       []".
+    //       `saveRecord(folder, identity, *record)` made `saveRecord(openDropFolder()->get(), identity,
+    //       *record)`, saving by path -> "FAIL: S15.352 (prune): the folder listed has the record [1 2 3], the
+    //       folder at the path []". Re-run via control_batch.sh, 2026-10-07.
     // COVERAGE-ASSERT: the link must have been re-pointed exactly once, by the scan's worker.
     {
         const QString label = QStringLiteral("S15.352 (prune)");
@@ -2722,19 +2785,23 @@ void recordThroughListedFolder(const QString& root) {
     // GOAL: S15.352 -- a file a scan listed is recorded in the folder it was listed in as soon as its
     //       import ends, whatever is at the drop path by then -- nothing, or another folder -- and
     //       whether or not the user also asked for it; another folder at the path keeps its record.
-    //       S15.367 -- a key recorded is not owed as well: a folder at the path holding the same file
-    //       (same key) has its file imported by its next scan, not taken as recorded.
     // WHY-THIS-SHAPE: the import is held in its mkdtemp, its source open, while the user asks for the
     //       same file (which makes it the user's) and the drop path is unlinked or re-pointed to B; then
-    //       released. The records are read at once, before any scan, so "recorded later" cannot pass. B
-    //       holds a hard link to x, so its scan meets the same key: owed, it would be written to B's
-    //       record without an import.
-    // CONTROL: in Importer::finish (app/library/importer.cpp), (a) `if (job.listedIn)` made
-    //       `if (false && job.listedIn)` -> all four "FAIL: S15.352 (...): after the import the listed
-    //       folder's record is [] ...", another folder's "[<key> | 7 8 9]"; (b) `owe();` added after the
-    //       record's successful save -> "FAIL:
-    //       S15.367: ... B's scan ran 0 import(s) ...".
+    //       released. The records are read at once, before any scan, so "recorded later" cannot pass.
+    // CONTROL: in Importer::finish (app/library/importer.cpp), `if (job.listedIn)` made `if (false &&
+    //       job.listedIn)` -> all four "FAIL: S15.352 (...): after the import the listed folder's record is []
+    //       ...", another folder's "[<key> | 7 8 9]". Re-run via control_batch.sh, 2026-10-07.
     // COVERAGE-ASSERT: each import must have been held, and the user's ask merged into it (one run).
+    //
+    // GOAL: S15.367 -- a key recorded is not also owed: B at the path, holding the same file (a hard link,
+    //       the same key), has it imported by its next scan, not taken as owed.
+    // WHY-THIS-SHAPE: a debt owed to A alone could not keep x out of B (S15.370), so this grades the debt
+    //       that could: one with no folder, as a filesystem without f_fsid owes. It cannot catch a debt
+    //       owed to A after a good write.
+    // CONTROL: in Importer::finish (app/library/importer.cpp), `owe(std::nullopt);` added before the last
+    //       `addOnce`, after the successful saveRecord, standing in for a no-f_fsid host -> "FAIL: S15.367: a key recorded at once
+    //       is not also owed: with B at the path, holding the same file, B's scan ran 0 import(s) and wrote
+    //       [<key>]". Via control_batch.sh, 2026-10-07.
     for (const bool anotherFolder : {false, true}) {
         for (const bool userToo : {false, true}) {
             const QString label = QStringLiteral("S15.352 (%1, %2)")
@@ -2788,7 +2855,6 @@ void recordThroughListedFolder(const QString& root) {
             if (!anotherFolder || userToo) {
                 continue;
             }
-            // B is at the path and holds the same file: nothing is owed, so its scan imports it.
             s.importer().rescan();
             const bool scanned = s.quiesce();
             const int bRuns = s.takeRuns();
@@ -2801,20 +2867,88 @@ void recordThroughListedFolder(const QString& root) {
     }
 }
 
-// S15.368, S15.369, S15.370: what is owed, and for how long.
+// A record that cannot be read: a folder in its place.
+[[nodiscard]] bool spoilRecord(const QString& drop) {
+    const QByteArray record = QFile::encodeName(drop + QStringLiteral("/.auto-imported"));
+    ::unlink(record.constData());
+    return ::mkdir(record.constData(), 0700) == 0;
+}
+
+[[nodiscard]] bool repairRecord(const QString& drop) {
+    return QDir().rmdir(drop + QStringLiteral("/.auto-imported"));
+}
+
+// Whether Importer::identityOf can tell folders at `path` apart: a filesystem ID that is neither zero nor
+// only the device number. Asked through fstatfs, so the fake above answers too.
+bool foldersTellApart(const QString& path) {
+    const int fd = ::open(QFile::encodeName(path).constData(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) {
+        return false;
+    }
+    struct statfs fs {};
+    struct stat st {};
+    const bool got = ::fstatfs(fd, &fs) == 0 && ::fstat(fd, &st) == 0;
+    ::close(fd);
+    const quint32 first = quint32(fs.f_fsid.__val[0]);
+    const quint32 second = quint32(fs.f_fsid.__val[1]);
+    return got && (first != 0 || second != 0) && !(second == 0 && first == quint32(st.st_dev));
+}
+
+// GOAL: S15.370, S15.378, S15.380 (another folder), S15.381 are reported not verified, never failed, where the
+//       scratch filesystem gives folders no identity: there key-only matching is the design (S15.385).
+// WHY-THIS-SHAPE: judged by the test's own reading of fstatfs, not by asking the importer, so a break in
+//       Importer::identityOf still reaches those checks and goes red (S15.378's control (b)).
+// CONTROL: by hand, 2026-10-07: this binary's fake (Device) forced on for the whole scratch folder ->
+//       owedKeys and owedByFolder print NOT VERIFIED for exactly those four and ctest says Skipped, no FAIL;
+//       with this guard also forced true -> FAIL for S15.370, S15.381, S15.378, S15.380 (another folder).
+bool foldersToldApart(const char* goals, const QString& root) {
+    if (foldersTellApart(root)) {
+        return true;
+    }
+    notVerified(goals, "the scratch filesystem at " + root.toStdString() +
+                           " reports a filesystem ID that is zero or only the device number (XFS, FAT, exFAT, f2fs), where "
+                           "debts are matched by key alone by design");
+    return false;
+}
+
+// The user imports x.wpx while the record cannot be read: its key is owed to this folder.
+[[nodiscard]] bool oweX(Session& s, const QString& drop) {
+    s.importer().importPath(drop + QStringLiteral("/x.wpx"));
+    return s.quiesce() && s.takeImported().size() == 1 && !s.importer().problems().filter(QStringLiteral("cannot be read")).isEmpty();
+}
+
+// The user imports `file` while this binary's open() refuses the drop folder with O_PATH: its key is owed
+// with no folder to name.
+[[nodiscard]] bool oweWithNoFolder(Session& s, const QString& drop, const QString& file) {
+    {
+        const std::scoped_lock lock(g_refusedOpenLock);
+        g_refusedOpen = QFile::encodeName(QDir::cleanPath(QDir(drop).absolutePath()));
+    }
+    g_refusingOpen = true;
+    const auto stopRefusing = qScopeGuard([] { g_refusingOpen = false; });
+    s.importer().importPath(file);
+    const bool done = s.quiesce();
+    g_refusingOpen = false;
+    return done && s.takeImported().size() == 1 && !s.importer().problems().filter(QStringLiteral("cannot be opened")).isEmpty();
+}
+
+// Another folder at the drop path, as a volume mounted or unmounted there: the folder moved aside and an
+// empty one made in its place, on the same filesystem with another inode. And back again.
+[[nodiscard]] bool swapOut(const QString& drop, const QString& aside) {
+    return ::rename(QFile::encodeName(drop).constData(), QFile::encodeName(aside).constData()) == 0 && QDir().mkdir(drop);
+}
+
+[[nodiscard]] bool swapBack(const QString& drop, const QString& aside) {
+    return QDir(drop).removeRecursively() && ::rename(QFile::encodeName(aside).constData(), QFile::encodeName(drop).constData()) == 0;
+}
+
+// S15.368, S15.369, S15.370, S15.381: what is owed, and for how long.
 void owedKeys(const QString& root) {
     const auto package = zipBytes(root + QStringLiteral("/owed-keys.scratch"), planEntries(titled("Owed")));
     if (!package) {
         fault("S15.368", QStringLiteral("the package could not be built"));
         return;
     }
-    // A record that cannot be read: a folder in its place.
-    const auto spoil = [](const QString& drop) {
-        const QByteArray record = QFile::encodeName(drop + QStringLiteral("/.auto-imported"));
-        ::unlink(record.constData());
-        return ::mkdir(record.constData(), 0700) == 0;
-    };
-    const auto repair = [](const QString& drop) { return QDir().rmdir(drop + QStringLiteral("/.auto-imported")); };
 
     // GOAL: S15.368 -- a key owed for a file that has since left the drop folder is no longer owed once
     //       a listing no longer shows the file: the file put back (the same key), with the record lacking
@@ -2823,9 +2957,11 @@ void owedKeys(const QString& root) {
     // WHY-THIS-SHAPE: the record is a folder when the user's import finishes, so the key is owed; x.wpx is
     //       then moved out (rename: the key stays), a scan lists the folder without it, and x.wpx comes
     //       back. Twice: with the record repaired before that scan, and with it still unreadable then.
-    // CONTROL: in Importer::scanDropFolder (app/library/importer.cpp), (a) `m_unrecorded.removeIf(gone);`
-    //       deleted -> "FAIL: S15.368 (record readable at the prune): ... 0 import(s) ..." and the unreadable
-    //       line; (b) that prune moved inside `if (record) { ... }` -> the unreadable line alone.
+    // CONTROL: in Importer::scanDropFolder (app/library/importer.cpp), (a) the debt prune
+    //       `m_unrecorded.removeIf(...)` made a no-op -> "FAIL: S15.368 (record readable at the prune): once a
+    //       listing no longer showed the owed file, the file put back ran 0 import(s), notices []" and the
+    //       unreadable line; (b) that prune made conditional on `if (record)` -> the unreadable line alone. Re-run
+    //       via control_batch.sh, 2026-10-07.
     // COVERAGE-ASSERT: the key must have been owed -- the import done and the record unreadable then.
     for (const bool readableAtPrune : {true, false}) {
         const QString label = readableAtPrune ? QStringLiteral("S15.368 (record readable at the prune)")
@@ -2835,7 +2971,7 @@ void owedKeys(const QString& root) {
         const QString away = base + QStringLiteral("/away.wpx");
         const QString file = drop + QStringLiteral("/x.wpx");
         const QString wallpapers = base + QStringLiteral("/wallpapers");
-        if (!QDir().mkpath(drop) || !writeBytes(file, *package) || !spoil(drop)) {
+        if (!QDir().mkpath(drop) || !writeBytes(file, *package) || !spoilRecord(drop)) {
             fault("S15.368", label + QStringLiteral(": the drop folder could not be built"));
             return;
         }
@@ -2847,14 +2983,14 @@ void owedKeys(const QString& root) {
             harnessFailure((label + QStringLiteral(": the import did not finish owed, or the file could not be moved out")).toStdString());
             return;
         }
-        if (readableAtPrune && !repair(drop)) {
+        if (readableAtPrune && !repairRecord(drop)) {
             fault("S15.368", label + QStringLiteral(": the record could not be repaired"));
             return;
         }
         s.importer().rescan();
         const bool pruned = s.quiesce();
         const QStringList made = entriesOf(wallpapers);
-        const bool back = (readableAtPrune || repair(drop)) && made.size() == 1 &&
+        const bool back = (readableAtPrune || repairRecord(drop)) && made.size() == 1 &&
                           QDir(wallpapers + QLatin1Char('/') + made.constFirst()).removeRecursively() &&
                           ::rename(QFile::encodeName(away).constData(), QFile::encodeName(file).constData()) == 0;
         if (!back) {
@@ -2881,14 +3017,15 @@ void owedKeys(const QString& root) {
     //       end, before the scan's continuation runs; x.wpx arrives then and the user's import of it ends
     //       owed (the record is a folder). Released, the scan prunes against a listing without x.wpx.
     // CONTROL: in Importer::finish (app/library/importer.cpp), `addOnce(m_finishedSinceListing);`
-    //       deleted from `owe` -> "FAIL: S15.369: ... the next scan ran 1 import(s) ...".
+    //       deleted from `owe` -> "FAIL: S15.369: a key owed while a listing was out survived it: the next scan
+    //       ran 1 import(s) and wrote [<key>]". Re-run via control_batch.sh, 2026-10-07.
     // COVERAGE-ASSERT: the listing must have been held, and the import owed while it was.
     {
         const QString base = root + QStringLiteral("/owed-mid-listing");
         const QString drop = base + QStringLiteral("/drop");
         const QString file = drop + QStringLiteral("/x.wpx");
         const QString wallpapers = base + QStringLiteral("/wallpapers");
-        if (!QDir().mkpath(drop) || !spoil(drop)) {
+        if (!QDir().mkpath(drop) || !spoilRecord(drop)) {
             fault("S15.369", QStringLiteral("the drop folder could not be built"));
             return;
         }
@@ -2916,7 +3053,7 @@ void owedKeys(const QString& root) {
         g_holdListing = false;
         const bool settled = s.quiesce();
         const QStringList made = entriesOf(wallpapers);
-        if (!listingHeld || !owedMeanwhile || !settled || made.size() != 1 || !repair(drop) ||
+        if (!listingHeld || !owedMeanwhile || !settled || made.size() != 1 || !repairRecord(drop) ||
             !QDir(wallpapers + QLatin1Char('/') + made.constFirst()).removeRecursively()) {
             harnessFailure("S15.369: the listing was not held, or the import did not end owed while it was");
             return;
@@ -2938,7 +3075,9 @@ void owedKeys(const QString& root) {
     //       away and a second scan's listing is held at its end; the import is let go and records the key;
     //       then the listing, which lacks x.wpx, is let go. Put back, x.wpx must not be imported.
     // CONTROL: in Importer::scanDropFolder (app/library/importer.cpp), `&& !m_finishedSinceListing.contains(key)`
-    //       deleted from `gone` -> "FAIL: S15.369 (recorded while listed): ... after the scan [] ... 1 import(s)".
+    //       deleted from `gone` -> "FAIL: S15.369 (recorded while listed): the record after the scan listed before
+    //       it is []; 1 import(s) once the file was back", and the owed-while-listed line above. Re-run via
+    //       control_batch.sh, 2026-10-07.
     // COVERAGE-ASSERT: the import and the second listing must both have been held.
     {
         const QString base = root + QStringLiteral("/recorded-mid-listing");
@@ -2998,15 +3137,27 @@ void owedKeys(const QString& root) {
                    .arg(runs));
     }
 
-    // GOAL: S15.370 -- a key owed is written to the record of whatever folder next lists a file with
-    //       that key, even one of another identity at the drop path (a remount gives a new device): the
-    //       file is not imported again.
+    // GOAL: S15.370 -- a key owed to folder A does not keep the same file out of another folder B at the
+    //       drop path: B's scan imports it once and writes the key to B's record.
     // WHY-THIS-SHAPE: the record is turned into a folder as the scan's import looks its file up, so the
-    //       key is owed; then the drop path is re-pointed at B, which holds a hard link to the same file.
-    // CONTROL: in Importer::scanDropFolder (app/library/importer.cpp), `if (m_unrecorded.contains(key))`
-    //       made `if (false && m_unrecorded.contains(key))` -> "FAIL: S15.370: ... 1 import(s) ...".
+    //       key is owed to A; then the drop path is re-pointed at B, which holds a hard link to the same file
+    //       (the same key), so only the folder can tell the debt from B's file.
+    // CONTROL: in Importer::scanDropFolder (app/library/importer.cpp), the absorb predicate made to ignore
+    //       the folder, `(true || owedTo(owed, identity)) && owed.key == key` -> "FAIL: S15.370: a key owed to
+    //       another folder kept the same file out of B: B's scan ran 0 import(s), notices [], B's record
+    //       [<key>]". Via control_batch.sh, 2026-10-07.
     // COVERAGE-ASSERT: the record must have been spoiled exactly once, by the import's lookup.
-    {
+    //
+    // GOAL: S15.381 -- writing B's record settles nothing owed to A: once A is back at the path with a
+    //       readable record, its scan imports nothing and writes the key to A's record.
+    // WHY-THIS-SHAPE: continues S15.370, whose import in B writes a record holding the very key A is owed --
+    //       the one case where a record written elsewhere could settle A's debt. A's record is repaired
+    //       (empty) and the wallpaper deleted, so only the debt keeps x out of A's import queue.
+    // CONTROL: in Importer::settle (app/library/importer.cpp), which saveRecord calls, the predicate made to
+    //       ignore the folder, `(true || owedTo(owed, identity)) && record.contains(owed.key)` -> "FAIL: S15.381:
+    //       B's record settled a debt owed to A: once A was back, its scan ran 1 import(s), notices [Imported
+    //       Owed.], A's record [<key>]", the S15.370 line staying green. Via control_run.sh, 2026-10-07.
+    if (foldersToldApart("S15.370, S15.381", root)) {
         const QString base = root + QStringLiteral("/owed-elsewhere");
         const QString a = base + QStringLiteral("/A");
         const QString b = base + QStringLiteral("/B");
@@ -3050,15 +3201,486 @@ void owedKeys(const QString& root) {
                                .toStdString());
             return;
         }
+        const QString key = keyOf(b + QStringLiteral("/x.wpx"));
+        if (!deleteWallpapers(wallpapers)) {
+            fault("S15.370", QStringLiteral("the wallpaper could not be deleted"));
+            return;
+        }
+        s.takeRuns();
+        s.importer().dismissNotices();
+        s.importer().rescan();
+        const bool quiet = s.quiesce();
+        const int runs = s.takeRuns();
+        expect(quiet && runs == 1 && s.importer().notices() == QStringList{QStringLiteral("Imported Owed.")} &&
+                   recordOf(b) == QStringList{key},
+               QStringLiteral("S15.370: a key owed to another folder kept the same file out of B: B's scan ran %1 import(s), "
+                              "notices [%2], B's record [%3]")
+                   .arg(runs)
+                   .arg(s.importer().notices().join(u" | "), recordOf(b).join(u" | ")));
+
+        if (!deleteWallpapers(wallpapers) || !repairRecord(a) || !pointLink(QFile::encodeName(link), QFile::encodeName(a))) {
+            fault("S15.381", QStringLiteral("the wallpaper could not be deleted, A's record repaired, or the drop path "
+                                            "pointed back at A"));
+            return;
+        }
+        s.takeRuns();
+        s.importer().dismissNotices();
+        s.importer().rescan();
+        const bool back = s.quiesce();
+        const int runsBack = s.takeRuns();
+        expect(back && runsBack == 0 && s.importer().notices().isEmpty() && recordOf(a) == QStringList{key},
+               QStringLiteral("S15.381: B's record settled a debt owed to A: once A was back, its scan ran %1 import(s), "
+                              "notices [%2], A's record [%3]")
+                   .arg(runsBack)
+                   .arg(s.importer().notices().join(u" | "), recordOf(a).join(u" | ")));
+    }
+}
+
+// S15.378, S15.379, S15.380, S15.384: a debt belongs to the folder it is owed to.
+void owedByFolder(const QString& root) {
+    const auto owedX = zipBytes(root + QStringLiteral("/owed-folder-x.scratch"), planEntries(titled("Owed X")));
+    const auto laterY = zipBytes(root + QStringLiteral("/owed-folder-y.scratch"), planEntries(titled("Later Y")));
+    if (!owedX || !laterY) {
+        fault("S15.378", QStringLiteral("the packages could not be built"));
+        return;
+    }
+
+    // GOAL: S15.378 -- a debt is pruned only by a listing of its own folder: a key owed to the drop
+    //       folder survives a scan that lists another folder at the path without the file, and once its
+    //       folder is back the file is not imported again (its wallpaper deleted meanwhile).
+    // WHY-THIS-SHAPE: the drop folder is renamed aside and an empty folder made at the path, which stands in
+    //       for an unmounted drive's mount point: the same filesystem, so the two differ by inode alone. A
+    //       rename, not a link re-pointed as S15.370 does, so the debt's own folder comes back with its
+    //       identity, as a remounted one does.
+    // CONTROL: in app/library/importer.cpp, (a) Importer::scanDropFolder's debt prune made to ignore the
+    //       folder, `(true || owedTo(owed, identity)) && gone(owed.key)` -> "FAIL: S15.378: a debt survived a
+    //       listing of another folder at the drop path: once its own folder was back, its scan ran 1 import(s),
+    //       notices [Imported Owed X.], record [<key>]"; (b) Importer::identityOf made to answer nothing for
+    //       every folder (its whole no-identity condition made `true`) -> the same line, and S15.380 (another
+    //       folder) beside it: the identity is really taken on this filesystem, not the fallback. Via
+    //       control_run.sh, 2026-10-07.
+    // COVERAGE-ASSERT: the other folder's record ("7 8 9", naming no file there) must have been pruned to
+    //       nothing, so its listing provably ran to the prune; and the key must have been owed.
+    if (foldersToldApart("S15.378", root)) {
+        const QString base = root + QStringLiteral("/owed-other-listing");
+        const QString drop = base + QStringLiteral("/drop");
+        const QString aside = base + QStringLiteral("/aside");
+        const QString wallpapers = base + QStringLiteral("/wallpapers");
+        if (!QDir().mkpath(drop) || !writeBytes(drop + QStringLiteral("/x.wpx"), *owedX) || !spoilRecord(drop)) {
+            fault("S15.378", QStringLiteral("the drop folder could not be built"));
+            return;
+        }
+        const QString key = keyOf(drop + QStringLiteral("/x.wpx"));
+        Session s(drop, wallpapers, 30000, Importer::Watching::Poll, 600000);
+        const bool owed = oweX(s, drop);
+        const bool swapped = swapOut(drop, aside) && writeBytes(drop + QStringLiteral("/.auto-imported"), "7 8 9\n");
+        s.importer().rescan();
+        const bool listed = s.quiesce();
+        const QFileInfo otherRecord(drop + QStringLiteral("/.auto-imported"));
+        if (!owed || !swapped || !listed || !otherRecord.exists() || otherRecord.size() != 0) {
+            harnessFailure(QStringLiteral("S15.378: the import ended owed %1, the other folder was put in place %2, its listing "
+                                          "pruned its record to [%3]")
+                               .arg(owed)
+                               .arg(swapped)
+                               .arg(recordOf(drop).join(u" | "))
+                               .toStdString());
+            return;
+        }
+        if (!swapBack(drop, aside) || !repairRecord(drop) || !deleteWallpapers(wallpapers)) {
+            fault("S15.378", QStringLiteral("the drop folder could not be put back and repaired, or the wallpaper deleted"));
+            return;
+        }
         s.takeRuns();
         s.importer().rescan();
         const bool quiet = s.quiesce();
         const int runs = s.takeRuns();
-        expect(quiet && runs == 0 && recordOf(b) == QStringList{keyOf(b + QStringLiteral("/x.wpx"))},
-               QStringLiteral("S15.370: an owed key met in a folder of another identity holding the same file: %1 import(s), "
-                              "that folder's record [%2]")
+        expect(quiet && runs == 0 && s.importer().notices().isEmpty() && recordOf(drop) == QStringList{key},
+               QStringLiteral("S15.378: a debt survived a listing of another folder at the drop path: once its own folder was back, "
+                              "its scan ran %1 import(s), notices [%2], record [%3]")
                    .arg(runs)
-                   .arg(recordOf(b).join(u" | ")));
+                   .arg(s.importer().notices().join(u" | "), recordOf(drop).join(u" | ")));
+    }
+
+    // GOAL: S15.379 -- a debt owed with no folder to name -- the drop folder could not be opened when the
+    //       import ended -- is still pruned by a listing that no longer shows its file: put back with its
+    //       wallpaper deleted, the file is imported again.
+    // WHY-THIS-SHAPE: oweWithNoFolder: this binary's open() refuses the drop folder with O_PATH during the user's import, the
+    //       one way a debt is owed with no identity that this host can stage; the other, a filesystem with
+    //       no f_fsid, needs FUSE. x.wpx is then moved out, the folder listed, and x.wpx put back.
+    // CONTROL: in Importer::scanDropFolder (app/library/importer.cpp), the debt prune made to spare debts with
+    //       no folder, `owed.folder && owedTo(owed, identity) && gone(owed.key)` -> "FAIL: S15.379: a debt owed
+    //       with no folder was pruned by a listing without its file: put back, it ran 0 import(s), notices []".
+    //       Via control_batch.sh, 2026-10-07. Deleting
+    //       Importer::owedTo's `!owed.folder ||` leaves this line green: such a debt is then neither pruned nor
+    //       used by any folder, which looks the same here; S15.384 grades that break.
+    // COVERAGE-ASSERT: the import must have said the drop folder could not be opened, which is the branch
+    //       that owes the key with no folder.
+    {
+        const QString base = root + QStringLiteral("/owed-no-folder");
+        const QString drop = base + QStringLiteral("/drop");
+        const QString file = drop + QStringLiteral("/x.wpx");
+        const QString away = base + QStringLiteral("/away.wpx");
+        const QString wallpapers = base + QStringLiteral("/wallpapers");
+        if (!QDir().mkpath(drop) || !writeBytes(file, *owedX)) {
+            fault("S15.379", QStringLiteral("the drop folder could not be built"));
+            return;
+        }
+        Session s(drop, wallpapers, 30000, Importer::Watching::Poll, 600000);
+        const bool owed = oweWithNoFolder(s, drop, file);
+        const bool movedOut = ::rename(QFile::encodeName(file).constData(), QFile::encodeName(away).constData()) == 0;
+        if (!owed || !movedOut) {
+            harnessFailure(QStringLiteral("S15.379: the import ended owed with no folder %1 (problems [%2]), the file moved out %3")
+                               .arg(owed)
+                               .arg(s.importer().problems().join(u" | "))
+                               .arg(movedOut)
+                               .toStdString());
+            return;
+        }
+        s.importer().rescan();
+        const bool pruned = s.quiesce();
+        if (!deleteWallpapers(wallpapers) || ::rename(QFile::encodeName(away).constData(), QFile::encodeName(file).constData()) != 0) {
+            fault("S15.379", QStringLiteral("the wallpaper could not be deleted or the file put back"));
+            return;
+        }
+        s.importer().dismissProblems();
+        s.takeRuns();
+        s.importer().rescan();
+        const bool again = s.quiesce();
+        const int runs = s.takeRuns();
+        expect(pruned && again && runs == 1 && s.importer().notices() == QStringList{QStringLiteral("Imported Owed X.")},
+               QStringLiteral("S15.379: a debt owed with no folder was pruned by a listing without its file: put back, it ran %1 "
+                              "import(s), notices [%2]")
+                   .arg(runs)
+                   .arg(s.importer().notices().join(u" | ")));
+    }
+
+    // GOAL: S15.384 -- a debt owed with no folder to name is used by any listing that shows its file: with its
+    //       wallpaper deleted, the drop folder's next scan imports nothing and writes the key to its record.
+    // WHY-THIS-SHAPE: owed through oweWithNoFolder (the drop folder refused during the user's import), then listed with
+    //       the file still there. Every folder speaks for such a debt, so the folder's identity, which the
+    //       debt lacks, must not stand between them.
+    // CONTROL: Importer::owedTo's `!owed.folder ||` deleted (app/library/importer.cpp) -> "FAIL: S15.384: a debt
+    //       owed with no folder was not used by the drop folder's listing: its scan ran 1 import(s), notices
+    //       [Imported Owed X.], record [<key>]", the S15.379 line staying green. Via control_batch.sh, 2026-10-07.
+    // COVERAGE-ASSERT: the import must have said the drop folder could not be opened.
+    {
+        const QString base = root + QStringLiteral("/owed-no-folder-used");
+        const QString drop = base + QStringLiteral("/drop");
+        const QString file = drop + QStringLiteral("/x.wpx");
+        const QString wallpapers = base + QStringLiteral("/wallpapers");
+        if (!QDir().mkpath(drop) || !writeBytes(file, *owedX)) {
+            fault("S15.384", QStringLiteral("the drop folder could not be built"));
+            return;
+        }
+        Session s(drop, wallpapers, 30000, Importer::Watching::Poll, 600000);
+        const bool owed = oweWithNoFolder(s, drop, file);
+        if (!owed || !deleteWallpapers(wallpapers)) {
+            harnessFailure(QStringLiteral("S15.384: the import ended owed with no folder %1 (problems [%2]), or the wallpaper "
+                                          "could not be deleted")
+                               .arg(owed)
+                               .arg(s.importer().problems().join(u" | "))
+                               .toStdString());
+            return;
+        }
+        s.importer().dismissProblems();
+        s.takeRuns();
+        s.importer().rescan();
+        const bool quiet = s.quiesce();
+        const int runs = s.takeRuns();
+        expect(quiet && runs == 0 && s.importer().notices().isEmpty() && recordOf(drop) == QStringList{keyOf(file)},
+               QStringLiteral("S15.384: a debt owed with no folder was not used by the drop folder's listing: its scan ran %1 "
+                              "import(s), notices [%2], record [%3]")
+                   .arg(runs)
+                   .arg(s.importer().notices().join(u" | "), recordOf(drop).join(u" | ")));
+    }
+
+    // GOAL: S15.380 -- the next record an import writes in a debt's own folder holds the debt too: after x.wpx
+    //       ends owed and y.wpx is imported into the repaired record, that record holds both keys, and an app
+    //       restarted with both wallpapers deleted imports nothing -- with no scan in between to write x's key.
+    // WHY-THIS-SHAPE: both imports are the user's and the drop folder is polled every 10 minutes, so no scan
+    //       runs before the restart; a scan would write x's key itself (S15.369) and hide the fold. The record
+    //       is read straight after y's import, and the importer destroyed, as the app exiting does.
+    // CONTROL: in Importer::finish (app/library/importer.cpp), the fold's `if (owedTo(owed, identity))` made
+    //       `if (false && owedTo(owed, identity))` -> "FAIL: S15.380 (same folder): the record written for y.wpx is
+    //       [<y>] where [<x> | <y>] was due; after a restart with the wallpapers deleted the scan ran 1 import(s),
+    //       notices [Imported Owed X.]". Via control_batch.sh, 2026-10-07.
+    {
+        const QString base = root + QStringLiteral("/owed-folded");
+        const QString drop = base + QStringLiteral("/drop");
+        const QString wallpapers = base + QStringLiteral("/wallpapers");
+        if (!QDir().mkpath(drop) || !writeBytes(drop + QStringLiteral("/x.wpx"), *owedX) || !spoilRecord(drop)) {
+            fault("S15.380", QStringLiteral("the drop folder could not be built"));
+            return;
+        }
+        QStringList want{keyOf(drop + QStringLiteral("/x.wpx"))};
+        bool owed = false;
+        bool wroteY = false;
+        QStringList afterY;
+        {
+            Session s(drop, wallpapers, 30000, Importer::Watching::Poll, 600000);
+            owed = oweX(s, drop);
+            if (owed && repairRecord(drop) && dropIn(drop, QStringLiteral("y.wpx"), *laterY)) {
+                want.append(keyOf(drop + QStringLiteral("/y.wpx")));
+                s.importer().importPath(drop + QStringLiteral("/y.wpx"));
+                wroteY = s.quiesce() && s.takeImported().size() == 1 && s.takeRuns() == 2;
+                afterY = recordOf(drop);
+            }
+        }
+        want.sort();
+        if (!owed || !wroteY || !deleteWallpapers(wallpapers)) {
+            harnessFailure(QStringLiteral("S15.380 (same folder): the import ended owed %1, y.wpx was imported alone after it %2, or "
+                                          "the wallpapers could not be deleted")
+                               .arg(owed)
+                               .arg(wroteY)
+                               .toStdString());
+            return;
+        }
+        Session restarted(drop, wallpapers, 30000, Importer::Watching::Poll, 600000);
+        restarted.importer().rescan();
+        const bool quiet = restarted.quiesce();
+        const int runs = restarted.takeRuns();
+        expect(afterY == want && quiet && runs == 0,
+               QStringLiteral("S15.380 (same folder): the record written for y.wpx is [%1] where [%2] was due; after a restart with the "
+                              "wallpapers deleted the scan ran %3 import(s), notices [%4]")
+                   .arg(afterY.join(u" | "), want.join(u" | "))
+                   .arg(runs)
+                   .arg(restarted.importer().notices().join(u" | ")));
+    }
+
+    // GOAL: S15.380 -- a record written in another folder at the drop path does not take, and so does not
+    //       settle, a debt owed to the drop folder: that record holds only its own key, and once the debt's
+    //       folder is back (its wallpaper deleted) the file is not imported again.
+    // WHY-THIS-SHAPE: x.wpx ends owed to the drop folder; the folder is moved aside, an empty one made at the
+    //       path and y.wpx imported there by the user, which writes that folder's record. A write that took
+    //       every debt would settle x's there, where x is not, and x would be imported again once its own
+    //       folder returned.
+    // CONTROL: in Importer::finish (app/library/importer.cpp), the fold made to take every debt, `if (true ||
+    //       owedTo(owed, identity))` -> "FAIL: S15.380 (another folder): the record written in another folder at
+    //       the path is [<x> | <y>]; once the debt's own folder was back, its scan ran 0 import(s), notices [],
+    //       record [<x>]" -- red on that record alone, since writing it no longer settles x's debt (S15.381
+    //       grades that). Re-run via control_batch.sh, 2026-10-07.
+    if (foldersToldApart("S15.380 (another folder)", root)) {
+        const QString base = root + QStringLiteral("/owed-fold-other");
+        const QString drop = base + QStringLiteral("/drop");
+        const QString aside = base + QStringLiteral("/aside");
+        const QString wallpapers = base + QStringLiteral("/wallpapers");
+        if (!QDir().mkpath(drop) || !writeBytes(drop + QStringLiteral("/x.wpx"), *owedX) || !spoilRecord(drop)) {
+            fault("S15.380", QStringLiteral("the drop folder could not be built"));
+            return;
+        }
+        const QString keyX = keyOf(drop + QStringLiteral("/x.wpx"));
+        Session s(drop, wallpapers, 30000, Importer::Watching::Poll, 600000);
+        const bool owed = oweX(s, drop);
+        const bool swapped = swapOut(drop, aside) && dropIn(drop, QStringLiteral("y.wpx"), *laterY);
+        const QString keyY = keyOf(drop + QStringLiteral("/y.wpx"));
+        s.importer().importPath(drop + QStringLiteral("/y.wpx"));
+        const bool wroteY = s.quiesce() && s.takeImported().size() == 1;
+        const QStringList otherRecord = recordOf(drop);
+        if (!owed || !swapped || !wroteY) {
+            harnessFailure(QStringLiteral("S15.380 (another folder): the import ended owed %1, the other folder was put in place %2, "
+                                          "y.wpx was imported there %3")
+                               .arg(owed)
+                               .arg(swapped)
+                               .arg(wroteY)
+                               .toStdString());
+            return;
+        }
+        if (!swapBack(drop, aside) || !repairRecord(drop) || !deleteWallpapers(wallpapers)) {
+            fault("S15.380", QStringLiteral("the drop folder could not be put back and repaired, or the wallpapers deleted"));
+            return;
+        }
+        s.takeRuns();
+        s.importer().rescan();
+        const bool quiet = s.quiesce();
+        const int runs = s.takeRuns();
+        expect(otherRecord == QStringList{keyY} && quiet && runs == 0 && recordOf(drop) == QStringList{keyX},
+               QStringLiteral("S15.380 (another folder): the record written in another folder at the path is [%1]; once the debt's "
+                              "own folder was back, its scan ran %2 import(s), notices [%3], record [%4]")
+                   .arg(otherRecord.join(u" | "))
+                   .arg(runs)
+                   .arg(s.importer().notices().join(u" | "), recordOf(drop).join(u" | ")));
+    }
+}
+
+// S15.385, S15.386: a filesystem ID that is only the device number gives a folder no identity.
+void deviceFsid(const QString& root) {
+    const auto owedX = zipBytes(root + QStringLiteral("/device-fsid.scratch"), planEntries(titled("Owed X")));
+    if (!owedX) {
+        fault("S15.385", QStringLiteral("the package could not be built"));
+        return;
+    }
+    const auto deviceOf = [](const QString& path) {
+        struct stat st {};
+        return ::stat(QFile::encodeName(path).constData(), &st) == 0 ? QString::number(quint32(st.st_dev), 16) : QStringLiteral("?");
+    };
+    // GOAL: S15.385 -- a folder whose filesystem ID is only its device number (as vfat, XFS, exFAT and f2fs
+    //       report it) has no identity, so its debts go by key alone: (absorb) another folder at the drop path
+    //       holding the owed file runs no import and writes the key; (prune) a listing of another folder
+    //       without the file ends the debt, so the file is imported again once its own folder is back.
+    //       S15.386 -- an ID that differs from it by one word ({device, 1}, {device + 1, 0}) is an identity:
+    //       the same two run folder by folder (one import; no import).
+    // WHY-THIS-SHAPE: no XFS or FAT can be mounted here, so this binary's fstatfs reports the ID built from
+    //       the folder's own st_dev, under this phase's folders only. The two near misses run the same
+    //       scenarios, so the device rule cannot pass by taking every ID as none.
+    // CONTROL: in Importer::identityOf (app/library/importer.cpp), via control_batch.sh, 2026-10-07: (1) the
+    //       device comparison removed (`if (fsid == 0)`) -> "FAIL: S15.385 (device number), absorb: ... its
+    //       scan ran 1 import(s) where 0 was due"; (2) major and minor swapped in the encoding -> the same
+    //       line; (3) `quint32(fs.f_fsid.__val[1]) == 0 &&` deleted -> "FAIL: S15.386 (second word 1),
+    //       absorb: ... 0 import(s) where 1 was due"; (4) `&& quint32(fs.f_fsid.__val[0]) == device` deleted
+    //       -> the same for "S15.386 (device + 1)".
+    // COVERAGE-ASSERT: the owing import and each graded scan must have met the fake (g_fsidsFaked rises).
+    struct Case {
+        FakeFsid fake;
+        const char* label;
+    };
+    for (const Case& c : {Case{FakeFsid::Device, "S15.385 (device number)"}, Case{FakeFsid::DeviceSecondWordSet, "S15.386 (second word 1)"},
+                          Case{FakeFsid::NextDevice, "S15.386 (device + 1)"}}) {
+        const bool keyOnly = c.fake == FakeFsid::Device;
+        const QString label = QString::fromLatin1(c.label);
+        const QString base = root + QStringLiteral("/device-fsid-%1").arg(int(c.fake));
+        if (!QDir().mkpath(base)) {
+            fault(c.label, QStringLiteral("the scratch folder could not be made"));
+            return;
+        }
+        {
+            const std::scoped_lock lock(g_fakeFsidLock);
+            g_fakeFsidUnder = QFile::encodeName(QFileInfo(base).canonicalFilePath());
+        }
+        g_fakeFsid = c.fake;
+        const auto unfake = qScopeGuard([] { g_fakeFsid = FakeFsid::Off; });
+        for (const bool absorb : {true, false}) {
+            const QString part = label + (absorb ? QStringLiteral(", absorb") : QStringLiteral(", prune"));
+            const QString drop = base + (absorb ? QStringLiteral("/absorb/drop") : QStringLiteral("/prune/drop"));
+            const QString aside = base + (absorb ? QStringLiteral("/absorb/aside") : QStringLiteral("/prune/aside"));
+            const QString wallpapers = base + (absorb ? QStringLiteral("/absorb/wallpapers") : QStringLiteral("/prune/wallpapers"));
+            if (!QDir().mkpath(drop) || !writeBytes(drop + QStringLiteral("/x.wpx"), *owedX) || !spoilRecord(drop)) {
+                fault(c.label, part + QStringLiteral(": the drop folder could not be built"));
+                return;
+            }
+            const QString key = keyOf(drop + QStringLiteral("/x.wpx"));
+            const QString device = deviceOf(drop);
+            Session s(drop, wallpapers, 30000, Importer::Watching::Poll, 600000);
+            const int beforeOwe = g_fsidsFaked.load();
+            const bool owed = oweX(s, drop) && g_fsidsFaked.load() > beforeOwe;
+            // The other folder: with a hard link to the owed file (absorb), or with a record naming no file
+            // there, which its listing must prune to nothing (prune).
+            bool other = swapOut(drop, aside);
+            if (absorb) {
+                other = other &&
+                        ::link(QFile::encodeName(aside + QStringLiteral("/x.wpx")).constData(), QFile::encodeName(drop + QStringLiteral("/x.wpx")).constData()) == 0;
+            } else {
+                other = other && writeBytes(drop + QStringLiteral("/.auto-imported"), "7 8 9\n");
+                s.importer().rescan();
+                const bool listed = s.quiesce();
+                const QFileInfo otherRecord(drop + QStringLiteral("/.auto-imported"));
+                other = other && listed && otherRecord.exists() && otherRecord.size() == 0 && swapBack(drop, aside) && repairRecord(drop);
+            }
+            if (!owed || !other || !deleteWallpapers(wallpapers)) {
+                harnessFailure((part + QStringLiteral(": the import ended owed through the fake %1, the other folder was set up%2 %3"))
+                                   .arg(owed)
+                                   .arg(absorb ? QString() : QStringLiteral(", listed and swapped back"))
+                                   .arg(other)
+                                   .toStdString());
+                return;
+            }
+            s.takeRuns();
+            s.importer().dismissNotices();
+            const int beforeScan = g_fsidsFaked.load();
+            s.importer().rescan();
+            const bool quiet = s.quiesce();
+            const int runs = s.takeRuns();
+            if (g_fsidsFaked.load() == beforeScan) {
+                harnessFailure((part + QStringLiteral(": the graded scan never met the faked filesystem ID")).toStdString());
+                return;
+            }
+            const int due = absorb == keyOnly ? 0 : 1;
+            expect(quiet && runs == due && recordOf(drop) == QStringList{key},
+                   QStringLiteral("%1: %2 (device %3): its scan ran %4 import(s) where %5 was due, notices [%6], record [%7]")
+                       .arg(part,
+                            absorb ? QStringLiteral("another folder at the drop path holding the owed file")
+                                   : QStringLiteral("the debt's own folder back after a listing of another folder without the file"),
+                            device)
+                       .arg(runs)
+                       .arg(due)
+                       .arg(s.importer().notices().join(u" | "), recordOf(drop).join(u" | ")));
+        }
+    }
+}
+
+// S15.387: a record read that already holds an owed key settles that debt.
+void readRecordSettles(const QString& root) {
+    const auto owedX = zipBytes(root + QStringLiteral("/settle-x.scratch"), planEntries(titled("Owed X")));
+    const auto laterY = zipBytes(root + QStringLiteral("/settle-y.scratch"), planEntries(titled("Later Y")));
+    if (!owedX || !laterY) {
+        fault("S15.387", QStringLiteral("the packages could not be built"));
+        return;
+    }
+    const auto inodeOf = [](const QString& path) {
+        struct stat st {};
+        return ::stat(QFile::encodeName(path).constData(), &st) == 0 ? quint64(st.st_ino) : quint64(0);
+    };
+    // GOAL: S15.387 -- a debt whose key a record read in its folder already holds is settled by that read:
+    //       with the record then deleted and the wallpaper gone, the next scan imports the file again. Read
+    //       by a scan, and by the user's import of a file the record already holds.
+    // WHY-THIS-SHAPE: x ends owed (the record a folder); another writer then puts x's key (and y's) in the
+    //       record. The read must write nothing -- y already recorded, x present -- or the write would settle
+    //       the debt and hide the read. Deleting the record leaves only the debt to keep x out.
+    // CONTROL: via control_batch.sh, 2026-10-07: Importer::scanDropFolder's `settle(identity, *record);`
+    //       deleted (app/library/importer.cpp) -> "FAIL: S15.387 (read by a scan): a debt the record read
+    //       already held was not settled: ... notices []", the import line green; Importer::finish's deleted
+    //       -> the same for "(read by the user's import of a recorded file)", notices [Imported Later Y.].
+    // COVERAGE-ASSERT: the key must have been owed, and the record not rewritten by the read (same inode).
+    for (const bool byImport : {false, true}) {
+        const QString label = byImport ? QStringLiteral("S15.387 (read by the user's import of a recorded file)")
+                                       : QStringLiteral("S15.387 (read by a scan)");
+        const QString base = root + (byImport ? QStringLiteral("/settled-by-import") : QStringLiteral("/settled-by-scan"));
+        const QString drop = base + QStringLiteral("/drop");
+        const QString record = drop + QStringLiteral("/.auto-imported");
+        const QString wallpapers = base + QStringLiteral("/wallpapers");
+        if (!QDir().mkpath(drop) || !writeBytes(drop + QStringLiteral("/x.wpx"), *owedX) || !spoilRecord(drop) ||
+            (byImport && !dropIn(drop, QStringLiteral("y.wpx"), *laterY))) {
+            fault("S15.387", label + QStringLiteral(": the drop folder could not be built"));
+            return;
+        }
+        QStringList outside{keyOf(drop + QStringLiteral("/x.wpx"))};
+        if (byImport) {
+            outside.append(keyOf(drop + QStringLiteral("/y.wpx")));
+        }
+        outside.sort();
+        Session s(drop, wallpapers, 30000, Importer::Watching::Poll, 600000);
+        const bool owed = oweX(s, drop);
+        const bool written = owed && repairRecord(drop) && writeBytes(record, (outside.join(u'\n') + u'\n').toLatin1());
+        const quint64 inode = inodeOf(record);
+        bool read = false;
+        if (written && byImport) {
+            s.importer().importPath(drop + QStringLiteral("/y.wpx"));
+            read = s.quiesce() && s.takeImported().size() == 1;
+        } else if (written) {
+            s.importer().rescan();
+            read = s.quiesce();
+        }
+        if (!owed || !written || !read || inodeOf(record) != inode || recordOf(drop) != outside) {
+            harnessFailure((label + QStringLiteral(": the import ended owed %1, the record was written by the other writer %2, read %3; "
+                                                   "after the read it is [%4], rewritten %5"))
+                               .arg(owed)
+                               .arg(written)
+                               .arg(read)
+                               .arg(recordOf(drop).join(u" | "))
+                               .arg(inodeOf(record) != inode)
+                               .toStdString());
+            return;
+        }
+        if (!QFile::remove(record) || !deleteWallpapers(wallpapers)) {
+            fault("S15.387", label + QStringLiteral(": the record or the wallpapers could not be deleted"));
+            return;
+        }
+        s.importer().dismissNotices();
+        s.importer().rescan();
+        const bool quiet = s.quiesce();
+        expect(quiet && s.importer().notices().contains(QStringLiteral("Imported Owed X.")),
+               QStringLiteral("%1: a debt the record read already held was not settled: with the record deleted, the next scan's "
+                              "notices are [%2]")
+                   .arg(label, s.importer().notices().join(u" | ")));
     }
 }
 
@@ -3198,10 +3820,10 @@ void recordOwedKept(const QString& root) {
     // WHY-THIS-SHAPE: this binary's renameat() refuses the first rename onto the record, the last step
     //       of its write; deleting the wallpaper means an import would make it again, so "nothing
     //       imported" is about the key, not about the library already holding the bytes.
-    // CONTROL: `addOnce(m_unrecorded);` deleted from the `owe` lambda in Importer::finish
+    // CONTROL: `m_unrecorded.append(owed);` deleted from the `owe` lambda in Importer::finish
     //       (app/library/importer.cpp) -> "FAIL: S15.353 (write refused): after the record's write failed
-    //       and the wallpaper was deleted, the next scan ran 1 import(s) and wrote the record []", the
-    //       read-failed line beside it.
+    //       and the wallpaper was deleted, the next scan ran 1 import(s) and wrote the record [<key>]", the
+    //       read-failed line beside it. Re-run via control_batch.sh, 2026-10-07.
     // COVERAGE-ASSERT: after the import the record must lack the file's key, its write refused at most
     //       once -- refused once on this code, and not attempted at all when nothing is owed, which is
     //       the defect this grades -- or the staging failed.
@@ -3252,7 +3874,7 @@ void recordOwedKept(const QString& root) {
     //       up, after the scan's own read of it; only the import's read meets the folder.
     // CONTROL: the `addProblem(*record.error());` after loadRecordIn in Importer::finish
     //       (app/library/importer.cpp) deleted -> "FAIL: S15.353 (read failed): when the import finished
-    //       the importer said []; ...".
+    //       the importer said []; ...". Re-run via control_batch.sh, 2026-10-07.
     // COVERAGE-ASSERT: the record must have been turned into a folder exactly once, by the import.
     {
         const QString drop = root + QStringLiteral("/owed-read");
@@ -3459,6 +4081,9 @@ int main(int argc, char* argv[]) {
     runPhase("nulInFileUrl", [&] { nulInFileUrl(root); });
     runPhase("recordThroughListedFolder", [&] { recordThroughListedFolder(root); });
     runPhase("owedKeys", [&] { owedKeys(root); });
+    runPhase("owedByFolder", [&] { owedByFolder(root); });
+    runPhase("deviceFsid", [&] { deviceFsid(root); });
+    runPhase("readRecordSettles", [&] { readRecordSettles(root); });
     runPhase("stamplessRefusal", [&] { stamplessRefusal(root); });
     runPhase("dropFolderUnreadable", [&] { dropFolderUnreadable(root); });
     runPhase("recordOwedKept", [&] { recordOwedKept(root); });

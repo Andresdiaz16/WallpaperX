@@ -1164,7 +1164,7 @@ bool runPhase(const PhaseName& which) {
                 // CONTROL: `m_fetch = Fetch::Idle;` added before the `fetchFrame(0)` that ends the
                 //       DaemonWatch::replaced handler (backend/kde/wallpaperx_item.cpp), so the fetch is not
                 //       queued behind the reply out -> "FAIL: nothing was asked of the new daemon before the
-                //       old daemon's reply landed (1 request(s))". Via control_batch.sh, re-run 2026-10-06.
+                //       old daemon's reply landed (1 request(s))". Via control_batch.sh, re-run 2026-10-07.
                 //       Reverted.
                 check(askedOfB == 0, "nothing was asked of the new daemon before the old daemon's reply landed (" +
                                          std::to_string(askedOfB) + " request(s))");

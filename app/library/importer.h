@@ -127,6 +127,23 @@ private:
         qint64 modifiedNs = 0;
         friend bool operator==(const DroppedKey&, const DroppedKey&) = default;
     };
+    // Which folder a drop folder is, across a remount: its filesystem's f_fsid, which ext4 and btrfs
+    // take from their UUID, and the folder's inode. Not st_dev, for the reason DroppedKey has
+    // none; an f_fsid that is only the device number counts as no identity.
+    struct FolderIdentity {
+        quint64 fsid = 0;
+        quint64 inode = 0;
+        friend bool operator==(const FolderIdentity&, const FolderIdentity&) = default;
+    };
+    // A key the record of `folder` owes. No folder when it could not be told: the drop folder could
+    // not be opened, or its filesystem reports no f_fsid (FUSE, some network mounts) or only the
+    // device number (XFS, FAT, exFAT, f2fs). Every folder speaks for such a debt, so there a
+    // different volume mounted at the path still settles it.
+    struct Owed {
+        DroppedKey key;
+        std::optional<FolderIdentity> folder;
+        friend bool operator==(const Owed&, const Owed&) = default;
+    };
     struct Job {
         QString path;
         // Where a scan listed it, if one did: that folder, still open, the name in it and the file's
@@ -146,6 +163,10 @@ private:
     enum class Scanning { No, Yes, YesThenAgain };
 
     static DroppedKey keyOf(const FileStamp& stamp);
+    // `folder`'s identity, or nothing where it cannot be told.
+    static std::optional<FolderIdentity> identityOf(int folder);
+    // Whether a listing or record of the folder `folder` speaks for `owed`.
+    static bool owedTo(const Owed& owed, const std::optional<FolderIdentity>& folder);
     void enqueue(Job job);
     void runNext();
     void finish(const Job& job, const ImportResult& result);
@@ -166,9 +187,11 @@ private:
     // file is imported by a scan and the record is not written, since either could import again a
     // wallpaper the user deleted.
     std::expected<QList<DroppedKey>, std::optional<QString>> loadRecordIn(int folder) const;
-    // Writes `record` back into `folder`, the folder it was read from; once it is written, no key in
-    // it is owed any more. Whether it was written; logs a failure.
-    bool saveRecord(int folder, const QList<DroppedKey>& record);
+    // Writes `record` back into `folder`, the folder it was read from, whose identity the caller read
+    // as `identity`, and settles it. Whether it was written; logs a failure.
+    bool saveRecord(int folder, const std::optional<FolderIdentity>& identity, const QList<DroppedKey>& record);
+    // Drops the debts owed to the folder `identity` that `record`, as read from or written to it, holds.
+    void settle(const std::optional<FolderIdentity>& identity, const QList<DroppedKey>& record);
 
     QString m_dropDirectory;
     QString m_wallpapersDirectory;
@@ -180,10 +203,11 @@ private:
     Scanning m_scanning = Scanning::No;
     // Keys of drop-folder files that finished importing but are not in their folder's record yet,
     // because reading or writing it failed: without them the next scan would import those files
-    // again. Added to the record of the next listing that holds the file -- not matched by folder,
-    // whose device number a remount can change -- and kept until a record holding them is written
-    // or a listing no longer shows the file.
-    QList<DroppedKey> m_unrecorded;
+    // again. Added to the record of a listing of their own folder that shows the file, and to the
+    // record finish() next writes there; kept until a record of their own folder is read or written
+    // holding them, or a listing of their own folder no longer shows the file. Another folder at the
+    // path -- a volume mounted or unmounted there -- neither uses nor settles them.
+    QList<Owed> m_unrecorded;
     // Keys finish() has recorded or owed since the latest listing began. A listing taken before the
     // file finished may not show it, so these are not pruned as gone, from the record or the debts.
     QList<DroppedKey> m_finishedSinceListing;

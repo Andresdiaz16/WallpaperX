@@ -26,7 +26,9 @@
 #include <fcntl.h>
 #include <sys/file.h>
 #include <sys/stat.h>
+#include <sys/statfs.h>
 #include <sys/statvfs.h>
+#include <sys/sysmacros.h>
 #include <unistd.h>
 
 namespace wallpaperx {
@@ -710,6 +712,33 @@ Importer::DroppedKey Importer::keyOf(const FileStamp& stamp)
     return {stamp.inode, stamp.size, stamp.modifiedNs};
 }
 
+std::optional<Importer::FolderIdentity> Importer::identityOf(int folder)
+{
+    struct statfs fs {};
+    struct stat st {};
+    if (::fstatfs(folder, &fs) != 0 || ::fstat(folder, &st) != 0) {
+        return std::nullopt;
+    }
+    quint64 fsid = 0;
+    static_assert(sizeof(fs.f_fsid) == sizeof(fsid));
+    std::memcpy(&fsid, &fs.f_fsid, sizeof(fsid));
+    // Zero is a filesystem that sets none, which would make every such folder the same one. XFS, FAT,
+    // exFAT and f2fs put the device number in the first word, encoded as the kernel's huge_encode_dev,
+    // and a remount can change that.
+    const unsigned devMajor = major(st.st_dev);
+    const unsigned devMinor = minor(st.st_dev);
+    const quint32 device = (devMinor & 0xffu) | (devMajor << 8) | ((devMinor & ~0xffu) << 12);
+    if (fsid == 0 || (quint32(fs.f_fsid.__val[1]) == 0 && quint32(fs.f_fsid.__val[0]) == device)) {
+        return std::nullopt;
+    }
+    return FolderIdentity{fsid, st.st_ino};
+}
+
+bool Importer::owedTo(const Owed& owed, const std::optional<FolderIdentity>& folder)
+{
+    return !owed.folder || owed.folder == folder;
+}
+
 void Importer::enqueue(Job job)
 {
     const bool wasBusy = busy();
@@ -777,8 +806,10 @@ void Importer::finish(const Job& job, const ImportResult& result)
             keys.append(key);
         }
     };
-    const auto owe = [this, &addOnce] {
-        addOnce(m_unrecorded);
+    const auto owe = [this, &key, &addOnce](const std::optional<FolderIdentity>& folder) {
+        if (const Owed owed{key, folder}; !m_unrecorded.contains(owed)) {
+            m_unrecorded.append(owed);
+        }
         addOnce(m_finishedSinceListing);
     };
     // The folder the scan listed it in, whatever is at the path now; for a file only the user named,
@@ -790,7 +821,7 @@ void Importer::finish(const Job& job, const ImportResult& result)
     } else if (isInFolder(job.path, m_dropDirectory)) {
         auto dropFolder = openDropFolder();
         if (!dropFolder) {
-            owe();
+            owe(std::nullopt);
             if (dropFolder.error()) {
                 addProblem(*dropFolder.error());
             }
@@ -801,20 +832,33 @@ void Importer::finish(const Job& job, const ImportResult& result)
     } else {
         return;
     }
+    const std::optional<FolderIdentity> identity = identityOf(folder);
     auto record = loadRecordIn(folder);
     if (!record) {
-        owe();
+        owe(identity);
         if (record.error()) {
             addProblem(*record.error());
         }
         return;
     }
-    if (!record->contains(key)) {
-        record->append(key);
-        if (!saveRecord(folder, *record)) {
-            owe();
-            return;
+    settle(identity, *record);
+    // This folder's earlier debts go in with it, so a write that works settles them too.
+    bool grew = false;
+    const auto addToRecord = [&record, &grew](const DroppedKey& owedKey) {
+        if (!record->contains(owedKey)) {
+            record->append(owedKey);
+            grew = true;
         }
+    };
+    addToRecord(key);
+    for (const Owed& owed : std::as_const(m_unrecorded)) {
+        if (owedTo(owed, identity)) {
+            addToRecord(owed.key);
+        }
+    }
+    if (grew && !saveRecord(folder, identity, *record)) {
+        owe(identity);
+        return;
     }
     addOnce(m_finishedSinceListing);
 }
@@ -854,8 +898,11 @@ void Importer::scanDropFolder()
             const QSet<QByteArray> held = m_watcher.scanFinished();
             if (listing) {
                 const int folder = ::dirfd(listing->folder.get());
+                const std::optional<FolderIdentity> identity = identityOf(folder);
                 auto record = loadRecordIn(folder);
-                if (!record && record.error()) {
+                if (record) {
+                    settle(identity, *record);
+                } else if (record.error()) {
                     addProblem(*record.error());
                 }
                 bool absorbed = false;
@@ -871,22 +918,27 @@ void Importer::scanDropFolder()
                     if (!record || record->contains(key)) {
                         continue;
                     }
-                    if (m_unrecorded.contains(key)) {
+                    // Only this folder's debts: one to another folder is settled by that folder alone. A
+                    // remount that changes f_fsid therefore imports the file once more.
+                    if (std::ranges::any_of(m_unrecorded, [&key, &identity](const Owed& owed) {
+                            return owedTo(owed, identity) && owed.key == key;
+                        })) {
                         record->append(key);
                         absorbed = true;
                     } else if (!held.contains(file.name) && jobFor(key) == nullptr) {
                         enqueue({file.path, Job::Listed{listing->folder, file.name, key}, Job::Asker::Scan});
                     }
                 }
-                // Forgets files no longer there, so one dropped in again is imported again -- from the
-                // debts too, read or not, since a file that is gone needs no protection.
+                // Forgets files no longer there, so one dropped in again is imported again -- from this
+                // folder's debts too, read or not, since a file that is gone needs no protection.
                 const auto gone = [this, &present](const DroppedKey& key) {
                     return !present.contains(key) && !m_finishedSinceListing.contains(key);
                 };
                 if (record && (record->removeIf(gone) > 0 || absorbed)) {
-                    saveRecord(folder, *record);
+                    saveRecord(folder, identity, *record);
                 }
-                m_unrecorded.removeIf(gone);
+                m_unrecorded.removeIf(
+                    [&gone, &identity](const Owed& owed) { return owedTo(owed, identity) && gone(owed.key); });
             } else if (listing.error()) {
                 qWarning("wallpaperx: %s", qUtf8Printable(*listing.error()));
             }
@@ -947,7 +999,7 @@ std::expected<QList<Importer::DroppedKey>, std::optional<QString>> Importer::loa
     return record;
 }
 
-bool Importer::saveRecord(int folder, const QList<DroppedKey>& record)
+bool Importer::saveRecord(int folder, const std::optional<FolderIdentity>& identity, const QList<DroppedKey>& record)
 {
     QByteArray bytes;
     for (const DroppedKey& key : record) {
@@ -960,8 +1012,14 @@ bool Importer::saveRecord(int folder, const QList<DroppedKey>& record)
                  path.constData(), std::strerror(error), encodeFileName(m_dropDirectory).constData());
         return false;
     }
-    m_unrecorded.removeIf([&record](const DroppedKey& owed) { return record.contains(owed); });
+    settle(identity, record);
     return true;
+}
+
+void Importer::settle(const std::optional<FolderIdentity>& identity, const QList<DroppedKey>& record)
+{
+    m_unrecorded.removeIf(
+        [&record, &identity](const Owed& owed) { return owedTo(owed, identity) && record.contains(owed.key); });
 }
 
 } // namespace wallpaperx

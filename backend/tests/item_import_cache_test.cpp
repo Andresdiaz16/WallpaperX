@@ -1490,9 +1490,11 @@ bool runPhase(const PhaseName& which) {
                 // CONTROL: in backend/kde/wallpaperx_item.cpp, (a) in WallpaperXItem::fetchFrame's reply
                 //       handler, `m_fetch = backOff ? Fetch::BackingOff : Fetch::Idle;` made `m_fetch =
                 //       Fetch::Idle;` -> "FAIL: a refused item makes no fetch during its back-off, across three
-                //       announcements (3 fetch(es) within 1800 ms)". (b) the `exchange` guard on
+                //       announcements (3 fetch(es) within 1800 ms)" (re-run via control_batch.sh 2026-10-07, after
+                //       `backOff` stopped requiring the item on screen). (b) the `exchange` guard on
                 //       g_descriptorRefusalReported in that handler's `if (backOff)` block made unconditional ->
-                //       "FAIL: two refusals in one run write one line to stderr (2 line(s))". (c) the reply
+                //       "FAIL: two refusals in one run write one line to stderr (2 line(s))" (re-run via
+                //       control_batch.sh 2026-10-07, after that block's doubledWait call changed). (c) the reply
                 //       handler's `else if (requestedMonitor == m_monitorId) queueFetch(generation);` deleted
                 //       -> "FAIL: a back-off with nothing announced, while a frame is shown, ends by asking again
                 //       for the refused frame, which is drawn (0 fetch(es) after it ...)".

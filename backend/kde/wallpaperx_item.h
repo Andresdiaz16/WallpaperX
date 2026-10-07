@@ -269,9 +269,17 @@ private:
     void retryWhileNothingIsShown();
     // Ends the wait after a TooManyDescriptors refusal. GUI thread.
     void reopenFetchAfterBackoff();
-    // A frame served, a new daemon, or the item leaving the screen: the next refusal of either kind
-    // waits the first, shortest time again. GUI thread.
+    // The next refusal of either kind waits the first, shortest time again. On its own for a frame
+    // served, which leaves any wait running. GUI thread.
     void endRefusalRuns();
+    // Ends the NoFreeImage run and stops its retry. On its own for a new monitor or the item leaving
+    // the screen: a TooManyDescriptors back-off and its count are the whole process's, so they
+    // outlive either. GUI thread.
+    void abandonNoImageRun();
+    // Ends both runs and stops the waits they started: the NoFreeImage retry and a
+    // TooManyDescriptors back-off. For a new daemon; the caller fetches afresh when it can. GUI
+    // thread.
+    void abandonRefusals();
     // Tells the daemon which dma_buf layouts this driver can import, so it stops choosing ones
     // this process cannot take. Render thread; sends from the GUI thread. Once per process.
     void reportImportModifiersOnce(quint32 drmFormat);
@@ -405,14 +413,13 @@ private:
     quint64 m_retriedGeneration = 0;
     // Whether a GetFrame is out or its TooManyDescriptors refusal is being waited out, and the
     // fetch owed when that ends: the refused one and what was announced meanwhile. No fetch is
-    // sent in either. Only Asking has a reply to
-    // come, which may name an import of a daemon or monitor this item has since left. GUI thread
-    // only.
+    // sent in either. Only Asking has a reply to come, which may name an import of a daemon or
+    // monitor this item has since left. GUI thread only.
     enum class Fetch { Idle, Asking, BackingOff };
     Fetch m_fetch = Fetch::Idle;
     std::optional<quint64> m_queuedFetch;
-    // Running exactly while m_fetch is BackingOff. A member, not a single shot, so a change of
-    // daemon can end the backoff: the refusal was the old daemon's, and the new one counts from zero.
+    // Running exactly while m_fetch is BackingOff. A member, not a single shot, so
+    // abandonRefusals() can end the backoff.
     QTimer m_backoffTimer;
     // The daemon lifetime of a GetFrame that outlived its patience and has not been answered, or 0.
     // Nothing more is asked of that lifetime until it answers or is replaced: a daemon that has
@@ -423,12 +430,13 @@ private:
     // too is a protocol violation and not a reason to ask again. GUI thread only.
     bool m_declareNoImports = false;
     // The retry after a NoFreeImage refusal. One at a time, so a refusal answered by another refusal
-    // cannot compound into a growing number of timers; stopped when the item leaves the screen or
-    // the daemon is replaced, so one armed before cannot set the first wait after. GUI thread only.
+    // cannot compound into a growing number of timers; stopped by abandonNoImageRun(), so one armed
+    // before cannot set the first wait after. GUI thread only.
     QTimer m_noImageRetryTimer;
     // The refusals of each kind in the current run, which double the wait after the next one. Kept
     // apart because their causes are unrelated: a busy image ring, and this process holding too many
-    // descriptors. Every run ends in endRefusalRuns(). GUI thread only.
+    // descriptors. A run ends in endRefusalRuns(), abandonNoImageRun() or abandonRefusals(). GUI
+    // thread only.
     int m_noImageRefusals = 0;
     int m_descriptorRefusals = 0;
     // Whether FrameReady is subscribed. Without it no wallpaper change is ever heard, which no

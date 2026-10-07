@@ -56,27 +56,39 @@
 
 #include <dbus/dbus.h>
 #include <dlfcn.h>
+#include <poll.h>
+#include <systemd/sd-bus.h>
+#include <sys/eventfd.h>
 #include <sys/mman.h>
+#include <time.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <atomic>
+#include <cerrno>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <regex>
 #include <string>
+#include <system_error>
+#include <thread>
 #include <vector>
 
 namespace {
 
-// The plugin's owner lookups as they leave this process: GetNameOwner for the daemon's name with a
-// timeout of its own (QtDBus's own lookups pass -1, the default). Each one's timeout is recorded while
-// g_recordLookups is set, and while g_redirectLookupsTo names a connection the lookup is sent there
-// instead of to the bus -- a stand-in bus driver that answers as late as a test chooses.
+// Every GetNameOwner for the daemon's name as it leaves this process -- the plugin's and QtDBus's own,
+// which cannot be told apart, since both pass -1 (QtDBus's default timeout). Each one's timeout is
+// recorded while g_recordLookups is set, and while g_redirectLookupsTo names a connection the lookup is
+// sent there instead of to the bus -- a stand-in bus driver that answers as late as a test chooses.
 std::mutex g_lookupLock;
 std::vector<int> g_lookupTimeouts;   // guarded by g_lookupLock
 std::string g_redirectLookupsTo;     // guarded by g_lookupLock
@@ -101,7 +113,7 @@ extern "C" dbus_bool_t dbus_connection_send_with_reply(DBusConnection* connectio
                                                        DBusPendingCall** pending, int timeout) {
     using Fn = dbus_bool_t (*)(DBusConnection*, DBusMessage*, DBusPendingCall**, int);
     static const Fn real = reinterpret_cast<Fn>(::dlsym(RTLD_NEXT, "dbus_connection_send_with_reply"));
-    if (g_recordLookups.load() && timeout > 0 && isDaemonOwnerLookup(message)) {
+    if (g_recordLookups.load() && isDaemonOwnerLookup(message)) {
         std::lock_guard<std::mutex> lock(g_lookupLock);
         g_lookupTimeouts.push_back(timeout);
         if (!g_redirectLookupsTo.empty()) dbus_message_set_destination(message, g_redirectLookupsTo.c_str());
@@ -299,7 +311,8 @@ int runLookupFailed() {
     //       forbids.
     // CONTROL: `m_lookupFailed = true;` deleted from DaemonWatch::askWhoOwns
     //       (backend/kde/wallpaperx_item.cpp) -> "FAIL: an item whose owner lookup failed says the daemon
-    //       could not be reached and asks it nothing (published [], 0 request(s))".
+    //       could not be reached and asks it nothing (published [], 0 request(s))". Re-run via
+    //       control_batch.sh, 2026-10-07.
     const QString kUnreachable = QStringLiteral("WallpaperX could not be reached.");
     const bool said = pumpUntil([&] { return publishedReason() == kUnreachable; }, 5000);
     check(said && stub.requests() == 0,
@@ -316,9 +329,10 @@ int runLookupFailed() {
     //       bounded below at 90% of its wait, since Qt's coarse timers fire up to 5% early (1899 ms has
     //       been seen for 2 s); the fourth also above, at 12 s, where the next doubling would be 16 s.
     // CONTROL: in DaemonWatch::askWhoOwns (backend/kde/wallpaperx_item.cpp), (a) `++m_failedAsks;`
-    //       deleted -> "FAIL: a failed owner lookup is asked again after 2, 4, 8 and 8 s (gaps 2099 2059
-    //       1999 1999 ms)"; (b) the retry's cap `kLookupRetryMaxMs` made `kWindowRetryMaxMs` -> the same
-    //       line, "(gaps 1914 4000 7999 16000 ms)".
+    //       deleted -> "FAIL: a failed owner lookup is asked again after 2, 4, 8 and 8 s (gaps 1927 1999
+    //       2000 2000 ms)"; (b) the cap in the retry's `doubledWait(kLookupRetryMs, m_failedAsks,
+    //       kLookupRetryMaxMs)` made `kWindowRetryMaxMs` -> the same line, "(gaps 1926 4000 7999 16000 ms)".
+    //       Via control_batch.sh, 2026-10-07.
     // COVERAGE-ASSERT: four retry gaps must be seen within 45 s (22 s are due); fewer is a FAIL, since
     //       the monitor is shown working -- only a monitor that stopped is reported not verified.
     const auto retryGaps = [&monitor] {
@@ -343,23 +357,26 @@ int runLookupFailed() {
               ("a failed owner lookup is asked again after 2, 4, 8 and 8 s (gaps " + seen + " ms)").c_str());
     }
 
-    // GOAL: S15.366 -- each lookup may take longer than the one before it: 2, 4, 8, 16, then 25 s
-    //       (QtDBus's own default) and no longer, so a bus slower than the first ask allows is still
-    //       answered in the end.
-    // WHY-THIS-SHAPE: read as the plugin passes it to libdbus, interposed in this binary; this bus answers
-    //       every lookup at once (refused), so the timeouts are the plugin's numbers and nothing else.
-    // CONTROL: in DaemonWatch::askWhoOwns (backend/kde/wallpaperx_item.cpp), (a) the call's timeout made
-    //       `kRefusedRetryMs` -> "FAIL: the owner lookups' timeouts grow 2, 4, 8, 16 and 25 s ([2000 2000 2000
-    //       2000 2000])"; (b) its cap made `2 * kFetchPatienceMs` -> the same line, the fifth 32000.
-    // COVERAGE-ASSERT: five timeouts are required; none seen at all means the interposer did not take
-    //       effect, which is reported not verified.
+    // GOAL: S15.366 -- every owner lookup, the first and each retry, waits QtDBus's default timeout (-1
+    //       to libdbus, 25 s): none is cut short, so a slow bus's answer is never thrown away.
+    // WHY-THIS-SHAPE: read as handed to libdbus, interposed in this binary. QtDBus's own lookups of the
+    //       name also pass -1 and cannot be told from the plugin's, so "every one is -1" is asserted, not
+    //       "the plugin's are": the contract makes them the same. This bus refuses every lookup at once,
+    //       so the retries happen and their timeouts are read.
+    // CONTROL: in DaemonWatch::askWhoOwns (backend/kde/wallpaperx_item.cpp), (a) the retries given a growing
+    //       timeout again, `asyncCall(request, m_failedAsks == 0 ? -1 : doubledWait(kLookupRetryMs, m_failedAsks,
+    //       kFetchPatienceMs))` -> "FAIL: every owner lookup waits QtDBus's default timeout, -1, at least five of
+    //       them ([-1 -1 4000 8000 16000 25000])"; (b) only the first ask given 2 s, `m_failedAsks == 0 ?
+    //       kLookupRetryMs : -1` -> the same line, "([-1 2000 -1 -1 -1 -1])". Via control_batch.sh, 2026-10-07.
+    // COVERAGE-ASSERT: five lookups are required, three of them at least retries (the gaps above need four);
+    //       none seen at all means the interposer did not take effect, which is reported not verified.
     const std::vector<int> timeouts = lookupTimeouts();
     if (timeouts.empty()) {
-        notVerified("S15.366", "none of the plugin's owner lookups was seen leaving this process");
+        notVerified("S15.366", "no owner lookup of the daemon's name was seen leaving this process");
     } else {
-        check(timeouts.size() >= 5 &&
-                  std::vector<int>(timeouts.begin(), timeouts.begin() + 5) == std::vector<int>{2000, 4000, 8000, 16000, 25000},
-              ("the owner lookups' timeouts grow 2, 4, 8, 16 and 25 s (" + listed(timeouts) + ")").c_str());
+        check(timeouts.size() >= 5 && std::ranges::all_of(timeouts, [](int t) { return t == -1; }),
+              ("every owner lookup waits QtDBus's default timeout, -1, at least five of them (" + listed(timeouts) + ")")
+                  .c_str());
     }
     return wallpaperx::testing::reportNotVerifiedOrPassed();
 }
@@ -668,7 +685,7 @@ int runStaleRefusal() {
     // CONTROL: in WallpaperXItem::fetchFrame's reply handler (backend/kde/wallpaperx_item.cpp), the
     //       `&& asked.lifetime == BufferClaims::instance().currentDaemon().lifetime` clause deleted from
     //       `backOff` -> "FAIL: a TooManyDescriptors refusal from a replaced daemon starts no back-off (the new
-    //       daemon asked 1962 ms after it)".
+    //       daemon asked 2047 ms after it)". Re-run via control_batch.sh, 2026-10-07.
     const std::vector<qint64> first = run.stub.times(0);
     const qint64 askedAfter = first.size() >= 2 ? first[1] - refusedAt : -1;
     check(askedAfter >= 0 && askedAfter < kEarliestBackoffEndMs,
@@ -776,7 +793,7 @@ int runRefusalRuns() {
     const S::Answer N = S::refuse(kNoFreeImage);
     const S::Answer D = S::refuse(kTooManyDescriptors);
     enum : int { kGrowNoImage, kGrowDescriptors, kNoImageThenDescriptors, kDescriptorsThenNoImage, kLeaveNoImage,
-                 kLeaveDescriptors, kServedDescriptors, kServedNoImage, kMonitors };
+                 kLeaveDescriptors, kServedDescriptors, kServedNoImage, kLeaveDuringBackoff, kMonitors };
     run.stub.script(kGrowNoImage, {N, N, N, N, N, N});
     run.stub.script(kGrowDescriptors, {D, D, D, D, D, D});
     run.stub.script(kNoImageThenDescriptors, {N, N, D});
@@ -785,8 +802,9 @@ int runRefusalRuns() {
     run.stub.script(kLeaveDescriptors, {D, D, D});
     run.stub.script(kServedDescriptors, {D, D, S::frame(), D});
     run.stub.script(kServedNoImage, {N, N, S::frame(), N});
+    run.stub.script(kLeaveDuringBackoff, {D, D});
     // The requests each monitor's grading needs, the last one answered by "nothing more".
-    const int due[kMonitors] = {6, 6, 4, 4, 4, 4, 5, 5};
+    const int due[kMonitors] = {6, 6, 4, 4, 4, 4, 5, 5, 3};
     std::vector<std::unique_ptr<QObject>> items;
     for (int m = 0; m < kMonitors; ++m) {
         items.push_back(run.item(m));
@@ -795,21 +813,23 @@ int runRefusalRuns() {
     // Driven as the requests arrive: off the screen after the second refusal, and back; an announcement
     // once a frame has been served.
     qint64 hiddenAt[kMonitors] = {};
+    qint64 shownAt[kMonitors] = {};
     bool shownAgain[kMonitors] = {};
     bool announced[kMonitors] = {};
     bool caughtUp = true;
     const auto drive = [&] {
-        for (const int m : {int(kLeaveNoImage), int(kLeaveDescriptors)}) {
-            // Off for 200 ms with the NoFreeImage retry armed; through the whole 4 s back-off for descriptors,
-            // so it ends while the item is away. Only once the item has taken the second refusal, or it would
-            // take it off the screen and start a run there.
-            const qint64 away = m == kLeaveNoImage ? 200 : 4600;
+        for (const int m : {int(kLeaveNoImage), int(kLeaveDescriptors), int(kLeaveDuringBackoff)}) {
+            // Off for 200 ms with the NoFreeImage retry armed; for descriptors, 4.6 s, past the whole 4 s
+            // back-off, and 300 ms, well inside it. Only once the item has taken the second refusal, or it
+            // would take it off the screen and start a run there.
+            const qint64 away = m == kLeaveNoImage ? 200 : m == kLeaveDescriptors ? 4600 : 300;
             if (run.stub.requests(m) == 2 && hiddenAt[m] == 0) {
                 caughtUp = run.itemsCaughtUp() && caughtUp;
                 rendererOf(items[m])->setVisible(false);
                 hiddenAt[m] = run.stub.nowMs();
             } else if (hiddenAt[m] != 0 && !shownAgain[m] && run.stub.nowMs() - hiddenAt[m] >= away) {
                 rendererOf(items[m])->setVisible(true);
+                shownAt[m] = run.stub.nowMs();
                 shownAgain[m] = true;
             }
         }
@@ -845,9 +865,10 @@ int runRefusalRuns() {
     //       wait (coarse timers) and the fifth above at 24 s, where an uncapped one would be 32 s.
     // CONTROL: in backend/kde/wallpaperx_item.cpp, (a) WallpaperXItem::retryWhileNothingIsShown's
     //       `m_noImageRefusals++` made `m_noImageRefusals` -> "FAIL: NoFreeImage refusals are asked again after
-    //       2, 4, 8, 16 and 16 s ([1900 1964 2000 2000 2000 2000] ms)"; (b) the back-off's
-    //       `m_descriptorRefusals++` made `m_descriptorRefusals` -> the TooManyDescriptors line; (c)
-    //       kRefusedRetryMaxMs made 32000 -> both lines, the fifth gap never measured ([1933 4000 8000 16000]).
+    //       2, 4, 8, 16 and 16 s ([1935 2000 2000 2000 2000 2000] ms)"; (b) the back-off's
+    //       `m_descriptorRefusals++` made `m_descriptorRefusals` -> the TooManyDescriptors line ([1938 2000 ...]);
+    //       (c) kRefusedRetryMaxMs made 32000 -> both lines, the fifth gap never measured ([1943 4000 8000
+    //       16000]). Re-run via control_batch.sh, 2026-10-07.
     // COVERAGE-ASSERT: all five gaps must have been measured; a run that never asked again fails here.
     const auto grew = [&](int m) {
         const qint64 want[] = {2000, 4000, 8000, 16000, 16000};
@@ -869,8 +890,9 @@ int runRefusalRuns() {
     //       the first, 2 s; counted from the other kind's run it would be 8 s.
     // CONTROL: in backend/kde/wallpaperx_item.cpp, (a) the back-off's delay counted from `m_noImageRefusals++`
     //       -> "FAIL: two NoFreeImage refusals do not lengthen the TooManyDescriptors back-off after them ([1900
-    //       3963 8000] ms)"; (b) retryWhileNothingIsShown's delay counted from `m_descriptorRefusals++` -> the
-    //       reverse line. Each break shares one counter, so each reddens both lines.
+    //       3988 8000] ms)"; (b) retryWhileNothingIsShown's delay counted from `m_descriptorRefusals++` -> the
+    //       reverse line ([1943 4000 8000] ms). Each break shares one counter, so each reddens both lines.
+    //       Re-run via control_batch.sh, 2026-10-07.
     check(firstWait(run.stub.gapAfter(kNoImageThenDescriptors, 2)),
           ("two NoFreeImage refusals do not lengthen the TooManyDescriptors back-off after them (" +
            gaps(kNoImageThenDescriptors) + " ms)")
@@ -880,23 +902,66 @@ int runRefusalRuns() {
            gaps(kDescriptorsThenNoImage) + " ms)")
               .c_str());
 
-    // GOAL: S15.363 -- leaving the screen ends both runs: the first wait after the item comes back is 2 s,
-    //       for NoFreeImage (whose 4 s retry was armed when it left) and for TooManyDescriptors.
-    // WHY-THIS-SHAPE: the NoFreeImage item leaves with its 4 s retry armed and is back 200 ms later, so a
-    //       retry left running would end the next wait at about 3.8 s; the descriptor item stays away through
-    //       its back-off. Each wait graded is the one after the first refusal on return.
-    // CONTROL: in WallpaperXItem::updateOnScreen (backend/kde/wallpaperx_item.cpp), (a)
-    //       `m_noImageRetryTimer.stop();` deleted -> "FAIL: after leaving the screen and coming back, the first
-    //       NoFreeImage wait is 2 s ([1929 220 3780] ms)"; (b) `endRefusalRuns();` deleted -> that line
-    //       ([1935 220 7779] ms) and the TooManyDescriptors one ([1935 4640 8359] ms).
+    // GOAL: S15.363 -- leaving the screen ends the NoFreeImage run: the first NoFreeImage wait after the item
+    //       comes back is 2 s, though its 4 s retry was armed when it left.
+    // WHY-THIS-SHAPE: the item is back 200 ms later, so a retry left running would end the next wait at
+    //       about 3.8 s, and a count carried over would make it 8 s. The wait graded is the one after the
+    //       first refusal on return.
+    // CONTROL: in backend/kde/wallpaperx_item.cpp, (a) `m_noImageRetryTimer.stop();` deleted from
+    //       WallpaperXItem::abandonNoImageRun -> "FAIL: after leaving the screen and coming back, the first
+    //       NoFreeImage wait is 2 s ([1946 220 3780] ms)"; (b) `m_noImageRefusals = 0;` deleted from it -> the
+    //       same line, "[1944 220 7780]". Via control_batch.sh, 2026-10-07.
     check(firstWait(run.stub.gapAfter(kLeaveNoImage, 2)),
           ("after leaving the screen and coming back, the first NoFreeImage wait is 2 s (" + gaps(kLeaveNoImage) +
            " ms)")
               .c_str());
-    check(firstWait(run.stub.gapAfter(kLeaveDescriptors, 2)),
-          ("after leaving the screen and coming back, the first TooManyDescriptors back-off is 2 s (" +
-           gaps(kLeaveDescriptors) + " ms)")
+
+    // GOAL: S15.382 -- leaving the screen does not end the TooManyDescriptors run: an item refused twice that
+    //       stays away past its 4 s back-off waits 8 s, not 2 s, after its first refusal on return.
+    // WHY-THIS-SHAPE: away 4.6 s, longer than the back-off, so the wait graded depends on the count alone, not
+    //       on a back-off still running at the return (S15.375 grades that). Bounded below at 90% of 8 s and
+    //       above at 12 s, where the next doubling would be 16 s.
+    // CONTROL: in backend/kde/wallpaperx_item.cpp, (a) WallpaperXItem::updateOnScreen's `abandonNoImageRun();`
+    //       made `abandonRefusals();` -> "FAIL: after leaving the screen and coming back, the TooManyDescriptors
+    //       count carries on: the first refusal on return waits 8 s ([1900 4640 1899] ms)", and the S15.375
+    //       line; (b) `m_descriptorRefusals = 0;` added to WallpaperXItem::abandonNoImageRun -> this line alone,
+    //       "[1940 4640 1900]". Via control_batch.sh, 2026-10-07.
+    const qint64 leaveDescriptorsWait = run.stub.gapAfter(kLeaveDescriptors, 2);
+    check(leaveDescriptorsWait >= 7200 && leaveDescriptorsWait < 12000,
+          ("after leaving the screen and coming back, the TooManyDescriptors count carries on: the first refusal "
+           "on return waits 8 s (" + gaps(kLeaveDescriptors) + " ms)")
               .c_str());
+
+    // GOAL: S15.375 -- leaving the screen during a TooManyDescriptors back-off does not end it: the item,
+    //       back 300 ms later, asks again when the 4 s back-off ends, and is asked then, not left unasked.
+    // WHY-THIS-SHAPE: two refusals arm a 4 s back-off and the item is away 300 ms, so "at once" (under 1 s
+    //       after the return) and "behind the back-off" (about 3.6 s after it) are far apart. Graded as the gap
+    //       from the refusal that armed the back-off to the next ask, on the stub's clock: at least 90% of 4 s,
+    //       and under 6 s, so the forced fetch queued behind it was sent.
+    // CONTROL: WallpaperXItem::updateOnScreen's `abandonNoImageRun();` made `abandonRefusals();`
+    //       (backend/kde/wallpaperx_item.cpp) -> "FAIL: an item that leaves the screen during a
+    //       TooManyDescriptors back-off asks again only when it ends (0 ms after its return; [1900 360] ms)".
+    //       Via control_batch.sh, 2026-10-07.
+    // COVERAGE-ASSERT: the item must have been hidden and shown again, and shown under 2 s after that
+    //       refusal, while the back-off still ran; otherwise an ask at once would also land late enough to pass.
+    //       CONTROL: test-side, this item's time away made 2500 ms -> "FAIL (harness): the item meant to leave
+    //       during its back-off was not hidden and shown again within 2 s of its second refusal ([1907 4000] ms)"
+    //       -- a run in which the graded gap alone would have passed.
+    const std::vector<qint64> backoffTimes = run.stub.times(kLeaveDuringBackoff);
+    const bool returnedInBackoff = shownAgain[kLeaveDuringBackoff] && backoffTimes.size() >= 2 &&
+                                   shownAt[kLeaveDuringBackoff] - backoffTimes[1] < 2000;
+    if (!returnedInBackoff) {
+        wallpaperx::testing::harnessFailure("the item meant to leave during its back-off was not hidden and shown "
+                                            "again within 2 s of its second refusal (" +
+                                            gaps(kLeaveDuringBackoff) + " ms)");
+    } else {
+        const qint64 askedAfterRefusal = backoffTimes.size() >= 3 ? backoffTimes[2] - backoffTimes[1] : -1;
+        const qint64 askedAfterReturn = backoffTimes.size() >= 3 ? backoffTimes[2] - shownAt[kLeaveDuringBackoff] : -1;
+        check(askedAfterRefusal >= 3600 && askedAfterRefusal < 6000,
+              ("an item that leaves the screen during a TooManyDescriptors back-off asks again only when it ends (" +
+               std::to_string(askedAfterReturn) + " ms after its return; " + gaps(kLeaveDuringBackoff) + " ms)")
+                  .c_str());
+    }
 
     // GOAL: S15.363 -- a frame served ends both runs: the next refusal of either kind waits 2 s.
     // CONTROL: in WallpaperXItem::fetchFrame's reply handler (backend/kde/wallpaperx_item.cpp), the
@@ -956,9 +1021,13 @@ int runRefusalReplaced() {
     // WHY-THIS-SHAPE: the descriptor item is backing off 8 s when the daemon changes, the NoFreeImage item has
     //       a run of two with no retry left running (one still running would govern the wait, which is a
     //       separate matter); the wait graded is after each one's first refusal from the new daemon.
-    // CONTROL: `endRefusalRuns();` deleted from the `replaced` handler in WallpaperXItem::connectToDaemon
-    //       (backend/kde/wallpaperx_item.cpp) -> "FAIL: after the daemon is replaced, the first TooManyDescriptors
-    //       back-off is 2 s ([1933 4000 120 15880] ms)" and the NoFreeImage line ([... 7880] ms).
+    // CONTROL: in backend/kde/wallpaperx_item.cpp, (a) `abandonRefusals();` deleted from the `replaced` handler
+    //       in WallpaperXItem::connectToDaemon -> both lines, "FAIL: after the daemon is replaced, the first
+    //       TooManyDescriptors back-off is 2 s ([1938 4000 8000] ms)" and "... the first NoFreeImage wait is 2 s
+    //       ([1938 4000 120 7880] ms)"; (b) `m_descriptorRefusals = 0;` deleted from
+    //       WallpaperXItem::abandonRefusals -> the descriptor line alone ([1941 4000 121 15879] ms); (c)
+    //       `m_noImageRefusals = 0;` deleted from WallpaperXItem::abandonNoImageRun -> the NoFreeImage line alone
+    //       ([1938 4000 121 7879] ms). Via control_batch.sh, 2026-10-07.
     check(firstWait(run.stub.gapAfter(kDescriptors, 3)),
           ("after the daemon is replaced, the first TooManyDescriptors back-off is 2 s (" + gaps(kDescriptors) + " ms)")
               .c_str());
@@ -969,7 +1038,7 @@ int runRefusalReplaced() {
 
 // A refusal that was asked before the item left the screen and answered while it was away.
 int runRefusalAway() {
-    const char* kGoal = "S15.363 (a refusal answered while the item is away starts no run)";
+    const char* kGoal = "S15.363 and S15.383 (a refusal answered while the item is away)";
     ScriptedRun run("wallpaperx-refusal-away");
     if (!run.ok) {
         notVerified(kGoal, "no bus connection could own io.wallpaperx.Daemon: " + run.bus.lastError().message().toStdString());
@@ -1012,20 +1081,31 @@ int runRefusalAway() {
         return wallpaperx::testing::reportNotVerifiedOrPassed();
     }
 
-    // GOAL: S15.363 -- leaving the screen ends both refusal runs, also for a fetch the item asked before
-    //       it left and the daemon refused while it was away: the first wait after it comes back is 2 s.
-    // WHY-THIS-SHAPE: the second fetch of each item is held by the stub until both items have left, then
-    //       refused, so the refusal provably lands off the screen; the items stay away 3 s, past every
-    //       wait it could arm. The wait graded is the one after the first refusal on return.
-    // CONTROL: in backend/kde/wallpaperx_item.cpp, (a) `&& m_onScreen` removed from `backOff` in
-    //       WallpaperXItem::fetchFrame's reply handler -> "FAIL: after a refusal answered while the item was
-    //       away, the first TooManyDescriptors back-off on its return is 2 s ([1907 3120 3880] ms)"; (b)
-    //       `!m_onScreen ||` removed from WallpaperXItem::retryWhileNothingIsShown -> "FAIL: ... the first
-    //       NoFreeImage wait on its return is 2 s ([2100 3120 4012] ms)". Each break reddens only its line.
-    check(firstWait(run.stub.gapAfter(kDescriptors, 2)),
-          ("after a refusal answered while the item was away, the first TooManyDescriptors back-off on its return is "
-           "2 s (" + gaps(kDescriptors) + " ms)")
+    // GOAL: S15.383 -- a TooManyDescriptors refusal answered while the item is away starts a back-off and
+    //       counts in the run: the ask after the item's return waits that 4 s back-off out, and the refusal
+    //       answering it, the run's third, is followed by 8 s.
+    // WHY-THIS-SHAPE: the second fetch is held by the stub until both items have left, then refused, so the
+    //       refusal provably lands off the screen; the items come back 3 s later, inside the 4 s it arms. An
+    //       item that started nothing asks at its return, about 3.1 s after the request, and then waits 4 s.
+    //       Bounds: 90% of each wait below; 6 s and 12 s above, short of the next doubling.
+    // CONTROL: in WallpaperXItem::fetchFrame's reply handler (backend/kde/wallpaperx_item.cpp), `&& m_onScreen`
+    //       added to `backOff` -> "FAIL: a TooManyDescriptors refusal answered while the item was away starts a
+    //       back-off its return waits out, and counts: [~2000 ~4000 ~8000] due ([1945 3121 3879] ms)", this
+    //       line alone. Via control_batch.sh, 2026-10-07.
+    const qint64 awayWait = run.stub.gapAfter(kDescriptors, 1);
+    const qint64 thirdWait = run.stub.gapAfter(kDescriptors, 2);
+    check(awayWait >= 3600 && awayWait < 6000 && thirdWait >= 7200 && thirdWait < 12000,
+          ("a TooManyDescriptors refusal answered while the item was away starts a back-off its return waits out, "
+           "and counts: [~2000 ~4000 ~8000] due (" + gaps(kDescriptors) + " ms)")
               .c_str());
+
+    // GOAL: S15.363 -- a NoFreeImage refusal answered while the item is away arms no retry and counts toward
+    //       no run: the first NoFreeImage wait after the item comes back is 2 s.
+    // WHY-THIS-SHAPE: as above; the items stay away 3 s, past the retry the refusal could arm.
+    // CONTROL: `!m_onScreen ||` removed from WallpaperXItem::retryWhileNothingIsShown
+    //       (backend/kde/wallpaperx_item.cpp) -> "FAIL: after a refusal answered while the item was away, the
+    //       first NoFreeImage wait on its return is 2 s ([1946 3120 3879] ms)", this line alone. Re-run via
+    //       control_batch.sh, 2026-10-07.
     check(firstWait(run.stub.gapAfter(kNoImage, 2)),
           ("after a refusal answered while the item was away, the first NoFreeImage wait on its return is 2 s (" +
            gaps(kNoImage) + " ms)")
@@ -1073,10 +1153,11 @@ int runRefusalReplacedRetry() {
     // WHY-THIS-SHAPE: refusal-replaced deliberately leaves no retry running, so it cannot see a timer that
     //       outlives the daemon. Here the 4 s retry is armed when the daemon changes; left running, it makes
     //       retryWhileNothingIsShown return early and ends the graded wait at about 3.9 s instead of 2 s.
-    // CONTROL: `m_noImageRetryTimer.stop();` deleted from the `replaced` handler in
-    //       WallpaperXItem::connectToDaemon (backend/kde/wallpaperx_item.cpp) -> "FAIL: with a 4 s NoFreeImage
-    //       retry running when the daemon is replaced, the first wait after the new daemon's refusal is 2 s
-    //       ([2099 121 3966] ms)".
+    // CONTROL: in backend/kde/wallpaperx_item.cpp, (a) `abandonRefusals();` deleted from the `replaced` handler
+    //       in WallpaperXItem::connectToDaemon -> "FAIL: with a 4 s NoFreeImage retry running when the daemon is
+    //       replaced, the first wait after the new daemon's refusal is 2 s ([1900 120 3798] ms)"; (b)
+    //       `m_noImageRetryTimer.stop();` deleted from WallpaperXItem::abandonNoImageRun -> the same line, "[1943
+    //       120 3880]". Via control_batch.sh, 2026-10-07.
     // COVERAGE-ASSERT: the new daemon must be asked within 1 s of the second refusal; asked later, what was
     //       left of the old 4 s timer would itself fall under 3 s and the check could not tell them apart.
     //       A replacement this harness made late is its own fault; an ask late after a prompt one is the item's.
@@ -1099,6 +1180,110 @@ int runRefusalReplacedRetry() {
     check(firstWait(run.stub.gapAfter(kNoImage, 2)),
           ("with a 4 s NoFreeImage retry running when the daemon is replaced, the first wait after the new daemon's "
            "refusal is 2 s ([" + gaps + "] ms)")
+              .c_str());
+    return wallpaperx::testing::reportNotVerifiedOrPassed();
+}
+
+// A change of monitor in the middle of each kind of refusal run.
+int runRefusalMonitor() {
+    const char* kGoal = "S15.376 (a monitor change ends the NoFreeImage run only)";
+    ScriptedRun run("wallpaperx-refusal-monitor");
+    if (!run.ok) {
+        notVerified(kGoal, "no bus connection could own io.wallpaperx.Daemon: " + run.bus.lastError().message().toStdString());
+        return wallpaperx::testing::reportNotVerifiedOrPassed();
+    }
+    using S = ScriptedStub;
+    constexpr int kDescriptorsFrom = 0;
+    constexpr int kDescriptorsTo = 1;
+    constexpr int kNoImageFrom = 2;
+    constexpr int kNoImageTo = 3;
+    // Two refusals on the first monitor arm a 4 s wait; one on the second, then "nothing more", which arms
+    // nothing, so the wait after that one refusal is the last thing either item does.
+    run.stub.script(kDescriptorsFrom, {S::refuse(kTooManyDescriptors), S::refuse(kTooManyDescriptors)});
+    run.stub.script(kDescriptorsTo, {S::refuse(kTooManyDescriptors)});
+    run.stub.script(kNoImageFrom, {S::refuse(kNoFreeImage), S::refuse(kNoFreeImage)});
+    run.stub.script(kNoImageTo, {S::refuse(kNoFreeImage)});
+    std::unique_ptr<QObject> descriptors = run.item(kDescriptorsFrom);
+    std::unique_ptr<QObject> noImage = run.item(kNoImageFrom);
+    if (descriptors == nullptr || noImage == nullptr) return wallpaperx::testing::reportNotVerifiedOrPassed();
+    if (!pumpUntil([&] { return run.stub.requests(kDescriptorsFrom) == 2 && run.stub.requests(kNoImageFrom) == 2; },
+                   10000)) {
+        check(false, ("refused items ask again on their own (" + std::to_string(run.stub.requests(kDescriptorsFrom)) +
+                      " and " + std::to_string(run.stub.requests(kNoImageFrom)) + " request(s) where 2 each were due)")
+                         .c_str());
+        return wallpaperx::testing::reportNotVerifiedOrPassed();
+    }
+    // Both second refusals taken, so the 4 s back-off and the 4 s retry are running when the monitors change.
+    if (!run.itemsCaughtUp()) {
+        wallpaperx::testing::harnessFailure("the items' connection did not answer the stub's Ping, so the second "
+                                            "refusals may not have been taken before the monitor change");
+        return wallpaperx::testing::reportNotVerifiedOrPassed();
+    }
+    const qint64 changedAt = run.stub.nowMs();
+    rendererOf(descriptors)->setProperty("monitorId", kDescriptorsTo);
+    rendererOf(noImage)->setProperty("monitorId", kNoImageTo);
+    (void)pumpUntil([&] { return run.stub.requests(kDescriptorsTo) >= 2 && run.stub.requests(kNoImageTo) >= 2; }, 20000);
+    const auto gaps = [&](int m) {
+        std::string out;
+        for (const qint64 t : run.stub.times(m)) out += (out.empty() ? "" : " ") + std::to_string(t - changedAt);
+        return "[" + out + "] ms after the change";
+    };
+    // COVERAGE-ASSERT: the change must come within 800 ms of both second refusals. Later, what is left of
+    //       the old 4 s waits would itself fall under the 3 s the descriptor check needs, or near the 2 s the
+    //       NoFreeImage check accepts, and neither could tell the old wait from a new one.
+    const qint64 lag = changedAt - std::min(run.stub.times(kDescriptorsFrom)[1], run.stub.times(kNoImageFrom)[1]);
+    if (lag >= 800) {
+        wallpaperx::testing::harnessFailure("the monitors changed " + std::to_string(lag) +
+                                            " ms after a second refusal, too late to tell the old waits from new ones");
+        return wallpaperx::testing::reportNotVerifiedOrPassed();
+    }
+    const std::vector<qint64> descriptorsTo = run.stub.times(kDescriptorsTo);
+    const std::vector<qint64> noImageTo = run.stub.times(kNoImageTo);
+
+    // GOAL: S15.376 (a) -- a TooManyDescriptors back-off outlives a monitor change: the refusal counts against
+    //       the whole process, so the new monitor is first asked when the 4 s back-off ends -- at least 3 s
+    //       after the change, not at once -- and is asked then, not left unasked.
+    // WHY-THIS-SHAPE: the change comes under 800 ms after the refusal that armed the 4 s back-off, so its end
+    //       lies about 3.2 s or more after the change even for a coarse timer firing 5% early; the upper
+    //       bound, 6 s, proves the forced fetch queued behind it went to the new monitor.
+    // CONTROL: `abandonNoImageRun();` in WallpaperXItem::setMonitorId (backend/kde/wallpaperx_item.cpp) made
+    //       `abandonRefusals();`, which also cancels the back-off -> "FAIL: a monitor change during a TooManyDescriptors
+    //       back-off asks the new monitor only when the back-off ends ([0 1923] ms after the change)", and (b)'s
+    //       line beside it. Via control_batch.sh, 2026-10-07.
+    const qint64 descriptorsFirst = descriptorsTo.empty() ? -1 : descriptorsTo[0] - changedAt;
+    check(descriptorsFirst >= 3000 && descriptorsFirst < 6000,
+          ("a monitor change during a TooManyDescriptors back-off asks the new monitor only when the back-off ends ("
+           + gaps(kDescriptorsTo) + ")")
+              .c_str());
+
+    // GOAL: S15.376 (b) -- the descriptor refusal count carries over a monitor change: the new monitor's
+    //       first refusal is the run's third, so the wait after it is 8 s, not the first 2 s.
+    // WHY-THIS-SHAPE: bounded below at 90% of 8 s (coarse timers) and above at 12 s, where the next doubling
+    //       would be 16 s.
+    // CONTROL: `m_descriptorRefusals = 0;` added beside `abandonNoImageRun();` in WallpaperXItem::setMonitorId
+    //       (backend/kde/wallpaperx_item.cpp) -> "FAIL: after a monitor change the descriptor refusal count carries
+    //       over: the new monitor's first refusal waits 8 s ([3980 5980] ms after the change)", alone; the
+    //       `abandonRefusals()` break above reddens it too ([0 1980]). Via control_batch.sh, 2026-10-07.
+    const qint64 descriptorsWait = run.stub.gapAfter(kDescriptorsTo, 0);
+    check(descriptorsWait >= 7200 && descriptorsWait < 12000,
+          ("after a monitor change the descriptor refusal count carries over: the new monitor's first refusal waits "
+           "8 s (" + gaps(kDescriptorsTo) + ")")
+              .c_str());
+
+    // GOAL: S15.376 (c) -- a monitor change ends the NoFreeImage run: the new monitor is asked at once, and
+    //       after its first NoFreeImage refusal the wait is 2 s, even with the old monitor's 4 s retry armed.
+    // WHY-THIS-SHAPE: the old 4 s retry, left running, would govern the wait (retryWhileNothingIsShown arms
+    //       nothing while it runs) and end it at about 3.8 s; a count carried over would make it 8 s.
+    // CONTROL: in backend/kde/wallpaperx_item.cpp, (a) `abandonNoImageRun();` deleted from
+    //       WallpaperXItem::setMonitorId -> "FAIL: a monitor change ends the NoFreeImage run: the new monitor is
+    //       asked at once and its first refusal waits 2 s ([0 3980] ms after the change)"; (b)
+    //       `m_noImageRetryTimer.stop();` deleted from WallpaperXItem::abandonNoImageRun -> the same line, "[0
+    //       3980]"; (c) `m_noImageRefusals = 0;` deleted from it -> the same line, "[1 7980]". Via
+    //       control_batch.sh, 2026-10-07.
+    const qint64 noImageFirst = noImageTo.empty() ? -1 : noImageTo[0] - changedAt;
+    check(noImageFirst >= 0 && noImageFirst < 1000 && firstWait(run.stub.gapAfter(kNoImageTo, 0)),
+          ("a monitor change ends the NoFreeImage run: the new monitor is asked at once and its first refusal "
+           "waits 2 s (" + gaps(kNoImageTo) + ")")
               .c_str());
     return wallpaperx::testing::reportNotVerifiedOrPassed();
 }
@@ -1150,7 +1335,8 @@ int runRefusalLog() {
     //       and must lie within 10% below and 1.5 s above the number logged.
     // CONTROL: in WallpaperXItem::fetchFrame's reply handler (backend/kde/wallpaperx_item.cpp), the line's
     //       `delay` argument made `kRefusedRetryMs` -> "FAIL: the TooManyDescriptors line names the wait that
-    //       follows it (logged [2000 2000], the second followed by 8000 ms)".
+    //       follows it (logged [2000 2000], the second followed by 8000 ms)". Re-run via control_batch.sh,
+    //       2026-10-07.
     // COVERAGE-ASSERT: two lines must have been logged and the second one's wait measured.
     const bool measured = logged.size() == 2 && waitAfterSecondLine >= 0;
     check(measured && logged[1] > kExpectedRetryMs && waitAfterSecondLine >= logged[1] * 9 / 10 &&
@@ -1161,69 +1347,266 @@ int runRefusalLog() {
     return wallpaperx::testing::reportNotVerifiedOrPassed();
 }
 
-// A stand-in bus driver for the daemon's owner lookup, on the stub's connection: it answers each
-// GetNameOwner it is sent after `delayMs`, naming the stub.
-class SlowOwnerLookup : public QDBusVirtualObject {
+// A stand-in bus driver for the daemon's owner lookup: each GetNameOwner sent to it is refused at once
+// while it is refusing, and otherwise answered `delayMs` late, naming `owner`. An sd-bus connection on a
+// thread of its own, not a QtDBus object: QtDBus's own lookup of the name, made while the item is built,
+// blocks the GUI thread inside QtDBus, and while it does no QtDBus connection in this process dispatches
+// anything.
+class StandInOwnerLookup {
 public:
-    SlowOwnerLookup(QDBusConnection bus, int delayMs) : m_bus(std::move(bus)), m_delayMs(delayMs) {}
-    QString introspect(const QString&) const override { return QString(); }
-    bool handleMessage(const QDBusMessage& message, const QDBusConnection&) override {
-        if (message.member() != QLatin1String("GetNameOwner")) return false;
-        message.setDelayedReply(true);
-        ++m_asked;
-        QTimer::singleShot(m_delayMs, [bus = m_bus, message]() mutable {
-            bus.send(message.createReply(QVariant(bus.baseService())));
-        });
-        return true;
+    StandInOwnerLookup(std::string owner, int delayMs, bool refusing)
+        : m_owner(std::move(owner)), m_delay(delayMs), m_refusing(refusing) {
+        const char* address = std::getenv("DBUS_SESSION_BUS_ADDRESS");
+        int r = sd_bus_new(&m_bus);
+        if (r < 0) {
+            m_bus = nullptr;
+            m_why = "sd_bus_new failed";
+            return;
+        }
+        const char* unique = nullptr;
+        if (address == nullptr || (r = sd_bus_set_address(m_bus, address)) < 0 || (r = sd_bus_set_bus_client(m_bus, 1)) < 0 ||
+            (r = sd_bus_start(m_bus)) < 0 || (r = sd_bus_add_filter(m_bus, nullptr, &StandInOwnerLookup::onMessage, this)) < 0 ||
+            (r = sd_bus_get_unique_name(m_bus, &unique)) < 0) {
+            m_why = std::string("its bus connection could not be started: ") + (address ? std::strerror(-r) : "no bus address");
+            return;
+        }
+        m_unique = unique;
+        // Before the thread: the destructor's only way to wake it, since m_bus is the thread's alone.
+        m_wake = ::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+        if (m_wake < 0) {
+            m_why = std::string("its wake descriptor could not be made: ") + std::strerror(errno);
+            return;
+        }
+        try {
+            m_thread = std::thread([this] { run(); });
+        } catch (const std::system_error& e) {
+            m_why = std::string("its thread could not be started: ") + e.what();
+            return;
+        }
+        m_ok = true;
     }
-    int asked() const { return m_asked; }
+    ~StandInOwnerLookup() {
+        m_stop.store(true);
+        if (m_thread.joinable()) {
+            // Adding 1 to a counter that only ever holds 0 or 1 cannot overflow, so only EINTR can refuse it.
+            // The thread wakes for nothing else: without this write the join waited out ctest's timeout.
+            const uint64_t one = 1;
+            while (::write(m_wake, &one, sizeof one) < 0 && errno == EINTR) {
+            }
+            m_thread.join();
+        }
+        if (m_wake >= 0) ::close(m_wake);
+        for (const Pending& p : m_pending) sd_bus_message_unref(p.call);
+        if (m_bus != nullptr) sd_bus_flush_close_unref(m_bus);
+    }
+    StandInOwnerLookup(const StandInOwnerLookup&) = delete;
+    StandInOwnerLookup& operator=(const StandInOwnerLookup&) = delete;
+
+    bool ok() const { return m_ok; }
+    const std::string& why() const { return m_why; }
+    const std::string& uniqueName() const { return m_unique; }
+    void answerLateFromNowOn() { m_refusing.store(false); }
+    int asked() const { return m_asked.load(); }
+    int refused() const { return m_refused.load(); }
+    int answeredLate() const { return m_answeredLate.load(); }
 
 private:
-    QDBusConnection m_bus;
-    int m_delayMs;
-    int m_asked = 0;
+    struct Pending {
+        std::chrono::steady_clock::time_point due;
+        sd_bus_message* call;
+    };
+
+    // On the stand-in's thread, inside sd_bus_process.
+    static int onMessage(sd_bus_message* message, void* self, sd_bus_error*) {
+        auto* driver = static_cast<StandInOwnerLookup*>(self);
+        if (sd_bus_message_is_method_call(message, "org.freedesktop.DBus", "GetNameOwner") <= 0) return 0;
+        ++driver->m_asked;
+        if (driver->m_refusing.load()) {
+            ++driver->m_refused;
+            (void)sd_bus_reply_method_errorf(message, "org.freedesktop.DBus.Error.AccessDenied", "this stand-in refuses the lookup");
+            return 1;
+        }
+        driver->m_pending.push_back({std::chrono::steady_clock::now() + driver->m_delay, sd_bus_message_ref(message)});
+        return 1;
+    }
+
+    void run() {
+        while (!m_stop.load()) {
+            const int r = sd_bus_process(m_bus, nullptr);
+            if (r < 0) return;
+            if (r > 0) continue;
+            const auto now = std::chrono::steady_clock::now();
+            // Until the next answer falls due or sd-bus has a deadline of its own; with neither, until
+            // the bus or the destructor wakes it.
+            std::optional<std::chrono::steady_clock::duration> wait;
+            const auto waitAtMost = [&wait](std::chrono::steady_clock::duration d) {
+                if (!wait || d < *wait) wait = d;
+            };
+            for (auto it = m_pending.begin(); it != m_pending.end();) {
+                if (it->due <= now) {
+                    if (sd_bus_reply_method_return(it->call, "s", m_owner.c_str()) >= 0) ++m_answeredLate;
+                    sd_bus_message_unref(it->call);
+                    it = m_pending.erase(it);
+                } else {
+                    waitAtMost(it->due - now);
+                    ++it;
+                }
+            }
+            (void)sd_bus_flush(m_bus);
+            // sd-bus's deadline is absolute on CLOCK_MONOTONIC, which steady_clock reads on Linux.
+            uint64_t deadlineUs = 0;
+            if (sd_bus_get_timeout(m_bus, &deadlineUs) > 0 && deadlineUs != UINT64_MAX) {
+                timespec ts{};
+                ::clock_gettime(CLOCK_MONOTONIC, &ts);
+                const uint64_t nowUs = uint64_t(ts.tv_sec) * 1000000 + uint64_t(ts.tv_nsec) / 1000;
+                waitAtMost(std::chrono::microseconds(deadlineUs > nowUs ? deadlineUs - nowUs : 0));
+            }
+            const int events = sd_bus_get_events(m_bus);
+            if (events < 0) return;
+            pollfd fds[] = {{sd_bus_get_fd(m_bus), short(events), 0}, {m_wake, POLLIN, 0}};
+            // Rounded up, so a wait under 1 ms does not spin at 0.
+            const int timeoutMs =
+                wait ? int(std::chrono::ceil<std::chrono::milliseconds>(*wait).count()) : -1;
+            if (::poll(fds, 2, timeoutMs) < 0 && errno != EINTR) return;
+        }
+    }
+
+    std::string m_owner;
+    std::chrono::milliseconds m_delay;
+    std::atomic<bool> m_refusing;
+    sd_bus* m_bus = nullptr;
+    std::string m_unique;
+    bool m_ok = false;
+    std::string m_why;
+    std::atomic<bool> m_stop{false};
+    int m_wake = -1;  // eventfd: the destructor writes it once m_stop is set
+    std::atomic<int> m_asked{0};
+    std::atomic<int> m_refused{0};
+    std::atomic<int> m_answeredLate{0};
+    std::vector<Pending> m_pending;  // the stand-in's thread only, until it is joined
+    std::thread m_thread;
 };
 
+// Every owner lookup of the daemon's name from here on goes to `driver`.
+void redirectLookups(const StandInOwnerLookup& driver) {
+    {
+        std::lock_guard<std::mutex> lock(g_lookupLock);
+        g_redirectLookupsTo = driver.uniqueName();
+    }
+    g_recordLookups.store(true);
+}
+
+void stopRedirectingLookups() { g_recordLookups.store(false); }
+
+const QString kUnreachableReason = QStringLiteral("WallpaperX could not be reached.");
+
 int runSlowLookup() {
-    const char* kGoal = "S15.366 (a lookup the bus answers late gets through)";
+    const char* kGoal = "S15.366 (a lookup the bus answers late is waited for)";
     ScriptedRun run("wallpaperx-refusal-slow-lookup");
     constexpr int kDelayMs = 3000;
-    SlowOwnerLookup driver(run.bus, kDelayMs);
-    if (!run.ok || !run.bus.registerVirtualObject(QStringLiteral("/org/freedesktop/DBus"), &driver)) {
+    if (!run.ok) {
         notVerified(kGoal, "no bus connection could own io.wallpaperx.Daemon: " + run.bus.lastError().message().toStdString());
         return wallpaperx::testing::reportNotVerifiedOrPassed();
     }
-    {
-        std::lock_guard<std::mutex> lock(g_lookupLock);
-        g_redirectLookupsTo = run.bus.baseService().toStdString();
+    StandInOwnerLookup driver(run.bus.baseService().toStdString(), kDelayMs, /*refusing=*/false);
+    if (!driver.ok()) {
+        notVerified(kGoal, "the stand-in bus driver could not be started: " + driver.why());
+        return wallpaperx::testing::reportNotVerifiedOrPassed();
     }
-    g_recordLookups.store(true);
+    redirectLookups(driver);
     run.stub.script(0, {});
+    const qint64 madeAt = run.stub.nowMs();
     std::unique_ptr<QObject> root = run.item(0);
     if (root == nullptr) return wallpaperx::testing::reportNotVerifiedOrPassed();
     const bool through = pumpUntil([&] { return run.stub.requests(0) > 0; }, 20000);
-    g_recordLookups.store(false);
-    run.bus.unregisterObject(QStringLiteral("/org/freedesktop/DBus"));
-    const std::vector<int> timeouts = lookupTimeouts();
+    stopRedirectingLookups();
+    const qint64 fetchedAfter = through ? run.stub.times(0)[0] - madeAt : -1;
+    const QString reasons = reasonsOf(root);
 
-    // GOAL: S15.366 -- a bus that answers the owner lookup later than the first ask allows (3 s, against
-    //       2 s) is still answered in the end: the next ask may take longer, so the item reaches the daemon.
-    // WHY-THIS-SHAPE: the plugin's lookups, told apart from QtDBus's own by the timeout they carry, are sent
-    //       by this binary's libdbus interposer to a stand-in driver on the stub's connection that answers
-    //       3 s late; QtDBus drops the first answer as timed out, exactly as from a slow bus. The item
-    //       reaching the stub at all is the verdict; the timeouts say why.
-    // CONTROL: in DaemonWatch::askWhoOwns (backend/kde/wallpaperx_item.cpp), the call's timeout made
-    //       `kRefusedRetryMs` -> "FAIL: an owner lookup the bus answers 3 s late gets through in the end (no
-    //       fetch in 20 s; timeouts [2000 2000 2000 2000])".
-    // COVERAGE-ASSERT: the stand-in must have been asked at least once, or the redirect never took.
-    if (driver.asked() < 1) {
-        wallpaperx::testing::harnessFailure("no owner lookup reached the stand-in bus driver, so the redirect never took");
+    // GOAL: S15.366 -- an owner lookup the bus answers 3 s late is waited for: the item reaches the daemon
+    //       and never says "WallpaperX could not be reached." meanwhile.
+    // WHY-THIS-SHAPE: every lookup of the name -- QtDBus's own too, which carry the same -1 and cannot be
+    //       told apart -- is sent by this binary's libdbus interposer to a stand-in driver that answers 3 s
+    //       late, as a slow bus at login does. Both halves are needed: a first
+    //       ask cut short at 2 s and a longer retry would still fetch, but only after saying the daemon
+    //       could not be reached. Every reason published is kept by the QML, so a passing one is seen.
+    // CONTROL: in DaemonWatch::askWhoOwns (backend/kde/wallpaperx_item.cpp), (a) every ask given 2 s,
+    //       `asyncCall(request, kLookupRetryMs)` -> "FAIL: an owner lookup the bus answers 3 s late is waited for:
+    //       no fetch in 20 s, reasons published [WallpaperX could not be reached.], timeouts [-1 2000 2000 2000
+    //       2000]"; (b) only the first ask given 2 s, `m_failedAsks == 0 ? kLookupRetryMs : -1` -> the same line,
+    //       "fetched 9837 ms after the item was made, reasons published [WallpaperX could not be reached.]" -- a
+    //       run in which "it fetched" alone would have passed. Via control_batch.sh, 2026-10-07.
+    // COVERAGE-ASSERT: the fetch must come no sooner than 90% of the stand-in's 3 s, or the plugin's lookup
+    //       was answered by the real bus and the redirect did not take; that is a harness fault.
+    if (driver.asked() < 1 || (through && fetchedAfter < kDelayMs * 9 / 10)) {
+        wallpaperx::testing::harnessFailure("the owner lookup was not answered by the stand-in bus driver (asked " +
+                                            std::to_string(driver.asked()) + " time(s), fetched " +
+                                            std::to_string(fetchedAfter) + " ms after the item was made)");
         return wallpaperx::testing::reportNotVerifiedOrPassed();
     }
-    check(through && timeouts.size() >= 2 && timeouts[0] == 2000 && timeouts[1] == 4000,
-          ("an owner lookup the bus answers 3 s late gets through in the end (" +
-           std::string(through ? "fetched" : "no fetch in 20 s") + "; timeouts " + listed(timeouts) + ")")
+    check(through && !reasons.contains(kUnreachableReason),
+          ("an owner lookup the bus answers 3 s late is waited for: " +
+           std::string(through ? "fetched " + std::to_string(fetchedAfter) + " ms after the item was made"
+                               : "no fetch in 20 s") +
+           ", reasons published " + reasons.toStdString() + ", timeouts " + listed(lookupTimeouts()))
               .c_str());
+    return wallpaperx::testing::reportNotVerifiedOrPassed();
+}
+
+int runSlowRetryLookup() {
+    const char* kGoal = "S15.377 (a retried lookup the bus answers late is waited for)";
+    ScriptedRun run("wallpaperx-refusal-slow-retry-lookup");
+    constexpr int kDelayMs = 9000;
+    if (!run.ok) {
+        notVerified(kGoal, "no bus connection could own io.wallpaperx.Daemon: " + run.bus.lastError().message().toStdString());
+        return wallpaperx::testing::reportNotVerifiedOrPassed();
+    }
+    StandInOwnerLookup driver(run.bus.baseService().toStdString(), kDelayMs, /*refusing=*/true);
+    if (!driver.ok()) {
+        notVerified(kGoal, "the stand-in bus driver could not be started: " + driver.why());
+        return wallpaperx::testing::reportNotVerifiedOrPassed();
+    }
+    redirectLookups(driver);
+    run.stub.script(0, {});
+    std::unique_ptr<QObject> root = run.item(0);
+    if (root == nullptr) return wallpaperx::testing::reportNotVerifiedOrPassed();
+    const bool lost = pumpUntil([&] { return reasonsOf(root).contains(kUnreachableReason); }, 5000);
+    driver.answerLateFromNowOn();
+    const qint64 lostAt = run.stub.nowMs();
+    if (!lost || driver.refused() < 1) {
+        stopRedirectingLookups();
+        wallpaperx::testing::harnessFailure("the first owner lookup was not refused by the stand-in bus driver, so no "
+                                            "retry follows (refused " + std::to_string(driver.refused()) +
+                                            ", reasons " + reasonsOf(root).toStdString() + ")");
+        return wallpaperx::testing::reportNotVerifiedOrPassed();
+    }
+    const bool through = pumpUntil([&] { return run.stub.requests(0) > 0; }, 20000);
+    stopRedirectingLookups();
+    const qint64 fetchedAfter = through ? run.stub.times(0)[0] - lostAt : -1;
+
+    // GOAL: S15.377 -- a retried owner lookup is waited for as long as the first: after a lookup is lost,
+    //       a retry the bus answers 9 s late still gets through, and the item reaches the daemon about 11 s
+    //       after the loss (the 2 s delay, then the answer).
+    // WHY-THIS-SHAPE: the stand-in refuses at once until the item says the daemon could not be reached, then
+    //       answers every lookup 9 s late. A retry cut short at 4, 8 or 16 s is thrown away and the next one
+    //       waits longer still, so the item would not reach the daemon until about 35 s; 20 s is the bound.
+    // CONTROL: in DaemonWatch::askWhoOwns (backend/kde/wallpaperx_item.cpp), the retries given a growing
+    //       timeout again, `asyncCall(request, m_failedAsks == 0 ? -1 : doubledWait(kLookupRetryMs, m_failedAsks,
+    //       kFetchPatienceMs))` -> "FAIL: a retried owner lookup the bus answers 9 s late is waited for (no fetch
+    //       in 20 s, timeouts [-1 -1 4000 8000])". Via control_batch.sh, 2026-10-07.
+    // COVERAGE-ASSERT: the fetch must come no sooner than 90% of the 9 s, and the stand-in must have answered
+    //       at least one lookup late; otherwise the retry was not the stand-in's, a harness fault.
+    if (through && (fetchedAfter < kDelayMs * 9 / 10 || driver.answeredLate() < 1)) {
+        wallpaperx::testing::harnessFailure("the retried lookup was not answered by the stand-in (fetched " +
+                                            std::to_string(fetchedAfter) + " ms after the loss, " +
+                                            std::to_string(driver.answeredLate()) + " late answer(s))");
+        return wallpaperx::testing::reportNotVerifiedOrPassed();
+    }
+    check(through, ("a retried owner lookup the bus answers 9 s late is waited for (" +
+                    std::string(through ? "fetched " + std::to_string(fetchedAfter) + " ms after the loss"
+                                        : "no fetch in 20 s") +
+                    ", timeouts " + listed(lookupTimeouts()) + ")")
+                       .c_str());
     return wallpaperx::testing::reportNotVerifiedOrPassed();
 }
 
@@ -1249,6 +1632,8 @@ int main(int argc, char** argv) {
         const std::string run = argv[1];
         if (run == "lookup-failed") return runLookupFailed();
         if (run == "slow-lookup") return runSlowLookup();
+        if (run == "slow-retry-lookup") return runSlowRetryLookup();
+        if (run == "refusal-monitor") return runRefusalMonitor();
         if (run == "stale-refusal") return runStaleRefusal();
         if (run == "patience") return runPatience();
         if (run == "refusal-runs") return runRefusalRuns();
@@ -1490,10 +1875,12 @@ int main(int argc, char** argv) {
         //       up to 5% early, so only an ask before 90% of it counts as at once; a replacement that took
         //       most of that itself leaves no margin, and is reported not verified. The daemon is replaced by
         //       dropping and re-taking the name, which the item hears as a departure and an arrival.
-        // CONTROL: the `if (m_fetch == Fetch::BackingOff) {...}` reset deleted from the `replaced`
-        //       handler in WallpaperXItem::connectToDaemon (backend/kde/wallpaperx_item.cpp) -> "FAIL: a
-        //       daemon that replaced the one refusing descriptors is asked at once, before the old back-off
-        //       ends (asked 1999 ms after the refusal, replaced at 100 ms)".
+        // CONTROL: in backend/kde/wallpaperx_item.cpp, (a) the `if (m_fetch == Fetch::BackingOff) {...}` block
+        //       deleted from WallpaperXItem::abandonRefusals -> "FAIL: a daemon that replaced the one refusing
+        //       descriptors is asked at once, before the old back-off ends (asked 2000 ms after the refusal,
+        //       replaced at 101 ms)"; (b) `abandonRefusals();` deleted from the `replaced` handler in
+        //       WallpaperXItem::connectToDaemon -> the same line, "asked 1999 ms ..., replaced at 100 ms". Via
+        //       control_batch.sh, 2026-10-07.
         const QString kDescriptorRefusal = QStringLiteral("WallpaperX has refused this desktop more frames for now.");
         const bool refused = pumpUntil(
             [&] { return stub.requests() > askedBefore && publishedReason() == kDescriptorRefusal; }, 5000);

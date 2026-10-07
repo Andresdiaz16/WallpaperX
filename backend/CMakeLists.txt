@@ -573,7 +573,8 @@ target_compile_definitions(wallpaperx-kpackage-metadata-test PRIVATE
 # Nothing else in this tree ever compiles those files -- Plasma loads them -- so a property
 # named wrongly in a binding or read back under the wrong name is accepted at load time and
 # silently shows nothing. What qmllint does *not* catch is written out in the test's own
-# header: an assignment target inside a JavaScript function body is unchecked.
+# header: a name reached through a `var`, and every read and write in a file where a nested
+# function declares a `const` or `let`, as main.qml's request handler does.
 #
 # Outside the if(WALLPAPERX_BUILD_KDE_PLUGIN) guard for the reason kpackage_metadata is: the
 # sanitizer tree and the hosted runner both configure with that option OFF.
@@ -1452,8 +1453,8 @@ if(WALLPAPERX_DBUS_RUN_SESSION)
         # bus has no service directories either (deny_owner_lookup.conf.in includes the isolated one).
         pkg_check_modules(WALLPAPERX_TEST_LIBSYSTEMD REQUIRED IMPORTED_TARGET libsystemd)
         target_link_libraries(wallpaperx-item-refusal-retry-test PRIVATE PkgConfig::WALLPAPERX_TEST_LIBSYSTEMD)
-        # libdbus, for the interposer that reads (and, in slow-lookup, redirects) the plugin's owner
-        # lookups as QtDBus hands them to it; exported so QtDBus's own call lands on it.
+        # libdbus, for the interposer that reads (and, in the slow-lookup runs, redirects) every owner
+        # lookup of the daemon's name as QtDBus hands it over; exported so QtDBus's own call lands on it.
         pkg_check_modules(WALLPAPERX_TEST_DBUS1 REQUIRED IMPORTED_TARGET dbus-1)
         target_link_libraries(wallpaperx-item-refusal-retry-test PRIVATE PkgConfig::WALLPAPERX_TEST_DBUS1)
         target_link_options(wallpaperx-item-refusal-retry-test PRIVATE
@@ -1470,8 +1471,8 @@ if(WALLPAPERX_DBUS_RUN_SESSION)
             SKIP_RETURN_CODE 77)
         # The same binary's scripted runs, each a process of its own: the plugin's daemon watch, its
         # one-line latch and its timeline record are process-wide.
-        foreach(refusal_run slow-lookup stale-refusal patience refusal-runs refusal-replaced refusal-log refusal-away
-                            refusal-replaced-retry)
+        foreach(refusal_run slow-lookup slow-retry-lookup stale-refusal patience refusal-runs refusal-replaced
+                            refusal-log refusal-away refusal-replaced-retry refusal-monitor)
             wallpaperx_add_test(NAME item_refusal_retry_${refusal_run}
                      COMMAND $<TARGET_FILE:wallpaperx-item-refusal-retry-test> ${refusal_run})
             set_tests_properties(item_refusal_retry_${refusal_run} PROPERTIES

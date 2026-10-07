@@ -85,8 +85,12 @@ constexpr int kRefusedRetryMs = 2000;
 // coming free.
 constexpr int kRefusedRetryMaxMs = 16000;
 
-// Where a failed owner lookup's retry stops doubling. Short, because until one answers no item can
-// fetch at all; a lookup is one message to the bus itself, not to the daemon.
+// How long the owner lookup first waits to ask again after a lost one. Short, because until one
+// answers no item can fetch at all.
+constexpr int kLookupRetryMs = 2000;
+
+// Where a failed owner lookup's retry stops doubling. Short for the same reason; a lookup is one
+// message to the bus itself, not to the daemon.
 constexpr int kLookupRetryMaxMs = 8000;
 
 // libdbus's "no timeout" (DBUS_TIMEOUT_INFINITE), which QtDBus passes through.
@@ -96,9 +100,9 @@ constexpr int kNoReplyTimeout = std::numeric_limits<int>::max();
 // reached: QtDBus's default call timeout, the patience every other call on this bus gets.
 constexpr int kFetchPatienceMs = 25000;
 
-// kRefusedRetryMs doubled `times` times, but never past `capMs`.
-int doubledWait(int times, int capMs) {
-    int ms = kRefusedRetryMs;
+// `baseMs` doubled `times` times, but never past `capMs`.
+int doubledWait(int baseMs, int times, int capMs) {
+    int ms = baseMs;
     for (int i = 0; i < times && ms < capMs; ++i) ms *= 2;
     return std::min(ms, capMs);
 }
@@ -839,9 +843,8 @@ private:
     void askWhoOwns();
 
     bool m_lookupFailed = false;
-    // Asks lost so far. Both the wait before the next ask and how long it may take grow with it: the
-    // retry covers a lookup lost while the owner stays put, which no change notice would report, and
-    // the growing timeout lets a bus slower than the first one answer in the end.
+    // Asks lost so far, which the wait before the next ask grows with. The retry covers a lookup lost
+    // while the owner stays put, which no change notice would report.
     int m_failedAsks = 0;
 };
 
@@ -879,10 +882,9 @@ void DaemonWatch::askWhoOwns() {
                                                           QStringLiteral("org.freedesktop.DBus"),
                                                           QStringLiteral("GetNameOwner"));
     request.setArguments({QString::fromUtf8(kService)});
-    // First short of QtDBus's 25 s, since until the bus answers no screen can be drawn; each ask after
-    // a lost one waits longer, up to those 25 s.
-    auto* call = new QDBusPendingCallWatcher(
-        QDBusConnection::sessionBus().asyncCall(request, doubledWait(m_failedAsks, kFetchPatienceMs)), this);
+    // QtDBus's default timeout, every time: a bus slow at login is still answering, and timing an
+    // ask out would only throw the answer away and tell every screen the daemon could not be reached.
+    auto* call = new QDBusPendingCallWatcher(QDBusConnection::sessionBus().asyncCall(request), this);
     connect(call, &QDBusPendingCallWatcher::finished, this, [this](QDBusPendingCallWatcher* done) {
         done->deleteLater();
         QString owner;
@@ -893,7 +895,7 @@ void DaemonWatch::askWhoOwns() {
             // can be addressed; a change reported meanwhile answers it instead.
             m_lookupFailed = true;
             emit lookupLost();
-            QTimer::singleShot(doubledWait(m_failedAsks, kLookupRetryMaxMs), this, [this] {
+            QTimer::singleShot(doubledWait(kLookupRetryMs, m_failedAsks, kLookupRetryMaxMs), this, [this] {
                 if (BufferClaims::instance().currentDaemon().lifetime == 0) askWhoOwns();
             });
             ++m_failedAsks;
@@ -990,6 +992,9 @@ void WallpaperXItem::setMonitorId(int monitorId) {
     reportWindows();
 
     emit monitorIdChanged();
+    // A busy image ring was the old monitor's; a descriptor back-off is the whole process's and
+    // runs on, the fetch below queued behind it.
+    abandonNoImageRun();
     // A screen that has just been identified may already have a frame waiting; without this the
     // desktop stays blank until the next time the wallpaper happens to change.
     if (m_monitorId >= 0) fetchFrame(0);
@@ -1079,9 +1084,9 @@ void WallpaperXItem::updateOnScreen() {
         // may report over this one meanwhile; coming back sends the state even if it is unchanged.
         m_windowsReported.reset();
         restartWindowRetry();
-        // It stops asking, and gives back what it held.
-        m_noImageRetryTimer.stop();
-        endRefusalRuns();
+        // A busy image ring is no concern off the screen; a descriptor back-off is the whole
+        // process's and runs on, the fetch on return queued behind it.
+        abandonNoImageRun();
         return;
     }
     // Assumed to be painted until a frame handed over proves otherwise, so a wallpaper resumes
@@ -1449,13 +1454,7 @@ void WallpaperXItem::connectToDaemon() {
             restartWindowRetry();
             // A refusal was the old daemon's to make. What was queued behind it is covered by the
             // forced fetch below, or by the next arrival's.
-            endRefusalRuns();
-            m_noImageRetryTimer.stop();
-            if (m_fetch == Fetch::BackingOff) {
-                m_backoffTimer.stop();
-                m_fetch = Fetch::Idle;
-                m_queuedFetch.reset();
-            }
+            abandonRefusals();
             // On departures too, and before the return below: a daemon numbers its images from
             // scratch, so every mark this item holds is meaningless either way -- and one that
             // never comes back is the case where no later frame would clear them or the
@@ -1623,10 +1622,10 @@ void WallpaperXItem::fetchFrame(quint64 generation) {
         // change: the latch stays shut for a backoff, and the refused fetch and what is
         // announced meanwhile queue behind it as they would behind a fetch in flight. Only
         // the current daemon's refusal: a replaced one's says nothing about the daemon asked next.
-        // Not off the screen: leaving ended the run, and coming back forces a fetch of its own.
+        // Off the screen too, since the refusal is the whole process's.
         const bool backOff = reply.type() == QDBusMessage::ErrorMessage &&
                              reply.errorName() == QLatin1String(kErrorTooManyDescriptors) &&
-                             asked.lifetime == BufferClaims::instance().currentDaemon().lifetime && m_onScreen;
+                             asked.lifetime == BufferClaims::instance().currentDaemon().lifetime;
         // Set before any early return, or one dropped reply stops fetching for good.
         m_fetch = backOff ? Fetch::BackingOff : Fetch::Idle;
         std::optional<quint64> queued;
@@ -1653,7 +1652,7 @@ void WallpaperXItem::fetchFrame(quint64 generation) {
             update();
         }
         if (backOff) {
-            const int delay = doubledWait(m_descriptorRefusals++, kRefusedRetryMaxMs);
+            const int delay = doubledWait(kRefusedRetryMs, m_descriptorRefusals++, kRefusedRetryMaxMs);
             if (!g_descriptorRefusalReported.exchange(true)) {
                 const std::string why = sanitizeForLog(reply.errorMessage().toStdString());
                 std::fprintf(stderr,
@@ -2365,7 +2364,7 @@ QSGNode* WallpaperXItem::updatePaintNode(QSGNode* old, UpdatePaintNodeData*) {
 // desktop with a wallpaper on it never polls.
 void WallpaperXItem::retryWhileNothingIsShown() {
     if (!m_onScreen || m_noImageRetryTimer.isActive()) return;
-    m_noImageRetryTimer.start(doubledWait(m_noImageRefusals++, kRefusedRetryMaxMs));
+    m_noImageRetryTimer.start(doubledWait(kRefusedRetryMs, m_noImageRefusals++, kRefusedRetryMaxMs));
 }
 
 // The end of a TooManyDescriptors backoff: the refused fetch and what was announced meanwhile are
@@ -2380,6 +2379,23 @@ void WallpaperXItem::reopenFetchAfterBackoff() {
 void WallpaperXItem::endRefusalRuns() {
     m_noImageRefusals = 0;
     m_descriptorRefusals = 0;
+}
+
+void WallpaperXItem::abandonNoImageRun() {
+    m_noImageRefusals = 0;
+    m_noImageRetryTimer.stop();
+}
+
+// The fetch queued behind a back-off is dropped, not sent: every caller forces a fetch of its own
+// once there is something to ask for.
+void WallpaperXItem::abandonRefusals() {
+    abandonNoImageRun();
+    m_descriptorRefusals = 0;
+    if (m_fetch == Fetch::BackingOff) {
+        m_backoffTimer.stop();
+        m_fetch = Fetch::Idle;
+        m_queuedFetch.reset();
+    }
 }
 
 // A still wallpaper sends no further FrameReady, so a released item must ask on its own. Not
