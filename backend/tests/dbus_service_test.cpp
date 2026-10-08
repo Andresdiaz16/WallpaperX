@@ -654,6 +654,11 @@ void runHostChecks(sdbus::IProxy& proxy, const std::string& imagePath, const Che
         {"signal", "FrameReady", ArgList{{"", "i:monitor_id"}, {"", "t:frame_generation"}}},
         // Argument-free: what the layouts now are is what the other consumers reported.
         {"signal", "ImportModifiersChanged", ArgList{}},
+        // GOAL: S15.393 -- ConfigChanged is exported, with no arguments: a consumer reads /config again.
+        // CONTROL: `sdbus::registerSignal("ConfigChanged")` deleted from DbusService::registerVTable
+        //       (backend/daemon/dbus_service.cpp) -> "FAIL: io.wallpaperx.Daemon exports exactly the
+        //       signals this table names".
+        {"signal", "ConfigChanged", ArgList{}},
     };
 
     for (const auto& [element, name, expectedArgs] : expected) {
@@ -2786,6 +2791,162 @@ void runImportModifierAnnouncementChecks(const wallpaperx::WallpaperManager::Con
     }
 }
 
+// ConfigChanged: what /config answers may have changed, so the plugin reads it again. Sent for an
+// accepted SetWallpaper/SetWallpaperWithProperties and a SetMonitorOutput that moved a name; nothing
+// else. Shader wallpapers, which this build records and never draws, so there is no Device.
+constexpr int32_t kMonitorNoticeFirst = 0;
+constexpr int32_t kMonitorNoticeSecond = 1;
+
+// A manager for one no-Device phase, graded as one (PhaseDeviceGrade, below), handed to `body`.
+void withNoDeviceManager(const wallpaperx::WallpaperManager::Config& config, const char* phase, const Check& check,
+                         const std::function<void(wallpaperx::WallpaperManager&)>& body);
+
+void runConfigChangedWireChecks(const wallpaperx::WallpaperManager::Config& base, const std::string& unrenderablePath,
+                                const Check& check) {
+    using sdbus::Variant;
+    using wallpaperx::testing::setMonitorOutput;
+    using wallpaperx::testing::setMonitorPause;
+    using wallpaperx::testing::setOutputFocus;
+    using wallpaperx::testing::setOutputSize;
+    using wallpaperx::testing::setOutputVisible;
+    using wallpaperx::testing::setWallpaperProperties;
+    using wallpaperx::testing::setWallpaperWithProperties;
+    const char* kGoals = "S15.394-S15.397 (when the daemon announces ConfigChanged)";
+    const std::string kName = "DP-NOTICE";
+
+    {
+        const wallpaperx::testing::ScratchDir scratch("dbusnotice");
+        if (!scratch.ok()) {
+            wallpaperx::testing::notVerified(kGoals, "a scratch directory for this phase's config file could not be made");
+            return;
+        }
+        wallpaperx::WallpaperManager::Config config = base;
+        config.configFile = scratch.path() / "wallpaperx" / "config.json";
+        withNoDeviceManager(config, "the config-notice wire phase", check, [&](wallpaperx::WallpaperManager& manager) {
+        auto serviceConn = sdbus::createSessionBusConnection();
+        DbusService service(*serviceConn, manager);
+        serviceConn->enterEventLoopAsync();
+        const sdbus::ServiceName daemonName{serviceConn->getUniqueName()};
+        const sdbus::ObjectPath objectPath{DbusService::kObjectPath};
+        AnnouncementLog announced;
+        auto listener = sdbus::createProxy(daemonName, objectPath);
+        listener->uponSignal("ConfigChanged").onInterface(DbusService::kInterface).call([&announced] { announced.record(); });
+        auto proxyOwner = sdbus::createProxy(daemonName, objectPath);
+        sdbus::IProxy& proxy = *proxyOwner;
+
+        // Signals from the daemon's one connection arrive in the order it sent them, so once a
+        // barrier call's own announcement is counted, any the calls before it sent are too.
+        // GOAL: S15.394 -- a SetMonitorOutput that names a screen announces ConfigChanged.
+        // CONTROL: `if (rebound) announceConfigChanged();` deleted from DbusService::setMonitorOutput
+        //       (backend/daemon/dbus_service.cpp) -> "naming a screen announces ConfigChanged" red, and the
+        //       phase abandoned there.
+        const std::string named = errorNameFrom([&] { setMonitorOutput(proxy, kMonitorNoticeFirst, kName); });
+        check(named.empty() && announced.waitFor(1), "naming a screen announces ConfigChanged");
+        if (!named.empty() || announced.count() < 1) {
+            std::fprintf(stderr, "  SetMonitorOutput answered '%s'; %d announcement(s) within 5 s\n", named.c_str(),
+                         announced.count());
+            return;
+        }
+
+        // GOAL: S15.395 and S15.396 -- an accepted SetWallpaper announces once, and repeating a binding
+        //       already on disk announces nothing.
+        // WHY-THIS-SHAPE: the SetWallpaper is the repeat's barrier; an exact count after it, never a
+        //       count taken when the repeat's reply came back.
+        // CONTROL: `announceConfigChanged();` deleted from DbusService::setWallpaper
+        //       (backend/daemon/dbus_service.cpp) -> "an accepted SetWallpaper announces ConfigChanged" red, and
+        //       the repeat's line beside it (its barrier never came).
+        // CONTROL: `if (rebound)` dropped from DbusService::setMonitorOutput's announcement -> "repeating
+        //       a binding already on disk announces nothing" red (3 announcements).
+        const std::string repeated = errorNameFrom([&] { setMonitorOutput(proxy, kMonitorNoticeFirst, kName); });
+        const std::string set = errorNameFrom([&] { setWallpaper(proxy, "shader", unrenderablePath, kMonitorNoticeFirst); });
+        check(repeated.empty() && set.empty() && announced.waitFor(2), "an accepted SetWallpaper announces ConfigChanged");
+        check(announced.count() == 2, "repeating a binding already on disk announces nothing");
+        if (announced.count() != 2) {
+            std::fprintf(stderr, "  repeat answered '%s', SetWallpaper '%s'; %d announcement(s)\n", repeated.c_str(),
+                         set.c_str(), announced.count());
+            return;
+        }
+
+        // GOAL: S15.396 -- a refused SetMonitorOutput or SetWallpaper announces nothing, and an accepted
+        //       SetWallpaperWithProperties announces once.
+        // CONTROL: in DbusService::setWallpaper (backend/daemon/dbus_service.cpp), `announceConfigChanged();`
+        //       moved above the `try` -> "refused calls announce nothing" red.
+        // COVERAGE-ASSERT: both calls must have been refused, or their silence is about something else.
+        const std::string emptyName = errorNameFrom([&] { setMonitorOutput(proxy, kMonitorNoticeSecond, ""); });
+        const std::string badType = errorNameFrom([&] { setWallpaper(proxy, "nonsense", unrenderablePath, kMonitorNoticeSecond); });
+        check(!emptyName.empty() && !badType.empty(), "the two refused calls were refused");
+        const std::string withProperties = errorNameFrom([&] {
+            setWallpaperWithProperties(proxy, "shader", unrenderablePath, kMonitorNoticeSecond, {{"speed", Variant(0.5)}});
+        });
+        check(withProperties.empty() && announced.waitFor(3), "an accepted SetWallpaperWithProperties announces ConfigChanged");
+        check(announced.count() == 3, "refused calls announce nothing");
+        if (announced.count() != 3) {
+            std::fprintf(stderr, "  refused with '%s' and '%s'; %d announcement(s)\n", emptyName.c_str(), badType.c_str(),
+                         announced.count());
+            return;
+        }
+
+        // GOAL: S15.396 -- a screen's reports and a monitor's settings announce nothing: SetOutputSize,
+        //       SetOutputVisible, SetOutputFocus, SetMonitorPause, SetWallpaperProperties. And S15.394's
+        //       other half: moving a name to another monitor announces once.
+        // CONTROL: `announceConfigChanged();` added at the end of DbusService::setOutputSize
+        //       (backend/daemon/dbus_service.cpp) -> "a screen's reports and a monitor's settings announce
+        //       nothing" red.
+        // COVERAGE-ASSERT: all five must have been accepted, so their silence is not a refusal's.
+        const std::string reports = errorNameFrom([&] {
+            setOutputSize(proxy, kName, 800, 600);
+            setOutputVisible(proxy, kName, false);
+            setOutputFocus(proxy, kName, true, false);
+            setMonitorPause(proxy, kMonitorNoticeFirst, "paused_while_focused");
+            setWallpaperProperties(proxy, kMonitorNoticeFirst, {{"speed", Variant(0.5)}});
+        });
+        check(reports.empty(), "the five report and setting calls were accepted");
+        if (!reports.empty()) std::fprintf(stderr, "  one answered '%s'\n", reports.c_str());
+        const std::string moved = errorNameFrom([&] { setMonitorOutput(proxy, kMonitorNoticeSecond, kName); });
+        check(moved.empty() && announced.waitFor(4), "moving a name to another monitor announces ConfigChanged");
+        check(announced.count() == 4, "a screen's reports and a monitor's settings announce nothing");
+        if (announced.count() != 4) std::fprintf(stderr, "  %d announcement(s)\n", announced.count());
+        });
+    }
+
+    // GOAL: S15.397 -- a SetMonitorOutput whose config write fails still announces ConfigChanged:
+    //       the binding may stand for this run, and the daemon cannot tell that from one undone.
+    // WHY-THIS-SHAPE: the config file's directory is under a regular file, so the write fails on any
+    //       host; the refusal is required to be RenderFailed, the write-failure answer, or the phase
+    //       is not verified -- an InvalidArgs would mean the call never reached the write.
+    // CONTROL: `announceConfigChanged();` deleted from DbusService::setMonitorOutput's failure branch
+    //       (backend/daemon/dbus_service.cpp) -> "a SetMonitorOutput whose write failed still announces
+    //       ConfigChanged" red.
+    {
+        const wallpaperx::testing::ScratchDir scratch("dbusnoticefail");
+        if (!scratch.ok() || !std::ofstream(scratch.path() / "blocker").put('x')) {
+            wallpaperx::testing::notVerified("S15.397", "a scratch file to block the config directory could not be made");
+            return;
+        }
+        wallpaperx::WallpaperManager::Config config = base;
+        config.configFile = scratch.path() / "blocker" / "wallpaperx" / "config.json";
+        withNoDeviceManager(config, "the config-notice failed-write phase", check, [&](wallpaperx::WallpaperManager& manager) {
+        auto serviceConn = sdbus::createSessionBusConnection();
+        DbusService service(*serviceConn, manager);
+        serviceConn->enterEventLoopAsync();
+        const sdbus::ServiceName daemonName{serviceConn->getUniqueName()};
+        const sdbus::ObjectPath objectPath{DbusService::kObjectPath};
+        AnnouncementLog announced;
+        auto listener = sdbus::createProxy(daemonName, objectPath);
+        listener->uponSignal("ConfigChanged").onInterface(DbusService::kInterface).call([&announced] { announced.record(); });
+        auto proxy = sdbus::createProxy(daemonName, objectPath);
+
+        const std::string failed = errorNameFrom([&] { setMonitorOutput(*proxy, kMonitorNoticeFirst, kName); });
+        if (failed != "io.wallpaperx.Daemon.Error.RenderFailed") {
+            wallpaperx::testing::notVerified("S15.397", "the staged write failure answered '" + failed +
+                                                            "', not RenderFailed, so the failure branch was not reached");
+            return;
+        }
+        check(announced.waitFor(1), "a SetMonitorOutput whose write failed still announces ConfigChanged");
+        });
+    }
+}
+
 // Every task the worker is handed is answered exactly once: a dropped export task (queue full,
 // worker stopping) would leave its caller waiting out sd-bus's ~25 s timeout. Driven at the worker,
 // since no bus sequence stages either state; on the coalescing phase's manager (no renders here, so
@@ -3063,6 +3224,15 @@ struct CaptureGradeOnExit {
     const wallpaperx::WallpaperManager& manager;
     ~CaptureGradeOnExit() { grade.capture(manager); }
 };
+
+void withNoDeviceManager(const wallpaperx::WallpaperManager::Config& config, const char* phase, const Check& check,
+                         const std::function<void(wallpaperx::WallpaperManager&)>& body) {
+    PhaseDeviceGrade grade(phase, check);
+    grade.expectNoDevice();
+    wallpaperx::WallpaperManager manager(config);
+    CaptureGradeOnExit captureGrade{grade, manager};
+    body(manager);
+}
 
 void runPropertiesWireChecks(const wallpaperx::WallpaperManager::Config& base, const std::string& imagePath,
                              const std::string& unrenderablePath, const Check& check) {
@@ -8115,6 +8285,7 @@ int main() {
         phase("importModifierClientWire", [&] { runImportModifierClientWireChecks(config, check); });
         phase("importModifierAnnouncement",
               [&] { runImportModifierAnnouncementChecks(config, imagePath, unrenderablePath, check); });
+        phase("configChangedWire", [&] { runConfigChangedWireChecks(config, unrenderablePath, check); });
 
         // These two drive renderPending() on this thread, so there is no worker for their Device to be
         // pinned to.

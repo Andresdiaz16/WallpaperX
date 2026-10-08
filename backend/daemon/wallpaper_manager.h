@@ -560,7 +560,10 @@ public:
     // A name carries its screen's reported size, so binding one can change what two monitors are
     // drawn at. Those are recorded as owed a render and put in `redraw` before anything can throw;
     // the caller posts them on success and on a failed write alike, since the binding stands.
-    void setMonitorOutput(int monitorId, const std::string& outputName, std::vector<int>& redraw);
+    //
+    // Returns whether the call moved a name: what /config answers changed. A throw leaves the
+    // caller not knowing, since a failed write keeps the binding it made.
+    bool setMonitorOutput(int monitorId, const std::string& outputName, std::vector<int>& redraw);
 
     // Records the size the screen named `outputName` is drawn at. The monitor whose drawing size
     // that changes is recorded as owed a render and put in `redraw` before anything can throw; the

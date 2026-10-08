@@ -15,27 +15,27 @@ WallpaperItem {
 
     anchors.fill: parent
 
-    // What the last poll established; everything shown derives from these in bindings. The
+    // What the last answer established; everything shown derives from these in bindings. The
     // linter checks a property read and a declarative binding but not an assignment target
     // inside a function body, so the logic lives where it can be seen.
     property var reply: null
     property bool answered: false
     property string refusalReason: ""
 
-    // The request still awaiting a reply, so a later tick supersedes it instead of racing it,
-    // and how many polls it has been waiting. A reply is not late until several have passed:
-    // the poll interval was doubling as the deadline, so a daemon answering slower than one
-    // tick was aborted every time and never once heard from.
+    // The request still awaiting a reply, and whether something said the answer may have changed
+    // since it was sent: that change may postdate its answer, so one more read follows it. However
+    // many arrive meanwhile, that is one read, so the notices' sender cannot pile requests up. Not
+    // aborted, and nothing times it out (QML's XMLHttpRequest has no timeout): it ends when whatever
+    // holds the port answers or exits, and a replacement would wait on the same server.
     property var pending: null
-    property int pendingPolls: 0
-    readonly property int lateAfterPolls: 5
+    property bool askAgain: false
 
     // What this will parse. The reply comes from whatever holds the port, and nothing else
     // bounds what the shell acts on. Not what it buffers: see the handler below.
     readonly property int maxBodyBytes: 65536
 
     // Checked on the way back as well as set on the way out: a redirect would otherwise make
-    // every screen's plugin fetch from wherever it names, once a second, from inside the shell.
+    // every screen's plugin fetch from wherever it names, from inside the shell.
     readonly property string daemonOrigin: "http://127.0.0.1:18462"
 
     // No headless Qt platform reports a screen name, and an empty one pins every state below to
@@ -98,6 +98,10 @@ WallpaperItem {
         if (root.screenState === "unnamed") {
             return qsTr("This screen has not reported a connector name.\nWallpaperX identifies screens by that name.");
         }
+        // Nothing would say when the answer changes, so any cause below could be long out of date.
+        if (notice.status === Loader.Error) {
+            return qsTr("WallpaperX cannot follow changes on this screen:\nits module could not be loaded.");
+        }
         if (root.screenState === "unreachable") {
             return qsTr("WallpaperX is not running.\nStart the wallpaperx-daemon service.");
         }
@@ -135,34 +139,21 @@ WallpaperItem {
             return;
         }
 
+        // A slow /config is waited for, not reported as "not running": it says nothing about the
+        // frame path, and apply(0, "") would tear the renderer down because the cheap path was slow.
         if (root.pending !== null) {
-            root.pendingPolls += 1;
-            if (root.pendingPolls < root.lateAfterPolls) {
-                return;
-            }
-            const late = root.pending;
-            root.pending = null;
-            root.pendingPolls = 0;
-            late.abort();
-            // Abandoned, but NOT reported as "not running". A slow /config says nothing about the
-            // frame path: the daemon can be answering D-Bus perfectly while this endpoint is
-            // parked behind a large decode. Calling apply(0, "") here would clear `answered`,
-            // drive screenState to "unreachable", deactivate the Loader, destroy the renderer
-            // item and with it release every GL object it imported -- tearing down the expensive
-            // path because the cheap one was slow. A genuine connection failure still arrives as
-            // status 0 on a COMPLETED request below, which does report it.
+            root.askAgain = true;
             return;
         }
-
         const request = new XMLHttpRequest();
         root.pending = request;
-        root.pendingPolls = 0;
+        const asked = root.connector;
         // The timestamp defeats any cache between here and the daemon: a wallpaper the user
         // just chose must not wait on a stale 200.
         const url = root.daemonOrigin + "/config?output=" +
-                    encodeURIComponent(root.connector) + "&t=" + Date.now();
+                    encodeURIComponent(asked) + "&t=" + Date.now();
         request.onreadystatechange = function () {
-            // Superseded or aborted: its answer describes a question already replaced.
+            // Only the request this waits on answers it.
             if (root.pending !== request) {
                 return;
             }
@@ -175,15 +166,23 @@ WallpaperItem {
                 return;
             }
             root.pending = null;
-            root.pendingPolls = 0;
-            // Redirected away from the daemon, or oversized: neither is ours whatever it holds,
-            // so both read as unreadable. An empty responseURL means Qt did not report one.
-            const from = request.responseURL;
-            const elsewhere = typeof from === "string" && from !== "" &&
-                              from.indexOf(root.daemonOrigin + "/") !== 0;
-            const body = request.responseText;
-            const usable = !elsewhere && body.length <= root.maxBodyBytes;
-            root.apply(request.status, usable ? body : "");
+            // Applied even with another read to follow, or a stream of notices would leave the
+            // screen unanswered; it is no older than anything applied before. Another screen's
+            // answer is not.
+            if (asked === root.connector) {
+                // Redirected away from the daemon, or oversized: neither is ours whatever it holds,
+                // so both read as unreadable. An empty responseURL means Qt did not report one.
+                const from = request.responseURL;
+                const elsewhere = typeof from === "string" && from !== "" &&
+                                  from.indexOf(root.daemonOrigin + "/") !== 0;
+                const body = request.responseText;
+                const usable = !elsewhere && body.length <= root.maxBodyBytes;
+                root.apply(request.status, usable ? body : "");
+            }
+            if (root.askAgain) {
+                root.askAgain = false;
+                root.refresh();
+            }
         };
         request.open("GET", url);
         request.send();
@@ -242,7 +241,8 @@ WallpaperItem {
         // session alive and hidden on its screen, and a renderer there would report under the same
         // screen name as the one shown, with nothing ordering its reports after the shown one's.
         // Hiding the containment is what Plasma does to stop showing it, so visibility, not the
-        // activity, is the fact; the poll goes on, so the renderer returns without waiting for one.
+        // activity, is the fact. A hidden copy goes on hearing of changes, so the renderer returns
+        // without waiting for an answer.
         active: root.visible && (root.screenState === "set" || root.screenState === "unset") && root.monitorId >= 0
         source: "WallpaperSurface.qml"
         onLoaded: {
@@ -318,11 +318,27 @@ WallpaperItem {
         }
     }
 
-    Timer {
-        interval: 1000
-        repeat: true
-        running: true
-        triggeredOnStart: true
-        onTriggered: root.refresh()
+    // When to ask again, loaded for the reason the renderer is. Never tied to visibility: a hidden
+    // copy keeps its answer current.
+    Loader {
+        id: notice
+
+        objectName: "wallpaperxConfigWatch"
+        source: "ConfigWatch.qml"
     }
+
+    Connections {
+        target: notice.item
+        ignoreUnknownSignals: true
+        function onConfigChanged() {
+            root.refresh();
+        }
+    }
+
+    // A screen renamed asks about the new name. Also the first ask when the name arrives after
+    // the start.
+    onConnectorChanged: root.refresh()
+
+    // After the watch above exists, so a change after this ask is reported.
+    Component.onCompleted: root.refresh()
 }

@@ -22,6 +22,7 @@
 #include <QByteArray>
 #include <QCoreApplication>
 #include <QDBusConnection>
+#include <QFile>
 #include <QGuiApplication>
 #include <QQmlComponent>
 #include <QQmlEngine>
@@ -34,6 +35,7 @@
 #include <QVariant>
 
 #include <cstdio>
+#include <cstring>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -209,10 +211,61 @@ bool backedOff(ReportStub& stub, const Scene& scene, const QString& out) {
     return two && calls.size() == 2 && calls[0].error == kRenderFailed && calls[1].error == kRenderFailed;
 }
 
+// GOAL: S15.402 -- an item created with no session bus says, once, that it cannot hear config changes ("could
+//       not subscribe to WallpaperX config changes"). False if it says nothing -- the screen then
+//       never learns of a new wallpaper and nothing explains why -- or says it more than once.
+// WHY-THIS-SHAPE: a process of its own (the entry item_window_report_no_bus), because QtDBus makes
+//       its session connection once per process; the address names a socket that does not exist, set
+//       before Qt connects. It still runs only under isolated_run.sh's private session.
+// CONTROL: in WallpaperXItem::connectToDaemon (backend/kde/wallpaperx_item.cpp),
+//       `watchConfigChanged(this, SLOT(onConfigChanged()));` replaced by the same
+//       QDBusConnection::sessionBus().connect(...) call made directly -> this line red, logged 0 times.
+//       Via control_run.sh 2026-10-08. Reverted.
+// COVERAGE-ASSERT: the session bus must be disconnected and the item instantiated, or not verified.
+int noBusRun(int argc, char** argv) {
+    constexpr const char* kClause = "the item's failed config-change subscription is reported";
+    if (const std::optional<int> refused = wallpaperx::testing::refuseOffPrivateTestBus()) return *refused;
+    if (!phaseSelected("no-bus")) return wallpaperx::testing::reportNotVerifiedOrPassed();
+    QTemporaryDir scratch;
+    if (!scratch.isValid()) {
+        notVerified(kClause, "no scratch directory for the absent bus's address");
+        return wallpaperx::testing::reportNotVerifiedOrPassed();
+    }
+    qputenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=" + QFile::encodeName(scratch.path()) + "/no-bus");
+    qputenv("QT_QPA_PLATFORM", "offscreen");
+    QGuiApplication app(argc, argv);
+    if (QDBusConnection::sessionBus().isConnected()) {
+        notVerified(kClause, "the session bus connected although its address names no socket");
+        return wallpaperx::testing::reportNotVerifiedOrPassed();
+    }
+    QQmlEngine engine;
+    engine.addImportPath(QString::fromUtf8(WALLPAPERX_QML_MODULE_PATH));
+    QQuickWindow window;
+    window.setGeometry(0, 0, 400, 300);
+    window.show();
+    ReportStub unused;
+    Harness harness(engine, window, unused);
+    StderrCapture capture;
+    Scene scene = harness.make(QStringLiteral("no-bus"));
+    if (scene.renderer != nullptr) scene.renderer->setProperty("output", QStringLiteral("DP-NO-BUS"));
+    pumpFor(kTurnMs * 2);
+    const QString logged = capture.text();
+    if (!capture.ok() || scene.renderer == nullptr) {
+        notVerified(kClause, !capture.ok() ? "stderr could not be captured" : "the item could not be instantiated");
+    } else {
+        const int lines = static_cast<int>(logged.count(QStringLiteral("could not subscribe to WallpaperX config changes")));
+        check(lines == 1, "an item created with no bus says once that it cannot hear config changes");
+        std::fprintf(stderr, "  logged %d time(s)\n", lines);
+    }
+    if (wallpaperx::testing::reportCheckFailures()) return 1;
+    return wallpaperx::testing::reportNotVerifiedOrPassed();
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     wallpaperx::testing::g_testName = "item_window_report_test";
+    if (argc > 1 && std::strcmp(argv[1], "no-bus") == 0) return noBusRun(argc, argv);
     // X.34: nothing owned or sent off the private bus.
     if (const std::optional<int> refused = wallpaperx::testing::refuseOffPrivateTestBus()) return *refused;
     qputenv("QT_QPA_PLATFORM", "offscreen");
@@ -439,33 +492,82 @@ int main(int argc, char** argv) {
         }
     }
 
-    if (phaseSelected("unknown-output-retry")) {
-        const QString out = QStringLiteral("DP-LOST");
+    // A report refused as UnknownOutput after the screen was known -- the daemon lost the name -- waits
+    // for the ConfigChanged naming the screen sends, then goes again behind the size report.
+    // `refused` stages the refusal; `method` is what it refused.
+    const auto unknownOutputWaitsForNotice = [&](const char* phase, const QString& out, const QString& method,
+                                                 const std::function<void(const Scene&)>& refused) {
         Scene scene = harness.settled(out);
-        if (ready(scene, "the unknown-output-retry phase")) {
-            // GOAL: a window report refused as UnknownOutput after the screen was known -- the daemon
-            //       lost the name -- is sent again on the retry timer, not at once (no sooner than one
-            //       retry interval, and inside the phase's arrival limit), though nothing changes, and
-            //       nothing is logged: it is ordinary until the app names the screen again.
-            // WHY-THIS-SHAPE: refused once the size report has already succeeded, because a refusal
-            //       of the immediate report is cured by the size report's first success anyway; only
-            //       a later one reaches the retry this goal is about. The gap is a lower bound.
-            // CONTROL: `m_sizeReported.reset();` and the `m_sizeReportTimer.start(kRefusedRetryMs)`
-            //       re-arm deleted from reportWindows's UnknownOutput branch -> the resend line red. A
-            //       "refused this screen's window state" fprintf added to that branch -> the log line red.
-            StderrCapture capture;
-            stub.refuseNext(kFocus, out, kUnknownOutput);
-            const std::size_t mark = stub.mark();
-            scene.renderer->setProperty("windowFocused", true);
-            const bool resent = pumpUntil([&] { return stub.calls(kFocus, out, mark).size() >= 2; }, kArrivalLimitMs);
-            const QString logged = capture.text();
-            const std::vector<ReportStub::Call> calls = stub.calls(kFocus, out, mark);
-            check(resent && calls[0].error == kUnknownOutput && calls[1].error.isEmpty() && focusArgsAre(calls[1], true, false) &&
-                      calls[1].atMs - calls[0].atMs >= kRetryFloorMs,
-                  "a window report refused as UnknownOutput is sent again after the retry interval");
-            checkNotLogged(capture, logged, "the unknown-output-retry phase's log clause", "and the refusal is not logged");
-            std::fprintf(stderr, "  %s: %s\n", qPrintable(out), ReportStub::describe(stub.callsFor(out, mark)).c_str());
+        if (!ready(scene, phase)) return;
+        StderrCapture capture;
+        stub.refuseNext(method, out, kUnknownOutput);
+        const std::size_t mark = stub.mark();
+        refused(scene);
+        const bool sent = pumpUntil([&] { return !stub.calls(method, out, mark).empty(); }, kArrivalLimitMs);
+        pumpFor(kQuietSpanMs);
+        const std::vector<ReportStub::Call> quiet = stub.callsFor(out, mark);
+        if (!sent || quiet.front().method != method || quiet.front().error != kUnknownOutput) {
+            notVerified(phase, "the staged report was never sent and refused as UnknownOutput (" +
+                                   ReportStub::describe(quiet) + ")");
+            return;
         }
+        const std::string name = method.toStdString();
+        check(quiet.size() == 1, (name + " refused as UnknownOutput sends nothing more without a ConfigChanged").c_str());
+        const std::size_t noticeMark = stub.mark();
+        if (!wallpaperx::testing::announceConfigChanged(bus)) {
+            notVerified(phase, "the stub could not send ConfigChanged");
+            return;
+        }
+        pumpUntil(
+            [&] {
+                const std::vector<ReportStub::Call> calls = stub.calls(method, out, noticeMark);
+                return !calls.empty() && calls.back().error.isEmpty();
+            },
+            kArrivalLimitMs);
+        pumpFor(kTurnMs);
+        const QString logged = capture.text();
+        const std::vector<ReportStub::Call> after = stub.callsFor(out, noticeMark);
+        // The size first, accepted, then the refused report, accepted.
+        bool sized = false, again = false;
+        for (const ReportStub::Call& call : after) {
+            if (call.method == kSize && call.error.isEmpty()) sized = true;
+            if (sized && call.method == method && call.error.isEmpty()) again = true;
+        }
+        check(sized && again, (name + " refused as UnknownOutput goes again at ConfigChanged, after the size").c_str());
+        checkNotLogged(capture, logged, phase, "and the refusal is not logged");
+        std::fprintf(stderr, "  %s: %s | after the notice: %s\n", qPrintable(out), ReportStub::describe(quiet).c_str(),
+                     ReportStub::describe(after).c_str());
+    };
+
+    if (phaseSelected("unknown-output-notice")) {
+        // GOAL: S15.190 -- a window report refused as UnknownOutput after the screen was known sends
+        //       nothing more -- neither the report nor the size -- over a 6 s span, and at the daemon's
+        //       next ConfigChanged sends the size and then the window report, both accepted; nothing is
+        //       logged.
+        // WHY-THIS-SHAPE: refused once the size report has already succeeded, because a refusal of the
+        //       immediate report is cured by the size report's first success anyway. Ordered on the
+        //       stub's record, not timed: the size's success is what re-sends the report, so "size,
+        //       then report" is the property and any gap is the scheduler's.
+        // CONTROL: `if (!m_sizeReportTimer.isActive()) m_sizeReportTimer.start(kRefusedRetryMs);` put
+        //       back after `m_sizeReported.reset();` in reportWindows's UnknownOutput branch
+        //       (backend/kde/wallpaperx_item.cpp) -> "sends nothing more without a ConfigChanged" red, and the
+        //       "goes again" line with it (the size went before the notice).
+        // CONTROL: `m_sizeReported.reset();` deleted from the same branch -> "goes again at
+        //       ConfigChanged, after the size" red.
+        unknownOutputWaitsForNotice("the unknown-output-notice phase", QStringLiteral("DP-LOST"), kFocus,
+                                    [](const Scene& scene) { scene.renderer->setProperty("windowFocused", true); });
+    }
+
+    if (phaseSelected("visible-unknown-notice")) {
+        // GOAL: S15.388 -- the same for a visibility report: hidden, refused as UnknownOutput, it sends
+        //       nothing more until ConfigChanged, then the size and the visibility report, both accepted.
+        // WHY-THIS-SHAPE: as the phase above; hidden through the scene's root, which is the change
+        //       that sends visibility.
+        // CONTROL: `m_sizeReported.reset();` deleted from reportVisible's UnknownOutput branch
+        //       (backend/kde/wallpaperx_item.cpp) -> "SetOutputVisible refused as UnknownOutput goes again
+        //       at ConfigChanged, after the size" red.
+        unknownOutputWaitsForNotice("the visible-unknown-notice phase", QStringLiteral("DP-LOST-VISIBLE"), kVisible,
+                                    [](const Scene& scene) { scene.rootItem()->setVisible(false); });
     }
 
     if (phaseSelected("silent-refusals")) {
@@ -479,8 +581,10 @@ int main(int argc, char** argv) {
         //       the span read here. "Not sent again" is read over three retry intervals. The
         //       no-daemon half claims no "not retried": a retry with no daemon never reaches the stub,
         //       and the next owner's re-report replaces it, so nothing here could see one.
-        // CONTROL: the early `return` for those two names deleted from reportWindows's reply handler
-        //       -> both log lines red. UnknownMethod moved from that return into `transient` -> "is not
+        // CONTROL: in reportWindows's reply handler (backend/kde/wallpaperx_item.cpp), via control_run.sh
+        //       2026-10-08, --phase '^silent-refusals$', each reverted. The early `return` for
+        //       `Refusal::Absent || ... UnknownMethod` deleted -> both log lines red. UnknownMethod dropped
+        //       from that return and from classifyRefusal's Permanent test, so it is retried -> "is not
         //       sent again" red, and the older daemon's log line with it.
         // COVERAGE-ASSERT: the one report must have arrived and been refused with UnknownMethod, so
         //       a staging that did not take cannot pass the silence.
@@ -670,12 +774,13 @@ int main(int argc, char** argv) {
             //       at a change and its first wait is the base one. The waits are lower bounds -- a
             //       timer never fires early -- so the doubling is read as "the second wait is at least
             //       two retry floors", which no fixed interval reaches.
-            // CONTROL: in reportWindows's reply handler (backend/kde/wallpaperx_item.cpp): the line
+            // CONTROL: in reportWindows's reply handler (backend/kde/wallpaperx_item.cpp), via
+            //       control_run.sh 2026-10-08, --phase '^transient-backoff$', each reverted. The line
             //       doubling `m_windowRetryMs` deleted -> the doubling line red, and the log-count line
-            //       (the wait never leaves the base the log condition reads); the size report's
-            //       `m_sizeReported.reset()` and re-arm put back in the transient branch -> the size
-            //       line red, and the doubling line (the size report's success re-sends every 2 s);
-            //       the log condition made `if (true)` -> the log-count line alone.
+            //       (the wait never leaves the base the log condition reads). `m_sizeReported.reset();`
+            //       and a `m_sizeReportTimer.start(kRefusedRetryMs)` added to the `Refusal::Retried`
+            //       branch -> the size line red, and the doubling line. The log condition made
+            //       `if (true)` -> the log-count line alone.
             // COVERAGE-ASSERT: three refused calls must have arrived, so two waits were measured.
             stub.refuseAlways(kFocus, out, kRenderFailed);
             StderrCapture capture;
@@ -713,7 +818,8 @@ int main(int argc, char** argv) {
             // GOAL: a window report refused once as RenderFailed is sent again on its own retry, with
             //       nothing changing, and the daemon ends up holding it.
             // CONTROL: `m_windowReportTimer.start(m_windowRetryMs);` deleted from reportWindows's
-            //       transient branch (backend/kde/wallpaperx_item.cpp) -> this line red.
+            //       `Refusal::Retried` branch (backend/kde/wallpaperx_item.cpp) -> this line red. Via
+            //       control_run.sh 2026-10-08, --phase '^transient-recovery$'. Reverted.
             stub.refuseNext(kFocus, out, kRenderFailed);
             const std::size_t mark = stub.mark();
             scene.renderer->setProperty("windowFocused", true);
@@ -723,6 +829,77 @@ int main(int argc, char** argv) {
                       calls[1].atMs - calls[0].atMs >= kRetryFloorMs,
                   "a window report refused once as RenderFailed is sent again after the retry interval and accepted");
             std::fprintf(stderr, "  %s: %s\n", qPrintable(out), ReportStub::describe(calls).c_str());
+        }
+    }
+
+    if (phaseSelected("refusal-kinds")) {
+        // GOAL: S15.403 -- a window report refused for any reason but its arguments or an unknown method is resent
+        //       after about 2 s and accepted -- LimitsExceeded, NoMemory, AccessDenied, Disconnected and an
+        //       error name the plugin does not know among them -- while one refused as InvalidArgs is not
+        //       resent. False if a busy or short-of-memory daemon leaves a screen wrongly paused or playing
+        //       until the next window change, or if a refusal no resend can cure is resent forever.
+        // WHY-THIS-SHAPE: one screen per error, all at once, each refused once (InvalidArgs always), so
+        //       the resend is graded between the 1.8 s floor and kBaseWaitCeilingMs. "Not resent" is read
+        //       over kQuietSpanMs, three retry intervals.
+        // CONTROL: in classifyRefusal (backend/kde/wallpaperx_item.cpp), via control_run.sh 2026-10-08,
+        //       --phase '^refusal-kinds$', each reverted. The default made `Refusal::Permanent` -> the five
+        //       retried kinds' lines red, InvalidArgs green. InvalidArgs dropped from the Permanent test ->
+        //       InvalidArgs's line alone.
+        // COVERAGE-ASSERT: every report must have arrived and been refused with its staged error, or the
+        //       phase is not verified.
+        struct Kind {
+            QString output;
+            QString error;
+            bool retried;
+            Scene scene;
+        };
+        std::vector<Kind> kinds;
+        kinds.push_back({QStringLiteral("DP-W-LIMITS"), QStringLiteral("org.freedesktop.DBus.Error.LimitsExceeded"), true, {}});
+        kinds.push_back({QStringLiteral("DP-W-NOMEMORY"), QStringLiteral("org.freedesktop.DBus.Error.NoMemory"), true, {}});
+        kinds.push_back({QStringLiteral("DP-W-ACCESS"), QStringLiteral("org.freedesktop.DBus.Error.AccessDenied"), true, {}});
+        kinds.push_back({QStringLiteral("DP-W-DISCONNECTED"), QStringLiteral("org.freedesktop.DBus.Error.Disconnected"), true, {}});
+        kinds.push_back({QStringLiteral("DP-W-UNKNOWN-ERROR"), QStringLiteral("io.wallpaperx.Daemon.Error.SomethingNew"), true, {}});
+        kinds.push_back({QStringLiteral("DP-W-INVALIDARGS"), kInvalidArgs, false, {}});
+        bool built = true;
+        for (Kind& k : kinds) {
+            k.scene = harness.settled(k.output);
+            built = built && k.scene.renderer != nullptr;
+        }
+        if (!built) {
+            notVerified("the refusal-kinds phase", "a scene could not be built, or its first size report never arrived");
+        } else {
+            const std::size_t mark = stub.mark();
+            for (Kind& k : kinds) {
+                if (k.retried) {
+                    stub.refuseNext(kFocus, k.output, k.error);
+                } else {
+                    stub.refuseAlways(kFocus, k.output, k.error);
+                }
+                k.scene.renderer->setProperty("windowFocused", true);
+            }
+            pumpFor(kQuietSpanMs);
+            bool staged = true;
+            for (const Kind& k : kinds) {
+                const std::vector<ReportStub::Call> calls = stub.calls(kFocus, k.output, mark);
+                staged = staged && !calls.empty() && calls.front().error == k.error;
+            }
+            if (!staged) {
+                notVerified("the refusal-kinds phase", "not every report arrived and was refused with its staged error");
+            } else {
+                for (const Kind& k : kinds) {
+                    const std::vector<ReportStub::Call> calls = stub.calls(kFocus, k.output, mark);
+                    const std::string name = k.error.toStdString();
+                    if (k.retried) {
+                        const qint64 gap = calls.size() >= 2 ? calls[1].atMs - calls[0].atMs : -1;
+                        check(calls.size() == 2 && calls[1].error.isEmpty() && focusArgsAre(calls[1], true, false) &&
+                                  gap >= kRetryFloorMs && gap <= kBaseWaitCeilingMs,
+                              ("a window report refused with " + name + " is resent after about 2 s and accepted").c_str());
+                    } else {
+                        check(calls.size() == 1, ("a window report refused with " + name + " is not resent").c_str());
+                    }
+                    std::fprintf(stderr, "  %s: %s\n", qPrintable(k.output), ReportStub::describe(calls).c_str());
+                }
+            }
         }
     }
 
@@ -1004,14 +1181,16 @@ int main(int argc, char** argv) {
         if (ready(scene, "the restart-unknown phase")) {
             // GOAL: a new daemon that does not know the name yet -- every report refused as
             //       UnknownOutput, the size report once -- ends up holding SetOutputVisible(name, true)
-            //       and the current window state once its size report is accepted.
+            //       and the current window state once it announces ConfigChanged (the screen named) and
+            //       the size report that sends is accepted.
             // WHY-THIS-SHAPE: the first visibility, window and size reports after the restart are
-            //       all refused, so neither direct send can satisfy the lines; only the size report's
-            //       retry and its success's re-send can. The phase is not verified unless the direct
-            //       sends were what the stub refused.
+            //       all refused, so neither direct send can satisfy the lines; only the size report sent
+            //       at the notice and its success's re-send can. The phase is not verified unless the
+            //       direct sends were what the stub refused.
             // CONTROL: in reportSize's success branch (backend/kde/wallpaperx_item.cpp),
-            //       `reportVisible();` deleted -> the visibility line red; `reportWindows();` deleted ->
-            //       the window line red. `unnamed ||` deleted from reportSize's `transient` -> both red.
+            //       `reportVisible();` deleted -> the visibility line red. `|| refusal == Refusal::Unnamed`
+            //       deleted from reportSize's `if (refusal == Refusal::Absent || ...)` reset-and-return
+            //       -> both lines red. Via control_run.sh 2026-10-08, --phase '^restart-unknown$'.
             //       Deleting `m_sizeReported.reset();` from either reply handler's UnknownOutput branch
             //       leaves it green: the size report's own refusal clears the same record here.
             if (!focusAccepted(stub, scene, out)) {
@@ -1024,14 +1203,28 @@ int main(int argc, char** argv) {
                 if (!wallpaperx::testing::restartDaemonName(bus)) {
                     notVerified("the restart-unknown phase", "the stub could not give up and retake the bus name");
                 } else {
-                    pumpUntil([&] { return holdsVisible(stub, out, mark) && holdsFocus(stub, out, mark, true, false); },
-                              kArrivalLimitMs);
+                    // The three refusals first, then the notice that says the name is known again.
+                    pumpUntil(
+                        [&] {
+                            return !stub.calls(kVisible, out, mark).empty() && !stub.calls(kFocus, out, mark).empty() &&
+                                   !stub.calls(kSize, out, mark).empty();
+                        },
+                        kArrivalLimitMs);
+                    pumpFor(kTurnMs);
+                    const bool noticed = wallpaperx::testing::announceConfigChanged(bus);
+                    if (noticed) {
+                        pumpUntil([&] { return holdsVisible(stub, out, mark) && holdsFocus(stub, out, mark, true, false); },
+                                  kArrivalLimitMs);
+                    }
                     pumpFor(kTurnMs);
                     const std::vector<ReportStub::Call> visible = stub.calls(kVisible, out, mark);
                     const std::vector<ReportStub::Call> focus = stub.calls(kFocus, out, mark);
                     const std::vector<ReportStub::Call> sizes = stub.calls(kSize, out, mark);
-                    if (visible.empty() || visible.front().error != kUnknownOutput || focus.empty() ||
-                        focus.front().error != kUnknownOutput || sizes.empty() || sizes.front().error != kUnknownOutput) {
+                    if (!noticed) {
+                        notVerified("the restart-unknown phase", "the stub could not send ConfigChanged");
+                    } else if (visible.empty() || visible.front().error != kUnknownOutput || focus.empty() ||
+                               focus.front().error != kUnknownOutput || sizes.empty() ||
+                               sizes.front().error != kUnknownOutput) {
                         notVerified("the restart-unknown phase", "the first reports after the restart were not refused as "
                                                                  "UnknownOutput as staged (" +
                                                                      ReportStub::describe(stub.callsFor(out, mark)) + ")");

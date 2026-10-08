@@ -329,7 +329,10 @@ void DbusService::registerVTable() {
             // Exists because a report refused for sharing no layout with another consumer is not
             // refused for anything the caller can fix -- and a consumer that retried on its own
             // schedule would have to poll. This says "the answer may have changed", once.
-            sdbus::registerSignal("ImportModifiersChanged"))
+            sdbus::registerSignal("ImportModifiersChanged"),
+            // No parameters, for the same reason: a consumer reads /config again, and that answer
+            // is the whole of what changed. Sent for a wallpaper set and a screen named.
+            sdbus::registerSignal("ConfigChanged"))
         .forInterface(std::string(kInterface));
 }
 
@@ -354,6 +357,16 @@ void DbusService::applyImportModifierUpdate(const ImportModifierUpdate& update) 
     }
 }
 
+void DbusService::announceConfigChanged() {
+    try {
+        m_object->emitSignal("ConfigChanged").onInterface(kInterface);
+    } catch (const std::exception& e) {
+        // Not the call's failure: what it changed is recorded. A consumer shows the old answer
+        // until the next change or daemon restart.
+        std::fprintf(stderr, "wallpaperx-daemon: failed to emit ConfigChanged: %s\n", e.what());
+    }
+}
+
 void DbusService::emitFrameReady(int monitorId, uint64_t generation) {
     // Called on the render worker's thread when a frame commits, and on the event-loop thread
     // when a release frees an image. sdbus-c++ documents signal emission on IObject as
@@ -364,8 +377,8 @@ void DbusService::emitFrameReady(int monitorId, uint64_t generation) {
             .withArguments(static_cast<int32_t>(monitorId), generation);
     } catch (const std::exception& e) {
         // A failed emit must not escape into the worker thread, where it would be
-        // std::terminate. The frame itself is fine and GetFrame will still serve it;
-        // only the notification was lost, which a polling consumer recovers from.
+        // std::terminate. The frame itself is fine and GetFrame will still serve it; only
+        // the notification was lost, and a consumer shows its older frame until the next one.
         std::fprintf(stderr, "wallpaperx-daemon: failed to emit FrameReady(monitor=%d, generation=%llu): %s\n",
                      monitorId, static_cast<unsigned long long>(generation), e.what());
     }
@@ -397,6 +410,7 @@ void DbusService::setWallpaper(const char* method, const std::string& type, cons
     // needs its monitor's target released, and that is GPU work, so it belongs on the
     // worker rather than in this handler.
     m_worker.post(monitorId);
+    announceConfigChanged();
 }
 
 void DbusService::setWallpaperProperties(int32_t monitorId, const WireProperties& properties) {
@@ -444,8 +458,9 @@ void DbusService::setMonitorOutput(int32_t monitorId, const std::string& outputN
     std::fflush(stdout);
 
     std::vector<int> redraw;
+    bool rebound = false;
     try {
-        m_manager.setMonitorOutput(monitorId, outputName, redraw);
+        rebound = m_manager.setMonitorOutput(monitorId, outputName, redraw);
     } catch (const InvalidRequest& e) {
         std::fprintf(stderr, "wallpaperx-daemon: SetMonitorOutput rejected (monitor=%d): %s\n",
                      monitorId, e.what());
@@ -455,6 +470,8 @@ void DbusService::setMonitorOutput(int32_t monitorId, const std::string& outputN
         // A save that could not be queued undid the binding and owes none.
         for (const int id : redraw) m_worker.post(id);
         m_worker.wake();
+        // Which of the two it was is not known here, and a needless read costs a consumer little.
+        announceConfigChanged();
         // As SetWallpaper does: the save behind this can throw on a machine out of threads
         // or memory, and letting that escape the callback tells the client nothing.
         std::fprintf(stderr, "wallpaperx-daemon: SetMonitorOutput failed (monitor=%d): %s\n",
@@ -466,6 +483,7 @@ void DbusService::setMonitorOutput(int32_t monitorId, const std::string& outputN
     for (const int id : redraw) m_worker.post(id);
     // And its window report, whose loss can end a pause.
     m_worker.wake();
+    if (rebound) announceConfigChanged();
 }
 
 void DbusService::setOutputSize(const std::string& outputName, uint32_t width, uint32_t height) {

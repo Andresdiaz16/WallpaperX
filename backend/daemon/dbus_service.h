@@ -47,6 +47,11 @@ public:
 private:
     void registerVTable();
 
+    // Emits ConfigChanged: what the config server answers may have changed, so consumers read it
+    // again. Not at startup: the config server answers before the name is claimed, so the name's
+    // arrival is that notice.
+    void announceConfigChanged();
+
     // DBus method handlers. PLAN.md's DBus Interface section is the wire contract.
     //
     // Returns once the request is recorded and queued: a successful reply means "accepted",

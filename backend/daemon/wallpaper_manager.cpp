@@ -1197,10 +1197,11 @@ void WallpaperManager::setWallpaperProperties(int monitorId, const WallpaperProp
     }
 }
 
-void WallpaperManager::setMonitorOutput(int monitorId, const std::string& outputName, std::vector<int>& redraw) {
+bool WallpaperManager::setMonitorOutput(int monitorId, const std::string& outputName, std::vector<int>& redraw) {
     requireValidMonitorId(monitorId);
     requireValidOutputName(outputName);
 
+    BindResult bound = BindResult::Unchanged;
     {
         std::lock_guard<std::mutex> stateLock(m_stateMutex);
         // At most two monitors change size: this one, and the one the name leaves.
@@ -1220,10 +1221,9 @@ void WallpaperManager::setMonitorOutput(int monitorId, const std::string& output
         std::map<std::string, int> outputsBefore = m_outputs;
         std::set<std::string> notDrawnBefore = m_outputsNotDrawn;
         std::map<std::string, FocusReport> focusBefore = m_outputFocus;
-        BindResult bound = BindResult::Unchanged;
         try {
             bound = bindOutputLocked(monitorId, outputName);
-            if (bound == BindResult::Unchanged && m_writer.outcome().onDisk()) return;
+            if (bound == BindResult::Unchanged && m_writer.outcome().onDisk()) return false;
             // Before the kept name below is cleared, which changes nothing here: a name bound
             // live already wins over a kept row carrying it.
             queuePersist(m_kept.rowsToWrite(liveWallpapers()));
@@ -1263,6 +1263,7 @@ void WallpaperManager::setMonitorOutput(int monitorId, const std::string& output
         throw std::runtime_error(whyNot.empty() ? "the screen name did not reach the config file"
                                                 : whyNot);
     }
+    return bound != BindResult::Unchanged;
 }
 
 void WallpaperManager::setOutputSize(const std::string& outputName, uint32_t width, uint32_t height,

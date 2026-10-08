@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 // The pane Plasma shows under Wallpaper settings for a WallpaperX screen. It deliberately
-// offers no wallpaper controls: the daemon is the single source of truth and main.qml polls it,
+// offers no wallpaper controls: the daemon is the single source of truth and main.qml reads it,
 // so a picker here would be a second writer with nothing arbitrating between them -- a screen
 // could show one thing while Plasma believed another. What it does instead is say where the
 // configuration lives, and open it.

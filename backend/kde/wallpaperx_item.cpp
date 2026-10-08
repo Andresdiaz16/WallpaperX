@@ -111,10 +111,29 @@ int doubledWait(int baseMs, int times, int capMs) {
 // has recovered, if no window changes meanwhile.
 constexpr int kWindowRetryMaxMs = 60000;
 
+// Where a size report's retry stops doubling: the longest a screen can stay drawn at the wrong size
+// after a daemon that failed to take it has recovered.
+constexpr int kSizeRetryMaxMs = 8000;
+
 // A screen size reported before the daemon knows the screen's name. Ordinary while the app has
-// not named it, and answered by the next report once it has.
+// not named it, and answered by the report the naming's ConfigChanged sends.
 constexpr const char* kErrorUnknownOutput = "io.wallpaperx.Daemon.Error.UnknownOutput";
-constexpr const char* kErrorRenderFailed = "io.wallpaperx.Daemon.Error.RenderFailed";
+
+// What answers a refused size or window report. Absent and Unnamed end with an event: the daemon's
+// arrival, or the ConfigChanged that naming the screen sends. Permanent cannot be cured by sending
+// the same report again. Anything else -- a daemon too busy, a bus short of memory, an error this
+// plugin does not know -- has nothing that announces its end, so it is retried.
+enum class Refusal { Absent, Unnamed, Permanent, Retried };
+
+Refusal classifyRefusal(const QString& name) {
+    if (name == QLatin1String("org.freedesktop.DBus.Error.ServiceUnknown")) return Refusal::Absent;
+    if (name == QLatin1String(kErrorUnknownOutput)) return Refusal::Unnamed;
+    if (name == QLatin1String("org.freedesktop.DBus.Error.InvalidArgs") ||
+        name == QLatin1String("org.freedesktop.DBus.Error.UnknownMethod")) {
+        return Refusal::Permanent;
+    }
+    return Refusal::Retried;
+}
 
 // Long enough to cover a login's burst of layout and scale changes, short enough that a rotation
 // is redrawn before anyone looks for it.
@@ -905,6 +924,36 @@ void DaemonWatch::askWhoOwns() {
     });
 }
 
+namespace {
+
+// From any sender, unlike FrameReady: naming the service makes QtDBus resolve its owner before the
+// rule is in place. A forged one costs a /config read, never more than one at a time, and a size
+// report where one is owed. Not retried: for a new receiver connect() is false only on a disconnected
+// bus, never for a rule the bus refuses.
+void watchConfigChanged(QObject* receiver, const char* slot) {
+    if (!QDBusConnection::sessionBus().connect(QString(), QString::fromUtf8(kPath), QString::fromUtf8(kInterface),
+                                               QStringLiteral("ConfigChanged"), receiver, slot)) {
+        std::fprintf(stderr, "wallpaperx: could not subscribe to WallpaperX config changes -- %s\n",
+                     sanitizeForLog(QDBusConnection::sessionBus().lastError().message().toStdString()).c_str());
+    }
+}
+
+}  // namespace
+
+ConfigWatch::ConfigWatch(QObject* parent) : QObject(parent) {
+    watchConfigChanged(this, SIGNAL(configChanged()));
+    if (DaemonWatch* watch = DaemonWatch::instance()) {
+        // A departure too: the screen then says the daemon is not running.
+        connect(watch, &DaemonWatch::replaced, this, &ConfigWatch::configChanged);
+        // A daemon that took its name before the watch's rule reached the bus is heard of only here,
+        // and main.qml's first read may have gone before its port was open. An empty answer is a
+        // daemon still absent, which that read already reported.
+        connect(watch, &DaemonWatch::named, this, [this](const QString& owner) {
+            if (!owner.isEmpty()) emit configChanged();
+        });
+    }
+}
+
 WallpaperXItem::PendingFrame::~PendingFrame() {
     closeDescriptors(request);
     releaseUnimported(claims, claim);
@@ -1010,8 +1059,8 @@ void WallpaperXItem::setOutput(const QString& output) {
     emit outputChanged();
     scheduleSizeReport();
     // Not after the size report, which waits to settle: the daemon places these by name alone, and
-    // a video stays stopped until it hears this screen is visible. An unknown-name refusal re-arms
-    // the size report.
+    // a video stays stopped until it hears this screen is visible. An unknown-name refusal reopens
+    // the size report, which the screen's naming sends.
     reportVisible();
     restartWindowRetry();
     reportWindows();
@@ -1176,10 +1225,9 @@ void WallpaperXItem::reportVisible() {
         const QString name = done->error().name();
         if (name == QLatin1String(kErrorUnknownOutput)) {
             // The size report's success is what says the daemon can place this screen, and it is
-            // not sent again while the size has not changed -- so the retry it already has for an
-            // unnamed screen is re-opened here rather than left suppressed.
+            // not sent again while the size has not changed -- so it is reopened here, to go with
+            // the ConfigChanged that naming the screen sends.
             m_sizeReported.reset();
-            if (!m_sizeReportTimer.isActive()) m_sizeReportTimer.start(kRefusedRetryMs);
             return;
         }
         // No daemon: its arrival reports again, through the owner watcher.
@@ -1216,31 +1264,27 @@ void WallpaperXItem::reportWindows() {
         if (m_windowsReported != report) return;
         m_windowsReported.reset();
         const QString name = done->error().name();
+        const Refusal refusal = classifyRefusal(name);
         // No daemon, or one older than this call: a new owner reports again, and an old daemon has
         // no pause setting for the report to serve. Neither is logged -- this follows every focus
         // change.
-        if (name == QLatin1String("org.freedesktop.DBus.Error.ServiceUnknown") ||
-            name == QLatin1String("org.freedesktop.DBus.Error.UnknownMethod")) {
+        if (refusal == Refusal::Absent || name == QLatin1String("org.freedesktop.DBus.Error.UnknownMethod")) {
             return;
         }
-        // Not logged, and retried through the size report as visibility is: its success is the only
+        // Not logged, and resent through the size report as visibility is: its success is the only
         // sign the daemon knows the name again.
-        if (name == QLatin1String(kErrorUnknownOutput)) {
+        if (refusal == Refusal::Unnamed) {
             m_sizeReported.reset();
-            if (!m_sizeReportTimer.isActive()) m_sizeReportTimer.start(kRefusedRetryMs);
             return;
         }
-        const bool transient = name == QLatin1String(kErrorRenderFailed) ||
-                               name == QLatin1String("org.freedesktop.DBus.Error.NoReply") ||
-                               name == QLatin1String("org.freedesktop.DBus.Error.Timeout");
         // A refusal that does not clear repeats with every retry, so a run of them is logged once.
-        if (!transient || m_windowRetryMs == kRefusedRetryMs) {
+        if (refusal == Refusal::Permanent || m_windowRetryMs == kRefusedRetryMs) {
             std::fprintf(stderr, "wallpaperx: the daemon refused this screen's window state -- %s\n",
                          sanitizeForLog(done->error().message().toStdString()).c_str());
         }
         // Its own retry, backed off. Not the size report's: the daemon can go on accepting that while
         // refusing this, which would resend both every interval for the session.
-        if (transient) {
+        if (refusal == Refusal::Retried) {
             m_windowReportTimer.start(m_windowRetryMs);
             m_windowRetryMs = std::min(m_windowRetryMs * 2, kWindowRetryMaxMs);
         }
@@ -1277,6 +1321,7 @@ void WallpaperXItem::reportSize() {
     connect(watcher, &QDBusPendingCallWatcher::finished, this, [this, report](QDBusPendingCallWatcher* done) {
         done->deleteLater();
         if (!done->isError()) {
+            m_sizeRefusals.reset();
             // The daemon answers to this screen by name now, which is what a visibility report
             // needs and the only thing that says when it has one -- so this is where a report the
             // daemon could not place is sent again.
@@ -1286,26 +1331,29 @@ void WallpaperXItem::reportSize() {
         }
         // Nothing to undo once a newer report has replaced this one.
         if (!(m_sizeReported == report)) return;
-        m_sizeReported.reset();
 
-        const QString name = done->error().name();
-        // The daemon's arrival reports again, through the owner watcher.
-        if (name == QLatin1String("org.freedesktop.DBus.Error.ServiceUnknown")) return;
-        // Ordinary until the app names the screen, so not logged. This item exists only while
-        // /config says the name is bound, so its retries end with it.
-        const bool unnamed = name == QLatin1String(kErrorUnknownOutput);
-        // Only what a resend can fix: an unnamed screen, a save that could not be queued, a daemon
-        // too busy to answer. Anything else stands until the daemon or the screen changes, and
-        // both of those report again on their own.
-        const bool transient = unnamed || name == QLatin1String(kErrorRenderFailed) ||
-                               name == QLatin1String("org.freedesktop.DBus.Error.NoReply") ||
-                               name == QLatin1String("org.freedesktop.DBus.Error.Timeout");
-        if (!unnamed) {
+        const Refusal refusal = classifyRefusal(done->error().name());
+        // Not logged: an unnamed screen is ordinary until the app runs.
+        if (refusal == Refusal::Absent || refusal == Refusal::Unnamed) {
+            m_sizeReported.reset();
+            return;
+        }
+        const bool retried = refusal == Refusal::Retried;
+        const int times = retried && m_sizeRefusals && m_sizeRefusals->report == report ? m_sizeRefusals->times + 1 : 0;
+        // A run of retries is logged once: each would repeat the line.
+        if (times == 0) {
             std::fprintf(stderr, "wallpaperx: the daemon refused this screen's size -- %s\n",
                          sanitizeForLog(done->error().message().toStdString()).c_str());
         }
+        // Refused again while the size and the daemon stay as they are, so the record stays: only a
+        // change of either sends it.
+        if (!retried) return;
+        m_sizeReported.reset();
+        m_sizeRefusals = SizeRefusals{report, times};
         // A trigger already pending goes sooner.
-        if (transient && !m_sizeReportTimer.isActive()) m_sizeReportTimer.start(kRefusedRetryMs);
+        if (!m_sizeReportTimer.isActive()) {
+            m_sizeReportTimer.start(doubledWait(kRefusedRetryMs, times, kSizeRetryMaxMs));
+        }
     });
 }
 
@@ -1426,13 +1474,16 @@ void WallpaperXItem::connectToDaemon() {
     // constructor. Nothing here waits on the bus.
     m_subscribed = subscribeToFrameReady();
     subscribeToImportModifiersChanged();
+    watchConfigChanged(this, SLOT(onConfigChanged()));
     // No early return on failure: an item that cannot hear FrameReady must still notice the
     // daemon arriving or leaving, and the watcher below is the only thing that can retry.
     if (!m_subscribed) publishReason();
 
     // The item is created with the desktop, so the daemon may not own its name yet.
     if (DaemonWatch* watch = DaemonWatch::instance()) {
-        // The first owner known. Nothing has been asked before it -- fetchFrame() waits for it.
+        // The first owner known. Nothing has been asked before it -- fetchFrame() waits for it. The
+        // reports need nothing here: a report needs an output, which comes after this constructor
+        // put the watch's rule on the bus, so a daemon that refused one as absent arrives as a change.
         connect(watch, &DaemonWatch::named, this, [this](const QString& owner) {
             if (owner.isEmpty()) {
                 setFetchReason(tr("WallpaperX is not running."));
@@ -1446,6 +1497,8 @@ void WallpaperXItem::connectToDaemon() {
         });
         connect(watch, &DaemonWatch::replaced, this, [this](const QString& newOwner) {
             m_sizeReported.reset();
+            // The old daemon's refusals: the new one's first is logged and retried at the first delay.
+            m_sizeRefusals.reset();
             // A new daemon takes every screen to be drawn until it is told otherwise, and one
             // that has gone remembers nothing.
             m_visibleReported.reset();
@@ -1469,13 +1522,14 @@ void WallpaperXItem::connectToDaemon() {
             }
             scheduleSizeReport();
             // Sent now, as setOutput does: the size report has failures it never retries, and a
-            // name the new daemon does not know yet is refused as UnknownOutput, which re-arms it.
+            // name the new daemon does not know yet is refused as UnknownOutput, sent again once
+            // ConfigChanged says it has been named.
             // Visibility only from the screen, as reportWindows() gates itself: an item off it
             // still holds the name, and its "not visible" would override a copy showing it.
             if (m_onScreen) reportVisible();
             reportWindows();
-            // Gated: an unconditional retry would add a duplicate match rule per restart,
-            // which is one of the things that makes the subscription fail in the first place.
+            // Gated: QtDBus refuses a repeat of a connection already held, and that false would
+            // clear m_subscribed and put the "could not subscribe" message over a working wallpaper.
             if (!m_subscribed) m_subscribed = subscribeToFrameReady();
             g_modifiersReported.store(false);
             fetchFrame(0);
@@ -1483,6 +1537,11 @@ void WallpaperXItem::connectToDaemon() {
     }
 
     if (m_monitorId >= 0) fetchFrame(0);
+}
+
+// A size already reported is not sent again, and one waiting to settle or to be retried goes then.
+void WallpaperXItem::onConfigChanged() {
+    if (!m_sizeReportTimer.isActive()) reportSize();
 }
 
 void WallpaperXItem::onFrameReady(int monitorId, qulonglong generation) {

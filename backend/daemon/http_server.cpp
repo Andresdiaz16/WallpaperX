@@ -140,7 +140,7 @@ HttpServer::HttpServer(WallpaperManager& manager, int port)
     m_server->set_write_timeout(kIoTimeoutSeconds, kIoTimeoutMicroseconds);
 
     // httplib's default sets SO_REUSEPORT, which lets another process of the same user bind
-    // alongside the daemon and take a share of the plugin's polls. SO_REUSEADDR is exclusive
+    // alongside the daemon and take a share of the plugin's requests. SO_REUSEADDR is exclusive
     // and still rebinds over TIME_WAIT. Reported rather than ignored: this callback replaces
     // httplib's default, so a silent failure leaves the socket with neither, surfacing later
     // as a bind refused over TIME_WAIT -- which reads as a stale socket, not as this.
@@ -253,8 +253,8 @@ void HttpServer::registerRoutes() {
             if (known) monitorId = bound->second;
         }
 
-        // An unset monitor answers with empty strings rather than 404: the plugin polls
-        // every second from startup, and "no wallpaper yet" is ordinary, not an error.
+        // An unset monitor answers with empty strings rather than 404: the plugin asks from
+        // startup, and "no wallpaper yet" is ordinary, not an error.
         nlohmann::json out{
             {"monitor_id", monitorId}, {"type", ""}, {"path", ""}, {"path_literal", ""}};
 

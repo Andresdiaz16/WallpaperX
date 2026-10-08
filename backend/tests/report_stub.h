@@ -197,4 +197,11 @@ inline bool restartDaemonName(QDBusConnection& bus, int gapMs = 100) {
     return gone && bus.registerService(QString::fromUtf8(kService));
 }
 
+// The daemon's ConfigChanged, sent from the stub's connection as the daemon sends it: a broadcast
+// on its path and interface. False when the bus would not take it.
+inline bool announceConfigChanged(QDBusConnection& bus) {
+    return bus.send(QDBusMessage::createSignal(QString::fromUtf8(kPath), QString::fromUtf8(kInterface),
+                                               QStringLiteral("ConfigChanged")));
+}
+
 }  // namespace wallpaperx::testing

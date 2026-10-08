@@ -23,6 +23,21 @@ class QDBusMessage;
 
 namespace wallpaperx {
 
+// Says when what the daemon's /config answers may have changed, so main.qml asks only then: the
+// daemon announced a change, the first lookup of its bus name found an owner, or the name changed
+// owner -- a daemon arriving, leaving or replaced. main.qml asks once at startup on its own; this
+// reports what comes after its creation. GUI thread.
+class ConfigWatch : public QObject {
+    Q_OBJECT
+    QML_NAMED_ELEMENT(WallpaperXConfigWatch)
+
+public:
+    explicit ConfigWatch(QObject* parent = nullptr);
+
+signals:
+    void configChanged();
+};
+
 // The item that puts a daemon-rendered frame on the desktop.
 //
 // Three threads meet here and the split is the whole design:
@@ -191,6 +206,10 @@ private slots:
     // process does not control.
     void onImportModifiersChanged();
 
+    // ConfigChanged() from the daemon, on the GUI thread: a screen may have been named, which is
+    // what a size refused as UnknownOutput waits for.
+    void onConfigChanged();
+
 private:
     // A frame fetched but not yet imported. Owns its fd until the render thread takes it: if
     // this is destroyed with one still in it, the fd is closed here rather than leaked, since a
@@ -349,10 +368,20 @@ private:
     // Settles the size before it is reported: a login lays the item out, exposes the window and
     // applies its scale in quick succession, and every intermediate size costs the daemon a redraw.
     QTimer m_sizeReportTimer;
-    // The last report sent and not refused, so an unchanged size is not sent again. Forgotten
-    // wherever the daemon may have lost it: a restart, or a monitor change, which can mean the
-    // name was unbound and bound again in between. GUI thread only.
+    // The last report sent, so an unchanged size is not sent again -- one refused for its
+    // arguments included. Forgotten when a resend could succeed: a refusal a later event or a
+    // retry can cure, a restart, or a monitor change, which can mean the name was unbound and bound
+    // again in between. Empty, it is sent at the next trigger, ConfigChanged among them. GUI thread
+    // only.
     std::optional<SizeReport> m_sizeReported;
+    // The report a run of retried refusals is about, and how many it has had, which doubles the
+    // wait before the next resend. A different report starts a new run; a success ends it. GUI
+    // thread only.
+    struct SizeRefusals {
+        SizeReport report;
+        int times = 0;
+    };
+    std::optional<SizeRefusals> m_sizeRefusals;
 
     // Whether this item is in a window and visible, which is Qt's answer, and whether the scene
     // graph is actually painting it, which is the compositor's -- Qt goes on calling an occluded

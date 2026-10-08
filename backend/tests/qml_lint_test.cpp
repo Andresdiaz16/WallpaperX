@@ -507,11 +507,35 @@ const std::string g_qmlModulePath = WALLPAPERX_QML_MODULE_PATH;
 const std::string g_qmlModulePath;
 #endif
 
+// Qt's own QML directory, where QtQuick and the Plasma modules live -- and where a system-wide
+// install of this project's com.wallpaperx lands. Empty when the build did not know it.
+#ifdef WALLPAPERX_QT_QML_IMPORT_DIR
+const std::string g_qtQmlImportDir = WALLPAPERX_QT_QML_IMPORT_DIR;
+#else
+const std::string g_qtQmlImportDir;
+#endif
+
+// GOAL: com.wallpaperx is resolved from this build tree, never from a copy installed on the host.
+//       False if the linter reads the installed module's type information: the files are then
+//       graded against whatever version was last installed, and a type this tree added is "not
+//       found" -- or a type it removed is still found.
+// WHY-THIS-SHAPE: `--bare` and the two directories in order, build tree first. A plain `-I <build>`
+//       is the obvious form and is what failed: qmllint searches its default import directories
+//       ahead of it, so the host's /usr/lib/qt6/qml copy won.
+// CONTROL: test-side, by hand 2026-10-07, `--bare` and the Qt directory dropped (back to the plain
+//       `-I <build>`) on a host whose installed module predates WallpaperXConfigWatch ->
+//       qml_lint_surface Skipped: "cannot resolve a module contents/ui/ConfigWatch.qml imports" and
+//       its verdict withheld. Restored.
 LintReport lintFile(const std::filesystem::path& file, std::string& hostProblem) {
     std::vector<std::string> argv{g_qmllint, "--ignore-settings", "--json", "-"};
     if (!g_qmlModulePath.empty()) {
+        if (!g_qtQmlImportDir.empty()) argv.emplace_back("--bare");
         argv.emplace_back("-I");
         argv.push_back(g_qmlModulePath);
+        if (!g_qtQmlImportDir.empty()) {
+            argv.emplace_back("-I");
+            argv.push_back(g_qtQmlImportDir);
+        }
     }
     argv.push_back(file.string());
     const ProcessResult run = runCapturingStdout(argv);
@@ -587,6 +611,9 @@ constexpr ProbeType kSurfaceProbeTypes[] = {
     {"Item", "QtQuick"},
     {"WallpaperXRenderer", "com.wallpaperx"},
 };
+constexpr ProbeType kWatchProbeTypes[] = {
+    {"WallpaperXConfigWatch", "com.wallpaperx"},
+};
 constexpr ProbeType kConfigProbeTypes[] = {
     {"Item", "QtQuick"},
     {"Control", "QtQuick.Controls"},
@@ -618,6 +645,12 @@ constexpr PackageQmlFile kPackageQml[] = {
     // the module's build-tree path above.
     {"contents/ui/WallpaperSurface.qml", "import QtQuick\nimport com.wallpaperx\n", kSurfaceProbeTypes,
      std::size(kSurfaceProbeTypes), "surface", true},
+    // GOAL: the change watch's file is linted like the rest, with the linter proven to read this
+    //       tree's WallpaperXConfigWatch first.
+    // CONTROL: a bogus root property (`bogusProperty: 1`) added to backend/kde/kpackage/contents/ui/
+    //       ConfigWatch.qml -> "FAIL: ... ConfigWatch.qml passes qmllint -W0" in qml_lint_surface.
+    {"contents/ui/ConfigWatch.qml", "import com.wallpaperx\n", kWatchProbeTypes, std::size(kWatchProbeTypes), "watch",
+     true},
     {"contents/ui/config.qml",
      "import QtQuick\nimport QtQuick.Controls\nimport QtQuick.Layouts\n"
      "import org.kde.kirigami\nimport org.kde.plasma.plasma5support\n",

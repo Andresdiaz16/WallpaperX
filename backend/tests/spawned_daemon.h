@@ -599,6 +599,21 @@ public:
         }
     }
 
+    // Writes `marker` into the capture stream from this process's side and waits for the reader to
+    // read it back. The stream is first in, first out, so on true everything that had reached the
+    // capture stream before the call is in output(). That is not everything the daemon wrote: its log
+    // pump (backend/daemon/log_pump.h) stands between its descriptors and this stream, and can still
+    // hold lines in its own pipe or memory, even with the daemon stopped. False if no writer could be
+    // had, the write fell short, or the marker was not read within `timeout`.
+    bool syncCapture(std::string_view marker, Clock::duration timeout) const {
+        const int writer = captureWriter(nullptr);
+        if (writer < 0) return false;
+        const std::string line = std::string(marker) + "\n";
+        const ssize_t n = write(writer, line.data(), line.size());
+        close(writer);
+        return n == static_cast<ssize_t>(line.size()) && waitForOutput(marker, timeout);
+    }
+
     // Stops draining the capture stream until resumeCapture(), so it can be filled and the daemon's
     // output made a reader that stopped reading. Returns once the reader thread has read for the
     // last time; false if it did not confirm within 2 s. While held, output is not captured and

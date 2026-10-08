@@ -71,6 +71,7 @@
 #include <netinet/in.h>
 #include <poll.h>
 #include <signal.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
@@ -2228,7 +2229,8 @@ bool primeTeardownWedge(sdbus::IProxy& proxy, const std::string& clip, std::stri
 //       backend/daemon/main.cpp -> "FAIL: a daemon whose teardown blocks still ends, rather than
 //       having to be killed", "still running 30.0 s after its bus was destroyed ...", alone; the
 //       escalation phase below stayed green. Observed 2026-09-26 via control_run.sh on NVIDIA.
-//       Reverted.
+//       Re-run 2026-10-08 with armBeforeHttp moved before the name claim, --phase
+//       stuckTeardownIsBounded: the same line alone, 30.1 s. Reverted.
 // COVERAGE-ASSERT: the wedge's own line must be in the output, or NOT VERIFIED: an unstuck stop
 //       exits promptly and would read green.
 void checkStuckTeardownIsBounded(const std::string& validationEnv, const std::string& clip, const Check& check) {
@@ -3289,6 +3291,101 @@ void checkChosenConfigPort(NameWatcher& names, const std::string& validationEnv,
     }
     daemon.shutdown(SIGTERM);
     awaitNameRelease(names, "the HTTP lifecycle phase");
+}
+
+// GOAL: S15.398 -- the config port answers /config the moment the daemon's bus name appears, and the
+//       daemon sends no ConfigChanged at startup. False if a plugin reading /config at the name's
+//       arrival can find the port closed (it shows "not running" until some later change), or if a
+//       startup announcement makes every plugin read /config a second time for nothing.
+// WHY-THIS-SHAPE: tests/wedge_shim.cpp delays the playing record's creation by 1.5 s, a step taken
+//       after the name is claimed and before the event loop, so a port bound after the claim is still
+//       closed when the name appears for certain, not for microseconds. "None at startup" is read as
+//       exactly one ConfigChanged, 1 s after a barrier SetMonitorOutput's own: a startup one leaves the
+//       same connection before the barrier's, so it cannot arrive after it, and a correct daemon can
+//       never reach two. The listener matches ConfigChanged from any sender, as the plugin subscribes,
+//       and is in place before the daemon starts: a proxy addressed to the well-known name hears
+//       nothing sent before the name is claimed. Only the daemon sends ConfigChanged on this bus.
+// CONTROL: via control_run.sh 2026-10-08, --phase configChangedAtStartup, each reverted. In serve()
+//       (backend/daemon/main.cpp) the HttpServer and armBeforeHttp moved to just after the claim block
+//       -> "the config port answers /config the moment the daemon's bus name appears" alone, the
+//       barrier taking 3001 ms. `announceConfigChanged();` added at the end of
+//       DbusService::renderRestored (backend/daemon/dbus_service.cpp) -> "the daemon sends no
+//       ConfigChanged at startup" alone, seen 2 times. The same added to DbusService::restoreSaved,
+//       which runs before the claim -> the same line alone, seen 2 times.
+// COVERAGE-ASSERT: the barrier, sent right after /config answered, must take at least 750 ms to be
+//       answered -- it cannot be served before the event loop runs -- or the read may have come after
+//       the delay and the phase is not verified.
+void checkConfigChangedAtStartup(NameWatcher& names, const std::string& validationEnv, const Check& check) {
+    constexpr const char* kGoal = "S15.398 (/config answers when the name appears; no ConfigChanged at startup)";
+    constexpr auto kInsideDelay = std::chrono::milliseconds(750);
+    const int port = unusedLoopbackPort();
+    if (port < 0) {
+        notVerified(kGoal, "no free loopback port could be found for this phase's daemon");
+        return;
+    }
+
+    // Written on the listener's dispatch thread; declared before the listener, so it outlives it.
+    struct Seen {
+        std::mutex mutex;
+        std::condition_variable arrived;
+        int count = 0;
+    } seen;
+    // Its event-loop thread stops when the connection is destroyed, before `seen` is.
+    auto listener = sdbus::createSessionBusConnection();
+    listener->addMatch(std::string("type='signal',path='") + DbusService::kObjectPath + "',interface='" +
+                           DbusService::kInterface + "',member='ConfigChanged'",
+                       [&seen](sdbus::Message) {
+                           {
+                               std::lock_guard<std::mutex> lock(seen.mutex);
+                               ++seen.count;
+                           }
+                           seen.arrived.notify_all();
+                       });
+    listener->enterEventLoopAsync();
+    const auto waitForCount = [&seen](int atLeast, std::chrono::seconds patience) {
+        std::unique_lock<std::mutex> lock(seen.mutex);
+        return seen.arrived.wait_for(lock, patience, [&] { return seen.count >= atLeast; });
+    };
+    const auto count = [&seen] {
+        std::lock_guard<std::mutex> lock(seen.mutex);
+        return seen.count;
+    };
+
+    SpawnedDaemon daemon(
+        {validationEnv, preloading(WALLPAPERX_WEDGE_SHIM), "WALLPAPERX_TEST_DELAY_PLAYING_OPEN_MS=1500"},
+        SpawnedDaemon::Stdout::Captured, {}, 0, configPortArgs(port));
+    if (!names.waitFor(true)) {
+        if (!reportedStartupFault(daemon, kGoal)) notVerified(kGoal, "the daemon never acquired the bus name");
+        return;
+    }
+    httplib::Client cli = wallpaperx::testing::makeClient(port);
+    const bool answered = wallpaperx::testing::get(cli, "/config?output=DP-STARTUP").ok();
+    const auto answeredAt = Clock::now();
+
+    auto proxy =
+        sdbus::createProxy(sdbus::ServiceName{DbusService::kBusName}, sdbus::ObjectPath{DbusService::kObjectPath});
+    const std::string named =
+        wallpaperx::testing::errorNameFrom([&] { wallpaperx::testing::setMonitorOutput(*proxy, 0, "DP-STARTUP"); });
+    const auto barrierTook = Clock::now() - answeredAt;
+    if (barrierTook < kInsideDelay) {
+        notVerified(kGoal, "the barrier SetMonitorOutput was answered " +
+                               std::to_string(static_cast<long long>(millis(barrierTook))) +
+                               " ms after /config, so the read may have come after the staged delay rather than "
+                               "inside it");
+    } else {
+        check(answered, "the config port answers /config the moment the daemon's bus name appears");
+        if (!named.empty() || !waitForCount(1, std::chrono::seconds(5))) {
+            notVerified("S15.398's no-startup-announcement clause",
+                        "the barrier SetMonitorOutput answered '" + named + "' or was not announced within 5 s");
+        } else {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            check(count() == 1, "the daemon sends no ConfigChanged at startup");
+        }
+        std::fprintf(stderr, "  /config %s at the name; the barrier took %.0f ms; ConfigChanged seen %d time(s)\n",
+                     answered ? "answered" : "did not answer", millis(barrierTook), count());
+    }
+    daemon.shutdown(SIGTERM);
+    awaitNameRelease(names, "the startup-announcement phase");
 }
 
 void checkHttpLifecycle(NameWatcher& names, const std::string& bluePath, const std::string& validationEnv,
@@ -5528,18 +5625,71 @@ void checkStopBeforeClaiming(NameWatcher& names, const std::string& validationEn
                 std::size(kDelays), beforeClaim, afterClaim, tooEarly);
 }
 
-void checkShutdownDuringStartup(NameWatcher& names, const std::string& validationEnv, const Check& check) {
-    using wallpaperx::testing::ConnectResult;
-    using wallpaperx::testing::describe;
-    using wallpaperx::testing::tryConnect;
+// For a stopped daemon: why it cannot be shown that its log pump (backend/daemon/log_pump.cpp) holds
+// none of what the daemon wrote, or empty when it can. Shown means the pipe on the daemon's stdout is
+// empty, and the pump thread -- the one thread polling that pipe's read end -- is blocked in the poll
+// that starts a pass, with no write pending, so everything it had read has gone on to the capture.
+// Reading another process's syscall and memory needs ptrace access; refused, it is not shown.
+std::string logPumpUnproven(pid_t pid) {
+    const std::string proc = "/proc/" + std::to_string(pid);
+    std::error_code ec;
+    const std::string pipe = std::filesystem::read_symlink(proc + "/fd/1", ec).string();
+    if (ec || pipe.rfind("pipe:", 0) != 0) return "its stdout is not a pipe /proc names";
+    const int reader = ::open((proc + "/fd/1").c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    if (reader < 0) return "its stdout pipe could not be opened through /proc";
+    int queued = -1;
+    const int asked = ::ioctl(reader, FIONREAD, &queued);
+    ::close(reader);
+    if (asked != 0) return "its stdout pipe's fill could not be read";
+    if (queued != 0) return "its stdout pipe still held " + std::to_string(queued) + " byte(s)";
 
+    const int mem = ::open((proc + "/mem").c_str(), O_RDONLY | O_CLOEXEC);
+    if (mem < 0) return "its memory could not be read";
+    int pumps = 0;
+    bool writing = false;
+    for (const auto& task : std::filesystem::directory_iterator(proc + "/task", ec)) {
+        std::ifstream in(task.path() / "syscall");
+        std::string number, fdsArg, countArg;
+        if (!(in >> number >> fdsArg >> countArg)) continue;  // "running", or blocked outside a call
+        const long call = std::strtol(number.c_str(), nullptr, 10);
+        bool polling = call == SYS_ppoll;
+#ifdef SYS_poll
+        polling = polling || call == SYS_poll;
+#endif
+        if (!polling) continue;
+        const unsigned long long fdsAt = std::strtoull(fdsArg.c_str(), nullptr, 16);
+        const unsigned long long count = std::strtoull(countArg.c_str(), nullptr, 16);
+        if (count == 0 || count > 16) continue;
+        std::vector<pollfd> fds(count);
+        const auto bytes = static_cast<ssize_t>(count * sizeof(pollfd));
+        if (::pread(mem, fds.data(), static_cast<size_t>(bytes), static_cast<off_t>(fdsAt)) != bytes) continue;
+        bool readsThePipe = false;
+        bool writes = false;
+        for (const pollfd& p : fds) {
+            std::error_code linkEc;
+            const std::string target = std::filesystem::read_symlink(proc + "/fd/" + std::to_string(p.fd), linkEc).string();
+            if (!linkEc && target == pipe && (p.events & POLLIN) != 0) readsThePipe = true;
+            if ((p.events & POLLOUT) != 0) writes = true;
+        }
+        if (!readsThePipe) continue;
+        ++pumps;
+        writing = writes;
+    }
+    ::close(mem);
+    if (ec) return "its threads could not be listed";
+    if (pumps != 1) return "no thread was blocked between passes polling its stdout pipe (the pump was mid-pass)";
+    if (writing) return "the pump was waiting to write output it held";
+    return {};
+}
+
+void checkShutdownDuringStartup(NameWatcher& names, const std::string& validationEnv, const Check& check) {
     constexpr const char* kGoal =
         "S8.20 (a shutdown signal that arrives before the event loop starts still stops the daemon)";
     constexpr int kAttempts = 12;
     constexpr std::size_t kConfigBytes = 1000000;
-    // The port whose refused connect says "not yet serving", so it must be one only this
-    // phase's daemon would ever bind: a daemon of the developer's on 18462 answers connects
-    // from a loop of its own and would hide every window.
+    // Printed and flushed after the startup steps that follow the claim, and before the loop gate.
+    const std::string servingLine = std::string("serving ") + DbusService::kBusName + " at";
+    // A port of this phase's own, so its daemon never reaches for the default one.
     const int kPort = unusedLoopbackPort();
     if (kPort < 0) {
         notVerified(kGoal, "no free loopback port could be found for this phase's daemon");
@@ -5567,13 +5717,15 @@ void checkShutdownDuringStartup(NameWatcher& names, const std::string& validatio
     //       leaveEventLoop() only for a loop already entered, so main must see the recorded stop
     //       and not enter the loop at all.
     //       The window is entered by force rather than by luck. SIGSTOP freezes the daemon
-    //       where it stands; a connect() to its port is then answered by the KERNEL, so it
-    //       still discriminates on a process that cannot run -- refused means the HttpServer
-    //       constructor has not completed, and that constructor runs before
-    //       enterEventLoop(). Only then is SIGTERM queued and SIGCONT sent. The obvious
-    //       simpler version -- signal as soon as the name appears and hope -- cannot tell
-    //       which side of the loop it landed on, so it would grade an ordinary shutdown and
-    //       report it as this one.
+    //       where it stands; a marker is then written into its capture pipe from this side and
+    //       read back (syncCapture), so everything that reached the capture is in hand -- and
+    //       logPumpUnproven() must show the daemon's log pump held nothing back, or the attempt
+    //       is inconclusive, never in the window. No "serving ... at" line then means it stopped
+    //       before the loop gate. Only then is
+    //       SIGTERM queued and SIGCONT sent. The port cannot be the witness: it is bound before
+    //       the name is claimed. The obvious simpler version -- signal as soon as the name
+    //       appears and hope -- cannot tell which side of the loop it landed on, so it would
+    //       grade an ordinary shutdown and report it as this one.
     //       The fixture is what makes that freeze land often enough to be usable, and it has
     //       to be a config whose cost falls AFTER the name: the config read and the restore
     //       both run before requestName(), so a merely large valid config lengthens the
@@ -5593,15 +5745,24 @@ void checkShutdownDuringStartup(NameWatcher& names, const std::string& validatio
     //       reddens the SIGINT and SIGHUP phases' exit and destructor lines, which signal as soon
     //       as the name appears and land in this window by accident, and the config-repair phase's
     //       exit; the SIGTERM phase, which does work first, stays green. Observed 2026-09-24 via
-    //       control_run.sh, those seven lines. Reverted.
-    // COVERAGE-ASSERT: an attempt counts only when the connect said refused while the
-    //       daemon was stopped. If no attempt in six lands in the window -- another process
-    //       took the port, or this host starts the daemon faster than the harness can freeze
-    //       it -- the phase reports NOT VERIFIED and grades nothing, rather than passing on
-    //       shutdowns that all happened from inside the loop.
+    //       control_run.sh, those seven lines. Reverted. Re-run with the serving-line witness
+    //       2026-10-08 via control_run.sh, --phase shutdownDuringStartup: "exits 0" (exit code 1)
+    //       and "still runs its destructor chain" red, caught on attempt 1 of 12. Reverted.
+    // CONTROL: test-side, by hand 2026-10-08: logPumpUnproven() made to return a reason always ->
+    //       every attempt inconclusive, "NOT VERIFIED -- ... (the last: its log writer may still have
+    //       held output: ...)", no FAIL line and nothing graded. Restored. A real held state, via
+    //       control_run.sh: `::usleep(300000);` before writeAll() in Pump::pass
+    //       (backend/daemon/log_pump.cpp) -> NOT VERIFIED, the last of 12 attempts "the pump was
+    //       mid-pass" with no serving line captured: one the serving line alone would have graded.
+    // COVERAGE-ASSERT: an attempt counts only when the capture was read back up to the freeze,
+    //       the log pump held nothing, and no serving line was seen. If no attempt in twelve lands in the window -- this host
+    //       starts the daemon faster than the harness can freeze it -- the phase reports NOT
+    //       VERIFIED and grades nothing, rather than passing on shutdowns that all happened from
+    //       inside the loop.
     int inWindow = 0;
     int attemptsUsed = 0;
-    std::string lastPortAnswer = "not probed";
+    int pumpUnproven = 0;
+    std::string lastWitness = "not probed";
     for (int attempt = 0; attempt < kAttempts && inWindow == 0; ++attempt) {
         ++attemptsUsed;
         // The copy each attempt makes would occupy the next attempt's target name, and the
@@ -5623,9 +5784,18 @@ void checkShutdownDuringStartup(NameWatcher& names, const std::string& validatio
 
         const pid_t pid = daemon.pid();
         const bool frozen = pid > 0 && ::kill(pid, SIGSTOP) == 0;
-        const ConnectResult port = frozen ? tryConnect("127.0.0.1", kPort, 500) : ConnectResult::Failed;
-        lastPortAnswer = describe(port);
-        const bool beforeLoop = frozen && port == ConnectResult::Refused;
+        const bool readBack =
+            frozen && daemon.syncCapture("daemon_system_test: capture marker, attempt " + std::to_string(attempt + 1),
+                                         std::chrono::seconds(5));
+        const bool serving = readBack && daemon.output().find(servingLine) != std::string::npos;
+        const std::string pumpHeld = readBack && !serving ? logPumpUnproven(pid) : std::string();
+        if (!pumpHeld.empty()) ++pumpUnproven;
+        lastWitness = !frozen            ? "the daemon could not be stopped"
+                      : !readBack         ? "its output could not be read back up to the freeze"
+                      : serving           ? "it had already printed its serving line"
+                      : !pumpHeld.empty() ? "its log writer may still have held output: " + pumpHeld
+                                          : "frozen before its serving line";
+        const bool beforeLoop = readBack && !serving && pumpHeld.empty();
 
         // Queued while the process is stopped, so it is provably delivered to a daemon that
         // had not reached enterEventLoop(); SIGCONT is what lets it be acted on.
@@ -5646,16 +5816,6 @@ void checkShutdownDuringStartup(NameWatcher& names, const std::string& validatio
         // second one would let a daemon that ignored the first pass on the second.
         const int exitCode = daemon.waitForExit();
         const std::string output = daemon.output();
-
-        // The refused connect is evidence only for a daemon that was going to bind that
-        // port. One that could not bind it at all -- another process took it -- answers
-        // refused from inside its event loop just as it does before reaching it, which would
-        // let this phase grade an ordinary shutdown and report it as a startup-window one.
-        if (output.find(bindFailureMarker(kPort)) != std::string::npos) {
-            lastPortAnswer = "refused, but that daemon never bound the port at all";
-            awaitNameRelease(names, "the next attempt at the startup-shutdown window");
-            continue;
-        }
         ++inWindow;
 
         const bool stopped = daemon.exitedNormally() && !daemon.timedOut();
@@ -5680,15 +5840,14 @@ void checkShutdownDuringStartup(NameWatcher& names, const std::string& validatio
     }
 
     if (inWindow > 0) {
-        std::printf("daemon_system_test: the daemon was frozen inside its startup window, before port %d was "
-                    "bound, on attempt %d of %d\n",
-                    kPort, attemptsUsed, kAttempts);
+        std::printf("daemon_system_test: the daemon was frozen inside its startup window, after the name and "
+                    "before its serving line, on attempt %d of %d (%d inconclusive for its log writer)\n",
+                    attemptsUsed, kAttempts, pumpUnproven);
         std::fflush(stdout);
     } else {
         notVerified(kGoal, std::string("no attempt in ") + std::to_string(kAttempts) +
-                               " froze the daemon before it had bound port " + std::to_string(kPort) +
-                               " (the last connect answered '" + lastPortAnswer +
-                               "'), so nothing was signalled inside the startup window");
+                               " froze the daemon before its serving line (the last: " + lastWitness +
+                               "), so nothing was signalled inside the startup window");
     }
 }
 
@@ -6504,6 +6663,7 @@ int main() {
         phase("defaultConfigPort", [&] { checkDefaultConfigPort(names, validationEnv, check); });
         phase("chosenConfigPort", [&] { checkChosenConfigPort(names, validationEnv, check); });
         phase("httpLifecycle", [&] { checkHttpLifecycle(names, bluePath, validationEnv, check); });
+        phase("configChangedAtStartup", [&] { checkConfigChangedAtStartup(names, validationEnv, check); });
         phase("configServerOwnsPort", [&] { checkConfigServerOwnsPort(names, validationEnv, check); });
         // The run's whole FrameReady history so far is the proof this host renders, which lets this
         // phase grade a missing frame rather than skip on it.

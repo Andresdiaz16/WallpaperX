@@ -694,6 +694,12 @@ target_compile_definitions(wallpaperx-qml-lint-test PRIVATE
     WALLPAPERX_BACKEND_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
     WALLPAPERX_QMLLINT_EXECUTABLE="${WALLPAPERX_QMLLINT_FOR_TEST}"
 )
+# Qt's own QML directory, so the linter can be run with only it and the build tree's module on its
+# import path: its default path would otherwise find a system-wide install of com.wallpaperx first.
+if(QT6_INSTALL_PREFIX AND QT6_INSTALL_QML)
+    target_compile_definitions(wallpaperx-qml-lint-test PRIVATE
+        WALLPAPERX_QT_QML_IMPORT_DIR="${QT6_INSTALL_PREFIX}/${QT6_INSTALL_QML}")
+endif()
 
 # The system-level tier: spawns the real wallpaperx-daemon executable and drives it over
 # the bus. It links the daemon library only for the DBus name/interface constants and
@@ -1579,7 +1585,10 @@ if(WALLPAPERX_DBUS_RUN_SESSION)
             WALLPAPERX_QML_MODULE_PATH="${CMAKE_CURRENT_BINARY_DIR}/qml")
         add_dependencies(wallpaperx-item-window-report-test wallpaperxplugin)
         wallpaperx_add_test(NAME item_window_report COMMAND $<TARGET_FILE:wallpaperx-item-window-report-test>)
-        set_tests_properties(item_window_report PROPERTIES
+        # The same binary with no session bus, a process of its own: QtDBus connects once per process.
+        wallpaperx_add_test(NAME item_window_report_no_bus
+                 COMMAND $<TARGET_FILE:wallpaperx-item-window-report-test> no-bus)
+        set_tests_properties(item_window_report item_window_report_no_bus PROPERTIES
             ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QT_NO_XDG_DESKTOP_PORTAL=1"
             LABELS "novulkan"
             RESOURCE_LOCK wallpaperx_bus_tests
@@ -1598,7 +1607,10 @@ if(WALLPAPERX_DBUS_RUN_SESSION)
         add_dependencies(wallpaperx-plasma-surface-test wallpaperxplugin
                          wallpaperx_taskmanager_standin wallpaperx_kwindowsystem_standin)
         wallpaperx_add_test(NAME plasma_surface COMMAND $<TARGET_FILE:wallpaperx-plasma-surface-test>)
-        set_tests_properties(plasma_surface PROPERTIES
+        # The same binary's config-named run, a process of its own: the change watch's first owner
+        # lookup answers once per process.
+        wallpaperx_add_test(NAME plasma_surface_named COMMAND $<TARGET_FILE:wallpaperx-plasma-surface-test> config-named)
+        set_tests_properties(plasma_surface plasma_surface_named PROPERTIES
             ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QT_NO_XDG_DESKTOP_PORTAL=1"
             LABELS "novulkan"
             RESOURCE_LOCK wallpaperx_bus_tests

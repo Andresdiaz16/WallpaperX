@@ -366,16 +366,24 @@ int serve(int argc, char** argv) {
         wallpaperx::DbusService service(*connection, manager);
         // Destroyed before ~DbusService joins the render worker and ~WallpaperManager tears the
         // device down, which is what the deadline is for. This is the one that covers a throw
-        // out of requestName() below, where the server further down does not exist yet.
+        // out of the config server's constructor below.
         ArmTeardown armBeforeService{teardownArmed, loopGate};
 
         // Before the name is claimed: this is what fills the monitor map.
         if (g_stopReason.load() == StopReason::None) service.restoreSaved();
 
+        // Declared after the service so it is destroyed first: its handlers call
+        // manager.snapshot(), so HTTP has to stop before anything it reads is torn down. Before
+        // the name, because the name's arrival is what tells a consumer to read /config. A second
+        // instance finds the port taken and says so before it fails to claim the name.
+        wallpaperx::HttpServer httpServer(manager, options->configPort);
+        // Destroyed first of everything here, so the ordinary stop is bounded from its own top.
+        ArmTeardown armBeforeHttp{teardownArmed, loopGate};
+
         // Claimed last, so the name on the bus means the daemon can answer: object registered,
-        // saved wallpapers back. Throws if another instance owns it, which is why nothing above
-        // may write to the config directory. Skipped after a stop, or a daemon on its way out
-        // would take the well-known name for a moment and drop it again.
+        // saved wallpapers back, /config served. Throws if another instance owns it, which is why
+        // nothing above may write to the config directory. Skipped after a stop, or a daemon on
+        // its way out would take the well-known name for a moment and drop it again.
         bool claimed = false;
         if (g_stopReason.load() == StopReason::None) {
             connection->requestName(sdbus::ServiceName{wallpaperx::DbusService::kBusName});
@@ -406,12 +414,6 @@ int serve(int argc, char** argv) {
             std::fprintf(stderr, "wallpaperx-daemon: wallpapers may not survive a restart: %s\n",
                          snap.health.persistence.detail.c_str());
         }
-
-        // Declared after the service so it is destroyed first: its handlers call
-        // manager.snapshot(), so HTTP has to stop before anything it reads is torn down.
-        wallpaperx::HttpServer httpServer(manager, options->configPort);
-        // Destroyed first of everything here, so the ordinary stop is bounded from its own top.
-        ArmTeardown armBeforeHttp{teardownArmed, loopGate};
 
         // Published under the gate, so a signal arriving before this point stops the loop being
         // entered at all rather than calling into the connection while the object is still

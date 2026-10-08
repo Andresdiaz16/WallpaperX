@@ -146,40 +146,53 @@ TestCase {
         ];
     }
 
-    // GOAL: a driven check must observe the state it drove, not one the plugin's own 1s poll
-    //       overwrote. Falsifiable: with the poll left running, a case driven to "set" reads
-    //       back "unreachable" the moment the event loop turns (measured, not assumed).
-    // WHY-THIS-SHAPE: the timer is found by the property only a Timer has rather than by index
-    //       into data[], because the index depends on declaration order in a production file
-    //       these tests must not constrain.
-    // CONTROL: leaving the poll running was observed first -- an item driven to "set" read back
-    //       "unreachable" after wait(1500). The count assert was seen red by misspelling the
-    //       property the scan looks for: 'the plugin has exactly one poll to quiesce. Actual
-    //       (): 0. Expected (): 1'. Both reverted.
-    // COVERAGE-ASSERT: the count is asserted, so a rename that makes this scan find nothing --
-    //       and quietly restores the clobbering the whole suite depends on avoiding -- fails.
-    function quiesceThePoll(item) {
-        let stopped = 0;
-        for (let i = 0; i < item.data.length; ++i) {
-            if (item.data[i].triggeredOnStart !== undefined) {
-                item.data[i].running = false;
-                stopped += 1;
-            }
+    // A stand-in for the change watch main.qml loads from the same blocked module: the one signal
+    // main.qml listens to, which a case emits to stand for the daemon's ConfigChanged.
+    Component {
+        id: standInWatch
+        Item {
+            signal configChanged()
         }
-        compare(stopped, 1, "the plugin has exactly one poll to quiesce");
     }
 
-    // Loads the real main.qml, stops its poll, and puts it on the named screen the case wants.
-    // createTemporaryObject so each case gets a plugin with no history from the last one.
-    function loadPlugin(connector) {
+    // GOAL (a property of this harness): every case but the ones about the watch itself runs with a
+    //       change watch that loaded, so describe() reaches the cause the case drove. False with the
+    //       real watch left in Loader.Error: describe() then answers "cannot follow changes" for every
+    //       named cause, and each cause check would grade that one message.
+    // WHY-THIS-SHAPE: found by objectName, not by index, for the reason childNamed() gives; the real
+    //       watch is required to have FAILED first, so the stand-in replaces a load this harness
+    //       blocked rather than one that might have worked.
+    // CONTROL: test-side, by hand 2026-10-07, `watch.sourceComponent = standInWatch;` deleted below ->
+    //       'the stand-in change watch loaded. Actual (): 3 Expected (): 1' on 34 of 45 cases. Restored.
+    function standInTheWatch(item) {
+        const watch = childNamed(item, "wallpaperxConfigWatch");
+        verify(watch !== null, "main.qml has a change watch");
+        compare(watch.status, Loader.Error, "the real change watch cannot load on this harness");
+        watch.sourceComponent = standInWatch;
+        compare(watch.status, Loader.Ready, "the stand-in change watch loaded");
+        return watch;
+    }
+
+    // The real main.qml, from a fresh Loader. createTemporaryObject so each case gets a plugin with no
+    // history from the last one.
+    function loadHost() {
         const host = createTemporaryObject(plugin, suite);
         verify(host !== null, "the plugin component was created: " + plugin.errorString());
         compare(host.status, Loader.Ready,
                 "main.qml loaded (Loader status " + host.status + ")");
-        const item = host.item;
-        verify(item !== null, "main.qml produced an item");
-        quiesceThePoll(item);
+        verify(host.item !== null, "main.qml produced an item");
+        return host;
+    }
+
+    // Loads the real main.qml with the stand-in watch and puts it on the named screen the case wants.
+    // Naming the screen makes main.qml ask the stub once; that answer is waited out, so a case that
+    // drives apply() is not overwritten by it afterwards.
+    function loadPlugin(connector) {
+        const item = loadHost().item;
+        standInTheWatch(item);
         item.connectorOverride = connector;
+        tryVerify(function () { return item.pending === null; }, 5000,
+                  "the read naming the screen made has settled");
         return item;
     }
 
@@ -422,14 +435,14 @@ TestCase {
     // see that file for why it is that port and not one of the harness's choosing.
     // ---------------------------------------------------------------------------------- //
 
-    // Loads a plugin, waits out any request its own start fired, and points the stub at the
-    // shape this case wants. The wait is not decoration: main.qml's refresh() counts a poll
-    // and returns when one is already pending, so a case that called it while a startup fetch
-    // was in flight would send nothing and then grade the startup fetch's answer.
+    // Loads a plugin whose naming read has been answered (loadPlugin waits it out), and resets the
+    // stub's counts and shape, so the case's own refresh() is the only request counted. Reset before
+    // the load too: the naming read is served in whatever shape the previous case left, and a plugin
+    // that starts out "unreadable" would satisfy a case's wait for that state with no request at all.
     function pluginReadyToFetch() {
+        stubDaemon.reset();
         const item = loadPlugin(suite.namedScreen);
-        tryVerify(function () { return item.pending === null; }, 5000,
-                  "the request the plugin's own start may have fired has settled");
+        compare(item.screenState, "set", "the naming read was answered with the stub's good reply");
         stubDaemon.reset();
         return item;
     }
@@ -1123,11 +1136,12 @@ TestCase {
     //       is built beside -- and the moment the plugin was installed system-wide for a live
     //       desktop test the import succeeded and this case failed against a correct build. A check
     //       that reads differently depending on what is installed grades the machine.
+    //       The change watch is stood in (loadPlugin), so the watch's own failure message, which
+    //       describe() puts first, does not answer for the renderer's.
     // CONTROL: the `if (surface.status === Loader.Error)` block deleted from describe() in
     //       backend/kde/kpackage/contents/ui/main.qml, so it falls through to the "will draw" line
-    //       -> "FAIL!: the plugin does not claim it will draw when the module could not be loaded"
-    //       and "FAIL!: the message names the module as the cause", that case alone. Observed
-    //       2026-09-20. Reverted.
+    //       -> "FAIL!: the plugin does not claim it will draw when the module could not be loaded",
+    //       that case alone.
     // COVERAGE-ASSERT: the interceptor is asserted to have rewritten at least one candidate qmldir
     //       URL, so a run in which it silently stopped matching cannot report Loader.Error as
     //       evidence of anything -- on a machine with no module installed the state would look
@@ -1186,24 +1200,60 @@ TestCase {
         compare(drawn.surface.item.output, suite.namedScreen, "and its screen's name");
     }
 
-    // GOAL: a hidden copy keeps asking the daemon what its screen shows, so that when it is shown its
-    //       answer is current and the renderer is created inside the switch rather than after a poll.
-    // WHY-THIS-SHAPE: real requests to the stub, counted while the copy is hidden, over a span in which
-    //       a 1 s poll asks at least twice.
-    // CONTROL: `running: root.visible` given to main.qml's poll Timer -> "a hidden copy keeps polling"
-    //       red. Observed 2026-10-01 through control_batch.sh, reverted.
-    function test_a_hidden_copy_keeps_polling() {
+    // GOAL: S15.203 -- a hidden copy reads /config at a change notice, so that when it is shown its
+    //       answer is current and the renderer is created inside the switch rather than after a read.
+    // WHY-THIS-SHAPE: a real request to the stub, counted while the copy is hidden, after the stand-in
+    //       watch emits the one signal main.qml listens to; exactly one, so a hidden copy that asked on
+    //       anything else would show.
+    // CONTROL: `enabled: root.visible` given to the `Connections` on `notice.item` in
+    //       backend/kde/kpackage/contents/ui/main.qml -> "a hidden copy reads /config at a notice" red.
+    function test_a_hidden_copy_reads_at_a_notice() {
         if (!stubDaemon.available()) {
             skip(stubDaemon.unavailableReason());
         }
-        const host = createTemporaryObject(plugin, suite);
-        compare(host.status, Loader.Ready, "main.qml loaded");
+        const host = loadHost();
         const item = host.item;
+        const watch = standInTheWatch(item);
         item.connectorOverride = suite.namedScreen;
         host.visible = false;
         verify(!item.visible, "the plugin is hidden through its parent");
         tryVerify(function () { return item.pending === null; }, 5000, "any request in flight has settled");
         stubDaemon.reset();
-        tryVerify(function () { return stubDaemon.requests() >= 2; }, 5000, "a hidden copy keeps polling");
+        verify(watch.item !== null, "a hidden copy still has its change watch");
+        watch.item.configChanged();
+        tryVerify(function () { return stubDaemon.requests() >= 1; }, 5000, "a hidden copy reads /config at a notice");
+        tryVerify(function () { return item.pending === null; }, 5000, "and the read is answered");
+        compare(stubDaemon.requests(), 1, "one notice, one read");
+    }
+
+    // GOAL: S15.392 -- a change watch whose module cannot be loaded is named as the cause on a named
+    //       screen, ahead of whatever the last answer said: with nothing to say when that answer
+    //       changes, any other cause shown could be long out of date.
+    // WHY-THIS-SHAPE: driven through two answers that would otherwise each name their own cause (an
+    //       unknown screen and a daemon gone), so the message is graded against a cause it must
+    //       outrank, not only for containing the right words. The watch is left unloaded by this
+    //       harness's module block, required to be in Loader.Error, so a host where it loaded cannot
+    //       pass.
+    // CONTROL: the `if (notice.status === Loader.Error)` branch deleted from describe() in
+    //       backend/kde/kpackage/contents/ui/main.qml -> "an unloadable change watch is named as the
+    //       cause" red, showing "does not know this screen".
+    function test_an_unloadable_watch_is_named_as_the_cause() {
+        const item = loadHost().item;
+        const watch = childNamed(item, "wallpaperxConfigWatch");
+        verify(watch !== null, "main.qml has a change watch");
+        verify(moduleBlock.blocked() > 0, "this harness made com.wallpaperx unloadable");
+        compare(watch.status, Loader.Error, "the change watch could not be loaded, which is the state graded");
+        item.connectorOverride = suite.namedScreen;
+        tryVerify(function () { return item.pending === null; }, 5000, "the naming read has settled");
+
+        const drives = [[200, '{"output":"DP-3","known":false}'], [0, ""]];
+        for (let i = 0; i < drives.length; ++i) {
+            item.apply(drives[i][0], drives[i][1]);
+            const shown = item.describe();
+            verify(shown.indexOf("cannot follow changes") !== -1,
+                   "an unloadable change watch is named as the cause [" + shown + "]");
+            verify(shown.indexOf("does not know this screen") === -1 && shown.indexOf("is not running") === -1,
+                   "and not a cause it could no longer follow [" + shown + "]");
+        }
     }
 }
