@@ -954,6 +954,11 @@ ConfigWatch::ConfigWatch(QObject* parent) : QObject(parent) {
     }
 }
 
+bool ConfigWatch::daemonAbsent() const {
+    const BufferClaims::Daemon daemon = BufferClaims::instance().currentDaemon();
+    return daemon.lifetime != 0 && daemon.owner.empty();
+}
+
 WallpaperXItem::PendingFrame::~PendingFrame() {
     closeDescriptors(request);
     releaseUnimported(claims, claim);

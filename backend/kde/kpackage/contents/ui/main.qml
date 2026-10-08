@@ -30,6 +30,10 @@ WallpaperItem {
     property var pending: null
     property bool askAgain: false
 
+    // Failed reads since something last prompted one; the wait before a retry grows with it. A good
+    // answer needs no reset: only a prompted read follows it.
+    property int failedReads: 0
+
     // What this will parse. The reply comes from whatever holds the port, and nothing else
     // bounds what the shell acts on. Not what it buffers: see the handler below.
     readonly property int maxBodyBytes: 65536
@@ -132,7 +136,15 @@ WallpaperItem {
         return qsTr("WallpaperX will draw:\n%1").arg(root.wallpaperPath);
     }
 
+    // Asks because something may have changed the answer, so a failure before it no longer counts
+    // towards the wait.
     function refresh() {
+        retry.stop();
+        root.failedReads = 0;
+        root.read();
+    }
+
+    function read() {
         // An empty output= is a request the daemon rightly refuses, so asking anyway would
         // report a refusal this plugin caused as though the daemon had rejected the screen.
         if (root.connector === "") {
@@ -178,6 +190,7 @@ WallpaperItem {
                 const body = request.responseText;
                 const usable = !elsewhere && body.length <= root.maxBodyBytes;
                 root.apply(request.status, usable ? body : "");
+                root.retryIfFailed(request.status);
             }
             if (root.askAgain) {
                 root.askAgain = false;
@@ -186,6 +199,22 @@ WallpaperItem {
         };
         request.open("GET", url);
         request.send();
+    }
+
+    // A read the next one may fix: nothing answered, or the server failed or asked for patience. A
+    // 200, or a refusal of the request itself, stands until something changes. Nothing is retried
+    // while the daemon's name has no owner: its arrival is announced, so retrying then only polls a
+    // stopped service.
+    function retryIfFailed(status: int) {
+        if (status !== 0 && status < 500 && status !== 408 && status !== 429) {
+            return;
+        }
+        root.failedReads += 1;
+        if (notice.item !== null && notice.item.daemonAbsent()) {
+            return;
+        }
+        retry.interval = Math.min(2000 * Math.pow(2, root.failedReads - 1), 8000);
+        retry.start();
     }
 
     function apply(status: int, body: string) {
@@ -325,6 +354,14 @@ WallpaperItem {
 
         objectName: "wallpaperxConfigWatch"
         source: "ConfigWatch.qml"
+    }
+
+    // The fallback for a failed read, since nothing announces that the daemon can answer again. It
+    // runs only after such a failure and never while the last answer stands.
+    Timer {
+        id: retry
+
+        onTriggered: root.read()
     }
 
     Connections {

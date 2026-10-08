@@ -16,19 +16,25 @@
 //   unloaded-renderer   -- a renderer the Loader has unloaded, not yet deleted, is not reached by
 //                          main.qml's monitor-id or screen-name changes;
 //   config-reads        -- main.qml reads /config when the screen is named, at each ConfigChanged
-//                          and on a rename, and at nothing else;
+//                          and on a rename, and, while the last answer was good, at nothing else;
 //   config-owner        -- it reads when the daemon's bus name loses its owner and when it gains one;
 //   config-supersede    -- notices during a slow read cause one more read after it, never two at once;
 //   config-rename       -- an answer about a name the screen no longer has is never applied;
 //   config-stream       -- answers are applied while notices keep arriving faster than reads end;
 //   config-named        -- run as `plasma_surface_test config-named`, a process of its own (the entry
 //                          plasma_surface_named): a daemon already named when the first change watch
-//                          is created causes one more read, from the watch's first owner lookup.
+//                          is created causes one more read, from the watch's first owner lookup;
+//   config-retry-*      -- run as `plasma_surface_test config-retry` (the entry plasma_surface_retry):
+//                          a failed read is retried on a growing wait, and only when the next read may
+//                          fix it;
+//   config-retry-no-bus -- run as `plasma_surface_test config-retry-no-bus` (plasma_surface_retry_no_bus):
+//                          with no bus, so no owner known, a failed read is still retried.
 //
 // Plasma's task manager and KWindowSystem modules are replaced by stand-ins on the import path
 // (tests/qml_standins/), so ScreenWindows.qml loads the same way on any host.
 
 #include "tests/loopback_stub.h"
+#include "tests/private_test_bus.h"
 #include "tests/pump.h"
 #include "tests/report_stub.h"
 #include "tests/test_phase.h"
@@ -37,6 +43,7 @@
 #include <QByteArray>
 #include <QCoreApplication>
 #include <QDBusConnection>
+#include <QFile>
 #include <QGuiApplication>
 #include <QMetaMethod>
 #include <QMetaProperty>
@@ -48,6 +55,7 @@
 #include <QQuickItem>
 #include <QQuickWindow>
 #include <QString>
+#include <QTemporaryDir>
 #include <QUrl>
 #include <QVariant>
 
@@ -59,9 +67,11 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <map>
 #include <mutex>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -373,12 +383,546 @@ bool spendFirstLookup() {
     return heard.connected() && pumpUntil([&] { return heard.count > 0; }, kArrivalLimitMs);
 }
 
+// ---- The failed-read retry: the runs `config-retry` and `config-retry-no-bus` ----
+
+qint64 nowMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// /config answering scripted statuses -- 200, on monitorId, once the script runs out -- and recording
+// which screen each request asked about and when it arrived. Can stop and serve again on the same port,
+// for a daemon whose port stops answering while its bus name stays owned.
+class RetryStub {
+public:
+    ~RetryStub() { stop(); }
+    std::atomic<int> monitorId{0};
+    bool start(std::string& why) {
+        m_server = std::make_unique<httplib::Server>();
+        m_server->Get("/config", [this](const httplib::Request& req, httplib::Response& res) {
+            const std::string output = req.get_param_value("output");
+            int status = 200;
+            {
+                std::unique_lock<std::mutex> lock(m_mutex);
+                m_arrivals.push_back({output, nowMs()});
+                m_peak = std::max(m_peak, ++m_inFlight);
+                if (!m_script.empty()) {
+                    status = m_script.front();
+                    m_script.pop_front();
+                }
+                if (m_holding) {
+                    ++m_held;
+                    // Bounded, so a phase that never releases cannot wedge the server's stop.
+                    m_changed.wait_for(lock, std::chrono::seconds(20), [&] { return !m_holding; });
+                }
+            }
+            res.status = status;
+            res.set_content(status == 200 ? R"({"output":")" + output + R"(","known":true,"path":"/w.png","monitor_id":)" +
+                                                std::to_string(monitorId.load()) + "}"
+                                          : R"({"error":"scripted )" + std::to_string(status) + R"("})",
+                            "application/json");
+            std::lock_guard<std::mutex> lock(m_mutex);
+            --m_inFlight;
+        });
+        if (!wallpaperx::testing::bindDaemonPort(*m_server)) {
+            why = "127.0.0.1:18462 could not be bound -- another daemon or test holds main.qml's port";
+            return false;
+        }
+        if (!wallpaperx::testing::serveOnThread(*m_server, m_thread)) {
+            why = "the /config stub's listener gave up before serving";
+            return false;
+        }
+        return true;
+    }
+    void stop() {
+        if (!m_server) return;
+        unhold();
+        wallpaperx::testing::stopServing(*m_server, m_thread);
+        m_server.reset();
+    }
+
+    // The statuses the next requests get, in order, replacing any still unused.
+    void script(std::initializer_list<int> statuses) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_script.assign(statuses.begin(), statuses.end());
+    }
+    void fill(int status, int count) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_script.assign(static_cast<std::size_t>(count), status);
+    }
+
+    // When each request about `output` arrived, on nowMs()'s clock.
+    std::vector<qint64> arrivals(const QString& output) const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        std::vector<qint64> out;
+        for (const auto& [asked, at] : m_arrivals) {
+            if (asked == output.toStdString()) out.push_back(at);
+        }
+        return out;
+    }
+    int requests(const QString& output) const { return static_cast<int>(arrivals(output).size()); }
+
+    int peak() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_peak;
+    }
+    void resetPeak() {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_peak = m_inFlight;
+    }
+
+    // From hold(), no request is answered until unhold(); held() counts those that arrived meanwhile.
+    void hold() {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_holding = true;
+        m_held = 0;
+    }
+    void unhold() {
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_holding = false;
+        }
+        m_changed.notify_all();
+    }
+    int held() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_held;
+    }
+
+private:
+    std::unique_ptr<httplib::Server> m_server;
+    std::thread m_thread;
+    mutable std::mutex m_mutex;
+    std::condition_variable m_changed;
+    std::deque<int> m_script;
+    std::vector<std::pair<std::string, qint64>> m_arrivals;
+    int m_inFlight = 0;
+    int m_peak = 0;
+    bool m_holding = false;
+    int m_held = 0;
+};
+
+// The retry's waits are 2, 4, then 8 s. A gap is graded no more than 6 % early -- a QML Timer does not
+// fire early -- and generously late, but not so late that a wait doubled by mistake fits.
+bool inWindow(qint64 gap, int nominalMs) {
+    return gap >= nominalMs * 94 / 100 && gap <= nominalMs + std::max(1000, nominalMs / 4);
+}
+qint64 lateLimit(int nominalMs) { return nominalMs + std::max(1000, nominalMs / 4); }
+
+std::string gapsOf(const std::vector<qint64>& at) {
+    std::string out;
+    for (std::size_t i = 1; i < at.size(); ++i) out += (out.empty() ? "" : ", ") + std::to_string(at[i] - at[i - 1]);
+    return out.empty() ? "(none)" : out;
+}
+
+QString stateOf(const Copy& copy) { return copy.plugin()->property("screenState").toString(); }
+
+// main.qml's retry Timer, its only one. Null when there is not exactly one, so a check that reads it
+// cannot read the wrong timer.
+QObject* retryTimerOf(const Copy& copy) {
+    QObject* found = nullptr;
+    int timers = 0;
+    for (QObject* child : copy.plugin()->findChildren<QObject*>(Qt::FindDirectChildrenOnly)) {
+        if (std::strcmp(child->metaObject()->className(), "QQmlTimer") == 0) {
+            found = child;
+            ++timers;
+        }
+    }
+    return timers == 1 ? found : nullptr;
+}
+
+// A copy shown, on a screen name of the phase's own, holding a good answer with nothing scheduled.
+// Each phase counts only requests about its own name, so a read a previous phase's copy sent cannot
+// land in its count.
+Copy settledCopy(QQmlEngine& engine, QQuickWindow& window, RetryStub& config, const QString& output, const char* phase) {
+    Copy a = makeCopy(engine, window, true);
+    if (a.holder) a.plugin()->setProperty("connectorOverride", output);
+    const bool up = a.holder && pumpUntil([&] { return config.requests(output) >= 1 && stateOf(a) == QLatin1String("set"); },
+                                          kArrivalLimitMs);
+    if (!up) {
+        notVerified(phase, "main.qml never asked /config about its screen and showed the answer");
+        a.holder.reset();
+        return a;
+    }
+    pumpFor(300);
+    if (a.configWatch() == nullptr) {
+        notVerified(phase, "main.qml's change watch did not load, so no notice could reach it");
+        a.holder.reset();
+    }
+    return a;
+}
+
+void retryBackoffPhase(QDBusConnection& bus, QQmlEngine& engine, QQuickWindow& window, RetryStub& config) {
+    // GOAL: S15.404 -- a read answered 500, 503, 408, 429 or 502 is read again with no notice, after
+    //       about 2, 4, 8, 8 and 8 s, and the first 200 is applied and ends the retries. False if any of
+    //       those statuses is not retried, if the wait does not grow or grows past 8 s, or if the reads
+    //       go on after the good answer.
+    // WHY-THIS-SHAPE: arrival times on the stub, graded as gaps between reads, not against the notice,
+    //       so the first read's own latency is not in any bound. Waited for by count with a deadline past
+    //       the sum of the late bounds; a stall fails the line rather than leaving fewer gaps to grade.
+    //       The 200 carries monitor id 9, which only that last read can bring.
+    // CONTROL: in main.qml (backend/kde/kpackage/contents/ui/main.qml), via control_batch.sh
+    //       2026-10-08, --phase '^config-retry-backoff$', each reverted. `retry.start();` deleted -> the
+    //       first line red, 1 read; the interval fixed at 2000 -> the first line red, gaps 2000 x5; the
+    //       timer calling refresh() instead of read() -> the same, gaps about 2000 x5; 408 and 429 dropped
+    //       from the retried set -> the first line red, 3 reads; `&& status !== 200` added to the
+    //       definitive test -> the second line alone red, 7 reads.
+    // COVERAGE-ASSERT: all five gaps are graded, or the line fails.
+    constexpr const char* kPhase = "the config-retry-backoff phase";
+    const QString output = QStringLiteral("DP-RETRY-BACKOFF");
+    const std::vector<int> waits{2000, 4000, 8000, 8000, 8000};
+    Copy a = settledCopy(engine, window, config, output, kPhase);
+    if (!a.holder) return;
+    config.script({500, 503, 408, 429, 502});
+    config.monitorId = 9;
+    const int from = config.requests(output);
+    if (!wallpaperx::testing::announceConfigChanged(bus)) {
+        notVerified(kPhase, "the stub's ConfigChanged could not be sent");
+        return;
+    }
+    qint64 deadline = 2 * kArrivalLimitMs;
+    for (int w : waits) deadline += lateLimit(w);
+    const bool all = pumpUntil([&] { return config.requests(output) >= from + 6; }, static_cast<int>(deadline));
+    const bool applied = all && pumpUntil([&] { return monitorIdOf(a) == 9; }, kArrivalLimitMs);
+    std::vector<qint64> at = config.arrivals(output);
+    at.erase(at.begin(), at.begin() + from);
+    bool shape = all && at.size() >= waits.size() + 1;
+    for (std::size_t i = 0; shape && i < waits.size(); ++i) shape = inWindow(at[i + 1] - at[i], waits[i]);
+    check(shape, "a read answered 500, 503, 408, 429, then 502 is read again after about 2, 4, 8, 8 and 8 s");
+    std::fprintf(stderr, "  %zu reads, gaps %s ms\n", at.size(), gapsOf(at).c_str());
+    pumpFor(10000);
+    const int after = config.requests(output) - from;
+    check(applied && after == 6 && stateOf(a) == QLatin1String("set"),
+          "and the 200 that follows is applied, with no read after it over 10 s");
+    std::fprintf(stderr, "  %d reads in all; monitor id %d; screen %s\n", after, monitorIdOf(a), qPrintable(stateOf(a)));
+}
+
+void retryUnreachablePhase(QDBusConnection& bus, QQmlEngine& engine, QQuickWindow& window, RetryStub& config) {
+    // GOAL: S15.405 -- a read nobody answers (status 0) while the daemon's name is still owned is
+    //       retried, so the screen returns to its wallpaper once the port answers again, with no notice.
+    //       False if the screen stays on "not running" until something is announced.
+    // WHY-THIS-SHAPE: the port is closed and reopened by the stub while the name stays held; nothing
+    //       is announced after the reopening, so only a retry can bring monitor id 11. Exactly one read
+    //       after the reopening: the retry, answered 200, and nothing more.
+    // CONTROL: `retry.start();` deleted from retryIfFailed (backend/kde/kpackage/contents/ui/main.qml)
+    //       -> this line red, no read after the reopening. Via control_batch.sh 2026-10-08, --phase
+    //       '^config-retry-unreachable$'. Reverted.
+    constexpr const char* kPhase = "the config-retry-unreachable phase";
+    const QString output = QStringLiteral("DP-RETRY-UNREACHABLE");
+    Copy a = settledCopy(engine, window, config, output, kPhase);
+    if (!a.holder) return;
+    config.stop();
+    const bool sent = wallpaperx::testing::announceConfigChanged(bus);
+    const bool down = sent && pumpUntil([&] { return stateOf(a) == QLatin1String("unreachable"); }, kArrivalLimitMs);
+    pumpFor(300);
+    config.monitorId = 11;
+    std::string why;
+    const bool reopened = config.start(why);
+    const int from = config.requests(output);
+    if (!down || !reopened) {
+        notVerified(kPhase, !down ? "the read with the port closed never showed the daemon as not running"
+                                  : "the stub could not serve again: " + why);
+        return;
+    }
+    const bool back = pumpUntil([&] { return monitorIdOf(a) == 11 && stateOf(a) == QLatin1String("set"); },
+                                static_cast<int>(lateLimit(2000)) + kArrivalLimitMs);
+    pumpFor(1000);
+    const int reads = config.requests(output) - from;
+    check(back && reads == 1, "a read nobody answered, with the daemon's name owned, is retried until the port answers");
+    std::fprintf(stderr, "  reads after the port reopened: %d; screen %s, monitor id %d\n", reads,
+                 qPrintable(stateOf(a)), monitorIdOf(a));
+}
+
+void retryDefinitivePhase(QDBusConnection& bus, QQmlEngine& engine, QQuickWindow& window, RetryStub& config) {
+    // GOAL: S15.406 -- a 400 or a 404 is shown as a refusal and not read again with nothing announced.
+    //       False if either is re-read: every screen would then poll a daemon that has already said no.
+    // WHY-THIS-SHAPE: 12 s of quiet after each, past the first two retries (2 s, then 4 s more), so a
+    //       retry with any wait up to 6 s shows. The refusal must be on screen, so the answer was applied.
+    // CONTROL: retryIfFailed's definitive test made `if (status === 200)` (backend/kde/kpackage/contents/
+    //       ui/main.qml) -> both lines red, 400 and 404 each re-read. Via control_batch.sh 2026-10-08,
+    //       --phase '^config-retry-definitive$'. Reverted.
+    constexpr const char* kPhase = "the config-retry-definitive phase";
+    const QString output = QStringLiteral("DP-RETRY-DEFINITIVE");
+    Copy a = settledCopy(engine, window, config, output, kPhase);
+    if (!a.holder) return;
+    for (int status : {400, 404}) {
+        config.script({status});
+        const int from = config.requests(output);
+        const bool sent = wallpaperx::testing::announceConfigChanged(bus);
+        const bool shown = sent && pumpUntil([&] { return stateOf(a) == QLatin1String("refused"); }, kArrivalLimitMs);
+        pumpFor(12000);
+        const int reads = config.requests(output) - from;
+        check(shown && reads == 1, ("a " + std::to_string(status) + " is shown as refused and not read again over 12 s").c_str());
+        std::fprintf(stderr, "  %d: %d read(s), screen %s\n", status, reads, qPrintable(stateOf(a)));
+    }
+}
+
+void retryAbsentPhase(QDBusConnection& bus, QQmlEngine& engine, QQuickWindow& window, RetryStub& config) {
+    // GOAL: S15.407 -- while the bus says nobody owns the daemon's name, a failed read is not retried;
+    //       when the name is taken again, the screen reads at once and retries that read's failure after
+    //       about 2 s. False if a stopped daemon is polled, or if its return is not retried.
+    // WHY-THIS-SHAPE: the stub's port stays open answering 503 throughout, so the only thing telling
+    //       the two halves apart is the name's owner; 12 s of absence spans the first two retries. The
+    //       return is timed from the moment the name is retaken.
+    // CONTROL: via control_batch.sh 2026-10-08, --phase '^config-retry-absent$', each reverted. The
+    //       owner test in retryIfFailed (backend/kde/kpackage/contents/ui/main.qml) made `if (false)`
+    //       -> the first line red, 3 reads while absent; ConfigWatch::daemonAbsent
+    //       (backend/kde/wallpaperx_item.cpp) returning `... && false` -> the same; daemonAbsent
+    //       returning `daemon.lifetime != 0` (owner ignored) -> the second line alone red, no retry.
+    constexpr const char* kPhase = "the config-retry-absent phase";
+    const QString output = QStringLiteral("DP-RETRY-ABSENT");
+    Copy a = settledCopy(engine, window, config, output, kPhase);
+    if (!a.holder) return;
+    config.fill(503, 1000);
+    const int from = config.requests(output);
+    if (!bus.unregisterService(QString::fromUtf8(wallpaperx::testing::kService))) {
+        notVerified(kPhase, "the stub could not give up the daemon's bus name");
+        return;
+    }
+    const bool departed = pumpUntil([&] { return config.requests(output) > from; }, kArrivalLimitMs);
+    pumpFor(12000);
+    const int whileAbsent = config.requests(output) - from;
+    if (!bus.registerService(QString::fromUtf8(wallpaperx::testing::kService))) {
+        notVerified(kPhase, "the stub could not take the daemon's bus name back");
+        config.script({});
+        return;
+    }
+    const qint64 retaken = nowMs();
+    const bool two = pumpUntil([&] { return config.requests(output) >= from + whileAbsent + 2; },
+                               kArrivalLimitMs + static_cast<int>(lateLimit(2000)));
+    std::vector<qint64> at = config.arrivals(output);
+    at.erase(at.begin(), at.begin() + from + whileAbsent);
+    config.script({});
+    check(departed && whileAbsent == 1, "a failed read while the daemon's name has no owner is not retried");
+    check(two && at[0] >= retaken && at[0] - retaken < 1000 && inWindow(at[1] - at[0], 2000),
+          "and the name retaken reads at once, and retries that read's failure after about 2 s");
+    std::fprintf(stderr, "  reads while absent: %d; after the return: %zu, first %lld ms after it, gaps %s ms\n", whileAbsent,
+                 at.size(), at.empty() ? -1LL : static_cast<long long>(at[0] - retaken), gapsOf(at).c_str());
+}
+
+void retryResetPhase(QDBusConnection& bus, QQmlEngine& engine, QQuickWindow& window, RetryStub& config) {
+    // GOAL: S15.408 -- a notice during the wait after failed reads reads at once, and the next wait
+    //       starts again at about 2 s. False if the notice waits for the retry, or if the wait goes on
+    //       growing from where the earlier failures left it.
+    // WHY-THIS-SHAPE: three failures first (reads at 0, 2 and 6 s), so the pending wait is 8 s and a
+    //       wait that kept growing is told apart from a reset one; the notice comes 1 s into it, so the
+    //       read at the notice cannot be the retry. Waited for by count with a deadline.
+    // CONTROL: in refresh() (backend/kde/kpackage/contents/ui/main.qml), via control_batch.sh
+    //       2026-10-08, --phase '^config-retry-reset$', each reverted. `root.failedReads = 0;` deleted ->
+    //       "and the wait after it starts again at about 2 s" alone red, no fifth read within the
+    //       deadline; `if (retry.running) return;` added first -> both lines red, no read at the notice.
+    constexpr const char* kPhase = "the config-retry-reset phase";
+    const QString output = QStringLiteral("DP-RETRY-RESET");
+    Copy a = settledCopy(engine, window, config, output, kPhase);
+    if (!a.holder) return;
+    config.fill(500, 1000);
+    const int from = config.requests(output);
+    const bool three = wallpaperx::testing::announceConfigChanged(bus) &&
+                       pumpUntil([&] { return config.requests(output) >= from + 3; },
+                                 kArrivalLimitMs + static_cast<int>(lateLimit(2000) + lateLimit(4000)));
+    if (!three) {
+        config.script({});
+        notVerified(kPhase, "the first three failed reads never happened, so there was no grown wait to interrupt");
+        return;
+    }
+    pumpFor(1000);
+    const qint64 noticed = nowMs();
+    const bool sent = wallpaperx::testing::announceConfigChanged(bus);
+    const bool five = sent && pumpUntil([&] { return config.requests(output) >= from + 5; },
+                                        1000 + static_cast<int>(lateLimit(2000)) + 500);
+    std::vector<qint64> at = config.arrivals(output);
+    at.erase(at.begin(), at.begin() + from);
+    config.script({});
+    check(at.size() >= 4 && at[3] >= noticed && at[3] - noticed < 1000, "a notice during the 8 s wait reads at once");
+    check(five && inWindow(at[4] - at[3], 2000), "and the wait after it starts again at about 2 s");
+    std::fprintf(stderr, "  %zu reads, gaps %s ms; the notice %lld ms after the third\n", at.size(), gapsOf(at).c_str(),
+                 at.size() >= 3 ? static_cast<long long>(noticed - at[2]) : -1LL);
+}
+
+void retryCancelPhase(QDBusConnection& bus, QQmlEngine& engine, QQuickWindow& window, RetryStub& config) {
+    // GOAL: S15.409 -- a good answer to a notice's read cancels a retry still pending from an earlier
+    //       failure. False if the stale retry fires anyway, so every good answer after a failure costs
+    //       one stray read.
+    // WHY-THIS-SHAPE: the second notice is sent only once the retry Timer is seen running, and well
+    //       before its 2 s are up, so a stray retry is due inside the 12 s counted.
+    // CONTROL: `retry.stop();` deleted from refresh() (backend/kde/kpackage/contents/ui/main.qml) ->
+    //       this line red, 3 reads. Via control_batch.sh 2026-10-08, --phase '^config-retry-cancel$'.
+    //       Reverted.
+    // COVERAGE-ASSERT: the retry Timer must be found and running when the second notice is sent, or not
+    //       verified: without a retry pending there is nothing to cancel.
+    constexpr const char* kPhase = "the config-retry-cancel phase";
+    const QString output = QStringLiteral("DP-RETRY-CANCEL");
+    Copy a = settledCopy(engine, window, config, output, kPhase);
+    if (!a.holder) return;
+    QObject* timer = retryTimerOf(a);
+    config.script({500});
+    config.monitorId = 12;
+    const int from = config.requests(output);
+    const bool armed = timer != nullptr && wallpaperx::testing::announceConfigChanged(bus) &&
+                       pumpUntil([&] { return stateOf(a) == QLatin1String("refused") && timer->property("running").toBool(); },
+                                 kArrivalLimitMs);
+    if (!armed) {
+        notVerified(kPhase, timer == nullptr ? "main.qml's retry Timer was not found as its one Timer"
+                                             : "the 500 never left a retry pending");
+        return;
+    }
+    const bool sent = wallpaperx::testing::announceConfigChanged(bus);
+    const bool good = sent && pumpUntil([&] { return monitorIdOf(a) == 12; }, kArrivalLimitMs);
+    pumpFor(12000);
+    const int reads = config.requests(output) - from;
+    check(good && reads == 2, "a good answer to a notice's read cancels the retry pending from an earlier failure");
+    std::fprintf(stderr, "  %d reads over 12 s; monitor id %d\n", reads, monitorIdOf(a));
+}
+
+void retryBoundPhase(QDBusConnection& bus, QQmlEngine& engine, QQuickWindow& window, RetryStub& config) {
+    // GOAL: S15.410 -- a retry falling due while a notice's read is still unanswered puts no second
+    //       read out. False if at any moment two reads are unanswered at the stub.
+    // WHY-THIS-SHAPE: deterministic, not a burst of notices against slow reads: a failure arms the
+    //       retry, then a notice's read is held at the stub past the moment that retry was due. Two
+    //       guards keep this at one -- refresh() stops the timer, and read() queues behind a pending
+    //       request -- so no single break of either goes red; the control breaks both.
+    // CONTROL: in main.qml (backend/kde/kpackage/contents/ui/main.qml), `retry.stop();` deleted from
+    //       refresh() and the Timer's handler made `{ root.pending = null; root.read(); }` -> this line
+    //       red, 2 out at once. Each half alone stayed green (1 out at once). Via control_batch.sh
+    //       2026-10-08, --phase '^config-retry-bound$'. Reverted.
+    // COVERAGE-ASSERT: the retry Timer must be running when the notice is sent, and the notice's read
+    //       held, or not verified.
+    constexpr const char* kPhase = "the config-retry-bound phase";
+    const QString output = QStringLiteral("DP-RETRY-BOUND");
+    Copy a = settledCopy(engine, window, config, output, kPhase);
+    if (!a.holder) return;
+    QObject* timer = retryTimerOf(a);
+    config.script({500, 500});
+    const int from = config.requests(output);
+    const bool armed = timer != nullptr && wallpaperx::testing::announceConfigChanged(bus) &&
+                       pumpUntil([&] { return config.requests(output) > from && timer->property("running").toBool(); },
+                                 kArrivalLimitMs);
+    bool heldOut = false;
+    if (armed) {
+        config.resetPeak();
+        config.hold();
+        heldOut = wallpaperx::testing::announceConfigChanged(bus) && pumpUntil([&] { return config.held() >= 1; }, 1500);
+        if (heldOut) pumpFor(2500);
+    }
+    const int peakHeld = config.peak();
+    config.unhold();
+    if (!armed || !heldOut) {
+        notVerified(kPhase, !armed ? "no failed read left a retry pending" : "the notice's read never reached the stub");
+        return;
+    }
+    pumpUntil([&] { return stateOf(a) == QLatin1String("set"); }, kArrivalLimitMs + static_cast<int>(lateLimit(2000)));
+    check(config.peak() == 1, "a retry due while a notice's read is unanswered puts no second read out");
+    std::fprintf(stderr, "  at most %d out at once while held, %d in all; %d reads\n", peakHeld, config.peak(),
+                 config.requests(output) - from);
+}
+
+// The bus-owning run: phases that drive the daemon's name and ConfigChanged. A process of its own, so
+// its stub can close and reopen main.qml's port without the other phases' stub holding it.
+int configRetryRun(QDBusConnection& bus) {
+    const bool backoff = phaseSelected("config-retry-backoff");
+    const bool unreachable = phaseSelected("config-retry-unreachable");
+    const bool definitive = phaseSelected("config-retry-definitive");
+    const bool absent = phaseSelected("config-retry-absent");
+    const bool reset = phaseSelected("config-retry-reset");
+    const bool cancel = phaseSelected("config-retry-cancel");
+    const bool bound = phaseSelected("config-retry-bound");
+    // Spent first, as in the main run, so the first owner lookup's read lands in no phase's count and
+    // the owner is known -- not "unknown", which is retried whatever the bus says.
+    if (!spendFirstLookup()) {
+        notVerified("the config-retry phases", "the change watch's first owner lookup did not answer within 5 s");
+    } else {
+        RetryStub config;
+        std::string why;
+        if (!config.start(why)) {
+            notVerified("the config-retry phases", why);
+        } else {
+            QQmlEngine engine;
+            addImportPaths(engine);
+            QQuickWindow window;
+            window.setGeometry(0, 0, 400, 300);
+            window.show();
+            if (backoff) retryBackoffPhase(bus, engine, window, config);
+            if (unreachable) retryUnreachablePhase(bus, engine, window, config);
+            if (definitive) retryDefinitivePhase(bus, engine, window, config);
+            if (absent) retryAbsentPhase(bus, engine, window, config);
+            if (reset) retryResetPhase(bus, engine, window, config);
+            if (cancel) retryCancelPhase(bus, engine, window, config);
+            if (bound) retryBoundPhase(bus, engine, window, config);
+        }
+    }
+    if (wallpaperx::testing::reportCheckFailures()) return 1;
+    return wallpaperx::testing::reportNotVerifiedOrPassed();
+}
+
+// GOAL: S15.411 -- with no session bus, so the daemon's owner can never be known, a failed read is
+//       retried after about 2 s, then 4 s more, until it is answered. False if "owner unknown" is
+//       taken for "owner absent": a plugin started before the bus would then never retry at all.
+// WHY-THIS-SHAPE: a process of its own (the entry plasma_surface_retry_no_bus): QtDBus makes its
+//       session connection once per process, and the address set here names a socket that does not
+//       exist. It still runs only under isolated_run.sh's private session.
+// CONTROL: ConfigWatch::daemonAbsent (backend/kde/wallpaperx_item.cpp) made to ignore `lifetime`
+//       (`return daemon.owner.empty();`) -> this line red, 1 read and no retry. Via control_batch.sh
+//       2026-10-08, --phase '^config-retry-no-bus$'. Reverted.
+// COVERAGE-ASSERT: the change watch must have loaded, or not verified: without it main.qml retries for
+//       want of a watch, and daemonAbsent() is never asked.
+int configRetryNoBusRun(int argc, char** argv) {
+    constexpr const char* kClause = "the no-bus retry";
+    if (const std::optional<int> refused = wallpaperx::testing::refuseOffPrivateTestBus()) return *refused;
+    if (!phaseSelected("config-retry-no-bus")) return wallpaperx::testing::reportNotVerifiedOrPassed();
+    QTemporaryDir scratch;
+    if (!scratch.isValid()) {
+        notVerified(kClause, "no scratch directory for the absent bus's address");
+        return wallpaperx::testing::reportNotVerifiedOrPassed();
+    }
+    qputenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=" + QFile::encodeName(scratch.path()) + "/no-bus");
+    qputenv("QT_QPA_PLATFORM", "offscreen");
+    QGuiApplication app(argc, argv);
+    if (QDBusConnection::sessionBus().isConnected()) {
+        notVerified(kClause, "the session bus connected although its address names no socket");
+        return wallpaperx::testing::reportNotVerifiedOrPassed();
+    }
+    RetryStub config;
+    std::string why;
+    if (!config.start(why)) {
+        notVerified(kClause, why);
+        return wallpaperx::testing::reportNotVerifiedOrPassed();
+    }
+    config.script({503, 503});
+    // makeCopy's own name: its first read, at naming, is the first one graded.
+    const QString output = kOutput;
+    QQmlEngine engine;
+    addImportPaths(engine);
+    QQuickWindow window;
+    window.setGeometry(0, 0, 400, 300);
+    window.show();
+    Copy a = makeCopy(engine, window, true);
+    if (!a.holder) {
+        notVerified(kClause, "main.qml could not be loaded");
+        return wallpaperx::testing::reportNotVerifiedOrPassed();
+    }
+    const bool three = pumpUntil([&] { return config.requests(output) >= 3 && stateOf(a) == QLatin1String("set"); },
+                                 kArrivalLimitMs + static_cast<int>(lateLimit(2000) + lateLimit(4000)));
+    pumpFor(500);
+    const std::vector<qint64> at = config.arrivals(output);
+    if (a.configWatch() == nullptr) {
+        notVerified(kClause, "main.qml's change watch did not load, so daemonAbsent() was never asked");
+    } else {
+        check(three && at.size() == 3 && inWindow(at[1] - at[0], 2000) && inWindow(at[2] - at[1], 4000),
+              "with no bus, a failed read is retried after about 2 s, then 4 s, until it is answered");
+    }
+    std::fprintf(stderr, "  %zu reads, gaps %s ms; screen %s\n", at.size(), gapsOf(at).c_str(), qPrintable(stateOf(a)));
+    if (wallpaperx::testing::reportCheckFailures()) return 1;
+    return wallpaperx::testing::reportNotVerifiedOrPassed();
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     wallpaperx::testing::g_testName = "plasma_surface_test";
+    // Before Qt connects to any bus: it points the session bus nowhere.
+    if (argc > 1 && std::strcmp(argv[1], "config-retry-no-bus") == 0) return configRetryNoBusRun(argc, argv);
     qputenv("QT_QPA_PLATFORM", "offscreen");
     const bool namedRun = argc > 1 && std::strcmp(argv[1], "config-named") == 0;
+    const bool retryRun = argc > 1 && std::strcmp(argv[1], "config-retry") == 0;
     QGuiApplication app(argc, argv);
 
     QDBusConnection bus = wallpaperx::testing::stubConnection();
@@ -394,6 +938,7 @@ int main(int argc, char** argv) {
         if (wallpaperx::testing::reportCheckFailures()) return 1;
         return wallpaperx::testing::reportNotVerifiedOrPassed();
     }
+    if (retryRun) return configRetryRun(bus);
 
     const bool readsSelected = phaseSelected("config-reads");
     const bool ownerSelected = phaseSelected("config-owner");
@@ -592,7 +1137,8 @@ int main(int argc, char** argv) {
                 } else {
                     const std::size_t mark = stub.mark();
                     config.monitorId = 1;
-                    // As the daemon does when the app moves a screen: main.qml reads /config only when told.
+                    // As the daemon does when the app moves a screen: after a good answer, main.qml reads
+                    // /config only when told.
                     const bool taken = wallpaperx::testing::announceConfigChanged(bus) &&
                                        pumpUntil([&] { return monitorIdOf(a) == 1; }, kArrivalLimitMs);
                     a.plugin()->setProperty("connectorOverride", moved);
@@ -635,9 +1181,10 @@ int main(int argc, char** argv) {
         };
 
         if (readsSelected && lookupSpent) {
-            // GOAL: S15.389 -- main.qml reads /config once when its screen is named and then not at all
-            //       while nothing is announced; each ConfigChanged causes exactly one read, whose answer
-            //       is applied; and a rename reads once, about the new name.
+            // GOAL: S15.389 -- main.qml reads /config once when its screen is named and then, while the
+            //       last answer was good, not at all with nothing announced; each ConfigChanged causes
+            //       exactly one read, whose answer is applied; and a rename reads once, about the new name.
+            //       (A failed answer is retried: S15.404-S15.411, the entry plasma_surface_retry.)
             // WHY-THIS-SHAPE: counted on the stub's own record of requests, over a quiet span of 3.5 s,
             //       long enough for any periodic re-read every 1 s or faster to ask at least three times.
             //       Exactly one, in any phase order, because main() spent the change watch's first owner

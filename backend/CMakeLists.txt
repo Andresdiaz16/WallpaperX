@@ -1610,7 +1610,12 @@ if(WALLPAPERX_DBUS_RUN_SESSION)
         # The same binary's config-named run, a process of its own: the change watch's first owner
         # lookup answers once per process.
         wallpaperx_add_test(NAME plasma_surface_named COMMAND $<TARGET_FILE:wallpaperx-plasma-surface-test> config-named)
-        set_tests_properties(plasma_surface plasma_surface_named PROPERTIES
+        # The failed-read retry, a process of its own so its stub can close and reopen the port; and
+        # with no session bus, which QtDBus decides once per process.
+        wallpaperx_add_test(NAME plasma_surface_retry COMMAND $<TARGET_FILE:wallpaperx-plasma-surface-test> config-retry)
+        wallpaperx_add_test(NAME plasma_surface_retry_no_bus
+                 COMMAND $<TARGET_FILE:wallpaperx-plasma-surface-test> config-retry-no-bus)
+        set_tests_properties(plasma_surface plasma_surface_named plasma_surface_retry plasma_surface_retry_no_bus PROPERTIES
             ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QT_NO_XDG_DESKTOP_PORTAL=1"
             LABELS "novulkan"
             RESOURCE_LOCK wallpaperx_bus_tests
