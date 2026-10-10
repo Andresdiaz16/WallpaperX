@@ -154,8 +154,7 @@ public:
     static bool supportsTimeline(std::string* whyNot = nullptr);
 
     // A timeline semaphore imported once and waited on for many pictures. 0 is "none". The name
-    // belongs to the share group of the context that imported it; release() needs a context of that
-    // group current.
+    // belongs to the share group of the context that imported it, and goes with that group.
     struct Timeline {
         unsigned int semaphore = 0;
     };
@@ -175,8 +174,6 @@ public:
     // this at the same time.
     static bool acquire(const Timeline& timeline, uint64_t value, unsigned int texture,
                         std::string* whyNot = nullptr);
-
-    static void release(const Timeline& timeline);
 
 private:
     // The dma_buf half of import(), through EGLImage. Separate because the two paths share

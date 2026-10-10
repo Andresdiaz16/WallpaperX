@@ -15,6 +15,7 @@
 #include <QDBusReply>
 #include <QDBusUnixFileDescriptor>
 #include <QOpenGLContext>
+#include <QOpenGLFunctions>
 #include <QPointer>
 #include <QQuickWindow>
 #include <QSGRendererInterface>
@@ -180,16 +181,17 @@ void disownDescriptors(FrameImport::Request& request) {
 // once enough have been made, released ones included. An unshared context is a group of one.
 //
 // Every import the group made is kept until the group's last context goes, and none is deleted by
-// hand: another context of the group may have a wait on it queued and not yet flushed, and no context
-// can order a delete after another's command stream. Keeping them costs a semaphore name per daemon
-// replacement and no imports, since released imports count against NVIDIA's limit too. A daemon's
-// late pictures are waited on its own import for as long as the group lives.
+// hand: a context of the group may still be about to wait on it for a daemon's late picture, and
+// released imports count against NVIDIA's limit too. Keeping them costs a semaphore name per daemon
+// replacement and no imports. A daemon's late pictures are waited on its own import for as long as
+// the group lives.
 struct GroupTimeline {
     struct Import {
         FrameImport::Timeline timeline;
         std::string owner;  // the unique name that granted it
     };
-    // Held across the import and each wait: the value waited for is state of the shared semaphore.
+    // Held across the import and each wait until it is flushed: the value waited for is state of the
+    // shared semaphore.
     std::mutex mutex;
     std::vector<Import> imports;  // guarded by mutex; only grows
 };
@@ -451,13 +453,27 @@ bool acquireOnGroupTimeline(const std::string& sender, uint64_t value, unsigned 
         failure = "no current GL context to import the acquire timeline into";
         return false;
     }
+    // Before the lock: functions() allocates on first use, and nothing may throw between setting the
+    // shared value and flushing it.
+    QOpenGLFunctions* const gl = context->functions();
     const std::shared_ptr<GroupTimeline> group = groupTimeline(context->shareGroup());
+    // Nothing under this lock may block the CPU on the GPU: an earlier wait of this context may be on a
+    // value a crashed daemon never signals, and every render thread of the group takes this lock.
     std::lock_guard<std::mutex> lock(group->mutex);
+    // Flushed before the lock is dropped, failed or not, since acquire can fail after setting the
+    // value: the value is state of the shared semaphore, and GL makes it visible to another context
+    // only once this one flushes, so a sibling setting its own value first could change what this wait
+    // waits for.
+    const auto waitOn = [&](const FrameImport::Timeline& timeline) {
+        const bool waited = FrameImport::acquire(timeline, value, texture, &failure);
+        gl->glFlush();
+        return waited;
+    };
     const auto grantedBySender = [&sender](const GroupTimeline::Import& held) { return held.owner == sender; };
     const auto granted = std::find_if(group->imports.begin(), group->imports.end(), grantedBySender);
-    if (granted != group->imports.end()) return FrameImport::acquire(granted->timeline, value, texture, &failure);
+    if (granted != group->imports.end()) return waitOn(granted->timeline);
 
-    // The record is made, and room for it reserved, before the import, so nothing can throw between the
+    // The entry is made, and room for it reserved, before the import, so nothing can throw between the
     // import and storing it.
     GroupTimeline::Import fresh{{}, sender};
     group->imports.reserve(group->imports.size() + 1);
@@ -472,8 +488,10 @@ bool acquireOnGroupTimeline(const std::string& sender, uint64_t value, unsigned 
     fresh.timeline = FrameImport::importTimeline(fd, &failure, &importRefused);
     ::close(fd);
     if (fresh.timeline.semaphore == 0) return false;
+    // No glFinish to publish it: an import is not a queued command, and on NVIDIA a sibling context
+    // can use it at once. A finish would also wait out this context's earlier waits under the lock.
     group->imports.push_back(std::move(fresh));
-    return FrameImport::acquire(group->imports.back().timeline, value, texture, &failure);
+    return waitOn(group->imports.back().timeline);
 }
 
 // GUI thread. Addressed to the unique name that granted the claim, never the well-known one: a unique

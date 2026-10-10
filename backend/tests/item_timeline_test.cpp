@@ -38,6 +38,10 @@
 //                       a sharing context imports nothing and its end deletes nothing (S15.436-S15.438);
 //                       a group's destroyed() erases its record (S15.442)
 //   shared-replaced     every earlier daemon's import stays in the group, none deleted by hand (S15.440, S15.441)
+//   shared-threads      two render threads in one group: no glFinish under the group lock, waits flushed, a failed
+//                       one too, before the other uses it (S15.443, S15.444)
+//   shared-stuck        a context stuck on an unsignalled value imports a new daemon's timeline; the other
+//                       render thread still gets through (S15.445)
 //
 // Every phase but refused-binary, refused-shared and stray-value needs a GL context that can wait on a Vulkan
 // timeline (GL_NV_timeline_semaphore), and reports NOT VERIFIED where there is none -- Mesa.
@@ -69,6 +73,7 @@
 #include <QQuickWindow>
 #include <QSGRendererInterface>
 #include <QString>
+#include <QThread>
 #include <QUrl>
 
 #include <fcntl.h>
@@ -78,13 +83,17 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <exception>
 #include <functional>
+#include <future>
 #include <memory>
 #include <new>
+#include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -145,6 +154,8 @@ enum class Phase {
     Rebuild,
     ContextShare,
     SharedReplaced,
+    SharedThreads,
+    SharedStuck,
 };
 
 struct PhaseName {
@@ -202,6 +213,14 @@ constexpr PhaseName kPhases[] = {
      true},
     {Phase::SharedReplaced, "shared-replaced",
      "S15.440 and S15.441 (a share group keeps every earlier daemon's import and deletes none by hand)", true},
+    {Phase::SharedThreads, "shared-threads",
+     "S15.443 and S15.444 (no glFinish under a share group's timeline lock; each wait on a group timeline, a failed "
+     "one too, flushed before another thread's context uses it)",
+     true},
+    {Phase::SharedStuck, "shared-stuck",
+     "S15.445 (a context stuck on a value never signalled does not hold up its share group's other render threads "
+     "when it imports a new daemon's timeline)",
+     true},
 };
 
 // Everything written to stderr while it is alive, which is where the plugin's refused-import line
@@ -341,6 +360,137 @@ std::unique_ptr<QOpenGLContext> withSharingScene(QOpenGLContext* shareWith, cons
     return shared;
 }
 
+// A scene graph whose frames run on a QThread of its own, as under Qt's threaded render loop: the GUI
+// thread polishes, then blocks while each call runs there, so it is blocked across every sync, which
+// is QQuickRenderControl's contract for a render thread. A sync and its endFrame() are separate calls,
+// so the test can hold this thread mid-frame while another scene runs. Joined on every exit.
+struct ThreadedScene {
+    QThread thread;
+    QObject worker;  // on `thread`; calls are queued to it
+    std::unique_ptr<QOpenGLContext> context;
+    Scene scene;
+    std::thread::id renderThread;
+    bool up = false;
+
+    ThreadedScene() {
+        worker.moveToThread(&thread);
+        thread.start();
+    }
+    ~ThreadedScene() {
+        down();
+        thread.quit();
+        thread.wait();
+    }
+    ThreadedScene(const ThreadedScene&) = delete;
+    ThreadedScene& operator=(const ThreadedScene&) = delete;
+
+    void on(const std::function<void()>& fn) {
+        QMetaObject::invokeMethod(&worker, [&fn] { fn(); }, Qt::BlockingQueuedConnection);
+    }
+    // `context` made (and shared) by the caller, on the GUI thread.
+    bool bringUp() {
+        scene.window.setGraphicsDevice(QQuickGraphicsDevice::fromOpenGLContext(context.get()));
+        scene.window.setGeometry(0, 0, static_cast<int>(kWidth), static_cast<int>(kHeight));
+        scene.control.prepareThread(&thread);
+        context->moveToThread(&thread);
+        on([this] {
+            up = scene.control.initialize();
+            renderThread = std::this_thread::get_id();
+        });
+        return up;
+    }
+    void sync() {
+        scene.control.polishItems();
+        on([this] {
+            scene.control.beginFrame();
+            scene.control.sync();
+        });
+    }
+    void end() {
+        on([this] {
+            wallpaperx::testing::gl_fault_detail::order(wallpaperx::testing::GlSemaphoreFaults::Call::FrameEnd, 0);
+            scene.control.endFrame();
+        });
+    }
+    void pass() {
+        sync();
+        end();
+    }
+    // `fn` queued to the render thread without waiting: the future is ready once it has run. For a call
+    // that may block there, so the GUI thread can bound its wait and release what holds it. Later on()
+    // calls queue behind it.
+    std::shared_future<void> post(std::function<void()> fn) {
+        auto ran = std::make_shared<std::promise<void>>();
+        std::shared_future<void> done = ran->get_future().share();
+        QMetaObject::invokeMethod(
+            &worker,
+            [fn = std::move(fn), ran] {
+                try {
+                    fn();
+                    ran->set_value();
+                } catch (...) {
+                    ran->set_exception(std::current_exception());
+                }
+            },
+            Qt::QueuedConnection);
+        return done;
+    }
+    // sync() and end() without waiting; the GUI thread must not touch this scene until the future is ready.
+    std::shared_future<void> syncLater() {
+        scene.control.polishItems();
+        return post([this] {
+            scene.control.beginFrame();
+            scene.control.sync();
+        });
+    }
+    std::shared_future<void> endLater() {
+        return post([this] {
+            wallpaperx::testing::gl_fault_detail::order(wallpaperx::testing::GlSemaphoreFaults::Call::FrameEnd, 0);
+            scene.control.endFrame();
+        });
+    }
+    // The item gone and its node reaped in one more frame, the scene graph invalidated and the context
+    // handed back, all before anything here is destroyed on the GUI thread.
+    void down() {
+        if (context == nullptr || context->thread() != &thread) return;
+        if (up) {
+            scene.root.reset();
+            pass();
+        }
+        up = false;
+        QThread* gui = QCoreApplication::instance()->thread();
+        on([this, gui] {
+            scene.control.invalidate();
+            if (QOpenGLContext* current = QOpenGLContext::currentContext()) current->doneCurrent();
+            context->moveToThread(gui);
+        });
+    }
+};
+
+// The plugin's item on `monitor` (the second by default), loaded into `into`; false after a reported
+// harness failure.
+bool loadSecondMonitorItem(Scene& into, const char* file, int monitor = wallpaperx::testing::kSecondMonitor) {
+    into.engine.addImportPath(QString::fromUtf8(WALLPAPERX_QML_MODULE_PATH));
+    into.component = std::make_unique<QQmlComponent>(&into.engine);
+    QString qml = wallpaperx::testing::cacheQmlSource();
+    qml.replace(QStringLiteral("monitorId: 0"), QStringLiteral("monitorId: ") + QString::number(monitor));
+    into.component->setData(qml.toUtf8(), QUrl::fromLocalFile(QCoreApplication::applicationDirPath() +
+                                                              QStringLiteral("/") + QString::fromUtf8(file)));
+    into.root.reset(into.component->create());
+    auto* root = qobject_cast<QQuickItem*>(into.root.get());
+    if (root == nullptr) {
+        wallpaperx::testing::harnessFailure(std::string("the item in ") + file + " could not be made");
+        return false;
+    }
+    root->setParentItem(into.window.contentItem());
+    into.item = qobject_cast<QQuickItem*>(into.root->property("rendererItem").value<QObject*>());
+    if (into.item == nullptr) {
+        wallpaperx::testing::harnessFailure(std::string("the item in ") + file + " exposed no rendererItem");
+        return false;
+    }
+    return true;
+}
+
 // The receivers of `object`'s destroyed(): QObject::receivers is protected, and a pointer to it taken
 // through a derived class is still a pointer to QObject's member, so no cast to a type `object` is not.
 int destroyedReceivers(const QObject* object) {
@@ -440,6 +590,7 @@ bool runPhase(const PhaseName& which) {
                 stub.numberHandoversFrom(500);
                 break;
             case Phase::LateValue:
+            case Phase::SharedStuck:
                 stub.serveTimelines(ExportingStub::Timeline::Grant);
                 stub.ownTimelines();
                 break;
@@ -2017,8 +2168,9 @@ bool runPhase(const PhaseName& which) {
                 //       (`reinterpret_cast<QOpenGLContextGroup*>(context)`) -> S15.436 red, "(cycle 0: 1
                 //       semaphore(s) created, 1 import(s) there, 0 back; ...)" in all three cycles, with only
                 //       S15.442's two checks red beside it; (b) re-run against `group->imports` via
-                //       control_batch.sh: every import in `group->imports` released and the list cleared from
-                //       each drawing context's aboutToBeDestroyed -> S15.437 "(cycle 0: 1 delete(s))" and
+                //       control_batch.sh: every import in `group->imports` deleted (glDeleteSemaphoresEXT,
+                //       resolved through eglGetProcAddress) and the list cleared from each drawing context's
+                //       aboutToBeDestroyed -> S15.437 "(cycle 0: 1 delete(s))" and
                 //       S15.438 "(cycle 0: 1 import(s), 3 value(s), 3 wait(s); ...)" in all three cycles;
                 //       (c) the group's record erased from each context's aboutToBeDestroyed -> S15.438 alone
                 //       red, "(cycle 0: 1 import(s), ...)" in all three cycles.
@@ -2151,18 +2303,7 @@ bool runPhase(const PhaseName& which) {
                 };
                 // Puts an item on the second monitor into `ys` and draws value pictures on A's timeline there.
                 const auto onSecondMonitor = [&](Scene& ys, const std::string& which) {
-                    ys.engine.addImportPath(QString::fromUtf8(WALLPAPERX_QML_MODULE_PATH));
-                    ys.component = std::make_unique<QQmlComponent>(&ys.engine);
-                    QString qml = wallpaperx::testing::cacheQmlSource();
-                    qml.replace(QStringLiteral("monitorId: 0"), QStringLiteral("monitorId: 1"));
-                    ys.component->setData(qml.toUtf8(), QUrl::fromLocalFile(QCoreApplication::applicationDirPath() +
-                                                                             QStringLiteral("/item_timeline_y.qml")));
-                    ys.root.reset(ys.component->create());
-                    auto* yRoot = qobject_cast<QQuickItem*>(ys.root.get());
-                    if (!staged(yRoot != nullptr, which + " could not be made")) return false;
-                    yRoot->setParentItem(ys.window.contentItem());
-                    ys.item = qobject_cast<QQuickItem*>(ys.root->property("rendererItem").value<QObject*>());
-                    if (!staged(ys.item != nullptr, which + " exposed no rendererItem")) return false;
+                    if (!loadSecondMonitorItem(ys, "item_timeline_y.qml")) return false;
                     (void)pumpUntil([&] { ys.renderPass(); return itemTexture(ys.item) != nullptr; }, 10000);
                     if (!staged(itemTexture(ys.item) != nullptr && settleQuiet(ys, stub),
                                 which + " never drew A's picture and went quiet")) {
@@ -2276,8 +2417,8 @@ bool runPhase(const PhaseName& which) {
                     // WHY-THIS-SHAPE: as above; only the item still held is rendered, so the other's own
                     //       fetches from B or C cannot put their waits in the window.
                     // CONTROL: in acquireOnGroupTimeline (backend/kde/wallpaperx_item.cpp), via control_batch.sh,
-                    //       2026-10-10, NVIDIA, reverted: the oldest import released and erased when a third is
-                    //       appended -> "FAIL: A's late value in a sibling context after B and C is waited on
+                    //       2026-10-10, NVIDIA, reverted: the oldest import deleted (glDeleteSemaphoresEXT, resolved
+                    //       through eglGetProcAddress) and erased when a third is appended -> "FAIL: A's late value in a sibling context after B and C is waited on
                     //       A's import (A is 1, waited on 3, 0 import(s); ...)", the check above staying green.
                     //       The newest-import break above turns this red too ("waited on 3").
                     // COVERAGE-ASSERT: a late picture drawn with at least one wait, else not staged.
@@ -2332,6 +2473,564 @@ bool runPhase(const PhaseName& which) {
                 const int lines = tripLines();
                 check(captureWorked() && lines == 0, "no semaphore import was refused (" + std::to_string(lines) +
                                                          " line(s))");
+                return true;
+            }
+
+            case Phase::SharedThreads: {
+                // Items P and Q on the second monitor, each in a scene graph on a render thread of its own,
+                // in a share group the test makes (not the phase scene's, which is not drawn here). Each
+                // round P syncs and is held mid-frame while Q runs a whole frame, then P ends its frame, so
+                // Q's calls land after P's wait and before anything Qt does at P's endFrame(). Graded on
+                // the recorded order of semaphore calls and of glFlush/glFinish (gl_semaphore_fault.h).
+                using Faults = wallpaperx::testing::GlSemaphoreFaults;
+                ThreadedScene p;
+                ThreadedScene q;
+                p.context = std::make_unique<QOpenGLContext>();
+                q.context = std::make_unique<QOpenGLContext>();
+                q.context->setShareContext(p.context.get());
+                if (!p.context->create() || !q.context->create() ||
+                    q.context->shareGroup() != p.context->shareGroup()) {
+                    wallpaperx::testing::harnessFailure("two contexts in one share group could not be made");
+                    return true;
+                }
+                if (!p.bringUp() || !q.bringUp()) {
+                    wallpaperx::testing::harnessFailure("a scene graph would not come up on a render thread of its own");
+                    return true;
+                }
+                if (!loadSecondMonitorItem(p.scene, "item_timeline_p.qml") ||
+                    !loadSecondMonitorItem(q.scene, "item_timeline_q.qml")) {
+                    return true;
+                }
+                struct StopRecording {
+                    ~StopRecording() { g_glSemaphoreFaults.recordOrder.store(false); }
+                } stopRecording;
+                {
+                    std::lock_guard<std::mutex> lock(g_glSemaphoreFaults.callsMutex);
+                    g_glSemaphoreFaults.callOrder.clear();
+                }
+                g_glSemaphoreFaults.recordOrder.store(true);
+                if (!pumpUntil(
+                        [&] {
+                            p.pass();
+                            q.pass();
+                            return p.scene.pictures() > 0 && q.scene.pictures() > 0;
+                        },
+                        10000)) {
+                    wallpaperx::testing::harnessFailure("the items on the render threads never drew a first picture");
+                    return true;
+                }
+                // GOAL: the flush and finish checks below grade the plugin only where the recorder can see
+                //       its glFlush and glFinish at all.
+                // WHY-THIS-SHAPE: a resolution flag, not "finishes > 0": the plugin is meant to call no
+                //       glFinish, so a count would turn the finish control into "not verified".
+                // CONTROL: eglGetProcAddress in gl_semaphore_fault.h made to return nullptr for glFlush and
+                //       glFinish, as a stack without core names there (Qt then uses dlsym), by hand, 2026-10-10,
+                //       NVIDIA, reverted -> "NOT VERIFIED -- ... glFlush and glFinish did not resolve through
+                //       eglGetProcAddress", a skip; with this gate also disabled the same run blamed the plugin:
+                //       "FAIL: a wait on a group timeline is flushed ... (33 of 33 not ...)" and the failed-wait FAIL.
+                if (!g_glSemaphoreFaults.flushWrapped.load() || !g_glSemaphoreFaults.finishWrapped.load()) {
+                    notVerified(kGoal, "glFlush and glFinish did not resolve through eglGetProcAddress (Qt then "
+                                       "looks them up with dlsym), so the recorder cannot see the plugin's flushes");
+                    return true;
+                }
+
+                constexpr int kRounds = 16;
+                for (int r = 0; r < kRounds; ++r) {
+                    const quint64 p0 = p.scene.pictures();
+                    const quint64 q0 = q.scene.pictures();
+                    const int served0 = stub.served();
+                    announce(bus, stub.nextGeneration(), wallpaperx::testing::kSecondMonitor);
+                    (void)pumpUntil([&] { return stub.served() >= served0 + 2; }, 3000);
+                    pumpFor(50);
+                    p.sync();
+                    q.pass();
+                    p.end();
+                    if (!pumpUntil(
+                            [&] {
+                                if (p.scene.pictures() > p0 && q.scene.pictures() > q0) return true;
+                                p.pass();
+                                q.pass();
+                                return false;
+                            },
+                            5000)) {
+                        wallpaperx::testing::harnessFailure("round " + std::to_string(r) +
+                                                            ": the two items did not both draw the announced picture");
+                        return true;
+                    }
+                }
+                // One more round in which P's wait fails after its value was set; disarmed before Q runs.
+                size_t faultMark = 0;
+                {
+                    std::lock_guard<std::mutex> lock(g_glSemaphoreFaults.callsMutex);
+                    faultMark = g_glSemaphoreFaults.callOrder.size();
+                }
+                const int failed0 = g_glSemaphoreFaults.waitsFailed.load();
+                {
+                    const int served0 = stub.served();
+                    announce(bus, stub.nextGeneration(), wallpaperx::testing::kSecondMonitor);
+                    (void)pumpUntil([&] { return stub.served() >= served0 + 2; }, 3000);
+                    pumpFor(50);
+                    g_glSemaphoreFaults.failWaits.store(1);
+                    p.sync();
+                    g_glSemaphoreFaults.failWaits.store(0);
+                    q.pass();
+                    p.end();
+                }
+                const int faultsFired = g_glSemaphoreFaults.waitsFailed.load() - failed0;
+                g_glSemaphoreFaults.recordOrder.store(false);
+                std::vector<Faults::OrderedCall> calls;
+                {
+                    std::lock_guard<std::mutex> lock(g_glSemaphoreFaults.callsMutex);
+                    calls = g_glSemaphoreFaults.callOrder;
+                }
+
+                // Which calls name a live timeline of this group: from its glCreateSemaphoresNV on one of
+                // the two render threads until a delete of it.
+                const auto ours = [&](const Faults::OrderedCall& c) {
+                    return c.thread == p.renderThread || c.thread == q.renderThread;
+                };
+                std::vector<bool> onTimeline(calls.size(), false);
+                {
+                    std::set<GLuint> live;
+                    for (size_t i = 0; i < calls.size(); ++i) {
+                        if (!ours(calls[i])) continue;
+                        if (calls[i].call == Faults::Call::CreateTimeline) live.insert(calls[i].name);
+                        if (calls[i].call == Faults::Call::Delete) live.erase(calls[i].name);
+                        onTimeline[i] = calls[i].name != 0 && live.count(calls[i].name) != 0;
+                    }
+                }
+                // The first call after `i` by the other render thread on the same timeline that sets a value
+                // (or, with `waits`, also waits); calls.size() when there is none.
+                const auto nextUseElsewhere = [&](size_t i, bool waits) {
+                    for (size_t k = i + 1; k < calls.size(); ++k) {
+                        const Faults::OrderedCall& c = calls[k];
+                        if (!ours(c) || c.thread == calls[i].thread || !onTimeline[k] || c.name != calls[i].name) continue;
+                        if (c.call == Faults::Call::SetValue || (waits && c.call == Faults::Call::Wait)) return k;
+                    }
+                    return calls.size();
+                };
+                const auto sameThreadBetween = [&](size_t i, size_t j, Faults::Call call) {
+                    for (size_t k = i + 1; k < j; ++k) {
+                        if (calls[k].thread == calls[i].thread && calls[k].call == call) return true;
+                    }
+                    return false;
+                };
+                const auto who = [&](std::thread::id t) { return t == p.renderThread ? "P" : "Q"; };
+
+                std::set<GLuint> imported;
+                int importsGraded = 0;
+                // Each import or value-set on a group timeline opens a section the plugin holds the group lock
+                // across; on its thread the next glFlush closes it (waitOn flushes before the lock goes).
+                int sectionsGraded = 0;
+                int importSections = 0;
+                int sectionsFinished = 0;
+                std::string firstFinished;
+                int waitsGraded = 0;
+                // Graded waits whose sibling's set came before the waiting thread ended its frame: only there
+                // can nothing of Qt's (it flushes at endFrame()) stand in for the plugin's flush.
+                int waitsTight = 0;
+                int waitsUnflushed = 0;
+                std::string firstUnflushed;
+                for (size_t i = 0; i < calls.size(); ++i) {
+                    if (!onTimeline[i] || !ours(calls[i])) continue;
+                    if (calls[i].call == Faults::Call::Import || calls[i].call == Faults::Call::SetValue) {
+                        ++sectionsGraded;
+                        if (calls[i].call == Faults::Call::Import) ++importSections;
+                        for (size_t k = i + 1; k < calls.size(); ++k) {
+                            if (calls[k].thread != calls[i].thread) continue;
+                            if (calls[k].call == Faults::Call::Flush) break;
+                            if (calls[k].call != Faults::Call::Finish) continue;
+                            if (++sectionsFinished == 1) {
+                                firstFinished = std::string(who(calls[i].thread)) +
+                                                (calls[i].call == Faults::Call::Import ? " imported " : " set a value on ") +
+                                                std::to_string(calls[i].name) + " at call " + std::to_string(i) +
+                                                ", glFinish at call " + std::to_string(k);
+                            }
+                            break;
+                        }
+                    }
+                    if (calls[i].call == Faults::Call::Import) {
+                        imported.insert(calls[i].name);
+                        if (nextUseElsewhere(i, true) != calls.size()) ++importsGraded;
+                    } else if (calls[i].call == Faults::Call::Wait) {
+                        const size_t j = nextUseElsewhere(i, false);
+                        if (j == calls.size()) continue;
+                        ++waitsGraded;
+                        if (!sameThreadBetween(i, j, Faults::Call::FrameEnd)) ++waitsTight;
+                        if (!sameThreadBetween(i, j, Faults::Call::Flush)) {
+                            if (++waitsUnflushed == 1) {
+                                firstUnflushed = std::string(who(calls[i].thread)) + " waited on " +
+                                                 std::to_string(calls[i].name) + " at call " + std::to_string(i) +
+                                                 ", " + who(calls[j].thread) + " set a value at call " +
+                                                 std::to_string(j);
+                            }
+                        }
+                    }
+                }
+                const GLuint shared = imported.size() == 1 ? *imported.begin() : 0;
+                int pWaits = 0;
+                int qWaits = 0;
+                int flushes = 0;
+                int finishes = 0;
+                for (size_t i = 0; i < calls.size(); ++i) {
+                    if (ours(calls[i]) && calls[i].call == Faults::Call::Flush) ++flushes;
+                    if (ours(calls[i]) && calls[i].call == Faults::Call::Finish) ++finishes;
+                    if (calls[i].call != Faults::Call::Wait || calls[i].name != shared || !onTimeline[i]) continue;
+                    if (calls[i].thread == p.renderThread) ++pWaits;
+                    if (calls[i].thread == q.renderThread) ++qWaits;
+                }
+                // P's wait made to fail: its first from the fault round on. Graded up to whichever comes first of
+                // P ending its frame (Qt flushes there) and Q's next value-set or wait on that name.
+                size_t faulted = calls.size();
+                for (size_t i = faultMark; i < calls.size(); ++i) {
+                    if (calls[i].thread == p.renderThread && calls[i].call == Faults::Call::Wait) {
+                        faulted = i;
+                        break;
+                    }
+                }
+                bool faultSetFirst = false;
+                bool faultFlushed = false;
+                size_t faultBound = calls.size();
+                std::string faultBoundBy = "the end of the record";
+                if (faulted != calls.size()) {
+                    for (size_t k = faultMark; k < faulted; ++k) {
+                        faultSetFirst = faultSetFirst || (calls[k].thread == p.renderThread &&
+                                                          calls[k].call == Faults::Call::SetValue &&
+                                                          calls[k].name == calls[faulted].name);
+                    }
+                    for (size_t k = faulted + 1; k < calls.size() && faultBound == calls.size(); ++k) {
+                        const Faults::OrderedCall& c = calls[k];
+                        if (c.thread == p.renderThread && c.call == Faults::Call::FrameEnd) {
+                            faultBound = k;
+                            faultBoundBy = "P ended its frame";
+                        } else if (c.thread == q.renderThread && c.name == calls[faulted].name &&
+                                   (c.call == Faults::Call::SetValue || c.call == Faults::Call::Wait)) {
+                            faultBound = k;
+                            faultBoundBy = "Q used the name";
+                        }
+                    }
+                    faultFlushed = sameThreadBetween(faulted, faultBound, Faults::Call::Flush);
+                }
+                std::printf("item_timeline_test: shared-threads: %zu call(s) recorded, %zu timeline import(s) (shared "
+                            "name %u); waits on it: P %d, Q %d; %d glFlush, %d glFinish on the render threads; locked "
+                            "sections graded %d (%d imports, %d imports used by the other thread), with a glFinish %d; "
+                            "waits graded %d, %d inside the waiter's frame, unflushed %d; failed wait: %d fired, at call "
+                            "%zu, value set first %d, bounded at call %zu by %s, flushed %d\n",
+                            calls.size(), imported.size(), shared, pWaits, qWaits, flushes, finishes, sectionsGraded,
+                            importSections, importsGraded, sectionsFinished, waitsGraded, waitsTight, waitsUnflushed,
+                            faultsFired, faulted, faultSetFirst ? 1 : 0, faultBound, faultBoundBy.c_str(),
+                            faultFlushed ? 1 : 0);
+                std::fflush(stdout);
+
+                // GOAL: S15.443 -- the plugin calls no glFinish while it holds a share group's timeline lock: on
+                //       the thread that imported a group timeline or set a value on one, no glFinish comes before
+                //       that thread's next glFlush, which ends the locked section.
+                // WHY-THIS-SHAPE: graded on the recorded call order, not on a stall: a glFinish only blocks when
+                //       an earlier wait of the context is stuck, which this phase does not stage (shared-stuck
+                //       does, on behaviour). Qt makes no glFinish on these threads, so a Finish in the section
+                //       can only be the plugin's.
+                // CONTROL: in acquireOnGroupTimeline (backend/kde/wallpaperx_item.cpp), via control_run.sh,
+                //       2026-10-10, NVIDIA, reverted: gl->glFinish() put back after importTimeline -> "FAIL: the
+                //       plugin calls no glFinish while it holds a share group's timeline lock (1 of 35 sections had
+                //       one; first: P imported 1 at call 15, glFinish at call 16)".
+                // COVERAGE-ASSERT: at least one import section and three sections in all graded, else not staged.
+                // GOAL: S15.443 -- every wait on a group timeline is followed on the waiting thread by glFlush
+                //       before the other thread sets a value on that name.
+                // WHY-THIS-SHAPE: the sibling's set must land before the waiter's endFrame(), where Qt flushes
+                //       anyway; left to the scheduler it lands after, and the check passes without the plugin's
+                //       flush (16 of the 33 graded waits here are such). Hence P held mid-frame, and a FrameEnd
+                //       mark recorded by the render thread itself, not a position the test assumes.
+                // CONTROL: in acquireOnGroupTimeline's waitOn (backend/kde/wallpaperx_item.cpp), via
+                //       control_run.sh, 2026-10-10, NVIDIA, reverted: the glFlush deleted -> "FAIL: a wait on a
+                //       group timeline is flushed on its thread before the other thread sets a value (17 of 33
+                //       not; first: P waited on 1 at call 21, Q set a value at call 22)".
+                // COVERAGE-ASSERT: both threads waited on the shared name, and at least three graded waits had
+                //       the sibling's set before the waiter's FrameEnd, else not staged. Controlled by ending P's
+                //       frame before Q's pass: "0 inside the waiter's frame" and the not-staged line.
+                const bool staged = shared != 0 && pWaits > 0 && qWaits > 0 && importsGraded > 0 && waitsTight >= 3 &&
+                                    importSections > 0 && sectionsGraded >= 3;
+                if (!staged) {
+                    wallpaperx::testing::harnessFailure(
+                        "not staged: one timeline import used by both render threads, and at least three waits whose "
+                        "sibling set a value inside the waiter's frame, were not recorded (see the line above)");
+                    return true;
+                }
+                check(sectionsFinished == 0,
+                      "the plugin calls no glFinish while it holds a share group's timeline lock (" +
+                          std::to_string(sectionsFinished) + " of " + std::to_string(sectionsGraded) +
+                          " sections had one; first: " + firstFinished + ")");
+                check(waitsUnflushed == 0,
+                      "a wait on a group timeline is flushed on its thread before the other thread sets a value (" +
+                          std::to_string(waitsUnflushed) + " of " + std::to_string(waitsGraded) + " not; first: " +
+                          firstUnflushed + ")");
+
+                // GOAL: S15.444 -- a wait on a group timeline that fails after its value was set is still
+                //       flushed on its thread before the lock goes: before that thread ends its frame and before
+                //       the other thread's next value-set or wait on the name.
+                // WHY-THIS-SHAPE: bounded by P's FrameEnd as well as by Q's use: after a failed wait the plugin
+                //       may stop using the timeline, so Q's use alone could leave no bound and Qt's endFrame()
+                //       flush would then pass for the plugin's. The fault is armed only across P's sync.
+                // CONTROL: in acquireOnGroupTimeline's waitOn (backend/kde/wallpaperx_item.cpp), via
+                //       control_run.sh, 2026-10-10, NVIDIA, reverted: glFlush only when acquire returned true ->
+                //       "FAIL: a failed wait on a group timeline is flushed on its thread before Q used the name
+                //       (wait at call 177, bound at call 178)".
+                // COVERAGE-ASSERT: exactly one wait failed, P's, on the shared name, with P's value-set on that
+                //       name before it, else not staged.
+                if (faultsFired != 1 || faulted == calls.size() || calls[faulted].name != shared || !faultSetFirst) {
+                    wallpaperx::testing::harnessFailure(
+                        "not staged: P's wait on the shared timeline, after setting its value, did not fail exactly once "
+                        "(see the failed-wait part of the line above)");
+                } else {
+                    check(faultFlushed, "a failed wait on a group timeline is flushed on its thread before " +
+                                            faultBoundBy + " (wait at call " + std::to_string(faulted) +
+                                            ", bound at call " + std::to_string(faultBound) + ")");
+                }
+                const int lines = tripLines();
+                check(captureWorked() && lines == 0, "no semaphore import was refused (" + std::to_string(lines) +
+                                                         " line(s))");
+                return true;
+            }
+
+            case Phase::SharedStuck: {
+                // P (monitor 1) and Q (monitor 2) on render threads of their own, one share group, both on A's
+                // own timeline. P then waits on a value A holds back on the GPU (the gate), B takes the name, and
+                // both items are handed a value on B's timeline. P's frame imports B's timeline into the group
+                // while its context is stuck; Q's frame must still get through. B serves from a Vulkan device of
+                // its own: the gate holds A's queue, and B's every value is waited for on its device.
+                using Faults = wallpaperx::testing::GlSemaphoreFaults;
+                constexpr int kThirdMonitor = 2;
+                constexpr int kSiblingBoundMs = 3000;
+                wallpaperx::Device deviceB(/*enableValidation=*/true);
+                grade.watch(deviceB);
+                wallpaperx::OffscreenTargetManager targetsB(deviceB);
+                std::vector<const wallpaperx::OffscreenTarget*> ringB;
+                for (size_t i = 0; i < 2; ++i) {
+                    const wallpaperx::OffscreenTarget& target = targetsB.create(static_cast<int>(20 + i), kWidth, kHeight);
+                    publishSolidFrame(deviceB, targetsB, target, "item_timeline_stuck_" + std::to_string(i) + ".png",
+                                      kPalette[i]);
+                    ringB.push_back(&target);
+                }
+                ThreadedScene p;
+                ThreadedScene q;
+                p.context = std::make_unique<QOpenGLContext>();
+                q.context = std::make_unique<QOpenGLContext>();
+                q.context->setShareContext(p.context.get());
+                if (!p.context->create() || !q.context->create() ||
+                    q.context->shareGroup() != p.context->shareGroup()) {
+                    wallpaperx::testing::harnessFailure("two contexts in one share group could not be made");
+                    return true;
+                }
+                if (!p.bringUp() || !q.bringUp()) {
+                    wallpaperx::testing::harnessFailure("a scene graph would not come up on a render thread of its own");
+                    return true;
+                }
+                if (!loadSecondMonitorItem(p.scene, "item_timeline_p.qml") ||
+                    !loadSecondMonitorItem(q.scene, "item_timeline_q.qml", kThirdMonitor)) {
+                    return true;
+                }
+                // Destroyed before P and Q, whose teardown runs a frame on each: the held value is reached first.
+                struct ReleaseLate {
+                    ExportingStub& stub;
+                    ~ReleaseLate() {
+                        std::string ignored;
+                        (void)stub.signalLateValue(ignored);
+                    }
+                } releaseLate{stub};
+                struct StopRecording {
+                    ~StopRecording() { g_glSemaphoreFaults.recordOrder.store(false); }
+                } stopRecording;
+                {
+                    std::lock_guard<std::mutex> lock(g_glSemaphoreFaults.callsMutex);
+                    g_glSemaphoreFaults.callOrder.clear();
+                }
+                g_glSemaphoreFaults.recordOrder.store(true);
+                // The first recorded call from `from` on by `thread` of kind `call` (on `name` unless 0); npos if none.
+                const auto findCall = [](size_t from, std::thread::id thread, Faults::Call call, GLuint name) {
+                    std::lock_guard<std::mutex> lock(g_glSemaphoreFaults.callsMutex);
+                    const std::vector<Faults::OrderedCall>& calls = g_glSemaphoreFaults.callOrder;
+                    for (size_t i = from; i < calls.size(); ++i) {
+                        if (calls[i].thread == thread && calls[i].call == call && (name == 0 || calls[i].name == name)) {
+                            return i;
+                        }
+                    }
+                    return std::string::npos;
+                };
+                const auto recordedSoFar = [] {
+                    std::lock_guard<std::mutex> lock(g_glSemaphoreFaults.callsMutex);
+                    return g_glSemaphoreFaults.callOrder.size();
+                };
+                const auto readyWithin = [](const std::shared_future<void>& done, int ms) {
+                    return done.wait_for(std::chrono::milliseconds(ms)) == std::future_status::ready;
+                };
+                // The latest request `from` received for `monitor` was answered on its timeline: a value went out.
+                const auto lastAnsweredOnTimeline = [](const ExportingStub& from, int monitor) {
+                    const std::vector<ExportingStub::Ask>& asks = from.asks();
+                    for (auto it = asks.rbegin(); it != asks.rend(); ++it) {
+                        if (it->monitorId == monitor) return it->onTimeline && it->served != 0;
+                    }
+                    return false;
+                };
+
+                // Both items on A's timeline, through the group's one import of it.
+                const auto announceBoth = [&](ExportingStub& from, QDBusConnection& on) {
+                    const quint64 generation = from.nextGeneration();
+                    announce(on, generation, wallpaperx::testing::kSecondMonitor);
+                    announce(on, generation, kThirdMonitor);
+                };
+                bool onA = false;
+                for (int round = 0; round < 12 && !onA; ++round) {
+                    const int served0 = stub.served();
+                    announceBoth(stub, bus);
+                    (void)pumpUntil([&] { return stub.served() >= served0 + 2; }, 3000);
+                    pumpFor(50);
+                    p.pass();
+                    q.pass();
+                    onA = lastAnsweredOnTimeline(stub, wallpaperx::testing::kSecondMonitor) &&
+                          lastAnsweredOnTimeline(stub, kThirdMonitor);
+                }
+                const size_t aImport = findCall(0, p.renderThread, Faults::Call::Import, 0) != std::string::npos
+                                           ? findCall(0, p.renderThread, Faults::Call::Import, 0)
+                                           : findCall(0, q.renderThread, Faults::Call::Import, 0);
+                GLuint nameA = 0;
+                if (aImport != std::string::npos) {
+                    std::lock_guard<std::mutex> lock(g_glSemaphoreFaults.callsMutex);
+                    nameA = g_glSemaphoreFaults.callOrder[aImport].name;
+                }
+                if (!onA || nameA == 0) {
+                    wallpaperx::testing::harnessFailure("not staged: P and Q never both drew a value picture on A's "
+                                                        "timeline through a group import");
+                    return true;
+                }
+                pumpFor(200);
+
+                // P waits on a value A has submitted behind its gate: held on the GPU until released.
+                const size_t lateMark = recordedSoFar();
+                const int lateServed0 = stub.served();
+                stub.lateValueNext({});
+                announce(bus, stub.nextGeneration(), wallpaperx::testing::kSecondMonitor);
+                const bool lateOut = pumpUntil([&] { return stub.lateValueSent(); }, 3000);
+                pumpFor(50);
+                if (!lateOut || stub.served() != lateServed0 + 1 ||
+                    !lastAnsweredOnTimeline(stub, wallpaperx::testing::kSecondMonitor)) {
+                    wallpaperx::testing::harnessFailure("not staged: the held value did not go to P alone (" +
+                                                        std::to_string(stub.served() - lateServed0) + " served; " +
+                                                        stub.acquireError() + ")");
+                    return true;
+                }
+                if (!readyWithin(p.syncLater(), 3000) || !readyWithin(p.endLater(), 3000)) {
+                    wallpaperx::testing::harnessFailure("P's frame with the held value did not return within 3 s");
+                    return true;
+                }
+                const size_t lateSet = findCall(lateMark, p.renderThread, Faults::Call::SetValue, nameA);
+                const size_t lateWait = findCall(lateMark, p.renderThread, Faults::Call::Wait, nameA);
+                if (lateSet == std::string::npos || lateWait == std::string::npos ||
+                    g_glSemaphoreFaults.waitsFailed.load() != 0) {
+                    wallpaperx::testing::harnessFailure("not staged: P did not wait on A's timeline for the held value");
+                    return true;
+                }
+
+                // B takes the name, and both items hold a reply carrying a value on B's timeline, unsynced. Only
+                // Q draws meanwhile, and only binary pictures: a drawn one is what asks B for its timeline.
+                SuccessorDaemon successor(deviceB, ringB);
+                if (!successor.ok || !successor.takeNameFrom(bus)) {
+                    wallpaperx::testing::harnessFailure("not staged: daemon B never took the name");
+                    return true;
+                }
+                bool onB = false;
+                for (int round = 0; round < 12 && !onB; ++round) {
+                    const int served0 = successor.stub.served();
+                    announceBoth(successor.stub, successor.bus);
+                    (void)pumpUntil([&] { return successor.stub.served() >= served0 + 2; }, 3000);
+                    pumpFor(100);
+                    const bool qValued = lastAnsweredOnTimeline(successor.stub, kThirdMonitor);
+                    onB = successor.stub.timelinesGranted() > 0 && qValued &&
+                          lastAnsweredOnTimeline(successor.stub, wallpaperx::testing::kSecondMonitor);
+                    if (!qValued) q.pass();
+                }
+                if (!onB) {
+                    std::string asked;
+                    for (const ExportingStub::Ask& a : successor.stub.asks()) {
+                        asked += " m" + std::to_string(a.monitorId) + (a.onTimeline ? "/t" : "/b") +
+                                 (a.served != 0 ? "+" : "-");
+                    }
+                    std::fprintf(stderr, "  B: %d timeline ask(s), %d granted; requests:%s\n",
+                                 successor.stub.timelineAsks(), successor.stub.timelinesGranted(), asked.c_str());
+                    wallpaperx::testing::harnessFailure("not staged: B never answered both items with a value");
+                    return true;
+                }
+
+                // P's frame imports B's timeline into the group; once that import is recorded, Q's frame runs.
+                const size_t importMark = recordedSoFar();
+                QElapsedTimer clock;
+                clock.start();
+                const std::shared_future<void> pFrame = p.syncLater();
+                size_t bImport = std::string::npos;
+                while (clock.elapsed() < 3000) {
+                    bImport = findCall(importMark, p.renderThread, Faults::Call::Import, 0);
+                    if (bImport != std::string::npos || readyWithin(pFrame, 0)) break;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                }
+                if (bImport == std::string::npos) bImport = findCall(importMark, p.renderThread, Faults::Call::Import, 0);
+                const qint64 qStart = clock.elapsed();
+                const std::shared_future<void> qFrame =
+                    bImport != std::string::npos ? q.syncLater() : std::shared_future<void>();
+                const bool qThrough = qFrame.valid() && readyWithin(qFrame, kSiblingBoundMs);
+                const qint64 qMs = clock.elapsed() - qStart;
+                const bool pReturned = readyWithin(pFrame, 0);
+                const qint64 pMs = clock.elapsed();
+                const bool stillHeld = stub.lateValuePending();
+                std::string why;
+                const bool released = stub.signalLateValue(why);
+                const bool drained = readyWithin(pFrame, 10000) && (!qFrame.valid() || readyWithin(qFrame, 10000));
+                if (!drained) {
+                    wallpaperx::testing::harnessFailure("the frames did not return within 10 s of the held value being "
+                                                        "released (" + why + ")");
+                    return true;
+                }
+                p.end();
+                if (qFrame.valid()) q.end();
+                GLuint nameB = 0;
+                if (bImport != std::string::npos) {
+                    std::lock_guard<std::mutex> lock(g_glSemaphoreFaults.callsMutex);
+                    nameB = g_glSemaphoreFaults.callOrder[bImport].name;
+                }
+                const bool qOnB = nameB != 0 && findCall(importMark, q.renderThread, Faults::Call::SetValue, nameB) !=
+                                                    std::string::npos;
+                std::printf("item_timeline_test: shared-stuck: A's timeline %u, P's held wait at call %zu; B's timeline "
+                            "%u imported by P at call %zu; Q's frame %s after %lld ms (bound %d), set a value on B's "
+                            "timeline %d; P's frame %s by then (%lld ms); value still held %d, released %d\n",
+                            nameA, lateWait, nameB, bImport, qThrough ? "returned" : "had not returned",
+                            static_cast<long long>(qMs), kSiblingBoundMs, qOnB ? 1 : 0,
+                            pReturned ? "had returned" : "had not returned", static_cast<long long>(pMs),
+                            stillHeld ? 1 : 0, released ? 1 : 0);
+                std::fflush(stdout);
+
+                // GOAL: S15.445 -- a render thread acquiring a picture on its share group's timeline gets through
+                //       within a bound while a sibling context of the group, whose earlier wait is on a value
+                //       never signalled, imports a new daemon's timeline into the group.
+                // WHY-THIS-SHAPE: the stuck value is held on the GPU behind a gate the test opens, so the bound
+                //       ends the wait, never a hang: Q's frame is waited for 3 s, then the value is released and
+                //       both frames drain. Q's frame runs only after P's import is recorded, so P is inside the
+                //       group lock or past it, never before it. A check on P's frame time would grade Qt and the
+                //       driver; the property is only that nothing under the lock blocks.
+                // CONTROL: in acquireOnGroupTimeline (backend/kde/wallpaperx_item.cpp), via control_run.sh,
+                //       2026-10-10, NVIDIA, reverted: gl->glFinish() put back after importTimeline -> "FAIL: a
+                //       render thread gets through while a sibling context of its share group, stuck on a value
+                //       never signalled, imports a new daemon's timeline (Q's frame had not returned after 3000
+                //       ms)"; the entry still ended in 5 s, the value released.
+                // COVERAGE-ASSERT: P imported B's timeline, the value was still held when Q was graded, and Q set
+                //       a value on B's timeline in that frame, else not staged.
+                if (bImport == std::string::npos || !stillHeld || !released || !qOnB) {
+                    wallpaperx::testing::harnessFailure(
+                        "not staged: P importing B's timeline while held, then Q acquiring on it, was not recorded "
+                        "(see the line above)");
+                    return true;
+                }
+                check(qThrough, "a render thread gets through while a sibling context of its share group, stuck on a "
+                                "value never signalled, imports a new daemon's timeline (Q's frame " +
+                                    std::string(qThrough ? "returned after " + std::to_string(qMs) + " ms"
+                                                         : "had not returned after " + std::to_string(qMs) + " ms") +
+                                    ")");
                 return true;
             }
         }

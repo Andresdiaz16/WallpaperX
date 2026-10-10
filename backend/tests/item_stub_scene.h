@@ -632,6 +632,8 @@ public:
     // Whether the late acquire went into a reply past the descriptor cap: sent, or held by this stub to
     // be sent. A reply the cap refused does not count. A failure making it is in acquireError().
     bool lateValueSent() const { return m_lateDelivered; }
+    // Submitted and held behind the gate: signalLateValue() not yet called.
+    bool lateValuePending() const { return m_latePending; }
     bool signalLateValue(std::string& why) {
         if (!m_latePending) {
             why = "no late value was handed out";

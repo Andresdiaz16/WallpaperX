@@ -1893,7 +1893,8 @@ if(WALLPAPERX_DBUS_RUN_SESSION)
             foreach(timeline_phase steady old-daemon unsupported unknown-interface too-many-copies retry-busy retry-exportfailed
                                    lost-reply refused-timeline refused-binary refused-shared wait-no-trip setup-create setup-type
                                    stray-value restart restart-memory stale-value context-move late-value
-                                   late-answer replaced-asking retry-replaced rebuild context-share shared-replaced)
+                                   late-answer replaced-asking retry-replaced rebuild context-share shared-replaced
+                                   shared-threads shared-stuck)
                 wallpaperx_add_display_test(NAME item_timeline_${timeline_phase}
                          COMMAND $<TARGET_FILE:wallpaperx-item-timeline-test> ${timeline_phase})
                 set_tests_properties(item_timeline_${timeline_phase} PROPERTIES

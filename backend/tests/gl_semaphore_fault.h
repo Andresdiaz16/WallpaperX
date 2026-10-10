@@ -27,6 +27,7 @@
 #include <atomic>
 #include <cstring>
 #include <mutex>
+#include <thread>
 #include <vector>
 
 namespace wallpaperx::testing {
@@ -65,6 +66,23 @@ struct GlSemaphoreFaults {
     std::vector<NamedCall> timelinesCreated;  // guarded by callsMutex
     std::vector<NamedCall> semaphoresDeleted;  // guarded by callsMutex
     std::vector<NamedCall> semaphoresWaited;  // guarded by callsMutex
+
+    // While recordOrder is set, every wrapped call in the one order the recorder's lock gave them, with
+    // the calling thread: what one context did before another touched the same name. glFlush and
+    // glFinish are seen only as Qt and the plugin resolve them, through eglGetProcAddress. FrameEnd is
+    // no GL call: a harness marks with it where a thread is about to end a scene-graph frame.
+    enum class Call { CreateTimeline, Import, SetValue, Wait, Flush, Finish, Delete, FrameEnd };
+    struct OrderedCall {
+        Call call;
+        GLuint name;  // 0 for glFlush and glFinish
+        std::thread::id thread;
+    };
+    std::atomic<bool> recordOrder{false};
+    std::vector<OrderedCall> callOrder;  // guarded by callsMutex
+    // Set once glFlush or glFinish was handed out wrapped. Where eglGetProcAddress has no core GL
+    // names, Qt falls back to dlsym and the recorder never sees either call.
+    std::atomic<bool> flushWrapped{false};
+    std::atomic<bool> finishWrapped{false};
 };
 
 inline GlSemaphoreFaults g_glSemaphoreFaults;
@@ -91,6 +109,48 @@ Fn realGl(const char* name) {
 // Any call the driver rejects will do; this one changes no state.
 inline void raiseGlError() { glEnable(0xFFFFu); }
 
+// Caller holds callsMutex.
+inline void orderLocked(GlSemaphoreFaults::Call call, GLuint name) {
+    if (g_glSemaphoreFaults.recordOrder.load()) {
+        g_glSemaphoreFaults.callOrder.push_back({call, name, std::this_thread::get_id()});
+    }
+}
+inline void order(GlSemaphoreFaults::Call call, GLuint name) {
+    std::lock_guard<std::mutex> lock(g_glSemaphoreFaults.callsMutex);
+    orderLocked(call, name);
+}
+
+// A call that touches a name another context may rely on is recorded before it is made, and one that
+// completes something (an import, a flush, a finish) after it returns: the recorded order then never
+// puts a completion ahead of a touch it did not precede.
+using ImportFdFn = void (*)(GLuint, GLenum, GLint);
+using ParameterUi64vFn = void (*)(GLuint, GLenum, const GLuint64*);
+using VoidFn = void (*)();
+
+inline void loggingImport(GLuint semaphore, GLenum handleType, GLint fd) {
+    static const ImportFdFn real = realGl<ImportFdFn>("glImportSemaphoreFdEXT");
+    if (real != nullptr) real(semaphore, handleType, fd);
+    order(GlSemaphoreFaults::Call::Import, semaphore);
+}
+
+inline void loggingSetValue(GLuint semaphore, GLenum pname, const GLuint64* value) {
+    static const ParameterUi64vFn real = realGl<ParameterUi64vFn>("glSemaphoreParameterui64vEXT");
+    order(GlSemaphoreFaults::Call::SetValue, semaphore);
+    if (real != nullptr) real(semaphore, pname, value);
+}
+
+inline void loggingFlush() {
+    static const VoidFn real = realGl<VoidFn>("glFlush");
+    if (real != nullptr) real();
+    order(GlSemaphoreFaults::Call::Flush, 0);
+}
+
+inline void loggingFinish() {
+    static const VoidFn real = realGl<VoidFn>("glFinish");
+    if (real != nullptr) real();
+    order(GlSemaphoreFaults::Call::Finish, 0);
+}
+
 inline void faultingWait(GLuint semaphore, GLuint buffers, const GLuint* bufferList, GLuint textures,
                          const GLuint* textureList, const GLenum* layouts) {
     GlSemaphoreFaults& faults = g_glSemaphoreFaults;
@@ -98,6 +158,7 @@ inline void faultingWait(GLuint semaphore, GLuint buffers, const GLuint* bufferL
     {
         std::lock_guard<std::mutex> lock(faults.callsMutex);
         faults.semaphoresWaited.push_back({semaphore, eglGetCurrentContext()});
+        orderLocked(GlSemaphoreFaults::Call::Wait, semaphore);
     }
     int armed = faults.failWaits.load();
     while (armed > 0 && !faults.failWaits.compare_exchange_weak(armed, armed - 1)) {
@@ -124,6 +185,7 @@ inline void faultingCreate(GLsizei n, GLuint* semaphores) {
     for (GLsizei i = 0; i < n; ++i) {
         g_glSemaphoreFaults.timelinesCreated.push_back(
             {semaphores[i], eglGetCurrentContext(), g_glSemaphoreFaults.semaphoresDeleted.size()});
+        orderLocked(GlSemaphoreFaults::Call::CreateTimeline, semaphores[i]);
     }
 }
 
@@ -131,7 +193,10 @@ inline void loggingDelete(GLsizei n, const GLuint* semaphores) {
     static const DeleteFn real = realGl<DeleteFn>("glDeleteSemaphoresEXT");
     {
         std::lock_guard<std::mutex> lock(g_glSemaphoreFaults.callsMutex);
-        for (GLsizei i = 0; i < n; ++i) g_glSemaphoreFaults.semaphoresDeleted.push_back({semaphores[i], eglGetCurrentContext()});
+        for (GLsizei i = 0; i < n; ++i) {
+            g_glSemaphoreFaults.semaphoresDeleted.push_back({semaphores[i], eglGetCurrentContext()});
+            orderLocked(GlSemaphoreFaults::Call::Delete, semaphores[i]);
+        }
     }
     if (real != nullptr) real(n, semaphores);
 }
@@ -164,12 +229,28 @@ extern "C" __eglMustCastToProperFunctionPointerType eglGetProcAddress(const char
             wrapper = reinterpret_cast<__eglMustCastToProperFunctionPointerType>(&detail::faultingParameteriv);
         } else if (std::strcmp(name, "glDeleteSemaphoresEXT") == 0) {
             wrapper = reinterpret_cast<__eglMustCastToProperFunctionPointerType>(&detail::loggingDelete);
+        } else if (std::strcmp(name, "glImportSemaphoreFdEXT") == 0) {
+            wrapper = reinterpret_cast<__eglMustCastToProperFunctionPointerType>(&detail::loggingImport);
+        } else if (std::strcmp(name, "glSemaphoreParameterui64vEXT") == 0) {
+            wrapper = reinterpret_cast<__eglMustCastToProperFunctionPointerType>(&detail::loggingSetValue);
+        }
+        const bool core = std::strcmp(name, "glFlush") == 0 || std::strcmp(name, "glFinish") == 0;
+        if (core) {
+            wrapper = reinterpret_cast<__eglMustCastToProperFunctionPointerType>(
+                std::strcmp(name, "glFlush") == 0 ? &detail::loggingFlush : &detail::loggingFinish);
         }
         // Only where the driver has the real one: a wrapper for a name the driver lacks would make
         // the plugin believe in a capability this host does not have.
         if (wrapper != nullptr) {
             if (detail::realProcAddress() == nullptr || detail::realProcAddress()(name) == nullptr) return nullptr;
-            wallpaperx::testing::g_glSemaphoreFaults.resolvedThroughHere.store(true);
+            wallpaperx::testing::GlSemaphoreFaults& faults = wallpaperx::testing::g_glSemaphoreFaults;
+            if (!core) {
+                faults.resolvedThroughHere.store(true);
+            } else if (std::strcmp(name, "glFlush") == 0) {
+                faults.flushWrapped.store(true);
+            } else {
+                faults.finishWrapped.store(true);
+            }
             return wrapper;
         }
     }

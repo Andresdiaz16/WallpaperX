@@ -832,13 +832,6 @@ bool FrameImport::acquire(const Timeline& timeline, uint64_t value, unsigned int
     return true;
 }
 
-void FrameImport::release(const Timeline& timeline) {
-    if (timeline.semaphore == 0) return;
-    // GL keeps a deleted semaphore alive until the waits queued on it have run.
-    const GLuint semaphore = timeline.semaphore;
-    semaphoreApi().destroy(1, &semaphore);
-}
-
 FrameImport::Result FrameImport::importOpaqueFd(Request& request) {
     Result out;
 
