@@ -10,7 +10,8 @@
 // sampled, the one stderr line the refused-import rule prints, and whether the item blanked.
 //
 // One phase per process (argv[1]): the plugin's timeline record, its record of which daemon it
-// talks to and its list of contexts that refused an import are process-wide and never reset.
+// talks to, its per-share-group timeline imports and its refused-import flag are process-wide and
+// never reset.
 //
 //   steady              one import per connection, none per picture; pixels right (S13.215, S13.216)
 //   old-daemon          a daemon without the method: asked once, never on the timeline (S13.222, S13.218)
@@ -22,6 +23,7 @@
 //   lost-reply          a timeline answer that never comes costs nothing (S13.217)
 //   refused-timeline    a refused timeline import: one line, the wallpaper keeps drawing (S13.223)
 //   refused-binary      the same for a refused binary import (S13.223)
+//   refused-shared      one refusal stops imports in every context, shared or not (S15.439)
 //   wait-no-trip        a failed wait gives up the timeline, not the context (S13.223, S13.217)
 //   setup-create        a timeline that cannot be created costs one picture (S13.217)
 //   setup-type          nor one whose type cannot be set (S13.217)
@@ -32,9 +34,12 @@
 //   late-answer         a timeline answer past QtDBus's 25 s is used, the daemon asked once (S15.336)
 //   replaced-asking     an ask still out to a replaced daemon does not hold up the new one (S15.337)
 //   rebuild             300 node rebuilds and a daemon replacement import the timeline once each (S15.419)
-//   context-share       one import per context: invalidated, new, returned to, address reused (S15.420)
+//   context-share       one import per share group: invalidated, new, returned to (S15.420);
+//                       a sharing context imports nothing and its end deletes nothing (S15.436-S15.438);
+//                       a group's destroyed() erases its record (S15.442)
+//   shared-replaced     every earlier daemon's import stays in the group, none deleted by hand (S15.440, S15.441)
 //
-// Every phase but refused-binary and stray-value needs a GL context that can wait on a Vulkan
+// Every phase but refused-binary, refused-shared and stray-value needs a GL context that can wait on a Vulkan
 // timeline (GL_NV_timeline_semaphore), and reports NOT VERIFIED where there is none -- Mesa.
 
 #include "kde/frame_import.h"
@@ -71,6 +76,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdio>
 #include <cstring>
@@ -123,6 +129,7 @@ enum class Phase {
     LostReply,
     RefusedTimeline,
     RefusedBinary,
+    RefusedShared,
     WaitNoTrip,
     SetupCreate,
     SetupType,
@@ -137,6 +144,7 @@ enum class Phase {
     RetryReplaced,
     Rebuild,
     ContextShare,
+    SharedReplaced,
 };
 
 struct PhaseName {
@@ -159,6 +167,8 @@ constexpr PhaseName kPhases[] = {
     {Phase::RefusedTimeline, "refused-timeline", "S13.223 (a refused timeline import keeps the wallpaper drawing)",
      true},
     {Phase::RefusedBinary, "refused-binary", "S13.223 (a refused binary import keeps the wallpaper drawing)", false},
+    {Phase::RefusedShared, "refused-shared",
+     "S15.439 (one refused import stops semaphore imports in every context, said once)", false},
     {Phase::WaitNoTrip, "wait-no-trip", "S13.223 and S13.217 (a failed wait gives up the timeline, not the context)",
      true},
     {Phase::SetupCreate, "setup-create", "S13.217 (a timeline that cannot be created costs one picture)", true},
@@ -187,7 +197,11 @@ constexpr PhaseName kPhases[] = {
     {Phase::Rebuild, "rebuild",
      "S15.419 (node rebuilds in one context never import the timeline again; a new daemon's is imported once)", true},
     {Phase::ContextShare, "context-share",
-     "S15.420 (the timeline is imported once per GL context, and a destroyed context's import is forgotten)", true},
+     "S15.420, S15.436-S15.438 and S15.442 (the timeline is imported once per GL share group and shared by its "
+     "contexts)",
+     true},
+    {Phase::SharedReplaced, "shared-replaced",
+     "S15.440 and S15.441 (a share group keeps every earlier daemon's import and deletes none by hand)", true},
 };
 
 // Everything written to stderr while it is alive, which is where the plugin's refused-import line
@@ -272,9 +286,13 @@ struct SuccessorDaemon {
     QDBusServiceWatcher watcher{QString::fromUtf8(kService), QDBusConnection::sessionBus(),
                                 QDBusServiceWatcher::WatchForOwnerChange};
 
-    SuccessorDaemon(wallpaperx::Device& device, const std::vector<const wallpaperx::OffscreenTarget*>& ring)
-        : bus(QDBusConnection::connectToBus(QDBusConnection::SessionBus, QStringLiteral("wallpaperx-timeline-b"))),
-          stub(device, ring) {
+    QString connection;  // the name QtDBus keeps the connection under, one per daemon alive at once
+
+    SuccessorDaemon(wallpaperx::Device& device, const std::vector<const wallpaperx::OffscreenTarget*>& ring,
+                    const QString& connectionName = QStringLiteral("wallpaperx-timeline-b"))
+        : bus(QDBusConnection::connectToBus(QDBusConnection::SessionBus, connectionName)),
+          stub(device, ring),
+          connection(connectionName) {
         stub.rotate();
         stub.serveTimelines(ExportingStub::Timeline::Grant);
         QObject::connect(&watcher, &QDBusServiceWatcher::serviceOwnerChanged,
@@ -284,7 +302,7 @@ struct SuccessorDaemon {
     ~SuccessorDaemon() {
         bus.unregisterObject(QString::fromUtf8(kPath));
         (void)bus.unregisterService(QString::fromUtf8(kService));
-        QDBusConnection::disconnectFromBus(QStringLiteral("wallpaperx-timeline-b"));
+        QDBusConnection::disconnectFromBus(connection);
     }
     SuccessorDaemon(const SuccessorDaemon&) = delete;
     SuccessorDaemon& operator=(const SuccessorDaemon&) = delete;
@@ -297,6 +315,61 @@ struct SuccessorDaemon {
                pumpUntil([&] { return newOwner == bus.baseService(); }, 3000);
     }
 };
+
+// A new context in `shareWith`'s share group, adopted by a second scene graph in which `in` runs; the
+// scene graph is invalidated after it. Returns the context owned and not current, the scene graph
+// gone, or null after a reported harness failure. The scene graph's own contexts share nothing.
+std::unique_ptr<QOpenGLContext> withSharingScene(QOpenGLContext* shareWith, const std::function<void(Scene&)>& in) {
+    auto shared = std::make_unique<QOpenGLContext>();
+    shared->setShareContext(shareWith);
+    if (!shared->create() || shared->shareGroup() != shareWith->shareGroup()) {
+        wallpaperx::testing::harnessFailure("no context sharing the scene's group could be made");
+        return nullptr;
+    }
+    {
+        Scene adopted;
+        adopted.window.setGraphicsDevice(QQuickGraphicsDevice::fromOpenGLContext(shared.get()));
+        adopted.window.setGeometry(0, 0, static_cast<int>(kWidth), static_cast<int>(kHeight));
+        if (!adopted.control.initialize()) {
+            wallpaperx::testing::harnessFailure("the scene graph would not adopt the sharing context");
+            return nullptr;
+        }
+        in(adopted);
+        adopted.control.invalidate();
+    }
+    if (QOpenGLContext::currentContext() == shared.get()) shared->doneCurrent();
+    return shared;
+}
+
+// The receivers of `object`'s destroyed(): QObject::receivers is protected, and a pointer to it taken
+// through a derived class is still a pointer to QObject's member, so no cast to a type `object` is not.
+int destroyedReceivers(const QObject* object) {
+    struct Peek : QObject {
+        using QObject::receivers;
+    };
+    return (object->*&Peek::receivers)(SIGNAL(destroyed(QObject*)));
+}
+
+// One of gl_semaphore_fault.h's call records, read under its lock: its length, and the names in it
+// from index `from` on.
+using CallRecord = std::vector<wallpaperx::testing::GlSemaphoreFaults::NamedCall> wallpaperx::testing::GlSemaphoreFaults::*;
+size_t recorded(CallRecord record) {
+    std::lock_guard<std::mutex> lock(g_glSemaphoreFaults.callsMutex);
+    return (g_glSemaphoreFaults.*record).size();
+}
+std::vector<GLuint> namesSince(CallRecord record, size_t from) {
+    std::lock_guard<std::mutex> lock(g_glSemaphoreFaults.callsMutex);
+    std::vector<GLuint> names;
+    const auto& calls = g_glSemaphoreFaults.*record;
+    for (size_t i = from; i < calls.size(); ++i) names.push_back(calls[i].name);
+    return names;
+}
+
+std::string listNames(const std::vector<GLuint>& names) {
+    std::string out;
+    for (GLuint name : names) out += (out.empty() ? "" : " ") + std::to_string(name);
+    return out.empty() ? "none" : out;
+}
 
 bool runPhase(const PhaseName& which) {
     const Phase phase = which.phase;
@@ -324,6 +397,7 @@ bool runPhase(const PhaseName& which) {
         switch (phase) {
             case Phase::OldDaemon:
             case Phase::RefusedBinary:
+            case Phase::RefusedShared:
             case Phase::StrayValue:
                 break;  // Absent: GetAcquireTimeline answered UnknownMethod, as a daemon from before it
             case Phase::LostReply:
@@ -501,11 +575,10 @@ bool runPhase(const PhaseName& which) {
                 //       an identity rather than a number read off the plugin. The two-picture bound is
                 //       message order on one connection -- the ask is sent before the fetch the next
                 //       FrameReady causes, and answered first -- not timing.
-                // CONTROL: in backend/kde/wallpaperx_item.cpp, (a) contextTimeline's reuse line (the
-                //       context's kept import returned) deleted -> "FAIL: a picture on the timeline costs no
-                //       semaphore import (20 over 20 pictures)", on the opaque-fd and dma_buf entries
-                //       both (re-run 2026-10-08 via control_run.sh on the NVIDIA entry after the import moved
-                //       from the node to the context, the same line); (b) WallpaperXItem::fetchOnTimeline made to return false -> "FAIL: the
+                // CONTROL: in backend/kde/wallpaperx_item.cpp, (a) acquireOnGroupTimeline's `grantedBySender`
+                //       made to return false, so every value imports -> "FAIL: a picture on the timeline
+                //       costs no semaphore import (20 over 20 pictures)" (via control_run.sh, 2026-10-10, on
+                //       the NVIDIA opaque-fd and dma_buf entries both); (b) WallpaperXItem::fetchOnTimeline made to return false -> "FAIL: the
                 //       item reaches the timeline within six pictures (0 request(s) on it, 0 value(s)
                 //       sent)"; (c) the wantAcquireTimeline call in updatePaintNode gated on more than
                 //       three semaphore imports -> "FAIL: reaching the timeline costs the binary
@@ -555,11 +628,10 @@ bool runPhase(const PhaseName& which) {
                 // CONTROL: importKeyFor() in backend/kde/wallpaperx_item.cpp given the constant bufferId
                 //       1, so both images share one import -> "FAIL: a picture waited on through the
                 //       timeline shows what was drawn into its image (2 of 4)", printing "step 1: read
-                //       blue where yellow was drawn; a value, through the kept import". And contextTimeline's
-                //       reuse line deleted -> the same line "(0 of 4)", every colour right and each step
-                //       "NOT a value through a kept import": the coverage half reddening alone. Observed
-                //       2026-09-23 on the NVIDIA entry; the second re-run 2026-10-08 via control_run.sh after
-                //       the import moved to the context, the same line. Reverted.
+                //       blue where yellow was drawn; a value, through the kept import" (2026-09-23, NVIDIA).
+                //       And acquireOnGroupTimeline's `grantedBySender` made to return false -> the same line
+                //       "(0 of 4)", every colour right and each step "NOT a value through a kept import": the
+                //       coverage half reddening alone (via control_run.sh, 2026-10-10, NVIDIA). Reverted.
                 const size_t first = static_cast<size_t>(stub.served()) % 2;  // the image served next
                 // Each image's new colour differs from the one it held, so a stale read is a wrong one.
                 constexpr int kColours[] = {2, 3, 3, 2};
@@ -903,35 +975,40 @@ bool runPhase(const PhaseName& which) {
 
             case Phase::RefusedTimeline:
             case Phase::RefusedBinary: {
-                // GOAL: S13.223 -- once the context refuses a semaphore import -- the timeline's, or a
-                //       picture's binary one -- it draws without the producer's hand-over for the rest
-                //       of its life: one stderr line when it trips, every picture after it drawn, no
+                // GOAL: S13.223 -- once the driver refuses a semaphore import -- the timeline's, or a
+                //       picture's binary one -- the process draws without the producer's hand-over from
+                //       then on: one stderr line when it trips, every picture after it drawn, no
                 //       semaphore import attempted again, and the wallpaper never blanks.
                 // WHY-THIS-SHAPE: the refusal is the driver's own, from a descriptor that is no
-                //       semaphore payload, so the flag is set by what sets it on a desktop. Afterwards
-                //       the stub keeps sending REAL hand-overs, so "no import attempted" means dropped,
-                //       not absent. Served and drawn are counted apart, because a picture that failed
-                //       is replaced by the item's own re-fetch and a lockstep count alone would miss it.
-                // CONTROL: in backend/kde/wallpaperx_item.cpp, (a) noteContextRefusedSemaphores made never
-                //       to set the context record's `refusesSemaphores` (`std::exchange(..., true)` made a
-                //       plain read; re-run 2026-10-08 via control_run.sh), so no context is ever marked -> "FAIL:
-                //       the refusal is said once, on stderr (16 line(s))" (14 on refused-binary) and
-                //       "FAIL: after the refusal no semaphore import is attempted again (10 over 10
-                //       pictures with real hand-overs)" on both entries; (b) `handedOver = true;` deleted
-                //       after it in updatePaintNode -> "FAIL: every picture served is drawn, the one that
-                //       tripped it included (17 served, 16 drawn; ...)" on both. Observed 2026-09-23 on
-                //       the NVIDIA entry. Reverted.
-                // COVERAGE-ASSERT: the marker printed at the start must be in the capture.
+                //       semaphore payload, so the flag is set by what sets it on a desktop. After the trip
+                //       every binary picture, on both entries, carries a descriptor, so "no import attempted"
+                //       means dropped, not absent. That descriptor is another unusable one, not a real
+                //       semaphore: on NVIDIA one refused import makes the stub's own vkCreateSemaphore fail
+                //       in this process, so "Real" would send none and leave nothing to drop. Served and
+                //       drawn are counted apart, because a failed picture is replaced by the item's re-fetch.
+                // CONTROL: in backend/kde/wallpaperx_item.cpp, via control_run.sh, 2026-10-10, NVIDIA, each
+                //       on both entries, reverted: (a) `g_semaphoresRefused.exchange(true)` in
+                //       noteSemaphoresRefused made a plain load(), so the flag is never set -> "FAIL: the
+                //       refusal is said once, on stderr (16 line(s))" (14 on refused-binary) and "FAIL: after
+                //       the refusal no semaphore import is attempted again (10 over 10 pictures)", and on
+                //       refused-timeline the coverage line "(0 over 10 pictures)": still asked on the timeline; (b)
+                //       `handedOver = true;` deleted after it in updatePaintNode -> "FAIL: every picture
+                //       served is drawn, the one that tripped it included (17 served, 16 drawn; ...)"; (c)
+                //       dropUnwaitableSync's `if (!g_semaphoresRefused.load())` made `if (true)`, so the
+                //       binary path ignores the flag -> refused-timeline: "FAIL: after the refusal no
+                //       semaphore import is attempted again (10 over 10 pictures)".
+                // COVERAGE-ASSERT: the marker printed at the start must be in the capture, and every
+                //       picture after the trip must have carried a descriptor.
                 const int served0 = stub.served();
                 const quint64 pictures0 = scene.pictures();
-                if (phase == Phase::RefusedBinary) {
-                    stub.sendAcquireFrom(served0 + 3, ExportingStub::Acquire::Unusable);
-                    stub.sendAcquireFrom(served0 + 4, ExportingStub::Acquire::Real);
-                }
+                if (phase == Phase::RefusedBinary) stub.sendAcquireFrom(served0 + 3, ExportingStub::Acquire::Unusable);
                 // The trip happens inside the drive: the timeline's first value, or the third picture.
                 const Drive run = drive(scene, stub, bus, 6);
                 const quint64 semaphoresAfterTrip = scene.semaphoreImports();
+                stub.sendAcquireFrom(stub.served() + 1, ExportingStub::Acquire::Unusable);
+                const int unusable0 = stub.unusableAcquiresSent();
                 const Drive after = drive(scene, stub, bus, 10);
+                const int unusableAfter = stub.unusableAcquiresSent() - unusable0;
                 const int lines = tripLines();
                 check(captureWorked(), "the stderr capture saw what was written during the phase");
                 check(lines == 1, "the refusal is said once, on stderr (" + std::to_string(lines) + " line(s))");
@@ -944,14 +1021,111 @@ bool runPhase(const PhaseName& which) {
                 check(scene.semaphoreImports() == semaphoresAfterTrip,
                       "after the refusal no semaphore import is attempted again (" +
                           std::to_string(scene.semaphoreImports() - semaphoresAfterTrip) + " over " +
-                          std::to_string(after.drawn) + " pictures with real hand-overs)");
-                if (phase == Phase::RefusedBinary) {
-                    check(stub.acquireFdsSent() > 0 && stub.unusableAcquiresSent() == 1,
-                          "the stub sent real hand-overs after the one refused (" +
-                              std::to_string(stub.unusableAcquiresSent()) + " refused)");
-                } else {
+                          std::to_string(after.drawn) + " pictures)");
+                check(after.drawn == 10 && unusableAfter >= after.drawn,
+                      "every picture after the refusal carried a semaphore descriptor (" + std::to_string(unusableAfter) +
+                          " over " + std::to_string(after.drawn) + " pictures)");
+                if (phase == Phase::RefusedTimeline) {
                     check(stub.timelinesGranted() >= 1, "the refused descriptor was handed over as the timeline");
                 }
+                return true;
+            }
+
+            case Phase::RefusedShared: {
+                // GOAL: S15.439 -- one refusal stops semaphore imports in the whole process: after a binary
+                //       import is refused in the scene's context, a new unshared context (a share group of its
+                //       own) and a new context sharing the scene's group each draw every picture and attempt
+                //       no semaphore import, and the refusal is said once.
+                // WHY-THIS-SHAPE: every picture from the trip on carries an unusable descriptor (a memfd),
+                //       not a real semaphore: on NVIDIA one refused import makes the stub's own
+                //       vkCreateSemaphore fail in this process, so "Real" would send nothing to drop. Each
+                //       context made by the test after the trip, so none could have been marked before it;
+                //       the item is moved into each, as in context-share.
+                // CONTROL: in backend/kde/wallpaperx_item.cpp, `std::atomic<bool> g_semaphoresRefused` replaced
+                //       by a flag kept per current context (same load()/exchange()), via control_run.sh,
+                //       2026-10-10, NVIDIA, reverted -> "FAIL: a refusal is said once for the process (3
+                //       line(s))", "FAIL: an unshared context made after the refusal imports no semaphore and
+                //       draws (4 drawn, 1 import(s))" and "FAIL: a context sharing the refusing one's group
+                //       imports no semaphore and draws (4 drawn, 1 import(s); ...)".
+                // COVERAGE-ASSERT: the unshared context is in a group of its own, the sharing one in the
+                //       scene's, and every picture drawn in each carried a descriptor.
+                const int served0 = stub.served();
+                stub.sendAcquireFrom(served0 + 2, ExportingStub::Acquire::Unusable);
+                const Drive run = drive(scene, stub, bus, 5);
+                const quint64 importsAfterTrip = scene.semaphoreImports();
+                QOpenGLContext* first = nullptr;
+                scene.renderPass([&] { first = QOpenGLContext::currentContext(); });
+                if (first == nullptr) {
+                    wallpaperx::testing::harnessFailure("the scene graph left no context current during its pass");
+                    return true;
+                }
+                auto* rootItem = qobject_cast<QQuickItem*>(scene.root.get());
+                // Pictures drawn in `in` after the item moved there; `carried`: of the descriptors sent then.
+                const auto visitIn = [&](Scene& in, int pictures, int& carried) {
+                    const int unusable0 = stub.unusableAcquiresSent();
+                    in.item = scene.item;  // not owned: the first scene's root still is
+                    rootItem->setParentItem(in.window.contentItem());
+                    pumpFor(20);
+                    const Drive there = drive(in, stub, bus, pictures);
+                    carried = stub.unusableAcquiresSent() - unusable0;
+                    rootItem->setParentItem(scene.window.contentItem());
+                    in.renderPass();
+                    pumpFor(20);
+                    return there;
+                };
+                Drive unshared;
+                int unsharedCarried = 0;
+                bool unsharedOwnGroup = false;
+                {
+                    Scene other;
+                    other.window.setGeometry(0, 0, static_cast<int>(kWidth), static_cast<int>(kHeight));
+                    if (!other.control.initialize()) {
+                        wallpaperx::testing::harnessFailure("a new scene graph could not be brought up");
+                        return true;
+                    }
+                    QOpenGLContext* context = nullptr;
+                    other.renderPass([&] { context = QOpenGLContext::currentContext(); });
+                    unsharedOwnGroup = context != nullptr && context != first &&
+                                       context->shareGroup() != first->shareGroup();
+                    unshared = visitIn(other, 4, unsharedCarried);
+                    other.control.invalidate();
+                }
+                const quint64 importsUnshared = scene.semaphoreImports() - importsAfterTrip;
+                Drive sharing;
+                int sharingCarried = 0;
+                if (withSharingScene(first, [&](Scene& adopted) { sharing = visitIn(adopted, 4, sharingCarried); }) ==
+                    nullptr) {
+                    return true;
+                }
+                const quint64 importsSharing = scene.semaphoreImports() - importsAfterTrip - importsUnshared;
+                const Drive back = drive(scene, stub, bus, 3);
+                const quint64 importsBack = scene.semaphoreImports() - importsAfterTrip - importsUnshared - importsSharing;
+                const int lines = tripLines();
+                std::printf("item_timeline_test: refused-shared: %d drawn through the trip; unshared context (own group: "
+                            "%s) %d drawn, %d descriptor(s), %llu import(s); sharing context %d drawn, %d descriptor(s), "
+                            "%llu import(s); back %d drawn, %llu import(s); %d refusal line(s)\n",
+                            run.drawn, unsharedOwnGroup ? "yes" : "no", unshared.drawn, unsharedCarried,
+                            static_cast<unsigned long long>(importsUnshared), sharing.drawn, sharingCarried,
+                            static_cast<unsigned long long>(importsSharing), back.drawn,
+                            static_cast<unsigned long long>(importsBack), lines);
+                std::fflush(stdout);
+                if (!unsharedOwnGroup || unsharedCarried < unshared.drawn || sharingCarried < sharing.drawn ||
+                    stub.unusableAcquiresSent() == 0) {
+                    wallpaperx::testing::harnessFailure("a refusal followed by pictures carrying descriptors in an "
+                                                        "unshared and a sharing context was not staged");
+                    return true;
+                }
+                check(captureWorked() && lines == 1,
+                      "a refusal is said once for the process (" + std::to_string(lines) + " line(s))");
+                check(!run.stalled && !unshared.stalled && unshared.drawn == 4 && importsUnshared == 0,
+                      "an unshared context made after the refusal imports no semaphore and draws (" +
+                          std::to_string(unshared.drawn) + " drawn, " + std::to_string(importsUnshared) + " import(s))");
+                check(!sharing.stalled && sharing.drawn == 4 && importsSharing == 0 && !back.stalled &&
+                          back.drawn == 3 && importsBack == 0 && drawingCleanly(scene),
+                      "a context sharing the refusing one's group imports no semaphore and draws (" +
+                          std::to_string(sharing.drawn) + " drawn, " + std::to_string(importsSharing) +
+                          " import(s); back " + std::to_string(back.drawn) + " drawn, " + std::to_string(importsBack) +
+                          " import(s); " + describe(scene) + ")");
                 return true;
             }
 
@@ -1111,8 +1285,8 @@ bool runPhase(const PhaseName& which) {
                 //       daemon for it (0 covering it to the old, 1 to the new)"; (b) `m_fetch != Fetch::Asking
                 //       &&` deleted from discardHeldFrame -> the first line; (c) `forgetStaleImports(node);`
                 //       added straight after the lambda at the top of updatePaintNode -> the first line;
-                //       (d) `&& record.timelineOwner == sender` deleted from contextTimeline's reuse line
-                //       (re-run 2026-10-08 via control_run.sh after the import moved to the context) -> "FAIL: and
+                //       (d) acquireOnGroupTimeline's `grantedBySender` made to ignore the owner (any sender
+                //       matches a held import; via control_run.sh, 2026-10-10, NVIDIA, restart entry) -> "FAIL: and
                 //       imports the new daemon's timeline rather than waiting its values on the old one (1
                 //       import(s) for 1 binary picture(s))". Via control_batch.sh, re-run 2026-10-06 on the
                 //       NVIDIA entry, (a)-(c) on both restart entries. Reverted.
@@ -1543,9 +1717,8 @@ bool runPhase(const PhaseName& which) {
                 // WHY-THIS-SHAPE: 300 rather than a handful: a handful of re-imports is green on the
                 //       driver too, and the refusal only comes past 250. Hiding the item is the cheapest
                 //       real trigger of a node rebuild; the item's own re-fetch draws the new node's picture.
-                // CONTROL: in contextTimeline (backend/kde/wallpaperx_item.cpp), the reuse line `if
-                //       (record.timeline.semaphore != 0 && record.timelineOwner == sender) return
-                //       record.timeline;` deleted, via control_batch.sh, 2026-10-08, NVIDIA -> "FAIL: every
+                // CONTROL: in acquireOnGroupTimeline (backend/kde/wallpaperx_item.cpp), `grantedBySender` made
+                //       to return false, so every value imports, via control_run.sh, 2026-10-10, NVIDIA -> "FAIL: every
                 //       rebuilt node's picture comes as a value and is waited on (first not: 252 of 300)",
                 //       "FAIL: no node rebuild imports the timeline again (253 import(s) over 300 rebuilds)"
                 //       and "FAIL: no semaphore import was refused (1 line(s))": the driver's refusal at the
@@ -1587,12 +1760,12 @@ bool runPhase(const PhaseName& which) {
                 //       new one sends here, so a new value waited on the OLD timeline completes rather
                 //       than stalling, and only the import count tells the pairing was wrong. The late
                 //       reply from the old daemon, waited on its own timeline, is the restart entry's.
-                // CONTROL: `&& record.timelineOwner == sender` deleted from contextTimeline's reuse line
-                //       (backend/kde/wallpaperx_item.cpp), via control_batch.sh, 2026-10-08, NVIDIA ->
+                // CONTROL: acquireOnGroupTimeline's `grantedBySender` made to ignore the owner
+                //       (backend/kde/wallpaperx_item.cpp), via control_run.sh, 2026-10-10, NVIDIA ->
                 //       "FAIL: the new daemon's timeline is imported once and its values are waited on (2
                 //       import(s) for 2 binary picture(s); 8 of 8 steady pictures as values, 8 wait(s); ...)".
-                //       Reverted. The rebuilds under the new daemon are red only under the reuse-line
-                //       deletion above ("0 import(s), 20 not waited"), the context having refused by then.
+                //       Reverted. The rebuilds under the new daemon are red only under the always-import
+                //       control above ("0 import(s), 20 not waited"), the process having refused by then.
                 SuccessorDaemon successor(device, ring);
                 if (!successor.takeNameFrom(bus)) {
                     wallpaperx::testing::harnessFailure("the second stub daemon never became the name's owner");
@@ -1678,12 +1851,10 @@ bool runPhase(const PhaseName& which) {
                 //       absence; what could break it is tying the shared import to the node, which
                 //       invalidation destroys (with no context current, measured). Asserted as an import
                 //       count, because a dropped import is re-made on the next picture and draws the same.
-                // CONTROL: in ~FrameNode (backend/kde/wallpaperx_item.cpp) every record's timeline
-                //       forgotten, via control_batch.sh, 2026-10-08, NVIDIA -> "FAIL: after the scene graph
-                //       is invalidated in the same context, the import is kept and every value waited (1
-                //       import(s), 6 value(s), 6 wait(s); ...)". Releasing only the current context's left
-                //       this green, and so did clearing the records in releaseResources(), which
-                //       invalidation does not call. Reverted.
+                // CONTROL: in ~FrameNode (backend/kde/wallpaperx_item.cpp) every share group's record cleared
+                //       (`g_shareGroups.clear()` under g_shareGroupsMutex), via control_run.sh, 2026-10-10,
+                //       NVIDIA -> "FAIL: after the scene graph is invalidated in the same context, the import is
+                //       kept and every value waited (1 import(s), 6 value(s), 6 wait(s); ...)". Reverted.
                 // COVERAGE-ASSERT: the item's node must be gone after the invalidation.
                 {
                     const quint64 semaphores0 = scene.semaphoreImports();
@@ -1710,20 +1881,90 @@ bool runPhase(const PhaseName& which) {
                               " value(s), " + std::to_string(waits) + " wait(s); " + describe(scene) + ")");
                 }
 
-                // GOAL: S15.420 -- each new GL context imports the timeline exactly once and waits on the
-                //       values drawn in it; moving the item back to a context that already holds the
-                //       import costs nothing.
+                // GOAL: S15.442 -- a share group's record is tied to the group's destroyed(): its first import
+                //       connects exactly one receiver there, and that receiver erases the group's record, so
+                //       the next value picture in the group imports the timeline again. False if the record
+                //       outlives the group, which a later group at the same address would inherit.
+                // WHY-THIS-SHAPE: Qt allocates groups, so a later group at a freed address cannot be staged:
+                //       the six-context loop below gets one in some runs and none in others. The group's real
+                //       destruction leaves nothing to observe, so destroyed() is emitted on a live group of the
+                //       test's own; only then can a fresh import show the record went. Emitted only when the
+                //       group had no receiver before its first import, so nothing of Qt's sees it. Before the
+                //       six-context loop, so a stale record there cannot have spoilt the item's timeline first.
+                // CONTROL: in groupTimeline (backend/kde/wallpaperx_item.cpp), via control_run.sh, 2026-10-10,
+                //       NVIDIA, reverted: (a) the QObject::connect to destroyed() deleted -> "FAIL: a group's
+                //       first import connects one receiver to its destroyed() (0 receiver(s), 1 import(s))" and
+                //       "FAIL: the group's destroyed() erases its record: its next value imports again (0
+                //       import(s))"; (b) the erase_if predicate made never to match -> the second line alone.
+                // COVERAGE-ASSERT: the group is not the scene's, had no receiver before, and both visits drew
+                //       three pictures with at least one value (else reported as not staged).
+                {
+                    QOpenGLContext* own = nullptr;
+                    scene.renderPass([&] { own = QOpenGLContext::currentContext(); });
+                    Scene other;
+                    other.window.setGeometry(0, 0, static_cast<int>(kWidth), static_cast<int>(kHeight));
+                    if (!other.control.initialize()) {
+                        wallpaperx::testing::harnessFailure("a new scene graph could not be brought up");
+                        return true;
+                    }
+                    QOpenGLContext* context = nullptr;
+                    other.renderPass([&] { context = QOpenGLContext::currentContext(); });
+                    QOpenGLContextGroup* group = context == nullptr ? nullptr : context->shareGroup();
+                    if (own == nullptr || group == nullptr || group == own->shareGroup()) {
+                        wallpaperx::testing::harnessFailure("the new scene graph's context is not in a group of its own");
+                        other.control.invalidate();
+                        return true;
+                    }
+                    // A staging failure skips this block's checks but not the phase, so the loops below still
+                    // grade whatever broke it.
+                    const int receivers0 = destroyedReceivers(group);
+                    const Visit first = visit(other);
+                    const int receivers1 = destroyedReceivers(group);
+                    if (receivers0 != 0 || first.there.stalled || first.there.drawn != 3 || first.values < 1) {
+                        wallpaperx::testing::harnessFailure(
+                            "a fresh group with no destroyed() receivers, visited with value pictures, was not staged (" +
+                            std::to_string(receivers0) + " receiver(s) before; " + std::to_string(first.there.drawn) +
+                            " drawn, " + std::to_string(first.values) + " value(s))");
+                    } else {
+                        check(first.importsThere == 1 && receivers1 == 1,
+                              "a group's first import connects one receiver to its destroyed() (" +
+                                  std::to_string(receivers1) + " receiver(s), " + std::to_string(first.importsThere) +
+                                  " import(s))");
+                        Q_EMIT group->destroyed(group);
+                        const Visit second = visit(other);
+                        std::printf("item_timeline_test: destroyed() on a live group: receivers %d -> %d; first visit "
+                                    "%llu import(s), after the signal %llu import(s), %d drawn, %d value(s)\n",
+                                    receivers0, receivers1, static_cast<unsigned long long>(first.importsThere),
+                                    static_cast<unsigned long long>(second.importsThere), second.there.drawn,
+                                    second.values);
+                        std::fflush(stdout);
+                        if (second.there.stalled || second.there.drawn != 3 || second.values < 1) {
+                            wallpaperx::testing::harnessFailure("the visit after the signal drew no value picture, so "
+                                                                "the erased record was not graded");
+                        } else {
+                            check(second.importsThere == 1,
+                                  "the group's destroyed() erases its record: its next value imports again (" +
+                                      std::to_string(second.importsThere) + " import(s))");
+                        }
+                    }
+                    other.control.invalidate();
+                }
+
+                // GOAL: S15.420 -- each new unshared GL context (a share group of its own) imports the
+                //       timeline exactly once and waits on the values drawn in it; moving the item back to
+                //       a group that already holds the import costs nothing.
                 // WHY-THIS-SHAPE: several contexts, each destroyed after its visit, so a record keyed by
-                //       anything shared across contexts (or not keyed at all) shows as a zero, and one
+                //       anything shared across groups (or not keyed at all) shows as a zero, and one
                 //       re-made per picture as a three. Values and waits are summed over the visit,
                 //       because which of its pictures lands in which window is the item's to decide.
-                // CONTROL: in backend/kde/wallpaperx_item.cpp via control_batch.sh, 2026-10-08, NVIDIA, each
-                //       reverted: (a) contextRecordLocked's lookup made to match any record -> "FAIL: each new
+                // CONTROL: in backend/kde/wallpaperx_item.cpp via control_run.sh, 2026-10-10, NVIDIA, each
+                //       reverted: (a) groupTimeline's lookup made to match any record -> "FAIL: each new
                 //       context imports the timeline once and waits on its values (6 of 6 wrong; first:
-                //       context 0: 3 drawn, 3 import(s) there, 2 back; 1 value(s), 5 wait(s))" -- the first
-                //       context's semaphore name fails its wait, and the item falls back to binary imports;
-                //       (b) contextTimeline's reuse line deleted -> "FAIL: moving back to the first context
-                //       costs no import (6 of 6 wrong; ... 2 back ...)".
+                //       context 0: 3 drawn, 3 import(s) there, 2 back; 0 value(s), 5 wait(s))" -- the first
+                //       group's semaphore name fails its wait, and the item falls back to binary imports;
+                //       (b) acquireOnGroupTimeline's `grantedBySender` made to return false -> "FAIL: moving
+                //       back to the first context costs no import (6 of 6 wrong; ... 2 back ...)", with the
+                //       invalidation check above and every S15.436/S15.438/S15.442 check red too.
                 constexpr int kContexts = 6;
                 int wrongThere = 0;
                 int wrongBack = 0;
@@ -1758,355 +1999,336 @@ bool runPhase(const PhaseName& which) {
                 check(wrongBack == 0, "moving back to the first context costs no import (" + std::to_string(wrongBack) +
                                           " of " + std::to_string(kContexts) + " wrong; first: " + firstWrong + ")");
 
-                // GOAL: S15.420 -- a destroyed context's record is forgotten: a new context made at the
-                //       very address of a destroyed one that held the timeline imports it afresh, rather
-                //       than being handed the dead context's semaphore name.
-                // WHY-THIS-SHAPE: contexts the scene graph makes never landed on a freed address in 20
-                //       tries, so the reuse is forced: the test makes the QOpenGLContext itself, by placement
-                //       new into one buffer, and hands it to the scene graph
-                //       (QQuickGraphicsDevice::fromOpenGLContext). Destroying it emits the
-                //       aboutToBeDestroyed the plugin listens for, as the scene graph's own teardown does.
-                // CONTROL: `g_contexts.erase(it);` deleted from the aboutToBeDestroyed handler in
-                //       contextRecordLocked (backend/kde/wallpaperx_item.cpp), via control_batch.sh,
-                //       2026-10-08, NVIDIA -> "FAIL: a context made where a destroyed one was imports the
-                //       timeline afresh (1 then 3 import(s); 1 value(s), 5 wait(s) in the second; ...)": handed
-                //       the dead context's name, the wait fails and the item falls back to binary imports.
-                //       Reverted.
-                // COVERAGE-ASSERT: both contexts must be at one address, and each must have been the one
-                //       current while the scene graph drew, or nothing here was keyed on them.
-                {
-                    const std::unique_ptr<unsigned char[]> storage(new unsigned char[sizeof(QOpenGLContext)]);
-                    std::array<Visit, 2> visits{};
-                    std::array<const void*, 2> addresses{};
-                    std::array<bool, 2> currentWhileDrawing{};
-                    for (size_t round = 0; round < 2; ++round) {
-                        auto* context = new (storage.get()) QOpenGLContext;
-                        // Declared before the scene, so the scene goes first and the context after it.
-                        struct DestroyContext {
-                            QOpenGLContext* context;
-                            ~DestroyContext() { context->~QOpenGLContext(); }
-                        } destroyContext{context};
-                        addresses[round] = context;
-                        if (!context->create()) {
-                            wallpaperx::testing::harnessFailure("no OpenGL context could be made for the scene graph to "
-                                                                "adopt");
-                            return true;
-                        }
-                        Scene adopted;
-                        adopted.window.setGraphicsDevice(QQuickGraphicsDevice::fromOpenGLContext(context));
-                        adopted.window.setGeometry(0, 0, static_cast<int>(kWidth), static_cast<int>(kHeight));
-                        if (!adopted.control.initialize()) {
-                            wallpaperx::testing::harnessFailure("the scene graph would not adopt a context of the test's");
-                            return true;
-                        }
-                        adopted.renderPass(
-                            [&] { currentWhileDrawing[round] = QOpenGLContext::currentContext() == context; });
-                        visits[round] = visit(adopted);
-                        adopted.control.invalidate();
-                    }
-                    std::printf("item_timeline_test: adopted contexts at %p and %p, %llu then %llu import(s)\n",
-                                addresses[0], addresses[1], static_cast<unsigned long long>(visits[0].importsThere),
-                                static_cast<unsigned long long>(visits[1].importsThere));
-                    std::fflush(stdout);
-                    if (addresses[0] != addresses[1] || !currentWhileDrawing[0] || !currentWhileDrawing[1]) {
-                        wallpaperx::testing::harnessFailure("the two adopted contexts were not one address both drawn "
-                                                            "with, so address reuse was not staged");
-                        return true;
-                    }
-                    check(!visits[0].there.stalled && !visits[1].there.stalled && visits[0].importsThere == 1 &&
-                              visits[1].importsThere == 1 && visits[1].values >= 1 &&
-                              visits[1].waits >= visits[1].values && drawingCleanly(scene),
-                          "a context made where a destroyed one was imports the timeline afresh (" +
-                              std::to_string(visits[0].importsThere) + " then " +
-                              std::to_string(visits[1].importsThere) + " import(s); " +
-                              std::to_string(visits[1].values) + " value(s), " + std::to_string(visits[1].waits) +
-                              " wait(s) in the second; " + describe(scene) + ")");
-                }
-
-                // GOAL: S15.430 -- a context that shares the scene's GL share group and is destroyed while not
-                //       current leaks no timeline import: the semaphore it imported outlives it only until the next
-                //       paint pass of any kind in a sibling context of the group, which deletes it; the destruction
-                //       itself deletes nothing, since no context of the group is current then. (The sibling here
-                //       draws value pictures; S15.434 below covers one drawing only sync_fds.)
+                // GOAL: S15.436 -- a context that shares the scene's GL share group waits on the group's one
+                //       timeline import: drawing value pictures there creates no semaphore and imports nothing,
+                //       and every value drawn is waited on.
+                // GOAL: S15.437 -- destroying a sharing context (not current, as the scene graph's teardown
+                //       leaves it) deletes no semaphore: the import belongs to the group, which lives on.
+                // GOAL: S15.438 -- after that destruction the sibling keeps waiting on the same import: its
+                //       next three value pictures import nothing and are each waited on. (The group keeps every
+                //       daemon's import while it lives: S15.440-441, graded on item_timeline_shared-replaced.)
                 // WHY-THIS-SHAPE: the test makes the sharing context itself (setShareContext on the scene's own)
-                //       and hands it to a second scene graph; the scene graph's own contexts share nothing here.
-                //       Read off the GL calls (gl_semaphore_fault.h logs every glCreateSemaphoresNV name and every
-                //       glDeleteSemaphoresEXT) and off glIsSemaphoreEXT in the sibling, since the import count
-                //       cannot see a leak.
-                // CONTROL: via control_run.sh, item_timeline_context-share, 2026-10-09, NVIDIA, reverted: the
-                //       orphanTimelineLocked() call removed from the aboutToBeDestroyed handler in contextRecordLocked
-                //       (backend/kde/wallpaperx_item.cpp) -> "FAIL: a sibling context's next value picture deletes
-                //       the dead sharing context's timeline import (cycle 0: deleted 0 time(s), alive: yes; ...)". The
-                //       handler releasing whether or not the context is current (`if (true)`) -> "FAIL: a sharing
-                //       context destroyed while not current deletes no semaphore then (cycle 0: deleted 1 time(s),
-                //       alive: yes)" and the line above: the delete reached no context, and the semaphore leaked. Not
-                //       controlled: that orphans are forgotten when their group is destroyed. Only a group made
-                //       later at the freed address could show it, and Qt allocates groups itself.
-                // COVERAGE-ASSERT: in every cycle, both contexts are in one share group, exactly one timeline was
-                //       imported in the sharing context, and it was not current when destroyed.
-                //
-                // GOAL: S15.432 -- a share group that gains and loses orphans again and again is watched once: over
-                //       three orphan-then-release cycles in one group, the group's destroyed() gains exactly one
-                //       receiver over its count before the first orphan and keeps it, and each cycle's orphan is
-                //       still deleted by the sibling's next paint pass.
-                // WHY-THIS-SHAPE: the count is read with QObject::receivers (protected, reached through a derived
-                //       class's using-declaration), since a repeated connection changes nothing else visible until
-                //       the group goes. One cycle cannot show it: the first connect is correct either way. Graded
-                //       against a baseline read before the first orphan, not as "at least one, constant": an
-                //       absolute count would credit any other receiver of the group as the plugin's connection.
-                // CONTROL: via control_batch.sh, item_timeline_context-share, 2026-10-10, NVIDIA, reverted, in
-                //       backend/kde/wallpaperx_item.cpp: releaseOrphanedTimelinesLocked() erasing the group's record
-                //       instead of clearing its orphans -> "FAIL: a share group gaining and losing orphans three times
-                //       is watched once (the group's destroyed() receivers: 0 before the first orphan, after each
-                //       cycle: 1 2 3)", every cycle's orphan still deleted; the QObject::connect in
-                //       orphanTimelineLocked() dropped -> the same line ending "after each cycle: 0 0 0)". From
-                //       2026-10-09, not re-run: orphanTimelineLocked() keeping only a group's first orphan ->
-                //       "FAIL: a sibling context's next value picture deletes ... (cycle 1: deleted 0 time(s), ...)".
-                // COVERAGE-ASSERT: all three cycles ran, and the group had no destroyed() receivers before the
-                //       first orphan (otherwise reported as not staged), so "baseline + 1" is the plugin's one.
+                //       and hands it to a second scene graph; the scene graph's own contexts share nothing.
+                //       Graded on glCreateSemaphoresNV and glDeleteSemaphoresEXT calls (gl_semaphore_fault.h)
+                //       and the import counter, not glIsSemaphoreEXT: a name freed and handed out again reads
+                //       as alive. Three cycles, so a record re-made per context shows on the second one too.
+                // CONTROL: in backend/kde/wallpaperx_item.cpp, via control_run.sh, 2026-10-10, NVIDIA, each
+                //       reverted: (a) acquireOnGroupTimeline keying the record by the context
+                //       (`reinterpret_cast<QOpenGLContextGroup*>(context)`) -> S15.436 red, "(cycle 0: 1
+                //       semaphore(s) created, 1 import(s) there, 0 back; ...)" in all three cycles, with only
+                //       S15.442's two checks red beside it; (b) re-run against `group->imports` via
+                //       control_batch.sh: every import in `group->imports` released and the list cleared from
+                //       each drawing context's aboutToBeDestroyed -> S15.437 "(cycle 0: 1 delete(s))" and
+                //       S15.438 "(cycle 0: 1 import(s), 3 value(s), 3 wait(s); ...)" in all three cycles;
+                //       (c) the group's record erased from each context's aboutToBeDestroyed -> S15.438 alone
+                //       red, "(cycle 0: 1 import(s), ...)" in all three cycles.
+                // COVERAGE-ASSERT: every cycle's sharing context is in the scene's group, drew 3 pictures there,
+                //       and was not current when destroyed (else reported as not staged).
                 QOpenGLContext* sibling = nullptr;
                 scene.renderPass([&] { sibling = QOpenGLContext::currentContext(); });
                 if (sibling == nullptr) {
                     wallpaperx::testing::harnessFailure("the scene graph left no context current during its pass");
                     return true;
                 }
-                struct Peek : QObject {
-                    using QObject::receivers;
+                const auto created = [] { return recorded(&wallpaperx::testing::GlSemaphoreFaults::timelinesCreated); };
+                const auto deletedTotal = [] {
+                    return recorded(&wallpaperx::testing::GlSemaphoreFaults::semaphoresDeleted);
                 };
-                const auto groupReceivers = [&] {
-                    return (sibling->shareGroup()->*&Peek::receivers)(SIGNAL(destroyed(QObject*)));
-                };
-                const auto created = [] {
-                    std::lock_guard<std::mutex> lock(g_glSemaphoreFaults.callsMutex);
-                    return g_glSemaphoreFaults.timelinesCreated;
-                };
-                const auto deleted = [](GLuint name) {
-                    std::lock_guard<std::mutex> lock(g_glSemaphoreFaults.callsMutex);
-                    int count = 0;
-                    for (const auto& call : g_glSemaphoreFaults.semaphoresDeleted) count += call.name == name ? 1 : 0;
-                    return count;
-                };
-                using IsFn = GLboolean (*)(GLuint);
-                static const IsFn isSemaphore = wallpaperx::testing::gl_fault_detail::realGl<IsFn>("glIsSemaphoreEXT");
-                // A context sharing the scene's group, visited by the item through a second scene graph that
-                // adopts it. Returned owned and not current, the scene graph gone; null after a reported failure.
                 struct Sharing {
                     std::unique_ptr<QOpenGLContext> context;
-                    GLuint name = 0;  // the one timeline imported there; 0 unless exactly one was
-                    size_t timelines = 0;
+                    size_t timelines = 0;  // semaphores created while it was visited
                     Visit visit;
                 };
                 const auto visitSharing = [&] {
                     Sharing out;
-                    auto shared = std::make_unique<QOpenGLContext>();
-                    shared->setShareContext(sibling);
-                    if (!shared->create() || shared->shareGroup() != sibling->shareGroup()) {
-                        wallpaperx::testing::harnessFailure("no context sharing the scene's group could be made");
-                        return out;
-                    }
-                    const size_t created0 = created().size();
-                    {
-                        Scene adopted;
-                        adopted.window.setGraphicsDevice(QQuickGraphicsDevice::fromOpenGLContext(shared.get()));
-                        adopted.window.setGeometry(0, 0, static_cast<int>(kWidth), static_cast<int>(kHeight));
-                        if (!adopted.control.initialize()) {
-                            wallpaperx::testing::harnessFailure("the scene graph would not adopt the sharing context");
-                            return out;
-                        }
+                    out.context = withSharingScene(sibling, [&](Scene& adopted) {
+                        const size_t created0 = created();
                         out.visit = visit(adopted);
-                        adopted.control.invalidate();
-                    }
-                    const auto made = created();
-                    out.timelines = made.size() - created0;
-                    out.name = out.timelines == 1 ? made.back().name : 0;
-                    if (QOpenGLContext::currentContext() == shared.get()) shared->doneCurrent();
-                    out.context = std::move(shared);
+                        out.timelines = created() - created0;
+                    });
                     return out;
                 };
-                constexpr int kOrphanCycles = 3;
-                const int receiversBefore = groupReceivers();
-                std::printf("item_timeline_test: the scene's share group has %d destroyed() receiver(s) before any "
-                            "orphan\n", receiversBefore);
-                std::fflush(stdout);
-                std::array<int, kOrphanCycles> receiversAfter{};
-                int cyclesDone = 0;
-                for (int cycle = 0; cycle < kOrphanCycles; ++cycle) {
+                for (int cycle = 0; cycle < 3; ++cycle) {
                     Sharing made = visitSharing();
                     if (made.context == nullptr) return true;
-                    QOpenGLContext* shared = made.context.get();
-                    const GLuint name = made.name;
                     const Visit& v = made.visit;
+                    QOpenGLContext* shared = made.context.get();
                     bool currentAtDestroy = false;
                     QObject::connect(shared, &QOpenGLContext::aboutToBeDestroyed,
                                      [&] { currentAtDestroy = QOpenGLContext::currentContext() == shared; });
-                    const int deletedBefore = deleted(name);
+                    const size_t deleted0 = deletedTotal();
                     made.context.reset();
-                    const int deletedAtDestroy = deleted(name) - deletedBefore;
-                    bool aliveBefore = false;
-                    scene.renderPass([&] { aliveBefore = isSemaphore != nullptr && isSemaphore(name) == GL_TRUE; });
-                    const Drive after = drive(scene, stub, bus, 2);
-                    bool aliveAfter = true;
-                    scene.renderPass([&] { aliveAfter = isSemaphore != nullptr && isSemaphore(name) == GL_TRUE; });
-                    const int deletedAfter = deleted(name) - deletedBefore - deletedAtDestroy;
-                    receiversAfter[static_cast<size_t>(cycle)] = groupReceivers();
-                    std::printf("item_timeline_test: cycle %d: sharing context imported name %u (%zu import(s)); at its "
-                                "destruction current: %s, deleted %d time(s), alive in the sibling: %s; after 2 sibling "
-                                "pictures deleted %d time(s), alive: %s; the group's destroyed() has %d receiver(s)\n",
-                                cycle, name, made.timelines, currentAtDestroy ? "yes" : "no", deletedAtDestroy,
-                                aliveBefore ? "yes" : "no", deletedAfter, aliveAfter ? "yes" : "no",
-                                receiversAfter[static_cast<size_t>(cycle)]);
-                    std::fflush(stdout);
-                    if (name == 0 || currentAtDestroy || v.importsThere != 1 || isSemaphore == nullptr) {
-                        wallpaperx::testing::harnessFailure("the sharing context did not import one timeline and go "
-                                                            "while not current, so the release was not staged");
-                        return true;
-                    }
-                    const bool keptAtDestroy = deletedAtDestroy == 0 && aliveBefore;
-                    const bool releasedBySibling = !after.stalled && deletedAfter == 1 && !aliveAfter && drawingCleanly(scene);
-                    check(keptAtDestroy, "a sharing context destroyed while not current deletes no semaphore then (cycle " +
-                                             std::to_string(cycle) + ": deleted " + std::to_string(deletedAtDestroy) +
-                                             " time(s), alive: " + (aliveBefore ? "yes" : "no") + ")");
-                    check(releasedBySibling,
-                          "a sibling context's next value picture deletes the dead sharing context's timeline import "
-                          "(cycle " + std::to_string(cycle) + ": deleted " + std::to_string(deletedAfter) +
-                              " time(s), alive: " + (aliveAfter ? "yes" : "no") + "; " + describe(scene) + ")");
-                    if (!keptAtDestroy || !releasedBySibling) break;
-                    ++cyclesDone;
-                }
-                if (receiversBefore != 0) {
-                    wallpaperx::testing::harnessFailure("the scene's share group already had destroyed() receivers "
-                                                        "before the first orphan, so watched-once was not staged");
-                } else if (cyclesDone == kOrphanCycles) {
-                    bool once = true;
-                    std::string counts;
-                    for (const int count : receiversAfter) {
-                        once = once && count == receiversBefore + 1;
-                        counts += (counts.empty() ? "" : " ") + std::to_string(count);
-                    }
-                    check(once, "a share group gaining and losing orphans three times is watched once (the group's "
-                                "destroyed() receivers: " + std::to_string(receiversBefore) +
-                                    " before the first orphan, after each cycle: " + counts + ")");
-                } else {
-                    std::printf("item_timeline_test: S15.432 not graded: an orphan cycle above failed\n");
-                    std::fflush(stdout);
-                }
-
-                // GOAL: S15.435 -- a context of the group destroyed while current deletes the group's orphans as
-                //       well as its own timeline import, with no paint pass between the orphaning and that
-                //       destruction.
-                // WHY-THIS-SHAPE: two sharing contexts, each visited by the item so each holds a record and an
-                //       import; the second is destroyed not current (an orphan), then the first is made current on
-                //       an offscreen surface and destroyed, with nothing drawn in between. Counted on the orphan's
-                //       name, which nothing else can be handed while it is alive; the first context's own delete
-                //       is graded beside it, as the other half of the same handler.
-                // CONTROL: via control_batch.sh, 2026-10-10, NVIDIA, reverted: `releaseOrphanedTimelinesLocked(context);`
-                //       removed from the aboutToBeDestroyed handler in contextRecordLocked
-                //       (backend/kde/wallpaperx_item.cpp) -> "FAIL: a context of the group destroyed while current
-                //       deletes the group's orphan and its own import (orphan deleted 0 time(s), its own 1)".
-                // COVERAGE-ASSERT: the orphan's context was not current at its destruction and nothing deleted its
-                //       name then; the survivor was current at its own.
-                {
-                    Sharing survivor = visitSharing();
-                    if (survivor.context == nullptr) return true;
-                    Sharing dead = visitSharing();
-                    if (dead.context == nullptr) return true;
-                    bool deadCurrent = false;
-                    QObject::connect(dead.context.get(), &QOpenGLContext::aboutToBeDestroyed,
-                                     [&, context = dead.context.get()] {
-                                         deadCurrent = QOpenGLContext::currentContext() == context;
-                                     });
-                    const int orphanBefore = deleted(dead.name);
-                    const int ownBefore = deleted(survivor.name);
-                    dead.context.reset();
-                    const int orphanAtItsDestroy = deleted(dead.name) - orphanBefore;
-                    QOffscreenSurface surface;
-                    surface.setFormat(survivor.context->format());
-                    surface.create();
-                    const bool madeCurrent = surface.isValid() && survivor.context->makeCurrent(&surface);
-                    bool survivorCurrent = false;
-                    QObject::connect(survivor.context.get(), &QOpenGLContext::aboutToBeDestroyed,
-                                     [&, context = survivor.context.get()] {
-                                         survivorCurrent = QOpenGLContext::currentContext() == context;
-                                     });
-                    survivor.context.reset();
-                    const int orphanDeleted = deleted(dead.name) - orphanBefore - orphanAtItsDestroy;
-                    const int ownDeleted = deleted(survivor.name) - ownBefore;
-                    std::printf("item_timeline_test: destroyed while current: orphan %u (its context current at its "
-                                "destruction: %s, deleted then %d time(s)), survivor %u (current: %s); deleted by the "
-                                "survivor's destruction: orphan %d time(s), its own %d time(s)\n",
-                                dead.name, deadCurrent ? "yes" : "no", orphanAtItsDestroy, survivor.name,
-                                survivorCurrent ? "yes" : "no", orphanDeleted, ownDeleted);
-                    std::fflush(stdout);
-                    if (dead.name == 0 || survivor.name == 0 || deadCurrent || orphanAtItsDestroy != 0 ||
-                        !madeCurrent || !survivorCurrent) {
-                        wallpaperx::testing::harnessFailure("an orphan and a sibling destroyed while current were not "
-                                                            "staged in one group");
-                        return true;
-                    }
-                    check(orphanDeleted == 1 && ownDeleted == 1,
-                          "a context of the group destroyed while current deletes the group's orphan and its own "
-                          "import (orphan deleted " + std::to_string(orphanDeleted) + " time(s), its own " +
-                              std::to_string(ownDeleted) + ")");
-                }
-
-                // GOAL: S15.434 -- a sibling that draws only sync_fd pictures (no timeline value sent or asked for)
-                //       deletes a dead sharing context's timeline import within two pictures.
-                // WHY-THIS-SHAPE: GL_NV_timeline_semaphore is hidden in the scene's own context
-                //       (gl_semaphore_fault.h) before the sharing context is visited, since the plugin re-reads a
-                //       context's extensions only after another context was current. The test binary's own
-                //       FrameImport::supportsTimeline() caches separately and cannot confirm the hide, so the
-                //       stub's value and on-timeline-request counts are required unchanged instead. "Deleted at
-                //       least once", not once and not glIsSemaphoreEXT: each sync_fd picture's semaphore can be
-                //       handed the freed name and delete it again.
-                // CONTROL: via control_batch.sh, 2026-10-10, NVIDIA, each reverted, in backend/kde/wallpaperx_item.cpp:
-                //       (a) the releaseOrphansOfCurrentGroup() call in updatePaintNode removed; (b) the same, with
-                //       releaseOrphanedTimelinesLocked(context) added to contextTimeline instead (S15.430 stayed
-                //       green, value pictures still release) -> both "FAIL: a sibling drawing only sync_fd pictures
-                //       deletes the dead sharing context's timeline import (2 drawn, deleted 0 time(s); ...)".
-                // COVERAGE-ASSERT: both sibling pictures were drawn with sync_fds, no value or timeline request
-                //       went out, and nothing deleted the name at its context's destruction.
-                {
-                    EGLContext sceneContext = EGL_NO_CONTEXT;
-                    scene.renderPass([&] { sceneContext = eglGetCurrentContext(); });
-                    struct Unhide {
-                        ~Unhide() { g_glSemaphoreFaults.hideTimelineIn.store(EGL_NO_CONTEXT); }
-                    } unhide;
-                    g_glSemaphoreFaults.hideTimelineIn.store(sceneContext);
-                    Sharing dead = visitSharing();
-                    if (dead.context == nullptr) return true;
-                    bool deadCurrent = false;
-                    QObject::connect(dead.context.get(), &QOpenGLContext::aboutToBeDestroyed,
-                                     [&, context = dead.context.get()] {
-                                         deadCurrent = QOpenGLContext::currentContext() == context;
-                                     });
-                    const int before = deleted(dead.name);
-                    dead.context.reset();
-                    const int atDestroy = deleted(dead.name) - before;
+                    const size_t deletedAtDestroy = deletedTotal() - deleted0;
+                    const quint64 semaphores0 = scene.semaphoreImports();
+                    const int waits0 = g_glSemaphoreFaults.waitsSeen.load();
                     const int values0 = stub.valuesSent();
-                    const int onTimeline0 = stub.onTimelineRequests();
-                    const int syncFds0 = stub.acquireFdsSent();
-                    const Drive after = drive(scene, stub, bus, 2);
-                    const int deletedAfter = deleted(dead.name) - before - atDestroy;
-                    const int values = stub.valuesSent() - values0;
-                    const int onTimeline = stub.onTimelineRequests() - onTimeline0;
-                    const int syncFds = stub.acquireFdsSent() - syncFds0;
-                    std::printf("item_timeline_test: sync_fd sibling: orphan %u (current at destruction: %s, deleted "
-                                "then %d time(s)); %d picture(s) drawn with %d sync_fd(s), %d value(s), %d timeline "
-                                "request(s); deleted after %d time(s)\n",
-                                dead.name, deadCurrent ? "yes" : "no", atDestroy, after.drawn, syncFds, values,
-                                onTimeline, deletedAfter);
+                    const Drive after = drive(scene, stub, bus, 3);
+                    const quint64 importsAfter = scene.semaphoreImports() - semaphores0;
+                    const int valuesAfter = stub.valuesSent() - values0;
+                    const int waitsAfter = g_glSemaphoreFaults.waitsSeen.load() - waits0;
+                    std::printf("item_timeline_test: cycle %d: sharing context: %zu semaphore(s) created, %llu import(s), "
+                                "%d drawn, %d value(s), %d wait(s); destroyed while current: %s, %zu delete(s) then; "
+                                "the sibling after: %llu import(s), %d value(s), %d wait(s)\n",
+                                cycle, made.timelines, static_cast<unsigned long long>(v.importsThere), v.there.drawn,
+                                v.values, v.waits, currentAtDestroy ? "yes" : "no", deletedAtDestroy,
+                                static_cast<unsigned long long>(importsAfter), valuesAfter, waitsAfter);
                     std::fflush(stdout);
-                    if (sceneContext == EGL_NO_CONTEXT || dead.name == 0 || deadCurrent || atDestroy != 0 ||
-                        values != 0 || onTimeline != 0 || syncFds < after.drawn) {
-                        wallpaperx::testing::harnessFailure("a sibling drawing only sync_fds beside an orphan was not "
-                                                            "staged");
+                    if (v.there.stalled || v.there.drawn != 3 || currentAtDestroy) {
+                        wallpaperx::testing::harnessFailure("the sharing context did not draw three pictures and go "
+                                                            "while not current, so nothing here was staged");
                         return true;
                     }
-                    check(!after.stalled && after.drawn == 2 && deletedAfter >= 1 && drawingCleanly(scene),
-                          "a sibling drawing only sync_fd pictures deletes the dead sharing context's timeline import "
-                          "(" + std::to_string(after.drawn) + " drawn, deleted " + std::to_string(deletedAfter) +
-                              " time(s); " + describe(scene) + ")");
+                    check(made.timelines == 0 && v.importsThere == 0 && v.importsBack == 0 && v.values >= 3 &&
+                              v.waits >= v.values,
+                          "a context sharing the group waits on the group's import and makes none (cycle " +
+                              std::to_string(cycle) + ": " + std::to_string(made.timelines) + " semaphore(s) created, " +
+                              std::to_string(v.importsThere) + " import(s) there, " + std::to_string(v.importsBack) +
+                              " back; " + std::to_string(v.values) + " value(s), " + std::to_string(v.waits) +
+                              " wait(s))");
+                    check(deletedAtDestroy == 0, "destroying a sharing context deletes no semaphore (cycle " +
+                                                     std::to_string(cycle) + ": " + std::to_string(deletedAtDestroy) +
+                                                     " delete(s))");
+                    check(!after.stalled && importsAfter == 0 && valuesAfter == 3 && waitsAfter >= 3 &&
+                              drawingCleanly(scene),
+                          "the sibling goes on waiting on the same import after a sharing context goes (cycle " +
+                              std::to_string(cycle) + ": " + std::to_string(importsAfter) + " import(s), " +
+                              std::to_string(valuesAfter) + " value(s), " + std::to_string(waitsAfter) + " wait(s); " +
+                              describe(scene) + ")");
                 }
+
+                const int lines = tripLines();
+                check(captureWorked() && lines == 0, "no semaphore import was refused (" + std::to_string(lines) +
+                                                         " line(s))");
+                return true;
+            }
+
+            case Phase::SharedReplaced: {
+                // Three items in one share group: X, the phase's item, in the scene's context, and Y and Z
+                // on the second monitor, each in a context the test makes to share it. Y's and Z's requests
+                // to daemon A are held while daemon B takes the name and X draws B's value pictures; one
+                // held reply is let go; daemon C takes the name and X draws C's; then the other is let go.
+                // Graded on the names glWaitSemaphoreEXT and glDeleteSemaphoresEXT were given
+                // (gl_semaphore_fault.h), against the names glCreateSemaphoresNV handed back: A, B, C.
+                if (!reachTimeline(6)) {
+                    check(false, "the item reaches the timeline within six pictures");
+                    return true;
+                }
+                QOpenGLContext* sibling = nullptr;
+                scene.renderPass([&] { sibling = QOpenGLContext::currentContext(); });
+                if (sibling == nullptr) {
+                    wallpaperx::testing::harnessFailure("the scene graph left no context current during its pass");
+                    return true;
+                }
+                using NamedCall = wallpaperx::testing::GlSemaphoreFaults::NamedCall;
+                const auto timelineCreated = [](size_t index) -> NamedCall {
+                    std::lock_guard<std::mutex> lock(g_glSemaphoreFaults.callsMutex);
+                    const auto& created = g_glSemaphoreFaults.timelinesCreated;
+                    return index < created.size() ? created[index] : NamedCall{0, EGL_NO_CONTEXT};
+                };
+                // Deletes of the timeline's name from its creation on.
+                const auto deletesOf = [](const NamedCall& timeline) {
+                    int count = 0;
+                    for (GLuint deleted :
+                         namesSince(&wallpaperx::testing::GlSemaphoreFaults::semaphoresDeleted, timeline.deletesBefore)) {
+                        if (deleted == timeline.name) ++count;
+                    }
+                    return count;
+                };
+                const auto onlyName = [](const std::vector<GLuint>& names, GLuint name) {
+                    return std::all_of(names.begin(), names.end(), [name](GLuint n) { return n == name; });
+                };
+                const auto staged = [](bool ok, const std::string& what) {
+                    if (!ok) wallpaperx::testing::harnessFailure("not staged: " + what);
+                    return ok;
+                };
+                const auto announceY = [&] { announce(bus, stub.nextGeneration(), wallpaperx::testing::kSecondMonitor); };
+                struct DropItem {
+                    Scene& scene;
+                    ~DropItem() {
+                        scene.root.reset();
+                        scene.renderPass();
+                    }
+                };
+                // Puts an item on the second monitor into `ys` and draws value pictures on A's timeline there.
+                const auto onSecondMonitor = [&](Scene& ys, const std::string& which) {
+                    ys.engine.addImportPath(QString::fromUtf8(WALLPAPERX_QML_MODULE_PATH));
+                    ys.component = std::make_unique<QQmlComponent>(&ys.engine);
+                    QString qml = wallpaperx::testing::cacheQmlSource();
+                    qml.replace(QStringLiteral("monitorId: 0"), QStringLiteral("monitorId: 1"));
+                    ys.component->setData(qml.toUtf8(), QUrl::fromLocalFile(QCoreApplication::applicationDirPath() +
+                                                                             QStringLiteral("/item_timeline_y.qml")));
+                    ys.root.reset(ys.component->create());
+                    auto* yRoot = qobject_cast<QQuickItem*>(ys.root.get());
+                    if (!staged(yRoot != nullptr, which + " could not be made")) return false;
+                    yRoot->setParentItem(ys.window.contentItem());
+                    ys.item = qobject_cast<QQuickItem*>(ys.root->property("rendererItem").value<QObject*>());
+                    if (!staged(ys.item != nullptr, which + " exposed no rendererItem")) return false;
+                    (void)pumpUntil([&] { ys.renderPass(); return itemTexture(ys.item) != nullptr; }, 10000);
+                    if (!staged(itemTexture(ys.item) != nullptr && settleQuiet(ys, stub),
+                                which + " never drew A's picture and went quiet")) {
+                        return false;
+                    }
+                    int values = 0;
+                    for (int i = 0; i < 8 && values < 2; ++i) {
+                        const int values0 = stub.valuesSent();
+                        const quint64 before = ys.pictures();
+                        announceY();
+                        if (!pumpUntil([&] { ys.renderPass(); return ys.pictures() > before; }, 5000)) break;
+                        if (stub.valuesSent() > values0) ++values;
+                    }
+                    return staged(values > 0, which + " drew no value picture on A's timeline");
+                };
+                const auto inYZ = [&](Scene& ys, Scene& zs) {
+                    if (!staged(settleQuiet(ys, stub) && settleQuiet(zs, stub), "Y and Z did not go quiet")) return;
+                    // Both requests held from one announcement: a second one while the first is held would
+                    // leave that item a newer generation to fetch from B straight after its late picture.
+                    const int onTimeline0 = stub.onTimelineRequests();
+                    stub.holdEveryReply(true);
+                    announceY();
+                    const bool bothAsked = pumpUntil([&] { return stub.heldReplies() >= 2; }, 3000);
+                    pumpFor(100);
+                    stub.holdEveryReply(false);
+                    if (!staged(bothAsked && stub.heldReplies() == 2 && stub.onTimelineRequests() - onTimeline0 == 2,
+                                "Y's and Z's requests to A were not both held on A's timeline (" +
+                                    std::to_string(stub.heldReplies()) + " held)")) {
+                        return;
+                    }
+
+                    SuccessorDaemon successor(device, ring);
+                    if (!staged(successor.ok && successor.takeNameFrom(bus), "daemon B never took the name")) return;
+                    pumpFor(50);
+                    (void)pumpUntil([&] { scene.renderPass(); return false; }, 200);
+                    (void)settleQuiet(scene, successor.stub);
+                    const Drive reachB = drive(scene, successor.stub, successor.bus, 8,
+                                               [&] { return successor.stub.valuesSent() > 0; });
+                    (void)drive(scene, successor.stub, successor.bus, 1);
+                    if (!staged(!reachB.stalled && successor.stub.valuesSent() > 0 &&
+                                    recorded(&wallpaperx::testing::GlSemaphoreFaults::timelinesCreated) == 2,
+                                "the first item never drew B's value pictures on a second timeline")) {
+                        return;
+                    }
+                    const NamedCall a = timelineCreated(0);
+                    const NamedCall b = timelineCreated(1);
+
+                    // GOAL: S15.440 -- an earlier daemon's late value, drawn in another context of the group
+                    //       after B's first value picture there, is waited on A's import: no import, and no
+                    //       wait on any other semaphore (B's included).
+                    // WHY-THIS-SHAPE: graded by the waited name, not pictures or a wait count: without A's
+                    //       import the late hand-over fails and the re-fetch from B is drawn and waited on, so
+                    //       both counters still rise. Both Y and Z are rendered: which held reply is oldest
+                    //       depends on which item asked first, so the one that draws is the one graded.
+                    // CONTROL: in acquireOnGroupTimeline (backend/kde/wallpaperx_item.cpp), via control_batch.sh,
+                    //       2026-10-10, NVIDIA, reverted: a found import waited on as the group's newest ->
+                    //       "FAIL: A's late value in a sibling context after B is waited on A's import (A is 1,
+                    //       waited on 2, 0 import(s); ...)"; the entry then timed out at exit, the GPU waiting
+                    //       on a value B's timeline never reaches.
+                    // COVERAGE-ASSERT: a late picture drawn with at least one wait, else not staged.
+                    size_t waited0 = recorded(&wallpaperx::testing::GlSemaphoreFaults::semaphoresWaited);
+                    const quint64 imports0 = ys.semaphoreImports() + zs.semaphoreImports();
+                    const quint64 yPictures0 = ys.pictures();
+                    const quint64 zPictures0 = zs.pictures();
+                    (void)stub.sendOldestHeld();
+                    bool yDrew = false;
+                    bool zDrew = false;
+                    (void)pumpUntil(
+                        [&] {
+                            ys.renderPass();
+                            zs.renderPass();
+                            yDrew = ys.pictures() > yPictures0;
+                            zDrew = zs.pictures() > zPictures0;
+                            return yDrew || zDrew;
+                        },
+                        3000);
+                    Scene* const early = yDrew == zDrew ? nullptr : yDrew ? &ys : &zs;
+                    std::vector<GLuint> waited = namesSince(&wallpaperx::testing::GlSemaphoreFaults::semaphoresWaited, waited0);
+                    quint64 imports = ys.semaphoreImports() + zs.semaphoreImports() - imports0;
+                    std::printf("item_timeline_test: shared-replaced: timelines A %u, B %u; the late picture after B "
+                                "drawn by %s, waited on [%s], %llu import(s)\n",
+                                a.name, b.name, early == &ys ? "Y" : early == &zs ? "Z" : "neither",
+                                listNames(waited).c_str(), static_cast<unsigned long long>(imports));
+                    std::fflush(stdout);
+                    if (!staged(early != nullptr && !waited.empty(),
+                                "not exactly one of Y and Z drew a late picture after B, with a wait")) {
+                        return;
+                    }
+                    check(onlyName(waited, a.name) && imports == 0 && drawingCleanly(*early),
+                          "A's late value in a sibling context after B is waited on A's import (A is " +
+                              std::to_string(a.name) + ", waited on " + listNames(waited) + ", " +
+                              std::to_string(imports) + " import(s); " + describe(*early) + ")");
+
+                    SuccessorDaemon third(device, ring, QStringLiteral("wallpaperx-timeline-c"));
+                    if (!staged(third.ok && third.takeNameFrom(successor.bus), "daemon C never took the name")) return;
+                    pumpFor(50);
+                    (void)pumpUntil([&] { scene.renderPass(); return false; }, 200);
+                    (void)settleQuiet(scene, third.stub);
+                    const Drive reachC =
+                        drive(scene, third.stub, third.bus, 8, [&] { return third.stub.valuesSent() > 0; });
+                    (void)drive(scene, third.stub, third.bus, 1);
+                    if (!staged(!reachC.stalled && third.stub.valuesSent() > 0 &&
+                                    recorded(&wallpaperx::testing::GlSemaphoreFaults::timelinesCreated) == 3,
+                                "the first item never drew C's value pictures on a third timeline")) {
+                        return;
+                    }
+                    const NamedCall c = timelineCreated(2);
+
+                    // GOAL: S15.440 -- the same after two replacements: A's late value, let go after C's
+                    //       first value picture in the group, is waited on A's import, with no import.
+                    // WHY-THIS-SHAPE: as above; only the item still held is rendered, so the other's own
+                    //       fetches from B or C cannot put their waits in the window.
+                    // CONTROL: in acquireOnGroupTimeline (backend/kde/wallpaperx_item.cpp), via control_batch.sh,
+                    //       2026-10-10, NVIDIA, reverted: the oldest import released and erased when a third is
+                    //       appended -> "FAIL: A's late value in a sibling context after B and C is waited on
+                    //       A's import (A is 1, waited on 3, 0 import(s); ...)", the check above staying green.
+                    //       The newest-import break above turns this red too ("waited on 3").
+                    // COVERAGE-ASSERT: a late picture drawn with at least one wait, else not staged.
+                    Scene& late = early == &ys ? zs : ys;
+                    waited0 = recorded(&wallpaperx::testing::GlSemaphoreFaults::semaphoresWaited);
+                    const quint64 lateImports0 = late.semaphoreImports();
+                    const quint64 latePictures0 = late.pictures();
+                    (void)stub.sendOldestHeld();
+                    const bool lateDrawn =
+                        pumpUntil([&] { late.renderPass(); return late.pictures() > latePictures0; }, 3000);
+                    waited = namesSince(&wallpaperx::testing::GlSemaphoreFaults::semaphoresWaited, waited0);
+                    imports = late.semaphoreImports() - lateImports0;
+                    std::printf("item_timeline_test: shared-replaced: timeline C %u; the late picture after C drawn %s, "
+                                "waited on [%s], %llu import(s)\n",
+                                c.name, lateDrawn ? "yes" : "no", listNames(waited).c_str(),
+                                static_cast<unsigned long long>(imports));
+                    std::fflush(stdout);
+                    if (!staged(lateDrawn && !waited.empty(), "the late picture after C was not drawn with a wait")) return;
+                    check(onlyName(waited, a.name) && imports == 0 && drawingCleanly(late),
+                          "A's late value in a sibling context after B and C is waited on A's import (A is " +
+                              std::to_string(a.name) + ", waited on " + listNames(waited) + ", " +
+                              std::to_string(imports) + " import(s); " + describe(late) + ")");
+
+                    // GOAL: S15.441 -- no group timeline is deleted by hand: through B's and C's first imports
+                    //       and both late pictures, A, B and C are each deleted 0 times.
+                    // WHY-THIS-SHAPE: each name counted from its own creation (deletesBefore, taken under the
+                    //       recorder's lock), not from a fixed point: the binary per-picture semaphores are
+                    //       deleted too, and one may have held B's or C's name before it became a timeline.
+                    //       A name cannot be handed out again while its timeline lives, so any delete of it
+                    //       from creation on means the timeline was deleted.
+                    // CONTROL: the oldest-import break above -> "FAIL: no group timeline is deleted by hand (A
+                    //       deleted 1, B 0, C 0 time(s) since each was made)".
+                    const int aDeleted = deletesOf(a);
+                    const int bDeleted = deletesOf(b);
+                    const int cDeleted = deletesOf(c);
+                    check(aDeleted == 0 && bDeleted == 0 && cDeleted == 0,
+                          "no group timeline is deleted by hand (A deleted " + std::to_string(aDeleted) + ", B " +
+                              std::to_string(bDeleted) + ", C " + std::to_string(cDeleted) +
+                              " time(s) since each was made)");
+                };
+                const auto inY = [&](Scene& ys) {
+                    DropItem dropY{ys};
+                    if (!onSecondMonitor(ys, "Y")) return;
+                    if (withSharingScene(sibling, [&](Scene& zs) {
+                            DropItem dropZ{zs};
+                            if (onSecondMonitor(zs, "Z")) inYZ(ys, zs);
+                        }) == nullptr) {
+                        return;
+                    }
+                };
+                if (withSharingScene(sibling, inY) == nullptr) return true;
                 const int lines = tripLines();
                 check(captureWorked() && lines == 0, "no semaphore import was refused (" + std::to_string(lines) +
                                                          " line(s))");

@@ -70,7 +70,7 @@ signals:
 // nothing, so it brings the memory.
 //
 // The acquire comes one of two ways, chosen by each fetch: a value on the daemon's acquire
-// timeline, imported once per GL context and shared by its nodes, when this item can wait on it; a new binary semaphore per
+// timeline, imported once per GL share group and shared by its contexts, when this item can wait on it; a new binary semaphore per
 // picture otherwise, which always works and is where any doubt sends it back.
 //
 // What is NOT cached is the claim: the daemon must not draw into the image being sampled, so every
@@ -178,10 +178,10 @@ public:
     quint64 importCount() const { return m_importCount.load(std::memory_order_relaxed); }
     quint64 reusedImportCount() const { return m_reusedImportCount.load(std::memory_order_relaxed); }
 
-    // How many semaphores this item has tried to import into its context, successful or not: one
-    // per picture on the binary path; on the timeline path one per context and daemon, counted by the
-    // item whose picture made it. Attempts, because each is
-    // an exposure -- on NVIDIA one failed import leaves every later one in the process failing.
+    // How many semaphores this item has tried to import, successful or not: one per picture on the
+    // binary path; on the timeline path one per share group and daemon, counted by the item whose
+    // picture made it. Attempts, because each is an exposure -- on NVIDIA one failed import leaves
+    // every later one in the process failing.
     quint64 semaphoreImportCount() const { return m_semaphoreImportCount.load(std::memory_order_relaxed); }
 
     // Pictures that arrived without memory for an import this item had dropped after naming it in
@@ -514,7 +514,7 @@ private:
     quint64 m_generationEpoch = 0;  // guarded by m_importedMutex
     // What the render thread has found about waiting on the daemon's acquire timeline, for the GUI
     // thread choosing which method a fetch uses: whether this item's context can wait on one at all
-    // -- false too once the context has refused a semaphore import -- and the daemon whose timeline
+    // -- false too once this process has had a semaphore import refused -- and the daemon whose timeline
     // this item failed to import or wait on, which it asks for sync_fds from then on.
     bool m_contextWaitsOnTimeline = false;  // guarded by m_importedMutex
     std::string m_timelineRefusedBy;        // guarded by m_importedMutex

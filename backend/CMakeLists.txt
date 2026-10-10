@@ -1872,9 +1872,9 @@ if(WALLPAPERX_DBUS_RUN_SESSION)
             endforeach()
 
             # The acquire timeline, from the plugin's side: one entry per phase, for
-            # item_release_ledger's reason -- the plugin's timeline record and its list of contexts
-            # that refused an import are process-wide. Needs GL_NV_timeline_semaphore, so every
-            # phase but two reports NOT VERIFIED on Mesa.
+            # item_release_ledger's reason -- the plugin's timeline imports and its refused-import
+            # flag are process-wide. Needs GL_NV_timeline_semaphore, so every phase but three
+            # reports NOT VERIFIED on Mesa.
             add_executable(wallpaperx-item-timeline-test tests/item_timeline_test.cpp)
             target_link_libraries(wallpaperx-item-timeline-test PRIVATE
                 wallpaperx-renderer wallpaperx-frame-import
@@ -1891,9 +1891,9 @@ if(WALLPAPERX_DBUS_RUN_SESSION)
                 "LINKER:--export-dynamic-symbol=glGetStringi")
             add_dependencies(wallpaperx-item-timeline-test wallpaperxplugin wallpaperx-shaders)
             foreach(timeline_phase steady old-daemon unsupported unknown-interface too-many-copies retry-busy retry-exportfailed
-                                   lost-reply refused-timeline refused-binary wait-no-trip setup-create setup-type
+                                   lost-reply refused-timeline refused-binary refused-shared wait-no-trip setup-create setup-type
                                    stray-value restart restart-memory stale-value context-move late-value
-                                   late-answer replaced-asking retry-replaced rebuild context-share)
+                                   late-answer replaced-asking retry-replaced rebuild context-share shared-replaced)
                 wallpaperx_add_display_test(NAME item_timeline_${timeline_phase}
                          COMMAND $<TARGET_FILE:wallpaperx-item-timeline-test> ${timeline_phase})
                 set_tests_properties(item_timeline_${timeline_phase} PROPERTIES

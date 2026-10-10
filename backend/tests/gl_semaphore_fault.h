@@ -50,15 +50,21 @@ struct GlSemaphoreFaults {
     // Needs glGetStringi exported as well; EGL_NO_CONTEXT hides nothing.
     std::atomic<EGLContext> hideTimelineIn{EGL_NO_CONTEXT};
 
-    // Every semaphore name glCreateSemaphoresNV handed back (the timeline imports) and every name passed
-    // to glDeleteSemaphoresEXT, each with the EGL context current at the call.
+    // Every semaphore name glCreateSemaphoresNV handed back (the timeline imports), every name passed
+    // to glDeleteSemaphoresEXT and every name passed to glWaitSemaphoreEXT, failed waits included,
+    // each with the EGL context current at the call.
     struct NamedCall {
         GLuint name;
         EGLContext context;
+        // For a creation: semaphoresDeleted's length at that moment, taken under the same lock, so
+        // a delete of this name from that index on is a delete of this semaphore, never of an
+        // earlier one that held the name.
+        size_t deletesBefore = 0;
     };
     std::mutex callsMutex;
     std::vector<NamedCall> timelinesCreated;  // guarded by callsMutex
     std::vector<NamedCall> semaphoresDeleted;  // guarded by callsMutex
+    std::vector<NamedCall> semaphoresWaited;  // guarded by callsMutex
 };
 
 inline GlSemaphoreFaults g_glSemaphoreFaults;
@@ -89,6 +95,10 @@ inline void faultingWait(GLuint semaphore, GLuint buffers, const GLuint* bufferL
                          const GLuint* textureList, const GLenum* layouts) {
     GlSemaphoreFaults& faults = g_glSemaphoreFaults;
     faults.waitsSeen.fetch_add(1);
+    {
+        std::lock_guard<std::mutex> lock(faults.callsMutex);
+        faults.semaphoresWaited.push_back({semaphore, eglGetCurrentContext()});
+    }
     int armed = faults.failWaits.load();
     while (armed > 0 && !faults.failWaits.compare_exchange_weak(armed, armed - 1)) {
     }
@@ -111,7 +121,10 @@ inline void faultingCreate(GLsizei n, GLuint* semaphores) {
     if (real == nullptr) return;
     real(n, semaphores);
     std::lock_guard<std::mutex> lock(g_glSemaphoreFaults.callsMutex);
-    for (GLsizei i = 0; i < n; ++i) g_glSemaphoreFaults.timelinesCreated.push_back({semaphores[i], eglGetCurrentContext()});
+    for (GLsizei i = 0; i < n; ++i) {
+        g_glSemaphoreFaults.timelinesCreated.push_back(
+            {semaphores[i], eglGetCurrentContext(), g_glSemaphoreFaults.semaphoresDeleted.size()});
+    }
 }
 
 inline void loggingDelete(GLsizei n, const GLuint* semaphores) {

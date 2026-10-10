@@ -100,10 +100,10 @@ inline GLuint nativeName(QSGTexture* texture) {
     return opengl == nullptr ? 0 : opengl->nativeTexture();
 }
 
-inline void announce(QDBusConnection& bus, quint64 generation) {
+inline void announce(QDBusConnection& bus, quint64 generation, int monitor = kFirstMonitor) {
     QDBusMessage ready =
         QDBusMessage::createSignal(QString::fromUtf8(kPath), QString::fromUtf8(kInterface), QStringLiteral("FrameReady"));
-    ready.setArguments({kFirstMonitor, static_cast<qulonglong>(generation)});
+    ready.setArguments({monitor, static_cast<qulonglong>(generation)});
     bus.send(ready);
 }
 

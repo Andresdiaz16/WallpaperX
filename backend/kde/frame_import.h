@@ -145,7 +145,7 @@ public:
     //
     // `importRefused`, when given, is set true only when the driver refused glImportSemaphoreFdEXT
     // itself -- on NVIDIA the one failure after which no semaphore import in this process succeeds
-    // again, in any context. Every other failure leaves it false.
+    // again. Every other failure leaves it false.
     static bool acquire(Request& request, unsigned int texture, std::string* whyNot = nullptr,
                         bool* importRefused = nullptr);
 
@@ -153,25 +153,26 @@ public:
     // GL_NV_timeline_semaphore. Mesa has the first and not the second, and keeps the binary path.
     static bool supportsTimeline(std::string* whyNot = nullptr);
 
-    // A timeline semaphore imported into one context, once, and waited on for many pictures. 0 is
-    // "none". Freed by release() with the same context current.
+    // A timeline semaphore imported once and waited on for many pictures. 0 is "none". The name
+    // belongs to the share group of the context that imported it; release() needs a context of that
+    // group current.
     struct Timeline {
         unsigned int semaphore = 0;
     };
 
     // Imports the timeline `fd` names. Borrows `fd`: the import is made from a duplicate, so the
-    // caller's descriptor is its own either way. Worth doing as rarely as possible -- measured on
-    // NVIDIA, after about 250 import-and-release cycles of one timeline the whole process is refused:
-    // every context, shared or not, any timeline, and vkCreateSemaphore too. Releasing gives nothing
-    // back. Whether it counts imports of one timeline or every semaphore import is not measured, so
-    // the binary path's import per picture may draw on the same budget. Import once per context and
-    // keep it. `importRefused` as for acquire().
+    // caller's descriptor is its own either way. Worth doing as rarely as possible: on NVIDIA, enough
+    // imports, released ones included, leave every later semaphore import in the process refused.
+    // `importRefused` as for acquire().
     static Timeline importTimeline(int fd, std::string* whyNot = nullptr, bool* importRefused = nullptr);
 
     // The per-picture half of the timeline path: waits for `value` against `texture`, carrying the
     // same acquire and layout as the binary wait. `value` must already have been reached. This
     // context cannot read the payload to check, and a wait for a value it never reaches stalls
     // every later command in the context -- which is why the daemon only hands out reached values.
+    //
+    // `value` is set on the semaphore object itself, so contexts sharing one Timeline must not call
+    // this at the same time.
     static bool acquire(const Timeline& timeline, uint64_t value, unsigned int texture,
                         std::string* whyNot = nullptr);
 

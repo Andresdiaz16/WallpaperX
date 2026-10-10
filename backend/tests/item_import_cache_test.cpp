@@ -31,7 +31,7 @@
 //                      out a back-off before asking again, logging once per run (S15.273)
 //   declare            each fetch names the images the node can draw again, and a reply leaving
 //                      their memory out is drawn through the kept import (S15.296)
-//   declare-refused    a context that refused the producer's acquire names nothing (S15.297)
+//   declare-refused    a process whose driver refused the producer's acquire names nothing (S15.297)
 //   declare-monitor    a fetch for another monitor names nothing of the old one (S15.296)
 //   declare-daemon     a fetch to a new daemon names nothing of the old one's (S15.296)
 //   unique-name        a fetch goes to the daemon's unique name, not the well-known one (S15.298)
@@ -196,7 +196,7 @@ constexpr PhaseName kPhases[] = {
     {Phase::DescriptorBackoff, "descriptor-backoff",
      "S15.273 (refused for descriptors, the item keeps its frame, backs off, and logs once per run)"},
     {Phase::Declare, "declare", "S15.296 (each fetch names exactly the images the node can draw again)"},
-    {Phase::DeclareRefused, "declare-refused", "S15.297 (a context that cannot wait on the acquire names nothing)"},
+    {Phase::DeclareRefused, "declare-refused", "S15.297 (a process that cannot wait on the acquire names nothing)"},
     {Phase::DeclareMonitor, "declare-monitor", "S15.296 (a fetch for another monitor names nothing of the old one)"},
     {Phase::DeclareDaemon, "declare-daemon", "S15.296 (a fetch to a new daemon names nothing of the old one's)"},
     {Phase::UniqueName, "unique-name", "S15.298 (a fetch is addressed to the daemon's unique name)"},
@@ -1677,22 +1677,23 @@ bool runPhase(const PhaseName& which) {
             }
 
             case Phase::DeclareRefused: {
-                // GOAL: S15.297 -- once this context has refused the producer's acquire, the item names
+                // GOAL: S15.297 -- once the driver has refused the producer's acquire, the item names
                 //       nothing: without the acquire an import is never drawn again, so naming one would
                 //       only have the daemon leave out memory the picture then needs.
                 // WHY-THIS-SHAPE: the refusal is staged with a descriptor that is no semaphore (the
-                //       stub's Unusable acquire), the one way to make this context refuse from outside
-                //       the item. The fetch before it must name the image, or nothing is shown to stop.
+                //       stub's Unusable acquire), the one way to make the driver refuse from outside the
+                //       item; it marks the whole process, and is never cleared, so nothing may run after
+                //       this in the same process. The fetch before it must name the image, or nothing is
+                //       shown to stop.
                 // CONTROL: in WallpaperXItem::updatePaintNode (backend/kde/wallpaperx_item.cpp), the
-                //       `&& !contextRefusesSemaphores()` term dropped from publishKnownImports -> "FAIL:
-                //       after the context refused the acquire, no fetch names an image (3 of 3 named
-                //       one)". Via control_run.sh, 2026-10-04 on the NVIDIA entry; re-run 2026-10-08 after
-                //       contextRefusesSemaphores moved onto the per-context record, the same line. Reverted.
+                //       `&& !g_semaphoresRefused.load()` term dropped from publishKnownImports -> "FAIL: after
+                //       the acquire was refused, no fetch names an image (3 of 3 named one)". Via
+                //       control_run.sh, 2026-10-10 on the NVIDIA entry. Reverted.
                 const size_t asks0 = stub.asks().size();
                 stub.sendAcquireFrom(stub.served() + 1, ExportingStub::Acquire::Unusable);
                 stub.sendAcquireFrom(stub.served() + 2, ExportingStub::Acquire::Real);
                 if (!drawNext(scene, stub, bus)) {
-                    check(false, "the picture whose acquire the context refuses is still drawn");
+                    check(false, "the picture whose acquire the driver refuses is still drawn");
                     return true;
                 }
                 const bool namedBefore = stub.asks().size() > asks0 && !stub.asks()[asks0].declared.empty();
@@ -1711,7 +1712,7 @@ bool runPhase(const PhaseName& which) {
                 int named = 0;
                 for (size_t i = asks1; i < stub.asks().size(); ++i) named += stub.asks()[i].declared.empty() ? 0 : 1;
                 check(stub.asks().size() - asks1 == 3 && named == 0,
-                      "after the context refused the acquire, no fetch names an image (" + std::to_string(named) +
+                      "after the acquire was refused, no fetch names an image (" + std::to_string(named) +
                           " of " + std::to_string(stub.asks().size() - asks1) + " named one)");
                 return true;
             }
