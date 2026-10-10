@@ -66,6 +66,13 @@ public:
     bool decodeNext();
     void draw(OffscreenTargetManager& targets, const OffscreenTarget& target);
 
+    // decodeNext() that gives up for now once the decoder has dropped `dropLimit` pictures on its way
+    // to the next one it returns, as VideoDecoder::next(dropLimit) does. Dropping leaves the picture
+    // converted last, and its timing and position, as they were; the next call carries on. Throws as
+    // decodeNext() does.
+    enum class Decode { Converted, Exhausted, Dropping };
+    Decode decodeWithin(uint32_t dropLimit);
+
     // When the picture draw() shows belongs on screen, as the decoder reported it. What paces the
     // pictures is the caller's; this only says where each one falls.
     struct PictureTiming {
@@ -84,6 +91,8 @@ public:
     std::optional<StreamPosition> shownPosition() const { return m_shownPosition; }
 
 private:
+    Decode decode(std::optional<uint32_t> dropLimit);
+
     // Built and replaced together, so the renderer never outlives the image it shows.
     struct Stage {
         Stage(Device& device, const DecodedFrame& first, const std::string& shaderDir);

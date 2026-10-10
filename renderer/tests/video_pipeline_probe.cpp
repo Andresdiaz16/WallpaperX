@@ -63,6 +63,8 @@ extern "C" {
 #include <iterator>
 #include <optional>
 #include <string>
+#include <utility>
+#include <variant>
 #include <vector>
 
 namespace {
@@ -186,6 +188,10 @@ struct CallTally {
 };
 bool g_tallying = false;
 CallTally g_tally;
+// Set once a case confirmed a hardware codec leaked at teardown; vkDestroyDevice called after that is the
+// device destroyed under the leaked codec's objects.
+bool g_watchDeviceDestroy = false;
+bool g_destroyedUnderLeak = false;
 // What av_seek_frame does during a tallied call. LateFirst moves the call's first timestamp seek
 // kLateSeconds past its target.
 enum class LoopSeek { None, FailAll, FailFirst, FailTimestamps, LateFirst };
@@ -1621,6 +1627,188 @@ void runStartAtChecks(Device& device, const std::string& label, bool onDevice, S
             fail("a pipeline opened at the last picture loops and plays on, only the loop's picture starting a pass");
         }
     }
+}
+
+// What a VideoDecoder returned on its way to one picture and the four after it, called with next(limit) until
+// that picture came (limit 0: next() alone). Pictures counted are those ffmpeg delivered during each call.
+struct BoundedRun {
+    std::vector<std::optional<std::chrono::nanoseconds>> times;
+    std::vector<std::optional<wallpaperx::StreamPosition>> positions;
+    std::vector<int> droppingCalls;  // pictures delivered in each call that answered Dropping
+    int finalCall = 0;               // pictures delivered in the call that returned the picture
+    int devicePictures = 0;
+    int hostPictures = 0;
+    bool failureConsumed = true;
+    std::string threw;
+};
+
+// With `failAfter`, the decoder opens at the start, returns that many pictures, and the measured calls meet a
+// hardware failure first; otherwise it opens at `startAt`.
+BoundedRun boundedRun(Device& device, const std::string& file, std::optional<wallpaperx::StreamPosition> startAt,
+                      int failAfter, uint32_t limit) {
+    BoundedRun run;
+    struct Clear {
+        ~Clear() {
+            g_tallying = false;
+            g_receiveExternalRemaining = 0;
+        }
+    } clear;
+    const auto tally = [&] {
+        run.devicePictures += g_tally.devicePictures;
+        run.hostPictures += g_tally.hostPictures;
+        g_tallying = false;
+        return g_tally.pictures;
+    };
+    try {
+        VideoDecoder decoder(device, file, startAt);
+        for (int i = 0; i < failAfter; ++i) {
+            if (!decoder.next()) {
+                run.threw = "the stream ended before the failure point";
+                return run;
+            }
+        }
+        if (failAfter > 0) g_receiveExternalRemaining = 1;
+        std::optional<DecodedFrame> first;
+        for (int call = 0; !first; ++call) {
+            if (call > 2000) {
+                run.threw = "no picture after 2000 bounded calls";
+                return run;
+            }
+            g_tally = CallTally{};
+            g_tallying = true;
+            if (limit == 0) {
+                first = decoder.next();
+                run.finalCall = tally();
+                if (!first) break;
+                continue;
+            }
+            auto step = decoder.next(limit);
+            const int delivered = tally();
+            if (std::holds_alternative<VideoDecoder::Dropping>(step)) {
+                run.droppingCalls.push_back(delivered);
+                continue;
+            }
+            first = std::move(std::get<std::optional<DecodedFrame>>(step));
+            run.finalCall = delivered;
+            if (!first) break;
+        }
+        if (!first) {
+            run.threw = "the stream ended before a picture";
+            return run;
+        }
+        run.failureConsumed = g_receiveExternalRemaining == 0;
+        run.times.push_back(first->presentationTime());
+        run.positions.push_back(first->position());
+        for (size_t i = 1; i < kFollowing; ++i) {
+            const std::optional<DecodedFrame> next = decoder.next();
+            if (!next) break;
+            run.times.push_back(next->presentationTime());
+            run.positions.push_back(next->position());
+        }
+    } catch (const std::exception& e) {
+        run.threw = e.what();
+    }
+    return run;
+}
+
+void runBoundedDecodeChecks(Device& device, const std::string& label, bool onDevice) {
+    if (onDevice ? !hardwareDecoderPresent(device, label) : !videoExtensionsHidden(device, label)) return;
+    const char* const file = "counter_long.mp4";
+    const std::optional<CounterReference> reference = counterReference(label, file);
+    if (!reference) return;
+    // 46 and 70 are 22 pictures past the keyframes at 24 and 48, so each catch-up drops about that many.
+    constexpr size_t kStart = 46;
+    constexpr int kFailAfter = 70;
+    const std::optional<wallpaperx::StreamPosition> position = positionAt(device, label, file, kStart, reference->ids[kStart]);
+    if (!position) return;
+
+    // GOAL: S15.413 -- VideoDecoder::next(n) delivers at most n pictures per call that answers Dropping (it
+    //       drops at least one), and a run of such calls returns exactly the picture and position next()
+    //       returns, then the same pictures after it: on a start part way in (the device's reset-point start,
+    //       or software's seek), and on the device for software's resume after a hardware failure.
+    // WHY-THIS-SHAPE: each call's pictures are counted where ffmpeg delivers them, and the run is compared with
+    //       an unbounded run of the same decoder from the same point, by timestamp and position -- the counter
+    //       would not see a position handed out wrong. Limits 1 and 4, so both a stop after every picture and
+    //       a stop part way through a group are taken. The total delivered must match too: a bounded run that
+    //       decoded a picture twice, or skipped one it then had to find again, shows there.
+    // CONTROL: via control_run.sh, 2026-10-08, each alone, reverted, in renderer/video/video_decoder.cpp decode().
+    //       `++dropped >= *dropLimit` made `>` -> on bounded_decode_device and bounded_decode_host_lavapipe "11
+    //       call(s) answered Dropping, 11 of them delivering other than 1 to 1 picture(s)" at every case, the
+    //       sequences still equal. The Dropping return also clearing `m_resume` -> "2 picture(s) delivered against
+    //       23 unbounded; picture 1 of 5 differs in timestamp or position" at both limits and cases, on both
+    //       entries; the limit-1 runs also fail the line above, having answered Dropping once (the coverage half).
+    // COVERAGE-ASSERT: the unbounded catch-up delivers at least 10 pictures, and the limit-1 run answered
+    //       Dropping at least 9 times; the failure case's injected failure was consumed and software
+    //       delivered pictures after it; the start cases delivered only where the entry says.
+    struct Case {
+        const char* what;
+        std::optional<wallpaperx::StreamPosition> startAt;
+        int failAfter;
+    };
+    std::vector<Case> cases{{"opened at picture 46", position, 0}};
+    if (onDevice) cases.push_back({"resumed in software after a hardware failure 70 pictures in", std::nullopt, kFailAfter});
+    int graded = 0;
+    for (const Case& c : cases) {
+        const BoundedRun unbounded = boundedRun(device, asset(file), c.startAt, c.failAfter, 0);
+        const std::string base = std::string(file) + " " + c.what;
+        if (!unbounded.threw.empty() || unbounded.times.size() != kFollowing) {
+            std::fprintf(stderr, "FAIL: %s: %s: the unbounded run %s\n", label.c_str(), base.c_str(),
+                         unbounded.threw.empty() ? "returned fewer than five pictures" : unbounded.threw.c_str());
+            fail("the unbounded decode a bounded run is compared with did not complete");
+            continue;
+        }
+        const bool premise = unbounded.finalCall >= 10 && unbounded.failureConsumed &&
+                             (c.failAfter > 0 ? unbounded.hostPictures > 0
+                                              : (onDevice ? unbounded.hostPictures == 0 : unbounded.devicePictures == 0));
+        if (!premise) {
+            std::fprintf(stderr, "FAIL: %s: %s: the unbounded catch-up delivered %d picture(s), %d on the device and %d in "
+                                 "software; failure %s\n",
+                         label.c_str(), base.c_str(), unbounded.finalCall, unbounded.devicePictures,
+                         unbounded.hostPictures, unbounded.failureConsumed ? "consumed" : "never consumed");
+            fail("a bounded-decode case did not reach the catch-up it is written for");
+            continue;
+        }
+        for (const uint32_t limit : {1u, 4u}) {
+            const BoundedRun bounded = boundedRun(device, asset(file), c.startAt, c.failAfter, limit);
+            const std::string what = base + ", next(" + std::to_string(limit) + ")";
+            if (!bounded.threw.empty()) {
+                std::fprintf(stderr, "FAIL: %s: %s: threw: %s\n", label.c_str(), what.c_str(), bounded.threw.c_str());
+                fail("a bounded decode threw where the unbounded one did not");
+                continue;
+            }
+            ++graded;
+            int delivered = bounded.finalCall;
+            int overLimit = 0;
+            for (const int n : bounded.droppingCalls) {
+                delivered += n;
+                if (n < 1 || n > static_cast<int>(limit)) ++overLimit;
+            }
+            if (overLimit != 0 || bounded.finalCall > static_cast<int>(limit) ||
+                (limit == 1 && bounded.droppingCalls.size() < 9)) {
+                std::fprintf(stderr, "FAIL: %s: %s: %zu call(s) answered Dropping, %d of them delivering other than 1 to "
+                                     "%u picture(s); the last delivered %d\n",
+                             label.c_str(), what.c_str(), bounded.droppingCalls.size(), overLimit, limit,
+                             bounded.finalCall);
+                fail("next(n) delivers at most n pictures per call, and at least one when it answers Dropping");
+            }
+            if (bounded.times != unbounded.times || bounded.positions != unbounded.positions ||
+                delivered != unbounded.finalCall) {
+                size_t first = 0;
+                while (first < bounded.times.size() && first < unbounded.times.size() &&
+                       bounded.times[first] == unbounded.times[first] && bounded.positions[first] == unbounded.positions[first]) {
+                    ++first;
+                }
+                std::fprintf(stderr, "FAIL: %s: %s: %d picture(s) delivered against %d unbounded; picture %zu of %zu differs "
+                                     "in timestamp or position\n",
+                             label.c_str(), what.c_str(), delivered, unbounded.finalCall, first + 1,
+                             unbounded.times.size());
+                fail("bounded calls to next(n) return the picture and position next() returns, and the same pictures after");
+            }
+            std::printf("%s: %s: %zu call(s) answered Dropping, then one returned the picture; %d delivered (unbounded %d)\n",
+                        label.c_str(), what.c_str(), bounded.droppingCalls.size(), delivered, unbounded.finalCall);
+        }
+    }
+    check(graded == static_cast<int>(cases.size()) * 2, "every bounded-decode case this check is written for was graded");
 }
 
 // GOAL: S15.172 -- a start part way in on the device, whose pictures then lose their timestamps before the
@@ -3630,7 +3818,6 @@ void runUnansweredProbeTeardownChecks(Device& device, const std::string& label) 
     bool devicePictures = true;
     bool aliveAtTeardown = false;
     bool drained = false;
-    bool stillStalled = false;
     try {
         RetireHarness harness(device, asset(file));
         for (int i = 0; i < 3; ++i) {
@@ -3645,10 +3832,6 @@ void runUnansweredProbeTeardownChecks(Device& device, const std::string& label) 
         g_stallHeld = true;
         static_cast<void>(harness.destroy());
         g_holdNextSubmission = false;
-        // The next teardown on a GPU that never answered, as the daemon's would be. Without it the probe's batch
-        // retires below and the Device, never told of the leak, destroys itself under the leaked codec's objects:
-        // VUID-vkDestroyDevice-device-05137 at teardown, a production defect recorded under S13.121, not graded.
-        stillStalled = !device.safeToFree("what the unanswered-probe teardown leaked");
         g_stallHeld = false;
     } catch (const std::exception& e) {
         g_stallHeld = false;
@@ -3695,16 +3878,13 @@ void runUnansweredProbeTeardownChecks(Device& device, const std::string& label) 
         fail("a teardown holding decode images did not ask the device a bounded question before freeing them");
         return;
     }
-    if (!stillStalled) {
-        std::fprintf(stderr, "FAIL: %s: %s: the Device saw no stalled batch after the unanswered probe\n",
-                     label.c_str(), what.c_str());
-        fail("the harness's stall did not outlive the teardown it was meant to stall");
-        return;
-    }
     if (hardware->freed) {
         std::fprintf(stderr, "FAIL: %s: %s: the hardware codec was %s\n", label.c_str(), what.c_str(),
                      codecFate(hardware).c_str());
         fail("a hardware codec was freed after the device did not answer, entering ffmpeg's unbounded wait");
+    } else {
+        // Graded by runGraded() once the Device is gone.
+        g_watchDeviceDestroy = true;
     }
     for (size_t i = 0; i < g_pools.size(); ++i) {
         if (!g_pools[i].freed || g_pools[i].freedDuring != kDestroying) continue;
@@ -5447,6 +5627,12 @@ extern "C" VkResult vkQueueSubmit(VkQueue queue, uint32_t count, const VkSubmitI
     return result;
 }
 
+extern "C" void vkDestroyDevice(VkDevice device, const VkAllocationCallbacks* allocator) {
+    static const auto real = realSymbol<void (*)(VkDevice, const VkAllocationCallbacks*)>("vkDestroyDevice");
+    if (g_watchDeviceDestroy) g_destroyedUnderLeak = true;
+    real(device, allocator);
+}
+
 extern "C" int av_hwframe_ctx_init(AVBufferRef* ref) {
     static const auto real = realSymbol<int (*)(AVBufferRef*)>("av_hwframe_ctx_init");
     auto* frames = reinterpret_cast<AVHWFramesContext*>(ref->data);
@@ -5653,6 +5839,25 @@ int runGraded(const std::string& label, bool hideVideoExtensions, const std::fun
             g_heldFences.clear();
             oracle.detach();
         }
+        // GOAL: S13.121's second half -- a decoder leaked because the device did not answer is reported to the
+        //       Device, so a GPU that answers again later does not have its Vulkan device destroyed under the
+        //       leaked codec's objects (VUID-vkDestroyDevice-device-05137).
+        // WHY-THIS-SHAPE: the probe's batch is let go before the Device is destroyed, so the GPU has caught up
+        //       and only the Device's own record of the leak keeps it from destroying itself. Graded at the call,
+        //       watched from when the case confirmed the codec leaked, rather than only through the validation
+        //       layer's teardown message, which reconcile() below counts without naming.
+        // CONTROL: via control_run.sh, 2026-10-08, NVIDIA, reverted: closeDecoder()'s `m_device.recordLeak(...)`
+        //       call removed (renderer/video/video_decoder.cpp) -> on video_pipeline_retire_device "FAIL: ...
+        //       [counter_resize.h264, device not answering at teardown]: vkDestroyDevice was called while the
+        //       leaked hardware codec lived (VUID-vkDestroyDevice-device-05137)", and the layer's own log naming
+        //       VUID-vkDestroyDevice-device-05137, counted by reconcile() as one message outside its window.
+        if (std::exchange(g_watchDeviceDestroy, false) && g_destroyedUnderLeak) {
+            std::fprintf(stderr, "FAIL: %s: vkDestroyDevice was called while the leaked hardware codec lived "
+                                 "(VUID-vkDestroyDevice-device-05137)\n",
+                         label.c_str());
+            fail("a decoder leaked at teardown was not reported to the Device, which then destroyed itself under it");
+        }
+        g_destroyedUnderLeak = false;
         oracle.reconcile(label.c_str());
         return wallpaperx::testing::failureCount() == 0;
     });
@@ -5762,7 +5967,8 @@ int main(int argc, char** argv) {
         "loop-cost-host",    "loop-resume",   "release-device",    "retire-device",
         "halves-device",     "halves-host",   "timing-device",     "timing-host",       "start-at-device",
         "start-at-device-ts", "start-at-host", "start-at-device-open-gop", "start-at-device-open-gop-hevc",
-        "start-at-device-open-gop-mp4", "start-at-host-open-gop", "start-at-device-budget", "start-at-device-av1"};
+        "start-at-device-open-gop-mp4", "start-at-host-open-gop", "start-at-device-budget", "start-at-device-av1",
+        "bounded-decode-device", "bounded-decode-host"};
     if (std::find(modes.begin(), modes.end(), mode) == modes.end()) {
         std::fprintf(stderr, "usage: %s <mode>, one of:", argv[0]);
         for (const std::string& m : modes) std::fprintf(stderr, " %s", m.c_str());
@@ -5826,8 +6032,11 @@ int main(int argc, char** argv) {
 
     return runGraded(label, mode == "sequence-host" || mode == "shape" || mode == "steady-host" || mode == "loop-host" ||
                                 mode == "loop-cost-host" || mode == "halves-host" || mode == "timing-host" ||
-                                mode == "start-at-host" || mode == "start-at-host-open-gop",
+                                mode == "start-at-host" || mode == "start-at-host-open-gop" ||
+                                mode == "bounded-decode-host",
                      [&](Device& device) {
+                         if (mode == "bounded-decode-device") runBoundedDecodeChecks(device, label, /*onDevice=*/true);
+                         if (mode == "bounded-decode-host") runBoundedDecodeChecks(device, label, /*onDevice=*/false);
                          if (mode == "sequence-device") runSequenceChecks(device, label, /*onDevice=*/true);
                          if (mode == "sequence-host") runSequenceChecks(device, label, /*onDevice=*/false);
                          if (mode == "resume-timestamps") runResumeTimestampChecks(device, label);

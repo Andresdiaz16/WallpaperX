@@ -6,6 +6,8 @@
 #include "../vulkan/offscreen.h"
 
 #include <stdexcept>
+#include <utility>
+#include <variant>
 
 namespace wallpaperx {
 
@@ -27,15 +29,32 @@ bool VideoPipeline::renderNext(OffscreenTargetManager& targets, const OffscreenT
 
 bool VideoPipeline::decodeNext() {
     m_device.assertGpuThread("VideoPipeline::decodeNext");
-    std::optional<DecodedFrame> frame = m_decoder.next();
+    return decode(std::nullopt) == Decode::Converted;
+}
+
+VideoPipeline::Decode VideoPipeline::decodeWithin(uint32_t dropLimit) {
+    m_device.assertGpuThread("VideoPipeline::decodeWithin");
+    return decode(dropLimit);
+}
+
+VideoPipeline::Decode VideoPipeline::decode(std::optional<uint32_t> dropLimit) {
+    std::optional<DecodedFrame> frame;
+    if (dropLimit) {
+        auto step = m_decoder.next(*dropLimit);
+        if (std::holds_alternative<VideoDecoder::Dropping>(step)) return Decode::Dropping;
+        frame = std::move(std::get<std::optional<DecodedFrame>>(step));
+    } else {
+        frame = m_decoder.next();
+    }
     bool startsPass = !m_stage && !m_decoder.startedMidStream();
     // No stage means nothing was ever shown, and a stream with nothing to show must not spin here.
     if (!frame && m_playback == Playback::Loop && m_stage) {
         m_decoder.restart();
+        // Unbounded: a restarted pass has returned nothing to resume after, so it drops nothing.
         frame = m_decoder.next();
         startsPass = true;
     }
-    if (!frame) return false;
+    if (!frame) return Decode::Exhausted;
 
     // The new stage is complete before the old one is freed, so a picture it refuses leaves the
     // old stage and the target as they were. The old converter's destructor then finds its
@@ -46,7 +65,7 @@ bool VideoPipeline::decodeNext() {
     static_cast<void>(m_stage->converter.convert(*frame));
     m_timing = PictureTiming{frame->presentationTime(), frame->duration(), startsPass};
     m_convertedPosition = frame->position();
-    return true;
+    return Decode::Converted;
 }
 
 VideoPipeline::PictureTiming VideoPipeline::timing() const {

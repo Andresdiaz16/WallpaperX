@@ -862,7 +862,7 @@ set(WALLPAPERX_PIPELINE_MODES sequence-device sequence-host resume-timestamps re
     steady-host loop-device loop-host loop-cost-device loop-cost-host loop-resume release-device retire-device
     halves-device halves-host timing-device timing-host start-at-device start-at-device-ts start-at-host
     start-at-device-open-gop start-at-device-open-gop-hevc start-at-device-open-gop-mp4 start-at-host-open-gop
-    start-at-device-budget start-at-device-av1)
+    start-at-device-budget start-at-device-av1 bounded-decode-device bounded-decode-host)
 foreach(MODE ${WALLPAPERX_PIPELINE_MODES})
     string(REPLACE "-" "_" MODE_NAME "${MODE}")
     wallpaperx_add_test(NAME video_pipeline_${MODE_NAME} COMMAND wallpaperx-video-pipeline-probe ${MODE})
@@ -1100,7 +1100,7 @@ if(WALLPAPERX_LAVAPIPE_ICD)
                                     LABELS "lavapipe" SKIP_RETURN_CODE 77)
     # The pipeline's entries that need no hardware decoder.
     foreach(MODE sequence-host shape steady-host loop-host loop-cost-host halves-host timing-host start-at-host
-                 start-at-host-open-gop)
+                 start-at-host-open-gop bounded-decode-host)
         string(REPLACE "-" "_" MODE_NAME "${MODE}")
         wallpaperx_add_test(NAME video_pipeline_${MODE_NAME}_lavapipe COMMAND wallpaperx-video-pipeline-probe ${MODE})
         set_tests_properties(video_pipeline_${MODE_NAME}_lavapipe

@@ -26,6 +26,8 @@
 
 #include <atomic>
 #include <cstring>
+#include <mutex>
+#include <vector>
 
 namespace wallpaperx::testing {
 
@@ -47,6 +49,16 @@ struct GlSemaphoreFaults {
     // driver without it: a second context in the same process that cannot wait on a timeline.
     // Needs glGetStringi exported as well; EGL_NO_CONTEXT hides nothing.
     std::atomic<EGLContext> hideTimelineIn{EGL_NO_CONTEXT};
+
+    // Every semaphore name glCreateSemaphoresNV handed back (the timeline imports) and every name passed
+    // to glDeleteSemaphoresEXT, each with the EGL context current at the call.
+    struct NamedCall {
+        GLuint name;
+        EGLContext context;
+    };
+    std::mutex callsMutex;
+    std::vector<NamedCall> timelinesCreated;  // guarded by callsMutex
+    std::vector<NamedCall> semaphoresDeleted;  // guarded by callsMutex
 };
 
 inline GlSemaphoreFaults g_glSemaphoreFaults;
@@ -56,6 +68,7 @@ namespace gl_fault_detail {
 using ProcAddress = __eglMustCastToProperFunctionPointerType (*)(const char*);
 using WaitFn = void (*)(GLuint, GLuint, const GLuint*, GLuint, const GLuint*, const GLenum*);
 using CreateFn = void (*)(GLsizei, GLuint*);
+using DeleteFn = void (*)(GLsizei, const GLuint*);
 using ParameterivFn = void (*)(GLuint, GLenum, const GLint*);
 
 inline ProcAddress realProcAddress() {
@@ -95,6 +108,18 @@ inline void faultingCreate(GLsizei n, GLuint* semaphores) {
         for (GLsizei i = 0; i < n; ++i) semaphores[i] = 0;
         return;
     }
+    if (real == nullptr) return;
+    real(n, semaphores);
+    std::lock_guard<std::mutex> lock(g_glSemaphoreFaults.callsMutex);
+    for (GLsizei i = 0; i < n; ++i) g_glSemaphoreFaults.timelinesCreated.push_back({semaphores[i], eglGetCurrentContext()});
+}
+
+inline void loggingDelete(GLsizei n, const GLuint* semaphores) {
+    static const DeleteFn real = realGl<DeleteFn>("glDeleteSemaphoresEXT");
+    {
+        std::lock_guard<std::mutex> lock(g_glSemaphoreFaults.callsMutex);
+        for (GLsizei i = 0; i < n; ++i) g_glSemaphoreFaults.semaphoresDeleted.push_back({semaphores[i], eglGetCurrentContext()});
+    }
     if (real != nullptr) real(n, semaphores);
 }
 
@@ -124,6 +149,8 @@ extern "C" __eglMustCastToProperFunctionPointerType eglGetProcAddress(const char
             wrapper = reinterpret_cast<__eglMustCastToProperFunctionPointerType>(&detail::faultingCreate);
         } else if (std::strcmp(name, "glSemaphoreParameterivNV") == 0) {
             wrapper = reinterpret_cast<__eglMustCastToProperFunctionPointerType>(&detail::faultingParameteriv);
+        } else if (std::strcmp(name, "glDeleteSemaphoresEXT") == 0) {
+            wrapper = reinterpret_cast<__eglMustCastToProperFunctionPointerType>(&detail::loggingDelete);
         }
         // Only where the driver has the real one: a wrapper for a name the driver lacks would make
         // the plugin believe in a capability this host does not have.

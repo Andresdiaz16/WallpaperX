@@ -451,8 +451,10 @@ void VideoDecoder::closeDecoder() noexcept {
     const bool decodeWorkHeld =
         !m_framesContexts.empty() &&
         ((m_codec != nullptr && m_codec->hw_device_ctx != nullptr) || m_retiredCodec.has_value());
-    if ((!m_framesContexts.empty() && !m_device.safeToFree("the video decoder's images")) ||
-        (decodeWorkHeld && !decodeWorkCanDrain())) {
+    const bool imagesFree = m_framesContexts.empty() || m_device.safeToFree("the video decoder's images");
+    if (!imagesFree || (decodeWorkHeld && !decodeWorkCanDrain())) {
+        // A false safeToFree() has told the Device already; an unanswered probe has not.
+        if (imagesFree) m_device.recordLeak("the video decoder, whose decode work the device did not answer for,");
         if (m_codec != nullptr && m_codec->hw_device_ctx != nullptr) m_codec = nullptr;
         m_retiredCodec.reset();
         m_framesContexts.clear();
@@ -623,6 +625,7 @@ void VideoDecoder::openDecoder() {
         throwFileFailure("cannot configure the decoder", err, m_file);
     }
     m_codec->pkt_timebase = stream.time_base;
+    m_softwareFormatRefused.store(false, std::memory_order_relaxed);
     m_codec->opaque = this;
     m_codec->get_format = &VideoDecoder::chooseFormat;
     // Frame threads would decode -- and submit to the decode and graphics queues -- off the GPU
@@ -1166,6 +1169,16 @@ bool VideoDecoder::attachHardwareFrames(AVCodecContext* codec) {
 // follows a refusal of every format.
 AVPixelFormat VideoDecoder::chooseFormat(AVCodecContext* codec, const AVPixelFormat* offered) {
     auto* self = static_cast<VideoDecoder*>(codec->opaque);
+    // Software takes the last plain format offered. A refusal is flagged rather than left to ffmpeg,
+    // whose slice decoders skip a slice they get no format for and go on reading.
+    if (codec->hw_device_ctx == nullptr) {
+        AVPixelFormat software = AV_PIX_FMT_NONE;
+        for (const AVPixelFormat* format = offered; *format != AV_PIX_FMT_NONE; ++format) {
+            if ((av_pix_fmt_desc_get(*format)->flags & AV_PIX_FMT_FLAG_HWACCEL) == 0) software = *format;
+        }
+        if (software == AV_PIX_FMT_NONE) self->m_softwareFormatRefused.store(true, std::memory_order_relaxed);
+        return software;
+    }
     try {
         return self->choose(codec, offered);
     } catch (const std::bad_alloc&) {
@@ -1177,24 +1190,12 @@ AVPixelFormat VideoDecoder::chooseFormat(AVCodecContext* codec, const AVPixelFor
 }
 
 // The decision, made from the stream's parsed headers. ffmpeg re-runs this without a format
-// whose setup failed, which is how a fault after the device's yes shows up here.
+// whose setup failed, which is how a fault after the device's yes shows up here. A codec opened for
+// the device only.
 AVPixelFormat VideoDecoder::choose(AVCodecContext* codec, const AVPixelFormat* offered) {
     bool vulkanOffered = false;
-    AVPixelFormat software = AV_PIX_FMT_NONE;
     for (const AVPixelFormat* format = offered; *format != AV_PIX_FMT_NONE; ++format) {
-        if (*format == AV_PIX_FMT_VULKAN) {
-            vulkanOffered = true;
-        } else if ((av_pix_fmt_desc_get(*format)->flags & AV_PIX_FMT_FLAG_HWACCEL) == 0) {
-            software = *format;
-        }
-    }
-
-    if (codec->hw_device_ctx == nullptr) {
-        if (software == AV_PIX_FMT_NONE) {
-            throw WallpaperContentError(
-                describeRejection(kComponent, "the wallpaper decodes to no format software can hold", m_file));
-        }
-        return software;
+        if (*format == AV_PIX_FMT_VULKAN) vulkanOffered = true;
     }
 
     if (vulkanOffered) {
@@ -1265,6 +1266,10 @@ void VideoDecoder::numberPacket() {
 // device that still answers, having arranged for the stream to be decoded in software instead.
 void VideoDecoder::failDecode(const char* what, int err) {
     if (m_parkedFailure) std::rethrow_exception(std::exchange(m_parkedFailure, nullptr));
+    if (m_softwareFormatRefused.load(std::memory_order_relaxed)) {
+        throw WallpaperContentError(
+            describeRejection(kComponent, "the wallpaper decodes to no format software can hold", m_file));
+    }
     const std::string failed = std::string(what) + " failed";
     const bool hardware = m_awaitingHardwareSetup || m_path == Path::Hardware;
     if (err == AVERROR_EXTERNAL && hardware) {
@@ -1281,8 +1286,21 @@ void VideoDecoder::failDecode(const char* what, int err) {
 
 std::optional<DecodedFrame> VideoDecoder::next() {
     m_device.assertGpuThread("VideoDecoder::next");
+    return std::get<std::optional<DecodedFrame>>(decode(std::nullopt));
+}
+
+std::variant<std::optional<DecodedFrame>, VideoDecoder::Dropping> VideoDecoder::next(uint32_t dropLimit) {
+    m_device.assertGpuThread("VideoDecoder::next");
+    return decode(dropLimit);
+}
+
+// Every state a drop can stop in is one the loop's head already resumes from: a dropped picture is
+// gone, and what admit() decided about it is in m_resume and m_pending.
+std::variant<std::optional<DecodedFrame>, VideoDecoder::Dropping> VideoDecoder::decode(
+    std::optional<uint32_t> dropLimit) {
     releaseRetiredCodec();
     releaseIdleFramesContexts();
+    uint32_t dropped = 0;
     for (;;) {
         // What the format callback decided during the last ffmpeg call comes before what that
         // call returned: a refusal of every format reads as bad input or as the end otherwise.
@@ -1290,7 +1308,9 @@ std::optional<DecodedFrame> VideoDecoder::next() {
         if (m_pending == Pending::SeekAgain) seekAgain();
         int err = avcodec_receive_frame(m_codec, m_frame);
         if (m_pending != Pending::Nothing) continue;
-        if (m_parkedFailure) failDecode("avcodec_receive_frame", err);
+        if (m_parkedFailure || m_softwareFormatRefused.load(std::memory_order_relaxed)) {
+            failDecode("avcodec_receive_frame", err);
+        }
         if (err == 0) {
             m_awaitingHardwareSetup = false;
             if (m_frame->format == AV_PIX_FMT_VULKAN) m_path = Path::Hardware;
@@ -1298,6 +1318,7 @@ std::optional<DecodedFrame> VideoDecoder::next() {
             const std::optional<uint64_t> packet = packetNumber(*m_frame);
             if (!admit(timestamp, packet)) {
                 av_frame_unref(m_frame);
+                if (dropLimit && ++dropped >= *dropLimit) return Dropping{};
                 continue;
             }
             AVFrame* out = av_frame_alloc();
@@ -1368,7 +1389,9 @@ std::optional<DecodedFrame> VideoDecoder::next() {
         if (err == AVERROR(EAGAIN) && !resend) continue;
         av_packet_unref(m_packet);
         if (m_pending != Pending::Nothing) continue;
-        if (m_parkedFailure) failDecode("avcodec_send_packet", err);
+        if (m_parkedFailure || m_softwareFormatRefused.load(std::memory_order_relaxed)) {
+            failDecode("avcodec_send_packet", err);
+        }
         if (err == AVERROR(EAGAIN)) {
             throw std::logic_error("VideoDecoder: ffmpeg refused the same packet twice without giving a frame");
         }

@@ -38,8 +38,10 @@
 #include "support/video_probe_support.h"
 
 extern "C" {
+#include <libavcodec/avcodec.h>
 #include <libavutil/error.h>
 #include <libavutil/hwcontext.h>
+#include <libavutil/pixdesc.h>
 #include <libavutil/pixfmt.h>
 }
 
@@ -140,6 +142,13 @@ struct RecordedSubmit {
 };
 bool g_recordingSubmits = false;
 std::vector<RecordedSubmit> g_submits;
+
+// While set, every pixel format descriptor this executable's own code looks up reads as a hardware
+// format -- a stream that offers a software codec nothing it can hold. Atomics: ffmpeg's frame threads
+// run the format callback.
+std::atomic<bool> g_everyFormatHardware{false};
+std::atomic<int> g_formatsShownAsHardware{0};
+std::atomic<int> g_sendsWhileHardwareOnly{0};
 
 // ------------------------------------------------------------------------- //
 // Fixtures
@@ -1156,6 +1165,64 @@ void runContentChecks(Device& device) {
         check(g_firstInjectionCall > armedAtCall,
               "the EAGAIN pair was spent before the decode loop was entered, so the guard was not reached");
         check(refusedTwice, "a packet ffmpeg refused twice did not raise std::logic_error");
+
+        // GOAL: S15.429 -- a software decode whose stream offers only hardware formats is refused as the
+        //       wallpaper's fault ("decodes to no format software can hold") within a few packets, rather than
+        //       read to its end with every slice skipped; and a later file, on a decoder of its own, decodes in
+        //       full.
+        // WHY-THIS-SHAPE: no real file offers a software codec only hardware formats, so the decoder's own
+        //       look-ups of format descriptors are made to answer "hardware" (the interposer below, keyed on the
+        //       caller being this executable, so ffmpeg's own look-ups are untouched). counter_long.mp4 has 320
+        //       packets: a decoder that ignores the refusal reads them all, which the packet bound tells apart.
+        // CONTROL: via control_run.sh, video_decoder_content_lavapipe, 2026-10-09, each reverted. chooseFormat()
+        //       (renderer/video/video_decoder.cpp) no longer setting m_softwareFormatRefused -> "FAIL: a stream
+        //       offering software only hardware formats is refused as the file's, naming why (said: )" and "FAIL:
+        //       that refusal comes within 16 packets, ... (321 sent)", 297 pictures. m_softwareFormatRefused made
+        //       `static inline` (renderer/video/video_decoder.h) with openDecoder()'s clear removed -> "FAIL: a
+        //       later file, on a decoder of its own, decodes in full after that refusal (-1 of 20)". The clear
+        //       alone removed stays green: the flag is set only on a software codec, and no decoder ever opens
+        //       a second codec after a software one, so nothing can observe it.
+        // COVERAGE-ASSERT: the interposer answered "hardware" to the decoder at least once.
+        constexpr int kFewPackets = 16;
+        if (haveAssets({"counter_long.mp4"})) {
+            std::string said;
+            bool asContent = false;
+            int frames = 0;
+            try {
+                VideoDecoder decoder(software, asset("counter_long.mp4"));
+                g_sendsWhileHardwareOnly = 0;
+                g_formatsShownAsHardware = 0;
+                g_everyFormatHardware = true;
+                while (decoder.next()) ++frames;
+            } catch (const WallpaperContentError& e) {
+                asContent = true;
+                said = e.what();
+            } catch (const std::exception& e) {
+                said = e.what();
+            }
+            g_everyFormatHardware = false;
+            const int sends = g_sendsWhileHardwareOnly.load();
+            std::printf("video_decoder_probe (content): every format shown as hardware -> %d packet(s) sent, %d "
+                        "picture(s), %d look-up(s) answered; %s\n",
+                        sends, frames, g_formatsShownAsHardware.load(), said.empty() ? "no refusal" : said.c_str());
+            check(g_formatsShownAsHardware.load() > 0,
+                  "the decoder looked a format up while every format read as hardware (the premise)");
+            check(asContent && said.find("decodes to no format software can hold") != std::string::npos,
+                  "a stream offering software only hardware formats is refused as the file's, naming why (said: " +
+                      said + ")");
+            check(sends <= kFewPackets, "that refusal comes within " + std::to_string(kFewPackets) + " packets, not at "
+                                            "the end of the file (" + std::to_string(sends) + " sent)");
+            int later = -1;
+            try {
+                later = decodeAll(software, asset("h264_raw.h264")).frames;
+            } catch (const std::exception& e) {
+                std::fprintf(stderr, "  the later file raised: %s\n", e.what());
+            }
+            check(later == cleanFrames, "a later file, on a decoder of its own, decodes in full after that refusal (" +
+                                            std::to_string(later) + " of " + std::to_string(cleanFrames) + ")");
+        } else {
+            g_notVerified = true;
+        }
     }
     g_hideVideoExtensions = false;
 }
@@ -1226,8 +1293,35 @@ static void noteInjection() {
     if (g_firstInjectionCall < 0) g_firstInjectionCall = g_ffmpegDecodeCalls;
 }
 
+// The descriptor ffmpeg holds, or while g_everyFormatHardware a copy flagged as a hardware format -- for a
+// caller in this executable only (the decoder under test); ffmpeg's own look-ups get the real one.
+extern "C" const AVPixFmtDescriptor* av_pix_fmt_desc_get(AVPixelFormat format) {
+    using Fn = const AVPixFmtDescriptor* (*)(AVPixelFormat);
+    static const Fn real = reinterpret_cast<Fn>(dlsym(RTLD_NEXT, "av_pix_fmt_desc_get"));
+    if (real == nullptr) {
+        std::fprintf(stderr, "video_decoder_probe: cannot resolve the real av_pix_fmt_desc_get\n");
+        std::abort();
+    }
+    const AVPixFmtDescriptor* descriptor = real(format);
+    if (!g_everyFormatHardware.load() || descriptor == nullptr) return descriptor;
+    Dl_info caller{};
+    Dl_info self{};
+    if (dladdr(__builtin_return_address(0), &caller) == 0 ||
+        dladdr(reinterpret_cast<void*>(&av_pix_fmt_desc_get), &self) == 0 || caller.dli_fbase != self.dli_fbase) {
+        return descriptor;
+    }
+    thread_local AVPixFmtDescriptor shown;
+    shown = *descriptor;
+    shown.flags |= AV_PIX_FMT_FLAG_HWACCEL;
+    g_formatsShownAsHardware.fetch_add(1);
+    return &shown;
+}
+
 extern "C" int avcodec_send_packet(AVCodecContext* context, const AVPacket* packet) {
     ++g_ffmpegDecodeCalls;
+    if (g_everyFormatHardware.load() && packet != nullptr && context != nullptr && context->opaque != nullptr) {
+        g_sendsWhileHardwareOnly.fetch_add(1);
+    }
     if (g_sendEagainRemaining > 0) {
         --g_sendEagainRemaining;
         noteInjection();

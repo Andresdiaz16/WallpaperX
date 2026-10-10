@@ -23,6 +23,8 @@
 #include "tests/client/http_probe.h"
 #include "tests/client/scratch_dir.h"
 #include "tests/name_watcher.h"
+#include "tests/self_exec.h"
+#include "tests/served_pixels.h"
 #include "tests/spawned_daemon.h"
 #include "tests/test_phase.h"
 #include "tests/test_report.h"
@@ -552,6 +554,112 @@ bool reportsGpuAndTier(const std::string& output) {
 }
 
 // ---------------------------------------------------------------------------- //
+// The pixel reader: this binary run again as `--read-blue-frame`, handed the frame's descriptors.
+// ---------------------------------------------------------------------------- //
+constexpr const char* kReaderMode = "--read-blue-frame";
+constexpr int kReaderMatched = 0;
+constexpr int kReaderMismatched = 1;
+constexpr int kReaderBadArguments = 2;
+constexpr int kReaderUnreadable = 77;
+
+// `a;b;c`, or `-` for none.
+std::vector<uint64_t> readerList(const std::string& text) {
+    std::vector<uint64_t> values;
+    if (text == "-") return values;
+    std::stringstream in(text);
+    for (std::string item; std::getline(in, item, ';');) values.push_back(std::stoull(item));
+    return values;
+}
+
+std::string readerJoin(const std::vector<uint64_t>& values) {
+    if (values.empty()) return "-";
+    std::string out;
+    for (const uint64_t v : values) out += (out.empty() ? "" : ";") + std::to_string(v);
+    return out;
+}
+
+// Arguments: fd width height memorySize handleType modifier drmFormat uuid-bytes offsets pitches syncFds.
+int readBlueFrameChild(int argc, char** argv) {
+    wallpaperx::testing::FrameLayout layout;
+    try {
+        if (argc != 13) throw std::invalid_argument("expected 11 values after the mode");
+        layout.fd = std::stoi(argv[2]);
+        layout.width = static_cast<uint32_t>(std::stoul(argv[3]));
+        layout.height = static_cast<uint32_t>(std::stoul(argv[4]));
+        layout.memorySize = std::stoull(argv[5]);
+        layout.handleType = std::stoi(argv[6]);
+        layout.modifier = std::stoull(argv[7]);
+        layout.drmFormat = static_cast<uint32_t>(std::stoul(argv[8]));
+        for (const uint64_t byte : readerList(argv[9])) layout.deviceUuid.push_back(static_cast<uint8_t>(byte));
+        layout.planeOffsets = readerList(argv[10]);
+        layout.rowPitches = readerList(argv[11]);
+        for (const uint64_t fd : readerList(argv[12])) layout.syncFds.push_back(static_cast<int>(fd));
+    } catch (const std::exception& e) {
+        std::printf("daemon_system_test (pixel reader): bad arguments: %s\n", e.what());
+        return kReaderBadArguments;
+    }
+
+    std::string unreadable;
+    const std::vector<unsigned char> image = wallpaperx::testing::readServedBgra(layout, unreadable);
+    if (image.empty()) {
+        std::printf("daemon_system_test (pixel reader): cannot read the frame: %s\n", unreadable.c_str());
+        if (unreadable.rfind("(harness)", 0) == 0) return kReaderBadArguments;
+        // readServedBgra() FAILs what the daemon served wrongly (a size or layout); only this exit code
+        // carries that to the parent, which would otherwise read it as unreadable, a skip.
+        return wallpaperx::testing::g_failures > 0 ? kReaderMismatched : kReaderUnreadable;
+    }
+
+    // The source is solid blue (R=0, G=0, B=255); the image is B,G,R,A.
+    constexpr int kTolerance = 6;
+    const size_t compared = image.size() / 4;
+    unsigned char firstBad[4] = {0, 0, 0, 0};
+    const size_t badPixels = wallpaperx::testing::countOffColour(image, 255, 0, 0, kTolerance, firstBad);
+    const char* path = wallpaperx::testing::servedFrameIsMapped(layout) ? "mapped"
+                                                                        : "imported through the plugin's GL importer";
+    if (badPixels != 0) {
+        std::printf("daemon_system_test (pixel reader): %zu of %zu pixels (%s) differ; expected B,G,R = 255,0,0, "
+                    "first mismatch was %d,%d,%d\n",
+                    badPixels, compared, path, firstBad[0], firstBad[1], firstBad[2]);
+        return kReaderMismatched;
+    }
+    std::printf("daemon_system_test (pixel reader): %ux%u pixels (%s) verified across the process boundary\n",
+                layout.width, layout.height, path);
+    return kReaderMatched;
+}
+
+// Runs the reader on `frame`, whose descriptors are lent to it as inheritable copies at 10 or above
+// (self_exec.h puts its readiness pipe on 3) and closed here once it has ended.
+wallpaperx::testing::SelfExecResult runPixelReader(const wallpaperx::testing::FrameLayout& frame) {
+    std::vector<int> lent;
+    const auto lend = [&lent](int fd) {
+        const int copy = ::fcntl(fd, F_DUPFD, 10);
+        if (copy >= 0) lent.push_back(copy);
+        return copy;
+    };
+    wallpaperx::testing::SelfExecResult result;
+    const int fd = lend(frame.fd);
+    std::vector<uint64_t> syncs;
+    for (const int sync : frame.syncFds) {
+        const int copy = lend(sync);
+        if (copy >= 0) syncs.push_back(static_cast<uint64_t>(copy));
+    }
+    if (fd < 0 || syncs.size() != frame.syncFds.size()) {
+        result.fault = std::string("the frame's descriptors could not be copied for the reader: ") + std::strerror(errno);
+    } else {
+        const std::vector<uint64_t> uuid(frame.deviceUuid.begin(), frame.deviceUuid.end());
+        std::fflush(stdout);
+        result = wallpaperx::testing::runSelf(
+            {kReaderMode, std::to_string(fd), std::to_string(frame.width), std::to_string(frame.height),
+             std::to_string(frame.memorySize), std::to_string(frame.handleType), std::to_string(frame.modifier),
+             std::to_string(frame.drmFormat), readerJoin(uuid), readerJoin(frame.planeOffsets),
+             readerJoin(frame.rowPitches), readerJoin(syncs)},
+            std::chrono::seconds(60));
+    }
+    for (const int copy : lent) ::close(copy);
+    return result;
+}
+
+// ---------------------------------------------------------------------------- //
 // Phase 2 -- one frame, end to end, into a process that did not allocate it.
 // ---------------------------------------------------------------------------- //
 void checkFirstFrame(sdbus::IProxy& proxy, FrameReadyLog& signals, const std::string& bluePath, const Check& check) {
@@ -570,10 +678,9 @@ void checkFirstFrame(sdbus::IProxy& proxy, FrameReadyLog& signals, const std::st
     const uint64_t minimumBytes = static_cast<uint64_t>(frame.width) * frame.height * 4;
     check(frame.memorySize >= minimumBytes, "memory_size covers at least width*height*4 bytes");
 
-    // Asserted only for a dma_buf: an OPAQUE_FD (NVIDIA's /dev/nvidiactl) has no size, and -1
-    // is its correct answer. errno kept now: the printf below may change it.
+    // Printed only: an OPAQUE_FD (NVIDIA's /dev/nvidiactl) has no size, and -1 is its correct answer.
+    // The mapped read checks a dma_buf's size itself (served_pixels.h).
     const off_t fdSize = lseek(frame.fd.get(), 0, SEEK_END);
-    const int lseekErrno = errno;
 
     std::printf("daemon_system_test: monitor %d -> %ux%u, memory_size=%llu, handle_type=%d, modifier=0x%llx, "
                 "fd is %s (%lld bytes)\n",
@@ -582,70 +689,52 @@ void checkFirstFrame(sdbus::IProxy& proxy, FrameReadyLog& signals, const std::st
                 static_cast<unsigned long long>(frame.drmModifier), wallpaperx::testing::fdDescription(frame.fd.get()).c_str(),
                 static_cast<long long>(fdSize));
 
-    // Only a LINEAR single-plane dma_buf is CPU-addressable; an OPAQUE_FD carries no layout and a
-    // tiled rowPitch is not a row length.
-    if (frame.handleType != 1) {
-        std::printf("daemon_system_test: cross-process content check skipped -- handle_type=%d (OPAQUE_FD); "
-                    "the fd is not a dma_buf and cannot be mapped. Run the lavapipe twin for this half.\n",
-                    frame.handleType);
-        return;
-    }
-    if (frame.drmModifier != wallpaperx::testing::kDrmModifierLinear || frame.planes.size() != 1) {
-        std::printf("daemon_system_test: cross-process content check skipped -- modifier 0x%llx with %zu plane(s) "
-                    "is not linear single-plane, so its rows are not CPU-addressable.\n",
-                    static_cast<unsigned long long>(frame.drmModifier), frame.planes.size());
-        return;
-    }
-    // A driver that cannot size the fd is a skip, as in the sibling tier, not a defect.
-    if (fdSize < 0) {
-        std::printf("daemon_system_test: cross-process content check skipped -- lseek(SEEK_END) cannot size this "
-                    "fd (%s), so the mapping below could not be bounded safely.\n",
-                    std::strerror(lseekErrno));
-        return;
-    }
-    check(static_cast<uint64_t>(fdSize) >= frame.memorySize,
-          "the dma_buf behind the fd is at least as large as the published memory_size");
-    if (static_cast<uint64_t>(fdSize) < frame.memorySize) return;
-
-    const wallpaperx::testing::MappedFrame mapping(frame.fd.get(), frame.memorySize);
-    if (!mapping.valid()) {
-        std::printf("daemon_system_test: cross-process content check skipped -- mmap failed (%s).\n",
-                    mapping.error().c_str());
-        return;
+    // GOAL: S6.23 -- a process that never allocated the image reads every pixel of the real
+    //       daemon's frame, on either export path: the opaque fd NVIDIA exports included.
+    // WHY-THIS-SHAPE: readServedBgra() (tests/served_pixels.h) maps a LINEAR dma_buf and imports
+    //       anything else through the plugin's GL importer, in a re-exec'd reader process: read
+    //       in-process, NVIDIA's GL left 24 device descriptors open and failed the whole-run leak
+    //       check below. Unreadable is notVerified(), a skip -- a printed "skipped" passed green.
+    // CONTROL: renderer/renderers/static_renderer.cpp zeroing the decoded image, control_run.sh
+    //       --phase '^firstFrameUnderStatusLoad$', 2026-10-08 -> "2073600 of 2073600 pixels
+    //       (imported through the plugin's GL importer) differ", "FAIL: a process that never
+    //       allocated the image reads the expected pixels" on daemon_system; "(mapped)" on the
+    //       lavapipe twin. Held, restored. Test-side: GL UUID zeroed -> NOT VERIFIED, Skipped. Re-run
+    //       2026-10-09 on daemon_system_lavapipe once the comparison moved to countOffColour()
+    //       (served_pixels.h): "2073600 of 2073600 pixels (mapped) differ", the same FAIL. Held.
+    const char* kContentGoal = "S6.23 -- the real daemon's frame read pixel by pixel from another process";
+    const wallpaperx::testing::FrameLayout layout = wallpaperx::testing::layoutOf(frame);
+    // GOAL: S15.431 -- a LINEAR dma_buf that carries a plane is read by mapping it, the path that grades
+    //       the published offset, pitch and size; never handed to the GL importer, which reads through
+    //       its own layout and would leave those unchecked.
+    // WHY-THIS-SHAPE: asserted on the predicate the reader branches on, from the wire's own fields, so
+    //       a FrameLayout producer that fills the plane in a form the predicate does not read goes red
+    //       here rather than quietly importing.
+    // CONTROL: test-side, by hand, 2026-10-09: servedFrameIsMapped() (tests/served_pixels.h) requiring a
+    //       second plane -> "FAIL: a LINEAR dma_buf with a plane is read by mapping it" on
+    //       daemon_system_lavapipe and dbus_service_lavapipe, while the reader printed "1920x1080 pixels
+    //       (imported through the plugin's GL importer) verified" -- the pixels alone would not have shown it.
+    //       Restored.
+    if (frame.handleType == 1 && frame.drmModifier == wallpaperx::testing::kDrmModifierLinear && !frame.planes.empty()) {
+        check(wallpaperx::testing::servedFrameIsMapped(layout), "a LINEAR dma_buf with a plane is read by mapping it");
     }
 
-    // The source is solid blue (R=0, G=0, B=255) and the frame is B8G8R8A8.
-    constexpr int kTolerance = 6;
-    const uint64_t offset = frame.planes[0].get<0>();
-    const uint64_t pitch = frame.planes[0].get<1>();
-    size_t badPixels = 0;
-    unsigned char firstBad[4] = {0, 0, 0, 0};
-    for (uint32_t y = 0; y < frame.height; ++y) {
-        const unsigned char* row = mapping.row(offset, pitch, y, static_cast<size_t>(frame.width) * 4);
-        if (row == nullptr) {
-            badPixels += frame.width;
-            continue;
-        }
-        for (uint32_t x = 0; x < frame.width; ++x) {
-            const unsigned char* px = row + static_cast<size_t>(x) * 4;
-            if (std::abs(int(px[0]) - 255) > kTolerance || std::abs(int(px[1]) - 0) > kTolerance ||
-                std::abs(int(px[2]) - 0) > kTolerance) {
-                if (badPixels == 0) std::memcpy(firstBad, px, 4);
-                ++badPixels;
-            }
-        }
+    // Read in a fresh process of this binary, not here: the GL driver keeps device descriptors open
+    // past eglTerminate, which would land on this run's whole-process descriptor-leak check.
+    const wallpaperx::testing::SelfExecResult reader = runPixelReader(layout);
+    if (!reader.fault.empty() || !reader.reaped || !WIFEXITED(reader.status) ||
+        (WEXITSTATUS(reader.status) != kReaderMatched && WEXITSTATUS(reader.status) != kReaderMismatched &&
+         WEXITSTATUS(reader.status) != kReaderUnreadable)) {
+        const std::string detail = reader.fault.empty() ? "it " + reader.how() : reader.fault;
+        phaseSetupFault("the cross-process pixel reader", detail.c_str());
+        return;
     }
-
-    check(badPixels == 0,
+    if (WEXITSTATUS(reader.status) == kReaderUnreadable) {
+        notVerified(kContentGoal, "the reader process could not read the frame (its reason is printed above)");
+        return;
+    }
+    check(WEXITSTATUS(reader.status) == kReaderMatched,
           "a process that never allocated the image reads the expected pixels through the published layout");
-    if (badPixels != 0) {
-        std::fprintf(stderr, "  %zu of %llu pixels differ; expected B,G,R = 255,0,0, first mismatch was %d,%d,%d\n",
-                     badPixels, static_cast<unsigned long long>(frame.width) * frame.height, firstBad[0], firstBad[1],
-                     firstBad[2]);
-    } else {
-        std::printf("daemon_system_test: %ux%u pixels verified across the process boundary\n", frame.width,
-                    frame.height);
-    }
 }
 
 // GOAL: S6.18 -- a GetStatus reply never reports an uninitialised GPU beside a monitor that
@@ -6217,7 +6306,8 @@ void checkStalledConfigWrite(NameWatcher& names, const std::string& validationEn
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc > 1 && std::string_view(argv[1]) == kReaderMode) return readBlueFrameChild(argc, argv);
     wallpaperx::testing::g_testName = "daemon_system_test";
 
     // S14.9, graded in name_watcher.h. First, before the scratch-directory probe and the config
@@ -6699,8 +6789,7 @@ int main() {
         const size_t fdsAfter = openFdCount();
         check(fdsAfter <= fdsBefore, "the client leaks no descriptors across the whole run");
         if (fdsAfter > fdsBefore) {
-            std::fprintf(stderr, "  %zu open fds before, %zu after\n", fdsBefore, fdsAfter);
-        }
+            std::fprintf(stderr, "  %zu open fds before, %zu after\n", fdsBefore, fdsAfter);        }
     } catch (const ScratchDirectoryLost& e) {
         phaseSetupFault("the phase running when the host lost its scratch directory", e.what());
     } catch (const std::exception& e) {

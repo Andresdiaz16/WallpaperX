@@ -1095,10 +1095,25 @@ private:
     bool creditCleanPlayLocked(MonitorState& state, std::chrono::steady_clock::time_point now, bool onTime) const;
 
     // advanceVideo() for one session: when it next needs a round, or nothing while its monitor is
-    // not playing. Appends to `round` what it showed and what it left owed. Caller must hold
-    // m_gpuMutex.
+    // not playing. Appends to `round` what it showed and what it left owed. A decode dropping pictures
+    // on the way to its next one stops at `catchUpUntil`, having dropped at least one, and carries on
+    // next round. Caller must hold m_gpuMutex.
     std::optional<std::chrono::steady_clock::time_point> advanceSessionLocked(
-        int monitorId, std::chrono::steady_clock::time_point now, ClockRound& round);
+        int monitorId, std::chrono::steady_clock::time_point now,
+        std::chrono::steady_clock::time_point catchUpUntil, ClockRound& round);
+
+    // A CatchingUp session caught up in one go, for a pass that must draw now. A failure that gives the
+    // position up closes the session and opens the file again at its first picture; any other closes it
+    // and is rethrown. Throws what videoSessionLocked() throws.
+    VideoSession& caughtUpSessionLocked(int monitorId, VideoSession& session, const std::string& path,
+                                        uint64_t wallpaperSeq);
+
+    // Whether `failure`, met by a CatchingUp session on its way to its saved position, gives that
+    // position up so the file plays from its first picture: a content error, since the position may be
+    // what failed, or a shortage, since only an open runs under retryAfterEvictionLocked(). Logs when
+    // it does. The caller has closed the session; the open that follows starts at the first picture,
+    // the position having been spent by the one before.
+    static bool givesUpPosition(int monitorId, const RenderFailure& failure);
 
     // The four entries to a monitor's retained decode session, all on the GPU thread with
     // m_gpuMutex held. A routine teardown -- a screen gone dark, an eviction, a wallpaper replaced --
@@ -1181,7 +1196,8 @@ private:
     void retryAfterEvictionLocked(Attempt&& attempt);
 
     // The session to draw this monitor's video with, opened and decoded into when it has none for
-    // this wallpaper -- so a re-post costs the blit of the picture already held. Never advances a
+    // this wallpaper -- so a re-post costs the blit of the picture already held. One opened where a
+    // released session stood is left CatchingUp, with nothing decoded. Never advances a
     // session that exists: that is advanceVideo()'s alone. ensureGpu() and this pass's
     // dropStaleVideoSessionLocked() must have run: a session found here is reused without asking
     // which wallpaper it was opened for. Throws what VideoPipeline's constructor and decodeNext()
@@ -1428,6 +1444,11 @@ private:
         // moves the schedule. Measured from `due` and not from the draw, so wake-up latency is not
         // charged to the next picture. A pass drawing a waiting picture shows it early and leaves
         // the schedule where it was.
+        //
+        // CatchingUp is a session opened at `openedAt` that has not yet decoded the picture there. It
+        // holds no picture: the monitor's frame is the one on screen when the session it replaces was
+        // released, which is that same picture. Clock rounds decode toward it a slice at a time.
+        struct CatchingUp {};
         struct Undrawn {};
         struct OnScreen {
             std::chrono::steady_clock::time_point timeline;
@@ -1448,7 +1469,7 @@ private:
             void retime(std::chrono::steady_clock::time_point now, double newSpeed);
             OnScreen planned() const;
         };
-        std::variant<Undrawn, OnScreen, Waiting> clock;
+        std::variant<Undrawn, OnScreen, Waiting, CatchingUp> clock;
 
         // When the clock first found this session's monitor not playing, or nothing while it is.
         // The whole off switch: a video nobody can see stops at once and keeps its picture, and

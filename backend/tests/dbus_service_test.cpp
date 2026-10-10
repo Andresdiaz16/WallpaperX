@@ -25,6 +25,7 @@
 #include "tests/client/daemon_client.h"
 #include "tests/client/scratch_dir.h"
 #include "tests/manager_output.h"
+#include "tests/served_pixels.h"
 #include "tests/stream_capture.h"
 #include "tests/test_phase.h"
 #include "tests/test_report.h"
@@ -180,8 +181,8 @@ using wallpaperx::testing::wallpaperStatus;
 
 // Pass/fail per tests/test_report.h. A host with no validation layer is a failure, not a skip.
 // Two clauses cannot be asked everywhere and report notVerified (a skip): S6.12's unreadable file
-// (root reads mode 000) and S6.24's content half (needs a mappable LINEAR DMA_BUF; NVIDIA exports
-// OPAQUE_FD).
+// (root reads mode 000) and S6.24's content half where the frame can be neither mapped nor imported
+// (a build without the GL importer, or no GL context on the exporting GPU).
 
 // Not square, so a width/height swap between target and wire fails.
 constexpr uint32_t kTargetWidth = 64;
@@ -4881,8 +4882,8 @@ void runWorkerCoalescingChecks(const wallpaperx::WallpaperManager::Config& confi
 //
 // Two independent answers below. The outcome checks decide it from whether a frame
 // exists at all, which needs no access to the frame's contents and therefore runs on
-// every ICD. The content check decides it from the pixels, which needs a CPU-mappable
-// export and therefore runs only on the DMA_BUF + LINEAR path.
+// every ICD. The content check decides it from the pixels: mapped from a LINEAR dma_buf,
+// imported through the plugin's GL importer otherwise (tests/served_pixels.h).
 // --------------------------------------------------------------------------- //
 void runCoalescingChecks(sdbus::IProxy& proxy, FrameReadyLog& signals, const std::string& imagePath,
                          const std::string& corruptPath, const std::vector<std::string>& burstPaths,
@@ -5010,77 +5011,43 @@ void runCoalescingChecks(sdbus::IProxy& proxy, FrameReadyLog& signals, const std
                 static_cast<unsigned long long>(frame.generation));
 
     // GOAL: S6.24's content half -- that the *pixels* of the exported frame are the last
-    //       burst request's, not the first's -- is either decided or reported as
-    //       undecided. It must never exit 0 having read no pixels.
-    // WHY-THIS-SHAPE: notVerified() rather than a print, and scoped to the content half
-    //       alone. The outcome checks above decide first-wins vs last-wins without
-    //       touching the frame's bytes and run on every ICD, so they are not in question
-    //       here; only the pixel comparison is. A check(false) would be wrong in the
-    //       other direction -- an OPAQUE_FD device is a correct daemon on hardware this
-    //       comparison cannot be performed on at all.
-    // CONTROL: `frame.handleType != 1` forced true on the Lavapipe tier, which normally
-    //       exports DMA_BUF/LINEAR and reaches the pixel loop. Observed: "NOT VERIFIED --
-    //       S6.24's content half ... this device exports OPAQUE_FD", "1 goal(s) could not
-    //       be exercised on this host", exit 77 where the unmutated run exits 0, and
-    //       ctest reporting dbus_service_test_lavapipe as Skipped. Reverted.
+    //       burst request's, not the first's -- is decided on every export this host can read
+    //       (an opaque fd included), and reported NOT VERIFIED only where it truly cannot.
+    // WHY-THIS-SHAPE: read through readServedBgra() (tests/served_pixels.h): a LINEAR dma_buf is
+    //       mapped, anything else is imported by the plugin's GL importer on the exporting GPU.
+    //       Skipping every non-mappable export, the old shape, left NVIDIA -- the target GPU --
+    //       ungraded. notVerified() for an unreadable frame, not check(false): that is this
+    //       host's limit, not the daemon's.
+    // CONTROL: backend/daemon/wallpaper_manager.cpp requestWallpaper() keeping a monitor's first
+    //       path (first-wins), control_run.sh --phase '^coalescing$', 2026-10-08 -> "FAIL: the
+    //       exported frame's pixels are the LAST image of the burst", "3072 of 3072 pixels (imported
+    //       through the plugin's GL importer) differ" on dbus_service (NVIDIA), "(mapped)" on
+    //       dbus_service_lavapipe. Held, restored. Test-side: the GL context's UUID zeroed in
+    //       served_pixels.h -> NOT VERIFIED naming this clause, ctest Skipped. Reverted. Once the comparison
+    //       moved to countOffColour() (served_pixels.h), 2026-10-09, dbus_service_lavapipe: StaticRenderer
+    //       (renderer/renderers/static_renderer.cpp) uploading zeros instead of the decoded image -> "FAIL:
+    //       the exported frame's pixels are the LAST image of the burst", "3072 of 3072 pixels (mapped)
+    //       differ". Held, restored.
     const char* kContentGoal = "S6.24's content half -- which request's pixels reached the exported frame "
                                "(its outcome half ran and held above)";
-    if (frame.handleType != 1) {
-        wallpaperx::testing::notVerified(
-            kContentGoal,
-            "this device exports OPAQUE_FD, whose bytes are importable only by another Vulkan/GL context on "
-            "the same device");
-        return;
-    }
-    if (frame.drmModifier != wallpaperx::testing::kDrmModifierLinear) {
-        char why[160];
-        std::snprintf(why, sizeof(why),
-                      "modifier 0x%llx is tiled, so its rows are not CPU-addressable and a byte comparison "
-                      "would fail a correct export",
-                      static_cast<unsigned long long>(frame.drmModifier));
-        wallpaperx::testing::notVerified(kContentGoal, why);
-        return;
-    }
-    if (frame.planes.empty()) {
-        check(false, "a LINEAR DMA_BUF frame carries a plane layout");
-        return;
+    const wallpaperx::testing::FrameLayout layout = wallpaperx::testing::layoutOf(frame);
+    const bool mapped = wallpaperx::testing::servedFrameIsMapped(layout);
+    if (frame.handleType == 1 && frame.drmModifier == wallpaperx::testing::kDrmModifierLinear) {
+        if (frame.planes.empty()) {
+            check(false, "a LINEAR DMA_BUF frame carries a plane layout");
+            return;
+        }
+        // S15.431, as in daemon_system_test's checkFirstFrame, whose annotation carries the control.
+        check(mapped, "a LINEAR dma_buf with a plane is read by mapping it");
     }
 
-    // The fd must really be at least memorySize bytes before it is mapped. MappedFrame
-    // bounds-checks rows against memorySize -- the value the daemon *claims* -- not
-    // against the object's real size, so a daemon publishing a too-large memorySize
-    // yields a mapping whose tail has no backing pages and the pixel loop below takes a
-    // SIGBUS. frame_export_probe gained exactly this gate; the equivalent check here did
-    // not. The nearest existing assertion is a non-fatal check() on a different monitor,
-    // which records a FAIL and then falls straight through into this mmap.
-    const off_t fdSize = lseek(frame.fd.get(), 0, SEEK_END);
-    if (fdSize < 0) {
-        // "Could not determine the size" is not "the size is fine". Falling through here
-        // is what the gate exists to prevent: mmap does not validate length against the
-        // object, so a shorter object maps cleanly and the pixel loop below dies of
-        // SIGBUS with no FAIL line at all. Losing the content check on a non-seekable
-        // exporter is a stated gap; a crash is not.
-        char why[256];
-        std::snprintf(why, sizeof(why),
-                      "lseek on the exported fd failed (%s), so its real size cannot be confirmed against the "
-                      "published memory_size of %llu before mapping it",
-                      std::strerror(errno), static_cast<unsigned long long>(frame.memorySize));
-        wallpaperx::testing::notVerified(kContentGoal, why);
+    // The fd's size against memory_size is checked inside readServedBgra(), with a FAIL of its own.
+    std::string unreadable;
+    const std::vector<unsigned char> image = wallpaperx::testing::readServedBgra(layout, unreadable);
+    if (image.empty()) {
+        wallpaperx::testing::notVerified(kContentGoal, unreadable);
         return;
     }
-    if (static_cast<uint64_t>(fdSize) < frame.memorySize) {
-        check(false, "the exported fd is at least as large as the memory_size the daemon published");
-        std::fprintf(stderr, "  fd is %lld bytes but memory_size is %llu -- not mapping it\n",
-                     static_cast<long long>(fdSize), static_cast<unsigned long long>(frame.memorySize));
-        return;
-    }
-
-    const wallpaperx::testing::MappedFrame mapping(frame.fd.get(), frame.memorySize);
-    if (!mapping.valid()) {
-        wallpaperx::testing::notVerified(kContentGoal, "mmap of the exported fd failed: " + mapping.error());
-        return;
-    }
-
     // The target is a solid fill of the last burst colour, in B8G8R8A8 order.
     const unsigned char* rgb = kBurstColors[kBurstColorCount - 1];
     const unsigned char expectedB = rgb[2];
@@ -5088,38 +5055,25 @@ void runCoalescingChecks(sdbus::IProxy& proxy, FrameReadyLog& signals, const std
     const unsigned char expectedR = rgb[0];
     constexpr int kTolerance = 6;
 
-    const uint64_t offset = frame.planes[0].get<0>();
-    const uint64_t pitch = frame.planes[0].get<1>();
-    size_t badPixels = 0;
+    // readServedBgra() returns frame.width x frame.height tightly packed; the size itself is S6.22's.
+    const size_t compared = image.size() / 4;
     unsigned char firstBad[4] = {0, 0, 0, 0};
-    for (uint32_t y = 0; y < kTargetHeight; ++y) {
-        const unsigned char* row = mapping.row(offset, pitch, y, static_cast<size_t>(kTargetWidth) * 4);
-        if (row == nullptr) {
-            badPixels += kTargetWidth;
-            continue;
-        }
-        for (uint32_t x = 0; x < kTargetWidth; ++x) {
-            const unsigned char* px = row + static_cast<size_t>(x) * 4;
-            if (std::abs(int(px[0]) - int(expectedB)) > kTolerance ||
-                std::abs(int(px[1]) - int(expectedG)) > kTolerance ||
-                std::abs(int(px[2]) - int(expectedR)) > kTolerance) {
-                if (badPixels == 0) std::memcpy(firstBad, px, 4);
-                ++badPixels;
-            }
-        }
-    }
+    const size_t badPixels =
+        wallpaperx::testing::countOffColour(image, expectedB, expectedG, expectedR, kTolerance, firstBad);
 
     check(badPixels == 0,
           "the exported frame's pixels are the LAST image of the burst, read back through its own fd");
+    const char* path = mapped ? "mapped" : "imported through the plugin's GL importer";
     if (badPixels != 0) {
         std::fprintf(stderr,
-                     "  %zu of %u pixels differ; expected B,G,R = %d,%d,%d, first mismatch was %d,%d,%d "
+                     "  %zu of %zu pixels (%s) differ; expected B,G,R = %d,%d,%d, first mismatch was %d,%d,%d "
                      "(the burst's first colour is B,G,R = %d,%d,%d)\n",
-                     badPixels, kTargetWidth * kTargetHeight, expectedB, expectedG, expectedR, firstBad[0],
-                     firstBad[1], firstBad[2], kBurstColors[0][2], kBurstColors[0][1], kBurstColors[0][0]);
+                     badPixels, compared, path, expectedB, expectedG, expectedR, firstBad[0], firstBad[1],
+                     firstBad[2], kBurstColors[0][2], kBurstColors[0][1], kBurstColors[0][0]);
     } else {
-        std::printf("dbus_service_test: exported frame is solid B,G,R = %d,%d,%d -- the burst's last image\n",
-                    expectedB, expectedG, expectedR);
+        std::printf("dbus_service_test: exported frame (%s, %zu pixels) is solid B,G,R = %d,%d,%d -- the burst's "
+                    "last image\n",
+                    path, compared, expectedB, expectedG, expectedR);
     }
 }
 

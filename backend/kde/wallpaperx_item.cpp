@@ -174,18 +174,116 @@ void disownDescriptors(FrameImport::Request& request) {
     for (int& syncFd : request.syncFds) syncFd = -1;
 }
 
-// GL contexts that have refused a semaphore import. On NVIDIA none succeeds there again, so such a
-// context draws without the producer's acquire for the rest of its life -- a small risk of a torn or
-// stale picture, chosen over a blank desktop. Per context, since a node is rebuilt in the same one;
-// forgotten when it is destroyed, so a later one at the same address starts clean. Render threads.
-std::mutex g_refusingMutex;
-std::vector<const QOpenGLContext*> g_refusingContexts;  // guarded by g_refusingMutex
+// What this process holds per GL context, which outlives the nodes rebuilt in it. A record is changed
+// only with its context current. Forgotten when the context is destroyed, so a later one at the same
+// address starts clean. Render threads.
+struct ContextRecord {
+    const QOpenGLContext* context = nullptr;
+    // A semaphore import was refused here. On NVIDIA none succeeds again anywhere in the process, so
+    // the context draws without the producer's acquire for the rest of its life -- a small risk of a
+    // torn or stale picture, chosen over a blank desktop. Each other context sets its own on its first
+    // refusal.
+    bool refusesSemaphores = false;
+    // The acquire timeline `timelineOwner` granted, imported here once and shared by every node: NVIDIA
+    // refuses every semaphore import in the process after about 250 imports of one timeline, even
+    // released ones, so one per node runs out over a session of rebuilt nodes. Kept after its daemon
+    // has gone -- every value that name sent was reached before it was sent -- until the next daemon's
+    // replaces it.
+    FrameImport::Timeline timeline;
+    std::string timelineOwner;
+};
+// Timelines imported by contexts destroyed while not current. The semaphores belong to the share
+// group, which outlives those contexts when others share it (Qt::AA_ShareOpenGLContexts), so they
+// are released by the next paint pass in a context of the group, or by one destroyed while current,
+// and forgotten with the group. A group whose remaining contexts never paint keeps them until it goes.
+// A record exists exactly while its group's destroyed() is connected, and outlives an emptied list,
+// so a long-lived group is connected once however many times it gains and loses orphans.
+struct ShareGroupRecord {
+    const QOpenGLContextGroup* group = nullptr;
+    std::vector<FrameImport::Timeline> orphans;
+};
+std::mutex g_contextsMutex;
+std::vector<ContextRecord> g_contexts;         // guarded by g_contextsMutex
+std::vector<ShareGroupRecord> g_shareGroups;   // guarded by g_contextsMutex
+
+void orphanTimelineLocked(QOpenGLContextGroup* group, const FrameImport::Timeline& timeline) {
+    auto found = std::find_if(g_shareGroups.begin(), g_shareGroups.end(),
+                              [group](const ShareGroupRecord& record) { return record.group == group; });
+    if (found == g_shareGroups.end()) {
+        // Connected before any orphan is stored: by the time the group goes, every context of it is
+        // gone and the semaphores with them, and a group made later at the same address must not be
+        // handed these.
+        g_shareGroups.push_back({group, {}});
+        try {
+            QObject::connect(group, &QObject::destroyed, [group] {
+                std::lock_guard<std::mutex> lock(g_contextsMutex);
+                std::erase_if(g_shareGroups, [group](const ShareGroupRecord& record) { return record.group == group; });
+            });
+        } catch (...) {
+            g_shareGroups.pop_back();
+            throw;
+        }
+        found = std::prev(g_shareGroups.end());
+    }
+    found->orphans.push_back(timeline);
+}
+
+// Caller holds g_contextsMutex, with `context` current.
+void releaseOrphanedTimelinesLocked(const QOpenGLContext* context) {
+    const QOpenGLContextGroup* group = context->shareGroup();
+    const auto found = std::find_if(g_shareGroups.begin(), g_shareGroups.end(),
+                                    [group](const ShareGroupRecord& record) { return record.group == group; });
+    if (found == g_shareGroups.end()) return;
+    for (const FrameImport::Timeline& orphan : found->orphans) FrameImport::release(orphan);
+    found->orphans.clear();
+}
+
+// Render thread. Every pass, whatever form its picture takes: a context that never imports the
+// timeline itself is often the only one left current in the group.
+void releaseOrphansOfCurrentGroup() {
+    const QOpenGLContext* context = QOpenGLContext::currentContext();
+    if (context == nullptr) return;
+    std::lock_guard<std::mutex> lock(g_contextsMutex);
+    releaseOrphanedTimelinesLocked(context);
+}
+
+// The record for `context`, made on first use. Caller holds g_contextsMutex; the reference is good
+// only while it does.
+ContextRecord& contextRecordLocked(QOpenGLContext* context) {
+    const auto found = std::find_if(g_contexts.begin(), g_contexts.end(),
+                                    [context](const ContextRecord& record) { return record.context == context; });
+    if (found != g_contexts.end()) return *found;
+    // Qt emits this before the native context goes and before it leaves its share group.
+    QObject::connect(
+        context, &QOpenGLContext::aboutToBeDestroyed, context,
+        [context] {
+            std::lock_guard<std::mutex> lock(g_contextsMutex);
+            const auto it = std::find_if(g_contexts.begin(), g_contexts.end(),
+                                         [context](const ContextRecord& record) { return record.context == context; });
+            if (it == g_contexts.end()) return;
+            if (QOpenGLContext::currentContext() == context) {
+                FrameImport::release(it->timeline);
+                releaseOrphanedTimelinesLocked(context);
+            } else if (it->timeline.semaphore != 0) {
+                // Nothing may throw out of a signal; a name that cannot be kept stays with the group.
+                try {
+                    orphanTimelineLocked(context->shareGroup(), it->timeline);
+                } catch (...) {
+                }
+            }
+            g_contexts.erase(it);
+        },
+        Qt::DirectConnection);
+    return g_contexts.emplace_back(ContextRecord{context});
+}
 
 bool contextRefusesSemaphores() {
     const QOpenGLContext* context = QOpenGLContext::currentContext();
     if (context == nullptr) return false;
-    std::lock_guard<std::mutex> lock(g_refusingMutex);
-    return std::find(g_refusingContexts.begin(), g_refusingContexts.end(), context) != g_refusingContexts.end();
+    std::lock_guard<std::mutex> lock(g_contextsMutex);
+    return std::any_of(g_contexts.begin(), g_contexts.end(), [context](const ContextRecord& record) {
+        return record.context == context && record.refusesSemaphores;
+    });
 }
 
 // Only for a refusal by glImportSemaphoreFdEXT itself: a flag set for anything else would give up the
@@ -194,19 +292,9 @@ void noteContextRefusedSemaphores(const std::string& why) {
     QOpenGLContext* context = QOpenGLContext::currentContext();
     if (context == nullptr) return;
     {
-        std::lock_guard<std::mutex> lock(g_refusingMutex);
-        if (std::find(g_refusingContexts.begin(), g_refusingContexts.end(), context) != g_refusingContexts.end()) {
-            return;
-        }
-        g_refusingContexts.push_back(context);
+        std::lock_guard<std::mutex> lock(g_contextsMutex);
+        if (std::exchange(contextRecordLocked(context).refusesSemaphores, true)) return;
     }
-    QObject::connect(
-        context, &QOpenGLContext::aboutToBeDestroyed, context,
-        [context] {
-            std::lock_guard<std::mutex> lock(g_refusingMutex);
-            std::erase(g_refusingContexts, context);
-        },
-        Qt::DirectConnection);
     std::fprintf(stderr,
                  "wallpaperx: this desktop's graphics context refused a semaphore import (%s), and on this driver "
                  "none succeeds there again. It now draws without waiting for the daemon's hand-over: the wallpaper "
@@ -411,6 +499,38 @@ int acquireTimelineFdFor(const std::string& sender) {
     std::lock_guard<std::mutex> lock(g_timelineMutex);
     if (g_timeline.state != AcquireTimelineRecord::State::Held || g_timeline.owner != sender) return -1;
     return ::fcntl(g_timeline.fd, F_DUPFD_CLOEXEC, 0);
+}
+
+// Render thread, context current. The acquire timeline `sender` granted, as imported into the current
+// context -- by the first picture there that needs it. Keyed on the unique name alone: the daemon keeps
+// one timeline per connection, and this process has one. Null on failure, with `importRefused` as for
+// FrameImport::importTimeline(). `imports` counts attempts.
+FrameImport::Timeline contextTimeline(const std::string& sender, std::atomic<quint64>& imports, std::string& failure,
+                                      bool& importRefused) {
+    QOpenGLContext* context = QOpenGLContext::currentContext();
+    if (context == nullptr) {
+        failure = "no current GL context to import the acquire timeline into";
+        return {};
+    }
+    // Held across the import, which runs once per daemon per context.
+    std::lock_guard<std::mutex> lock(g_contextsMutex);
+    ContextRecord& record = contextRecordLocked(context);
+    if (record.timeline.semaphore != 0 && record.timelineOwner == sender) return record.timeline;
+    const int fd = acquireTimelineFdFor(sender);
+    if (fd < 0) {
+        // A descriptor that could not be duplicated, or the record replaced for a newer daemon while
+        // this picture was in flight.
+        failure = "no acquire timeline from the daemon that sent this frame";
+        return {};
+    }
+    imports.fetch_add(1, std::memory_order_relaxed);
+    const FrameImport::Timeline imported = FrameImport::importTimeline(fd, &failure, &importRefused);
+    ::close(fd);
+    if (imported.semaphore == 0) return {};
+    // GL keeps a deleted semaphore alive until the waits already queued on it have run.
+    FrameImport::release(std::exchange(record.timeline, imported));
+    record.timelineOwner = sender;
+    return record.timeline;
 }
 
 // GUI thread. Addressed to the unique name that granted the claim, never the well-known one: a unique
@@ -711,32 +831,9 @@ public:
 
     ~FrameNode() override {
         m_imports.clear();
-        FrameImport::release(m_timeline);
         // Silent when the item gave this image back on its way off the screen: the same claim
         // released twice would free an image another reader in this process still holds.
         if (m_claims && m_claims->remove(m_claim)) releaseClaimWhenReadsFinish(m_claim);
-    }
-
-    // The acquire timeline `sender` granted, imported into this node's context by the first picture
-    // that needs it and kept: one semaphore import per node, not per picture. Null on failure, with
-    // `importRefused` as for FrameImport::importTimeline(). `imports` counts attempts.
-    FrameImport::Timeline timeline(const std::string& sender, std::atomic<quint64>& imports, std::string& failure,
-                                   bool& importRefused) {
-        if (m_timeline.semaphore != 0 && m_timelineSender == sender) return m_timeline;
-        const int fd = acquireTimelineFdFor(sender);
-        if (fd < 0) {
-            // A descriptor that could not be duplicated, or the record replaced for a newer daemon
-            // while this picture was in flight.
-            failure = "no acquire timeline from the daemon that sent this frame";
-            return {};
-        }
-        imports.fetch_add(1, std::memory_order_relaxed);
-        const FrameImport::Timeline imported = FrameImport::importTimeline(fd, &failure, &importRefused);
-        ::close(fd);
-        if (imported.semaphore == 0) return {};
-        FrameImport::release(std::exchange(m_timeline, imported));
-        m_timelineSender = sender;
-        return m_timeline;
     }
 
     // Which images this node holds an import of, most recently drawn first.
@@ -826,10 +923,6 @@ private:
     // node's to give back.
     std::shared_ptr<ClaimSet> m_claims;
     BufferClaims::Claim m_claim;
-    // See timeline(). Safe to keep after its daemon has gone: every value that name sent was reached
-    // before it was sent, so even a late one waits for nothing. The next daemon's picture replaces it.
-    FrameImport::Timeline m_timeline;
-    std::string m_timelineSender;
 };
 
 }  // namespace
@@ -2162,6 +2255,7 @@ QSGNode* WallpaperXItem::updatePaintNode(QSGNode* old, UpdatePaintNodeData*) {
     // this item could have presented in, and on a scene graph that cannot import at all every
     // forced pass would otherwise read as a desktop drawing the wallpaper it can never show.
     m_paintCount.fetch_add(1, std::memory_order_relaxed);
+    releaseOrphansOfCurrentGroup();
 
     // The epoch is read BEFORE the frame is claimed, not after. forgetGenerations() clears or
     // unnumbers m_pending and bumps the epoch under two separate locks, in that order, so an epoch read
@@ -2270,7 +2364,7 @@ QSGNode* WallpaperXItem::updatePaintNode(QSGNode* old, UpdatePaintNodeData*) {
             failure = "this item no longer waits on that daemon's acquire timeline";
         }
 
-        // The hand-over, in the form the daemon sent: a value, waited on through the node's one
+        // The hand-over, in the form the daemon sent: a value, waited on through the context's one
         // import of the timeline, or sync_fds, each imported as a semaphore of its own. A refused
         // import draws this picture unwaited, since its memory imported fine.
         if (stopped == Stopped::Nothing) {
@@ -2278,7 +2372,7 @@ QSGNode* WallpaperXItem::updatePaintNode(QSGNode* old, UpdatePaintNodeData*) {
             bool importRefused = false;
             if (incoming->request.timelineValue != 0) {
                 const FrameImport::Timeline timeline =
-                    node->timeline(incoming->sender, m_semaphoreImportCount, failure, importRefused);
+                    contextTimeline(incoming->sender, m_semaphoreImportCount, failure, importRefused);
                 handedOver = timeline.semaphore != 0 &&
                              FrameImport::acquire(timeline, incoming->request.timelineValue, importedTexture, &failure);
                 if (!handedOver && !importRefused) {

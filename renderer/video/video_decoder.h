@@ -11,6 +11,7 @@ extern "C" {
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <exception>
@@ -239,6 +240,13 @@ public:
     // throw the decoder is not usable.
     std::optional<DecodedFrame> next();
 
+    // next() that gives up for now once it has decoded and dropped `dropLimit` pictures on the way to
+    // the one it returns -- what a start part way in and a software resume both decode through. It
+    // drops at least one before giving up. Dropping then: nothing is lost, and the next call of either
+    // form carries on from there.
+    struct Dropping {};
+    std::variant<std::optional<DecodedFrame>, Dropping> next(uint32_t dropLimit);
+
     // Starts the stream again: the next picture is its first, and a later hardware failure resumes
     // among the pictures returned since, never earlier ones. The path is kept, so a decoder that fell
     // back to software stays there. The codec is flushed, not reopened, and the container rewound;
@@ -256,6 +264,9 @@ public:
     Path path() const { return m_path; }
 
 private:
+    std::variant<std::optional<DecodedFrame>, Dropping> decode(std::optional<uint32_t> dropLimit);
+    // ffmpeg's format negotiation. A software codec's frame threads call it off the GPU thread, so on
+    // that path it reads nothing of the decoder and writes only m_softwareFormatRefused.
     static AVPixelFormat chooseFormat(AVCodecContext* codec, const AVPixelFormat* offered);
     AVPixelFormat choose(AVCodecContext* codec, const AVPixelFormat* offered);
     bool attachHardwareFrames(AVCodecContext* codec);
@@ -433,8 +444,12 @@ private:
     // which a software resume that has lost m_returned's timestamp starts from again.
     std::optional<int64_t> m_startedAfter;
     // A failure decided inside the format callback, which cannot throw through ffmpeg's frames;
-    // rethrown when ffmpeg reports the error that follows.
+    // rethrown when ffmpeg reports the error that follows. Hardware only, whose codec is
+    // single-threaded and so calls back on the GPU thread.
     std::exception_ptr m_parkedFailure;
+    // A software codec's stream offered no plain format. Set by the format callback on whichever
+    // frame thread runs it; decode() turns it into the file's failure. Per codec: openDecoder() clears it.
+    std::atomic<bool> m_softwareFormatRefused{false};
 };
 
 }

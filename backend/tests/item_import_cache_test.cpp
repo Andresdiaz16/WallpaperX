@@ -1686,7 +1686,8 @@ bool runPhase(const PhaseName& which) {
                 // CONTROL: in WallpaperXItem::updatePaintNode (backend/kde/wallpaperx_item.cpp), the
                 //       `&& !contextRefusesSemaphores()` term dropped from publishKnownImports -> "FAIL:
                 //       after the context refused the acquire, no fetch names an image (3 of 3 named
-                //       one)". Via control_run.sh, 2026-10-04 on the NVIDIA entry. Reverted.
+                //       one)". Via control_run.sh, 2026-10-04 on the NVIDIA entry; re-run 2026-10-08 after
+                //       contextRefusesSemaphores moved onto the per-context record, the same line. Reverted.
                 const size_t asks0 = stub.asks().size();
                 stub.sendAcquireFrom(stub.served() + 1, ExportingStub::Acquire::Unusable);
                 stub.sendAcquireFrom(stub.served() + 2, ExportingStub::Acquire::Real);

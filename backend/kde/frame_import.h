@@ -144,8 +144,8 @@ public:
     // Refuses a wait this context cannot perform, exactly as import() does.
     //
     // `importRefused`, when given, is set true only when the driver refused glImportSemaphoreFdEXT
-    // itself -- on NVIDIA the one failure after which no semaphore import in this context succeeds
-    // again. Every other failure leaves it false.
+    // itself -- on NVIDIA the one failure after which no semaphore import in this process succeeds
+    // again, in any context. Every other failure leaves it false.
     static bool acquire(Request& request, unsigned int texture, std::string* whyNot = nullptr,
                         bool* importRefused = nullptr);
 
@@ -161,8 +161,11 @@ public:
 
     // Imports the timeline `fd` names. Borrows `fd`: the import is made from a duplicate, so the
     // caller's descriptor is its own either way. Worth doing as rarely as possible -- measured on
-    // NVIDIA, once one semaphore import fails in a context, every later one there fails too.
-    // `importRefused` as for acquire().
+    // NVIDIA, after about 250 import-and-release cycles of one timeline the whole process is refused:
+    // every context, shared or not, any timeline, and vkCreateSemaphore too. Releasing gives nothing
+    // back. Whether it counts imports of one timeline or every semaphore import is not measured, so
+    // the binary path's import per picture may draw on the same budget. Import once per context and
+    // keep it. `importRefused` as for acquire().
     static Timeline importTimeline(int fd, std::string* whyNot = nullptr, bool* importRefused = nullptr);
 
     // The per-picture half of the timeline path: waits for `value` against `texture`, carrying the

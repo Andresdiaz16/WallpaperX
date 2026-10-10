@@ -900,6 +900,12 @@ bool Device::safeToFree(const char* whatIsLeaked, std::optional<SubmitTicket> re
     return false;
 }
 
+void Device::recordLeak(const char* whatIsLeaked) noexcept {
+    assertGpuThread("Device::recordLeak");
+    abandon();
+    std::fprintf(stderr, "Device: %s is leaked rather than freed\n", whatIsLeaked);
+}
+
 bool Device::lost() const {
     assertGpuThread("Device::lost");
     return m_lost;

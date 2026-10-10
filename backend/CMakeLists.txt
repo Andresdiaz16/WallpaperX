@@ -214,6 +214,23 @@ if(EGL_FOUND AND OpenGL_OpenGL_FOUND)
         LABELS "novulkan;no-tsan"
         SKIP_RETURN_CODE 77)
 
+    # Descriptor growth across hundreds of imports, successful and refused. It opens the host's Vulkan
+    # driver, so no `novulkan`; unlabelled, the TSan block disables it, which the proprietary GL
+    # library's crash under TSan (above) requires anyway. The lavapipe twin below covers the dma_buf
+    # branch in CI.
+    add_executable(wallpaperx-frame-import-fd-test tests/frame_import_fd_test.cpp)
+    target_link_libraries(wallpaperx-frame-import-fd-test PRIVATE wallpaperx-frame-import wallpaperx-renderer)
+    add_dependencies(wallpaperx-frame-import-fd-test wallpaperx-shaders)
+    target_include_directories(wallpaperx-frame-import-fd-test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../renderer/tests)
+    target_compile_definitions(wallpaperx-frame-import-fd-test PRIVATE
+        WALLPAPERX_SHADER_DIR="${WALLPAPERX_SHADER_OUTPUT_DIR}"
+        WALLPAPERX_TEST_IMAGE_DIR="${WALLPAPERX_IMPORT_ASSET_DIR}")
+    wallpaperx_add_test(NAME frame_import_fds COMMAND wallpaperx-frame-import-fd-test)
+    set_tests_properties(frame_import_fds PROPERTIES
+        ENVIRONMENT "WALLPAPERX_FORCE_HANDLE_TYPE=opaque"
+        SKIP_RETURN_CODE 77)
+
     # The generation rules are pure functions, so this needs no GPU and no daemon -- but it does
     # need the item, hence the KDE plugin guard.
     if(WALLPAPERX_BUILD_KDE_PLUGIN)
@@ -228,6 +245,11 @@ if(EGL_FOUND AND OpenGL_OpenGL_FOUND)
     if(WALLPAPERX_LAVAPIPE_ICD)
         wallpaperx_add_test(NAME frame_import_probe_lavapipe COMMAND wallpaperx-frame-import-probe)
         set_tests_properties(frame_import_probe_lavapipe PROPERTIES
+            ENVIRONMENT "VK_ICD_FILENAMES=${WALLPAPERX_LAVAPIPE_ICD};WALLPAPERX_FORCE_HANDLE_TYPE=dmabuf"
+            LABELS "lavapipe"
+            SKIP_RETURN_CODE 77)
+        wallpaperx_add_test(NAME frame_import_fds_lavapipe COMMAND wallpaperx-frame-import-fd-test)
+        set_tests_properties(frame_import_fds_lavapipe PROPERTIES
             ENVIRONMENT "VK_ICD_FILENAMES=${WALLPAPERX_LAVAPIPE_ICD};WALLPAPERX_FORCE_HANDLE_TYPE=dmabuf"
             LABELS "lavapipe"
             SKIP_RETURN_CODE 77)
@@ -419,6 +441,12 @@ target_include_directories(wallpaperx-dbus-service-test PRIVATE
 target_compile_definitions(wallpaperx-dbus-service-test PRIVATE
     WALLPAPERX_TEST_IMAGE_DIR="${CMAKE_CURRENT_BINARY_DIR}/test_assets"
 )
+# The GL importer, to read an opaque-fd frame's pixels on the GPU that exported it
+# (tests/served_pixels.h); without it such a frame's contents are reported NOT VERIFIED.
+if(WALLPAPERX_HAVE_FRAME_IMPORT)
+    target_link_libraries(wallpaperx-dbus-service-test PRIVATE wallpaperx-frame-import)
+    target_compile_definitions(wallpaperx-dbus-service-test PRIVATE WALLPAPERX_HAVE_FRAME_IMPORT=1)
+endif()
 
 # Step 7's HTTP config server. In-process, like dbus_service_test, and for the same
 # reason: half of what it must establish is that /config and GetStatus agree, which needs
@@ -737,6 +765,11 @@ target_compile_definitions(wallpaperx-daemon-system-test PRIVATE
 # a stale or missing daemon binary, and would report the daemon's absence as a bus
 # timeout thirty seconds later.
 add_dependencies(wallpaperx-daemon-system-test wallpaperx-daemon)
+# As dbus_service_test: reads the real daemon's opaque-fd frame through the plugin's GL importer.
+if(WALLPAPERX_HAVE_FRAME_IMPORT)
+    target_link_libraries(wallpaperx-daemon-system-test PRIVATE wallpaperx-frame-import)
+    target_compile_definitions(wallpaperx-daemon-system-test PRIVATE WALLPAPERX_HAVE_FRAME_IMPORT=1)
+endif()
 
 # --------------------------------------------------------------------------- #
 # Step 13 Stage E1: a video wallpaper drawn by the daemon
@@ -857,8 +890,20 @@ if(WALLPAPERX_FFMPEG_EXECUTABLE)
         COMMENT "Generating video wallpaper fixture wallpaper_rate240.mp4"
         VERBATIM
     )
+    # Twelve seconds of 4K whose only keyframe is its first: a video resumed 150 pictures in decodes
+    # them all to catch up, which is what makes a catch-up that holds the GPU in one piece visible.
+    add_custom_command(
+        OUTPUT ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_4k_long_gop.mp4
+        COMMAND ${WALLPAPERX_FFMPEG_EXECUTABLE} -y -v error
+                -f lavfi -i testsrc2=size=3840x2160:rate=30:duration=12
+                -c:v libx264 -preset ultrafast -crf 32 -g 1000 -keyint_min 1000 -sc_threshold 0 -pix_fmt yuv420p
+                ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_4k_long_gop.mp4
+        COMMENT "Generating video wallpaper fixture wallpaper_4k_long_gop.mp4"
+        VERBATIM
+    )
     add_custom_target(wallpaperx-backend-video-fixtures
-                      DEPENDS ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_rate240.mp4
+                      DEPENDS ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_4k_long_gop.mp4
+                              ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_rate240.mp4
                               ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_bands.mp4
                               ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_one_picture.mp4
                               ${WALLPAPERX_BACKEND_VIDEO_ASSET_DIR}/wallpaper_slow.mp4
@@ -1318,10 +1363,8 @@ if(WALLPAPERX_DBUS_RUN_SESSION)
     set_tests_properties(daemon_system PROPERTIES RESOURCE_LOCK wallpaperx_bus_tests
                          SKIP_RETURN_CODE 77)
 
-    # The cross-process content check only runs where the export is a LINEAR dma_buf,
-    # which on the machines this is developed on means Lavapipe. On NVIDIA (OPAQUE_FD)
-    # the twin still covers the process, wire and concurrency halves and says out loud
-    # that it skipped the pixels.
+    # The twin reads the cross-process frame the other way: a LINEAR dma_buf, mapped, where
+    # the NVIDIA entry above imports its OPAQUE_FD through the plugin's GL importer.
     if(WALLPAPERX_LAVAPIPE_ICD)
         wallpaperx_add_test(NAME daemon_system_lavapipe
                  COMMAND ${_wx_asan_preload} $<TARGET_FILE:wallpaperx-daemon-system-test>)
@@ -1390,11 +1433,9 @@ if(WALLPAPERX_DBUS_RUN_SESSION)
         RESOURCE_LOCK wallpaperx_bus_tests
         SKIP_RETURN_CODE 77)
 
-    # The lavapipe twin earns its place on pixels, not on driver coverage: this GPU exports
-    # OPAQUE_FD, which no client can map, so the check that the picture is cover-cropped is
-    # answerable only where the export is a LINEAR dma_buf. The default entry still grades
-    # everything else and says out loud that it skipped the pixels. It is also a software
-    # decode, which is the other half of the decoder this daemon may be handed.
+    # The lavapipe twin grades the other export path: a LINEAR dma_buf, whose pixels are mapped,
+    # where this GPU's OPAQUE_FD export is read through the plugin's GL importer. It is also a
+    # software decode, which is the other half of the decoder this daemon may be handed.
     if(WALLPAPERX_LAVAPIPE_ICD)
         wallpaperx_add_test(NAME video_wallpaper_lavapipe
                  COMMAND $<TARGET_FILE:wallpaperx-video-wallpaper-test>)
@@ -1852,7 +1893,7 @@ if(WALLPAPERX_DBUS_RUN_SESSION)
             foreach(timeline_phase steady old-daemon unsupported unknown-interface too-many-copies retry-busy retry-exportfailed
                                    lost-reply refused-timeline refused-binary wait-no-trip setup-create setup-type
                                    stray-value restart restart-memory stale-value context-move late-value
-                                   late-answer replaced-asking retry-replaced)
+                                   late-answer replaced-asking retry-replaced rebuild context-share)
                 wallpaperx_add_display_test(NAME item_timeline_${timeline_phase}
                          COMMAND $<TARGET_FILE:wallpaperx-item-timeline-test> ${timeline_phase})
                 set_tests_properties(item_timeline_${timeline_phase} PROPERTIES

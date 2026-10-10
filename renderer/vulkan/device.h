@@ -261,6 +261,12 @@ public:
     [[nodiscard]] bool safeToFree(const char* whatIsLeaked,
                                   std::optional<SubmitTicket> reader = std::nullopt) noexcept;
 
+    // For a caller that leaks objects made on this device on a judgement safeToFree() did not make --
+    // a decoder whose library would wait on work this Device never submitted. Prints the report and
+    // makes teardown leak the device too, as a false safeToFree() does: destroying a device while a
+    // child of it lives is invalid even once the GPU has caught up.
+    void recordLeak(const char* whatIsLeaked) noexcept;
+
     // Whether a queue submission or a fence query on this Device has returned
     // VK_ERROR_DEVICE_LOST. Permanent once true, as the loss is: nothing this Device submits can
     // run again. Object creation still succeeds on a lost device, so no creation call is asked.

@@ -70,7 +70,7 @@ signals:
 // nothing, so it brings the memory.
 //
 // The acquire comes one of two ways, chosen by each fetch: a value on the daemon's acquire
-// timeline, imported once per node, when this item can wait on it; a new binary semaphore per
+// timeline, imported once per GL context and shared by its nodes, when this item can wait on it; a new binary semaphore per
 // picture otherwise, which always works and is where any doubt sends it back.
 //
 // What is NOT cached is the claim: the daemon must not draw into the image being sampled, so every
@@ -179,8 +179,9 @@ public:
     quint64 reusedImportCount() const { return m_reusedImportCount.load(std::memory_order_relaxed); }
 
     // How many semaphores this item has tried to import into its context, successful or not: one
-    // per picture on the binary path, one per node on the timeline path. Attempts, because each is
-    // an exposure -- on NVIDIA one failed import leaves every later one in the context failing.
+    // per picture on the binary path; on the timeline path one per context and daemon, counted by the
+    // item whose picture made it. Attempts, because each is
+    // an exposure -- on NVIDIA one failed import leaves every later one in the process failing.
     quint64 semaphoreImportCount() const { return m_semaphoreImportCount.load(std::memory_order_relaxed); }
 
     // Pictures that arrived without memory for an import this item had dropped after naming it in
