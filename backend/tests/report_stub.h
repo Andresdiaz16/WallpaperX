@@ -2,8 +2,9 @@
 
 #pragma once
 
-// A stand-in daemon for the plugin's three screen reports -- SetOutputSize, SetOutputVisible and
-// SetOutputFocus -- for tests that run the item with no GPU. Every report is recorded in arrival
+// A stand-in daemon for the plugin's screen reports -- SetOutputSize, SetOutputVisible, and the focus
+// report as SetOutputFocusState or an older daemon's SetOutputFocus -- for tests that run the item with
+// no GPU. Every report is recorded in arrival
 // order and answered with success unless a test told it otherwise. GetFrame is refused with
 // NoFrame, so the item never imports anything and never arms its paint watch; GetAcquireTimeline is
 // answered as a daemon from before it existed.
@@ -75,7 +76,7 @@ public:
             return connection.send(message.createReply());
         }
         if (member != QLatin1String("SetOutputSize") && member != QLatin1String("SetOutputVisible") &&
-            member != QLatin1String("SetOutputFocus")) {
+            member != QLatin1String("SetOutputFocus") && member != QLatin1String("SetOutputFocusState")) {
             return false;
         }
 
@@ -114,6 +115,8 @@ public:
     void refuseAlways(const QString& member, const QString& output, const QString& errorName) {
         m_alwaysRefuse[{member, output}] = errorName;
     }
+    // Ends a refuseAlways().
+    void stopRefusing(const QString& member, const QString& output) { m_alwaysRefuse.erase({member, output}); }
 
     // The next `member` call is recorded and not answered until releaseHeld().
     void holdNext(const QString& member) { m_holdNext = member; }
@@ -195,6 +198,14 @@ inline bool restartDaemonName(QDBusConnection& bus, int gapMs = 100) {
     const bool gone = bus.unregisterService(QString::fromUtf8(kService));
     pumpFor(gapMs);
     return gone && bus.registerService(QString::fromUtf8(kService));
+}
+
+// A different daemon taking over: the name given up on `from` and taken on `to`, which must already
+// carry `stub` at the path, so the owner's unique name changes as it does when another process starts.
+inline bool handDaemonName(QDBusConnection& from, QDBusConnection& to, int gapMs = 100) {
+    const bool gone = from.unregisterService(QString::fromUtf8(kService));
+    pumpFor(gapMs);
+    return gone && to.registerService(QString::fromUtf8(kService));
 }
 
 // The daemon's ConfigChanged, sent from the stub's connection as the daemon sends it: a broadcast

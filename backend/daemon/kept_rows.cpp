@@ -69,12 +69,20 @@ std::vector<PersistedWallpaper> KeptRows::rowsToWrite(const LiveWallpapers& live
     // The same authority rule as names: a carried row speaks for an id only where this build
     // cannot bind one.
     for (auto& [monitorId, row] : rows) {
-        if (monitorId < m_maxMonitors) row.pauseJson.clear();
+        if (monitorId < m_maxMonitors) {
+            row.pauseJson.clear();
+            row.soundJson.clear();
+        }
     }
     for (const auto& [monitorId, text] : live.pause) {
         PersistedWallpaper& row = rows[monitorId];
         row.monitorId = monitorId;
         row.pauseJson = text;
+    }
+    for (const auto& [monitorId, text] : live.sound) {
+        PersistedWallpaper& row = rows[monitorId];
+        row.monitorId = monitorId;
+        row.soundJson = text;
     }
 
     std::vector<PersistedWallpaper> entries;
@@ -82,7 +90,7 @@ std::vector<PersistedWallpaper> KeptRows::rowsToWrite(const LiveWallpapers& live
     for (auto& [monitorId, row] : rows) {
         // A row the clearing loop emptied has nothing left to say. Written out, the next
         // start reads it back and reports it as a wallpaper that did not come back.
-        if (row.type.empty() && row.path.empty() && row.output.empty() && row.pauseJson.empty()) continue;
+        if (row.type.empty() && row.path.empty() && row.output.empty() && !row.holdsMonitorSettings()) continue;
         entries.push_back(std::move(row));
     }
     return entries;

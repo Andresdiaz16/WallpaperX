@@ -75,6 +75,7 @@
 using wallpaperx::ConfigStore;
 using wallpaperx::LoadResult;
 using wallpaperx::LogFraming;
+using wallpaperx::PersistedConfig;
 using wallpaperx::PersistedWallpaper;
 using wallpaperx::SaveResult;
 using wallpaperx::sanitizeForLog;
@@ -705,7 +706,7 @@ std::string repairClausesIn(const std::string& detail) {
     static constexpr const char* kRepairClauses[] = {
         "displaced by another entry", "dropped, unusable", "entries dropped, another entry",
         "entries dropped, no build can apply", "screen names dropped, no build can apply",
-        "given conflicting pause settings"};
+        "given conflicting pause settings", "given conflicting sound settings", "volumes outside 0 to 1 moved"};
     std::string found;
     for (const char* clause : kRepairClauses) {
         if (detail.find(clause) != std::string::npos) found += std::string(" '") + clause + "'";
@@ -804,7 +805,7 @@ void runLocationChecks() {
 
     const ConfigStore disabled{std::filesystem::path{}};
     check(!disabled.enabled(), "a ConfigStore built from an empty path reports itself disabled");
-    const SaveResult saved = disabled.save({PersistedWallpaper{0, "static", "/tmp/x.png"}});
+    const SaveResult saved = disabled.save(PersistedConfig{{PersistedWallpaper{0, "static", "/tmp/x.png"}}});
     check(saved.error.empty(), "saving through a disabled store is not an error");
     const LoadResult loaded = disabled.load();
     check(loaded.entries.empty() && loaded.error.empty() && !loaded.fileExisted,
@@ -1046,7 +1047,7 @@ void runRoundTripChecks() {
     check(discriminating == static_cast<int>(cases.size()),
           "every round-trip case is one sanitizeForLog would alter, so a sanitizing store would fail this phase");
 
-    const SaveResult saved = store.save(entries);
+    const SaveResult saved = store.save(PersistedConfig{entries});
     check(saved.error.empty() && saved.skippedNonUtf8 == 0, "the adversarial paths are all saved (they are UTF-8)");
     const LoadResult loaded = store.load();
     check(loaded.entries.size() == cases.size(), "every saved entry comes back");
@@ -1106,7 +1107,7 @@ void runNonUtf8Checks() {
     };
     check(!wallpaperx::isValidUtf8(lone80), "the case path really is invalid UTF-8, so this phase can discriminate");
 
-    const SaveResult saved = store.save(entries);
+    const SaveResult saved = store.save(PersistedConfig{entries});
     check(saved.error.empty(), "a path that is not valid UTF-8 does not fail the write");
     if (!saved.error.empty()) std::fprintf(stderr, "  save error: %s\n", saved.error.c_str());
     check(saved.skippedNonUtf8 == 1, "the save reports exactly one entry skipped for its path");
@@ -1125,7 +1126,7 @@ void runNonUtf8Checks() {
     // The same rule for `type`. It cannot come from a client -- requestWallpaper rejects
     // anything outside three literals -- but the store is a public class whose save() must
     // not throw for any input, and dump() throws on either field.
-    const SaveResult badType = store.save({{0, std::string("sta\xFFtic"), "/tmp/first.png"}});
+    const SaveResult badType = store.save(PersistedConfig{{{0, std::string("sta\xFFtic"), "/tmp/first.png"}}});
     check(badType.error.empty() && badType.skippedNonUtf8 == 1,
           "a type that is not valid UTF-8 is skipped the same way rather than failing the write");
 
@@ -1148,7 +1149,7 @@ void runNonUtf8Checks() {
     //       entries". Two more go red in the connector-name phase from the same edit.
     const std::filesystem::path namedFile = scratch.path() / "named.json";
     const ConfigStore namedStore(namedFile);
-    const SaveResult namedSave = namedStore.save({{7, "static", lone80, "DP-KEEP"}});
+    const SaveResult namedSave = namedStore.save(PersistedConfig{{{7, "static", lone80, "DP-KEEP"}}});
     check(namedSave.error.empty(), "a row with an unwritable path and a usable name does not fail the write");
     std::string namedWhy;
     const std::map<int, RowInFile> namedRows = rowsInFile(namedFile, namedWhy);
@@ -2122,14 +2123,13 @@ void runMalformedEntryCopyChecks() {
     //       between the two calls is a real point in backend/daemon/main.cpp's startup, and it
     //       is the only one at which both properties are visible.
     // CONTROL: the repair written from inside restoreSaved() instead of being handed to
-    //       writeRepairedConfig() -- `if (repaired) { queuePersist(m_kept.rowsToWrite(
-    //       liveWallpapers())); awaitPersisted(); }` at the end of WallpaperManager::restoreSaved()
+    //       writeRepairedConfig() -- `if (repaired) { queuePersist(configToWriteLocked());
+    //       awaitPersisted(); }` at the end of WallpaperManager::restoreSaved()
     //       (backend/daemon/wallpaper_manager.cpp), in place of `if (repaired) m_repair = ...;`, via
-    //       control_run.sh, --phase 'the copy made for malformed entries', 2026-09-29 -> "FAIL: a
+    //       control_batch.sh, --phase 'the copy made for malformed entries', re-run 2026-10-11 -> "FAIL: a
     //       config with malformed entries is still there after the copy is made", "FAIL: the copy
     //       holds the bytes of the file the entries were rejected from", and "FAIL: a second start
-    //       with a different malformed config does not overwrite the first start's copy", the last
-    //       printing a copy holding the daemon's rewrite. Reverted.
+    //       with a different malformed config does not overwrite the first start's copy". Reverted.
     {
         WallpaperManager::Config config;
         config.configFile = file;
@@ -2414,11 +2414,11 @@ void runRepairCopyChecks() {
     // WHY-THIS-SHAPE: a real client save on the SAME manager that failed to preserve, graded on
     //       the row reaching the file. A fresh manager would prove nothing: it never attempted a
     //       copy, so it is not in the state this check is about.
-    // CONTROL: via control_run.sh, 2026-09-29: WallpaperManager::requestWallpaper()'s
-    //       `queuePersist(m_kept.rowsToWrite(liveWallpapers()));` guarded by `if (!m_preserveFailed)`
-    //       (backend/daemon/wallpaper_manager.cpp), refusing a client's save over a copy that could
-    //       not be taken -> "FAIL: an ordinary save still reaches the file after a copy that could
-    //       not be taken", printing "ids on disk: 1 2", and nothing else red. Reverted.
+    // CONTROL: via control_batch.sh, --phase 'the copy made before a repair is written', re-run 2026-10-11:
+    //       WallpaperManager::requestWallpaper()'s `queuePersist(configToWriteLocked());` guarded by `if
+    //       (!m_preserveFailed)` (backend/daemon/wallpaper_manager.cpp), refusing a client's save over a copy
+    //       that could not be taken -> "FAIL: an ordinary save still reaches the file after a copy that could
+    //       not be taken", and nothing else red. Reverted.
     manager.requestWallpaper("static", paths->wallpapers[0].string(), 3);
     waitForRows(file, [](const std::map<int, RowInFile>& rows) { return rows.count(3) == 1; });
     std::string why;
@@ -3250,7 +3250,7 @@ void runOutputFieldChecks() {
         // A wallpaper with no name, which is every row a build without this field writes.
         {3, "static", "/tmp/three.png", ""},
     };
-    const SaveResult saved = store.save(entries);
+    const SaveResult saved = store.save(PersistedConfig{entries});
     check(saved.error.empty() && saved.skippedNonUtf8 == 0, "a row carrying a connector name is saved");
     if (!saved.error.empty()) std::fprintf(stderr, "  save error: %s\n", saved.error.c_str());
 
@@ -3375,9 +3375,9 @@ void runOutputFieldChecks() {
     //       is not counted as a dropped wallpaper", printing "1 wallpapers reported dropped".
     const std::string badUtf8Name = std::string("DP\xFF-1");
     check(!wallpaperx::isValidUtf8(badUtf8Name), "the case name really is invalid UTF-8, so this phase can discriminate");
-    const SaveResult badSave = store.save({{0, "static", "/tmp/zero.png", "DP-0"},
-                                           {1, "static", "/tmp/one.png", badUtf8Name},
-                                           {2, "static", "/tmp/two.png", "DP-2"}});
+    const SaveResult badSave = store.save(PersistedConfig{{{0, "static", "/tmp/zero.png", "DP-0"},
+                                                           {1, "static", "/tmp/one.png", badUtf8Name},
+                                                           {2, "static", "/tmp/two.png", "DP-2"}}});
     check(badSave.error.empty(), "a connector name that is not valid UTF-8 does not fail the write");
     if (!badSave.error.empty()) std::fprintf(stderr, "  save error: %s\n", badSave.error.c_str());
     std::string badWhy;
@@ -3451,11 +3451,12 @@ void runOutputFieldChecks() {
     //       entry.output.empty())) continue;` that discards the row -> "FAIL: a row that loses
     //       both halves is reported as one lost wallpaper and one lost name", printing "1
     //       wallpapers and 0 names reported dropped, 0 rows on disk". Re-run via control_batch.sh,
-    //       2026-09-30, after the skip line gained `&& entry.pauseJson.empty()`: the same. Reverted.
+    //       2026-10-11, after the skip line gained `&& !entry.holdsMonitorSettings()`: the FAIL line the same.
+    //       Reverted.
     const std::filesystem::path bothBadFile = scratch.path() / "bothbad.json";
     const ConfigStore bothBadStore(bothBadFile);
     const std::string badUtf8Path = std::string("/tmp/bad\x80name.png");
-    const SaveResult bothBad = bothBadStore.save({{4, "static", badUtf8Path, badUtf8Name}});
+    const SaveResult bothBad = bothBadStore.save(PersistedConfig{{{4, "static", badUtf8Path, badUtf8Name}}});
     std::string bothWhy;
     const std::map<int, RowInFile> afterBoth = rowsInFile(bothBadFile, bothWhy);
     const bool bothCounted =
@@ -6184,7 +6185,7 @@ void runStartupRepairChecks() {
     //       carried "1 entries dropped, no build can apply them" -- the phantom loss this rule
     //       exists to stop, and nothing else in the binary red. Observed 2026-08-19; re-run via
     //       control_batch.sh, --phase 'the repair a start performs is written at that start',
-    //       2026-09-30, after the skip gained `&& row.pauseJson.empty()`: the same two lines. Reverted.
+    //       2026-10-11, after the skip gained `&& !row.holdsMonitorSettings()`: the same two lines. Reverted.
     const bool emptyRowNotWritten = afterFirstStart.count(40) == 0;
     check(emptyRowNotWritten, "a kept row left holding nothing is not written back");
     if (!emptyRowNotWritten) {
@@ -7362,7 +7363,7 @@ void runTempFileSymlinkChecks() {
     }
 
     const ConfigStore store(file);
-    const SaveResult saved = store.save({PersistedWallpaper{0, "static", "/photos/a.png", "DP-1"}});
+    const SaveResult saved = store.save(PersistedConfig{{PersistedWallpaper{0, "static", "/photos/a.png", "DP-1"}}});
 
     // GOAL: a save whose temporary path has been replaced by a symlink refuses, and the file
     //       the link points at keeps its bytes. False if the open follows the link: the config
@@ -8746,7 +8747,7 @@ void runOutputSizeFieldChecks() {
     PersistedWallpaper nameless{1, "static", "/tmp/one.png", ""};
     nameless.outputSizeJson = wallpaperx::toJsonText(wallpaperx::OutputSize{1920, 1080});
     const PersistedWallpaper unsized{2, "", "", "DP-2"};
-    const SaveResult saved = store.save({named, nameless, unsized});
+    const SaveResult saved = store.save(PersistedConfig{{named, nameless, unsized}});
     check(saved.error.empty(), "rows carrying screen sizes are saved");
 
     // GOAL: S13.97 -- a size is written as {width, height} beside the connector name it describes, and
@@ -9952,13 +9953,13 @@ void runNoReasonWaitChecks() {
     };
     {
         wallpaperx::ConfigWriter writer{wallpaperx::ConfigStore(dir / "landed.json")};
-        writer.queue(rows);
+        writer.queue(PersistedConfig{rows});
         grade("a save that landed", writer, true);
     }
     {
         wallpaperx::ConfigWriter writer{wallpaperx::ConfigStore(dir / "refused.json")};
         writer.refuse("refused by this test");
-        writer.queue(rows);
+        writer.queue(PersistedConfig{rows});
         grade("a save the writer refused", writer, false);
     }
     std::string fixtureWhy;
@@ -9973,7 +9974,7 @@ void runNoReasonWaitChecks() {
     }
     {
         wallpaperx::ConfigWriter writer{wallpaperx::ConfigStore(dir / "stalled.json")};
-        writer.queue(rows);
+        writer.queue(PersistedConfig{rows});
         grade("a write that never came back", writer, false);
     }
     (void)blocked.release(std::chrono::milliseconds(5000));
@@ -10864,6 +10865,81 @@ void runSavedSpeedAboveCapChecks() {
     }
 }
 
+void runSavedVolumeOutsideRangeChecks() {
+    constexpr const char* kGoals = "S15.492 (a saved volume outside 0 to 1 is moved to the nearer end, counted and "
+                                   "repaired)";
+    const ScratchDir scratch("savedvolume");
+    const std::optional<PhasePaths> paths = preparePhase(scratch, kGoals, 2);
+    if (!paths) return;
+    const ScopedEnv stateHome("XDG_STATE_HOME", stateHomeOf(scratch).string());
+    const std::filesystem::path& file = paths->config;
+    const std::filesystem::path copy = preservedCopyDir(scratch) / "config.json.bad";
+
+    const auto row = [&paths](int id, const nlohmann::json& properties) {
+        nlohmann::json out = configRow(id, "static", paths->wallpapers[id == 1 ? 1 : 0].string(), "");
+        out["properties"] = properties;
+        return out;
+    };
+    // Nothing else in the file is one a start drops or repairs, so the clamp alone decides the rewrite.
+    nlohmann::json monitors = nlohmann::json::array();
+    monitors.push_back(row(0, {{"volume", 50}, {"mute", true}}));
+    monitors.push_back(row(1, {{"volume", -0.5}}));
+    monitors.push_back(row(2, {{"volume", 0.5}}));
+    const std::string original = nlohmann::json({{"version", 1}, {"monitors", monitors}}).dump();
+    if (!writeFile(file, original)) {
+        notVerified(kGoals, "the config file this phase reads could not be written");
+        return;
+    }
+    WallpaperManager::Config managerConfig;
+    managerConfig.configFile = file;
+    WallpaperManager manager(managerConfig);
+    manager.restoreSaved();
+    manager.preserveUnreadableConfig();
+    manager.writeRepairedConfig();
+
+    // GOAL: S15.492 -- a saved volume above 1 or below 0 on a row this build applies is restored as 1 or 0,
+    //       the rest of the row kept; one inside 0 to 1 is kept as it is. The persistence report counts the
+    //       two in one clause and drops nothing, and the file is copied aside, then rewritten with the values
+    //       the daemon now holds.
+    // WHY-THIS-SHAPE: no other value in the file is one a start drops or repairs, so the copy and the
+    //       rewrite can only come from the clamp; with a dropped value present a repair would happen anyway,
+    //       which would hide a clamp that no longer counted as one.
+    // CONTROL: via control_batch.sh, --phase '^a saved volume outside 0 to 1$', 2026-10-11, each alone,
+    //       reverted: the clamp line in usableProperties (backend/daemon/wallpaper_properties.cpp) deleted ->
+    //       "FAIL: a saved volume of 50 is restored as 1, ...", the count line and "the rewrite holds the
+    //       clamped volumes"; `clampedVolumes > 0 ||` removed from `repaired` in WallpaperManager::restoreSaved
+    //       (backend/daemon/wallpaper_manager.cpp) -> "FAIL: a clamped volume copies the file aside before the
+    //       repair", the count line and the rewrite line.
+    const WallpaperManager::Snapshot snap = manager.snapshot();
+    const auto holds = [&snap](int id, const WallpaperProperties& expected) {
+        return snap.monitors.count(id) == 1 && snap.monitors.at(id).properties == expected;
+    };
+    const bool restored = holds(0, {{"volume", 1.0}, {"mute", true}}) && holds(1, {{"volume", 0.0}}) && holds(2, {{"volume", 0.5}});
+    check(restored, "a saved volume of 50 is restored as 1, -0.5 as 0 and 0.5 as itself, the rest of the row kept");
+    if (!restored) {
+        for (const int id : {0, 1, 2}) {
+            const bool there = snap.monitors.count(id) == 1;
+            std::fprintf(stderr, "  monitor %d: %s\n", id,
+                         there ? wallpaperx::toJsonText(snap.monitors.at(id).properties).c_str() : "(not restored)");
+        }
+    }
+    const std::string& detail = snap.health.persistence.detail;
+    const std::optional<int> clamped = clauseCountOrSkip(detail, " wallpaper volumes outside 0 to 1 moved to the nearer of the two", kGoals);
+    if (clamped) {
+        const bool counted = *clamped == 2 && clauseCount(detail, " wallpaper property values dropped").value_or(-1) == 0;
+        check(counted, "the two volumes are counted in one clause, and nothing is counted as dropped");
+        if (!counted) std::fprintf(stderr, "  detail: %s\n", detail.c_str());
+    }
+    check(std::filesystem::exists(copy) && readFile(copy) == original, "a clamped volume copies the file aside before the repair");
+    const bool rewritten = waitForFile([&] {
+        return fieldTextIn(file, 0, "properties") == nlohmann::json({{"mute", true}, {"volume", 1.0}}).dump() &&
+               fieldTextIn(file, 1, "properties") == nlohmann::json({{"volume", 0.0}}).dump() &&
+               fieldTextIn(file, 2, "properties") == nlohmann::json({{"volume", 0.5}}).dump();
+    });
+    check(rewritten, "the rewrite holds the clamped volumes");
+    if (!rewritten) std::fprintf(stderr, "  config.json: %s\n", readFile(file).c_str());
+}
+
 // ---------------------------------------------------------------------------- //
 // Step 15 chunk 3c: a monitor's pause setting -- how it is written, read back, carried for a newer
 // build, and what a start makes of several rows that disagree about it.
@@ -10892,10 +10968,10 @@ nlohmann::json pauseRow(int monitorId, const nlohmann::json& pause) {
 // WHY-THIS-SHAPE: two monitors, because the two rows reach the file by different rules: the wallpaper
 //       row would be written for its wallpaper anyway, so only the pause-only row can show a writer or
 //       a filter that drops a row with nothing but a pause.
-// CONTROL: via control_batch.sh, --phase 'pause setting across a restart', 2026-09-30, each alone,
+// CONTROL: via control_batch.sh, --phase 'pause setting across a restart', re-run 2026-10-11, each alone,
 //       reverted. (a) the `live.pause` loop in KeptRows::rowsToWrite (backend/daemon/kept_rows.cpp)
 //       deleted -> "FAIL: a pause setting on a wallpaper's row survives a restart" and the two pause-only
-//       lines. (b) `&& row.pauseJson.empty()` removed from rowsToWrite's final filter -> "FAIL: the
+//       lines. (b) `&& !row.holdsMonitorSettings()` removed from rowsToWrite's final filter -> "FAIL: the
 //       pause-only row is written with an empty type and path" and "FAIL: a pause setting on a monitor
 //       with no wallpaper survives a restart". ConfigStore::save's skip is not reached here -- an empty
 //       type and path are valid text, so the row is written anyway; runPauseOnlyStoreChecks grades it.
@@ -10938,10 +11014,9 @@ void runPauseRestartChecks() {
 // GOAL: S15.133's writer half -- ConfigStore::save keeps a row whose wallpaper it cannot write and that
 //       has no name when the row carries a pause: a path that is not valid UTF-8 costs the row its
 //       wallpaper, not its pause.
-// CONTROL: via control_batch.sh, --phase 'pause-only row in the store', 2026-09-30, `&&
-//       entry.pauseJson.empty()` removed from ConfigStore::save's skip (backend/daemon/config_store.cpp)
-//       -> "FAIL: a row whose path cannot be written keeps its pause", the file written with no rows.
-//       Reverted.
+// CONTROL: via control_batch.sh, --phase 'pause-only row in the store', re-run 2026-10-11, `&&
+//       !entry.holdsMonitorSettings()` removed from ConfigStore::save's skip (backend/daemon/config_store.cpp)
+//       -> "FAIL: a row whose path cannot be written keeps its pause". Reverted.
 void runPauseOnlyStoreChecks() {
     const ScratchDir scratch("pausestore");
     if (!scratch.ok()) {
@@ -10955,7 +11030,7 @@ void runPauseOnlyStoreChecks() {
     row.type = "static";
     row.path = std::string("/tmp/bad\x80name.png");
     row.pauseJson = "\"always_paused\"";
-    const SaveResult saved = store.save({row});
+    const SaveResult saved = store.save(PersistedConfig{{row}});
     const LoadResult loaded = store.load();
     const auto it = std::find_if(loaded.entries.begin(), loaded.entries.end(),
                                  [](const PersistedWallpaper& e) { return e.monitorId == 7; });
@@ -11047,12 +11122,12 @@ void runPauseUnknownValueChecks() {
 // WHY-THIS-SHAPE: the kept row is the case, because a row this build applies has no separate copy of the
 //       pause to go stale.
 // CONTROL: two defences, and only both together turn this red -- via control_batch.sh, --phase 'a kept
-//       row's pause for a monitor this build uses', 2026-09-30: `if (!pauseTravels) keep.pauseJson.clear();`
-//       deleted from WallpaperManager::restoreSaved() (backend/daemon/wallpaper_manager.cpp) AND the
-//       `monitorId < m_maxMonitors` clearing loop deleted from KeptRows::rowsToWrite
-//       (backend/daemon/kept_rows.cpp) -> "FAIL: SetMonitorPause(play) removes the pause of a monitor
-//       whose row is kept for its type", the row still carrying "always_paused". Each alone left it
-//       green, measured the same day: the other defence clears the stale copy. Reverted.
+//       row's pause for a monitor this build uses', 2026-09-30, re-run 2026-10-11 after the clearing loop
+//       gained the sound field: `if (!pauseTravels) keep.pauseJson.clear();` deleted from
+//       WallpaperManager::restoreSaved() (backend/daemon/wallpaper_manager.cpp) AND the clearing loop's
+//       `row.pauseJson.clear();` deleted from KeptRows::rowsToWrite (backend/daemon/kept_rows.cpp) -> "FAIL:
+//       SetMonitorPause(play) removes the pause of a monitor whose row is kept for its type". Each alone left
+//       it green, measured 2026-09-30: the other defence clears the stale copy. Reverted.
 void runPauseKeptRowChecks() {
     constexpr const char* kGoals = "S15.135 (a kept row's pause does not compete with the live setting)";
     const ScratchDir scratch("pausekeptrow");
@@ -11208,13 +11283,14 @@ std::string pauseStateOf(const WallpaperManager& manager, const std::filesystem:
 // WHY-THIS-SHAPE: runOutputSizeFailedCallChecks()' sweep, twice: once alternating two modes, and once
 //       with a manager per step started from a file whose row carries an unknown value, since a call that
 //       succeeds replaces it.
-// CONTROL: via control_batch.sh, --phase 'a failed SetMonitorPause', 2026-09-30, the catch's restore in
-//       WallpaperManager::setMonitorPause (backend/daemon/wallpaper_manager.cpp) -- the erase and the
-//       insert -- deleted -> "FAIL: a SetMonitorPause that failed on an allocation left the monitor's pause
-//       setting as it was", printing "allocation 1 threw std::bad_alloc: paused_while_focused ->
-//       always_paused", the same for the unknown-value sweep ("(unknown) / file \"paused_on_battery\" ->
-//       play / ..."), and both "the same SetMonitorPause again, unfaulted, reaches the config file" lines.
-//       Reverted. The sweeps fault 9 and 7 allocations, 7 and 6 of them while building the save.
+// CONTROL: via control_batch.sh, --phase '^a failed SetMonitorPause changes nothing$', 2026-10-11, the
+//       undo in the catch of WallpaperManager::commitLocked (backend/daemon/wallpaper_manager.cpp), which
+//       setMonitorPause goes through, deleted (`exchange();`) -> "FAIL: a SetMonitorPause that failed on an
+//       allocation left the monitor's pause setting as it was", printing "allocation 1 threw
+//       std::bad_alloc: paused_while_focused -> always_paused", the same for the unknown-value sweep
+//       ("(unknown) / file \"paused_on_battery\" -> always_paused / ..."), and both "the same
+//       SetMonitorPause again, unfaulted, reaches the config file" lines. Reverted. The sweeps fault 9
+//       and 7 allocations, 7 and 6 of them while building the save.
 void runPauseFailedCallChecks() {
     constexpr const char* kGoals = "S15.140 (a SetMonitorPause that fails on an allocation changes nothing)";
 #if !WALLPAPERX_ALLOCATION_INSTRUMENT
@@ -11279,6 +11355,360 @@ void runPauseFailedCallChecks() {
         } else {
             notVerified(kGoals, "a step of the unknown-value sweep could not stage a row carrying an unknown pause value");
         }
+    }
+#endif
+}
+
+// ---------------------------------------------------------------------------- //
+// Step 15 chunk 5b: sound on every screen (the config root's `sound`) and on one monitor (a row's) --
+// how each is written, read back, carried for a newer build, and what a start makes of rows that
+// disagree about it.
+// ---------------------------------------------------------------------------- //
+
+// A monitor's sound setting as GetStatus reports it: "on", "off", "(unknown)" for a value this build keeps
+// and treats as on, "(none)" for a monitor the snapshot does not list.
+std::string monitorSoundOf(const WallpaperManager& manager, int monitorId) {
+    const WallpaperManager::Snapshot snap = manager.snapshot();
+    const auto it = snap.monitorSound.find(monitorId);
+    if (it == snap.monitorSound.end()) return "(none)";
+    return it->second.enabled ? (*it->second.enabled ? "on" : "off") : "(unknown)";
+}
+
+// The same for sound on every screen.
+std::string globalSoundOf(const WallpaperManager& manager) {
+    const std::optional<bool> sound = manager.snapshot().sound;
+    return sound ? (*sound ? "on" : "off") : "(unknown)";
+}
+
+// A row carrying only a sound setting.
+nlohmann::json soundRow(int monitorId, const nlohmann::json& sound) {
+    nlohmann::json row = configRow(monitorId, "", "", "");
+    row["sound"] = sound;
+    return row;
+}
+
+// The config root's `field` as dump() text; "(no field)", or "(no file)" when the file is not a JSON object.
+std::string rootFieldIn(const std::filesystem::path& file, const char* field) {
+    const nlohmann::json root = nlohmann::json::parse(readFile(file), nullptr, false);
+    if (root.is_discarded() || !root.is_object()) return "(no file)";
+    return root.contains(field) ? root.at(field).dump() : "(no field)";
+}
+
+// GOAL: S15.460 -- sound off on every screen and on two monitors survives a restart: the root carries
+//       `"sound": false`, a monitor with a wallpaper carries it on its row, and a monitor with no wallpaper
+//       gets a row of its own with an empty type and path. Switched back on after the restart, nothing of
+//       it is left: no root field, no field on the wallpaper's row, no sound-only row.
+// WHY-THIS-SHAPE: a wallpaper's row and a sound-only row reach the file by different rules -- only the
+//       second shows a filter that drops a row carrying nothing but sound.
+// CONTROL: via control_batch.sh, --phase '^sound settings across a restart$', 2026-10-11, each alone,
+//       reverted. ConfigStore::load (backend/daemon/config_store.cpp) not reading the root `sound` -> "FAIL:
+//       sound off on every screen, on a wallpaper's monitor and on a monitor with none survives a restart";
+//       not reading a row's -> the same line; ConfigStore::save not writing the root's -> that line and
+//       "FAIL: sound off is written at the root, on a wallpaper's row, and on a sound-only row ...".
+//       KeptRows::rowsToWrite's final filter (backend/daemon/kept_rows.cpp) made `row.pauseJson.empty()`
+//       instead of `!row.holdsMonitorSettings()` -> the written line and the restart line.
+void runSoundRestartChecks() {
+    constexpr const char* kGoals = "S15.460 (sound settings across a restart)";
+    const ScratchDir scratch("soundrestart");
+    const std::optional<PhasePaths> paths = preparePhase(scratch, kGoals, 1);
+    if (!paths) return;
+    const ScopedEnv stateHome("XDG_STATE_HOME", stateHomeOf(scratch).string());
+    const std::filesystem::path& file = paths->config;
+    WallpaperManager::Config managerConfig;
+    managerConfig.configFile = file;
+    {
+        WallpaperManager manager(managerConfig);
+        manager.requestWallpaper("static", paths->wallpapers[0].string(), 2);
+        manager.setMonitorSound(2, false);
+        manager.setMonitorSound(5, false);
+        manager.setSound(false);
+        if (!writerIdle(manager)) {
+            check(false, "the sound settings this phase restarts with reached the file");
+            return;
+        }
+    }
+    const nlohmann::json bare = rowJsonIn(file, 5);
+    const bool written = rootFieldIn(file, "sound") == "false" && fieldTextIn(file, 2, "sound") == "false" &&
+                         bare.is_object() && bare.value("type", std::string("x")).empty() &&
+                         bare.value("path", std::string("x")).empty() && bare.value("sound", nlohmann::json()) == false;
+    check(written, "sound off is written at the root, on a wallpaper's row, and on a sound-only row with an empty type and path");
+    if (!written) std::fprintf(stderr, "  config.json: %s\n", readFile(file).c_str());
+
+    WallpaperManager restarted(managerConfig);
+    restarted.restoreSaved();
+    const bool restored = globalSoundOf(restarted) == "off" && monitorSoundOf(restarted, 2) == "off" &&
+                          monitorSoundOf(restarted, 5) == "off";
+    check(restored, "sound off on every screen, on a wallpaper's monitor and on a monitor with none survives a restart");
+    if (!restored) {
+        std::fprintf(stderr, "  after the restart: every screen %s, monitor 2 %s, monitor 5 %s\n",
+                     globalSoundOf(restarted).c_str(), monitorSoundOf(restarted, 2).c_str(),
+                     monitorSoundOf(restarted, 5).c_str());
+    }
+
+    restarted.setSound(true);
+    restarted.setMonitorSound(2, true);
+    restarted.setMonitorSound(5, true);
+    const bool cleared = writerIdle(restarted) && rootFieldIn(file, "sound") == "(no field)" &&
+                         fieldTextIn(file, 2, "sound") == "(no field)" && fieldTextIn(file, 5, "sound") == "(no row)";
+    check(cleared, "sound switched back on leaves no root field, no field on the row and no sound-only row");
+    if (!cleared) std::fprintf(stderr, "  config.json: %s\n", readFile(file).c_str());
+}
+
+// GOAL: S15.461 -- ConfigStore itself: a row whose wallpaper it cannot write and that has no name is kept
+//       when it carries a sound setting, and the root's sound text is written and read back as given, a
+//       value no build knows included; with none given the root has no `sound` key.
+// CONTROL: via control_batch.sh, --phase '^a sound setting in the store$', 2026-10-11, each alone, in
+//       ConfigStore::save (backend/daemon/config_store.cpp): the skip's `!entry.holdsMonitorSettings()` made
+//       `entry.pauseJson.empty()` -> "FAIL: a row whose path cannot be written keeps its sound setting"; the
+//       root's sound not written -> "FAIL: the root's sound text is written and read back as given". Reverted.
+void runSoundStoreChecks() {
+    const ScratchDir scratch("soundstore");
+    if (!scratch.ok()) {
+        notVerified("S15.461", "a scratch directory could not be created");
+        return;
+    }
+    const std::filesystem::path file = scratch.path() / "config.json";
+    const ConfigStore store(file);
+    PersistedWallpaper row;
+    row.monitorId = 7;
+    row.type = "static";
+    row.path = std::string("/tmp/bad\x80name.png");
+    row.soundJson = "false";
+    const SaveResult saved = store.save(PersistedConfig{{row}, "\"loud\""});
+    const LoadResult loaded = store.load();
+    const auto it = std::find_if(loaded.entries.begin(), loaded.entries.end(),
+                                 [](const PersistedWallpaper& e) { return e.monitorId == 7; });
+    const bool kept = saved.error.empty() && saved.skippedNonUtf8 == 1 && it != loaded.entries.end() &&
+                      it->type.empty() && it->path.empty() && it->soundJson == "false";
+    check(kept, "a row whose path cannot be written keeps its sound setting");
+    const bool root = rootFieldIn(file, "sound") == "\"loud\"" && loaded.soundJson == "\"loud\"";
+    check(root, "the root's sound text is written and read back as given");
+    if (!kept || !root) {
+        std::fprintf(stderr, "  save error '%s'; read root '%s'; config.json: %s\n", saved.error.c_str(),
+                     loaded.soundJson.c_str(), readFile(file).c_str());
+    }
+    const SaveResult plain = store.save(PersistedConfig{{PersistedWallpaper{0, "static", "/tmp/a.png"}}});
+    const bool absent = plain.error.empty() && rootFieldIn(file, "sound") == "(no field)" && store.load().soundJson.empty();
+    check(absent, "with no root sound setting the file has no root sound field");
+    if (!absent) std::fprintf(stderr, "  config.json: %s\n", readFile(file).c_str());
+}
+
+// GOAL: S15.462 -- sound values this build does not know are kept exactly as read and treated as on: an
+//       unknown root value reports null and leaves a focused screen heard; an object on a monitor's row
+//       reports null; a sound-only row for id 40, which this build cannot bind, is carried. A save made
+//       for another reason writes all three back as read. An explicit `true` loads as on and is not
+//       written again.
+// WHY-THIS-SHAPE: compared as dump() text for runKeptPropertiesVerbatimChecks' reason; the save is forced
+//       by another monitor, so the rows under test are written by the rule for carrying, not by a change.
+// CONTROL: via control_batch.sh, --phase '^sound values this build does not know$', 2026-10-11, each
+//       alone, reverted, in backend/daemon/wallpaper_manager.cpp: the constructor keeping only a root value
+//       that reads false -> "FAIL: unknown sound values report null, ..." and the written-back line;
+//       restoreSaved's `if (!soundTravels) keep.soundJson.clear();` made unconditional -> the written-back
+//       line alone; restoreSaved storing a row's value only when soundFromJson() knows it -> the null line
+//       and the written-back line; soundHeardLocked reading the root as `soundFromJson(m_sound) != true` ->
+//       "FAIL: a focused screen whose sound values are unknown at both levels is heard", alone; restoreSaved's
+//       erase of an explicit true never taken -> "FAIL: an explicit sound true is not written again", alone.
+void runSoundUnknownValueChecks() {
+    constexpr const char* kGoals = "S15.462 (sound values a newer build wrote are kept, and treated as on)";
+    const ScratchDir scratch("soundunknown");
+    const std::optional<PhasePaths> paths = preparePhase(scratch, kGoals, 2);
+    if (!paths) return;
+    const ScopedEnv stateHome("XDG_STATE_HOME", stateHomeOf(scratch).string());
+    const std::filesystem::path& file = paths->config;
+    const std::string wp = paths->wallpapers[0].string();
+    const nlohmann::json unknownRoot = "loud";
+    const nlohmann::json unknownRow = {{"newer", 1}, {"levels", {0.5, 1}}};
+    nlohmann::json one = configRow(1, "static", wp, "DP-1");
+    one["sound"] = unknownRow;
+    nlohmann::json six = configRow(6, "static", wp, "");
+    six["sound"] = true;
+    const nlohmann::json monitors = nlohmann::json::array({one, soundRow(40, false), six});
+    if (!writeFile(file, nlohmann::json({{"version", 1}, {"sound", unknownRoot}, {"monitors", monitors}}).dump())) {
+        notVerified(kGoals, "the config file this phase reads could not be written");
+        return;
+    }
+    WallpaperManager::Config managerConfig;
+    managerConfig.configFile = file;
+    WallpaperManager manager(managerConfig);
+    manager.restoreSaved();
+    manager.preserveUnreadableConfig();
+    manager.writeRepairedConfig();
+
+    const bool reported = globalSoundOf(manager) == "(unknown)" && monitorSoundOf(manager, 1) == "(unknown)" &&
+                          monitorSoundOf(manager, 6) == "on";
+    check(reported, "unknown sound values report null, and an explicit true reports on");
+    if (!reported) {
+        std::fprintf(stderr, "  every screen %s, monitor 1 %s, monitor 6 %s\n", globalSoundOf(manager).c_str(),
+                     monitorSoundOf(manager, 1).c_str(), monitorSoundOf(manager, 6).c_str());
+    }
+    bool heard = false;
+    try {
+        manager.setOutputFocus(":test.sound", "DP-1", wallpaperx::ScreenFocus::Window, false);
+        const WallpaperManager::Snapshot snap = manager.snapshot();
+        const auto it = snap.monitorSound.find(1);
+        heard = it != snap.monitorSound.end() && it->second.heard;
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "  the focus report was refused: %s\n", e.what());
+    }
+    check(heard, "a focused screen whose sound values are unknown at both levels is heard");
+
+    const bool saved = saveForAnotherReason(manager, paths->wallpapers[1].string(), 8);
+    check(saved, "the save this phase forces lands");
+    const bool asRead = saved && rootFieldIn(file, "sound") == unknownRoot.dump() &&
+                        fieldTextIn(file, 1, "sound") == unknownRow.dump() && fieldTextIn(file, 40, "sound") == "false";
+    check(asRead, "unknown sound values and a sound-only row for id 40 are written back as read");
+    const bool onDropped = saved && fieldTextIn(file, 6, "sound") == "(no field)";
+    check(onDropped, "an explicit sound true is not written again");
+    if (!asRead || !onDropped) std::fprintf(stderr, "  config.json: %s\n", readFile(file).c_str());
+}
+
+// GOAL: S15.463 -- for an id this build can use, the live sound setting is the only one written: a row
+//       kept for its unknown wallpaper type carries no sound of its own, so SetMonitorSound(5, true)
+//       removes the monitor's sound from the file.
+// CONTROL: two defences, as S15.135's -- via control_batch.sh, --phase '^a kept row's sound for a monitor
+//       this build uses$', 2026-10-11, `if (!soundTravels) keep.soundJson.clear();` deleted from
+//       WallpaperManager::restoreSaved (backend/daemon/wallpaper_manager.cpp) AND `row.soundJson.clear();`
+//       deleted from KeptRows::rowsToWrite's clearing loop (backend/daemon/kept_rows.cpp) -> this line red.
+//       Reverted. Each alone was not run.
+void runSoundKeptRowChecks() {
+    constexpr const char* kGoals = "S15.463 (a kept row's sound does not compete with the live setting)";
+    const ScratchDir scratch("soundkeptrow");
+    const std::optional<PhasePaths> paths = preparePhase(scratch, kGoals, 1);
+    if (!paths) return;
+    const ScopedEnv stateHome("XDG_STATE_HOME", stateHomeOf(scratch).string());
+    const std::filesystem::path& file = paths->config;
+    nlohmann::json five = configRow(5, "hologram", paths->wallpapers[0].string(), "");
+    five["sound"] = false;
+    if (!writeFile(file, nlohmann::json({{"version", 1}, {"monitors", nlohmann::json::array({five})}}).dump())) {
+        notVerified(kGoals, "the config file this phase reads could not be written");
+        return;
+    }
+    WallpaperManager::Config managerConfig;
+    managerConfig.configFile = file;
+    WallpaperManager manager(managerConfig);
+    manager.restoreSaved();
+    if (monitorSoundOf(manager, 5) != "off") {
+        check(false, "a sound setting on a row kept for its wallpaper type applies to that monitor");
+        std::fprintf(stderr, "  monitor 5: %s\n", monitorSoundOf(manager, 5).c_str());
+        return;
+    }
+    manager.setMonitorSound(5, true);
+    const bool idle = writerIdle(manager);
+    const nlohmann::json row = rowJsonIn(file, 5);
+    const bool removed = idle && row.is_object() && row.value("type", std::string()) == "hologram" && !row.contains("sound");
+    check(removed, "SetMonitorSound(true) removes the sound of a monitor whose row is kept for its type");
+    if (!removed) std::fprintf(stderr, "  config.json: %s\n", readFile(file).c_str());
+}
+
+// GOAL: S15.464 -- a start that finds several rows giving one monitor different sound values reports
+//       it once per monitor ("N monitors given conflicting sound settings"), ids kept for a newer build
+//       counted too, keeps the last row's value, and copies the file aside before rewriting it; rows
+//       that agree are no conflict.
+// WHY-THIS-SHAPE: monitor 0 false then true (a rule treating an explicit true as absent reads it as no
+//       conflict), monitor 1 false twice (agreeing), kept id 40 false then an unknown value; so the
+//       count is 2 only under the right rule, and monitor 0's last value differs from its first.
+// CONTROL: via control_batch.sh, --phase '^several rows giving one monitor a sound, disagreeing$',
+//       2026-10-11, each alone, reverted, in WallpaperManager::restoreSaved (backend/daemon/wallpaper_manager.cpp):
+//       `soundConflicts.insert(entry.monitorId);` deleted -> the count line, the copy line and the rewrite
+//       line red; `!soundConflicts.empty() ||` deleted from `repaired` -> the copy and rewrite lines red; an
+//       explicit true's `m_soundSettings.erase(entry.monitorId);` made a no-op, an earlier false winning -> "FAIL:
+//       the last row's sound value wins" and the rewrite line.
+void runSoundConflictChecks() {
+    constexpr const char* kGoals = "S15.464 (several rows giving one monitor different sound values)";
+    const ScratchDir scratch("soundconflict");
+    const std::optional<PhasePaths> paths = preparePhase(scratch, kGoals, 0);
+    if (!paths) return;
+    const ScopedEnv stateHome("XDG_STATE_HOME", stateHomeOf(scratch).string());
+    const std::filesystem::path& file = paths->config;
+    const std::filesystem::path copy = preservedCopyDir(scratch) / "config.json.bad";
+    const nlohmann::json monitors = nlohmann::json::array({soundRow(0, false), soundRow(1, false), soundRow(40, false),
+                                                           soundRow(0, true), soundRow(1, false), soundRow(40, "x")});
+    const std::string original = nlohmann::json({{"version", 1}, {"monitors", monitors}}).dump();
+    if (!writeFile(file, original)) {
+        notVerified(kGoals, "the config file this phase reads could not be written");
+        return;
+    }
+    WallpaperManager::Config managerConfig;
+    managerConfig.configFile = file;
+    WallpaperManager manager(managerConfig);
+    manager.restoreSaved();
+    manager.preserveUnreadableConfig();
+    manager.writeRepairedConfig();
+
+    const std::string detail = manager.snapshot().health.persistence.detail;
+    const std::optional<int> counted = clauseCountOrSkip(detail, " monitors given conflicting sound settings", kGoals);
+    if (counted) {
+        check(*counted == 2, "a start counts each monitor given conflicting sound values once");
+        if (*counted != 2) std::fprintf(stderr, "  %d counted; detail: %s\n", *counted, detail.c_str());
+    }
+    // Monitor 0 ends on an explicit true and has no wallpaper, so nothing lists it.
+    const bool lastWins = monitorSoundOf(manager, 0) == "(none)" && monitorSoundOf(manager, 1) == "off";
+    check(lastWins, "the last row's sound value wins");
+    if (!lastWins) {
+        std::fprintf(stderr, "  monitor 0 %s, monitor 1 %s\n", monitorSoundOf(manager, 0).c_str(),
+                     monitorSoundOf(manager, 1).c_str());
+    }
+    const bool copied = std::filesystem::exists(copy) && readFile(copy) == original;
+    check(copied, "a sound conflict copies the file aside first");
+    if (!copied) std::fprintf(stderr, "  copies: %s\n", joined(preservedCopyNames(file, preservedCopyDir(scratch))).c_str());
+    const bool rewritten = waitForFile([&] {
+        const nlohmann::json root = nlohmann::json::parse(readFile(file), nullptr, false);
+        if (root.is_discarded() || !root.contains("monitors") || root["monitors"].size() != 2) return false;
+        return fieldTextIn(file, 0, "sound") == "(no row)" && fieldTextIn(file, 1, "sound") == "false" &&
+               fieldTextIn(file, 40, "sound") == "\"x\"";
+    });
+    check(rewritten, "the rewrite carries one row per monitor with the last sound value");
+    if (!rewritten) std::fprintf(stderr, "  config.json: %s\n", readFile(file).c_str());
+}
+
+// GOAL: S15.465 -- a SetSound or SetMonitorSound that fails on an allocation changes nothing: the setting
+//       reads as it did, the file is as it was, and the same call unfaulted then reaches the file.
+// WHY-THIS-SHAPE: runPauseFailedCallChecks' sweep; each step asks for the value the last one did not.
+// CONTROL: via control_batch.sh, --phase '^a failed SetSound or SetMonitorSound changes nothing$',
+//       2026-10-11, reverted: the undo in the catch of WallpaperManager::commitLocked
+//       (backend/daemon/wallpaper_manager.cpp), which setSound and setMonitorSound both go through, deleted
+//       (`exchange();`) -> "FAIL: a SetSound that failed on an allocation left sound on every screen as it
+//       was", "FAIL: the same SetSound again, unfaulted, reaches the config file", and the same two lines
+//       for SetMonitorSound.
+void runSoundFailedCallChecks() {
+    constexpr const char* kGoals = "S15.465 (a SetSound or SetMonitorSound that fails on an allocation changes nothing)";
+#if !WALLPAPERX_ALLOCATION_INSTRUMENT
+    notVerified(kGoals, "this build replaces no allocator -- the instrument is compiled out under a sanitizer");
+#else
+    SweepFixture fx("soundalloc", kGoals);
+    if (!fx.manager) return;
+    const std::filesystem::path file = fx.paths->config;
+    WallpaperManager& manager = *fx.manager;
+    const auto onFor = [](long long step) { return step % 2 != 0; };
+    {
+        const FailedCallSweep sweep{
+            "SetSound",
+            "sound on every screen as it was",
+            false,
+            [](long long) {},
+            [&](long long step, long long failAt, std::vector<int>&) {
+                const FailAllocation armed(failAt);
+                manager.setSound(onFor(step));
+            },
+            [&] { return globalSoundOf(manager); },
+            [&](long long step) { return rootFieldIn(file, "sound") == (onFor(step) ? "(no field)" : "false"); },
+        };
+        gradeFailedCallSweep(sweep, sweepFailedCall([&]() -> WallpaperManager& { return manager; }, file, sweep), kGoals);
+    }
+    {
+        const FailedCallSweep sweep{
+            "SetMonitorSound",
+            "the monitor's sound setting as it was",
+            false,
+            [](long long) {},
+            [&](long long step, long long failAt, std::vector<int>&) {
+                const FailAllocation armed(failAt);
+                manager.setMonitorSound(3, onFor(step));
+            },
+            [&] { return monitorSoundOf(manager, 3); },
+            [&](long long step) { return fieldTextIn(file, 3, "sound") == (onFor(step) ? "(no field)" : "false"); },
+        };
+        gradeFailedCallSweep(sweep, sweepFailedCall([&]() -> WallpaperManager& { return manager; }, file, sweep), kGoals);
     }
 #endif
 }
@@ -11435,6 +11865,7 @@ int main() {
         {"a kept row's properties, exactly", runKeptPropertiesVerbatimChecks},
         {"a kept row's screen size, exactly", runKeptOutputSizeVerbatimChecks},
         {"a saved speed above 2", runSavedSpeedAboveCapChecks},
+        {"a saved volume outside 0 to 1", runSavedVolumeOutsideRangeChecks},
         {"losses a later row made up for", runSupersededLossCountChecks},
         {"a rejected size on a name a later row unbound", runUnboundRejectedSizeChecks},
         {"a monitor's pause setting across a restart", runPauseRestartChecks},
@@ -11444,6 +11875,12 @@ int main() {
         {"several rows giving one monitor a pause, disagreeing", runPauseConflictChecks},
         {"several rows agreeing on a pause", runPauseAgreementChecks},
         {"a failed SetMonitorPause changes nothing", runPauseFailedCallChecks},
+        {"sound settings across a restart", runSoundRestartChecks},
+        {"a sound setting in the store", runSoundStoreChecks},
+        {"sound values this build does not know", runSoundUnknownValueChecks},
+        {"a kept row's sound for a monitor this build uses", runSoundKeptRowChecks},
+        {"several rows giving one monitor a sound, disagreeing", runSoundConflictChecks},
+        {"a failed SetSound or SetMonitorSound changes nothing", runSoundFailedCallChecks},
     };
     for (const Phase& phase : kPhases) {
         if (!wallpaperx::testing::phaseSelected(phase.name)) continue;

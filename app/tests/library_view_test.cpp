@@ -268,23 +268,70 @@ void detail(QQmlEngine& engine, QQuickWindow& window, LibraryManager& library, A
     QStringList order;
     QQuickItem* slider = nullptr;
     QQuickItem* toggle = nullptr;
+    QQuickItem* speedRow = nullptr;
+    QQuickItem* muteRow = nullptr;
+    QQuickItem* volumeRow = nullptr;
     for (QQuickItem* row : rows) {
         const QString key = row->property("modelData").value<WallpaperProperty>().key;
         order.append(key);
         if (key == u"speed") {
             slider = firstInheriting(row, "QQuickSlider");
+            speedRow = row;
         } else if (key == u"mute") {
             toggle = firstInheriting(row, "QQuickSwitch");
+            muteRow = row;
+        } else if (key == u"volume") {
+            volumeRow = row;
         }
     }
-    // GOAL: S15.46 -- the detail view lists the settings top to bottom in wallpaper.json's order.
+    // GOAL: S15.46 -- the detail view lists the settings top to bottom in wallpaper.json's order, the
+    //       volume the library adds for a video with sound after them.
     // CONTROL: app/qml/WallpaperDetail.qml, the Repeater's `model: root.chosen.properties` made
-    //       `root.chosen.properties.slice().sort((a, b) => a.key.localeCompare(b.key))` -> red,
-    //       "S15.46: the settings are shown as mute,speed,tint"; restored.
-    expect(order.join(u',') == u"speed,mute,tint", QStringLiteral("S15.46: the settings are shown as %1, not speed,mute,tint").arg(order.join(u',')));
-    if (!slider || !toggle) {
-        expect(false, QStringLiteral("S15.46: no slider for speed or no switch for mute"));
+    //       `root.chosen.properties.slice().sort((a, b) => a.key.localeCompare(b.key))` (control_batch,
+    //       re-run 2026-10-11) -> red, "S15.46: the settings are shown as mute,speed,tint,volume"; restored.
+    expect(order.join(u',') == u"speed,mute,tint,volume",
+           QStringLiteral("S15.46: the settings are shown as %1, not speed,mute,tint,volume").arg(order.join(u',')));
+    if (!slider || !toggle || !volumeRow) {
+        expect(false, QStringLiteral("S15.46: no slider for speed, no switch for mute or no row for volume"));
         return;
+    }
+    // The shown texts of a row's labels, left to right.
+    const auto textsOf = [](QQuickItem* row) {
+        QList<QQuickItem*> labels;
+        for (QQuickItem* item : allInheriting(row, "QQuickText")) {
+            if (item->isVisible() && !item->property("text").toString().isEmpty()) {
+                labels.append(item);
+            }
+        }
+        std::ranges::sort(labels, {}, [](const QQuickItem* item) { return item->mapToScene(QPointF(0, 0)).x(); });
+        QStringList texts;
+        for (const QQuickItem* item : labels) {
+            texts.append(item->property("text").toString());
+        }
+        return texts;
+    };
+
+    // GOAL: S15.482 -- a video's own sound settings are labelled "Sound" and "Volume" whatever
+    //       wallpaper.json calls them, and the volume shows as a whole percentage: 100 % at 1, 25 % at
+    //       0.25, while another float keeps two decimals.
+    // CONTROL: via control_batch.sh, 2026-10-11, each alone, reverted, in app/qml/WallpaperDetail.qml: the
+    //       volume's percentage made `Number(row.current).toFixed(2)` -> "FAIL: S15.482: ... the volume row
+    //       [Volume, 1.00] at 1 and [Volume, 0.25] at 0.25 ..."; the label made `row.modelData.label` ->
+    //       "... the mute row reads [Mute], the volume row [volume, 100 %] ...".
+    {
+        const QStringList muteTexts = textsOf(muteRow);
+        const QStringList speedTexts = textsOf(speedRow);
+        const QStringList atOne = textsOf(volumeRow);
+        library.setPropertyValue(QStringLiteral("volume"), 0.25);
+        settleEvents(window);
+        const QStringList atQuarter = textsOf(volumeRow);
+        library.resetPropertyValues();
+        settleEvents(window);
+        expect(muteTexts.value(0) == u"Sound" && atOne == QStringList{QStringLiteral("Volume"), QStringLiteral("100 %")} &&
+                   atQuarter == QStringList{QStringLiteral("Volume"), QStringLiteral("25 %")} &&
+                   speedTexts == QStringList{QStringLiteral("Speed"), QStringLiteral("1.00")},
+               QStringLiteral("S15.482: the mute row reads [%1], the volume row [%2] at 1 and [%3] at 0.25, the speed row [%4]")
+                   .arg(muteTexts.join(u", "), atOne.join(u", "), atQuarter.join(u", "), speedTexts.join(u", ")));
     }
     const auto sliderValue = [&] { return slider->property("value").toDouble(); };
     const auto speed = [&] { return library.propertyValues().value(QStringLiteral("speed")).toDouble(); };
@@ -321,20 +368,28 @@ void detail(QQmlEngine& engine, QQuickWindow& window, LibraryManager& library, A
     settleEvents(window);
     expect(sliderValue() == 1.0, QStringLiteral("S15.46: after a drag and a reset the slider shows %1, not 1").arg(sliderValue()));
 
-    // GOAL: S15.46 -- the mute switch likewise: a click turns the library's mute off, and a
-    //       reset afterwards turns the switch back on.
-    // CONTROL: app/qml/WallpaperDetail.qml, the Switch's `onToggled: root.library.setPropertyValue(row.modelData.key, checked)`
-    //       made `onToggled: { root.library.setPropertyValue(row.modelData.key, checked); checked = checked; }`
-    //       -> red, "S15.46: after a click and a reset the switch is off"; restored.
+    // GOAL: S15.46 and S15.481 -- the mute setting shows as a "Sound" switch that is on when the
+    //       wallpaper is not muted: muted by default, it starts off; a click turns it on and the library's
+    //       mute off; a reset afterwards turns the switch back off.
+    // WHY-THIS-SHAPE: a declared default of mute true, so on/off and muted/unmuted differ at every step
+    //       and a switch showing mute itself reads the opposite.
+    // CONTROL: via control_batch.sh, 2026-10-11, each alone, reverted, in app/qml/WallpaperDetail.qml: the
+    //       Switch's `checked` without `!== row.isMute` -> "FAIL: S15.481: a muted wallpaper's Sound switch
+    //       started on; after a click the library holds mute true and the switch is off"; its onToggled without
+    //       the inversion -> "... started off; after a click the library holds mute true and the switch is on"
+    //       and the reset line; onToggled given `checked = checked;` after the write (the binding cut) ->
+    //       "FAIL: S15.46: after a click and a reset the Sound switch is on", alone.
+    const bool startsOff = !toggle->property("checked").toBool();
     QTest::mouseClick(&window, Qt::LeftButton, {}, centreOf(toggle));
     settleEvents(window);
     const QVariant muted = library.propertyValues().value(QStringLiteral("mute"));
-    expect(muted == QVariant(false) && !toggle->property("checked").toBool(),
-           QStringLiteral("S15.46: after clicking the switch the library holds mute %1 and the switch is %2")
-               .arg(muted.toString(), toggle->property("checked").toBool() ? QStringLiteral("on") : QStringLiteral("off")));
+    expect(startsOff && muted == QVariant(false) && toggle->property("checked").toBool(),
+           QStringLiteral("S15.481: a muted wallpaper's Sound switch started %1; after a click the library holds mute %2 and the switch is %3")
+               .arg(startsOff ? QStringLiteral("off") : QStringLiteral("on"), muted.toString(),
+                    toggle->property("checked").toBool() ? QStringLiteral("on") : QStringLiteral("off")));
     library.resetPropertyValues();
     settleEvents(window);
-    expect(toggle->property("checked").toBool(), QStringLiteral("S15.46: after a click and a reset the switch is off"));
+    expect(!toggle->property("checked").toBool(), QStringLiteral("S15.46: after a click and a reset the Sound switch is on"));
 }
 
 // S15.52, S15.55: a library too long to fit, scrolled to its end.
@@ -626,7 +681,8 @@ int main(int argc, char* argv[]) {
 
     const QString dir = scratch.path() + QStringLiteral("/lib #?% é");
     const QString ocean = dir + QStringLiteral("/ocean");
-    if (!writeFolder(ocean, planEntries(QByteArray(kPlanManifest))).isEmpty() ||
+    // A video with sound, so the detail view offers its sound controls (S15.473).
+    if (!writeFolder(ocean, planEntriesWith(QByteArray(kPlanManifest), soundVideo())).isEmpty() ||
         !writeFolder(dir + QStringLiteral("/broken"), {{QStringLiteral("wallpaper.json"), "hello"}}).isEmpty()) {
         harnessFailure("the library folder could not be built");
         static_cast<void>(wallpaperx::testing::reportHarnessFaults("in this test file's fixtures, not in the app"));

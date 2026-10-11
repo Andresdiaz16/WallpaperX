@@ -47,8 +47,8 @@ public:
 private:
     void registerVTable();
 
-    // Emits ConfigChanged: what the config server answers may have changed, so consumers read it
-    // again. Not at startup: the config server answers before the name is claimed, so the name's
+    // Emits ConfigChanged: what the config server answers, or a setting GetStatus reports, may have
+    // changed, so consumers read it again. Not at startup: the config server answers before the name is claimed, so the name's
     // arrival is that notice.
     void announceConfigChanged();
 
@@ -87,9 +87,14 @@ private:
     // which is what stops or resumes the video.
     void setMonitorPause(int32_t monitorId, const std::string& mode);
 
+    // Sound on or off for every screen, and for one monitor. Saved and waited on like
+    // SetMonitorPause; a change announces ConfigChanged.
+    void setSound(bool on);
+    void setMonitorSound(int32_t monitorId, bool on);
+
     // What the screen named `outputName` says about its windows, recorded against `client` -- the
     // sender -- so it ends when that process leaves the bus. Wakes the worker for the same reason.
-    void setOutputFocus(const std::string& client, const std::string& outputName, bool windowFocused,
+    void setOutputFocus(const std::string& client, const std::string& outputName, ScreenFocus focus,
                         bool windowMaximized);
 
     void emitFrameReady(int monitorId, uint64_t generation);

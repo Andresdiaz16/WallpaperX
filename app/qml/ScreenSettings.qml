@@ -22,6 +22,13 @@ ColumnLayout {
                                                           : root.daemon.pauseModes[root.output];
         return mode === undefined ? "play" : mode;
     }
+    // A screen the daemon has no setting for has sound.
+    readonly property bool shownSound: {
+        const pending = root.applier.pendingScreenSound;
+        if (pending !== undefined)
+            return pending;
+        return root.daemon.screenSound[root.output] !== false;
+    }
 
     spacing: 4
 
@@ -59,6 +66,24 @@ ColumnLayout {
             visible: root.applier.pauseState === ApplyController.Working
             running: visible
         }
+        Switch {
+            id: screenSound
+
+            text: qsTr("Sound on this screen")
+            enabled: root.daemon.state === DaemonClient.Ready && root.applier.screenSoundState !== ApplyController.Working
+            checked: root.shownSound
+            onToggled: {
+                root.applier.setScreenSound(screenSound.checked);
+                // As the pause choice: shown once the daemon has it.
+                screenSound.checked = Qt.binding(() => root.shownSound);
+            }
+        }
+        BusyIndicator {
+            Layout.preferredHeight: screenSound.implicitHeight
+            Layout.preferredWidth: screenSound.implicitHeight
+            visible: root.applier.screenSoundState === ApplyController.Working
+            running: visible
+        }
         Item {
             Layout.fillWidth: true
         }
@@ -75,6 +100,13 @@ ColumnLayout {
                 return root.applier.pauseMessage;
             return "";
         }
+    }
+    Label {
+        Layout.fillWidth: true
+        wrapMode: Text.Wrap
+        textFormat: Text.PlainText
+        visible: text !== ""
+        text: root.applier.screenSoundState === ApplyController.Failed ? root.applier.screenSoundMessage : ""
     }
     Label {
         Layout.fillWidth: true

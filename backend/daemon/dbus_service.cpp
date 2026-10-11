@@ -309,13 +309,33 @@ void DbusService::registerVTable() {
             sdbus::registerMethod("SetMonitorPause")
                 .implementedAs([this](int32_t monitorId, const std::string& mode) { setMonitorPause(monitorId, mode); })
                 .withInputParamNames("monitor_id", "mode"),
+            sdbus::registerMethod("SetSound").implementedAs([this](bool on) { setSound(on); }).withInputParamNames("on"),
+            sdbus::registerMethod("SetMonitorSound")
+                .implementedAs([this](int32_t monitorId, bool on) { setMonitorSound(monitorId, on); })
+                .withInputParamNames("monitor_id", "on"),
+            // A plugin that cannot report the desktop's focus. Kept for one built before
+            // SetOutputFocusState.
             sdbus::registerMethod("SetOutputFocus")
                 .implementedAs([this](const std::string& outputName, bool windowFocused, bool windowMaximized) {
                     // The sender, for SetImportModifiers' reason: it is what a departure names.
                     const char* sender = m_object->getCurrentlyProcessedMessage().getSender();
-                    setOutputFocus(sender ? sender : "", outputName, windowFocused, windowMaximized);
+                    setOutputFocus(sender ? sender : "", outputName,
+                                   windowFocused ? ScreenFocus::Window : ScreenFocus::None, windowMaximized);
                 })
                 .withInputParamNames("output_name", "window_focused", "window_maximized"),
+            sdbus::registerMethod("SetOutputFocusState")
+                .implementedAs([this](const std::string& outputName, const std::string& focus, bool windowMaximized) {
+                    const std::optional<ScreenFocus> parsed = screenFocusFromName(focus);
+                    if (!parsed) {
+                        const std::string message = "unknown focus " + sanitizeForLog(focus) +
+                                                    " (expected none, window or desktop)";
+                        std::fprintf(stderr, "wallpaperx-daemon: SetOutputFocusState rejected: %s\n", message.c_str());
+                        throw sdbus::Error(sdbus::Error::Name{kErrorInvalidArgs}, message);
+                    }
+                    const char* sender = m_object->getCurrentlyProcessedMessage().getSender();
+                    setOutputFocus(sender ? sender : "", outputName, *parsed, windowMaximized);
+                })
+                .withInputParamNames("output_name", "focus", "window_maximized"),
             sdbus::registerMethod("GetStatus").implementedAs([this]() { return getStatus(); }).withOutputParamNames("status"),
             // frame_generation rides along with the monitor id. A bare FrameReady(monitor)
             // was unambiguous only while rendering was synchronous; now that several
@@ -331,7 +351,8 @@ void DbusService::registerVTable() {
             // schedule would have to poll. This says "the answer may have changed", once.
             sdbus::registerSignal("ImportModifiersChanged"),
             // No parameters, for the same reason: a consumer reads /config again, and that answer
-            // is the whole of what changed. Sent for a wallpaper set and a screen named.
+            // is the whole of what changed. Sent for a wallpaper set, a screen named and a sound
+            // setting changed.
             sdbus::registerSignal("ConfigChanged"))
         .forInterface(std::string(kInterface));
 }
@@ -550,11 +571,42 @@ void DbusService::setMonitorPause(int32_t monitorId, const std::string& mode) {
     m_worker.wake();
 }
 
-void DbusService::setOutputFocus(const std::string& client, const std::string& outputName, bool windowFocused,
+void DbusService::setSound(bool on) {
+    std::printf("wallpaperx-daemon: SetSound(on=%s)\n", on ? "true" : "false");
+    std::fflush(stdout);
+
+    bool changed = false;
+    try {
+        changed = m_manager.setSound(on);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "wallpaperx-daemon: SetSound failed: %s\n", e.what());
+        throw sdbus::Error(sdbus::Error::Name{kErrorRenderFailed}, e.what());
+    }
+    if (changed) announceConfigChanged();
+}
+
+void DbusService::setMonitorSound(int32_t monitorId, bool on) {
+    std::printf("wallpaperx-daemon: SetMonitorSound(monitor=%d, on=%s)\n", monitorId, on ? "true" : "false");
+    std::fflush(stdout);
+
+    bool changed = false;
+    try {
+        changed = m_manager.setMonitorSound(monitorId, on);
+    } catch (const InvalidRequest& e) {
+        std::fprintf(stderr, "wallpaperx-daemon: SetMonitorSound rejected (monitor=%d): %s\n", monitorId, e.what());
+        throw sdbus::Error(sdbus::Error::Name{kErrorInvalidArgs}, e.what());
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "wallpaperx-daemon: SetMonitorSound failed (monitor=%d): %s\n", monitorId, e.what());
+        throw sdbus::Error(sdbus::Error::Name{kErrorRenderFailed}, e.what());
+    }
+    if (changed) announceConfigChanged();
+}
+
+void DbusService::setOutputFocus(const std::string& client, const std::string& outputName, ScreenFocus focus,
                                  bool windowMaximized) {
     // Refusals only: this follows every change of the focused window.
     try {
-        m_manager.setOutputFocus(client, outputName, windowFocused, windowMaximized);
+        m_manager.setOutputFocus(client, outputName, focus, windowMaximized);
     } catch (const UnknownOutput& e) {
         std::fprintf(stderr, "wallpaperx-daemon: SetOutputFocus rejected: %s\n", e.what());
         throw sdbus::Error(sdbus::Error::Name{kErrorUnknownOutput}, e.what());
@@ -915,10 +967,23 @@ std::string DbusService::getStatus() {
         pause[std::to_string(monitorId)] = {
             {"mode", monitor.mode ? nlohmann::json(toString(*monitor.mode)) : nlohmann::json(nullptr)},
             {"paused", monitor.paused},
-            {"window_focused", monitor.windowFocused},
+            {"focus", toString(monitor.focus)},
+            {"window_focused", monitor.focus == ScreenFocus::Window},
             {"window_maximized", monitor.windowMaximized}};
     }
     status["pause"] = std::move(pause);
+
+    // `enabled` is null for a setting a newer build wrote, which this one keeps and treats as on.
+    // `heard` is what the three levels and the screen's focus report come to now; it does not say
+    // whether the wallpaper has sound to play.
+    nlohmann::json monitorSound = nlohmann::json::object();
+    for (const auto& [monitorId, monitor] : snap.monitorSound) {
+        monitorSound[std::to_string(monitorId)] = {
+            {"enabled", monitor.enabled ? nlohmann::json(*monitor.enabled) : nlohmann::json(nullptr)},
+            {"heard", monitor.heard}};
+    }
+    status["sound"] = {{"enabled", snap.sound ? nlohmann::json(*snap.sound) : nlohmann::json(nullptr)},
+                       {"monitors", std::move(monitorSound)}};
 
     return status.dump();
 }

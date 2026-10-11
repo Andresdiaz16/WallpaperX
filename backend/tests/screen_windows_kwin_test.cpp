@@ -54,7 +54,8 @@ using wallpaperx::testing::pumpFor;
 using wallpaperx::testing::pumpUntil;
 using wallpaperx::testing::ReportStub;
 
-const QString kFocus = QStringLiteral("SetOutputFocus");
+// The focus report: SetOutputFocusState(name, "window" | "desktop" | "none", maximized).
+const QString kFocus = QStringLiteral("SetOutputFocusState");
 const QString kOutput = QStringLiteral("WPX-KWIN");
 constexpr int kSettleLimitMs = 8000;
 // Long enough for KWin to map and place a new window, so the client's answer names its output.
@@ -131,13 +132,16 @@ int runClient(int argc, char** argv) {
 
 // ---- the scene ------------------------------------------------------------------------------- //
 
+// The focus as the report names it. The wallpaper here is a layer-shell background that takes no
+// keyboard focus, so KWin never activates it: every state without a focused window is "none".
 struct Facts {
-    bool focused = false;
+    QString focus = QStringLiteral("none");
     bool maximized = false;
     bool operator==(const Facts&) const = default;
 };
+Facts focusedWindow(bool maximized) { return {QStringLiteral("window"), maximized}; }
 
-std::string text(Facts f) { return std::string("(") + (f.focused ? "T" : "F") + "," + (f.maximized ? "T" : "F") + ")"; }
+std::string text(const Facts& f) { return "(" + f.focus.toStdString() + "," + (f.maximized ? "T" : "F") + ")"; }
 
 }  // namespace
 
@@ -200,9 +204,9 @@ Window {
     const auto last = [&]() -> std::optional<Facts> {
         const std::vector<ReportStub::Call> calls = stub.calls(kFocus, kOutput);
         if (calls.empty()) return std::nullopt;
-        return Facts{calls.back().args.value(1).toBool(), calls.back().args.value(2).toBool()};
+        return Facts{calls.back().args.value(1).toString(), calls.back().args.value(2).toBool()};
     };
-    const auto settlesOn = [&](Facts want) { return pumpUntil([&] { return last() == want; }, kSettleLimitMs); };
+    const auto settlesOn = [&](const Facts& want) { return pumpUntil([&] { return last() == want; }, kSettleLimitMs); };
     const auto history = [&](std::size_t mark) { return ReportStub::describe(stub.calls(kFocus, kOutput, mark)); };
 
     // The precondition every step is measured from: the wallpaper reports no window, and its watcher
@@ -212,12 +216,28 @@ Window {
     const QString wallpaperScreen = window != nullptr && window->screen() != nullptr ? window->screen()->name() : QString();
     QObject* windowsLoader = surface->findChild<QObject*>(QStringLiteral("wallpaperxWindows"));
     QObject* watcher = windowsLoader != nullptr ? windowsLoader->property("item").value<QObject*>() : nullptr;
-    if (watcher == nullptr || wallpaperScreen.isEmpty() || !settlesOn({})) {
+    const bool noWindow = pumpUntil(
+        [&] {
+            const std::optional<Facts> now = last();
+            return now && now->focus != QLatin1String("window") && !now->maximized;
+        },
+        kSettleLimitMs);
+    if (watcher == nullptr || wallpaperScreen.isEmpty() || !noWindow) {
         notVerified(kGoals, "the wallpaper never loaded its window watcher on an output and settled on reporting no "
                             "window (reports: " + history(0) + ")");
         return wallpaperx::testing::reportNotVerifiedOrPassed();
     }
     std::fprintf(stderr, "  the wallpaper is on %s\n", qPrintable(wallpaperScreen));
+    // GOAL: with no window open the screen reports no focus at all ("none"), not the desktop: this
+    //       wallpaper takes no keyboard focus, so KWin never activates it, here or in any step below
+    //       that ends with no window focused.
+    // WHY-THIS-SHAPE: the precondition above accepts any state without a focused window, so a report of
+    //       "desktop" is graded here as the plugin's, not skipped as a harness that never settled.
+    // CONTROL: via control_batch.sh, 2026-10-11, `&& root.Window.active` dropped from desktopFocused in
+    //       backend/kde/kpackage/contents/ui/ScreenWindows.qml -> this line red, with "showing the desktop
+    //       reports no window and no focused desktop", "minimizing a maximized window reports no window" and
+    //       "a fullscreen window on the other output does not count here". Reverted.
+    check(settlesOn({}), "with no window open the screen reports \"none\", not the desktop");
 
     QProcess client;
     client.setProcessChannelMode(QProcess::ForwardedErrorChannel);
@@ -256,12 +276,12 @@ Window {
     };
 
     // One step: a command and the state this screen must settle on.
-    const auto settleCheck = [&](std::size_t mark, Facts want, const char* what) {
+    const auto settleCheck = [&](std::size_t mark, const Facts& want, const char* what) {
         const bool settled = settlesOn(want);
         check(settled, what);
         if (!settled) std::fprintf(stderr, "  wanted %s; saw %s\n", text(want).c_str(), history(mark).c_str());
     };
-    const auto step = [&](const char* command, Facts want, const char* what) {
+    const auto step = [&](const char* command, const Facts& want, const char* what) {
         const std::size_t mark = stub.mark();
         if (send(command)) settleCheck(mark, want, what);
     };
@@ -297,9 +317,9 @@ Window {
             if (wallpaperx::testing::reportHarnessFaults("in this test's client, not in the plugin")) return 1;
             return wallpaperx::testing::reportNotVerifiedOrPassed();
         }
-        settleCheck(mark, {true, false}, "a window opened on this screen is reported focused");
+        settleCheck(mark, focusedWindow(false), "a window opened on this screen is reported focused");
     }
-    step("max", {true, true}, "maximizing it reports a maximized window");
+    step("max", focusedWindow(true), "maximizing it reports a maximized window");
 
     // GOAL: "show desktop" turns both facts off while it is on: windows are hidden, not minimized.
     // CONTROL: `!KWindowSystem.showingDesktop &&` dropped from both bindings in ScreenWindows.qml ->
@@ -312,15 +332,15 @@ Window {
         notVerified("the show-desktop step", "org.kde.kwindowsystem could not be loaded to turn it on");
     } else {
         QMetaObject::invokeMethod(desktop.get(), "show", Q_ARG(QVariant, true));
-        check(settlesOn({}), "showing the desktop reports no window");
+        check(settlesOn({}), "showing the desktop reports no window and no focused desktop");
         QMetaObject::invokeMethod(desktop.get(), "show", Q_ARG(QVariant, false));
-        check(settlesOn({true, true}), "and leaving it reports the maximized window again");
+        check(settlesOn(focusedWindow(true)), "and leaving it reports the maximized window again");
     }
 
-    step("normal", {true, false}, "restoring it reports a window that is not maximized");
-    step("full", {true, true}, "making it fullscreen reports a maximized window");
-    step("normal", {true, false}, "restoring it from fullscreen reports a window that is not maximized");
-    step("max", {true, true}, "maximizing it again");
+    step("normal", focusedWindow(false), "restoring it reports a window that is not maximized");
+    step("full", focusedWindow(true), "making it fullscreen reports a maximized window");
+    step("normal", focusedWindow(false), "restoring it from fullscreen reports a window that is not maximized");
+    step("max", focusedWindow(true), "maximizing it again");
     // GOAL: a minimized window counts nowhere, though it is still maximized.
     // CONTROL: `filterMinimized: false` in ScreenWindows.qml -> this line red, and the other-output
     //       line below with it (the minimized maximized window still counts here).
@@ -351,7 +371,7 @@ Window {
                 pumpFor(kPlaceMs);
                 bool claimed = false;
                 for (const ReportStub::Call& call : stub.calls(kFocus, kOutput, mark)) {
-                    if (call.args.value(1).toBool() || call.args.value(2).toBool()) claimed = true;
+                    if (call.args.value(1).toString() != QLatin1String("none") || call.args.value(2).toBool()) claimed = true;
                 }
                 check(settled && !claimed && last() == Facts{},
                       "a fullscreen window on the other output does not count here");

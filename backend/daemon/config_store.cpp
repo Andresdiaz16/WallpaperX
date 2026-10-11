@@ -41,6 +41,7 @@ constexpr const char* kKeyWidth = "width";
 constexpr const char* kKeyHeight = "height";
 constexpr const char* kKeyProperties = "properties";
 constexpr const char* kKeyPause = "pause";
+constexpr const char* kKeySound = "sound";
 
 // load() returns from a dozen places; this is what keeps the descriptor from leaking out
 // of any of them.
@@ -255,6 +256,8 @@ LoadResult ConfigStore::load() const {
             result.error = describe(m_file, "has no monitors array");
             return result;
         }
+        // Not judged here, like pause below: see PersistedWallpaper::propertiesJson.
+        if (root.contains(kKeySound)) result.soundJson = root.at(kKeySound).dump();
 
         for (const nlohmann::json& element : root.at(kKeyMonitors)) {
             PersistedWallpaper entry;
@@ -275,26 +278,29 @@ LoadResult ConfigStore::load() const {
             // A config written before properties existed has none.
             if (element.contains(kKeyProperties)) entry.propertiesJson = element.at(kKeyProperties).dump();
             if (element.contains(kKeyPause)) entry.pauseJson = element.at(kKeyPause).dump();
+            if (element.contains(kKeySound)) entry.soundJson = element.at(kKeySound).dump();
             result.entries.push_back(std::move(entry));
         }
     } catch (const std::exception& e) {
         result.entries.clear();
+        result.soundJson.clear();
         result.error = describe(m_file, std::string("could not be read: ") + e.what());
     } catch (...) {
         result.entries.clear();
+        result.soundJson.clear();
         result.error = describe(m_file, "could not be read");
     }
     return result;
 }
 
-SaveResult ConfigStore::save(const std::vector<PersistedWallpaper>& entries) const {
+SaveResult ConfigStore::save(const PersistedConfig& config) const {
     SaveResult result;
     if (!enabled()) return result;
 
     const std::filesystem::path temp = m_file.string() + ".tmp";
     try {
         nlohmann::json monitors = nlohmann::json::array();
-        for (const PersistedWallpaper& entry : entries) {
+        for (const PersistedWallpaper& entry : config.monitors) {
             // dump() throws on invalid UTF-8 and Linux paths are arbitrary bytes, so a
             // single unusual filename would otherwise cost every monitor its wallpaper.
             // Dropping just this entry keeps the rest, and the count tells the caller a
@@ -312,7 +318,7 @@ SaveResult ConfigStore::save(const std::vector<PersistedWallpaper>& entries) con
             // file cannot carry leaves the screen anonymous either way.
             if (!nameOk && !entry.output.empty()) ++result.skippedNames;
             // Nothing left worth a row.
-            if (!wallpaperOk && (!nameOk || entry.output.empty()) && entry.pauseJson.empty()) continue;
+            if (!wallpaperOk && (!nameOk || entry.output.empty()) && !entry.holdsMonitorSettings()) continue;
 
             // Both keys stay present whatever survives: load() reads a row missing either one
             // as malformed, which would turn a degraded write into a lost row at the next start.
@@ -343,9 +349,18 @@ SaveResult ConfigStore::save(const std::vector<PersistedWallpaper>& entries) con
                 nlohmann::json pause = nlohmann::json::parse(entry.pauseJson, nullptr, false);
                 if (!pause.is_discarded()) row[kKeyPause] = std::move(pause);
             }
+            // The same: absent means on.
+            if (!entry.soundJson.empty()) {
+                nlohmann::json sound = nlohmann::json::parse(entry.soundJson, nullptr, false);
+                if (!sound.is_discarded()) row[kKeySound] = std::move(sound);
+            }
             monitors.push_back(std::move(row));
         }
-        const nlohmann::json root{{kKeyVersion, kSchemaVersion}, {kKeyMonitors, std::move(monitors)}};
+        nlohmann::json root{{kKeyVersion, kSchemaVersion}, {kKeyMonitors, std::move(monitors)}};
+        if (!config.soundJson.empty()) {
+            nlohmann::json sound = nlohmann::json::parse(config.soundJson, nullptr, false);
+            if (!sound.is_discarded()) root[kKeySound] = std::move(sound);
+        }
         const std::string text = root.dump(2) + "\n";
 
         constexpr int kFlags = O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW;

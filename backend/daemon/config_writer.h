@@ -33,7 +33,7 @@ struct PersistWorker {
 
     // One slot, not a queue: the newest snapshot already describes everything the older ones
     // would have written.
-    std::optional<std::vector<PersistedWallpaper>> pending;
+    std::optional<PersistedConfig> pending;
 
     // Set when a snapshot is handed over, cleared when the write returns. A value that stays
     // put is what tells the health report the filesystem has stopped answering.
@@ -87,10 +87,10 @@ public:
     void allow();
     bool refusing() const;
 
-    // Hands rows over without waiting. False when nothing was queued -- disabled, refused, or
+    // Hands the file's contents over without waiting. False when nothing was queued -- disabled, refused, or
     // no thread -- and outcome() then carries which. Taken by value so the copy, if any, is made
     // before anything here changes: a throw leaves this object as it was.
-    bool queue(std::vector<PersistedWallpaper> rows);
+    bool queue(PersistedConfig config);
 
     // A bounded wait for the last queue() to land: a wait that runs out leaves the write in
     // flight and the rows not known to be on disk. Returns whether they reached the file, true

@@ -441,6 +441,28 @@ inline void setOutputFocus(sdbus::IProxy& proxy, const std::string& outputName, 
         .withArguments(outputName, windowFocused, windowMaximized);
 }
 
+// The same report naming what holds the focus -- "none", "window" or "desktop" -- as the plugin sends
+// it now. Shared for setOutputSize's reason.
+inline void setOutputFocusState(sdbus::IProxy& proxy, const std::string& outputName, const std::string& focus,
+                                bool windowMaximized, std::chrono::microseconds timeout = {}) {
+    proxy.callMethod("SetOutputFocusState")
+        .onInterface(DbusService::kInterface)
+        .withTimeout(timeout)
+        .withArguments(outputName, focus, windowMaximized);
+}
+
+// Sound on or off for every screen, and for one monitor. Shared for setOutputSize's reason.
+inline void setSound(sdbus::IProxy& proxy, bool on, std::chrono::microseconds timeout = {}) {
+    proxy.callMethod("SetSound").onInterface(DbusService::kInterface).withTimeout(timeout).withArguments(on);
+}
+
+inline void setMonitorSound(sdbus::IProxy& proxy, int32_t monitorId, bool on, std::chrono::microseconds timeout = {}) {
+    proxy.callMethod("SetMonitorSound")
+        .onInterface(DbusService::kInterface)
+        .withTimeout(timeout)
+        .withArguments(monitorId, on);
+}
+
 // Reports what the frame consumer can import, as the plugin's render thread does.
 //
 // Here rather than in one test file for the same reason as setMonitorOutput above: the
@@ -623,6 +645,25 @@ inline const nlohmann::json* pauseStatus(const StatusReply& status, const std::s
     if (!pause.is_object()) return nullptr;
     const auto it = pause.find(monitorId);
     return it != pause.end() && it->is_object() ? &*it : nullptr;
+}
+
+// GetStatus's top-level `sound` object, or null when it is missing or not an object. Guarded as
+// wallpaperStatus() is.
+inline const nlohmann::json* soundStatus(const StatusReply& status) {
+    const nlohmann::json& json = status.json();
+    if (!json.is_object() || !json.contains("sound")) return nullptr;
+    const nlohmann::json& sound = json["sound"];
+    return sound.is_object() ? &sound : nullptr;
+}
+
+// One monitor's entry in `sound.monitors`, or null. Guarded the same way.
+inline const nlohmann::json* monitorSoundStatus(const StatusReply& status, const std::string& monitorId) {
+    const nlohmann::json* sound = soundStatus(status);
+    if (sound == nullptr || !sound->contains("monitors")) return nullptr;
+    const nlohmann::json& monitors = (*sound)["monitors"];
+    if (!monitors.is_object()) return nullptr;
+    const auto it = monitors.find(monitorId);
+    return it != monitors.end() && it->is_object() ? &*it : nullptr;
 }
 
 // The monitor GetStatus says `name` resolves to, or kNoOutputBinding when it resolves to

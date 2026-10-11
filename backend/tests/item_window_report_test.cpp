@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-// What the KDE plugin tells the daemon about the windows on its screen: SetOutputFocus(name,
-// focused, maximized), sent from the item's windowFocused and windowMaximized properties (which
-// ScreenWindows.qml sets), and when it is sent again. Also the two reports chunk 3d made immediate:
+// What the KDE plugin tells the daemon about the windows on its screen: SetOutputFocusState(name,
+// focus, maximized), sent from the item's windowFocused, desktopFocused and windowMaximized properties
+// (which ScreenWindows.qml sets), falling back to SetOutputFocus(name, focused, maximized) for a daemon
+// that does not know the newer method, and when it is sent again. Also the two reports chunk 3d made immediate:
 // setting `output` sends visibility and focus at once rather than after the size report's settle.
 //
 // A stub on this run's private bus stands in for the daemon (tests/report_stub.h) and records every
@@ -55,7 +56,10 @@ using wallpaperx::testing::StderrCapture;
 
 const QString kSize = QStringLiteral("SetOutputSize");
 const QString kVisible = QStringLiteral("SetOutputVisible");
-const QString kFocus = QStringLiteral("SetOutputFocus");
+const QString kFocus = QStringLiteral("SetOutputFocusState");
+// The same report as a daemon older than SetOutputFocusState takes it.
+const QString kLegacyFocus = QStringLiteral("SetOutputFocus");
+const QString kUnknownMethod = QStringLiteral("org.freedesktop.DBus.Error.UnknownMethod");
 const QString kUnknownOutput = QStringLiteral("io.wallpaperx.Daemon.Error.UnknownOutput");
 const QString kRenderFailed = QStringLiteral("io.wallpaperx.Daemon.Error.RenderFailed");
 // A refusal neither reportSize nor reportWindows retries: what stays refused for good.
@@ -82,8 +86,17 @@ constexpr int kRetryArrivalLimitMs = 10000;
 // The log line the item writes when the daemon refuses a window report it does not treat as silent.
 const QString kWindowRefusalLog = QStringLiteral("refused this screen's window state");
 
+// SetOutputFocusState(name, focus, maximized) with `focus` by its wire name.
+bool focusStateIs(const ReportStub::Call& call, const QString& focus, bool maximized) {
+    return call.method == kFocus && call.args.size() == 3 && call.args.at(1).typeId() == QMetaType::QString &&
+           call.args.at(1).toString() == focus && call.args.at(2).toBool() == maximized;
+}
+
+// A window report saying whether a window has the focus, in whichever of the two methods `call` is.
 bool focusArgsAre(const ReportStub::Call& call, bool focused, bool maximized) {
-    return call.args.size() == 3 && call.args.at(1).toBool() == focused && call.args.at(2).toBool() == maximized;
+    if (call.method == kFocus) return focusStateIs(call, focused ? QStringLiteral("window") : QStringLiteral("none"), maximized);
+    return call.args.size() == 3 && call.args.at(1).typeId() == QMetaType::Bool && call.args.at(1).toBool() == focused &&
+           call.args.at(2).toBool() == maximized;
 }
 
 // What the daemon holds for `method` on `out` from the calls after `since`: the last one it
@@ -290,18 +303,19 @@ int main(int argc, char** argv) {
         const QString out = QStringLiteral("DP-ORDER");
         Scene scene = harness.settled(out);
         if (ready(scene, "the argument-order phase")) {
-            // GOAL: a window focused on this screen is reported as SetOutputFocus(name, true, false),
-            //       and one maximized as (name, false, true): the daemon reads the fields by position.
+            // GOAL: a window focused on this screen is reported as SetOutputFocusState(name, "window",
+            //       false), and one maximized as (name, "none", true): the daemon reads the fields by position.
             // WHY-THIS-SHAPE: one fact at a time, so a swapped pair cannot pass by symmetry.
             // CONTROL: report.windows.focused and report.windows.maximized swapped in
-            //       WallpaperXItem::reportWindows's setArguments (backend/kde/wallpaperx_item.cpp) ->
-            //       both lines red. All controls in this file observed 2026-10-01 through
-            //       control_batch.sh, phase by phase, and reverted.
+            //       WallpaperXItem::sendWindowReport's SetOutputFocusState arguments
+            //       (backend/kde/wallpaperx_item.cpp) -> both lines red. Re-run 2026-10-11 through
+            //       control_batch.sh, --phase '^argument-order$'; the other controls in this file were observed
+            //       2026-10-01 or later, phase by phase, and reverted.
             std::size_t mark = stub.mark();
             scene.renderer->setProperty("windowFocused", true);
             const bool sent = pumpUntil([&] { return !stub.calls(kFocus, out, mark).empty(); }, kArrivalLimitMs);
             const bool rightOrder = sent && focusArgsAre(stub.calls(kFocus, out, mark).front(), true, false);
-            check(rightOrder, "a focused window is reported as SetOutputFocus(name, true, false)");
+            check(rightOrder, "a focused window is reported as SetOutputFocusState(name, \"window\", false)");
             if (!rightOrder) std::fprintf(stderr, "  saw %s\n", ReportStub::describe(stub.calls(kFocus, out, mark)).c_str());
 
             scene.renderer->setProperty("windowFocused", false);
@@ -310,7 +324,7 @@ int main(int argc, char** argv) {
             scene.renderer->setProperty("windowMaximized", true);
             const bool sentMax = pumpUntil([&] { return !stub.calls(kFocus, out, mark).empty(); }, kArrivalLimitMs);
             check(sentMax && focusArgsAre(stub.calls(kFocus, out, mark).front(), false, true),
-                  "a maximized window is reported as SetOutputFocus(name, false, true)");
+                  "a maximized window is reported as SetOutputFocusState(name, \"none\", true)");
         }
     }
 
@@ -323,8 +337,8 @@ int main(int argc, char** argv) {
             // WHY-THIS-SHAPE: the two properties are set without returning to the event loop, so no
             //       timer can fire between them on any machine and "exactly one" is not a claim about
             //       scheduling.
-            // CONTROL: `m_windowReportTimer.start(0);` replaced by `reportWindows();` in both setters
-            //       (backend/kde/wallpaperx_item.cpp) -> this line red.
+            // CONTROL: `m_windowReportTimer.start(0);` replaced by `reportWindows();` in all three setters
+            //       (backend/kde/wallpaperx_item.cpp) -> this line red. Re-run 2026-10-11, --phase '^one-call$'.
             // COVERAGE-ASSERT: the one call must have arrived; zero calls fails as surely as two.
             const std::size_t mark = stub.mark();
             scene.renderer->setProperty("windowFocused", true);
@@ -332,7 +346,7 @@ int main(int argc, char** argv) {
             pumpFor(kTurnMs);
             const std::vector<ReportStub::Call> calls = stub.calls(kFocus, out, mark);
             check(calls.size() == 1 && focusArgsAre(calls.front(), true, true),
-                  "two facts changed in one turn are one SetOutputFocus carrying both");
+                  "two facts changed in one turn are one SetOutputFocusState carrying both");
             if (calls.size() != 1) std::fprintf(stderr, "  saw %s\n", ReportStub::describe(calls).c_str());
         }
     }
@@ -398,9 +412,9 @@ int main(int argc, char** argv) {
 
     if (phaseSelected("immediate")) {
         // GOAL: setting `output` on an item on the screen sends SetOutputVisible(name, true) and
-        //       SetOutputFocus(name, ...) before the size report, which waits to settle: a video stays
+        //       SetOutputFocusState(name, ...) before the size report, which waits to settle: a video stays
         //       stopped until the daemon hears its screen is visible. Properties set while `output`
-        //       was empty are what that first SetOutputFocus carries.
+        //       was empty are what that first SetOutputFocusState carries.
         // WHY-THIS-SHAPE: graded by order against SetOutputSize, not by a time bound: the size report
         //       cannot leave before its settle, so "before it" holds on any machine and an upper bound
         //       on the arrival time would grade the scheduler.
@@ -436,7 +450,7 @@ int main(int argc, char** argv) {
             } else {
                 check(visibleAt >= 0 && visibleAt < sizeAt && calls[static_cast<size_t>(visibleAt)].args.value(1).toBool(),
                       "setting the screen name sends SetOutputVisible(name, true) before the size report");
-                check(focusAt >= 0 && focusAt < sizeAt, "and SetOutputFocus before the size report");
+                check(focusAt >= 0 && focusAt < sizeAt, "and SetOutputFocusState before the size report");
             }
             check(focusAt >= 0 && focusArgsAre(calls[static_cast<size_t>(focusAt)], true, true),
                   "the window state set before the screen had a name is reported once it has one");
@@ -571,8 +585,9 @@ int main(int argc, char** argv) {
     }
 
     if (phaseSelected("silent-refusals")) {
-        // GOAL: a window report a daemon older than the method refuses (UnknownMethod) is not logged
-        //       and not sent again; one sent while no daemon is on the bus (ServiceUnknown) is not
+        // GOAL: a window report a daemon older than both focus methods refuses (UnknownMethod, then
+        //       UnknownMethod again for SetOutputFocus) is not logged and neither is sent again; one
+        //       sent while no daemon is on the bus (ServiceUnknown) is not
         //       logged, and the daemon that arrives next is told the state. This follows every focus
         //       change, so a log line or a retry here repeats for the life of the session.
         // WHY-THIS-SHAPE: the older daemon starts refusing only once the scene has settled with its
@@ -581,20 +596,21 @@ int main(int argc, char** argv) {
         //       the span read here. "Not sent again" is read over three retry intervals. The
         //       no-daemon half claims no "not retried": a retry with no daemon never reaches the stub,
         //       and the next owner's re-report replaces it, so nothing here could see one.
-        // CONTROL: in reportWindows's reply handler (backend/kde/wallpaperx_item.cpp), via control_run.sh
-        //       2026-10-08, --phase '^silent-refusals$', each reverted. The early `return` for
-        //       `Refusal::Absent || ... UnknownMethod` deleted -> both log lines red. UnknownMethod dropped
-        //       from that return and from classifyRefusal's Permanent test, so it is retried -> "is not
-        //       sent again" red, and the older daemon's log line with it.
+        // CONTROL: in sendWindowReport's reply handler (backend/kde/wallpaperx_item.cpp), via
+        //       control_batch.sh, re-run 2026-10-11, --phase '^silent-refusals$', each reverted. The early
+        //       `return` for `Refusal::Absent || ... UnknownMethod` deleted -> both log lines red. UnknownMethod
+        //       dropped from that return and from classifyRefusal's Permanent test, so it is retried -> "is not
+        //       sent again, in either method" red, and the older daemon's log line with it.
         // COVERAGE-ASSERT: the one report must have arrived and been refused with UnknownMethod, so
         //       a staging that did not take cannot pass the silence.
         const QString old = QStringLiteral("DP-OLD-DAEMON");
-        const QString unknownMethod = QStringLiteral("org.freedesktop.DBus.Error.UnknownMethod");
+        const QString unknownMethod = kUnknownMethod;
         Scene oldScene = harness.settled(old);
         const QString gone = QStringLiteral("DP-NO-DAEMON");
         Scene goneScene = harness.settled(gone);
         if (ready(oldScene, "the silent-refusals phase") && ready(goneScene, "the silent-refusals phase")) {
             stub.refuseAlways(kFocus, old, unknownMethod);
+            stub.refuseAlways(kLegacyFocus, old, unknownMethod);
             StderrCapture capture;
             const std::size_t mark = stub.mark();
             oldScene.renderer->setProperty("windowFocused", true);
@@ -603,10 +619,15 @@ int main(int argc, char** argv) {
             // captured would land in the file instead of the run's output.
             const QString oldLog = capture.text();
             const std::vector<ReportStub::Call> oldCalls = stub.calls(kFocus, old, mark);
-            check(!oldCalls.empty() && oldCalls.front().error == unknownMethod,
-                  "the older daemon's refusal was staged: the report arrived and was refused as UnknownMethod");
-            check(oldCalls.size() == 1, "a window report an older daemon does not know is not sent again");
-            if (oldCalls.size() != 1) std::fprintf(stderr, "  %s: %s\n", qPrintable(old), ReportStub::describe(oldCalls).c_str());
+            const std::vector<ReportStub::Call> legacyCalls = stub.calls(kLegacyFocus, old, mark);
+            check(!oldCalls.empty() && oldCalls.front().error == unknownMethod && !legacyCalls.empty() &&
+                      legacyCalls.front().error == unknownMethod,
+                  "the older daemon's refusal was staged: both reports arrived and were refused as UnknownMethod");
+            check(oldCalls.size() == 1 && legacyCalls.size() == 1,
+                  "a window report an older daemon does not know is not sent again, in either method");
+            if (oldCalls.size() != 1 || legacyCalls.size() != 1) {
+                std::fprintf(stderr, "  %s: %s\n", qPrintable(old), ReportStub::describe(stub.callsFor(old, mark)).c_str());
+            }
             checkNotLogged(capture, oldLog, "the silent-refusals phase's older-daemon log clause",
                            "and an older daemon's refusal is not logged");
 
@@ -644,8 +665,9 @@ int main(int argc, char** argv) {
             //       accepted, which is the only way to put the two answers in that order on any
             //       machine. The refusal is RenderFailed, one the item retries, so a wrongly honoured
             //       refusal is visible as a resend as well as a log line.
-            // CONTROL: `if (m_windowsReported != report) return;` deleted from reportWindows's reply
-            //       handler -> both lines red.
+            // CONTROL: `if (m_windowsReported != report) return;` deleted from sendWindowReport's reply
+            //       handler (backend/kde/wallpaperx_item.cpp) -> both lines red. Re-run 2026-10-11, --phase
+            //       '^stale-refusal$'.
             stub.holdNext(kFocus);
             const std::size_t mark = stub.mark();
             scene.renderer->setProperty("windowFocused", true);
@@ -774,8 +796,8 @@ int main(int argc, char** argv) {
             //       at a change and its first wait is the base one. The waits are lower bounds -- a
             //       timer never fires early -- so the doubling is read as "the second wait is at least
             //       two retry floors", which no fixed interval reaches.
-            // CONTROL: in reportWindows's reply handler (backend/kde/wallpaperx_item.cpp), via
-            //       control_run.sh 2026-10-08, --phase '^transient-backoff$', each reverted. The line
+            // CONTROL: in sendWindowReport's reply handler (backend/kde/wallpaperx_item.cpp), via
+            //       control_batch.sh, re-run 2026-10-11, --phase '^transient-backoff$', each reverted. The line
             //       doubling `m_windowRetryMs` deleted -> the doubling line red, and the log-count line
             //       (the wait never leaves the base the log condition reads). `m_sizeReported.reset();`
             //       and a `m_sizeReportTimer.start(kRefusedRetryMs)` added to the `Refusal::Retried`
@@ -817,9 +839,9 @@ int main(int argc, char** argv) {
         if (ready(scene, "the transient-recovery phase")) {
             // GOAL: a window report refused once as RenderFailed is sent again on its own retry, with
             //       nothing changing, and the daemon ends up holding it.
-            // CONTROL: `m_windowReportTimer.start(m_windowRetryMs);` deleted from reportWindows's
+            // CONTROL: `m_windowReportTimer.start(m_windowRetryMs);` deleted from sendWindowReport's
             //       `Refusal::Retried` branch (backend/kde/wallpaperx_item.cpp) -> this line red. Via
-            //       control_run.sh 2026-10-08, --phase '^transient-recovery$'. Reverted.
+            //       control_batch.sh, re-run 2026-10-11, --phase '^transient-recovery$'. Reverted.
             stub.refuseNext(kFocus, out, kRenderFailed);
             const std::size_t mark = stub.mark();
             scene.renderer->setProperty("windowFocused", true);
@@ -911,8 +933,8 @@ int main(int argc, char** argv) {
             //       not after the longer wait the previous run of refusals had reached.
             // WHY-THIS-SHAPE: two refusals then an acceptance leave a forgetful item at an 8 s wait, a
             //       correct one at 2 s; kBaseWaitCeilingMs sits between the two.
-            // CONTROL: `m_windowRetryMs = kRefusedRetryMs;` deleted from reportWindows's success branch
-            //       (backend/kde/wallpaperx_item.cpp) -> this line red.
+            // CONTROL: `m_windowRetryMs = kRefusedRetryMs;` deleted from sendWindowReport's success branch
+            //       (backend/kde/wallpaperx_item.cpp) -> this line red. Re-run 2026-10-11, --phase '^retry-reset$'.
             stub.refuseNext(kFocus, out, kRenderFailed);
             stub.refuseNext(kFocus, out, kRenderFailed);
             std::size_t mark = stub.mark();
@@ -1235,6 +1257,204 @@ int main(int argc, char** argv) {
                     }
                 }
                 std::fprintf(stderr, "  %s: %s\n", qPrintable(out), ReportStub::describe(stub.callsFor(out, mark)).c_str());
+            }
+        }
+    }
+
+    if (phaseSelected("desktop-focus")) {
+        const QString out = QStringLiteral("DP-DESKTOP");
+        Scene scene = harness.settled(out);
+        if (ready(scene, "the desktop-focus phase")) {
+            // GOAL: S15.466 -- desktopFocused changing alone is reported, as SetOutputFocusState(name,
+            //       "desktop", false); with a maximized window as ("desktop", true); and the desktop losing
+            //       the focus as ("none", true).
+            // WHY-THIS-SHAPE: one property per step and nothing else changing, so a setter that queued no
+            //       report shows as a step with no call.
+            // CONTROL: via control_batch.sh, --phase '^desktop-focus$', 2026-10-11, each alone, reverted, in
+            //       backend/kde/wallpaperx_item.cpp: `m_windowReportTimer.start(0);` deleted from setDesktopFocused
+            //       -> both lines red; sendWindowReport naming the desktop "none" -> the first line red.
+            // COVERAGE-ASSERT: each step must have produced a call to compare.
+            struct Step {
+                const char* property;
+                bool value;
+                const char* focus;
+                bool maximized;
+            };
+            const Step steps[] = {{"desktopFocused", true, "desktop", false},
+                                  {"windowMaximized", true, "desktop", true},
+                                  {"desktopFocused", false, "none", true}};
+            int compared = 0;
+            bool right = true;
+            for (const Step& step : steps) {
+                const std::size_t mark = stub.mark();
+                scene.renderer->setProperty(step.property, step.value);
+                const bool sent = pumpUntil([&] { return !stub.calls(kFocus, out, mark).empty(); }, kArrivalLimitMs);
+                const std::vector<ReportStub::Call> calls = stub.calls(kFocus, out, mark);
+                if (sent) ++compared;
+                if (!sent || !focusStateIs(calls.front(), QString::fromLatin1(step.focus), step.maximized)) {
+                    right = false;
+                    std::fprintf(stderr, "  %s=%d: saw %s\n", step.property, step.value, ReportStub::describe(calls).c_str());
+                }
+            }
+            check(right, "the desktop's focus is reported as SetOutputFocusState(name, \"desktop\", maximized), "
+                         "and its loss as \"none\"");
+            check(compared == 3, "each desktop-focus step sent a report");
+        }
+    }
+
+    if (phaseSelected("window-wins")) {
+        const QString out = QStringLiteral("DP-WINS");
+        Scene scene = harness.settled(out);
+        if (ready(scene, "the window-wins phase")) {
+            // GOAL: S15.467 -- with both windowFocused and desktopFocused true the report names "window",
+            //       in one call; the window then losing the focus leaves "desktop".
+            // WHY-THIS-SHAPE: both set in one turn of the event loop, so exactly one report carries them
+            //       both on any machine.
+            // CONTROL: via control_batch.sh, --phase '^window-wins$', 2026-10-11, sendWindowReport testing
+            //       desktopFocused before focused (backend/kde/wallpaperx_item.cpp) -> the first line red; naming
+            //       the desktop "none" -> "FAIL: and the window losing the focus leaves "desktop"". Reverted.
+            std::size_t mark = stub.mark();
+            scene.renderer->setProperty("desktopFocused", true);
+            scene.renderer->setProperty("windowFocused", true);
+            pumpFor(kTurnMs);
+            const std::vector<ReportStub::Call> both = stub.calls(kFocus, out, mark);
+            check(both.size() == 1 && focusStateIs(both.front(), QStringLiteral("window"), false),
+                  "a focused window and a focused desktop together are reported as one \"window\"");
+            if (both.size() != 1) std::fprintf(stderr, "  saw %s\n", ReportStub::describe(both).c_str());
+            mark = stub.mark();
+            scene.renderer->setProperty("windowFocused", false);
+            const bool sent = pumpUntil([&] { return !stub.calls(kFocus, out, mark).empty(); }, kArrivalLimitMs);
+            check(sent && focusStateIs(stub.calls(kFocus, out, mark).front(), QStringLiteral("desktop"), false),
+                  "and the window losing the focus leaves \"desktop\"");
+        }
+    }
+
+    if (phaseSelected("older-daemon")) {
+        const QString out = QStringLiteral("DP-OLDER");
+        const QString picky = QStringLiteral("DP-PICKY");
+        Scene scene = harness.settled(out);
+        Scene pickyScene = harness.settled(picky);
+        if (ready(scene, "the older-daemon phase") && ready(pickyScene, "the older-daemon phase")) {
+            // GOAL: S15.468 -- a daemon that answers SetOutputFocusState with UnknownMethod is told the same
+            //       report as SetOutputFocus(name, window focused, maximized), once per change and after the
+            //       refusal, and from then on is sent SetOutputFocus alone while it owns the name; desktop-only
+            //       focus reaches it as (false, false), a maximized window as (false, true); nothing is logged.
+            // WHY-THIS-SHAPE: the first two changes are read after a quiet span of three retry intervals, so
+            //       "once per change" is a count and a fallback that repeated or never stopped shows. The
+            //       maximized step comes after those counts are taken, with the window not focused, so a
+            //       maximized flag forced false, copied from focused, or swapped with it shows.
+            // CONTROL: listed with the checks below.
+            // COVERAGE-ASSERT: the first newer call must have been refused as staged, or the phase is not graded.
+            stub.refuseAlways(kFocus, out, kUnknownMethod);
+            stub.refuseAlways(kFocus, picky, kInvalidArgs);
+            const std::size_t mark = stub.mark();
+            std::optional<StderrCapture> capture;
+            capture.emplace();
+            scene.renderer->setProperty("windowFocused", true);
+            pumpUntil([&] { return !stub.calls(kLegacyFocus, out, mark).empty(); }, kArrivalLimitMs);
+            const std::size_t second = stub.mark();
+            scene.renderer->setProperty("windowFocused", false);
+            scene.renderer->setProperty("desktopFocused", true);
+            pumpFor(kQuietSpanMs);
+            const std::vector<ReportStub::Call> newer = stub.calls(kFocus, out, mark);
+            const std::vector<ReportStub::Call> legacy = stub.calls(kLegacyFocus, out, mark);
+            const std::vector<ReportStub::Call> newerAfter = stub.calls(kFocus, out, second);
+            const std::vector<ReportStub::Call> legacyAfter = stub.calls(kLegacyFocus, out, second);
+            const std::size_t third = stub.mark();
+            scene.renderer->setProperty("windowMaximized", true);
+            pumpUntil([&] { return !stub.calls(kLegacyFocus, out, third).empty() || !stub.calls(kFocus, out, third).empty(); },
+                      kArrivalLimitMs);
+            const std::vector<ReportStub::Call> maximized = stub.calls(kLegacyFocus, out, third);
+            const QString logged = capture->text();
+            const bool captured = capture->ok();
+            // Released before the InvalidArgs refusal, which the item logs as it should.
+            capture.reset();
+
+            // GOAL: S15.469 -- a refusal of SetOutputFocusState by any other name sends no SetOutputFocus.
+            // WHY-THIS-SHAPE: read once the item has handled the InvalidArgs reply -- it has logged the refusal,
+            //       or sent a fallback -- and behind a later report from the same item: the bus keeps one
+            //       sender's messages in order, so a fallback sent from that handler arrives before it. A fixed
+            //       wait would pass a fallback still in flight. The wait ends on a fallback as well as on the
+            //       log, so a handler that falls back without logging is graded, not skipped.
+            std::optional<StderrCapture> pickyCapture;
+            pickyCapture.emplace();
+            const std::size_t pickyMark = stub.mark();
+            pickyScene.renderer->setProperty("windowFocused", true);
+            const bool pickyHandled = pumpUntil(
+                [&] {
+                    return pickyCapture->count(kWindowRefusalLog.toStdString()) > 0 || !stub.calls(kLegacyFocus, picky, pickyMark).empty();
+                },
+                kArrivalLimitMs);
+            const std::size_t pickyBarrier = stub.mark();
+            pickyScene.renderer->setProperty("windowFocused", false);
+            const bool pickyBehind = pumpUntil([&] { return !stub.callsFor(picky, pickyBarrier).empty(); }, kArrivalLimitMs);
+            pickyCapture.reset();
+
+            const bool staged = !newer.empty() && newer.front().error == kUnknownMethod &&
+                                !stub.calls(kFocus, picky, pickyMark).empty() &&
+                                stub.calls(kFocus, picky, pickyMark).front().error == kInvalidArgs && pickyHandled && pickyBehind;
+            if (!staged) {
+                notVerified("the older-daemon phase", "the newer reports were not refused and handled as staged (" +
+                                                          ReportStub::describe(stub.callsFor(out, mark)) + "; " +
+                                                          ReportStub::describe(stub.callsFor(picky, pickyMark)) + ")");
+            } else {
+                // CONTROL: via control_batch.sh, --phase '^older-daemon$', 2026-10-11, each alone, reverted, in
+                //       backend/kde/wallpaperx_item.cpp: the fallback sendWindowReport(WindowFocus) deleted ->
+                //       "FAIL: ... is sent SetOutputFocus after the refusal" and the "alone, once" line;
+                //       reportWindows' `older` forced false -> "FAIL: and the next change goes to it as
+                //       SetOutputFocus alone, once" and the maximized line; the legacy call sending `focused ||
+                //       desktopFocused` -> the desktop-only and maximized lines; its maximized sent as false ->
+                //       "FAIL: and a maximized window reaches it as SetOutputFocus(name, false, true)" alone; the
+                //       fallback taken for any error name -> "FAIL: a refusal by any other name sends no
+                //       SetOutputFocus" alone; a refusal line printed before the fallback -> "FAIL: and the
+                //       fallback is not logged" alone; the owner comparison dropped from `older` -> S15.491's
+                //       line alone.
+                const auto calls = stub.callsFor(out, mark);
+                const bool afterRefusal = !calls.empty() && calls.front().method == kFocus;
+                check(afterRefusal && !legacy.empty() && focusArgsAre(legacy.front(), true, false) && legacy.front().error.isEmpty(),
+                      "a daemon refusing SetOutputFocusState as UnknownMethod is sent SetOutputFocus after the refusal");
+                check(newer.size() == 1 && legacy.size() == 2 && newerAfter.empty(),
+                      "and the next change goes to it as SetOutputFocus alone, once");
+                check(legacyAfter.size() == 1 && focusArgsAre(legacyAfter.front(), false, false),
+                      "and desktop-only focus reaches it as SetOutputFocus(name, false, false)");
+                check(!maximized.empty() && focusArgsAre(maximized.front(), false, true),
+                      "and a maximized window reaches it as SetOutputFocus(name, false, true)");
+                check(stub.calls(kLegacyFocus, picky, pickyMark).empty(), "a refusal by any other name sends no SetOutputFocus");
+                if (!captured) {
+                    notVerified("the older-daemon phase's log clause", "stderr could not be captured");
+                } else {
+                    check(!logged.contains(kWindowRefusalLog), "and the fallback is not logged");
+                }
+                std::fprintf(stderr, "  %s: %s\n  %s: %s\n", qPrintable(out), ReportStub::describe(calls).c_str(),
+                             qPrintable(picky), ReportStub::describe(stub.callsFor(picky, pickyMark)).c_str());
+
+                // GOAL: S15.491 -- once another daemon owns the name, one that knows SetOutputFocusState, the
+                //       item sends SetOutputFocusState again.
+                // WHY-THIS-SHAPE: the name moves to a second connection carrying the same stub, so the owner's
+                //       unique name changes as a restarted daemon's does; restartDaemonName() keeps the same
+                //       connection and so the same owner. The item's resent size report shows it has seen the
+                //       new owner before the focus is changed.
+                QDBusConnection newerBus =
+                    QDBusConnection::connectToBus(QDBusConnection::SessionBus, QStringLiteral("wallpaperx-report-stub-newer"));
+                stub.stopRefusing(kFocus, out);
+                const std::size_t ownerMark = stub.mark();
+                const bool moved = newerBus.isConnected() && newerBus.registerVirtualObject(QString::fromUtf8(wallpaperx::testing::kPath), &stub) &&
+                                   wallpaperx::testing::handDaemonName(bus, newerBus);
+                const bool seen = moved && pumpUntil([&] { return !stub.calls(kSize, out, ownerMark).empty(); }, kArrivalLimitMs);
+                if (!seen) {
+                    notVerified("the older-daemon phase's owner change", moved ? "the item sent no size report to the new owner"
+                                                                                 : "the name could not be moved to a second connection");
+                } else {
+                    const std::size_t changed = stub.mark();
+                    scene.renderer->setProperty("windowFocused", true);
+                    const bool asked = pumpUntil([&] { return !stub.calls(kFocus, out, changed).empty(); }, kArrivalLimitMs);
+                    check(asked && focusArgsAre(stub.calls(kFocus, out, changed).front(), true, true),
+                          "after another daemon takes the name, SetOutputFocusState is sent again");
+                    if (!asked) std::fprintf(stderr, "  after the owner change: %s\n", ReportStub::describe(stub.callsFor(out, ownerMark)).c_str());
+                }
+                if (moved) static_cast<void>(wallpaperx::testing::handDaemonName(newerBus, bus));
+                newerBus.unregisterObject(QString::fromUtf8(wallpaperx::testing::kPath));
+                QDBusConnection::disconnectFromBus(QStringLiteral("wallpaperx-report-stub-newer"));
             }
         }
     }

@@ -651,6 +651,16 @@ void runHostChecks(sdbus::IProxy& proxy, const std::string& imagePath, const Che
         {"method", "SetMonitorPause", ArgList{{"in", "i:monitor_id"}, {"in", "s:mode"}}},
         {"method", "SetOutputFocus",
          ArgList{{"in", "s:output_name"}, {"in", "b:window_focused"}, {"in", "b:window_maximized"}}},
+        // GOAL: S15.446 -- the two sound setters and the focus report naming the desktop are exported
+        //       with these signatures, and SetOutputFocus keeps its own beside them for an older plugin.
+        // CONTROL: via control_batch.sh, --phase '^host$', 2026-10-11, in DbusService::registerVTable
+        //       (backend/daemon/dbus_service.cpp), each alone: SetMonitorSound's "on" renamed "enabled" ->
+        //       "FAIL: wire signature of method SetMonitorSound is unchanged"; SetOutputFocusState's "focus"
+        //       renamed "state" -> "FAIL: wire signature of method SetOutputFocusState is unchanged". Reverted.
+        {"method", "SetSound", ArgList{{"in", "b:on"}}},
+        {"method", "SetMonitorSound", ArgList{{"in", "i:monitor_id"}, {"in", "b:on"}}},
+        {"method", "SetOutputFocusState",
+         ArgList{{"in", "s:output_name"}, {"in", "s:focus"}, {"in", "b:window_maximized"}}},
         {"method", "GetStatus", ArgList{{"out", "s:status"}}},
         {"signal", "FrameReady", ArgList{{"", "i:monitor_id"}, {"", "t:frame_generation"}}},
         // Argument-free: what the layouts now are is what the other consumers reported.
@@ -1516,10 +1526,9 @@ constexpr int32_t kMonitorPropsLimits = 4;    // set at both limits at once
 constexpr int32_t kMonitorPropsCleared = 5;   // set with properties, then with SetWallpaper
 constexpr int32_t kMonitorPropsCap = 6;       // set at exactly the top speed
 
-// One monitor's row in a config file, or null.
-nlohmann::json configRowOf(const std::filesystem::path& file, int32_t monitorId) {
-    std::ifstream in(file, std::ios::binary);
-    const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+// One monitor's row in a config file's text, or null. Given the text configTextOnceIdle() returned,
+// so a write that failed (empty text) reads as no row rather than as whatever an earlier write left.
+nlohmann::json configRowOf(const std::string& text, int32_t monitorId) {
     const nlohmann::json root = nlohmann::json::parse(text, nullptr, false);
     if (root.is_discarded() || !root.is_object() || !root.contains("monitors") || !root["monitors"].is_array()) {
         return nullptr;
@@ -1821,14 +1830,15 @@ void runPropertiesWireChecksOn(wallpaperx::WallpaperManager& manager, const std:
         const std::string plain =
             errorNameFrom([&] { setWallpaper(proxy, "shader", unrenderablePath, kMonitorPropsCleared); });
         const nlohmann::json afterPlain = entryOf(kMonitorPropsCleared);
-        const nlohmann::json row = configRowOf(configFile, kMonitorPropsCleared);
+        const std::string text = configTextOnceIdle(manager, configFile);
+        const nlohmann::json row = configRowOf(text, kMonitorPropsCleared);
         const bool cleared = plain.empty() && afterPlain.is_object() &&
                              afterPlain.value("properties", nlohmann::json()) == nlohmann::json::object() &&
-                             row.is_object() && !row.contains("properties");
+                             !text.empty() && row.is_object() && !row.contains("properties");
         check(cleared, "SetWallpaper after SetWallpaperWithProperties clears the properties, in GetStatus and in the file");
         if (!cleared) {
-            std::fprintf(stderr, "  SetWallpaper answered '%s'; GetStatus entry: %s; file row: %s\n", plain.c_str(),
-                         afterPlain.dump().c_str(), row.dump().c_str());
+            std::fprintf(stderr, "  SetWallpaper answered '%s'; GetStatus entry: %s; file row: %s; file: %s\n", plain.c_str(),
+                         afterPlain.dump().c_str(), row.dump().c_str(), text.empty() ? "(write failed)" : text.c_str());
         }
     }
 }
@@ -2644,7 +2654,24 @@ void runImportModifierClientWireChecks(const wallpaperx::WallpaperManager::Confi
 // apart); the wire shows what the flag does. Its own managers, no Device; the wire half has no
 // monitors, so every change condemns nothing -- S6.60's case, and a fresh daemon's state.
 
-// Counts ImportModifiersChanged; every wait has a failure branch (X.1).
+// True once every signal the daemon sent before this call has been counted by a handler running on
+// `listener`'s connection. That connection asks GetStatus without waiting: the daemon answers it after
+// every signal it sent earlier, and the connection's one event-loop thread runs callbacks in arrival
+// order, so the reply's runs after theirs. False, printed, when no reply came.
+bool announcementsSettled(sdbus::IProxy& listener) {
+    auto answered = std::make_shared<std::promise<void>>();
+    std::future<void> done = answered->get_future();
+    listener.callMethodAsync("GetStatus")
+        .onInterface(DbusService::kInterface)
+        .uponReplyInvoke([answered](std::optional<sdbus::Error>, std::string) { answered->set_value(); });
+    if (done.wait_for(std::chrono::seconds(10)) != std::future_status::ready) {
+        std::fprintf(stderr, "  the listener's GetStatus had no answer in 10 s, so its count is not settled\n");
+        return false;
+    }
+    return true;
+}
+
+// Counts a signal (ImportModifiersChanged, ConfigChanged); every wait has a failure branch (X.1).
 class AnnouncementLog {
 public:
     void record() {
@@ -2768,10 +2795,13 @@ void runImportModifierAnnouncementChecks(const wallpaperx::WallpaperManager::Con
     }
 
     // GOAL: S6.59 on the wire -- re-reporting the set in force announces nothing.
-    // WHY-THIS-SHAPE: an exact count after the barrier, not right after the re-report's reply.
+    // WHY-THIS-SHAPE: an exact count after the barrier, not right after the re-report's reply, and read
+    //       once announcementsSettled() has ordered a reply behind every signal already sent: the at-least
+    //       wait above can be met by an extra signal before the barrier's own has arrived.
     // CONTROL: `if (!update.changed) return;` deleted from DbusService::applyImportModifierUpdate
     //       (backend/daemon/dbus_service.cpp) -> this alone ("3 announcement(s) arrived").
-    check(announced.count() == 2, "re-reporting the set already in force announces nothing");
+    const bool importSettled = announcementsSettled(*listener);
+    check(importSettled && announced.count() == 2, "re-reporting the set already in force announces nothing");
     if (announced.count() != 2) {
         std::fprintf(stderr, "  %d announcement(s) arrived across two changes and one identical re-report\n",
                      announced.count());
@@ -2835,8 +2865,9 @@ void runConfigChangedWireChecks(const wallpaperx::WallpaperManager::Config& base
         auto proxyOwner = sdbus::createProxy(daemonName, objectPath);
         sdbus::IProxy& proxy = *proxyOwner;
 
-        // Signals from the daemon's one connection arrive in the order it sent them, so once a
-        // barrier call's own announcement is counted, any the calls before it sent are too.
+        // Signals from the daemon's one connection arrive in the order it sent them. An exact count is read
+        // after announcementsSettled(), never on the at-least wait alone, which an extra signal could meet
+        // before the barrier call's own has arrived.
         // GOAL: S15.394 -- a SetMonitorOutput that names a screen announces ConfigChanged.
         // CONTROL: `if (rebound) announceConfigChanged();` deleted from DbusService::setMonitorOutput
         //       (backend/daemon/dbus_service.cpp) -> "naming a screen announces ConfigChanged" red, and the
@@ -2861,7 +2892,8 @@ void runConfigChangedWireChecks(const wallpaperx::WallpaperManager::Config& base
         const std::string repeated = errorNameFrom([&] { setMonitorOutput(proxy, kMonitorNoticeFirst, kName); });
         const std::string set = errorNameFrom([&] { setWallpaper(proxy, "shader", unrenderablePath, kMonitorNoticeFirst); });
         check(repeated.empty() && set.empty() && announced.waitFor(2), "an accepted SetWallpaper announces ConfigChanged");
-        check(announced.count() == 2, "repeating a binding already on disk announces nothing");
+        const bool repeatSettled = announcementsSettled(*listener);
+        check(repeatSettled && announced.count() == 2, "repeating a binding already on disk announces nothing");
         if (announced.count() != 2) {
             std::fprintf(stderr, "  repeat answered '%s', SetWallpaper '%s'; %d announcement(s)\n", repeated.c_str(),
                          set.c_str(), announced.count());
@@ -2880,7 +2912,8 @@ void runConfigChangedWireChecks(const wallpaperx::WallpaperManager::Config& base
             setWallpaperWithProperties(proxy, "shader", unrenderablePath, kMonitorNoticeSecond, {{"speed", Variant(0.5)}});
         });
         check(withProperties.empty() && announced.waitFor(3), "an accepted SetWallpaperWithProperties announces ConfigChanged");
-        check(announced.count() == 3, "refused calls announce nothing");
+        const bool refusedSettled = announcementsSettled(*listener);
+        check(refusedSettled && announced.count() == 3, "refused calls announce nothing");
         if (announced.count() != 3) {
             std::fprintf(stderr, "  refused with '%s' and '%s'; %d announcement(s)\n", emptyName.c_str(), badType.c_str(),
                          announced.count());
@@ -2905,7 +2938,8 @@ void runConfigChangedWireChecks(const wallpaperx::WallpaperManager::Config& base
         if (!reports.empty()) std::fprintf(stderr, "  one answered '%s'\n", reports.c_str());
         const std::string moved = errorNameFrom([&] { setMonitorOutput(proxy, kMonitorNoticeSecond, kName); });
         check(moved.empty() && announced.waitFor(4), "moving a name to another monitor announces ConfigChanged");
-        check(announced.count() == 4, "a screen's reports and a monitor's settings announce nothing");
+        const bool reportsSettled = announcementsSettled(*listener);
+        check(reportsSettled && announced.count() == 4, "a screen's reports and a monitor's settings announce nothing");
         if (announced.count() != 4) std::fprintf(stderr, "  %d announcement(s)\n", announced.count());
         });
     }
@@ -3332,17 +3366,17 @@ void runPauseWireChecks(const wallpaperx::WallpaperManager::Config& base, const 
 
     // GOAL: S15.125 -- before any SetOutputFocus, a screen is taken to have no focused and no
     //       maximized window, so both window modes play, and GetStatus shows both window fields false.
-    // CONTROL: via control_batch.sh, --phase '^pauseWire$', 2026-09-30, in pausedLocked()
+    // CONTROL: via control_batch.sh, --phase '^pauseWire$', re-run 2026-10-11, in pausedLocked()
     //       (backend/daemon/wallpaper_manager.cpp), the focused case made `return report == nullptr ||
-    //       report->windowFocused;` -> "FAIL: before any focus report, both window modes play", monitor 0
-    //       reading "paused":true, beside the S15.126 and S15.127 lines that need an unreported screen to
-    //       play. Reverted.
+    //       report->focus == ScreenFocus::Window;` -> "FAIL: before any focus report, both window modes play",
+    //       beside the S15.126 and S15.127 lines that need an unreported screen to play. Reverted.
     {
         const nlohmann::json focused = pauseOf(kMonitorPauseFocused);
         const nlohmann::json maximized = pauseOf(kMonitorPauseMaximized);
         const auto unreported = [](const nlohmann::json& entry, const char* mode) {
             return entry.is_object() && entry == nlohmann::json({{"mode", mode},
                                                                  {"paused", false},
+                                                                 {"focus", "none"},
                                                                  {"window_focused", false},
                                                                  {"window_maximized", false}});
         };
@@ -3357,13 +3391,13 @@ void runPauseWireChecks(const wallpaperx::WallpaperManager::Config& base, const 
     // WHY-THIS-SHAPE: both screens are sent the same report twice, once with only the focused bit and
     //       once with only the maximized bit, so each mode is seen paused by its own field and playing
     //       under the other's. One report of both bits would pass a mode that read either field.
-    // CONTROL: via control_batch.sh, --phase '^pauseWire$', 2026-09-30, the two `report->...` fields
-    //       swapped in pausedLocked() (backend/daemon/wallpaper_manager.cpp) -> "FAIL: a focused window
-    //       pauses paused_while_focused and not paused_while_maximized" and "FAIL: a maximized window
-    //       pauses paused_while_maximized and not paused_while_focused", with the later checks that rely on
-    //       a focused report pausing. Reverted. For the window fields: snapshot()'s `status.windowFocused =
-    //       report->windowFocused;` (backend/daemon/wallpaper_manager.cpp) made `= false;` -> "FAIL: GetStatus
-    //       shows what each screen last reported about its windows", alone. Reverted.
+    // CONTROL: via control_batch.sh, --phase '^pauseWire$', re-run 2026-10-11, the two report terms
+    //       (`report->focus == ScreenFocus::Window`, `report->windowMaximized`) swapped in pausedLocked()
+    //       (backend/daemon/wallpaper_manager.cpp) -> "FAIL: a focused window pauses paused_while_focused and
+    //       not paused_while_maximized" and "FAIL: a maximized window pauses paused_while_maximized and not
+    //       paused_while_focused", with the later checks that rely on a focused report pausing. Reverted. For
+    //       the window fields: snapshot()'s `status.focus = report->focus;` made `= ScreenFocus::None;` ->
+    //       "FAIL: GetStatus shows what each screen last reported about its windows", alone. Reverted.
     {
         const std::string first = errorNameFrom([&] {
             setOutputFocus(proxy, "DP-PF", true, false);
@@ -3482,7 +3516,7 @@ void runPauseWireChecks(const wallpaperx::WallpaperManager::Config& base, const 
         const std::string pausedText = configTextOnceIdle(manager, config.configFile);
         const std::string playError = errorNameFrom([&] { setMonitorPause(proxy, kMonitorPauseKept, "play"); });
         const std::string after = configTextOnceIdle(manager, config.configFile);
-        const nlohmann::json row = configRowOf(config.configFile, kMonitorPauseKept);
+        const nlohmann::json row = configRowOf(after, kMonitorPauseKept);
         const bool asBefore = pauseError.empty() && playError.empty() && !before.empty() && pausedText != before &&
                               after == before && row.is_object() && !row.contains("pause");
         check(asBefore, "play writes no pause field, leaving the file as it was before the pause");
@@ -3506,15 +3540,15 @@ void runPauseWireChecks(const wallpaperx::WallpaperManager::Config& base, const 
                                        {{"speed", sdbus::Variant(1.5)}});
         });
         const nlohmann::json entry = pauseOf(kMonitorPauseKept);
-        configTextOnceIdle(manager, config.configFile);
-        const nlohmann::json row = configRowOf(config.configFile, kMonitorPauseKept);
+        const std::string text = configTextOnceIdle(manager, config.configFile);
+        const nlohmann::json row = configRowOf(text, kMonitorPauseKept);
         const bool kept = answered.empty() && entry.is_object() && entry.value("mode", std::string()) == "always_paused" &&
-                          entry.value("paused", false) && row.is_object() &&
+                          entry.value("paused", false) && !text.empty() && row.is_object() &&
                           row.value("pause", nlohmann::json()) == "always_paused";
         check(kept, "a pause setting survives SetWallpaper and SetWallpaperWithProperties, in GetStatus and in the file");
         if (!kept) {
-            std::fprintf(stderr, "  answered '%s'; entry: %s; file row: %s\n", answered.c_str(), entry.dump().c_str(),
-                         row.dump().c_str());
+            std::fprintf(stderr, "  answered '%s'; entry: %s; file row: %s; file: %s\n", answered.c_str(), entry.dump().c_str(),
+                         row.dump().c_str(), text.empty() ? "(write failed)" : text.c_str());
         }
     }
 
@@ -3533,6 +3567,7 @@ void runPauseWireChecks(const wallpaperx::WallpaperManager::Config& base, const 
                             wallpaperStatus(status, std::to_string(kMonitorPauseBare)) == nullptr && entry != nullptr &&
                             *entry == nlohmann::json({{"mode", "always_paused"},
                                                       {"paused", true},
+                                                      {"focus", "none"},
                                                       {"window_focused", false},
                                                       {"window_maximized", false}});
         check(listed, "a monitor with a pause setting and no wallpaper is listed in GetStatus's pause object");
@@ -3553,11 +3588,10 @@ void runPauseWireChecks(const wallpaperx::WallpaperManager::Config& base, const 
     //       InvalidArgs", all three names answered '', and "FAIL: no refused call changed a pause entry or
     //       wrote the file"; `requireValidMonitorId(monitorId);` deleted -> "FAIL: SetMonitorPause refuses a
     //       monitor id outside [0, 32) as InvalidArgs" and the same unchanged line, a "-1" entry appearing.
-    //       In WallpaperManager::setOutputFocus, the unbound-name throw made `return;` -> "FAIL:
-    //       SetOutputFocus refuses a name no monitor answers to as UnknownOutput", alone; and its
-    //       `requireValidOutputName(outputName);` deleted -> "FAIL: SetOutputFocus refuses an empty or
-    //       over-long name as InvalidArgs", both bad names answering UnknownOutput, and the non-UTF-8 line
-    //       below.
+    //       In WallpaperManager::setOutputFocus, re-run 2026-10-11 after its ScreenFocus signature: the
+    //       unbound-name throw made `return;` -> "FAIL: SetOutputFocus refuses a name no monitor answers to as
+    //       UnknownOutput", alone; and its `requireValidOutputName(outputName);` deleted -> "FAIL:
+    //       SetOutputFocus refuses an empty or over-long name as InvalidArgs" and the non-UTF-8 line below.
     {
         const auto snapshotAll = [&proxy] {
             const StatusReply status = getStatusOrExplain(proxy);
@@ -3599,12 +3633,12 @@ void runPauseWireChecks(const wallpaperx::WallpaperManager::Config& base, const 
         // WHY-THIS-SHAPE: UnknownOutput derives from InvalidRequest, and an unvalidated non-UTF-8 name is
         //       simply unbound, so catching InvalidRequest alone would pass with validation gone; the
         //       subclass is caught first and counts as a failure.
-        // CONTROL: via control_batch.sh, --phase '^pauseWire$', 2026-09-30, `requireValidOutputName(outputName);`
+        // CONTROL: via control_batch.sh, --phase '^pauseWire$', re-run 2026-10-11, `requireValidOutputName(outputName);`
         //       deleted from WallpaperManager::setOutputFocus (backend/daemon/wallpaper_manager.cpp) -> this
-        //       line red, printing that the name reached the bound-name lookup. Reverted.
+        //       line red. Reverted.
         bool notUtf8 = false;
         try {
-            manager.setOutputFocus(":1.pause", "DP-\x80", true, true);
+            manager.setOutputFocus(":1.pause", "DP-\x80", wallpaperx::ScreenFocus::Window, true);
             std::fprintf(stderr, "  a non-UTF-8 name was accepted\n");
         } catch (const wallpaperx::UnknownOutput&) {
             std::fprintf(stderr, "  a non-UTF-8 name reached the bound-name lookup\n");
@@ -3623,6 +3657,574 @@ void runPauseWireChecks(const wallpaperx::WallpaperManager::Config& base, const 
                          pauseBefore.c_str(), pauseAfter.c_str(), fileBefore.c_str(), fileAfter.c_str());
         }
     }
+}
+
+// --------------------------------------------------------------------------- //
+// Step 15 chunk 5b -- sound on every screen and per monitor, the "would be heard" answer, and the
+// focus report that can name the desktop. Shader wallpapers, recorded and never drawn.
+// --------------------------------------------------------------------------- //
+constexpr int32_t kMonitorSoundNamed = 0;   // a wallpaper, answers to DP-SND
+constexpr int32_t kMonitorSoundBare = 3;    // a sound setting first, a wallpaper later
+constexpr int32_t kMonitorHeard = 0;        // a wallpaper, answers to DP-HEARD
+constexpr int32_t kMonitorHeardPaused = 1;  // a wallpaper and paused_while_focused, answers to DP-HEARDP
+
+// The parsed root of a config file, or null.
+nlohmann::json configRootOf(const std::string& text) {
+    const nlohmann::json root = nlohmann::json::parse(text, nullptr, false);
+    return root.is_discarded() || !root.is_object() ? nlohmann::json(nullptr) : root;
+}
+
+void runSoundWireChecks(const wallpaperx::WallpaperManager::Config& base, const std::string& unrenderablePath,
+                        const Check& check) {
+    using sdbus::Variant;
+    using wallpaperx::testing::monitorSoundStatus;
+    using wallpaperx::testing::setMonitorOutput;
+    using wallpaperx::testing::setMonitorSound;
+    using wallpaperx::testing::setSound;
+    using wallpaperx::testing::setWallpaperProperties;
+    using wallpaperx::testing::setWallpaperWithProperties;
+    using wallpaperx::testing::soundStatus;
+    constexpr const char* kInvalidArgs = "org.freedesktop.DBus.Error.InvalidArgs";
+    const char* kGoals = "S15.447-S15.452 (the sound settings on the wire)";
+    const wallpaperx::testing::ScratchDir scratch("dbussound");
+    if (!scratch.ok()) {
+        wallpaperx::testing::notVerified(kGoals, "a scratch directory for this phase's config file could not be made");
+        return;
+    }
+    wallpaperx::WallpaperManager::Config config = base;
+    config.configFile = scratch.path() / "wallpaperx" / "config.json";
+    withNoDeviceManager(config, "the sound wire phase", check, [&](wallpaperx::WallpaperManager& manager) {
+    auto serviceConn = sdbus::createSessionBusConnection();
+    DbusService service(*serviceConn, manager);
+    serviceConn->enterEventLoopAsync();
+    const sdbus::ServiceName daemonName{serviceConn->getUniqueName()};
+    const sdbus::ObjectPath objectPath{DbusService::kObjectPath};
+    AnnouncementLog announced;
+    auto listener = sdbus::createProxy(daemonName, objectPath);
+    listener->uponSignal("ConfigChanged").onInterface(DbusService::kInterface).call([&announced] { announced.record(); });
+    auto proxyOwner = sdbus::createProxy(daemonName, objectPath);
+    sdbus::IProxy& proxy = *proxyOwner;
+
+    // Null also for a GetStatus that failed, so no check reads null as an answer.
+    const auto soundOf = [&proxy]() -> nlohmann::json {
+        const StatusReply status = getStatusOrExplain(proxy);
+        const nlohmann::json* sound = soundStatus(status);
+        return sound != nullptr ? *sound : nlohmann::json(nullptr);
+    };
+    const auto monitorOf = [&proxy](int32_t monitorId) -> nlohmann::json {
+        const StatusReply status = getStatusOrExplain(proxy);
+        const nlohmann::json* entry = monitorSoundStatus(status, std::to_string(monitorId));
+        return entry != nullptr ? *entry : nlohmann::json(nullptr);
+    };
+    const auto settledCount = [&]() -> std::optional<int> {
+        if (!announcementsSettled(*listener)) return std::nullopt;
+        return announced.count();
+    };
+
+    const std::string setupError = errorNameFrom([&] {
+        setWallpaper(proxy, "shader", unrenderablePath, kMonitorSoundNamed);
+        setMonitorOutput(proxy, kMonitorSoundNamed, "DP-SND");
+    });
+    if (!setupError.empty()) {
+        wallpaperx::testing::notVerified(kGoals, "the setup SetWallpaper/SetMonitorOutput answered '" + setupError + "'");
+        return;
+    }
+
+    // GOAL: S15.447 -- with no sound setting anywhere, GetStatus's `sound` reports sound on and lists the
+    //       monitor holding a wallpaper as on and not heard (no screen has reported a focus).
+    // CONTROL: via control_batch.sh, --phase '^soundWire$', 2026-10-11, snapshot()'s loop adding every
+    //       monitor in m_monitors to out.monitorSound (backend/daemon/wallpaper_manager.cpp) deleted -> this
+    //       line red, and S15.449's "SetMonitorSound(true) is reported on" line. Reverted.
+    {
+        const nlohmann::json sound = soundOf();
+        const nlohmann::json expected = {
+            {"enabled", true}, {"monitors", {{"0", {{"enabled", true}, {"heard", false}}}}}};
+        check(sound == expected, "with no sound setting, GetStatus reports sound on and lists the monitor with a wallpaper");
+        if (sound != expected) std::fprintf(stderr, "  sound: %s\n", sound.dump().c_str());
+    }
+
+    // GOAL: S15.448 -- SetSound(false) is reported in GetStatus and written as `"sound": false` at the
+    //       config root; SetSound(true) removes it again, leaving the file byte for byte as it was.
+    // WHY-THIS-SHAPE: the file is compared once the writer is idle, before and after the pair; reading
+    //       only GetStatus would pass a setting that never reaches the file.
+    // CONTROL: via control_batch.sh, --phase '^soundWire$', 2026-10-11, each alone, reverted: ConfigStore::save
+    //       (backend/daemon/config_store.cpp) not writing the root `sound` -> "FAIL: SetSound(false) is
+    //       reported off and written as "sound": false at the config root"; WallpaperManager::setSound
+    //       (backend/daemon/wallpaper_manager.cpp) committing the text "true" for on in place of
+    //       `commitSettingLocked(m_sound, soundJsonText(on))` -> "FAIL: SetSound(true) is reported on and
+    //       leaves the file as it was, with no sound field".
+    {
+        const std::string before = configTextOnceIdle(manager, config.configFile);
+        const std::string offError = errorNameFrom([&] { setSound(proxy, false); });
+        const nlohmann::json offStatus = soundOf();
+        const std::string offText = configTextOnceIdle(manager, config.configFile);
+        const std::string onError = errorNameFrom([&] { setSound(proxy, true); });
+        const nlohmann::json onStatus = soundOf();
+        const std::string after = configTextOnceIdle(manager, config.configFile);
+        const nlohmann::json offRoot = configRootOf(offText);
+        const bool off = offError.empty() && offStatus.is_object() && offStatus.value("enabled", nlohmann::json()) == false &&
+                         offRoot.is_object() && offRoot.value("sound", nlohmann::json()) == false;
+        check(off, "SetSound(false) is reported off and written as \"sound\": false at the config root");
+        const bool on = onError.empty() && onStatus.is_object() && onStatus.value("enabled", nlohmann::json()) == true &&
+                        !before.empty() && after == before && !configRootOf(after).contains("sound");
+        check(on, "SetSound(true) is reported on and leaves the file as it was, with no sound field");
+        if (!off || !on) {
+            std::fprintf(stderr, "  answered '%s', '%s'; status off %s, on %s\n  before: %s\n  off:    %s\n  after:  %s\n",
+                         offError.c_str(), onError.c_str(), offStatus.dump().c_str(), onStatus.dump().c_str(),
+                         before.c_str(), offText.c_str(), after.c_str());
+        }
+    }
+
+    // GOAL: S15.449 -- SetMonitorSound(id, false) on a monitor with no wallpaper lists it in GetStatus
+    //       (enabled false, not heard) and writes a row of its own carrying `"sound": false` with an empty
+    //       type and path; the setting survives SetWallpaper and SetWallpaperWithProperties, in GetStatus
+    //       and in the file; SetMonitorSound(id, true) removes the field from the row.
+    // CONTROL: via control_batch.sh, --phase '^soundWire$', 2026-10-11, each alone, reverted. The `live.sound`
+    //       loop in KeptRows::rowsToWrite (backend/daemon/kept_rows.cpp) deleted -> "FAIL: SetMonitorSound(false)
+    //       on a monitor with no wallpaper is listed off and written on a row of its own" and the survival
+    //       line. `m_soundSettings.erase(monitorId);` added before requestWallpaper's save
+    //       (backend/daemon/wallpaper_manager.cpp) -> "FAIL: a monitor's sound setting survives SetWallpaper
+    //       and SetWallpaperWithProperties, in GetStatus and the file", alone. setMonitorSound's `if (!on)`
+    //       before the lock dropped, storing off whatever is asked -> "FAIL: SetMonitorSound(true) is
+    //       reported on and removes the field from the monitor's row" and S15.451's line.
+    {
+        const std::string bareError = errorNameFrom([&] { setMonitorSound(proxy, kMonitorSoundBare, false); });
+        const nlohmann::json bareEntry = monitorOf(kMonitorSoundBare);
+        const std::string bareText = configTextOnceIdle(manager, config.configFile);
+        const nlohmann::json bareRow = configRowOf(bareText, kMonitorSoundBare);
+        const bool bare = bareError.empty() && bareEntry == nlohmann::json({{"enabled", false}, {"heard", false}}) &&
+                          !bareText.empty() && bareRow.is_object() && bareRow.value("type", std::string("x")).empty() &&
+                          bareRow.value("path", std::string("x")).empty() &&
+                          bareRow.value("sound", nlohmann::json()) == false;
+        check(bare, "SetMonitorSound(false) on a monitor with no wallpaper is listed off and written on a row of its own");
+        if (!bare) {
+            std::fprintf(stderr, "  answered '%s'; entry %s; row %s; file: %s\n", bareError.c_str(), bareEntry.dump().c_str(),
+                         bareRow.dump().c_str(), bareText.empty() ? "(write failed)" : bareText.c_str());
+        }
+
+        const std::string setError = errorNameFrom([&] {
+            setWallpaper(proxy, "shader", unrenderablePath, kMonitorSoundBare);
+            setWallpaperWithProperties(proxy, "shader", unrenderablePath, kMonitorSoundBare, {{"speed", Variant(1.5)}});
+        });
+        const nlohmann::json keptEntry = monitorOf(kMonitorSoundBare);
+        const std::string keptText = configTextOnceIdle(manager, config.configFile);
+        const nlohmann::json keptRow = configRowOf(keptText, kMonitorSoundBare);
+        const bool kept = setError.empty() && keptEntry.value("enabled", nlohmann::json()) == false && !keptText.empty() &&
+                          keptRow.is_object() && keptRow.value("type", std::string()) == "shader" &&
+                          keptRow.value("sound", nlohmann::json()) == false;
+        check(kept, "a monitor's sound setting survives SetWallpaper and SetWallpaperWithProperties, in GetStatus and the file");
+        if (!kept) {
+            std::fprintf(stderr, "  answered '%s'; entry %s; row %s; file: %s\n", setError.c_str(), keptEntry.dump().c_str(),
+                         keptRow.dump().c_str(), keptText.empty() ? "(write failed)" : keptText.c_str());
+        }
+
+        const std::string onError = errorNameFrom([&] { setMonitorSound(proxy, kMonitorSoundBare, true); });
+        const nlohmann::json onEntry = monitorOf(kMonitorSoundBare);
+        const std::string onText = configTextOnceIdle(manager, config.configFile);
+        const nlohmann::json onRow = configRowOf(onText, kMonitorSoundBare);
+        const bool cleared = onError.empty() && onEntry == nlohmann::json({{"enabled", true}, {"heard", false}}) &&
+                             !onText.empty() && onRow.is_object() && !onRow.contains("sound");
+        check(cleared, "SetMonitorSound(true) is reported on and removes the field from the monitor's row");
+        if (!cleared) {
+            std::fprintf(stderr, "  answered '%s'; entry %s; row %s; file: %s\n", onError.c_str(), onEntry.dump().c_str(),
+                         onRow.dump().c_str(), onText.empty() ? "(write failed)" : onText.c_str());
+        }
+    }
+
+    // GOAL: S15.450 -- SetMonitorSound refuses a monitor id outside [0, 32) as InvalidArgs and changes
+    //       nothing: GetStatus's `sound` and the file are as before, and nothing is announced.
+    // WHY-THIS-SHAPE: each refused call asks for sound off, which an accepted one would show in the
+    //       sound object, the file and the announcement count.
+    // CONTROL: via control_batch.sh, --phase '^soundWire$', 2026-10-11, `requireValidMonitorId(monitorId);`
+    //       deleted from WallpaperManager::setMonitorSound (backend/daemon/wallpaper_manager.cpp) -> both lines
+    //       red. Reverted.
+    {
+        const std::string fileBefore = configTextOnceIdle(manager, config.configFile);
+        const nlohmann::json soundBefore = soundOf();
+        const std::optional<int> countBefore = settledCount();
+        bool refused = true;
+        for (const int32_t id : {-1, 32}) {
+            const std::string answer = errorNameFrom([&] { setMonitorSound(proxy, id, false); });
+            if (answer != kInvalidArgs) {
+                refused = false;
+                std::fprintf(stderr, "  SetMonitorSound(%d, false) answered '%s'\n", id, answer.c_str());
+            }
+        }
+        check(refused, "SetMonitorSound refuses a monitor id outside [0, 32) as InvalidArgs");
+        const std::optional<int> countAfter = settledCount();
+        const std::string fileAfter = configTextOnceIdle(manager, config.configFile);
+        const nlohmann::json soundAfter = soundOf();
+        const bool unchanged = !fileBefore.empty() && fileAfter == fileBefore && soundBefore.is_object() &&
+                               soundAfter == soundBefore && countBefore && countAfter && *countAfter == *countBefore;
+        check(unchanged, "a refused SetMonitorSound changes no sound entry, writes nothing and announces nothing");
+        if (!unchanged) {
+            std::fprintf(stderr, "  sound before %s, after %s; announcements %d -> %d\n", soundBefore.dump().c_str(),
+                         soundAfter.dump().c_str(), countBefore.value_or(-1), countAfter.value_or(-1));
+        }
+    }
+
+    // GOAL: S15.451 -- SetSound and SetMonitorSound announce ConfigChanged exactly once for a change of the
+    //       setting and not at all for a call that repeats the setting in force.
+    // WHY-THIS-SHAPE: the count is read after announcementsSettled(), which orders a reply behind every
+    //       earlier signal on the listener's own connection. Waiting for "at least N" and reading the count
+    //       then would pass a repeat's extra signal that had not arrived yet.
+    // CONTROL: via control_batch.sh, --phase '^soundWire$', 2026-10-11, each alone, reverted: in
+    //       DbusService::setSound and then DbusService::setMonitorSound (backend/daemon/dbus_service.cpp),
+    //       `changed = ... || true;` -> "FAIL: a sound setting announces ConfigChanged once per change and
+    //       never for a repeat", the repeat announcing 1. Re-run 2026-10-11 where the answer now comes from,
+    //       WallpaperManager's two commitSettingLocked overloads (backend/daemon/wallpaper_manager.cpp):
+    //       the string one's `changed` made `true`, then the map one's -> the same line, each alone.
+    // COVERAGE-ASSERT: all six steps must have been compared. Controlled with DbusService::setMonitorSound
+    //       made to throw InvalidRequest (backend/daemon/dbus_service.cpp) -> "FAIL: every announcement step
+    //       was compared", beside the S15.449 lines. Reverted.
+    {
+        struct Step {
+            const char* what;
+            std::function<void()> call;
+            int expected;
+        };
+        const std::vector<Step> steps = {
+            {"SetSound(false), a change", [&] { setSound(proxy, false); }, 1},
+            {"SetSound(false) again", [&] { setSound(proxy, false); }, 0},
+            {"SetMonitorSound(0, false), a change", [&] { setMonitorSound(proxy, kMonitorSoundNamed, false); }, 1},
+            {"SetMonitorSound(0, false) again", [&] { setMonitorSound(proxy, kMonitorSoundNamed, false); }, 0},
+            {"SetMonitorSound(0, true), a change", [&] { setMonitorSound(proxy, kMonitorSoundNamed, true); }, 1},
+            {"SetSound(true), a change", [&] { setSound(proxy, true); }, 1},
+        };
+        int compared = 0;
+        bool exact = true;
+        std::optional<int> before = settledCount();
+        for (const Step& step : steps) {
+            if (!before) break;
+            const std::string answer = errorNameFrom(step.call);
+            const std::optional<int> after = settledCount();
+            if (!answer.empty() || !after) {
+                std::fprintf(stderr, "  %s answered '%s'\n", step.what, answer.c_str());
+                exact = false;
+                break;
+            }
+            ++compared;
+            if (*after - *before != step.expected) {
+                exact = false;
+                std::fprintf(stderr, "  %s announced %d time(s), expected %d\n", step.what, *after - *before, step.expected);
+            }
+            before = after;
+        }
+        check(exact, "a sound setting announces ConfigChanged once per change and never for a repeat");
+        check(compared == static_cast<int>(steps.size()), "every announcement step was compared");
+    }
+
+    // GOAL: S15.452 -- `volume` is refused as InvalidArgs unless it is a number from 0 to 1, by
+    //       SetWallpaperProperties and SetWallpaperWithProperties alike, and a refusal leaves the stored
+    //       properties as they were; 0, 0.5 and 1 are stored.
+    // CONTROL: via control_batch.sh, --phase '^soundWire$', 2026-10-11, propertyError's volume bound `*number > 1`
+    //       made `> 2` (backend/daemon/wallpaper_properties.cpp) -> "FAIL: a volume outside 0 to 1, or not a
+    //       number, is refused and changes nothing", alone. Reverted.
+    {
+        const auto propertiesOf = [&proxy]() -> nlohmann::json {
+            const StatusReply status = getStatusOrExplain(proxy);
+            const nlohmann::json* entry = wallpaperStatus(status, std::to_string(kMonitorSoundNamed));
+            return entry != nullptr && entry->contains("properties") ? (*entry)["properties"] : nlohmann::json(nullptr);
+        };
+        const std::string base = errorNameFrom([&] { setWallpaperProperties(proxy, kMonitorSoundNamed, {{"volume", Variant(0.25)}}); });
+        const nlohmann::json held = propertiesOf();
+        bool refused = base.empty() && held.is_object();
+        const std::vector<std::pair<const char*, Variant>> bad = {
+            {"1.5", Variant(1.5)}, {"-0.1", Variant(-0.1)}, {"true", Variant(true)}, {"\"#ffffff\"", Variant(std::string("#ffffff"))}};
+        for (const auto& [label, value] : bad) {
+            const std::string viaProperties = errorNameFrom([&] { setWallpaperProperties(proxy, kMonitorSoundNamed, {{"volume", value}}); });
+            const std::string viaSet = errorNameFrom([&] {
+                setWallpaperWithProperties(proxy, "shader", unrenderablePath, kMonitorSoundNamed, {{"volume", value}});
+            });
+            if (viaProperties != kInvalidArgs || viaSet != kInvalidArgs) {
+                refused = false;
+                std::fprintf(stderr, "  volume %s answered '%s' and '%s'\n", label, viaProperties.c_str(), viaSet.c_str());
+            }
+        }
+        const nlohmann::json afterRefusals = propertiesOf();
+        check(refused && afterRefusals == held, "a volume outside 0 to 1, or not a number, is refused and changes nothing");
+        if (afterRefusals != held) std::fprintf(stderr, "  properties %s -> %s\n", held.dump().c_str(), afterRefusals.dump().c_str());
+        bool accepted = true;
+        for (const double value : {0.0, 0.5, 1.0}) {
+            const std::string answer = errorNameFrom([&] { setWallpaperProperties(proxy, kMonitorSoundNamed, {{"volume", Variant(value)}}); });
+            const nlohmann::json now = propertiesOf();
+            if (!answer.empty() || !now.is_object() || now.value("volume", nlohmann::json()) != value) {
+                accepted = false;
+                std::fprintf(stderr, "  volume %g answered '%s'; properties %s\n", value, answer.c_str(), now.dump().c_str());
+            }
+        }
+        check(accepted, "a volume of 0, 0.5 and 1 is stored");
+    }
+    });
+}
+
+void runFocusStateWireChecks(const wallpaperx::WallpaperManager::Config& base, const std::string& unrenderablePath,
+                             const Check& check) {
+    using sdbus::Variant;
+    using wallpaperx::testing::monitorSoundStatus;
+    using wallpaperx::testing::pauseStatus;
+    using wallpaperx::testing::setMonitorOutput;
+    using wallpaperx::testing::setMonitorPause;
+    using wallpaperx::testing::setMonitorSound;
+    using wallpaperx::testing::setOutputFocus;
+    using wallpaperx::testing::setOutputFocusState;
+    using wallpaperx::testing::setSound;
+    using wallpaperx::testing::setWallpaperProperties;
+    constexpr const char* kInvalidArgs = "org.freedesktop.DBus.Error.InvalidArgs";
+    constexpr const char* kUnknownOutput = "io.wallpaperx.Daemon.Error.UnknownOutput";
+    const char* kGoals = "S15.453-S15.458 (the focus report naming the desktop, and when a screen is heard)";
+    const wallpaperx::testing::ScratchDir scratch("dbusfocusstate");
+    if (!scratch.ok()) {
+        wallpaperx::testing::notVerified(kGoals, "a scratch directory for this phase's config file could not be made");
+        return;
+    }
+    wallpaperx::WallpaperManager::Config config = base;
+    config.configFile = scratch.path() / "wallpaperx" / "config.json";
+    withNoDeviceManager(config, "the focus state wire phase", check, [&](wallpaperx::WallpaperManager& manager) {
+    auto serviceConn = sdbus::createSessionBusConnection();
+    DbusService service(*serviceConn, manager);
+    serviceConn->enterEventLoopAsync();
+    const sdbus::ServiceName daemonName{serviceConn->getUniqueName()};
+    const sdbus::ObjectPath objectPath{DbusService::kObjectPath};
+    AnnouncementLog announced;
+    auto listener = sdbus::createProxy(daemonName, objectPath);
+    listener->uponSignal("ConfigChanged").onInterface(DbusService::kInterface).call([&announced] { announced.record(); });
+    // The reports are recorded against this connection, which stays on the bus for the whole phase.
+    auto proxyOwner = sdbus::createProxy(daemonName, objectPath);
+    sdbus::IProxy& proxy = *proxyOwner;
+
+    // Null also for a GetStatus that failed.
+    const auto pauseOf = [&proxy](int32_t monitorId) -> nlohmann::json {
+        const StatusReply status = getStatusOrExplain(proxy);
+        const nlohmann::json* entry = pauseStatus(status, std::to_string(monitorId));
+        return entry != nullptr ? *entry : nlohmann::json(nullptr);
+    };
+    const auto heardOf = [&proxy](int32_t monitorId) -> std::optional<bool> {
+        const StatusReply status = getStatusOrExplain(proxy);
+        const nlohmann::json* entry = monitorSoundStatus(status, std::to_string(monitorId));
+        if (entry == nullptr || !entry->contains("heard") || !(*entry)["heard"].is_boolean()) return std::nullopt;
+        return (*entry)["heard"].get<bool>();
+    };
+    const auto heardIs = [&heardOf](int32_t monitorId, bool expected) {
+        const std::optional<bool> now = heardOf(monitorId);
+        return now && *now == expected;
+    };
+    const auto pausedIs = [&pauseOf](int32_t monitorId, bool expected) {
+        const nlohmann::json entry = pauseOf(monitorId);
+        return entry.is_object() && entry.contains("paused") && entry["paused"] == expected;
+    };
+
+    const std::string setupError = errorNameFrom([&] {
+        setWallpaper(proxy, "shader", unrenderablePath, kMonitorHeard);
+        setMonitorOutput(proxy, kMonitorHeard, "DP-HEARD");
+        setWallpaper(proxy, "shader", unrenderablePath, kMonitorHeardPaused);
+        setMonitorOutput(proxy, kMonitorHeardPaused, "DP-HEARDP");
+        setMonitorPause(proxy, kMonitorHeardPaused, "paused_while_focused");
+    });
+    if (!setupError.empty()) {
+        wallpaperx::testing::notVerified(kGoals, "the setup calls answered '" + setupError + "'");
+        return;
+    }
+    if (!announcementsSettled(*listener)) {
+        check(false, "the announcement count settled after the setup");
+        return;
+    }
+    const int announcedAfterSetup = announced.count();
+
+    // GOAL: S15.453 -- with sound on at every level, a screen is heard exactly when its last report names
+    //       a window or the desktop as focused and no maximized window: never before any report, never
+    //       for "none", never with a maximized or fullscreen window whatever has the focus. And S15.454 --
+    //       GetStatus's pause entry echoes the reported focus by name, with window_focused true only for
+    //       "window".
+    // WHY-THIS-SHAPE: every combination of the three focus names and the maximized flag, one report each
+    //       on one screen, so each wrong rule (desktop not counted, maximized ignored, a desktop report
+    //       dropped as if empty, window_focused read off any focus) flips a different row.
+    // CONTROL: via control_batch.sh, --phase '^focusStateWire$', 2026-10-11, each alone, reverted, in
+    //       backend/daemon/wallpaper_manager.cpp unless named: soundHeardLocked's `focus != ScreenFocus::None`
+    //       made `== ScreenFocus::Window` -> the heard line and S15.455's premise; its `&&
+    //       !report->windowMaximized` dropped -> the heard line alone; setOutputFocus's erase condition made
+    //       `focus != ScreenFocus::Window` (a desktop report dropped) -> both lines, S15.455's premise and
+    //       S15.456's desktop line. In getStatus (backend/daemon/dbus_service.cpp): `"focus"` hard-wired
+    //       "none" -> the echo line (and S15.456, S15.458, which read it); window_focused made `focus !=
+    //       ScreenFocus::None` -> the echo line alone.
+    // COVERAGE-ASSERT: all seven rows must have been compared. Controlled with ScreenFocus::Desktop dropped
+    //       from kScreenFocuses (backend/daemon/screen_focus.h), so "desktop" is refused -> "FAIL: every focus
+    //       row was compared", beside the heard and echo lines. Reverted.
+    {
+        struct Row {
+            const char* focus;
+            bool maximized;
+            bool heard;
+        };
+        const Row rows[] = {{"window", false, true}, {"none", false, false}, {"desktop", false, true},
+                            {"window", true, false}, {"desktop", true, false}, {"none", true, false}};
+        int compared = 0;
+        bool heardRule = heardIs(kMonitorHeard, false);
+        if (!heardRule) std::fprintf(stderr, "  before any report: heard %s\n", heardOf(kMonitorHeard) ? "true" : "(none)");
+        if (heardOf(kMonitorHeard)) ++compared;
+        bool echoed = true;
+        for (const Row& row : rows) {
+            const std::string answer = errorNameFrom([&] { setOutputFocusState(proxy, "DP-HEARD", row.focus, row.maximized); });
+            const std::optional<bool> heard = heardOf(kMonitorHeard);
+            const nlohmann::json entry = pauseOf(kMonitorHeard);
+            if (!answer.empty() || !heard) {
+                std::fprintf(stderr, "  (%s, %s) answered '%s'\n", row.focus, row.maximized ? "maximized" : "-", answer.c_str());
+                heardRule = false;
+                echoed = false;
+                continue;
+            }
+            ++compared;
+            if (*heard != row.heard) {
+                heardRule = false;
+                std::fprintf(stderr, "  (%s, %s): heard %s, expected %s\n", row.focus, row.maximized ? "maximized" : "-",
+                             *heard ? "true" : "false", row.heard ? "true" : "false");
+            }
+            const bool matches = entry.is_object() && entry.value("focus", std::string()) == row.focus &&
+                                 entry.value("window_focused", nlohmann::json()) == (std::string(row.focus) == "window") &&
+                                 entry.value("window_maximized", nlohmann::json()) == row.maximized;
+            if (!matches) {
+                echoed = false;
+                std::fprintf(stderr, "  (%s, %s): pause entry %s\n", row.focus, row.maximized ? "maximized" : "-",
+                             entry.dump().c_str());
+            }
+        }
+        check(heardRule, "a screen is heard exactly when a window or the desktop has the focus and nothing is maximized");
+        check(echoed, "GetStatus echoes the reported focus by name, window_focused true only for a window");
+        check(compared == 7, "every focus row was compared");
+    }
+
+    // GOAL: S15.459 -- a focus report announces no ConfigChanged: the six reports above sent none.
+    // CONTROL: via control_batch.sh, --phase '^focusStateWire$', 2026-10-11, `announceConfigChanged();` added
+    //       after SetOutputFocusState's setOutputFocus call (backend/daemon/dbus_service.cpp) -> this line red,
+    //       alone. Reverted.
+    {
+        const bool settled = announcementsSettled(*listener);
+        check(settled && announced.count() == announcedAfterSetup, "focus reports announce no ConfigChanged");
+        if (settled && announced.count() != announcedAfterSetup) {
+            std::fprintf(stderr, "  %d announcement(s) for six reports\n", announced.count() - announcedAfterSetup);
+        }
+    }
+
+    // GOAL: S15.455 -- each sound level alone silences a focused screen: the wallpaper's `mute`, the
+    //       screen's SetMonitorSound(false) and SetSound(false); with all three back on it is heard again.
+    // WHY-THIS-SHAPE: the screen reports the desktop itself as focused (SetOutputFocusState "desktop")
+    //       throughout, the state in which sound is meant to play; one level is switched off at a time and
+    //       back, so a rule ignoring any one of them shows on its own line.
+    // CONTROL: via control_batch.sh, --phase '^focusStateWire$', 2026-10-11, each alone, reverted, one term
+    //       of soundHeardLocked (backend/daemon/wallpaper_manager.cpp) dropped: the `soundOn(m_sound)` test ->
+    //       "FAIL: switching off sound on every screen alone silences the screen"; the screen setting's ->
+    //       "... the screen's sound ..."; `wallpaperMuted(...)` -> "... its wallpaper's mute ...". Each alone.
+    {
+        const std::string premiseError = errorNameFrom([&] { setOutputFocusState(proxy, "DP-HEARD", "desktop", false); });
+        const bool premise = premiseError.empty() && heardIs(kMonitorHeard, true);
+        check(premise, "the screen whose desktop has the focus is heard (the premise)");
+        if (premise) {
+            struct Level {
+                const char* what;
+                std::function<void()> off;
+                std::function<void()> on;
+            };
+            const Level levels[] = {
+                {"its wallpaper's mute", [&] { setWallpaperProperties(proxy, kMonitorHeard, {{"mute", Variant(true)}}); },
+                 [&] { setWallpaperProperties(proxy, kMonitorHeard, {{"mute", Variant(false)}}); }},
+                {"the screen's sound", [&] { setMonitorSound(proxy, kMonitorHeard, false); },
+                 [&] { setMonitorSound(proxy, kMonitorHeard, true); }},
+                {"sound on every screen", [&] { setSound(proxy, false); }, [&] { setSound(proxy, true); }},
+            };
+            for (const Level& level : levels) {
+                const std::string offError = errorNameFrom(level.off);
+                const bool silenced = offError.empty() && heardIs(kMonitorHeard, false);
+                const std::string onError = errorNameFrom(level.on);
+                const bool back = onError.empty() && heardIs(kMonitorHeard, true);
+                check(silenced && back, (std::string("switching off ") + level.what + " alone silences the screen").c_str());
+                if (!silenced || !back) {
+                    std::fprintf(stderr, "  answered '%s', '%s'; silenced %s, heard again %s\n", offError.c_str(),
+                                 onError.c_str(), silenced ? "yes" : "no", back ? "yes" : "no");
+                }
+            }
+        }
+    }
+
+    // GOAL: S15.456 -- paused_while_focused pauses for a focused window and not for the focused desktop.
+    // CONTROL: via control_batch.sh, --phase '^focusStateWire$', 2026-10-11, pausedLocked's WhileWindowFocused
+    //       case made `report->focus != ScreenFocus::None` (backend/daemon/wallpaper_manager.cpp) -> "FAIL:
+    //       paused_while_focused does not pause while the desktop has the focus", alone. Reverted.
+    {
+        const std::string desktopError = errorNameFrom([&] { setOutputFocusState(proxy, "DP-HEARDP", "desktop", false); });
+        const bool desktopPlays = desktopError.empty() && pausedIs(kMonitorHeardPaused, false) &&
+                                  pauseOf(kMonitorHeardPaused).value("focus", std::string()) == "desktop";
+        const std::string windowError = errorNameFrom([&] { setOutputFocusState(proxy, "DP-HEARDP", "window", false); });
+        const bool windowPauses = windowError.empty() && pausedIs(kMonitorHeardPaused, true);
+        check(desktopPlays, "paused_while_focused does not pause while the desktop has the focus");
+        check(windowPauses, "paused_while_focused pauses while a window has the focus");
+        if (!desktopPlays || !windowPauses) {
+            std::fprintf(stderr, "  answered '%s', '%s'; entry now %s\n", desktopError.c_str(), windowError.c_str(),
+                         pauseOf(kMonitorHeardPaused).dump().c_str());
+        }
+    }
+
+    // GOAL: S15.457 -- SetOutputFocusState refuses a focus name other than none, window and desktop as
+    //       InvalidArgs and records nothing; a screen name no monitor answers to is UnknownOutput.
+    // WHY-THIS-SHAPE: the refused calls carry maximized=true over a recorded ("window", false), so a
+    //       refusal that recorded anything (as none, say) shows in the pause entry and in `heard`.
+    // CONTROL: via control_batch.sh, --phase '^focusStateWire$', 2026-10-11, SetOutputFocusState's parse made
+    //       `screenFocusFromName(focus).value_or(ScreenFocus::None)` (backend/daemon/dbus_service.cpp) -> "FAIL:
+    //       SetOutputFocusState refuses an unknown focus name as InvalidArgs and records nothing", alone.
+    //       Reverted. WallpaperManager::setOutputFocus's unbound-name throw made `return;`
+    //       (backend/daemon/wallpaper_manager.cpp) -> "FAIL: SetOutputFocusState refuses a name no monitor
+    //       answers to as UnknownOutput", alone. Reverted.
+    {
+        const std::string setError = errorNameFrom([&] { setOutputFocusState(proxy, "DP-HEARD", "window", false); });
+        const nlohmann::json before = pauseOf(kMonitorHeard);
+        bool refused = setError.empty() && before.is_object();
+        for (const char* name : {"sideways", "", "Desktop", "window "}) {
+            const std::string answer = errorNameFrom([&] { setOutputFocusState(proxy, "DP-HEARD", name, true); });
+            if (answer != kInvalidArgs) {
+                refused = false;
+                std::fprintf(stderr, "  focus \"%s\" answered '%s'\n", name, answer.c_str());
+            }
+        }
+        const nlohmann::json after = pauseOf(kMonitorHeard);
+        check(refused && after == before && heardIs(kMonitorHeard, true),
+              "SetOutputFocusState refuses an unknown focus name as InvalidArgs and records nothing");
+        if (after != before) std::fprintf(stderr, "  entry %s -> %s\n", before.dump().c_str(), after.dump().c_str());
+        const std::string unbound = errorNameFrom([&] { setOutputFocusState(proxy, "DP-NOWHERE", "desktop", false); });
+        check(unbound == kUnknownOutput, "SetOutputFocusState refuses a name no monitor answers to as UnknownOutput");
+        if (unbound != kUnknownOutput) std::fprintf(stderr, "  it answered '%s'\n", unbound.c_str());
+    }
+
+    // GOAL: S15.458 -- an older plugin's SetOutputFocus still works: (true, false) records a focused window
+    //       (focus "window", heard), (false, false) none (not heard), (false, true) a maximized window and no
+    //       focus.
+    // CONTROL: via control_batch.sh, --phase '^focusStateWire$', 2026-10-11, SetOutputFocus's mapping made
+    //       `ScreenFocus::None` whatever window_focused says (backend/daemon/dbus_service.cpp) -> this line red,
+    //       alone. Reverted.
+    {
+        struct Old {
+            bool focused;
+            bool maximized;
+            const char* focus;
+            bool heard;
+        };
+        const Old reports[] = {{true, false, "window", true}, {false, false, "none", false}, {false, true, "none", false}};
+        bool mapped = true;
+        for (const Old& report : reports) {
+            const std::string answer =
+                errorNameFrom([&] { setOutputFocus(proxy, "DP-HEARD", report.focused, report.maximized); });
+            const nlohmann::json entry = pauseOf(kMonitorHeard);
+            const bool ok = answer.empty() && entry.is_object() && entry.value("focus", std::string()) == report.focus &&
+                            entry.value("window_maximized", nlohmann::json()) == report.maximized &&
+                            heardIs(kMonitorHeard, report.heard);
+            if (!ok) {
+                mapped = false;
+                std::fprintf(stderr, "  SetOutputFocus(%d, %d) answered '%s'; entry %s; heard %s\n", report.focused,
+                             report.maximized, answer.c_str(), entry.dump().c_str(),
+                             heardOf(kMonitorHeard).value_or(false) ? "true" : "false");
+            }
+        }
+        check(mapped, "SetOutputFocus maps a focused window to \"window\" and no focus to \"none\"");
+    }
+    });
 }
 
 // One accepted request plus one render pass, on this thread. Returns whether a frame
@@ -8235,6 +8837,8 @@ int main() {
         phase("unservicedRequest", [&] { runUnservicedRequestChecks(config, imagePath, unrenderablePath, check); });
         phase("propertiesWire", [&] { runPropertiesWireChecks(config, imagePath, unrenderablePath, check); });
         phase("pauseWire", [&] { runPauseWireChecks(config, unrenderablePath, check); });
+        phase("soundWire", [&] { runSoundWireChecks(config, unrenderablePath, check); });
+        phase("focusStateWire", [&] { runFocusStateWireChecks(config, unrenderablePath, check); });
         phase("importModifierClient", [&] { runImportModifierClientChecks(config, imagePath, check); });
         phase("importModifierClientWire", [&] { runImportModifierClientWireChecks(config, check); });
         phase("importModifierAnnouncement",

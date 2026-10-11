@@ -50,17 +50,22 @@ constexpr double kMaxPlaybackSpeed = 2.0;
 
 // Why `properties` cannot be stored, or empty when it can. Keys are 1 to kMaxPropertyKeyBytes of
 // ASCII letters, digits, '_', '-' and '.', so they are safe to log and publish unescaped; numbers
-// are finite; "speed" is above 0 and at most kMaxPlaybackSpeed and "mute" a bool, the two the
-// daemon applies.
+// are finite; "speed" is above 0 and at most kMaxPlaybackSpeed, "mute" a bool and "volume" a number
+// from 0 to 1, the keys the daemon gives a meaning.
 std::string propertiesError(const WallpaperProperties& properties);
 
 // `properties` without the entries propertiesError() would refuse, and without those past
 // kMaxProperties, adding how many were left out to `dropped`. For a config file, where one bad
-// value must not cost the wallpaper it rides on.
-WallpaperProperties usableProperties(const WallpaperProperties& properties, int& dropped);
+// value must not cost the wallpaper it rides on. A numeric "volume" outside 0 to 1 is moved to the
+// nearer end and counted in `clampedVolumes` instead: a build before "volume" was reserved stored
+// whatever range the wallpaper declared, which no longer says what it meant.
+WallpaperProperties usableProperties(const WallpaperProperties& properties, int& dropped, int& clampedVolumes);
 
 // What "speed" says a video plays at: 1 without one, else within the playback range.
 double playbackSpeed(const WallpaperProperties& properties);
+
+// The wallpaper's own sound level: "mute" switches it off, unset means on.
+bool wallpaperMuted(const WallpaperProperties& properties);
 
 // An object of numbers, booleans and "#rrggbb" strings: the form both the config file and
 // GetStatus carry.

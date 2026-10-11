@@ -406,6 +406,11 @@ void selectionAndValues(const QString& root) {
         fault("S15.38", QStringLiteral("the library could not be built: ") + why);
         return;
     }
+    // A video with sound, so the declared mute is offered and volume added after it (S15.473).
+    if (!writeBytes(ocean + QStringLiteral("/assets/video.mp4"), soundVideo())) {
+        fault("S15.38", QStringLiteral("ocean's video could not be written"));
+        return;
+    }
     LibraryManager m(dir, kSettleMs);
     m.rescan();
     if (!readyWith(m, 3)) {
@@ -414,7 +419,8 @@ void selectionAndValues(const QString& root) {
     }
     Counts c;
     countSignals(m, c);
-    const QVariantMap defaults{{QStringLiteral("speed"), 1.0}, {QStringLiteral("mute"), true}, {QStringLiteral("tint"), QStringLiteral("#ffffff")}};
+    const QVariantMap defaults{{QStringLiteral("speed"), 1.0}, {QStringLiteral("mute"), true}, {QStringLiteral("tint"), QStringLiteral("#ffffff")},
+                               {QStringLiteral("volume"), 1.0}};
 
     // GOAL: S15.38 -- only a usable wallpaper in the list can be opened: select() of a broken or
     //       unknown path returns false and changes and emits nothing.
@@ -433,7 +439,7 @@ void selectionAndValues(const QString& root) {
     //       before any edit.
     // CONTROL: app/library/library_manager.cpp, propertyValues()'s `m_edits.value(property.key, property.defaultValue)`
     //       made `m_edits.value(property.key, QVariant())` -> red, "S15.40: the defaults read {mute=,
-    //       speed=, tint=}"; restored.
+    //       speed=, tint=, volume=}" (control_batch, re-run 2026-10-11 on a video with sound); restored.
     expect(m.propertyValues() == defaults, QStringLiteral("S15.40: the defaults read %1").arg(describe(m.propertyValues())));
 
     c.values = 0;
@@ -445,11 +451,13 @@ void selectionAndValues(const QString& root) {
     //       propertyValuesChanged.
     // CONTROL: app/library/library_manager.cpp, setPropertyValue()'s `if (!accepted) { return false; }`
     //       made `if (!accepted) { changeSelection([&] { m_edits.insert(key, value); }); return true; }`
-    //       -> red, "S15.40: the refused edit speed = 9 returned 1"; restored.
+    //       -> red, "S15.40: the refused edit speed = 9 returned 1", and each row after it, the two volume
+    //       rows included (control_batch, re-run 2026-10-11); restored.
     const QVariantMap before = m.propertyValues();
     const std::pair<const char*, QVariant> refused[] = {
         {"speed", 9.0}, {"speed", QStringLiteral("1")}, {"speed", std::numeric_limits<double>::quiet_NaN()},
         {"nope", 1.0},  {"mute", 1},                     {"tint", QStringLiteral("red")},
+        {"volume", 1.5}, {"volume", -0.1},
     };
     c.values = 0;
     for (const auto& [key, value] : refused) {
@@ -460,7 +468,7 @@ void selectionAndValues(const QString& root) {
     }
     // CONTROL: app/library/wpx_package.cpp, accept()'s `if (value.typeId() == QMetaType::QColor) {`
     //       made `if (false) {` -> red, "S15.40: a QColor tint and mute=false read {mute=false,
-    //       speed=1.8, tint=#ffffff}" (control_batch, 2026-10-02); restored.
+    //       speed=1.8, tint=#ffffff, volume=1}" (control_batch, re-run 2026-10-11); restored.
     const bool tookColour = m.setPropertyValue(QStringLiteral("tint"), QColor(255, 0, 0));
     const bool tookMute = m.setPropertyValue(QStringLiteral("mute"), false);
     expect(tookColour && tookMute && m.propertyValues().value(QStringLiteral("tint")) == QVariant(QStringLiteral("#ff0000")) &&
@@ -470,7 +478,7 @@ void selectionAndValues(const QString& root) {
     // GOAL: S15.40 -- resetPropertyValues() puts every value back to its default, and says so.
     // CONTROL: app/library/library_manager.cpp, resetPropertyValues()'s `m_edits.clear();` made
     //       `m_edits.remove(QStringLiteral("speed"));` -> red, "S15.40: after a reset the values read
-    //       {mute=false, speed=1, tint=#ff0000}"; restored.
+    //       {mute=false, speed=1, tint=#ff0000, volume=1}" (control_batch, re-run 2026-10-11); restored.
     c.values = 0;
     m.resetPropertyValues();
     expect(m.propertyValues() == defaults && c.values == 1,
@@ -480,7 +488,7 @@ void selectionAndValues(const QString& root) {
     //       re-selecting the open one keeps them.
     // CONTROL: app/library/library_manager.cpp, the `m_edits.clear();` inside select()'s
     //       changeSelection deleted -> red, "S15.38: re-select kept edits 1, the other wallpaper had
-    //       none 1; after coming back speed read 1.8" (control_batch, 2026-10-02); restored.
+    //       none 1; after coming back speed read 1.8" (control_batch, re-run 2026-10-11); restored.
     const bool setSpeed = m.setPropertyValue(QStringLiteral("speed"), 1.8);
     const bool reselect = setSpeed && m.select(ocean) && m.propertyValues().value(QStringLiteral("speed")) == QVariant(1.8);
     const bool other = m.select(still) && m.propertyValues().isEmpty();
@@ -495,13 +503,13 @@ void selectionAndValues(const QString& root) {
     //       and no emission ever exposing an out-of-range value.
     // WHY-THIS-SHAPE: every propertyValuesChanged is checked against the wallpaper as read at that
     //       moment, not only the end state, since the first emission after the rescan is the one a
-    //       binding (and Apply) would read.
-    // CONTROL: app/library/library_manager.cpp, settle()'s pruning `property.accept(m_edits.value(property.key))`
-    //       made `std::optional<QVariant>(m_edits.value(property.key))` -> red, "S15.40: after the
-    //       rewrite ... the values read {speed=1.8, tint=#00ff00, zoom=2}" and "an emission exposed
-    //       speed=1.8"; settle()'s `m_edits = std::move(edits);` made `m_edits.clear();` -> red,
-    //       "...the values read {speed=1, tint=#ffffff, zoom=2}" (both control_batch, 2026-10-02);
-    //       restored.
+    //       binding (and Apply) would read. The rewrite drops tint, not mute: a video with sound
+    //       always offers mute (S15.473), so only a property it does not add can be dropped.
+    // CONTROL: app/library/library_manager.cpp, control_batch, re-run 2026-10-11: settle()'s pruning
+    //       `property.accept(m_edits.value(property.key))` made `std::optional<QVariant>(m_edits.value(property.key))`
+    //       -> red, "S15.40: after the rewrite ... the values read {mute=false, speed=1.8, volume=1, zoom=2}"
+    //       and "an emission exposed speed=1.8"; settle()'s `m_edits = std::move(edits);` made
+    //       `m_edits.clear();` -> red, "...the values read {mute=true, speed=1, volume=1, zoom=2}"; restored.
     // COVERAGE-ASSERT: at least one emission was checked.
     if (!m.setPropertyValue(QStringLiteral("speed"), 1.8) || !m.setPropertyValue(QStringLiteral("mute"), false) ||
         !m.setPropertyValue(QStringLiteral("tint"), QStringLiteral("#00ff00"))) {
@@ -521,14 +529,15 @@ void selectionAndValues(const QString& root) {
     });
     OrderedJson narrowed = planManifest();
     narrowed["properties"] = OrderedJson::parse(R"({"speed": {"type": "float", "default": 1.0, "min": 0.1, "max": 1.5},
-                                                   "tint": {"type": "color", "default": "#ffffff"},
+                                                   "mute": {"type": "bool", "default": true},
                                                    "zoom": {"type": "float", "default": 2.0, "min": 0.0, "max": 4.0}})");
     if (!writeBytes(oceanManifest, jsonBytes(narrowed))) {
         harnessFailure("S15.40: the narrowed wallpaper.json could not be written");
         return;
     }
-    const bool reread = waitUntil([&] { return m.selectedWallpaper().properties.size() == 3 && m.selectedWallpaper().properties[2].key == u"zoom"; }, kWaitMs);
-    const QVariantMap want{{QStringLiteral("speed"), 1.0}, {QStringLiteral("tint"), QStringLiteral("#00ff00")}, {QStringLiteral("zoom"), 2.0}};
+    const bool reread = waitUntil([&] { return m.selectedWallpaper().properties.size() == 4 && m.selectedWallpaper().properties[2].key == u"zoom"; }, kWaitMs);
+    const QVariantMap want{{QStringLiteral("speed"), 1.0}, {QStringLiteral("mute"), false}, {QStringLiteral("zoom"), 2.0},
+                           {QStringLiteral("volume"), 1.0}};
     expect(reread && m.selectedPath() == ocean && m.propertyValues() == want,
            QStringLiteral("S15.40: after the rewrite (reread %1) the open wallpaper is \"%2\" and the values read %3, not %4")
                .arg(reread).arg(m.selectedPath(), describe(m.propertyValues()), describe(want)));
@@ -540,19 +549,20 @@ void selectionAndValues(const QString& root) {
     //       is rewritten again so the old edit would fit, the value stays at the default, and a
     //       property dropped and restored comes back at its default, not at the old edit.
     // WHY-THIS-SHAPE: follows the S15.40 rewrite on the same open wallpaper, so the edits it made
-    //       (speed 1.8, mute off) are exactly the ones the narrowing refused or dropped.
-    // CONTROL: app/library/library_manager.cpp, settle()'s `m_edits = std::move(edits);` deleted
-    //       and propertyValues() made to filter instead (`m_edits.value(property.key, property.defaultValue)`
-    //       wrapped in `property.accept(...).value_or(property.defaultValue)`), one patch, the
-    //       behaviour before decision B -> red, "S15.57: after the file was widened again the
-    //       values read {mute=false, speed=1.8, tint=#00ff00}" (control_batch, 2026-10-02); restored.
+    //       (speed 1.8, tint green) are exactly the ones the narrowing refused or dropped; mute's edit,
+    //       still valid throughout, stays.
+    // CONTROL: app/library/library_manager.cpp, control_batch, 2026-10-11: settle()'s pruning made to keep
+    //       every edit, as for S15.40 -> red, "S15.57: after the file was widened again (reread 1) the values
+    //       read {mute=false, speed=1.8, tint=#ffffff, volume=1}"; restored. (The 2026-10-02 control, filtering
+    //       in propertyValues() instead of pruning in settle(), was not re-run.)
     if (reread) {
         if (!writeBytes(oceanManifest, QByteArray(kPlanManifest))) {
             harnessFailure("S15.57: the widened wallpaper.json could not be written");
             return;
         }
-        const bool widened = waitUntil([&] { return m.selectedWallpaper().properties.size() == 3 && m.selectedWallpaper().properties[1].key == u"mute"; }, kWaitMs);
-        const QVariantMap wantBack{{QStringLiteral("speed"), 1.0}, {QStringLiteral("mute"), true}, {QStringLiteral("tint"), QStringLiteral("#00ff00")}};
+        const bool widened = waitUntil([&] { return m.selectedWallpaper().properties.size() == 4 && m.selectedWallpaper().properties[2].key == u"tint"; }, kWaitMs);
+        const QVariantMap wantBack{{QStringLiteral("speed"), 1.0}, {QStringLiteral("mute"), false}, {QStringLiteral("tint"), QStringLiteral("#ffffff")},
+                                   {QStringLiteral("volume"), 1.0}};
         expect(widened && m.selectedPath() == ocean && m.propertyValues() == wantBack,
                QStringLiteral("S15.57: after the file was widened again (reread %1) the values read %2, not %3")
                    .arg(widened).arg(describe(m.propertyValues()), describe(wantBack)));
@@ -1207,6 +1217,55 @@ void revealed(const QString& root) {
            QStringLiteral("S15.69: a folder revealed while a file in it was open for writing ended listed %1 and selected \"%2\"").arg(listed).arg(m.selectedPath()));
 }
 
+// S15.490
+void probeReused(const QString& root) {
+    const QString dir = root + QStringLiteral("/reused");
+    const QString asset = dir + QStringLiteral("/ocean/assets/video.mp4");
+    if (!writeFolder(dir + QStringLiteral("/ocean"), planEntriesWith(QByteArray(kPlanManifest), soundVideo())).isEmpty()) {
+        fault("S15.490", QStringLiteral("the library could not be written"));
+        return;
+    }
+    // A quiet period no test outlasts, so only rescan() starts a scan.
+    LibraryManager m(dir, 600000);
+    m.rescan();
+    const auto oceanAudio = [&] {
+        const Wallpaper* ocean = find(m.wallpapers(), QStringLiteral("ocean"));
+        return ocean != nullptr && ocean->usable() ? int(ocean->audio) : -1;
+    };
+    if (!readyWith(m, 1) || oceanAudio() != int(AudioStreams::Present)) {
+        notVerified("S15.490 (a rescan reuses the probe's answer)", "the first scan did not list ocean with sound");
+        return;
+    }
+    // Non-media bytes of the same size in place, the modification time put back, so the stamp is unchanged.
+    const QByteArray path = QFile::encodeName(asset);
+    struct stat before {};
+    const int fd = ::stat(path.constData(), &before) == 0 ? ::open(path.constData(), O_WRONLY | O_CLOEXEC) : -1;
+    const QByteArray junk(qsizetype(before.st_size), 'x');
+    const timespec times[2] = {{0, UTIME_OMIT}, before.st_mtim};
+    const bool rewritten = fd >= 0 && ::write(fd, junk.constData(), size_t(junk.size())) == junk.size() && ::futimens(fd, times) == 0;
+    if (fd >= 0) {
+        ::close(fd);
+    }
+    // A second folder, so the rescan's result always differs and its arrival can be waited for.
+    if (!rewritten || !writeFolder(dir + QStringLiteral("/marker"), planEntries(titled("Marker"))).isEmpty()) {
+        fault("S15.490", QStringLiteral("the asset could not be rewritten, or the marker folder written"));
+        return;
+    }
+    // GOAL: S15.490 at the manager -- rescan() hands the rows it shows to the scan, so an asset whose
+    //       stamp is unchanged keeps the answer it was probed with.
+    // WHY-THIS-SHAPE: the asset is no longer media, so a scan handed nothing reads it as Unknown; the marker
+    //       folder makes the rescan's result a change, whose arrival is the barrier.
+    // CONTROL: via control_batch.sh, --phase '^probeReused$', 2026-10-11, LibraryManager::rescan
+    //       (app/library/library_manager.cpp) calling `scanLibrary(directory)` with no rows -> "FAIL: S15.490:
+    //       after a rescan with ocean's stamp unchanged, ocean's audio reads 0 (Present is 2; rescanned 1)".
+    //       Reverted.
+    m.rescan();
+    const bool rescanned = readyWith(m, 2);
+    expect(rescanned && oceanAudio() == int(AudioStreams::Present),
+           QStringLiteral("S15.490: after a rescan with ocean's stamp unchanged, ocean's audio reads %1 (Present is %2; rescanned %3)")
+               .arg(oceanAudio()).arg(int(AudioStreams::Present)).arg(rescanned));
+}
+
 } // namespace
 
 int main(int argc, char* argv[]) {
@@ -1230,5 +1289,6 @@ int main(int argc, char* argv[]) {
     runPhase("betweenReadAndHandled", [&] { betweenReadAndHandled(root); });
     runPhase("idleLibrary", [&] { idleLibrary(root); });
     runPhase("revealed", [&] { revealed(root); });
+    runPhase("probeReused", [&] { probeReused(root); });
     return verdict();
 }

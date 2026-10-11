@@ -131,6 +131,30 @@ std::expected<DaemonStatus, QString> parseDaemonStatus(const QByteArray& json)
         }
     }
 
+    // A setting a newer daemon wrote is null, and applied as on, as is everything a daemon older than
+    // sound settings reports.
+    const QJsonValue sound = root.value(QStringLiteral("sound"));
+    if (!sound.isUndefined()) {
+        if (!sound.isObject()) {
+            return refuse("has sound settings that are not an object");
+        }
+        const QJsonObject settings = sound.toObject();
+        status.sound = settings.value(QStringLiteral("enabled")).toBool(true);
+        const QJsonValue monitors = settings.value(QStringLiteral("monitors"));
+        if (!monitors.isUndefined() && !monitors.isObject()) {
+            return refuse("has a list of monitors that is not an object");
+        }
+        const QJsonObject screens = monitors.toObject();
+        for (auto it = screens.begin(); it != screens.end(); ++it) {
+            const auto id = monitorIdOf(it.key());
+            if (!id) {
+                return refuse("lists a monitor id out of range");
+            }
+            status.occupied.insert(*id);
+            status.screenSound.insert(*id, it.value().toObject().value(QStringLiteral("enabled")).toBool(true));
+        }
+    }
+
     const QJsonObject persistence = root.value(QStringLiteral("persistence")).toObject();
     status.persistenceStatus = persistence.value(QStringLiteral("status")).toString();
     status.persistenceDetail = persistence.value(QStringLiteral("detail")).toString();
@@ -177,6 +201,15 @@ QVariantMap DaemonClient::pauseModes() const
         modes.insert(it.key(), mode == m_status.pauseModes.cend() ? QStringLiteral("play") : mode->value_or(QString()));
     }
     return modes;
+}
+
+QVariantMap DaemonClient::screenSound() const
+{
+    QVariantMap sound;
+    for (auto it = m_status.outputs.cbegin(); it != m_status.outputs.cend(); ++it) {
+        sound.insert(it.key(), m_status.screenSound.value(it.value(), true));
+    }
+    return sound;
 }
 
 QString DaemonClient::persistenceProblem() const
@@ -327,16 +360,40 @@ void DaemonClient::setPause(QObject* context, int monitorId, const QString& mode
 {
     QDBusMessage message = method("SetMonitorPause");
     message.setArguments({monitorId, mode});
+    sendSetting(context, message, [this, monitorId, mode] {
+        m_status.pauseModes.insert(monitorId, mode);
+        m_status.occupied.insert(monitorId);
+    }, std::move(done));
+}
+
+void DaemonClient::setSound(QObject* context, bool on, Done done)
+{
+    QDBusMessage message = method("SetSound");
+    message.setArguments({on});
+    sendSetting(context, message, [this, on] { m_status.sound = on; }, std::move(done));
+}
+
+void DaemonClient::setScreenSound(QObject* context, int monitorId, bool on, Done done)
+{
+    QDBusMessage message = method("SetMonitorSound");
+    message.setArguments({monitorId, on});
+    sendSetting(context, message, [this, monitorId, on] {
+        m_status.screenSound.insert(monitorId, on);
+        m_status.occupied.insert(monitorId);
+    }, std::move(done));
+}
+
+void DaemonClient::sendSetting(QObject* context, const QDBusMessage& message, std::function<void()> record, Done done)
+{
     send(context, message, m_timeouts.callMs,
-         [this, monitorId, mode, done = std::move(done)](std::expected<QDBusMessage, QString> reply) {
+         [this, record = std::move(record), done = std::move(done)](std::expected<QDBusMessage, QString> reply) {
              if (!reply) {
                  done(std::unexpected(std::move(reply.error())));
                  return;
              }
              // The reply is the daemon saying so, and the screen shows it before the re-read lands.
              if (m_state == State::Ready) {
-                 m_status.pauseModes.insert(monitorId, mode);
-                 m_status.occupied.insert(monitorId);
+                 record();
                  emit statusChanged();
              }
              refresh();

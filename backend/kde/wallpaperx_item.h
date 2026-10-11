@@ -93,6 +93,8 @@ class WallpaperXItem : public QQuickItem {
     // Whether a window has the focus on this screen, and whether one on it is maximized or
     // fullscreen. Set from QML, which can see the windows; reported to the daemon under `output`.
     Q_PROPERTY(bool windowFocused READ windowFocused WRITE setWindowFocused NOTIFY windowFocusedChanged)
+    // Whether this screen's desktop window -- the one this item is drawn in -- has the focus.
+    Q_PROPERTY(bool desktopFocused READ desktopFocused WRITE setDesktopFocused NOTIFY desktopFocusedChanged)
     Q_PROPERTY(bool windowMaximized READ windowMaximized WRITE setWindowMaximized NOTIFY windowMaximizedChanged)
     // Why nothing is being drawn, when nothing is. Empty while the wallpaper is showing, so QML
     // can fall back to the message states main.qml already derives rather than inventing its own.
@@ -163,6 +165,8 @@ public:
 
     bool windowFocused() const { return m_windows.focused; }
     void setWindowFocused(bool focused);
+    bool desktopFocused() const { return m_windows.desktopFocused; }
+    void setDesktopFocused(bool focused);
     bool windowMaximized() const { return m_windows.maximized; }
     void setWindowMaximized(bool maximized);
 
@@ -193,6 +197,7 @@ signals:
     void monitorIdChanged();
     void outputChanged();
     void windowFocusedChanged();
+    void desktopFocusedChanged();
     void windowMaximizedChanged();
     void unavailableReasonChanged();
     void frameShownChanged();
@@ -353,10 +358,11 @@ private:
 
     struct Windows {
         bool focused = false;
+        bool desktopFocused = false;
         bool maximized = false;
         bool operator==(const Windows&) const = default;
     };
-    // What SetOutputFocus was last told. GUI thread.
+    // What the daemon was last told. GUI thread.
     struct WindowReport {
         QString output;
         Windows windows;
@@ -365,6 +371,10 @@ private:
     // Tells the daemon what the windows on this screen are doing, when that changed or the daemon
     // may have lost it. GUI thread.
     void reportWindows();
+    // WindowFocus is SetOutputFocus, for a daemon that does not know SetOutputFocusState.
+    enum class WindowCall { FocusState, WindowFocus };
+    // Precondition: m_windowsReported holds `report`.
+    void sendWindowReport(const WindowReport& report, WindowCall call);
     // Wherever the item starts speaking to a different daemon, name or monitor, or stops speaking:
     // the next refusal starts a new run, retried at the first delay and logged, and a retry left
     // from the old run is dropped. Each caller arranges its own resend.
@@ -399,13 +409,16 @@ private:
     // The last answer the daemon accepted, so an unchanged one is not sent again. Empty wherever
     // the daemon may have lost it, as the size report is.
     std::optional<bool> m_visibleReported;
-    // The two window facts as QML last set them.
+    // The window facts as QML last set them.
     Windows m_windows;
     // The last window report sent and not refused. Forgotten wherever the daemon may have lost it,
     // and on leaving the screen, after which another item for the name may have reported over it.
     std::optional<WindowReport> m_windowsReported;
-    // Zero delay after a change, so both facts changing in one QML update are one report rather than
-    // two. Also holds the retry of a refused report, which a change brings forward.
+    // The unique name of the daemon last found to answer SetOutputFocusState with UnknownMethod. While
+    // it owns the name, window reports go straight to SetOutputFocus. GUI thread.
+    std::string m_lacksFocusState;
+    // Zero delay after a change, so facts changing together in one QML update are one report rather
+    // than several. Also holds the retry of a refused report, which a change brings forward.
     QTimer m_windowReportTimer;
     // How long the next retry of a refused window report waits: doubles while the daemon goes on
     // refusing, back to the start on an accepted one or a new context (restartWindowRetry). Only the

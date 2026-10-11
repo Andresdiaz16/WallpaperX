@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 // What the windows on this screen are doing, read from Plasma's task manager model -- the one its
-// panels and its own image wallpaper use for the same question. Loaded, never imported: a Plasma
-// whose task manager module will not load loses these two facts and nothing else, and the daemon
-// then takes the screen to have no window.
+// panels and its own image wallpaper use for the same question -- and whether the desktop has the
+// focus here. Loaded, never imported: a Plasma whose task manager module will not load loses these
+// facts and nothing else, and the daemon then takes the screen to have nothing focused.
 import QtQuick
 import org.kde.kwindowsystem
 import org.kde.taskmanager as TaskManager
@@ -11,7 +11,7 @@ import org.kde.taskmanager as TaskManager
 Item {
     id: root
 
-    // The renderer these two facts are written to. Its type is not named here: that would import
+    // The renderer these facts are written to. Its type is not named here: that would import
     // com.wallpaperx, tying this file's loading to the renderer module's. var, not QtObject: qmllint
     // checks the writes below against a declared type, and QObject has neither property.
     required property var renderer
@@ -29,12 +29,18 @@ Item {
     // Showing the desktop hides windows without minimizing them.
     readonly property bool focused: root.onScreen && !KWindowSystem.showingDesktop && root.anyActive
     readonly property bool maximized: root.onScreen && !KWindowSystem.showingDesktop && root.anyMaximized
+    // The window this item is in is the screen's desktop window, which the task model never lists.
+    // KWin focuses it when it is clicked, when the desktop is shown, and when no window on the screen
+    // is left to take the focus.
+    readonly property bool desktopFocused: root.onScreen && root.Window.active
 
     onFocusedChanged: root.renderer.windowFocused = root.focused
+    onDesktopFocusedChanged: root.renderer.desktopFocused = root.desktopFocused
     onMaximizedChanged: root.renderer.windowMaximized = root.maximized
     // A value already true when the bindings first ran raised no change.
     Component.onCompleted: {
         root.renderer.windowFocused = root.focused;
+        root.renderer.desktopFocused = root.desktopFocused;
         root.renderer.windowMaximized = root.maximized;
     }
 

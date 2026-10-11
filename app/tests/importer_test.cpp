@@ -776,6 +776,9 @@ void refusals(const QString& root) {
         return name != u"assets/extra.bin" || zip_set_file_compression(zip, index, ZIP_CM_STORE, 0) == 0;
     }));
     build(patchBytes(at("damaged.wpx"), QByteArray(16, 'Q'), QByteArray("QQQQQQQQRQQQQQQQ")) ? QString() : QStringLiteral("damaged.wpx could not be damaged"));
+    OrderedJson loud = planManifest();
+    loud["properties"]["volume"] = OrderedJson::parse(R"({"type": "float", "default": 50, "min": 0, "max": 100})");
+    build(writeZip(at("loudvolume.wpx"), planEntriesWith(jsonBytes(loud), soundVideo())));
     if (!why.isEmpty()) {
         fault("S15.76", why);
         return;
@@ -796,6 +799,14 @@ void refusals(const QString& root) {
         {"badmanifest.wpx", QStringLiteral("wallpaper.json is for schema version \"2\"")},
         {"bigdeclared.wpx", QStringLiteral("It unpacks to more than 4 GiB.")},
         {"damaged.wpx", QStringLiteral("assets/extra.bin is damaged in the archive")},
+        // GOAL: S15.488's archive half -- a .wpx whose video has sound and whose wallpaper.json declares a
+        //       volume of 0 to 100 is refused at import with the volume's sentence: an archive is not probed,
+        //       so the refusal comes from reading the unpacked folder.
+        // CONTROL: via control_batch.sh, --phase '^refusals$', 2026-10-11, settleSoundProperties' `return
+        //       problem;` made a no-op (app/library/wpx_package.cpp) -> "FAIL: S15.76: loudvolume.wpx gave
+        //       Imported ...; wanted Refused "Property "volume" ... allows 0 to 100 ..."". Reverted.
+        {"loudvolume.wpx",
+         QStringLiteral("Property \"volume\" in wallpaper.json allows 0 to 100, and WallpaperX plays a video's volume from 0 to 1.")},
     };
     // GOAL: S15.76 -- a package that could put a file outside its folder, holds a link or special
     //       file, has more than 4096 files, declares more than 4 GiB unpacked, uses the name kept
@@ -822,7 +833,7 @@ void refusals(const QString& root) {
     //       body emptied -> "clash.wpx ... left [.import-...]".
     // COVERAGE-ASSERT: clash, duplicate and damaged are counted being refused after their
     //       unfinished folder was made, so its removal is graded, not merely never needed.
-    static_assert(std::size(cases) == 11, "a refusal row was added or dropped");
+    static_assert(std::size(cases) == 12, "a refusal row was added or dropped");
     QStringList afterUnfinished;
     for (const Case& c : cases) {
         const auto before = sourceState(at(c.file));

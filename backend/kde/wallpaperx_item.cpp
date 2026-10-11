@@ -1132,6 +1132,13 @@ void WallpaperXItem::setWindowFocused(bool focused) {
     m_windowReportTimer.start(0);
 }
 
+void WallpaperXItem::setDesktopFocused(bool focused) {
+    if (m_windows.desktopFocused == focused) return;
+    m_windows.desktopFocused = focused;
+    emit desktopFocusedChanged();
+    m_windowReportTimer.start(0);
+}
+
 void WallpaperXItem::setWindowMaximized(bool maximized) {
     if (m_windows.maximized == maximized) return;
     m_windows.maximized = maximized;
@@ -1305,24 +1312,57 @@ void WallpaperXItem::reportWindows() {
     // may be showing it.
     if (!m_onScreen || m_output.isEmpty() || m_windowsReported == report) return;
 
-    QDBusConnection bus = QDBusConnection::sessionBus();
-    if (!bus.isConnected()) return;
-    QDBusMessage request = QDBusMessage::createMethodCall(QString::fromUtf8(kService), QString::fromUtf8(kPath),
-                                                          QString::fromUtf8(kInterface),
-                                                          QStringLiteral("SetOutputFocus"));
-    request.setArguments({report.output, report.windows.focused, report.windows.maximized});
     m_windowsReported = report;
+    const bool older = !m_lacksFocusState.empty() && m_lacksFocusState == BufferClaims::instance().currentDaemon().owner;
+    sendWindowReport(report, older ? WindowCall::WindowFocus : WindowCall::FocusState);
+}
 
+void WallpaperXItem::sendWindowReport(const WindowReport& report, WindowCall call) {
+    QDBusConnection bus = QDBusConnection::sessionBus();
+    if (!bus.isConnected()) {
+        m_windowsReported.reset();
+        return;
+    }
+    QDBusMessage request;
+    if (call == WindowCall::FocusState) {
+        request = QDBusMessage::createMethodCall(QString::fromUtf8(kService), QString::fromUtf8(kPath),
+                                                 QString::fromUtf8(kInterface), QStringLiteral("SetOutputFocusState"));
+        // A window keeps precedence: QML reads the two from different sources, which can disagree
+        // for the moment between one window losing the focus and the desktop gaining it.
+        const QString focus = report.windows.focused          ? QStringLiteral("window")
+                              : report.windows.desktopFocused ? QStringLiteral("desktop")
+                                                              : QStringLiteral("none");
+        request.setArguments({report.output, focus, report.windows.maximized});
+    } else {
+        request = QDBusMessage::createMethodCall(QString::fromUtf8(kService), QString::fromUtf8(kPath),
+                                                 QString::fromUtf8(kInterface), QStringLiteral("SetOutputFocus"));
+        request.setArguments({report.output, report.windows.focused, report.windows.maximized});
+    }
+
+    // The owner as this item knows it when asking, not the reply's sender, which an answer from
+    // within this process leaves empty. A stale one is undone by the owner change still to arrive,
+    // which resends the report; a unique name is never reused.
+    std::string asked = BufferClaims::instance().currentDaemon().owner;
     auto* watcher = new QDBusPendingCallWatcher(bus.asyncCall(request), this);
-    connect(watcher, &QDBusPendingCallWatcher::finished, this, [this, report](QDBusPendingCallWatcher* done) {
+    connect(watcher, &QDBusPendingCallWatcher::finished, this,
+            [this, report, call, asked = std::move(asked)](QDBusPendingCallWatcher* done) {
         done->deleteLater();
         if (!done->isError()) {
             m_windowRetryMs = kRefusedRetryMs;
             return;
         }
-        if (m_windowsReported != report) return;
-        m_windowsReported.reset();
         const QString name = done->error().name();
+        const bool older =
+            call == WindowCall::FocusState && name == QLatin1String("org.freedesktop.DBus.Error.UnknownMethod");
+        if (older) m_lacksFocusState = asked;
+        if (m_windowsReported != report) return;
+        // A daemon older than SetOutputFocusState: told what it understands, the window's focus
+        // without the desktop's, and so for as long as it owns the name.
+        if (older) {
+            sendWindowReport(report, WindowCall::WindowFocus);
+            return;
+        }
+        m_windowsReported.reset();
         const Refusal refusal = classifyRefusal(name);
         // No daemon, or one older than this call: a new owner reports again, and an old daemon has
         // no pause setting for the report to serve. Neither is logged -- this follows every focus

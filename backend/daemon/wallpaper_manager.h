@@ -8,6 +8,8 @@
 #include "kept_rows.h"
 #include "log_escape.h"
 #include "pause_mode.h"
+#include "screen_focus.h"
+#include "sound_setting.h"
 // kTargetDepth and the two numbers behind it: separate because the KDE plugin sizes its import
 // cache against them and cannot include this header.
 #include "ring_depth.h"
@@ -171,9 +173,19 @@ struct PauseStatus {
     // Nothing for a setting a newer build wrote, which this one keeps and does not apply.
     std::optional<PauseMode> mode = PauseMode::Play;
     bool paused = false;
-    // What the screen bound to this monitor last reported; false when it has not.
-    bool windowFocused = false;
+    // What the screen bound to this monitor last reported; None and false when it has not.
+    ScreenFocus focus = ScreenFocus::None;
     bool windowMaximized = false;
+};
+
+// A monitor's sound setting and what the three levels come to on it now.
+struct MonitorSoundStatus {
+    // Nothing for a setting a newer build wrote, which this one keeps and treats as on.
+    std::optional<bool> enabled = true;
+    // Sound is on globally, on this screen and for its wallpaper, a window or the desktop on this
+    // screen has the focus, and no window on it is maximized or fullscreen. Says nothing about
+    // whether the wallpaper has sound to play.
+    bool heard = false;
 };
 
 // True once a config read has been abandoned mid-call. That thread is still blocked in the
@@ -591,17 +603,26 @@ public:
     // Idempotent.
     void setMonitorPause(int monitorId, const std::string& mode);
 
-    // Records what the screen named `outputName` reports about its windows: whether one has the
-    // focus there, and whether one there is maximized or fullscreen. Not persisted. A screen that
-    // has never reported, or whose reporter `client` has since left the bus, is taken to have
-    // neither, so the focus modes play until a report says otherwise. Throws as setOutputVisible()
-    // does. The caller wakes the render worker. Idempotent.
-    void setOutputFocus(const std::string& client, const std::string& outputName, bool windowFocused,
+    // Records what the screen named `outputName` reports about its windows: what holds the focus
+    // there, and whether a window there is maximized or fullscreen. Not persisted. A screen that has
+    // never reported, or whose reporter `client` has since left the bus, is taken to have neither,
+    // so the focus modes play until a report says otherwise. Throws as setOutputVisible() does. The
+    // caller wakes the render worker. Idempotent.
+    void setOutputFocus(const std::string& client, const std::string& outputName, ScreenFocus focus,
                         bool windowMaximized);
 
     // Drops every focus report `client` made, because it left the bus. Returns whether any went,
     // which may have ended a pause, so the caller wakes the render worker.
     bool forgetOutputFocus(const std::string& client);
+
+    // Switches sound on or off for every screen, above each screen's own setting. Persisted, saved
+    // and waited on as setMonitorPause() does, all or nothing up to the queued save. Returns whether
+    // the setting changed. Idempotent.
+    bool setSound(bool on);
+
+    // The same for one monitor, below the global setting and above its wallpaper's `mute`. Survives
+    // every wallpaper change. Throws InvalidRequest for a bad id.
+    bool setMonitorSound(int monitorId, bool on);
 
     // Records what the consumer named by `client` says it can import, and returns the monitors
     // to re-post so their images are rebuilt against it. GPU-free, like requestWallpaper: the
@@ -814,6 +835,12 @@ public:
 
         // Every monitor holding a wallpaper or a pause setting.
         std::map<int, PauseStatus> pause;
+
+        // The global sound setting; nothing for a value a newer build wrote, applied as on.
+        std::optional<bool> sound = true;
+
+        // Every monitor holding a wallpaper or a sound setting.
+        std::map<int, MonitorSoundStatus> monitorSound;
     };
     Snapshot snapshot() const;
 
@@ -1151,6 +1178,9 @@ private:
     // now. Caller must hold m_stateMutex.
     bool pausedLocked(int monitorId) const;
 
+    // MonitorSoundStatus::heard for this monitor. Caller must hold m_stateMutex.
+    bool soundHeardLocked(int monitorId) const;
+
     // Ends the clean-play stretch of a monitor that is paused now. Called by every change that can
     // pause one, so a pause and its end landing between two clock rounds is not counted as played.
     // Caller must hold m_stateMutex.
@@ -1290,13 +1320,31 @@ private:
     // m_stateMutex wherever a render or a bus call could be running beside it.
     LiveWallpapers liveWallpapers() const;
 
+    // What the next save writes: the kept rows merged with live state, and the root settings. Caller
+    // must hold m_stateMutex.
+    PersistedConfig configToWriteLocked() const;
+
+    // What committing a persisted setting did. Skipped: unchanged and known to be on disk, so nothing
+    // was queued. Rewritten: unchanged, but queued, since the file is not known to hold it.
+    enum class SettingCommit { Skipped, Rewritten, Changed };
+    // Puts `next` in a persisted setting and queues the save, all or nothing: a save that cannot be
+    // queued puts the old value back and rethrows. The root's setting is text, empty for absent; a
+    // monitor's is an entry in `settings`, nothing for absent. Caller must hold m_stateMutex, and
+    // waits for the write after releasing it unless Skipped.
+    SettingCommit commitSettingLocked(std::string& setting, std::string next);
+    SettingCommit commitSettingLocked(std::map<int, std::string>& settings, int monitorId,
+                                      std::optional<std::string> next);
+    // Both through this: `exchange` swaps the old and new values, so calling it again undoes it.
+    template <class Exchange>
+    SettingCommit commitLocked(bool changed, Exchange exchange);
+
     // The persistence report, over that live state. Same locking rule.
     std::string keptDetail(const std::string& base) const;
 
     // Hands `entries` to the writer without waiting; a refusal or a missing thread reaches
     // persistence health through the writer's outcome. Never blocks, so a change can be queued
     // under m_stateMutex and undone there if this throws: nothing is handed over in that case.
-    void queuePersist(std::vector<PersistedWallpaper> entries);
+    void queuePersist(PersistedConfig config);
 
     // The writer's bounded wait for what was last queued. Returns whether it is known to be on
     // disk; on false, `whyNot` receives that write's own reason, sanitized. Parks the calling
@@ -1336,7 +1384,7 @@ private:
     std::vector<PersistedWallpaper> m_restore;
 
     // The repair restoreSaved() computed, until writeRepairedConfig() takes it out.
-    std::optional<std::vector<PersistedWallpaper>> m_repair;
+    std::optional<PersistedConfig> m_repair;
 
     // The counts restoreSaved() carried forward, until recordStartingVideos() puts them on disk.
     // Written and read before the event loop starts.
@@ -1509,13 +1557,19 @@ private:
     // it is, if any. Guarded by m_stateMutex.
     std::map<int, std::string> m_pauseSettings;
 
+    // The global sound setting as the config root carries it, and each monitor's as its row does:
+    // JSON text, absent or empty meaning on, kept as read for pause's reason (sound_setting.h).
+    // Guarded by m_stateMutex.
+    std::string m_sound;
+    std::map<int, std::string> m_soundSettings;
+
     // What each screen reported about its windows, by name for m_outputsNotDrawn's reason, and who
-    // reported it, so the report dies with its reporter. Only a report of a focused or maximized
+    // reported it, so the report dies with its reporter. Only a report of some focus or a maximized
     // window is held: absent means neither. Every key is a bound name -- bindOutputLocked() drops a
     // name's report with its binding. Guarded by m_stateMutex.
     struct FocusReport {
         std::string reporter;
-        bool windowFocused = false;
+        ScreenFocus focus = ScreenFocus::None;
         bool windowMaximized = false;
     };
     std::map<std::string, FocusReport> m_outputFocus;

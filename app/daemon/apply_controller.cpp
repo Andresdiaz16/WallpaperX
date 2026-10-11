@@ -51,6 +51,7 @@ ApplyController::ApplyController(KScreenClient& kscreen, LibraryManager& library
         emit blockedReasonChanged();
         emit applyChanged();
         emit pauseChanged();
+        emit screenSoundChanged();
     });
 }
 
@@ -60,14 +61,9 @@ QString ApplyController::applyMessage() const
     return m_apply == Progress::Working || selected ? m_applyMessage : QString();
 }
 
-QString ApplyController::pauseMessage() const
+bool ApplyController::forSelected(const Change& change) const
 {
-    return m_kscreen.selectedOutput() == m_pauseOutput ? m_pauseMessage : QString();
-}
-
-QString ApplyController::pendingPauseMode() const
-{
-    return m_pause == Progress::Working && m_kscreen.selectedOutput() == m_pauseOutput ? m_pendingPauseMode : QString();
+    return change.everyScreen || m_kscreen.selectedOutput() == change.output;
 }
 
 QString ApplyController::blockedReason() const
@@ -134,29 +130,72 @@ void ApplyController::apply()
 
 void ApplyController::setPauseMode(const QString& mode)
 {
+    if (!isPauseMode(mode)) {
+        return;
+    }
+    changeScreenSetting(m_pause, &ApplyController::pauseChanged, mode, tr("The pause setting"),
+                        [this, mode](int monitorId, DaemonClient::Done done) {
+                            m_daemon.setPause(this, monitorId, mode, std::move(done));
+                        });
+}
+
+void ApplyController::setScreenSound(bool on)
+{
+    changeScreenSetting(m_screenSound, &ApplyController::screenSoundChanged, on, tr("The sound setting"),
+                        [this, on](int monitorId, DaemonClient::Done done) {
+                            m_daemon.setScreenSound(this, monitorId, on, std::move(done));
+                        });
+}
+
+void ApplyController::setSound(bool on)
+{
+    if (m_sound.state == Progress::Working) {
+        return;
+    }
+    m_sound.value = on;
+    settle(m_sound, &ApplyController::soundChanged, Progress::Working, {});
+    m_daemon.setSound(this, on, [this](std::expected<void, QString> set) {
+        if (!set) {
+            settle(m_sound, &ApplyController::soundChanged, Progress::Failed,
+                   tr("Sound was not changed for every screen. %1").arg(set.error()));
+            return;
+        }
+        settle(m_sound, &ApplyController::soundChanged, Progress::Done, {});
+    });
+}
+
+void ApplyController::changeScreenSetting(
+    Change& change, ChangeSignal changed, const QVariant& value, const QString& what,
+    std::function<void(int monitorId, std::function<void(std::expected<void, QString>)>)> send)
+{
     const Monitor monitor = m_kscreen.selectedMonitor();
-    if (m_pause == Progress::Working || monitor.outputName.isEmpty() || !isPauseMode(mode)) {
+    if (change.state == Progress::Working || monitor.outputName.isEmpty()) {
         return;
     }
     const QString where = monitorName(monitor);
-    m_pauseOutput = monitor.outputName;
-    m_pendingPauseMode = mode;
+    change.output = monitor.outputName;
+    change.value = value;
     if (const QString refusal = outputRefusal(monitor.outputName); !refusal.isEmpty()) {
-        settlePause(Progress::Failed, refusal);
+        settle(change, changed, Progress::Failed, refusal);
         return;
     }
-    settlePause(Progress::Working, {});
-    m_daemon.bindMonitor(this, monitor.outputName, [=, this](std::expected<int, QString> monitorId) {
+    settle(change, changed, Progress::Working, {});
+    // `change` is a member, so it lives as long as the replies, which run only while this does.
+    const auto fail = [this, &change, changed, what, where](const QString& why) {
+        settle(change, changed, Progress::Failed, tr("%1 for %2 was not changed. %3").arg(what, where, why));
+    };
+    m_daemon.bindMonitor(this, monitor.outputName,
+                         [this, &change, changed, fail, send = std::move(send)](std::expected<int, QString> monitorId) {
         if (!monitorId) {
-            settlePause(Progress::Failed, tr("The pause setting for %1 was not changed. %2").arg(where, monitorId.error()));
+            fail(monitorId.error());
             return;
         }
-        m_daemon.setPause(this, *monitorId, mode, [=, this](std::expected<void, QString> set) {
+        send(*monitorId, [this, &change, changed, fail](std::expected<void, QString> set) {
             if (!set) {
-                settlePause(Progress::Failed, tr("The pause setting for %1 was not changed. %2").arg(where, set.error()));
+                fail(set.error());
                 return;
             }
-            settlePause(Progress::Done, {});
+            settle(change, changed, Progress::Done, {});
         });
     });
 }
@@ -171,11 +210,11 @@ void ApplyController::settleApply(Progress state, QString message)
     emit applyChanged();
 }
 
-void ApplyController::settlePause(Progress state, QString message)
+void ApplyController::settle(Change& change, ChangeSignal changed, Progress state, QString message)
 {
-    m_pause = state;
-    m_pauseMessage = std::move(message);
-    emit pauseChanged();
+    change.state = state;
+    change.message = std::move(message);
+    emit (this->*changed)();
 }
 
 void ApplyController::startLive(const QString& wallpaperPath, const QString& connector, int monitorId, QVariantMap sent)

@@ -116,7 +116,8 @@ void LibraryManager::rescan()
         m_reveal->scanBegun = true;
     }
     const QString directory = m_directory;
-    QtConcurrent::run([directory] { return scanLibrary(directory); })
+    // A copy: the rows can change on this thread while the scan runs.
+    QtConcurrent::run([directory, previous = m_model.wallpapers()] { return scanLibrary(directory, previous); })
         // A throw would otherwise skip the continuation and leave the state as it was, Loading at first.
         .onFailed([directory]() -> ScanResult {
             return std::unexpected(QStringLiteral("Reading %1 failed: %2.").arg(directory, describeCurrentException()));

@@ -110,9 +110,11 @@ struct Rig {
         ocean = lib + QStringLiteral("/ocean");
         river = lib + QStringLiteral("/river");
         glow = lib + QStringLiteral("/glow");
+        // Ocean's video has sound and River's is silent, so a declared mute is offered for Ocean only.
         for (const auto& [path, json] : {std::pair{ocean, QByteArray(kPlanManifest)}, std::pair{river, titled("River")},
                                          std::pair{glow, shaderManifest()}}) {
-            if (const QString why = writeFolder(path, planEntries(json)); !why.isEmpty()) {
+            if (const QString why = writeFolder(path, planEntriesWith(json, path == ocean ? soundVideo() : silentVideo()));
+                !why.isEmpty()) {
                 return QStringLiteral("the library could not be written: ") + why;
             }
         }
@@ -464,7 +466,10 @@ void applyOrder() {
     // CONTROL: app/daemon/apply_controller.cpp, a `m_plasma.activate(...)` added before
     //       `m_daemon.setWallpaper(...)` (Plasma asked first; control_batch, 2026-10-02) -> red,
     //       "S15.233: Apply sent [GetStatus,SetMonitorOutput,evaluateScript,SetWallpaperWithProperties,
-    //       evaluateScript] and ended 2: Ocean Waves is on DP-1.".
+    //       evaluateScript] and ended 2: Ocean Waves is on DP-1.". The values line: the added volume's default
+    //       made 0.5 in settleSoundProperties (app/library/wpx_package.cpp; control_batch, 2026-10-11) -> red,
+    //       "S15.233: SetWallpaperWithProperties carried ... {mute=true(bool), speed=1.5(double),
+    //       tint=#ffffff(QString), volume=0.5(double)}".
     rig.library->select(rig.ocean);
     rig.library->setPropertyValue(QStringLiteral("speed"), 1.5);
     rig.log.clear();
@@ -485,17 +490,34 @@ void applyOrder() {
     const auto set = rig.sent("SetWallpaperWithProperties");
     expect(bind.size() == 1 && bind[0].signature == u"is" && bind[0].args == QVariantList{0, QStringLiteral("DP-1")},
            QStringLiteral("S15.233: the screen was bound as %1").arg(bind.isEmpty() ? QStringLiteral("(nothing)") : bind[0].signature + u' ' + bind[0].args.value(0).toString() + u' ' + bind[0].args.value(1).toString()));
-    const QVariantMap wantValues{{QStringLiteral("speed"), 1.5}, {QStringLiteral("mute"), true}, {QStringLiteral("tint"), QStringLiteral("#ffffff")}};
+    const QVariantMap wantValues{{QStringLiteral("speed"), 1.5}, {QStringLiteral("mute"), true}, {QStringLiteral("tint"), QStringLiteral("#ffffff")},
+                                 {QStringLiteral("volume"), 1.0}};
     const QVariantMap values = set.isEmpty() ? QVariantMap() : set[0].args.value(3).toMap();
     expect(set.size() == 1 && set[0].signature == u"ssia{sv}" && set[0].args.value(0).toString() == u"video" &&
                set[0].args.value(1) == QString(rig.ocean + QStringLiteral("/assets/video.mp4")) && set[0].args.value(2) == 0 &&
                values == wantValues && values.value(QStringLiteral("speed")).typeId() == QMetaType::Double &&
-               values.value(QStringLiteral("mute")).typeId() == QMetaType::Bool && values.value(QStringLiteral("tint")).typeId() == QMetaType::QString,
+               values.value(QStringLiteral("mute")).typeId() == QMetaType::Bool && values.value(QStringLiteral("tint")).typeId() == QMetaType::QString &&
+               values.value(QStringLiteral("volume")).typeId() == QMetaType::Double,
            QStringLiteral("S15.233: SetWallpaperWithProperties carried %1 %2 %3 %4")
                .arg(set.isEmpty() ? QStringLiteral("(nothing)") : set[0].signature, set.isEmpty() ? QString() : set[0].args.value(1).toString(),
                     set.isEmpty() ? QString() : set[0].args.value(2).toString(), describeMap(values)));
     expect(rig.shellFake->plugins() == kAfterDp1,
            QStringLiteral("S15.233: after Apply on DP-1 the desktops are [%1], not [%2]").arg(joined(rig.shellFake->plugins()), joined(kAfterDp1)));
+
+    // GOAL: S15.473's Apply half -- a silent video's declared mute is not sent: River, whose
+    //       wallpaper.json declares mute over a video with no sound, is applied with speed and tint alone.
+    // CONTROL: via control_batch.sh, --phase '^applyOrder$', 2026-10-11, settleSoundProperties' `==
+    //       AudioStreams::Absent` strip made `if (false)` (app/library/wpx_package.cpp) -> "FAIL: S15.473: a silent
+    //       video was applied with {mute=true(bool), speed=1(double), tint=#ffffff(QString), volume=1(double)}
+    //       (2 call(s))". Reverted.
+    rig.library->select(rig.river);
+    const bool riverFinished = rig.apply();
+    const auto riverSet = rig.sent("SetWallpaperWithProperties");
+    const QVariantMap riverValues = riverSet.size() == 2 ? riverSet[1].args.value(3).toMap() : QVariantMap();
+    expect(riverFinished && riverSet.size() == 2 &&
+               riverValues == QVariantMap{{QStringLiteral("speed"), 1.0}, {QStringLiteral("tint"), QStringLiteral("#ffffff")}},
+           QStringLiteral("S15.473: a silent video was applied with %1 (%2 call(s))").arg(describeMap(riverValues)).arg(riverSet.size()));
+    rig.library->select(rig.ocean);
 
     // GOAL: S15.233 -- a wallpaper the daemon refuses is reported Failed with its reason, and Plasma
     //       is never asked to switch to it.
@@ -551,6 +573,192 @@ void freeIds() {
         }
     }
     expect(!freeMonitorId(full), QStringLiteral("S15.235: with all %1 ids in use one was still offered").arg(kMonitorIds));
+
+    // GOAL: S15.475 -- a monitor GetStatus lists only for a sound setting is in use: a new screen is
+    //       not given its id, which would hand that screen the setting.
+    // CONTROL: via control_batch.sh, --phase '^freeIds$', 2026-10-11, `status.occupied.insert(*id);` deleted
+    //       from parseDaemonStatus's sound loop (app/daemon/daemon_client.cpp) -> "FAIL: S15.475: with 0 named,
+    //       1 showing and 2 holding a sound setting the free id is 2". Reverted.
+    const QByteArray soundOnly = R"({"outputs_literal": {"DP-1": 0}, "wallpapers": {"1": {"type": "video"}},
+                                     "sound": {"enabled": true, "monitors": {"2": {"enabled": false, "heard": false}}},
+                                     "persistence": {"status": "ok"}})";
+    const auto withSound = parseDaemonStatus(soundOnly);
+    const auto soundId = withSound ? freeMonitorId(*withSound) : std::nullopt;
+    expect(withSound && soundId == 3, QStringLiteral("S15.475: with 0 named, 1 showing and 2 holding a sound setting the free id is %1 (%2)")
+                                          .arg(soundId ? QString::number(*soundId) : QStringLiteral("none"), withSound ? QString() : withSound.error()));
+}
+
+void soundStatus() {
+    // GOAL: S15.476 -- GetStatus's `sound` is read as the daemon applies it: false is off; true, null (a
+    //       value a newer build wrote) and an older daemon's missing `sound` are on, for every screen and
+    //       per monitor; a `sound` that is not an object, a `monitors` that is not one, or a monitor id
+    //       out of range refuses the whole status.
+    // CONTROL: via control_batch.sh, --phase '^soundStatus$', 2026-10-11, each alone, reverted, in
+    //       app/daemon/daemon_client.cpp unless named: the global `toBool(true)` made `toBool(false)` -> "FAIL:
+    //       S15.476: values a newer build wrote read as sound 0, monitor 2 1"; the monitor's likewise -> "...
+    //       sound 1, monitor 2 0"; `status.sound = true` whatever is read -> "... sound off, monitor 2 off read
+    //       as sound 1 ..."; DaemonStatus's `bool sound = true;` made false (app/daemon/daemon_client.h) -> "...
+    //       an older daemon read as sound 0 ..."; each of the three refusals deleted (the id one made
+    //       `continue`) -> its row's "was accepted"; the monitor's `enabled` read from `heard` instead ->
+    //       "FAIL: S15.476: sound on, monitor 2 on read as sound 1, monitor 2 0" and the newer-build row.
+    struct Row {
+        const char* what;
+        QByteArray json;
+        bool parses;
+        bool sound;
+        std::optional<bool> monitorTwo;
+    };
+    const auto with = [](const char* sound) {
+        return QByteArray(R"({"outputs_literal": {}, "persistence": {"status": "ok"}, "sound": )") + QByteArray(sound) + QByteArray("}");
+    };
+    const Row rows[] = {
+        {"sound off, monitor 2 off", with(R"({"enabled": false, "monitors": {"2": {"enabled": false, "heard": false}}})"), true, false, false},
+        // As the daemon lists a monitor that holds a wallpaper and is not heard: `heard` is not the setting.
+        {"sound on, monitor 2 on", with(R"({"enabled": true, "monitors": {"2": {"enabled": true, "heard": false}}})"), true, true, true},
+        {"values a newer build wrote", with(R"({"enabled": null, "monitors": {"2": {"enabled": null, "heard": false}}})"), true, true, true},
+        {"an older daemon", QByteArray(R"({"outputs_literal": {}, "persistence": {"status": "ok"}})"), true, true, std::nullopt},
+        {"a sound that is not an object", with("false"), false, true, std::nullopt},
+        {"monitors that are not an object", with(R"({"enabled": true, "monitors": [2]})"), false, true, std::nullopt},
+        {"a monitor id out of range", with(R"({"enabled": true, "monitors": {"32": {"enabled": false}}})"), false, true, std::nullopt},
+    };
+    for (const Row& row : rows) {
+        const auto status = parseDaemonStatus(row.json);
+        if (!row.parses) {
+            expect(!status, QStringLiteral("S15.476: %1 was accepted").arg(QLatin1StringView(row.what)));
+            continue;
+        }
+        const std::optional<bool> two = status && status->screenSound.contains(2) ? std::optional<bool>(status->screenSound.value(2)) : std::nullopt;
+        expect(status && status->sound == row.sound && two == row.monitorTwo,
+               QStringLiteral("S15.476: %1 read as sound %2, monitor 2 %3 (%4)")
+                   .arg(QLatin1StringView(row.what))
+                   .arg(status && status->sound)
+                   .arg(two ? QString::number(*two) : QStringLiteral("none"), status ? QString() : status.error()));
+    }
+}
+
+void soundSetters() {
+    constexpr const char* goals = "S15.477-S15.480";
+    Rig rig;
+    if (!build(rig, goals, QStringLiteral("sound"))) {
+        return;
+    }
+    // GOAL: S15.477 -- setSound(false) sends SetSound(false) typed `b`, ends Done, and the client then
+    //       reports sound off as the daemon does; setSound(true) the same for on.
+    // CONTROL: via control_batch.sh, --phase '^soundSetters$', 2026-10-11, DaemonClient::setSound sending `!on`
+    //       (app/daemon/daemon_client.cpp) -> "FAIL: S15.477: setSound(0) sent b true and the client reads 0,
+    //       the daemon 1" and the same for setSound(1). Reverted.
+    for (const bool on : {false, true}) {
+        rig.applier->setSound(on);
+        const bool done = waitUntil([&] { return rig.applier->soundState() != Progress::Working; }, kWaitMs);
+        const auto sent = rig.sent("SetSound");
+        const bool reread = rig.daemonDrained() && waitUntil([&] { return rig.client->sound() == on; }, kWaitMs);
+        expect(done && reread && rig.applier->soundState() == Progress::Done && !sent.isEmpty() && sent.back().signature == u"b" &&
+                   sent.back().args == QVariantList{on} && rig.daemonFake->sound == QJsonValue(on),
+               QStringLiteral("S15.477: setSound(%1) sent %2 and the client reads %3, the daemon %4")
+                   .arg(on)
+                   .arg(sent.isEmpty() ? QStringLiteral("(nothing)") : sent.back().signature + u' ' + sent.back().args.value(0).toString())
+                   .arg(rig.client->sound())
+                   .arg(rig.daemonFake->sound.toBool()));
+    }
+
+    // GOAL: S15.478 -- setScreenSound(false) with DP-1 selected binds it and sends SetMonitorSound(its
+    //       id, false) typed `ib`, ends Done, and the client then reports DP-1 off and HDMI-A-1 on.
+    // WHY-THIS-SHAPE: HDMI-A-1 holds a wallpaper on an id of its own, so GetStatus lists it as
+    //       {enabled: true}, as the daemon lists every monitor holding a wallpaper; unlisted, its "on"
+    //       would come from the client's default for a missing entry and not from reading one.
+    // CONTROL: via control_batch.sh, --phase '^soundSetters$', 2026-10-11, ApplyController::setScreenSound
+    //       sending `!on` (app/daemon/apply_controller.cpp) -> "FAIL: S15.478: setScreenSound(false) on DP-1 (id
+    //       0) sent ib and the client reads DP-1 true, HDMI-A-1 true", and S15.479's line; the client reading a
+    //       listed monitor's `heard` in place of `enabled` (DaemonClient's status parse,
+    //       app/daemon/daemon_client.cpp) -> "... reads DP-1 false, HDMI-A-1 false", alone. Reverted.
+    constexpr int kHdmiId = 7;
+    rig.daemonFake->outputs.insert(QStringLiteral("HDMI-A-1"), kHdmiId);
+    rig.daemonFake->wallpapers.insert(kHdmiId);
+    rig.applier->setScreenSound(false);
+    const bool screenDone = waitUntil([&] { return rig.applier->screenSoundState() != Progress::Working; }, kWaitMs);
+    const auto screenSent = rig.sent("SetMonitorSound");
+    const int dp1 = rig.daemonFake->outputs.value(QStringLiteral("DP-1"), -1);
+    const bool screenRead = rig.daemonDrained() &&
+                            waitUntil([&] { return rig.client->screenSound().value(QStringLiteral("DP-1")) == QVariant(false); }, kWaitMs);
+    expect(screenDone && screenRead && dp1 >= 0 && rig.applier->screenSoundState() == Progress::Done && screenSent.size() == 1 &&
+               screenSent[0].signature == u"ib" && screenSent[0].args == QVariantList{dp1, false} &&
+               dp1 != kHdmiId && rig.client->screenSound().value(QStringLiteral("HDMI-A-1")) == QVariant(true),
+           QStringLiteral("S15.478: setScreenSound(false) on DP-1 (id %1) sent %2 and the client reads DP-1 %3, HDMI-A-1 %4")
+               .arg(dp1)
+               .arg(screenSent.isEmpty() ? QStringLiteral("(nothing)") : screenSent[0].signature)
+               .arg(rig.client->screenSound().value(QStringLiteral("DP-1")).toString(),
+                    rig.client->screenSound().value(QStringLiteral("HDMI-A-1")).toString()));
+
+    // GOAL: S15.479 -- once the daemon has answered a sound change, the client reports the new value
+    //       before its status read comes back: with GetStatus held, sound and DP-1's sound already read
+    //       as set.
+    // WHY-THIS-SHAPE: the two setters are held first, so the screen's bind, which may read the status,
+    //       is over before GetStatus is held too; then they are answered. The value read can only come
+    //       from the replies, which are known handled once the controller is Done.
+    // CONTROL: via control_batch.sh, --phase '^soundSetters$', 2026-10-11, `record();` deleted from
+    //       DaemonClient::sendSetting (app/daemon/daemon_client.cpp) -> "FAIL: S15.479: with the status read
+    //       held (1), the client read sound 0 and DP-1 false once the daemon answered", alone. Reverted.
+    rig.daemonFake->hold = {QStringLiteral("SetSound"), QStringLiteral("SetMonitorSound")};
+    rig.applier->setSound(false);
+    rig.applier->setScreenSound(true);
+    const bool settersHeld = waitUntil([&] { return rig.daemonFake->held.size() == 2; }, kWaitMs);
+    rig.daemonFake->hold = {QStringLiteral("GetStatus")};
+    rig.daemonFake->release();
+    const bool globalEarly = waitUntil([&] { return rig.applier->soundState() == Progress::Done; }, kWaitMs) && !rig.client->sound();
+    const bool screenEarly = waitUntil([&] { return rig.applier->screenSoundState() == Progress::Done; }, kWaitMs) &&
+                             rig.client->screenSound().value(QStringLiteral("DP-1")) == QVariant(true);
+    const bool statusHeld = settersHeld && waitUntil([&] {
+        return std::ranges::any_of(rig.daemonFake->held, [](const QDBusMessage& m) { return m.member() == u"GetStatus"; });
+    }, kWaitMs);
+    expect(statusHeld && globalEarly && screenEarly,
+           QStringLiteral("S15.479: with the status read held (%1), the client read sound %2 and DP-1 %3 once the daemon answered")
+               .arg(statusHeld).arg(rig.client->sound()).arg(rig.client->screenSound().value(QStringLiteral("DP-1")).toString()));
+    rig.daemonFake->hold.clear();
+    rig.daemonFake->release();
+
+    // GOAL: S15.480 -- a sound change still running shows its value: for every screen whichever is
+    //       selected, for one screen only while that screen is selected; a second change while one runs
+    //       is ignored; a refused change says which setting, and the daemon's reason.
+    // CONTROL: via control_batch.sh, --phase '^soundSetters$', 2026-10-11, each alone, reverted, in
+    //       app/daemon/apply_controller.cpp unless named: forSelected() made `return true` -> the pending line
+    //       ("... DP-1's false and false"); `Change m_sound{true}` made `{false}` (app/daemon/apply_controller.h)
+    //       -> the pending line and the refusal line; setSound's Working guard deleted -> the pending line ("a
+    //       second change was sent"); the every-screen sentence reworded, and then the screen's `tr("The sound
+    //       setting")` -> the refusal line.
+    rig.daemonFake->hold = {QStringLiteral("SetSound"), QStringLiteral("SetMonitorSound")};
+    const qsizetype soundCalls = rig.sent("SetSound").size();
+    rig.applier->setSound(true);
+    rig.applier->setScreenSound(false);
+    const bool bothHeld = waitUntil([&] { return rig.daemonFake->held.size() == 2; }, kWaitMs);
+    rig.applier->setSound(false);
+    const bool ignored = rig.daemonDrained() && rig.sent("SetSound").size() == soundCalls + 1;
+    const QVariant globalOnDp1 = rig.applier->pendingSound();
+    const QVariant screenOnDp1 = rig.applier->pendingScreenSound();
+    rig.kscreen->select(QStringLiteral("HDMI-A-1"));
+    const QVariant globalOnHdmi = rig.applier->pendingSound();
+    const QVariant screenOnHdmi = rig.applier->pendingScreenSound();
+    rig.kscreen->select(QStringLiteral("DP-1"));
+    expect(bothHeld && ignored && globalOnDp1 == QVariant(true) && globalOnHdmi == QVariant(true) && screenOnDp1 == QVariant(false) &&
+               !screenOnHdmi.isValid(),
+           QStringLiteral("S15.480: while held, every screen's pending reads %1 on DP-1 and %2 on HDMI-A-1, DP-1's %3 and %4; a second "
+                          "change was %5")
+               .arg(globalOnDp1.toString(), globalOnHdmi.toString(), screenOnDp1.toString(), screenOnHdmi.toString(),
+                    ignored ? QStringLiteral("ignored") : QStringLiteral("sent")));
+    rig.daemonFake->hold.clear();
+    rig.daemonFake->release();
+    if (!waitUntil([&] { return rig.applier->soundState() != Progress::Working && rig.applier->screenSoundState() != Progress::Working; }, kWaitMs)) {
+        harnessFailure("S15.480: the held sound changes never finished, so the refusal case cannot start");
+        return;
+    }
+    rig.daemonFake->refuse.insert(QStringLiteral("SetSound"), {QStringLiteral("io.wallpaperx.Daemon.Error.RenderFailed"), QStringLiteral("disk full")});
+    rig.daemonFake->refuse.insert(QStringLiteral("SetMonitorSound"), {QStringLiteral("org.freedesktop.DBus.Error.InvalidArgs"), QStringLiteral("no")});
+    rig.applier->setSound(false);
+    rig.applier->setScreenSound(true);
+    const bool failed = waitUntil([&] { return rig.applier->soundState() == Progress::Failed && rig.applier->screenSoundState() == Progress::Failed; }, kWaitMs);
+    expect(failed && rig.applier->soundMessage() == u"Sound was not changed for every screen. The WallpaperX service could not do it: disk full" &&
+               rig.applier->screenSoundMessage() == u"The sound setting for DP-1 was not changed. The WallpaperX service refused it: no",
+           QStringLiteral("S15.480: the refusals read \"%1\" and \"%2\"").arg(rig.applier->soundMessage(), rig.applier->screenSoundMessage()));
+    rig.daemonFake->refuse.clear();
 }
 
 void bindQueue() {
@@ -615,8 +823,8 @@ void liveEdits() {
     // CONTROL: app/daemon/apply_controller.cpp, control_batch, 2026-10-02: `startLive(...)` added
     //       right after apply()'s Working state (live before the daemon accepted) -> red, "S15.237:
     //       after a refused Apply an edit sent 1 call(s), live on "DP-1""; sendLive()'s setProperties
-    //       given only `speed` -> red, "S15.237: with Plasma refusing (live on "DP-1"), the edit after
-    //       Apply sent [ia{sv} 0 {speed=0.75(double)}] (1 call(s))".
+    //       given only `speed` (re-run 2026-10-11, with volume expected too) -> red, "S15.237: with Plasma
+    //       refusing (live on "DP-1"), the edit after Apply sent [ia{sv} 0 {speed=0.75(double)}] (1 call(s))".
     rig.library->setPropertyValue(QStringLiteral("speed"), 0.5);
     const bool beforeDrained = rig.daemonDrained();
     expect(beforeDrained && edits().isEmpty(), QStringLiteral("S15.237: an edit before any Apply sent %1 call(s)").arg(edits().size()));
@@ -637,7 +845,8 @@ void liveEdits() {
     rig.library->setPropertyValue(QStringLiteral("speed"), 0.75);
     const bool sentOne = waitUntil([&] { return !edits().isEmpty(); }, kWaitMs);
     const bool afterDrained = rig.daemonDrained();
-    const QVariantMap want{{QStringLiteral("speed"), 0.75}, {QStringLiteral("mute"), true}, {QStringLiteral("tint"), QStringLiteral("#ffffff")}};
+    const QVariantMap want{{QStringLiteral("speed"), 0.75}, {QStringLiteral("mute"), true}, {QStringLiteral("tint"), QStringLiteral("#ffffff")},
+                           {QStringLiteral("volume"), 1.0}};
     const QVariantMap got = edits().isEmpty() ? QVariantMap() : edits().back().args.value(1).toMap();
     expect(applied && sentOne && afterDrained && rig.applier->applyState() == Progress::Failed && rig.applier->liveOutput() == u"DP-1" &&
                edits().size() == 1 && edits()[0].signature == u"ia{sv}" && edits()[0].args.value(0) == 0 && got == want,
@@ -1010,8 +1219,8 @@ void pauseScope() {
     }
     // GOAL: S15.248 -- a pause change still running shows its mode only for the screen it is for:
     //       with DP-1's change held, HDMI-A-1 shows no pending mode, and DP-1 shows the mode being set.
-    // CONTROL: app/daemon/apply_controller.cpp, pendingPauseMode()'s `&& m_kscreen.selectedOutput() ==
-    //       m_pauseOutput` deleted (control_batch, 2026-10-04) -> red, "S15.248: with DP-1's change held,
+    // CONTROL: app/daemon/apply_controller.cpp, forSelected() -- which pendingPauseMode() reads -- made
+    //       `return true` (control_batch, re-run 2026-10-11) -> red, "S15.248: with DP-1's change held,
     //       HDMI-A-1 shows "always_paused" pending and DP-1 "always_paused" (held 1, state 1)".
     rig.daemonFake->hold.insert(QStringLiteral("SetMonitorPause"));
     rig.applier->setPauseMode(QStringLiteral("always_paused"));
@@ -1032,8 +1241,8 @@ void pauseScope() {
 
     // GOAL: S15.249 -- a failed pause change's sentence shows only while the screen it was for is
     //       selected: not under HDMI-A-1, and again on returning to DP-1.
-    // CONTROL: app/daemon/apply_controller.cpp, pauseMessage() returning `m_pauseMessage` whatever is
-    //       selected (control_batch, 2026-10-04) -> red, "S15.249: DP-1's refused change reads "The
+    // CONTROL: app/daemon/apply_controller.h, pauseMessage() returning `m_pause.message` whatever is
+    //       selected (control_batch, re-run 2026-10-11) -> red, "S15.249: DP-1's refused change reads "The
     //       pause setting for DP-1 was not changed. ..." on DP-1, the same on HDMI-A-1 and back on DP-1".
     rig.daemonFake->refuse.insert(QStringLiteral("SetMonitorPause"), {QStringLiteral("org.freedesktop.DBus.Error.InvalidArgs"), QStringLiteral("no")});
     rig.applier->setPauseMode(QStringLiteral("paused_while_focused"));
@@ -1213,9 +1422,9 @@ void longConnectors() {
     //       sends nothing to the daemon; at exactly 256 bytes it is sent.
     // WHY-THIS-SHAPE: "nothing" is the whole call log less the drain marker, read once the marker
     //       has arrived, so a bind's GetStatus counts as much as SetMonitorPause.
-    // CONTROL: app/daemon/apply_controller.cpp, setPauseMode()'s refusal block deleted (control_batch,
-    //       2026-10-04) -> red, "S15.253: a pause change on 257 bytes ended 2 reading "" and sent
-    //       [GetStatus,SetMonitorOutput,SetMonitorPause,GetStatus]".
+    // CONTROL: app/daemon/apply_controller.cpp, the refusal block setPauseMode() now reaches through
+    //       changeScreenSetting() deleted (control_batch, re-run 2026-10-11) -> red, "S15.253: a pause change
+    //       on 257 bytes ...".
     rig.kscreen->select(ascii257);
     rig.daemonFake->calls.clear();
     rig.applier->setPauseMode(QStringLiteral("always_paused"));
@@ -1633,6 +1842,8 @@ int main(int argc, char* argv[]) {
     runPhase("slowStatusRefresh", slowStatusRefresh);
     runPhase("slowStatusBind", slowStatusBind);
     runPhase("statusNoAnswer", statusNoAnswer);
+    runPhase("soundStatus", soundStatus);
+    runPhase("soundSetters", soundSetters);
 
     const bool failed = wallpaperx::testing::reportCheckFailures();
     const bool faulted = wallpaperx::testing::reportHarnessFaults("in this test file or its stand-ins, not in the app");

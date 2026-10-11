@@ -2,6 +2,7 @@
 
 #pragma once
 
+#include "audio_probe.h"
 #include "unique_fd.h"
 
 #include <QByteArray>
@@ -104,8 +105,13 @@ public:
     // The files as they were read; for an archive, the archive's own.
     FileStamp previewStamp;
     FileStamp assetStamp;
-    // In the order wallpaper.json lists them.
+    // In the order wallpaper.json lists them. In a folder, a video with an audio stream has `mute`
+    // and `volume` whether declared or not, a wallpaper known to have none has neither, and a video
+    // the probe could not answer for has them as declared.
     QList<WallpaperProperty> properties;
+    // What the asset holds for sound, in a folder: Absent for a static or shader wallpaper, the
+    // probe's answer for a video. Unknown in an archive, which is not probed; not given to QML.
+    AudioStreams audio = AudioStreams::Unknown;
 
     // False for a default-constructed Wallpaper, which stands for none.
     bool usable() const { return !filePath.isEmpty() && problem.isEmpty(); }
@@ -126,6 +132,12 @@ inline constexpr qint64 kMaxPreviewBytes = 32 << 20;
 constexpr qsizetype kMaxProperties = 64;
 constexpr qsizetype kMaxPropertyKeyBytes = 64;
 constexpr double kMaxPlaybackSpeed = 2.0;
+constexpr double kMaxVolume = 1.0;
+
+// The keys of a video's own sound: offered for every video with sound, declared or not, and
+// removed from a wallpaper known to have none.
+constexpr const char* kMuteKey = "mute";
+constexpr const char* kVolumeKey = "volume";
 
 // The manifest fields of a wallpaper.json; the file fields are left empty. The error is a
 // sentence for the user.
@@ -133,10 +145,11 @@ std::expected<Wallpaper, QString> parseManifest(const QByteArray& json);
 
 // Reads the .wpx archive open as `fd`, which stays the caller's, shown as `path`. Never fails: an
 // archive that cannot be used comes back broken. The path need not be UTF-8: nothing is ever set
-// from it.
+// from it. The sound keys are not judged: that needs the asset probed for sound, which only a
+// folder read does.
 Wallpaper readWallpaper(int fd, const QString& path);
-// Reads one wallpaper folder by the same rules. The folder itself must not be a link, and every
-// file wallpaper.json names must, its links followed, be a file inside it.
+// Reads one wallpaper folder by the same rules, and judges the sound keys. The folder itself must
+// not be a link, and every file wallpaper.json names must, its links followed, be a file inside it.
 Wallpaper readWallpaperFolder(const QString& path);
 
 // The bytes of `name` inside a wallpaper folder, refused when larger than `maxBytes`, or when it
@@ -146,8 +159,9 @@ std::expected<QByteArray, QString> readWallpaperEntry(const QString& folderPath,
 
 // Every wallpaper folder directly in `directory`: each subfolder not hidden, and each link to a
 // folder, which is listed broken. Usable ones first, each group by title. A directory that does
-// not exist is an empty library; one that cannot be listed is the error.
-std::expected<QList<Wallpaper>, QString> scanLibrary(const QString& directory);
+// not exist is an empty library; one that cannot be listed is the error. A video whose asset has
+// the path and stamp it had in `previous`, an earlier scan, is not probed again.
+std::expected<QList<Wallpaper>, QString> scanLibrary(const QString& directory, const QList<Wallpaper>& previous = {});
 // The order scanLibrary lists in.
 bool listedBefore(const Wallpaper& a, const Wallpaper& b);
 

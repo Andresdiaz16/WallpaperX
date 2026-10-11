@@ -132,7 +132,10 @@ public:
                 return connection.send(message.createReply());
             }
             // Answered for the reason the other two are: declined, it is logged as a refusal.
-            if (message.member() == QLatin1String("SetOutputFocus")) return connection.send(message.createReply());
+            if (message.member() == QLatin1String("SetOutputFocus") ||
+                message.member() == QLatin1String("SetOutputFocusState")) {
+                return connection.send(message.createReply());
+            }
             if (message.member() == QLatin1String("SetOutputVisible")) {
                 const QList<QVariant> args = message.arguments();
                 if (args.size() >= 2) {

@@ -208,6 +208,8 @@ WallpaperManager::WallpaperManager(Config config)
     // daemon's config before it finds out it has no right to run.
     const LoadResult loaded = loadWithDeadline();
     m_restore = loaded.entries;
+    // An explicit on is no setting at all, as play is for pause.
+    if (soundFromJson(loaded.soundJson) != true) m_sound = loaded.soundJson;
     m_loadPreservable = loaded.preservable;
     m_loadMalformed = loaded.malformedEntries;
     m_loadError = loaded.error;
@@ -287,7 +289,7 @@ void WallpaperManager::preserveUnreadableConfig() {
 }
 
 void WallpaperManager::writeRepairedConfig() {
-    std::optional<std::vector<PersistedWallpaper>> repair;
+    std::optional<PersistedConfig> repair;
     {
         std::lock_guard<std::mutex> stateLock(m_stateMutex);
         repair.swap(m_repair);
@@ -341,7 +343,12 @@ LiveWallpapers WallpaperManager::liveWallpapers() const {
                                                                 : std::optional<OutputSize>(size->second)});
     }
     live.pause = m_pauseSettings;
+    live.sound = m_soundSettings;
     return live;
+}
+
+PersistedConfig WallpaperManager::configToWriteLocked() const {
+    return PersistedConfig{m_kept.rowsToWrite(liveWallpapers()), m_sound};
 }
 
 std::string WallpaperManager::keptDetail(const std::string& base) const {
@@ -1152,7 +1159,7 @@ void WallpaperManager::requestWallpaper(const std::string& type, const std::stri
         try {
             // Before the kept row below is cleared, which changes nothing here: a live monitor's
             // wallpaper already wins over a kept row for the same id.
-            queuePersist(m_kept.rowsToWrite(liveWallpapers()));
+            queuePersist(configToWriteLocked());
         } catch (...) {
             swapWallpaper();
             if (!existed) m_monitors.erase(monitorId);
@@ -1209,7 +1216,7 @@ void WallpaperManager::setWallpaperProperties(int monitorId, const WallpaperProp
     WallpaperProperties next = properties;
     it->second.properties.swap(next);
     try {
-        queuePersist(m_kept.rowsToWrite(liveWallpapers()));
+        queuePersist(configToWriteLocked());
     } catch (...) {
         it->second.properties.swap(next);
         throw;
@@ -1245,7 +1252,7 @@ bool WallpaperManager::setMonitorOutput(int monitorId, const std::string& output
             if (bound == BindResult::Unchanged && m_writer.outcome().onDisk()) return false;
             // Before the kept name below is cleared, which changes nothing here: a name bound
             // live already wins over a kept row carrying it.
-            queuePersist(m_kept.rowsToWrite(liveWallpapers()));
+            queuePersist(configToWriteLocked());
         } catch (...) {
             m_outputs.swap(outputsBefore);
             m_outputsNotDrawn.swap(notDrawnBefore);
@@ -1308,7 +1315,7 @@ void WallpaperManager::setOutputSize(const std::string& outputName, uint32_t wid
     const OutputSize before = targetSizeLocked(bound->second);
     const auto stored = m_outputSizes.insert_or_assign(outputName, size).first;
     try {
-        queuePersist(m_kept.rowsToWrite(liveWallpapers()));
+        queuePersist(configToWriteLocked());
     } catch (...) {
         if (sizeBefore) {
             stored->second = *sizeBefore;
@@ -1384,23 +1391,7 @@ void WallpaperManager::setMonitorPause(int monitorId, const std::string& mode) {
 
     {
         std::lock_guard<std::mutex> stateLock(m_stateMutex);
-        const auto current = m_pauseSettings.find(monitorId);
-        const bool unchanged = current == m_pauseSettings.end() ? !next : next && current->second == *next;
-        // Unchanged writes only while the file is not known to hold it, as setOutputSize() does --
-        // which is why a save that cannot be queued is undone below.
-        if (unchanged && m_writer.outcome().onDisk()) return;
-
-        // Set aside rather than copied, so putting it back cannot throw.
-        decltype(m_pauseSettings)::node_type previous;
-        if (current != m_pauseSettings.end()) previous = m_pauseSettings.extract(current);
-        try {
-            if (next) m_pauseSettings.emplace(monitorId, std::move(*next));
-            queuePersist(m_kept.rowsToWrite(liveWallpapers()));
-        } catch (...) {
-            m_pauseSettings.erase(monitorId);
-            if (!previous.empty()) m_pauseSettings.insert(std::move(previous));
-            throw;
-        }
+        if (commitSettingLocked(m_pauseSettings, monitorId, std::move(next)) == SettingCommit::Skipped) return;
         endPlayIfPausedLocked(monitorId);
     }
 
@@ -1409,7 +1400,71 @@ void WallpaperManager::setMonitorPause(int monitorId, const std::string& mode) {
     awaitPersisted();
 }
 
-void WallpaperManager::setOutputFocus(const std::string& client, const std::string& outputName, bool windowFocused,
+bool WallpaperManager::setSound(bool on) {
+    SettingCommit commit = SettingCommit::Skipped;
+    {
+        std::lock_guard<std::mutex> stateLock(m_stateMutex);
+        commit = commitSettingLocked(m_sound, soundJsonText(on));
+    }
+    if (commit == SettingCommit::Skipped) return false;
+    awaitPersisted();
+    return commit == SettingCommit::Changed;
+}
+
+bool WallpaperManager::setMonitorSound(int monitorId, bool on) {
+    requireValidMonitorId(monitorId);
+    std::optional<std::string> next;
+    if (!on) next = soundJsonText(false);
+    SettingCommit commit = SettingCommit::Skipped;
+    {
+        std::lock_guard<std::mutex> stateLock(m_stateMutex);
+        commit = commitSettingLocked(m_soundSettings, monitorId, std::move(next));
+    }
+    if (commit == SettingCommit::Skipped) return false;
+    awaitPersisted();
+    return commit == SettingCommit::Changed;
+}
+
+// Unchanged writes only while the file is not known to hold it, as setOutputSize() does -- which is
+// why a save that cannot be queued is undone.
+template <class Exchange>
+WallpaperManager::SettingCommit WallpaperManager::commitLocked(bool changed, Exchange exchange) {
+    if (!changed && m_writer.outcome().onDisk()) return SettingCommit::Skipped;
+    exchange();
+    try {
+        queuePersist(configToWriteLocked());
+    } catch (...) {
+        exchange();
+        throw;
+    }
+    return changed ? SettingCommit::Changed : SettingCommit::Rewritten;
+}
+
+WallpaperManager::SettingCommit WallpaperManager::commitSettingLocked(std::string& setting, std::string next) {
+    const bool changed = setting != next;
+    return commitLocked(changed, [&setting, &next]() noexcept { setting.swap(next); });
+}
+
+WallpaperManager::SettingCommit WallpaperManager::commitSettingLocked(std::map<int, std::string>& settings,
+                                                                      int monitorId,
+                                                                      std::optional<std::string> next) {
+    const auto current = settings.find(monitorId);
+    const bool changed = current == settings.end() ? next.has_value() : next != current->second;
+    // The new entry is made before anything changes, so the exchange allocates nothing and cannot throw.
+    std::map<int, std::string>::node_type held;
+    if (next) {
+        std::map<int, std::string> made;
+        made.emplace(monitorId, std::move(*next));
+        held = made.extract(made.begin());
+    }
+    return commitLocked(changed, [&settings, monitorId, &held]() noexcept {
+        auto out = settings.extract(monitorId);
+        if (!held.empty()) settings.insert(std::move(held));
+        held = std::move(out);
+    });
+}
+
+void WallpaperManager::setOutputFocus(const std::string& client, const std::string& outputName, ScreenFocus focus,
                                       bool windowMaximized) {
     requireValidOutputName(outputName);
 
@@ -1420,11 +1475,11 @@ void WallpaperManager::setOutputFocus(const std::string& client, const std::stri
                             "; it must be named with SetMonitorOutput first");
     }
     // Not persisted, for setOutputVisible()'s reason.
-    if (!windowFocused && !windowMaximized) {
+    if (focus == ScreenFocus::None && !windowMaximized) {
         m_outputFocus.erase(outputName);
         return;
     }
-    m_outputFocus.insert_or_assign(outputName, FocusReport{client, windowFocused, windowMaximized});
+    m_outputFocus.insert_or_assign(outputName, FocusReport{client, focus, windowMaximized});
     endPlayIfPausedLocked(bound->second);
 }
 
@@ -1508,8 +1563,8 @@ LoadResult WallpaperManager::loadWithDeadline() const {
 // Neither records health: every reader goes through snapshot(), which asks the writer and
 // overwrites persistence with its answer. An abandoned wait marks the worker stalled, so that
 // is in the answer too.
-void WallpaperManager::queuePersist(std::vector<PersistedWallpaper> entries) {
-    m_writer.queue(std::move(entries));
+void WallpaperManager::queuePersist(PersistedConfig config) {
+    m_writer.queue(std::move(config));
 }
 
 bool WallpaperManager::awaitPersisted(std::string& whyNot) {
@@ -1597,10 +1652,14 @@ std::vector<int> WallpaperManager::restoreSaved() {
     std::set<std::string> sizeRejectedFor;
     // Only on rows this build applies: a kept row's values are its newer build's to judge.
     std::map<int, int> droppedPropertiesOn;
+    std::map<int, int> clampedVolumesOn;
     // Monitor id -> the last `pause` text a row gave it. Not m_pauseSettings: that erases play,
     // which would make an explicit play indistinguishable from a row that says nothing.
     std::map<int, std::string> pauseRead;
     std::set<int> pauseConflicts;
+    // The same for `sound`, whose on is likewise erased.
+    std::map<int, std::string> soundRead;
+    std::set<int> soundConflicts;
 
     // Screen name -> the kept row that claimed it last, in file order. The sweep at the end
     // needs "who claimed this name last", which m_kept.carried()'s own order does not carry.
@@ -1692,13 +1751,26 @@ std::vector<int> WallpaperManager::restoreSaved() {
                 }
             }
         }
+        const bool soundTravels = !entry.soundJson.empty() && entry.monitorId >= kMaxMonitors;
+        if (!entry.soundJson.empty()) {
+            const auto [read, first] = soundRead.try_emplace(entry.monitorId, entry.soundJson);
+            if (!first && read->second != entry.soundJson) soundConflicts.insert(entry.monitorId);
+            read->second = entry.soundJson;
+            if (entry.monitorId < kMaxMonitors) {
+                if (soundFromJson(entry.soundJson) == true) {
+                    m_soundSettings.erase(entry.monitorId);
+                } else {
+                    m_soundSettings.insert_or_assign(entry.monitorId, entry.soundJson);
+                }
+            }
+        }
 
         // A row with no wallpaper stops here rather than falling into the arm below, whose
         // health text is the user's only notice that a wallpaper did not come back. Only a
         // name or a setting for a bigger build is still worth carrying; a row with nothing left
         // on it would otherwise ride every save for the life of the install.
-        if (entry.type.empty() && entry.path.empty() && !nameTravels && !pauseTravels) {
-            if (entry.output.empty() && entry.pauseJson.empty()) m_kept.countDroppedEntry();
+        if (entry.type.empty() && entry.path.empty() && !nameTravels && !pauseTravels && !soundTravels) {
+            if (entry.output.empty() && !entry.holdsMonitorSettings()) m_kept.countDroppedEntry();
             continue;
         }
 
@@ -1724,9 +1796,10 @@ std::vector<int> WallpaperManager::restoreSaved() {
                 if (!nameTravels) keep.outputSizeJson.clear();
                 // Applied above instead.
                 if (!pauseTravels) keep.pauseJson.clear();
+                if (!soundTravels) keep.soundJson.clear();
                 // Nothing left to carry. Kept, it would ride every save for the life of the
                 // install and come back as a wallpaper that did not return.
-                if (keep.type.empty() && keep.path.empty() && keep.output.empty() && keep.pauseJson.empty()) continue;
+                if (keep.type.empty() && keep.path.empty() && keep.output.empty() && !keep.holdsMonitorSettings()) continue;
                 if (nameTravels) keptNameOwner[keep.output] = keep.monitorId;
                 keptIndex.emplace(entry.monitorId, m_kept.carried().size());
                 m_kept.carried().push_back(std::move(keep));
@@ -1751,6 +1824,7 @@ std::vector<int> WallpaperManager::restoreSaved() {
                 keptNameOwner[entry.output] = entry.monitorId;
             }
             if (pauseTravels) held.pauseJson = entry.pauseJson;
+            if (soundTravels) held.soundJson = entry.soundJson;
             continue;
         }
 
@@ -1771,8 +1845,10 @@ std::vector<int> WallpaperManager::restoreSaved() {
         state.type = entry.type;
         state.path = entry.path;
         int dropped = 0;
-        state.properties = usableProperties(propertiesFromJson(entry.propertiesJson, dropped), dropped);
+        int clamped = 0;
+        state.properties = usableProperties(propertiesFromJson(entry.propertiesJson, dropped), dropped, clamped);
         droppedPropertiesOn[entry.monitorId] = dropped;
+        clampedVolumesOn[entry.monitorId] = clamped;
         ++state.requestSeq;
         ++state.wallpaperSeq;
         state.lastError.clear();
@@ -1811,6 +1887,8 @@ std::vector<int> WallpaperManager::restoreSaved() {
 
     int droppedProperties = 0;
     for (const auto& [monitorId, dropped] : droppedPropertiesOn) droppedProperties += dropped;
+    int clampedVolumes = 0;
+    for (const auto& [monitorId, clamped] : clampedVolumesOn) clampedVolumes += clamped;
     int rejectedSizes = 0;
     // Only a name still bound: one a later row took away is counted as displaced, not here.
     for (const std::string& name : sizeRejectedFor) {
@@ -1863,6 +1941,11 @@ std::vector<int> WallpaperManager::restoreSaved() {
         m_kept.note(std::to_string(droppedProperties) +
                     " wallpaper property values dropped, unusable; those values must be set again");
     }
+    if (clampedVolumes > 0) {
+        m_kept.note(std::to_string(clampedVolumes) +
+                    " wallpaper volumes outside 0 to 1 moved to the nearer of the two; set them again if that "
+                    "is not the level wanted");
+    }
     if (duplicateIds > 0) {
         // Not "the last entry won": three collisions feed this counter and one is resolved by
         // the EARLIER row, the one this build can show. The copy is named by its own note
@@ -1879,6 +1962,11 @@ std::vector<int> WallpaperManager::restoreSaved() {
                     " monitors given conflicting pause settings by several entries; the last entry's "
                     "was kept, and the rest survive only if the file was copied (see below)");
     }
+    if (!soundConflicts.empty()) {
+        m_kept.note(std::to_string(soundConflicts.size()) +
+                    " monitors given conflicting sound settings by several entries; the last entry's "
+                    "was kept, and the rest survive only if the file was copied (see below)");
+    }
 
     // Kept entries are invisible otherwise: they are in no monitor's status and are not
     // malformed, so nothing would tell the user those wallpapers did not come back.
@@ -1886,7 +1974,8 @@ std::vector<int> WallpaperManager::restoreSaved() {
     // already sanitized and would be escaped a second time.
     // Any rejected size, not only those left uncompensated: the rewrite removes its bytes either way.
     repaired = displacedNames > 0 || rejectedNames > 0 || !sizeRejectedFor.empty() || duplicateIds > 0 ||
-               droppedProperties > 0 || !pauseConflicts.empty() || m_kept.anyDropped();
+               droppedProperties > 0 || clampedVolumes > 0 || !pauseConflicts.empty() || !soundConflicts.empty() ||
+               m_kept.anyDropped();
     if ((!m_kept.carried().empty() || repaired) && m_health.persistence.status == HealthStatus::Ok) {
         recordHealthLocked(&DaemonHealth::persistence, HealthStatus::Ok,
                            keptDetail(m_store.file().string()));
@@ -1894,7 +1983,7 @@ std::vector<int> WallpaperManager::restoreSaved() {
     // Held, not written: this runs before the bus name is claimed, and the write would land
     // on a running daemon's config and on top of the bytes preserveUnreadableConfig() has
     // yet to copy aside. main() writes it once both are settled.
-    if (repaired) m_repair = m_kept.rowsToWrite(liveWallpapers());
+    if (repaired) m_repair = configToWriteLocked();
     return monitorIds;
 }
 
@@ -1972,10 +2061,23 @@ bool WallpaperManager::pausedLocked(int monitorId) const {
     switch (*mode) {
         case PauseMode::Play: return false;
         case PauseMode::Always: return true;
-        case PauseMode::WhileWindowFocused: return report != nullptr && report->windowFocused;
+        case PauseMode::WhileWindowFocused: return report != nullptr && report->focus == ScreenFocus::Window;
         case PauseMode::WhileWindowMaximized: return report != nullptr && report->windowMaximized;
     }
     return false;
+}
+
+bool WallpaperManager::soundHeardLocked(int monitorId) const {
+    if (!soundOn(m_sound)) return false;
+    if (const auto setting = m_soundSettings.find(monitorId); setting != m_soundSettings.end() && !soundOn(setting->second)) {
+        return false;
+    }
+    const auto monitor = m_monitors.find(monitorId);
+    if (monitor == m_monitors.end() || monitor->second.type.empty() || wallpaperMuted(monitor->second.properties)) {
+        return false;
+    }
+    const FocusReport* report = focusReportLocked(monitorId);
+    return report != nullptr && report->focus != ScreenFocus::None && !report->windowMaximized;
 }
 
 void WallpaperManager::endPlayIfPausedLocked(int monitorId) {
@@ -3126,7 +3228,7 @@ WallpaperManager::Snapshot WallpaperManager::snapshot() const {
         if (setting != m_pauseSettings.end()) status.mode = pauseModeFromJson(setting->second);
         status.paused = pausedLocked(monitorId);
         if (const FocusReport* report = focusReportLocked(monitorId)) {
-            status.windowFocused = report->windowFocused;
+            status.focus = report->focus;
             status.windowMaximized = report->windowMaximized;
         }
         return status;
@@ -3134,6 +3236,20 @@ WallpaperManager::Snapshot WallpaperManager::snapshot() const {
     for (const auto& [monitorId, state] : m_monitors) out.pause.emplace(monitorId, pauseStatus(monitorId));
     for (const auto& [monitorId, setting] : m_pauseSettings) {
         if (!out.pause.contains(monitorId)) out.pause.emplace(monitorId, pauseStatus(monitorId));
+    }
+
+    out.sound = soundFromJson(m_sound);
+    const auto soundStatus = [this](int monitorId) {
+        MonitorSoundStatus status;
+        if (const auto setting = m_soundSettings.find(monitorId); setting != m_soundSettings.end()) {
+            status.enabled = soundFromJson(setting->second);
+        }
+        status.heard = soundHeardLocked(monitorId);
+        return status;
+    };
+    for (const auto& [monitorId, state] : m_monitors) out.monitorSound.emplace(monitorId, soundStatus(monitorId));
+    for (const auto& [monitorId, setting] : m_soundSettings) {
+        if (!out.monitorSound.contains(monitorId)) out.monitorSound.emplace(monitorId, soundStatus(monitorId));
     }
     return out;
 }

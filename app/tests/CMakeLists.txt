@@ -30,6 +30,8 @@ set(WALLPAPERX_APP_APPLY_SOURCES
 # The library: reading .wpx archives and watching the folder. The preview provider is separate
 # because it needs Qt Quick.
 set(WALLPAPERX_APP_LIBRARY_SOURCES
+    ${CMAKE_CURRENT_SOURCE_DIR}/../library/audio_probe.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../library/audio_probe.h
     ${CMAKE_CURRENT_SOURCE_DIR}/../library/wpx_package.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../library/wpx_package.h
     ${CMAKE_CURRENT_SOURCE_DIR}/../library/folder_watcher.cpp
@@ -50,7 +52,7 @@ set(WALLPAPERX_APP_TESTS_DIR ${CMAKE_CURRENT_SOURCE_DIR})
 
 function(wallpaperx_app_library_test_target target)
     target_include_directories(${target} PRIVATE ${WALLPAPERX_APP_TESTS_DIR}/../library)
-    target_link_libraries(${target} PRIVATE Qt6::Concurrent Qt6::Gui nlohmann_json::nlohmann_json PkgConfig::LIBZIP)
+    target_link_libraries(${target} PRIVATE Qt6::Concurrent Qt6::Gui nlohmann_json::nlohmann_json PkgConfig::LIBZIP PkgConfig::LIBAV)
 endfunction()
 
 function(wallpaperx_app_test_target target)

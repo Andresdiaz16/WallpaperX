@@ -2,6 +2,7 @@
 
 #include "video_decoder.h"
 
+#include "ffmpeg_fd_io.h"
 #include "frame_converter.h"
 #include "reset_point.h"
 
@@ -51,11 +52,6 @@ std::string avErrorString(int err) {
 
 // ffmpeg's own default for a file it opens, and what its probes are sized against.
 constexpr int kIoBufferSize = 32768;
-
-// A protocol list that names no protocol there is, which is how ffmpeg is told to open nothing:
-// an empty list means "unrestricted" to it, so the refusal has to be spelt as a name that matches
-// none.
-constexpr const char* kNoProtocols = "none";
 
 constexpr const char* kComponent = "VideoDecoder";
 
@@ -501,33 +497,6 @@ void VideoDecoder::releaseIdleFramesContexts() noexcept {
     });
 }
 
-int VideoDecoder::readFile(void* opaque, uint8_t* buffer, int size) {
-    const int fd = static_cast<VideoDecoder*>(opaque)->m_fd;
-    ssize_t got = 0;
-    do {
-        got = ::read(fd, buffer, static_cast<size_t>(size));
-    } while (got < 0 && errno == EINTR);
-    if (got < 0) return AVERROR(errno);
-    return got == 0 ? AVERROR_EOF : static_cast<int>(got);
-}
-
-int VideoDecoder::refuseOpen(AVFormatContext*, AVIOContext**, const char*, int, AVDictionary**) {
-    return AVERROR(EACCES);
-}
-
-int64_t VideoDecoder::seekFile(void* opaque, int64_t offset, int whence) {
-    const int fd = static_cast<VideoDecoder*>(opaque)->m_fd;
-    // Asked for the file's length rather than for a position; AVSEEK_FORCE is advice about how
-    // dear a seek is, which costs a regular file nothing.
-    if ((whence & ~AVSEEK_FORCE) == AVSEEK_SIZE) {
-        struct stat info{};
-        if (::fstat(fd, &info) != 0) return AVERROR(errno);
-        return info.st_size;
-    }
-    const off_t at = ::lseek(fd, static_cast<off_t>(offset), whence & ~AVSEEK_FORCE);
-    return at == static_cast<off_t>(-1) ? AVERROR(errno) : at;
-}
-
 void VideoDecoder::openFile() {
     m_fd = openWallpaperFile(m_file, kComponent);
     if (m_fd < 0) {
@@ -538,14 +507,8 @@ void VideoDecoder::openFile() {
         throwFileFailure("cannot open the wallpaper", AVERROR(why), m_file);
     }
 
-    auto* buffer = static_cast<unsigned char*>(av_malloc(kIoBufferSize));
-    if (buffer == nullptr) throwOutOfMemory("VideoDecoder");
-    m_io = avio_alloc_context(buffer, kIoBufferSize, /*write_flag=*/0, this, &VideoDecoder::readFile, nullptr,
-                              &VideoDecoder::seekFile);
-    if (m_io == nullptr) {
-        av_free(buffer);
-        throwOutOfMemory("VideoDecoder");
-    }
+    m_io = ffmpeg_fd::openReader(&m_fd, kIoBufferSize);
+    if (m_io == nullptr) throwOutOfMemory("VideoDecoder");
 }
 
 // The I/O context before the file it reads.
@@ -567,19 +530,7 @@ void VideoDecoder::openContainer() {
     }
     m_format = avformat_alloc_context();
     if (m_format == nullptr) throwOutOfMemory("VideoDecoder");
-    m_format->pb = m_io;
-    m_format->flags |= AVFMT_FLAG_CUSTOM_IO;
-    // A container whose content names further files -- a playlist, a concat script, an image
-    // sequence, a QuickTime external data reference -- has them opened on this thread, by a path
-    // this decoder never checked, so a pipe among them parks the thread exactly as the wallpaper's
-    // own path would. Both refusals earn their place: io_open is the hook a demuxer uses to open a
-    // file for this context, while one that opens a container of its own -- a concat script does --
-    // builds a fresh context that inherits the protocol list and nothing else. Nothing here needs a
-    // protocol; the bytes come from the descriptor. Such a container fails to play, which is the
-    // intended loss.
-    m_format->io_open = &VideoDecoder::refuseOpen;
-    m_format->protocol_whitelist = av_strdup(kNoProtocols);
-    if (m_format->protocol_whitelist == nullptr) throwOutOfMemory("VideoDecoder");
+    if (!ffmpeg_fd::readOnlyThrough(m_format, m_io)) throwOutOfMemory("VideoDecoder");
     // Frees the context on failure, never a caller's I/O context.
     if (const int err = avformat_open_input(&m_format, m_file.c_str(), nullptr, nullptr); err < 0) {
         // The context and the demuxer it found are gone, so the file is probed again to say what it

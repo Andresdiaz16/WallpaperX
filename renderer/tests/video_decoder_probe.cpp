@@ -751,7 +751,11 @@ private:
 //       "Refused" is not enough on its own -- a parked open that the watchdog released also ends in
 //       an error -- so the rescue flag is what fails the park, and the rescue is what lets that
 //       failure be printed instead of hanging the run.
-// CONTROL: renderer/video/video_decoder.cpp, three runs, all reverted.
+// CONTROL: the refusal now lives in renderer/video/ffmpeg_fd_io.h's readOnlyThrough(); via
+//       control_batch.sh, 2026-10-11, its protocol list made "file,pipe" -> both ffconcat cases red (the
+//       pipe one parked and released by the watchdog, the ordinary one "was opened", not refused as a
+//       content error, not described as a list of other files), the HLS case green. Reverted.
+//       Earlier, in renderer/video/video_decoder.cpp before the move, three runs, all reverted.
 //       (1) `protocol_whitelist` not set, io_open kept -> both ffconcat cases red: the pipe one
 //       "parked the decoding thread in an open until a writer appeared", released by the watchdog
 //       and printed; the ordinary one "was opened". The HLS case stayed GREEN -- io_open refused

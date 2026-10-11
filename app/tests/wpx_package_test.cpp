@@ -6,6 +6,7 @@
 // S15.55, S15.67, S15.68, S15.221-S15.225 in GOALS.md; the last graded against the daemon's own
 // property rules (daemon_rules.cpp).
 
+#include "audio_probe.h"
 #include "daemon_rules.h"
 #include "openat2_shim.h"
 #include "preview_image_provider.h"
@@ -281,7 +282,8 @@ std::string daemonVerdict(const OrderedJson& properties) {
         const std::string type = spec.value("type", "");
         if (type == "float") {
             defaults.emplace_back(key, spec.at("default").get<double>());
-            if (key == "speed") {
+            // The two the daemon bounds: a slider at either end of the declared range must be a value it takes.
+            if (key == "speed" || key == "volume") {
                 for (const char* end : {"min", "max"}) {
                     if (const std::string why = daemonPropertiesError({{key, spec.at(end).get<double>()}}); !why.empty()) {
                         extremes = why;
@@ -328,7 +330,8 @@ void daemonPropertyRules() {
     // GOAL: S15.223 -- "speed" declaring a range that starts at or below 0 or ends above 2 is
     //       refused, naming the range, not narrowed to fit; (0.1, 2] and the smallest positive
     //       minimum are usable; "Speed" is another key and is not checked.
-    // GOAL: S15.224 -- a "speed" that is not a float, and a "mute" that is not a bool, list broken.
+    // GOAL: S15.224 -- a "speed" that is not a float lists broken. ("mute" and "volume" are judged where
+    //       the folder is read, knowing whether they are kept: soundPropertyRules.)
     // WHY-THIS-SHAPE: each refusal is paired with the usable case on the other side of its boundary
     //       (64/65 characters and properties, min 0/smallest positive, max 2/2.0001), so neither a
     //       validator that refuses too much nor one that refuses too little passes; each refusal's
@@ -342,8 +345,7 @@ void daemonPropertyRules() {
     //       "S15.223: speed from 0 was accepted"; `> kMaxPlaybackSpeed` made `> 3` -> red, "S15.223: speed to
     //       2.0001 was accepted"; the not-a-float test made `if (false)` -> red, "S15.224: a bool speed
     //       was refused with "...allows 0 to 0, ...", not "...is not a float..."" (the range check
-    //       catches it, with the wrong sentence); the mute test made `false` -> red, "S15.224: a float
-    //       mute was accepted".
+    //       catches it, with the wrong sentence).
     // GOAL: S15.255 -- a key with a trailing newline, also after 64 allowed characters, and a colour
     //       default with one, are refused, as the daemon refuses them.
     // WHY-THIS-SHAPE: a pattern anchored with `^...$` matches before a final "\n"; graded against
@@ -375,11 +377,6 @@ void daemonPropertyRules() {
         {"S15.224", "a bool speed", one("speed", flag), "Property \"speed\" in wallpaper.json is not a float, and WallpaperX reads a video's speed as one."},
         {"S15.224", "a colour speed", one("speed", spec(R"({"type": "color", "default": "#ffffff"})")),
          "Property \"speed\" in wallpaper.json is not a float, and WallpaperX reads a video's speed as one."},
-        {"S15.224", "a float mute", one("mute", spec(R"({"type": "float", "default": 0.5, "min": 0.1, "max": 1})")),
-         "Property \"mute\" in wallpaper.json is not a bool, and WallpaperX reads \"mute\" as one."},
-        {"S15.224", "a colour mute", one("mute", spec(R"({"type": "color", "default": "#000000"})")),
-         "Property \"mute\" in wallpaper.json is not a bool, and WallpaperX reads \"mute\" as one."},
-        {"S15.224", "a bool mute", one("mute", flag), nullptr},
         {"S15.255", "a key ending in a newline", one("glow\n", flag), badKey},
         {"S15.255", "a 64-character key and a newline", one(std::string(64, 'k') + "\n", flag), badKey},
         {"S15.255", "a colour default ending in a newline", one("tint", OrderedJson{{"type", "color"}, {"default", "#aabbcc\n"}}),
@@ -422,8 +419,8 @@ void daemonPropertyRules() {
                    .arg(what, parsed ? QStringLiteral("usable") : QStringLiteral("broken"),
                         daemon.empty() ? QStringLiteral("accept it") : QStringLiteral("refuse it (%1)").arg(QString::fromStdString(daemon))));
     }
-    expect(outside == 30 && checked == 23 + outside,
-           QStringLiteral("S15.221-S15.225: %1 rows were checked, %2 of them characters outside the rule; expected 53 and 30").arg(checked).arg(outside));
+    expect(outside == 30 && checked == 20 + outside,
+           QStringLiteral("S15.221-S15.225: %1 rows were checked, %2 of them characters outside the rule; expected 50 and 30").arg(checked).arg(outside));
 }
 
 // S15.35, S15.53
@@ -936,6 +933,11 @@ void folderNamesThatAreNotUtf8(const QString& root) {
 void sharedValidator(const QString& root) {
     const QString dir = root + QStringLiteral("/shared");
     const QByteArray plan(kPlanManifest);
+    // The whole pair carries no sound property: a folder's video is given or stripped of them by what
+    // the probe hears (S15.473), which an archive is not, so only a manifest without them reads the same.
+    OrderedJson soundlessJson = planManifest();
+    soundlessJson["properties"].erase("mute");
+    const QByteArray soundless = jsonBytes(soundlessJson);
     Entries noPreview = planEntries(plan);
     noPreview.removeAt(1);
     QByteArray huge = plan;
@@ -944,8 +946,8 @@ void sharedValidator(const QString& root) {
     atCap.append(QByteArray(kMaxManifestBytes - plan.size(), ' '));
     if (!writeFolder(dir + QStringLiteral("/nopreview"), noPreview).isEmpty() ||
         !writeZip(dir + QStringLiteral("/nopreview.wpx"), noPreview).isEmpty() ||
-        !writeFolder(dir + QStringLiteral("/whole"), planEntries(plan)).isEmpty() ||
-        !writeZip(dir + QStringLiteral("/whole.wpx"), planEntries(plan)).isEmpty() ||
+        !writeFolder(dir + QStringLiteral("/whole"), planEntries(soundless)).isEmpty() ||
+        !writeZip(dir + QStringLiteral("/whole.wpx"), planEntries(soundless)).isEmpty() ||
         !writeFolder(dir + QStringLiteral("/huge"), planEntries(huge)).isEmpty() ||
         !writeFolder(dir + QStringLiteral("/atcap"), planEntries(atCap)).isEmpty()) {
         harnessFailure("S15.67: the folders and archives could not be built");
@@ -959,7 +961,9 @@ void sharedValidator(const QString& root) {
     //       the whole pair proves the refusal is about the preview and nothing else.
     // CONTROL: app/library/wpx_package.cpp, readFrom's `contents.find(parsed->previewName)` made
     //       `contents.find(parsed->assetName)` -> red, "S15.67: the folder missing its preview read
-    //       as usable=1 ..." and "... the archive missing its preview read as usable=1 ..."; restored.
+    //       as usable=1 ..." and "... the archive missing its preview read as usable=1 ..." (control_batch,
+    //       re-run 2026-10-11 with the soundless whole pair); restored. The whole-pair line has no control
+    //       of its own.
     const Wallpaper folder = readWallpaperFolder(dir + QStringLiteral("/nopreview"));
     const Wallpaper archive = readArchive(dir + QStringLiteral("/nopreview.wpx"));
     const Wallpaper wholeFolder = readWallpaperFolder(dir + QStringLiteral("/whole"));
@@ -969,7 +973,7 @@ void sharedValidator(const QString& root) {
     expect(isBrokenOnly(archive) && archive.problem == u"The archive has no preview.png, which wallpaper.json names.",
            QStringLiteral("S15.67: the archive missing its preview read as usable=%1 problem \"%2\"").arg(archive.usable()).arg(archive.problem));
     expect(wholeFolder.usable() && wholeArchive.usable() && wholeFolder.properties == wholeArchive.properties &&
-               wholeFolder.title == wholeArchive.title,
+               wholeFolder.properties.size() == 2 && wholeFolder.title == wholeArchive.title,
            QStringLiteral("S15.67: the same contents whole read as folder usable=%1 (%2), archive usable=%3 (%4)")
                .arg(wholeFolder.usable()).arg(wholeFolder.problem).arg(wholeArchive.usable()).arg(wholeArchive.problem));
 
@@ -1369,6 +1373,379 @@ void leaseDoesNotBlock(const QString& root) {
                .arg(opened ? QStringLiteral("opened") : QString::fromLocal8Bit(std::strerror(error))));
 }
 
+QString nameOf(AudioStreams audio) {
+    switch (audio) {
+    case AudioStreams::Unknown:
+        return QStringLiteral("Unknown");
+    case AudioStreams::Absent:
+        return QStringLiteral("Absent");
+    case AudioStreams::Present:
+        return QStringLiteral("Present");
+    }
+    return QStringLiteral("(not an AudioStreams)");
+}
+
+// S15.472, S15.487
+void audioProbe(const QString& root) {
+    const QString dir = root + QStringLiteral("/probe");
+    struct Case {
+        const char* what;
+        QString file;
+        QByteArray bytes;
+        AudioStreams audio;
+    };
+    const QByteArray listing("ffconcat version 1.0\nfile listed.wav\n");
+    const Case cases[] = {
+        {"a WAV file (audio declared in its header)", QStringLiteral("wav"), wavAudio(), AudioStreams::Present},
+        {"an FLV video whose audio follows its video", QStringLiteral("flv-sound"), flvVideo(true), AudioStreams::Present},
+        {"the same FLV video without the audio", QStringLiteral("flv-silent"), flvVideo(false), AudioStreams::Absent},
+        {"a Y4M video", QStringLiteral("y4m"), y4mVideo(), AudioStreams::Absent},
+        {"a file that is not media", QStringLiteral("junk"), QByteArrayLiteral("not really a video"), AudioStreams::Unknown},
+        {"an ffconcat script listing a WAV file beside it", QStringLiteral("listing"), listing, AudioStreams::Unknown},
+    };
+    const QString cwd = QDir::currentPath();
+    if (!QDir().mkpath(dir) || !writeBytes(dir + QStringLiteral("/listed.wav"), wavAudio())) {
+        harnessFailure("S15.472: the probe's folder could not be made");
+        return;
+    }
+    // FFmpeg is given no file name, so a name a container lists is looked up in the working directory.
+    if (::chdir(QFile::encodeName(dir).constData()) != 0) {
+        harnessFailure("S15.487: the working directory could not be moved to the listing's folder");
+        return;
+    }
+    const auto back = qScopeGuard([&cwd] { static_cast<void>(::chdir(QFile::encodeName(cwd).constData())); });
+    // GOAL: S15.472 -- the app hears a video's sound by an audio stream it can decode: a WAV file's
+    //       header-declared stream and an FLV video's audio found only by reading its packets are Present;
+    //       the same FLV without the audio tag and a Y4M video are Absent; a file FFmpeg cannot open as media
+    //       is Unknown, not Absent. The probe reads from the file's start wherever the descriptor stands.
+    // GOAL: S15.487 -- the probe opens no file a container names: an ffconcat script listing a real WAV
+    //       file in the working directory is Unknown, never Present.
+    // WHY-THIS-SHAPE: each descriptor is left at the file's end before the probe, so a probe that read
+    //       from the offset it was given would see nothing; the FLV pair differs only by the audio tag, and
+    //       is large enough for FFmpeg to recognise without it. The listed file is a WAV the working
+    //       directory holds, so a probe that followed the listing would find its audio.
+    // CONTROL: via control_batch.sh, --phase '^audioProbe$', 2026-10-11, each alone, reverted, in
+    //       app/library/audio_probe.cpp: the AVFMTCTX_NOHEADER test made `if (true)` -> "FAIL: S15.472: an FLV
+    //       video whose audio follows its video probed as Absent, not Present", alone; the `lseek(fd, 0,
+    //       SEEK_SET)` deleted -> the WAV, both FLVs and the Y4M "probed as Unknown"; the audio-type test
+    //       dropped from holdsDecodableAudio -> the Y4M and the silent FLV "probed as Present"; the packet
+    //       loop's EOF answered Unknown -> the silent FLV "probed as Unknown, not Absent", alone; a refused
+    //       open answered Absent -> the non-media file and the listing "probed as Absent, not Unknown";
+    //       readOnlyThrough() replaced by bare custom I/O -> "FAIL: S15.487: an ffconcat script listing a WAV
+    //       file beside it probed as Present, not Unknown", alone.
+    int probed = 0;
+    for (const Case& c : cases) {
+        const QString path = dir + QLatin1Char('/') + c.file;
+        if (!writeBytes(path, c.bytes)) {
+            harnessFailure("S15.472: a probe fixture could not be written");
+            return;
+        }
+        const int fd = ::open(QFile::encodeName(path).constData(), O_RDONLY | O_CLOEXEC);
+        if (fd < 0 || ::lseek(fd, 0, SEEK_END) < 0) {
+            harnessFailure("S15.472: a probe fixture could not be opened");
+            if (fd >= 0) {
+                ::close(fd);
+            }
+            return;
+        }
+        const AudioStreams heard = probeAudioStreams(fd);
+        ::close(fd);
+        ++probed;
+        expect(heard == c.audio, QStringLiteral("%1: %2 probed as %3, not %4")
+                                     .arg(c.file == u"listing" ? QStringLiteral("S15.487") : QStringLiteral("S15.472"),
+                                          QLatin1StringView(c.what), nameOf(heard), nameOf(c.audio)));
+    }
+    expect(probed == 6, QStringLiteral("S15.472: %1 probe cases ran, not 6").arg(probed));
+}
+
+// S15.473
+void soundProperties(const QString& root) {
+    const QString dir = root + QStringLiteral("/sound");
+    const auto write = [&](const char* name, const QByteArray& manifest, const QByteArray& asset) {
+        return writeFolder(dir + QLatin1Char('/') + QLatin1StringView(name), planEntriesWith(manifest, asset)).isEmpty();
+    };
+    OrderedJson undeclared = planManifest();
+    undeclared["properties"].erase("mute");
+    OrderedJson declared = planManifest();
+    declared["properties"]["volume"] = OrderedJson::parse(R"({"type": "float", "default": 0.25, "min": 0, "max": 0.5, "label": "Loudness"})");
+    OrderedJson still = declared;
+    still["type"] = "static";
+    still["file"] = "assets/video.mp4";
+    OrderedJson full = planManifest();
+    full["properties"] = OrderedJson::object();
+    for (int i = 0; i < int(kMaxProperties); ++i) {
+        full["properties"]["k" + std::to_string(i)] = OrderedJson::parse(R"({"type": "bool", "default": true})");
+    }
+    if (!write("added", jsonBytes(undeclared), soundVideo()) || !write("declared", jsonBytes(declared), soundVideo()) ||
+        !write("silent", jsonBytes(declared), silentVideo()) || !write("still", jsonBytes(still), soundVideo()) ||
+        !write("full", jsonBytes(full), soundVideo())) {
+        harnessFailure("S15.473: the wallpaper folders could not be written");
+        return;
+    }
+    const auto at = [&](const char* name) { return readWallpaperFolder(dir + QLatin1Char('/') + QLatin1StringView(name)); };
+    const auto find = [](const Wallpaper& w, const char* key) -> const WallpaperProperty* {
+        const auto it = std::ranges::find(w.properties, QLatin1StringView(key), &WallpaperProperty::key);
+        return it == w.properties.end() ? nullptr : &*it;
+    };
+
+    // GOAL: S15.473 -- a video folder whose video has sound offers `mute` (bool, default false) and
+    //       `volume` (float 0 to 1, default 1) after its declared properties when wallpaper.json declares
+    //       neither; declared ones keep their own default, range and label, and nothing is added twice.
+    //       A silent video, and a still, list neither, a declared one included, and keep every other
+    //       property. With wallpaper.json at the 64-property cap nothing is added.
+    // WHY-THIS-SHAPE: the same declared manifest read over a video with sound, a silent video and as a
+    //       still, so only the probe and the type decide; the cap case has no sound key of its own.
+    // CONTROL: via control_batch.sh, --phase '^soundProperties$', 2026-10-11, each alone, reverted, in
+    //       app/library/wpx_package.cpp: audioOf() answering Absent in place of the probe -> "FAIL: S15.473: a
+    //       video with sound declaring neither reads speed,tint" and the declaring-both line; settleSoundProperties'
+    //       `== AudioStreams::Absent` strip made `if (false)` -> "... a silent video reads speed,mute,tint,volume
+    //       and a still speed,mute,tint,volume"; audioOf()'s not-a-video answer deleted, so a still is probed ->
+    //       "... a silent video reads speed,tint and a still speed,mute,tint,volume"; the cap test dropped from
+    //       `declared` -> "... at the property cap reads 66 properties"; mute added whether declared or not ->
+    //       "... declaring both reads speed,mute,tint,volume,mute" and the cap line (65).
+    const Wallpaper added = at("added");
+    const WallpaperProperty* mute = find(added, "mute");
+    const WallpaperProperty* volume = find(added, "volume");
+    expect(added.usable() && keysOf(added.properties) == u"speed,tint,mute,volume" && mute != nullptr &&
+               mute->type == WallpaperProperty::Type::Bool && mute->defaultValue == QVariant(false) && volume != nullptr &&
+               volume->type == WallpaperProperty::Type::Float && volume->defaultValue == QVariant(1.0) && volume->minimum == 0.0 &&
+               volume->maximum == 1.0,
+           QStringLiteral("S15.473: a video with sound declaring neither reads %1 (usable %2)").arg(keysOf(added.properties)).arg(added.usable()));
+    const Wallpaper kept = at("declared");
+    const WallpaperProperty* keptMute = find(kept, "mute");
+    const WallpaperProperty* keptVolume = find(kept, "volume");
+    expect(kept.usable() && keysOf(kept.properties) == u"speed,mute,tint,volume" && keptMute != nullptr &&
+               keptMute->defaultValue == QVariant(true) && keptVolume != nullptr && keptVolume->maximum == 0.5 &&
+               keptVolume->defaultValue == QVariant(0.25) && keptVolume->label == u"Loudness",
+           QStringLiteral("S15.473: a video with sound declaring both reads %1 (usable %2)").arg(keysOf(kept.properties)).arg(kept.usable()));
+    const Wallpaper silent = at("silent");
+    const Wallpaper stillRead = at("still");
+    expect(silent.usable() && keysOf(silent.properties) == u"speed,tint" && stillRead.usable() &&
+               keysOf(stillRead.properties) == u"speed,tint",
+           QStringLiteral("S15.473: declaring both, a silent video reads %1 and a still %2").arg(keysOf(silent.properties), keysOf(stillRead.properties)));
+    const Wallpaper fullRead = at("full");
+    expect(fullRead.usable() && fullRead.properties.size() == kMaxProperties && find(fullRead, "mute") == nullptr,
+           QStringLiteral("S15.473: a video with sound at the property cap reads %1 properties (usable %2)")
+               .arg(fullRead.properties.size()).arg(fullRead.usable()));
+}
+
+// S15.224, S15.225, S15.474, S15.488, S15.489
+void soundPropertyRules(const QString& root) {
+    const QString dir = root + QStringLiteral("/soundrules");
+    const auto spec = [](const char* text) { return OrderedJson::parse(text); };
+    const OrderedJson loudVolume = spec(R"({"type": "float", "default": 50, "min": 0, "max": 100})");
+    const OrderedJson floatMute = spec(R"({"type": "float", "default": 0.5, "min": 0.1, "max": 1})");
+    const auto manifest = [](const char* type, const OrderedJson& properties) {
+        OrderedJson json = planManifest();
+        json["type"] = type;
+        json["properties"] = properties;
+        return jsonBytes(json);
+    };
+    const auto at = [&](const QString& name) { return readWallpaperFolder(dir + QLatin1Char('/') + name); };
+    const auto write = [&](const QString& name, const QByteArray& json, const QByteArray& asset) {
+        return writeFolder(dir + QLatin1Char('/') + name, planEntriesWith(json, asset)).isEmpty();
+    };
+    struct Row {
+        const char* goal;
+        const char* what;
+        OrderedJson properties;
+        const char* reason; // nullptr: usable
+    };
+    const char* notBool = "Property \"mute\" in wallpaper.json is not a bool, and WallpaperX reads \"mute\" as one.";
+    const Row rows[] = {
+        {"S15.224", "a float mute", OrderedJson{{"mute", floatMute}}, notBool},
+        {"S15.224", "a colour mute", OrderedJson{{"mute", spec(R"({"type": "color", "default": "#000000"})")}}, notBool},
+        {"S15.224", "a bool mute", OrderedJson{{"mute", spec(R"({"type": "bool", "default": true})")}}, nullptr},
+        {"S15.474", "volume from 0 to 0.5", OrderedJson{{"volume", spec(R"({"type": "float", "default": 0.25, "min": 0, "max": 0.5})")}}, nullptr},
+        {"S15.474", "volume from 0 to 1", OrderedJson{{"volume", spec(R"({"type": "float", "default": 1, "min": 0, "max": 1})")}}, nullptr},
+        {"S15.474", "volume to 1.5", OrderedJson{{"volume", spec(R"({"type": "float", "default": 1, "min": 0, "max": 1.5})")}},
+         "Property \"volume\" in wallpaper.json allows 0 to 1.5, and WallpaperX plays a video's volume from 0 to 1."},
+        {"S15.474", "volume from -0.1", OrderedJson{{"volume", spec(R"({"type": "float", "default": 0.5, "min": -0.1, "max": 1})")}},
+         "Property \"volume\" in wallpaper.json allows -0.1 to 1, and WallpaperX plays a video's volume from 0 to 1."},
+        {"S15.474", "a bool volume", OrderedJson{{"volume", spec(R"({"type": "bool", "default": true})")}},
+         "Property \"volume\" in wallpaper.json is not a float, and WallpaperX reads a video's volume as one."},
+        {"S15.474", "volume from 0 to 100", OrderedJson{{"volume", loudVolume}},
+         "Property \"volume\" in wallpaper.json allows 0 to 100, and WallpaperX plays a video's volume from 0 to 1."},
+    };
+    // The same broken pair declared by a still, a shader, a video with sound and a video the probe cannot read.
+    OrderedJson broken = planManifest()["properties"];
+    broken["mute"] = floatMute;
+    broken["volume"] = loudVolume;
+    OrderedJson loudOnly = planManifest()["properties"];
+    loudOnly["volume"] = loudVolume;
+    int index = 0;
+    bool written = true;
+    for (const Row& row : rows) {
+        written = write(QStringLiteral("row%1").arg(index++), manifest("video", row.properties), soundVideo()) && written;
+    }
+    written = write(QStringLiteral("still"), manifest("static", broken), soundVideo()) &&
+              write(QStringLiteral("shader"), manifest("shader", broken), soundVideo()) &&
+              write(QStringLiteral("unknown"), QByteArray(kPlanManifest), QByteArrayLiteral("not really a video")) &&
+              write(QStringLiteral("unknownloud"), manifest("video", loudOnly), QByteArrayLiteral("not really a video")) && written;
+    if (!written) {
+        harnessFailure("S15.474: the wallpaper folders could not be written");
+        return;
+    }
+
+    // GOAL: S15.224 and S15.474 at the folder read -- a video with sound declaring a "mute" that is not a
+    //       bool, or a "volume" that is not a float or whose range leaves 0 to 1 (0 to 100 included), lists
+    //       broken with that property's sentence; a bool mute and volumes within 0 to 1 are usable.
+    // GOAL: S15.225 for these -- the app lists each usable exactly when the daemon would take its properties.
+    // WHY-THIS-SHAPE: each row is a whole folder over a video with sound, read as the library reads it,
+    //       since the manifest check no longer judges these keys (S15.488's parseManifest line below).
+    // CONTROL: via control_batch.sh, --phase '^soundPropertyRules$', 2026-10-11, settleSoundProperties'
+    //       `return problem;` made a no-op (app/library/wpx_package.cpp) -> every refusal row "was listed
+    //       usable", e.g. "FAIL: S15.474: a video with sound declaring volume from 0 to 100 was listed usable",
+    //       each with its S15.225 line ("the daemon would refuse it (property volume must be a number from 0 to
+    //       1)"), and S15.489's 0-to-100 line. Reverted.
+    // COVERAGE-ASSERT: the row count.
+    int checked = 0;
+    index = 0;
+    for (const Row& row : rows) {
+        const Wallpaper read = at(QStringLiteral("row%1").arg(index++));
+        const QString what = QString::fromLatin1(row.what);
+        ++checked;
+        if (row.reason == nullptr) {
+            expect(read.usable(), QStringLiteral("%1: a video with sound declaring %2 was listed broken: %3").arg(QLatin1StringView(row.goal), what, read.problem));
+        } else {
+            expect(!read.usable() && read.problem.endsWith(QString::fromUtf8(row.reason)),
+                   QStringLiteral("%1: a video with sound declaring %2 was listed %3 \"%4\", not broken \"%5\"")
+                       .arg(QLatin1StringView(row.goal), what, read.usable() ? QStringLiteral("usable") : QStringLiteral("broken"), read.problem,
+                            QString::fromUtf8(row.reason)));
+        }
+        const std::string daemon = daemonVerdict(row.properties);
+        expect(read.usable() == daemon.empty(),
+               QStringLiteral("S15.225: a video with sound declaring %1: the app lists it %2, the daemon would %3")
+                   .arg(what, read.usable() ? QStringLiteral("usable") : QStringLiteral("broken"),
+                        daemon.empty() ? QStringLiteral("accept it") : QStringLiteral("refuse it (%1)").arg(QString::fromStdString(daemon))));
+    }
+    expect(checked == 9, QStringLiteral("S15.474: %1 sound rows were checked, not 9").arg(checked));
+
+    // GOAL: S15.488 -- a still or a shader declaring a float "mute" and a "volume" of 0 to 100 is usable
+    //       and keeps neither, its other properties kept in order; parseManifest accepts that manifest.
+    // WHY-THIS-SHAPE: both keys broken at once, so a rule applied before the keys are taken away shows on
+    //       either; the asset is the video with sound, so only the type decides.
+    // CONTROL: via control_batch.sh, --phase '^soundPropertyRules$', 2026-10-11, settleSoundProperties' rule
+    //       loop copied above the Absent strip (app/library/wpx_package.cpp) -> "FAIL: S15.488: declaring a float
+    //       mute and a volume of 0 to 100, a still reads  (Property "mute" ... is not a bool ...) and a shader
+    //       ...", alone. Reverted.
+    const Wallpaper still = at(QStringLiteral("still"));
+    const Wallpaper shader = at(QStringLiteral("shader"));
+    const auto parsed = parseManifest(manifest("video", broken));
+    expect(still.usable() && keysOf(still.properties) == u"speed,tint" && shader.usable() && keysOf(shader.properties) == u"speed,tint" &&
+               parsed.has_value(),
+           QStringLiteral("S15.488: declaring a float mute and a volume of 0 to 100, a still reads %1 (%2) and a shader %3 (%4); "
+                          "the manifest alone was %5")
+               .arg(keysOf(still.properties), still.problem, keysOf(shader.properties), shader.problem,
+                    parsed ? QStringLiteral("accepted") : QStringLiteral("refused: ") + parsed.error()));
+
+    // GOAL: S15.489 -- a video whose asset FFmpeg cannot open keeps a declared `mute` as declared and is
+    //       given no `volume` of its own; a declared volume of 0 to 100 there is still refused.
+    // WHY-THIS-SHAPE: the asset is the same non-media file in both, so the probe answers Unknown for both
+    //       (S15.472's non-media case); `audio` is read as well, so a pass for some other reason shows.
+    // CONTROL: via control_batch.sh, --phase '^soundPropertyRules$', 2026-10-11, each alone, reverted, in
+    //       settleSoundProperties (app/library/wpx_package.cpp): the strip taken for any answer but Present ->
+    //       "FAIL: S15.489: a video the probe cannot read, declaring mute, reads speed,tint (usable 1, audio
+    //       Unknown)" and the 0-to-100 line ("was listed usable"); the `== AudioStreams::Unknown` return
+    //       deleted -> "... declaring mute, reads speed,mute,tint,volume ...", alone.
+    const Wallpaper unknown = at(QStringLiteral("unknown"));
+    const Wallpaper unknownLoud = at(QStringLiteral("unknownloud"));
+    const auto keptMute = std::ranges::find(unknown.properties, QStringLiteral("mute"), &WallpaperProperty::key);
+    expect(unknown.usable() && unknown.audio == AudioStreams::Unknown && keysOf(unknown.properties) == u"speed,mute,tint" &&
+               keptMute != unknown.properties.end() && keptMute->defaultValue == QVariant(true),
+           QStringLiteral("S15.489: a video the probe cannot read, declaring mute, reads %1 (usable %2, audio %3)")
+               .arg(keysOf(unknown.properties)).arg(unknown.usable()).arg(nameOf(unknown.audio)));
+    expect(!unknownLoud.usable() &&
+               unknownLoud.problem.endsWith(u"Property \"volume\" in wallpaper.json allows 0 to 100, and WallpaperX plays a video's volume from 0 to 1."),
+           QStringLiteral("S15.489: a video the probe cannot read, declaring a volume of 0 to 100, was listed %1 \"%2\"")
+               .arg(unknownLoud.usable() ? QStringLiteral("usable") : QStringLiteral("broken"), unknownLoud.problem));
+}
+
+// S15.490
+void probeReuse(const QString& root) {
+    const QString dir = root + QStringLiteral("/reuse");
+    const QString assets = dir + QStringLiteral("/ocean/assets");
+    const QString asset = assets + QStringLiteral("/video.mp4");
+    if (!writeFolder(dir + QStringLiteral("/ocean"), planEntriesWith(QByteArray(kPlanManifest), soundVideo())).isEmpty()) {
+        harnessFailure("S15.490: the library could not be written");
+        return;
+    }
+    const QByteArray assetPath = QFile::encodeName(asset);
+    struct stat original {};
+    if (::stat(assetPath.constData(), &original) != 0) {
+        harnessFailure("S15.490: the asset could not be read");
+        return;
+    }
+    const auto audioIn = [](const std::expected<QList<Wallpaper>, QString>& scan) {
+        return scan && scan->size() == 1 && scan->front().usable() ? nameOf(scan->front().audio) : QStringLiteral("(no usable row)");
+    };
+
+    // GOAL: S15.490 -- a scan opens a video folder's asset once, the probe reading the descriptor the
+    //       folder read opened.
+    // WHY-THIS-SHAPE: counted by the binary's own open/openat/openat2 replacements (FileOpens), on the
+    //       assets folder alone, so the manifest and preview reads are not in the count.
+    // CONTROL: via control_batch.sh, --phase '^probeReuse$', 2026-10-11, readFolderAt
+    //       (app/library/wpx_package.cpp) probing a second descriptor it opens with openat -> "FAIL: S15.490: the
+    //       first scan read audio Present and opened the asset 2 time(s), not Present and once". Reverted.
+    std::expected<QList<Wallpaper>, QString> first;
+    int opened = -1;
+    {
+        FileOpens opens(assets);
+        if (!opens.ok()) {
+            harnessFailure("S15.490: the open counter was already counting another folder");
+            return;
+        }
+        static_cast<void>(opens.take());
+        first = scanLibrary(dir);
+        opened = opens.take();
+    }
+    expect(audioIn(first) == u"Present" && opened == 1,
+           QStringLiteral("S15.490: the first scan read audio %1 and opened the asset %2 time(s), not Present and once").arg(audioIn(first)).arg(opened));
+    if (audioIn(first) != u"Present") {
+        return;
+    }
+
+    // Non-media bytes of the same size written in place, and the modification time put back: the asset's
+    // stamp (device, inode, size, time) is as the first scan read it.
+    const int fd = ::open(assetPath.constData(), O_WRONLY | O_CLOEXEC);
+    const QByteArray junk(qsizetype(original.st_size), 'x');
+    const timespec times[2] = {{0, UTIME_OMIT}, original.st_mtim};
+    struct stat after {};
+    const bool rewritten = fd >= 0 && ::write(fd, junk.constData(), size_t(junk.size())) == junk.size() && ::futimens(fd, times) == 0 &&
+                           ::fstat(fd, &after) == 0;
+    if (fd >= 0) {
+        ::close(fd);
+    }
+    if (!rewritten || after.st_ino != original.st_ino || after.st_size != original.st_size || after.st_mtim.tv_sec != original.st_mtim.tv_sec ||
+        after.st_mtim.tv_nsec != original.st_mtim.tv_nsec) {
+        harnessFailure("S15.490: the asset could not be rewritten with its stamp kept");
+        return;
+    }
+
+    // GOAL: S15.490 -- a rescan given an earlier scan reuses its probe answer for an asset whose stamp is
+    //       unchanged, and probes again once the modification time moves.
+    // WHY-THIS-SHAPE: the asset is no longer media, so a scan with no earlier one answers Unknown; Present
+    //       can then only come from the earlier answer. The touched case is read against the same earlier
+    //       scan, so only the stamp differs.
+    // CONTROL: via control_batch.sh, --phase '^probeReuse$', 2026-10-11, each alone, reverted, audioOf()'s stamp
+    //       comparison (app/library/wpx_package.cpp) made `false` -> "FAIL: S15.490: with its stamp unchanged, a
+    //       rescan given the first scan read Unknown and one without it Unknown"; made `true` -> "FAIL: S15.490:
+    //       with the modification time moved, a rescan given the first scan read Present, not Unknown".
+    const auto reused = scanLibrary(dir, *first);
+    const auto fresh = scanLibrary(dir);
+    expect(audioIn(reused) == u"Present" && audioIn(fresh) == u"Unknown",
+           QStringLiteral("S15.490: with its stamp unchanged, a rescan given the first scan read %1 and one without it %2, not Present and Unknown")
+               .arg(audioIn(reused), audioIn(fresh)));
+    const timespec later[2] = {{0, UTIME_OMIT}, {original.st_mtim.tv_sec + 1, original.st_mtim.tv_nsec}};
+    if (::utimensat(AT_FDCWD, assetPath.constData(), later, 0) != 0) {
+        harnessFailure("S15.490: the asset's modification time could not be moved");
+        return;
+    }
+    const auto touched = scanLibrary(dir, *first);
+    expect(audioIn(touched) == u"Unknown",
+           QStringLiteral("S15.490: with the modification time moved, a rescan given the first scan read %1, not Unknown").arg(audioIn(touched)));
+}
+
 } // namespace
 
 int main(int argc, char* argv[]) {
@@ -1395,5 +1772,9 @@ int main(int argc, char* argv[]) {
     runPhase("previewAddresses", [&] { previewAddresses(root); });
     runPhase("defaultDirectory", [&] { defaultDirectory(root); });
     runPhase("leaseDoesNotBlock", [&] { leaseDoesNotBlock(root); });
+    runPhase("audioProbe", [&] { audioProbe(root); });
+    runPhase("soundProperties", [&] { soundProperties(root); });
+    runPhase("soundPropertyRules", [&] { soundPropertyRules(root); });
+    runPhase("probeReuse", [&] { probeReuse(root); });
     return verdict();
 }

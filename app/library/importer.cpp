@@ -538,7 +538,8 @@ ImportResult unpackPackage(int folder, const QByteArray& name, const QString& ar
     }
     const QByteArray record = "sha256:" + hash->toHex() + '\n';
 
-    // The same rules the library applies, before anything is written.
+    // The library's rules, before anything is written, except the sound keys': judging those needs
+    // the asset probed for sound, so they are judged only after the unpack, by readWallpaperFolder.
     if (const Wallpaper checked = readWallpaper(source.get(), archivePath); !checked.usable()) {
         return withStamp(refused(checked.problem));
     }

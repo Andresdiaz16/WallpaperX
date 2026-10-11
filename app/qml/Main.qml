@@ -19,10 +19,51 @@ ApplicationWindow {
     visible: true
     title: qsTr("WallpaperX")
 
+    // Sound on every screen, as being set or else as the daemon has it.
+    readonly property bool shownSound: window.applier.pendingSound !== undefined ? window.applier.pendingSound
+                                                                                  : window.daemon.sound
+
     ColumnLayout {
         anchors.fill: parent
         anchors.margins: 16
         spacing: 8
+
+        RowLayout {
+            Layout.fillWidth: true
+
+            Label {
+                textFormat: Text.PlainText
+                font.bold: true
+                text: qsTr("General")
+            }
+            Switch {
+                id: sound
+
+                text: qsTr("Sound on every screen")
+                enabled: window.daemon.state === DaemonClient.Ready && window.applier.soundState !== ApplyController.Working
+                checked: window.shownSound
+                onToggled: {
+                    window.applier.setSound(sound.checked);
+                    sound.checked = Qt.binding(() => window.shownSound);
+                }
+            }
+            BusyIndicator {
+                Layout.preferredHeight: sound.implicitHeight
+                Layout.preferredWidth: sound.implicitHeight
+                visible: window.applier.soundState === ApplyController.Working
+                running: visible
+            }
+            Item {
+                Layout.fillWidth: true
+            }
+        }
+        Label {
+            Layout.fillWidth: true
+            wrapMode: Text.Wrap
+            textFormat: Text.PlainText
+            visible: text !== ""
+            text: window.applier.soundState === ApplyController.Failed ? window.applier.soundMessage : ""
+        }
 
         Label {
             text: qsTr("Choose a monitor")

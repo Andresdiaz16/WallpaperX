@@ -149,7 +149,7 @@ inline bool blockingWriteFixtureWorks(const std::filesystem::path& probeFile, st
     auto saved = std::make_shared<std::promise<std::string>>();
     std::future<std::string> future = saved->get_future();
     std::thread([saved, store] {
-        saved->set_value(store.save({PersistedWallpaper{7, "static", "/probe.png"}}).error);
+        saved->set_value(store.save(PersistedConfig{{PersistedWallpaper{7, "static", "/probe.png"}}}).error);
     }).detach();
 
     if (future.wait_for(std::chrono::milliseconds(500)) == std::future_status::ready) {

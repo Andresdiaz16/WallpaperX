@@ -37,11 +37,14 @@ bool isPauseMode(const QString& mode);
 struct DaemonStatus {
     // Connector name to monitor id, from `outputs_literal`.
     QHash<QString, int> outputs;
-    // Ids holding a wallpaper or a pause setting, named or not.
+    // Ids holding a wallpaper, a pause setting or a sound setting, named or not.
     QSet<int> occupied;
     // A monitor's pause mode; nullopt for one a newer daemon wrote that this one does not apply.
     // A monitor with no entry plays.
     QHash<int, std::optional<QString>> pauseModes;
+    // Sound as the daemon applies it, globally and per monitor; a monitor with no entry is on.
+    bool sound = true;
+    QHash<int, bool> screenSound;
     QString persistenceStatus;
     QString persistenceDetail;
 
@@ -55,9 +58,9 @@ std::expected<DaemonStatus, QString> parseDaemonStatus(const QByteArray& json);
 std::optional<int> freeMonitorId(const DaemonStatus& status);
 
 struct DaemonTimeouts {
-    // Every call, GetStatus included. SetMonitorOutput, SetWallpaper* and SetMonitorPause wait for
-    // the config file to be written, and a GetStatus can queue behind one of them: given less, a
-    // healthy daemon mid-write would be shown as unavailable.
+    // Every call, GetStatus included. SetMonitorOutput, SetWallpaper*, SetMonitorPause and the sound
+    // settings wait for the config file to be written, and a GetStatus can queue behind one of them:
+    // given less, a healthy daemon mid-write would be shown as unavailable.
     int callMs = 25000;
 };
 
@@ -77,6 +80,10 @@ class DaemonClient : public QObject {
     // Connector name to pause mode, for every named screen; "" for a mode this app does not know.
     // A screen with no entry plays.
     Q_PROPERTY(QVariantMap pauseModes READ pauseModes NOTIFY statusChanged)
+    // Whether sound is on for every screen.
+    Q_PROPERTY(bool sound READ sound NOTIFY statusChanged)
+    // Connector name to whether sound is on there, for every named screen.
+    Q_PROPERTY(QVariantMap screenSound READ screenSound NOTIFY statusChanged)
     // Why the daemon's settings may not be on disk, or empty.
     Q_PROPERTY(QString persistenceProblem READ persistenceProblem NOTIFY statusChanged)
 
@@ -97,6 +104,8 @@ public:
     State state() const { return m_state; }
     QString unavailableReason() const { return m_unavailableReason; }
     QVariantMap pauseModes() const;
+    bool sound() const { return m_status.sound; }
+    QVariantMap screenSound() const;
     QString persistenceProblem() const;
 
     // Reads GetStatus again; a reply to an earlier read is then discarded.
@@ -111,6 +120,8 @@ public:
                       const QVariantMap& properties, Done done);
     void setProperties(QObject* context, int monitorId, const QVariantMap& properties, Done done);
     void setPause(QObject* context, int monitorId, const QString& mode, Done done);
+    void setSound(QObject* context, bool on, Done done);
+    void setScreenSound(QObject* context, int monitorId, bool on, Done done);
 
 signals:
     void statusChanged();
@@ -126,6 +137,8 @@ private:
     void send(QObject* context, const QDBusMessage& message, int timeoutMs,
               std::function<void(std::expected<QDBusMessage, QString>)> onReply);
     void sendAndRefresh(QObject* context, const QDBusMessage& message, Done done);
+    // Sends a setting change; on success `record` writes it into the status shown, then it is read again.
+    void sendSetting(QObject* context, const QDBusMessage& message, std::function<void()> record, Done done);
     void bindNext();
     void finishBind(std::expected<int, QString> result);
     void settle(State state, QString reason, DaemonStatus status);

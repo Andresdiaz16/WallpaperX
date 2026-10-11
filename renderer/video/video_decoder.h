@@ -279,11 +279,6 @@ private:
     // through. ffmpeg is given the path only as a hint to probing and as text in its messages.
     void openFile();
     void closeFile() noexcept;
-    static int readFile(void* opaque, uint8_t* buffer, int size);
-    static int64_t seekFile(void* opaque, int64_t offset, int whence);
-    // The io_open hook: refuses every open ffmpeg would make of its own accord; openContainer()
-    // says why.
-    static int refuseOpen(AVFormatContext*, AVIOContext**, const char*, int, AVDictionary**);
     void openDecoder();
     void closeDecoder() noexcept;
     void retireDecoder() noexcept;

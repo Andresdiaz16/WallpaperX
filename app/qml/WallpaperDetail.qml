@@ -112,6 +112,10 @@ Item {
 
                                 required property wallpaperProperty modelData
                                 readonly property var current: root.library.propertyValues[row.modelData.key]
+                                // A video's own sound, shown as sound on and a percentage whatever
+                                // wallpaper.json calls them.
+                                readonly property bool isMute: row.modelData.key === "mute"
+                                readonly property bool isVolume: row.modelData.key === "volume"
 
                                 Layout.fillWidth: true
 
@@ -119,7 +123,7 @@ Item {
                                     Layout.preferredWidth: 120
                                     elide: Text.ElideRight
                                     textFormat: Text.PlainText
-                                    text: row.modelData.label
+                                    text: row.isMute ? qsTr("Sound") : row.isVolume ? qsTr("Volume") : row.modelData.label
                                 }
                                 Slider {
                                     Layout.fillWidth: true
@@ -132,12 +136,14 @@ Item {
                                 Label {
                                     visible: row.modelData.type === "float"
                                     textFormat: Text.PlainText
-                                    text: row.modelData.type === "float" ? Number(row.current).toFixed(2) : ""
+                                    text: row.modelData.type !== "float" ? ""
+                                        : row.isVolume ? qsTr("%1 %").arg(Math.round(Number(row.current) * 100))
+                                        : Number(row.current).toFixed(2)
                                 }
                                 Switch {
                                     visible: row.modelData.type === "bool"
-                                    checked: row.modelData.type === "bool" && row.current === true
-                                    onToggled: root.library.setPropertyValue(row.modelData.key, checked)
+                                    checked: row.modelData.type === "bool" && (row.current === true) !== row.isMute
+                                    onToggled: root.library.setPropertyValue(row.modelData.key, checked !== row.isMute)
                                 }
                                 Rectangle {
                                     visible: row.modelData.type === "color"

@@ -447,11 +447,11 @@ void scopedMessages(Window& w, QQuickItem* root, LibraryManager& library, Servic
     }
     // GOAL: S15.248 -- in the window, a pause change still running shows its mode in DP-1's
     //       selector only; HDMI-A-1's shows what the daemon has for it.
-    // CONTROL: app/daemon/apply_controller.cpp, pendingPauseMode()'s `&& m_kscreen.selectedOutput() ==
-    //       m_pauseOutput` deleted (control_batch, 2026-10-04) -> red, "S15.248: with DP-1's change
-    //       held the selector shows "always_paused" on DP-1, "always_paused" on HDMI-A-1, "always_paused"
-    //       back on DP-1 (held 1)"; `emit pauseChanged();` deleted from the KScreen selectionChanged
-    //       handler -> red, the same line.
+    // CONTROL: app/daemon/apply_controller.cpp, forSelected() -- which pendingPauseMode() reads -- made
+    //       `return true` (control_batch, re-run 2026-10-11) -> red, "S15.248: with DP-1's change held the
+    //       selector shows "always_paused" on DP-1, "always_paused" on HDMI-A-1, "always_paused" back on DP-1
+    //       (held 1)"; `emit pauseChanged();` deleted from the KScreen selectionChanged handler (2026-10-04)
+    //       -> red, the same line.
     s.daemonFake.hold.insert(QStringLiteral("SetMonitorPause"));
     choosePause(combo, 1);
     const bool held = waitFor([&] { return !s.daemonFake.held.isEmpty(); }, kWaitMs) && settle(w.window);
@@ -473,9 +473,9 @@ void scopedMessages(Window& w, QQuickItem* root, LibraryManager& library, Servic
     // WHY-THIS-SHAPE: the window, not only the getter: ScreenSettings' message label is bound to
     //       the pause properties alone, so it changes on a new selection only if the controller
     //       says those changed then.
-    // CONTROL: app/daemon/apply_controller.cpp, control_batch, 2026-10-04: pauseMessage() returning
-    //       `m_pauseMessage` whatever is selected -> red, "S15.249: in the window the refusal shows on
-    //       DP-1 1, on HDMI-A-1 1, back on DP-1 1 (failed 1)"; `emit pauseChanged();` deleted from the
+    // CONTROL: app/daemon/apply_controller.h, control_batch, re-run 2026-10-11: pauseMessage() returning
+    //       `m_pause.message` whatever is selected -> red, "S15.249: in the window the refusal shows on
+    //       DP-1 1, on HDMI-A-1 1, back on DP-1 1 (failed 1)"; (2026-10-04) `emit pauseChanged();` deleted from the
     //       KScreen selectionChanged handler -> red, the same line (the getters were right, the label
     //       stale).
     s.daemonFake.refuse.insert(QStringLiteral("SetMonitorPause"), {QStringLiteral("org.freedesktop.DBus.Error.InvalidArgs"), QStringLiteral("no")});
@@ -489,6 +489,175 @@ void scopedMessages(Window& w, QQuickItem* root, LibraryManager& library, Servic
            QStringLiteral("S15.249: in the window the refusal shows on DP-1 %1, on HDMI-A-1 %2, back on DP-1 %3 (failed %4)")
                .arg(onDp1).arg(onOther).arg(returned).arg(failed));
     s.daemonFake.refuse.clear();
+}
+
+// A click in the middle of `item`, as the user makes one.
+void clickOn(QQuickWindow& window, QQuickItem* item) {
+    QTest::mouseClick(&window, Qt::LeftButton, {}, item->mapToScene(QPointF(item->width() / 2, item->height() / 2)).toPoint());
+}
+
+void soundSwitches(Window& w, QQuickItem* root, Services& s) {
+    const auto step = [&](bool selected) { return selected && settle(w.window); };
+    if (!step(w.client.select(QStringLiteral("DP-1")))) {
+        expect(false, QStringLiteral("S15.483: DP-1 could not be selected"));
+        return;
+    }
+    QQuickItem* global = buttonNamed(root, QStringLiteral("Sound on every screen"));
+    QQuickItem* screen = buttonNamed(root, QStringLiteral("Sound on this screen"));
+    if (global == nullptr || screen == nullptr) {
+        expect(false, QStringLiteral("S15.483: Main shows %1 switch for every screen and %2 for the screen")
+                          .arg(global ? QStringLiteral("a") : QStringLiteral("no"), screen ? QStringLiteral("a") : QStringLiteral("no")));
+        return;
+    }
+    const auto checked = [](const QQuickItem* item) { return item->property("checked").toBool(); };
+
+    // GOAL: S15.483 -- the "Sound on every screen" switch shows the daemon's setting; a click sends
+    //       SetSound with the new value; while the change is held the switch shows that value and
+    //       cannot be clicked; once it is done the switch still shows it; afterwards it follows the
+    //       daemon again, a value a newer build wrote shown as on.
+    // WHY-THIS-SHAPE: the daemon's own value is changed behind the window after the click, so a
+    //       switch the click cut loose from its binding is caught; the held reply makes the pending
+    //       value the only source the switch can be showing.
+    // CONTROL: via control_batch.sh, 2026-10-11, each alone, reverted, in app/qml/Main.qml: shownSound made
+    //       `window.daemon.sound` alone -> "FAIL: S15.483: ... held 1, it was checked 1 (enabled 0) ..."; the
+    //       switch's `enabled` without the Working test -> "... it was checked 0 (enabled 1) ..."; the
+    //       onToggled re-binding replaced by `sound.checked = sound.checked;` -> "... it followed the daemon on
+    //       0, off 1, and a newer build's value as on 0 ...". Deleting the re-binding line instead stays green:
+    //       in this Qt a click does not break the `checked` binding, so the line guards an assignment.
+    {
+        const bool startsOn = checked(global);
+        s.daemonFake.hold.insert(QStringLiteral("SetSound"));
+        clickOn(w.window, global);
+        const bool held = waitFor([&] { return !s.daemonFake.held.isEmpty(); }, kWaitMs) && settle(w.window);
+        const bool heldChecked = checked(global);
+        const bool heldEnabled = global->isEnabled();
+        const bool pendingShown = !heldChecked && !heldEnabled;
+        s.daemonFake.hold.clear();
+        s.daemonFake.release();
+        const bool done = waitFor([&] { return s.applier.soundState() != ApplyController::Progress::Working; }, kWaitMs) && settle(w.window);
+        const auto sent = s.daemonFake.named(QStringLiteral("SetSound"));
+        const bool doneChecked = checked(global);
+        const bool offAfter = !doneChecked && global->isEnabled();
+        s.daemonFake.sound = true;
+        s.daemon.refresh();
+        const bool follows = waitFor([&] { return checked(global); }, kWaitMs);
+        s.daemonFake.sound = false;
+        s.daemon.refresh();
+        const bool followsOff = waitFor([&] { return !checked(global); }, kWaitMs);
+        s.daemonFake.sound = QJsonValue::Null;
+        s.daemon.refresh();
+        const bool newerOn = waitFor([&] { return checked(global); }, kWaitMs);
+        expect(startsOn && held && pendingShown && done && sent.size() == 1 && sent[0].args == QVariantList{false} && offAfter && follows &&
+                   followsOff && newerOn,
+               QStringLiteral("S15.483: the every-screen switch started checked %1; held %2, it was checked %3 (enabled %4); done %5 it "
+                              "is checked %6; it followed the daemon on %7, off %8, and a newer build's value as on %9; sent %10 SetSound")
+                   .arg(startsOn).arg(held).arg(heldChecked).arg(heldEnabled).arg(done).arg(doneChecked).arg(follows)
+                   .arg(followsOff).arg(newerOn).arg(sent.size()));
+        s.daemonFake.sound = true;
+        s.daemon.refresh();
+        waitFor([&] { return checked(global); }, kWaitMs);
+    }
+
+    // GOAL: S15.484 -- the "Sound on this screen" switch shows the selected screen's setting; a click on
+    //       DP-1 sends SetMonitorSound(DP-1's id, false); while held, DP-1's switch shows off and
+    //       HDMI-A-1's shows its own on; once done DP-1 still shows off and HDMI-A-1 on, and the switch
+    //       follows the daemon again afterwards.
+    // CONTROL: via control_batch.sh, 2026-10-11, each alone, reverted: ScreenSettings.qml's shownSound
+    //       ignoring the pending value (app/qml/ScreenSettings.qml) -> "FAIL: S15.484: ... held 1: DP-1 off 0,
+    //       HDMI-A-1 on 1, back off 0 ..."; ApplyController::forSelected() made `return true`
+    //       (app/daemon/apply_controller.cpp) -> "... HDMI-A-1 on 0 ..."; its onToggled re-binding replaced by
+    //       `screenSound.checked = screenSound.checked;` -> "... followed the daemon 0 ...". Deleting the
+    //       re-binding line instead stays green, as for S15.483. The client reading a listed monitor's
+    //       `heard` in place of `enabled` (app/daemon/daemon_client.cpp) -> "... started 0 ...; followed the
+    //       daemon 0 ...": DP-1 holds a wallpaper, so the stand-in daemon lists it as the real one does.
+    {
+        const bool startsOn = checked(screen);
+        s.daemonFake.hold.insert(QStringLiteral("SetMonitorSound"));
+        clickOn(w.window, screen);
+        const bool held = waitFor([&] { return !s.daemonFake.held.isEmpty(); }, kWaitMs) && settle(w.window);
+        const bool pendingDp1 = !checked(screen);
+        const bool hdmiOwn = step(w.client.select(QStringLiteral("HDMI-A-1"))) && checked(screen);
+        const bool pendingBack = step(w.client.select(QStringLiteral("DP-1"))) && !checked(screen);
+        s.daemonFake.hold.clear();
+        s.daemonFake.release();
+        const bool done = waitFor([&] { return s.applier.screenSoundState() != ApplyController::Progress::Working; }, kWaitMs) &&
+                          settle(w.window);
+        const int dp1 = s.daemonFake.outputs.value(QStringLiteral("DP-1"), -1);
+        const auto sent = s.daemonFake.named(QStringLiteral("SetMonitorSound"));
+        const bool offAfter = !checked(screen);
+        const bool hdmiAfter = step(w.client.select(QStringLiteral("HDMI-A-1"))) && checked(screen);
+        const bool back = step(w.client.select(QStringLiteral("DP-1")));
+        s.daemonFake.screenSound.remove(dp1);
+        s.daemon.refresh();
+        // DP-1 holds the wallpaper applyAndPause applied, so GetStatus still lists it, now {enabled: true}:
+        // following the daemon is reading that entry, not the default for a missing one.
+        if (!s.daemonFake.wallpapers.contains(dp1)) {
+            notVerified("S15.484's follow-the-daemon half", "DP-1 holds no wallpaper in the stand-in daemon, so GetStatus does not list it");
+        }
+        const bool follows = back && waitFor([&] { return checked(screen); }, kWaitMs);
+        expect(startsOn && held && pendingDp1 && hdmiOwn && pendingBack && done && dp1 >= 0 && sent.size() == 1 &&
+                   sent[0].args == QVariantList{dp1, false} && offAfter && hdmiAfter && follows,
+               QStringLiteral("S15.484: the screen switch started %1; held %2: DP-1 off %3, HDMI-A-1 on %4, back off %5; done %6: DP-1 off "
+                              "%7, HDMI-A-1 on %8; followed the daemon %9; sent %10 SetMonitorSound")
+                   .arg(startsOn).arg(held).arg(pendingDp1).arg(hdmiOwn).arg(pendingBack).arg(done).arg(offAfter).arg(hdmiAfter)
+                   .arg(follows).arg(sent.size()));
+    }
+
+    // GOAL: S15.485 -- once the daemon has answered, both switches show the new value before the
+    //       status read that follows comes back.
+    // WHY-THIS-SHAPE: the setters are held first, so DP-1's bind is over before GetStatus is held; the
+    //       switch can then only be showing what the reply recorded.
+    // CONTROL: via control_batch.sh, 2026-10-11, `record();` deleted from DaemonClient::sendSetting
+    //       (app/daemon/daemon_client.cpp) -> "FAIL: S15.485: with the status read held (1), the switches show
+    //       every screen 0 and DP-1 1 once the daemon answered (done 1)". Reverted.
+    {
+        s.daemonFake.hold = {QStringLiteral("SetSound"), QStringLiteral("SetMonitorSound")};
+        clickOn(w.window, global);
+        clickOn(w.window, screen);
+        const bool settersHeld = waitFor([&] { return s.daemonFake.held.size() == 2; }, kWaitMs);
+        s.daemonFake.hold = {QStringLiteral("GetStatus")};
+        s.daemonFake.release();
+        const bool done = waitFor([&] {
+            return s.applier.soundState() == ApplyController::Progress::Done && s.applier.screenSoundState() == ApplyController::Progress::Done;
+        }, kWaitMs) && settle(w.window);
+        const bool globalOn = checked(global);
+        const bool screenOn = checked(screen);
+        // The status read crosses the bus after the replies are handled, so its arrival is waited for.
+        const bool statusHeld = settersHeld && waitFor([&] {
+            return std::ranges::any_of(s.daemonFake.held, [](const QDBusMessage& m) { return m.member() == u"GetStatus"; });
+        }, kWaitMs);
+        expect(settersHeld && done && statusHeld && !globalOn && !screenOn,
+               QStringLiteral("S15.485: with the status read held (%1), the switches show every screen %2 and DP-1 %3 once the daemon "
+                              "answered (done %4)")
+                   .arg(statusHeld).arg(globalOn).arg(screenOn).arg(done));
+        s.daemonFake.hold.clear();
+        s.daemonFake.release();
+    }
+
+    // GOAL: S15.486 -- a refused sound change says so under its switch: the every-screen sentence
+    //       whichever screen is selected, the screen's only under DP-1.
+    // CONTROL: via control_batch.sh, 2026-10-11, each alone, reverted: screenSoundMessage() returning the
+    //       message whatever is selected (app/daemon/apply_controller.h) -> "FAIL: S15.486: the refusals show
+    //       both on DP-1 1, only every screen's on HDMI-A-1 0"; Main.qml's sound message label given `text:
+    //       ""` (app/qml/Main.qml) -> "... both on DP-1 0, only every screen's on HDMI-A-1 0".
+    {
+        s.daemonFake.refuse.insert(QStringLiteral("SetSound"), {QStringLiteral("io.wallpaperx.Daemon.Error.RenderFailed"), QStringLiteral("disk full")});
+        s.daemonFake.refuse.insert(QStringLiteral("SetMonitorSound"), {QStringLiteral("org.freedesktop.DBus.Error.InvalidArgs"), QStringLiteral("no")});
+        clickOn(w.window, global);
+        clickOn(w.window, screen);
+        const bool failed = waitFor([&] {
+            return s.applier.soundState() == ApplyController::Progress::Failed && s.applier.screenSoundState() == ApplyController::Progress::Failed;
+        }, kWaitMs) && settle(w.window);
+        const auto shown = [&](const char* prefix) { return labelStarting(root, QString::fromLatin1(prefix)) != nullptr; };
+        const char* everyScreen = "Sound was not changed for every screen.";
+        const char* thisScreen = "The sound setting for DP-1 was not changed.";
+        const bool onDp1 = shown(everyScreen) && shown(thisScreen);
+        const bool onHdmi = step(w.client.select(QStringLiteral("HDMI-A-1"))) && shown(everyScreen) && !shown(thisScreen);
+        expect(failed && onDp1 && onHdmi,
+               QStringLiteral("S15.486: the refusals show both on DP-1 %1, only every screen's on HDMI-A-1 %2 (failed %3)")
+                   .arg(onDp1).arg(onHdmi).arg(failed));
+        s.daemonFake.refuse.clear();
+    }
 }
 
 } // namespace
@@ -565,6 +734,7 @@ int main(int argc, char* argv[]) {
         Services services{*daemonFake, *daemon, *applier};
         applyAndPause(w, window->contentItem(), *library, services);
         scopedMessages(w, window->contentItem(), *library, services);
+        soundSwitches(w, window->contentItem(), services);
     }
 
     root.reset();

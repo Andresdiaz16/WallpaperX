@@ -47,6 +47,22 @@ struct PersistedWallpaper {
     // fact about the monitor id, so it rides on a row with no wallpaper and no name as well, and is
     // text for propertiesJson's reason.
     std::string pauseJson;
+
+    // The monitor's sound setting, the `sound` field as JSON text, empty when the row has none. The
+    // monitor's, like pauseJson.
+    std::string soundJson;
+
+    // Whether the row carries a setting of the monitor, which keeps it worth writing with no
+    // wallpaper and no name.
+    bool holdsMonitorSettings() const { return !pauseJson.empty() || !soundJson.empty(); }
+};
+
+// The whole file: the settings at its root and one row per monitor.
+struct PersistedConfig {
+    std::vector<PersistedWallpaper> monitors;
+
+    // The root `sound` field as JSON text, empty when absent (sound_setting.h).
+    std::string soundJson;
 };
 
 // Not a fit -- real names run under a dozen bytes -- but a finite bound on a string a
@@ -95,6 +111,9 @@ OutputSize outputSizeFromJson(const std::string& text);
 
 struct LoadResult {
     std::vector<PersistedWallpaper> entries;
+
+    // The root `sound` field as JSON text, empty when absent.
+    std::string soundJson;
 
     // Empty when nothing was wrong, including the ordinary case of no file at all.
     std::string error;
@@ -157,7 +176,7 @@ public:
     // Temp file + rename(), so a crash mid-write cannot leave a truncated config. No
     // fsync: 824 us against 9 us for the rename alone (PLAN.md Step 8), on the DBus
     // event-loop thread, buying only survival of a power cut.
-    SaveResult save(const std::vector<PersistedWallpaper>& entries) const;
+    SaveResult save(const PersistedConfig& config) const;
 
 private:
     std::filesystem::path m_file;

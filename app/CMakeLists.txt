@@ -19,6 +19,8 @@ find_package(sdbus-c++ REQUIRED CONFIG)
 find_package(nlohmann_json REQUIRED)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(LIBZIP REQUIRED IMPORTED_TARGET libzip)
+# Only to tell whether a video has sound, with the FFmpeg the daemon plays it with.
+pkg_check_modules(LIBAV REQUIRED IMPORTED_TARGET libavformat>=61 libavcodec>=61 libavutil>=59)
 
 # --------------------------------------------------------------------------- #
 # wallpaperx GUI
@@ -39,6 +41,8 @@ qt_add_executable(wallpaperx
     daemon/daemon_client.h
     daemon/apply_controller.cpp
     daemon/apply_controller.h
+    library/audio_probe.cpp
+    library/audio_probe.h
     library/current_exception.h
     library/unique_fd.h
     library/wpx_package.cpp
@@ -66,6 +70,7 @@ target_link_libraries(wallpaperx PRIVATE
     SDBusCpp::sdbus-c++
     nlohmann_json::nlohmann_json
     PkgConfig::LIBZIP
+    PkgConfig::LIBAV
 )
 
 qt_add_qml_module(wallpaperx

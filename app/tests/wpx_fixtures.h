@@ -40,10 +40,12 @@
 #include <exception>
 #include <functional>
 #include <future>
+#include <initializer_list>
 #include <memory>
 #include <optional>
 #include <string>
 #include <thread>
+#include <utility>
 
 #include <dirent.h>
 #include <fcntl.h>
@@ -121,6 +123,94 @@ inline Entries planEntries(const QByteArray& manifest) {
     return {{QStringLiteral("wallpaper.json"), manifest},
             {QStringLiteral("preview.png"), pngBytes(1280, 720)},
             {QStringLiteral("assets/video.mp4"), QByteArrayLiteral("not really a video")}};
+}
+
+// Real media, written byte by byte so no encoder is needed; the probe test (S15.472) checks the probe
+// against all of them.
+namespace media {
+inline void bigEndian(QByteArray& out, quint32 value, int bytes) {
+    for (int i = bytes - 1; i >= 0; --i) {
+        out.append(char((value >> (8 * i)) & 0xff));
+    }
+}
+inline void littleEndian(QByteArray& out, quint32 value, int bytes) {
+    for (int i = 0; i < bytes; ++i) {
+        out.append(char((value >> (8 * i)) & 0xff));
+    }
+}
+inline QByteArray flvTag(int type, const QByteArray& data, quint32 timestamp) {
+    QByteArray tag;
+    tag.append(char(type));
+    bigEndian(tag, quint32(data.size()), 3);
+    bigEndian(tag, timestamp & 0xffffff, 3);
+    tag.append(char(timestamp >> 24));
+    bigEndian(tag, 0, 3);
+    tag.append(data);
+    bigEndian(tag, quint32(11 + data.size()), 4);
+    return tag;
+}
+} // namespace media
+
+// An FLV file of `videoTags` Sorenson H.263 video tags and, with `audio`, one 16-bit PCM audio tag
+// after them. FLV names its streams only as their packets arrive, so its audio is found only by reading
+// past the video. Each picture is 128 bytes: FFmpeg recognises an FLV file only past about 100 bytes
+// after its header, which one shorter tag without the audio does not reach.
+inline QByteArray flvVideo(bool audio, int videoTags = 1) {
+    QByteArray out("FLV\x01", 4);
+    out.append(char(audio ? 0x05 : 0x01));
+    media::bigEndian(out, 9, 4);
+    media::bigEndian(out, 0, 4);
+    for (int i = 0; i < videoTags; ++i) {
+        QByteArray picture(1, char(i == 0 ? 0x12 : 0x22));
+        picture.append(QByteArray(128, '\0'));
+        out.append(media::flvTag(9, picture, quint32(i * 40)));
+    }
+    if (audio) {
+        QByteArray sound(1, char(0x3e));
+        sound.append(QByteArray(64, '\0'));
+        out.append(media::flvTag(8, sound, 0));
+    }
+    return out;
+}
+
+// A WAV file: one 8 kHz mono 16-bit PCM stream, declared in its header.
+inline QByteArray wavAudio() {
+    constexpr int kSamples = 800;
+    QByteArray out("RIFF");
+    media::littleEndian(out, 36 + kSamples * 2, 4);
+    out.append("WAVEfmt ");
+    // The fmt chunk: its size, PCM, one channel, 8000 Hz, bytes per second, bytes per sample, bits.
+    const std::initializer_list<std::pair<quint32, int>> format{{16, 4}, {1, 2}, {1, 2}, {8000, 4}, {16000, 4}, {2, 2}, {16, 2}};
+    for (const auto& [value, bytes] : format) {
+        media::littleEndian(out, value, bytes);
+    }
+    out.append("data");
+    media::littleEndian(out, kSamples * 2, 4);
+    for (int i = 0; i < kSamples; ++i) {
+        media::littleEndian(out, i % 40 < 20 ? 1000u : 0xfc18u, 2);
+    }
+    return out;
+}
+
+// A YUV4MPEG2 file: two raw 16x16 pictures and nothing else.
+inline QByteArray y4mVideo() {
+    QByteArray out("YUV4MPEG2 W16 H16 F25:1 Ip A1:1 C420jpeg\n");
+    for (int frame = 0; frame < 2; ++frame) {
+        out.append("FRAME\n");
+        out.append(QByteArray(16 * 16 * 3 / 2, char(0x80)));
+    }
+    return out;
+}
+
+// A video with an audio stream, and the same video without it.
+inline QByteArray soundVideo() { return flvVideo(true); }
+inline QByteArray silentVideo() { return flvVideo(false); }
+
+// PLAN's entries with `asset` as the video file.
+inline Entries planEntriesWith(const QByteArray& manifest, const QByteArray& asset) {
+    Entries entries = planEntries(manifest);
+    entries.last().second = asset;
+    return entries;
 }
 
 // Writes a ZIP archive holding `entries` at `path`, letting `each` adjust every entry once added

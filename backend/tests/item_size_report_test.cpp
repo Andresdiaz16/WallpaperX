@@ -440,8 +440,11 @@ void eventRefusalsPhase(Harness& h) {
     // GOAL (a property of this harness): the only refusals in the span are the size refusals
     //       this phase stages, so the counts below are about them. False when the stub declines
     //       the item's visibility or window report and Qt's error is logged beside them.
-    // CONTROL: SetOutputVisible and SetOutputFocus dropped from the methods ReportStub answers
-    //       (tests/report_stub.h) -> this line red. Observed 2026-10-01. Reverted.
+    // CONTROL: via control_batch.sh, --phase '^event-refusals$', 2026-10-11, each alone, in
+    //       backend/tests/report_stub.h, reverted: SetOutputVisible dropped from the methods it answers ->
+    //       this line red (the visibility half); SetOutputFocusState answered InvalidArgs, a refusal the item
+    //       logs -> this line red (the window half). Dropping the focus method instead cannot work: the item
+    //       reads UnknownMethod as an older daemon and logs nothing.
     const int otherRefusals = logged.count(QStringLiteral("refused this screen's visibility")) +
                               logged.count(QStringLiteral("refused this screen's window state"));
     check(otherRefusals == 0, "the item logged no refusal of a report this stub does not refuse");

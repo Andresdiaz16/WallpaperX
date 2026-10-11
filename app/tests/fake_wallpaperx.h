@@ -167,8 +167,8 @@ protected:
     bool m_registered = false;
 };
 
-// io.wallpaperx.Daemon at /io/wallpaperx/Daemon: GetStatus from the fields below, and the four
-// setters the app calls, each changing them as the daemon would.
+// io.wallpaperx.Daemon at /io/wallpaperx/Daemon: GetStatus from the fields below, and the setters
+// the app calls, each changing them as the daemon would.
 class FakeDaemon : public FakeService {
 public:
     FakeDaemon(QString service, CallLog* log)
@@ -180,6 +180,12 @@ public:
     QMap<int, QJsonValue> pause;
     QString persistence = QStringLiteral("ok");
     QString persistenceDetail = QStringLiteral("the disk is full");
+    // Sound on every screen and per monitor as GetStatus's `sound` carries them; null is a value a
+    // newer daemon wrote. With reportsSound false, GetStatus has no `sound` key, as a daemon older than
+    // sound settings answers.
+    bool reportsSound = true;
+    QJsonValue sound = true;
+    QMap<int, QJsonValue> screenSound;
 
     QString status() const {
         QJsonObject names;
@@ -194,12 +200,25 @@ public:
         for (auto it = pause.cbegin(); it != pause.cend(); ++it) {
             modes.insert(QString::number(it.key()), QJsonObject{{QStringLiteral("mode"), it.value()}, {QStringLiteral("paused"), false}});
         }
-        const QJsonObject root{{QStringLiteral("outputs"), names},
-                               {QStringLiteral("outputs_literal"), names},
-                               {QStringLiteral("wallpapers"), shown},
-                               {QStringLiteral("pause"), modes},
-                               {QStringLiteral("persistence"),
-                                QJsonObject{{QStringLiteral("status"), persistence}, {QStringLiteral("detail"), persistenceDetail}}}};
+        QJsonObject root{{QStringLiteral("outputs"), names},
+                         {QStringLiteral("outputs_literal"), names},
+                         {QStringLiteral("wallpapers"), shown},
+                         {QStringLiteral("pause"), modes},
+                         {QStringLiteral("persistence"),
+                          QJsonObject{{QStringLiteral("status"), persistence}, {QStringLiteral("detail"), persistenceDetail}}}};
+        if (reportsSound) {
+            // As the daemon lists them: every monitor holding a wallpaper, and every one with a setting.
+            QSet<int> listed = wallpapers;
+            for (auto it = screenSound.cbegin(); it != screenSound.cend(); ++it) {
+                listed.insert(it.key());
+            }
+            QJsonObject monitors;
+            for (const int id : listed) {
+                monitors.insert(QString::number(id), QJsonObject{{QStringLiteral("enabled"), screenSound.value(id, QJsonValue(true))},
+                                                                 {QStringLiteral("heard"), false}});
+            }
+            root.insert(QStringLiteral("sound"), QJsonObject{{QStringLiteral("enabled"), sound}, {QStringLiteral("monitors"), monitors}});
+        }
         return QString::fromUtf8(QJsonDocument(root).toJson(QJsonDocument::Compact));
     }
 
@@ -215,6 +234,16 @@ protected:
             wallpapers.insert(call.args.value(2).toInt());
         } else if (call.member == u"SetMonitorPause") {
             pause.insert(call.args.value(0).toInt(), call.args.value(1).toString());
+        } else if (call.member == u"SetSound") {
+            sound = call.args.value(0).toBool();
+        } else if (call.member == u"SetMonitorSound") {
+            // On is no setting; status() still lists the monitor as on while it holds a wallpaper.
+            const int id = call.args.value(0).toInt();
+            if (call.args.value(1).toBool()) {
+                screenSound.remove(id);
+            } else {
+                screenSound.insert(id, false);
+            }
         }
     }
     void answer(const QDBusMessage& m) override {

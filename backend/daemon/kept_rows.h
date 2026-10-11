@@ -32,6 +32,9 @@ struct LiveWallpapers {
     // this build can bind, whatever a carried row says.
     std::map<int, std::string> pause;
 
+    // Monitor id -> its sound setting as JSON text; absent means on. The same authority as `pause`.
+    std::map<int, std::string> sound;
+
     // Whether a live monitor holds a wallpaper for this id, which is what decides that a kept
     // row for the same id will not survive the next save.
     bool holds(int monitorId) const;
@@ -56,7 +59,7 @@ public:
     // Clears the wallpaper half of a kept row, its properties included, answering whether there was one to clear -- the
     // caller reports the loss, and only when there was one. Takes the row, not an id: one
     // caller holds a copy not yet carried. Says nothing about `output`: a lost name is a
-    // different loss, counted separately. Nor about `pauseJson`, which is the monitor's.
+    // different loss, counted separately. Nor about `pauseJson` or `soundJson`, which are the monitor's.
     static bool dropWallpaper(PersistedWallpaper& row);
 
     // Losses no restart brings back, counted so they are reported at all. Name-only rows

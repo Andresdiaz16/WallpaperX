@@ -15,6 +15,7 @@ namespace {
 
 constexpr const char* kSpeed = "speed";
 constexpr const char* kMute = "mute";
+constexpr const char* kVolume = "volume";
 
 std::optional<std::uint8_t> hexByte(char high, char low) {
     const auto digit = [](char c) -> int {
@@ -46,6 +47,9 @@ std::string propertyError(const std::string& key, const PropertyValue& value) {
         return "property speed must be a number above 0 and at most 2";
     }
     if (key == kMute && !std::holds_alternative<bool>(value)) return "property mute must be a boolean";
+    if (key == kVolume && (number == nullptr || *number < 0 || *number > 1)) {
+        return "property volume must be a number from 0 to 1";
+    }
     return {};
 }
 
@@ -82,11 +86,16 @@ std::string propertiesError(const WallpaperProperties& properties) {
     return {};
 }
 
-WallpaperProperties usableProperties(const WallpaperProperties& properties, int& dropped) {
+WallpaperProperties usableProperties(const WallpaperProperties& properties, int& dropped, int& clampedVolumes) {
     WallpaperProperties usable;
-    for (const auto& [key, value] : properties) {
+    for (const auto& [key, read] : properties) {
+        PropertyValue value = read;
+        double* volume = key == kVolume ? std::get_if<double>(&value) : nullptr;
+        const bool clamped = volume != nullptr && std::isfinite(*volume) && (*volume < 0 || *volume > 1);
+        if (clamped) *volume = std::clamp(*volume, 0.0, 1.0);
         if (usable.size() < kMaxProperties && propertyError(key, value).empty()) {
-            usable.emplace(key, value);
+            usable.emplace(key, std::move(value));
+            if (clamped) ++clampedVolumes;
         } else {
             ++dropped;
         }
@@ -100,6 +109,12 @@ double playbackSpeed(const WallpaperProperties& properties) {
     const double* speed = std::get_if<double>(&it->second);
     if (speed == nullptr || !std::isfinite(*speed)) return 1.0;
     return std::clamp(*speed, kMinPlaybackSpeed, kMaxPlaybackSpeed);
+}
+
+bool wallpaperMuted(const WallpaperProperties& properties) {
+    const auto it = properties.find(kMute);
+    const bool* mute = it == properties.end() ? nullptr : std::get_if<bool>(&it->second);
+    return mute != nullptr && *mute;
 }
 
 nlohmann::json toJson(const WallpaperProperties& properties) {

@@ -51,19 +51,19 @@ void ConfigWriter::startLocked() {
         worker = std::make_shared<PersistWorker>();
         std::thread([worker, store = m_store] {
             for (;;) {
-                std::vector<PersistedWallpaper> entries;
+                PersistedConfig contents;
                 {
                     std::unique_lock<std::mutex> lock(worker->mutex);
                     // No stop condition: there is nothing safe to wait for at exit, since a
                     // write on a dead mount cannot be interrupted. The thread ends with the
                     // process, and holds nothing the process needs to release.
                     worker->wake.wait(lock, [&worker] { return worker->pending.has_value(); });
-                    entries = std::move(*worker->pending);
+                    contents = std::move(*worker->pending);
                     worker->pending.reset();
                     worker->writingSince = std::chrono::steady_clock::now();
                 }
 
-                const SaveResult saved = store.save(entries);
+                const SaveResult saved = store.save(contents);
 
                 // Said by the thread that learns it: the startup repair is queued, so any other
                 // report of it races the write and can read as a clean start.
@@ -106,7 +106,7 @@ void ConfigWriter::startLocked() {
     m_worker = std::move(worker);
 }
 
-bool ConfigWriter::queue(std::vector<PersistedWallpaper> rows) {
+bool ConfigWriter::queue(PersistedConfig config) {
     if (!m_store.enabled()) return false;
 
     std::shared_ptr<PersistWorker> worker;
@@ -132,7 +132,7 @@ bool ConfigWriter::queue(std::vector<PersistedWallpaper> rows) {
         // Replaced, not appended: an older snapshot waiting behind a stalled write describes a
         // state this one already supersedes, so writing it would only be a slower route to the
         // same file.
-        worker->pending = std::move(rows);
+        worker->pending = std::move(config);
     }
     worker->wake.notify_one();
     return true;

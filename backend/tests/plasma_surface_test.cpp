@@ -87,7 +87,7 @@ using wallpaperx::testing::ReportStub;
 
 const QString kOutput = QStringLiteral("DP-ACTIVITY");
 const QString kVisible = QStringLiteral("SetOutputVisible");
-const QString kFocus = QStringLiteral("SetOutputFocus");
+const QString kFocus = QStringLiteral("SetOutputFocusState");
 const QString kSize = QStringLiteral("SetOutputSize");
 constexpr int kArrivalLimitMs = 5000;
 
@@ -997,7 +997,7 @@ int main(int argc, char** argv) {
             surface->setProperty("monitorId", 0);
             surface->setProperty("output", kOutput);
             const bool reported = pumpUntil([&] { return !stub.calls(kFocus, kOutput, mark).empty(); }, kArrivalLimitMs);
-            check(reported && !stub.calls(kFocus, kOutput, mark).front().args.value(1).toBool() &&
+            check(reported && stub.calls(kFocus, kOutput, mark).front().args.value(1).toString() == QLatin1String("none") &&
                       !stub.calls(kFocus, kOutput, mark).front().args.value(2).toBool(),
                   "and the screen is reported as having no focused or maximized window");
         }
@@ -1061,7 +1061,7 @@ int main(int argc, char** argv) {
 
         if (restartSelected) {
             // GOAL: when every copy is asked to report again -- a daemon restart -- only the copy on
-            //       the screen answers: one SetOutputVisible, true, and one SetOutputFocus. A hidden
+            //       the screen answers: one SetOutputVisible, true, and one SetOutputFocusState. A hidden
             //       copy that still had a renderer would send "not visible" under the same name, and
             //       whichever arrived last would decide whether the user's video plays.
             // WHY-THIS-SHAPE: counted, not ordered: with two answers their order is a race, measured
@@ -1099,7 +1099,7 @@ int main(int argc, char** argv) {
                     const std::size_t focus = stub.calls(kFocus, kOutput, mark).size();
                     check(sized && seen.size() == 1 && seen.front(), "a daemon restart is answered by the shown copy alone");
                     check(sized && focus == 1, "and with one window report");
-                    std::fprintf(stderr, "  after the restart: SetOutputVisible %s; %zu SetOutputFocus\n",
+                    std::fprintf(stderr, "  after the restart: SetOutputVisible %s; %zu SetOutputFocusState\n",
                                  describe(seen).c_str(), focus);
                 }
             }

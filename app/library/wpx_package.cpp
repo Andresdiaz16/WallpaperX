@@ -2,11 +2,13 @@
 
 #include "wpx_package.h"
 
+#include "audio_probe.h"
 #include "unique_fd.h"
 
 #include <QColor>
 #include <QDir>
 #include <QFileInfo>
+#include <QHash>
 #include <QRegularExpression>
 #include <QStandardPaths>
 #include <QStringDecoder>
@@ -60,11 +62,14 @@ bool isPropertyKey(const QString& key)
     return pattern.match(key).hasMatch();
 }
 
+QString propertyProblem(const QString& key, const QString& what)
+{
+    return QStringLiteral("Property \"%1\" in wallpaper.json %2").arg(key, what);
+}
+
 std::expected<WallpaperProperty, QString> parseProperty(const QString& key, const Json& spec)
 {
-    const auto refuse = [&key](const QString& what) {
-        return std::unexpected(QStringLiteral("Property \"%1\" in wallpaper.json %2").arg(key, what));
-    };
+    const auto refuse = [&key](const QString& what) { return std::unexpected(propertyProblem(key, what)); };
     // Not quoted back: it can hold anything, a bidirectional override included.
     if (!isPropertyKey(key)) {
         return std::unexpected(QStringLiteral("wallpaper.json has a property whose name is not 1 to %1 letters, "
@@ -129,8 +134,9 @@ std::expected<WallpaperProperty, QString> parseProperty(const QString& key, cons
     }
     property.defaultValue = *accepted;
 
-    // The two keys the daemon applies, refused rather than clamped: a clamped range is one the
-    // author never declared.
+    // A key the daemon gives a meaning, refused rather than clamped: a clamped range is one the
+    // author never declared. The sound keys are checked in settleSoundProperties(), which knows
+    // whether they are kept.
     if (key == u"speed") {
         if (property.type != WallpaperProperty::Type::Float) {
             return refuse(QStringLiteral("is not a float, and WallpaperX reads a video's speed as one."));
@@ -142,10 +148,31 @@ std::expected<WallpaperProperty, QString> parseProperty(const QString& key, cons
                               .arg(property.maximum)
                               .arg(kMaxPlaybackSpeed));
         }
-    } else if (key == u"mute" && property.type != WallpaperProperty::Type::Bool) {
-        return refuse(QStringLiteral("is not a bool, and WallpaperX reads \"mute\" as one."));
     }
     return property;
+}
+
+// Why the daemon would refuse a declared `mute` or `volume`, for the same reason as `speed`.
+std::optional<QString> soundPropertyProblem(const WallpaperProperty& property)
+{
+    if (property.key == QLatin1StringView(kMuteKey) && property.type != WallpaperProperty::Type::Bool) {
+        return propertyProblem(property.key, QStringLiteral("is not a bool, and WallpaperX reads \"mute\" as one."));
+    }
+    if (property.key != QLatin1StringView(kVolumeKey)) {
+        return std::nullopt;
+    }
+    if (property.type != WallpaperProperty::Type::Float) {
+        return propertyProblem(property.key,
+                               QStringLiteral("is not a float, and WallpaperX reads a video's volume as one."));
+    }
+    if (property.minimum < 0.0 || property.maximum > kMaxVolume) {
+        return propertyProblem(property.key,
+                               QStringLiteral("allows %1 to %2, and WallpaperX plays a video's volume from 0 to %3.")
+                                   .arg(property.minimum)
+                                   .arg(property.maximum)
+                                   .arg(kMaxVolume));
+    }
+    return std::nullopt;
 }
 
 struct ZipDiscard {
@@ -239,13 +266,19 @@ struct ReadFile {
     FileStamp stamp;
 };
 
+struct FoundFile {
+    FileStamp stamp;
+    // The file, open, in a folder; none in an archive.
+    UniqueFd fd;
+};
+
 // The files of one wallpaper, wherever they are kept. Messages are sentences for the user.
 class Contents {
 public:
     virtual ~Contents() = default;
     virtual std::expected<ReadFile, QString> read(const QString& name, qint64 maxBytes) = 0;
     // The file wallpaper.json names as `name`.
-    virtual std::expected<FileStamp, QString> find(const QString& name) = 0;
+    virtual std::expected<FoundFile, QString> find(const QString& name) = 0;
 };
 
 class ArchiveContents final : public Contents {
@@ -261,12 +294,12 @@ public:
         return ReadFile{std::move(*bytes), m_stamp};
     }
 
-    std::expected<FileStamp, QString> find(const QString& name) override
+    std::expected<FoundFile, QString> find(const QString& name) override
     {
         if (!locate(m_zip, name)) {
             return std::unexpected(QStringLiteral("The archive has no %1, which wallpaper.json names.").arg(name));
         }
-        return m_stamp;
+        return FoundFile{m_stamp, {}};
     }
 
 private:
@@ -335,14 +368,14 @@ public:
         return ReadFile{std::move(*bytes), stampFrom(st)};
     }
 
-    std::expected<FileStamp, QString> find(const QString& name) override
+    std::expected<FoundFile, QString> find(const QString& name) override
     {
         struct stat st {};
         auto fd = open(name, QStringLiteral("The folder has no %1, which wallpaper.json names.").arg(name), st);
         if (!fd) {
             return std::unexpected(fd.error());
         }
-        return stampFrom(st);
+        return FoundFile{stampFrom(st), std::move(*fd)};
     }
 
 private:
@@ -370,32 +403,97 @@ private:
     int m_dir;
 };
 
+struct ReadContents {
+    Wallpaper wallpaper;
+    // The asset, still open, when `wallpaper` is usable and read from a folder.
+    UniqueFd asset;
+};
+
 // The one validator for a folder and an archive: the manifest, then every file it names.
-Wallpaper readFrom(Wallpaper file, Contents& contents)
+ReadContents readFrom(Wallpaper file, Contents& contents)
 {
     const auto manifest = contents.read(QString::fromLatin1(kManifestName), kMaxManifestBytes);
     if (!manifest) {
-        return broken(std::move(file), manifest.error());
+        return {broken(std::move(file), manifest.error())};
     }
     file.stamp = manifest->stamp;
     auto parsed = parseManifest(manifest->bytes);
     if (!parsed) {
-        return broken(std::move(file), parsed.error());
+        return {broken(std::move(file), parsed.error())};
     }
     const auto preview = contents.find(parsed->previewName);
     if (!preview) {
-        return broken(std::move(file), preview.error());
+        return {broken(std::move(file), preview.error())};
     }
-    const auto asset = contents.find(parsed->assetName);
+    auto asset = contents.find(parsed->assetName);
     if (!asset) {
-        return broken(std::move(file), asset.error());
+        return {broken(std::move(file), asset.error())};
     }
     parsed->filePath = std::move(file.filePath);
     parsed->fileName = std::move(file.fileName);
     parsed->stamp = file.stamp;
-    parsed->previewStamp = *preview;
-    parsed->assetStamp = *asset;
-    return std::move(*parsed);
+    parsed->previewStamp = preview->stamp;
+    parsed->assetStamp = asset->stamp;
+    return {std::move(*parsed), std::move(asset->fd)};
+}
+
+// Gives a video with sound its own sound controls, taking the declared ones where there are, and
+// takes them from a wallpaper known to have none: they would set nothing anyone can hear. One the
+// probe could not answer for keeps them as declared. What is kept is what Apply sends, so it is
+// held to the daemon's rule; the error is a sentence for the user.
+std::optional<QString> settleSoundProperties(Wallpaper& wallpaper)
+{
+    if (wallpaper.audio == AudioStreams::Absent) {
+        wallpaper.properties.removeIf([](const WallpaperProperty& property) {
+            return property.key == QLatin1StringView(kMuteKey) || property.key == QLatin1StringView(kVolumeKey);
+        });
+        return std::nullopt;
+    }
+    for (const WallpaperProperty& property : std::as_const(wallpaper.properties)) {
+        if (auto problem = soundPropertyProblem(property)) {
+            return problem;
+        }
+    }
+    if (wallpaper.audio == AudioStreams::Unknown) {
+        return std::nullopt;
+    }
+    // Taken as declared once the daemon's property cap is reached: one more would cost the
+    // wallpaper its Apply.
+    const auto declared = [&wallpaper](const char* key) {
+        return wallpaper.properties.size() >= kMaxProperties ||
+               std::ranges::contains(wallpaper.properties, QLatin1StringView(key), &WallpaperProperty::key);
+    };
+    if (!declared(kMuteKey)) {
+        WallpaperProperty mute;
+        mute.key = mute.label = QString::fromLatin1(kMuteKey);
+        mute.type = WallpaperProperty::Type::Bool;
+        mute.defaultValue = false;
+        wallpaper.properties.append(mute);
+    }
+    if (!declared(kVolumeKey)) {
+        WallpaperProperty volume;
+        volume.key = volume.label = QString::fromLatin1(kVolumeKey);
+        volume.type = WallpaperProperty::Type::Float;
+        volume.defaultValue = kMaxVolume;
+        volume.minimum = 0.0;
+        volume.maximum = kMaxVolume;
+        wallpaper.properties.append(volume);
+    }
+    return std::nullopt;
+}
+
+// Probe answers from an earlier scan, by asset path, each with the version of the asset it is for.
+using KnownAudio = QHash<QString, std::pair<FileStamp, AudioStreams>>;
+
+AudioStreams audioOf(const Wallpaper& wallpaper, int assetFd, const KnownAudio& known)
+{
+    if (wallpaper.type != u"video") {
+        return AudioStreams::Absent;
+    }
+    if (const auto it = known.constFind(wallpaper.assetPath); it != known.cend() && it->first == wallpaper.assetStamp) {
+        return it->second;
+    }
+    return probeAudioStreams(assetFd);
 }
 
 Wallpaper namedFile(const QString& path)
@@ -407,7 +505,7 @@ Wallpaper namedFile(const QString& path)
 }
 
 // The folder `name` in `parent` (a descriptor, or AT_FDCWD), shown as `path`.
-Wallpaper readFolderAt(int parent, const QByteArray& name, const QString& path)
+Wallpaper readFolderAt(int parent, const QByteArray& name, const QString& path, const KnownAudio& known = {})
 {
     Wallpaper folder = namedFile(path);
     // The daemon and Plasma take a path as a D-Bus string, which must be UTF-8.
@@ -426,11 +524,16 @@ Wallpaper readFolderAt(int parent, const QByteArray& name, const QString& path)
                                                           : QStringLiteral("It cannot be opened: %1.").arg(systemError(error)));
     }
     FolderContents contents(dir.get());
-    Wallpaper read = readFrom(std::move(folder), contents);
-    if (read.usable()) {
-        read.assetPath = read.filePath + u'/' + read.assetName;
+    ReadContents read = readFrom(std::move(folder), contents);
+    Wallpaper& wallpaper = read.wallpaper;
+    if (wallpaper.usable()) {
+        wallpaper.assetPath = wallpaper.filePath + u'/' + wallpaper.assetName;
+        wallpaper.audio = audioOf(wallpaper, read.asset.get(), known);
+        if (auto problem = settleSoundProperties(wallpaper)) {
+            return broken(std::move(wallpaper), std::move(*problem));
+        }
     }
-    return read;
+    return std::move(wallpaper);
 }
 
 } // namespace
@@ -624,7 +727,7 @@ Wallpaper readWallpaper(int fd, const QString& path)
     }
     file.stamp = archive->stamp;
     ArchiveContents contents(archive->zip.get(), archive->stamp);
-    return readFrom(std::move(file), contents);
+    return readFrom(std::move(file), contents).wallpaper;
 }
 
 Wallpaper readWallpaperFolder(const QString& path)
@@ -647,8 +750,17 @@ std::expected<QByteArray, QString> readWallpaperEntry(const QString& folderPath,
     return std::move(file->bytes);
 }
 
-std::expected<QList<Wallpaper>, QString> scanLibrary(const QString& directory)
+std::expected<QList<Wallpaper>, QString> scanLibrary(const QString& directory, const QList<Wallpaper>& previous)
 {
+    KnownAudio known;
+    for (const Wallpaper& wallpaper : previous) {
+        // Only a probe's answer: any other type's Absent says nothing of the file. Unknown is asked
+        // again, since what kept the probe from answering may have passed.
+        if (wallpaper.usable() && wallpaper.type == u"video" && wallpaper.audio != AudioStreams::Unknown &&
+            !wallpaper.assetPath.isEmpty()) {
+            known.insert(wallpaper.assetPath, {wallpaper.assetStamp, wallpaper.audio});
+        }
+    }
     const QDir dir(directory);
     std::unique_ptr<DIR, int (*)(DIR*)> listing(::opendir(encodeFileName(dir.absolutePath()).constData()), ::closedir);
     if (!listing) {
@@ -696,7 +808,7 @@ std::expected<QList<Wallpaper>, QString> scanLibrary(const QString& directory)
             continue;
         }
         if (S_ISDIR(st.st_mode)) {
-            wallpapers.append(readFolderAt(dirFd, name, path));
+            wallpapers.append(readFolderAt(dirFd, name, path, known));
         }
     }
     // readdir's end and its failure differ only in errno.

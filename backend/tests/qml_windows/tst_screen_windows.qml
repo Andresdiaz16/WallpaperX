@@ -30,6 +30,7 @@ TestCase {
         id: rendererStandIn
         QtObject {
             property bool windowFocused: false
+            property bool desktopFocused: false
             property bool windowMaximized: false
         }
     }
@@ -37,6 +38,19 @@ TestCase {
     Component {
         id: host
         Loader {}
+    }
+
+    // A top-level window of its own, to take the activation from the test's window.
+    Component {
+        id: otherWindow
+        Window {
+            width: 50
+            height: 50
+            visible: true
+            // Not transient to the test's window: an active transient child counts as its parent's
+            // activation, which is what keeps a desktop menu "desktop".
+            transientParent: null
+        }
     }
 
     function cleanup() {
@@ -237,5 +251,30 @@ TestCase {
         const renderer = createTemporaryObject(rendererStandIn, suite, { windowFocused: true, windowMaximized: true });
         load(renderer, suite);
         compareFacts(renderer, false, false, "a new watcher with no windows");
+    }
+
+    // GOAL: S15.470 -- desktopFocused is written to the renderer as the window the file is in gains and
+    //       loses the activation: true while that window is active, false once another top-level window
+    //       takes it; and it never sets windowFocused.
+    // WHY-THIS-SHAPE: the activation is moved by a real second window, as KWin moves it away from the
+    //       desktop; the value is read on the renderer, so both the binding and the change handler that
+    //       carries it there are graded.
+    // CONTROL: via control_batch.sh, 2026-10-11, each alone, reverted, in
+    //       backend/kde/kpackage/contents/ui/ScreenWindows.qml: `&& root.Window.active` dropped from
+    //       desktopFocused, and the onDesktopFocusedChanged handler deleted -> each "FAIL! ...
+    //       test_the_desktop_focus_follows_the_windows_activation() 'the desktop is not reported focused
+    //       once another window is active' returned FALSE".
+    function test_the_desktop_focus_follows_the_windows_activation() {
+        const p = loaded();
+        suite.Window.window.requestActivate();
+        tryVerify(() => suite.Window.active, 3000, "the test's window became active (the premise)");
+        tryVerify(() => p.renderer.desktopFocused === true, 3000, "the active window's desktop is reported focused");
+        compare(p.renderer.windowFocused, false, "and no window is reported focused for it");
+        const other = createTemporaryObject(otherWindow, suite);
+        other.requestActivate();
+        tryVerify(() => !suite.Window.active, 3000, "another window took the activation (the premise)");
+        tryVerify(() => p.renderer.desktopFocused === false, 3000, "the desktop is not reported focused once another window is active");
+        suite.Window.window.requestActivate();
+        tryVerify(() => p.renderer.desktopFocused === true, 3000, "and is again once its window is active again");
     }
 }
